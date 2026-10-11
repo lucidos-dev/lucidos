@@ -2,6 +2,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-04
+- **Amended by**: [0391](0391-agent-teardown-reaps-by-agent-run-marker.md). The
+  group teardown named below missed every Bash call until then.
 
 ## Context
 

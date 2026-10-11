@@ -1,6 +1,7 @@
 import { effect } from '@preact/signals';
 import { APPEARANCE_CHANNEL, readAppearancePush } from '@lucidos/appearance';
 import { postToAppFrame } from './app-bridge';
+import { mountedAppFrames } from '../../utils/appFrame';
 import { appearanceVersion } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import { themeEffectsPreference } from '../../utils/themeEffects';
@@ -23,7 +24,7 @@ let pushQueued = false;
 function pushToEveryFrame(): void {
   pushQueued = false;
   const appearance = paintedAppearance();
-  for (const frame of document.querySelectorAll<HTMLIFrameElement>('iframe[data-role="app-ui-frame"]')) {
+  for (const frame of mountedAppFrames()) {
     postToAppFrame(frame, APPEARANCE_CHANNEL, appearance);
   }
 }

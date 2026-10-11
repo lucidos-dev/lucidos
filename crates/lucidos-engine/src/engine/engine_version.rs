@@ -11,6 +11,7 @@
 //! false here and `BuildState` stays `Idle`. Their "new version" source is the
 //! release updater, `updater.rs`.
 
+use super::background_build::{BackgroundBuild, BuildHost, FinishedBuild};
 use super::LucidosEngine;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1202,7 +1203,8 @@ impl LucidosEngine {
         }
         let running = build_id_commit(crate::ENGINE_BUILD_ID)?;
         let root = crate::paths::repo_root().ok()?;
-        pending_commits_since(running, self.served_frontend_commit().as_deref(), &root).await
+        let served = self.served_frontend_source_commit();
+        pending_commits_since(running, served.as_deref(), &root).await
     }
 
     /// One periodic self-heal tick (dev only). Retriggers a background rebuild
@@ -1287,7 +1289,7 @@ impl LucidosEngine {
         crate::log!(
             "[Rebuild] self-heal: engine source is behind HEAD with a stale binary, triggering a background rebuild"
         );
-        self.trigger_background_rebuild();
+        self.join_or_start_background_rebuild();
     }
 
     /// Kick off a background engine rebuild (dev only), the non-disruptive half
@@ -1295,86 +1297,24 @@ impl LucidosEngine {
     /// When the rebuild finishes, the on-disk build id differs from the running
     /// `ENGINE_BUILD_ID` and `version_status` surfaces the switch.
     ///
-    /// A second call **coalesces**: the in-flight build is aborted, killing its
-    /// whole process group, and a fresh build starts. The build therefore always
-    /// reflects the latest merged source. No-op packaged.
-    pub fn trigger_background_rebuild(self: &Arc<Self>) {
+    /// For an Apply and self-heal. A build in flight is **joined**, never
+    /// aborted: it builds once more if HEAD moved past it (ADR 0412). No-op
+    /// packaged.
+    pub fn join_or_start_background_rebuild(self: &Arc<Self>) {
         if crate::runtime::is_packaged() {
             return;
         }
-        let generation = self.build_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        // Coalesce: abort any running build task. Its child dies with it
-        // (`kill_on_drop` plus the process-group kill in `run_engine_build`).
-        let superseded = self.build_task.lock().unwrap().take();
-        if let Some(old) = &superseded {
-            old.abort();
+        crate::engine::background_build::join_or_start(self);
+    }
+
+    /// The explicit Rebuild (`POST /api/v1/engine/rebuild`): abort the build in
+    /// flight, killing its whole process group, and start over. The user's
+    /// escape from a hung build. No-op packaged.
+    pub fn restart_background_rebuild(self: &Arc<Self>) {
+        if crate::runtime::is_packaged() {
+            return;
         }
-        // Stamped once here, so the state the SSE poke reports and the state the
-        // elapsed counter reads are the same start moment.
-        let building = BuildState::building_now();
-        // Read the failure this build is retrying BEFORE `Building` overwrites
-        // it. An identical repeat is the only PROOF that retrying is futile,
-        // and it is what lets the toast withhold Retry.
-        let previous_failure = self.build_state().failure().map(|f| f.summary.clone());
-        self.set_build_state(building.clone());
-        let engine = self.clone();
-        let workspace = self.workspace_path().to_path_buf();
-        let handle = tokio::spawn(async move {
-            // Push `building` over SSE so a connected client shows the spinner
-            // immediately. The version-status poll alone misses this transient
-            // window, since iOS suspends the timer on a backgrounded PWA.
-            engine.emit_build_state_changed(&building).await;
-            // HAND THE BUILD LOCK OVER, do not race it. `abort()` only REQUESTS
-            // cancellation: the superseded task drops its `flock` guard when it
-            // next reaches an await point, strictly after `abort()` returns.
-            // Probing the shared lock without waiting reads the dying build's
-            // own guard as a peer's. That returns `SkippedLocked` and leaves NO
-            // build running until the next self-heal tick.
-            //
-            // Awaiting the handle resolves only once the task has stopped and
-            // its locals, the lock guard among them, are dropped. Bounded
-            // without a timeout because every await in that task is cancel-safe
-            // and already unblocked at cancellation: the SSE emit, the lock
-            // wait's sleep, `Child::wait`, the output pipe's reads, and the
-            // drain timeout.
-            if let Some(old) = superseded {
-                let _ = old.await;
-            }
-            // Read BEFORE the build, so a `Ready` records the source it
-            // actually compiled. Read after, an Apply landing mid-build would
-            // give `Ready` commits it never saw, and `rebuild_is_wedged` would
-            // declare futile a rebuild nobody has attempted yet.
-            //
-            // UNCACHED, unlike every other caller. Here a stale read is recorded
-            // as fact: an Apply that moves HEAD and triggers a build inside one
-            // TTL window hands this build the PREVIOUS commit. The stamp is then
-            // wrong forever, and the wedge for that HEAD is missed. One fork per
-            // build, against a build running for tens of seconds, is cheap.
-            let built_head = current_head_sha().await;
-            let outcome = run_engine_build(
-                &workspace,
-                previous_failure.as_deref(),
-                &engine.build_process_group,
-            )
-            .await;
-            // Only the latest generation updates state. A superseded build's
-            // completion is ignored, since a newer build is already `Building`.
-            if engine.build_generation.load(Ordering::SeqCst) == generation {
-                let state = match outcome {
-                    EngineBuildOutcome::Succeeded => BuildState::ready_from(built_head),
-                    EngineBuildOutcome::Failed(reason) => BuildState::failed_with(reason),
-                    // A co-located engine holds the shared build lock. This is
-                    // NOT our compile failure, so it must not surface the
-                    // build-failed toast. The peer's build advances the shared
-                    // binary, and the self-heal driver retries next tick if it
-                    // does not land.
-                    EngineBuildOutcome::SkippedLocked => BuildState::Idle,
-                };
-                engine.set_build_state(state.clone());
-                engine.emit_build_state_changed(&state).await;
-            }
-        });
-        *self.build_task.lock().unwrap() = Some(handle);
+        crate::engine::background_build::restart(self);
     }
 
     /// Emit the transient `EngineBuildStateChanged` UI poke. A connected client
@@ -1396,6 +1336,87 @@ impl LucidosEngine {
             )
             .await;
     }
+}
+
+#[async_trait::async_trait]
+impl BuildHost for LucidosEngine {
+    fn background_build(&self) -> &BackgroundBuild {
+        &self.background_build
+    }
+
+    fn build_state(&self) -> BuildState {
+        LucidosEngine::build_state(self)
+    }
+
+    fn set_build_state(&self, state: BuildState) {
+        LucidosEngine::set_build_state(self, state);
+    }
+
+    async fn emit_build_state_changed(&self, state: &BuildState) {
+        LucidosEngine::emit_build_state_changed(self, state).await;
+    }
+
+    async fn run_build(&self, previous_failure: Option<&str>) -> FinishedBuild {
+        // Read BEFORE the build, so a `Ready` records the source it
+        // actually compiled. Read after, an Apply landing mid-build would
+        // give `Ready` commits it never saw, and `rebuild_is_wedged` would
+        // declare futile a rebuild nobody has attempted yet.
+        //
+        // UNCACHED, unlike every other caller. Here a stale read is recorded
+        // as fact: an Apply that moves HEAD and triggers a build inside one
+        // TTL window hands this build the PREVIOUS commit. The stamp is then
+        // wrong forever, and the wedge for that HEAD is missed. One fork per
+        // build, against a build running for tens of seconds, is cheap.
+        let built_head = current_head_sha().await;
+        let outcome = run_engine_build(
+            self.workspace_path(),
+            previous_failure,
+            &self.build_process_group,
+        )
+        .await;
+        let state = match outcome {
+            EngineBuildOutcome::Succeeded => BuildState::ready_from(built_head.clone()),
+            EngineBuildOutcome::Failed(reason) => BuildState::failed_with(reason),
+            // A co-located engine holds the shared build lock. This is
+            // NOT our compile failure, so it must not surface the
+            // build-failed toast. The peer's build advances the shared
+            // binary, and the self-heal driver retries next tick if it
+            // does not land.
+            EngineBuildOutcome::SkippedLocked => BuildState::Idle,
+        };
+        FinishedBuild { state, built_head }
+    }
+
+    /// A success is judged by the binary it published, which the build
+    /// script's own rebuild once may have moved past `built_head`.
+    async fn covers_head(&self, finished: &FinishedBuild) -> bool {
+        let built = match &finished.state {
+            // A peer holds the build lock and builds for us. Self-heal follows
+            // that build up, as it did before any join.
+            BuildState::Idle => return true,
+            BuildState::Ready { .. } => self
+                .engine_disk_build_id()
+                .await
+                .as_deref()
+                .and_then(build_id_commit)
+                .map(str::to_string)
+                .or_else(|| finished.built_head.clone()),
+            _ => finished.built_head.clone(),
+        };
+        let (Some(built), Some(head), Ok(root)) =
+            (built, current_head_sha().await, crate::paths::repo_root())
+        else {
+            return false;
+        };
+        build_covers_head(&built, &head, &root).await
+    }
+}
+
+/// Whether a build of commit `built` already reflects `head`: the same commit,
+/// or no restart-requiring file between them. An unknown answer reads as
+/// "not covered", since one more build costs less than a binary behind HEAD.
+async fn build_covers_head(built: &str, head: &str, root: &std::path::Path) -> bool {
+    head.starts_with(built) || no_restart_between(built, head, root).await == Some(true)
 }
 
 /// Outcome of a background engine build. `SkippedLocked` is distinct from
@@ -1458,12 +1479,12 @@ async fn acquire_engine_build_lock_waiting(
 }
 
 /// SIGKILLs the build's process group if the build future is DROPPED, i.e. when
-/// a coalescing Apply aborts it.
+/// an explicit Rebuild restarts it.
 ///
 /// `kill_on_drop(true)` reaches only the direct child, which is `web-dev.sh`.
 /// The `cargo` it spawned is a grandchild and survives. Without this guard, a
-/// rapid series of Applies leaves superseded builds compiling against the
-/// shared `target/`, each slowing the build the user is waiting on.
+/// restarted build leaves its `cargo` compiling against the shared `target/`,
+/// slowing the build the user is waiting on.
 ///
 /// Disarmed the moment the child is reaped. After `wait` the pid, and with it
 /// the group id, can be recycled, and signalling a recycled group would hit
@@ -1646,10 +1667,12 @@ fn wants_pending_commits(
 /// The [`PendingCommits`] a switch from the `running` commit would bring, or
 /// `None` when git could not answer.
 ///
-/// Every commit since `running` that the `served` client lacks: the trunk HEAD
-/// its snapshot was taken at (`LucidosEngine::served_frontend_commit`).
-/// Excluding both keeps the list inside `running..HEAD` even when `served` is
-/// older. With no `served` commit known, it lists everything since `running`.
+/// Every commit since `running` that the served client lacks. `served` is the
+/// commit its snapshot was built from
+/// (`LucidosEngine::served_frontend_source_commit`). Excluding both keeps the
+/// list inside `running..HEAD` even when `served` is older. With no `served`
+/// commit known, or one past an engine change, it lists everything since
+/// `running`.
 ///
 /// `--no-merges`: an Apply lands as a merge whose subject is the branch name,
 /// and everything it merged is in this same range under its own subject.
@@ -1658,6 +1681,10 @@ async fn pending_commits_since(
     served: Option<&str>,
     root: &std::path::Path,
 ) -> Option<PendingCommits> {
+    let served = match served {
+        Some(commit) => compatible_served_commit(running, commit, root).await,
+        None => None,
+    };
     let mut args = vec![
         "log".to_string(),
         "--no-merges".to_string(),
@@ -1674,9 +1701,9 @@ async fn pending_commits_since(
 /// `None`. That is INV-A's git test: no file `files_require_restart` flags
 /// differs between the two commits.
 ///
-/// Recording a served commit only through this check means an engine change
-/// can never be recorded as served. `None` lists everything since `running`.
-pub(crate) async fn compatible_served_commit(
+/// Excluding a served commit only through this check means an engine change
+/// is never left out of the list as already served.
+async fn compatible_served_commit(
     running: &str,
     candidate: &str,
     root: &std::path::Path,
@@ -1932,7 +1959,7 @@ async fn current_head_sha() -> Option<String> {
 
 /// Run `web-dev.sh --engine-build -w <ws>` to rebuild the engine binary on disk,
 /// copying its output into the workspace engine log. The build runs in its own
-/// process group so a coalescing abort kills `cargo` too, not just the script
+/// process group so a restart kills `cargo` too, not just the script
 /// (see [`BuildProcessGroupGuard`]). Holds the checkout-shared build lock for
 /// the whole build, and returns `SkippedLocked` when a peer already holds it.
 async fn run_engine_build(
@@ -2002,7 +2029,7 @@ fn engine_build_command(
         .arg("--engine-build")
         .env(lucidos_build_slot::ENV_PRIORITY, "1")
         .kill_on_drop(true);
-    // Own process group, so a coalescing abort can reach the `cargo` grandchild
+    // Own process group, so a restart can reach the `cargo` grandchild
     // and not just this script. See `BuildProcessGroupGuard`.
     crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
     cmd
@@ -2693,7 +2720,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     }
 
     /// A lock that frees DURING the wait is acquired, not reported as a peer
-    /// build. A build superseded by a coalescing Apply is still dropping its
+    /// build. A build an explicit Rebuild restarted is still dropping its
     /// guard when the replacement probes. A single instantaneous try turns that
     /// millisecond into `SkippedLocked`, leaving no build running at all.
     #[tokio::test]
@@ -2737,9 +2764,9 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A coalescing abort must take the GRANDCHILD down with the script.
+    /// A restart must take the GRANDCHILD down with the script.
     /// `kill_on_drop` reaps only the direct child, so without the group guard a
-    /// superseded build leaves its `cargo` compiling against the shared
+    /// restarted build leaves its `cargo` compiling against the shared
     /// `target/`. Modelled with a shell that backgrounds a `sleep` and waits.
     #[tokio::test]
     async fn dropping_the_build_group_guard_kills_the_grandchild() {
@@ -3583,7 +3610,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         assert_eq!(
             compatible_served_commit(&running, &served, &dir).await,
             Some(served.clone()),
-            "a frontend-only landing can be recorded as served"
+            "a frontend-only landing can count as served"
         );
         apply(
             "b",
@@ -3604,7 +3631,18 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             ],
         );
 
-        let commits = pending_commits_since(&running, Some(&served), &dir)
+        // The served commit arrives as the snapshot's stamp, the way the
+        // engine reads it.
+        let snapshot = dir.join("snapshot");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(
+            snapshot.join(crate::api::frontend_snapshot::SOURCE_COMMIT_FILE),
+            format!("{served}\n"),
+        )
+        .unwrap();
+        let stamped = crate::api::frontend_snapshot::read_source_commit(&snapshot);
+        assert_eq!(stamped.as_deref(), Some(served.as_str()));
+        let commits = pending_commits_since(&running, stamped.as_deref(), &dir)
             .await
             .expect("a resolvable range is a real answer");
         assert_eq!(
@@ -3657,7 +3695,15 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         assert_eq!(
             compatible_served_commit(&running, &head, &dir).await,
             None,
-            "a commit past an engine change is never recorded as served"
+            "a commit past an engine change never counts as served"
+        );
+        // A snapshot stamped past the engine change: a client for the new
+        // engine. The switch still brings the engine change, so all five show.
+        let past_engine = pending_commits_since(&running, Some(&head), &dir).await;
+        assert_eq!(
+            past_engine.map(|c| c.total),
+            Some(5),
+            "an engine change is never left out as already served"
         );
         let level = pending_commits_since(&head, Some(&head), &dir).await;
         assert_eq!(level.map(|c| c.total), Some(0), "nothing to bring");

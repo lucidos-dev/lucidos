@@ -173,6 +173,23 @@ export interface PaneSwipeEnv {
   paneWidth: () => number;
   textFieldFocused: () => boolean;
   styleOf: StyleOf;
+  /** Whether the page itself pans sideways, so it owns every sideways drag. */
+  pageScrollsSideways: () => boolean;
+}
+
+/** The part of a document the page-scroll check reads. */
+export interface PageNode {
+  scrollingElement: { scrollWidth: number; clientWidth: number } | null;
+  documentElement: Element | null;
+  body: Element | null;
+}
+
+/** Whether a page is wider than its frame, so a sideways drag pans it. Its
+ *  root or body at `overflow-x: hidden` or `clip` stops that pan. */
+export function pageScrollsSideways(doc: PageNode, overflowXOf: (el: Element) => string): boolean {
+  const root = doc.scrollingElement;
+  if (!root || root.scrollWidth <= root.clientWidth) return false;
+  return [doc.documentElement, doc.body].every((el) => !el || !/^(hidden|clip)$/.test(overflowXOf(el)));
 }
 
 function onlyTouch(e: Event): Touch | null {
@@ -206,7 +223,7 @@ export function trackPaneSwipe(
     abandon();
     const t = onlyTouch(e);
     if (!t || e.defaultPrevented || env.textFieldFocused()) return;
-    if (horizontalDragClaimed(e.target as DragNode | null, env.styleOf)) return;
+    if (env.pageScrollsSideways() || horizontalDragClaimed(e.target as DragNode | null, env.styleOf)) return;
     touch.start(...screenPoint(t));
   };
 
@@ -234,21 +251,47 @@ export function trackPaneSwipe(
     touch.cancel();
   };
 
+  // Only the user's own events drive a drag. The HTML preview runs untrusted
+  // script, which can dispatch touch events of its own.
   const passive: AddEventListenerOptions = { passive: true };
   const active: AddEventListenerOptions = { passive: false };
-  surface.addEventListener('touchstart', onStart, passive);
-  surface.addEventListener('touchmove', onMove, active);
-  surface.addEventListener('touchend', onEnd, passive);
-  surface.addEventListener('touchcancel', abandon, passive);
-  // A frame that reloads mid-drag never sends its touchend.
-  surface.addEventListener('pagehide', abandon, passive);
+  const trusted = (fn: (e: Event) => void) => (e: Event) => { if (e.isTrusted) fn(e); };
+  const listeners: Array<[string, (e: Event) => void, AddEventListenerOptions]> = [
+    ['touchstart', trusted(onStart), passive],
+    ['touchmove', trusted(onMove), active],
+    ['touchend', trusted(onEnd), passive],
+    ['touchcancel', trusted(abandon), passive],
+    // A frame that reloads mid-drag never sends its touchend.
+    ['pagehide', trusted(abandon), passive],
+  ];
+  for (const [type, fn, options] of listeners) surface.addEventListener(type, fn, options);
   return () => {
-    surface.removeEventListener('touchstart', onStart, passive);
-    surface.removeEventListener('touchmove', onMove, active);
-    surface.removeEventListener('touchend', onEnd, passive);
-    surface.removeEventListener('touchcancel', abandon, passive);
-    surface.removeEventListener('pagehide', abandon, passive);
+    for (const [type, fn, options] of listeners) surface.removeEventListener(type, fn, options);
   };
+}
+
+/**
+ * Track sideways drags in a frame that fills its pane. Shared by an app frame
+ * and the HTML artifact preview's bridge, whose handlers wrap the drag in their
+ * own message shapes.
+ *
+ * `yieldToWidePage` gives every sideways drag to a page wider than the frame.
+ * The preview passes it, since an artifact is arbitrary HTML, often a fixed
+ * layout or a wide table. An app is written against the claim rules instead.
+ */
+export function installFramePaneSwipe(
+  win: Window,
+  handlers: PaneSwipeHandlers,
+  { yieldToWidePage }: { yieldToWidePage: boolean },
+): () => void {
+  return trackPaneSwipe(win, handlers, {
+    // The frame is full-bleed in its pane, so its width is the pane's.
+    paneWidth: () => win.innerWidth,
+    textFieldFocused,
+    styleOf: computedStyleOf,
+    pageScrollsSideways: () => yieldToWidePage
+      && pageScrollsSideways(win.document, (el) => win.getComputedStyle(el).overflowX),
+  });
 }
 
 /**
@@ -261,13 +304,8 @@ export function trackPaneSwipe(
 export function installAppPaneSwipe(): () => void {
   if (typeof window === 'undefined' || window.parent === window) return () => {};
   const post = (message: object) => window.parent.postMessage(message, '*');
-  return trackPaneSwipe(
-    window,
-    {
-      onDrag: (dx) => post({ type: APP_SWIPE_MESSAGE_TYPE, dx }),
-      onRelease: (paneDelta) => post({ type: APP_SWIPE_END_MESSAGE_TYPE, paneDelta }),
-    },
-    // The app frame is full-bleed in its pane, so its width is the pane's.
-    { paneWidth: () => window.innerWidth, textFieldFocused, styleOf: computedStyleOf },
-  );
+  return installFramePaneSwipe(window, {
+    onDrag: (dx) => post({ type: APP_SWIPE_MESSAGE_TYPE, dx }),
+    onRelease: (paneDelta) => post({ type: APP_SWIPE_END_MESSAGE_TYPE, paneDelta }),
+  }, { yieldToWidePage: false });
 }

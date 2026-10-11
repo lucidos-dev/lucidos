@@ -5,7 +5,7 @@
 //! reaches the running turn's injection channel, so the message was never at
 //! risk. Only the answer to "has the loop consumed it" lived in memory, as a
 //! channel remainder that died with the process. Three already-written markers
-//! answer it instead: a `UserPromptInjected.injected_message_id` (consumed), a
+//! answer it instead: a `PromptInjected.injected_message_id` (consumed), a
 //! `QueuedMessageRemoved.removed_message_id` (retracted), and any event's
 //! `request_event_id` (a turn picked it up).
 //!
@@ -36,7 +36,7 @@ use crate::engine::{InjectedPrompt, InjectedPromptKind};
 /// * `sequence > $2` keeps the window behind the interrupted turn. No lower
 ///   bound would replay messages stranded weeks ago into a live conversation.
 /// * `sequence <= $3` stops at the reader's fence ([`window_end_sequence`]).
-/// * no `UserPromptInjected` naming it: the loop took it. Announcing a
+/// * no `PromptInjected` naming it: the loop took it. Announcing a
 ///   recovered message writes one, which is what makes a second pass a no-op.
 /// * no `QueuedMessageRemoved` naming it: a retraction beats a recovery.
 /// * no event stamped with it as `request_event_id`: a turn has it, running or
@@ -56,7 +56,7 @@ SELECT e.id, e.payload \
    AND NOT EXISTS ( \
          SELECT 1 FROM events u \
           WHERE u.aggregate = 'thread' AND u.aggregate_id = $1 \
-            AND u.event_type = 'UserPromptInjected' \
+            AND u.event_type = 'PromptInjected' \
             AND u.payload->>'injected_message_id' = e.id::text) \
    AND NOT EXISTS ( \
          SELECT 1 FROM events r \

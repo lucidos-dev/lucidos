@@ -35,12 +35,12 @@ function seedParentWithRunningCcChild(): { parentId: string; childId: string } {
       `INSERT INTO thread_summaries (` +
         `thread_id, title, source, last_activity, message_count, is_saved, has_response, ` +
         `status, archive_state, state, is_coding_agent, active_children_count, total_children_count, ` +
-        `coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo, ` +
+        `coding_agent_change_state, coding_agent_is_external_repo, ` +
         `blocking_descendant_count` +
         `) VALUES (` +
         `'${parentId}', 'cascade archive parent', 'chat', '${now}', 2, false, true, ` +
         `'idle', 'inbox', 'active', false, 1, 1, ` +
-        `false, false, false, ` +
+        `'none', false, ` +
         `1` +
         `)`,
       // Give the parent SOMETHING to render — at minimum a user message and a
@@ -54,12 +54,12 @@ function seedParentWithRunningCcChild(): { parentId: string; childId: string } {
       `INSERT INTO thread_summaries (` +
         `thread_id, parent_thread_id, title, source, last_activity, message_count, is_saved, has_response, ` +
         `status, archive_state, state, is_coding_agent, active_children_count, total_children_count, ` +
-        `coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo, ` +
+        `coding_agent_change_state, coding_agent_is_external_repo, ` +
         `blocking_descendant_count` +
         `) VALUES (` +
         `'${childId}', '${parentId}', 'cascade archive child', 'claude_code', '${now}', 1, false, false, ` +
         `'running', 'inbox', 'active', true, 0, 0, ` +
-        `false, false, false, ` +
+        `'none', false, ` +
         `0` +
         `)`,
     ].join(';\n'),

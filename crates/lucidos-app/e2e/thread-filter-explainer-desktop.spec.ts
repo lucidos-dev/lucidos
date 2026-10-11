@@ -122,15 +122,18 @@ test.describe('Explainer in the thread filter panel: desktop layout', () => {
     await page.mouse.click(canvas.x + canvas.width / 2, canvas.y + canvas.height / 2);
     await expect(popover).toHaveCount(0);
 
-    // The click was swallowed: the filter panel is untouched, and the status it
-    // was showing did not change.
+    // The click was swallowed: the filter panel is untouched, and nothing in
+    // it changed. No type narrows the list, and "Include deleted" is still off.
     await expect(page.locator('.thread-drawer .thread-filter-panel')).toBeVisible();
     // "Filters", not "Thread filters": the pane is already the Threads pane, so
     // the row says the short form (AppHeader, and the mobile row matching it).
     await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Filters');
-    await expect(
-      page.locator('.thread-filter-panel .drawer-view-option-active .drawer-view-label'),
-    ).toHaveText('All statuses');
+    await expect(page
+      .locator('.thread-filter-panel .thread-filter-option:not(.thread-filter-option-child)', { hasText: 'Lucidos' })
+      .locator('input[type="checkbox"]')).toBeChecked();
+    await expect(page
+      .locator('.thread-filter-panel label.thread-filter-option', { hasText: 'Include deleted' })
+      .locator('input[type="checkbox"]')).not.toBeChecked();
 
     // And it reopens at once: the dismiss spent its one swallow on the click it
     // was armed for, so the next press on the icon lands.

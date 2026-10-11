@@ -31,6 +31,8 @@ function registryRow(id: string, label: string, efforts: string[]): ModelInfo {
     routes: [{ provider: 'vertex', id, reasoning_efforts: efforts }],
     preferred_provider: null,
     vision: false,
+    default_effort: null,
+    successor: null,
     sort_order: 0,
     source: 'builtin',
     enabled: true,
@@ -41,7 +43,7 @@ function registryRow(id: string, label: string, efforts: string[]): ModelInfo {
 /** The chat picker's list, which every background row offers. */
 const REGISTRY: ModelInfo[] = [
   registryRow('claude-haiku-4-5-20251001', 'Haiku 4.5', ['none', 'low']),
-  registryRow('gemini-3.5-flash', 'Gemini 3.5 Flash', ['none', 'low']),
+  registryRow('gemini-3.8-flash', 'Gemini 3.8 Flash', ['low', 'medium', 'high']),
 ];
 
 /** The engine's answer, before it lands. */
@@ -50,12 +52,14 @@ const UNRESOLVED: BackgroundRows = { row: () => null, error: null, refresh: asyn
 function resolvedTo(row: Partial<BackgroundModel>): BackgroundRows {
   return {
     row: () => ({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       effort: null,
       source: 'default',
       reachable: true,
+      not_served: [],
       needs_vision: false,
       vision: true,
+      default_effort: null,
       recommended: [],
       ...row,
     }),
@@ -138,7 +142,7 @@ describe('JudgmentModelRow', () => {
   it('offers only the chat models with no TypeSafe key', () => {
     mount();
     open();
-    expect(optionValues()).toEqual(['claude-haiku-4-5-20251001', 'gemini-3.5-flash']);
+    expect(optionValues()).toEqual(['claude-haiku-4-5-20251001', 'gemini-3.8-flash']);
   });
 
   /** Unloaded credentials read as no key. An ungated rule would drop the row
@@ -154,7 +158,7 @@ describe('JudgmentModelRow', () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
     mount();
     open();
-    expect(optionValues()).toEqual(['claude-haiku-4-5-20251001', 'gemini-3.5-flash', 'typesafe-jev']);
+    expect(optionValues()).toEqual(['claude-haiku-4-5-20251001', 'gemini-3.8-flash', 'typesafe-jev']);
   });
 
   it('reads the backend in force on the trigger', () => {
@@ -206,14 +210,14 @@ describe('JudgmentModelRow', () => {
   it('commits a chat model with the tier picked for it', async () => {
     mount();
     open();
-    pick('gemini-3.5-flash');
-    pick('gemini-3.5-flash|low');
+    pick('gemini-3.8-flash');
+    pick('gemini-3.8-flash|low');
     expect(savePreference).toHaveBeenCalledWith('judgment_command_guard', 'chat');
     await Promise.resolve();
     expect(saveModelSelection).toHaveBeenCalledWith(
       'model_command_judge',
       'reasoning_command_judge',
-      { model: 'gemini-3.5-flash', reasoningEffort: 'low', provider: null },
+      { model: 'gemini-3.8-flash', reasoningEffort: 'low', provider: null },
     );
   });
 
@@ -258,7 +262,7 @@ describe('JudgmentModelRow', () => {
     open();
     expect(optionValues()).toEqual([
       'claude-haiku-4-5-20251001',
-      'gemini-3.5-flash',
+      'gemini-3.8-flash',
       'cloudflare-clef',
       'cloudflare-clef-flash',
     ]);
@@ -283,16 +287,16 @@ describe('JudgmentModelRow', () => {
    *  System One rows get one too. */
   it('lists the recommended models first, each section under a heading', () => {
     credentials.value = { status: 'loaded', data: [typeSafeCred()] };
-    mount(false, resolvedTo({ recommended: ['gemini-3.5-flash'] }));
+    mount(false, resolvedTo({ recommended: [{ model: 'gemini-3.8-flash', effort: null }] }));
     open();
-    expect(optionValues()).toEqual(['gemini-3.5-flash', 'claude-haiku-4-5-20251001', 'typesafe-jev']);
+    expect(optionValues()).toEqual(['gemini-3.8-flash', 'claude-haiku-4-5-20251001', 'typesafe-jev']);
     const headings = [...document.body.querySelectorAll('.control-section-label')].map((h) => h.textContent);
     expect(headings).toEqual(['Recommended', 'Other models', 'System One']);
   });
 
   /** A stored pick nobody serves is refused, never moved, so the row says so. */
   it('says when no configured provider serves the stored pick', () => {
-    preferences.value = { status: 'loaded', data: { model_command_judge: 'gemini-3.5-flash' } };
+    preferences.value = { status: 'loaded', data: { model_command_judge: 'gemini-3.8-flash' } };
     mount(false, resolvedTo({ source: 'preference', reachable: false }));
     expect(detail()).toBe('No configured provider serves this model');
   });

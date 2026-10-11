@@ -207,10 +207,10 @@ function DiskUsageBar({
   workspaceDataBytes?: number;
 }) {
   if (useSkeleton()) {
-    return <div class="disk-usage-bar" aria-hidden="true"><SkBlock w="100%" h="100%" /></div>;
+    return <div class="settings-overview-bar" aria-hidden="true"><SkBlock w="100%" h="100%" /></div>;
   }
   return (
-    <div class="disk-usage-bar" role="img" aria-label="Disk usage breakdown">
+    <div class="settings-overview-bar" role="img" aria-label="Disk usage breakdown">
       {rows.map((row, idx) => (
         <Segment
           key={row.thread_id}
@@ -266,14 +266,14 @@ function KeyRow({
   children: ComponentChildren;
 }) {
   return (
-    <div class="disk-usage-key-row">
-      <span class={`disk-usage-legend-swatch ${swatch}`} aria-hidden="true" />
-      <span class="disk-usage-key-label">
+    <div class="settings-overview-key-row">
+      <span class={`settings-overview-swatch ${swatch}`} aria-hidden="true" />
+      <span class="settings-overview-key-label">
         {label}
         {explainer}
-        {note && <span class="disk-usage-key-note">{note}</span>}
+        {note && <span class="settings-overview-key-note">{note}</span>}
       </span>
-      <span class="disk-usage-key-value">{children}</span>
+      <span class="settings-overview-key-value">{children}</span>
     </div>
   );
 }
@@ -321,10 +321,10 @@ function RecommendedCleanupCard({
   }
 
   return (
-    <div class="disk-usage-reclaim">
-      <div class="disk-usage-reclaim-text">
-        <div class="disk-usage-reclaim-title">Free up space</div>
-        <div class="disk-usage-reclaim-figure">
+    <div class="settings-overview-card">
+      <div class="settings-overview-card-text">
+        <div class="settings-overview-card-title">Free up space</div>
+        <div class="settings-overview-card-figure">
           <Figure skeleton={skeleton} w="9rem">
             {estimate && (nothingToFree
               ? 'Nothing to free right now'
@@ -332,7 +332,7 @@ function RecommendedCleanupCard({
           </Figure>
         </div>
         {estimate && !nothingToFree && (
-          <p class="disk-usage-reclaim-note">{describeEstimate(estimate)}</p>
+          <p class="settings-overview-card-note">{describeEstimate(estimate)}</p>
         )}
       </div>
       {estimate && !nothingToFree && (
@@ -428,7 +428,7 @@ function WorktreeRowView({
 
   const swatch = (
     <span
-      class={`disk-usage-legend-swatch ${paletteClass(colorIdx)}`}
+      class={`settings-overview-swatch ${paletteClass(colorIdx)}`}
       aria-hidden="true"
     />
   );
@@ -532,11 +532,11 @@ export function DiskUsagePage() {
   return (
     <>
       <div class="settings-section disk-usage-overview">
-        <div class="disk-usage-headline">
-          <span class="disk-usage-headline-value">
+        <div class="settings-overview-headline">
+          <span class="settings-overview-headline-value">
             <Figure skeleton={summarySkeleton} w="5rem">{freeBytes != null ? formatBytes(freeBytes) : dash}</Figure>
           </span>
-          <span class="disk-usage-headline-sub">
+          <span class="settings-overview-headline-sub">
             free{diskTotalBytes != null && ` of ${formatBytes(diskTotalBytes)}`}
           </span>
           {pressureLabel && <span class={`disk-usage-pressure ${pressureLabel.cls}`}>{pressureLabel.text}</span>}
@@ -561,7 +561,7 @@ export function DiskUsagePage() {
             )}
           </LoadingFade>
         )}
-        <div class="disk-usage-key">
+        <div class="settings-overview-key">
           <KeyRow
             swatch="disk-usage-segment-worktrees"
             label="Worktrees"

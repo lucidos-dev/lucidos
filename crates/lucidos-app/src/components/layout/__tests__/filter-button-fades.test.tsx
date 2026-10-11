@@ -1,19 +1,21 @@
 // @vitest-environment jsdom
 /**
- * The Filter button's glyph and badge fade rather than swap. Each keeps every
- * state it can show MOUNTED and flips which one is shown, so the CSS transition
- * runs on nodes that already exist. The pane title does not fade: it switches
- * word at once.
+ * The Filter button's glyph fades rather than swaps. It keeps every glyph it
+ * can show MOUNTED and flips which one is shown, so the CSS transition runs on
+ * nodes that already exist. Under Ongoing the whole button fades out in a slot
+ * that keeps its box. The pane title switches word at once, and fades out only
+ * when its word no longer fits.
  *
  * These tests pin the DOM the CSS keys on. The frames are covered by
  * `e2e/threads-header-filter-transitions.spec.ts`.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
-import { FilterButtonGlyph, FilterButtonBadge, ThreadsPaneTitle } from '../ThreadFilterButton';
+import { FilterButtonGlyph, ThreadsPaneTitle, titleFits, groupingButtonBadgeCount, groupingButtonLabel, otherGrouping } from '../ThreadsHeaderControls';
 import { FILTER_BUTTON_GLYPHS, type FilterGlyph } from '../ThreadFilterPanel';
 import { openThreadFilterPanel, closeThreadFilterPanel } from '../../../store/threadFilterPanel';
+import { setDrawerGrouping } from '../../../store/store';
 
 let host: HTMLElement;
 
@@ -44,13 +46,12 @@ describe('the Filter glyph crossfades', () => {
     }
   });
 
-  // Outline to solid and back, funnel to status, status to status and back:
-  // each is the same nodes with the shown flag moved, which is what lets the
-  // opacity transition run and reverse.
+  // Outline to solid and back: the same nodes with the shown flag moved, which
+  // is what lets the opacity transition run and reverse.
   it('moves the shown flag between the same nodes on every change', () => {
     show('all');
     const before = layers();
-    for (const glyph of ['filtered', 'all', 'review', 'in-flight', 'all'] as const) {
+    for (const glyph of ['filtered', 'all', 'filtered', 'all'] as const) {
       show(glyph);
       expect(layers()).toEqual(before);
       expect(current().map(l => l.dataset.layer)).toEqual([glyph]);
@@ -59,43 +60,7 @@ describe('the Filter glyph crossfades', () => {
 
   it('wraps the stack in the element that carries the translucency', () => {
     show('filtered');
-    expect(host.firstElementChild?.classList.contains('filter-glyph')).toBe(true);
-  });
-});
-
-describe('the needs-attention badge fades both ways', () => {
-  const badge = () => host.querySelector('.badge.filter-badge') as HTMLElement;
-  const show = (count: number) => act(() => { render(<FilterButtonBadge count={count} />, host); });
-
-  it('is mounted but not shown while there is nothing to count', () => {
-    show(0);
-    expect(badge()).not.toBeNull();
-    expect(badge().hasAttribute('data-shown')).toBe(false);
-    expect(badge().textContent).toBe('');
-  });
-
-  it('appears, changes count and disappears on one node', () => {
-    show(0);
-    const node = badge();
-    show(2);
-    expect(badge()).toBe(node);
-    expect(node.hasAttribute('data-shown')).toBe(true);
-    expect(node.textContent).toBe('2');
-    // A count change while shown only repaints the number.
-    show(3);
-    expect(badge()).toBe(node);
-    expect(node.hasAttribute('data-shown')).toBe(true);
-    expect(node.textContent).toBe('3');
-    // Going to 0 (or the panel opening) fades it out still reading 3.
-    show(0);
-    expect(badge()).toBe(node);
-    expect(node.hasAttribute('data-shown')).toBe(false);
-    expect(node.textContent).toBe('3');
-  });
-
-  it('stays out of the accessibility tree, since the button names itself', () => {
-    show(4);
-    expect(badge().getAttribute('aria-hidden')).toBe('true');
+    expect(host.firstElementChild?.classList.contains('crossfade-glyph')).toBe(true);
   });
 });
 
@@ -106,14 +71,50 @@ describe('the pane title switches word at once', () => {
   });
   const title = () => host.firstElementChild as HTMLElement;
 
-  afterEach(() => closeThreadFilterPanel());
+  beforeEach(() => vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} }));
+  afterEach(() => {
+    act(() => { render(null, host); });
+    closeThreadFilterPanel();
+    setDrawerGrouping('folders');
+    vi.unstubAllGlobals();
+  });
 
-  it('says what the pane shows, in one plain element with the header centring', () => {
+  it('names the grouping, or the filter panel, in one plain element', () => {
+    act(() => setDrawerGrouping('folders'));
     show(false);
-    expect(title().textContent).toBe('Threads');
+    expect(title().textContent).toBe('Folders');
     expect(title().className).toBe('threads-header-title');
     expect(layers()).toHaveLength(0);
     show(true);
     expect(title().textContent).toBe('Filters');
+    show(false);
+    act(() => setDrawerGrouping('ongoing'));
+    expect(title().textContent).toBe('Ongoing');
+  });
+
+  it('is whole or hidden: a word that outgrows its box is marked cramped', () => {
+    expect(titleFits(60, 60)).toBe(true);
+    expect(titleFits(60.4, 60)).toBe(true);
+    expect(titleFits(61, 60)).toBe(false);
+    expect(titleFits(60, 0)).toBe(false);
+  });
+});
+
+describe('the grouping button', () => {
+  it('offers the other grouping', () => {
+    expect(otherGrouping('folders')).toBe('ongoing');
+    expect(otherGrouping('ongoing')).toBe('folders');
+  });
+
+  it('badges the attention count under Folders only', () => {
+    // Under Ongoing the Blocked group's own header carries it.
+    expect(groupingButtonBadgeCount('folders', 3)).toBe(3);
+    expect(groupingButtonBadgeCount('ongoing', 3)).toBe(0);
+  });
+
+  it('names what a press does, and carries the badge count for assistive tech', () => {
+    expect(groupingButtonLabel('folders', 0)).toBe('Show Ongoing');
+    expect(groupingButtonLabel('folders', 2)).toBe('Show Ongoing (2 blocked)');
+    expect(groupingButtonLabel('ongoing', 0)).toBe('Show Folders');
   });
 });

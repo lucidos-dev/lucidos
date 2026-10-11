@@ -2,7 +2,7 @@
 //! single domain family: navigate_ui, git_clone, get_backup_status,
 //! request_credential, connect_oauth_account, execute_intent,
 //! ask_user_question, await_event, list_event_waits, cancel_event_wait,
-//! todo_write.
+//! request_read, todo_write.
 //!
 //! (manage_repositories / manage_models moved to the capability parity manifest —
 //! domains `repositories` / `models` — and are built by `capability_manifest`.)
@@ -388,7 +388,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                                             },
                                             "description": {
                                                 "type": "string",
-                                                "description": "Optional one-line explanation under the label."
+                                                "description": "Optional inline markdown under the label: a one-line explanation, this option's own picture `![A](artifacts/a.png)`, or a widget embed `![A](app:<id>?params={…})`."
                                             }
                                         },
                                         "required": ["label"]
@@ -499,6 +499,33 @@ pub(super) fn event_wait_agent_tools() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+/// The argument `request_read` takes, and the read-request route's body field.
+pub(crate) const READ_ARG: &str = "read";
+
+/// The *read decision* (ADR 0409, ADR 0417). Scoped to the calling thread and
+/// takes no thread id, so an agent can only decide for its own reply.
+pub(super) fn request_read_tools() -> Vec<ToolDefinition> {
+    vec![request_read_tool()]
+}
+
+/// The one `request_read` schema, also the tool the turn-end gate forces.
+pub(crate) fn request_read_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: tn::REQUEST_READ.to_string(),
+        description: "Your read decision on this turn's reply, when sure. read: true when it holds what the user asked for (a report, findings, what a trigger run found) or they will read it later: the thread waits under Review until seen. read: false for small talk, a plain \"done\", or a progress report while sub-threads or an event wait still run. Unsure, skip it: Lucidos decides. It does not notify.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                (READ_ARG): {
+                    "type": "boolean",
+                    "description": "Whether the user should read this reply."
+                }
+            },
+            "required": [READ_ARG]
+        }),
+    }
 }
 
 /// The todo list, everywhere the *self-curated context mode* is off.

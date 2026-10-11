@@ -10,6 +10,7 @@ import { entryChunkBudget, underDevBuildWatch } from './vite/entryChunkBudget';
 import { shellChunkPreload } from './vite/shellChunkPreload';
 import { inlineBootScript } from './vite/inlineBootScript';
 import { layoutMediaPlugin } from './vite/layoutMediaPlugin';
+import { readHeadCommit, sourceCommitStamp } from './vite/sourceCommitStamp';
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 
@@ -291,7 +292,9 @@ export default defineConfig({
       : []),
     buildIdVirtualModule(), suppressMergeReload(), inlineAppearanceBoot(), syncPublicDir(),
     stampServiceWorker(), preact(), entryChunkBudget(underDevBuildWatch(process.env, process.ppid)),
-    shellChunkPreload(), atomicDistPublish(),
+    shellChunkPreload(),
+    sourceCommitStamp(!!process.env.LUCIDOS_ATOMIC_DIST, () => readHeadCommit(__dirname), resolve(__dirname, 'dist')),
+    atomicDistPublish(),
   ],
   css: { postcss: { plugins: [layoutMediaPlugin()] } },
   build: {
@@ -385,9 +388,19 @@ export default defineConfig({
       // barrel, for the same reason as the six above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/pane-swipe': resolve(__dirname, '../../packages/lucidos-sdk/src/paneSwipe.ts'),
+      // The widget height protocol (ADR 0402): the channel the host marks a
+      // widget frame on and the message the frame answers with. Reached
+      // WITHOUT the barrel, like the pane swipe above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/widget-frame': resolve(__dirname, '../../packages/lucidos-sdk/src/widgetFrame.ts'),
+      // One sound at a time: the frame's message, the host's pause channel, and
+      // the helpers the host runs on its own document. Reached WITHOUT the
+      // barrel, like the pane swipe above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/one-sound': resolve(__dirname, '../../packages/lucidos-sdk/src/oneSound.ts'),
       // The preference catalog, generated from the engine's. Every default and
       // value list the host reads comes from here, never from a copy. Reached
-      // WITHOUT the barrel, for the same reason as the seven above.
+      // WITHOUT the barrel, for the same reason as the aliases above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/preference-catalog': resolve(__dirname, '../../packages/lucidos-sdk/src/generated/preference-catalog.ts'),
       // The engine constants a client must agree with, generated from the

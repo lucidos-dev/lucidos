@@ -487,7 +487,7 @@ describe('a turn parked on an event wait', () => {
       // The watch fires mid-turn. Its anchor is the delivery card; the loop it
       // was injected into keeps streaming under `req-1`.
       { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'del-1', event_type: 'ChangeProposed', payload: {}, matched_index: 0 },
-      { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived.', mode: 'agent', delivered_event_id: 'del-1' },
+      { type: 'PromptInjected', text: 'An event you subscribed to has arrived.', mode: 'agent', delivered_event_id: 'del-1' },
       { type: 'ToolCalled', name: 'read_file', args: { path: 'notes.md' }, request_event_id: 'req-1' },
       { type: 'ToolResult', name: 'read_file', result: 'ok', request_event_id: 'req-1' },
       { type: 'ResponseGenerated', text: 'The change landed, and the build is stopped.', request_event_id: 'req-1' },
@@ -497,7 +497,7 @@ describe('a turn parked on an event wait', () => {
     expect(exchanges.map((e) => e.userEvent.type)).toEqual([
       'MessageReceived',
       'MessageReceived',
-      'UserPromptInjected',
+      'PromptInjected',
     ]);
     // The message turn keeps only what it did BEFORE the delivery.
     expect(exchanges[1].steps.map((s) => s.event.type)).toEqual([
@@ -528,7 +528,7 @@ describe('a turn parked on an event wait', () => {
       ...park,
       { type: 'ResponseGenerated', text: "I'll watch for that." },
       { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'del-1', event_type: 'ChangeProposed', payload: {}, matched_index: 0 },
-      { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived.', mode: 'agent', delivered_event_id: 'del-1', event_id: 'reentry-1' },
+      { type: 'PromptInjected', text: 'An event you subscribed to has arrived.', mode: 'agent', delivered_event_id: 'del-1', event_id: 'reentry-1' },
       { type: 'ToolCalled', name: 'read_file', args: { path: 'notes.md' }, request_event_id: 'reentry-1' },
       { type: 'ToolResult', name: 'read_file', result: 'ok', request_event_id: 'reentry-1' },
       { type: 'ResponseGenerated', text: 'The change landed.', request_event_id: 'reentry-1' },
@@ -537,7 +537,7 @@ describe('a turn parked on an event wait', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges.map((e) => e.userEvent.type)).toEqual([
       'MessageReceived',
-      'UserPromptInjected',
+      'PromptInjected',
     ]);
     expect(exchanges[1].steps.map((s) => s.event.type)).toEqual([
       'ToolCalled',

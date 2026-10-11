@@ -28,6 +28,7 @@ import { RECENTS_KEY } from '../../store/actions/entityReferences';
 import { CloseIcon, ClearIcon } from '../shared/icons';
 import { SearchField } from '../shared/SearchField';
 import { CategoryIcon } from '../shared/CategoryIcon';
+import { ListedAppIcon } from '../shared/AppIcon';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
 import { getMenuSearchResults, findMenuSearchEntry } from './menuIndex';
 import {
@@ -191,7 +192,9 @@ function ResultRow({ item, index = 0, selected = false, onSelect, onHover }: {
     >
       <SkBlock w="1rem" h="1rem" round>
         <span class="search-everywhere-result-icon">
-          {item && <CategoryIcon category={searchResultIconCategory(item)} />}
+          {item && (item.category === 'apps'
+            ? <ListedAppIcon appId={item.id} name={item.title} />
+            : <CategoryIcon category={searchResultIconCategory(item)} />)}
         </span>
       </SkBlock>
       <span class="search-everywhere-result-info">
@@ -427,8 +430,12 @@ export function SearchEverywhere() {
     if (isTextHit(item)) {
       // The navigation router owns opening at a line: source view, the range
       // and the scroll, applied after the open clears the previous file's.
-      void handleNavigationRequest({ target: 'file', file_path: item.hit.path, line: item.hit.line });
-      focusDest();
+      // Find in file then opens on the query, from that line, and takes the
+      // focus, so the pane must not.
+      void handleNavigationRequest(
+        { target: 'file', file_path: item.hit.path, line: item.hit.line },
+        { find: query },
+      );
       return;
     }
     switch (item.category) {

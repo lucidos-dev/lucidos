@@ -591,6 +591,19 @@ fn test_describe_tool_count_events() {
     );
 }
 
+/// The read decision runs on every turn, so its no reads quietly (ADR 0417).
+#[test]
+fn describe_tool_labels_each_read_decision() {
+    assert_eq!(
+        describe_tool("request_read", &serde_json::json!({ "read": false })),
+        "No read needed"
+    );
+    assert_eq!(
+        describe_tool("request_read", &serde_json::json!({ "read": true })),
+        "Asking you to read this reply..."
+    );
+}
+
 #[test]
 fn test_describe_tool_threads_and_changes() {
     assert_eq!(
@@ -1786,7 +1799,8 @@ fn ensure_workspace_gitignore_noop_when_all_entries_present() {
     let dir = tempfile::tempdir().unwrap();
     // Trailing-line variation + manually added user entries — must
     // be preserved without mutation.
-    let original = ".lucidos/\ndata/postgres/\ndata/blobs/\ndata/.env\nmy-secret.env\n";
+    let original =
+        ".lucidos/\ndata/postgres/\ndata/blobs/\ndata/.env\ndata/plugin-media/\nmy-secret.env\n";
     std::fs::write(dir.path().join(".gitignore"), original).unwrap();
     let changed = ensure_workspace_gitignore_entries(dir.path()).expect("ensure ok");
     assert!(!changed, "all entries present must report changed=false");
@@ -1914,9 +1928,10 @@ fn pin_workspace_vite_port_noop_when_file_exists() {
     // .gitignore before the lucidos.toml helper runs.
     std::fs::write(ws.join("seed"), "x").unwrap();
     let mut idx = repo.index().unwrap();
+    let base = reset_index_to_head(&repo, &mut idx).unwrap();
     idx.add_path(std::path::Path::new("seed")).unwrap();
     idx.write().unwrap();
-    let seed_sha = commit_index(&repo, "seed").unwrap();
+    let seed_sha = commit_index(&repo, "seed", base).unwrap();
 
     let existing = "# my custom pin\n[ports]\nvite = 9999\n";
     std::fs::write(ws.join("lucidos.toml"), existing).unwrap();
@@ -2056,27 +2071,29 @@ fn repo_with_seed_commit(ws: &std::path::Path) -> git2::Repository {
     let repo = git2::Repository::init_opts(ws, &opts).unwrap();
     std::fs::write(ws.join("seed.txt"), "seed").unwrap();
     let mut index = repo.index().unwrap();
+    let base = reset_index_to_head(&repo, &mut index).unwrap();
     index.add_path(std::path::Path::new("seed.txt")).unwrap();
     index.write().unwrap();
-    commit_index(&repo, "seed").unwrap();
+    commit_index(&repo, "seed", base).unwrap();
     repo
 }
 
-/// Write one file and stage it onto the current head.
-fn stage_one(repo: &git2::Repository, name: &str) {
+/// Write one file and stage it onto the current head, returning that head.
+fn stage_one(repo: &git2::Repository, name: &str) -> IndexBase {
     let ws = repo.workdir().unwrap().to_path_buf();
     std::fs::write(ws.join(name), name).unwrap();
     let mut index = repo.index().unwrap();
-    reset_index_to_head(repo, &mut index).unwrap();
+    let base = reset_index_to_head(repo, &mut index).unwrap();
     index.add_path(std::path::Path::new(name)).unwrap();
     index.write().unwrap();
+    base
 }
 
 /// Stage one file through `repo` and commit it, the way a competing writer
 /// (another `Repository` handle, a `git` CLI process) lands on HEAD.
 fn write_and_commit(repo: &git2::Repository, name: &str, message: &str) -> String {
-    stage_one(repo, name);
-    commit_index(repo, message).unwrap()
+    let base = stage_one(repo, name);
+    commit_index(repo, message, base).unwrap()
 }
 
 /// A competing FULL-TREE commit, the shape `ArtifactManager::commit_all_dirty`
@@ -2084,12 +2101,12 @@ fn write_and_commit(repo: &git2::Repository, name: &str, message: &str) -> Strin
 /// of committing, which is what makes that writer's retry find nothing to stage.
 fn commit_whole_tree(repo: &git2::Repository, message: &str) -> String {
     let mut index = repo.index().unwrap();
-    reset_index_to_head(repo, &mut index).unwrap();
+    let base = reset_index_to_head(repo, &mut index).unwrap();
     index
         .add_all(["."], git2::IndexAddOption::DEFAULT, None)
         .unwrap();
     index.write().unwrap();
-    commit_index(repo, message).unwrap()
+    commit_index(repo, message, base).unwrap()
 }
 
 /// Lose the HEAD compare-and-swap for real. Hold the reference HEAD resolved to
@@ -2156,9 +2173,9 @@ fn a_held_branch_ref_lock_is_classified_as_contention() {
     let dir = tempfile::tempdir().unwrap();
     let repo = repo_with_seed_commit(dir.path());
     hold_main_ref_lock(dir.path());
-    stage_one(&repo, "ours.txt");
+    let base = stage_one(&repo, "ours.txt");
 
-    let err = commit_index(&repo, "ours").expect_err("a held ref lock must block the commit");
+    let err = commit_index(&repo, "ours", base).expect_err("a held ref lock must block the commit");
 
     assert_eq!(err.class(), git2::ErrorClass::Os);
     assert_eq!(err.code(), git2::ErrorCode::Locked);
@@ -2188,8 +2205,8 @@ fn a_write_waits_out_a_held_branch_ref_lock() {
         if attempts == 3 {
             std::fs::remove_file(&lock).unwrap();
         }
-        stage_one(&repo, "ours.txt");
-        commit_index(&repo, "ours")
+        let base = stage_one(&repo, "ours.txt");
+        commit_index(&repo, "ours", base)
     })
     .expect("the write must land once the lock clears");
 
@@ -2220,7 +2237,7 @@ fn a_lost_head_race_retries_onto_the_new_head_and_keeps_both_commits() {
     let ours = retry_while_repo_contended(|| {
         attempts += 1;
         let mut index = repo.index()?;
-        reset_index_to_head(&repo, &mut index)?;
+        let base = reset_index_to_head(&repo, &mut index)?;
         index.add_path(std::path::Path::new("ours.txt"))?;
         index.write()?;
 
@@ -2231,7 +2248,7 @@ fn a_lost_head_race_retries_onto_the_new_head_and_keeps_both_commits() {
                 write_and_commit(&other, "theirs.txt", "theirs");
             }));
         }
-        commit_index(&repo, "ours")
+        commit_index(&repo, "ours", base)
     })
     .expect("the retry must commit onto the new head");
 
@@ -2281,7 +2298,7 @@ fn a_deletion_the_race_winner_already_committed_settles_as_done() {
     let reported = retry_while_repo_contended(|| {
         attempts += 1;
         let mut index = repo.index()?;
-        reset_index_to_head(&repo, &mut index)?;
+        let base = reset_index_to_head(&repo, &mut index)?;
         let _ = index.remove_path(std::path::Path::new("doomed.txt"));
         index.write()?;
 
@@ -2292,7 +2309,7 @@ fn a_deletion_the_race_winner_already_committed_settles_as_done() {
                 commit_whole_tree(&other, "theirs: sweep the working tree");
             }));
         }
-        commit_index_unless_unchanged(&repo, "delete doomed.txt")
+        commit_index_unless_unchanged(&repo, "delete doomed.txt", base)
     })
     .expect("an already-committed deletion must not fail the request");
 
@@ -2326,14 +2343,123 @@ fn an_uncontended_deletion_still_makes_its_own_commit() {
     std::fs::remove_file(ws.join("doomed.txt")).unwrap();
 
     let mut index = repo.index().unwrap();
-    reset_index_to_head(&repo, &mut index).unwrap();
+    let base = reset_index_to_head(&repo, &mut index).unwrap();
     let _ = index.remove_path(std::path::Path::new("doomed.txt"));
     index.write().unwrap();
-    let sha = commit_index_unless_unchanged(&repo, "delete doomed.txt").unwrap();
+    let sha = commit_index_unless_unchanged(&repo, "delete doomed.txt", base).unwrap();
 
     assert_ne!(sha, before, "a real deletion must produce a new commit");
     let head = repo.head().unwrap().peel_to_commit().unwrap();
     assert_eq!(head.message().unwrap(), "delete doomed.txt");
     assert!(head.tree().unwrap().get_name("doomed.txt").is_none());
     assert!(head.tree().unwrap().get_name("seed.txt").is_some());
+}
+
+/// A commit landing between `reset_index_to_head` and `commit_index` makes
+/// libgit2 refuse the commit with a retryable error. The stale tree must never
+/// land on the new HEAD, which would drop the competitor's file.
+#[test]
+fn a_head_that_moved_after_the_reset_refuses_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_with_seed_commit(dir.path());
+    let other = git2::Repository::open(dir.path()).unwrap();
+
+    let base = stage_one(&repo, "ours.txt");
+    let theirs = write_and_commit(&other, "theirs.txt", "theirs");
+
+    let err = commit_index(&repo, "ours", base).expect_err("a moved HEAD must refuse the commit");
+    assert_eq!(err.class(), git2::ErrorClass::Object);
+    assert_eq!(err.code(), git2::ErrorCode::Modified);
+    assert!(
+        is_transient_repo_contention(&err),
+        "the real libgit2 error must be retried: {}",
+        err.message()
+    );
+
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(
+        head.id().to_string(),
+        theirs,
+        "HEAD must stay on the winner"
+    );
+}
+
+/// The same race end to end through the retry helper, with no synthesized
+/// error: the competitor commits after the attempt reset its index. The retry
+/// must land on top of the winner with the winner's file still in the tree.
+#[test]
+fn a_commit_between_reset_and_commit_is_kept_by_the_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    let repo = repo_with_seed_commit(ws);
+    let other = git2::Repository::open(ws).unwrap();
+    std::fs::write(ws.join("ours.txt"), "ours").unwrap();
+
+    let mut attempts = 0;
+    let ours = retry_while_repo_contended(|| {
+        attempts += 1;
+        let mut index = repo.index()?;
+        let base = reset_index_to_head(&repo, &mut index)?;
+        index.add_path(std::path::Path::new("ours.txt"))?;
+        index.write()?;
+        if attempts == 1 {
+            write_and_commit(&other, "theirs.txt", "theirs");
+        }
+        commit_index(&repo, "ours", base)
+    })
+    .expect("the retry must commit onto the new head");
+
+    assert_eq!(attempts, 2, "the first attempt must be refused, not land");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.id().to_string(), ours);
+    assert_eq!(head.parent(0).unwrap().message().unwrap(), "theirs");
+    let tree = head.tree().unwrap();
+    assert!(
+        tree.get_name("theirs.txt").is_some(),
+        "theirs.txt was reverted"
+    );
+    assert!(tree.get_name("ours.txt").is_some(), "ours.txt was lost");
+}
+
+/// A deletion committed between a full-tree writer's staging and its commit
+/// stays deleted. This is the `commit_all_dirty` shape.
+#[test]
+fn a_deletion_landing_mid_full_tree_commit_stays_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path();
+    let repo = repo_with_seed_commit(ws);
+    let other = git2::Repository::open(ws).unwrap();
+    write_and_commit(&repo, "doomed.txt", "add doomed");
+    std::fs::write(ws.join("dirty.txt"), "dirty").unwrap();
+
+    let mut attempts = 0;
+    retry_while_repo_contended(|| {
+        attempts += 1;
+        let mut index = repo.index()?;
+        let base = reset_index_to_head(&repo, &mut index)?;
+        index.add_all(["."], git2::IndexAddOption::DEFAULT, None)?;
+        index.write()?;
+        if attempts == 1 {
+            std::fs::remove_file(ws.join("doomed.txt")).unwrap();
+            let mut theirs = other.index().unwrap();
+            let theirs_base = reset_index_to_head(&other, &mut theirs).unwrap();
+            theirs
+                .remove_path(std::path::Path::new("doomed.txt"))
+                .unwrap();
+            theirs.write().unwrap();
+            commit_index(&other, "delete doomed", theirs_base).unwrap();
+        }
+        commit_index(&repo, "sweep the working tree", base)
+    })
+    .expect("the retry must commit onto the deletion");
+
+    assert_eq!(attempts, 2, "the first attempt must be refused, not land");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.parent(0).unwrap().message().unwrap(), "delete doomed");
+    let tree = head.tree().unwrap();
+    assert!(
+        tree.get_name("doomed.txt").is_none(),
+        "the deletion was reverted"
+    );
+    assert!(tree.get_name("dirty.txt").is_some(), "dirty.txt was lost");
 }

@@ -430,7 +430,7 @@ pub async fn round_two_sequence(pool: &PgPool, thread_id: Uuid) -> Fallible<Opti
 /// Sequence of the thread's nth prompt, counting from one.
 ///
 /// A prompt is a `MessageReceived`, which on an eval thread is the driver's own
-/// post and nothing else. A wake writes `UserPromptInjected` and a scripted
+/// post and nothing else. A wake writes `PromptInjected` and a scripted
 /// answer writes `UserQuestionAnswered`.
 pub async fn prompt_sequence(pool: &PgPool, thread_id: Uuid, nth: usize) -> Fallible<Option<i64>> {
     let row: Option<(i64,)> = sqlx::query_as(
@@ -829,7 +829,7 @@ mod tests {
     /// It is what a reader checks to see that a domain was excluded on purpose.
     /// Making the drift test exhaustive is its only job, so it lives here: I4
     /// allows one test region per file, and this is that region.
-    const NOT_RECOVERY_DOMAINS: [&str; 10] = [
+    const NOT_RECOVERY_DOMAINS: [&str; 11] = [
         "changes",
         "env_vars",
         "mcp",
@@ -840,6 +840,7 @@ mod tests {
         "repositories",
         "thread_queue",
         "trigger_groups",
+        "widgets",
     ];
 
     /// The model under test.

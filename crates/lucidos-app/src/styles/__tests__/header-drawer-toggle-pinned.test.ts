@@ -63,9 +63,10 @@ describe('one toggle, in one host', () => {
     }
   });
 
-  it('reads in the order it sits on screen: toggle, then Filter, then Search', () => {
+  it('reads in the order it sits on screen: toggle, Filter, title, Grouping, Search', () => {
     // Tab follows the DOM. The toggle sits ahead of the drawer row on screen,
-    // and Filter sits between the title and Search, so the markup says the same.
+    // Filter leads the row, and Grouping sits between the title and Search, so
+    // the markup says the same.
     const at = (needle: string) => {
       const i = appHeader.indexOf(needle);
       expect(i, `${needle} not found in AppHeader.tsx`).toBeGreaterThanOrEqual(0);
@@ -73,12 +74,15 @@ describe('one toggle, in one host', () => {
     };
     const threadsHeader = at('function ThreadsHeader');
     expect(at('class="thread-toggle-slot"')).toBeLessThan(at('<ThreadsHeader />'));
-    const title = appHeader.indexOf('class="threads-header-title"', threadsHeader);
-    // Both headers render Filter through one component, which carries its label.
+    // Both headers render each button through one component, which carries its label.
     const filter = appHeader.indexOf('<ThreadFilterButton', threadsHeader);
+    const title = appHeader.indexOf('class="threads-header-title"', threadsHeader);
+    const grouping = appHeader.indexOf('<ThreadGroupingButton', threadsHeader);
     const search = appHeader.indexOf('aria-label="Search threads"', threadsHeader);
-    expect(title).toBeLessThan(filter);
-    expect(filter).toBeLessThan(search);
+    expect(filter).toBeGreaterThan(threadsHeader);
+    expect(filter).toBeLessThan(title);
+    expect(title).toBeLessThan(grouping);
+    expect(grouping).toBeLessThan(search);
   });
 
   it('the host has no focus handler: the button fills it and keeps its clicks', () => {
@@ -111,7 +115,7 @@ describe('it rests in the corner in both drawer states', () => {
     // Arithmetic rather than luck. The row's lead is the toggle's `left`, plus
     // its `width`, plus a gap. The row pads past that and clips at it, so
     // nothing in the row paints or hit-tests under the toggle in any frame.
-    // That covers Filter and Search riding the row's right edge into the
+    // That covers Grouping and Search riding the row's right edge into the
     // corner as the drawer shuts.
     const slot = desktopRule('.thread-toggle-slot');
     const row = desktopRule('.threads-header');

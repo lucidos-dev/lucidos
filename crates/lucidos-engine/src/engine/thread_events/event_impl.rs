@@ -188,6 +188,9 @@ impl ThreadEvent {
             Self::ThreadArchived => "ThreadArchived",
             Self::ThreadArchiveRequested => "ThreadArchiveRequested",
             Self::ThreadUnarchived => "ThreadUnarchived",
+            Self::ThreadReadRequested => "ThreadReadRequested",
+            Self::ThreadReadNotRequested => "ThreadReadNotRequested",
+            Self::ThreadReplySeen { .. } => "ThreadReplySeen",
             Self::ThreadTriageProposed { .. } => "ThreadTriageProposed",
             Self::ThreadStarted { .. } => "ThreadStarted",
             Self::ThreadDiscarded { .. } => "ThreadDiscarded",
@@ -201,6 +204,8 @@ impl ThreadEvent {
             Self::ChangeReverted { .. } => "ChangeReverted",
             Self::ChangeSetAside { .. } => "ChangeSetAside",
             Self::ChangeBroughtBack { .. } => "ChangeBroughtBack",
+            Self::ChangeWithdrawn { .. } => "ChangeWithdrawn",
+            Self::ProposalWithheld { .. } => "ProposalWithheld",
             Self::ChangeApplyFailed { .. } => "ChangeApplyFailed",
             Self::MergeConflictDetected { .. } => "MergeConflictDetected",
             Self::MergeResolutionStarted { .. } => "MergeResolutionStarted",
@@ -208,7 +213,7 @@ impl ThreadEvent {
             Self::ChangeHardened { .. } => "ChangeHardened",
             Self::ChangeSummarized { .. } => "ChangeSummarized",
             Self::CodingAgentSettingsChanged { .. } => "CodingAgentSettingsChanged",
-            Self::UserPromptInjected { .. } => "UserPromptInjected",
+            Self::PromptInjected { .. } => "PromptInjected",
             Self::CredentialRequested { .. } => "CredentialRequested",
             Self::PluginInstallRequested { .. } => "PluginInstallRequested",
             Self::PluginUninstallRequested { .. } => "PluginUninstallRequested",
@@ -218,6 +223,8 @@ impl ThreadEvent {
             Self::McpConsentRequested { .. } => "McpConsentRequested",
             Self::UserQuestionAsked { .. } => "UserQuestionAsked",
             Self::UserQuestionAnswered { .. } => "UserQuestionAnswered",
+            Self::OwnerApprovalRequested { .. } => "OwnerApprovalRequested",
+            Self::OwnerApprovalSpent { .. } => "OwnerApprovalSpent",
             Self::CodingAgentPermissionRequest { .. } => "CodingAgentPermissionRequest",
             Self::CodingAgentPermissionResolved { .. } => "CodingAgentPermissionResolved",
             Self::CommandPermissionRequested { .. } => "CommandPermissionRequested",
@@ -247,6 +254,9 @@ impl ThreadEvent {
             Self::SideQuestionAnswered { .. } => "SideQuestionAnswered",
             Self::SideQuestionFailed { .. } => "SideQuestionFailed",
             Self::SideQuestionDismissed { .. } => "SideQuestionDismissed",
+            Self::WidgetShown { .. } => "WidgetShown",
+            Self::WidgetPinned { .. } => "WidgetPinned",
+            Self::WidgetUnpinned { .. } => "WidgetUnpinned",
             // Transient
             Self::CumulativeTextUpdated { .. } => "CumulativeTextUpdated",
             Self::LlmCallRetried { .. } => "LlmCallRetried",
@@ -314,6 +324,9 @@ impl ThreadEvent {
         "ThreadArchived",
         "ThreadArchiveRequested",
         "ThreadUnarchived",
+        "ThreadReadRequested",
+        "ThreadReadNotRequested",
+        "ThreadReplySeen",
         "ThreadTriageProposed",
         "ThreadStarted",
         "ThreadDiscarded",
@@ -327,6 +340,8 @@ impl ThreadEvent {
         "ChangeReverted",
         "ChangeSetAside",
         "ChangeBroughtBack",
+        "ChangeWithdrawn",
+        "ProposalWithheld",
         "ChangeApplyFailed",
         "MergeConflictDetected",
         "MergeResolutionStarted",
@@ -334,7 +349,7 @@ impl ThreadEvent {
         "ChangeHardened",
         "ChangeSummarized",
         "CodingAgentSettingsChanged",
-        "UserPromptInjected",
+        "PromptInjected",
         "CredentialRequested",
         "PluginInstallRequested",
         "PluginUninstallRequested",
@@ -344,6 +359,8 @@ impl ThreadEvent {
         "McpConsentRequested",
         "UserQuestionAsked",
         "UserQuestionAnswered",
+        "OwnerApprovalRequested",
+        "OwnerApprovalSpent",
         "CodingAgentPermissionRequest",
         "CodingAgentPermissionResolved",
         "CommandPermissionRequested",
@@ -383,6 +400,9 @@ impl ThreadEvent {
         "SideQuestionAnswered",
         "SideQuestionFailed",
         "SideQuestionDismissed",
+        "WidgetShown",
+        "WidgetPinned",
+        "WidgetUnpinned",
     ];
 
     /// The `#[serde(alias = ...)]` spellings, kept for rows written before a
@@ -419,6 +439,9 @@ impl ThreadEvent {
         "SessionResumed",
         "TextStreaming",
         "Thinking",
+        "UserPromptInjected",
+        "WidgetHidden",
+        "WidgetRestored",
     ];
 
     /// Whether `name` is a `ThreadEvent` wire name, current or legacy.
@@ -492,7 +515,7 @@ impl ThreadEvent {
     pub const INDEXABLE_EVENT_TYPES: &'static [&'static str] = &[
         "MessageReceived",
         "SpokenMessageReceived",
-        "UserPromptInjected",
+        "PromptInjected",
         "ResponseGenerated",
         "ResponseCanceled",
         "ResponseAborted",
@@ -513,18 +536,18 @@ impl ThreadEvent {
             // `MessageReceived` beside it until ADR 0201 stopped writing one.
             // Without this arm nothing spoken reaches memory at all.
             Self::SpokenMessageReceived { text, .. } => Some(text),
-            // A `UserPromptInjected` carrying `injected_message_id` is an
+            // A `PromptInjected` carrying `injected_message_id` is an
             // ACKNOWLEDGEMENT of a `MessageReceived` that is already persisted
             // and already indexed, with the same text copied verbatim. Indexing
             // it again files the user's sentence into memory twice. The engine
             // mode (a resume note, a legacy child-thread callback) carries no
             // such id and is the only original content here, so it stays.
-            Self::UserPromptInjected {
+            Self::PromptInjected {
                 text,
                 injected_message_id: None,
                 ..
             } => Some(text),
-            Self::UserPromptInjected { .. } => None,
+            Self::PromptInjected { .. } => None,
             Self::ResponseGenerated { text, .. } => Some(text),
             Self::ResponseCanceled { text, .. } => Some(text),
             Self::ResponseAborted { text, .. } => Some(text),

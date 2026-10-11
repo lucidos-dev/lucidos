@@ -38,8 +38,6 @@ const handleNavigationRequest = vi.fn();
 vi.mock('./navigation-request', () => ({
   routeThreadNavigation,
   handleNavigationRequest,
-  navigationIsForThisDevice: (actor?: { kind?: string; device_id?: string }) =>
-    actor?.kind !== 'device' || actor.device_id === THIS_DEVICE,
 }));
 vi.mock('./thread-label', () => ({ formatThreadLabel: (id: string) => `thread ${id}` }));
 

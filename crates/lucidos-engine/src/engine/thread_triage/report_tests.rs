@@ -22,9 +22,13 @@ fn row(f: impl FnOnce(&mut TriageFacts)) -> TriageRow {
     };
     f(&mut facts);
     TriageRow {
+        family_root: facts.thread_id,
+        family_pinned: false,
         facts,
         title: "Title".into(),
         section: "inbox".into(),
+        inbox_sub_threads: 0,
+        pinned_sub_threads: 0,
     }
 }
 

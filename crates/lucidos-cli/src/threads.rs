@@ -39,9 +39,9 @@ pub(crate) struct ListFilters<'a> {
     /// `Some(true)` keeps threads holding an unsent draft, `Some(false)` the
     /// rest, `None` filters nothing.
     pub has_draft: Option<bool>,
-    /// The same three-way filter on whether a coding-agent branch differs
-    /// from main.
-    pub has_diff: Option<bool>,
+    /// Keeps coding-agent threads in this change state. The engine validates
+    /// the value, so a typo comes back as its refusal.
+    pub change_state: Option<String>,
 }
 
 /// Resolve `--parent <uuid>` / `--my-children` into the single `parent` value
@@ -276,8 +276,8 @@ fn build_query_params(filters: &ListFilters<'_>) -> Vec<(&'static str, String)> 
     if let Some(d) = filters.has_draft {
         params.push(("has_draft", d.to_string()));
     }
-    if let Some(d) = filters.has_diff {
-        params.push(("has_diff", d.to_string()));
+    if let Some(state) = filters.change_state.as_deref() {
+        params.push(("change_state", state.to_string()));
     }
     params
 }
@@ -313,17 +313,17 @@ mod tests {
     }
 
     #[test]
-    fn the_draft_and_diff_filters_go_out_as_explicit_booleans() {
+    fn the_draft_and_change_state_filters_go_out_as_given() {
         let params = super::build_query_params(&ListFilters {
             has_draft: Some(true),
-            has_diff: Some(false),
+            change_state: Some("unproposed".to_string()),
             ..ListFilters::default()
         });
         assert_eq!(
             params,
             vec![
                 ("has_draft", "true".to_string()),
-                ("has_diff", "false".to_string()),
+                ("change_state", "unproposed".to_string()),
             ]
         );
     }

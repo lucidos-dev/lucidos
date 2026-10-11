@@ -383,6 +383,11 @@ async fn plan_marker_proposed_then_approved_round_trip() {
     assert!(approve.status().is_success());
     let approve_body: serde_json::Value = approve.json().await.expect("approve-plan non-JSON");
     assert_eq!(approve_body["approved"], json!(true));
+    // Wire contract: `lucidos planned approve` marks this file Approved.
+    assert_eq!(
+        approve_body["plan_path"],
+        json!("docs/plans/2026-06-19-e2e.md")
+    );
     assert_eq!(read_state(branch.clone()).await, "SATISFIED");
 
     // Re-approving an already-planned branch is a no-op (approved: false).
@@ -636,8 +641,8 @@ async fn sequential_apply_two_changes_succeeds() {
     // owns exactly one branch, and `propose_change` reuses the existing
     // pending change for that branch rather than stacking a second. The
     // single-change apply endpoint is gated by `available_thread_actions_for`,
-    // which derives Apply from the thread's per-thread `coding_agent_proposed`
-    // flag — applying change 1 clears that flag on its thread. So each change
+    // which derives Apply from the thread's per-thread change state, and
+    // applying change 1 takes its thread off `proposed`. So each change
     // must live on its own synthetic thread, exactly as two real CC threads
     // would. (This test still exercises the regression it was written for:
     // two sequential applies must leave the working tree clean.)
@@ -1389,7 +1394,7 @@ async fn a_set_aside_change_waits_out_of_the_way_until_brought_back() {
         .await
         .contains(&change_id.to_string()));
     let proposed: bool = sqlx::query_scalar(
-        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
@@ -1553,5 +1558,100 @@ async fn archive_sets_aside_unproposed_branch_work_but_never_a_decided_one() {
             .execute(&pool)
             .await;
     }
+    pool.close().await;
+}
+
+/// A branch that lands only an implementation plan applies with no hardening,
+/// whether its plan awaits approval or is approved. Plans have no tests, and
+/// hardening runs on the branch that implements the plan.
+#[tokio::test]
+async fn a_plan_only_change_applies_without_hardening_under_either_marker() {
+    let client = user_client().await;
+    let ws = workspace_path();
+    let repo_root = ws.to_str().unwrap();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let _tree = crate::support::workspace_tree_lock().write().await;
+
+    for state in ["proposed", "planned"] {
+        let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+        let branch = format!("e2e-test/plan-only-{state}-{suffix}");
+        let plan = format!("docs/plans/e2e-plan-only-{suffix}.md");
+        commit_on_new_branch(&branch, &plan, "## Implementation Plan\n");
+
+        let thread_id = Uuid::new_v4();
+        let change_id = Uuid::new_v4();
+        seed_cc_thread_summary(&pool, thread_id, "idle").await;
+        seed_change_for_test(
+            &client,
+            change_id,
+            thread_id,
+            &branch,
+            repo_root,
+            "E2E plan only",
+            &[&plan],
+            false,
+            false,
+        )
+        .await;
+        let mark = local_process_client()
+            .post(format!("{}/api/v1/internal/mark-planned", base_url()))
+            .json(&json!({
+                "repo_root": repo_root,
+                "branch_name": branch,
+                "head_sha": "deadbeef",
+                "state": state,
+                "plan_path": plan,
+            }))
+            .send()
+            .await
+            .expect("mark-planned POST failed");
+        assert!(
+            mark.status().is_success(),
+            "mark-planned: {}",
+            mark.status()
+        );
+
+        apply_ok(&client, change_id).await;
+        let hardening: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_id = $1::text AND event_type = 'MissingHardeningDetected'",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count hardening events");
+        assert_eq!(
+            hardening, 0,
+            "a plan alone must never start a hardening ({state})"
+        );
+    }
+
+    pool.close().await;
+}
+
+/// Harden starts a turn. So it refuses a thread whose work does not wait on
+/// hardening, rather than start a turn the Not ready strip never offered.
+#[tokio::test]
+async fn harden_refuses_a_thread_with_no_work_held_for_hardening() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+
+    let resp = client
+        .post(format!(
+            "{}/api/v1/threads/{}/harden",
+            base_url(),
+            thread_id
+        ))
+        .send()
+        .await
+        .expect("harden request failed");
+    assert_eq!(resp.status().as_u16(), 409, "{:?}", resp.text().await);
+
     pool.close().await;
 }

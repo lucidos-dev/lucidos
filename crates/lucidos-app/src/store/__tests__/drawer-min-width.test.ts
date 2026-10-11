@@ -15,11 +15,13 @@
  * Then it turned build-independent: the web client pays the same reserve, so a
  * workspace stops the drawer at the same width in the browser as in the app.
  *
- * The two ends are the lead plus the drawer toggle, which rests over the row,
- * and the padding plus Filter and Search. The first is the wider one up to
- * about 166% ui-scale, because the lead is a px reserve and the rest is rem.
+ * Then it dropped the title's own room. The row holds two controls at each
+ * end: the toggle and Filter, then Grouping and Search. A title that does not
+ * fit hides rather than ellipsizing, so the floor is the two ends alone. The
+ * lead is a px reserve plus rem, and the trail is all rem. So the leading end
+ * is the wider one at every scale a user can pick.
  *
- * Three things are pinned: the arithmetic on both sides of that crossing, the
+ * Three things are pinned: the arithmetic at every scale a user can pick, the
  * re-clamp a UI-scale change owes a settled drawer, and the fact that the TS
  * mirror of the row's rem parts still matches the CSS declaring them.
  */
@@ -44,46 +46,33 @@ const shellCss: string = readFileSync(
 
 /** A button and its gap, mirrored from `computeMinDrawerWidth`'s constants. */
 const BUTTON_REM = 2.25 + 0.25;
-/** The title's own room. */
-const TITLE_REM = 4.5;
 /** The row's own trailing padding. */
 const PAD_REM = 0.5;
 const LIGHTS_RESERVE_PX = 80;
 
-/** The row's leading end at a root: the lead, then the drawer toggle. */
-const leadEnd = (rem: number, lead = LIGHTS_RESERVE_PX) => lead + BUTTON_REM * rem;
-/** The row's trailing end at a root: the padding, then Filter and Search. */
+/** The row's leading end at a root: the lead, then the toggle and Filter. */
+const leadEnd = (rem: number, lead = LIGHTS_RESERVE_PX) => lead + 2 * BUTTON_REM * rem;
+/** The row's trailing end at a root: the padding, then Grouping and Search. */
 const trailEnd = (rem: number) => (PAD_REM + 2 * BUTTON_REM) * rem;
 
 describe('computeMinDrawerWidth', () => {
   it('is symmetric around the centred title, paying the wider end at both sides', () => {
-    // The title is centred on the PANE (`.threads-header-title`), not on the gap
-    // between the controls, so the floor is `2 * side + title` rather than a
-    // single run of controls, and the wider end is paid on both sides.
-    expect(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX))
-      .toBe(Math.ceil(2 * leadEnd(16) + TITLE_REM * 16));
-    expect(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX)).toBe(312);
+    // The title is centred on the PANE (`.threads-header-title`), so the wider
+    // end is paid on both sides. It keeps no title room of its own: a title
+    // that does not fit hides.
+    expect(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX)).toBe(Math.ceil(2 * leadEnd(16)));
+    expect(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX)).toBe(320);
   });
 
-  it('is sized by the leading end through the everyday scales', () => {
-    // 75% to 162.5%: the px reserve plus the toggle outweighs Filter and Search.
-    for (const rem of [12, 16, 20, 22, 24, 26]) {
+  it('is sized by the leading end at every scale a user can pick', () => {
+    // 75% to 200%: the px reserve outweighs the trailing end's padding, since
+    // both ends hold two controls.
+    for (const rem of [12, 16, 20, 22, 24, 28, 32]) {
       expect(leadEnd(rem), `${rem}px root`).toBeGreaterThan(trailEnd(rem));
       expect(computeMinDrawerWidth(rem, LIGHTS_RESERVE_PX), `${rem}px root`)
-        .toBe(Math.ceil(2 * leadEnd(rem) + TITLE_REM * rem));
+        .toBe(Math.ceil(2 * leadEnd(rem)));
     }
-  });
-
-  it('is sized by the trailing end above about 166% ui-scale', () => {
-    // Filter and Search are all rem, the reserve is not, so from 175% up the
-    // trailing end is the wider one. A floor that kept paying the leading end
-    // there would let the title run under Filter.
-    for (const rem of [28, 32]) {
-      expect(trailEnd(rem), `${rem}px root`).toBeGreaterThan(leadEnd(rem));
-      expect(computeMinDrawerWidth(rem, LIGHTS_RESERVE_PX), `${rem}px root`)
-        .toBe(Math.ceil(2 * trailEnd(rem) + TITLE_REM * rem));
-    }
-    expect(computeMinDrawerWidth(28, LIGHTS_RESERVE_PX)).toBe(434);
+    expect(computeMinDrawerWidth(20, LIGHTS_RESERVE_PX)).toBe(360);
   });
 
   it('scales with the root font size, because the row does', () => {
@@ -97,9 +86,9 @@ describe('computeMinDrawerWidth', () => {
     // The web row leads with the toggle at 0.5rem, so its own need is the
     // wider of that end and the trailing one. The floor it is held to is the
     // packaged build's (ADR 0058). The difference is title room the web row
-    // gains rather than anything it has to clear: 64px at a 16px root.
-    const webRow = Math.ceil(2 * Math.max(leadEnd(16, PAD_REM * 16), trailEnd(16)) + TITLE_REM * 16);
-    expect(webRow).toBe(248);
+    // gains rather than anything it has to clear.
+    const webRow = Math.ceil(2 * Math.max(leadEnd(16, PAD_REM * 16), trailEnd(16)));
+    expect(webRow).toBe(176);
     expect(computeMinDrawerWidth(16, LIGHTS_RESERVE_PX) - webRow)
       .toBe(2 * (leadEnd(16) - trailEnd(16)));
   });
@@ -108,7 +97,7 @@ describe('computeMinDrawerWidth', () => {
     // The floor is paid with the packaged build's lead on every client. It
     // must still cover the web row wherever the rem part outgrows the reserve.
     for (const rem of [12, 16, 24, 32, 48, 200]) {
-      const webRow = Math.ceil(2 * Math.max(leadEnd(rem, PAD_REM * rem), trailEnd(rem)) + TITLE_REM * rem);
+      const webRow = Math.ceil(2 * Math.max(leadEnd(rem, PAD_REM * rem), trailEnd(rem)));
       expect(computeMinDrawerWidth(rem, LIGHTS_RESERVE_PX), `${rem}px root`)
         .toBeGreaterThanOrEqual(webRow);
     }
@@ -122,11 +111,10 @@ describe('computeMinDrawerWidth', () => {
 
   it('holds the reserve fixed while the rem part scales', () => {
     // The lights are OS chrome: they do not grow with our root font size, so
-    // growing the root grows only the rem term. 16px to 24px stays on the
-    // leading end, where the reserve is paid.
+    // growing the root grows only the rem term.
     const grew = computeMinDrawerWidth(24, LIGHTS_RESERVE_PX)
       - computeMinDrawerWidth(16, LIGHTS_RESERVE_PX);
-    expect(grew).toBe((2 * BUTTON_REM + TITLE_REM) * 8);
+    expect(grew).toBe(4 * BUTTON_REM * 8);
   });
 });
 
@@ -216,12 +204,12 @@ describe('the two split-pane floors', () => {
     // `clampToRange`'s empty-range branch load-bearing rather than defensive.
     // The crossing moved down a step when the drawer's floor became the
     // packaged build's on every client, so pin both sides of it: 137.5% is the
-    // widest scale that still fits, 150% the first that does not.
+    // widest scale that still fits (exactly), 150% the first that does not.
     const sumAt = (fontSize: string) => {
       vi.stubGlobal('getComputedStyle', () => ({ fontSize, getPropertyValue: () => '' }));
       return minDrawerWidth() + minThreadPanePx() + minContentPanePx();
     };
-    expect(sumAt('22px')).toBeLessThan(1280);
+    expect(sumAt('22px')).toBeLessThanOrEqual(1280);
     expect(sumAt('24px')).toBeGreaterThan(1280);
   });
 });
@@ -237,7 +225,7 @@ describe('the TS mirror of the row still matches the CSS', () => {
 
   const row = rules.find(r => r.selector === '.threads-header' && r.atRules === DESKTOP);
 
-  it('the icon box is 2.25rem: the toggle, Filter and Search', () => {
+  it('the icon box is 2.25rem: the toggle, Filter, Grouping and Search', () => {
     expect(desktopRoot?.props.get('--header-icon-box')).toBe('2.25rem');
   });
 
@@ -280,17 +268,16 @@ describe('the TS mirror of the row still matches the CSS', () => {
   });
 
   it('the centred title clamps to the same two ends the floor pays twice', () => {
-    // The floor is `2 * max(leadEnd, trailEnd) + title`, and the doubling is
-    // there because the title is centred on the PANE. The CSS clamp has to
-    // count the same two ends, or the two disagree about the row. Skip one in
-    // the clamp and the title runs under a control. Skip one in the floor and
-    // the drawer stops where the title is an ellipsis. The exact expression is
-    // pinned next door, in styles/__tests__/header-band-centering.test.ts.
+    // The floor is `2 * max(leadEnd, trailEnd)`, and the doubling is there
+    // because the title is centred on the PANE. The CSS clamp has to count the
+    // same two ends, or the two disagree about the row. Skip one in the clamp
+    // and the title runs under a control. The exact expression is pinned next
+    // door, in styles/__tests__/header-band-centering.test.ts.
     const title = rules.find(
       r => r.selector === '.threads-header-title' && r.atRules === DESKTOP,
     );
     const clamp = title?.props.get('max-width') ?? '';
-    expect(clamp).toContain('2 * max(var(--threads-row-lead),');
+    expect(clamp).toContain('2 * max(var(--threads-row-lead) + var(--header-icon-box) + var(--pane-header-gap),');
     expect(clamp).toContain(`${PAD_REM}rem + 2 * (var(--header-icon-box) + var(--pane-header-gap))`);
   });
 });

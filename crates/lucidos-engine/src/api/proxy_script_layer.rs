@@ -71,13 +71,7 @@ impl OAuthLookup for DbOAuthLookup {
                             provider, err
                         ),
                     ),
-                    AccountLookupError::RefreshFailed(err) => (
-                        StatusCode::BAD_GATEWAY,
-                        format!(
-                            "OAuth token refresh failed for provider '{}': {}",
-                            provider, err
-                        ),
-                    ),
+                    AccountLookupError::RefreshFailed(msg) => (StatusCode::BAD_GATEWAY, msg),
                 })?;
             out.push(account);
         }

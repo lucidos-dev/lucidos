@@ -17,7 +17,7 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     emit_cc_idle(&bus, thread_id, true, None).await;
 
     let (status, has_changes): (String, bool) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT status, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
@@ -70,21 +70,21 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     .unwrap();
 
     let (status, has_changes): (String, bool) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT status, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(status, "idle", "ChangeApplied → idle");
-    assert!(!has_changes, "ChangeApplied clears coding_agent_proposed");
+    assert!(!has_changes, "ChangeApplied takes the thread off proposed");
 
     // reset_worktree_and_idle emits CodingAgentIdled { has_changes: false }
     // THIS IS THE REGRESSION SCENARIO: previously this set status back to 'waiting'
     emit_cc_idle(&bus, thread_id, false, Some("sid-1")).await;
 
     let (status, has_changes): (String, bool) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT status, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
@@ -94,7 +94,7 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
         status, "idle",
         "CodingAgentIdled(no changes) after ChangeApplied must stay idle"
     );
-    assert!(!has_changes, "coding_agent_proposed stays false");
+    assert!(!has_changes, "the thread stays unproposed");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -175,17 +175,14 @@ async fn change_applied_keeps_inbox_shows_archive() {
     );
 
     // The change is applied, so the proposal flag follows it down.
-    let coding_agent_proposed: bool = sqlx::query_scalar(
-        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    let proposed: bool = sqlx::query_scalar(
+        "SELECT coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(
-        !coding_agent_proposed,
-        "ChangeApplied must clear coding_agent_proposed"
-    );
+    assert!(!proposed, "ChangeApplied must take the thread off proposed");
 
     // A subsequent CodingAgentIdled(no changes) keeps section as 'inbox' (idempotent)
     emit_cc_idle(&bus, thread_id, false, Some("sid-1")).await;
@@ -250,8 +247,8 @@ async fn change_discarded_keeps_inbox_shows_archive() {
     .await
     .unwrap();
 
-    let (section, coding_agent_proposed): (String, bool) = sqlx::query_as(
-        "SELECT archive_state, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    let (section, proposed): (String, bool) = sqlx::query_as(
+        "SELECT archive_state, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
@@ -262,8 +259,8 @@ async fn change_discarded_keeps_inbox_shows_archive() {
         "ChangeDiscarded must NOT clear inbox — Archive button needs to appear"
     );
     assert!(
-        !coding_agent_proposed,
-        "ChangeDiscarded must clear coding_agent_proposed"
+        !proposed,
+        "ChangeDiscarded must take the thread off proposed"
     );
 
     pool.close().await;
@@ -994,10 +991,9 @@ async fn startup_resets_orphaned_waiting_threads_without_changes() {
 
     // Simulate engine restart: run the orphan-waiting cleanup query from main.rs.
     sqlx::query(
-        "UPDATE thread_summaries SET status = 'idle', \
-             coding_agent_proposed = FALSE, coding_agent_requires_restart = FALSE, \
-             coding_agent_is_external_repo = FALSE \
-             WHERE status = 'waiting' AND coding_agent_proposed = FALSE AND source = 'claude_code'",
+        "UPDATE thread_summaries SET status = 'idle', coding_agent_is_external_repo = FALSE \
+         WHERE status = 'waiting' AND coding_agent_change_state <> 'proposed' \
+           AND source = 'claude_code'",
     )
     .execute(&pool)
     .await
@@ -1019,15 +1015,15 @@ async fn startup_resets_orphaned_waiting_threads_without_changes() {
     // skips it (clearing CC flags here would lose the proposal). The
     // Option B migration (20260519203328) catches this case separately by
     // flipping status='waiting' → 'idle' for any source='claude_code'
-    // regardless of coding_agent_proposed.
+    // regardless of its change state.
     let (status_b, has_changes_b, requires_restart_b): (String, bool, bool) = sqlx::query_as(
-            "SELECT status, coding_agent_proposed, coding_agent_requires_restart FROM thread_summaries WHERE thread_id = $1"
+            "SELECT status, coding_agent_change_state = 'proposed', coding_agent_requires_restart FROM thread_summaries WHERE thread_id = $1"
         ).bind(thread_b).fetch_one(&pool).await.unwrap();
     assert_eq!(
         status_b, "waiting",
-        "Legacy sweep must NOT touch rows with coding_agent_proposed=true"
+        "Legacy sweep must NOT touch a proposed row"
     );
-    assert!(has_changes_b, "coding_agent_proposed preserved");
+    assert!(has_changes_b, "the proposed state is preserved");
     assert!(
         requires_restart_b,
         "coding_agent_requires_restart preserved"
@@ -1064,12 +1060,12 @@ async fn thread_archived_goes_idle_and_the_proposal_follows_the_changes_row() {
     .await
     .unwrap();
     // Replay the production lifecycle: idle → propose keeps status='idle'
-    // (a proposed change is an artifact, not a parked loop) and sets
-    // coding_agent_proposed.
+    // (a proposed change is an artifact, not a parked loop) and moves the
+    // thread to proposed.
     emit_change_proposed(&bus, thread_id, "claude-code/feat", true).await;
 
     let (status, has_changes): (String, bool) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT status, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
@@ -1088,7 +1084,7 @@ async fn thread_archived_goes_idle_and_the_proposal_follows_the_changes_row() {
 
     let (status, has_changes, requires_restart, is_external): (String, bool, bool, bool) =
         sqlx::query_as(
-            "SELECT status, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo \
+            "SELECT status, coding_agent_change_state = 'proposed', coding_agent_requires_restart, coding_agent_is_external_repo \
              FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -1125,7 +1121,7 @@ async fn thread_archived_goes_idle_and_the_proposal_follows_the_changes_row() {
     .await
     .unwrap();
     let (has_changes, requires_restart): (bool, bool) = sqlx::query_as(
-        "SELECT coding_agent_proposed, coding_agent_requires_restart \
+        "SELECT coding_agent_change_state = 'proposed', coding_agent_requires_restart \
          FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)

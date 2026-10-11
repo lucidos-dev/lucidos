@@ -1,13 +1,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
+use crate::api::thread_reach::ThreadReachVerb;
 use crate::core::event_subscription::EventSubscription;
 use crate::runtime::CodingAgent;
 
 use super::{
-    AbortCause, ActorMode, AnswerKind, CancelCause, ChildCompletionStatus, EventWaitCancelCause,
-    FormRequestOutcome, MessageOrigin, QuestionOption, RecalledMemory, SessionEndReason, TodoItem,
-    TriggerInvocation, VoiceSessionEndReason,
+    AbortCause, ActorMode, AnswerKind, CancelCause, CaptureFormat, ChildCompletionStatus,
+    EventWaitCancelCause, FormRequestOutcome, MessageOrigin, OwnerApproval, QuestionOption,
+    RecalledMemory, SessionEndReason, TodoItem, TriggerInvocation, UnproposedReason,
+    VoiceSessionEndReason,
 };
 
 /// Replay default for events persisted before the `agent` field existed —
@@ -56,7 +59,7 @@ fn default_true() -> bool {
 }
 
 fn default_inject_mode() -> ActorMode {
-    // Historical UserPromptInjected rows pre-date the mode field. The only
+    // Historical PromptInjected rows pre-date the mode field. The only
     // emit site at the time was the user-correction path, so defaulting to
     // Human keeps legacy rows attributed correctly.
     ActorMode::Human
@@ -244,9 +247,17 @@ pub enum ThreadEvent {
         reasoning_effort: Option<String>,
         /// How long the call took, wall clock, where the caller timed it.
         /// Absent for every purpose but the compactor today. The Tree
-        /// backfill estimate reads it as a model's seconds per call.
+        /// backfill estimate reads it as a model's seconds per call at a tier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// The *served model*: the model id the provider's reply named,
+        /// verbatim. `model` is the one Lucidos asked for. Absent when the
+        /// reply named none, and on every row written before the field
+        /// existed. One that is neither `model` nor a dated snapshot of it
+        /// means another model answered: a provider reroute, or the router
+        /// sending a retired model's successor (ADR 0418).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
     },
     /// The engine's automatic pre-turn recall: `retrieve_context` vector-searched
     /// long-term memory with classifier-derived `queries` and injected the hits
@@ -486,6 +497,10 @@ pub enum ThreadEvent {
         /// sub-agent's narration, never the session's reply. Absent otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
+        /// The text is a *progress note*: the provider's summary of what the
+        /// agent wrote before a tool call. The agent itself read it in full.
+        #[serde(default, skip_serializing_if = "is_false")]
+        progress_note: bool,
     },
     /// Streamed reasoning from a coding agent, the coding-agent mirror
     /// of the chat agent's `ThoughtStreamed`. Carries plaintext reasoning the
@@ -627,9 +642,9 @@ pub enum ThreadEvent {
         /// True iff the agent went idle while the chat-agent's
         /// `run_bash_background` tool still had a task running for this thread.
         /// **Recorded history only.** As of the bg-bash-gate removal this no
-        /// longer drives any projection or UI. The change proposes at idle
-        /// regardless of background bash (correctness is covered by
-        /// harden-at-apply), and the chat-agent bash auto-resumes CC via
+        /// longer drives any projection or UI. A live event wait, not a
+        /// background task, holds the idle proposal (ADR 0395), and the
+        /// chat-agent bash auto-resumes CC via
         /// `spawn_bash_completion_watcher`. Kept on the event so the timeline
         /// still records that an idle overlapped a background task.
         #[serde(default, skip_serializing_if = "is_false")]
@@ -681,6 +696,25 @@ pub enum ThreadEvent {
     /// The user took a thread back out of the archive: Archive all's Undo
     /// (ADR 0349). Moves it to the inbox and bumps nothing else.
     ThreadUnarchived,
+    /// The thread's own agent asked the user to read its latest reply (ADR
+    /// 0409). Sets `read_requested`, which lists the thread in the drawer's
+    /// Review group once its turn ends, unless its change already lists it
+    /// (ADR 0421). The actor names the agent thread, and is absent when the
+    /// turn-end gate forced the decision.
+    ThreadReadRequested,
+    /// The thread's agent decided its reply needs no reading: the no half of
+    /// the turn's *read decision*. Projects nothing, so it never clears an
+    /// unseen request (ADR 0409). The actor names the agent thread, and is
+    /// absent when the turn-end gate forced the decision.
+    ThreadReadNotRequested,
+    /// The user saw the reply a read request pointed at: its end stayed on
+    /// screen for the seen dwell. Clears `read_requested`. Recorded only while
+    /// the thread's summary still reads `seen_version`, so a duplicate or a
+    /// sighting older than a newer request records nothing.
+    ThreadReplySeen {
+        /// The thread's `summary_version` when the client saw the reply.
+        seen_version: i64,
+    },
     /// The Lucidos Agent proposed a *thread triage* in this thread (ADR 0349).
     /// `apply_triage` acts only on these entries, and only after the user
     /// replied to this event.
@@ -820,10 +854,9 @@ pub enum ThreadEvent {
         /// emit; engine-internal recovery emits resolve it the same way.
         #[serde(default, skip_serializing_if = "is_false")]
         hardened: bool,
-        /// `true` when the work did not come from a finished turn: a user Stop
-        /// cut it short, or recovery found it after a turn was killed. The
-        /// frontend confirms before Apply, and Apply All passes it over. A
-        /// later clean turn re-emits with `false`.
+        /// `true` when nobody saw the work finish: the archive net's
+        /// set-aside proposals. A pending change is never incomplete
+        /// (ADR 0400), and older rows marked so are withdrawn at boot.
         #[serde(default, skip_serializing_if = "is_false")]
         incomplete: bool,
         /// `true` when the engine proposes the change straight into set-aside:
@@ -889,6 +922,19 @@ pub enum ThreadEvent {
     /// thread proposed new work on the same branch.
     ChangeBroughtBack {
         change_id: String,
+    },
+    /// A pending or set-aside change went back to unproposed work, and its
+    /// branch kept every commit (ADR 0400). A turn that stopped committed past
+    /// it, or Bring back met work that never finished.
+    ChangeWithdrawn {
+        change_id: String,
+    },
+    /// A turn end left work on the branch and proposed none of it (ADR 0400).
+    /// `files` is what a proposal would have carried.
+    ProposalWithheld {
+        branch_name: String,
+        files: Vec<String>,
+        reason: UnproposedReason,
     },
     ChangeReverted {
         #[serde(default, skip_serializing_if = "is_empty_str")]
@@ -1005,11 +1051,13 @@ pub enum ThreadEvent {
         claude_config_dir_explicit: Option<bool>,
     },
 
-    // Mid-flight injection — a user correction OR a system message (e.g. parent
-    // thread receiving a child's [Child thread completed] callback) sent into
-    // the agentic loop. `mode` and `origin` describe the actor; both default
-    // for back-compat with old DB rows that pre-date these fields.
-    UserPromptInjected {
+    // A prompt fed into the agentic loop outside the ordinary send path, mid-turn
+    // or as a new turn's opening. `mode` names the sender: a human interjection,
+    // an agent's follow-up into its child thread, or the engine (a resume note,
+    // an event-wait re-entry anchor). `mode` and `origin` default for old rows
+    // that pre-date them.
+    #[serde(alias = "UserPromptInjected")]
+    PromptInjected {
         text: String,
         #[serde(default = "default_inject_mode")]
         mode: ActorMode,
@@ -1124,10 +1172,33 @@ pub enum ThreadEvent {
         worktree_path: Option<String>,
         #[serde(default)]
         multi_select: bool,
+        /// Set only on an *owner approval card* (ADR 0387): the act its
+        /// Allow once authorizes. The engine wrote this card's text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_approval: Option<OwnerApproval>,
     },
     UserQuestionAnswered {
         tool_use_id: String,
         answer: AnswerKind,
+    },
+    /// A thread asked for an *owner approval* (ADR 0387), through `POST
+    /// /api/v1/owner-approvals`. `question` is the card the engine wrote. It
+    /// is shown when the thread asks `AskUserQuestion` with `request_id` as
+    /// its question. A request grants nothing until the owner allows the card.
+    OwnerApprovalRequested {
+        request_id: String,
+        approval: OwnerApproval,
+        question: String,
+    },
+    /// A thread spent an *owner approval* on the clause-4 act it names
+    /// (ADR 0387). Emitted only by `api::owner_approval`, before the act's
+    /// handler writes anything. `tool_use_id` names the approval card, and a
+    /// unique index on it refuses a second spend.
+    OwnerApprovalSpent {
+        tool_use_id: String,
+        verb: ThreadReachVerb,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_thread_id: Option<uuid::Uuid>,
     },
 
     /// CC requested permission for a tool call (e.g. Edit/Write/Bash on a path
@@ -1653,6 +1724,39 @@ pub enum ThreadEvent {
     SideQuestionDismissed {
         side_question_id: uuid::Uuid,
     },
+    /// A widget instance was shown at this point in the thread (ADRs 0402,
+    /// 0407, 0415). Draws its inline card here and adds no chip to the
+    /// thread's widget shelf. The widget's files stay in its app folder.
+    WidgetShown {
+        app_id: String,
+        /// The instance's *widget params*. Absent means none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<BTreeMap<String, Value>>,
+        /// The instance's chip label. Absent means the widget's name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// The user or the agent pinned a widget instance: its chip is now on this
+    /// thread's widget shelf. A pin alone adds the instance, as from an
+    /// embed. No file changes.
+    #[serde(alias = "WidgetRestored")]
+    WidgetPinned {
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<BTreeMap<String, Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// A widget instance was unpinned: its chip left this thread's widget
+    /// shelf. The thread's card stays, and no file changes.
+    #[serde(alias = "WidgetHidden")]
+    WidgetUnpinned {
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<BTreeMap<String, Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
 
     // ---- Transient — never persisted ----
     // Every transient variant is past-tense (events-only model — no command
@@ -1682,6 +1786,10 @@ pub enum ThreadEvent {
     AppUiCaptureRequested {
         app_id: String,
         request_id: String,
+        /// Set when the agent saves the capture as a file. The frame then
+        /// renders at the device pixel ratio, in this format.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        save_format: Option<CaptureFormat>,
     },
     NavigationRequested {
         payload: String,

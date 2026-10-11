@@ -53,10 +53,8 @@ export interface SchemePreset {
   hint: string;
 }
 
-/** Five minutes, which is what Slack and Stripe both document.
- *
- *  A `{timestamp}` template with no tolerance skips the replay check. That
- *  check is the only reason either scheme signs a timestamp. */
+/** Five minutes, which is what Slack and Stripe both document. Each preset
+ *  names the window its sender documents, so the editor shows it. */
 const REPLAY_TOLERANCE_SECS = 300;
 
 export const SCHEME_PRESETS: SchemePreset[] = [

@@ -159,11 +159,15 @@ impl OpenDecision {
     /// The choices are the card's own options plus one more, for the caller who
     /// said something they do not cover. A free-text question has only that
     /// one, which is right: it is the whole of what the card takes.
+    ///
+    /// An *owner approval card* keeps its Allow once on screen (ADR 0387). It is
+    /// spendable authority, and the talker reads agent-supplied text aloud.
     pub fn question(
         tool_use_id: &str,
         question: &str,
         options: &[QuestionOption],
         multi_select: bool,
+        owner_approval: bool,
     ) -> Self {
         let id = format!("{}:{}", DecisionKind::Question.tag(), tool_use_id);
         // Numbered by position within THIS card, not by the option's own id,
@@ -172,6 +176,9 @@ impl OpenDecision {
         let mut choices: Vec<DecisionChoice> = options
             .iter()
             .enumerate()
+            .filter(|(_, option)| {
+                !(owner_approval && option.label == crate::api::owner_approval::ALLOW_ONCE_LABEL)
+            })
             .map(|(index, option)| DecisionChoice {
                 id: format!("{}#opt{}", id, index),
                 label: option.label.clone(),
@@ -460,6 +467,7 @@ pub async fn open_on(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<OpenDecision> 
             &q.question,
             &q.options,
             q.multi_select,
+            q.owner_approval,
         ));
     }
     if let Some((payload, request_id)) = requested(command) {

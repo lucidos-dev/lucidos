@@ -356,7 +356,9 @@ async fn coding_agent_routing_is_derived_from_the_child_row() {
 async fn the_home_thread_follows_up_a_coding_agent_thread_it_never_spawned() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
-    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
     let (parent, chat_child) = parent_and_child(&bus).await;
     let cc_thread = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
@@ -420,7 +422,9 @@ async fn the_home_thread_follows_up_a_coding_agent_thread_it_never_spawned() {
 async fn the_home_thread_cannot_follow_up_an_unsent_draft() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
-    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
     let draft = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: draft,

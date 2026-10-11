@@ -100,6 +100,17 @@ load, never a read, so use `lucidos.data.read`. See
 replace the pass and your files would stop loading behind a gateway. Relative
 refs already resolve against your app's directory.
 
+**Your app may write its own fragment and query.** These stay on your document:
+
+- `history.replaceState(null, '', '#30d')` and `pushState`, with a relative
+  `#…` or `?…`. The SDK resolves them against your frame's URL, not the base.
+- An in-page link, `<a href="#section">`.
+- `location.hash = '30d'`.
+
+Avoid `location.assign('#30d')` and `location.href = '#30d'`. Both resolve
+against the base and reload your app, so set `location.hash` instead. WebKit
+refuses a write that names another path, because the frame is sandboxed.
+
 The pass reaches your app's files and the workspace's `data/` tree, and nothing
 else. A `system-knowhow/` path from `lucidos.data.url` routes through
 `/api/v1/data/…`, an engine API route, so it still answers **401** behind a
@@ -271,6 +282,25 @@ stays out of the way of a drag that is not a pane swipe:
 - give the element a `touch-action` that keeps the sideways pan, such as
   `touch-action: pan-y` on a carousel or `none` on a canvas.
 
+### One sound at a time
+
+**A sound your app starts pauses every other sound in Lucidos, with no code
+from you.** When an `<audio>` or `<video>` element starts playing with sound,
+`sdk.js` tells Lucidos. Lucidos pauses the media playing in every other app and
+widget, and in its own file previews. Your app's media pauses the same way when
+a sound starts somewhere else. Two sound player widgets on one question card
+therefore never play over each other.
+
+Only audible media takes part. A muted element, such as a background video,
+neither pauses others nor gets paused. Nor does a stream with no audio track,
+such as a camera preview. An element counts once it plays unmuted, or is
+unmuted while playing.
+
+It does not reach:
+
+- Web Audio (`AudioContext`): it has no `play` event to watch;
+- a second element in your own app: layer your own sounds as you like.
+
 ### Find in app
 
 **Your app's text is searchable with no code from you.** The header's *Find*
@@ -424,7 +454,14 @@ host shell uses, from one source**. The engine appends
 `crates/lucidos-app/src/styles/global/shared-components.css` (which the host
 imports via `global.css`) to the served stylesheet. Apply these class names and
 your controls render like the rest of Lucidos and track the theme and UI scale.
-The class names are the contract:
+The class names are the contract.
+
+**A button is an action; a picked option is state.** Use the `.action-btn`
+family for something the user presses to make a thing happen. Show a current
+view, sort or filter with `.segmented-control` or `.pill-bar`, never by swapping
+`.action-btn` variants. The shared classes gate their hovers inside
+`@media (hover: hover)`, and a hover you write needs the same gate
+(`building-an-app.md` § Scaffolding defaults).
 
 | Class | Use for |
 |---|---|
@@ -451,6 +488,7 @@ The class names are the contract:
 | `.mini-spinner` | The spinning ring the host shows for a working state, such as a save in flight: `<span class="mini-spinner" aria-hidden="true"></span>` beside text that says what is happening. It stops under reduced motion and stays drawn. Recolour it with `--spinner-color`, for example `style="--spinner-color: currentColor"` inside a button. A busy button is a disabled `.action-btn` holding the ring and its label. Loading data draws a skeleton or nothing, never a spinner. |
 | `.empty-state`, `.error-text` | Empty/error placeholders |
 | `data-tooltip` (an attribute, plus the `#tooltip` rules that paint it) | A themed Lucidos tooltip on any element. Write the attribute, and `sdk.js` builds, positions and paints the box (§ Tooltips, under lucidos.ui). |
+| `.ring`, `.bar-run`, `.choice-row` + `.choice` | The widget shapes: a ring gauge, a run of bars for a short series, and a wrapping row of choices to pick from. App frames only, since the host draws none. See § Widget shapes below. |
 
 Prefer these over hand-rolled buttons and rows. A plain unclassed `<button>`
 gets a neutral default that does **not** match Lucidos's primary blue button.
@@ -463,7 +501,9 @@ the other only tightens markdown-table type, so every other width decision is
 yours. The rules, and the three regions the host paints over a fullscreen app,
 are in `system-knowhow/building-an-app.md` § Responsive by default.
 
-Apps using `lucidos._capture()` don't need to include `html2canvas`: the SDK loads it on demand from `/api/v1/static/html2canvas.min.js`. `html2canvas` can't rasterize CSS Color 4 functions (`color()`, `oklab()`, `oklch()`, `color-mix()`). When the screenshot fails for any reason, the capture degrades to **DOM-only** rather than throwing. It returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes), prefixed with the failure reason. So the agent still sees the layout.
+`lucidos._capture()` needs nothing from your app. The SDK draws the page through an SVG `foreignObject`. So the browser renders the snapshot, and any CSS it paints comes out right, CSS Color 4 included. It embeds your fonts and images by reading them over the host bridge. One it cannot read (another host, or a route outside the app reach table) paints empty.
+
+When the screenshot fails for any reason, the capture degrades to **DOM-only** rather than throwing. It returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes), prefixed with the failure reason. So the agent still sees the layout.
 
 External-host apps point `baseUrl` at the Lucidos instance with `lucidos.configure`:
 
@@ -480,6 +520,50 @@ need it: the SDK reads the gateway prefix from `<base href>` / the `/app/` URL.
 `token`, when set, goes out as an `Authorization: Bearer <token>` header on every
 SDK request, for embedders calling a remote engine that requires auth. Both are
 optional, and each call merges into the existing config.
+
+### Widget shapes
+
+`sdk-iframe.css` ships three shapes for what a widget shows instead of a
+table. They draw from the theme tokens only, so they follow the user's theme,
+corners and motion setting with no code from you. Each carries its own fill,
+so it reads on any ground. When to use them is in
+`system-knowhow/building-an-app.md` § Widgets, under "How a widget looks".
+
+| Class | What it draws | You set |
+|---|---|---|
+| `.ring` (+ `.ring-value`, `.ring-label`) | A ring gauge. The accent arc fills a `--bg-tertiary` track, and the children sit in the hole. It stays round in a square theme. | `--ring-value`, from 0 to 1. Optional: `--ring-size` (default `6rem`), `--ring-weight` (`0.5rem`), `--ring-color` (`--accent`), `--ring-track`. |
+| `.bar-run` > `.bar-run-item` (+ `.bar-run-bar`, `.bar-run-label`) | A run of rounded bars, one per item, for a short series such as seven days. `.is-accent` on an item paints its bar in the accent. | `--bar-value` on each item, from 0 to 1. Optional: `--bar-run-height` (default `3.5rem`), `--bar-color` on an item. |
+| `.choice-row` > `.choice` (+ `.choice-meta`) | A wrapping row of round tap targets, at least `2.75rem` square, for a pick among data items: a day, a slot, a fare. A `.choice-meta` puts a small second line under the label. `aria-pressed="true"` (or `.active`) fills the picked choice with the accent. | Nothing. Use a `<button>` per choice, and set `aria-pressed` when the user picks. |
+
+A new `--ring-value` or `--bar-value` slides to its place, and both fill in on
+first paint. Under `data-motion="reduce"` they show the value at once. A choice squeezes a
+little on press, and paints no fill under a finger.
+
+A choice is not a `.pill-bar-btn`. The pill bar switches a view or narrows a list,
+on one line. A choice row picks a data item, wraps, and can hold two lines.
+
+```html
+<div class="ring" style="--ring-value: 0.86">
+  <span class="ring-value">86</span><span class="ring-label">today</span>
+</div>
+
+<div class="bar-run" role="img" aria-label="Readiness, last 7 days">
+  <div class="bar-run-item" style="--bar-value: 0.62">
+    <span class="bar-run-bar"></span><span class="bar-run-label">F</span>
+  </div>
+  <!-- one item per day -->
+  <div class="bar-run-item is-accent" style="--bar-value: 0.86">
+    <span class="bar-run-bar"></span><span class="bar-run-label">T</span>
+  </div>
+</div>
+
+<div class="choice-row" role="group" aria-label="Long run day">
+  <button class="choice">Fri<span class="choice-meta">3 events</span></button>
+  <button class="choice" aria-pressed="true">Sat<span class="choice-meta">free</span></button>
+</div>
+```
+
+Set a value from script with `el.style.setProperty('--ring-value', 0.9)`.
 
 ## Error Handling
 
@@ -736,6 +820,8 @@ interface ProxyClient {
 
 **A model call through it records its own cost.** When the upstream is a model provider, the engine reads the usage block from the reply and writes a `ContextCaptured` with `purpose: "proxy"`. An app never reports its own model spend, and the Token Cost app counts it. To read that block, the engine asks a model provider for an uncompressed reply, so `Content-Encoding` is absent there.
 
+OpenAI speech (`/audio/speech`) reports usage only on an SSE stream. So for `mp3`, `aac`, `pcm` and `wav` the engine asks for one, records it, and hands the app plain audio. `tts-1` records its input's character count, which is what it is billed by. **`flac` and `opus` are refused with a 400**, because neither can report its cost: ask for another format (ADR 0423).
+
 **The upstream cannot act on the Lucidos origin.** The engine serves the response from its own origin, so it passes only the headers a caller reads:
 
 - content, caching and range headers, `Location`, `Link` and `Retry-After`
@@ -796,7 +882,7 @@ The engine already holds credentials and routing for every model provider in the
 
 - **Only the credential is injected.** The layer adds just the auth header. `Content-Type`, `anthropic-version` and any attribution headers stay yours to set in `init`.
 - **`apis.json` overrides the builtin.** A same-name entry in `data/config/apis.json` wins, so you can point `openai` at a mock/gateway or add auth layers.
-- **Vertex is addressed by suffix.** The engine owns the `…/projects/<project>/locations/<region>` prefix (from its own Vertex config, region default `europe-west1`) and mints the OAuth token. Send only `/publishers/<publisher>/models/<model>:<method>`. The region is the engine's configured one. A model that must run elsewhere (e.g. a `global`-only Gemini variant) needs an `apis.json` override.
+- **Vertex is addressed by suffix.** The engine owns the `…/projects/<project>/locations/<region>` prefix (from its own Vertex config, region default `europe-west1`) and mints the OAuth token. Send only `/publishers/<publisher>/models/<model>:<method>`: any other path answers 400, because the token could manage every resource in the project. The region is the engine's configured one. A model that must run elsewhere (e.g. a `global`-only Gemini variant) needs an `apis.json` override.
 - **Not configured → 404.** With no credential/config and no `apis.json` entry, the call returns 404 naming what to set.
 - **Every default base already includes `/v1`.** Send `/models`, never `/v1/models`, which doubles the segment and answers 404. A `local` base you configure yourself may lack it.
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, and an app must not build on an anonymous endpoint that can vanish without notice (ADR 0104).
@@ -840,8 +926,8 @@ Builds an absolute URL onto the engine's `/api/v1` surface, carrying the
 Pass the path *after* `/api/v1`.
 
 ```js
-// A subresource loads from an app frame, and this is the URL it needs.
-img.src = lucidos.apiUrl('/static/some-asset.png');
+// A stylesheet loads from an app frame, and this is the URL it needs.
+link.href = lucidos.apiUrl('/fonts/fira-code.css');
 ```
 
 **A `fetch` of what this returns does NOT work inside the host shell.** The
@@ -1229,18 +1315,31 @@ interface App {
   id: string;             // folder name under data/apps/
   name: string;
   description: string;
-  /** Optional icon from the app's manifest.json (emoji or asset path).
-   *  Omitted when the manifest has none. */
+  /** The app icon: the manifest's `icon` as a path inside the app folder
+   *  (`assets/icon.svg`). Omitted unless it meets building-an-app.md
+   *  § App icon. */
   icon?: string;
   /** When the host lifts its loading cover, from the manifest's `reveal`.
    *  Always present: `on-load` unless the manifest says `on-ready`. */
   reveal: 'on-load' | 'on-ready';
+  /** `widget` for a small answer shown inline in a thread. */
+  kind: 'app' | 'widget';
+  /** The thread a widget was made in. Omitted for an app. */
+  origin_thread_id?: string;
+  /** The plugin that ships a widget, instead of a thread. */
+  origin_plugin_id?: string;
+  /** A reusable widget may be shown in any thread. False for an app. */
+  reusable: boolean;
+  /** The names a widget takes in its params. Omitted when it declares none. */
+  params?: Record<string, { description: string; required?: boolean }>;
+  /** A built-in widget: shipped with Lucidos and read-only. Omitted otherwise. */
+  built_in?: boolean;
 }
 ```
 
 The shape mirrors the app's `manifest.json` (`name` / `description` / `icon` /
-`reveal`) plus the `id` derived from its folder. `list()` hits `GET /api/v1/apps`; `get(id)`
-hits `GET /api/v1/app?id=<id>` and throws a `404` `SdkError` for an unknown id.
+`reveal` / `kind` / `origin_thread_id` or `origin_plugin_id` / `reusable` / `params`) plus the `id` and, for a built-in widget, `built_in` derived from its folder. `list()` hits `GET /api/v1/apps`, which lists apps only, never a *widget*.
+`get(id)` hits `GET /api/v1/app?id=<id>` and answers for a widget too. It throws a `404` `SdkError` for an unknown id.
 
 ### Example
 
@@ -1248,6 +1347,23 @@ hits `GET /api/v1/app?id=<id>` and throws a `404` `SdkError` for an unknown id.
 const apps = await lucidos.apps.list();
 const me = await lucidos.apps.get('habit-tracker');
 console.log(me.name, me.icon ?? '(no icon)');
+```
+
+## lucidos.params: Widget Params
+
+```ts
+lucidos.params(): Record<string, unknown>
+```
+
+A *widget*'s params for the place it shows (ADR 0415): the JSON object given to `widgets(action="show")`, a *widget embed*, or a pin. It returns `{}` when the widget was given none, or when the value is not a JSON object.
+
+The host writes the object into the frame URL under the one query key `params`. So a param name never collides with a host name. The widget's `manifest.json` declares the names it takes (`system-knowhow/building-an-app.md` § Widgets). Params are visible in the URL, so never pass a credential. Params over 2 KB are refused.
+
+### Example
+
+```js
+const { clip } = lucidos.params();
+if (!clip) document.body.textContent = 'No clip given';
 ```
 
 ## lucidos.preferences: User Settings
@@ -1571,6 +1687,19 @@ interface ThreadsListOptions {
   parent?: string;
 }
 
+/** Why a turn end left a coding agent's work unproposed. */
+type UnproposedReason =
+  | 'plan_missing'
+  | 'plan_awaiting_approval'
+  | 'outside_bound'
+  | 'hardening_missing'
+  | 'turn_incomplete';
+
+type CodingAgentChangeState =
+  | { kind: 'none' }
+  | { kind: 'unproposed'; reason: UnproposedReason | null }
+  | { kind: 'proposed'; requires_restart: boolean };
+
 /** Projected snapshot of a thread's metadata, derived from the event
  *  stream by the `thread_summaries` projection. */
 interface ThreadSummary {
@@ -1615,9 +1744,12 @@ interface ThreadSummary {
    *  Any OTHER interruption (a crash, or a switch whose resume the boot could
    *  not deliver) is `failed` and offers a Continue button. */
   status: string;
-  coding_agent_has_diff: boolean;
-  coding_agent_proposed: boolean;
-  coding_agent_requires_restart: boolean;
+  /** What the coding agent's branch holds: its *change state*. `none` means
+   *  no work. `unproposed` means work that no pending change carries; a
+   *  `reason` says a turn end withheld it, and `null` means none did (still
+   *  running, an event wait, an external repo, or set aside). `proposed`
+   *  means a pending change the user can apply. */
+  coding_agent_change_state: CodingAgentChangeState;
   coding_agent_is_external_repo: boolean;
   last_revived_at: string | null;
   parent_thread_id?: string | null;
@@ -1682,6 +1814,8 @@ lucidos.ui.toast(message: string, type?: ToastType, opts?: ToastOptions): void
 lucidos.ui.dismissToast(key: string): void
 lucidos.ui.ready(): void
 lucidos.ui.prompt(options: PromptOptions): Promise<string | null>
+lucidos.ui.focusedThread(): Promise<string | null>
+lucidos.ui.onFocusedThreadChange(callback: (threadId: string | null) => void): () => void
 lucidos.ui.Select.create(opts: SelectCreateOptions): SelectInstance
 lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 lucidos.ui.disableTooltips(): void
@@ -1715,7 +1849,9 @@ past its box.
 
 **Inside the host shell, the app repaints with it.** The shell pushes what it painted to every watching app frame, in the same task. So a scale drag, a zoom gesture or a theme switch moves the app with the shell rather than after the save. The push covers theme mode, theme, font, UI scale, style overrides, motion and theme effects. From the first push on it owns the app's appearance, and `PreferencesChanged` re-reads only the external-link target and Autocorrect. A popped-out app tab has no shell, so it follows `PreferencesChanged` as above.
 
-Under `system`, `watchPreferences()` watches the OS appearance two ways. The `prefers-color-scheme` media query covers a flip while the app is on screen. The frame's resume (`visibilitychange`, `focus`, `pageshow`) covers one announced while it was not, the normal case in an installed iOS PWA. Both sample a moment after the event and re-apply only when the resolved theme moved. Your app does none of this itself.
+Under `system`, `watchPreferences()` watches the OS appearance two ways. The `prefers-color-scheme` media query covers a flip while the app is on screen. The frame's resume (`visibilitychange`, `focus`, `pageshow`) covers one announced while it was not, the normal case in an installed iOS PWA.
+
+Both sample a moment after the event. A moved theme repaints only if a second read, about a second later, still sees the move. So a brief iOS wake that still reports the app-switcher snapshot's appearance repaints nothing. Your app does none of this itself.
 
 `navigate()` sends a navigation request to the Lucidos frontend via SSE. `target`
 and `params` (`NavigateParams` = `NavigateUi` minus `target`) are typed against
@@ -1763,6 +1899,91 @@ Four rules:
 
 The progress bar needs nothing from you. It also keeps running when the 3 s
 fuse lifts the cover before `load`, so a slow page still says it is loading.
+
+### Sizing a widget to its content
+
+A *widget* shows inline in its thread as a *widget card*, so its frame fits
+what it draws instead of filling a pane. Nothing to call: when the host marks a
+frame as a widget, the SDK measures `document.body` and reports its height on
+every resize. Design the widget to fit one phone screen, with the answer on its
+top screen.
+
+- **Inline**, the frame takes the full height you report and never scrolls
+  inside. Past about one phone screen, the card clips with a fade and an
+  Expand button that opens the widget full size in Canvas.
+- **On the shelf**, a pinned widget drops open under the title, capped at 70%
+  of the screen height.
+
+- **Never size the body to the viewport.** `height: 100vh`, `min-height:
+  100%` or a full-height flex body reports the frame's own height, so the
+  frame can never shrink to the content.
+- **Load the SDK.** A widget without `<script src="/api/v1/sdk.js">` reports
+  nothing and keeps a fixed default height.
+- The same widget opened full size in the Canvas pane reports nothing, so
+  there it is an ordinary app.
+
+### Drawing for a widget window
+
+A *widget window* floats a widget over the app in one of three *widget window
+modes*. The SDK stamps the mode on `<html>` as `data-widget-mode`: `minimal`,
+`window` or `docked`. Every other place leaves the attribute off, so style a
+compact form under it and keep your normal layout as the default.
+
+```css
+/* Minimal: the total only, no controls. */
+html[data-widget-mode="minimal"] .controls,
+html[data-widget-mode="minimal"] .list { display: none; }
+```
+
+- **Minimal** is the widget alone, in the shape it draws. The page is
+  see-through and the body takes its content's width, which the SDK reports
+  with the height. So keep a minimal form small, and give it a background of
+  its own where it needs one. The window stops at 24 rem wide, and longer
+  text wraps there.
+- **Window** keeps the size the user set, and your page scrolls inside it.
+  A "Show more" never resizes the window.
+- **Docked** hangs under the thread's title row at the row's width. Its
+  height follows your content, up to half the screen.
+- **The window owns its controls.** It draws a mode button, a ⋯ menu and
+  Close in a pill above your widget. Near the top of the screen, or docked,
+  the pill goes under it. It never covers your widget, so draw edge to edge.
+- **A drag on your widget moves the window.** A mouse or pen drag that starts
+  on no control moves a minimal or window-mode window. The SDK does it for
+  you. A control is a link, button, form field, `label`, `summary`, an ARIA
+  widget role, `contenteditable`, or anything with `cursor: pointer`. To keep
+  a drag for yourself, call `preventDefault()` on its `pointerdown`. A plain
+  click is never a drag, and a finger drag still scrolls.
+
+### Reading the thread the user has open
+
+`lucidos.ui.focusedThread()` gives the id of the *focused thread*: the thread
+the user has open in the thread pane. Use it for a "This thread" view, such as
+a cost or a file list for the thread the user is in.
+`lucidos.ui.onFocusedThreadChange(callback)` calls `callback` with the new id
+each time the user opens another thread. It returns a function that stops the
+calls.
+
+```js
+const show = (threadId) => {
+  document.querySelector('#scope').textContent = threadId ?? 'No thread open';
+};
+// Subscribe first, then read, so no change can land between the two.
+lucidos.ui.onFocusedThreadChange(show);
+show(await lucidos.ui.focusedThread());
+```
+
+- **The host decides, not your app.** A widget window floats over whatever
+  thread the user is in. So the value is that thread, not the thread the
+  widget came from.
+- **`null` means the empty compose view.** No thread is open there.
+- **A draft and Home are threads.** A draft the user is typing gives its id.
+- **The Canvas pane does not change it.** A panel or an app beside the thread
+  leaves the value alone, as does a phone swipe to the Canvas pane. The thread
+  is still open.
+- **No host, no answer.** In its own tab your app has no thread pane, so
+  `focusedThread()` rejects. The subscription is never called there.
+- **Every frame hears every change.** The Canvas app, each widget card and
+  each widget window get the same calls.
 
 ### Navigation targets
 

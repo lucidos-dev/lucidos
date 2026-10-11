@@ -10,6 +10,7 @@ use crate::engine::LucidosEngine;
 use uuid::Uuid;
 
 use super::super::recursion_guard::MAX_THREAD_DEPTH;
+use super::workspace_prompt_footprint as footprint;
 
 /// The ten per-turn context-section strings produced by
 /// [`LucidosEngine::build_chat_context_sections`]. Empty strings mean the
@@ -79,15 +80,11 @@ impl LucidosEngine {
                     Vec::new()
                 }
             };
-            super::workspace_payload::build_file_list_section(&all_files)
+            footprint::build_file_list_section(&all_files)
         }; // end file_list_context if/else
 
         // Include user profile content so LLM doesn't need to read it
-        let profile_context = if user_profile.is_empty() {
-            String::new()
-        } else {
-            format!("[USER PROFILE - ALREADY IN CONTEXT - NEVER call read_file on user_profile.md]\n{}\n[END PROFILE]", user_profile)
-        };
+        let profile_context = footprint::build_user_profile_section(user_profile);
 
         let device_preferences_context =
             crate::engine::agent_context::build_user_device_preferences_context_for_turn(
@@ -99,80 +96,16 @@ impl LucidosEngine {
             .await;
 
         // Include available API credentials so LLM knows which services are configured
-        let stored_credentials_context = if !classification.needs_credentials {
-            log!("[Chat] Skipping credentials context (not needed for this query)");
-            String::new()
+        let credentials_context = if classification.needs_credentials {
+            self.credentials_section().await
         } else {
-            match CredentialStore::list(&self.pool).await {
-                Ok(creds) if !creds.is_empty() => {
-                    let cred_list: Vec<String> = creds
-                        .iter()
-                        .map(|c| format!("  - {} ({})", c.service_name, c.base_urls.join(", ")))
-                        .collect();
-                    format!("[CONFIGURED API CREDENTIALS - auth headers are auto-injected for these services]\n{}\nYou can use http_request directly with these APIs - credentials are automatically added.\n[END CREDENTIALS]", cred_list.join("\n"))
-                }
-                Ok(_) => String::new(),
-                // A read that failed is not "no credentials configured", and
-                // the prompt renders the two identically. The agent will tell
-                // the user to set up what they already have, so say why here.
-                Err(e) => {
-                    log!("[Chat] Cannot list credentials for the prompt: {}. The turn goes out as if none were configured", e);
-                    String::new()
-                }
-            }
+            log!("[Chat] Skipping stored credentials context (not needed for this query)");
+            self.builtin_proxies_section().await
         };
-        // Every turn, unlike the stored list above. A builtin provider proxy is
-        // neither a credential row nor an apis.json entry. Without this block
-        // the agent asks the user for a key the engine already holds.
-        let builtin_proxies_context = crate::api::proxy_builtin::render_builtin_proxies_block(
-            &crate::api::proxy_builtin::builtin_proxy_states(&self.clone_arc()).await,
-        );
-        let credentials_context = [stored_credentials_context, builtin_proxies_context]
-            .into_iter()
-            .filter(|section| !section.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Add configured email accounts to context
-        let email_accounts_context = match EmailStore::list(&self.pool).await {
-            Ok(accounts) if !accounts.is_empty() => {
-                let mut section = String::from("[CONFIGURED EMAIL ACCOUNTS]\n");
-                for acc in &accounts {
-                    let auth = if acc.oauth_account_id.is_some() {
-                        " [OAuth]"
-                    } else {
-                        ""
-                    };
-                    section.push_str(&format!("- {} ({}){}\n", acc.name, acc.email_address, auth));
-                }
-                section.push_str("[END EMAIL ACCOUNTS]");
-                section
-            }
-            Ok(_) => String::new(),
-            Err(e) => {
-                log!("[Chat] Cannot list email accounts for the prompt: {}. The turn goes out as if none were configured", e);
-                String::new()
-            }
-        };
-
-        // Add connected OAuth accounts to context
-        let oauth_context = match OAuthStore::list(&self.pool).await {
-            Ok(accounts) if !accounts.is_empty() => {
-                let account_list: Vec<String> = accounts
-                    .iter()
-                    .map(|a| {
-                        let email = a.email.as_deref().unwrap_or("unknown");
-                        format!("  - {} ({}) — scopes: {}", a.provider, email, a.scopes)
-                    })
-                    .collect();
-                format!("\n[CONNECTED OAUTH ACCOUNTS - auth tokens are auto-injected and refreshed for these providers]\n{}\nYou can use http_request with these providers' APIs — OAuth tokens are automatically added.\n[END OAUTH ACCOUNTS]", account_list.join("\n"))
-            }
-            Ok(_) => String::new(),
-            Err(e) => {
-                log!("[Chat] Cannot list OAuth accounts for the prompt: {}. The turn goes out as if none were connected", e);
-                String::new()
-            }
-        };
+        let email_accounts_context =
+            footprint::build_email_accounts_section(&self.email_accounts_for_prompt().await);
+        let oauth_context =
+            footprint::build_oauth_accounts_section(&self.oauth_accounts_for_prompt().await);
 
         // The id comes off the request body and is joined into a path below, so
         // a traversal id would list another directory's docs.
@@ -199,17 +132,10 @@ impl LucidosEngine {
             // The same loader the Know-how routing list is built from, so the
             // two surfaces cannot disagree about what exists or what it is
             // called. Ids only: bodies are one `load_knowhow` away.
-            let app_knowhow_dir = self
-                .workspace_path
-                .join(crate::core::APPS_DIR)
-                .join(&ctx.app_id)
-                .join("knowhow");
-            let summaries = crate::core::KnowhowStore::load_summaries(
-                &app_knowhow_dir,
-                crate::core::KnowhowListDepth::FilesOnly,
+            let knowhow_listing = footprint::build_app_knowhow_listing(
+                &ctx.app_id,
+                &self.app_knowhow_summaries(&ctx.app_id),
             );
-            let knowhow_listing =
-                super::workspace_payload::build_app_knowhow_listing(&ctx.app_id, &summaries);
 
             active_app_ui_section(&app_name, &ctx.app_id, &knowhow_listing)
         } else {
@@ -346,6 +272,62 @@ impl LucidosEngine {
                 false
             })
     }
+
+    /// The credentials block as a turn that needs credentials carries it: the
+    /// stored list, then the builtin provider proxies.
+    pub(crate) async fn credentials_section(&self) -> String {
+        footprint::build_credentials_section(
+            &self.stored_credentials_for_prompt().await,
+            &self.builtin_proxies_section().await,
+        )
+    }
+
+    /// One app's own knowhow docs, as the open app's listing names them.
+    /// `app_id` must already be traversal-checked.
+    pub(crate) fn app_knowhow_summaries(&self, app_id: &str) -> Vec<crate::core::KnowhowSummary> {
+        crate::core::KnowhowStore::load_summaries(
+            &self
+                .workspace_path
+                .join(crate::core::APPS_DIR)
+                .join(app_id)
+                .join("knowhow"),
+            crate::core::KnowhowListDepth::FilesOnly,
+        )
+    }
+
+    /// The builtin provider proxies, sent on every turn. A builtin proxy is
+    /// neither a credential row nor an apis.json entry. Without this block the
+    /// agent asks the user for a key the engine already holds.
+    pub(crate) async fn builtin_proxies_section(&self) -> String {
+        crate::api::proxy_builtin::render_builtin_proxies_block(
+            &crate::api::proxy_builtin::builtin_proxy_states(&self.clone_arc()).await,
+        )
+    }
+
+    /// The stored credentials a prompt names. A read that failed is not "no
+    /// credentials", and the prompt renders the two alike, so it says why here.
+    pub(crate) async fn stored_credentials_for_prompt(&self) -> Vec<crate::core::CredentialInfo> {
+        CredentialStore::list(&self.pool).await.unwrap_or_else(|e| {
+            log!("[Chat] Cannot list credentials for the prompt: {}. The turn goes out as if none were configured", e);
+            Vec::new()
+        })
+    }
+
+    /// The email accounts a prompt names, with a failed read logged.
+    pub(crate) async fn email_accounts_for_prompt(&self) -> Vec<crate::core::EmailAccountInfo> {
+        EmailStore::list(&self.pool).await.unwrap_or_else(|e| {
+            log!("[Chat] Cannot list email accounts for the prompt: {}. The turn goes out as if none were configured", e);
+            Vec::new()
+        })
+    }
+
+    /// The OAuth accounts a prompt names, with a failed read logged.
+    pub(crate) async fn oauth_accounts_for_prompt(&self) -> Vec<crate::core::OAuthAccountInfo> {
+        OAuthStore::list(&self.pool).await.unwrap_or_else(|e| {
+            log!("[Chat] Cannot list OAuth accounts for the prompt: {}. The turn goes out as if none were connected", e);
+            Vec::new()
+        })
+    }
 }
 
 /// Shared anchoring clause appended to the `[ACTIVE APP UI]` and
@@ -376,7 +358,7 @@ indicates otherwise.";
 ///
 /// `knowhow_listing` names the app's docs and their ids, and carries no doc
 /// bodies. It comes from
-/// [`super::workspace_payload::build_app_knowhow_listing`], which owns the
+/// [`super::workspace_prompt_footprint::build_app_knowhow_listing`], which owns the
 /// reasoning and the size rule.
 fn active_app_ui_section(app_name: &str, app_id: &str, knowhow_listing: &str) -> String {
     format!(
@@ -417,7 +399,9 @@ tooltip, a logo, styling). Edit THIS file.{anchor}\n\
 
 #[cfg(test)]
 mod tests {
-    use super::super::workspace_payload::{build_app_knowhow_listing, build_knowhow_section};
+    use super::super::workspace_prompt_footprint::{
+        build_app_knowhow_listing, build_knowhow_section,
+    };
     use super::{active_app_ui_section, active_file_context_section};
     use crate::core::knowhow::KnowhowDirs;
     use crate::core::{KnowhowListDepth, KnowhowStore};

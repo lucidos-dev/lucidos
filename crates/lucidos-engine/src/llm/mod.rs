@@ -10,12 +10,14 @@ pub mod metered;
 pub mod mock;
 pub use mock::MOCK_MODEL;
 pub mod model_registry;
+pub mod not_served;
 pub mod openai;
 pub mod provider;
 pub mod provider_build;
 pub mod provider_selection;
 pub mod reasoning;
 pub mod routing;
+pub mod served_model;
 pub mod tool_names;
 pub mod tools;
 pub mod unconfigured;
@@ -27,13 +29,14 @@ pub mod web_search;
 pub use anthropic::{
     resolve_anthropic_auth, AnthropicAuth, AnthropicAuthSource, AnthropicProvider,
 };
-pub(crate) use aux_provider::AuxProvider;
+pub(crate) use aux_provider::{AuxProvider, NotServedReport};
 pub use image::{ImageProvider, ImageSize};
 pub use judgment::{
     Answers, ChoiceAnswer, Judgment, JudgmentProvider, NoulCriteria, Question, SystemOneProvider,
     JEV_DEFAULT_MODEL,
 };
 pub use model_registry::{ModelRegistry, ProviderKind};
+pub use not_served::ModelNotServed;
 pub use openai::{
     resolve_bearer_key, resolve_openai_api_key, OpenAiKeySource, OpenAiProvider,
     OPENAI_DEFAULT_BASE_URL,

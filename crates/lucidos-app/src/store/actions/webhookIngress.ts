@@ -16,7 +16,7 @@
 import { webhookIngress } from '../store';
 import { failedIfFresh, setLoadingIfFresh } from '../types';
 import { fetchWebhookIngress, type WebhookIngressOutage } from '../../api/client';
-import { elapsedSeconds } from '../../utils/formatTime';
+import { elapsedSeconds } from '../../utils/elapsed';
 
 export async function loadWebhookIngress(): Promise<void> {
   setLoadingIfFresh(webhookIngress);

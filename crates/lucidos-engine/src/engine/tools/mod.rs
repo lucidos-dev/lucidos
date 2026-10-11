@@ -1,3 +1,5 @@
+pub(crate) mod app_capture;
+mod app_lint;
 mod apps;
 pub(crate) mod bash;
 pub(crate) mod bash_background;
@@ -22,7 +24,7 @@ mod notifications;
 pub(crate) mod plugins;
 mod preferences;
 mod proxy;
-mod python;
+pub(crate) mod python;
 pub(crate) mod recall;
 pub(crate) mod repo_files;
 mod repositories;
@@ -31,6 +33,7 @@ pub(crate) mod search;
 pub(crate) mod todo;
 mod unsent;
 mod web;
+mod widgets;
 
 pub(crate) use capabilities::TurnCapabilities;
 
@@ -140,7 +143,7 @@ impl LucidosEngine {
         verb: ThreadReachVerb,
     ) -> Result<(), String> {
         crate::api::thread_reach::refuse_thread_without_authority(
-            self.pool(),
+            &self.event_bus,
             caller_thread_id,
             target,
             verb,
@@ -254,6 +257,7 @@ impl LucidosEngine {
             // Grouped env-var tool (list/set/delete). `set_environment_variable`
             // stays wired as a back-compat alias → dispatched as action "set".
             tn::ENV_VARS | tn::SET_ENVIRONMENT_VARIABLE => self.execute_env_vars(name, args).await,
+            tn::WIDGETS => to_outcome(self.execute_widgets(args, thread_id).await),
             tn::MANAGE_MODELS => to_outcome(self.execute_manage_models(args).await),
             tn::WEB_SEARCH | tn::FETCH_NEWS => {
                 to_outcome(self.execute_web_tool(name, args, thread_id).await)
@@ -314,6 +318,7 @@ impl LucidosEngine {
             tn::LIST_HELD_MESSAGES => self.execute_list_held_messages(args).await,
             tn::DETACH_CHILD_THREAD => self.execute_detach_child_thread(args, thread_id).await,
             tn::ARCHIVE_THREAD => self.execute_archive_thread(args, thread_id).await,
+            tn::REQUEST_READ => self.execute_request_read(args, thread_id).await,
             tn::TRIAGE_THREADS => self.execute_triage_threads(thread_id).await,
             tn::APPLY_THREAD_TRIAGE => self.execute_apply_thread_triage(args, thread_id).await,
             tn::LIST_CHANGES => self.execute_list_changes(args, thread_id).await,
@@ -806,6 +811,22 @@ impl LucidosEngine {
         }
     }
 
+    /// LLM tool: the turn's *read decision* on this thread's latest reply
+    /// (ADR 0409, ADR 0417). The thread is `execute_tool`'s ambient one, so the
+    /// model cannot name another.
+    async fn execute_request_read(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::read_request::{record_agent_read_decision, ReadDecision};
+        let decision = ReadDecision::from_tool_args(args)?;
+        record_agent_read_decision(&self.event_bus, thread_id, decision)
+            .await
+            .map_err(|e| format!("Error: recording the read decision failed: {e}"))?;
+        Ok(decision.ack().to_string())
+    }
+
     /// LLM tool: list thread summaries for the workspace. Mirrors
     /// `GET /api/v1/threads/list` and `lucidos threads list`, except that a
     /// row carries its draft as the preview reader fields, never in full.
@@ -833,7 +854,7 @@ impl LucidosEngine {
                 sources: sources.as_deref(),
                 parent,
                 has_draft: bool_arg(args, "has_draft")?,
-                has_diff: bool_arg(args, "has_diff")?,
+                change_state: change_state_arg(args)?,
                 limit,
             })
             .await
@@ -860,7 +881,7 @@ impl LucidosEngine {
                 sources: sources.as_deref(),
                 parent,
                 has_draft: bool_arg(args, "has_draft")?,
-                has_diff: bool_arg(args, "has_diff")?,
+                change_state: change_state_arg(args)?,
                 limit: 0,
             })
             .await
@@ -1546,7 +1567,7 @@ const QUERY_EVENTS_TRUNCATION_HINT: &str =
      before drilling. Do not retry with a larger byte_limit unless you have \
      already narrowed the query.";
 
-/// A three-way boolean filter arg (`has_draft`, `has_diff`). Absent or null
+/// A three-way boolean filter arg, such as `has_draft`. Absent or null
 /// is no filter, and `"true"` / `"false"` spelled as strings are read as
 /// booleans. Anything else is refused: ignoring it would answer with the whole
 /// workspace, a question the model did not ask.
@@ -1556,6 +1577,29 @@ fn bool_arg(args: &serde_json::Value, name: &str) -> Result<Option<bool>, String
         Some(serde_json::Value::Bool(b)) => Ok(Some(*b)),
         Some(serde_json::Value::String(s)) if s == "true" || s == "false" => Ok(Some(s == "true")),
         Some(other) => Err(format!("Error: {name} takes true or false, not {other}.")),
+    }
+}
+
+/// The `change_state` filter: one of [`ChangeStateKind`]'s values, or absent.
+/// The retired `has_diff` filter is refused by name, since ignoring it would
+/// answer with every thread (ADR 0400).
+fn change_state_arg(
+    args: &serde_json::Value,
+) -> Result<Option<crate::engine::thread_lifecycle::ChangeStateKind>, String> {
+    use crate::engine::thread_lifecycle::ChangeStateKind;
+    let allowed = || ChangeStateKind::ALL.map(ChangeStateKind::as_str).join(", ");
+    if args.get("has_diff").is_some() {
+        return Err(format!(
+            "Error: has_diff was replaced by change_state, which takes one of {}.",
+            allowed()
+        ));
+    }
+    match args.get("change_state") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => ChangeStateKind::parse(s)
+            .map(Some)
+            .ok_or_else(|| format!("Error: change_state takes one of {}, not {s:?}.", allowed())),
+        Some(other) => Err(format!("Error: change_state takes a string, not {other}.")),
     }
 }
 

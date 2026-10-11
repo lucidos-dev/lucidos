@@ -13,8 +13,7 @@
  *
  * **Nothing at all until the workspace turns voice on.** Voice is experimental
  * and ships off, so the control is absent rather than inert: a dead button is a
- * thing to wonder about, and `/api/v1/voice` refuses the socket anyway. The
- * home thread's own switch hides it the same way, since a call needs Home.
+ * thing to wonder about, and `/api/v1/voice` refuses the socket anyway.
  *
  * **Nor on any thread but home, nor when the destination is a coding agent**
  * (ADR 0362, ADR 0165). Same reasoning. `available` carries both, so one gate
@@ -47,7 +46,7 @@ import type { CallPhase } from '../../voice/callState';
 import { pressCallToggle } from '../../store/voice';
 import { voiceCall } from '../../store/voiceCall';
 import { preferences } from '../../store/store';
-import { homeThreadEnabled, voiceEnabled } from '../../store/actions/preferences';
+import { voiceEnabled } from '../../store/actions/preferences';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 
 /**
@@ -132,7 +131,7 @@ export function CallToggle({ available = true, attrs }: { available?: boolean; a
   // A call already up survives either reason arriving mid-call, so the reader
   // never loses the control they ring off with. The switch can be turned off
   // and the destination can move; both leave the button where it was.
-  if ((!voiceEnabled() || !homeThreadEnabled() || !available) && !on) return null;
+  if ((!voiceEnabled() || !available) && !on) return null;
   return (
     <>
       <button
@@ -180,7 +179,7 @@ export function callToggleAction(available: boolean): HeaderActionSpec | null {
   preferences.value;
   const call = voiceCall.value;
   const on = isOnCall(call.phase);
-  if ((!voiceEnabled() || !homeThreadEnabled() || !available) && !on) return null;
+  if ((!voiceEnabled() || !available) && !on) return null;
   return {
     key: 'call-toggle',
     dataRole: 'call-toggle',

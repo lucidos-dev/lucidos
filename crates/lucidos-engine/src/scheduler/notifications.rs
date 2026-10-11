@@ -43,7 +43,7 @@ use crate::engine::thread_events::MessageOrigin;
 /// rejected; the bare string `"none"` is still rejected.)
 ///
 /// Workspaces that still have triggers or apps emitting the old strings
-/// must migrate them. `system-knowhow/workspace-audit.md` finds them, and
+/// must migrate them. `system-knowhow/workspace-audit/triggers.md` finds them, and
 /// its remediation section owns the rewrite. Historical `NotificationCreated`
 /// event payloads with the old form remain in the events table forever
 /// (event-sourcing immutability), but the projection is built once by the
@@ -777,7 +777,7 @@ mod tests {
     // Strict deserialization — only the canonical {kind, to?} object form is
     // accepted. Legacy bare strings ('modal' / 'none' / 'open_app' /
     // 'open_thread') are rejected; workspaces with stale taps must migrate
-    // via system-knowhow/workspace-audit.md.
+    // via system-knowhow/workspace-audit/triggers.md.
 
     #[test]
     fn tap_deserializes_canonical_modal_object() {

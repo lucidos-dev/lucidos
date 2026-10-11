@@ -331,7 +331,7 @@ pub(crate) enum InjectedPromptGroup {
     /// One engine re-entry, kept out of any batch. Named for the LAYOUT rather
     /// than the source, because every engine re-entry gets the same one: its
     /// exchange-starter is already on the wire, so the text is projected inline
-    /// and no `UserPromptInjected` is emitted. Which re-entry it is stays on
+    /// and no `PromptInjected` is emitted. Which re-entry it is stays on
     /// [`InjectedPromptKind`], which is what the log line reads.
     Standalone(InjectedPrompt),
 }
@@ -339,7 +339,7 @@ pub(crate) enum InjectedPromptGroup {
 /// Keep each engine re-entry as a standalone user-channel block, but batch
 /// contiguous user/agent/engine text prompts so one injection window becomes
 /// one LLM user message. Each original prompt still emits its own
-/// UserPromptInjected audit event at append time.
+/// PromptInjected audit event at append time.
 pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<InjectedPromptGroup> {
     let mut groups = Vec::new();
     let mut user_batch = Vec::new();
@@ -654,7 +654,7 @@ pub(crate) async fn append_injected_prompts_to_messages(
                         thread_id,
                         &prompt.text[..prompt.text.floor_char_boundary(80)]
                     );
-                    emit_user_prompt_injected_event(bus, thread_id, meta, prompt).await;
+                    emit_prompt_injected_event(bus, thread_id, meta, prompt).await;
                 }
                 let has_images = prompts_have_images(&batch);
                 messages.push(coalesced_user_text_message(workspace, &batch));
@@ -1177,19 +1177,26 @@ pub(crate) fn parse_app_capture_marker(s: &str) -> Option<(&str, &str)> {
 /// Inverse of [`parse_app_capture_marker`]: format a tool-result string for
 /// the agentic loop to feed back to Claude.
 ///
-/// When the SDK couldn't take a screenshot (html2canvas can't render every
-/// CSS feature — `oklab(...)` colors, for one), it returns `screenshot = ""`
-/// and stuffs the failure into `dom`. Wrapping that in `[APP_CAPTURE:]`
+/// When the SDK couldn't take a screenshot (the rasterizer failed, for one),
+/// it returns `screenshot = ""` and stuffs the failure into `dom`. Wrapping that in `[APP_CAPTURE:]`
 /// (empty marker) makes the parser hand the loop an empty base64, which
 /// becomes a `ContentBlock::Image { data: "" }` and gets a 400
 /// `image cannot be empty` from Anthropic. Drop the marker entirely in that
 /// case so the result falls through to the plain-text path; the LLM still
 /// reads the `dom` (which carries the error) and can decide how to proceed.
-pub(crate) fn format_capture_result(screenshot_b64: &str, dom: &str) -> String {
+///
+/// `lead` is a line the agent reads before the DOM, such as where the capture
+/// was saved. Empty adds nothing.
+pub(crate) fn format_capture_result(screenshot_b64: &str, lead: &str, dom: &str) -> String {
     if screenshot_b64.is_empty() {
         dom.to_string()
-    } else {
+    } else if lead.is_empty() {
         format!("[APP_CAPTURE:{}]\nDOM snapshot:\n{}", screenshot_b64, dom)
+    } else {
+        format!(
+            "[APP_CAPTURE:{}]\n{}\nDOM snapshot:\n{}",
+            screenshot_b64, lead, dom
+        )
     }
 }
 
@@ -1522,7 +1529,7 @@ impl QuestionReaskCause {
             Self::AskedInProse => {
                 "You ended your turn with a question typed as prose, so the user got no \
                  clickable card. Prose does not park the thread: it reads as finished, nothing \
-                 lights the needs-attention badge, and nobody is told you are waiting. Re-issue \
+                 lights the Blocked badge, and nobody is told you are waiting. Re-issue \
                  the question now as an `ask_user_question` TOOL CALL with 2-4 options, and do \
                  NOT inline them as a typed-reply menu. Reserve plaintext for a genuinely \
                  open-ended question (e.g. \"what should I name this?\") where pre-baked options \
@@ -1632,6 +1639,31 @@ pub(crate) const TOOL_RESULTS_INSTRUCTION: &str = "Results above. The user never
      before you ask them anything or finish. Do not repeat what you already told them. Proceed \
      to your next action or final answer.";
 
+/// `instruction`, led by what the user read of the round's progress notes.
+/// The agent believes they read its whole text, so without this it skips the
+/// steps or draft it "already told them". A round with a card gets nothing
+/// here: the card gate's refusal says it instead.
+pub(crate) fn instruction_after_round(
+    instruction: &str,
+    progress_notes: &[String],
+    raised_a_card: bool,
+) -> String {
+    if progress_notes.is_empty() || raised_a_card {
+        return instruction.to_string();
+    }
+    let seen = progress_notes
+        .iter()
+        .map(|note| format!("\"{note}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Part of what you wrote before these tool calls reached the user only as this summary: \
+         {seen}. The full text behind it never reached them. If it held anything they need, \
+         such as steps, a draft, a link or a picture, write it out in full in your reply, or in \
+         a card's `message`.\n\n{instruction}"
+    )
+}
+
 /// How many times one turn may be sent back for leaving work open with nothing
 /// to re-open the thread. One, and the bound matters more here than for the
 /// re-ask above. A model that answers the nudge and still leaves the list open
@@ -1696,6 +1728,65 @@ pub(crate) fn should_nudge_unwatched_turn(
     nudges_forced: usize,
 ) -> bool {
     matches!(open_items, Some(n) if n > 0) && !covered && nudges_forced < MAX_TODO_WAKE_NUDGE
+}
+
+/// What decides whether a round's reply, beside its read decision, ends the
+/// turn without another round (ADR 0417).
+pub(crate) struct FinalAnswerBesideDecision<'a> {
+    pub(crate) response: &'a crate::llm::provider::LlmResponse,
+    pub(crate) had_errors: bool,
+    pub(crate) thread_id: Uuid,
+    pub(crate) injections_pending: bool,
+    pub(crate) cancelled: bool,
+    /// The re-ask guard's inputs. `ends_in_a_question` is read off the reply.
+    pub(crate) question: QuestionReaskInputs,
+    pub(crate) wake_nudges_forced: usize,
+}
+
+/// Whether a round's calls are its read decision and nothing else.
+pub(crate) fn calls_only_the_read_decision(calls: &[crate::llm::provider::ToolCall]) -> bool {
+    !calls.is_empty() && calls.iter().all(|c| c.name == tn::REQUEST_READ)
+}
+
+impl LucidosEngine {
+    /// The reply a decision-only round ends the turn on, or `None` when the
+    /// turn must take the ordinary path: a failed call, a pending follow-up, or
+    /// a Stop. So does text the user saw only as a note or never saw, and
+    /// anything the re-ask guard or the wake check would send back.
+    pub(crate) async fn final_answer_beside_decision(
+        &self,
+        input: FinalAnswerBesideDecision<'_>,
+    ) -> Option<String> {
+        // A progress note is a summary of text the user never saw in full, so
+        // it never stands in for the answer. Only `content` has been through
+        // the working-understanding splice.
+        if input.had_errors
+            || input.injections_pending
+            || input.cancelled
+            || !input.response.progress_notes.is_empty()
+            || !calls_only_the_read_decision(&input.response.tool_calls)
+        {
+            return None;
+        }
+        let answer = input
+            .response
+            .content
+            .as_deref()
+            .map(|c| self.clean_response(c))
+            .filter(|c| !c.is_empty())?;
+        let question = QuestionReaskInputs {
+            ends_in_a_question: reply_ends_in_a_question(&answer),
+            ..input.question
+        };
+        if question_reask_cause(question).is_some() {
+            return None;
+        }
+        let (open, covered) = self.wake_check_facts(input.thread_id).await;
+        if should_nudge_unwatched_turn(open, covered, input.wake_nudges_forced) {
+            return None;
+        }
+        Some(answer)
+    }
 }
 
 /// What the generic consecutive-call circuit breaker should do given the
@@ -1889,9 +1980,9 @@ pub(crate) async fn emit_iteration_cap_response_generated(
 /// so reusing that UUID here causes an `events_pkey` duplicate-key
 /// error and the event is silently dropped under `emit_or_log`. The
 /// frontend correlates pending messages via `MessageReceived.id`;
-/// `UserPromptInjected` is a separate engine-side acknowledgment whose
+/// `PromptInjected` is a separate engine-side acknowledgment whose
 /// link back to the request is carried by `meta.request_event_id`.
-pub(crate) async fn emit_user_prompt_injected_event(
+pub(crate) async fn emit_prompt_injected_event(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
     base_meta: &crate::engine::thread_events::EventMeta,
@@ -1902,7 +1993,7 @@ pub(crate) async fn emit_user_prompt_injected_event(
     bus.emit_or_log(
         crate::engine::event_bus::BusEvent::Thread {
             thread_id,
-            event: crate::engine::thread_events::ThreadEvent::UserPromptInjected {
+            event: crate::engine::thread_events::ThreadEvent::PromptInjected {
                 text: prompt.text.clone(),
                 mode: prompt.mode,
                 origin: prompt.origin.clone(),
@@ -1911,7 +2002,7 @@ pub(crate) async fn emit_user_prompt_injected_event(
             },
             meta: inject_meta,
         },
-        "[AgenticLoop] UserPromptInjected",
+        "[AgenticLoop] PromptInjected",
     )
     .await;
 }

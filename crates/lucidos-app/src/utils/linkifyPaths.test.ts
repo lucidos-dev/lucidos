@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, hrefLineRef, labelLineRef, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
 import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
 
 describe('DATA_PATH_PREFIXES', () => {
@@ -270,6 +270,38 @@ describe('extractSettingsViewFromHref', () => {
 
 // The chat router and the preview router both claim `repo:` through this, so a
 // repo citation never reaches the terminal guard or the OS opener.
+describe('hrefLineRef', () => {
+  it.each([
+    ['artifacts/a.md#L7', { line: 7 }],
+    ['artifacts/a.md#L10-L20', { line: 10, lineEnd: 20 }],
+    ['artifacts/a.md#L10-20', { line: 10, lineEnd: 20 }],
+  ])('reads %s', (href, ref) => {
+    expect(hrefLineRef(href)).toEqual(ref);
+  });
+
+  it.each(['artifacts/a.md', 'artifacts/a.md#intro', 'artifacts/a.md#L'])('finds no line in %s', (href) => {
+    expect(hrefLineRef(href)).toBeNull();
+  });
+});
+
+/** A link that names its lines only in its label (`main.rs:510-520`) still
+ *  lands on them: the label is the citation the reader clicked. */
+describe('labelLineRef', () => {
+  it.each([
+    ['Consumer.kt:184-204', { line: 184, lineEnd: 204 }],
+    ['main.rs:7', { line: 7 }],
+    ['main.rs:10\u201320', { line: 10, lineEnd: 20 }],
+    ['main.rs:10 - 20', { line: 10, lineEnd: 20 }],
+    ['  main.rs:7  ', { line: 7 }],
+  ])('reads %s', (label, ref) => {
+    expect(labelLineRef(label)).toEqual(ref);
+  });
+
+  it.each(['notes.md', 'the V088 migration', 'src/main.rs', 'at 10:30 today', 'version 2'])('finds no line in %s', (label) => {
+    expect(labelLineRef(label)).toBeNull();
+  });
+});
+
 describe('extractRepoFileTargetFromHref', () => {
   it('reads a repository named by name, at HEAD', () => {
     expect(extractRepoFileTargetFromHref('repo:lucidos:file:crates/lucidos-app/src/main.tsx')).toEqual({
@@ -486,6 +518,21 @@ describe('linkifyPaths', () => {
     expect(result).not.toContain('href="data/artifacts/foo/index.html"');
     // Visible text (the inner <code>...) is preserved
     expect(result).toContain('<code>artifacts/foo/index.html</code>');
+  });
+
+  // The forced `href="#"` cannot carry a line, so the rewrite moves it onto
+  // the anchor. A known path and a path known only by shape both keep it.
+  it.each([
+    [['artifacts/foo.md'], '<p><a href="artifacts/foo.md#L10-L20">x</a></p>', 'data-line="10" data-line-end="20"'],
+    [[], '<p><a href="artifacts/foo.md#L7">x</a></p>', 'data-line="7"'],
+  ])('keeps the cited line of an artifact href (known paths %j)', (known, html, attrs) => {
+    const result = linkifyPaths(html, known, []);
+    expect(result).toContain(`data-path="artifacts/foo.md" ${attrs}>`);
+  });
+
+  it('replaces a data-line the anchor brought with it', () => {
+    const result = linkifyPaths('<p><a href="artifacts/foo.md" data-line="99">x</a></p>', [], []);
+    expect(result).toContain('<a href="#" class="artifact-link" data-path="artifacts/foo.md">x</a>');
   });
 
   it('rewrites anchors with absolute /data/<known-artifact> href', () => {

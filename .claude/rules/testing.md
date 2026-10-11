@@ -54,23 +54,40 @@ follow:
 and the rejected template-database alternative: `docs/e2e-test-decisions.md`
 § "The e2e database is rebuilt from zero, never truncated".
 
-## GitHub mode (`--github`)
+## GitHub mode is the default (`--local` opts out)
 
-Every e2e script takes `--github`: `./scripts/e2e.sh --github`,
-`./scripts/e2e-browser.sh --github -f chat.spec.ts`, and so on. The suites run
-on GitHub's runners, and the report and exit code match a local run (ADR 0382).
-The driver is `scripts/e2e-github.sh`, the runner half
-`scripts/e2e-github-shard.sh`, the workflow `.github/workflows/e2e.yml`.
+Every e2e script runs on GitHub's runners when it can: `./scripts/e2e.sh`,
+`./scripts/e2e-browser.sh -f chat.spec.ts`, and so on (ADRs 0382, 0386). The
+report and exit code match a local run. The driver is `scripts/e2e-github.sh`,
+the runner half `scripts/e2e-github-shard.sh`, the workflow
+`.github/workflows/e2e.yml`.
 
+- **Where a run goes.** `e2e_github_handoff` decides, once, for all five
+  scripts. A run stays here for any of these:
+  - `--local`, or a local-only flag (`--no-reset`, `--headed`, `--ios`,
+    `--packaged` and friends).
+  - A local-only variable: `THREAD_SHOTS` and the other screenshot switches, or
+    `LUCIDOS_E2E_DEBUG`.
+  - An unmet precondition: a dirty tree, no release libraries, no `lucidos`
+    remote, or no `gh`. The fallback prints its reason.
+- **`--github` insists.** It skips the fallback and fails instead.
+- **`LUCIDOS_E2E_LOCAL=1` keeps nested scripts here.** A local decision exports
+  it, and the shard and the local leg set it. A new caller of an e2e script
+  from inside a run inherits it, so it never pushes a second run.
 - **What runs where.** Linux runs API, WASM, embedder, `chromium` and `mobile`.
-  macOS runs `mobile-webkit`, on the port iOS ships. Specs that spawn a real
-  Claude Code (`e2e_spec_needs_claude_code`) run on this host as the local leg.
+  macOS runs `mobile-webkit`, on the port iOS ships. A spec with a test tagged
+  `@real-claude-code` (`e2e_spec_needs_real_claude_code`) runs on this host as
+  the local leg. Every other spec meets the *fake Claude Code* on GitHub.
+- **Tag a test `@real-claude-code` when it needs real model behaviour**: resume
+  memory, interrupts mid-turn, mid-turn messages, side questions, tool use. An
+  untagged test gets only `Say exactly: "X"` answered, and anything else gets
+  the fake's fixed `no rule` reply. Why: ADR 0388.
 - **What gets pushed.** HEAD, stripped and scanned like a release, as a
   parentless commit on an `e2e/<run-id>` branch of the mirror. The driver
   deletes the branch afterwards, and each run sweeps finished ones over a day
   old.
-- **No secrets in the workflow, ever.** That is why the Claude Code specs stay
-  local. `./scripts/check-e2e-workflow.sh` enforces the workflow's limits.
+- **No secrets in the workflow, ever.** That is why the real-Claude-Code specs
+  stay local. `./scripts/check-e2e-workflow.sh` enforces the workflow's limits.
 - **Exit 76** means the run produced no verdict.
 - **Harness changes must stay runner-safe.** A shard reaches Postgres only
   through `shared_pg_psql` and `LUCIDOS_EXTERNAL_PG_PORT`, because macOS runners
@@ -118,8 +135,8 @@ and removes it with `remove_data_fixtures` (both in `api_support/mod.rs`). Both
 go through `PUT` / `DELETE /api/v1/data`, which commit in the same step.
 
 `e2e-api.sh` also runs the **gateway chain test**
-(`crates/lucidos-gateway/src/chain_tests.rs`), the only test that puts a real
-gateway in front of a real engine. It binds the gateway's own router to a free
+(`crates/lucidos-gateway/src/chain_tests.rs`), the only local test that puts a
+real gateway in front of a real engine. It binds the gateway's own router to a free
 port and routes `/e2e-test/` at the session's engine. It then asks for an app's
 own files with no cookie. It lives in `lucidos-gateway` because that crate is
 bin-only: nothing outside it can build the router. It is `#[ignore]`d because
@@ -131,6 +148,12 @@ coding-agent worktree, deliberately and with no opt-out (ADR 0021 § "the opt-ou
 stops at the gateway"). Do not work around that to write a gateway test. A test
 process spawns no engine and dies with the run, which is why the router is fair
 game where the daemon is not.
+
+**GitHub browser shards do run the binary** (`LUCIDOS_E2E_GATEWAY=own`, ADR
+0385). A runner is no worktree. That gateway is session-scoped, and it only
+adopts the engine the harness started. In every mode the e2e engine's
+`LUCIDOS_GATEWAY_PORT` and `LUCIDOS_WORKSPACE_ID` come from a gateway that lists
+it at the engine's port. They are never inherited from the caller.
 
 ## Contract Tests (Rust ↔ TypeScript)
 

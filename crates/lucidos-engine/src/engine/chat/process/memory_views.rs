@@ -3,13 +3,14 @@
 //! entries. A Classic turn never reaches this file, which is what keeps its
 //! request byte-identical (I2).
 //!
-//! The snapshot and each marked thread view piece lead the message as memory
-//! view blocks. Each ends a prefix the prompt cache can keep.
+//! Both views lead the message in blocks of a few lines. A later request can
+//! read the prompt cache up to any block end. Each block that takes a cache
+//! mark is a memory view block.
 
 use uuid::Uuid;
 
 use crate::engine::summary_tree::module::{Surface, ViewBudgets};
-use crate::engine::summary_tree::view::{self, ThreadView};
+use crate::engine::summary_tree::view::{self, ViewBlocks};
 use crate::engine::LucidosEngine;
 use crate::llm::provider::{ContentBlock, MessageContent};
 
@@ -17,45 +18,33 @@ use crate::llm::provider::{ContentBlock, MessageContent};
 #[derive(Debug, Default)]
 pub(crate) struct TurnMemoryViews {
     /// Shared byte for byte by every thread of this view budget (I5).
-    pub(crate) snapshot: String,
-    pub(crate) thread: ThreadView,
+    pub(crate) snapshot: ViewBlocks,
+    pub(crate) thread: ViewBlocks,
     pub(crate) recent: String,
 }
 
 impl TurnMemoryViews {
     pub(crate) fn bytes(&self) -> usize {
-        self.snapshot.len() + self.thread.text.len() + self.recent.len()
+        self.snapshot.text.len() + self.thread.text.len() + self.recent.len()
     }
 
     /// The workspace half, snapshot then recent block, for the context view.
     pub(crate) fn workspace(&self) -> String {
-        [self.snapshot.as_str(), self.recent.as_str()]
+        [self.snapshot.text.as_str(), self.recent.as_str()]
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join(super::context_mode::PART_SEPARATOR)
     }
 
-    /// Put the views in front of the message. The snapshot, whose end other
-    /// threads read through, and each thread view piece ending at a mark are
-    /// memory view blocks. The thread view's rest is plain text.
+    /// Put the views in front of the message, snapshot first, one content
+    /// block per view block. A marked block is a memory view block, and every
+    /// other block is plain text.
     pub(crate) fn lead(&self, content: MessageContent) -> MessageContent {
-        let mut blocks: Vec<ContentBlock> = Vec::new();
-        if !self.snapshot.is_empty() {
-            blocks.push(ContentBlock::MemoryView {
-                text: self.snapshot.clone(),
-            });
-        }
-        if !self.thread.text.is_empty() {
-            let pieces = self.thread.pieces();
-            let (rest, marked) = pieces.split_last().expect("pieces end with the rest");
-            blocks.extend(marked.iter().map(|piece| ContentBlock::MemoryView {
-                text: piece.to_string(),
-            }));
-            blocks.push(ContentBlock::Text {
-                text: rest.to_string(),
-            });
-        }
+        let mut blocks: Vec<ContentBlock> = [&self.snapshot, &self.thread]
+            .into_iter()
+            .flat_map(ViewBlocks::blocks)
+            .collect();
         if blocks.is_empty() {
             return content;
         }
@@ -120,7 +109,7 @@ impl LucidosEngine {
                     thread_id,
                     e
                 );
-                ThreadView::default()
+                ViewBlocks::default()
             });
         TurnMemoryViews {
             snapshot: workspace.snapshot,
@@ -134,19 +123,28 @@ impl LucidosEngine {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_snapshot_leads_as_its_own_memory_view_block() {
-        let views = TurnMemoryViews {
-            snapshot: "[WORKSPACE MEMORY VIEW]\n".into(),
-            ..Default::default()
-        };
-        let MessageContent::Blocks(blocks) = views.lead(MessageContent::Text("rest".into())) else {
+    /// A view of `text`, cut where the `ends` lines start, marked where the `marks` lines start.
+    fn blocks(text: &str, ends: &[&str], marks: &[&str]) -> ViewBlocks {
+        let at = |line: &&str| text.find(line).expect("the line is in the text");
+        ViewBlocks {
+            text: text.into(),
+            ends: ends.iter().map(at).collect(),
+            marks: marks.iter().map(at).collect(),
+        }
+    }
+
+    fn texts(content: MessageContent) -> Vec<(bool, String)> {
+        let MessageContent::Blocks(blocks) = content else {
             panic!("a led message is blocks");
         };
-        assert!(
-            matches!(&blocks[0], ContentBlock::MemoryView { text } if text.starts_with("[WORKSPACE"))
-        );
-        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == "rest"));
+        blocks
+            .into_iter()
+            .map(|b| match b {
+                ContentBlock::MemoryView { text } => (true, text),
+                ContentBlock::Text { text } => (false, text),
+                other => panic!("unexpected block {other:?}"),
+            })
+            .collect()
     }
 
     #[test]
@@ -155,41 +153,32 @@ mod tests {
         assert!(matches!(led, MessageContent::Text(text) if text == "rest"));
     }
 
-    /// Each thread view piece ending at a mark is a memory view block, after
-    /// the snapshot. The rest of the view is plain text, so its end, which
-    /// moves every turn, is never a breakpoint.
+    /// Every view block is its own content block, snapshot first, so each
+    /// block end is a boundary the cache lookback can find. Only the marked
+    /// ones are memory view blocks; the rest, which moves every turn, is text.
     #[test]
-    fn each_marked_thread_piece_leads_as_a_memory_view_block() {
-        let text = "[THREAD MEMORY VIEW]\n[0+2] a\n[2+1] b\n[3+1] c\n[END THREAD MEMORY VIEW]";
-        let first = text.find("[2+1]").unwrap();
-        let second = text.find("[3+1]").unwrap();
+    fn each_view_block_leads_as_its_own_block_and_the_marked_ones_are_memory_views() {
+        let snapshot =
+            "[WORKSPACE MEMORY VIEW]\n[w/0+4] a\n[w/4+1] b\n[END WORKSPACE MEMORY VIEW]\n";
+        let thread = "[THREAD MEMORY VIEW]\n[0+2] a\n[2+1] b\n[3+1] c\n[END THREAD MEMORY VIEW]";
         let views = TurnMemoryViews {
-            snapshot: "[WORKSPACE MEMORY VIEW]\n".into(),
-            thread: ThreadView {
-                text: text.into(),
-                marks: vec![first, second],
-            },
+            snapshot: blocks(snapshot, &["[w/4+1]"], &["[w/4+1]"]),
+            thread: blocks(thread, &["[2+1]", "[3+1]"], &["[3+1]"]),
             recent: String::new(),
         };
-        let MessageContent::Blocks(blocks) = views.lead(MessageContent::Text("rest".into())) else {
-            panic!("a led message is blocks");
-        };
-        let texts: Vec<(bool, &str)> = blocks
-            .iter()
-            .map(|b| match b {
-                ContentBlock::MemoryView { text } => (true, text.as_str()),
-                ContentBlock::Text { text } => (false, text.as_str()),
-                other => panic!("unexpected block {other:?}"),
-            })
-            .collect();
+        let (s, t) = (
+            snapshot.find("[w/4+1]").unwrap(),
+            [thread.find("[2+1]").unwrap(), thread.find("[3+1]").unwrap()],
+        );
         assert_eq!(
-            texts,
+            texts(views.lead(MessageContent::Text("rest".into()))),
             vec![
-                (true, "[WORKSPACE MEMORY VIEW]\n"),
-                (true, &text[..first]),
-                (true, &text[first..second]),
-                (false, &text[second..]),
-                (false, "rest"),
+                (true, snapshot[..s].to_string()),
+                (false, snapshot[s..].to_string()),
+                (false, thread[..t[0]].to_string()),
+                (true, thread[t[0]..t[1]].to_string()),
+                (false, thread[t[1]..].to_string()),
+                (false, "rest".to_string()),
             ]
         );
     }

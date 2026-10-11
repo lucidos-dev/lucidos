@@ -70,6 +70,8 @@ function makeChange(over: Partial<Change> = {}): Change {
     files: ['a.rs'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-01-01T00:00:00Z',
     resolved_at: null,
@@ -99,11 +101,8 @@ function makeThread(over: Partial<ThreadState['meta']> = {}): ThreadState {
       totalChildrenCount: 0,
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
-      codingAgentProposed: true,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'proposed', requires_restart: false },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: true,
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
@@ -125,7 +124,7 @@ let host: HTMLDivElement;
 beforeEach(() => {
   changes.value = {
     status: 'loaded',
-    data: [makeChange({ thread_unsettled: true, thread_settling: true })],
+    data: [makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: true })],
   };
   appliedChanges.value = { status: 'loaded', data: [] };
   setAsideChanges.value = { status: 'loaded', data: [] };
@@ -182,7 +181,7 @@ describe('the Changes panel row', () => {
   it('names the unsettled thread in the row details, not in a tooltip', () => {
     changes.value = {
       status: 'loaded',
-      data: [makeChange({ thread_unsettled: true, thread_settling: false })],
+      data: [makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: false })],
     };
     render(<ChangesView />, host);
     expect(actionLabels()).toEqual(['Diff']);
@@ -194,7 +193,7 @@ describe('the Changes panel row', () => {
   it('shows an apply resolving merge conflicts as in flight, with no standing apply', () => {
     changes.value = {
       status: 'loaded',
-      data: [makeChange({ thread_unsettled: true, thread_settling: true, resolving_conflict: true })],
+      data: [makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: true, resolving_conflict: true })],
     };
     render(<ChangesView />, host);
     expect(actionLabels()).not.toContain('Apply on settle');
@@ -264,7 +263,7 @@ describe('the Not finished bulk control', () => {
   it('draws no toggle when nothing in the section can be armed', () => {
     changes.value = {
       status: 'loaded',
-      data: [makeChange({ thread_unsettled: true, thread_settling: false })],
+      data: [makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: false })],
     };
     render(<ChangesView />, host);
     expect(host.querySelector('.changes-bulk-actions')).toBeNull();
@@ -300,7 +299,7 @@ describe("the thread's own prompt row", () => {
   it('offers nothing while the thread resolves an apply that hit merge conflicts', () => {
     changes.value = {
       status: 'loaded',
-      data: [makeChange({ thread_unsettled: true, thread_settling: true, resolving_conflict: true })],
+      data: [makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: true, resolving_conflict: true })],
     };
     expect(standingApply()).toBeNull();
   });

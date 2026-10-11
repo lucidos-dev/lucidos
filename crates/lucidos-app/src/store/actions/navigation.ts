@@ -85,6 +85,10 @@ function overlaysEqual(a: PanelOverlay, b: PanelOverlay): boolean {
     case 'file-preview': return a.path === (b as typeof a).path;
     case 'url-preview': return a.url === (b as typeof a).url;
     case 'notification-detail': return a.notification.id === (b as typeof a).notification.id;
+    case 'plugin-detail': {
+      const bb = b as typeof a;
+      return a.marketplaceId === bb.marketplaceId && a.pluginId === bb.pluginId;
+    }
   }
 }
 

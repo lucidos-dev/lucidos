@@ -29,7 +29,8 @@ Other workspaces install what you publish, so get the shape right before scaffol
 1. **What's the cohesive unit?** List the files you intend to bundle and confirm each one would be misleading or non-functional without the others. If the answer is "they're related but each works alone", ship them as separate apps / knowhow / triggers, not a plugin.
 2. **`id` and `name`?** `id` must match `[a-z0-9-]+`, max 64 chars: confirm the slug. `name` is the human title.
 3. **Distribution shape?** Single-repo git URL, monorepo subpath, or local `.lucidos-plugin` archive. Drives whether `source` is set in the manifest and where the user will publish.
-4. **Cron triggers, OAuth, personal data?** None of those ship in plugins (see "What doesn't belong in a plugin" below). If the bundle would benefit from a cron trigger, surface that in the manifest `description` so the install-time LLM can offer to set one up. Confirm with the user that this is the intended UX.
+4. **Pictures and widgets?** Propose an icon, two to four screenshots and a `media/README.md` for every plugin you package (see "Plugin media"). Ask which of the workspace's reusable widgets should ship with it (see "Shipping widgets").
+5. **Cron triggers, OAuth, personal data?** None of those ship in plugins (see "What doesn't belong in a plugin" below). If the bundle would benefit from a cron trigger, surface that in the manifest `description` so the install-time LLM can offer to set one up. Confirm with the user that this is the intended UX.
 
 ## Plugin layout
 
@@ -49,6 +50,9 @@ my-plugin/
                          #   one `<id>.json` per theme; see themes.md
   fonts/                 # optional, mirrors data/fonts/
                          #   one `<slug>/` per font; see workspace-fonts.md
+  media/                 # optional, never installed as content:
+                         #   the icon, screenshots, videos and README.md
+                         #   the Plugins panel shows; see "Plugin media"
 ```
 
 The `manifest.json` sidecar carries only WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never loads provider config from it: `data/config/apis.json` is the single source of truth for proxy entries. A plugin that ships a signer puts the matching `apis.json` snippet in its `setup` field. The install-time LLM then walks the user through pasting it into `data/config/apis.json` and registering the credential.
@@ -60,7 +64,7 @@ Install validates the tree (`core/plugins.rs::validate_tree` and `validate_archi
 - `id` matches `[a-z0-9-]+`, non-empty, max 64 chars. Uppercase, underscore, dot all reject.
 - `version` parses as semver.
 - `source`, when present, looks like a git remote: starts with `https://`, `http://`, `git@`, or ends in `.git`. Bare strings, `file://` URLs, and `.lucidos-plugin` paths are not valid. `source` is optional: omit it for archive-only plugins shared peer-to-peer (Slack drop, USB stick, attachment). `update_plugin` and `check_plugin_updates` refuse a sourceless plugin with an explanatory error. Install and uninstall work fine.
-- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules, themes, fonts}`. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (macOS Finder adds it when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed. A `looks/` folder, the name themes had before ADR 0316, is refused with a hint to rename it `themes/`.
+- Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules, themes, fonts, media}`. `media/` is never content: it holds *plugin media* and counts toward nothing below. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (macOS Finder adds it when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed. A `looks/` folder, the name themes had before ADR 0316, is refused with a hint to rename it `themes/`.
 - At least one of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/`, `themes/`, `fonts/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
 - Every file under `themes/` is `<id>.json` and a valid theme, with an id no built-in theme uses (`InvalidTheme` otherwise). The rules are in `themes.md`, theme parts included. A part value past a cap, or a part on a protected surface, fails staging with the field, the rule and the limit (`dark.parts.chat-text.text-shadow: blur 2em is over the 0.6em cap.`).
 - Every file under `fonts/` belongs to a valid workspace font: `fonts/<slug>/font.json` plus the font files it names (`InvalidFont` otherwise). A theme in the plugin may name a workspace font only if the plugin ships it. Install is refused when the plugin's new fonts would take the workspace past 100. The rules are in `workspace-fonts.md`.
@@ -74,7 +78,7 @@ There is no separate install destination. `apps/foo/index.html` in the plugin la
 
 ## `manifest.toml` schema
 
-Four required fields, four optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest`, so future additive fields stay compatible with old install records.
+Four required fields, seven optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest`, so future additive fields stay compatible with old install records.
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
@@ -85,6 +89,9 @@ Four required fields, four optional. Unknown extra fields are accepted and round
 | `source` | no | string | Git remote URL where the plugin lives. Used by `check_plugin_updates` and `update_plugin` to re-fetch the manifest. Omit for archive-only sharing: the plugin still installs and uninstalls, but the update tools return an explanatory error. When present, it must look like a git remote (`https://`, `http://`, `git@`, or ending in `.git`). |
 | `engine` | no | string | Semver requirement on the Lucidos release (e.g. `">=0.46.1"`). **Enforced at install and update**: see "The `engine` requirement" below. Omit it and any release installs the plugin, but Lucidos shows that it declares none. Declare it. |
 | `setup` | no | string | Markdown wiring instructions, written **to the agent about what to do with the user**. It renders in the install confirmation panel before the user confirms, and on confirm it drives a spawned Lucidos Agent setup thread. The engine never interprets it. This is the only way to ship workspace state rather than a file, a webhook above all. See "Install confirmation panel" below and `plugin-setup.md`. |
+| `icon` | no | string | The plugin icon, a path inside `media/` (`"media/icon.svg"`). See "Plugin media". |
+| `screenshots` | no | array of string | Paths inside `media/`, in the order the plugin detail page shows them. |
+| `videos` | no | array of string | Paths inside `media/`, shown after the screenshots. |
 | `categories` | no | array of string | Topical tags for browsing the **Store** (the Plugins panel's category filter). A **controlled vocabulary** (see below): pick from the allowed set. Normalised to lowercase on parse. An unknown value is **dropped and flagged** at catalog-scan time (it appears in the catalog's `errors`), never blocking install. |
 
 **Plugin categories: the controlled vocabulary.** The allowed values are: `productivity`, `finance`, `health`, `developer-tools`, `data`, `communication`, `automation`, `lifestyle`, `research`, `fun` (kebab-case). The catalog offers a filter pill per category that appears in it, and each card shows its category chips. The set stays small so categories stay browsable: a free-form tag would fragment (`finance` vs `money` vs `budgeting`). Tag a plugin with the one or few that fit, or omit `categories` if none do. (Source of truth: `PLUGIN_CATEGORIES` in `crates/lucidos-engine/src/core/plugins.rs`.)
@@ -101,7 +108,7 @@ Four required fields, four optional. Unknown extra fields are accepted and round
 
 **Always declare `engine`.** Without it, an older release installs the plugin, and it breaks at run time with no clear message. For example, an app that calls `lucidos.request` needs 0.39.0 or later, the first release that ships it. Declared, the same install is refused up front, with a sentence that tells the user to update Lucidos. Your floor is the release that first shipped the newest platform feature your plugin uses.
 
-**The workspace audit keeps asking until you declare one.** `system-knowhow/workspace-audit.md` checks every installed plugin and every plugin tree a workspace authors. It flags a plugin with no `engine` on every pass, with a fix the user can act on: update to a version that declares one, ask the author, or add the floor themselves.
+**The workspace audit keeps asking until you declare one.** `system-knowhow/workspace-audit/plugins.md` checks every installed plugin and every plugin tree a workspace authors. It flags a plugin with no `engine` on every pass, with a fix the user can act on: update to a version that declares one, ask the author, or add the floor themselves.
 
 **Adding `engine` later still needs a version bump.** `check_plugin_updates` compares semver. Add `engine` without raising `version`, and every existing installer sees `Already at latest` and never receives the floor.
 
@@ -124,6 +131,63 @@ categories = ["automation", "developer-tools"]
 It ships knowhow only, so its floor is the first release with a working plugin install/uninstall lifecycle, not a later UI feature.
 
 The `source` may be the GitHub tree URL the user copied from the address bar. The install tool parses it back into a git remote, branch and subpath. For a single-repo plugin, use the bare git URL.
+
+## Plugin media
+
+*Plugin media* is what the Plugins panel shows for a plugin: an icon, screenshots, videos and a long description. It lives in the plugin's top-level `media/` folder, and the manifest names each file. Lucidos never merges media into the workspace's content, and runs no plugin code to show it (ADR 0414).
+
+```toml
+icon = "media/icon.svg"
+screenshots = ["media/board.png", "media/settings.png"]
+videos = ["media/tour.mp4"]
+```
+
+```
+my-plugin/
+  manifest.toml
+  apps/...
+  media/
+    icon.svg
+    board.png
+    settings.png
+    tour.mp4
+    README.md            # the long description, no manifest key needed
+```
+
+| Entry | Formats | Limit |
+|---|---|---|
+| `icon` | SVG, PNG, WebP | 512 KB, the app icon's limit |
+| each of `screenshots` | PNG, JPEG, WebP | 4 MB, at most 8 |
+| each of `videos` | MP4, WebM | 25 MB, at most 3 |
+| `media/README.md` | markdown | 256 KB |
+| everything together | | 64 MB |
+
+- **Paths start with `media/`.** Lucidos drops a path outside it, a symlink, a missing file, a wrong format and a file over its limit. It also drops an entry past a count limit, or one that takes the total over 64 MB.
+- **A media problem never blocks.** The scan lists the plugin and install goes ahead. The plugin detail page names each dropped file and the limit it broke, so the author sees it in their own Plugins panel.
+- **No `icon`?** The Plugins panel falls back to the app icon of the plugin's single app (widgets do not count), then to a *monogram tile*.
+- **`media/README.md` is the long description.** It renders as markdown on the plugin detail page, through the same sanitizer as chat, so raw HTML and scripts are stripped. The manifest `description` stays the one line the list row shows.
+- **Where it is kept.** A marketplace scan keeps each listed version's media in `.lucidos/plugin-media/`, a cache the next scan rebuilds. Install copies the plugin's media to `data/plugin-media/<id>/`. It is engine-managed and gitignored, never in a commit, the file list or the "Modified" badge. It outlives the marketplace and is in every backup. An update replaces it whole, and uninstall deletes it.
+- **Served by `GET /api/v1/plugins/media/...`**, the Lucidos shell only, never an app. It serves only what a kept copy lists: the manifest's entries, the README and the app icon fallback. Every answer carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox; default-src 'none'`. An SVG opened directly cannot run script.
+
+## Shipping widgets
+
+A plugin may ship *reusable widgets* (ADR 0414). Such a widget's plugin owns it, not a thread. Its `apps/<id>/manifest.json` must say so:
+
+```json
+{
+  "name": "Habit board",
+  "description": "Today's habits, one tap each.",
+  "icon": "assets/icon.svg",
+  "kind": "widget",
+  "reusable": true,
+  "origin_plugin_id": "habit-tracker"
+}
+```
+
+- **`"reusable": true`** and **`"origin_plugin_id"` equal to the plugin's `id`**, with **no `origin_thread_id`**. Any other widget folder fails validation: the scan names the folder in the catalog's errors, and install refuses with `apps/<id>/ is not a widget a plugin can ship`.
+- **Any thread may show it**, and the agent sees it with the other reusable widgets.
+- **It offers no "Stop reusing"**, and `widgets(action="stop_reusing")` refuses it. Uninstall removes it with the rest of the plugin, and an update replaces it. Deleting a thread never touches it.
+- **Make one from a thread's widget** by copying its folder into the plugin's `apps/` and rewriting the manifest as above: drop `origin_thread_id`, add `origin_plugin_id`, set `reusable`.
 
 ## Install confirmation panel
 
@@ -178,6 +242,15 @@ The installed view is the home for plugins that ship **no app** (knowhow-, trigg
 A **marketplace** is a git repository (or GitHub tree URL) registered at `data/config/plugin-marketplaces.json`, added and removed under **Settings → Marketplaces**. A scan clones each one, finds valid `manifest.toml` plugin roots, and compares each version against installed `PluginInstalled` events. The catalog shows each plugin as a card, read from the last scan (see "A scan never runs on a page open" below). `Install`/`Update` stage the same confirmation panel described above. The catalog never writes plugin files directly.
 
 **Settings → Marketplaces** adds, renames and removes a marketplace. Only the name is editable there. The id hashes the URL, so a row's URL is read-only: pointing at another repository is a remove plus an add. The rename re-posts the stored URL, which is why the registry entry keeps its id.
+
+Each card leads with the plugin icon: its *plugin media* icon, its single app's icon, or a *monogram tile*. It shows the manifest `description` cut to two lines. A tap on the card opens its **plugin detail page** in the content pane. The page holds:
+
+- the full description;
+- every screenshot and video in one strip that scrolls sideways, where a screenshot opens full size;
+- `media/README.md`, rendered as markdown;
+- a muted note naming each media file the engine left out, and why.
+
+The page carries the card's own buttons. It shows media only: no plugin code runs there. The README renders through the chat sanitizer. Lucidos drops its images, inline styles and form controls, since each would fetch from a host the author picked or draw over the page. List pictures as `screenshots` instead. Its web links open in a new tab, and a relative link shows as plain text.
 
 Each card has a primary button that progresses **Install → Setup → Open**, plus an **Uninstall** button once the plugin is on disk:
 
@@ -456,6 +529,8 @@ Apps, knowhow, and **event-driven (`on_event`) triggers** belong in plugins: the
 
 So if a plugin would benefit from a cron trigger, mention it in the manifest `description`. The install-time LLM then offers to set one up. The canonical example is `browser-learning` v0.2.0, which ships knowhow only and relies on that prompt for its reflection (cron) trigger.
 
+**A thread's widget does not ship.** A *widget* made in a thread names that thread (`origin_thread_id`), which no other workspace has. Ship it as a plugin widget instead (see "Shipping widgets"), or have the agent make an app from it ("Make app") and package that.
+
 **Webhooks do not ship either, and for the same reason.** A webhook is a row in the `webhooks` table, not a file, so no manifest field or content dir holds one. Three things would have to travel with it and none can:
 
 - The shared secret is a `credentials` row, and plugins never ship credentials.
@@ -555,16 +630,23 @@ Pick this for ad-hoc sharing (Slack, email), pre-publication testing, and plugin
    - knowhow files use the same frontmatter rules as any other knowhow (`system-knowhow/building-knowhow.md`);
    - apps follow the app conventions (`system-knowhow/building-an-app.md`);
    - triggers obey the intent-vs-procedure rule (`system-knowhow/triggers.md`).
-2. **Find every external reference, then ask the user how to handle each one.** Walk the apps' HTML/JS/CSS for `src=`, `href=`, `import`, and `fetch(...)` calls. A path that does not resolve to a file you ship under the plugin tree needs a decision: absolute paths, and paths into `data/artifacts/`, another app's tree, or unshipped `data/scripts/` / `data/knowhow/`. **List each one back to the user and ask what to do** before bundling. Never silently rewrite or drop a reference. Per reference, the user picks one of:
+2. **Add the plugin media.** The Plugins panel shows it before anyone installs, so treat it as part of the plugin:
+   - **Icon**: write `media/icon.svg`, a simple shape on the app's own colours. With no icon, the panel shows the single app's icon or a *monogram tile*.
+   - **Screenshots**: take them yourself. Show each view worth showing, then call `capture_app` with `save_as_artifact` (`plugin-shots/board.png`), and copy the file into `media/`. The file is sharp, at the device's pixel ratio, in the format the extension names. Phone-width views read best in the detail page's strip. The capture comes from the turn's last used device, so ask the user to open the app on their phone first. Prefer `.png`, and use `.jpg` for a view over the 4 MB limit.
+   - **README**: write `media/README.md` for the person deciding to install: what it does, what it needs, what to try first. Keep it to text and links, since the detail page shows no images from it.
+   - **Manifest**: list each file under `icon`, `screenshots` and `videos`, within the limits in "Plugin media".
+   - **Widgets**: copy each reusable widget the user chose into `apps/<id>/`, and rewrite its manifest as "Shipping widgets" says.
+   - **Check**: after a scan, the plugin detail page names any file the engine left out and the limit it broke.
+3. **Find every external reference, then ask the user how to handle each one.** Walk the apps' HTML/JS/CSS for `src=`, `href=`, `import`, and `fetch(...)` calls. A path that does not resolve to a file you ship under the plugin tree needs a decision: absolute paths, and paths into `data/artifacts/`, another app's tree, or unshipped `data/scripts/` / `data/knowhow/`. **List each one back to the user and ask what to do** before bundling. Never silently rewrite or drop a reference. Per reference, the user picks one of:
    - (a) bundle the asset by copying it into `apps/<id>/` (or the right plugin subtree) and rewriting the reference;
    - (b) leave the reference as-is, because the installer provides the file separately (rare: document this in the plugin's README or `description`);
    - (c) delete the reference and the dependent feature;
    - (d) abort packaging.
 
    Ask because the engine cannot guess. An image in `data/artifacts/foo.png` might be a source of truth the user wants to share, or scratch they want to drop. Auto-bundling risks shipping private workspace artifacts, and auto-dropping risks publishing a broken feature.
-3. **Bump `version` in `manifest.toml` before publishing.** Without a bump, `check_plugin_updates` reports `"Already at latest"` to existing installers, and they never get the new content. Adding `engine` for the first time needs its own bump too (see "The `engine` requirement" above).
-4. **For archive distribution, package as zip and verify.** From inside the plugin tree, run `zip -r ../my-plugin.lucidos-plugin .`. Then check that `unzip -l ../my-plugin.lucidos-plugin` lists every expected file. `file ../my-plugin.lucidos-plugin` must report `Zip archive data`, not `gzip compressed data`.
-5. **Commit and push.** For monorepo plugins, the install URL changes only if the subpath changes. `update_plugin` re-fetches new content under the same path.
+4. **Bump `version` in `manifest.toml` before publishing.** Without a bump, `check_plugin_updates` reports `"Already at latest"` to existing installers, and they never get the new content. Adding `engine` for the first time needs its own bump too (see "The `engine` requirement" above).
+5. **For archive distribution, package as zip and verify.** From inside the plugin tree, run `zip -r ../my-plugin.lucidos-plugin .`. Then check that `unzip -l ../my-plugin.lucidos-plugin` lists every expected file. `file ../my-plugin.lucidos-plugin` must report `Zip archive data`, not `gzip compressed data`.
+6. **Commit and push.** For monorepo plugins, the install URL changes only if the subpath changes. `update_plugin` re-fetches new content under the same path.
 
 Authors need no manual smoke test: the engine's e2e tests cover install, update and uninstall.
 

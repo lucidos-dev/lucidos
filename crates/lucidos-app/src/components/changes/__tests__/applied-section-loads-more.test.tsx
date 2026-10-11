@@ -41,6 +41,8 @@ function applied(id: string): Change {
     files: ['a.rs'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'applied',
     created_at: '2026-01-01T00:00:00Z',
     resolved_at: '2026-01-01T01:00:00Z',

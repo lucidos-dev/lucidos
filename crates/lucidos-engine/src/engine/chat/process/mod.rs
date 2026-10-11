@@ -27,6 +27,7 @@ mod context_build;
 pub(crate) mod context_mode;
 pub(crate) mod context_panel;
 mod context_sections;
+mod footprint_sections;
 mod history;
 mod memory_views;
 mod run;
@@ -36,9 +37,9 @@ mod titles;
 mod turn_clock;
 mod turn_tail;
 pub(crate) mod working_understanding;
-// `pub(super)` so the per-trigger knowhow listing in `chat::process_helpers`
-// can share this module's routing-description ceiling.
-pub(super) mod workspace_payload;
+// Crate-visible so the per-trigger knowhow listing in `chat::process_helpers`
+// shares its routing-description ceiling, and `widget_guidance` its app lines.
+pub(crate) mod workspace_prompt_footprint;
 
 // Re-exported only for the colocated `process_tests` module, which reaches
 // these via `super::`. Non-test code imports them from the child modules
@@ -61,7 +62,7 @@ pub(crate) use turn_tail::TurnTail;
 /// consequence of the first. "The event is already on the wire" says nothing
 /// about whether the input is a message the person sent, yet a live thread
 /// routes the two differently: a message is injected as `UserText` and
-/// acknowledged with a `UserPromptInjected`, and it arms the Codex redirect
+/// acknowledged with a `PromptInjected`, and it arms the Codex redirect
 /// interrupt; an engine re-entry is injected as `ReentryFromEngine`, silently.
 ///
 /// Modelling both as one nullable id made every reader infer the second from
@@ -92,7 +93,7 @@ pub(crate) enum PreEmittedOrigin {
     /// places, and folding a wait re-entry into `ReentryFromEngine` would put a
     /// child that does not exist into the log.
     ///
-    /// Anchored to the `UserPromptInjected` `emit_resolution` wrote beside the
+    /// Anchored to the `PromptInjected` `emit_resolution` wrote beside the
     /// resolution, which carries the payload as prose. One shape, always: a
     /// subscription does not hold its thread's turn, so there is never a
     /// dangling tool call for the delivery to land in instead.

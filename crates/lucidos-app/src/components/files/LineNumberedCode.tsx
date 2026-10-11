@@ -1,6 +1,8 @@
-import { useCallback, useRef } from 'preact/hooks';
-import { useSignalEffect } from '@preact/signals';
-import { selectedLines, consumeLineScrollTarget } from '../../store/store';
+import { useCallback, useEffect, useRef } from 'preact/hooks';
+import { effect } from '@preact/signals';
+import type { VNode } from 'preact';
+import { consumeLineScrollTarget } from '../../store/store';
+import { usePreviewPath, usePreviewViewState } from './previewViewState';
 import { SkText, useSkeleton } from '../shared/Skeleton';
 
 /** Line widths the source view shimmers with while its file loads. */
@@ -24,8 +26,8 @@ export interface CodeRow {
 /** How these rows relate to the previewed file's own line numbering.
  *
  *  `file` means they ARE the file's lines: clicking a number selects into the
- *  `selectedLines` store signal, that selection renders as a highlight here, and
- *  a pending `lineScrollTarget` is consumed and scrolled to here.
+ *  preview's `selectedLines`, that selection renders as a highlight here, and a
+ *  pending `lineScrollTarget` is consumed and scrolled to here.
  *
  *  `none` means they are a derived view: one column of a side-by-side diff, whose
  *  numbers are the OLD file's on the left and the NEW file's on the right. A
@@ -41,14 +43,15 @@ export type LineSelectionMode = 'file' | 'none';
  *           unreachable and a reader following a citation needs the part it
  *           was about.
  *  `pan`    keep it on one line and pan it, under a gutter pinned to the left
- *           edge and over an opaque surface.
+ *           edge. The gutter is ONE column beside the code, so a long file
+ *           carries one pinned box rather than one per line.
  *  `caller` neither. The caller's own scroller owns the overflow, and its own
  *           rules own the row's background.
  *
  *  `caller` is what a side-by-side diff column passes, and the distinction is
  *  load-bearing rather than tidy. Those columns tint rows green and red, and
- *  `pan`'s opaque surface outranks a single caller class and would paint over
- *  every one of them. */
+ *  their gutter must carry the tint with its row, which a separate pinned
+ *  column would not. */
 export type WideLineMode = 'wrap' | 'pan' | 'caller';
 
 interface Props {
@@ -71,6 +74,7 @@ export function fileRows(lines: string[]): CodeRow[] {
 export interface RenderedRow {
   key: string | number;
   cls: string;
+  selected: boolean;
   /** What the gutter shows: the line number, or nothing for a filler row. */
   gutter: string;
   /** `data-line`, which is what the scroll target looks a row up by. Absent for
@@ -102,6 +106,7 @@ export function renderRows(
     return {
       key: row.num ?? `filler-${i}`,
       cls: ['code-line', row.cls, isSelected ? 'line-selected' : ''].filter(Boolean).join(' '),
+      selected: isSelected,
       gutter: row.num === null ? '' : String(row.num),
       dataLine: row.num ?? undefined,
       selectLine: selectable ? row.num : null,
@@ -131,11 +136,11 @@ export function codeBlockClass(selectable: boolean, wideLines: WideLineMode): st
  *
  *  Shared by both file previews (`RepoFilePreview` for a registered repository
  *  clone, `FilePreviewInline` for a workspace data file) and by each column of
- *  the side-by-side diff, so there is exactly one implementation of line
- *  numbering, selection and the navigate-driven scroll. The selection itself
- *  lives in the `selectedLines` store signal, which is also what
- *  `currentChatContext` reads to attach a line range to a chat message, so a
- *  range picked here is the same range a message carries.
+ *  the side-by-side diff. So there is exactly one implementation of line
+ *  numbering, selection and the navigate-driven scroll. The selection lives in
+ *  the provided `PreviewViewState`. In the Files panel that is the global
+ *  `selectedLines`. `currentChatContext` attaches it to a chat message, so a
+ *  range picked there is the range a message carries.
  *
  *  Callers render this inside their own scroll container: `.repo-file-content`
  *  for the repo preview, `.file-preview-content` for the data-file one,
@@ -143,6 +148,8 @@ export function codeBlockClass(selectable: boolean, wideLines: WideLineMode): st
 export function LineNumberedCode({ rows, selection = 'file', wideLines }: Props) {
   const preRef = useRef<HTMLPreElement>(null);
   const sk = useSkeleton();
+  const { selectedLines, lineScrollTarget } = usePreviewViewState();
+  const path = usePreviewPath();
   // A placeholder is never a file view: it must not consume a scroll target
   // that belongs to the content it stands in for.
   const selectable = selection === 'file' && !sk;
@@ -156,18 +163,20 @@ export function LineNumberedCode({ rows, selection = 'file', wideLines }: Props)
     } else {
       selectedLines.value = { start: lineNum, end: lineNum };
     }
-  }, []);
+  }, [selectedLines]);
 
-  // Honour a pending navigate-to-a-line request. `useSignalEffect` (not a plain
-  // `useEffect`) so it fires on mount, which is the usual case where the request
-  // was set while this file's content was still being fetched, AND on a later
-  // request for a file already on screen, where nothing else about the render
-  // would have changed. Consuming clears the request, so re-renders don't
-  // re-scroll a user who has since scrolled away; a line past the end of the
-  // file consumes it too and simply scrolls nowhere.
-  useSignalEffect(() => {
+  // Honour a pending navigate-to-a-line request. A signal `effect` fires on
+  // mount, the usual case: the request was set while the content was loading.
+  // It also fires on a later request for a file already on screen, where
+  // nothing else about the render changed. It re-subscribes when the provided
+  // view or path changes, since a replacing modal preview of the same file keeps
+  // this component mounted. Only a target naming this file is taken. The router
+  // writes it while the previous file's rows are still mounted. Consuming
+  // clears the request, so a re-render never re-scrolls a reader who scrolled
+  // away. A line past the end scrolls nowhere.
+  useEffect(() => effect(() => {
     if (!selectable) return;
-    const target = consumeLineScrollTarget();
+    const target = consumeLineScrollTarget(lineScrollTarget, path);
     if (target === null) return;
     const row = preRef.current?.querySelector(`[data-line="${target}"]`);
     if (!row) {
@@ -179,23 +188,33 @@ export function LineNumberedCode({ rows, selection = 'file', wideLines }: Props)
       selectedLines.value = null;
       return;
     }
-    row.scrollIntoView({ block: 'center' });
-  });
+    // In pan mode the row starts right of the pinned gutter. Scrolling a row
+    // wider than the view would pan its left edge under the gutter. Its gutter
+    // cell is level with it and never off the left edge.
+    const gutter = preRef.current!.querySelector('.line-numbered-gutter');
+    const cell = gutter?.children[Array.prototype.indexOf.call(row.parentElement!.children, row)];
+    scrollIntoViewVertically(cell ?? row);
+  }), [selectable, lineScrollTarget, selectedLines, path]);
 
   // Read CONDITIONALLY: reading a signal during render is what subscribes the
   // component to it, so a non-selectable column never subscribes and never
   // re-renders on a selection change elsewhere.
   const sel = selectable ? selectedLines.value : null;
 
+  const pan = wideLines === 'pan';
+
   if (sk) {
     return (
       <pre class={codeBlockClass(false, wideLines)} aria-hidden="true">
-        {SKELETON_LINE_WIDTHS.map((w, i) => (
-          <div key={i} class="code-line">
-            <span class="line-number">{i + 1}</span>
-            <SkText class="line-content" w={w} />
-          </div>
-        ))}
+        {layoutCells(pan, SKELETON_LINE_WIDTHS.map((w, i) => ({
+          key: i,
+          cls: 'code-line',
+          selected: false,
+          dataLine: undefined,
+          gutter: String(i + 1),
+          onGutterClick: undefined,
+          content: <SkText class="line-content" w={w} />,
+        })))}
       </pre>
     );
   }
@@ -205,19 +224,77 @@ export function LineNumberedCode({ rows, selection = 'file', wideLines }: Props)
       class={codeBlockClass(selectable, wideLines)}
       ref={preRef}
     >
-      {renderRows(rows, sel, selectable).map((r) => (
-        <div key={r.key} data-line={r.dataLine} class={r.cls}>
-          <span
-            class="line-number"
-            onClick={r.selectLine === null
-              ? undefined
-              : (e: MouseEvent) => handleLineClick(r.selectLine!, e.shiftKey)}
-          >
-            {r.gutter}
-          </span>
-          <span class="line-content" dangerouslySetInnerHTML={{ __html: r.html || ' ' }} />
-        </div>
-      ))}
+      {layoutCells(pan, renderRows(rows, sel, selectable).map((r) => ({
+        ...r,
+        onGutterClick: r.selectLine === null
+          ? undefined
+          : (e: MouseEvent) => handleLineClick(r.selectLine!, e.shiftKey),
+        content: <span class="line-content" dangerouslySetInnerHTML={{ __html: r.html || ' ' }} />,
+      })))}
     </pre>
   );
+}
+
+/** One row's gutter and content, before `layoutCells` places them. */
+interface RowCells {
+  key: string | number;
+  cls: string;
+  selected: boolean;
+  dataLine: number | undefined;
+  gutter: string;
+  onGutterClick: ((e: MouseEvent) => void) | undefined;
+  content: VNode;
+}
+
+/** Place the cells. Wrap and caller modes keep each gutter cell inside its
+ *  row, since a wrapped row grows and a diff row's tint must cover its number.
+ *
+ *  Pan mode splits them into a gutter column and a code column, and pins only
+ *  the column. A sticky cell per row made WebKit reposition every one of them
+ *  on each scroll frame, about 48 ms a frame at 2,600 lines. Every row is one
+ *  line tall in pan mode, so cell N and row N stay level without measuring.
+ *  `data-line` stays on the code row, which is what the scroll target finds.
+ *  The column is hidden from assistive tech, which would otherwise read every
+ *  number before the first line of code.
+ *
+ *  In every mode the number is CSS generated content from `data-line-number`,
+ *  never a text node. So find in file matches only code, and a copied
+ *  selection carries no numbers. */
+function layoutCells(pan: boolean, cells: RowCells[]) {
+  const gutterCell = (c: RowCells) => (
+    <span
+      key={c.key}
+      class={pan && c.selected ? 'line-number line-selected' : 'line-number'}
+      data-line-number={c.gutter || undefined}
+      onClick={c.onGutterClick}
+    />
+  );
+  if (!pan) {
+    return cells.map((c) => (
+      <div key={c.key} data-line={c.dataLine} class={c.cls}>
+        {gutterCell(c)}
+        {c.content}
+      </div>
+    ));
+  }
+  return [
+    <div key="gutter" class="line-numbered-gutter" aria-hidden="true">{cells.map(gutterCell)}</div>,
+    <div key="code" class="line-numbered-code">
+      {cells.map((c) => <div key={c.key} data-line={c.dataLine} class={c.cls}>{c.content}</div>)}
+    </div>,
+  ];
+}
+
+/** Center `el` vertically, leaving every ancestor's horizontal scroll where it
+ *  was. `scrollIntoView` can also pan: aimed at the pinned gutter cell, it
+ *  opened the file preview modal with the start of every line cut off. */
+export function scrollIntoViewVertically(el: Element): void {
+  const panned: [Element, number][] = [];
+  for (let node = el.parentElement; node; node = node.parentElement) {
+    panned.push([node, node.scrollLeft]);
+  }
+  el.scrollIntoView({ block: 'center' });
+  for (const [node, left] of panned) {
+    if (node.scrollLeft !== left) node.scrollLeft = left;
+  }
 }

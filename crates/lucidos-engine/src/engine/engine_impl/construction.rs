@@ -859,7 +859,22 @@ impl LucidosEngine {
             );
         }
         let python_runtime = PythonRuntime::new(workspace_path.clone())?;
-        let app_manager = Arc::new(AppManager::new(&workspace_path)?);
+        let repo_root = git_ops::main_worktree().await;
+
+        // The built-in widgets ship in `system-widgets/`, resolved exactly like
+        // `system-knowhow/` below (ADR 0415).
+        let (system_widgets_dir, system_widgets_warning) = crate::core::resolve_system_widgets_dir(
+            std::env::var(crate::core::system_widgets::SYSTEM_WIDGETS_DIR.env_var)
+                .ok()
+                .as_deref(),
+            &repo_root,
+            crate::runtime::is_packaged(),
+        );
+        if let Some(warning) = &system_widgets_warning {
+            log!("{}", warning);
+        }
+        let app_manager =
+            Arc::new(AppManager::new(&workspace_path)?.with_system_widgets(system_widgets_dir));
 
         // The embedding model that powers vector memory is a multi-hundred-MB
         // HuggingFace download on a cold cache (and a non-trivial ONNX load even
@@ -942,17 +957,17 @@ impl LucidosEngine {
             log!("[Engine] User language: {}", user_language);
         }
 
-        let repo_root = git_ops::main_worktree().await;
-
         // Resolve the engine-shipped `system-knowhow/` reference set. In a packaged
-        // build the launcher stages it as the 7th resource and points
+        // build the launcher stages it as a bundle resource and points
         // LUCIDOS_SYSTEM_KNOWHOW_DIR at it; dev/e2e leave the env var unset and fall
         // back to the source checkout's `<repo_root>/system-knowhow`. A set-but-missing
         // env var (mis-staged bundle) resolves to unavailable with a loud warning
         // rather than a bogus repo-root fallback. See
         // docs/plans/2026-07-07-package-system-knowhow-resource.md.
         let (system_knowhow_dir, system_knowhow_warning) = crate::core::resolve_system_knowhow_dir(
-            std::env::var("LUCIDOS_SYSTEM_KNOWHOW_DIR").ok().as_deref(),
+            std::env::var(crate::core::system_knowhow::SYSTEM_KNOWHOW_DIR.env_var)
+                .ok()
+                .as_deref(),
             &repo_root,
             crate::runtime::is_packaged(),
         );
@@ -1278,12 +1293,10 @@ impl LucidosEngine {
             pending_commits_cache: std::sync::Mutex::new(Default::default()),
             head_sha_cache: std::sync::Mutex::new(Default::default()),
             self_heal_state: std::sync::Mutex::new(Default::default()),
-            build_task: std::sync::Mutex::new(None),
-            build_generation: std::sync::atomic::AtomicU64::new(0),
+            background_build: Default::default(),
             build_process_group: std::sync::atomic::AtomicU32::new(0),
             served_frontend: std::sync::OnceLock::new(),
             served_frontend_source: std::sync::OnceLock::new(),
-            served_frontend_commit: Default::default(),
             frontend_refresh_generation: std::sync::atomic::AtomicU64::new(0),
             frontend_refresh_task: std::sync::Mutex::new(None),
             frontend_refresh_started: std::sync::Mutex::new(None),
@@ -1349,7 +1362,7 @@ impl LucidosEngine {
             pool,
             proxy_token_cache: Arc::new(crate::api::proxy_token_cache::ProxyTokenCache::new()),
             wasm_engine,
-            pending_captures: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_captures: Arc::default(),
             pending_installs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_uninstalls: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             frontend_origin: std::sync::Mutex::new(None),

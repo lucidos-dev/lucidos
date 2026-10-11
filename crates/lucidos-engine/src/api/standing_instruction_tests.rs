@@ -12,7 +12,12 @@ use crate::engine::thread_events::{
 use crate::test_support::{setup_test_db, teardown_test_db};
 
 /// A user turn, opened by whoever `origin` names.
-async fn open_turn(bus: &EventBus, thread_id: Uuid, mode: ActorMode, origin: MessageOrigin) {
+pub(crate) async fn open_turn(
+    bus: &EventBus,
+    thread_id: Uuid,
+    mode: ActorMode,
+    origin: MessageOrigin,
+) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {

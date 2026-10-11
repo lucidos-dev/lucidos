@@ -21,6 +21,12 @@ async fn git(args: &[&str], dir: &Path) {
     );
 }
 
+/// A checkpoint id of its own. The temp index path is keyed by the id in the
+/// shared OS temp dir. A fixed id collides with other runs on the host.
+fn fresh_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 async fn init_repo(root: &Path) {
     git(&["init", "-b", "main"], root).await;
     git(&["config", "user.email", "t@example.com"], root).await;
@@ -46,7 +52,7 @@ async fn checkpoint_restores_deleted_overwritten_and_untracked() {
     // captured: a reversible command could delete it.
     fs::write(root.join("data/artifacts/untracked.txt"), "untracked").unwrap();
 
-    let id = "11111111-1111-1111-1111-111111111111";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
 
     // The "reversible" command: delete one, overwrite another, create a new.
@@ -100,7 +106,7 @@ async fn undo_removes_only_what_the_command_created() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "22222222-2222-2222-2222-222222222222";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     fs::write(root.join("by-command.txt"), "from the command").unwrap();
     create_command_post_image(root, id).await.unwrap();
@@ -131,7 +137,7 @@ async fn undo_restores_only_what_the_command_deleted_or_overwrote() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     fs::remove_file(root.join("deleted.txt")).unwrap();
     fs::write(root.join("overwritten.txt"), "clobbered").unwrap();
@@ -167,7 +173,7 @@ async fn an_overwritten_file_edited_again_or_a_deleted_file_recreated_is_kept() 
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     fs::write(root.join("overwritten.txt"), "clobbered").unwrap();
     fs::remove_file(root.join("deleted.txt")).unwrap();
@@ -199,7 +205,7 @@ async fn undo_restores_a_deleted_directory_tree() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     fs::remove_dir_all(root.join("data/app")).unwrap();
     create_command_post_image(root, id).await.unwrap();
@@ -227,7 +233,7 @@ async fn undo_puts_back_a_directory_the_command_replaced_with_a_file() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "abababab-abab-abab-abab-abababababab";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     fs::remove_dir_all(root.join("data/cfg")).unwrap();
     fs::write(root.join("data/cfg"), "a file now").unwrap();
@@ -251,7 +257,7 @@ async fn undo_puts_back_a_file_the_command_replaced_with_a_directory() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "cdcdcdcd-cdcd-cdcd-cdcd-cdcdcdcdcdcd";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     fs::remove_file(root.join("data/foo")).unwrap();
     fs::create_dir_all(root.join("data/foo")).unwrap();
@@ -271,7 +277,7 @@ async fn a_created_file_edited_since_the_command_is_kept() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "33333333-3333-3333-3333-333333333333";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     fs::write(root.join("report.md"), "generated").unwrap();
     create_command_post_image(root, id).await.unwrap();
@@ -296,7 +302,7 @@ async fn removing_created_files_prunes_only_directories_it_emptied() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "44444444-4444-4444-4444-444444444444";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     // One brand-new directory tree, and one file dropped into an existing one.
     fs::create_dir_all(root.join("data/artifacts/plugins")).unwrap();
@@ -324,7 +330,7 @@ async fn a_command_touching_only_ignored_paths_has_no_effects() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "55555555-5555-5555-5555-555555555555";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     // The reported case: an rmtree of a gitignored staging directory. The
     // snapshot never captured it, so undo could restore nothing.
@@ -392,7 +398,7 @@ async fn undo_removes_a_created_symlink_dangling_or_not() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     std::os::unix::fs::symlink("real.txt", root.join("live-link")).unwrap();
     std::os::unix::fs::symlink("gone.txt", root.join("dangling-link")).unwrap();
@@ -423,7 +429,7 @@ async fn a_created_symlink_repointed_since_the_command_is_kept() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     std::os::unix::fs::symlink("a.txt", root.join("link")).unwrap();
     create_command_post_image(root, id).await.unwrap();
@@ -449,7 +455,7 @@ async fn effects_are_unavailable_without_a_post_image() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let id = "66666666-6666-6666-6666-666666666666";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     fs::write(root.join("a.txt"), "v2").unwrap();
     fs::write(root.join("b.txt"), "new").unwrap();
@@ -479,7 +485,7 @@ async fn checkpoint_in_repo_without_head_is_parentless() {
     let root = tmp.path();
     init_repo(root).await;
     fs::write(root.join("a.txt"), "v1").unwrap();
-    let id = "77777777-7777-7777-7777-777777777777";
+    let id = &fresh_id();
     create_command_checkpoint(root, id).await.unwrap();
     fs::write(root.join("a.txt"), "v2").unwrap();
     create_command_post_image(root, id).await.unwrap();
@@ -498,8 +504,8 @@ async fn retention_reclaims_only_pairs_past_the_window() {
     git(&["add", "-A"], root).await;
     git(&["commit", "-m", "init"], root).await;
 
-    let old = "88888888-8888-8888-8888-888888888888";
-    let fresh = "99999999-9999-9999-9999-999999999999";
+    let old = &fresh_id();
+    let fresh = &fresh_id();
     for id in [old, fresh] {
         create_command_checkpoint(root, id).await.unwrap();
         create_command_post_image(root, id).await.unwrap();

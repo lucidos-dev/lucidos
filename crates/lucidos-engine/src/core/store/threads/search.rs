@@ -27,18 +27,46 @@ fn contains_pattern(token: &str) -> String {
 /// Binds, in order:
 /// - $1 every token's pattern
 /// - $2 the limit
-/// - $3 the token count
-/// - $4 the query as a phrase pattern
-/// - $5 the query as an exact pattern
-/// - $6 the long tokens' patterns
-/// - $7 the short tokens' patterns
-pub(super) fn text_search_sql() -> String {
+/// - $3 the query as a phrase pattern
+/// - $4 the query as an exact pattern
+/// - $5 the long tokens' patterns
+/// - $6 the short tokens' patterns
+///
+/// `with_entities` adds the arm that reads `memory_entries`. Pass it only when
+/// that table exists, since naming a missing relation fails the whole query.
+pub(super) fn text_search_sql(with_entities: bool) -> String {
     // The title the user sees, whitespace collapsed like `title_match` does.
     let shown_title =
         "btrim(regexp_replace(COALESCE(s.title, s.first_message, ''), '\\s+', ' ', 'g'))";
     // Joins `best_scores b` against `thread_summaries s`, so the alias is `s`.
     let thread_cols_prefixed = thread_cols("s");
-    let home_visible = home_visible_sql("s");
+    // Drive from memory_entries (the small side) and join into events by
+    // primary key. The CASE keeps the cast off non-event sources.
+    let (entity_cte, entity_arm) = if with_entities {
+        (
+            format!(
+                ", entity_matches AS (\
+                    SELECT m.thread_id, 0.7::float8 AS match_score FROM (\
+                        SELECT e.thread_id, t.pattern \
+                        FROM memory_entries me \
+                        JOIN events e ON e.id = CASE WHEN me.source->>'type' = 'event' THEN (me.source->>'id')::uuid END \
+                        CROSS JOIN unnest($1::text[]) AS t(pattern) \
+                        WHERE me.source->>'type' = 'event' \
+                          AND {IS_MESSAGE} \
+                          AND EXISTS (\
+                              SELECT 1 FROM jsonb_array_elements_text(me.entities) AS ent \
+                              WHERE ent ILIKE t.pattern\
+                          )\
+                    ) m \
+                    GROUP BY m.thread_id \
+                    HAVING COUNT(DISTINCT m.pattern) = cardinality($1::text[])\
+                )"
+            ),
+            " UNION ALL SELECT thread_id, match_score FROM entity_matches",
+        )
+    } else {
+        (String::new(), "")
+    };
 
     // Message text: the long tokens find candidate threads through the trigram
     // index. The short tokens are then checked only on those threads' messages.
@@ -47,37 +75,20 @@ pub(super) fn text_search_sql() -> String {
             SELECT thread_id, 1.0::float8 AS match_score FROM thread_summaries WHERE title ILIKE ALL($1::text[])\
         ), long_token_threads AS (\
             SELECT e.thread_id \
-            FROM events e CROSS JOIN unnest($6::text[]) AS t(pattern) \
+            FROM events e CROSS JOIN unnest($5::text[]) AS t(pattern) \
             WHERE {IS_MESSAGE} AND {MESSAGE_TEXT} ILIKE t.pattern \
             GROUP BY e.thread_id \
-            HAVING COUNT(DISTINCT t.pattern) = cardinality($6::text[])\
+            HAVING COUNT(DISTINCT t.pattern) = cardinality($5::text[])\
         ), content_matches AS (\
             SELECT c.thread_id, 0.7::float8 AS match_score FROM long_token_threads c \
             WHERE NOT EXISTS (\
-                SELECT 1 FROM unnest($7::text[]) AS t(pattern) \
+                SELECT 1 FROM unnest($6::text[]) AS t(pattern) \
                 WHERE NOT EXISTS (\
                     SELECT 1 FROM events e \
                     WHERE e.thread_id = c.thread_id AND {IS_MESSAGE} AND {MESSAGE_TEXT} ILIKE t.pattern\
                 )\
             )\
-        ), entity_matches AS (\
-            /* Drive from memory_entries (the small side) and join into events by \
-               primary key. The CASE keeps the cast off non-event sources. */\
-            SELECT m.thread_id, 0.7::float8 AS match_score FROM (\
-                SELECT e.thread_id, t.pattern \
-                FROM memory_entries me \
-                JOIN events e ON e.id = CASE WHEN me.source->>'type' = 'event' THEN (me.source->>'id')::uuid END \
-                CROSS JOIN unnest($1::text[]) AS t(pattern) \
-                WHERE me.source->>'type' = 'event' \
-                  AND {IS_MESSAGE} \
-                  AND EXISTS (\
-                      SELECT 1 FROM jsonb_array_elements_text(me.entities) AS ent \
-                      WHERE ent ILIKE t.pattern\
-                  )\
-            ) m \
-            GROUP BY m.thread_id \
-            HAVING COUNT(DISTINCT m.pattern) = $3\
-        ), draft_matches AS (\
+        ){entity_cte}, draft_matches AS (\
             SELECT thread_id, 0.7::float8 AS match_score FROM thread_summaries \
             WHERE compose_text ILIKE ALL($1::text[])\
         ), scored AS (\
@@ -85,16 +96,14 @@ pub(super) fn text_search_sql() -> String {
             UNION ALL \
             SELECT thread_id, match_score FROM content_matches \
             UNION ALL \
-            SELECT thread_id, match_score FROM entity_matches \
-            UNION ALL \
             SELECT thread_id, match_score FROM draft_matches\
+            {entity_arm}\
         ), best_scores AS (\
             SELECT thread_id, MAX(match_score) AS score FROM scored GROUP BY thread_id\
         ) \
         SELECT {thread_cols_prefixed}, b.score \
         FROM best_scores b JOIN thread_summaries s ON s.thread_id = b.thread_id \
-        WHERE {home_visible} \
-        ORDER BY {shown_title} ILIKE $5 DESC, {shown_title} ILIKE $4 DESC, \
+        ORDER BY {shown_title} ILIKE $4 DESC, {shown_title} ILIKE $3 DESC, \
                  b.score DESC, s.last_activity DESC LIMIT $2",
     )
 }
@@ -140,7 +149,6 @@ impl EventStore {
         let (long, short): (Vec<&str>, Vec<&str>) = distinct.iter().partition(|t| is_indexable(t));
         let long_patterns: Vec<String> = long.iter().map(|t| contains_pattern(t)).collect();
         let short_patterns: Vec<String> = short.iter().map(|t| contains_pattern(t)).collect();
-        let token_count = patterns.len() as i64;
         let exact_pattern = super::super::escape_like(&tokens.join(" "));
         let phrase_pattern = format!("%{exact_pattern}%");
 
@@ -151,10 +159,11 @@ impl EventStore {
             score: f64,
         }
 
-        let rows = sqlx::query_as::<_, SearchRow>(&text_search_sql())
+        let has_memory_entries =
+            crate::memory::pgvector::PgVectorIndex::table_exists(&self.pool).await?;
+        let rows = sqlx::query_as::<_, SearchRow>(&text_search_sql(has_memory_entries))
             .bind(&patterns)
             .bind(limit)
-            .bind(token_count)
             .bind(&phrase_pattern)
             .bind(&exact_pattern)
             .bind(&long_patterns)
@@ -196,14 +205,10 @@ impl EventStore {
         }
         let long_patterns: Vec<String> = long.iter().map(|t| contains_pattern(t)).collect();
         let short_patterns: Vec<String> = short.iter().map(|t| contains_pattern(t)).collect();
-        // A hidden home thread stays out, as it does from thread search.
-        let home_visible = home_visible_sql("h");
         let sql = format!(
             "SELECT e.id AS event_id, e.thread_id, e.created, {MESSAGE_TEXT} AS text \
              FROM events e CROSS JOIN unnest($1::text[]) AS t(pattern) \
              WHERE {IS_MESSAGE} AND {MESSAGE_TEXT} ILIKE t.pattern \
-               AND NOT EXISTS (SELECT 1 FROM thread_summaries h \
-                               WHERE h.thread_id = e.thread_id AND NOT {home_visible}) \
                AND NOT EXISTS (SELECT 1 FROM unnest($3::text[]) AS s(pattern) \
                                WHERE {MESSAGE_TEXT} NOT ILIKE s.pattern) \
              GROUP BY e.id \
@@ -277,9 +282,8 @@ impl EventStore {
         // happen to return it. `thread_uuids` is already bounded by the
         // caller's SEMANTIC_CANDIDATE_LIMIT.
         let sql = format!(
-            "SELECT {} FROM thread_summaries t WHERE t.thread_id = ANY($1::uuid[]) AND {}",
+            "SELECT {} FROM thread_summaries t WHERE t.thread_id = ANY($1::uuid[])",
             THREAD_COLS.as_str(),
-            home_visible_sql("t"),
         );
         let rows = sqlx::query_as::<_, ThreadRow>(&sql)
             .bind(&thread_uuids)

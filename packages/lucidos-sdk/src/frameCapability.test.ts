@@ -1,8 +1,11 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import {
   adoptCapability,
+  anchorHistoryToDocument,
   capabilityCarrier,
   currentCapability,
+  documentRelative,
+  inPageFragment,
   splitCapability,
 } from './frameCapability';
 
@@ -31,9 +34,17 @@ function stampBase(href: string | null): { href: string | null } {
   return element;
 }
 
+const DOCUMENT_HREF = 'https://host.example/dev/app/site-publisher/?device=abc123';
+
 afterEach(() => {
   globalThis.document.querySelector = originalQuerySelector;
+  delete (globalThis as { location?: unknown }).location;
 });
+
+/** Where the document itself sits. The suite has no `location` of its own. */
+function placeDocument(href = DOCUMENT_HREF): void {
+  (globalThis as { location?: unknown }).location = { href };
+}
 
 describe('splitCapability', () => {
   it('takes a capability path apart into its three pieces', () => {
@@ -100,5 +111,71 @@ describe('a renewal replaces the pass in place', () => {
     expect(adoptCapability('a/b')).toBe(false);
     expect(adoptCapability('')).toBe(false);
     expect(currentCapability()).toBe(PASS);
+  });
+});
+
+describe('a relative URL the app moves to resolves against its own document', () => {
+  const CAPABILITY_BASE = `/dev/~cap/${PASS}/app/site-publisher/`;
+
+  it('keeps the document path and query under a capability base', () => {
+    stampBase(CAPABILITY_BASE);
+    placeDocument();
+    expect(documentRelative('#30d')).toBe(`${DOCUMENT_HREF}#30d`);
+    expect(documentRelative('?range=7d')).toBe('https://host.example/dev/app/site-publisher/?range=7d');
+    expect(documentRelative(new URL('https://host.example/dev/app/site-publisher/#x'))).toBe(
+      'https://host.example/dev/app/site-publisher/#x',
+    );
+  });
+
+  it('leaves the browser in charge where no pass is stamped', () => {
+    placeDocument();
+    for (const base of [null, '/dev/', './']) {
+      stampBase(base);
+      expect(documentRelative('#30d'), String(base)).toBe('#30d');
+    }
+  });
+
+  it('passes an unparseable URL through, so the browser throws its own error', () => {
+    stampBase(CAPABILITY_BASE);
+    placeDocument();
+    expect(documentRelative('http://[')).toBe('http://[');
+  });
+
+  it('anchors pushState and replaceState, and leaves a missing URL alone', () => {
+    stampBase(CAPABILITY_BASE);
+    placeDocument();
+    const calls: unknown[][] = [];
+    const record = function (this: unknown, ...args: unknown[]) {
+      calls.push([this, ...args]);
+    } as History['pushState'];
+    const target = { pushState: record, replaceState: record } as Pick<History, 'pushState' | 'replaceState'>;
+    anchorHistoryToDocument(target);
+    target.replaceState.call(target, { a: 1 }, '', '#probe');
+    target.pushState.call(target, null, '', '#pushed');
+    target.replaceState.call(target, null, '');
+    expect(calls).toEqual([
+      [target, { a: 1 }, '', `${DOCUMENT_HREF}#probe`],
+      [target, null, '', `${DOCUMENT_HREF}#pushed`],
+      [target, null, '', undefined],
+    ]);
+  });
+});
+
+describe('an in-page link stays on this document', () => {
+  it('names the fragment on the document URL under a capability base', () => {
+    stampBase(`/dev/~cap/${PASS}/app/site-publisher/`);
+    placeDocument();
+    expect(inPageFragment('#section')).toBe(`${DOCUMENT_HREF}#section`);
+    expect(inPageFragment('#')).toBe(`${DOCUMENT_HREF}#`);
+  });
+
+  it('leaves every other link, and every document without a pass, to the browser', () => {
+    stampBase(`/dev/~cap/${PASS}/app/site-publisher/`);
+    placeDocument();
+    for (const href of [null, '', 'page.html#section', '?q=1', '/dev/app/x/#y', 'https://example.com/#z']) {
+      expect(inPageFragment(href), String(href)).toBeNull();
+    }
+    stampBase(null);
+    expect(inPageFragment('#section')).toBeNull();
   });
 });

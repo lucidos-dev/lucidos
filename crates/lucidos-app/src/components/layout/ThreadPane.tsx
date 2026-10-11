@@ -1,8 +1,9 @@
 import { useRef, useLayoutEffect } from 'preact/hooks';
-import { focusedThreadId, promptAnimating, promptSendCollapsing, activeThreadIsComposing, composeViewActive, scaledDurationMs } from '../../store/store';
+import { focusedThreadId, promptAnimating, promptSendCollapsing, activeThreadIsComposing, composeViewActive, homeWelcomeActive, scaledDurationMs } from '../../store/store';
 import { PromptInput } from '../chat/PromptInput';
 import { CreateThreadView } from '../chat/CreateThreadView';
 import { ThreadView } from '../chat/ThreadView';
+import { HomeWelcomeTitle } from '../chat/HomeWelcomeTitle';
 import { isReducedMotion } from '../../utils/motion';
 import { isMobile } from '../../utils/viewport';
 
@@ -15,6 +16,8 @@ export function ThreadPane() {
   const tid = focusedThreadId.value;
   // Composing drafts share the brand-new compose layout — prompt re-docks only after Send.
   const isComposingDraft = activeThreadIsComposing.value;
+  // So does an empty Home showing the welcome, until its first message.
+  const isHomeWelcome = homeWelcomeActive.value;
   // Shared with PromptInput's height animation via composeViewActive so both agree.
   const isComposeEmpty = composeViewActive.value;
 
@@ -146,11 +149,14 @@ export function ThreadPane() {
 
   return (
     <div class={`thread-pane${isComposeEmpty ? ' compose-empty' : ''}`} data-drop-zone="attach">
-      <div class="thread-pane-body">
+      {/* Keyed with the body, so the title coming and going never remounts
+          the body, and with it the prompt the FLIP below measures. */}
+      {tid && isHomeWelcome && <HomeWelcomeTitle key="home-title" threadId={tid} />}
+      <div key="body" class="thread-pane-body">
         {/* The prompt keeps its node through the compose-to-thread swap, since
             useHideOnScroll measures that node. The keys stop the diff pairing
             the thread view's div with the prompt's div by tag. */}
-        {tid && !isComposingDraft
+        {tid && !isComposingDraft && !isHomeWelcome
           ? <div key="thread" class="thread-view-clip"><ThreadView /></div>
           : <CreateThreadView key="compose" />}
         <div key="prompt" class="prompt-area" ref={promptRef}>

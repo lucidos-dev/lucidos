@@ -29,8 +29,10 @@ vi.hoisted(() => {
 
 import { makeThreadState } from './threads-test-helpers';
 import { type ThreadState } from '../thread-events';
-import { fetchThreads } from '../../api/threads';
+import { fetchThreads, type CodingAgentChangeState } from '../../api/threads';
+import * as scrollState from '../../components/chat/scrollState';
 import { awayFromBottom, followSurvivesScroll, notAtTop, setActiveScrollElement, setFollowLiveEdge, stopFollowingBottom } from '../../components/chat/scrollState';
+import { provideScrollState } from '../../components/chat/scrollStateHandle';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { threadScrollKey } from '../savedScroll';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
@@ -54,7 +56,6 @@ vi.mock('../../api/threads', () => ({
 vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../components/chat/promptFocus')>()),
   focusPromptNow: vi.fn(),
-  composeHandlers: vi.fn(),
 }));
 
 vi.mock('../../api/client', async (importOriginal) => ({
@@ -71,6 +72,9 @@ vi.mock('../../api/client', async (importOriginal) => ({
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
+
+// The store reaches scrollState through the handle, which the shell fills.
+provideScrollState(scrollState);
 
 beforeEach(() => {
   threadMap.value = new Map();
@@ -515,7 +519,7 @@ describe('loadAllThreads', () => {
     threadsLoaded.value = false;
   });
 
-  function mockApiResponse(threads: { thread_id: string; title: string; channel: string; last_activity: string; status?: string; coding_agent_proposed?: boolean; coding_agent_requires_restart?: boolean; coding_agent_is_external_repo?: boolean }[]) {
+  function mockApiResponse(threads: { thread_id: string; title: string; channel: string; last_activity: string; status?: string; coding_agent_change_state?: CodingAgentChangeState; coding_agent_is_external_repo?: boolean }[]) {
     (fetchThreads as any).mockResolvedValue({
       saved: [],
       active_threads: [],
@@ -528,9 +532,7 @@ describe('loadAllThreads', () => {
         message_count: 1,
         section: 'archived',
         status: t.status || 'idle',
-        coding_agent_proposed: t.coding_agent_proposed || false,
-        coding_agent_requires_restart: t.coding_agent_requires_restart || false,
-        coding_agent_incomplete: false,
+        coding_agent_change_state: t.coding_agent_change_state ?? { kind: 'none' },
         coding_agent_is_external_repo: t.coding_agent_is_external_repo || false,
         active_children_count: 0,
       })),
@@ -564,9 +566,9 @@ describe('loadAllThreads', () => {
         message_count: 1, section: 'inbox', status: 'idle',
         active_children_count: 0, total_children_count: 0,
         blocking_descendant_count: 0, attention_descendant_count: 0,
-        coding_agent_proposed: false, coding_agent_requires_restart: false,
-        coding_agent_is_external_repo: false, 
-        coding_agent_has_diff: false, last_revived_at: null, state: 'active',
+        coding_agent_change_state: { kind: 'none' },
+        coding_agent_is_external_repo: false,
+        last_revived_at: null, state: 'active',
       })),
     });
     return ids;
@@ -663,7 +665,7 @@ describe('loadAllThreads', () => {
     // SSE skeleton has stale title but newer updatedAt from live events
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T17:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T17:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -684,7 +686,7 @@ describe('loadAllThreads', () => {
     // SSE delivered ThreadTitleGenerated → generatedTitleIds has this thread
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Generated Title', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Generated Title', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     generatedTitleIds.add('t1');
@@ -702,7 +704,7 @@ describe('loadAllThreads', () => {
   it('does not overwrite title with placeholder "..."', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Good Title From SSE', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Good Title From SSE', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -746,10 +748,10 @@ describe('loadAllThreads', () => {
     // SSE skeletons with timestamps from live events
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:30:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:30:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T15:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 't2', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T15:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -781,8 +783,8 @@ describe('loadAllThreads', () => {
       composing: [],
       active: [],
       archive: [
-        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 5, section: 'archived', status: 'idle', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
-        { thread_id: 't2', title: 'Thread 2', channel: 'claude_code', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 12, section: 'archived', status: 'idle', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 5, section: 'archived', status: 'idle', coding_agent_change_state: { kind: 'none' }, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 't2', title: 'Thread 2', channel: 'claude_code', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 12, section: 'archived', status: 'idle', coding_agent_change_state: { kind: 'none' }, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
       ],
     });
 
@@ -795,7 +797,7 @@ describe('loadAllThreads', () => {
   it('updates messageCount on existing threads from API', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 't1', title: '...', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-03-15T19:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
 
@@ -805,7 +807,7 @@ describe('loadAllThreads', () => {
       composing: [],
       active: [],
       archive: [
-        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 7, section: 'archived', status: 'idle', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 't1', title: 'Thread 1', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 7, section: 'archived', status: 'idle', coding_agent_change_state: { kind: 'none' }, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
       ],
     });
 
@@ -818,11 +820,11 @@ describe('loadAllThreads', () => {
     (fetchThreads as any).mockResolvedValue({
       saved: [],
       active_threads: [
-        { thread_id: 't1', title: 'Active', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'archived', active_children_count: 0, status: 'running', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, last_revived_at: null },
+        { thread_id: 't1', title: 'Active', channel: 'chat', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'archived', active_children_count: 0, status: 'running', coding_agent_change_state: { kind: 'none' }, coding_agent_is_external_repo: false, last_revived_at: null },
       ],
       active: ['t1'],
       archive: [
-        { thread_id: 't2', title: 'Idle', channel: 'chat', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 3, section: 'archived', active_children_count: 0, status: 'idle', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, last_revived_at: null },
+        { thread_id: 't2', title: 'Idle', channel: 'chat', last_activity: '2026-03-15T17:00:00Z', created_at: '2026-03-15T17:00:00Z', message_count: 3, section: 'archived', active_children_count: 0, status: 'idle', coding_agent_change_state: { kind: 'none' }, coding_agent_is_external_repo: false, last_revived_at: null },
       ],
       composing: [],
     });
@@ -850,7 +852,7 @@ describe('loadAllThreads', () => {
     (fetchThreads as any).mockResolvedValue({
       saved: [],
       active_threads: [
-        { thread_id: 't1', title: 'Trigger Run', channel: 'trigger', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'archived', status: 'running', coding_agent_proposed: false, coding_agent_requires_restart: false, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
+        { thread_id: 't1', title: 'Trigger Run', channel: 'trigger', last_activity: '2026-03-15T18:00:00Z', created_at: '2026-03-15T18:00:00Z', message_count: 1, section: 'archived', status: 'running', coding_agent_change_state: { kind: 'none' }, coding_agent_is_external_repo: false, last_revived_at: null, active_children_count: 0 },
       ],
       active: ['t1'],
       archive: [],
@@ -906,9 +908,7 @@ describe('loadAllThreads — compose preservation', () => {
         message_count: 0,
         section: 'archived',
         status: 'idle',
-        coding_agent_proposed: false,
-        coding_agent_requires_restart: false,
-        coding_agent_incomplete: false,
+        coding_agent_change_state: { kind: 'none' },
         coding_agent_is_external_repo: false,
         last_revived_at: null,
         active_children_count: 0,
@@ -1079,9 +1079,7 @@ describe('loadAllThreads — compose preservation', () => {
           message_count: 0,
           section: 'archived',
           status: 'idle',
-          coding_agent_proposed: false,
-          coding_agent_requires_restart: false,
-          coding_agent_incomplete: false,
+          coding_agent_change_state: { kind: 'none' },
           coding_agent_is_external_repo: false,
           last_revived_at: null,
           active_children_count: 0,
@@ -1170,9 +1168,7 @@ describe('loadAllThreads — compose preservation', () => {
           message_count: 0,
           section: 'archived',
           status: 'idle',
-          coding_agent_proposed: false,
-          coding_agent_requires_restart: false,
-          coding_agent_incomplete: false,
+          coding_agent_change_state: { kind: 'none' },
           coding_agent_is_external_repo: false,
           last_revived_at: null,
           active_children_count: 0,

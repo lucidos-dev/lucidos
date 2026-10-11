@@ -10,7 +10,7 @@ use std::time::Duration;
 pub const MOCK_MODEL: &str = "mock";
 
 // ~100 words — long enough for streaming/cancel tests to have content to work with.
-pub(crate) const MOCK_RESPONSE: &str = "\
+pub const MOCK_RESPONSE: &str = "\
 The quick brown fox jumps over the lazy dog. A pangram is a sentence that \
 contains every letter of the alphabet at least once. The five boxing wizards \
 jump quickly across the moonlit field. Pack my box with five dozen liquor jugs. \
@@ -55,6 +55,50 @@ pub const MOCK_READ_FILES_SENTINEL: &str = "MOCK_READ_FILES:";
 /// it, such as where `write_file` lands a path. The sentinels above stay
 /// because each also shapes the turn around its call.
 pub const MOCK_TOOL_CALL_SENTINEL: &str = "MOCK_TOOL_CALL:";
+
+/// On the request line, the reply carries its own read decision beside the
+/// text: `request_read` with `read: true`, once. The turn then ends on that
+/// text without another round.
+pub const MOCK_READ_BESIDE_REPLY_SENTINEL: &str = "MOCK_READ_BESIDE_REPLY";
+
+/// A message carrying this makes a forced `request_read` answer `read: true`.
+/// Without it the forced decision is `read: false`, as for most replies.
+pub const MOCK_READ_YES_SENTINEL: &str = "MOCK_READ_YES";
+
+/// Sentinel that makes a turn's model call wait, then fail:
+/// `MOCK_FAIL_AFTER_MS: <milliseconds>` on the request line.
+///
+/// The wait is the window a test types a follow-up into the live turn. Only
+/// a call offering tools fails, so the title and classification calls that
+/// quote the message still answer.
+pub const MOCK_FAIL_AFTER_MS_SENTINEL: &str = "MOCK_FAIL_AFTER_MS:";
+
+/// The error a scripted failure returns, so a test can find its terminator.
+pub const MOCK_SCRIPTED_FAILURE: &str = "mock provider: scripted failure";
+
+/// How long this turn's call waits before its scripted failure. The request
+/// line only, like every other sentinel.
+pub fn scripted_failure_delay(messages: &[Message]) -> Option<u64> {
+    sentinel_line(messages, MOCK_FAIL_AFTER_MS_SENTINEL)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The arguments the mock answers a forced call to `tool` with.
+fn forced_arguments(tool: &str, messages: &[Message]) -> serde_json::Value {
+    if tool != crate::llm::tool_names::REQUEST_READ {
+        return serde_json::json!({});
+    }
+    let read = messages.iter().any(|m| match &m.content {
+        MessageContent::Text(text) => text.contains(MOCK_READ_YES_SENTINEL),
+        MessageContent::Blocks(blocks) => blocks.iter().any(
+            |b| matches!(b, ContentBlock::Text { text, .. } if text.contains(MOCK_READ_YES_SENTINEL)),
+        ),
+    });
+    serde_json::json!({ crate::llm::tools::READ_ARG: read })
+}
 
 /// Sentinel that makes the mock end its reply on a question typed as prose:
 /// `MOCK_ASK_IN_PROSE: <question>`, to the end of the line. The engine then
@@ -205,6 +249,22 @@ fn sentinel_line(messages: &[Message], sentinel: &str) -> Option<String> {
     sentinel_line_in(messages.last()?, sentinel)
 }
 
+/// Whether this turn's request line carries `sentinel`, for a sentinel that
+/// takes no arguments.
+fn request_line_has(messages: &[Message], sentinel: &str) -> bool {
+    let has = |text: &str| {
+        text.rsplit(REQUEST_LINE_MARKER)
+            .next()
+            .is_some_and(|request| request.contains(sentinel))
+    };
+    messages.last().is_some_and(|m| match &m.content {
+        MessageContent::Text(text) => has(text),
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if has(text))),
+    })
+}
+
 fn sentinel_line_in(message: &Message, sentinel: &str) -> Option<String> {
     let from_text = |text: &str| {
         let request = text.rsplit(REQUEST_LINE_MARKER).next()?;
@@ -248,7 +308,7 @@ impl LlmProvider for MockProvider {
         &self,
         messages: Vec<Message>,
         tools: Vec<ToolDefinition>,
-        _selection: ModelSelection<'_>,
+        selection: ModelSelection<'_>,
         _system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
         _call: crate::llm::metered::CallToken,
@@ -256,10 +316,29 @@ impl LlmProvider for MockProvider {
         // Small initial delay to simulate network round-trip
         tokio::time::sleep(Duration::from_millis(50)).await;
 
+        // A forced call answers with its one tool, as a real provider must.
+        if let Some(tool) = selection.forced_tool {
+            return Ok(LlmResponse {
+                tool_calls: vec![ToolCall {
+                    id: format!("toolu_mock_forced_{tool}"),
+                    name: tool.to_string(),
+                    arguments: forced_arguments(tool, &messages),
+                    thought_signature: None,
+                }],
+                stop_reason: Some("tool_use".to_string()),
+                ..LlmResponse::default()
+            });
+        }
+
         // A real model can only call a tool the request offers. Callers that
         // offer none (the compactor, the title writer) quote thread messages,
         // sentinels included, and must still get text back.
         let offers = |name: &str| tools.iter().any(|t| t.name == name);
+
+        if let Some(wait_ms) = scripted_failure_delay(&messages).filter(|_| !tools.is_empty()) {
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            return Err(MOCK_SCRIPTED_FAILURE.into());
+        }
 
         if let Some(event_type) =
             scripted_await_event(&messages).filter(|_| offers(crate::llm::tool_names::AWAIT_EVENT))
@@ -284,11 +363,12 @@ impl LlmProvider for MockProvider {
                 input_tokens: None,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                served_model: None,
                 thinking_chars: None,
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
                 model_only_text: None,
-                content_is_progress_notes: false,
+                progress_notes: Vec::new(),
             });
         }
 
@@ -308,11 +388,12 @@ impl LlmProvider for MockProvider {
                 input_tokens: None,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                served_model: None,
                 thinking_chars: None,
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
                 model_only_text: None,
-                content_is_progress_notes: false,
+                progress_notes: Vec::new(),
             });
         }
 
@@ -336,11 +417,12 @@ impl LlmProvider for MockProvider {
                 input_tokens: None,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                served_model: None,
                 thinking_chars: None,
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
                 model_only_text: None,
-                content_is_progress_notes: false,
+                progress_notes: Vec::new(),
             });
         }
 
@@ -360,13 +442,18 @@ impl LlmProvider for MockProvider {
                 input_tokens: None,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
+                served_model: None,
                 thinking_chars: None,
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
                 model_only_text: None,
-                content_is_progress_notes: false,
+                progress_notes: Vec::new(),
             });
         }
+
+        let beside_reply = request_line_has(&messages, MOCK_READ_BESIDE_REPLY_SENTINEL)
+            && offers(crate::llm::tool_names::REQUEST_READ)
+            && !already_called(&messages, crate::llm::tool_names::REQUEST_READ);
 
         // Once the array carries an `await_event` call, the turn says its piece
         // and ends: this is the "subscribe, then finish" shape the real tool
@@ -389,6 +476,20 @@ impl LlmProvider for MockProvider {
             }
         }
 
+        if beside_reply {
+            return Ok(LlmResponse {
+                content: Some(body),
+                tool_calls: vec![ToolCall {
+                    id: "toolu_mock_request_read".to_string(),
+                    name: crate::llm::tool_names::REQUEST_READ.to_string(),
+                    arguments: serde_json::json!({ crate::llm::tools::READ_ARG: true }),
+                    thought_signature: None,
+                }],
+                stop_reason: Some("tool_use".to_string()),
+                ..LlmResponse::default()
+            });
+        }
+
         Ok(LlmResponse {
             content: Some(body),
             tool_calls: vec![],
@@ -397,11 +498,12 @@ impl LlmProvider for MockProvider {
             input_tokens: None,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            served_model: None,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: None,
-            content_is_progress_notes: false,
+            progress_notes: Vec::new(),
         })
     }
 
@@ -413,6 +515,56 @@ impl LlmProvider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The beside-reply sentinel takes no arguments, so it may end its line.
+    #[test]
+    fn the_beside_reply_sentinel_counts_at_the_end_of_the_request_line() {
+        let msgs = assembled("", "marker MOCK_READ_BESIDE_REPLY");
+        assert!(request_line_has(&msgs, MOCK_READ_BESIDE_REPLY_SENTINEL));
+        let quoted = assembled("earlier: MOCK_READ_BESIDE_REPLY", "hello");
+        assert!(!request_line_has(&quoted, MOCK_READ_BESIDE_REPLY_SENTINEL));
+    }
+
+    /// A forced call answers with its one tool: `read: false` by default, and
+    /// `read: true` when the turn carries the sentinel.
+    #[tokio::test]
+    async fn a_forced_call_answers_with_its_tool() {
+        let provider = MockProvider::new(MOCK_MODEL.to_string());
+        let decide = |text: &str| {
+            let messages = vec![Message {
+                role: "user".into(),
+                content: MessageContent::Text(text.into()),
+            }];
+            let provider = &provider;
+            async move {
+                provider
+                    .chat(
+                        messages,
+                        vec![crate::llm::tools::request_read_tool()],
+                        ModelSelection::default()
+                            .with_forced_tool(Some(crate::llm::tool_names::REQUEST_READ)),
+                        None,
+                        None,
+                        crate::llm::metered::CallToken::for_test(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let no = decide("thanks").await;
+        assert_eq!(no.tool_calls.len(), 1);
+        assert_eq!(no.tool_calls[0].name, "request_read");
+        assert_eq!(
+            no.tool_calls[0].arguments[crate::llm::tools::READ_ARG],
+            false
+        );
+        assert!(no.content.is_none());
+        let yes = decide(&format!("write the report {MOCK_READ_YES_SENTINEL}")).await;
+        assert_eq!(
+            yes.tool_calls[0].arguments[crate::llm::tools::READ_ARG],
+            true
+        );
+    }
 
     #[tokio::test]
     async fn mock_returns_fixed_response() {
@@ -669,6 +821,51 @@ mod tests {
             }]),
         });
         assert_eq!(scripted_tool_call(&msgs), None, "never twice");
+    }
+
+    #[test]
+    fn a_scripted_failure_reads_its_wait_from_this_turns_request_only() {
+        assert_eq!(
+            scripted_failure_delay(&assembled("", "go MOCK_FAIL_AFTER_MS: 1500")),
+            Some(1500)
+        );
+        assert_eq!(
+            scripted_failure_delay(&assembled("earlier: MOCK_FAIL_AFTER_MS: 1500", "hello")),
+            None,
+            "a quoted sentinel fails nothing"
+        );
+        assert_eq!(
+            scripted_failure_delay(&assembled("", "MOCK_FAIL_AFTER_MS: soon")),
+            None
+        );
+    }
+
+    /// A call offering no tools quotes the message, sentinel included, and
+    /// must still answer. Only the turn's own call fails.
+    #[tokio::test]
+    async fn a_scripted_failure_fails_only_a_call_offering_tools() {
+        let provider = MockProvider::new(MOCK_MODEL.to_string());
+        let call = |tools: Vec<ToolDefinition>| {
+            let provider = &provider;
+            async move {
+                provider
+                    .chat(
+                        assembled("", "MOCK_FAIL_AFTER_MS: 1"),
+                        tools,
+                        ModelSelection::default(),
+                        None,
+                        None,
+                        crate::llm::metered::CallToken::for_test(),
+                    )
+                    .await
+            }
+        };
+        let err = call(offered(&[crate::llm::tool_names::READ_FILE]))
+            .await
+            .expect_err("the turn's call fails");
+        assert_eq!(err.to_string(), MOCK_SCRIPTED_FAILURE);
+        let answered = call(vec![]).await.expect("a tool-less call answers");
+        assert_eq!(answered.content.as_deref(), Some(MOCK_RESPONSE));
     }
 
     #[test]

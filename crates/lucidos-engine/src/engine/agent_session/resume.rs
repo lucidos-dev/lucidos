@@ -155,13 +155,13 @@ pub(crate) async fn lookup_latest_worktree_path(
 ///
 /// Each half is read from the surface that owns it.
 ///
-/// `has_changes` comes from `thread_summaries.coding_agent_has_diff`, the exact
-/// column the `CodingAgentIdled` projection writes, so preserving it makes the
+/// `has_changes` comes from the change state holding work, which the
+/// `CodingAgentIdled` projection writes, so preserving it makes the
 /// emit a no-op instead of a downgrade. It is also the only source that is
 /// right on a **first** turn, because the worktree's post-commit hook
 /// (`coding_agent_diff_refresh`) has already corrected it mid-turn from the
 /// branch the worktree is really on, and there is no previous idle event to
-/// read. An apply or discard resets the column, so a stale `true` cannot
+/// read. An apply or discard resets the state, so a stale `true` cannot
 /// outlive the change it described.
 ///
 /// `requires_restart` is NOT projected (the `CodingAgentIdled` arm leaves that
@@ -172,14 +172,15 @@ pub(crate) async fn lookup_prior_change_flags(
     thread_id: uuid::Uuid,
 ) -> (bool, bool) {
     let has_changes = sqlx::query_scalar::<_, bool>(
-        "SELECT coding_agent_has_diff FROM thread_summaries WHERE thread_id = $1",
+        "SELECT coding_agent_change_state <> $2 FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
+    .bind(crate::engine::thread_lifecycle::ChangeStateKind::None)
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
         log!(
-            "[AgentSession] Failed to read prior coding_agent_has_diff for {}: {}",
+            "[AgentSession] Failed to read the prior branch work for {}: {}",
             thread_id,
             e
         );

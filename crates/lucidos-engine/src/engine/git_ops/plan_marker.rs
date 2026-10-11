@@ -109,25 +109,13 @@ impl PlanMarkerKind {
     }
 }
 
-/// `Present` carries which kind of marker exists (for diagnostics / wire);
-/// `Missing` means no row for this `(repo, branch)` — the only state that
-/// blocks the gate.
+/// `Present` carries which kind of marker exists; `Missing` means no row for
+/// this `(repo, branch)`. `change_ops::PlanFloor` decides what each one means
+/// for a change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlanMarkerState {
     Present(PlanMarkerKind),
     Missing,
-}
-
-impl PlanMarkerState {
-    pub(crate) fn is_present(&self) -> bool {
-        matches!(self, PlanMarkerState::Present(_))
-    }
-
-    /// Whether this state satisfies the gate (a present marker whose kind
-    /// satisfies it). `Proposed` and `Missing` both block.
-    pub(crate) fn satisfies_gate(&self) -> bool {
-        matches!(self, PlanMarkerState::Present(k) if k.satisfies_gate())
-    }
 }
 
 pub(crate) async fn plan_marker_state(
@@ -272,6 +260,25 @@ pub(crate) async fn record_planned(
     Ok(())
 }
 
+/// Whether `path` (repo-relative) is a plan file: what the `implementation-plan`
+/// skill writes, and what the `cc-plan-gate` hook never blocks.
+pub(crate) fn is_plan_file(path: &str) -> bool {
+    path.starts_with("docs/plans/")
+}
+
+/// Whether every file a branch would land is a plan file. An empty list is no
+/// evidence of a plan-only branch.
+pub(crate) fn lands_plan_files_only(landing: &[String]) -> bool {
+    !landing.is_empty() && landing.iter().all(|f| is_plan_file(f))
+}
+
+/// Whether Lucidos-source work must run `/harden` before it may become a
+/// change or merge. A plan has no tests, so hardening runs on the branch that
+/// implements it.
+pub(crate) fn needs_hardening(hardened: bool, landing: &[String]) -> bool {
+    !hardened && !lands_plan_files_only(landing)
+}
+
 /// Which of `changed` fall outside the `bound` a `BoundedSecurityFix` named.
 /// An empty result means the branch kept its promise.
 ///
@@ -286,7 +293,7 @@ pub(crate) async fn record_planned(
 pub(crate) fn bounded_fix_violations(bound: &[String], changed: &[String]) -> Vec<String> {
     changed
         .iter()
-        .filter(|f| !f.starts_with("docs/plans/"))
+        .filter(|f| !is_plan_file(f))
         .filter(|f| !bound.iter().any(|b| b == *f))
         .cloned()
         .collect()
@@ -390,35 +397,46 @@ pub(crate) async fn plan_marker_files(
 /// Approve a `Proposed` plan: flip its state to `Planned` so the gate passes.
 /// Targeted update — only a `proposed` row is flipped, so it never fabricates a
 /// marker on an unplanned branch and never clobbers an `acknowledged_simple`
-/// ack. `plan_path` and `reason` are preserved. Returns whether a row was
-/// flipped (`false` = no proposed row: missing, already planned, or simple).
-/// Called by the `/api/v1/internal/approve-plan` endpoint that the
-/// `lucidos planned approve` CLI POSTs to.
+/// ack. `plan_path` and `reason` are preserved. `None` means no proposed row:
+/// missing, already planned, or simple. Called by the
+/// `/api/v1/internal/approve-plan` endpoint that `lucidos planned approve`
+/// POSTs to.
 pub(crate) async fn approve_plan(
     pool: &sqlx::PgPool,
     repo_root: &Path,
     branch_name: &str,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
+) -> Result<Option<ApprovedPlan>, sqlx::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
         "UPDATE planned_branches SET state = 'planned', planned_at = NOW() \
-         WHERE repo_root = $1 AND branch_name = $2 AND state = 'proposed'",
+         WHERE repo_root = $1 AND branch_name = $2 AND state = 'proposed' \
+         RETURNING plan_path",
     )
     .bind(canonical_repo_root(repo_root))
     .bind(branch_name)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(result.rows_affected() > 0)
+    Ok(row.map(|(plan_path,)| ApprovedPlan { plan_path }))
 }
 
-/// Delete the plan record. Call after successful merge, alongside
-/// `consume_harden_marker`.
+/// A plan [`approve_plan`] flipped, with the file the CLI marks approved.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ApprovedPlan {
+    pub plan_path: Option<String>,
+}
+
+/// Delete the plan record once its change applied, alongside
+/// `consume_harden_marker`. A `proposed` marker stays: a plan-only Apply landed
+/// the plan before approval, and `approve_plan` still has to find it.
 pub(crate) async fn consume_plan_marker(pool: &sqlx::PgPool, repo_root: &Path, branch_name: &str) {
-    if let Err(e) =
-        sqlx::query("DELETE FROM planned_branches WHERE repo_root = $1 AND branch_name = $2")
-            .bind(canonical_repo_root(repo_root))
-            .bind(branch_name)
-            .execute(pool)
-            .await
+    if let Err(e) = sqlx::query(
+        "DELETE FROM planned_branches WHERE repo_root = $1 AND branch_name = $2 \
+         AND state <> $3",
+    )
+    .bind(canonical_repo_root(repo_root))
+    .bind(branch_name)
+    .bind(PlanMarkerKind::Proposed.as_db())
+    .execute(pool)
+    .await
     {
         log!(
             "[Plan] Failed to delete planned_branches row for {}: {}",

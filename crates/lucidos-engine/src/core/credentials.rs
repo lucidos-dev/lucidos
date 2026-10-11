@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use uuid::Uuid;
 
@@ -311,6 +312,7 @@ impl CredentialStore {
                 auth_value = EXCLUDED.auth_value,
                 auth_header = EXCLUDED.auth_header,
                 env_var_name = EXCLUDED.env_var_name,
+                scope_declared = true,
                 updated_at = NOW()
             RETURNING id, (xmax = 0) AS created
             "#
@@ -591,7 +593,8 @@ impl CredentialStore {
         let base_urls = base_urls.map(scope_members);
 
         // `COALESCE($2::text[], base_urls)` is what makes `None` mean "keep":
-        // a NULL bind leaves the column as it stands. `auth_value` gets two
+        // a NULL bind leaves the column as it stands. Only a named scope,
+        // empty or not, declares it. `auth_value` gets two
         // static queries instead, because a NULL there is the value the user
         // just typed. `env_var_name` is always set (NULL clears it back to the
         // `CRED_` default).
@@ -600,7 +603,8 @@ impl CredentialStore {
                 sqlx::query_scalar::<_, String>(
                     r#"
                     UPDATE credentials
-                    SET base_urls = COALESCE($2::text[], base_urls), auth_type = $3, auth_header = $4, auth_value = $5, env_var_name = $6, updated_at = NOW()
+                    SET base_urls = COALESCE($2::text[], base_urls), auth_type = $3, auth_header = $4, auth_value = $5, env_var_name = $6,
+                        scope_declared = scope_declared OR $2::text[] IS NOT NULL, updated_at = NOW()
                     WHERE id = $1
                     RETURNING service_name
                     "#,
@@ -618,7 +622,8 @@ impl CredentialStore {
                 sqlx::query_scalar::<_, String>(
                     r#"
                     UPDATE credentials
-                    SET base_urls = COALESCE($2::text[], base_urls), auth_type = $3, auth_header = $4, env_var_name = $5, updated_at = NOW()
+                    SET base_urls = COALESCE($2::text[], base_urls), auth_type = $3, auth_header = $4, env_var_name = $5,
+                        scope_declared = scope_declared OR $2::text[] IS NOT NULL, updated_at = NOW()
                     WHERE id = $1
                     RETURNING service_name
                     "#,
@@ -698,7 +703,7 @@ impl CredentialStore {
     ) -> Result<Option<String>, sqlx::Error> {
         let base_urls = scope_members(base_urls);
         let updated = sqlx::query_scalar::<_, String>(
-            "UPDATE credentials SET base_urls = $2, updated_at = NOW() \
+            "UPDATE credentials SET base_urls = $2, scope_declared = true, updated_at = NOW() \
              WHERE id = $1 RETURNING service_name",
         )
         .bind(id)
@@ -719,66 +724,82 @@ impl CredentialStore {
         Ok(updated)
     }
 
-    /// Give a credential that carries no scope the one its `apis.json` entry
-    /// uses, and announce it. Returns whether the row changed.
+    /// The startup pass behind ADR 0144 decision 4. A credential stored before
+    /// the proxy checked scopes gets the one scope its `apis.json` entries
+    /// agree on, announced. Returns each `(service_name, base_url)` it scoped.
     ///
-    /// Once per credential, at startup, so the proxy's scope check has
-    /// something to enforce for a row that predates it (ADR 0144). The
-    /// `WHERE` clause is what makes it once: a row that already has a scope is
-    /// never rewritten, so this cannot walk a user's own correction back. It
-    /// also never APPENDS to a scope set: an entry naming an already-scoped
-    /// credential says nothing about whether the user wants both hosts, and
-    /// `apis.json` is writable over the API.
+    /// **Once, for the whole table.** Only a row whose `scope_declared` is
+    /// false is a candidate, and the pass ends by declaring every row. Every
+    /// write path declares too, an empty set included. So an empty scope a
+    /// user chose is never filled in from `apis.json`, which an app can write
+    /// (ADR 0156).
     ///
-    /// A `secret` is skipped, because for that type an empty scope is the
-    /// answer rather than a gap. That value is only ever signed with, so
-    /// inferring a host for it grants the reach ADR 0144 exists to refuse.
-    /// Scoping one is a user's explicit act, through Settings or
-    /// `lucidos credentials set-base-urls`.
-    pub async fn infer_scope_if_empty(
+    /// It never appends to a scope set, and two entries naming different
+    /// hosts are no answer. Only a type sent as a header is inferred: a
+    /// `secret` is signed with, an `oauth_client` blob is read by the OAuth
+    /// flow alone, and neither needs a host. Scoping any of them is the user's
+    /// act, through Settings or `lucidos credentials set-base-urls`.
+    pub async fn infer_undeclared_scopes(
         pool: &PgPool,
         event_bus: &EventBus,
-        service_name: &str,
-        base_url: &str,
-    ) -> Result<bool, sqlx::Error> {
-        // Through the same speller as every other write, so the documented
-        // "one speller" holds. A malformed `apis.json` value is declined here
-        // rather than stored as a scope the gate can only ever refuse.
-        let inferred = match normalized_base_urls(vec![base_url.to_string()]) {
-            Ok(urls) => urls,
-            Err(reason) => {
-                log!("[Credentials] not scoping '{service_name}': {reason}");
-                return Ok(false);
-            }
-        };
-        let [base_url] = inferred.as_slice() else {
-            return Ok(false);
-        };
-        let updated: Option<String> = sqlx::query_scalar(
-            "UPDATE credentials SET base_urls = ARRAY[$1], updated_at = NOW() \
-             WHERE service_name = $2 AND cardinality(base_urls) = 0 \
-             AND auth_type <> $3 \
-             RETURNING service_name",
-        )
-        .bind(base_url)
-        .bind(service_name)
-        .bind(AuthType::Secret.to_string())
-        .fetch_optional(pool)
-        .await?;
-        if updated.is_none() {
-            return Ok(false);
-        }
-        event_bus
-            .emit_or_log(
-                BusEvent::System(SystemEvent::CredentialScopeInferred {
-                    service_name: service_name.to_string(),
-                    base_url: base_url.to_string(),
-                    actor: None,
-                }),
-                "[Credentials] CredentialScopeInferred",
+        configured: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let inferable: Vec<String> = [
+            AuthType::ApiKey,
+            AuthType::Bearer,
+            AuthType::Basic,
+            AuthType::Password,
+        ]
+        .iter()
+        .map(AuthType::to_string)
+        .collect();
+        let mut scoped = Vec::new();
+        for (service_name, scopes) in configured {
+            // Through the same speller as every other write. A malformed
+            // value is declined rather than stored as a scope the gate refuses.
+            let base_url = match normalized_base_urls(scopes.iter().cloned().collect()) {
+                Ok(urls) => match urls.as_slice() {
+                    [one] => one.clone(),
+                    _ => continue,
+                },
+                Err(reason) => {
+                    log!("[Credentials] not scoping '{service_name}': {reason}");
+                    continue;
+                }
+            };
+            let updated: Option<String> = sqlx::query_scalar(
+                "UPDATE credentials SET base_urls = ARRAY[$1], scope_declared = true, \
+                 updated_at = NOW() \
+                 WHERE service_name = $2 AND NOT scope_declared \
+                 AND cardinality(base_urls) = 0 AND auth_type = ANY($3) \
+                 RETURNING service_name",
             )
-            .await;
-        Ok(true)
+            .bind(&base_url)
+            .bind(service_name)
+            .bind(&inferable)
+            .fetch_optional(pool)
+            .await?;
+            if updated.is_none() {
+                continue;
+            }
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::CredentialScopeInferred {
+                        service_name: service_name.clone(),
+                        base_url: base_url.clone(),
+                        actor: None,
+                    }),
+                    "[Credentials] CredentialScopeInferred",
+                )
+                .await;
+            scoped.push((service_name.clone(), base_url));
+        }
+        // What makes the pass once. Declaring a row changes nothing a reader
+        // sees, so it announces nothing beyond the inferences above.
+        sqlx::query("UPDATE credentials SET scope_declared = true WHERE NOT scope_declared")
+            .execute(pool)
+            .await?;
+        Ok(scoped)
     }
 
     /// Find a credential whose scope covers the given URL.

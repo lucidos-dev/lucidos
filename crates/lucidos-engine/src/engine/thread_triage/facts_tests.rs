@@ -56,6 +56,7 @@ async fn ask(bus: &EventBus, id: Uuid) {
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta::NONE,
     })
@@ -205,6 +206,80 @@ async fn an_empty_composing_thread_is_not_a_root() {
     let ids: Vec<Uuid> = rows.iter().map(|r| r.facts.thread_id).collect();
     assert!(!ids.contains(&empty));
     assert!(find(&rows, drafted).facts.has_draft);
+
+    teardown_test_db(&db).await;
+}
+
+/// Archive all counts inbox threads the way the drawer's badge does. An
+/// archived sub-thread is not one. An inbox thread below it is its own root,
+/// so it is counted there and not again under the root above.
+#[tokio::test]
+async fn a_root_counts_its_inbox_sub_threads_once() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let root = spawn(&bus, None).await;
+    let open = spawn(&bus, Some(root)).await;
+    let pinned = spawn(&bus, Some(root)).await;
+    let archived = spawn(&bus, Some(root)).await;
+    let below_archived = spawn(&bus, Some(archived)).await;
+    for id in [root, open, below_archived] {
+        settle(&pool, id, "archive_state = 'inbox'").await;
+    }
+    settle(&pool, pinned, "is_saved = TRUE").await;
+    settle(&pool, archived, "archive_state = 'archived'").await;
+
+    let rows = load(&pool, TriageScope::Inbox { except: None })
+        .await
+        .unwrap();
+    let root_row = find(&rows, root);
+    assert_eq!(
+        root_row.inbox_sub_threads, 2,
+        "the open and the pinned child"
+    );
+    assert_eq!(root_row.pinned_sub_threads, 1);
+    assert_eq!(find(&rows, below_archived).inbox_sub_threads, 0);
+
+    teardown_test_db(&db).await;
+}
+
+/// The drawer's family root is the topmost ancestor, through archived ones. A
+/// triage root under a pinned family is pinned, so nothing archives a thread
+/// the drawer shows under Pinned.
+#[tokio::test]
+async fn a_root_knows_its_drawer_family_and_whether_it_is_pinned() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let pinned_top = spawn(&bus, None).await;
+    let archived_child = spawn(&bus, Some(pinned_top)).await;
+    let under_pinned = spawn(&bus, Some(archived_child)).await;
+    let archived_top = spawn(&bus, None).await;
+    let pinned_child = spawn(&bus, Some(archived_top)).await;
+    let plain_child = spawn(&bus, Some(archived_top)).await;
+    settle(&pool, pinned_top, "is_saved = TRUE").await;
+    for id in [archived_child, archived_top] {
+        settle(&pool, id, "archive_state = 'archived'").await;
+    }
+    settle(&pool, pinned_child, "is_saved = TRUE").await;
+    for id in [under_pinned, plain_child] {
+        settle(&pool, id, "archive_state = 'inbox'").await;
+    }
+
+    let rows = load(&pool, TriageScope::Inbox { except: None })
+        .await
+        .unwrap();
+    let row = find(&rows, under_pinned);
+    assert_eq!(row.family_root, pinned_top);
+    assert!(row.family_pinned);
+    assert!(row.facts.is_pinned, "a pinned family pins its members");
+
+    let pinned = find(&rows, pinned_child);
+    assert_eq!(pinned.family_root, archived_top);
+    assert!(!pinned.family_pinned);
+    assert!(pinned.facts.is_pinned);
+    let plain = find(&rows, plain_child);
+    assert_eq!(plain.family_root, archived_top);
+    assert!(!plain.facts.is_pinned);
+    assert_eq!(find(&rows, pinned_top).family_root, pinned_top);
 
     teardown_test_db(&db).await;
 }

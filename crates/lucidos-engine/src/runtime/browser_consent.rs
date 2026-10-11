@@ -5,106 +5,24 @@ use chromiumoxide::cdp::browser_protocol::page::{FrameTree, GetFrameTreeParams};
 use chromiumoxide::Page;
 use std::time::Duration;
 
+/// `hasConsentContext`, the gate every consent click pass checks before it
+/// clicks. The browser runs under the user's logged-in profile.
+const CONSENT_CONTEXT_JS: &str = include_str!("browser_consent_context.js");
+
+/// Clicks an accept button in the main frame.
+const CONSENT_CLICK_JS: &str = include_str!("browser_consent_click.js");
+
+/// Wraps a script `body` in an IIFE with `hasConsentContext` in scope.
+fn consent_script(body: &str) -> String {
+    format!("(function() {{\n{CONSENT_CONTEXT_JS}\n{body}\n}})()")
+}
+
 /// Auto-dismiss cookie consent dialogs.
 /// Tries multiple strategies including CMP APIs and button clicking.
 pub(super) async fn dismiss_cookie_consent(page: &Page) {
     log!("[BrowserConsent] Starting cookie consent dismissal...");
 
-    // JavaScript to find and click cookie consent buttons
-    let consent_js = r#"
-        (function() {
-            // Only exact matches for accept-all type buttons
-            const exactAcceptTexts = [
-                // English - specific "accept all" variants
-                'accept all', 'accept all cookies', 'allow all', 'allow all cookies',
-                'allow essential and optional cookies', 'i agree', 'agree to all',
-                // Norwegian
-                'godta alle', 'godta alle cookies', 'aksepter alle', 'tillat alle',
-                'jeg godtar', 'jeg aksepterer', 'godkjenn alle', 'ja, jeg samtykker',
-                // Swedish
-                'acceptera alla', 'godkänn alla',
-                // Danish
-                'accepter alle', 'tillad alle',
-                // German
-                'alle akzeptieren', 'alle cookies akzeptieren',
-                // French
-                'tout accepter', 'accepter tout',
-                // Spanish
-                'aceptar todo', 'aceptar todas',
-                // Dutch
-                'alles accepteren',
-                // Italian
-                'accetta tutto', 'accetta tutti'
-            ];
-
-            // Reject texts - never click these (be liberal)
-            const rejectTexts = [
-                'choose', 'customize', 'settings', 'preferences', 'manage', 'options',
-                'reject', 'decline', 'deny', 'refuse', 'only essential', 'only necessary',
-                'learn more', 'more info', 'read more', 'how we use', 'about', 'details',
-                'privacy policy', 'cookie policy', 'purpose', 'partner', 'vendor',
-                'category', 'categories',
-                'velg', 'innstillinger', 'avvis', 'kun nødvendige', 'les mer', // Norwegian
-                'ablehnen', 'einstellungen', // German
-                'refuser', 'paramètres' // French
-            ];
-
-            // Find and click accept button
-            const buttons = document.querySelectorAll('button, [role="button"], a.button, input[type="button"], input[type="submit"]');
-            let fallbackButton = null;
-
-            for (const btn of buttons) {
-                const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase().trim();
-                const rect = btn.getBoundingClientRect();
-
-                // Size checks
-                if (rect.width < 50 || rect.height < 20) continue;
-
-                // Must be reasonably visible
-                if (rect.top < 0 || rect.top > 800) continue;
-
-                // Consent buttons are SHORT - reject long text
-                if (text.length > 40) continue;
-
-                // Skip if contains reject text
-                if (rejectTexts.some(t => text.includes(t))) continue;
-
-                // Match accept phrases - exact match preferred
-                const normalizedText = text.replace(/[^a-z0-9æøåäöü\s]/g, '').trim();
-                if (exactAcceptTexts.some(t => text === t || normalizedText === t)) {
-                    console.log('[Lucidos] Clicking exact match: ' + text);
-                    btn.click();
-                    return 'clicked: ' + text;
-                }
-
-                // Also allow contains match for key phrases (only if text is short enough)
-                if (text.length < 30) {
-                    const keyPhrases = ['godta alle', 'accept all', 'allow all', 'aksepter alle', 'tillat alle'];
-                    if (keyPhrases.some(p => text.includes(p) || normalizedText.includes(p))) {
-                        console.log('[Lucidos] Clicking contains match: ' + text);
-                        btn.click();
-                        return 'clicked: ' + text;
-                    }
-                }
-
-                // Track potential fallback (simple short accept words)
-                if (!fallbackButton && ['accept', 'godta', 'accepter', 'aksepter'].includes(text)) {
-                    fallbackButton = { btn, text };
-                }
-            }
-
-            // Use fallback if no better match found
-            if (fallbackButton) {
-                console.log('[Lucidos] Clicking fallback: ' + fallbackButton.text);
-                fallbackButton.btn.click();
-                return 'clicked fallback: ' + fallbackButton.text;
-            }
-
-            // Return info about what we found
-            const buttonTexts = Array.from(buttons).slice(0, 10).map(b => (b.innerText || '').substring(0, 40).replace(/\n/g, ' '));
-            return 'not found. Buttons: ' + JSON.stringify(buttonTexts);
-        })()
-        "#;
+    let consent_js = consent_script(CONSENT_CLICK_JS);
 
     // Wait for cookie dialogs to appear (they often load async)
     tokio::time::sleep(Duration::from_millis(2000)).await;
@@ -209,7 +127,7 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
 
     // Try clicking in main frame
     for attempt in 1..=3 {
-        if let Ok(result) = page.evaluate(consent_js).await {
+        if let Ok(result) = page.evaluate(consent_js.as_str()).await {
             if let Ok(msg) = result.into_value::<String>() {
                 log!(
                     "[BrowserConsent] Consent search attempt {}: {}",
@@ -234,23 +152,8 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
 
     // Fallback: Try to find button position via JavaScript and click via CDP
     // This works for cross-origin iframes because we click at screen coordinates
-    let find_button_js = r#"
-        (function() {
-            // Check if an element or its ancestors contain cookie/consent context
-            function hasConsentContext(el) {
-                const contextWords = ['cookie', 'informasjonskapsl', 'personvern', 'privacy',
-                    'consent', 'samtykke', 'gdpr', 'tracking', 'sporing'];
-                let node = el;
-                for (let i = 0; i < 6 && node && node !== document.body; i++) {
-                    const t = (node.innerText || '').toLowerCase().substring(0, 500);
-                    const id = (node.id || '').toLowerCase();
-                    const cls = (node.className || '').toLowerCase();
-                    if (contextWords.some(w => t.includes(w) || id.includes(w) || cls.includes(w))) return true;
-                    node = node.parentElement;
-                }
-                return false;
-            }
-
+    let find_button_js = consent_script(
+        r#"
             const acceptPhrases = ['godta alle', 'accept all', 'aksepter alle',
                                    'tillat alle', 'allow all'];
 
@@ -299,8 +202,8 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
             }
 
             return null;
-        })()
-        "#;
+        "#,
+    );
 
     if let Ok(result) = page.evaluate(find_button_js).await {
         if let Ok(Some(json_str)) = result.into_value::<Option<String>>() {
@@ -335,14 +238,15 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
                 const src = iframe.src || '';
                 const id = iframe.id || '';
                 const className = iframe.className || '';
+                let host = '';
+                try { host = new URL(src).hostname; } catch (e) {}
 
-                // Check if this looks like a consent iframe
+                // Clicks land blind, at offsets measured on Sourcepoint's
+                // dialog, so only a frame Sourcepoint marks as its own counts.
+                // A keyword in some other frame's URL proves nothing.
                 const isConsentIframe =
-                    src.includes('privacy') || src.includes('consent') || src.includes('sourcepoint') ||
-                    src.includes('sp_message') || src.includes('gdpr') || src.includes('cmp.') ||
-                    src.includes('/cmp') || src.includes('cookie') ||
-                    id.includes('sp_message') || id.includes('consent') ||
-                    className.includes('sp_message') || className.includes('consent');
+                    host.endsWith('privacy-mgmt.com') || host.includes('sourcepoint') ||
+                    id.includes('sp_message') || className.includes('sp_message');
 
                 if (isConsentIframe) {
                     const rect = iframe.getBoundingClientRect();
@@ -481,91 +385,32 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
     log!("[BrowserConsent] No cookie consent dialog found after all attempts");
 }
 
-/// Finds the accept button inside ONE frame, by matching the phrases below.
+/// Finds the accept button inside ONE frame, by matching phrases inside a
+/// consent dialog.
 ///
 /// Module-level so `frame_consent_button_js_reports_no_page_text` can assert
 /// the debug payload carries no page text. That payload is logged, and a
 /// consent or callback page shows one-time codes in its visible body.
-const FRAME_CONSENT_BUTTON_JS: &str = r#"
-    (function() {
-        // Key phrases to look for (must contain one of these)
-        const acceptPhrases = [
-            'godta alle', 'aksepter alle', 'tillat alle',
-            'accept all', 'allow all', 'i agree',
-            'acceptera alla', 'accepter alle',
-            'alle akzeptieren', 'tout accepter',
-            'aceptar todo', 'alles accepteren', 'accetta tutto'
-        ];
+const FRAME_CONSENT_BUTTON_JS: &str = include_str!("browser_consent_frame_probe.js");
 
-        // Reject if contains these
-        const rejectPhrases = [
-            'settings', 'preferences', 'manage', 'reject', 'decline',
-            'learn more', 'read more', 'how we use', 'privacy policy',
-            'innstillinger', 'avvis', 'les mer', 'velg'
-        ];
+/// The origin and path of `url`. The query string and fragment can carry an
+/// OAuth `code`, `access_token` or `id_token`.
+fn without_query(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
 
-        // Search all elements for accept text
-        const allElements = document.querySelectorAll('button, [role="button"], a, span, div, p');
-        let bestMatch = null;
-
-        for (const el of allElements) {
-            const text = (el.innerText || el.textContent || '').toLowerCase().trim();
-
-            // Skip if empty or too long
-            if (!text || text.length > 50) continue;
-
-            // Skip reject patterns
-            if (rejectPhrases.some(p => text.includes(p))) continue;
-
-            // Check for accept phrase
-            const hasAccept = acceptPhrases.some(p => text.includes(p));
-            if (!hasAccept) continue;
-
-            const rect = el.getBoundingClientRect();
-
-            // Must be visible
-            if (rect.width < 20 || rect.height < 10) continue;
-            if (rect.top < 0 || rect.top > 1400 || rect.left < 0) continue;
-
-            // Prefer shorter text (more specific match)
-            if (!bestMatch || text.length < bestMatch.textLen) {
-                bestMatch = {
-                    x: rect.left + rect.width / 2,
-                    y: rect.top + rect.height / 2,
-                    text: text.substring(0, 50),
-                    textLen: text.length
-                };
-            }
-        }
-
-        if (bestMatch) {
-            return JSON.stringify({
-                x: bestMatch.x + (window.screenX || 0),
-                y: bestMatch.y + (window.screenY || 0),
-                clientX: bestMatch.x,
-                clientY: bestMatch.y,
-                text: bestMatch.text
-            });
-        }
-
-        // Debug: what is in this frame. Both fields below go straight into
-        // an engine log line, which is persisted.
-        //
-        // origin + pathname, never location.href. A frame's query string
-        // and fragment can carry an OAuth `code`, `access_token` or
-        // `id_token`.
-        //
-        // The body TEXT is not reported, for the same reason. A consent,
-        // callback or 2FA page shows a one-time passcode or the account
-        // email in its visible body. The button count is the diagnostic.
-        const buttonCount = document.querySelectorAll('button').length;
-        return JSON.stringify({
-            debug: true,
-            buttonCount: buttonCount,
-            url: location.origin + location.pathname
-        });
-    })()
-"#;
+/// A frame served from a consent manager's host is searched first. Only the
+/// host counts: an embedded `/privacy-policy` page or a `cmpid=` parameter
+/// names no consent manager.
+fn is_consent_frame_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or_default();
+    ["consent", "privacy", "cmp", "cookie"]
+        .iter()
+        .any(|word| host.contains(word))
+}
 
 async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)> {
     // Get all frames
@@ -583,16 +428,8 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
     // Sort frames: consent-related iframes first, skip main frame (index 0)
     let mut frame_indices: Vec<usize> = (0..frame_ids.len()).collect();
     frame_indices.sort_by(|&a, &b| {
-        let url_a = &frame_urls[a];
-        let url_b = &frame_urls[b];
-        let is_consent_a = url_a.contains("consent")
-            || url_a.contains("privacy")
-            || url_a.contains("cmp")
-            || url_a.contains("cookie");
-        let is_consent_b = url_b.contains("consent")
-            || url_b.contains("privacy")
-            || url_b.contains("cmp")
-            || url_b.contains("cookie");
+        let is_consent_a = is_consent_frame_url(&frame_urls[a]);
+        let is_consent_b = is_consent_frame_url(&frame_urls[b]);
         // Consent frames first, then by original index (skip main frame by putting it last)
         match (is_consent_a, is_consent_b) {
             (true, false) => std::cmp::Ordering::Less,
@@ -610,17 +447,15 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
         }
     });
 
-    let find_button_js = FRAME_CONSENT_BUTTON_JS;
+    let probe_js = consent_script(FRAME_CONSENT_BUTTON_JS);
 
     // Try each frame in priority order
     for &idx in &frame_indices {
         let frame_id = &frame_ids[idx];
         let frame_url = &frame_urls[idx];
-        // Drop the query string and fragment before logging: an OAuth callback
-        // frame carries `code` / `access_token` / `id_token` there, and the
-        // 60-char cap is a length guard, not redaction (a short host leaves the
-        // token well inside it). The origin + path is all the log needs.
-        let logged_url = frame_url.split(['?', '#']).next().unwrap_or(frame_url);
+        // The 60-char cap is a length guard, not redaction: a short host leaves
+        // a token well inside it. `without_query` is the redaction.
+        let logged_url = without_query(frame_url);
         log!(
             "[BrowserConsent] Searching frame {}: {}",
             idx,
@@ -642,7 +477,7 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
                     use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 
                     let eval = EvaluateParams::builder()
-                        .expression(find_button_js.to_string())
+                        .expression(probe_js.clone())
                         .context_id(world.execution_context_id);
 
                     if let Ok(eval_params) = eval.build() {
@@ -802,5 +637,31 @@ mod tests {
             !debug_return.contains("location.href"),
             "location.href would carry an OAuth token into the log"
         );
+    }
+
+    /// A script must open with the IIFE. chromiumoxide sends a string that
+    /// starts `function ` through `callFunctionOn`, which would call the
+    /// context helper instead of running the body.
+    #[test]
+    fn consent_script_runs_the_body_with_the_context_helper_in_scope() {
+        let script = consent_script("return 1;");
+
+        assert!(script.starts_with("(function() {"));
+        assert!(script.trim_end().ends_with("})()"));
+        assert!(script.find("function hasConsentContext(el)") < script.find("return 1;"));
+    }
+
+    /// A path or a marketing parameter names no consent manager.
+    #[test]
+    fn consent_frame_url_reads_only_the_host() {
+        assert!(!is_consent_frame_url(
+            "https://signup.example.com/form?cmpid=123"
+        ));
+        assert!(!is_consent_frame_url("https://example.com/terms#cookie"));
+        assert!(!is_consent_frame_url("https://example.com/privacy-policy"));
+        assert!(!is_consent_frame_url("about:blank"));
+        assert!(is_consent_frame_url(
+            "https://cdn.privacy-mgmt.example.net/index.html?id=1"
+        ));
     }
 }

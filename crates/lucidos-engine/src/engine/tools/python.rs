@@ -1,7 +1,17 @@
 use super::super::LucidosEngine;
+use super::app_lint::app_lint_note_on_disk;
 use super::ToolOutcome;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::llm::tools::{BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS};
+
+/// The packages a `run_python` / `run_python_background` call installs before
+/// it runs. The command guard reads the same list, so it judges what pip gets.
+pub(crate) fn requested_packages(args: &serde_json::Value) -> Vec<&str> {
+    args.get("packages")
+        .and_then(|v| v.as_array())
+        .map(|list| list.iter().filter_map(|p| p.as_str()).collect())
+        .unwrap_or_default()
+}
 
 impl LucidosEngine {
     pub(crate) async fn execute_python_tool(
@@ -12,13 +22,12 @@ impl LucidosEngine {
         let code = args["code"].as_str().unwrap_or("");
         let commit_message = args.get("commit_message").and_then(|v| v.as_str());
 
-        if let Some(packages) = args.get("packages").and_then(|v| v.as_array()) {
-            let names: Vec<&str> = packages.iter().filter_map(|p| p.as_str()).collect();
-            if !names.is_empty() {
-                if let Err(e) = self.python_runtime.ensure_packages(&names).await {
-                    return Err(format!("installing packages: {}", e).into());
-                }
-            }
+        if let Err(e) = self
+            .python_runtime
+            .ensure_packages(&requested_packages(args))
+            .await
+        {
+            return Err(format!("installing packages: {}", e).into());
         }
 
         let env_vars = self.build_tool_env_vars(thread_id).await;
@@ -132,6 +141,10 @@ impl LucidosEngine {
             for path in &updated {
                 response.push_str(&format!("\n  updated: data/{}", path));
             }
+            let data_dir = self.workspace_path().join(crate::core::DATA_DIR);
+            for path in created.iter().chain(updated.iter()) {
+                response.push_str(&app_lint_note_on_disk(&data_dir, path).unwrap_or_default());
+            }
         }
 
         Ok(crate::core::redact_secret_values(&response, &secrets))
@@ -183,13 +196,12 @@ impl LucidosEngine {
             return Err(format!("Error: failed to prepare python venv: {}", e));
         }
 
-        if let Some(packages) = args.get("packages").and_then(|v| v.as_array()) {
-            let names: Vec<&str> = packages.iter().filter_map(|p| p.as_str()).collect();
-            if !names.is_empty() {
-                if let Err(e) = self.python_runtime.ensure_packages(&names).await {
-                    return Err(format!("Error: installing packages: {}", e));
-                }
-            }
+        if let Err(e) = self
+            .python_runtime
+            .ensure_packages(&requested_packages(args))
+            .await
+        {
+            return Err(format!("Error: installing packages: {}", e));
         }
 
         // Write the script to a per-run directory under `.lucidos/exhaust/`

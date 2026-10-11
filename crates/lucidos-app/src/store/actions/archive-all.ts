@@ -10,13 +10,14 @@ import {
   archiveAll,
   archiveAllPreflight,
   unarchiveThreads,
+  type ArchiveAllKept,
   type ArchiveAllPreflight,
 } from '../../api/threads';
 import { showConfirm, showToast } from '../store';
 import type { ToastAction } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { CHANGE_TO_RESOLVE, WAITING_FOR_ANSWER } from './blockerCopy';
-import { ARCHIVE_ALL_MAX_IDS } from '@lucidos/engine-constants';
+import { ARCHIVE_ALL_MAX_IDS, ARCHIVE_ALL_PINNED_SUB_THREAD, ARCHIVE_ALL_SAME_FAMILY } from '@lucidos/engine-constants';
 
 /** How long the Undo stays on screen. */
 const UNDO_MS = 10_000;
@@ -33,9 +34,10 @@ export function idBatches(ids: string[]): string[][] {
 /** A press still running, so a second press cannot start a parallel one. */
 let pressInFlight = false;
 
-/** Each kept reason as a count phrase, singular then plural. Where a reason is
- *  also a thread menu blocker, the phrase is the menu's own words (ADR 0378).
- *  `busy` is wider than running: it covers a paused turn and an event wait. */
+/** Each kept reason as a count phrase, singular then plural, in the order the
+ *  summary names them. Where a reason is also a thread menu blocker, the
+ *  phrase is the menu's own words (ADR 0378). `busy` is wider than running: it
+ *  covers a paused turn and an event wait. */
 const KEPT_PHRASES: Record<string, [string, string]> = {
   question: [WAITING_FOR_ANSWER, WAITING_FOR_ANSWER],
   pending_change: [`with ${CHANGE_TO_RESOLVE}`, `with ${CHANGE_TO_RESOLVE}`],
@@ -43,10 +45,20 @@ const KEPT_PHRASES: Record<string, [string, string]> = {
   draft: ['with an unsent draft', 'with unsent drafts'],
   failed_run: ['whose last run failed', 'whose last run failed'],
   busy: ['still working', 'still working'],
+  // A pinned sub-thread under a safe root: the archive leaves it open.
+  [ARCHIVE_ALL_PINNED_SUB_THREAD]: ['pinned', 'pinned'],
   // Only a thread that changed after the confirm is kept for these three.
   pinned: ['now pinned', 'now pinned'],
   archived: ['already archived', 'already archived'],
   gone: ['no longer there', 'no longer there'],
+  // The other inbox threads of a family kept for one of the reasons above.
+  [ARCHIVE_ALL_SAME_FAMILY]: ['more alongside them', 'more alongside them'],
+};
+
+/** Where a slug sits in the summary: `KEPT_PHRASES` order, unknown slugs last. */
+const slugRank = (slug: string) => {
+  const rank = Object.keys(KEPT_PHRASES).indexOf(slug);
+  return rank === -1 ? Object.keys(KEPT_PHRASES).length : rank;
 };
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -55,6 +67,7 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
 export function keptSummary(counts: Record<string, number>): string {
   return Object.entries(counts)
     .filter(([, n]) => n > 0)
+    .sort(([a], [b]) => slugRank(a) - slugRank(b))
     .map(([slug, n]) => {
       const [one, many] = KEPT_PHRASES[slug] ?? ['kept for another reason', 'kept for another reason'];
       return plural(n, one, many);
@@ -68,19 +81,35 @@ export function archiveAllConfirmation(
   preflight: ArchiveAllPreflight,
 ): { title: string; message: string } | null {
   if (preflight.safe.length === 0) return null;
-  const title = `Archive ${plural(preflight.safe.length, 'thread', 'threads')}?`;
-  if (preflight.kept_count === 0) {
+  const title = `Archive ${plural(preflight.safe_thread_count, 'thread', 'threads')}?`;
+  const kept = preflight.kept_thread_count;
+  if (kept === 0) {
     return { title, message: 'Everything in Current goes to Archive. You can undo right after.' };
   }
-  const needs = preflight.kept_count === 1 ? '1 needs you and stays' : `${preflight.kept_count} need you and stay`;
-  return { title, message: `${needs} in Current: ${keptSummary(preflight.kept)}. You can undo right after.` };
+  const stay = kept === 1 ? '1 stays open' : `${kept} stay open`;
+  return { title, message: `${stay}: ${keptSummary(preflight.kept)}. You can undo right after.` };
 }
 
 /** What the toast says when nothing in Current is safe to archive. */
 export function nothingToArchiveMessage(preflight: ArchiveAllPreflight): string {
-  if (preflight.kept_count === 0) return 'Nothing to archive.';
-  const needs = preflight.kept_count === 1 ? '1 thread in Current needs you' : `${preflight.kept_count} threads in Current need you`;
-  return `Nothing to archive. ${needs}: ${keptSummary(preflight.kept)}.`;
+  const kept = preflight.kept_thread_count;
+  if (kept === 0) return 'Nothing to archive.';
+  const stay = kept === 1 ? '1 thread stays open' : `${kept} threads stay open`;
+  return `Nothing to archive. ${stay}: ${keptSummary(preflight.kept)}.`;
+}
+
+/** The confirmed families that changed and stayed, counted as the confirm
+ *  counts: each family once under its slug, its other threads beside it. */
+export function changedSinceConfirm(kept: ArchiveAllKept[]): Record<string, number> {
+  const changed: Record<string, number> = {};
+  const add = (slug: string, n: number) => {
+    if (n > 0) changed[slug] = (changed[slug] ?? 0) + n;
+  };
+  for (const { slug, thread_count } of kept) {
+    add(slug, 1);
+    add(ARCHIVE_ALL_SAME_FAMILY, thread_count - 1);
+  }
+  return changed;
 }
 
 /** What the toast says once the archive answered. `changed` counts, by slug,
@@ -122,12 +151,12 @@ async function runArchiveAll(): Promise<void> {
   if (!ok) return;
 
   const batch: string[] = [];
-  const changed: Record<string, number> = {};
+  const kept: ArchiveAllKept[] = [];
   try {
     for (const ids of idBatches(preflight.safe.map((t) => t.thread_id))) {
       const result = await archiveAll(ids);
       batch.push(...result.archived);
-      for (const { slug } of result.kept) changed[slug] = (changed[slug] ?? 0) + 1;
+      kept.push(...result.kept);
     }
   } catch (e) {
     if (batch.length === 0) {
@@ -139,7 +168,7 @@ async function runArchiveAll(): Promise<void> {
     }
     return;
   }
-  showToast(archiveAllResultMessage(batch.length, changed), 'success', {
+  showToast(archiveAllResultMessage(batch.length, changedSinceConfirm(kept)), 'success', {
     autoDismissMs: UNDO_MS,
     action: batch.length > 0 ? undoAction(batch) : undefined,
   });

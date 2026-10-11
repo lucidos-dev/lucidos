@@ -6,6 +6,7 @@ import {
 import { THREAD_HASH_RE } from '../store/actions/cross-workspace';
 import { normalizeBasePath } from './basePath';
 import { STATUS_SWAP_MS } from './bootSplash';
+import { SHELL_CACHE_PREFIX } from '../hooks/sw-update';
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error — same
@@ -375,6 +376,10 @@ describe('index.html inline boot splash', () => {
     base?: string | null;
     gatewayPort?: string | null;
     workspaceId?: string | null;
+    /** The Cache API. Absent by default, as in a browser without one. */
+    caches?: { keys(): Promise<string[]>; delete(name: string): Promise<boolean> };
+    /** `navigator.onLine`. Online by default. */
+    online?: boolean;
   }
 
   function runInlineWatchdog(initialRetry: boolean | RetryMark = false, doc: DocContext = {}) {
@@ -450,8 +455,11 @@ describe('index.html inline boot splash', () => {
         return splash;
       },
     };
-    new Function('window', 'document', 'sessionStorage', 'location', 'history', 'URL', source)(
-      fakeWindow, fakeDocument, storage, location, history, URL,
+    new Function(
+      'window', 'document', 'sessionStorage', 'location', 'history', 'URL', 'caches', 'navigator', source,
+    )(
+      fakeWindow, fakeDocument, storage, location, history, URL, doc.caches,
+      { onLine: doc.online ?? true },
     );
     const fireError = (target: unknown) => {
       for (const fn of listeners.get('error') ?? []) fn({ target });
@@ -574,6 +582,109 @@ describe('index.html inline boot splash', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Every reload here follows a failed bundle, and the service worker serves
+  // bundles cache-first. A bad cached copy kept the phone on "Tap to retry"
+  // across every tap, until a new build changed the chunk's hash.
+  const SHELL_CACHE_ABC = `${SHELL_CACHE_PREFIX}abc`;
+  function fakeCaches(names: string[], opts: { hang?: boolean } = {}) {
+    const deleted: string[] = [];
+    return {
+      deleted,
+      api: {
+        keys: () => (opts.hang ? new Promise<string[]>(() => {}) : Promise.resolve(names)),
+        delete: (name: string) => { deleted.push(name); return Promise.resolve(true); },
+      },
+    };
+  }
+
+  it('drops the bundle caches, and only those, before its automatic retry', async () => {
+    vi.useFakeTimers();
+    try {
+      const cache = fakeCaches([SHELL_CACHE_ABC, 'lucidos-blob-v1']);
+      const watchdog = runInlineWatchdog(false, { caches: cache.api });
+      watchdog.fireEntryModuleError();
+      expect(watchdog.location.replace).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cache.deleted).toEqual([SHELL_CACHE_ABC]);
+      expect(watchdog.location.replace).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops the bundle caches before a tap reloads', async () => {
+    vi.useFakeTimers();
+    try {
+      const cache = fakeCaches([SHELL_CACHE_ABC]);
+      const watchdog = runInlineWatchdog(true, { caches: cache.api });
+      watchdog.fireEntryModuleError();
+      watchdog.click();
+      expect(watchdog.location.reload).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cache.deleted).toEqual([SHELL_CACHE_ABC]);
+      expect(watchdog.location.reload).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Offline, nothing could refetch the shell, and the reload would land on the
+  // browser's error page instead of the splash.
+  it('keeps the bundle caches when the browser reports offline', async () => {
+    vi.useFakeTimers();
+    try {
+      const cache = fakeCaches([SHELL_CACHE_ABC]);
+      const watchdog = runInlineWatchdog(true, { caches: cache.api, online: false });
+      watchdog.fireEntryModuleError();
+      watchdog.click();
+      expect(watchdog.location.reload).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cache.deleted).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops its automatic retry when the module takes boot over during the eviction', async () => {
+    vi.useFakeTimers();
+    try {
+      const cache = fakeCaches([SHELL_CACHE_ABC], { hang: true });
+      const watchdog = runInlineWatchdog(false, { caches: cache.api });
+      vi.advanceTimersByTime(15_000);
+      (watchdog.fakeWindow.__lucidosBootLoaded as () => void)();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(watchdog.location.replace).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still reloads, once, when the Cache API hangs', async () => {
+    vi.useFakeTimers();
+    try {
+      const cache = fakeCaches([], { hang: true });
+      const watchdog = runInlineWatchdog(true, { caches: cache.api });
+      watchdog.fireEntryModuleError();
+      watchdog.click();
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(watchdog.location.reload).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(watchdog.location.reload).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(watchdog.location.reload).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Pin test: neither the raw service worker nor this inline script can import.
+  it('names the same bundle cache prefix as the service worker', () => {
+    const sw = readFileSync(resolve(__dirname, '../../public/sw.js'), 'utf-8');
+    const swPrefix = sw.match(/const SHELL_CACHE = '([^']+)' \+ BUILD_ID/)?.[1];
+    expect(swPrefix).toBe(SHELL_CACHE_PREFIX);
+    expect(html).toContain(`var SHELL_CACHE_PREFIX = '${swPrefix}';`);
   });
 
   it('recovers the moment the entry module reports it cannot load, not 15s later', () => {

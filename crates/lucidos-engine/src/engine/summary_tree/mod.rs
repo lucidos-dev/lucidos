@@ -8,16 +8,20 @@
 //! Each in-scope thread has a tree over its own entries. The workspace has one
 //! tree whose leaves are settled thread turns and artifact writes
 //! ([`workspace_log`]). The design follows the OptChat spec: 512-byte lines, a
-//! short message is its own node, a thread's leaves build in order, and a merge
-//! starts only once both children are built. Phase decisions live in
-//! `docs/plans/2026-10-04-tree-memory-module-and-the-home-thread.md`, and the
-//! backfill's speed in `docs/plans/2026-10-06-tree-backfill-in-hours.md`.
+//! short message is its own node, a thread's leaves build a few at a time, and
+//! a merge starts only once both children are built. Each compactor call reads
+//! a *compaction view* ([`compaction_view`]). Phase decisions live in
+//! `docs/plans/2026-10-04-tree-memory-module-and-the-home-thread.md`, the
+//! backfill's speed in `docs/plans/2026-10-06-tree-backfill-in-hours.md`, and
+//! the compactor's cache and prompt in
+//! `docs/plans/2026-10-08-tree-compactor-follows-optchat-revision-3c190e06.md`.
 //!
 //! A workspace on the Tree *memory module* reads them ([`module`]): each turn
 //! preloads two *memory views* ([`view`]), and the recall tools open any line
 //! down to its event ([`recall`]). The compactor runs for exactly those
 //! workspaces ([`consumer`]).
 
+mod compaction_view;
 mod compactor;
 pub(crate) mod compactor_models;
 mod consumer;
@@ -34,7 +38,7 @@ pub(crate) mod view;
 pub(crate) mod workspace_log;
 
 pub use compactor_models::CompactorSelection;
-pub(crate) use compactor_models::{compactor_selection, COMPACTOR_DEFAULTS};
+pub(crate) use compactor_models::{compactor_selection, default_effort_for, COMPACTOR_DEFAULTS};
 pub use consumer::spawn;
 pub use estimate::{Bounds, EffortCost, ModelCost, TreeBackfillEstimate};
 pub use module::{tree_ready, BackfillProgress, TreeBackfill};
@@ -65,8 +69,9 @@ const RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 /// Longest tool call or tool result an entry carries, head and tail kept.
 const CAP_CHARS: usize = 30_000;
 
-/// Size of the context tiling a compactor call reads.
-const CONTEXT_BYTES: usize = 16_000;
+/// Most bytes of its thread's raw entries a workspace turn leaf reads as
+/// context.
+const RAW_CONTEXT_BYTES: usize = 16_000;
 
 /// Events younger than this are left for the next drain. An event's sequence
 /// is assigned at insert, so a slow transaction can commit a lower sequence

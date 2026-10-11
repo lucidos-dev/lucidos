@@ -252,12 +252,22 @@
     word-break: break-all;
 }
 
-/* Settings → System → Memory: the Tree confirm panel and the backfill bar. */
+/* Settings → System → Memory: the Tree confirm modal and the backfill bar.
+   The body scrolls, so a short phone screen still reaches Start in the foot. */
 .memory-tree-confirm {
+    width: min(32rem, calc(100vw - 2rem));
+    max-height: calc(var(--app-height, 100dvh) - 2rem - var(--safe-area-top) - var(--safe-area-bottom));
+    display: flex;
+    flex-direction: column;
+}
+
+.memory-tree-confirm-body {
     display: flex;
     flex-direction: column;
     gap: var(--space-sm);
-    padding-bottom: var(--space-sm);
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 .memory-tree-estimate {
@@ -265,7 +275,6 @@
     grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
     gap: var(--space-sm) var(--space-lg);
     margin: 0;
-    padding-left: var(--space-lg);
 }
 
 .memory-tree-estimate-item {
@@ -286,13 +295,6 @@
     min-height: 1.25em;
     color: var(--text-primary);
     font-variant-numeric: tabular-nums;
-}
-
-.memory-tree-confirm-actions {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    gap: var(--space-sm);
 }
 
 .memory-tree-progress {
@@ -316,7 +318,8 @@
 
 /* A sheen runs along the fill while the compactor works, so one long tree
    still reads as busy between counts. An activity cue, so its duration stays
-   literal. */
+   literal. The sheen repaints every frame, so the fill owns its layer
+   (an-endless-repaint-owns-its-layer.test.ts). */
 .memory-tree-status[data-working] .progress-bar-fill {
     background: linear-gradient(
         90deg,
@@ -325,6 +328,7 @@
         var(--accent) 75%
     );
     background-size: 200% 100%;
+    will-change: transform;
     animation: shimmer 2.4s linear infinite;
 }
 

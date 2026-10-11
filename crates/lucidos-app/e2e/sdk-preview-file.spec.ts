@@ -2,7 +2,9 @@ import { test, expect } from './fixtures';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve } from 'path';
 import { WORKSPACE, git } from './db-helpers';
-import { apiRequest, clickHeaderAction, ensureMobileView, gotoWithRetry } from './helpers';
+import {
+  apiRequest, clickHeaderAction, ensureMobileView, gotoWithRetry, waitForModalExitFade,
+} from './helpers';
 
 const APP_ID = 'e2e-sdk-preview-test';
 const APP_DIR = resolve(WORKSPACE, 'data/apps', APP_ID);
@@ -204,6 +206,7 @@ test.describe('SDK lucidos.ui.previewFile: a file preview over the app', () => {
     await modal(page).locator('button', { hasText: 'Open in Files' }).click();
 
     await expect(modal(page)).toHaveCount(0);
+    await waitForModalExitFade(page);
     const inlinePreview = page.locator('.file-preview-inline:visible');
     await expect(inlinePreview).toBeVisible();
     await expect(inlinePreview.locator(`.code-line[data-line="${CITED_LINE}"]`))
@@ -223,6 +226,7 @@ test.describe('SDK lucidos.ui.previewFile: a file preview over the app', () => {
     await modal(page).locator('a', { hasText: 'the other file' }).click();
 
     await expect(modal(page)).toHaveCount(0);
+    await waitForModalExitFade(page);
     const inlinePreview = page.locator('.file-preview-inline:visible');
     await expect(inlinePreview).toContainText('The other file');
     await expect(inlinePreview.locator('.line-selected')).toHaveCount(0);

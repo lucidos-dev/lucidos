@@ -14,22 +14,27 @@ use std::ops::Range;
 
 use uuid::Uuid;
 
-use crate::engine::thread_events::{ActorMode, AnswerKind, QuestionOption, ThreadEvent};
+use crate::engine::thread_events::{
+    ActorMode, AnswerKind, MessageOrigin, QuestionOption, ThreadEvent,
+};
 
-/// What produced an entry. OptChat's kinds, plus `work` for a sub-thread's
-/// report and the two workspace leaf kinds.
+/// The role an entry plays, named by the head word of the thing it is: a
+/// prompt, a response, a tool call, a tool result, a child report. The
+/// workspace tree adds its two leaf kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EntryKind {
-    /// The owner's words, or another agent addressing this thread.
-    User,
-    /// The agent's reply.
-    Talk,
+    /// Words sent into the thread, with the *ActorMode* the event recorded:
+    /// a person's message, an agent's, or the engine's (a fired trigger, an
+    /// image description).
+    Prompt(ActorMode),
+    /// The agent's reply, or the failure that ended its turn.
+    Response,
     /// A tool call, as its name and JSON input.
-    Tool,
+    Call,
     /// A tool result.
-    Echo,
+    Result,
     /// A sub-thread's report.
-    Work,
+    Report,
     /// Workspace tree: one settled thread turn.
     Turn,
     /// Workspace tree: one artifact write.
@@ -39,11 +44,13 @@ pub(crate) enum EntryKind {
 impl EntryKind {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            Self::User => "user",
-            Self::Talk => "talk",
-            Self::Tool => "tool",
-            Self::Echo => "echo",
-            Self::Work => "work",
+            Self::Prompt(ActorMode::Human) => "prompt (human)",
+            Self::Prompt(ActorMode::Agent) => "prompt (agent)",
+            Self::Prompt(ActorMode::Engine) => "prompt (engine)",
+            Self::Response => "response",
+            Self::Call => "call",
+            Self::Result => "result",
+            Self::Report => "report",
             Self::Turn => "turn",
             Self::Artifact => "artifact",
         }
@@ -135,7 +142,7 @@ pub(crate) const TURN_END_EVENT_TYPES: &[&str] = &[
 pub(crate) const ENTRY_EVENT_TYPES: &[&str] = &[
     "MessageReceived",
     "SpokenMessageReceived",
-    "UserPromptInjected",
+    "PromptInjected",
     "TriggerStarted",
     "TextStreamed",
     "ToolCalled",
@@ -198,10 +205,10 @@ impl Projector {
         self.turn_start = self.log.entries.len();
     }
 
-    /// Log the round's text as one talk entry, under its first delta.
+    /// Log the round's text as one response entry, under its first delta.
     fn flush_round_text(&mut self) {
         if let Some((id, text)) = self.round_text.take() {
-            self.push(EntryKind::Talk, text.trim().to_string(), id);
+            self.push(EntryKind::Response, text.trim().to_string(), id);
         }
     }
 
@@ -216,37 +223,40 @@ impl Projector {
             ThreadEvent::MessageReceived {
                 text,
                 user_image_hashes,
+                mode,
                 ..
             } => self.push(
-                EntryKind::User,
+                EntryKind::Prompt(*mode),
                 with_images(text, user_image_hashes.len()),
                 id,
             ),
+            // Only a person speaks into a call. Nothing emits the coding
+            // agent event any more, and a person typed every stored one.
             ThreadEvent::SpokenMessageReceived { text, .. }
             | ThreadEvent::CodingAgentUserMessageSent { text, .. } => {
-                self.push(EntryKind::User, text.clone(), id)
+                self.push(EntryKind::Prompt(ActorMode::Human), text.clone(), id)
             }
             // One carrying `injected_message_id` acknowledges a message the
             // log already holds, with the same text.
-            ThreadEvent::UserPromptInjected {
+            ThreadEvent::PromptInjected {
                 text,
                 mode,
                 injected_message_id: None,
                 ..
-            } => {
-                let kind = match mode {
-                    ActorMode::Human => EntryKind::User,
-                    ActorMode::Agent | ActorMode::Engine => EntryKind::Work,
-                };
-                self.push(kind, text.clone(), id)
-            }
+            } => self.push(EntryKind::Prompt(*mode), text.clone(), id),
             ThreadEvent::TriggerStarted {
                 trigger_name,
                 prompt: Some(prompt),
+                origin,
                 ..
             } => {
                 let name = trigger_name.as_deref().unwrap_or("a trigger");
-                self.push(EntryKind::User, format!("[{name} fired] {prompt}"), id)
+                let mode = MessageOrigin::mode_or(origin.as_ref(), ActorMode::Engine);
+                self.push(
+                    EntryKind::Prompt(mode),
+                    format!("[{name} fired] {prompt}"),
+                    id,
+                )
             }
             ThreadEvent::ChildThreadCompleted {
                 child_thread_title,
@@ -254,11 +264,13 @@ impl Projector {
                 ..
             } => {
                 let title = child_thread_title.as_deref().unwrap_or("sub-thread");
-                self.push(EntryKind::Work, format!("[{title}] {summary}"), id)
+                self.push(EntryKind::Report, format!("[{title}] {summary}"), id)
             }
-            ThreadEvent::ImageDescribed { description, .. } => {
-                self.push(EntryKind::Echo, format!("image: {description}"), id)
-            }
+            ThreadEvent::ImageDescribed { description, .. } => self.push(
+                EntryKind::Prompt(ActorMode::Engine),
+                format!("image: {description}"),
+                id,
+            ),
             ThreadEvent::TextStreamed { text } if self.kind == ThreadKind::LucidosAgent => {
                 self.round_text
                     .get_or_insert_with(|| (id, String::new()))
@@ -266,12 +278,12 @@ impl Projector {
                     .push_str(text);
             }
             ThreadEvent::ToolCalled { name, args, .. } if self.kind == ThreadKind::LucidosAgent => {
-                self.push(EntryKind::Tool, cap(&format!("{name} {args}")), id)
+                self.push(EntryKind::Call, cap(&format!("{name} {args}")), id)
             }
             ThreadEvent::ToolResult { name, result, .. }
                 if self.kind == ThreadKind::LucidosAgent =>
             {
-                self.push(EntryKind::Echo, cap(&format!("[{name}] {result}")), id)
+                self.push(EntryKind::Result, cap(&format!("[{name}] {result}")), id)
             }
             ThreadEvent::CodingAgentTextStreamed { text, .. } => {
                 if !text.trim().is_empty() {
@@ -294,14 +306,18 @@ impl Projector {
                     None => asked,
                 };
                 self.questions.push((tool_use_id.clone(), options.clone()));
-                self.push(EntryKind::Talk, text, id)
+                self.push(EntryKind::Response, text, id)
             }
             ThreadEvent::UserQuestionAnswered {
                 tool_use_id,
                 answer,
             } if self.kind == ThreadKind::CodingAgent => {
                 if let Some(text) = self.answer_text(tool_use_id, answer) {
-                    self.push(EntryKind::User, format!("Answered: {text}"), id)
+                    self.push(
+                        EntryKind::Prompt(ActorMode::Human),
+                        format!("Answered: {text}"),
+                        id,
+                    )
                 }
             }
             ThreadEvent::ResponseGenerated { text, .. } => self.settle_reply(text, None, id),
@@ -314,15 +330,15 @@ impl Projector {
             ThreadEvent::ResponseFailed { error } => {
                 self.flush_round_text();
                 let (kind, text) = match self.pending_reply.take() {
-                    Some(reply) => (EntryKind::Talk, format!("{reply}\n\nfailed: {error}")),
-                    None => (EntryKind::Echo, format!("failed: {error}")),
+                    Some(reply) => (EntryKind::Response, format!("{reply}\n\nfailed: {error}")),
+                    None => (EntryKind::Response, format!("failed: {error}")),
                 };
                 self.push(kind, text, id);
                 self.end_turn(id);
             }
             ThreadEvent::CodingAgentIdled { .. } => {
                 if let Some(reply) = self.pending_reply.take() {
-                    self.push(EntryKind::Talk, reply, id);
+                    self.push(EntryKind::Response, reply, id);
                 }
                 self.end_turn(id);
             }
@@ -344,7 +360,7 @@ impl Projector {
             Some(how) => format!("{reply} ({how})"),
             None => reply,
         };
-        self.push(EntryKind::Talk, text, id);
+        self.push(EntryKind::Response, text, id);
         self.end_turn(id);
     }
 

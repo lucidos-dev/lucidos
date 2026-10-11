@@ -60,6 +60,8 @@ function makeChange(id: string, overrides: Partial<Change> = {}): Change {
     files: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'],
     requires_restart: false,
     hardened: false,
+    needs_hardening: true,
+    apply_ready: false,
     status: 'applied',
     created_at: '2026-05-04T00:00:00Z',
     resolved_at: '2026-05-04T00:01:00Z',

@@ -162,7 +162,7 @@ pub(crate) fn mark_report_lines(report: &serde_json::Value) -> Vec<String> {
 }
 
 /// GET the hardening state of the current branch from the parent engine.
-/// Used by `cmd_query` (printing) and `cc_stop_reminder` (deciding).
+/// Used by `cmd_query`, which prints it.
 pub(crate) fn query_state(ws: &Workspace) -> Result<HardenedState, BoxError> {
     let (url, _branch, body) = fetch_marker(ws)?;
     let state = body

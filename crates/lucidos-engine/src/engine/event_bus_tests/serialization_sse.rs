@@ -783,6 +783,7 @@ fn reserved_type_names_match_event_type() {
         },
         AppDeleted {
             app_id: "a".into(),
+            kind: None,
             actor: None,
         },
         DomainEvent {

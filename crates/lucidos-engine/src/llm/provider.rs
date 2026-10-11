@@ -77,15 +77,17 @@ pub enum ContentBlock {
     /// the results the block rides on.
     #[serde(rename = "engine_tail")]
     EngineTail { text: String },
-    /// A *memory view* block that ends a cache prefix (ADR 0362). One is the
-    /// workspace view snapshot, which every thread of one budget sends byte
-    /// for byte. The others are thread view pieces, each ending at a cache
-    /// mark that consecutive turns share.
+    /// A view block that ends a cache prefix (ADR 0362): a *memory view*'s
+    /// or a *compaction view*'s. A view goes out one block per 4 lines, and
+    /// only the blocks that take a cache mark are memory view blocks: the
+    /// snapshot's last whole block, the thread view's rungs, and a compaction
+    /// view's trailing rungs.
     ///
-    /// Every provider renders it as ordinary text. Anthropic also puts a cache
-    /// breakpoint on it while one of the four is free, so a later request
-    /// reads the prefix through it from the cache. A Classic turn never builds
-    /// one, which is what keeps its request byte-identical.
+    /// Every provider renders it as ordinary text. Anthropic puts a cache
+    /// breakpoint on it while one of the four is free, and the GPT Responses
+    /// wire puts one on it too. A later request then reads the prefix through
+    /// it from the cache. A Classic turn never builds one, which is what keeps
+    /// its request byte-identical.
     #[serde(rename = "memory_view")]
     MemoryView { text: String },
 }
@@ -126,15 +128,18 @@ pub struct LlmResponse {
     /// chars/4 estimate (which over-counts base64 image bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u32>,
-    /// Cache-write token count (Anthropic-only). `None` on providers without
-    /// prompt caching. Together with `cache_read_tokens` lets the modal show
+    /// Cache-write token count: Anthropic, and OpenAI from GPT-5.6 on. `None`
+    /// on providers that report none. Together with `cache_read_tokens` lets the modal show
     /// hit/miss rate so the user can see why a turn was cheap or expensive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_tokens: Option<u32>,
-    /// Cache-read token count (Anthropic-only). `None` on providers without
-    /// prompt caching.
+    /// Cache-read token count. `None` on providers that report none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<u32>,
+    /// The *served model*: the model id the provider's reply names, verbatim.
+    /// `None` when the reply names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
     /// Total characters of thinking text. High value with empty content
     /// distinguishes "thought hard then gave up" from "said nothing".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,11 +171,11 @@ pub struct LlmResponse {
     /// or the other, so setting both would send the same text twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_only_text: Option<String>,
-    /// Every part of `content` came from progress notes, and none from a reply.
-    /// A note summarizes what the model drafted, so a draft never reaches the
-    /// user through one. The question card gate reads this.
-    #[serde(default)]
-    pub content_is_progress_notes: bool,
+    /// The *progress notes* in `content`: the provider's short summaries of
+    /// text the model wrote before a tool call, in place of that text. The
+    /// user saw only these, and the full text never reached Lucidos.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress_notes: Vec<String>,
 }
 
 impl LlmResponse {
@@ -206,12 +211,18 @@ pub struct ModelSelection<'a> {
     /// first configured route.
     pub provider: Option<crate::llm::model_registry::ProviderKind>,
     /// One of `llm::reasoning::EFFORT_LADDER`, snapped onto what the resolved
-    /// backend supports. `None` leaves the provider's own default.
+    /// backend supports. `None` runs the model at its *default effort*, and a
+    /// model without one at its provider's own default.
     pub reasoning_effort: Option<&'a str>,
     /// Cap on one HTTP attempt, body included. An *auxiliary model call* sets
     /// it so its deadline can contain the provider's retries (ADR 0107). A turn
     /// leaves it `None`, so a long valid stream is never cut off.
     pub attempt_timeout: Option<std::time::Duration>,
+    /// The one tool the model must call, for an engine decision such as the
+    /// turn-end gate's read decision (ADR 0417). Each provider maps it to its
+    /// own `tool_choice` form. On Claude a forced call runs without thinking,
+    /// and a model that cannot turn thinking off is refused before sending.
+    pub forced_tool: Option<&'a str>,
 }
 
 impl<'a> ModelSelection<'a> {
@@ -230,6 +241,11 @@ impl<'a> ModelSelection<'a> {
 
     pub fn with_attempt_timeout(mut self, attempt_timeout: Option<std::time::Duration>) -> Self {
         self.attempt_timeout = attempt_timeout;
+        self
+    }
+
+    pub fn with_forced_tool(mut self, forced_tool: Option<&'a str>) -> Self {
+        self.forced_tool = forced_tool;
         self
     }
 }
@@ -251,6 +267,12 @@ pub trait LlmProvider: Send + Sync {
     /// Returns the default model name for this provider.
     fn default_model(&self) -> &str {
         ""
+    }
+
+    /// The effort a chat with `selection` goes out at, for its cost record.
+    /// The router fills and clamps it; a leaf sends what it is given.
+    fn effort_sent(&self, selection: &ModelSelection<'_>) -> Option<String> {
+        selection.reasoning_effort.map(str::to_string)
     }
 
     /// Whether this provider can actually serve LLM calls. `true` for every

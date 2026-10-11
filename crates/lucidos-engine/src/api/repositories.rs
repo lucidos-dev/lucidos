@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::diff::{parse_diff_output, DiffFile, RepoDiff};
 use super::AppState;
-use crate::core::changes::ChangeState;
+use crate::core::changes::ChangeStatusData;
 use crate::core::repositories::{Repository, RepositoryStore};
 
 pub async fn list_repositories(
@@ -319,14 +319,16 @@ pub async fn get_change_diff(
 
     let repo_root = std::path::Path::new(&change.repo_root);
     let range = match &change.state {
-        ChangeState::Pending { .. } | ChangeState::SetAside => {
+        ChangeStatusData::Pending { .. }
+        | ChangeStatusData::SetAside
+        | ChangeStatusData::Withdrawn => {
             if super::is_dangerous_git_ref(&change.branch_name) {
                 return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));
             }
             let base = crate::engine::git_ops::default_diff_base(repo_root).await;
             format!("{}...{}", base, change.branch_name)
         }
-        ChangeState::Applied(shas) | ChangeState::Reverted(shas) => {
+        ChangeStatusData::Applied(shas) | ChangeStatusData::Reverted(shas) => {
             let pre_sha = shas.pre.as_deref().ok_or((
                 StatusCode::BAD_REQUEST,
                 "No merge SHA recorded for this change: it was applied before SHA tracking was added"
@@ -338,7 +340,7 @@ pub async fn get_change_diff(
                 .ok_or((StatusCode::BAD_REQUEST, "No post-merge SHA recorded".into()))?;
             format!("{}..{}", pre_sha, post_sha)
         }
-        ChangeState::Discarded => return Err(discarded_change_has_no_diff(id)),
+        ChangeStatusData::Discarded => return Err(discarded_change_has_no_diff(id)),
     };
 
     // App coding-agent changes live under `data/apps/<id>/` in the workspace
@@ -367,7 +369,7 @@ pub struct ThreadCcDiff {
 /// Falls back to the registered repo + branch ref when no worktree is left on
 /// disk. Pre-May-2026 `agent_recovery` removed worktrees for idle external-repo
 /// sessions without emitting `WorktreeCleaned`. The historical state is
-/// therefore `coding_agent_proposed=true` + branch alive + worktree dir missing.
+/// therefore a pending change + branch alive + worktree dir missing.
 /// That fallback needs a `SessionStarted.repo_id`, which only an external-repo
 /// thread carries. Finding the worktree is the only way an app or
 /// Lucidos-source thread ever gets a diff.
@@ -803,12 +805,17 @@ pub async fn get_change_file(
     };
 
     let git_ref = match &change.state {
-        ChangeState::Pending { .. } | ChangeState::SetAside => change.branch_name.clone(),
-        ChangeState::Applied(shas) | ChangeState::Reverted(shas) => match shas.post.as_deref() {
+        ChangeStatusData::Pending { .. }
+        | ChangeStatusData::SetAside
+        | ChangeStatusData::Withdrawn => change.branch_name.clone(),
+        ChangeStatusData::Applied(shas) | ChangeStatusData::Reverted(shas) => match shas
+            .post
+            .as_deref()
+        {
             Some(sha) => sha.to_string(),
             None => return (StatusCode::BAD_REQUEST, "No post-merge SHA recorded").into_response(),
         },
-        ChangeState::Discarded => return discarded_change_has_no_diff(id).into_response(),
+        ChangeStatusData::Discarded => return discarded_change_has_no_diff(id).into_response(),
     };
 
     git_show_file(

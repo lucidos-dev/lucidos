@@ -4,7 +4,7 @@
  * the work.
  *
  * The two hook-free components are invoked directly and their vnode trees
- * walked, the `thread-toggle-attention-badge.test.tsx` way. The other two hosts
+ * walked, the `thread-toggle-blocked-badge.test.tsx` way. The other two hosts
  * are source-scanned. `Drawer` takes a hook, and `SettingsHome` warms the
  * Settings reads on mount. Standing either up would pin the mechanism rather
  * than the requirement, the reason `settings-nav-structure.test.ts` gives.

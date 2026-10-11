@@ -88,7 +88,7 @@ function engagedKey(exchange: Exchange, index: number): RenderRow | null {
  * The step that announces the loop picking this message up, or undefined.
  *
  * The chat fast path writes the `MessageReceived` first. The agentic loop then
- * emits a `UserPromptInjected` carrying its id when it ingests it, which
+ * emits a `PromptInjected` carrying its id when it ingests it, which
  * `findAbsorbTarget` files here. Between the two the message sits in the queue
  * and the running turn keeps writing above it. That window is legitimate, and
  * this is where it ends.
@@ -97,7 +97,7 @@ function ingestionStep(exchange: Exchange) {
   const ownId = exchange.userEvent._eventId;
   if (exchange.userEvent.type !== 'MessageReceived' || !ownId) return undefined;
   return exchange.steps.find(step =>
-    step.event.type === 'UserPromptInjected'
+    step.event.type === 'PromptInjected'
     && (step.event as { injected_message_id?: string }).injected_message_id === ownId,
   );
 }

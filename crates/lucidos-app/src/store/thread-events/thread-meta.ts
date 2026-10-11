@@ -1,6 +1,7 @@
-import { EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS } from '../../generated/thread-lifecycle';
-import type { EventChannel, ThreadStatus } from '../../generated/thread-lifecycle';
+import { changeWork, EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS } from '../../generated/thread-lifecycle';
+import type { ChangeWork, EventChannel, ThreadStatus } from '../../generated/thread-lifecycle';
 import type { EventWaitSummary, StoredEvent, ThreadInitiator, ThreadSection, TodoItem } from './thread-event-types';
+import type { CodingAgentChangeState } from '../../api/threads';
 
 /** Post-event projection snapshot carried on persisted SSE thread events
  *  (`data.aggregate`) and on `fetchThreadEvents` HTTP responses
@@ -48,6 +49,9 @@ export type ThreadAggregate = {
    *  its parent is still owed a result (ADR 0252). The backend always sends
    *  it; optional only so test fixtures needn't set it. */
   isStoppedChild?: boolean;
+  /** Whether the thread's agent asked the user to read its latest reply,
+   *  still unseen (ADR 0409). Optional only so test fixtures needn't set it. */
+  readRequested?: boolean;
   /** How many event waits this thread holds unresolved. Consumed by
    *  `resolveVisualStatus` via `count > 0`. See `ThreadMeta.liveEventWaitCount`
    *  for why the count is carried separately from `meta.liveEventWaits`. */
@@ -60,28 +64,17 @@ export type ThreadAggregate = {
    *  Optional only so a partial test aggregate needn't supply it; the backend
    *  always sends it. Absence leaves the list alone, `[]` clears it. */
   liveEventWaits?: EventWaitSummary[];
-  /** Whether the CC branch has any diff against main on disk — pure git
-   *  truth. Backs the WaitingBanner Diff button. Independent of the proposal
-   *  lifecycle: a thread can have a diff mid-session before CC has formally
-   *  proposed (and stays true between proposal and Apply / Discard). */
-  codingAgentHasDiff: boolean;
-  /** The thread holds a pending change, complete or incomplete. Set by
-   *  `ChangeProposed`, cleared on Apply / Discard / Set aside / Archive. Backs
-   *  the Apply / Discard buttons and blocks Archive. Whether it is ready to
-   *  review is `changeReadyToReview`. */
-  codingAgentProposed: boolean;
-  /** Whether the proposed change requires an engine restart. Only meaningful
-   *  when `codingAgentProposed` is true. */
-  codingAgentRequiresRestart: boolean;
-  /** Whether the proposed change is incomplete: its turn did not finish, so it
-   *  is not ready to review (ADR 0346). Only meaningful when
-   *  `codingAgentProposed` is true. Read it through `changeReadyToReview`. */
-  codingAgentIncomplete: boolean;
+  /** What the coding-agent branch holds. See `ThreadMeta.codingAgentChangeState`. */
+  codingAgentChangeState: CodingAgentChangeState;
   /** Whether the Claude Code session is bound to an external repo. External repos
    *  can't be Applied via the engine merge flow — the WaitingBanner shows
    *  Done / Archive instead. */
   codingAgentIsExternalRepo: boolean;
   isSaved: boolean;
+  /** Whether this is the home thread. The engine omits the key on every other
+   *  thread. An SSE event can be the first the client hears of Home, so this
+   *  is what keeps it out of the drawer's sections. */
+  home?: true;
   hasResponse: boolean;
   lastRevivedAt: string | null;
   parentThreadId: string | null;
@@ -163,14 +156,13 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.blockingDescendantCount !== agg.blockingDescendantCount) { meta.blockingDescendantCount = agg.blockingDescendantCount; changed = true; }
   if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
   if (!!meta.isStoppedChild !== !!agg.isStoppedChild) { meta.isStoppedChild = !!agg.isStoppedChild; changed = true; }
+  if (!!meta.readRequested !== !!agg.readRequested) { meta.readRequested = !!agg.readRequested; changed = true; }
   if (meta.liveEventWaitCount !== agg.liveEventWaitCount) { meta.liveEventWaitCount = agg.liveEventWaitCount; changed = true; }
   if (agg.liveEventWaits !== undefined && !sameWaits(meta.liveEventWaits, agg.liveEventWaits)) { meta.liveEventWaits = agg.liveEventWaits; changed = true; }
-  if (meta.codingAgentHasDiff !== agg.codingAgentHasDiff) { meta.codingAgentHasDiff = agg.codingAgentHasDiff; changed = true; }
-  if (meta.codingAgentProposed !== agg.codingAgentProposed) { meta.codingAgentProposed = agg.codingAgentProposed; changed = true; }
-  if (meta.codingAgentRequiresRestart !== agg.codingAgentRequiresRestart) { meta.codingAgentRequiresRestart = agg.codingAgentRequiresRestart; changed = true; }
-  if (meta.codingAgentIncomplete !== agg.codingAgentIncomplete) { meta.codingAgentIncomplete = agg.codingAgentIncomplete; changed = true; }
+  if (!sameChangeState(meta.codingAgentChangeState, agg.codingAgentChangeState)) { meta.codingAgentChangeState = agg.codingAgentChangeState; changed = true; }
   if (meta.codingAgentIsExternalRepo !== agg.codingAgentIsExternalRepo) { meta.codingAgentIsExternalRepo = agg.codingAgentIsExternalRepo; changed = true; }
   if (meta.saved !== agg.isSaved) { meta.saved = agg.isSaved; changed = true; }
+  if (agg.home && !meta.home) { meta.home = true; changed = true; }
   // updatedAt / messageCount: overlay unconditionally, do NOT mark changed
   meta.messageCount = agg.messageCount;
   meta.updatedAt = agg.lastActivity;
@@ -270,6 +262,10 @@ export type ThreadMeta = {
    *  reads as false, which is what a meta built before the field existed
    *  means. */
   isStoppedChild?: boolean;
+  /** The *read request*: the thread's agent asked the user to read its latest
+   *  reply, and they have not seen it yet (ADR 0409). Lists a settled thread
+   *  under Review. Absent reads as false. */
+  readRequested?: boolean;
   /** How many *event waits* this thread holds unresolved, from the backend
    *  projection (`thread_summaries.live_event_wait_count`). Consumed by
    *  `resolveVisualStatus` via `count > 0` to paint the same Waiting dot
@@ -282,20 +278,12 @@ export type ThreadMeta = {
    *  also re-open the drift this pair exists to close, by leaving a reader of
    *  one unable to notice that the other was wrong. */
   liveEventWaitCount: number;
-  /** Whether the CC branch has any diff against main on disk — pure git
-   *  truth. Backs the WaitingBanner Diff button. Independent of the proposal
-   *  lifecycle: a thread can have a diff mid-session before CC has formally
-   *  proposed (and stays true between proposal and Apply / Discard). */
-  codingAgentHasDiff: boolean;
-  /** The thread holds a pending change. See `ThreadMeta.codingAgentProposed`. */
-  codingAgentProposed: boolean;
-  /** Whether the proposed change requires an engine restart. Only meaningful
-   *  when `codingAgentProposed` is true. */
-  codingAgentRequiresRestart: boolean;
-  /** Whether the proposed change is incomplete: its turn did not finish, so it
-   *  is not ready to review (ADR 0346). Only meaningful when
-   *  `codingAgentProposed` is true. Read it through `changeReadyToReview`. */
-  codingAgentIncomplete: boolean;
+  /** What the coding-agent branch holds (ADR 0400): no work, unproposed work,
+   *  or a pending change. The server's summary and SSE aggregate set it, and
+   *  an optimistic archive writes `NO_CHANGE` until they answer. A pending
+   *  change is what Apply acts on and what blocks Archive; read that through
+   *  `changeReadyToReview`. */
+  codingAgentChangeState: CodingAgentChangeState;
   /** Whether the Claude Code session is bound to an external repo — drives the
    *  WaitingBanner Done / Archive vs Apply choice. */
   codingAgentIsExternalRepo: boolean;
@@ -567,10 +555,7 @@ export function makeOptimisticThreadState(opts: {
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
       liveEventWaitCount: 0,
-      codingAgentHasDiff: false,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: NO_CHANGE,
       codingAgentIsExternalRepo: false,
       lastRevivedAt: ts,
       triggerId: opts.triggerId,
@@ -649,11 +634,11 @@ export const isExcludedFromSections = (t: ThreadState): boolean =>
  *  picker) passes `effectiveThreadStatus`, which honors optimistic archiving and
  *  pending sends.
  *
- *  Tier 1 is deliberately WIDER than `threadNeedsAttention`, which covers tier 0
+ *  Tier 1 is deliberately WIDER than `threadIsBlocked`, which covers tier 0
  *  plus Failed but neither Paused nor a ready change (that one has its own
  *  Review view). This is a sort key, not a badge: floating a paused thread to
  *  the top of Current costs the user nothing, whereas counting one in the
- *  needs-attention badge would light it on every version switch, for work the
+ *  Blocked badge would light it on every version switch, for work the
  *  engine is about to resume by itself. */
 export function reviewTier(t: ThreadState, status: ThreadStatus): 0 | 1 | 2 {
   if (status === 'waiting_for_user_answer') return 0;
@@ -661,12 +646,23 @@ export function reviewTier(t: ThreadState, status: ThreadStatus): 0 | 1 | 2 {
   return 2;
 }
 
-/** The thread holds a change ready to review: pending, from a turn that
- *  finished. An incomplete change still blocks Archive, through
- *  `codingAgentProposed`, but never reads as ready (ADR 0346). The one place
- *  that combines the two flags, for every "ready to review" reader. */
-export function changeReadyToReview(meta: Pick<ThreadMeta, 'codingAgentProposed' | 'codingAgentIncomplete'>): boolean {
-  return meta.codingAgentProposed && !meta.codingAgentIncomplete;
+/** The thread holds a change ready to review: a pending change. An unfinished
+ *  turn never proposes (ADR 0400), so every pending change is ready. */
+export function changeReadyToReview(meta: Pick<ThreadMeta, 'codingAgentChangeState'>): boolean {
+  return meta.codingAgentChangeState.kind === 'proposed';
+}
+
+/** The change state of a thread whose branch holds no work. */
+export const NO_CHANGE: CodingAgentChangeState = Object.freeze({ kind: 'none' });
+
+/** Whether two change states say the same thing, field by field. */
+export function sameChangeState(a: CodingAgentChangeState, b: CodingAgentChangeState): boolean {
+  if (a === b) return true;
+  switch (a.kind) {
+    case 'none': return b.kind === 'none';
+    case 'unproposed': return b.kind === 'unproposed' && a.reason === b.reason;
+    case 'proposed': return b.kind === 'proposed' && a.requires_restart === b.requires_restart;
+  }
 }
 
 /** Whether this event type updates the thread's last_activity in the backend
@@ -696,17 +692,24 @@ export type CodingAgentWaitingInfo = {
   requiresRestart: boolean;
 };
 
+/** What the thread holds toward a change: proposed, or held by an idle that
+ *  ended while an event wait was live (ADR 0395). */
+export function threadChangeWork(meta: ThreadMeta): ChangeWork {
+  return changeWork(meta.codingAgentChangeState.kind, meta.liveEventWaitCount > 0);
+}
+
 /** Get CC waiting info from thread meta. Returns null for non-CC threads,
  *  threads without a pending proposal, and threads whose loop is mid-stream
  *  (status==='running' means a follow-up turn is in flight, so the user is
  *  not yet being asked to review). */
 export function getCodingAgentWaitingInfo(meta: ThreadMeta): CodingAgentWaitingInfo | null {
+  const change = meta.codingAgentChangeState;
   if (meta.channel !== 'claude_code') return null;
-  if (!meta.codingAgentProposed) return null;
+  if (change.kind !== 'proposed') return null;
   if (meta.status === 'running') return null;
   return {
-    proposed: meta.codingAgentProposed,
+    proposed: true,
     isExternalRepo: meta.codingAgentIsExternalRepo,
-    requiresRestart: meta.codingAgentRequiresRestart,
+    requiresRestart: change.requires_restart,
   };
 }

@@ -89,11 +89,8 @@ function makeActiveThread(id: string, updatedAt: string): ThreadState {
       totalChildrenCount: 0,
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
@@ -392,7 +389,7 @@ describe('superseded drafts are dropped; unsent work is not', () => {
   it('never supersedes on an agent-authored injection carrying the same text', () => {
     typeDraftHere(T, DRAFT, WATERMARK);
 
-    peerSubmitted({ type: 'UserPromptInjected', text: DRAFT, mode: 'agent' }, AFTER);
+    peerSubmitted({ type: 'PromptInjected', text: DRAFT, mode: 'agent' }, AFTER);
 
     expect(getDraft(T).text).toBe(DRAFT);
   });

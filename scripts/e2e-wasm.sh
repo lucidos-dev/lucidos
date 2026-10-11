@@ -2,8 +2,8 @@
 # Build signer WASM artifacts then run the wasm signer e2e tests.
 #
 # Usage:
-#   ./scripts/e2e-wasm.sh [-- cargo test args]
-#   ./scripts/e2e-wasm.sh --github            # on GitHub's runners, ADR 0382
+#   ./scripts/e2e-wasm.sh                              # on GitHub's runners when it can, ADR 0386
+#   ./scripts/e2e-wasm.sh --local [-- cargo test args]   # on this host
 #
 # Builds every signer in `signers/` to `wasm32-unknown-unknown` release mode
 # (via `./signers/build-all.sh`) so the tests in
@@ -19,6 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/e2e_github.sh
 source "$SCRIPT_DIR/lib/e2e_github.sh"
 e2e_github_handoff wasm "$@"
+set -- ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 CARGO_ARGS=()

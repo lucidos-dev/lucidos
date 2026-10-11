@@ -18,6 +18,8 @@ function change(id: string, threadId: string, overrides: Partial<Change> = {}): 
     files: ['a.ts'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-05-04T00:00:00Z',
     resolved_at: null,
@@ -87,7 +89,7 @@ describe('activityRows', () => {
   });
 
   it('names the Apply All member in flight, its phase and its position', () => {
-    const pending = [change('c-1', 't-1'), change('c-2', 't-2', { hardened: false })];
+    const pending = [change('c-1', 't-1'), change('c-2', 't-2', { needs_hardening: true })];
     const phases = new Map<string, ApplyPhaseReading>([['t-2', { phase: 'hardening', eventId: 'e-9', startedAt: null }]]);
     const rows = activityRows({
       ...IDLE,
@@ -119,7 +121,7 @@ describe('activityRows', () => {
 
   it('says how long each phase runs and how long the batch has left, once estimates exist', () => {
     const pending = [
-      change('c-2', 't-2', { hardened: false, predicted_conflict: 'clean' }),
+      change('c-2', 't-2', { needs_hardening: true, predicted_conflict: 'clean' }),
       change('c-3', 't-1', { predicted_conflict: 'conflict' }),
     ];
     const rows = activityRows({
@@ -191,7 +193,7 @@ describe('activityRows', () => {
   it('counts a Changes-panel apply that is hardening, with no Apply Now behind it', () => {
     const rows = activityRows({
       ...IDLE,
-      pending: [change('c-1', 't-1', { hardened: false })],
+      pending: [change('c-1', 't-1', { needs_hardening: true })],
       phases: new Map([['t-1', { phase: 'hardening', eventId: 'e-1', startedAt: null }]]),
     });
     expect(rows.map((r) => r.label)).toEqual(['Hardening: Card gate fix']);
@@ -204,7 +206,7 @@ describe('activityRows', () => {
       ...IDLE,
       pending: [
         change('c-1', 't-1', { resolving_conflict: true }),
-        change('c-2', 't-2', { hardened: false }),
+        change('c-2', 't-2', { needs_hardening: true }),
       ],
     });
     expect(rows.map((r) => r.label)).toEqual(['Resolving merge conflict: Card gate fix']);
@@ -229,7 +231,7 @@ describe('activityRows', () => {
       batch: { changeIds: ['c-1', 'c-2', 'c-3'], resolvedChangeIds: [], applyingChangeIds: ['c-2'], resolvingChangeIds: ['c-1'] },
       pending: [
         change('c-1', 't-1', { resolving_conflict: true }),
-        change('c-2', 't-2', { hardened: false }),
+        change('c-2', 't-2', { needs_hardening: true }),
         change('c-3', 't-3'),
       ],
     });

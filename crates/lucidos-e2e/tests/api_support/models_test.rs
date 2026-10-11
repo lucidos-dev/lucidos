@@ -146,6 +146,10 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
             "claude-opus-5",
             vec!["none", "low", "medium", "high", "xhigh", "max"],
         ),
+        (
+            "claude-haiku-5-5",
+            vec!["none", "low", "medium", "high", "xhigh", "max"],
+        ),
         // A model that always thinks has no `none`, on the direct Anthropic
         // provider as on Vertex.
         (
@@ -166,7 +170,12 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
             vec!["none", "low", "medium", "high", "max"],
         ),
         // Gemini collapses everything above high onto high.
-        ("gemini-3.5-flash", vec!["none", "low", "medium", "high"]),
+        (
+            "gemini-3-flash-preview",
+            vec!["none", "low", "medium", "high"],
+        ),
+        // Gemini 3.8 Flash always reasons, so it has no `none` either.
+        ("gemini-3.8-flash", vec!["low", "medium", "high"]),
         // GPT-5.6 and GPT-6 Astra have a real max; earlier OpenAI families top
         // out at xhigh.
         (
@@ -199,6 +208,24 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
             .collect();
         assert_eq!(tiers, expected, "{id}");
     }
+}
+
+/// A retired builtin stays listed, so past turns keep its label, but no
+/// picker offers it, and it names the model the engine sends instead.
+#[tokio::test]
+async fn a_retired_builtin_is_disabled_and_names_its_successor() {
+    let client = user_client().await;
+    let api = base_url();
+    let retired = find_model(&client, &api, "gemini-3.5-flash")
+        .await
+        .expect("the retired row stays in the registry");
+    assert_eq!(retired["enabled"], false);
+    assert_eq!(retired["successor"], "gemini-3.8-flash");
+    let current = find_model(&client, &api, "gemini-3.8-flash")
+        .await
+        .expect("the successor is seeded");
+    assert_eq!(current["enabled"], true);
+    assert!(current["successor"].is_null());
 }
 
 /// A user-added local model gets the conservative set the moment it is created,
@@ -442,6 +469,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
         "claude-opus-5-5",
         "claude-sonnet-5-5",
         "claude-opus-5",
+        "claude-haiku-5-5",
     ] {
         let m = find_model(&client, &api, id)
             .await

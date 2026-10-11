@@ -23,6 +23,7 @@ function row(over: Partial<MarketplacePlugin>): MarketplacePlugin {
     files_count: 1,
     engine_compatible: true,
     status: 'available',
+    media: { screenshots: [], videos: [], problems: [] },
     ...over,
   };
 }

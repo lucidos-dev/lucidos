@@ -10,9 +10,24 @@
 //! Those last three satisfy every gate; `proposed` and the absence of a marker
 //! both block.
 
-use crate::hardened::git_context;
+use crate::hardened::{git_context, run_git};
 use crate::http::client as http_client;
 use crate::workspace::{BoxError, Workspace};
+
+/// When and how a plan's build moves to a fresh thread. Both moments an agent
+/// turns to ask for approval print it: `mark --plan` and the edit gate's deny.
+/// The engine prompt names the option only, since it is paid on every request.
+pub(crate) const NEW_THREAD_HANDOFF: &str = "When this thread's context is already heavy \
+    (a long grill, many pictures) AND the plan spans several phases or layers, also offer \
+    `Implement in a new thread`, so the build starts from the plan file alone. It counts like a \
+    fork: `Approve` stays first, and `Request changes` is dropped whenever it appears. Picking it \
+    approves the plan: run `lucidos planned approve` here, then spawn the builder with \
+    `lucidos spawn-thread --to \"$LUCIDOS_WORKSPACE\" --relation child --coding-agent \
+    <claude-code|codex>` (your own backend; without the flag it starts a chat thread), and end \
+    your turn. The spawn message names the plan path and tells the \
+    builder its first step: `git merge <this branch>`, since its worktree starts from main and \
+    lacks the plan. It then runs `lucidos planned mark --plan <path>` and `lucidos planned \
+    approve` without asking again, because the user approved here.";
 
 /// Which kind of planning decision is being recorded.
 #[derive(Debug, Clone)]
@@ -102,8 +117,8 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
         // the Lucidos MCP server, and sending either after the other's tool
         // would strand a proposed plan with no way to get it approved.
         MarkKind::Plan(p) => println!(
-            "Plan recorded (awaiting approval): {} ({}). Summarize it in your message, then ask for approval with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), not in prose. The card's question is one short line that never repeats the summary. The option pair is a floor: if the plan offers a real fork, that fork takes the second slot and `Request changes` is dropped rather than carried as a third. Once approved, run `lucidos planned approve`.",
-            branch, p
+            "Plan recorded (awaiting approval): {} ({}). Summarize it in your message, then ask for approval with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), not in prose. The card's question is one short line that never repeats the summary. The option pair is a floor: if the plan offers a real fork, that fork takes the second slot and `Request changes` is dropped rather than carried as a third. Once approved, run `lucidos planned approve`. {}",
+            branch, p, NEW_THREAD_HANDOFF
         ),
         MarkKind::Simple(r) => println!("Simple change acknowledged: {} ({})", branch, r),
         // The reminder is the only enforcement of the lane's other two
@@ -150,6 +165,19 @@ pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
         .map_err(|e| format!("POST {} returned non-JSON body: {}", url, e))?;
     if body.get("approved").and_then(|v| v.as_bool()) == Some(true) {
         println!("Plan approved: {}. Implementation is unblocked.", branch);
+        if let Some(plan_path) = body.get("plan_path").and_then(|v| v.as_str()) {
+            // The marker is already approved. A failed file edit must not
+            // read as a failed approval, so it only warns.
+            match mark_plan_file_approved(&cwd, plan_path) {
+                Ok(true) => println!("Marked {} as approved and committed it.", plan_path),
+                Ok(false) => {}
+                Err(e) => eprintln!(
+                    "Could not mark {} as approved ({}). Change its status line to \
+                     `{}` and commit it.",
+                    plan_path, e, APPROVED_STATUS
+                ),
+            }
+        }
     } else {
         // Nothing to flip — no proposed plan (already approved, a --simple ack,
         // or no marker at all). Surface it so the agent doesn't assume success.
@@ -160,6 +188,47 @@ pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
         );
     }
     Ok(())
+}
+
+/// The status line the `implementation-plan` skill writes into a new plan.
+pub(crate) const PROPOSED_STATUS: &str = "- **Status**: Proposed";
+/// What `planned approve` rewrites it to.
+pub(crate) const APPROVED_STATUS: &str = "- **Status**: Approved";
+
+/// The plan text with its status line flipped to approved. `None` when it has
+/// no proposed status line, as in a plan written before the line existed.
+pub(crate) fn approved_plan_text(text: &str) -> Option<String> {
+    let mut flipped = false;
+    let out: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            if !flipped && line.trim_end() == PROPOSED_STATUS {
+                flipped = true;
+                line.replacen(PROPOSED_STATUS, APPROVED_STATUS, 1)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    flipped.then_some(out)
+}
+
+/// Flip the plan file's status line and commit it, so the file on main says
+/// what the marker says. Returns whether it committed anything.
+fn mark_plan_file_approved(cwd: &std::path::Path, plan_path: &str) -> Result<bool, BoxError> {
+    let toplevel = run_git(cwd, &["rev-parse", "--show-toplevel"])?;
+    let file = std::path::Path::new(&toplevel).join(plan_path);
+    let text =
+        std::fs::read_to_string(&file).map_err(|e| format!("read {}: {}", file.display(), e))?;
+    let Some(approved) = approved_plan_text(&text) else {
+        return Ok(false);
+    };
+    std::fs::write(&file, approved).map_err(|e| format!("write {}: {}", file.display(), e))?;
+    let file_arg = file.to_string_lossy();
+    run_git(cwd, &["add", "--", &file_arg])?;
+    let message = format!("docs(plans): approve {}", plan_path);
+    run_git(cwd, &["commit", "-m", &message, "--", &file_arg])?;
+    Ok(true)
 }
 
 /// GET the Planned-marker state of the current branch from the parent engine.
@@ -203,6 +272,20 @@ pub(crate) fn cmd_state(ws: &Workspace) -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_flips_only_the_proposed_status_line() {
+        let plan = "## Plan\n\nQuotes `- **Status**: Proposed` inline.\n- **Status**: Proposed\n";
+        assert_eq!(
+            approved_plan_text(plan).as_deref(),
+            Some("## Plan\n\nQuotes `- **Status**: Proposed` inline.\n- **Status**: Approved\n")
+        );
+        assert_eq!(
+            approved_plan_text("## Old plan\n\nNo status line.\n"),
+            None,
+            "a plan written before the status line existed is left alone"
+        );
+    }
 
     #[test]
     fn parse_round_trips_known_states() {

@@ -342,7 +342,7 @@ pub(crate) async fn emit_generated_title(
     fallback_title: Option<String>,
     image_count: usize,
 ) {
-    match crate::engine::home_thread::is_marked_home_thread(pool, thread_id).await {
+    match crate::engine::home_thread::is_home_thread(pool, thread_id).await {
         Ok(false) => {}
         Ok(true) => return,
         Err(e) => {
@@ -506,7 +506,9 @@ mod capture_tests {
     async fn the_home_thread_gets_no_model_call_and_no_generated_title() {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
-        let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+        let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+            .await
+            .unwrap();
         let other = Uuid::new_v4();
         let call = |reply| {
             TitleCall::over(std::sync::Arc::new(ScriptedProvider::new(

@@ -97,7 +97,7 @@ SELECT e.event_type, e.payload->>'text' \
             AND q.payload->>'tool_use_id' = $2 \
           ORDER BY q.sequence LIMIT 1) \
    AND ( e.event_type = 'ChildThreadCompleted' \
-         OR ( e.event_type = 'UserPromptInjected' \
+         OR ( e.event_type = 'PromptInjected' \
               AND e.payload->>'mode' = 'agent' \
               AND NOT e.payload ? 'injected_message_id' ) ) \
    AND NOT EXISTS ( \

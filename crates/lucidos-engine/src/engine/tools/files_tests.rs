@@ -1,9 +1,43 @@
 use super::*;
 
+/// An app manager with no built-in widgets, for the read-only checks.
+fn no_apps() -> crate::core::AppManager {
+    let ws = tempfile::tempdir().unwrap();
+    crate::core::AppManager::new(ws.path()).unwrap()
+}
+
+#[test]
+fn read_only_reason_blocks_a_built_in_widget_and_nothing_else() {
+    let ws = tempfile::tempdir().unwrap();
+    let shipped = tempfile::tempdir().unwrap();
+    let player = shipped.path().join("lucidos-sound-player");
+    std::fs::create_dir_all(&player).unwrap();
+    std::fs::write(player.join("manifest.json"), r#"{"name":"Sound player"}"#).unwrap();
+    let apps = crate::core::AppManager::new(ws.path())
+        .unwrap()
+        .with_system_widgets(Some(shipped.path().to_path_buf()));
+
+    for p in [
+        "apps/lucidos-sound-player/index.html",
+        "apps/lucidos-sound-player/manifest.json",
+    ] {
+        let reason = read_only_reason(p, &apps).expect(p);
+        assert!(reason.contains("built-in"), "got: {reason}");
+    }
+    // A NEW app may not take the reserved prefix, through any write.
+    let reason = read_only_reason("apps/lucidos-new/manifest.json", &apps).unwrap();
+    assert!(reason.contains("reserved"), "got: {reason}");
+    // A workspace app that already holds such an id stays writable.
+    let mine = ws.path().join("data/apps/lucidos-mine");
+    std::fs::create_dir_all(&mine).unwrap();
+    std::fs::write(mine.join("manifest.json"), r#"{"name":"Mine"}"#).unwrap();
+    assert!(read_only_reason("apps/lucidos-mine/index.html", &apps).is_none());
+}
+
 #[test]
 fn read_only_reason_blocks_system_knowhow() {
-    assert!(read_only_reason("system-knowhow/best-practices.md").is_some());
-    assert!(read_only_reason("system-knowhow/scripts/list.sh").is_some());
+    assert!(read_only_reason("system-knowhow/best-practices.md", &no_apps()).is_some());
+    assert!(read_only_reason("system-knowhow/scripts/list.sh", &no_apps()).is_some());
 }
 
 #[test]
@@ -16,14 +50,17 @@ fn read_only_reason_blocks_ephemeral_scratch() {
         ".lucidos/tmp/changelog-v0.15.0.md",
         ".lucidos/tmp/some-repo/build.sh",
     ] {
-        assert!(read_only_reason(p).is_some(), "{p} should be refused");
+        assert!(
+            read_only_reason(p, &no_apps()).is_some(),
+            "{p} should be refused"
+        );
     }
 }
 
 #[test]
 fn scratch_refusal_names_run_python() {
     // A refusal is only useful if it says what to do instead.
-    let reason = read_only_reason(".lucidos/tmp/scratch.py").unwrap();
+    let reason = read_only_reason(".lucidos/tmp/scratch.py", &no_apps()).unwrap();
     assert!(reason.contains("run_python"), "got: {reason}");
     assert!(reason.contains("workspace root"), "got: {reason}");
 }
@@ -68,21 +105,27 @@ fn data_path_app_manifest_id_only_matches_the_manifest() {
 #[test]
 fn app_lifecycle_event_is_birth_and_death_only() {
     let name = || Some("Demo".to_string());
+    let delete = ManifestOp::Delete {
+        kind_before: Some(AppKind::Widget),
+    };
     // Manifest newly appeared → AppCreated (the load-bearing case).
     assert!(matches!(
-        app_lifecycle_event("a", name, true, false, false),
+        app_lifecycle_event("a", name, true, false, ManifestOp::Write),
         Some(SystemEvent::AppCreated { .. })
     ));
     // Manifest edited (existed before, still exists) → None: AppUpdated is
     // emitted once per turn by the agentic loop, not per write.
-    assert!(app_lifecycle_event("a", name, true, false, true).is_none());
-    // Manifest removed (existed before) → AppDeleted.
+    assert!(app_lifecycle_event("a", name, true, true, ManifestOp::Write).is_none());
+    // Manifest removed (existed before) → AppDeleted, carrying the kind it had.
     assert!(matches!(
-        app_lifecycle_event("a", name, false, true, true),
-        Some(SystemEvent::AppDeleted { .. })
+        app_lifecycle_event("a", name, false, true, delete),
+        Some(SystemEvent::AppDeleted {
+            kind: Some(AppKind::Widget),
+            ..
+        })
     ));
     // Delete against an app that never existed → nothing.
-    assert!(app_lifecycle_event("a", name, false, true, false).is_none());
+    assert!(app_lifecycle_event("a", name, false, false, delete).is_none());
 }
 
 #[test]
@@ -133,13 +176,13 @@ fn an_artifact_change_is_left_to_its_own_artifact_event() {
 
 #[test]
 fn read_only_reason_allows_user_paths() {
-    assert!(read_only_reason("artifacts/notes.md").is_none());
-    assert!(read_only_reason("knowhow/lucidos/best-practices.md").is_none());
-    assert!(read_only_reason("apps/foo/index.html").is_none());
-    assert!(read_only_reason("triggers/daily/check.md").is_none());
+    assert!(read_only_reason("artifacts/notes.md", &no_apps()).is_none());
+    assert!(read_only_reason("knowhow/lucidos/best-practices.md", &no_apps()).is_none());
+    assert!(read_only_reason("apps/foo/index.html", &no_apps()).is_none());
+    assert!(read_only_reason("triggers/daily/check.md", &no_apps()).is_none());
     // The scratch guard matches a path prefix, not a name prefix: an artifact
     // that merely starts with the same letters stays writable.
-    assert!(read_only_reason("artifacts/.lucidosrc").is_none());
+    assert!(read_only_reason("artifacts/.lucidosrc", &no_apps()).is_none());
 }
 
 #[test]

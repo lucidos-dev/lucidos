@@ -85,10 +85,14 @@ pub(crate) fn parse_context_suffix(model: &str) -> (&str, bool) {
 /// its own arm or it silently falls to the no-thinking 8192-token path.
 ///
 /// Haiku 4.5 rides the `budget_tokens` path. Its 64K output ceiling clears
-/// the largest budget plus the reply allowance in [`thinking_config`].
+/// the largest budget plus the reply allowance in [`thinking_config`]. The
+/// Haiku 5 family is adaptive, and needs its own arm for the same reason as
+/// Sonnet 5. Its [`ADAPTIVE_THINKING_MODELS`] entry matches the same fragment,
+/// so no Haiku 5 id can reach the `budget_tokens` path.
 pub(crate) fn supports_extended_thinking(model: &str) -> bool {
     model.contains("claude-3-7-sonnet")
         || model.contains("claude-haiku-4-5")
+        || model.contains("claude-haiku-5")
         || model.contains("claude-sonnet-4")
         || model.contains("claude-sonnet-5")
         || model.contains("claude-opus-4")
@@ -136,8 +140,8 @@ struct AdaptiveModel {
 ///
 /// 128_000 is the exact ceiling, not a decimal reading of "128k". Vertex
 /// rejects anything above it with `max_tokens: N > 128000, which is the maximum
-/// allowed number of output tokens`. Opus 4.7, Opus 4.8, Opus 5 and Sonnet 5
-/// each report that same number.
+/// allowed number of output tokens`. Opus 4.7, Opus 4.8, Opus 5, Sonnet 5 and
+/// Haiku 5.5 each report that same number.
 const ADAPTIVE_THINKING_MODELS: &[AdaptiveModel] = &[
     AdaptiveModel {
         fragment: "claude-opus-4-7",
@@ -166,6 +170,11 @@ const ADAPTIVE_THINKING_MODELS: &[AdaptiveModel] = &[
     },
     AdaptiveModel {
         fragment: "claude-sonnet-5",
+        max_output_tokens: 128_000,
+        mode: ThinkingMode::OnByDefault,
+    },
+    AdaptiveModel {
+        fragment: "claude-haiku-5",
         max_output_tokens: 128_000,
         mode: ThinkingMode::OnByDefault,
     },
@@ -285,16 +294,21 @@ type ThinkingConfig = (Option<ClaudeThinking>, Option<ClaudeOutputConfig>, u32);
 /// model + reasoning effort. Adaptive-thinking models (Opus 4.7+, Fable 5) use
 /// `output_config.effort`; older thinking models (Sonnet 4.x, Haiku 4.5) use a
 /// `budget_tokens` ceiling; non-thinking models get neither.
+///
+/// No effort asks for the model's own default: thinking as the model does it
+/// unasked, at the API's default effort.
 fn thinking_config(base_model: &str, reasoning_effort: Option<&str>) -> ThinkingConfig {
     if !supports_extended_thinking(base_model) {
         return (None, None, NO_THINKING_MAX_TOKENS);
     }
-    let effort =
-        reasoning_effort.unwrap_or(crate::core::prefs::CHAT_REASONING_EFFORT.default_text());
-    match adaptive_model(base_model) {
-        Some(entry) => adaptive_thinking_config(entry, effort),
-        None if effort == "none" => (None, None, NO_THINKING_MAX_TOKENS),
-        None => {
+    match (adaptive_model(base_model), reasoning_effort) {
+        (Some(entry), None) if entry.mode == ThinkingMode::OffByDefault => {
+            (None, None, NO_THINKING_MAX_TOKENS)
+        }
+        (Some(entry), None) => adaptive_request(entry, None),
+        (Some(entry), Some(effort)) => adaptive_thinking_config(entry, effort),
+        (None, None | Some("none")) => (None, None, NO_THINKING_MAX_TOKENS),
+        (None, Some(effort)) => {
             let budget = crate::llm::thinking_budget_for_effort(effort);
             (
                 Some(ClaudeThinking {
@@ -327,26 +341,27 @@ fn adaptive_thinking_config(entry: &AdaptiveModel, effort: &str) -> ThinkingConf
         ),
         // `reasoning::supported_efforts` never offers `none` here, so routing
         // has already snapped it to `low`. This covers a caller that bypassed it.
-        (ThinkingMode::AlwaysOn, "none") => adaptive_request(entry, "low"),
-        (_, effort) => adaptive_request(entry, effort),
+        (ThinkingMode::AlwaysOn, "none") => adaptive_request(entry, Some("low")),
+        (_, effort) => adaptive_request(entry, Some(effort)),
     }
 }
 
-/// Adaptive thinking at `effort`, with the model's own `max_tokens` ceiling so
-/// `end_turn` ends the turn rather than a budget we invented. See
+/// Adaptive thinking at `effort`, or at the API's default effort for `None`.
+/// It takes the model's own `max_tokens` ceiling, so `end_turn` ends the turn
+/// rather than a budget we invented. See
 /// [`ADAPTIVE_THINKING_MODELS`].
 ///
 /// A model that always thinks writes its notes between tool calls as
 /// `thinking` blocks, empty unless the request asks for progress updates. So
 /// it always asks: without them a long tool-calling turn streams nothing.
-fn adaptive_request(entry: &AdaptiveModel, effort: &str) -> ThinkingConfig {
+fn adaptive_request(entry: &AdaptiveModel, effort: Option<&str>) -> ThinkingConfig {
     (
         Some(ClaudeThinking {
             thinking_type: "adaptive".to_string(),
             budget_tokens: None,
             display: (entry.mode == ThinkingMode::AlwaysOn).then_some(DISPLAY_PROGRESS_UPDATES),
         }),
-        Some(ClaudeOutputConfig {
+        effort.map(|effort| ClaudeOutputConfig {
             effort: effort.to_string(),
         }),
         entry.max_output_tokens,
@@ -483,6 +498,7 @@ pub(crate) fn build_claude_request(
         thinking,
         output_config,
         anthropic_beta,
+        tool_choice: None,
     };
 
     crate::llm::cache_probe::log_request(&request, model, request_url, provider_tag);
@@ -652,9 +668,9 @@ pub(crate) async fn parse_claude_stream(
     // Build LlmResponse from accumulated blocks
     let mut content: Option<String> = None;
     let mut tool_calls = Vec::new();
+    let mut progress_notes = Vec::new();
     let mut thinking_chars: usize = 0;
     let mut thinking_blocks: usize = 0;
-    let mut wrote_reply = false;
 
     // A turn can carry more than one text block (Anthropic interleaves
     // thinking and text). They are separate blocks in the wire format, not a
@@ -673,13 +689,11 @@ pub(crate) async fn parse_claude_stream(
 
     for block in blocks {
         match block {
-            AccumulatedBlock::Text(text) => {
-                wrote_reply |= !text.trim().is_empty();
-                append_content(&text);
-            }
+            AccumulatedBlock::Text(text) => append_content(&text),
             AccumulatedBlock::ProgressNote(note) => {
                 thinking_blocks += 1;
                 append_content(&note);
+                progress_notes.push(note);
             }
             AccumulatedBlock::ToolUse {
                 id,
@@ -721,7 +735,6 @@ pub(crate) async fn parse_claude_stream(
     }
 
     Ok(LlmResponse {
-        content_is_progress_notes: content.is_some() && !wrote_reply,
         content,
         tool_calls,
         stop_reason: turn_meta.stop_reason,
@@ -729,6 +742,7 @@ pub(crate) async fn parse_claude_stream(
         input_tokens: turn_meta.input_tokens,
         cache_creation_tokens: turn_meta.cache_creation_tokens,
         cache_read_tokens: turn_meta.cache_read_tokens,
+        served_model: turn_meta.served_model,
         thinking_chars: Some(thinking_chars),
         thinking_blocks: Some(thinking_blocks),
         unknown_sse_dropped: turn_meta.unknown_sse_dropped,
@@ -736,6 +750,7 @@ pub(crate) async fn parse_claude_stream(
         // answer fragment and already rides in `content`, so nothing here is
         // model-only.
         model_only_text: None,
+        progress_notes,
     })
 }
 
@@ -1013,6 +1028,7 @@ fn process_sse_data(
                     provider_tag,
                 ));
             }
+            meta.served_model = crate::llm::served_model::served_model_of(&data["message"]);
         }
         "message_delta" => {
             if let Some(sr) = data["delta"]["stop_reason"].as_str() {
@@ -1052,12 +1068,12 @@ const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// block, then tools[-1]. A Classic request holds no memory view block, so it
 /// marks tools, system and the two messages, as it always has.
 ///
-/// A Tree turn's first round marks the view snapshot and both thread view
-/// marks, and later rounds keep the snapshot and the first. Every view prefix
-/// holds tools and system, so their own markers only pay when the snapshot
-/// misses. A first round's reads need no marker of their own: the lookback
-/// from the last message reaches every view boundary in it. ADR 0362's
-/// amendment weighs it.
+/// A Tree turn's first round marks the snapshot's last whole block and both
+/// thread view rungs. Later rounds keep the snapshot and the first rung.
+/// Every view prefix holds tools and system, so their own markers only pay
+/// when the snapshot misses. A read finds only an entry some earlier request
+/// wrote, at most 20 blocks before a marker. The rungs sit where that lookback
+/// reaches the previous turn's rungs. ADR 0362's amendments weigh it.
 ///
 /// **A fifth marker is a turn-killing change.** The request carries no
 /// top-level `cache_control`, so nothing asks for an automatic breakpoint, and
@@ -1208,11 +1224,46 @@ pub(crate) struct ClaudeRequest {
     pub output_config: Option<ClaudeOutputConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic_beta: Option<Vec<String>>,
+    /// Set only by [`ClaudeRequest::force_tool`]. Every other request leaves
+    /// the choice to the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ClaudeToolChoice>,
+}
+
+/// A `tool_choice` naming the one tool the model must call.
+#[derive(Debug, Serialize)]
+pub(crate) struct ClaudeToolChoice {
+    #[serde(rename = "type")]
+    pub choice_type: &'static str,
+    pub name: String,
 }
 
 impl ClaudeRequest {
     pub(crate) fn thinking_display(&self) -> ThinkingDisplay {
         ThinkingDisplay::of(self.thinking.as_ref())
+    }
+
+    /// Make the model call `tool`, with thinking off: the API refuses a forced
+    /// tool beside extended thinking. A model whose thinking cannot be turned
+    /// off refuses any forced tool, so it is an error here, before anything
+    /// is sent.
+    pub(crate) fn force_tool(&mut self, tool: &str, model: &str) -> Result<(), String> {
+        let (base_model, _) = parse_context_suffix(model);
+        if thinking_mode(base_model) == Some(ThinkingMode::AlwaysOn) {
+            return Err(format!(
+                "{base_model} always thinks, so it cannot be made to call {tool}. \
+                 Pick a model that can for this background task."
+            ));
+        }
+        let (thinking, output_config, max_tokens) = thinking_config(base_model, Some("none"));
+        self.thinking = thinking;
+        self.output_config = output_config;
+        self.max_tokens = max_tokens;
+        self.tool_choice = Some(ClaudeToolChoice {
+            choice_type: "tool",
+            name: tool.to_string(),
+        });
+        Ok(())
     }
 }
 
@@ -1300,6 +1351,8 @@ pub(crate) struct TurnMeta {
     pub input_tokens: Option<u32>,
     pub cache_read_tokens: Option<u32>,
     pub cache_creation_tokens: Option<u32>,
+    /// The model `message_start` names: the *served model*.
+    pub served_model: Option<String>,
     /// Count of SSE shapes the parser saw but couldn't classify — unknown
     /// `content_block_start.content_block.type` or unknown
     /// `content_block_delta.delta.type` (excluding the known-quiet
@@ -1514,10 +1567,17 @@ mod tests {
             ("claude-opus-5-5[1m]", ThinkingMode::AlwaysOn),
             ("claude-fable-5", ThinkingMode::AlwaysOn),
             ("claude-fable-5-1[1m]", ThinkingMode::AlwaysOn),
+            ("claude-haiku-5-5", ThinkingMode::OnByDefault),
+            // A later Haiku 5 id passes the extended-thinking gate too, so it
+            // must land here rather than on the `budget_tokens` path.
+            ("claude-haiku-5-6", ThinkingMode::OnByDefault),
         ] {
             assert_eq!(thinking_mode(id), Some(mode), "{id}");
         }
         assert_eq!(thinking_mode("claude-sonnet-4-6"), None);
+        for id in HAIKU_4_5_IDS {
+            assert_eq!(thinking_mode(id), None, "{id}");
+        }
     }
 
     /// Thinking cannot be turned off on these models: `disabled` and
@@ -1555,13 +1615,34 @@ mod tests {
     /// loud, and must not carry an effort: `disabled` is a 400 at `xhigh`/`max`.
     #[test]
     fn effort_none_disables_thinking_on_a_model_that_thinks_by_default() {
-        for id in ["claude-opus-5", "claude-sonnet-5"] {
+        for id in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-5-5"] {
             let (thinking, output_config, max_tokens) = thinking_config(id, Some("none"));
             let thinking = thinking.expect("explicit thinking config");
             assert_eq!(thinking.thinking_type, "disabled", "{id}");
             assert!(thinking.budget_tokens.is_none(), "{id}");
             assert!(output_config.is_none(), "{id}");
             assert_eq!(max_tokens, NO_THINKING_MAX_TOKENS, "{id}");
+        }
+    }
+
+    /// No effort asks for what the model does unasked: thinking stays off where
+    /// it is off by default, and runs at the API's default effort elsewhere.
+    #[test]
+    fn no_effort_runs_the_model_at_its_own_default() {
+        for id in ["claude-opus-4-8", "claude-haiku-4-5"] {
+            let (thinking, output_config, max_tokens) = thinking_config(id, None);
+            assert!(thinking.is_none(), "{id}");
+            assert!(output_config.is_none(), "{id}");
+            assert_eq!(max_tokens, NO_THINKING_MAX_TOKENS, "{id}");
+        }
+        for id in ["claude-opus-5", "claude-opus-5-5", "claude-fable-5"] {
+            let (thinking, output_config, _) = thinking_config(id, None);
+            assert_eq!(
+                thinking.expect("adaptive").thinking_type,
+                "adaptive",
+                "{id}"
+            );
+            assert!(output_config.is_none(), "{id} sends no effort");
         }
     }
 
@@ -1700,6 +1781,57 @@ mod tests {
         assert_eq!(sent.len(), offered.len(), "{offered:?} sent {sent:?}");
     }
 
+    /// Haiku 5.5 rejects `budget_tokens`, any sampling parameter, and a
+    /// `disabled` thinking beside `xhigh` or `max`. Every tier the picker
+    /// offers it must reach both transports as a request it accepts.
+    #[test]
+    fn haiku_5_5_sends_only_fields_it_accepts_at_every_tier() {
+        use crate::llm::model_registry::ProviderKind;
+        let id = "claude-haiku-5-5";
+        for provider in [ProviderKind::Vertex, ProviderKind::Anthropic] {
+            let offered = crate::llm::reasoning::supported_efforts(provider, id);
+            assert_eq!(offered, crate::llm::EFFORT_LADDER, "{provider:?}");
+            for &effort in offered {
+                for target in [
+                    WireTarget::Vertex {
+                        url: VERTEX_TEST_URL,
+                    },
+                    WireTarget::Direct {
+                        url: "https://api.anthropic.com/v1/messages",
+                    },
+                ] {
+                    let (req, _) = build_claude_request(
+                        vec![Message {
+                            role: "user".into(),
+                            content: MessageContent::Text("hi".into()),
+                        }],
+                        vec![],
+                        id,
+                        None,
+                        Some(effort),
+                        target,
+                        "test",
+                    );
+                    let json = serde_json::to_value(&req).unwrap();
+                    for field in ["temperature", "top_p", "top_k"] {
+                        assert!(json.get(field).is_none(), "{field} at {effort}");
+                    }
+                    assert!(json["thinking"].get("budget_tokens").is_none());
+                    let max_tokens = json["max_tokens"].as_u64().unwrap();
+                    if effort == "none" {
+                        assert_eq!(json["thinking"]["type"], "disabled");
+                        assert!(json.get("output_config").is_none());
+                        assert_eq!(max_tokens, u64::from(NO_THINKING_MAX_TOKENS));
+                        continue;
+                    }
+                    assert_eq!(json["thinking"]["type"], "adaptive", "{effort}");
+                    assert_eq!(json["output_config"]["effort"], effort);
+                    assert_eq!(max_tokens, 128_000, "{effort}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn message_content_to_claude_value_filters_empty_text_blocks() {
         // When pasting images without text, empty text blocks must be filtered
@@ -1759,6 +1891,8 @@ mod tests {
         // Cache breakdown survives separately so the modal can show hit rate.
         assert_eq!(meta.cache_creation_tokens, Some(1000));
         assert_eq!(meta.cache_read_tokens, Some(500));
+        // The same event names the model that served the turn.
+        assert_eq!(meta.served_model.as_deref(), Some("claude-opus-4-7"));
     }
 
     #[test]
@@ -2110,6 +2244,84 @@ mod tests {
         assert!(messages[2].content.is_string());
     }
 
+    /// A forced request at `effort`, as the provider sends it.
+    fn forced_request(model: &str, effort: Option<&str>) -> Result<serde_json::Value, String> {
+        let (mut req, _) = build_claude_request(
+            vec![Message {
+                role: "user".into(),
+                content: MessageContent::Text("hi".into()),
+            }],
+            vec![crate::llm::tools::request_read_tool()],
+            model,
+            None,
+            effort,
+            WireTarget::Direct {
+                url: "https://api.anthropic.com/v1/messages",
+            },
+            "Anthropic",
+        );
+        req.force_tool(crate::llm::tool_names::REQUEST_READ, model)?;
+        Ok(serde_json::to_value(&req).unwrap())
+    }
+
+    /// A forced call names its tool and runs without thinking, whatever effort
+    /// the caller passed: the API refuses a forced tool beside thinking.
+    #[test]
+    fn a_forced_call_names_its_tool_and_turns_thinking_off() {
+        for model in ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+            let json = forced_request(model, Some("high")).unwrap();
+            assert_eq!(
+                json["tool_choice"],
+                serde_json::json!({ "type": "tool", "name": "request_read" }),
+                "{model}"
+            );
+            assert!(json.get("thinking").is_none(), "{model}: {json}");
+            assert!(json.get("output_config").is_none(), "{model}");
+            assert_eq!(json["max_tokens"], NO_THINKING_MAX_TOKENS, "{model}");
+        }
+        // A model that thinks unless told not to is told not to.
+        let json = forced_request("claude-opus-5", Some("high")).unwrap();
+        assert_eq!(json["thinking"]["type"], "disabled");
+        assert!(json.get("output_config").is_none());
+    }
+
+    /// A model whose thinking cannot be turned off refuses every forced tool,
+    /// so the request is never sent.
+    #[test]
+    fn an_always_thinking_model_refuses_a_forced_call_before_it_is_sent() {
+        for model in [
+            "claude-opus-5-5[1m]",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+        ] {
+            let err = forced_request(model, None).expect_err(model);
+            assert!(err.contains("always thinks"), "{err}");
+        }
+    }
+
+    /// An ordinary request leaves the choice to the model.
+    #[test]
+    fn an_unforced_request_sends_no_tool_choice() {
+        let (req, _) = build_claude_request(
+            vec![Message {
+                role: "user".into(),
+                content: MessageContent::Text("hi".into()),
+            }],
+            vec![crate::llm::tools::request_read_tool()],
+            "claude-opus-4-8",
+            None,
+            None,
+            WireTarget::Direct {
+                url: "https://api.anthropic.com/v1/messages",
+            },
+            "Anthropic",
+        );
+        assert!(serde_json::to_value(&req)
+            .unwrap()
+            .get("tool_choice")
+            .is_none());
+    }
+
     #[test]
     fn apply_cache_control_to_penultimate_message_needs_two_messages() {
         // With one message the anchor would land on the tail, doubling a marker
@@ -2327,6 +2539,7 @@ mod tests {
             thinking: None,
             output_config: None,
             anthropic_beta: None,
+            tool_choice: None,
         };
 
         let json = serde_json::to_value(&req).unwrap();
@@ -2830,51 +3043,11 @@ mod tests {
             response.content.clone().unwrap()
         );
         assert_eq!(response.thinking_blocks, Some(2));
-        assert!(!response.content_is_progress_notes, "a reply came after it");
-    }
-
-    /// The refund incident's shape: the model drafted a message in its
-    /// reasoning, and only a note came back before the question card.
-    #[tokio::test]
-    async fn a_round_with_only_a_note_before_its_tool_call_is_flagged() {
-        const BODY: &str = concat!(
-            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
-            "\n\n",
-            r#"data: {"type":"content_block_start","index":0,"#,
-            r#""content_block":{"type":"thinking","thinking":""}}"#,
-            "\n\n",
-            r#"data: {"type":"content_block_delta","index":0,"#,
-            r#""delta":{"type":"thinking_delta","thinking":"Here it is now: the steps."}}"#,
-            "\n\n",
-            r#"data: {"type":"content_block_stop","index":0}"#,
-            "\n\n",
-            r#"data: {"type":"content_block_start","index":1,"#,
-            r#""content_block":{"type":"tool_use","id":"toolu_1","name":"ask_user_question","input":{}}}"#,
-            "\n\n",
-            r#"data: {"type":"content_block_delta","index":1,"#,
-            r#""delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
-            "\n\n",
-            r#"data: {"type":"content_block_stop","index":1}"#,
-            "\n\n",
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"#,
-            r#""usage":{"output_tokens":40}}"#,
-            "\n\n"
-        );
-        let response = parse_claude_stream(
-            sse_response(BODY),
-            &None,
-            ThinkingDisplay::ProgressUpdates,
-            "Test",
-        )
-        .await
-        .expect("a note-then-tool turn parses");
-
         assert_eq!(
-            response.content.as_deref(),
-            Some("Here it is now: the steps.")
+            response.progress_notes,
+            ["Found the config. Checking the port next."],
+            "the note is reported as a summary, and the text block is not"
         );
-        assert_eq!(response.tool_calls.len(), 1);
-        assert!(response.content_is_progress_notes);
     }
 
     /// Without progress-update display, the same text is reasoning. It must
@@ -2895,7 +3068,7 @@ mod tests {
         assert_eq!(*seen.lock().expect("callback mutex"), "The port is 8080.");
         assert_eq!(response.thinking_blocks, Some(2));
         assert!(response.thinking_chars.unwrap() > 0);
-        assert!(!response.content_is_progress_notes, "only the reply shows");
+        assert!(response.progress_notes.is_empty());
     }
 
     /// An interrupted response can end on a progress block holding a fixed
@@ -2940,6 +3113,7 @@ mod tests {
 
         assert_eq!(response.content.as_deref(), Some("Started on it."));
         assert_eq!(*seen.lock().expect("callback mutex"), "Started on it.");
+        assert!(response.progress_notes.is_empty());
     }
 
     /// The live incident: Vertex sent only the interrupted-work sentinel, then
@@ -3502,9 +3676,9 @@ mod tests {
         ]
     }
 
-    /// A Tree turn's opening message as `TurnMemoryViews::lead` builds it:
-    /// the snapshot, two thread view pieces ending at marks, the view's rest,
-    /// then the message.
+    /// A Tree turn's opening message in the shape `TurnMemoryViews::lead`
+    /// gives it: the snapshot's marked block, the thread view's two rungs, the
+    /// view's rest, then the message.
     fn tree_message(snapshot: bool) -> Message {
         let mut blocks = Vec::new();
         if snapshot {
@@ -3591,6 +3765,50 @@ mod tests {
     fn a_later_tree_round_keeps_the_snapshot_and_the_first_thread_mark() {
         assert_eq!(
             marked(&tree_turn(true, 2)),
+            ["m0b0", "m0b1", "m1b0", "m2b0"]
+        );
+    }
+
+    /// A compactor request: a compaction view with three marked rungs, its
+    /// unmarked rest, then the step. A retry round appends the model's line
+    /// and the follow-up.
+    fn compaction_request(retry: bool) -> ClaudeRequest {
+        let view = |text: &str| ContentBlock::MemoryView { text: text.into() };
+        let text = |text: &str| ContentBlock::Text { text: text.into() };
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![
+                view("<chat>\na\nb\nc\nd\n"),
+                view("e\nf\ng\nh\n"),
+                view("i\nj\nk\nl\n"),
+                text("m\n</chat>\n"),
+                text("Compaction: compress this message"),
+            ]),
+        }];
+        if retry {
+            messages.push(Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("a line too long".into()),
+            });
+            messages.push(Message {
+                role: "user".into(),
+                content: MessageContent::Text("Too long: your line is 600 bytes".into()),
+            });
+        }
+        request_for(messages)
+    }
+
+    /// A compactor request's first round marks its end and all three rungs.
+    /// A retry round marks the last two messages and the first two rungs.
+    /// Neither passes the four the API allows.
+    #[test]
+    fn a_compaction_request_marks_its_rungs_within_the_limit() {
+        assert_eq!(
+            marked(&compaction_request(false)),
+            ["m0b0", "m0b1", "m0b2", "m0b4"]
+        );
+        assert_eq!(
+            marked(&compaction_request(true)),
             ["m0b0", "m0b1", "m1b0", "m2b0"]
         );
     }

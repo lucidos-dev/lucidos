@@ -25,6 +25,9 @@ export function ModelSelectionField({
   model,
   effort,
   provider,
+  effortFor,
+  unsetEffortLabel,
+  defaultEffortLabel,
   disabled,
   onChange,
 }: {
@@ -36,6 +39,9 @@ export function ModelSelectionField({
   effort: string | null;
   /** The backend picked for `model`, or `null` for the model's own default. */
   provider?: string | null;
+  effortFor?: (model: string) => string | null;
+  unsetEffortLabel?: string;
+  defaultEffortLabel?: (model: string) => string;
   disabled?: boolean;
   onChange: (patch: ModelSelectionPatch) => void;
 }) {
@@ -50,7 +56,7 @@ export function ModelSelectionField({
   useHidePanelWebviewWhile(open);
 
   const selection = useModelSelection({
-    models, vocabulary, model, effort, onChange,
+    models, vocabulary, model, effort, effortFor, unsetEffortLabel, defaultEffortLabel, onChange,
     providerFor: (m) => (m === model ? provider ?? null : null),
   });
 

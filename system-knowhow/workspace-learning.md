@@ -129,7 +129,7 @@ The same correction shape recurs across threads ("the report is too long", "stop
 
 #### 7. Coding-agent sessions that produce nothing
 
-`CodingAgentIdled` with no `ChangeProposed` on a recurring task, or a `ChangeDiscarded` before Apply. Either suggests the knowhow behind that coding-agent flow is unclear about what success looks like. The fix lives in that knowhow.
+`CodingAgentIdled` with no `ChangeProposed` on a recurring task (outside an event wait, which holds the proposal by design, ADR 0395), or a `ChangeDiscarded` before Apply. Either suggests the knowhow behind that coding-agent flow is unclear about what success looks like. The fix lives in that knowhow.
 
 #### 8. App-level friction: splits
 

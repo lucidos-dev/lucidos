@@ -1,9 +1,10 @@
 /**
  * Welcome surface: gating + provider-aware content.
  *
- * Gating is "show until dismissed" (`showWelcomeSurface` = isEmpty &&
- * !welcomeDismissed; the dismissal lives in the DB-backed
- * welcome_suggestions_dismissed preference). Content stays provider-aware: when
+ * Placement is `welcomePlacement`. The welcome goes in Home when Home exists,
+ * and on the compose view only when it does not. It shows nowhere while
+ * threads load or once dismissed, and the dismissal lives in the DB-backed
+ * welcome_suggestions_dismissed preference. Content stays provider-aware: when
  * no LLM provider is configured the welcome guides the user to Settings → Models
  * → Providers instead of offering the setup interview, which would chat into a
  * "no provider" error. These tests invoke the components directly and walk the
@@ -43,7 +44,7 @@ vi.mock('../../../store/actions/menu', async (importOriginal) => ({
 
 import { WelcomeMessage, ProviderSetupWelcome, SetupInterviewWelcome } from '../WelcomeMessage';
 import { openFreeProviderSettings, openProviderSettings } from '../../../store/actions/menu';
-import { showWelcomeSurface } from '../CreateThreadView';
+import { welcomePlacement } from '../CreateThreadView';
 import { threadHeaderActions } from '../../layout/ThreadHeaderActions';
 import { dialogParagraphs } from '../../shared/DialogMessage';
 import { llmConfigured, showConfirm } from '../../../store/store';
@@ -90,18 +91,25 @@ function textOf(node: ComponentChildren): string {
   return textOf(v.props.children as ComponentChildren);
 }
 
-describe('showWelcomeSurface — show-until-dismissed gating', () => {
-  it('hides whenever the compose view is not empty', () => {
-    expect(showWelcomeSurface({ isEmpty: false, welcomeDismissed: false })).toBe(false);
-    expect(showWelcomeSurface({ isEmpty: false, welcomeDismissed: true })).toBe(false);
+describe('welcomePlacement: one place, Home first', () => {
+  it('belongs to Home whenever Home exists', () => {
+    expect(welcomePlacement({ threadsLoaded: true, homeId: 'home', welcomeDismissed: false })).toBe('home');
   });
 
-  it('shows on the empty compose view until dismissed', () => {
-    // One rule: show until the user dismisses it (stored in the DB-backed
-    // welcome_suggestions_dismissed preference). No workspace-history or
-    // provider gating — the provider-aware variant is content, not gating.
-    expect(showWelcomeSurface({ isEmpty: true, welcomeDismissed: false })).toBe(true);
-    expect(showWelcomeSurface({ isEmpty: true, welcomeDismissed: true })).toBe(false);
+  it('falls back to the compose view only when there is no Home', () => {
+    expect(welcomePlacement({ threadsLoaded: true, homeId: null, welcomeDismissed: false })).toBe('compose');
+  });
+
+  it('shows nowhere while the thread list loads, so it never flashes in compose', () => {
+    for (const homeId of ['home', null]) {
+      expect(welcomePlacement({ threadsLoaded: false, homeId, welcomeDismissed: false })).toBe('none');
+    }
+  });
+
+  it('shows nowhere once dismissed', () => {
+    for (const homeId of ['home', null]) {
+      expect(welcomePlacement({ threadsLoaded: true, homeId, welcomeDismissed: true })).toBe('none');
+    }
   });
 });
 

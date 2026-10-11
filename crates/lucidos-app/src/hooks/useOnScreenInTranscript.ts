@@ -35,7 +35,7 @@ export function useOnScreenInTranscript(el: HTMLElement | null): boolean {
  *  target that never crosses the root is still answered.
  *
  *  One observer is the ONLY notifier here, which is what makes the root matter
- *  so much. `notification-visit.ts` roots its own at the window and gets away
+ *  so much. `seen-target.ts` roots its own at the window and gets away
  *  with it, because a scroll, a navigation and a mutation each resample it
  *  too. */
 export function watchOnScreen(el: HTMLElement, onChange: (onScreen: boolean) => void): () => void {

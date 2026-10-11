@@ -1,18 +1,25 @@
 import type { ComponentChildren, ComponentType } from 'preact';
 import { GlyphBadge } from './GlyphBadge';
+import { ChevronRightIcon } from './icons';
 
-/** The icon, label and count every list panel's section header draws: the
- *  thread drawer, Triggers, Changes and Thread queue. One markup, so the
- *  spacing and the count's look (styles/section-header.css) cannot differ
- *  between panels. A header with no count draws none. */
-export function SectionHeaderContent({ Icon, title, count, running }: {
+/** The chevron, icon, label and count every list panel's section header
+ *  draws: the thread drawer, Triggers, Changes and Thread queue. One markup,
+ *  so the spacing and the count's look (styles/section-header.css) cannot
+ *  differ between panels. A header with no count draws none.
+ *
+ *  A `collapsible` header leads with a chevron, which turns with the
+ *  `aria-expanded` of the element holding this content. A header that cannot
+ *  collapse draws none. */
+export function SectionHeaderContent({ Icon, title, count, running, collapsible }: {
     Icon?: ComponentType<{ size?: string }>;
     title: ComponentChildren;
     count?: number | string;
     running?: boolean;
+    collapsible?: boolean;
 }) {
     return (
         <>
+            {collapsible && <span class="section-chevron" aria-hidden="true"><ChevronRightIcon size="0.875rem" /></span>}
             {Icon && <span class="section-icon"><Icon size="0.875rem" /></span>}
             {/* While the section holds running work the label shimmers
                 INVERTED: the bold label rests at full strength and a muted band
@@ -48,7 +55,7 @@ export function SectionHeader({ title, count, collapsed, onToggle, actions, clas
                 onClick={onToggle}
                 aria-expanded={!collapsed}
             >
-                <SectionHeaderContent title={title} count={count} />
+                <SectionHeaderContent title={title} count={count} collapsible />
             </button>
             {actions && <div class="list-section-actions">{actions}</div>}
         </div>

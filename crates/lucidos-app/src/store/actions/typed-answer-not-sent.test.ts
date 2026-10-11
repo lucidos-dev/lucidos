@@ -31,7 +31,6 @@ vi.mock('../../api/client', async (importOriginal) => ({
   submitChat: vi.fn(),
 }));
 vi.mock('./thread-navigation', () => ({ pushThreadNavState: vi.fn(), removeThreadNavEntries: vi.fn() }));
-vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./thread-loading', () => ({
   refreshThreadEvents: vi.fn().mockResolvedValue(true),
   forgetThreadEventsFailures: vi.fn(),

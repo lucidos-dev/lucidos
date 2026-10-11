@@ -93,6 +93,7 @@ describe('installKeyboardForwarding', () => {
     cleanup();
     cleanup = () => {};
     delete (window as unknown as { parent?: unknown }).parent;
+    vi.unstubAllGlobals();
   });
 
   it('forwards a modifier chord to the parent', () => {
@@ -137,10 +138,12 @@ describe('installKeyboardForwarding', () => {
   it('cancels the browser default for a host-bound chord, so ⌘P is not a print', () => {
     const parent = { postMessage: vi.fn() };
     (window as unknown as { parent: unknown }).parent = parent;
+    vi.stubGlobal('location', { origin: 'https://localhost:5251' });
     cleanup = installKeyboardForwarding();
-    // The host's push, as _bridge.ts receives it: from the parent, on the channel.
+    // The host's push, as _bridge.ts receives it: from the parent, on the frame's
+    // origin, on the channel.
     const push = new Event('message');
-    Object.assign(push, { source: parent, data: { type: 'lucidos:bridge:push', channel: KEYBINDINGS_CHANNEL, data: { bindings: [SEARCH_FILES] } } });
+    Object.assign(push, { source: parent, origin: 'https://localhost:5251', data: { type: 'lucidos:bridge:push', channel: KEYBINDINGS_CHANNEL, data: { bindings: [SEARCH_FILES] } } });
     window.dispatchEvent(push);
     const bound = new Event('keydown', { cancelable: true });
     Object.assign(bound, { key: 'p', metaKey: true, ctrlKey: false, shiftKey: false, altKey: false });

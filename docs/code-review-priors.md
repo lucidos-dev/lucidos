@@ -15,15 +15,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
-- **A model added to the Claude thinking gate thinks at the chat default when a
-  call names no effort.** A reviewer reports a call passing
-  `ModelSelection::default()` (a file summary, a memory check) suddenly
-  spending a `high` budget on the newly added model. But `thinking_config` in
-  `llm/anthropic_wire.rs` resolves a missing effort to the
-  `chat_reasoning_effort` default for every thinking model, Sonnet 4.6
-  included. Those calls run on the provider's default model, so the new model
-  joins the same contract rather than changing it. Re-flag only if a missing
-  effort stops meaning the chat default.
+- **A call that names no effort runs at the model's default effort.** A
+  reviewer reports a call passing `ModelSelection::default()` (a file summary,
+  a memory check) with no effort, and expects the provider's default. But
+  `RoutingProvider::effort_for_route` fills a missing effort from the model
+  row's *default effort*, and sends none only for a model without one
+  (ADR 0390). Re-flag only if a missing effort stops meaning that.
 
 - **A side question recomputes its repo directory grants rather than copying
   the session's.** A reviewer reports privilege escalation: an agent edits
@@ -183,7 +180,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Two things make it narrow. The child deliberately stays in the wrapper's
   process group, so every ordinary kill reaches both: a terminal Ctrl-C, and
-  the engine's `BuildProcessGroupGuard` on a coalesced Apply. The escape
+  the engine's `BuildProcessGroupGuard` when an explicit Rebuild restarts the
+  build. The escape
   needs a deliberate single-pid SIGKILL. The OOM killer will not do it, since
   it picks the largest RSS and the wrapper is tiny.
 
@@ -304,24 +302,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 - **Command-guard preferences are read once per response, not per tool
   call.** See the comment block at the top of the agentic loop
   (`agentic_loop/run.rs`) — the toggles can't change mid-response.
-- **Failed coding-agent turns deliberately do NOT auto-propose changes.**
-  `propose_one_held_back_change` (agent_recovery/has_diff.rs) skips threads
-  whose last turn didn't end `Generated`: interrupted/canceled/failed
-  threads recover via Continue, and an Apply button on a failed turn's diff
-  would over-claim (same reasoning as ADR 0001). `coding_agent_has_diff`
-  keeps the Diff button visible meanwhile.
-- **Recovery marks a question-parked thread's pending change `incomplete`
-  BEFORE the preserve guard — deliberate, not a bypass.** In
-  `recover_orphaned_worktrees` (agent_recovery/recovery.rs), the
-  `mark_pending_change_incomplete` re-emit for an actively-running branch runs
-  before the `thread_has_unanswered_question` preserve `continue`. That is
-  conservative by design: the pending row was populated mid-turn (per-commit
-  emits) and the user never confirmed it, so Apply must require explicit
-  confirmation whether or not the thread is parked on a question. The
-  re-emitted `ChangeProposed` is not in the preserve predicate's terminal
-  exclusion list, so the card stays answerable; the flag self-heals to
-  `incomplete: false` at the resumed session's next clean idle. Re-flag only
-  if the re-emit starts landing an event from the predicate's exclusion list.
+- **Failed coding-agent turns deliberately do NOT auto-propose changes**
+  (ADR 0400). `propose_one_held_back_change` (agent_recovery/has_diff.rs)
+  emits `ProposalWithheld { turn_incomplete }` for a thread whose last turn
+  did not end `Generated`, never `ChangeProposed`. Such threads recover via
+  Continue. An Apply on a failed turn's diff would over-claim (same reasoning
+  as ADR 0001). The `unproposed` change state keeps the Diff button visible.
+- **Recovery withholds a question-parked thread's unfinished work BEFORE the
+  preserve guard: deliberate, not a bypass.** In `recover_orphaned_worktrees`
+  (agent_recovery/recovery.rs), `redecide_branch_work(.., finished: false)`
+  runs for an actively-running branch before the
+  `thread_has_unanswered_question` preserve `continue`. The commits past the
+  pending row are half-finished work, so they must never ride an Apply,
+  parked question or not. Boot withdraws the row without asking git, then
+  withholds the branch's work. `ProposalWithheld` and `ChangeWithdrawn` move no status, so the
+  card stays answerable. Re-flag only if the withhold starts landing an event
+  from the preserve predicate's exclusion list.
 - **Trigger threads run one indexed events-table lookup per persisted
   event** (the `is_top_level` latest-start query in
   `event_bus_projection_thread.rs`). Indexed, `LIMIT 1`, accepted cost.
@@ -415,7 +411,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 - **The staged-resource resolvers (`LUCIDOS_CLI_BIN`, `LUCIDOS_SDK_DIR`,
   `LUCIDOS_SYSTEM_KNOWHOW_DIR`) deliberately do NOT share an env-or-fallback
   kernel, and `resolve_system_knowhow_dir` hardcodes the `"system-knowhow"`
-  basename.** Reviewers flag both: (1) "third/fourth bespoke
+  basename.** The one exception is `system-knowhow` and `system-widgets`, which
+  share `core::shipped_dir::resolve_shipped_dir` because their missing-resource
+  policy is the same (warn + None). Reviewers flag both: (1) "third/fourth bespoke
   env-var-else-fallback resolver — extract a shared `resolve_staged_dir`" — but
   the three implement deliberately *different* missing-resource policies (CLI:
   sibling-walk + fail-fast at spawn; SDK: log + serve a stub; system-knowhow:
@@ -686,7 +684,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   elsewhere (`knowhow::id_from_path`) is historical, not evidence of support.
   Re-flag only if a Windows target lands, at which point the fix is one
   normalization at the walk, not per-predicate. (`core/artifacts.rs`,
-  `engine/chat/process/workspace_payload.rs`.)
+  `engine/chat/process/workspace_prompt_footprint.rs`.)
 
 - **Binding an `i64` into `make_interval(secs => $n)` is correct, not a
   reinterpreted float.** `make_interval` declares `secs` as `double precision`,
@@ -1302,6 +1300,16 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **A keepMounted modal's exit drawing does not bring back the iOS ghost
+  pixels.** A reviewer cites the file-search fixes and reads the fading copy
+  `overlayExitDrawing.ts` leaves as the same removed fixed layer. That ghost
+  came from the overlay sitting inside the swipe track's
+  `will-change: transform` layer, which it no longer does: `SearchEverywhere`
+  and `FileSearchModal` now mount in `OverlayLayer` at the app root. Their live
+  container still never leaves the DOM. Every other backdrop modal adds and
+  removes a fixed layer on each open and close. Re-flag only with an iOS PWA
+  ghost seen after the drawing landed.
+
 - **An overlay field keeps a header the composer already hid.** A reviewer
   reports that `useHideOnScroll` skips an overlay field without restoring the
   header, so a menu opened from the composer keeps the collapsed spacer. That
@@ -1665,6 +1673,17 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   two writes for a sub-pixel case. Re-flag only with a report of a container
   left visibly off.
 
+- **The repaint nudge may run during a landed deep link's glide.** A reviewer
+  reads `forceWebKitRepaint` gating on the RESOLVE rather than the claim, and
+  says a nudge mid-glide disrupts the landing. It cannot. `animateScroll` reads
+  `scrollTop` once, on its first frame, and then only writes absolute
+  positions. Its next frame overwrites the nudge, and `restoreNudge` yields.
+
+  The deep-link glide is a plain navigation, so `onScroll` has no landing to
+  cancel for it. Chevron glides already run beside streaming nudges. Gating on
+  the whole claim left the transcript blank for its four seconds. Re-flag only
+  if the tween starts re-reading `scrollTop` mid-glide.
+
 - **A new deep-link claim clearing `_pendingEventScrollLandedOffEdge` cannot
   resurrect a ride, because the thread's RECORD is the durable guard.** The flag
   (`components/chat/scrollState.ts`) says the last landing rested off the live
@@ -1702,23 +1721,17 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   acquires an event of its own. (`store/thread-events/exchange-render.ts`,
   `components/chat/chat-exchange-parts.tsx`, `components/chat/StepDetailModal.tsx`.)
 
-- **The shared `Dropdown` portals its menu to `<body>` at a z-index BELOW
-  `--z-modal`, and no dropdown is nested in a modal, so the "hidden behind the
-  modal it belongs to" bug has no instance.** The shape invites the finding
-  (Codex raised it as P1 on 2026-08-09): a body-portaled panel at
-  `--z-control-panel + 1` would indeed render under a `.modal-overlay`, and its
-  clicks would read as "outside" to the enclosing overlay's dismiss handler.
-  What refutes it is that **no `<Dropdown>` renders inside a backdrop
-  `<Overlay>`**. `CredentialModal` and `TriggerDetails` are the two that look
-  like modals and are not: both are reached through `InlineForm`, which
-  `ContentPane` renders as an ordinary content-pane view inside
-  `.content-pane-body` (`overlay?.type === 'form'`), which is why neither file
-  contains an `<Overlay>` at all. The name is a leftover. Every other
-  Dropdown host is a settings page, the composer, or a content-pane view.
-  Re-flag only with an actual nesting: a `<Dropdown>` rendered inside a panel
-  that is itself a backdrop `<Overlay>`. The `.dropdown-menu` rule in
-  `styles/global/host-components.css` states the ordering constraint at the
-  site, including what to do if that day comes.
+- **A portaled `Dropdown` menu inside a backdrop modal mounts in that modal's
+  panel, not `<body>`. So it is never "hidden behind the modal it belongs to".**
+  A backdrop `<Overlay>` provides its panel through `PortalTarget`
+  (`components/shared/Overlay.tsx`), and a nested `portal` overlay mounts
+  there. The Tree memory confirm's model picker needed it first.
+
+  On a phone the modal and the menu sit inside `.mobile-swipe-pane`. Its
+  `translateZ(0)` makes it their containing block. But the pane sits at the
+  screen's origin when shown (measured: top 0, full height), so the menu's
+  viewport coordinates still land right. Re-flag only if a containing block
+  between the menu and the screen moves off the origin.
 
 - **`sendCompose`'s catch cannot be reached by a failed chat POST, so a reviewer
   reasoning about "the send failed after the draft was cleared" is describing an
@@ -2300,27 +2313,19 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   re-sets `panelOverlay` for a non-navigation reason.
   (`components/files/FilePreviewModal.tsx`, `store/actions/filePreviewModal.ts`.)
 
-- **The preview modal mutating `filePreviewSource` / `selectedLines` /
-  `lineScrollTarget` / `filePreviewEditing` is a scoped BORROW, not shared-state
-  leakage.** Those four are the Files panel's view state, and the modal writes
-  all four on open, which looks like one surface reaching into another's state.
-  It snapshots them first and restores them in `closeFilePreviewModal`, and the
-  panel's preview is never mounted while the modal is up (the modal is reachable
-  only from an app iframe, so the content pane is showing that app), so there is
-  no concurrent reader. The one close that does NOT restore is the
-  navigation-triggered one (`{ navigated: true }`), and that asymmetry is
-  load-bearing rather than an oversight: `openFilePreview` clears the selection,
-  the scroll target and the source toggle BEFORE it sets `panelOverlay`, so by
-  the time the modal's watcher sees the overlay change the borrowed signals
-  already belong to the destination, and handing the snapshot back would paint
-  the panel's pre-modal highlight onto the file just opened. The escalation
-  closes before it navigates, so it restores normally. It is deliberate over threading a selection + scroll +
-  source-mode triple as props through `FilePreviewInline`, `RepoFileText` and
-  `LineNumberedCode`, which would widen the panel's own code for no panel
-  benefit. Pinned by the restore cases in
-  `store/actions/filePreviewModal.test.ts`. Re-flag only if a second surface can
-  read those signals while the modal is open.
-  (`store/actions/filePreviewModal.ts`, `docs/plans/2026-08-05-file-preview-modal-from-an-app.md`.)
+- **The preview components reading their view state from a context is not an
+  indirection to inline.** `LineNumberedCode`, `FilePreviewInline` and
+  `RepoFileContent` read the selection, the scroll target, the Source toggle and
+  the edit state through `usePreviewViewState()`. The Files panel gets the
+  global signals by default, and the file preview modal provides a fresh set per
+  open. Reading the globals directly looks simpler. But a link in agent prose
+  opens the modal over a Files preview, so both would share one highlight and
+  one scroll target.
+
+  The old borrow-and-restore design held only while the modal was app-only.
+  Pinned by "each preview reads its own view state" in
+  `components/files/__tests__/line-numbered-pan-layout.test.tsx`.
+  (`components/files/previewViewState.ts`, `docs/plans/2026-10-08-transcript-file-links-open-the-preview-modal.md`.)
 
 - **The navigation focus marker's entrance bloom does NOT revert `96b2c8e2a`,
   which removed an entrance animation "per user request".** A reviewer running
@@ -2444,43 +2449,6 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   unhides a window. Re-flag only if the navigate payload gains a per-window
   identity to key on. (`store/actions/oauth.ts`,
   `crates/lucidos-engine/src/engine/tools/credentials.rs`.)
-
-- **The thread filter panel's "Include deleted" checkbox sits INSIDE the
-  radiogroup on purpose** (2026-08-09). ARIA says a `radiogroup` owns radios,
-  so a checkbox and its Explainer partway through the set reads as a
-  conformance break, and both Codex and a fresh reviewer will reach for it. It
-  is the deliberate resolution of a three-way trade-off. The panel is ONE
-  single-select set (four statuses, an "or" rule, then "All statuses"), and the
-  requested reading order puts the modifier directly under that last row so the
-  "By thread types" heading below lands on the thread types it names. Splitting
-  the wrapper into two radiogroups to keep the
-  checkbox out reports one choice as two independent sets, which misleads worse
-  than a foreign child does; CSS `order` keeps the DOM clean but desynchronises
-  tab order from the visuals, which is a real keyboard bug rather than a
-  conformance one. The rows are `<button role="radio">` with no roving
-  tabindex, so the practical AT behaviour is per-row announcement plus Tab,
-  which the interleaved checkbox does not disturb. Re-flag only with a fix that
-  keeps ONE group, the DOM order, and the visual order at once.
-  (`components/layout/ThreadFilterPanel.tsx`.)
-
-- **"Include deleted" being off DOES count toward the "filtered" note, by
-  product decision** (2026-08-09). The mechanical objection is correct and will
-  be re-derived every round: `deletedOptionsHidden` gates which triggers / repos
-  / apps the OPTION LISTS offer, and excludes no thread from the list on screen,
-  so folding it into `narrowed` reports a narrowing the thread list does not
-  have. It was raised with the user before it was built and overruled twice, in
-  those words: a workspace where something deleted is being held back is not
-  showing you all of it, and the row says so. The refinement that answers the
-  mechanical objection came from the same place and is what `deletedOptionsHidden`
-  encodes: the note fires only when something deleted actually EXISTS and is
-  unselected, never on the switch merely sitting at its default, so the default
-  view on a workspace that has never deleted anything stays quiet. The explainer
-  inside the note names this cause in its own paragraph, so the user is never
-  left guessing which setting is responsible. Re-flag only if the note starts
-  firing with nothing deleted, or if "Include deleted" gains the power to hide
-  threads (at which point the two causes stop being distinguishable and the
-  copy needs revisiting). (`components/layout/ThreadFilterPanel.tsx`,
-  `store/threadFilterActive.ts`.)
 
 - **There is no hidden duplicate transcript, so no "the hidden mount steals the
   shared scroll state" bug.** `App.tsx` mounts ONE layout tree, `SplitLayout`
@@ -2846,7 +2814,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag if a desktop false positive is actually observed in the log, or if
   the settle-time re-read is removed.
 
-- **`notification-visit.ts` roots its `IntersectionObserver` at the WINDOW while
+- **`seen-target.ts` roots its `IntersectionObserver` at the WINDOW while
   its verdict measures the transcript's band, and that is not the latching bug
   `useOnScreenInTranscript` warns about.** A reviewer reading the hook's comment
   goes looking for the same shape elsewhere and finds it one file over. The two
@@ -3042,7 +3010,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Chased once as the cause of a queued message reading "Requesting" while the
   running turn read "Done". The real cause was `canQueueBehind` omitting
-  `UserPromptInjected`. Re-flag only if `foldEvent` stops calling
+  `PromptInjected`. Re-flag only if `foldEvent` stops calling
   `isAuxiliaryCapture`, or if a capture starts arriving without a `purpose`.
 
 - **The transcript's `keydown` arm deliberately has NO `e.target === el`
@@ -3157,6 +3125,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `docs/plans/2026-10-07-tree-memory-settings-polish.md`.)
 
 ## Scripts (bash)
+
+- **The stale debug object prune checks cargo's lock, then deletes without
+  holding it.** A reviewer reports a race: a cargo takes `.cargo-lock` after
+  the last check in `prune_stale_debug_objects` and loses objects mid-link. But
+  the delete list holds only generations that existed at listing time and that
+  no binary links. A cargo starting later writes new generation names and
+  hardlinks reused objects from the incremental cache, never from old `deps`
+  names (ADR 0408). Re-flag only if rustc starts reading old generation names.
 
 - **`scripts/lib/prose_scan.sh` measures sentence LENGTH on colon-split
   units, not on terminator-split sentences.** A reviewer reads a comment with
@@ -3550,14 +3526,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Installed/Store tabs had, not a new correctness break. Re-flag only if the
   panels become simultaneously visible. (`store/store.ts`, `store/actions/apps.ts`.)
 
-- **`get_recent_threads` dropping the `coding_agent_proposed` out-of-window
+- **`get_recent_threads` dropping the `proposed` out-of-window
   bypass does NOT lose work behind the archive curtain.** The outer `WHERE` only
   returns inbox rows + the contiguous archived window — it no longer force-loads
-  an archived `coding_agent_proposed` row. This looks like it violates the
+  an archived row whose `coding_agent_change_state` is `proposed`. This looks like it violates the
   "archived-with-pending-changes routes to Current" invariant
   (`display_section`, test `archived_with_pending_changes_routes_to_current`), but
-  archived + `coding_agent_proposed=TRUE` is an UNREACHABLE state: `ChangeProposed`
-  (the event whose pending `changes` row the flag follows) and `CodingAgentIdled` both
+  archived + `proposed` is an UNREACHABLE state: `ChangeProposed`
+  (the event whose pending `changes` row the state follows) and `CodingAgentIdled` both
   transition the thread `to_inbox` (`thread_lifecycle.rs` transition table), so a
   proposed CC thread is always inbox; `is_blocking` removes the Archive action
   while an in-workspace change is pending; and the external-repo archive cascade
@@ -3938,6 +3914,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Settled architecture questions
 
+- **A widget shown before the opt-in shelf has no chip until pinned.** A
+  reviewer reads `fold_thread_widgets` starting every `WidgetShown` unpinned
+  and asks for a migration that keeps old chips. ADR 0407 chose this on
+  purpose: the shelf is opt-in, and the widget's inline card stays in the
+  transcript. Re-flag only if the shelf stops being opt-in.
+  (`engine/widgets.rs`.)
+
 - **No shared turn-lifecycle orchestrator across the agent-session loop and
   the chat agentic loop** — ADR 0003. The seam already exists
   (`lifecycle.rs` pure decision functions + the typed terminal helpers).
@@ -4038,12 +4021,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   finding is refuted by ADR 0049** (2026-08-10, the jump moved to the wake
   card). The reasoning is sound on its face and Codex produced it: an attached
   `EventWaitDelivered` is followed by the paired `await_event` `ToolResult`
-  rather than by the `UserPromptInjected` that renders `EventDeliveryBody`, so
+  rather than by the `PromptInjected` that renders `EventDeliveryBody`, so
   moving the `Go to event` link off the arming row would leave such a delivery
   with no route to its matched event. What makes it moot is that the attached
   shape was retired on 2026-08-06 (ADR 0049, *Every event wait is detached*):
   **`was_attached` appears in no Rust file at all**, so the engine cannot emit
-  one, and every delivery writes a `UserPromptInjected` re-entry anchor. The field
+  one, and every delivery writes a `PromptInjected` re-entry anchor. The field
   survives only on the frontend wire type and its fixtures, for rows persisted
   before that date. Putting the link back on the arming card to serve those is
   the wrong trade twice over: the user removed it from there deliberately (it
@@ -4268,9 +4251,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `savePreference(reasoningKey, …)`. A network error between them leaves the
   new model stored beside the old effort, so the stated pairing is broken.
 
-  The two writes really are sequential, and the pattern predates the helper:
-  `setCurrentModel` has saved `chat_model` then `chat_reasoning_effort` the same
-  way since the chat pair existed. What makes it survivable is that **neither
+  The two writes really are sequential, and the pattern predates the helper.
+  `setChatModelSelection` saves `chat_model`, then `chat_reasoning_efforts`.
+  What makes it survivable is that **neither
   end trusts the stored pair**. The picker clamps for display
   (`clampToOffered`), and `RoutingProvider::effort_for_model` clamps the request
   at the wire. A stale effort is therefore a value nothing acts on. That is why
@@ -4433,13 +4416,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 - **The retraction check before a queued message is announced is a check then
   an act, and that window is not closable here.** A reviewer sees
   `filter_removed_queued_prompts` followed by an awaited
-  `emit_user_prompt_injected_event` (`chat/rerun.rs`, and the same pair in
+  `emit_prompt_injected_event` (`chat/rerun.rs`, and the same pair in
   `api::chat::announce_orphan_batch`) and asks for an atomic conditional write.
 
   Three things make the residual acceptable. The check runs per message rather
   than per batch, so the window is one statement rather than the whole announce
   loop. The other side guards too: the removal endpoint refuses with 409 once a
-  `UserPromptInjected` names the message. And an atomic form would have to write
+  `PromptInjected` names the message. And an atomic form would have to write
   the event outside `EventBus`, which CLAUDE.md names as the single entry point
   for event persistence.
 

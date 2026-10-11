@@ -47,9 +47,7 @@ const BADGE_MODIFIERS = [
   '.brand-badge',
   '.brand-badge-dot',
   '.brand-unread-badge',
-  '.drawer-view-count',
   '.system-attention-badge-corner',
-  '.filter-badge',
 ];
 const BADGE_SHEET: string = resolve(src, 'styles/badges.css');
 const isBadgeCornerRule = (path: string, selector: string): boolean =>

@@ -45,6 +45,25 @@ impl CodingAgentTextBuffer {
         self.persisted_len = self.text.len();
     }
 
+    /// The unflushed tail, now marked persisted. `None` while it holds only
+    /// whitespace.
+    fn take_tail(&mut self) -> Option<String> {
+        let tail = self.unflushed()?.to_string();
+        self.mark_flushed();
+        Some(tail)
+    }
+
+    /// Close the prose before `note`, then add `note` as its own paragraph.
+    /// Returns the two chunks to store: the prose, then the note.
+    fn close_with_progress_note(&mut self, note: &str) -> (Option<String>, Option<String>) {
+        let prose = self.take_tail();
+        self.break_paragraph();
+        self.push(note);
+        let note = self.take_tail();
+        self.break_paragraph();
+        (prose, note)
+    }
+
     /// Emit the unflushed tail as one `CodingAgentTextStreamed` and mark it
     /// persisted. Does nothing while the tail holds only whitespace.
     pub(crate) async fn flush(
@@ -55,24 +74,38 @@ impl CodingAgentTextBuffer {
         meta: &crate::engine::thread_events::EventMeta,
         label: &'static str,
     ) {
-        let Some(tail) = self.unflushed() else {
-            return;
-        };
-        event_bus
-            .emit_or_log(
-                crate::engine::event_bus::BusEvent::Thread {
+        if let Some(tail) = self.take_tail() {
+            emit(event_bus, thread_id, coding_agent, meta, label, tail, false).await;
+        }
+    }
+
+    /// Store the prose before `note`, then `note` in its own event, marked a
+    /// progress note. The card gate reads the mark, so a note never shares an
+    /// event with prose.
+    pub(crate) async fn flush_progress_note(
+        &mut self,
+        note: &str,
+        event_bus: &crate::engine::event_bus::EventBus,
+        thread_id: Uuid,
+        coding_agent: crate::runtime::CodingAgent,
+        meta: &crate::engine::thread_events::EventMeta,
+    ) {
+        const LABEL: &str = "[AgentSession] CodingAgentTextStreamed (progress note)";
+        let (prose, note) = self.close_with_progress_note(note);
+        for (text, progress_note) in [(prose, false), (note, true)] {
+            if let Some(text) = text {
+                emit(
+                    event_bus,
                     thread_id,
-                    event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed {
-                        text: tail.to_string(),
-                        coding_agent,
-                        parent_tool_use_id: None,
-                    },
-                    meta: meta.clone(),
-                },
-                label,
-            )
-            .await;
-        self.mark_flushed();
+                    coding_agent,
+                    meta,
+                    LABEL,
+                    text,
+                    progress_note,
+                )
+                .await;
+            }
+        }
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -93,6 +126,32 @@ impl CodingAgentTextBuffer {
     }
 }
 
+async fn emit(
+    event_bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    coding_agent: crate::runtime::CodingAgent,
+    meta: &crate::engine::thread_events::EventMeta,
+    label: &'static str,
+    text: String,
+    progress_note: bool,
+) {
+    event_bus
+        .emit_or_log(
+            crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed {
+                    text,
+                    coding_agent,
+                    parent_tool_use_id: None,
+                    progress_note,
+                },
+                meta: meta.clone(),
+            },
+            label,
+        )
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::CodingAgentTextBuffer;
@@ -104,6 +163,8 @@ mod tests {
         /// More text for the block already open.
         Delta(&'static str),
         Tool,
+        /// A progress note, stored as its own chunk and marked `*`.
+        Note(&'static str),
     }
 
     /// Drive the buffer the way the loop does: break the paragraph where a
@@ -113,30 +174,32 @@ mod tests {
     fn run(steps: &[Step]) -> (Vec<String>, CodingAgentTextBuffer) {
         let mut buf = CodingAgentTextBuffer::default();
         let mut chunks = Vec::new();
-        let mut flush = |buf: &mut CodingAgentTextBuffer| {
-            if let Some(tail) = buf.unflushed() {
-                chunks.push(tail.to_string());
-                buf.mark_flushed();
-            }
+        let flush = |buf: &mut CodingAgentTextBuffer, chunks: &mut Vec<String>| {
+            chunks.extend(buf.take_tail());
         };
         for step in steps {
             match step {
                 Step::Block(text) => {
                     buf.break_paragraph();
                     buf.push(text);
-                    flush(&mut buf);
+                    flush(&mut buf, &mut chunks);
                 }
                 Step::Delta(text) => {
                     buf.push(text);
-                    flush(&mut buf);
+                    flush(&mut buf, &mut chunks);
                 }
                 Step::Tool => {
-                    flush(&mut buf);
+                    flush(&mut buf, &mut chunks);
                     buf.break_paragraph();
+                }
+                Step::Note(note) => {
+                    let (prose, note) = buf.close_with_progress_note(note);
+                    chunks.extend(prose);
+                    chunks.extend(note.map(|note| format!("*{note}")));
                 }
             }
         }
-        flush(&mut buf);
+        flush(&mut buf, &mut chunks);
         (chunks, buf)
     }
 
@@ -264,5 +327,31 @@ mod tests {
         assert!(buf.is_empty());
         buf.push("B");
         assert_eq!(buf.unflushed(), Some("B"));
+    }
+
+    #[test]
+    fn a_progress_note_is_its_own_chunk_between_paragraphs() {
+        use Step::*;
+        let (chunks, buf) = run(&[
+            Block("Reading the code."),
+            Note("I mapped the flow."),
+            Tool,
+            Block("Done."),
+        ]);
+        assert_eq!(
+            chunks,
+            ["Reading the code.", "*\n\nI mapped the flow.", "\n\nDone."]
+        );
+        assert_eq!(
+            buf.as_str(),
+            "Reading the code.\n\nI mapped the flow.\n\nDone."
+        );
+    }
+
+    #[test]
+    fn a_progress_note_opening_the_turn_gets_no_leading_break() {
+        use Step::*;
+        let (chunks, _) = run(&[Note("Looking."), Block("Found it.")]);
+        assert_eq!(chunks, ["*Looking.", "\n\nFound it."]);
     }
 }

@@ -1,5 +1,5 @@
 import { isIOS, isWebKit } from './platform';
-import { OPEN_REPAINT_BURST_DELAYS_MS } from './webkitRepaint';
+import { OPEN_REPAINT_BURST_DELAYS_MS } from './repaintBurst';
 
 /** Live action buttons whose tap mutates state irreversibly — answering a CC
  *  question (`.question-option`) or granting/denying a permission (the
@@ -115,8 +115,34 @@ function onResume(): void {
   step({ kind: 'resume' });
   scheduleSettle();
 }
+
+/** Focus sits in one of the page's own frames, such as a widget the reader
+ *  just pressed. The window `focus` that ends it is the reader tapping the
+ *  host, not the page coming back, so it must not arm the guard. It still
+ *  repaints, since a tray restore can return focus to the frame unseen. A hide
+ *  in between makes the next `focus` a real resume again. */
+let focusInFrame = false;
+let blurCheck: ReturnType<typeof setTimeout> | undefined;
+
+function onWindowBlur(): void {
+  // The active element names the frame a tick after the window's blur.
+  clearTimeout(blurCheck);
+  blurCheck = setTimeout(() => { focusInFrame = document.activeElement?.tagName === 'IFRAME'; }, 0);
+}
+function onWindowFocus(): void {
+  const fromFrame = focusInFrame;
+  focusInFrame = false;
+  if (fromFrame) fireRepaint();
+  else onResume();
+}
+function onPageHide(): void {
+  // A freeze can hold the blur's check past the hide, so it goes too.
+  clearTimeout(blurCheck);
+  focusInFrame = false;
+}
 function onVisibilityChange(): void {
   if (document.visibilityState === 'visible') onResume();
+  else onPageHide();
 }
 function onClickCapture(e: MouseEvent): void {
   step({ kind: 'click', irreversible: isIrreversibleTapTarget(e.target) }, e);
@@ -131,7 +157,9 @@ function install(): void {
   // until a tap.
   document.addEventListener('visibilitychange', onVisibilityChange);
   window.addEventListener('pageshow', onResume);
-  window.addEventListener('focus', onResume);
+  window.addEventListener('pagehide', onPageHide);
+  window.addEventListener('focus', onWindowFocus);
+  window.addEventListener('blur', onWindowBlur);
   // The wake-tap guard is iOS ONLY, unlike the repaint above. A desktop window
   // is raised BY a click, so swallowing the first one there would eat an
   // ordinary click-to-focus. The phone has no such gesture: its first tap

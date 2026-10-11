@@ -18,6 +18,18 @@
     animation: modal-in var(--duration-fast) ease;
 }
 
+/* The drawing a backdrop <Overlay> leaves as it closes (overlayExitDrawing.ts):
+   its entrance, played backwards. Click-through, so the UI behind is live at
+   once. Nothing inside moves, or a copied panel would replay its own entrance. */
+.modal-overlay.modal-overlay-leaving {
+    animation: modal-out var(--duration-fast) ease forwards;
+    pointer-events: none;
+}
+.modal-overlay.modal-overlay-leaving * {
+    animation: none;
+    transition: none;
+}
+
 /* UI-blocking overlay — blocks interaction while the client refreshes (swaps
    the service worker and reloads). Engine restart no longer blocks here: the
    gateway boot splash + GET-gate + SSE reconnect make it a recoverable
@@ -110,7 +122,13 @@
  * in-progress step description and a drawer section header that contains a
  * running thread. Reuses the same 200%→-200% sweep direction as the skeleton
  * `shimmer` keyframe. `color` is the no-clip fallback (and the reduced-motion
- * resting color). */
+ * resting color).
+ *
+ * The sweep repaints every frame, so the text owns its compositing layer.
+ * Without one, each frame re-rasterizes the transcript's layer around it, and
+ * WebKit's GPU process can grow without bound under a streaming turn.
+ * `inline-block` lets a span take the layer
+ * (an-endless-repaint-owns-its-layer.test.ts). */
 @keyframes running-shimmer {
     0% { background-position: 200% 0; }
     100% { background-position: -200% 0; }
@@ -129,6 +147,8 @@
     background-clip: text;
     -webkit-text-fill-color: transparent;
     color: var(--text-secondary);
+    display: inline-block;
+    will-change: transform;
     animation: running-shimmer 2.6s linear infinite;
 }
 

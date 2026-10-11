@@ -71,6 +71,27 @@ fn every_indexable_event_type_indexes_text() {
     }
 }
 
+/// A row the rename migration never reached still reads back under the new
+/// name, and writes back under it.
+#[test]
+fn a_user_prompt_injected_row_reads_back_as_prompt_injected() {
+    let event: ThreadEvent = serde_json::from_value(json!({
+        "type": "UserPromptInjected",
+        "text": "carry on",
+        "mode": "engine",
+    }))
+    .expect("the retired name is a serde alias");
+    assert!(matches!(
+        &event,
+        ThreadEvent::PromptInjected { text, mode: ActorMode::Engine, .. } if text == "carry on"
+    ));
+    assert_eq!(event.event_type(), "PromptInjected");
+    assert_eq!(
+        serde_json::to_value(&event).unwrap()["type"],
+        "PromptInjected"
+    );
+}
+
 #[test]
 fn thread_event_serializes_with_type_tag() {
     let event = ThreadEvent::ToolCalled {
@@ -210,6 +231,7 @@ fn thread_event_type_name_extraction() {
                 text: "t".into(),
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 parent_tool_use_id: None,
+                progress_note: false,
             },
             "CodingAgentTextStreamed",
         ),
@@ -493,6 +515,14 @@ fn legacy_event_names_deserialize_via_alias() {
         (
             r#"{"type":"PushNotificationRequest"}"#,
             "PushNotificationRequested",
+        ),
+        (
+            r#"{"type":"WidgetRestored","app_id":"fare-grid"}"#,
+            "WidgetPinned",
+        ),
+        (
+            r#"{"type":"WidgetHidden","app_id":"fare-grid"}"#,
+            "WidgetUnpinned",
         ),
     ];
     for (json, expected_type) in cases {

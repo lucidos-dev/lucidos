@@ -2,10 +2,11 @@
 # Run Rust API e2e tests against the e2e-test workspace.
 #
 # Usage:
-#   ./scripts/e2e-api.sh [options] [-- cargo test args]
-#   ./scripts/e2e-api.sh --github [options]   # on GitHub's runners, ADR 0382
+#   ./scripts/e2e-api.sh [options] [-- cargo test args]   # on GitHub's runners when it can, ADR 0386
+#   ./scripts/e2e-api.sh --local [options]                # on this host
 #
 # Options:
+#   --local          Run on this host, not on GitHub. Local-only flags imply it.
 #   -f <filter>      Filter tests by name (passed to cargo test as filter)
 #   --no-reset       Skip DB reset AND leave the workspace running for the next
 #                    invocation. Use for fast iteration on a single test.
@@ -21,6 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/e2e_github.sh
 source "$SCRIPT_DIR/lib/e2e_github.sh"
 e2e_github_handoff api "$@"
+set -- ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$SCRIPT_DIR/lib/e2e.sh"

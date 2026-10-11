@@ -155,7 +155,7 @@ fn build_trigger_started_event_records_the_resolved_model_and_effort() {
         &TriggerInvocation::Schedule,
         "Summarize today.",
         false,
-        &sel(Some("gemini-3.5-flash"), Some("low"), Some("anthropic")),
+        &sel(Some("gemini-3.8-flash"), Some("low"), Some("anthropic")),
     );
     let ThreadEvent::TriggerStarted {
         model,
@@ -166,7 +166,7 @@ fn build_trigger_started_event_records_the_resolved_model_and_effort() {
     else {
         panic!("expected TriggerStarted");
     };
-    assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(model.as_deref(), Some("gemini-3.8-flash"));
     assert_eq!(reasoning_effort.as_deref(), Some("low"));
     assert_eq!(
         provider.as_deref(),
@@ -1376,6 +1376,20 @@ fn registry() -> crate::llm::ModelRegistry {
     crate::llm::model_registry::empty()
 }
 
+/// The router's own model, standing in for an unset `chat_model`.
+const FALLBACK_MODEL: &str = "router-default";
+
+/// Store `effort` as the account's chat tier for `model`.
+async fn seed_chat_effort(pool: &sqlx::PgPool, model: &str, effort: &str) {
+    crate::test_support::seed_preference(
+        pool,
+        prefs::CHAT_REASONING_EFFORTS.key(),
+        &format!("{model}={effort}"),
+    )
+    .await
+    .unwrap();
+}
+
 /// A registry mapping one id to one provider, for the clamp cases.
 fn registry_with(id: &str, provider: crate::llm::ProviderKind) -> crate::llm::ModelRegistry {
     use std::collections::HashMap;
@@ -1395,16 +1409,17 @@ fn registry_with(id: &str, provider: crate::llm::ProviderKind) -> crate::llm::Mo
 #[tokio::test]
 async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "gemini-3.5-flash")
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "gemini-3.8-flash")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "max")
-        .await
-        .unwrap();
+    seed_chat_effort(&pool, "gemini-3.8-flash", "max").await;
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry(),
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         Some(true),
         None,
@@ -1422,13 +1437,14 @@ async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
 #[tokio::test]
 async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
-        .await
-        .unwrap();
+    seed_chat_effort(&pool, "claude-opus-4-8[1m]", "high").await;
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry(),
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         Some(true),
         None,
@@ -1449,13 +1465,14 @@ async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
     crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-4-8[1m]")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
-        .await
-        .unwrap();
+    seed_chat_effort(&pool, "claude-opus-4-8[1m]", "high").await;
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry(),
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         None,
         None,
@@ -1479,9 +1496,7 @@ async fn chat_route_reuses_thread_last_model_over_preference() {
     crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
-        .await
-        .unwrap();
+    seed_chat_effort(&pool, "account-model", "high").await;
     let tid = uuid::Uuid::new_v4();
     sqlx::query(
         "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
@@ -1497,7 +1512,10 @@ async fn chat_route_reuses_thread_last_model_over_preference() {
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry(),
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         None,
         Some(tid),
@@ -1523,9 +1541,7 @@ async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
     crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
-        .await
-        .unwrap();
+    seed_chat_effort(&pool, "account-model", "high").await;
     let tid = uuid::Uuid::new_v4();
     sqlx::query(
         "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
@@ -1535,7 +1551,7 @@ async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
     .bind(tid.to_string())
     .bind(serde_json::json!({
         "trigger_id": "t-1",
-        "model": "gemini-3.5-flash",
+        "model": "gemini-3.8-flash",
         "reasoning_effort": "low",
     }))
     .bind(tid)
@@ -1545,7 +1561,10 @@ async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry(),
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         None,
         Some(tid),
@@ -1554,7 +1573,7 @@ async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
     )
     .await;
 
-    assert_eq!(resolved.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(resolved.model.as_deref(), Some("gemini-3.8-flash"));
     assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -1570,30 +1589,31 @@ async fn trigger_route_prefers_the_triggers_own_model_and_effort() {
     crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
-        .await
-        .unwrap();
+    seed_chat_effort(&pool, "account-model", "high").await;
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry(),
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         None,
         None,
         None,
-        sel(Some("gemini-3.5-flash"), Some("low"), None),
+        sel(Some("gemini-3.8-flash"), Some("low"), None),
     )
     .await;
 
-    assert_eq!(resolved.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(resolved.model.as_deref(), Some("gemini-3.8-flash"));
     assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// The two fields resolve independently, so a trigger that pins only the model
-/// still inherits the account effort, and one that pins only the effort still
-/// inherits the account model. Pinning one must never freeze the other.
+/// A trigger that pins only the model runs it at that model's own tier, never
+/// the account model's. One that pins only the effort still inherits the
+/// account model. Pinning one must never freeze the other.
 #[tokio::test]
 async fn trigger_route_resolves_model_and_effort_independently() {
     let (pool, db_name) = setup_test_db().await;
@@ -1603,30 +1623,33 @@ async fn trigger_route_resolves_model_and_effort_independently() {
     crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-5")
         .await
         .unwrap();
-    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "high")
-        .await
-        .unwrap();
+    seed_chat_effort(&pool, "claude-opus-5", "high").await;
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry(),
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         None,
         None,
         None,
-        sel(Some("gemini-3.5-flash"), None, None),
+        sel(Some("gemini-3.8-flash"), None, None),
     )
     .await;
-    assert_eq!(resolved.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(resolved.model.as_deref(), Some("gemini-3.8-flash"));
     assert_eq!(
-        resolved.reasoning_effort.as_deref(),
-        Some("high"),
-        "account effort still applies"
+        resolved.reasoning_effort, None,
+        "the account's tier belongs to its own model"
     );
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry(),
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         None,
         None,
@@ -1648,23 +1671,23 @@ async fn trigger_route_resolves_model_and_effort_independently() {
 /// The resolved pair is clamped HERE, not only at the wire, so the effort a
 /// turn stamps on its events is the effort it actually sends.
 ///
-/// The mismatch is manufactured by per-field resolution: the model comes from
-/// the request and the effort from the account preference, so nothing upstream
-/// pairs them. Left unclamped, the turn records `xhigh` for a local model,
+/// The mismatch is manufactured by a stored tier the model's route cannot run.
+/// Left unclamped, the turn records `xhigh` for a local model,
 /// which the in-thread picker then displays as the thread's setting even though
 /// its dropdown offers no such tier, and which the next turn reads back as the
 /// thread's remembered effort.
 #[tokio::test]
 async fn a_resolved_effort_is_clamped_to_what_the_resolved_model_supports() {
     let (pool, db_name) = setup_test_db().await;
-    crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "xhigh")
-        .await
-        .unwrap();
+    seed_chat_effort(&pool, "muse-glimmer:30b-mlx", "xhigh").await;
     let registry = registry_with("muse-glimmer:30b-mlx", crate::llm::ProviderKind::Local);
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry,
+        crate::core::ModelDefaults {
+            registry: &registry,
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         None,
         None,
@@ -1694,7 +1717,10 @@ async fn a_coding_agent_effort_is_not_clamped_against_the_chat_registry() {
 
     let resolved = resolve_route_overrides(
         &pool,
-        &registry,
+        crate::core::ModelDefaults {
+            registry: &registry,
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         Some(true),
         None,
@@ -1873,7 +1899,10 @@ async fn a_provider_the_model_cannot_use_is_not_stamped() {
 
     let off_route = resolve_route_overrides(
         &pool,
-        &registry,
+        crate::core::ModelDefaults {
+            registry: &registry,
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         None,
         None,
@@ -1885,7 +1914,10 @@ async fn a_provider_the_model_cannot_use_is_not_stamped() {
 
     let on_route = resolve_route_overrides(
         &pool,
-        &registry,
+        crate::core::ModelDefaults {
+            registry: &registry,
+            fallback_model: FALLBACK_MODEL,
+        },
         |_| true,
         None,
         None,

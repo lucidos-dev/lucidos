@@ -1,18 +1,18 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, awaitedThreadId, drawerView, threadSearchQuery, threadSearchResults } from '../store';
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, ongoingFilter, threadSearchQuery, threadSearchResults } from '../store';
 import { appliedThreadFilter } from '../appliedThreadFilter';
 import { revealThreadPane } from './pane';
-import type { ThreadSection, ThreadState } from '../thread-events';
-import { deepLinkAnchorInThread, describeWaitSubscription } from '../thread-events';
+import type { ThreadMeta, ThreadSection, ThreadState } from '../thread-events';
+import { deepLinkAnchorInThread, describeWaitSubscription, NO_CHANGE } from '../thread-events';
 import type { ConfirmDetailGroup, ConfirmDetails } from '../types';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attentionThreads, reviewThreads, inFlightThreads, draftThreads } from '../../components/drawer/family-graph';
+import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, selectedOngoingRows } from '../../components/drawer/family-graph';
 import type { FamilyGraph } from '../../components/drawer/family-graph';
 import { saveThread, unsaveThread, archiveThread, unarchiveThreads, type ArchiveSkippedMember } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
 import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sectionMutatedAt, threadEventsStillArriving } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
 import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
-import { scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll, stopFollowingBottom } from '../../components/chat/scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll, stopFollowingBottom } from '../../components/chat/scrollStateHandle';
 import { pushThreadNavState } from './thread-navigation';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { markThreadOpenStart } from '../../utils/threadOpenMarks';
@@ -162,7 +162,7 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
 }
 
 /** Scroll the open thread to `eventId` and pulse it, or say why it can't.
- *  `focusThread`'s event deep link, and the late landing of a Needs attention
+ *  `focusThread`'s event deep link, and the late landing of a Blocked
  *  open whose target was only known once the events arrived. An event drawn as
  *  a step lands on the turn holding it. */
 export function landOnEvent(threadId: string, eventId: string): void {
@@ -485,49 +485,39 @@ function visibleThreadsAndGraph(): { visible: ThreadState[]; graph: FamilyGraph 
   return { visible, graph };
 }
 
-/** The visible thread ids of the drawer view the user is *currently looking at*,
- *  in the same order the drawer renders them. The post-archive focus walks this
- *  so "next" is the next visible row in whatever view is active — the next
- *  Needs-attention row when the attention view is open, the next Review/In flight
- *  row, the next filtered Current row in the default view — instead of always
- *  jumping into Current. Mirrors `ThreadDrawer`'s `activeView` resolution: a live
- *  search query overrides the selected view; otherwise `drawerView` decides.
+/** The visible thread ids of the drawer list the user is *currently looking
+ *  at*, in the same order the drawer renders them. The post-archive focus
+ *  walks this, so "next" is the next visible row of the list on screen: the
+ *  selected ongoing group's listed rows under Ongoing, the filtered Current rows under
+ *  Folders. Mirrors `ThreadDrawer`'s `activeView` resolution: a live search
+ *  query overrides the grouping.
  *
- *  The alternate views (attention/review/in-flight/drafts) deliberately bypass the
- *  channel/trigger/repo/app filter — exactly as the drawer renders them — so the
- *  next focus matches what's on screen. Only the default `all` view is
- *  filter-aware, walking the visible Current section (`orderedCurrentForReview`)
- *  the same way the drawer does. */
+ *  The Ongoing grouping deliberately bypasses the channel/trigger/repo/app
+ *  filter, exactly as the drawer renders it. Only Folders is filter-aware,
+ *  walking the visible Current section (`orderedCurrentForReview`) the same way
+ *  the drawer does. */
 function orderedVisibleThreadIds(): string[] {
-  // Search overrides the selected view (mirrors ThreadDrawer's activeView).
+  // Search overrides the grouping (mirrors ThreadDrawer's activeView).
   if (threadSearchQuery.value.trim().length > 0) {
     const results = threadSearchResults.value;
     return results.status === 'loaded' ? results.data.map(r => r.thread_id) : [];
   }
-  const map = threadMap.value;
-  switch (drawerView.value) {
-    case 'attention': return attentionThreads(map).map(t => t.meta.id);
-    case 'review':    return reviewThreads(map).map(t => t.meta.id);
-    case 'in-flight': return inFlightThreads(map).map(n => n.thread.meta.id);
-    case 'drafts':    return draftThreads(map).map(t => t.meta.id);
-    case 'all':
-    default: {
-      const { visible, graph } = visibleThreadsAndGraph();
-      return orderedCurrentForReview(visible, graph).map(t => t.meta.id);
-    }
-  }
+  if (drawerGrouping.value === 'ongoing') return selectedOngoingRows.value.map(n => n.thread.meta.id);
+  const { visible, graph } = visibleThreadsAndGraph();
+  return orderedCurrentForReview(visible, graph).map(t => t.meta.id);
 }
 
-/** Which drawer view `orderedVisibleThreadIds` walks: a live search, or the
- *  selected view. */
+/** Which drawer list `orderedVisibleThreadIds` walks: a live search, the selected
+ *  ongoing group, or Folders. */
 function activeViewKey(): string {
   const query = threadSearchQuery.value.trim();
-  return query.length > 0 ? `search:${query}` : drawerView.value;
+  if (query.length > 0) return `search:${query}`;
+  return drawerGrouping.value === 'ongoing' ? `ongoing:${selectedOngoingGroup.value}:${ongoingFilter.value}` : 'folders';
 }
 
 /** The active view's rows as they stood when the focused thread was opened.
  *  A thread often leaves its view before it is archived: stopping a question
- *  leaves Needs attention, applying a change leaves Review. Its row in this
+ *  leaves Blocked, applying a change leaves Review. Its row in this
  *  snapshot is the position the archive hand-off falls back on. */
 let openedViewRows: { threadId: string; view: string; ids: string[] } | null = null;
 
@@ -545,7 +535,7 @@ function neighboursOf(ids: readonly string[], idx: number): string[] {
 
 /** Ordered list of visible thread ids to consider as the next focus when the
  *  user archives `aroundId` — closest below first, then closest above — within
- *  the currently active drawer view (`orderedVisibleThreadIds`). Snapshotted
+ *  the drawer list on screen (`orderedVisibleThreadIds`). Snapshotted
  *  BEFORE the optimistic flip so the position anchor survives the cascade
  *  dropping `aroundId` (and its descendants) out of the view.
  *
@@ -744,16 +734,18 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
   // cascade leaves the active view, visibleCandidatesAround() can't compute it.
   const candidates = visibleCandidatesAround(threadId);
 
-  // Snapshot section, pin and codingAgentProposed on every family member so we
-  // can roll back if the API rejects (409 blocking, 500 mid-cascade). All three
-  // are required to leave Current and Pinned: `displaySection` keeps a pinned
-  // thread in Pinned and one with pending changes in Current, whatever
-  // `section` says. `cascade` was collected up front (above the draft confirm).
-  type Snap = { section: ThreadSection; saved: boolean; codingAgentProposed: boolean };
+  // Snapshot section, pin and change state on every family member so we can
+  // roll back if the API rejects (409 blocking, 500 mid-cascade). All three are
+  // required to leave Current and Pinned: `displaySection` keeps a pinned
+  // thread in Pinned and one with a pending change in Current, whatever
+  // `section` says. An archive leaves the branch's work at `none`: the archive
+  // net sets a pending change aside, and `ThreadArchived` clears what remains.
+  // `cascade` was collected up front (above the draft confirm).
+  type Snap = Pick<ThreadMeta, 'section' | 'saved' | 'codingAgentChangeState'>;
   const snapshot = new Map<string, Snap>();
   const optimistic = new Map(threadMap.value);
   // Stamp BEFORE the flip so any in-flight GET issued before this moment is
-  // considered stale wrt section/codingAgentProposed. See `sectionMutatedAt`
+  // considered stale wrt section/change state. See `sectionMutatedAt`
   // in thread-loading.ts for the iOS-PWA-resume race this prevents.
   const flippedAt = Date.now();
   for (const tid of cascade) {
@@ -763,11 +755,11 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     snapshot.set(tid, {
       section: t.meta.section,
       saved: t.meta.saved,
-      codingAgentProposed: t.meta.codingAgentProposed,
+      codingAgentChangeState: t.meta.codingAgentChangeState,
     });
     optimistic.set(tid, {
       ...t,
-      meta: { ...t.meta, section: 'archived', saved: false, codingAgentProposed: false },
+      meta: { ...t.meta, section: 'archived', saved: false, codingAgentChangeState: NO_CHANGE },
     });
   }
   threadMap.value = optimistic;

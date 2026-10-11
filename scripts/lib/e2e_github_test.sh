@@ -1,6 +1,6 @@
 #!/bin/bash
-# Tests for e2e GitHub mode: scripts/lib/e2e_github.sh and the plan half of
-# scripts/e2e-github-shard.sh (ADR 0382).
+# Tests for e2e GitHub mode: scripts/lib/e2e_github.sh, the plan half of
+# scripts/e2e-github-shard.sh, and its fake Claude Code install (ADR 0382).
 #
 # Hermetic. A throwaway git repo, an invented denylist, and stubbed `git push`
 # and `gh`, so nothing here reaches a remote, the network or a real token.
@@ -17,6 +17,7 @@ FAIL=0
 pass() { echo "  ok:   $*"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $*"; FAIL=$((FAIL + 1)); }
 
+unset LUCIDOS_E2E_LOCAL
 export E2E_WORKSPACE="$SANDBOX/e2e-test"
 mkdir -p "$E2E_WORKSPACE/.lucidos/worktrees"
 # The public mirror does not ship the release libraries, so the commit tests
@@ -31,6 +32,8 @@ fi
 source "$SCRIPT_DIR/e2e.sh"
 # shellcheck source=scripts/lib/e2e_github.sh
 source "$SCRIPT_DIR/e2e_github.sh"
+# A screenshot switch or debug knob in the caller's shell must not steer the hand-off.
+while stray="$(e2e_github_local_only_env)" && [ -n "$stray" ]; do unset "$stray"; done
 
 REPO="$SANDBOX/repo"
 git init -q "$REPO"
@@ -190,17 +193,92 @@ test_the_sweep_removes_only_old_finished_run_branches() {
     fi
 }
 
-# shellcheck disable=SC2317 # exec is shadowed to observe the hand-off
-test_the_handoff_strips_github_and_ignores_it_after_dashes() {
-    echo "test: e2e_github_handoff hands over only when --github comes before --"
-    local out
-    out="$(exec() { echo "exec $*"; }; e2e_github_handoff browser -f chat.spec.ts --github -- --grep x; echo none)"
-    case "$out" in
-        *"e2e-github.sh browser -f chat.spec.ts -- --grep x"*) pass "--github hands over, minus the flag" ;;
-        *) fail "hand-off printed: $out" ;;
-    esac
-    out="$(exec() { echo "exec $*"; }; e2e_github_handoff browser -- --github; echo none)"
-    if [ "$out" = none ]; then pass "--github after -- belongs to Playwright"; else fail "handed over on: $out"; fi
+# handoff_outcome <unavailable-reason> <suite> [args]: run the hand-off with
+# exec and the precondition check stubbed. Prints "github <suite> <args>" when
+# it handed over, or "local <args> env=<LUCIDOS_E2E_LOCAL>" when it stayed.
+# shellcheck disable=SC2317 # exec and the reason check are shadowed to observe the hand-off
+handoff_outcome() {
+    local stub_reason="$1"
+    shift
+    (
+        exec() { shift; echo "github $*"; exit 0; }
+        e2e_github_unavailable_reason() { printf '%s' "$stub_reason"; }
+        e2e_github_handoff "$@"
+        echo "local ${E2E_ARGS[*]-} env=${LUCIDOS_E2E_LOCAL:-}"
+    ) 2>&1
+}
+
+expect_outcome() { # <what> <expected glob> <actual>
+    # shellcheck disable=SC2053 # $2 is a glob on purpose
+    if [[ "$3" == $2 ]]; then pass "$1"; else fail "$1: got '$3'"; fi
+}
+
+test_the_handoff_defaults_to_github() {
+    echo "test: e2e_github_handoff hands over by default, keeping every other argument"
+    expect_outcome "a bare run goes to GitHub" "*running on GitHub*github all" "$(handoff_outcome "" all)"
+    expect_outcome "filters ride along" "*running on GitHub*github browser -f chat.spec.ts -- --grep x" \
+        "$(handoff_outcome "" browser -f chat.spec.ts -- --grep x)"
+    expect_outcome "--github is stripped" "*running on GitHub*github api -f health" "$(handoff_outcome "" api --github -f health)"
+    expect_outcome "--local after -- belongs to Playwright" "*running on GitHub*github browser -- --local" \
+        "$(handoff_outcome "" browser -- --local)"
+}
+
+# shellcheck disable=SC2030,SC2031 # each export is scoped to its own $(...) on purpose
+test_the_handoff_stays_local_when_asked_or_inherited() {
+    echo "test: --local, a local-only flag, or an inherited LUCIDOS_E2E_LOCAL keeps the run here"
+    expect_outcome "--local stays, minus the flag, and exports the mark" "local -f health env=1" \
+        "$(handoff_outcome "" api --local -f health)"
+    local flag
+    for flag in "${E2E_GITHUB_LOCAL_ONLY_FLAGS[@]}"; do
+        expect_outcome "$flag stays local" "local $flag -f chat.spec.ts env=1" \
+            "$(handoff_outcome "" browser "$flag" -f chat.spec.ts)"
+    done
+    expect_outcome "cargo args to wasm stay local" "local -- --nocapture env=1" \
+        "$(handoff_outcome "" wasm -- --nocapture)"
+    expect_outcome "a bare embedder run goes to GitHub" "*running on GitHub*github embedder" \
+        "$(handoff_outcome "" embedder)"
+    expect_outcome "LUCIDOS_E2E_PACKAGED stays local and says why" "*LUCIDOS_E2E_PACKAGED is set*local  env=1" \
+        "$(export LUCIDOS_E2E_PACKAGED=1; handoff_outcome "" all)"
+    expect_outcome "a screenshot switch stays local" "*THREAD_SHOTS is set*local -f thread-shots.spec.ts env=1" \
+        "$(export THREAD_SHOTS=1; handoff_outcome "" browser -f thread-shots.spec.ts)"
+    expect_outcome "a switch set to 0 is off" "*running on GitHub*github api" \
+        "$(export LUCIDOS_E2E_DEBUG=0; handoff_outcome "" api)"
+    expect_outcome "--github with a local-only variable is refused" "*contradict*" \
+        "$(export LUCIDOS_E2E_PACKAGED=1; handoff_outcome "" all --github)"
+    expect_outcome "an inherited mark wins even over --github" "local -f chat.spec.ts env=1" \
+        "$(LUCIDOS_E2E_LOCAL=1 handoff_outcome "" browser --github -f chat.spec.ts)"
+    expect_outcome "--github with --local is refused" "*contradict*" \
+        "$(handoff_outcome "" browser --github --local)"
+}
+
+test_the_handoff_falls_back_only_without_github() {
+    echo "test: an unmet precondition runs here and says why, unless --github insists"
+    expect_outcome "the fallback names its reason" "*running on this host: the tree is dirty*local -f x env=1" \
+        "$(handoff_outcome "the tree is dirty" api -f x)"
+    expect_outcome "--github hands over so the driver refuses loudly" "*running on GitHub*github api -f x" \
+        "$(handoff_outcome "the tree is dirty" api --github -f x)"
+}
+
+# shellcheck disable=SC2317,SC2329 # gh is shadowed so the check never depends on this host
+test_the_unavailable_reason_names_each_precondition() {
+    echo "test: e2e_github_unavailable_reason names each unmet precondition, and nothing when all hold"
+    local repo="$SANDBOX/maintainer" out
+    git init -q "$repo"
+    mkdir -p "$repo/scripts/lib"
+    echo "# stand-in" >"$repo/scripts/lib/release_tree.sh"
+    git -C "$repo" add -A
+    git -C "$repo" -c user.email=dev@example.com -c user.name=Dev commit -qm init
+    gh() { :; }
+
+    expect_outcome "a mirror checkout lacks the release libraries" "*release_tree.sh*" \
+        "$(e2e_github_unavailable_reason "$REPO")"
+    expect_outcome "a missing remote is named" "*'lucidos' remote*" "$(e2e_github_unavailable_reason "$repo")"
+    git -C "$repo" remote add lucidos https://example.invalid/mirror.git
+    out="$(e2e_github_unavailable_reason "$repo")"
+    if [ -z "$out" ]; then pass "a clean maintainer checkout can use GitHub"; else fail "refused with: $out"; fi
+    echo "scratch" >"$repo/untracked.txt"
+    expect_outcome "a dirty tree is named" "*uncommitted*" "$(e2e_github_unavailable_reason "$repo")"
+    unset -f gh
 }
 
 # A fake download: the plan, then one directory per shard.
@@ -283,6 +361,109 @@ test_the_plan_puts_webkit_on_macos_and_respects_test_ignore() {
     fi
 }
 
+test_only_tagged_specs_stay_on_the_local_leg() {
+    echo "test: a spec stays local only when a test in it is tagged @real-claude-code"
+    local spec_dir="$SCRIPT_DIR/../../crates/lucidos-app/e2e" spec wrong=""
+    for spec in chat coding-agent-cancel coding-agent-resume-after-exit side-question; do
+        e2e_spec_needs_real_claude_code "$spec_dir/$spec.spec.ts" || wrong="$wrong $spec(untagged)"
+    done
+    for spec in coding-agent coding-agent-follow-ups coding-agent-mid-session-settings \
+        coding-agent-model-preselect coding-agent-reasoning-preselect model-switching \
+        control-menu control-menu-over-header-mobile; do
+        e2e_spec_spawns_claude_code "$spec_dir/$spec.spec.ts" || wrong="$wrong $spec(spawns-nothing)"
+        ! e2e_spec_needs_real_claude_code "$spec_dir/$spec.spec.ts" || wrong="$wrong $spec(tagged)"
+    done
+    if [ -z "$wrong" ]; then pass "four files local, eight on GitHub against the fake"; else fail "misrouted:$wrong"; fi
+}
+
+test_a_spec_file_among_playwright_args_is_a_selection() {
+    echo "test: a spec file after -- narrows the run, and an option's value never does"
+    local wrong=""
+    e2e_github_is_spec_arg "" "chat.spec.ts" || wrong="$wrong bare-name"
+    e2e_github_is_spec_arg "e2e/chat.spec.ts" "e2e/side-question.spec.ts" || wrong="$wrong path-after-spec"
+    e2e_github_is_spec_arg "--retries" "e2e/chat.spec.ts" || wrong="$wrong after-a-flag"
+    ! e2e_github_is_spec_arg "--grep" "chat.spec.ts" || wrong="$wrong grep-value"
+    ! e2e_github_is_spec_arg "-g" "chat.spec.ts" || wrong="$wrong g-value"
+    ! e2e_github_is_spec_arg "" "--grep" || wrong="$wrong flag"
+    ! e2e_github_is_spec_arg "" "send message" || wrong="$wrong title"
+    if [ -z "$wrong" ]; then pass "spec files select, option values and titles do not"; else fail "misread:$wrong"; fi
+}
+
+test_the_plan_refuses_a_real_claude_code_spec() {
+    echo "test: the shard plan refuses a request naming a @real-claude-code spec"
+    local req="$SANDBOX/real-cc-request.json" ghout="$SANDBOX/real-cc-gh-output"
+    echo '{"suites": ["browser"], "api_args": [], "browser": {"projects": ["chromium"], "specs": ["coding-agent.spec.ts", "chat.spec.ts"], "pw_args": []}}' >"$req"
+    : >"$ghout"
+    if E2E_GITHUB_REQUEST="$req" E2E_GITHUB_OUT="$SANDBOX/real-cc-out" GITHUB_OUTPUT="$ghout" \
+        "$SCRIPT_DIR/../e2e-github-shard.sh" plan >/dev/null 2>&1; then
+        fail "the plan accepted chat.spec.ts"
+    elif grep -q '^linux=' "$ghout"; then
+        fail "the plan refused but still wrote a matrix"
+    else
+        pass "refused, with no matrix written"
+    fi
+}
+
+test_the_fake_installs_only_on_a_runner_and_never_over_a_claude() {
+    echo "test: the fake Claude Code installs only on a GitHub runner, never over an existing one"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" home="$SANDBOX/runner-home" target rel fake rust want
+    rel="$(bash -c 'source "$1"; printf %s "$FAKE_CLAUDE_CODE_HOME_PATH"' _ "$shard")"
+    fake="$(bash -c 'source "$1"; printf %s "$FAKE_CLAUDE_CODE"' _ "$shard")"
+    rust="$SCRIPT_DIR/../../crates/lucidos-engine/src/runtime/claude_code.rs"
+    # The engine's first probe, the first home.join() in resolve_claude_binary.
+    if [ "$(sed -n '/fn resolve_claude_binary(/,/^}/p' "$rust" | grep -o 'home\.join("[^"]*")' | head -1)" = "home.join(\"$rel\")" ]; then
+        pass "the fake goes where resolve_claude_binary looks first"
+    else
+        fail "FAKE_CLAUDE_CODE_HOME_PATH ($rel) is not resolve_claude_binary's first probe"
+    fi
+    target="$home/$rel"
+    mkdir -p "$home"
+    if GITHUB_ACTIONS='' bash -c 'source "$1"; install_fake_claude_code "$2"' _ "$shard" "$home" 2>/dev/null \
+        || [ -e "$target" ] || [ -L "$target" ]; then
+        fail "installed off a runner"
+    else
+        pass "refused off a runner, nothing written"
+    fi
+    mkdir -p "$(dirname "$target")"
+    echo "a real claude" >"$target"
+    if GITHUB_ACTIONS=true bash -c 'source "$1"; install_fake_claude_code "$2"' _ "$shard" "$home" 2>/dev/null \
+        || [ "$(cat "$target")" != "a real claude" ]; then
+        fail "replaced an existing claude"
+    else
+        pass "refused over an existing claude, which is untouched"
+    fi
+    rm -f "$target"
+    if GITHUB_ACTIONS=true bash -c 'source "$1"; install_fake_claude_code "$2"' _ "$shard" "$home" \
+        && want="$(node "$fake" --version)" && [ -n "$want" ] \
+        && [ "$("$target" --version)" = "$want" ]; then
+        pass "installed on a runner, and it runs through the link"
+    else
+        fail "the installed fake did not answer --version"
+    fi
+}
+
+test_the_runner_checkout_gets_a_main_and_an_existing_one_never_moves() {
+    echo "test: a checkout with no main gets one at HEAD, and an existing main is left alone"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" repo="$SANDBOX/runner-checkout" head old
+    git init -q -b e2e/20261008-000000-ab12 "$repo"
+    git -C "$repo" -c user.email=e2e@example.com -c user.name=e2e commit -q --allow-empty -m one
+    head="$(git -C "$repo" rev-parse HEAD)"
+    bash -c 'source "$1"; ensure_main_branch "$2"' _ "$shard" "$repo"
+    if [ "$(git -C "$repo" rev-parse --verify --quiet refs/heads/main)" = "$head" ]; then
+        pass "main names the run branch's HEAD"
+    else
+        fail "no main at HEAD after ensure_main_branch"
+    fi
+    old="$head"
+    git -C "$repo" -c user.email=e2e@example.com -c user.name=e2e commit -q --allow-empty -m two
+    bash -c 'source "$1"; ensure_main_branch "$2"' _ "$shard" "$repo"
+    if [ "$(git -C "$repo" rev-parse refs/heads/main)" = "$old" ]; then
+        pass "an existing main is never moved"
+    else
+        fail "ensure_main_branch moved an existing main"
+    fi
+}
+
 test_the_lock_holder_is_named_only_while_alive() {
     echo "test: the local leg sees the e2e lock as held only while its holder lives"
     local lock dead
@@ -328,9 +509,17 @@ fi
 test_only_run_branches_qualify
 test_delete_refuses_anything_but_a_run_branch
 test_the_sweep_removes_only_old_finished_run_branches
-test_the_handoff_strips_github_and_ignores_it_after_dashes
+test_the_handoff_defaults_to_github
+test_the_handoff_stays_local_when_asked_or_inherited
+test_the_handoff_falls_back_only_without_github
+test_the_unavailable_reason_names_each_precondition
 test_the_report_matches_the_local_tally_and_exit_codes
 test_the_plan_puts_webkit_on_macos_and_respects_test_ignore
+test_only_tagged_specs_stay_on_the_local_leg
+test_a_spec_file_among_playwright_args_is_a_selection
+test_the_plan_refuses_a_real_claude_code_spec
+test_the_fake_installs_only_on_a_runner_and_never_over_a_claude
+test_the_runner_checkout_gets_a_main_and_an_existing_one_never_moves
 test_the_lock_holder_is_named_only_while_alive
 test_the_pinned_postgres_versions_resolve
 

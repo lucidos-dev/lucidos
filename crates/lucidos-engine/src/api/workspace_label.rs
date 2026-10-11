@@ -234,7 +234,7 @@ mod tests {
 
     fn listing() -> &'static str {
         r#"{"workspaces":[
-            {"id":"personal","name":"personal","port":5174,"health":"unhealthy","autostart":false},
+            {"id":"myws","name":"myws","port":5174,"health":"unhealthy","autostart":false},
             {"id":"dev","name":"development","port":5173,"health":"healthy","autostart":true}
         ]}"#
     }
@@ -254,7 +254,7 @@ mod tests {
         // The whole security property of this route in one assertion: a listing
         // full of other people's workspaces yields nothing for a slug we don't
         // match, rather than the first row or a merged view.
-        assert_eq!(label_for(listing(), "work", "5173"), None);
+        assert_eq!(label_for(listing(), "other", "5173"), None);
     }
 
     #[test]

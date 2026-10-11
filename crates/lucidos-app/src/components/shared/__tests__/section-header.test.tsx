@@ -3,7 +3,7 @@
 // and a collapse the panel remembers per device.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
-import { SectionHeader } from '../SectionHeader';
+import { SectionHeader, SectionHeaderContent } from '../SectionHeader';
 import {
   collapsedChangesSectionIds,
   toggleChangesSectionCollapsed,
@@ -41,6 +41,20 @@ describe('SectionHeader', () => {
     expect(header.classList.contains('list-section-title-collapsible')).toBe(true);
     expect(header.classList.contains('collapsed')).toBe(true);
     expect(host.querySelector('.list-section-toggle')?.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('leads the toggle with a chevron, before the icon, inside the element carrying aria-expanded', () => {
+    render(<SectionHeader title="Queued" count={1} collapsed={false} onToggle={() => {}} />, host);
+    const toggle = host.querySelector<HTMLButtonElement>('.list-section-toggle')!;
+    const chevron = toggle.firstElementChild!;
+    expect(chevron.classList.contains('section-chevron')).toBe(true);
+    expect(chevron.getAttribute('aria-hidden')).toBe('true');
+    expect(chevron.querySelector('svg')).not.toBeNull();
+  });
+
+  it('draws no chevron on a header that cannot collapse', () => {
+    render(<SectionHeaderContent title="Results" />, host);
+    expect(host.querySelector('.section-chevron')).toBeNull();
   });
 
   it('puts the actions beside the toggle, never inside it', () => {

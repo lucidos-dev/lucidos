@@ -54,10 +54,12 @@ const ANCHOR_GAP = 4;
  *    pinned to the far right of a row/header, where `'start'` would push a wide
  *    menu off-screen and the viewport clamp would then strand it near the left
  *    edge, detached from the trigger.
+ *  - `'center'`: the panel centres under the anchor, for a trigger in the
+ *    middle of a row, like the Home icon.
  *  - `'container-center'`: the panel centres in the box it clamps into, and
  *    the anchor sets only its vertical placement. For a panel sized to span its
  *    pane, like a phone's composer menus at the header palette width. */
-export type AnchorAlign = 'start' | 'end' | 'container-center';
+export type AnchorAlign = 'start' | 'end' | 'center' | 'container-center';
 
 /** What a popover is positioned against: an element, or a bare box. */
 export type AnchorBox = Pick<HTMLElement, 'getBoundingClientRect'>;
@@ -125,11 +127,12 @@ export function computeAnchorPosition(
   const bounds = container?.getBoundingClientRect();
   const boundsLeft = bounds?.left ?? 0;
   const boundsRight = bounds?.right ?? window.innerWidth;
-  const desiredLeft = align === 'end'
-    ? rect.right - panelWidth
-    : align === 'container-center'
-      ? (boundsLeft + boundsRight - panelWidth) / 2
-      : rect.left;
+  const desiredLeft = {
+    start: rect.left,
+    end: rect.right - panelWidth,
+    center: (rect.left + rect.right - panelWidth) / 2,
+    'container-center': (boundsLeft + boundsRight - panelWidth) / 2,
+  }[align];
   const left = clampWithin(desiredLeft, panelWidth, boundsLeft, boundsRight, CLAMP_MARGIN);
   // A container with no room left to give is not a cap, it is a disappearing
   // act: capping to 0 renders a zero-width panel that is invisible while the
@@ -265,6 +268,11 @@ export function useAnchoredPosition(
     // the uncapped height (`naturalPanelHeight`), so this cannot cycle.
     const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
     if (ro && panelRef.current) ro.observe(panelRef.current);
+    // An anchor can move with no scroll or resize: the phone's sticky title row
+    // glides back in on `translate` when the bars reveal. Re-measure once it
+    // lands, or a panel opened mid-glide stays where the row was.
+    const movingAnchor = 'addEventListener' in anchor ? (anchor as HTMLElement) : null;
+    movingAnchor?.addEventListener('transitionend', schedule);
     // The observer above re-measures a frame late, so the frame that first
     // shows new content would place it by the old content's size. A mutation
     // callback runs right after the render commits, before that frame paints.
@@ -320,6 +328,7 @@ export function useAnchoredPosition(
       morph?.cancel();
       ro?.disconnect();
       mo?.disconnect();
+      movingAnchor?.removeEventListener('transitionend', schedule);
       window.removeEventListener('scroll', schedule, true);
       window.removeEventListener('resize', schedule);
       if (vv) {

@@ -15,6 +15,7 @@
  */
 import { test, expect, Page } from './fixtures';
 import { assertHealthy, navigateToApp, ensureMobileView } from './helpers';
+import { ensureHomeThread } from './db-helpers';
 
 test.use({ viewport: { width: 393, height: 852 } });
 
@@ -270,6 +271,9 @@ test.describe('The chevron reach never takes a neighbour\'s tap', () => {
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+    // Home is one of the neighbours, and a spec before this one may have
+    // truncated the threads, home included.
+    ensureHomeThread();
   });
 
   test('the mark, the title and the edge controls keep their taps at 200%', async ({ page }) => {
@@ -278,7 +282,12 @@ test.describe('The chevron reach never takes a neighbour\'s tap', () => {
       await ensureMobileView(page, pane.view);
       await setScale(page, '200%', 32);
       const neighbours: Neighbour[] = pane.view === 'thread'
-        ? [MARK, { sel: '.mobile-thread-header .thread-toggle' }, { sel: '.mobile-thread-header .hamburger-panel' }]
+        ? [
+          MARK,
+          { sel: '.mobile-thread-header .home-thread-btn' },
+          { sel: '.mobile-thread-header .thread-toggle' },
+          { sel: '.mobile-thread-header .hamburger-panel' },
+        ]
         : [{ sel: '.mobile-content-header .hamburger-panel' }, { sel: '.mobile-content-header .mobile-content-title', optional: true }];
       for (const n of neighbours) {
         const taps = await tapsOn(page, n);

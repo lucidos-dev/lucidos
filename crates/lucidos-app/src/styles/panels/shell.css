@@ -451,18 +451,16 @@
     gap: 0.25rem;
 }
 
-/* The pane containers are keyboard-focusable for pane navigation: the split
-   panes carry tabindex=-1 (focused as a fallback by focusPaneMainControl when a
-   pane has no focusable child), and the thread drawer is a role="tree" single
-   tab stop (tabindex=0, aria-activedescendant — see ThreadDrawer). When the
-   container itself holds DOM focus the browser paints its native outline around
-   the WHOLE pane. The active-pane cue is the header wash (plus the highlighted row
-   inside the drawer) — NOT a frame around the pane body, so suppress the
-   container's own focus outline. (Real focusable controls inside a pane keep their
-   own :focus-visible ring.) */
+/* Three keyboard-focusable boxes paint no outline of their own. The split
+   panes carry tabindex=-1, focused as a fallback by focusPaneMainControl when a
+   pane has no focusable child. The drawer's tree is a single tab stop
+   (tabindex=0, aria-activedescendant, see ThreadDrawer). A native outline would
+   frame the whole box. The active-pane cue is the header wash, plus the
+   highlighted row inside the drawer. Real controls inside keep their own
+   :focus-visible ring. */
 .pane-thread:focus,
 .pane-content:focus,
-.thread-drawer:focus {
+.thread-drawer-tree:focus {
     outline: none;
 }
 
@@ -543,6 +541,17 @@
 .compose-empty .prompt-area {
     padding-top: 0;
     margin-top: 0;
+}
+
+/* An empty Home showing the welcome takes the compose layout above, and keeps
+   its title at the pane's top, outside the centred welcome and prompt
+   (ADR 0411). Out of flow, so the centring is the compose view's exactly. */
+.home-welcome-title {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1;
 }
 
 /* --- Content pane body --- */
@@ -678,25 +687,47 @@
     user-select: none;
 }
 
-/* The thread drawer toggle: the containing block for its needs-attention
-   badge, which hangs past the button's corner. */
-.thread-toggle {
+/* The thread drawer toggle and the grouping button: the containing block for
+   their Blocked badge, which hangs past the button's corner. */
+.thread-toggle,
+.grouping-btn {
     overflow: visible;
     position: relative;
 }
 
-/* Slot holding the single unified Filter button, which toggles the merged
-   Status + Thread type panel down in the drawer pane (see ThreadFilterPanel).
-   Sizes to the button; `position: relative` is the containing block for the
-   needs-attention `.badge`, which is absolutely positioned so it never changes
-   the slot's width and the Threads title beside it holds its place as the count
-   appears/clears. */
-.view-selector-slot {
+/* Slot holding the Filter button, which toggles the thread filter panel down
+   in the drawer pane (see ThreadFilterPanel). The filter shapes the Folders
+   grouping only, so under Ongoing the button fades out IN PLACE. The slot keeps
+   its box in both groupings, so no neighbour moves and nothing slides under the
+   fading button (frontend.md, a single control). `visibility` steps at the END
+   of the fade-out, so the button leaves the tab order once it is gone. Fading
+   in, it steps at the start. */
+.filter-slot {
     display: flex;
     align-items: center;
     flex-shrink: 0;
-    gap: 0.25rem;
-    position: relative;
+    transition: opacity var(--duration-normal) ease, visibility var(--duration-normal);
+}
+
+.filter-slot:not([data-shown]) {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+/* The threads-pane title is whole or hidden. Once its word outgrows the room
+   between the row's two ends, it fades out rather than ellipsizing
+   (`ThreadsPaneTitle`). Both layouts, on the fade the row's other changes use. */
+.threads-header-title,
+.mobile-threads-header .mobile-header-title {
+    text-overflow: clip;
+    transition: opacity var(--duration-fast) ease, visibility var(--duration-fast);
+}
+
+.threads-header-title[data-cramped],
+.mobile-threads-header .mobile-header-title[data-cramped] {
+    opacity: 0;
+    visibility: hidden;
 }
 
 /* --titlebar-lights-reserve is REGISTERED, because one of its three readers is
@@ -804,12 +835,23 @@
            own `gap`, so styles/__tests__/content-header-title-centring.test.ts
            checks the two agree. */
         --content-side-reserve: calc(3 * var(--header-icon-box) + 4 * 0.25rem);
+        /* The room a wide pane keeps at each end before the Canvas title grows
+           past --desktop-nav-span. Seven boxes: a file preview's six actions,
+           the widest set any content view shows, plus the bell. Eight gaps: the
+           six between them and the two the collapse measurement charges, as
+           above. So the title grows only out of room no cluster needs, and no
+           action folds that the fixed span let ride. */
+        --content-unfolded-reserve: calc(7 * var(--header-icon-box) + 8 * 0.25rem);
+        /* How far the Canvas title may grow on a wide pane. The cap keeps the
+           chevrons from drifting out to the row's ends. */
+        --desktop-content-title-span-max: 36rem;
         /* How far apart the back/forward chevrons are held, on BOTH panes. The
            point is that they hold still: a cluster sized to its contents put
            them wherever the current title or workspace name happened to leave
            them, so they moved under the pointer on every navigation. A narrow
            pane squeezes the span rather than the controls in it, down to the
-           floor below.
+           floor below. A wide Canvas pane grows its own span past this one
+           (--desktop-content-title-span-max).
            Mobile deliberately carries no twin of this token. A pane can be far
            wider than a phone row, so desktop wants a distance to hold; a phone
            row has no width to spare, and there the chevrons take everything
@@ -1309,8 +1351,8 @@
         pointer-events: none;
     }
 
-    /* Threads header: the title centred on the drawer pane, Filter and Search
-       at the trailing end, and the leading end kept free for the drawer toggle.
+    /* Threads header: the title centred on the drawer pane, Filter leading just
+       past the drawer toggle's room, and Grouping and Search at the trailing end.
        z-index 3 keeps the row's controls above .drawer-divider / .split-divider
        (both z-index 2), whose bands meet this header's edges. */
     .threads-header {
@@ -1318,8 +1360,8 @@
            which rests over it (.thread-toggle-slot): the toggle's inset, its
            box and one gap. The row pads its content past this and CLIPS at it,
            so nothing in the row paints or hit-tests under the toggle. That
-           includes Filter and Search, which ride the row's shrinking right edge
-           toward the corner as the drawer shuts.
+           includes Grouping and Search, which ride the row's shrinking right
+           edge toward the corner as the drawer shuts.
 
            Declared HERE rather than on :root, because --pane-header-gap is
            declared on .pane-header, and a custom property is substituted on the
@@ -1334,9 +1376,9 @@
         transform: translateY(calc(-50% - var(--header-band-lift)));
         display: flex;
         align-items: center;
-        /* Filter and Search are the row's only in-flow children, and both sit
-           at the trailing end; the title is centred on the pane out of flow
-           (below). Harmless under .search-active, where the field is the one
+        /* Grouping and Search sit at the trailing end, and Filter leads by its
+           own auto margin (below); the title is centred on the pane out of
+           flow. Harmless under .search-active, where the field is the one
            visible child and fills the row on its own `flex: 1`. */
         justify-content: flex-end;
         gap: var(--pane-header-gap);
@@ -1395,35 +1437,38 @@
        out-of-flow child.
 
        The max-width is the structural non-overlap guarantee: the title clears
-       the WIDER of the row's two ends on both sides and ellipsizes into what is
-       left, instead of running under a control. The leading end is the toggle's
-       room (--threads-row-lead, which carries the traffic-lights reserve on the
-       overlay build). The trailing end is the row's padding plus Filter and
-       Search, each a --header-icon-box and a gap. --co never gets narrow enough
-       for this to eat the title outright, because computeMinDrawerWidth
-       (store/paneMinimums.ts) floors the drawer at this same arithmetic plus a
-       title wide enough to stay a title.
+       the WIDER of the row's two ends on both sides, instead of running under a
+       control. The leading end is the toggle's room (--threads-row-lead, which
+       carries the traffic-lights reserve on the overlay build) plus Filter. The
+       trailing end is the row's padding plus Grouping and Search. Each control
+       is a --header-icon-box and a gap.
 
-       The needs-attention badge is absolutely positioned so it can't shift the
-       title as the count appears/clears. */
+       A word wider than that room is hidden, never ellipsized
+       (`ThreadsPaneTitle`'s data-cramped, below). computeMinDrawerWidth
+       (store/paneMinimums.ts) floors the drawer at the two ends alone, so the
+       controls always fit and the title is what gives way. */
     .threads-header-title {
         position: absolute;
         left: 50%;
         top: 50%;
         transform: translate(-50%, -50%);
-        max-width: calc(100% - 2 * max(var(--threads-row-lead), 0.5rem + 2 * (var(--header-icon-box) + var(--pane-header-gap))));
+        max-width: calc(100% - 2 * max(var(--threads-row-lead) + var(--header-icon-box) + var(--pane-header-gap), 0.5rem + 2 * (var(--header-icon-box) + var(--pane-header-gap))));
         font-size: var(--font-size-lg);
         font-weight: 600;
         color: var(--text-primary);
         white-space: nowrap;
         text-align: center;
         overflow: hidden;
-        text-overflow: ellipsis;
     }
 
-    /* The filter/search buttons never shrink — the title gives way instead. */
+    /* The buttons never shrink — the title gives way instead. */
     .threads-header .threads-header-btn {
         flex-shrink: 0;
+    }
+
+    /* Filter leads the row, past the toggle's room. */
+    .threads-header .filter-slot {
+        margin-right: auto;
     }
 
     /* Brand area spans from drawer edge to split divider. It holds the Lucidos
@@ -1652,8 +1697,12 @@
 
        Same span as the thread pane's (--desktop-nav-span), so the chevrons on
        the two panes are held the same distance apart whatever each row happens
-       to put between them. The clamp is the same three-part rule: hold the span
-       when the pane can afford it, give way to the side reserves when it
+       to put between them. A wide Canvas pane is the exception: its span grows
+       out of room past --content-unfolded-reserve, up to
+       --desktop-content-title-span-max, so a long title shows more of itself.
+       The span still depends on the pane width alone, so the chevrons still
+       hold still across navigations. The clamp is the same three-part rule:
+       hold the span when the pane can afford it, give way to the side reserves when it
        cannot, never squeeze below the controls' own width. Its middle arm is
        the structural non-overlap guarantee that `min-width: 0` used to give the
        flex zone, and it is a DERIVED reserve rather than a guessed one (see
@@ -1686,7 +1735,11 @@
         width: clamp(
             var(--desktop-nav-min-span),
             calc(100% - 2 * var(--content-side-reserve)),
-            var(--desktop-nav-span)
+            clamp(
+                var(--desktop-nav-span),
+                calc(100% - 2 * var(--content-unfolded-reserve)),
+                var(--desktop-content-title-span-max)
+            )
         );
         display: flex;
         align-items: center;
@@ -1866,7 +1919,7 @@
         transition: none;
     }
 
-    /* Ease the needs-attention / drafts toggles' active-state color change. */
+    /* Ease the Blocked / drafts toggles' active-state color change. */
     .threads-header .icon-btn {
         transition: color var(--duration-normal), background var(--duration-normal);
     }
@@ -2131,9 +2184,9 @@
     transition: none;
 }
 
-/* ─── The threads Filter button's fades ─────────────────────────────────────
-   Its glyph, badge and pressed highlight, the pane title and the filter panel
-   (drawer.css) all change on --duration-fast, so they land together.
+/* ─── The threads Filter and Grouping buttons' fades ────────────────────────
+   Their glyphs, badges and pressed highlight, the pane title and the filter
+   panel (drawer.css) all change on --duration-fast, so they land together.
 
    Each element that fades holds `will-change: opacity` at rest. A running fade
    puts its element on a compositing layer, and a layer snaps to whole pixels.
@@ -2141,7 +2194,8 @@
    and badge can hop as a fade starts and drop back as it ends. Emulators paint
    without that compositing and never show it: check on a real iPhone. */
 
-.app-header .icon-btn.filter-btn {
+.app-header .icon-btn.filter-btn,
+.app-header .icon-btn.grouping-btn {
     transition-duration: var(--duration-fast);
 }
 
@@ -2150,57 +2204,32 @@
    flare mid-fade. So the shapes paint opaque and the WRAPPER carries the
    alpha, which composites the whole stack once. Hover and pressed paint the
    glyph opaque, as they paint the other header icons. */
-.app-header .filter-glyph {
+.app-header .crossfade-glyph {
     color: var(--header-fg);
     opacity: var(--header-fg-muted-alpha);
     transition: opacity var(--duration-fast) ease;
     will-change: opacity;
 }
 
-.app-header .filter-glyph > .crossfade-layer {
+.app-header .crossfade-glyph > .crossfade-layer {
     display: flex;
     will-change: opacity;
 }
 
-.app-header .icon-btn.view-selector-active .filter-glyph {
+.app-header .icon-btn.view-selector-active .crossfade-glyph {
     opacity: 1;
 }
 
 @media (hover: hover) {
-    .app-header .icon-btn.filter-btn:hover:where(:not(:disabled)) .filter-glyph {
+    .app-header .icon-btn:hover:where(:not(:disabled)) .crossfade-glyph {
         opacity: 1;
     }
-}
-
-/* The badge stays mounted and fades both ways. `visibility` flips at the END
-   of a fade out and at the START of a fade in, so a hidden badge takes no
-   pointer at any point. The ring keeps its own transition, on this timing.
-   `transform` stays in `will-change`, because the layer it keeps is what holds
-   the count on its pill's middle (badges.css). */
-.app-header .badge.filter-badge {
-    opacity: 0;
-    visibility: hidden;
-    will-change: transform, opacity;
-    transition:
-        box-shadow var(--duration-fast),
-        opacity var(--duration-fast) ease,
-        visibility 0s linear var(--duration-fast);
-}
-
-.app-header .badge.filter-badge[data-shown] {
-    opacity: 1;
-    visibility: visible;
-    transition:
-        box-shadow var(--duration-fast),
-        opacity var(--duration-fast) ease,
-        visibility 0s;
 }
 
 /* Cancelled outright rather than left to the scaled duration, which still
    waits a frame or two for its start (see .crossfade-layer). The button's own
    transitions are cancelled in global/modal-overlay.css. */
-:root[data-motion="reduce"] .app-header .badge.filter-badge,
-:root[data-motion="reduce"] .app-header .filter-glyph {
+:root[data-motion="reduce"] .app-header .crossfade-glyph {
     transition: none;
 }
 

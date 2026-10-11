@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use crate::core::changes::ChangeStatus;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
-use crate::engine::thread_events::{MessageOrigin, ThreadEvent};
-use crate::engine::thread_lifecycle::ThreadStatus;
+use crate::engine::thread_events::{MessageOrigin, ThreadEvent, UnproposedReason};
+use crate::engine::thread_lifecycle::{CodingAgentChangeState, ThreadStatus};
 use crate::engine::types::AgentSession;
 use crate::engine::LucidosEngine;
 
@@ -48,9 +48,6 @@ pub struct StandingApply {
 pub(crate) enum ArmedChange {
     /// Still pending, with files to merge.
     Ready(Uuid),
-    /// Still pending, but marked unfinished by a stopped turn. A clean turn
-    /// clears the mark on the same change, so only the settle decides.
-    Incomplete,
     /// It resolved, vanished, or emptied out, so this arm can never fire.
     Gone(&'static str),
     /// Nothing is bound and nothing is pending yet.
@@ -67,10 +64,10 @@ pub(crate) struct SettleFacts {
     /// A row can read `idle` with its question still open (ADR 0293).
     pub parked_on_question: bool,
     pub live_event_waits: bool,
-    /// `thread_summaries.coding_agent_has_diff`: the branch holds commits the
-    /// projection has seen. A settled thread with a diff and no pending change
-    /// is one whose `ChangeProposed` is still on its way.
-    pub has_diff: bool,
+    /// The thread's change state. Unproposed work with no reason is a
+    /// `ChangeProposed` still on its way. With a reason, a turn end withheld
+    /// it, and nothing will propose it by itself (ADR 0400).
+    pub change_state: CodingAgentChangeState,
     pub armed_change: ArmedChange,
     pub turn_settle: TurnSettle,
 }
@@ -124,8 +121,7 @@ pub(crate) const TURN_FAILED: &str = "The turn failed.";
 pub(crate) const NOTHING_PROPOSED: &str = "The thread settled without proposing a change.";
 pub(crate) const CHANGE_RESOLVED: &str = "The change was already applied or discarded.";
 pub(crate) const CHANGE_EMPTY: &str = "The change has no file changes left.";
-pub(crate) const CHANGE_INCOMPLETE: &str =
-    "The change is unfinished work from a stopped turn. Apply it from its own Apply, which asks first.";
+pub(crate) const CHANGE_WITHDRAWN: &str = "The change went back to unfinished work on its branch.";
 pub(crate) const CHANGE_SET_ASIDE: &str = "The change was set aside.";
 pub(crate) const THREAD_GONE: &str = "The thread no longer exists.";
 pub(crate) const TURN_CUT_OFF: &str = "The session stopped before its turn finished settling.";
@@ -228,12 +224,16 @@ pub(crate) fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
         _ if facts.turn_settle == TurnSettle::CutOff => StandingVerdict::Drop(TURN_CUT_OFF),
         _ => match facts.armed_change {
             ArmedChange::Ready(change_id) => StandingVerdict::Fire(change_id),
-            // The proposal follows the turn's terminal, so a diff on the branch
-            // means it is on its way and `ChangeProposed` re-drives this
-            // resolution.
-            ArmedChange::Unproposed if facts.has_diff => StandingVerdict::Wait,
-            ArmedChange::Unproposed => StandingVerdict::Drop(NOTHING_PROPOSED),
-            ArmedChange::Incomplete => StandingVerdict::Drop(CHANGE_INCOMPLETE),
+            // Work with no reason is a proposal on its way, and
+            // `ChangeProposed` re-drives this resolution. Withheld work waits
+            // on the owner, so the arm cannot apply it (ADR 0400).
+            ArmedChange::Unproposed => match facts.change_state {
+                CodingAgentChangeState::Unproposed { reason: None } => StandingVerdict::Wait,
+                CodingAgentChangeState::Unproposed {
+                    reason: Some(reason),
+                } => StandingVerdict::Drop(withheld(reason)),
+                _ => StandingVerdict::Drop(NOTHING_PROPOSED),
+            },
             // Handled above, before the status match.
             ArmedChange::Gone(reason) => StandingVerdict::Drop(reason),
         },
@@ -244,7 +244,7 @@ pub(crate) fn standing_verdict(facts: &SettleFacts) -> StandingVerdict {
 /// archive request resolver shares it, for the same settle reason.
 ///
 /// **A wait's delivery or expiry never re-takes a verdict.** Each clears the
-/// live-wait count while the status still reads `idle`. The `UserPromptInjected`
+/// live-wait count while the status still reads `idle`. The `PromptInjected`
 /// anchor right behind it moves the thread to `running`. A verdict taken
 /// between the two would fire on work the wake is about to extend (ADR 0266).
 /// A cancel starts no wake, so it resolves like any other event.
@@ -262,24 +262,36 @@ pub(crate) fn thread_to_resolve(event: &BusEvent) -> Option<Uuid> {
     }
 }
 
+/// What the owner hears when the settle withheld the thread's work.
+fn withheld(reason: UnproposedReason) -> &'static str {
+    match reason {
+        UnproposedReason::PlanMissing => "The work is not ready: it needs an implementation plan.",
+        UnproposedReason::PlanAwaitingApproval => {
+            "The work is not ready: its implementation plan awaits approval."
+        }
+        UnproposedReason::OutsideBound => {
+            "The work is not ready: it reaches past the files its security fix named."
+        }
+        UnproposedReason::HardeningMissing => "The work is not ready: it has not been hardened.",
+        UnproposedReason::TurnIncomplete => "The work is not ready: its turn did not finish.",
+    }
+}
+
 /// One stored change row, as a standing apply reads it.
-pub(crate) type ArmedChangeRow = (Uuid, ChangeStatus, i32, bool);
+pub(crate) type ArmedChangeRow = (Uuid, ChangeStatus, i32);
 
 /// Classify the change an arm is bound to from its stored row. Pure, so the
 /// mapping is testable without a database. `None` = the row is gone.
-///
-/// Incomplete work never lands through an arm: only its own Apply, which
-/// confirms, lands it (ADR 0328). The verdict checks that at the settle.
 pub(crate) fn classify_bound_change(row: Option<ArmedChangeRow>) -> ArmedChange {
     match row {
         None => ArmedChange::Gone(CHANGE_RESOLVED),
-        Some((_, ChangeStatus::SetAside, _, _)) => ArmedChange::Gone(CHANGE_SET_ASIDE),
-        Some((_, status, _, _)) if status != ChangeStatus::Pending => {
+        Some((_, ChangeStatus::SetAside, _)) => ArmedChange::Gone(CHANGE_SET_ASIDE),
+        Some((_, ChangeStatus::Withdrawn, _)) => ArmedChange::Gone(CHANGE_WITHDRAWN),
+        Some((_, status, _)) if status != ChangeStatus::Pending => {
             ArmedChange::Gone(CHANGE_RESOLVED)
         }
-        Some((_, _, 0, _)) => ArmedChange::Gone(CHANGE_EMPTY),
-        Some((_, _, _, true)) => ArmedChange::Incomplete,
-        Some((id, _, _, false)) => ArmedChange::Ready(id),
+        Some((_, _, 0)) => ArmedChange::Gone(CHANGE_EMPTY),
+        Some((id, _, _)) => ArmedChange::Ready(id),
     }
 }
 
@@ -470,14 +482,16 @@ async fn read_settle_facts(
     arm: &StandingApply,
     sessions: &AgentSessions,
 ) -> FactsProbe {
-    let probe: Result<Option<(String, i32, bool, bool)>, sqlx::Error> = sqlx::query_as(
-        "SELECT status, live_event_wait_count, coding_agent_has_diff, is_coding_agent \
+    type SettleRow = (String, i32, String, Option<String>, bool, bool);
+    let probe: Result<Option<SettleRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT status, live_event_wait_count, coding_agent_change_state, \
+                coding_agent_unproposed_reason, coding_agent_requires_restart, is_coding_agent \
          FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(arm.thread_id)
     .fetch_optional(pool)
     .await;
-    let (status, live_waits, has_diff, is_coding_agent) = match probe {
+    let (status, live_waits, kind, reason, requires_restart, is_coding_agent) = match probe {
         Ok(Some(row)) => row,
         Ok(None) => return FactsProbe::ThreadGone,
         Err(e) => {
@@ -523,7 +537,11 @@ async fn read_settle_facts(
         status,
         parked_on_question,
         live_event_waits: live_waits > 0,
-        has_diff,
+        change_state: CodingAgentChangeState::from_columns(
+            &kind,
+            reason.as_deref(),
+            requires_restart,
+        ),
         armed_change,
         turn_settle,
     })
@@ -591,7 +609,7 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
     let probe: Result<Option<ArmedChangeRow>, sqlx::Error> = match arm.change_id {
         Some(change_id) => {
             sqlx::query_as(
-                "SELECT id, status, file_count, incomplete FROM changes \
+                "SELECT id, status, file_count FROM changes \
                  WHERE id = $1 AND thread_id = $2",
             )
             .bind(change_id)
@@ -601,7 +619,7 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
         }
         None => {
             sqlx::query_as(
-                "SELECT id, status, file_count, incomplete FROM changes \
+                "SELECT id, status, file_count FROM changes \
                  WHERE thread_id = $1 AND status = $2 \
                  ORDER BY created_at LIMIT 1",
             )
@@ -1132,7 +1150,7 @@ impl LucidosEngine {
 mod db_tests {
     use super::*;
     use crate::test_support::{
-        seed_thread_event, setup_test_db, start_cc_session, teardown_test_db,
+        seed_change_state, seed_thread_event, setup_test_db, start_cc_session, teardown_test_db,
     };
     use sqlx::PgPool;
 
@@ -1375,8 +1393,8 @@ mod db_tests {
     }
 
     /// **Stop.** A Stop's terminal sets `idle` before the run loop commits the
-    /// stopped turn and proposes it as incomplete. Firing in that window would
-    /// merge the stopped turn's partial commits, so the arm waits for the idle.
+    /// stopped turn and withholds it. Firing in that window would merge the
+    /// stopped turn's partial commits, so the arm waits for the idle.
     #[tokio::test]
     async fn a_stopped_turn_holds_the_arm_until_its_idle() {
         let (pool, db) = setup_test_db().await;
@@ -1909,36 +1927,65 @@ mod db_tests {
         teardown_test_db(&db).await;
     }
 
-    /// **A Stop's unfinished work on a resumed thread is armable**, since the
-    /// running turn's clean idle clears the mark. A settled thread holding the
-    /// same change has nothing to wait for, so it is refused.
+    /// **I10. A withheld settle ends an unbound arm, naming the reason.** A
+    /// running thread over the same withheld work still has a settle to come,
+    /// so it is armable. A settled one has nothing to wait for.
     #[tokio::test]
-    async fn an_incomplete_change_is_armable_while_its_thread_runs() {
+    async fn a_withheld_settle_refuses_an_unbound_arm_with_its_reason() {
         let (pool, db) = setup_test_db().await;
         let running = Uuid::new_v4();
         let settled = Uuid::new_v4();
         seed_thread(&pool, running, "running").await;
         seed_thread(&pool, settled, "idle").await;
-        let running_change = Uuid::new_v4();
-        let settled_change = Uuid::new_v4();
-        seed_change(&pool, running_change, running, ChangeStatus::Pending).await;
-        seed_change(&pool, settled_change, settled, ChangeStatus::Pending).await;
-        sqlx::query("UPDATE changes SET incomplete = TRUE")
-            .execute(&pool)
-            .await
-            .expect("mark the changes incomplete");
+        let withheld_work = CodingAgentChangeState::Unproposed {
+            reason: Some(UnproposedReason::TurnIncomplete),
+        };
+        seed_change_state(&pool, running, withheld_work).await;
+        seed_change_state(&pool, settled, withheld_work).await;
 
-        async fn refusal(pool: &PgPool, thread: Uuid, change: Uuid) -> Option<String> {
-            check_arm_has_a_settle(pool, &arm_for(thread, Some(change)), &no_sessions())
+        async fn refusal(pool: &PgPool, thread: Uuid) -> Option<String> {
+            check_arm_has_a_settle(pool, &arm_for(thread, None), &no_sessions())
                 .await
                 .err()
                 .map(|e| e.to_string())
         }
-        assert_eq!(refusal(&pool, running, running_change).await, None);
-        let refused = refusal(&pool, settled, settled_change)
+        assert_eq!(refusal(&pool, running).await, None);
+        let refused = refusal(&pool, settled)
             .await
-            .expect("a settled thread's unfinished work has nothing to wait for");
-        assert!(refused.contains(CHANGE_INCOMPLETE), "{refused}");
+            .expect("a settled thread's withheld work has nothing to wait for");
+        assert!(
+            refused.contains(withheld(UnproposedReason::TurnIncomplete)),
+            "{refused}"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// **I10, the bound arm.** A change withdrawn under its arm can never be
+    /// applied, so the arm ends even while its thread still runs.
+    #[tokio::test]
+    async fn a_bound_arm_on_a_withdrawn_change_reads_it_as_gone() {
+        let (pool, db) = setup_test_db().await;
+        let thread = Uuid::new_v4();
+        let change = Uuid::new_v4();
+        seed_thread(&pool, thread, "running").await;
+        seed_change(&pool, change, thread, ChangeStatus::Pending).await;
+        let arm = arm_for(thread, Some(change));
+        insert_arm(&pool, &arm).await.expect("insert arm");
+        sqlx::query("UPDATE changes SET status = $2 WHERE id = $1")
+            .bind(change)
+            .bind(ChangeStatus::Withdrawn)
+            .execute(&pool)
+            .await
+            .expect("withdraw the change");
+
+        let FactsProbe::Ready(facts) = read_settle_facts(&pool, &arm, &no_sessions()).await else {
+            panic!("facts must read back");
+        };
+        assert_eq!(facts.armed_change, ArmedChange::Gone(CHANGE_WITHDRAWN));
+        assert_eq!(
+            standing_verdict(&facts),
+            StandingVerdict::Drop(CHANGE_WITHDRAWN)
+        );
         teardown_test_db(&db).await;
     }
 
@@ -2116,7 +2163,7 @@ mod tests {
             status: status.to_string(),
             parked_on_question: false,
             live_event_waits: false,
-            has_diff: false,
+            change_state: CodingAgentChangeState::None,
             armed_change,
             turn_settle: TurnSettle::Settled,
         }
@@ -2233,7 +2280,7 @@ mod tests {
             on: Vec::new(),
             reason: String::new(),
         });
-        let anchor = on_thread(ThreadEvent::UserPromptInjected {
+        let anchor = on_thread(ThreadEvent::PromptInjected {
             text: "An event you subscribed to has arrived".to_string(),
             mode: crate::engine::thread_events::ActorMode::Agent,
             origin: None,
@@ -2361,26 +2408,45 @@ mod tests {
         );
     }
 
-    /// A Stop's unfinished work is what an arm on a resumed thread waits for:
-    /// the turn's clean idle clears the mark on the same change. A settle that
-    /// leaves it unfinished drops the arm, since only its own Apply lands it.
+    /// I10. A settle that withheld its work drops the arm with copy naming the
+    /// reason: nothing will propose that work by itself. A thread still
+    /// settling keeps the arm, since its next turn end may propose.
     #[test]
-    fn an_incomplete_change_waits_for_the_settle_and_drops_if_still_unfinished() {
-        for status in ["running", "paused"] {
+    fn a_withheld_settle_drops_with_the_reason_and_a_settling_one_waits() {
+        for reason in UnproposedReason::ALL {
+            let withheld_facts = SettleFacts {
+                change_state: CodingAgentChangeState::Unproposed {
+                    reason: Some(reason),
+                },
+                ..facts("idle", ArmedChange::Unproposed)
+            };
             assert_eq!(
-                standing_verdict(&facts(status, ArmedChange::Incomplete)),
-                StandingVerdict::Wait,
-                "{status}"
+                standing_verdict(&withheld_facts),
+                StandingVerdict::Drop(withheld(reason)),
+                "{reason:?}"
             );
+            for status in ["running", "paused"] {
+                let settling = SettleFacts {
+                    status: status.to_string(),
+                    ..withheld_facts.clone()
+                };
+                assert_eq!(
+                    standing_verdict(&settling),
+                    StandingVerdict::Wait,
+                    "{reason:?} {status}"
+                );
+            }
+            let mut mid_settle = withheld_facts.clone();
+            mid_settle.turn_settle = TurnSettle::InFlight;
+            assert_eq!(standing_verdict(&mid_settle), StandingVerdict::Wait);
         }
-        let mut mid_settle = facts("idle", ArmedChange::Incomplete);
-        mid_settle.turn_settle = TurnSettle::InFlight;
-        assert_eq!(standing_verdict(&mid_settle), StandingVerdict::Wait);
+    }
 
-        assert_eq!(
-            standing_verdict(&facts("idle", ArmedChange::Incomplete)),
-            StandingVerdict::Drop(CHANGE_INCOMPLETE)
-        );
+    /// Each reason has its own copy, so the owner hears why.
+    #[test]
+    fn each_withheld_reason_reads_differently() {
+        let copies: HashSet<&str> = UnproposedReason::ALL.into_iter().map(withheld).collect();
+        assert_eq!(copies.len(), UnproposedReason::ALL.len());
     }
 
     /// The proposal follows the turn's terminal, so a settled thread with a
@@ -2389,7 +2455,7 @@ mod tests {
     #[test]
     fn a_settled_thread_with_a_diff_waits_for_its_proposal() {
         let mut with_diff = facts("idle", ArmedChange::Unproposed);
-        with_diff.has_diff = true;
+        with_diff.change_state = CodingAgentChangeState::Unproposed { reason: None };
         assert_eq!(standing_verdict(&with_diff), StandingVerdict::Wait);
 
         let without = facts("idle", ArmedChange::Unproposed);
@@ -2403,28 +2469,28 @@ mod tests {
     fn bound_change_classification() {
         let id = Uuid::new_v4();
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::Pending, 3, false))),
+            classify_bound_change(Some((id, ChangeStatus::Pending, 3))),
             ArmedChange::Ready(id)
         );
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::Applied, 3, false))),
+            classify_bound_change(Some((id, ChangeStatus::Applied, 3))),
             ArmedChange::Gone(CHANGE_RESOLVED)
         );
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::Discarded, 3, false))),
+            classify_bound_change(Some((id, ChangeStatus::Discarded, 3))),
             ArmedChange::Gone(CHANGE_RESOLVED)
         );
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::Pending, 0, false))),
+            classify_bound_change(Some((id, ChangeStatus::Pending, 0))),
             ArmedChange::Gone(CHANGE_EMPTY)
         );
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::Pending, 3, true))),
-            ArmedChange::Incomplete,
-            "a clean turn can still finish a Stop's work, so it is not gone"
+            classify_bound_change(Some((id, ChangeStatus::Withdrawn, 3))),
+            ArmedChange::Gone(CHANGE_WITHDRAWN),
+            "a withdrawn change went back to its branch, so the arm can never fire"
         );
         assert_eq!(
-            classify_bound_change(Some((id, ChangeStatus::SetAside, 3, false))),
+            classify_bound_change(Some((id, ChangeStatus::SetAside, 3))),
             ArmedChange::Gone(CHANGE_SET_ASIDE)
         );
         assert_eq!(

@@ -1,9 +1,10 @@
-# E2E GitHub mode (ADR 0382): run the e2e suites a driver asked for.
+# E2E GitHub mode (ADRs 0382, 0386): run the e2e suites a driver asked for.
 #
-# `./scripts/e2e*.sh --github` pushes a stripped, scanned, parentless commit to
-# an e2e/<run-id> branch, with its selection in .github/e2e-request.json. This
-# workflow runs from that push. The driver downloads every shard's output,
-# reports it like a local run, and deletes the branch.
+# Unless a run stays local, `./scripts/e2e*.sh` pushes a stripped, scanned,
+# parentless commit to an e2e/<run-id> branch, with its selection in
+# .github/e2e-request.json. This workflow runs from that push. The driver
+# downloads every shard's output, reports it like a local run, and deletes the
+# branch.
 #
 # Limits `scripts/check-e2e-workflow.sh` enforces:
 #   - No secrets, and the token is contents: read.
@@ -147,6 +148,7 @@ jobs:
           path: |
             crates/lucidos-app/test-results
             ~/workspaces/e2e-test/.lucidos/engine.log
+            ~/workspaces/e2e-test/.lucidos/e2e-gateway/gateway.log
           retention-days: 1
           if-no-files-found: ignore
 
@@ -190,6 +192,7 @@ jobs:
           path: |
             crates/lucidos-app/test-results
             ~/workspaces/e2e-test/.lucidos/engine.log
+            ~/workspaces/e2e-test/.lucidos/e2e-gateway/gateway.log
           retention-days: 1
           if-no-files-found: ignore
 

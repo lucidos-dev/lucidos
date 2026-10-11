@@ -82,7 +82,7 @@ pub fn is_public_path(path: &str) -> bool {
 ///
 /// A dot segment is never public, and paths arrive un-normalized. Three walks
 /// this stops: `/~/assets/../api/v1/control/...` out of the picker's assets,
-/// `/<slug>/api/v1/static/../threads/list` out of the app-asset exemption, and
+/// `/<slug>/api/v1/fonts/../threads/list` out of the app-asset exemption, and
 /// `/<slug>/~cap/<token>/data/../api/v1/credentials` out of a capability.
 ///
 /// Both exemptions call it first, so neither can forget it.
@@ -94,17 +94,17 @@ fn carries_a_dot_segment(path: &str) -> bool {
 ///
 /// Not a string comparison, because the gateway builds the upstream URL with
 /// `reqwest::Url::parse`, which follows the WHATWG rules. There `%2e` is a dot
-/// and `\` is a segment separator, so `/dev/api/v1/static/%2e%2e/threads/list`
+/// and `\` is a segment separator, so `/dev/api/v1/fonts/%2e%2e/threads/list`
 /// reaches the engine as `/api/v1/threads/list`. A literal-only guard reads
-/// that as an ordinary asset under `/static/` and exempts it, which is an auth
+/// that as an ordinary asset under `/fonts/` and exempts it, which is an auth
 /// bypass rather than a near miss.
 ///
 /// The four double-dot spellings and the two single-dot ones are the parser's
 /// own list. `%2e%2e%2f` is not among them: an encoded slash stays encoded, so
 /// no segment split happens and nothing pops. A double-encoded `%252e` reaches
-/// the engine unchanged, where the two exempt trees hold three exact routes and
-/// no wildcard, so it 404s. Adding a `/static/*path` that decodes would reopen
-/// that half.
+/// the engine unchanged, where the exempt tree holds one single-segment route
+/// and no wildcard, so it 404s. Adding a `/fonts/*path` that decodes would
+/// reopen that half.
 fn is_dot_segment(segment: &str) -> bool {
     if segment == "." || segment == ".." {
         return true;
@@ -128,7 +128,7 @@ const APP_ASSET_FILES: [&str; 4] = [
 
 /// The `/api/v1` sub-trees an app frame loads from. Prefixes, because a font
 /// file and a bundled script are named by the asset rather than listed here.
-const APP_ASSET_TREES: [&str; 2] = ["/fonts/", "/static/"];
+const APP_ASSET_TREES: [&str; 1] = ["/fonts/"];
 
 /// May an app frame load this with no credential at all?
 ///
@@ -723,7 +723,6 @@ mod tests {
             "/dev/api/v1/sdk-iframe.css",
             "/dev/api/v1/sdk-iframe-audio.js",
             "/dev/api/v1/fonts/fira-code.css",
-            "/dev/api/v1/static/html2canvas.min.js",
             "/myws/api/v1/sdk.js",
         ] {
             assert!(is_public_path(path), "{path}");
@@ -744,7 +743,8 @@ mod tests {
             // A tree exemption needs the tree, not a route that starts like it.
             "/dev/api/v1/fonts",
             "/dev/api/v1/fonts-admin/list",
-            "/dev/api/v1/staticky",
+            // Not an app-asset tree: the engine serves nothing under `/static/`.
+            "/dev/api/v1/static/html2canvas.min.js",
             // The prefix has to be the whole of `api/v1`, and a slug has to be
             // there: `/api/v1/sdk.js` names a workspace called `api`.
             "/dev/api/v1beta/sdk.js",
@@ -766,20 +766,20 @@ mod tests {
 
     #[test]
     fn a_tree_exemption_cannot_be_walked_out_of() {
-        // `/fonts/` and `/static/` are prefixes, so they admit a tail, and the
-        // proxy hands that tail to `reqwest::Url::parse`. Every path here is
+        // `/fonts/` is a prefix, so it admits a tail, and the proxy hands that
+        // tail to `reqwest::Url::parse`. Every path here is
         // ordinary-looking to a literal `..` scan and pops the tree off once
         // the parser sees it. Each assertion states both halves: the gate
         // refuses it, and the reason it must.
         for path in [
-            r"/dev/api/v1/static/%2e%2e/threads/list",
-            r"/dev/api/v1/static/%2E%2E/threads/list",
-            r"/dev/api/v1/static/.%2e/threads/list",
-            r"/dev/api/v1/static/%2e./threads/list",
-            r"/dev/api/v1/static/%2e/%2e%2e/threads/list",
+            r"/dev/api/v1/fonts/%2e%2e/threads/list",
+            r"/dev/api/v1/fonts/%2E%2E/threads/list",
+            r"/dev/api/v1/fonts/.%2e/threads/list",
+            r"/dev/api/v1/fonts/%2e./threads/list",
+            r"/dev/api/v1/fonts/%2e/%2e%2e/threads/list",
             r"/dev/api/v1/fonts/a/%2e%2e/%2e%2e/credentials",
-            r"/dev/api/v1/static/..\threads/list",
-            r"/dev/api/v1/static/%2e%2e\threads/list",
+            r"/dev/api/v1/fonts/..\threads/list",
+            r"/dev/api/v1/fonts/%2e%2e\threads/list",
         ] {
             assert!(!is_public_path(path), "{path}");
 
@@ -790,8 +790,7 @@ mod tests {
             let upstream =
                 reqwest::Url::parse(&format!("http://127.0.0.1:0{rest}")).expect("a parsable url");
             assert!(
-                !upstream.path().starts_with("/api/v1/static/")
-                    && !upstream.path().starts_with("/api/v1/fonts/"),
+                !upstream.path().starts_with("/api/v1/fonts/"),
                 "{path} was chosen because it escapes its tree, and it resolved to {}",
                 upstream.path()
             );
@@ -1406,7 +1405,6 @@ mod tests {
             "/dev/api/v1/sdk.js",
             "/dev/api/v1/sdk-iframe-audio.js",
             "/dev/api/v1/fonts/fira-code.css",
-            "/dev/api/v1/static/html2canvas.min.js",
         ] {
             let response = get(&state, path, &as_a_tag).await;
             assert_eq!(

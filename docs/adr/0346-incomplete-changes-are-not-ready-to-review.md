@@ -1,6 +1,7 @@
 # 0346: An incomplete change waits under Not finished, not Review, and still blocks Archive
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0400](0400-coding-agent-change-state.md). An
+  unfinished turn no longer proposes, so no pending change is incomplete.
 - **Date**: 2026-10-02
 
 ## Context

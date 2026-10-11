@@ -74,6 +74,9 @@
     border-radius: calc(var(--radius-control) * 0.75);
     background: linear-gradient(90deg, var(--sk-base) 25%, var(--sk-shine) 50%, var(--sk-base) 75%);
     background-size: 200% 100%;
+    /* The sweep repaints every frame, so the bar owns its layer
+       (an-endless-repaint-owns-its-layer.test.ts). */
+    will-change: transform;
     animation: shimmer 1.5s infinite;
     vertical-align: middle;
 }
@@ -973,6 +976,11 @@
 @keyframes modal-in {
     from { opacity: 0; }
     to { opacity: 1; }
+}
+
+@keyframes modal-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
 }
 
 /* Contextual drop highlights — applied to the element with data-drop-zone

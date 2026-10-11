@@ -36,6 +36,8 @@ function makeChange(over: Partial<Change> = {}): Change {
     files: ['a.rs'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-01-01T00:00:00Z',
     resolved_at: null,

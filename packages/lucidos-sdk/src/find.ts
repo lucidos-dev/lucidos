@@ -3,7 +3,7 @@
  *
  * Three places run it. An app frame serves it as the `find` host op, since
  * the host cannot read an isolated frame (ADR 0227). The HTML artifact preview
- * gets a bundle of it (`previewFind.build.mjs`). The host imports it as
+ * gets a bundle of it (`previewBundles.build.mjs`). The host imports it as
  * `@lucidos/find` for text previews and the transcript.
  *
  * It never edits the DOM it searches. Matches are Ranges in two CSS Custom
@@ -16,9 +16,9 @@ export const ALL_HIGHLIGHT = 'lucidos-find';
 /** The match the reader is on. */
 export const CURRENT_HIGHLIGHT = 'lucidos-find-current';
 
-/** A query that matches more than this stops counting, so one letter cannot
- *  build a Highlight of every character on the page. */
-export const MAX_FIND_MATCHES = 2000;
+/** A query that matches more than this stops counting. Every match is a Range
+ *  the page repaints, and 2000 of them froze an iPhone. */
+export const MAX_FIND_MATCHES = 500;
 
 /** Subtrees whose text the reader never sees as page text. Form fields are
  *  skipped too: their text nodes hold a default, not what the field shows. */
@@ -190,12 +190,20 @@ export function highlightApiPresent(): boolean {
   return typeof CSS !== 'undefined' && 'highlights' in CSS && typeof Highlight === 'function';
 }
 
-/** The first match at or below the top of `root`'s visible box. A fresh query
- *  lands where the reader is looking, instead of jumping to the top. */
-function firstInView(ranges: Range[], root: Element): number {
-  const top = Math.max(0, root.getBoundingClientRect().top);
+/** The first match at or below the top of `root`'s visible box, and of the
+ *  clear band. A fresh query lands where the reader is looking, instead of
+ *  jumping to the top. */
+function firstInView(ranges: Range[], root: Element, band: ClearBand | undefined): number {
+  const top = Math.max(0, root.getBoundingClientRect().top, band?.top ?? 0);
   const index = ranges.findIndex((r) => r.getBoundingClientRect().bottom >= top);
   return index === -1 ? 0 : index;
+}
+
+/** The first match starting at or after `from`, or -1 when none does. */
+function firstFrom(ranges: Range[], from: Node): number {
+  const at = from.ownerDocument!.createRange();
+  at.setStartBefore(from);
+  return ranges.findIndex((r) => r.compareBoundaryPoints(Range.START_TO_START, at) >= 0);
 }
 
 function scrolls(el: Element): boolean {
@@ -211,20 +219,39 @@ function centring(spanStart: number, spanSize: number, boxStart: number, boxSize
   return visible ? 0 : spanStart - boxStart - (boxSize - spanSize) / 2;
 }
 
+/** The rows of the viewport nothing covers, top inclusive, bottom exclusive. */
+export interface ClearBand {
+  top: number;
+  bottom: number;
+}
+
+/** `[start, end)` cut to `band`, or left whole when nothing of it is clear. */
+function clipToBand(start: number, end: number, band: ClearBand | undefined): [number, number] {
+  if (!band) return [start, end];
+  const top = Math.max(start, band.top);
+  const bottom = Math.min(end, band.bottom);
+  return bottom > top ? [top, bottom] : [start, end];
+}
+
 /** Bring the match itself into view. Its element may be taller than the
  *  screen, such as a long `<pre>`. So every scroller from the match out to the
  *  page moves by the range's own box, innermost first. Instant, as in every
- *  browser's find: a smooth scroll per keystroke lags the typing. */
-export function revealRange(range: Range): void {
+ *  browser's find: a smooth scroll per keystroke lags the typing.
+ *
+ *  `band` is the part of the viewport nothing covers. A match under a floating
+ *  bar is not in view, so it is centred in what stays clear. */
+export function revealRange(range: Range, band?: ClearBand): void {
   for (let el = range.startContainer.parentElement; el && el !== document.documentElement; el = el.parentElement) {
     if (!scrolls(el)) continue;
     const box = el.getBoundingClientRect();
     const r = range.getBoundingClientRect();
-    el.scrollTop += centring(r.top, r.height, box.top, box.height);
+    const [top, bottom] = clipToBand(box.top, box.bottom, band);
+    el.scrollTop += centring(r.top, r.height, top, bottom - top);
     el.scrollLeft += centring(r.left, r.width, box.left, box.width);
   }
   const r = range.getBoundingClientRect();
-  const dy = centring(r.top, r.height, 0, window.innerHeight);
+  const [top, bottom] = clipToBand(0, window.innerHeight, band);
+  const dy = centring(r.top, r.height, top, bottom - top);
   const dx = centring(r.left, r.width, 0, window.innerWidth);
   if (dx || dy) window.scrollBy(dx, dy);
 }
@@ -280,13 +307,17 @@ export function createPainter(highlights: () => boolean): FindPainter {
 
 export interface Finder {
   /** Run one query or step. The text is re-read every time, because the page
-   *  may have re-rendered since the last call. */
-  find(query: string, step?: 1 | -1): FindResult;
+   *  may have re-rendered since the last call. `from` starts the query over,
+   *  on the first match at or after that node. */
+  find(query: string, step?: 1 | -1, from?: Node): FindResult;
   clear(): void;
 }
 
-/** A find session over the text under `root()`, painted by `painter`. */
-export function createFinder(root: () => Element | null, painter: FindPainter): Finder {
+/** A find session over the text under `root()`, painted by `painter`. `band`
+ *  names the part of the viewport nothing floats over, as `revealRange` takes. */
+export function createFinder(
+  root: () => Element | null, painter: FindPainter, band?: () => ClearBand | undefined,
+): Finder {
   let session: { query: string; current: number } | null = null;
   const none: FindResult = { total: 0, current: 0, capped: false };
   const clear = () => {
@@ -295,7 +326,7 @@ export function createFinder(root: () => Element | null, painter: FindPainter): 
   };
   return {
     clear,
-    find(query, step) {
+    find(query, step, from) {
       const pattern = queryPattern(query);
       const el = root();
       if (!pattern || !el) {
@@ -307,15 +338,18 @@ export function createFinder(root: () => Element | null, painter: FindPainter): 
       const capped = spans.length > MAX_FIND_MATCHES;
       const ranges = spans.slice(0, MAX_FIND_MATCHES).map((s) => spanToRange(page, s));
       const total = ranges.length;
+      const uncovered = band?.();
 
       let current: number;
-      if (session?.query !== query) current = firstInView(ranges, el);
+      const start = from ? firstFrom(ranges, from) : -1;
+      if (start !== -1) current = start;
+      else if (from || session?.query !== query) current = firstInView(ranges, el, uncovered);
       else if (step) current = stepIndex(session.current, step, total);
       else current = Math.min(session.current, Math.max(total - 1, 0));
 
       session = { query, current };
       painter.paint(ranges, total > 0 ? current : -1);
-      if (total > 0) revealRange(ranges[current]);
+      if (total > 0) revealRange(ranges[current], uncovered);
       return { total, current: total > 0 ? current + 1 : 0, capped };
     },
   };

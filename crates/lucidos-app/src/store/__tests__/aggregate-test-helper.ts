@@ -5,9 +5,11 @@
 // backend's projection. The Rust lifecycle tests
 // (engine/thread_lifecycle_tests/tests.rs) remain the source of truth for
 // the rules; this helper is a TS-side mirror, not a duplicate spec.
+import type { CodingAgentChangeState } from '../../api/threads';
 import {
   handleEvent,
   isSwitchTeardownAbort,
+  NO_CHANGE,
   type AbortCause,
   type MessageOrigin,
   type ThreadAggregate,
@@ -42,11 +44,8 @@ function aggregateFromMeta(meta: ThreadMeta): ThreadAggregate {
     blockingDescendantCount: meta.blockingDescendantCount,
     attentionDescendantCount: meta.attentionDescendantCount,
     liveEventWaitCount: meta.liveEventWaitCount,
-    codingAgentProposed: meta.codingAgentProposed,
-    codingAgentRequiresRestart: meta.codingAgentRequiresRestart,
-    codingAgentIncomplete: meta.codingAgentIncomplete,
+    codingAgentChangeState: meta.codingAgentChangeState,
     codingAgentIsExternalRepo: meta.codingAgentIsExternalRepo,
-    codingAgentHasDiff: meta.codingAgentHasDiff,
     isSaved: meta.saved,
     hasResponse: false,
     lastRevivedAt: meta.lastRevivedAt || null,
@@ -60,6 +59,56 @@ function aggregateFromMeta(meta: ThreadMeta): ThreadAggregate {
   };
 }
 
+/** A fact about the branch: whether it differs from main. A pending change
+ *  keeps the state `proposed`, and work that stays unproposed keeps its
+ *  reason. Mirrors `branch_work_sql` (engine `event_bus/mod.rs`). */
+function branchWork(state: CodingAgentChangeState, hasWork: boolean): CodingAgentChangeState {
+  if (state.kind === 'proposed') return state;
+  if (!hasWork) return NO_CHANGE;
+  return state.kind === 'unproposed' ? state : { kind: 'unproposed', reason: null };
+}
+
+/** A thread's last pending change left `pending`. Applied and Discarded leave
+ *  nothing to speak of; Set aside and Withdraw keep the work unproposed. Mirrors
+ *  `sync_thread_proposal` with `landing_after`, for a thread holding one
+ *  change. */
+function changeLeft(state: CodingAgentChangeState, landing: 'none' | 'unproposed'): CodingAgentChangeState {
+  if (state.kind !== 'proposed') return state;
+  return landing === 'none' ? NO_CHANGE : { kind: 'unproposed', reason: null };
+}
+
+/** The change-state rule for `event`. Mirrors the engine's projection arms. */
+function nextChangeState(state: CodingAgentChangeState, event: ThreadEvent | TransientEvent): CodingAgentChangeState {
+  switch (event.type) {
+    case 'CodingAgentIdled':
+      return event.has_changes === undefined ? state : branchWork(state, event.has_changes);
+    case 'CodingAgentDiffChanged':
+      return branchWork(state, event.has_diff);
+    case 'ChangeProposed':
+      if (event.set_aside) return changeLeft(state, 'unproposed');
+      return { kind: 'proposed', requires_restart: event.requires_restart === true };
+    case 'ChangeBroughtBack':
+      return { kind: 'proposed', requires_restart: false };
+    case 'ChangeSetAside':
+    case 'ChangeWithdrawn':
+      return changeLeft(state, 'unproposed');
+    case 'ChangeApplied':
+    case 'ChangeDiscarded':
+      return branchWork(changeLeft(state, 'none'), false);
+    case 'ThreadArchived':
+      return branchWork(state, false);
+    case 'ProposalWithheld':
+      return state.kind === 'proposed' ? state : { kind: 'unproposed', reason: event.reason };
+    // A new turn starts, so the last turn end's reason no longer stands.
+    case 'CodingAgentUserMessageSent':
+    case 'PromptInjected':
+    case 'ContinuationRequested':
+      return state.kind === 'unproposed' && state.reason !== null ? { kind: 'unproposed', reason: null } : state;
+    default:
+      return state;
+  }
+}
+
 /** Status values that are a VERDICT about how the turn ended, not a resting
  *  state. Mirrors `PRESERVED_STATUS_VERDICTS` (engine `event_bus/mod.rs`). */
 const VERDICT_STATUSES: ReadonlySet<string> = new Set(['failed', 'paused']);
@@ -68,7 +117,7 @@ const VERDICT_STATUSES: ReadonlySet<string> = new Set(['failed', 'paused']);
  *  projection arms write `status = 'running'` plainly. */
 const START_EVENTS: ReadonlySet<string> = new Set([
   'MessageReceived', 'TriggerStarted', 'CodingAgentUserMessageSent',
-  'UserPromptInjected', 'CodingAgentPromptSent', 'ContinuationRequested',
+  'PromptInjected', 'CodingAgentPromptSent', 'ContinuationRequested',
   'UserQuestionAnswered', 'CodingAgentPermissionResolved',
   'CommandPermissionResolved', 'McpPermissionResolved',
 ]);
@@ -119,9 +168,7 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
     // discard where no pending change exists, so no `ChangeDiscarded` is emitted
     // to carry the clear (see the `thread-flows-cc-status` case for that shape).
     if (reason === 'discarded') {
-      out.codingAgentProposed = false;
-      out.codingAgentRequiresRestart = false;
-      out.codingAgentIncomplete = false;
+      out.codingAgentChangeState = NO_CHANGE;
       out.codingAgentIsExternalRepo = false;
       out.status = 'idle';
       return out;
@@ -138,20 +185,9 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
     'ResponseGenerated', 'ResponseCanceled', 'SessionEnded', 'CodingAgentIdled',
   ]);
 
-  // CC flag rules.
-  if (event.type === 'CodingAgentIdled') {
-    if (event.has_changes !== undefined) out.codingAgentProposed = !!event.has_changes;
-    if (event.requires_restart !== undefined) out.codingAgentRequiresRestart = !!event.requires_restart;
-  } else if (t === 'ChangeProposed') {
-    out.codingAgentProposed = true;
-    out.codingAgentIncomplete = (event as { incomplete?: boolean }).incomplete === true;
-  } else if (t === 'ChangeApplied' || t === 'ChangeDiscarded' || t === 'ThreadArchived') {
-    out.codingAgentProposed = false;
-    out.codingAgentRequiresRestart = false;
-    out.codingAgentIncomplete = false;
+  out.codingAgentChangeState = nextChangeState(agg.codingAgentChangeState, event);
+  if (t === 'ChangeApplied' || t === 'ChangeDiscarded' || t === 'ThreadArchived') {
     out.codingAgentIsExternalRepo = false;
-  } else if (t === 'MergeConflictDetected') {
-  } else if (t === 'ChangeApplyFailed') {
   }
 
   // `preserving_verdict`: an event that only streams or closes out the ended

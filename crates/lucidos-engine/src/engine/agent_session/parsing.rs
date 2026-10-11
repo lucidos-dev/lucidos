@@ -1,5 +1,5 @@
 /// One parsed question from CC's `AskUserQuestion` tool input.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ParsedQuestion {
     pub question: String,
     pub options: Vec<crate::engine::thread_events::QuestionOption>,
@@ -54,12 +54,13 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
                             .filter(|s| !s.trim().is_empty())
                             .map(|s| s.to_string())
                     };
-                    crate::engine::thread_events::QuestionOption {
+                    lift_widget_embed(crate::engine::thread_events::QuestionOption {
                         id: format!("opt-{}", i),
                         label,
                         description: non_empty("description"),
                         preview: non_empty("preview"),
-                    }
+                        widget: None,
+                    })
                 })
                 .collect()
         })
@@ -73,6 +74,49 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
         options,
         multi_select,
     }
+}
+
+/// Lift an option's one *widget embed* out of its description or preview into
+/// its typed `widget` (ADR 0415). Two embeds, or a broken one, are left in
+/// the text untouched: `option_embed_problem` names them, and the walk refuses
+/// the card.
+fn lift_widget_embed(
+    mut option: crate::engine::thread_events::QuestionOption,
+) -> crate::engine::thread_events::QuestionOption {
+    use crate::engine::widget_embed::{scan, without_embeds};
+    let in_description = option.description.as_deref().map(scan).unwrap_or_default();
+    let in_preview = option.preview.as_deref().map(scan).unwrap_or_default();
+    let (field, matches) = match (in_description.len(), in_preview.len()) {
+        (1, 0) => (&mut option.description, in_description),
+        (0, 1) => (&mut option.preview, in_preview),
+        _ => return option,
+    };
+    let Ok(embed) = matches[0].embed.clone() else {
+        return option;
+    };
+    *field = field
+        .as_deref()
+        .and_then(|text| without_embeds(text, &matches));
+    option.widget = Some(embed);
+    option
+}
+
+/// Why an option's embeds cannot become its widget, if they cannot: more than
+/// one, or one whose syntax is broken.
+pub(crate) fn option_embed_problem(
+    option: &crate::engine::thread_events::QuestionOption,
+) -> Option<String> {
+    use crate::engine::widget_embed::scan;
+    let left: Vec<_> = [&option.description, &option.preview]
+        .into_iter()
+        .flatten()
+        .flat_map(|text| scan(text))
+        .collect();
+    if let Some(reason) = left.iter().find_map(|m| m.embed.as_ref().err()) {
+        return Some(format!("its widget embed is broken: {reason}"));
+    }
+    let count = left.len() + usize::from(option.widget.is_some());
+    (count > 1).then(|| format!("it holds {count} widget embeds; an option draws one"))
 }
 
 #[cfg(test)]

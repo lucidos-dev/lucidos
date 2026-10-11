@@ -106,6 +106,87 @@ export function adoptCapability(capability: string): boolean {
   return true;
 }
 
+/**
+ * A history URL resolved against this document's own URL, not the stamped base.
+ *
+ * The base carries the pass in its PATH, so it names a different document.
+ * A bare `#tab` resolved against it changes the path. WebKit then refuses the
+ * `replaceState` from a sandboxed frame, and Chromium moves the frame onto a
+ * URL whose pass expires.
+ *
+ * The author never wrote that base, so their relative URL means their page.
+ * A document with no pass stamped keeps the browser's own answer, which also
+ * leaves an author's own `<base>` in charge.
+ */
+export function documentRelative(url: string | URL): string | URL {
+  if (!currentCapability()) return url;
+  try {
+    return new URL(url, location.href).href;
+  } catch {
+    // Unparseable: the browser's own call throws its own error for it.
+    return url;
+  }
+}
+
+/**
+ * The URL an in-page link (`href="#section"`) names, or `null` for any other.
+ *
+ * Followed natively, such a link resolves against the stamped base and loads
+ * the app afresh at that URL, rather than scrolling. Only a document carrying
+ * a pass needs the redirect.
+ */
+export function inPageFragment(href: string | null): string | null {
+  if (!href?.startsWith('#') || !currentCapability()) return null;
+  return new URL(href, location.href).href;
+}
+
+type HistoryUrlMethods = Pick<History, 'pushState' | 'replaceState'>;
+
+/** Make `pushState` and `replaceState` on `target` resolve via `documentRelative`. */
+export function anchorHistoryToDocument(target: HistoryUrlMethods): void {
+  for (const method of ['pushState', 'replaceState'] as const) {
+    const native = target[method];
+    target[method] = function (this: History, data: unknown, unused: string, url?: string | URL | null) {
+      if (url == null) return native.call(this, data, unused, url);
+      return native.call(this, data, unused, documentRelative(url));
+    };
+  }
+}
+
+/**
+ * Keep the stamped base out of the URLs this document moves to.
+ *
+ * Covers the history API and in-page link clicks. `location.hash = …` needs
+ * nothing, since it edits the document's own URL. `location.assign('#x')`
+ * resolves against the base and cannot be wrapped.
+ */
+export function installDocumentRelativeUrls(): void {
+  anchorHistoryToDocument(History.prototype);
+  const followInPageLink = (event: MouseEvent) => {
+    if (event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    // The composed path, so a link inside a shadow root is found too.
+    const link = event.composedPath().find(
+      (node): node is Element => node instanceof Element && node.matches('a[href], area[href]'),
+    );
+    if (!link || link.hasAttribute('download')) return;
+    const target = link.getAttribute('target');
+    if (target && target !== '_self') return;
+    const url = inPageFragment(link.getAttribute('href'));
+    if (!url) return;
+    event.preventDefault();
+    // `assign`, as a native link click re-scrolls to an unchanged fragment.
+    // A `location.hash` write skips that case.
+    location.assign(url);
+  };
+  // Re-added at the start of each click, so it runs after every window
+  // listener the app has added, and the app's `preventDefault` still wins.
+  window.addEventListener('click', () => {
+    window.removeEventListener('click', followInPageLink);
+    window.addEventListener('click', followInPageLink, { once: true });
+  }, true);
+}
+
 /** What the host fans out on the `frame-capability` channel. */
 interface RenewedCapability {
   capability?: unknown;

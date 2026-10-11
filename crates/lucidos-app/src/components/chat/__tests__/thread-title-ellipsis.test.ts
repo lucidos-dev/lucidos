@@ -45,9 +45,11 @@ describe('Desktop header title truncates with an ellipsis', () => {
   const desktop = ruleBody(drawerCss, '.thread-view-header .thread-title');
   const text = ruleBody(drawerCss, '.thread-view-header .thread-title-text');
 
+  /* Its cap leaves room for the pin, so only the widget shelf ever wraps. */
   it('shrinks below its text, so the text can overflow it', () => {
     expect(base).toMatch(/min-width:\s*0/);
     expect(desktop).toMatch(/flex:\s*0 1 auto/);
+    expect(desktop).toMatch(/max-width:\s*calc\(100% - var\(--title-icon-box\)/);
     expect(desktop).not.toMatch(/width:\s*max-content/);
   });
 

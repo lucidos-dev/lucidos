@@ -1,7 +1,8 @@
 import { marked } from 'marked';
 import type { Tokens } from 'marked';
 import DOMPurify from 'dompurify';
-import { BARE_EMAIL_ATTR, CODE_COPY_ATTR, COPY_ICON, COPY_ID_NONCE, escapeHtmlAttr } from './markedConfig';
+import { BARE_EMAIL_ATTR, CODE_COPY_ATTR, COPY_ID_NONCE, WIDGET_EMBED_SLOT_ATTR, escapeHtmlAttr } from './markedConfig';
+import { COPY_ICON } from './copyIcons';
 import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
 import { WORKSPACE_ID } from './basePath';
@@ -681,6 +682,11 @@ export function renderMarkdownInline(md: string): string {
   return inDom(html, ['<'], (body) => {
     for (const el of Array.from(body.querySelectorAll(INTERACTIVE_ELEMENTS))) {
       el.replaceWith(...Array.from(el.childNodes));
+    }
+    // Inline markdown mounts no widget: an option lifts its embed first, so
+    // what is left reads as its label (ADR 0415).
+    for (const slot of Array.from(body.querySelectorAll(`[${WIDGET_EMBED_SLOT_ATTR}]`))) {
+      slot.replaceWith(slot.textContent ?? '');
     }
     prepareImagesIn(body);
   });

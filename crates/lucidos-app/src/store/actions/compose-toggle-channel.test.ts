@@ -60,10 +60,6 @@ vi.mock('./thread-navigation', () => ({
   pushThreadNavState: vi.fn(),
 }));
 
-vi.mock('../../components/chat/scrollState', () => ({
-  followSentMessage: vi.fn(),
-  stopFollowingBottom: vi.fn(),
-}));
 
 vi.mock('./thread-loading', () => ({
   refreshThreadEvents: vi.fn().mockResolvedValue(true),
@@ -130,11 +126,8 @@ function makeMeta(id: string, overrides: Partial<ThreadMeta>): ThreadMeta {
     totalChildrenCount: 0,
     blockingDescendantCount: 0,
     attentionDescendantCount: 0,
-    codingAgentProposed: false,
-    codingAgentRequiresRestart: false,
-    codingAgentIncomplete: false,
+    codingAgentChangeState: { kind: 'none' },
     codingAgentIsExternalRepo: false,
-    codingAgentHasDiff: false,
     lastRevivedAt: '',
     state: 'composing',
     latestTodoList: null,

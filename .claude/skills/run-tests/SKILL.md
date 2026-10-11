@@ -87,12 +87,12 @@ report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Expect **`18 ignored` in the lib run and `0 ignored` in the doctest run**,
+Expect **`20 ignored` in the lib run and `0 ignored` in the doctest run**,
 and nothing else. Any other ignored test is a real skip and must be
 fixed. (`crates/lucidos-engine/tests/`, the integration binaries, has
-no `#[ignore]` at all.) The eighteen are three different things:
-**thirteen codegen writers**, **three diagnostic printers**, and **two
-live-provider checks**.
+no `#[ignore]` at all.) The twenty are four different things:
+**thirteen codegen writers**, **four diagnostic printers**, **two
+live-provider checks**, and **one subprocess body**.
 
 ### The thirteen codegen writers
 
@@ -132,12 +132,15 @@ When a guard fails it prints the exact regeneration command; run that,
 then re-run the suite. `cargo test -p lucidos-engine --lib -- --ignored --list`
 prints the live list if you need to re-check the set.
 
-### The three diagnostic printers
+### The four diagnostic printers
 
-All three live in `engine::chat::process::system_prompt::tests`. The
+Three live in `engine::chat::process::system_prompt::tests`. The
 first two arrived with the 2026-08-07 prompt-budget trim, the third with
 capability-gated tool families
 (`docs/plans/2026-08-18-capability-gated-tool-families-and-two-volatile-values.md`).
+The fourth, `engine::text_search::tests::timing_against_a_real_workspace`,
+arrived with Text search. It times searches over the workspace named by
+`TEXT_SEARCH_TIMING_WORKSPACE`, so it cannot run without one.
 None asserts anything, so
 none has a pass/fail to skip: they are on-demand dumps, shaped as tests
 only because `cargo test` is how you run a thing in a Rust crate. The
@@ -148,6 +151,7 @@ only because `cargo test` is how you run a thing in a Rust crate. The
 | `print_full_tool_schema_ranking` | `no_single_tool_schema_dominates_the_always_loaded_budget` (per-tool ceiling) and `always_loaded_context_stays_under_budget` (total budget) |
 | `print_gated_array_sizes` | the same two budget guards. They measure the gate-blind engine-authored surface, so they bound every gate setting this printer dumps |
 | `print_frozen_tool_contract` | nothing automated: it exists for a manual before/after diff across a prose-only trim |
+| `timing_against_a_real_workspace` | the rest of `engine/text_search_tests.rs`, over fixture workspaces |
 
 So `print_frozen_tool_contract` is the one entry that does not satisfy
 clause (a) below. It stays as-is because un-ignoring it would add a
@@ -184,6 +188,14 @@ cargo test -p lucidos-engine --lib voice::live -- --ignored --nocapture
 |---|---|
 | `voice::realtime::…::a_real_session_accepts_the_opening_payload` | `the_instructions_reach_the_opening_payload`, `the_talker_is_opened_with_one_tool_and_it_delegates`, `end_of_turn_is_decided_semantically`, and the rest of `voice/realtime_tests.rs` |
 | `voice::live::…::a_real_session_accepts_the_opening_payload` | `the_opening_frame_names_the_model_and_starts_a_session`, `the_session_delegates_to_us_and_never_to_a_rented_backend`, `the_opening_frame_declares_no_tools`, and the rest of `voice/live_tests.rs` |
+
+### The one subprocess body
+
+`runtime::agent_run_marker::tests::sleeper_body` is not a test. It is the
+process that `the_sweep_reaps_its_own_marker_and_nothing_else` spawns and
+then reaps. macOS hides the environment of `/bin/sleep`, so the test
+binary sleeps instead. That sweep test carries every assertion, which
+satisfies clause (a).
 
 **One doctest.** The doc run reports `1 passed; 0 failed; 0 ignored`.
 It is a ```` ```compile_fail ```` example on `Pref` in

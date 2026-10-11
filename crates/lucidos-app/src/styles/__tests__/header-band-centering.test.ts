@@ -67,7 +67,7 @@ describe('the desktop header centers on the whole bar, not on the header alone',
     // A plain flex child of the lifted `.threads-header`, beside Search. Any
     // vertical term here moves it off the line the rest of the bar sits on.
     const slotRules = shellRules.filter(
-      r => r.selector.includes('.view-selector-slot') && r.atRules === DESKTOP,
+      r => r.selector.includes('.filter-slot') && r.atRules === DESKTOP,
     );
     for (const rule of slotRules) {
       for (const prop of ['top', 'bottom', 'transform', 'margin-top', 'position']) {
@@ -75,11 +75,11 @@ describe('the desktop header centers on the whole bar, not on the header alone',
       }
     }
 
-    // The base rule is the only positioned ancestor left for the
-    // needs-attention badge. Drop it and the count silently moves onto the
-    // drawer's corner.
-    const base = shellRules.find(r => r.selector === '.view-selector-slot' && r.atRules === '');
-    expect(base?.props.get('position'), 'the badge hangs off this').toBe('relative');
+    // Nor in the base rule, which every layout shares.
+    const base = shellRules.find(r => r.selector === '.filter-slot' && r.atRules === '');
+    for (const prop of ['top', 'bottom', 'transform', 'margin-top', 'position']) {
+      expect(base?.props.get(prop), `.filter-slot { ${prop} }`).toBeUndefined();
+    }
   });
 });
 
@@ -350,7 +350,8 @@ describe('on the overlay build the leading control only steps sideways', () => {
 describe('the Threads title is centred on the pane, not between the icons', () => {
   it('is out of the flex row and pinned to the pane\'s own middle', () => {
     // `flex: 1` centres the title on the GAP between the row's two ends, and
-    // those differ in width: the toggle's room leads, Filter and Search trail.
+    // those differ in width: the toggle's room and Filter lead, Grouping and
+    // Search trail.
     const title = desktopRule('.threads-header-title');
     expect(title.props.get('position')).toBe('absolute');
     expect(title.props.get('left')).toBe('50%');
@@ -361,10 +362,12 @@ describe('the Threads title is centred on the pane, not between the icons', () =
     expect(title.props.get('top')).toBe('50%');
   });
 
-  it('packs Filter and Search at the row\'s trailing edge', () => {
-    // With the title out of flow they are the row's only in-flow children,
-    // and the leading end belongs to the toggle.
+  it('packs Grouping and Search at the row\'s trailing edge, and Filter at its leading one', () => {
+    // With the title out of flow the buttons are the row's only in-flow
+    // children. Filter's auto margin carries it to the leading end, just past
+    // the toggle's room.
     expect(desktopRule('.threads-header').props.get('justify-content')).toBe('flex-end');
+    expect(desktopRule('.threads-header .filter-slot').props.get('margin-right')).toBe('auto');
   });
 
   it('clears the WIDER of the row\'s two ends on BOTH sides, on both builds', () => {
@@ -373,7 +376,7 @@ describe('the Threads title is centred on the pane, not between the icons', () =
     // The clamp is therefore the structural non-overlap guarantee. One clamp
     // for both builds: the overlay build moves only --header-lead-inset.
     expect(desktopRule('.threads-header-title').props.get('max-width')).toBe(
-      'calc(100% - 2 * max(var(--threads-row-lead), '
+      'calc(100% - 2 * max(var(--threads-row-lead) + var(--header-icon-box) + var(--pane-header-gap), '
         + '0.5rem + 2 * (var(--header-icon-box) + var(--pane-header-gap))))',
     );
     expect(shellRules.filter(
@@ -384,10 +387,11 @@ describe('the Threads title is centred on the pane, not between the icons', () =
   it('counts the same two ends the row actually keeps clear', () => {
     // The clamp is symmetric about the pane's middle only if its two terms are
     // what the row keeps at each end. CSS cannot hand that back as a resolved
-    // length, so this is the drift check. The leading term is the property the
-    // row pads with, and the trailing term starts with the row's own padding.
+    // length, so this is the drift check. The leading term starts with the
+    // property the row pads with, and the trailing term with the row's own
+    // padding.
     const clamp = desktopRule('.threads-header-title').props.get('max-width')!;
-    const [, lead, trailPad] = /max\((var\([\w-]+\)), ([\d.]+rem) \+/.exec(clamp) ?? [];
+    const [, lead, trailPad] = /max\((var\([\w-]+\)) [^,]+, ([\d.]+rem) \+/.exec(clamp) ?? [];
     expect(desktopRule('.threads-header').props.get('padding'))
       .toBe(`0 ${trailPad} 0 ${lead}`);
   });

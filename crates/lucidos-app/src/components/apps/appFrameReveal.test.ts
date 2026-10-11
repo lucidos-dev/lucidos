@@ -63,7 +63,7 @@ describe('an on-ready app', () => {
 });
 
 describe('the open app\'s reveal', () => {
-  const opened: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-ready' };
+  const opened: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-ready', kind: 'app', reusable: false };
   const listed = (reveal: App['reveal']): Loadable<App[]> => ({ status: 'loaded', data: [{ ...opened, reveal }] });
 
   it('follows a manifest edited since the app opened', () => {

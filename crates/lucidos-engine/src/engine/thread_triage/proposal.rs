@@ -67,7 +67,7 @@ const USER_REPLY_SQL: &str =
          AND r.payload->>'removed_message_id' = e.id::text) \
        AND EXISTS (SELECT 1 FROM events c WHERE c.thread_id = e.thread_id \
          AND (c.payload->>'request_event_id' = e.id::text \
-           OR (c.event_type = 'UserPromptInjected' \
+           OR (c.event_type = 'PromptInjected' \
                AND c.payload->>'injected_message_id' = e.id::text)))))";
 
 /// The newest proposal's entries, when the user replied after it.

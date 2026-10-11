@@ -179,3 +179,27 @@ stops at the gateway"). That guard was not widened for a test. `chain_tests.rs` 
 the chain instead, by binding the real gateway router in front of the live e2e
 engine from a test process. It registers nothing, adopts nothing, spawns no
 engine and dies with the test, so it is not the daemon the guard exists for.
+
+## Amendment, 2026-10-10: a relative URL the app moves to resolves against its own document
+
+The base names another path: `/<slug>/~cap/<pass>/app/<id>/` against a
+document at `/<slug>/app/<id>/`. A bare `#x` resolves against the base, so
+`history.replaceState(null, '', '#30d')` asked to change the path. WebKit
+refused it from the sandboxed frame. Chromium allowed it and moved the frame
+onto a URL whose pass expires. An in-page `<a href="#x">` reloaded the app at
+the base URL instead of scrolling.
+
+**The SDK resolves the history API and in-page links against the document's
+own URL** whenever the base carries a pass (`installDocumentRelativeUrls` in
+`frameCapability.ts`). The author never wrote that base, so their relative URL
+means their page. An author's own base, and a direct hit with none, keep the
+browser's answer.
+
+**Loading the frame at the `~cap` URL was rejected.** The base and the document
+would agree only until the first renewal, half an hour in. The host also sets
+`src` before the engine mints, as § Rationale says.
+
+`location.assign('#x')` and `location.href = '#x'` still resolve against the
+base, and a `Location` method cannot be wrapped. `location.hash = …` edits the
+document's own URL and needs nothing. `system-knowhow/js-sdk.md` § Setup tells
+authors which to use.

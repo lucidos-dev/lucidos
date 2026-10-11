@@ -331,6 +331,7 @@ mod tests {
             "claude-fable-5-1",
             "claude-sonnet-5",
             "claude-sonnet-5-5",
+            "claude-haiku-5-5",
         ] {
             let req = build_request(model, "q");
             assert_eq!(req["max_tokens"], THINKING_MAX_TOKENS, "{model}");

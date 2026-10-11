@@ -7,6 +7,9 @@
   drops it.
 - **Amended by**: [0282: A resumed turn keeps the owner's instruction](0282-a-resumed-turn-keeps-the-owners-instruction.md).
   An engine resume carries the standing instruction of the turn it resumes.
+- **Amended by**: [0387: An owner approval authorizes one act](0387-an-owner-approval-authorizes-one-act.md).
+  The owner's Allow on an engine-worded card lets a thread press one clause-4
+  act. Clause 5's two shapes are unchanged.
 
 ## Context
 

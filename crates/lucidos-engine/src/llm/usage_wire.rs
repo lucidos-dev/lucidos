@@ -26,6 +26,7 @@ pub struct ProviderUsage {
 /// - OpenAI Chat Completions: `usage.prompt_tokens`.
 /// - OpenAI Responses, Anthropic Messages: `usage.input_tokens`. Anthropic
 ///   reports cache reads and writes apart from it, so they are added back.
+///   OpenAI reports both inside it, writes from GPT-5.6 on.
 ///
 /// `None` when the body names no prompt tokens, so a reply that is not a
 /// model call never reads as one that cost nothing.
@@ -67,15 +68,17 @@ fn read(body: &Value) -> Option<ProviderUsage> {
     let (input, output) = (input.unwrap_or(0), output.unwrap_or(0));
     let cache_write = count(block, "cache_creation_input_tokens").unwrap_or(0);
     let cache_read = count(block, "cache_read_input_tokens").unwrap_or(0);
-    let openai_cached = block
-        .pointer("/input_tokens_details/cached_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let openai_detail = |field: &str| {
+        block
+            .pointer(&format!("/input_tokens_details/{field}"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
     Some(usage(
         input.saturating_add(cache_write).saturating_add(cache_read),
         output,
-        cache_read + openai_cached,
-        cache_write,
+        cache_read + openai_detail("cached_tokens"),
+        cache_write + openai_detail("cache_write_tokens"),
     ))
 }
 
@@ -163,6 +166,9 @@ mod tests {
         let responses = json!({"usage": {"input_tokens": 40, "output_tokens": 3,
             "input_tokens_details": {"cached_tokens": 12}}});
         assert_eq!(counts(from_json(&responses).unwrap()), (40, 3, 12, 0));
+        let written = json!({"usage": {"input_tokens": 40, "output_tokens": 3,
+            "input_tokens_details": {"cached_tokens": 12, "cache_write_tokens": 20}}});
+        assert_eq!(counts(from_json(&written).unwrap()), (40, 3, 12, 20));
     }
 
     #[test]
@@ -193,5 +199,15 @@ mod tests {
         let stream = "data: {\"type\":\"response.created\",\"response\":{}}\n\n\
             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":2}}}\n\n";
         assert_eq!(counts(from_event_stream(stream).unwrap()), (9, 2, 0, 0));
+    }
+
+    /// The `[DONE]` line after the usage frame is not JSON, so it is skipped
+    /// rather than ending the parse.
+    #[test]
+    fn a_speech_stream_reads_its_done_frame() {
+        let stream = "data: {\"type\":\"speech.audio.delta\",\"audio\":\"SUQz\"}\n\n\
+            data: {\"type\":\"speech.audio.done\",\"usage\":{\"input_tokens\":51,\"output_tokens\":420,\"total_tokens\":471}}\n\n\
+            data: [DONE]\n\n";
+        assert_eq!(counts(from_event_stream(stream).unwrap()), (51, 420, 0, 0));
     }
 }

@@ -677,3 +677,113 @@ async fn returns_immediately_when_answer_already_persisted() {
         .await
         .unwrap();
 }
+
+/// ADR 0415 on the hook path: a bad option widget refuses the batch before any
+/// card is written, and a good one is lifted into the option's `widget`.
+#[tokio::test]
+async fn an_option_widget_is_checked_and_lifted_on_the_hook_path() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+    let ask = |tool_use_id: String, description: &str| {
+        json!({
+            "thread_id": thread_id.to_string(),
+            "tool_use_id": tool_use_id,
+            "session_id": "sid-1",
+            "questions": [{
+                "question": "Which voice?",
+                "options": [
+                    {"label": "Marin", "description": description},
+                    {"label": "Ash", "description": ""}
+                ]
+            }]
+        })
+    };
+
+    let refused = client
+        .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+        .json(&ask(
+            format!("toolu_bad_{}", thread_id.simple()),
+            "Warm. ![Marin](app:lucidos-sound-player)",
+        ))
+        .send()
+        .await
+        .expect("hook post");
+    assert_eq!(
+        refused.status().as_u16(),
+        500,
+        "a missing required param refuses"
+    );
+    let reason = refused.text().await.unwrap_or_default();
+    assert!(reason.contains("needs the param 'clip'"), "{reason}");
+    assert_eq!(
+        count_events_of_type(&pool, thread_id, "UserQuestionAsked").await,
+        0,
+        "no card before the refusal"
+    );
+
+    let tool_use_id = format!("toolu_good_{}", thread_id.simple());
+    let q0 = format!("{tool_use_id}#q0");
+    let pool_bg = pool.clone();
+    let client_bg = client.clone();
+    let q0_bg = q0.clone();
+    let answerer = tokio::spawn(async move {
+        wait_for_question_asked(&pool_bg, thread_id, &q0_bg).await;
+        client_bg
+            .post(format!(
+                "{}/api/v1/threads/{}/answer-question",
+                base_url(),
+                thread_id
+            ))
+            .json(&json!({
+                "tool_use_id": q0_bg,
+                "answer": { "kind": "Selected", "option_id": "opt-0" }
+            }))
+            .send()
+            .await
+            .expect("answer post");
+    });
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .json(&ask(
+                tool_use_id.clone(),
+                r#"Warm. ![Marin](app:lucidos-sound-player?params={"clip": "artifacts/voices/marin.mp3"})"#,
+            ))
+            .send(),
+    )
+    .await
+    .expect("did not time out")
+    .expect("hook post");
+    answerer.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let option: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload->'options'->0 FROM events WHERE thread_id = $1 \
+         AND event_type = 'UserQuestionAsked'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the card was asked");
+    assert_eq!(option["description"], "Warm.");
+    assert_eq!(option["widget"]["app_id"], "lucidos-sound-player");
+    assert_eq!(option["widget"]["label"], "Marin");
+    assert_eq!(
+        option["widget"]["params"]["clip"],
+        "artifacts/voices/marin.mp3"
+    );
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}

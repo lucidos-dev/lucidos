@@ -1,4 +1,5 @@
 import { FindBar } from '../shared/FindBar';
+import { fileFindScope } from '../../store/actions/find-request';
 import { useEffect, useLayoutEffect, useRef } from 'preact/hooks';
 import { activeMenuItem, appPseudoFullscreen, panelOverlay, settingsSubview, notificationDetailPending, parseRepoPath } from '../../store/store';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
@@ -28,6 +29,7 @@ import { onPageResume } from '../../utils/pageResume';
 import { trackPullToRefresh } from '@lucidos/pull-to-refresh';
 import { runPanelRefresh, showPullTravel } from '../../store/panelRefresh';
 import { PullRefreshAffordance } from './PullRefreshAffordance';
+import { PreviewPathContext } from '../files/previewViewState';
 
 const FilesView = lazyComponent(() => import('../files/FilesView').then(m => m.FilesView));
 const AppsView = lazyComponent(() => import('../apps/AppsView').then(m => m.AppsView));
@@ -40,6 +42,7 @@ const RepoFilePreviewWithSidebar = lazyComponent(() => import('../files/RepoFile
 const UrlPreviewInline = lazyComponent(() => import('../files/UrlPreviewInline').then(m => m.UrlPreviewInline));
 const AppUiInline = lazyComponent(() => import('../apps/AppUiInline').then(m => m.AppUiInline));
 const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.InlineForm));
+const PluginDetailPage = lazyComponent(() => import('../plugins/PluginDetailPage').then(m => m.PluginDetailPage));
 
 // A lazy view draws nothing until its chunk lands, not even its own skeleton,
 // and a rebuild renames every chunk. Every view here is one tap away, so they
@@ -47,6 +50,7 @@ const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.Inline
 for (const view of [
   FilesView, AppsView, PluginsView, TriggersView, SettingsView, ChangesView,
   FilePreviewInline, RepoFilePreviewWithSidebar, UrlPreviewInline, AppUiInline, InlineForm,
+  PluginDetailPage,
 ]) {
   prefetchWhenIdle(view);
 }
@@ -206,17 +210,22 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
           return (
             <div class="file-preview-frame content-view-full-bleed">
               <FilePreviewPath path={overlay.path} />
-              <FindBar surface="content" scope={`file:${overlay.path}`} placeholder="Find in file" />
+              <FindBar surface="content" scope={fileFindScope(overlay.path)} placeholder="Find in file" />
               <FilePreviewContextMenu path={overlay.path} layout={layout}>
-                {repo
-                  ? <RepoFilePreviewWithSidebar locator={repo} layout={layout} />
-                  : <FilePreviewInline path={overlay.path} layout={layout} />}
+                <PreviewPathContext.Provider value={overlay.path}>
+                  {repo
+                    ? <RepoFilePreviewWithSidebar locator={repo} layout={layout} />
+                    : <FilePreviewInline path={overlay.path} layout={layout} />}
+                </PreviewPathContext.Provider>
               </FilePreviewContextMenu>
             </div>
           );
         })()}
         {overlay?.type === 'url-preview' && <UrlPreviewInline url={overlay.url} layout={layout} />}
         {overlay?.type === 'notification-detail' && <NotificationDetailInline />}
+        {overlay?.type === 'plugin-detail' && (
+          <PluginDetailPage marketplaceId={overlay.marketplaceId} pluginId={overlay.pluginId} name={overlay.name} />
+        )}
         {/* A notification the page doesn't already hold is being fetched (the
             cold push-tap deep link; every other open resolves from memory and
             never gets here). The pane was revealed on the tap, so this fills it

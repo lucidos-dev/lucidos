@@ -14,15 +14,15 @@ import type { Page } from './fixtures';
  * enough. The mobile rendering of the same split button is covered by
  * `change-actions-split-mobile.spec.ts`.
  *
- * Verifies the WaitingBanner Diff affordance reacts to `coding_agent_has_diff`
+ * Verifies the WaitingBanner Diff affordance reacts to `coding_agent_change_state`
  * flips driven by the projection. Diff SHOWS only when there is a diff — no diff
  * means no Diff affordance at all (not a greyed/disabled one). Diff is always a
  * standalone top-level icon (never folded into the Apply/Discard split menu),
  * so `diffVisible()` just checks for that button.
  *
  *   - CC thread, no diff     → Diff hidden.
- *   - ChangeProposed lands   → projection flips coding_agent_has_diff=TRUE → SSE → Diff appears (standalone icon).
- *   - ChangeApplied lands    → projection flips coding_agent_has_diff=FALSE → SSE → Diff disappears.
+ *   - ChangeProposed lands   → projection flips the change state to 'proposed' → SSE → Diff appears (standalone icon).
+ *   - ChangeApplied lands    → projection flips the change state to 'none' → SSE → Diff disappears.
  *
  * The seed step uses `POST /api/v1/internal/seed-change-for-test`, which emits
  * `ChangeProposed` through the live EventBus, so the projection write AND
@@ -43,13 +43,13 @@ async function diffVisible(page: Page): Promise<boolean> {
 }
 
 /** Seed a CC thread in the 'waiting' state with NO changes (so initial
- *  coding_agent_has_diff is FALSE). Mirrors the helper in cc-stuck-waiting.spec.ts. */
+ *  coding_agent_change_state is 'none'). Mirrors the helper in cc-stuck-waiting.spec.ts. */
 function seedWaitingThread(suffix: string): { threadId: string } {
   const threadId = randomUUID();
   const now = new Date().toISOString();
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo, coding_agent_has_diff) VALUES ('${threadId}', 'E2E Diff Branch ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, false, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'E2E Diff Branch ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"test","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'ResponseGenerated', '{"text":"Done.","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'CodingAgentIdled', '{"has_changes":false,"is_external_repo":false,"requires_restart":false}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
@@ -73,8 +73,8 @@ function createBranch(suffix: string): { branch: string; file: string } {
 }
 
 /** Hit the dev-only seed endpoint which emits ChangeProposed (aggregate path)
- *  via the live EventBus. The projection sets coding_agent_has_diff=TRUE in the
- *  same tx and the per-event aggregate is broadcast over SSE. */
+ *  via the live EventBus. The projection sets the change state to 'proposed' in
+ *  the same tx and the per-event aggregate is broadcast over SSE. */
 async function seedChangeProposed(page: Page, opts: {
   changeId: string;
   threadId: string;
@@ -92,12 +92,14 @@ async function seedChangeProposed(page: Page, opts: {
       files: [opts.file],
       requires_restart: false,
       hardened: true,
+      needs_hardening: false,
+      apply_ready: true,
     },
   });
   expect(resp.ok(), `seed-change-for-test failed: ${resp.status()} ${await resp.text()}`).toBeTruthy();
 }
 
-test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () => {
+test.describe('WaitingBanner Diff button reacts to coding_agent_change_state', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
     // Settle stale waiting CC threads so their banners don't fight the test
@@ -152,7 +154,7 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
         description: `E2E diff enable ${suffix}`,
       });
 
-      // SSE delivers the new aggregate → coding_agent_has_diff=TRUE → the Diff
+      // SSE delivers the new aggregate → the state reads 'proposed' → the Diff
       // affordance appears (a standalone top-level button, alongside the
       // Apply/Discard split button). Generous timeout to cover slow CI without
       // masking flakes.
@@ -183,7 +185,7 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
       });
       await expect.poll(() => diffVisible(page), { timeout: 10_000 }).toBe(true);
 
-      // Apply via the real API → ChangeApplied → projection clears coding_agent_has_diff.
+      // Apply via the real API → ChangeApplied → the projection's state falls to 'none'.
       const applyResp = await apiRequest(page).post(`/api/v1/changes/${changeId}/apply`);
       expect(applyResp.ok(), `apply failed: ${applyResp.status()} ${await applyResp.text()}`).toBeTruthy();
       appliedToMain = true;

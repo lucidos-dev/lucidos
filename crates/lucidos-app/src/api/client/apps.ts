@@ -1,6 +1,7 @@
-import { API, API_BASE, json, mutatingFetch, retryTransientRead, throwIfNotOk } from './_core';
+import { API, API_BASE, json, mutatingFetch, retryTransientRead, throwIfNotOk, throwIfRefused } from './_core';
 import { readDeviceId } from '../../utils/deviceIdHeader';
-import { lucidos } from '@lucidos/sdk';
+import { lucidos, WIDGET_PARAMS_QUERY } from '@lucidos/sdk';
+import { canonicalWidgetParams, hasWidgetParams, type WidgetParams } from '../../utils/widgetParams';
 import type { App, PinnedAppEntry } from '../../store/types';
 import type { ApiResult, ArtifactsResponse, UploadResponse } from '../types';
 
@@ -171,6 +172,15 @@ export function deleteAppApi(
   });
 }
 
+/** Record that the user opened an app's UI: the evidence the workspace prompt
+ *  footprint judges an app's use by (ADR 0413). */
+export async function recordAppOpenedApi(id: string): Promise<void> {
+  const res = await mutatingFetch(`${API}/app/opened?id=${encodeURIComponent(id)}`, {
+    method: 'POST',
+  });
+  await throwIfNotOk(res);
+}
+
 export function updateAppApi(
   id: string,
   data: { name: string; description: string; instructions?: string }
@@ -220,6 +230,7 @@ export function appUrl(
   appId: string,
   threadId?: string,
   fragment?: string,
+  widgetParams?: WidgetParams,
 ): string {
   const base = `${API_BASE}/app/${encodeURIComponent(appId)}/`;
   const params = new URLSearchParams();
@@ -233,12 +244,25 @@ export function appUrl(
   // read them out of the shell's storage the way a same-origin one could.
   const deviceId = readDeviceId();
   if (deviceId) params.set('device', deviceId);
+  // A widget's params ride one key the SDK owns, so they never meet a host
+  // name (ADR 0415). Canonical, so one instance always has one URL.
+  if (hasWidgetParams(widgetParams)) params.set(WIDGET_PARAMS_QUERY, canonicalWidgetParams(widgetParams));
   const query = params.toString();
   const withQuery = query ? `${base}?${query}` : base;
   return fragment ? `${withQuery}#${fragment}` : withQuery;
 }
 
+/** The URL of a file inside an app folder, such as its app icon. `path` is
+ *  relative to the folder, and each segment is encoded on its own. */
+export function appFileUrl(appId: string, path: string): string {
+  const segments = path.split('/').map(encodeURIComponent).join('/');
+  return `${API_BASE}/app/${encodeURIComponent(appId)}/${segments}`;
+}
+
 // --- App Capture ---
+/** Answer a capture request. The body names this page's device the way a chat
+ *  send does, so the engine checks the answer against the device the turn
+ *  recorded. */
 export async function postAppCapture(
   requestId: string,
   screenshot: string,
@@ -247,7 +271,7 @@ export async function postAppCapture(
   const resp = await mutatingFetch(`${API}/app-capture`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ request_id: requestId, screenshot, dom }),
+    body: JSON.stringify({ request_id: requestId, device_id: readDeviceId(), screenshot, dom }),
   });
   await throwIfNotOk(resp);
 }
@@ -257,20 +281,26 @@ export function getPinnedAppUis(deviceId: string): Promise<{ entries: PinnedAppE
   return json(`${API}/pinned-apps?device_id=${encodeURIComponent(deviceId)}`);
 }
 
-export function pinAppApi(appId: string, deviceId: string): Promise<ApiResult> {
-  return json(`${API}/pinned-apps`, {
+/** Pin an app for a device. A refusal THROWS: the engine answers a failed pin
+ *  with `200 {success: false}`, and `pinApp` reverts its optimistic pin only on
+ *  a rejection. */
+export async function pinAppApi(appId: string, deviceId: string): Promise<ApiResult> {
+  const result = await json<ApiResult>(`${API}/pinned-apps`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ app_id: appId, device_id: deviceId }),
   });
+  return throwIfRefused(result, `the engine refused to pin "${appId}"`);
 }
 
-export function unpinAppApi(appId: string, deviceId: string): Promise<ApiResult> {
-  return json(`${API}/pinned-apps`, {
+/** Unpin an app for a device. A refusal THROWS, as `pinAppApi` explains. */
+export async function unpinAppApi(appId: string, deviceId: string): Promise<ApiResult> {
+  const result = await json<ApiResult>(`${API}/pinned-apps`, {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ app_id: appId, device_id: deviceId }),
   });
+  return throwIfRefused(result, `the engine refused to unpin "${appId}"`);
 }
 
 // --- Events ---

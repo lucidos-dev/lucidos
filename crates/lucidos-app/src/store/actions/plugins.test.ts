@@ -3,9 +3,13 @@ import type { InstalledPlugin } from '../types';
 
 const fetchInstalledPlugins = vi.fn();
 vi.mock('../../api/client', () => ({ fetchInstalledPlugins }));
+const revealContentPane = vi.fn();
+vi.mock('./pane', () => ({ revealContentPane }));
+const pushNavState = vi.fn();
+vi.mock('./navigation', () => ({ pushNavState }));
 
-const { installedPlugins } = await import('../store');
-const { loadInstalledPlugins } = await import('./plugins');
+const { installedPlugins, panelOverlay } = await import('../store');
+const { loadInstalledPlugins, openPluginDetail } = await import('./plugins');
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
@@ -54,5 +58,21 @@ describe('loadInstalledPlugins', () => {
     await first;
 
     expect(installedPlugins.value).toEqual({ status: 'loaded', data: [plugin('kept')] });
+  });
+});
+
+describe('openPluginDetail', () => {
+  // A navigation that lands content reveals the content pane and takes a nav
+  // history row (`.claude/rules/frontend.md`).
+  it('lands the plugin detail page, reveals the pane and records history', () => {
+    openPluginDetail({ marketplace_id: 'mkt', id: 'habit-tracker', name: 'Habit Tracker' } as never);
+    expect(panelOverlay.value).toEqual({
+      type: 'plugin-detail',
+      marketplaceId: 'mkt',
+      pluginId: 'habit-tracker',
+      name: 'Habit Tracker',
+    });
+    expect(revealContentPane).toHaveBeenCalledOnce();
+    expect(pushNavState).toHaveBeenCalledOnce();
   });
 });

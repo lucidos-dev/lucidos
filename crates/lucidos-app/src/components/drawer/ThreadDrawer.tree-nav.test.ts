@@ -1,8 +1,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
-  leftAction, rightAction, nodeKey, sectionNavKey, handleDrawerKeyDown,
+  leftAction, rightAction, nodeKey, sectionNavKey, ongoingTileNavKey, handleDrawerKeyDown, landingGroupFor,
   type DrawerNavNode, type NavCollapseState,
 } from './ThreadDrawer';
+import type { OngoingGroup } from '../../store/store';
 import { openThreadFilterPanel, closeThreadFilterPanel } from '../../store/threadFilterPanel';
 
 // Pure ←/→ tree-navigation logic for the drawer — no signals, no DOM.
@@ -162,6 +163,46 @@ describe('rightAction (expand / descend)', () => {
   it('is a no-op once archived children are already revealed and there is nothing else', () => {
     const nodes = [thread('p', 0, null, false, 'current', 2)];
     expect(rightAction(nodes[0], nodes, 0, state([], [], ['p']))).toEqual({ type: 'none' });
+  });
+});
+
+const tile = (g: OngoingGroup, selected = false): DrawerNavNode => ({ kind: 'tile', group: g, selected });
+const groupRow = (id: string, g: OngoingGroup): DrawerNavNode =>
+  ({ kind: 'thread', id, depth: 0, parentId: null, hasChildren: false, sectionKey: null, group: g });
+
+describe('the Ongoing grouping (tiles)', () => {
+  it('keys a tile apart from every section header', () => {
+    const keys = [
+      ...(['saved', 'current', 'archive'] as const).map(k => nodeKey(section(k))),
+      ...(['blocked', 'review', 'drafts', 'in-flight'] as const).map(g => nodeKey(tile(g))),
+    ];
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(nodeKey(tile('in-flight'))).toBe(ongoingTileNavKey('in-flight'));
+    // Section-prefixed, so nothing reads a tile as a thread.
+    expect(nodeKey(tile('in-flight')).startsWith(sectionNavKey(''))).toBe(true);
+  });
+
+  it('→ steps to the next tile, and stops at the last', () => {
+    const nodes = [tile('drafts'), tile('in-flight', true), groupRow('t', 'in-flight')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'focusKey', key: ongoingTileNavKey('in-flight') });
+    expect(rightAction(nodes[1], nodes, 1, state())).toEqual({ type: 'none' });
+  });
+
+  it('← steps to the previous tile, and stops at the first', () => {
+    expect(leftAction(tile('review'), state())).toEqual({ type: 'focusKey', key: ongoingTileNavKey('blocked') });
+    expect(leftAction(tile('blocked', true), state())).toEqual({ type: 'none' });
+  });
+
+  it('← on a row returns to its tile', () => {
+    expect(leftAction(groupRow('t', 'in-flight'), state())).toEqual({ type: 'focusKey', key: ongoingTileNavKey('in-flight') });
+  });
+
+  it('opens a Blocked or Review row on what needs the user, and every other row as it was', () => {
+    expect(landingGroupFor('ongoing', 'blocked')).toBe('blocked');
+    expect(landingGroupFor('ongoing', 'review')).toBe('review');
+    expect(landingGroupFor('ongoing', 'drafts')).toBeNull();
+    expect(landingGroupFor('ongoing', 'in-flight')).toBeNull();
+    expect(landingGroupFor('folders', 'blocked')).toBeNull();
   });
 });
 

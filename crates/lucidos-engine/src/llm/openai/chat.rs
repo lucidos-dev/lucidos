@@ -167,6 +167,11 @@ impl OpenAiProvider {
         )
     }
 
+    /// The Chat Completions `tool_choice` that makes the model call `tool`.
+    fn forced_tool_choice_chat(tool: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "function", "function": { "name": tool } })
+    }
+
     fn build_chat_body(
         &self,
         model: &str,
@@ -313,6 +318,10 @@ impl OpenAiProvider {
         if let Some(usage) = data.get("usage") {
             meta.absorb_chat_usage(usage);
         }
+        // Every chunk names the model; the first one that does is kept.
+        if meta.served_model.is_none() {
+            meta.served_model = crate::llm::served_model::served_model_of(&data);
+        }
 
         let choices = match data.get("choices").and_then(|c| c.as_array()) {
             Some(c) => c,
@@ -394,7 +403,11 @@ impl OpenAiProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let model = selection.model.unwrap_or(&self.model);
         let reasoning_effort = selection.reasoning_effort;
-        let body = self.build_chat_body(model, messages, tools, system_prompt, reasoning_effort);
+        let mut body =
+            self.build_chat_body(model, messages, tools, system_prompt, reasoning_effort);
+        if let Some(tool) = selection.forced_tool {
+            body["tool_choice"] = Self::forced_tool_choice_chat(tool);
+        }
 
         let mut attempt = 0u32;
         loop {
@@ -429,11 +442,14 @@ impl OpenAiProvider {
                     continue;
                 }
 
-                return Err(crate::llm::with_retry_context(
-                    format!("OpenAI API error ({}): {}", status, error_body),
-                    attempt,
-                )
-                .into());
+                return Err(crate::llm::not_served::failure(
+                    status.as_u16(),
+                    &error_body,
+                    crate::llm::with_retry_context(
+                        format!("OpenAI API error ({}): {}", status, error_body),
+                        attempt,
+                    ),
+                ));
             }
 
             match self.parse_chat_stream(resp, &on_token).await {
@@ -601,7 +617,7 @@ mod tests {
 
         // include_usage final chunk: empty choices, usage carried alone.
         OpenAiProvider::process_chat_chunk(
-            r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49,"prompt_tokens_details":{"cached_tokens":12}}}"#,
+            r#"{"model":"google/gemini-3.8-flash","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49,"prompt_tokens_details":{"cached_tokens":12}}}"#,
             &mut content,
             &mut tools,
             &mut meta,
@@ -624,6 +640,10 @@ mod tests {
         assert_eq!(resp.cache_read_tokens, Some(12));
         // OpenAI doesn't separate cache writes from reads, so this stays None.
         assert_eq!(resp.cache_creation_tokens, None);
+        assert_eq!(
+            resp.served_model.as_deref(),
+            Some("google/gemini-3.8-flash")
+        );
     }
 
     /// The overlap, on its own, so it is not buried in a stream test. The
@@ -1125,6 +1145,15 @@ mod tests {
             .get("stream_options")
             .expect("stream_options must be sent");
         assert_eq!(opts["include_usage"], serde_json::Value::Bool(true));
+    }
+
+    /// Chat Completions forces a call by naming the function.
+    #[test]
+    fn a_forced_call_names_its_function() {
+        assert_eq!(
+            OpenAiProvider::forced_tool_choice_chat("request_read"),
+            serde_json::json!({ "type": "function", "function": { "name": "request_read" } })
+        );
     }
 
     /// The effort reaches the body exactly as handed in, for every model.

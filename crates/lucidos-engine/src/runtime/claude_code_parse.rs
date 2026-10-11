@@ -421,15 +421,18 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                                 events.push(prose(text.to_string()));
                             }
                         }
-                        // The trailing break flushes the note at once, so it
-                        // shows while the model keeps thinking.
                         "thinking" if notes_are_text && !is_api_error_banner => {
                             if let Some(note) = block
                                 .get("thinking")
                                 .and_then(|v| v.as_str())
                                 .and_then(crate::llm::anthropic_wire::progress_note)
                             {
-                                events.push(prose(format!("{note}\n\n")));
+                                events.push(match &parent_tool_use_id {
+                                    Some(_) => prose(note.to_string()),
+                                    None => AgentEvent::ProgressNote {
+                                        text: note.to_string(),
+                                    },
+                                });
                             }
                         }
                         "tool_use" => {

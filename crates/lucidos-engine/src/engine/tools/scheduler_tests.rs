@@ -140,6 +140,43 @@ fn next_occurrence_multi_single_schedule() {
     assert_eq!(next, s.upcoming(tz).next());
 }
 
+/// Regression: in the hour a fall-back repeats, `cron` gave the EARLIER of
+/// the two ambiguous instants, already in the past. The trigger loop read it
+/// as due and fired again after every run until the hour was over. Europe/Oslo
+/// falls back at 01:00 UTC on 25 October 2026.
+#[test]
+fn the_next_fire_in_a_repeated_hour_is_never_in_the_past() {
+    use std::str::FromStr;
+    let oslo: chrono_tz::Tz = "Europe/Oslo".parse().unwrap();
+    let at = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    for (expr, now, want) in [
+        // 02:10 CET, the second pass. `cron` offered 02:15 CEST (00:15 UTC).
+        (
+            "0 */15 * * * *",
+            "2026-10-25T01:10:00Z",
+            "2026-10-25T01:15:00Z",
+        ),
+        // 02:05 CET. `cron` offered 02:30 CEST (00:30 UTC), which already ran.
+        (
+            "0 30 2 * * *",
+            "2026-10-25T01:05:00Z",
+            "2026-10-25T01:30:00Z",
+        ),
+    ] {
+        let schedule = cron::Schedule::from_str(expr).unwrap();
+        let next = next_occurrences_after(std::slice::from_ref(&schedule), oslo, at(now), 1);
+        assert_eq!(
+            next.first().map(|t| t.with_timezone(&chrono::Utc)),
+            Some(at(want)),
+            "{expr} at {now}"
+        );
+    }
+}
+
 #[test]
 fn next_occurrence_multi_empty_returns_none() {
     let tz: chrono_tz::Tz = "UTC".parse().unwrap();

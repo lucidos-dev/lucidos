@@ -274,8 +274,8 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('system');
   });
 
-  it('UserPromptInjected (no origin): label is engine, summary "Message from Lucidos"', () => {
-    const ex = exchangeWith({ type: 'UserPromptInjected', text: 'do X' });
+  it('PromptInjected (no origin): label is engine, summary "Message from Lucidos"', () => {
+    const ex = exchangeWith({ type: 'PromptInjected', text: 'do X' });
     const desc = describeInitiator(ex, '<p>do X</p>', [], 'tid');
     expect(desc.label).toBe(ENGINE_LABEL);
     expect(desc.summary).toBe('Message from Lucidos');
@@ -294,9 +294,9 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
    *  `TriggerStarted` and `ChildThreadCompleted` above, whose rows own their
    *  prefixes too. An injection with no resolved delivery is NOT this case and
    *  keeps its prose summary, covered by the test below. */
-  it('UserPromptInjected (event delivery): the row names the event, the header stays quiet', () => {
+  it('PromptInjected (event delivery): the row names the event, the header stays quiet', () => {
     const ex = exchangeWith({
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'An event you subscribed to has arrived …\n\nCodingAgentIdled:\n{ … }',
       delivered_event_id: 'evt-1',
     });
@@ -321,9 +321,9 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   /** The link can dangle: the delivery sits in an earlier exchange, so a long
    *  thread can load the anchor without it. Falling back to the prose is the
    *  honest thing to show when the structured half is not in hand. */
-  it('UserPromptInjected (delivery not loaded): falls back to the prose body', () => {
+  it('PromptInjected (delivery not loaded): falls back to the prose body', () => {
     const ex = exchangeWith({
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'An event you subscribed to has arrived …',
       delivered_event_id: 'evt-gone',
     });
@@ -335,18 +335,18 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
   /** The reported card: a wait that timed out read "Auto-prompt sent", with
    *  nothing to say where the words came from. An older row carries no origin,
    *  so its frozen opening sentence identifies it. */
-  it('UserPromptInjected (timed-out wait, older row): summary "Wait timed out"', () => {
+  it('PromptInjected (timed-out wait, older row): summary "Wait timed out"', () => {
     const ex = exchangeWith({
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'A subscription you registered has timed out.\n\nTimed out. Nothing matching X happened.',
       mode: 'agent',
     });
     expect(describeInitiator(ex, '<p>x</p>', [], 'tid').summary).toBe('Wait timed out');
   });
 
-  it('UserPromptInjected (timed-out wait, engine origin): summary "Wait timed out"', () => {
+  it('PromptInjected (timed-out wait, engine origin): summary "Wait timed out"', () => {
     const ex = exchangeWith({
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'anything',
       mode: 'agent',
       origin: { kind: 'engine', reason: { kind: 'event_wait', outcome: 'expired', watched: ['X'], wait_reason: 'r' } },
@@ -356,12 +356,12 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.summary).toBe('Wait timed out');
   });
 
-  // Regression: a child→parent callback emits UserPromptInjected with
+  // Regression: a child→parent callback emits PromptInjected with
   // origin = ThreadLink { direction: 'child', mode: 'agent' }. The chip must
   // render "Lucidos Agent", not "Lucidos Engine".
-  it('UserPromptInjected (child callback): label is Lucidos Agent', () => {
+  it('PromptInjected (child callback): label is Lucidos Agent', () => {
     const ex = exchangeWith({
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: '[Child thread completed] ...',
       mode: 'agent',
       origin: { kind: 'thread_link', thread_id: 'child-1', mode: 'agent', direction: 'child' },
@@ -500,9 +500,9 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
 // the action AS the label, attribution in the popover. Only the device-owner
 // case is affected — engine/system-driven variants keep their chip.
 describe('describeInitiator — user control turns render iconless (ResponseCanceled style)', () => {
-  it('UserPromptInjected (device origin): iconless label names it as your message, injected body kept', () => {
+  it('PromptInjected (device origin): iconless label names it as your message, injected body kept', () => {
     const ex = exchangeWith({
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'do X',
       origin: { kind: 'device', device_id: 'd-1' },
     });

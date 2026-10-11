@@ -13,16 +13,20 @@ import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
-import { dirname, relative, resolve } from 'node:path';
-// @ts-expect-error: same
-import { fileURLToPath } from 'node:url';
-import { cssRules, selectorList, styleSheetPaths, type CssRule } from './css-rule-helpers';
+import { relative, resolve } from 'node:path';
+import {
+  cssRules, ENGINE_SERVED_CSS, REPO_ROOT, selectorList, styleSheetPaths, type CssRule,
+} from './css-rule-helpers';
 
-/** Every stylesheet in the client, component-level sheets included. */
-const srcRoot: string = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+/** Every stylesheet in the client, component-level sheets included, plus the
+ *  ones the engine serves to app frames. A finger taps inside an app too. */
+const paths: string[] = [...new Set([
+  ...styleSheetPaths(resolve(REPO_ROOT, 'crates/lucidos-app/src')),
+  ...ENGINE_SERVED_CSS.map((path) => resolve(REPO_ROOT, path)),
+])];
 
-const sheets: { file: string; rules: CssRule[] }[] = styleSheetPaths(srcRoot).map((path) => ({
-  file: relative(srcRoot, path),
+const sheets: { file: string; rules: CssRule[] }[] = paths.map((path) => ({
+  file: relative(REPO_ROOT, path),
   rules: cssRules(readFileSync(path, 'utf-8')),
 }));
 
@@ -42,10 +46,16 @@ const TOUCH_CLASS_GATE = 'body:not(.is-touch)';
 const PAINT_PROPS = ['background', 'background-color', 'background-image', 'box-shadow'];
 
 describe('a tap paints no background', () => {
-  it('turns the tap highlight off once, on the root', () => {
+  // Once per document: the host's root, and the root every app frame loads.
+  it('turns the tap highlight off once, on each root', () => {
     const setters = all.filter(({ rule }) => rule.props.has('-webkit-tap-highlight-color'));
-    expect(setters.map(where)).toEqual(['styles/global/base.css: html']);
-    expect(setters[0].rule.props.get('-webkit-tap-highlight-color')).toBe('transparent');
+    expect(setters.map(where)).toEqual([
+      'crates/lucidos-app/src/styles/global/base.css: html',
+      'crates/lucidos-engine/src/api/sdk_iframe.css: html',
+    ]);
+    for (const { rule } of setters) {
+      expect(rule.props.get('-webkit-tap-highlight-color')).toBe('transparent');
+    }
   });
 
   it('keeps every hover on a pointer', () => {

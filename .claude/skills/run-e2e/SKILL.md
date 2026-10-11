@@ -5,9 +5,9 @@ description: Use when asked to "run e2e", "run the full e2e suite", "run end-to-
 
 # Run the full e2e suite
 
-Run `./scripts/e2e.sh` — this runs the full e2e suite in four phases.
-Iterate to green; never bypass a failing test. Zero failed AND zero
-skipped is the bar.
+Commit, then run `./scripts/e2e.sh`. It runs the full e2e suite in four
+phases, on GitHub's runners by default (see GitHub mode below). Iterate to
+green; never bypass a failing test. Zero failed AND zero skipped is the bar.
 
 ## Never run e2e on top of itself
 
@@ -92,16 +92,26 @@ coding-agent worktree. See ADR 0021.)
 **Inside `/harden`, stay in the turn.** Apply reads the next idle as a finished
 `/harden`, so there use the exit-file join `/harden` Phase 4.5 describes.
 
-## GitHub mode: the same run on GitHub's runners
+## GitHub mode is the default
 
-`./scripts/e2e.sh --github` runs the suites on GitHub instead of this host
-(ADR 0382). Every e2e script takes the flag, and its filters mean the same.
-Reach for it when this host is busy, or another run holds the e2e lock.
+Every e2e script runs on GitHub's runners when it can (ADRs 0382, 0386), and
+its filters mean the same there. The first line of output says where it runs.
 
-- **It tests the committed HEAD.** It refuses a dirty tree, so commit first.
-- **Only the Claude Code specs run here**, as the local leg, under the e2e
-  lock. The leg waits up to an hour for a held lock rather than failing. A
-  selection without them takes no lock and builds nothing here.
+- **`--local` runs here.** Use it to iterate on uncommitted edits while the
+  e2e lock is free. A local-only flag such as `--no-reset` or `--headed`
+  implies it, and so does a screenshot switch such as `THREAD_SHOTS=1`, since
+  GitHub would never see it.
+- **Re-run committed work on GitHub, never in the lock queue.** When the lock
+  is held, commit and send the re-run to GitHub
+  (`./scripts/e2e-browser.sh -f <spec>`, `./scripts/e2e-api.sh -f <filter>`).
+  Wait for the lock only for uncommitted edits or a `@real-claude-code` spec.
+- **It tests the committed HEAD, so commit first.** A dirty tree runs locally
+  instead, and says so. So does a checkout without the release libraries, the
+  `lucidos` remote or `gh`. `--github` turns each of those into an error.
+- **Only spec files with a test tagged `@real-claude-code` run here**, as the
+  local leg, under the e2e lock (ADR 0388). The leg waits up to an hour for a
+  held lock rather than failing. A selection without them takes no lock and
+  builds nothing here.
 - **It is a long wait.** A cold run builds the engine before any test starts.
   Run it as a background task, exactly like a local run.
 - **Exit 76 means no verdict**: the push was refused, the run never started or
@@ -110,8 +120,8 @@ Reach for it when this host is busy, or another run holds the e2e lock.
   shard, `gh run download <run> --repo lucidos-dev/lucidos -n e2e-traces-<shard>`
   fetches its Playwright traces and engine log.
 - **Fix a failure locally.** Reproduce it with the targeted sub-scripts below.
-  Rerun one spec on GitHub with `./scripts/e2e-browser.sh --github -f <spec>`
-  only when it fails nowhere else.
+  Rerun one spec on GitHub with `./scripts/e2e-browser.sh -f <spec>` to confirm
+  the fix there.
 
 ## A memory stop is the harness's to recover, never yours
 
@@ -132,15 +142,17 @@ unverified range goes to a later run on a cold host.
 
 ## Targeted sub-scripts
 
-After the first full run identifies failures, iterate with the targeted
-sub-scripts — don't keep re-running the full suite while debugging:
+After the first full run identifies failures, debug on this host with the
+targeted sub-scripts while the lock is free. `--no-reset` keeps them local;
+don't keep re-running the full suite while debugging:
 
 - `./scripts/e2e-api.sh --no-reset -f <test_name>` — single Rust API test.
 - `./scripts/e2e-browser.sh --no-reset -f <file.spec.ts> [-- --grep "<name>"]` — single Playwright test.
-- `./scripts/e2e-wasm.sh` — WASM phase (rebuilds + reruns).
-- `./scripts/e2e-embedder.sh` — embedder phase.
+- `./scripts/e2e-wasm.sh --local` — WASM phase (rebuilds + reruns).
+- `./scripts/e2e-embedder.sh --local` — embedder phase.
 
-After fix iteration, run the full `./scripts/e2e.sh` once for the final
+Once a fix is committed, confirm it on GitHub with the same filter, minus
+`--no-reset`. Then run the full `./scripts/e2e.sh` once on GitHub for the final
 clean verification.
 
 ## No bypassing — every test must run and pass

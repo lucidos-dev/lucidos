@@ -24,6 +24,7 @@ export const APP_REACHABLE_ROUTES: AppReachableRoute[] = [
   { path: '/events/query', methods: ['GET'] },
   { path: '/events/types', methods: ['GET'] },
   { path: '/fonts', methods: ['GET'] },
+  { path: '/fonts/:file', methods: ['GET'] },
   { path: '/health', methods: ['GET'] },
   { path: '/knowhow', methods: ['GET'] },
   { path: '/knowhow/read', methods: ['GET'] },

@@ -64,7 +64,7 @@ pub(in crate::api) async fn archive_all_preflight(
 
 /// POST /api/v1/threads/archive-all `{thread_ids}`: archive the confirmed
 /// threads that are still safe. Answers
-/// `{archived: [...], kept: [{thread_id, reason, slug}]}`. `archived` lists every
+/// `{archived: [...], kept: [{thread_id, reason, slug, thread_count}]}`. `archived` lists every
 /// member the cascades took, which is exactly what Undo hands back.
 pub(in crate::api) async fn archive_all(
     State(state): State<AppState>,
@@ -93,6 +93,10 @@ pub(in crate::api) async fn archive_all(
                 thread_id: id,
                 reason: rejection_text(&rejection),
                 slug: refusal_kept_slug(&rejection.1),
+                thread_count: rows
+                    .iter()
+                    .find(|r| r.facts.thread_id == id)
+                    .map_or(1, |r| r.counted_threads()),
             }),
         }
     }

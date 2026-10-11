@@ -5,21 +5,26 @@ use std::fmt::Display;
 use std::path::PathBuf;
 
 use crate::api::actor::HEADER_DEVICE_ID;
+use crate::api::frontend_snapshot::SOURCE_COMMIT_FILE;
 use crate::api::internal::CLIENT_LOG_MAX_BATCH;
 use crate::api::proxy_timeout::CLIENT_WAIT_SECS;
 use crate::api::threads::archive_all::MAX_IDS;
 use crate::engine::agent_recovery::{
     AUTO_RECOVERY_AFTER_HANG_REASON, AUTO_RESUME_AFTER_API_ERROR_REASON,
-    AUTO_RESUME_AFTER_SWITCH_REASON, ENGINE_RESTART_INTERRUPT_REASON, USER_CLICKED_CONTINUE_REASON,
+    AUTO_RESUME_AFTER_SWITCH_REASON, ENGINE_RESTART_INTERRUPT_REASON, HARDEN_REQUESTED_REASON,
+    USER_CLICKED_CONTINUE_REASON,
 };
 use crate::engine::agent_session::side_question::SIDE_QUESTION_TIMEOUT;
 use crate::engine::claude_code::{
     BROAD_ALLOW_INEFFECTIVE, CC_PROTECTED_PATH_MARKERS, CODEX_BACKEND_TOOLS, SESSION_PATH_TOOLS,
 };
+use crate::engine::thread_triage::archive_all::{PINNED_SUB_THREAD, SAME_FAMILY};
+use crate::engine::widgets::WIDGET_PARAMS_MAX_BYTES;
 use crate::llm::judgment::endpoint::{
     SystemOneEndpoint, CLOUDFLARE_ACCOUNTS_PREFIX, CLOUDFLARE_WORKERS_AI_CREDENTIAL_SERVICE,
     SYSTEM_ONE_CUSTOM_CREDENTIAL_SERVICE, TYPESAFE_API_KEY_ENV, TYPESAFE_CREDENTIAL_SERVICE,
 };
+use crate::runtime::TakesEffect;
 use crate::voice::sections::SECTIONS;
 
 const REGENERATE: &str =
@@ -74,8 +79,18 @@ fn generate_ts() -> String {
 
     ts.from("api/internal.rs");
     ts.export("CLIENT_LOG_MAX_BATCH", CLIENT_LOG_MAX_BATCH);
+    ts.from("engine/widgets.rs");
+    ts.export("WIDGET_PARAMS_MAX_BYTES", WIDGET_PARAMS_MAX_BYTES);
     ts.from("api/threads/archive_all.rs");
     ts.renamed("MAX_IDS", "ARCHIVE_ALL_MAX_IDS", MAX_IDS);
+    ts.from("engine/thread_triage/archive_all.rs");
+    ts.renamed(
+        "SAME_FAMILY",
+        "ARCHIVE_ALL_SAME_FAMILY",
+        quoted(SAME_FAMILY),
+    );
+    let pinned = quoted(PINNED_SUB_THREAD);
+    ts.renamed("PINNED_SUB_THREAD", "ARCHIVE_ALL_PINNED_SUB_THREAD", pinned);
     ts.from("engine/agent_session/side_question.rs");
     let side_ms = SIDE_QUESTION_TIMEOUT.as_millis();
     ts.renamed("SIDE_QUESTION_TIMEOUT", "SIDE_QUESTION_TIMEOUT_MS", side_ms);
@@ -87,6 +102,8 @@ fn generate_ts() -> String {
     );
     ts.from("api/actor.rs");
     ts.export("HEADER_DEVICE_ID", quoted(HEADER_DEVICE_ID));
+    ts.from("api/frontend_snapshot.rs");
+    ts.export("SOURCE_COMMIT_FILE", quoted(SOURCE_COMMIT_FILE));
 
     ts.from("engine/claude_code/mod.rs");
     ts.export("BROAD_ALLOW_INEFFECTIVE", list(BROAD_ALLOW_INEFFECTIVE));
@@ -113,6 +130,7 @@ fn generate_ts() -> String {
             "ENGINE_RESTART_INTERRUPT_REASON",
             ENGINE_RESTART_INTERRUPT_REASON,
         ),
+        ("HARDEN_REQUESTED_REASON", HARDEN_REQUESTED_REASON),
     ];
     for (name, value) in reasons {
         ts.export(name, quoted(value));
@@ -137,6 +155,13 @@ fn generate_ts() -> String {
     }
     let ids = list(&SystemOneEndpoint::ALL.map(SystemOneEndpoint::id));
     ts.renamed("SystemOneEndpoint::id", "SYSTEM_ONE_ENDPOINT_IDS", ids);
+
+    ts.from("runtime/agent_runtime.rs");
+    let takes_effect = TakesEffect::ALL.map(|t| serde_json::to_value(t).expect("a unit variant"));
+    let takes_effect = takes_effect
+        .each_ref()
+        .map(|v| v.as_str().expect("a string"));
+    ts.renamed("TakesEffect", "TAKES_EFFECT_VALUES", list(&takes_effect));
 
     let mut out = ts.out;
     out.push_str("/** `SECTIONS` in `voice/sections.rs`. */\n");

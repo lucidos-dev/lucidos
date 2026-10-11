@@ -14,12 +14,10 @@ fn brought_back_event(change_id: Uuid) -> ThreadEvent {
     }
 }
 
-async fn coding_agent_proposed(pool: &PgPool, thread_id: Uuid) -> bool {
-    sqlx::query_scalar("SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1")
-        .bind(thread_id)
-        .fetch_one(pool)
+async fn is_proposed(pool: &PgPool, thread_id: Uuid) -> bool {
+    crate::test_support::read_change_state(pool, thread_id)
         .await
-        .unwrap()
+        .is_proposed()
 }
 
 async fn archive_state(pool: &PgPool, thread_id: Uuid) -> String {
@@ -30,8 +28,8 @@ async fn archive_state(pool: &PgPool, thread_id: Uuid) -> String {
         .unwrap()
 }
 
-/// S1 and S4: a set-aside change leaves every pending read and clears the
-/// thread's proposal flag, which Review, attention and the archive gate read.
+/// S1 and S4: a set-aside change leaves every pending read and takes the
+/// thread off `proposed`, which Review, attention and the archive gate read.
 /// Bringing it back restores both.
 #[tokio::test]
 async fn set_aside_leaves_pending_and_bring_back_returns_it() {
@@ -46,7 +44,7 @@ async fn set_aside_leaves_pending_and_bring_back_returns_it() {
         aggregate_proposed(change_id, "branch-s", "/r"),
     )
     .await;
-    assert!(coding_agent_proposed(&pool, thread).await);
+    assert!(is_proposed(&pool, thread).await);
 
     emit(&bus, thread, set_aside_event(change_id)).await;
     let proj = ChangesProjection::new(pool.clone());
@@ -56,7 +54,7 @@ async fn set_aside_leaves_pending_and_bring_back_returns_it() {
         row.resolved_at.is_none(),
         "a set-aside change is open, not resolved"
     );
-    assert!(!coding_agent_proposed(&pool, thread).await);
+    assert!(!is_proposed(&pool, thread).await);
     assert!(proj.list_pending().await.unwrap().is_empty());
     assert!(proj.pending_for_thread(thread).await.unwrap().is_empty());
     assert!(proj
@@ -78,7 +76,7 @@ async fn set_aside_leaves_pending_and_bring_back_returns_it() {
     let row = proj.get_by_id(change_id).await.unwrap().expect("row");
     assert_eq!(row.status(), ChangeStatus::Pending);
     assert!(row.resolved_at.is_none());
-    assert!(coding_agent_proposed(&pool, thread).await);
+    assert!(is_proposed(&pool, thread).await);
     assert!(proj.list_set_aside().await.unwrap().is_empty());
 
     teardown_test_db(&db).await;
@@ -141,7 +139,7 @@ async fn a_proposal_made_set_aside_leaves_an_archived_thread_archived() {
     emit(&bus, thread, proposed).await;
 
     assert_eq!(archive_state(&pool, thread).await, "archived");
-    assert!(!coding_agent_proposed(&pool, thread).await);
+    assert!(!is_proposed(&pool, thread).await);
     let row = ChangesProjection::new(pool.clone())
         .get_by_id(change_id)
         .await
@@ -218,7 +216,7 @@ async fn bringing_a_change_back_surfaces_an_archived_thread() {
 
     emit(&bus, thread, brought_back_event(change_id)).await;
     assert_eq!(archive_state(&pool, thread).await, "inbox");
-    assert!(coding_agent_proposed(&pool, thread).await);
+    assert!(is_proposed(&pool, thread).await);
 
     teardown_test_db(&db).await;
 }

@@ -23,6 +23,8 @@ import {
     anythingAbove,
     atScrollTop,
     fillAction,
+    clampedScrollTop,
+    scrollAsksForOlder,
     UPWARD_SCROLL_KEYS,
     scrollToTopNeedsRenderAll,
     type WindowEdge,
@@ -89,6 +91,61 @@ describe('a paged thread is always reachable', () => {
      *  reachable with no older turn behind it. */
     it('counts a turn whose head is clamped off', () => {
         expect(anythingAbove(false, { exchange: 0, rowsHidden: 40 }, false)).toBe(true);
+    });
+});
+
+/** Only a scroll TOWARD the top asks for older history.
+ *
+ *  The margin is measured from the top, so a short window puts a reader at its
+ *  bottom inside it. Reported on the home thread: one turn drew 1,386px, and
+ *  scrolling down at the bottom fetched 17 pages in 20 seconds. Each landed
+ *  above the reader mid-gesture, and the hold lost the race on iOS: they were
+ *  carried up into the middle of the thread. */
+describe('a scroll asking for older history', () => {
+    /** A phone pane, a window short enough to sit wholly inside the margin. */
+    const short = (scrollTop: number) => ({ scrollTop, scrollHeight: 1386, clientHeight: 449 });
+    const bottom = clampedScrollTop(short(937));
+
+    it('asks when the reader moves up inside the margin', () => {
+        expect(scrollAsksForOlder(bottom, clampedScrollTop(short(900)))).toBe(true);
+    });
+
+    it('never asks when the reader moves down, the reported case', () => {
+        expect(scrollAsksForOlder(clampedScrollTop(short(900)), bottom)).toBe(false);
+    });
+
+    it('never asks for a scroll that did not move', () => {
+        expect(scrollAsksForOlder(bottom, bottom)).toBe(false);
+    });
+
+    it('never asks above the margin, whichever way the reader went', () => {
+        const tall = (scrollTop: number) => ({ scrollTop, scrollHeight: 20000, clientHeight: 449 });
+        expect(scrollAsksForOlder(clampedScrollTop(tall(9000)), clampedScrollTop(tall(8000)))).toBe(false);
+    });
+
+    /** iOS rubber-bands past the bottom and springs back. The return lowers
+     *  `scrollTop`, but the reader is still at the bottom and asked for nothing. */
+    it('reads an overscroll past the bottom as the bottom', () => {
+        expect(clampedScrollTop(short(1000))).toBe(937);
+        expect(scrollAsksForOlder(clampedScrollTop(short(1000)), bottom)).toBe(false);
+    });
+
+    /** Past the top, the gesture handlers own the ask: no scroll event fires
+     *  once the reader is pinned there. */
+    it('reads an overscroll past the top as the top', () => {
+        expect(clampedScrollTop(short(-40))).toBe(0);
+    });
+
+    /** The baseline moves on EVERY scroll, the app's own included. Otherwise
+     *  the next reader move is measured from where they were before our write. */
+    it('re-takes the baseline before the navigation guard', () => {
+        const handler = threadViewSource.slice(
+            threadViewSource.indexOf('const onScroll = () => {'),
+            threadViewSource.indexOf('let lastTouchY'),
+        );
+        const baseline = handler.indexOf('lastTop = clampedScrollTop(el);');
+        expect(baseline).toBeGreaterThan(-1);
+        expect(baseline).toBeLessThan(handler.indexOf('if (isNavigationScroll(el) || isWhereWeLastScrolledIt(el)) return;'));
     });
 });
 
@@ -263,7 +320,7 @@ describe('a reader pinned at the very top', () => {
         );
         expect(effect.match(/requestBackfill\(/g)).toHaveLength(1);
         expect(effect.match(/growRenderWindow\(/g)).toHaveLength(1);
-        expect(effect).toContain('if (el.scrollTop > WINDOW_EXPAND_MARGIN_PX) return;\n            reachForOlder();');
+        expect(effect).toContain('if (!scrollAsksForOlder(previousTop, lastTop)) return;\n            reachForOlder();');
     });
 
     /** The app's own writes never ask, however late their scroll event lands.

@@ -8,6 +8,12 @@ import {
   RECOMMENDED_SECTION,
 } from './backgroundModels';
 
+/** Recommended models with no recommended tier, as every row but the
+ *  compactor's sends them. */
+function untiered(...models: string[]) {
+  return models.map((model) => ({ model, effort: null }));
+}
+
 function registryRow(id: string, provider: string, vision = false): ModelInfo {
   return {
     id,
@@ -15,6 +21,8 @@ function registryRow(id: string, provider: string, vision = false): ModelInfo {
     routes: [{ provider, id, reasoning_efforts: ['none', 'low'] }],
     preferred_provider: null,
     vision,
+    default_effort: null,
+    successor: null,
     sort_order: 0,
     source: 'builtin',
     enabled: true,
@@ -44,7 +52,7 @@ describe('backgroundModelChoices', () => {
    *  in their order. The Vertex model is recommended, but nothing configured serves it. */
   it('offers the chat picker list, recommended first, unreachable ones left out', () => {
     const choices = backgroundModelChoices(
-      ['cheap-vertex-model', 'cheap-anthropic-model'],
+      untiered('cheap-vertex-model', 'cheap-anthropic-model'),
       null,
     );
     expect(choices.map((c) => [c.value, c.section])).toEqual([
@@ -56,7 +64,7 @@ describe('backgroundModelChoices', () => {
   /** The recommended order wins over the registry's, and no model repeats. */
   it('keeps the recommended order and lists each model once', () => {
     configuredProviders.value = ['anthropic', 'vertex'];
-    const choices = backgroundModelChoices(['cheap-anthropic-model', 'cheap-vertex-model'], null);
+    const choices = backgroundModelChoices(untiered('cheap-anthropic-model', 'cheap-vertex-model'), null);
     expect(choices.map((c) => c.value)).toEqual([
       'cheap-anthropic-model',
       'cheap-vertex-model',
@@ -81,10 +89,10 @@ describe('backgroundModelChoices', () => {
         registryRow('cheap-anthropic-model', 'anthropic'),
       ],
     };
-    const choices = backgroundModelChoices(['cheap-anthropic-model'], null, true);
+    const choices = backgroundModelChoices(untiered('cheap-anthropic-model'), null, true);
     expect(choices.map((c) => c.value)).toEqual(['flagship-model']);
     // Other rows are unchanged.
-    expect(backgroundModelChoices(['cheap-anthropic-model'], null).map((c) => c.value)).toEqual([
+    expect(backgroundModelChoices(untiered('cheap-anthropic-model'), null).map((c) => c.value)).toEqual([
       'cheap-anthropic-model',
       'flagship-model',
     ]);
@@ -99,8 +107,23 @@ describe('backgroundModelChoices', () => {
 
   /** A stored pick nothing serves still renders as selected. */
   it('keeps a stored pick the registry does not offer', () => {
-    const choices = backgroundModelChoices(['cheap-anthropic-model'], 'cheap-vertex-model');
+    const choices = backgroundModelChoices(untiered('cheap-anthropic-model'), 'cheap-vertex-model');
     expect(choices.map((c) => c.value)).toContain('cheap-vertex-model');
+  });
+
+  /** The engine names a recommended tier only on the compactor's row. A model
+   *  carries the tier it was sent, and no other model carries one. */
+  it('carries the recommended tier the engine sends, and only that', () => {
+    const choices = backgroundModelChoices(
+      [{ model: 'cheap-anthropic-model', effort: 'low' }],
+      null,
+    );
+    expect(choices.map((c) => [c.value, c.recommendedEffort])).toEqual([
+      ['cheap-anthropic-model', 'low'],
+      ['flagship-model', undefined],
+    ]);
+    expect(backgroundModelChoices(untiered('cheap-anthropic-model'), null)[0].recommendedEffort)
+      .toBeUndefined();
   });
 });
 
@@ -110,6 +133,7 @@ describe('backgroundRowCaveat', () => {
     effort: 'none',
     source: 'preference',
     reachable,
+    not_served: [],
     needs_vision: false,
     vision: false,
     recommended: [],
@@ -146,6 +170,20 @@ describe('backgroundRowCaveat', () => {
     expect(backgroundRowCaveat(row(false, { needs_vision: true }), null)).toBe(
       'No configured provider serves this model',
     );
+  });
+
+  /** A provider refusing the pick is not a missing credential, and adding
+   *  one would not help, so it gets its own sentence (ADR 0403). */
+  it('says when the provider no longer serves the pick', () => {
+    expect(
+      backgroundRowCaveat(row(false, { not_served: ['cheap-vertex-model'] }), null),
+    ).toBe('Its provider no longer serves this model. Pick another');
+  });
+
+  it('names a default it moved past', () => {
+    expect(
+      backgroundRowCaveat(row(true, { source: 'default', not_served: ['claude-haiku-4-5'] }), null),
+    ).toBe('Moved past claude-haiku-4-5: its provider no longer serves it');
   });
 
   it('says when the engine could not be asked', () => {

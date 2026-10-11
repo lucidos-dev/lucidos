@@ -1,8 +1,10 @@
-import { useRef, useLayoutEffect } from 'preact/hooks';
+import { createContext } from 'preact';
+import { useCallback, useContext, useRef, useLayoutEffect, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import type { ComponentChildren, RefObject, JSX } from 'preact';
 import { useDismissOnOutside } from '../../hooks/useAnchoredPopover';
 import { overlayModalAttrs, useOverlayFocus } from './overlayFocus';
+import { leaveExitDrawing, type ExitLook } from './overlayExitDrawing';
 import {
   overlayStack,
   overlayStackDepth,
@@ -12,6 +14,11 @@ import {
 } from '../../store/overlayStack';
 
 let overlayIdCounter = 0;
+
+/** Where a portaled panel mounts: `<body>`, or the panel of the backdrop modal
+ *  it opened inside. A menu portaled to `<body>` sits below `--z-modal`, so it
+ *  would open behind its modal, and a tap on it would dismiss that modal. */
+const PortalTarget = createContext<HTMLElement | null>(null);
 
 // While any <Overlay> is open, the children of the main UI (`.app-shell > *`)
 // are made inert via `data-overlay-open` on <html> + CSS — so elements BEHIND
@@ -132,6 +139,8 @@ export interface OverlayProps {
    *  block. The dismiss/anchor/Escape/inert contracts are unaffected —
    *  `panel.contains()` works across a portal, and the portaled node sits
    *  outside `.app-shell` so it's interactive without the inert exemption.
+   *  Inside a backdrop modal the panel portals into that modal's panel instead,
+   *  so it paints above the modal and its taps read as inside it.
    *  Only honored for `backdrop:false`. Default `false`. */
   portal?: boolean;
   children: ComponentChildren;
@@ -153,6 +162,8 @@ export interface OverlayProps {
  *  4. **Keyboard focus**: a dialog contains Tab. It takes focus on
  *     open and hands it back on close. An anchored popover closes on a Tab
  *     from outside it (`overlayFocus.ts`).
+ *  5. **Exit fade**: a backdrop modal fades out however it closes. It leaves
+ *     an inert drawing of its last frame behind (`overlayExitDrawing.ts`).
  *
  *  Positioning stays with the caller (CSS via `overlayClass`/`panelClass` for
  *  modals, `panelStyle` for anchored popovers) — only the contract is
@@ -178,8 +189,26 @@ export function Overlay({
   // Portal only makes sense for a backdrop-less anchored panel (a backdrop
   // modal owns the full-screen `.modal-overlay` container instead).
   const usePortal = portal && !backdrop && typeof document !== 'undefined';
+  const portalTarget = useContext(PortalTarget);
   const internalRef = useRef<HTMLDivElement>(null);
   const panelRef = externalPanelRef ?? internalRef;
+  const [modalPanel, setModalPanel] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (backdrop) setModalPanel(open ? panelRef.current : null);
+  }, [open, backdrop]);
+
+  // The exit fade. Preact detaches the panel's ref while the panel is still
+  // on screen, however the modal closes: `open` going false, or the caller
+  // unmounting the whole <Overlay>, as `ConfirmDialog` does. So that is where
+  // a backdrop modal leaves its fading drawing. The callback must stay
+  // stable, since a new one per render would detach and re-attach each time.
+  const latest = useRef({ panelRef, exitLook: null as ExitLook | null });
+  latest.current.panelRef = panelRef;
+  const attachPanel = useCallback((el: HTMLDivElement | null) => {
+    const { panelRef: ref, exitLook } = latest.current;
+    if (!el && ref.current && exitLook) leaveExitDrawing(ref.current, exitLook);
+    ref.current = el;
+  }, []);
 
   // This overlay's `overlayStack` identity. Declared before the dismiss hook
   // below, which reads it to ask whether this overlay is the top one.
@@ -250,13 +279,13 @@ export function Overlay({
       ? ['modal-overlay', overlayClass, hiddenClass].filter(Boolean).join(' ')
       : [panelClass, hiddenClass].filter(Boolean).join(' ');
     const hidden = <div class={cls} aria-hidden="true" />;
-    return usePortal ? createPortal(hidden, document.body) : hidden;
+    return usePortal ? createPortal(hidden, portalTarget ?? document.body) : hidden;
   }
 
   const panel = (
     <div
       {...panelProps}
-      ref={panelRef}
+      ref={attachPanel}
       class={panelClass}
       style={panelStyle}
       role={panelRole}
@@ -271,16 +300,20 @@ export function Overlay({
       data-overlay-panel={idRef.current}
       {...overlayModalAttrs(modal)}
     >
-      {children}
+      {backdrop ? <PortalTarget.Provider value={modalPanel}>{children}</PortalTarget.Provider> : children}
     </div>
   );
 
-  if (!backdrop) return usePortal ? createPortal(panel, document.body) : panel;
+  if (!backdrop) {
+    latest.current.exitLook = null;
+    return usePortal ? createPortal(panel, portalTarget ?? document.body) : panel;
+  }
   const cls = ['modal-overlay', overlayClass].filter(Boolean).join(' ');
   // Paint order follows the stack, so the overlay the contract calls top is the
   // one the reader sees on top (ADR 0237). Backdrop mode only: an anchored panel
   // takes its level from its own class, which this cannot know. An `overlayClass`
   // may name no z-index, since this inline one beats it.
   const z = `z-index: calc(var(--z-modal) + ${overlayStackDepth(overlayStack.value, idRef.current)})`;
+  latest.current.exitLook = { cls, style: z };
   return <div class={cls} style={z}>{panel}</div>;
 }

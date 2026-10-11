@@ -24,7 +24,7 @@ import {
   IRREVERSIBLE_TAP_SELECTOR,
   type ResumeEvent,
 } from './pageResume';
-import { OPEN_REPAINT_BURST_DELAYS_MS } from './webkitRepaint';
+import { OPEN_REPAINT_BURST_DELAYS_MS } from './repaintBurst';
 
 describe('reduceResumeGuard', () => {
   it('a foreground-resume arms the guard and requests a repaint', () => {

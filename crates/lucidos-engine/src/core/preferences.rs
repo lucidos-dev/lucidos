@@ -104,8 +104,8 @@ pub struct PreferenceStore;
 /// wire. This form crosses an await and is stamped on a starter event. So it
 /// holds `String`s, and names its provider by the registry's own value.
 ///
-/// Every field is resolved INDEPENDENTLY, so a turn can take its model from the
-/// thread's memory and its effort from the account preference.
+/// The model resolves on its own. The effort and the provider resolve for that
+/// model, so neither follows a thread onto another model.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedModelSelection {
     pub model: Option<String>,
@@ -113,6 +113,19 @@ pub struct ResolvedModelSelection {
     /// The backend to serve it. `None` lets the model's own *preferred
     /// provider* decide, then its first configured route.
     pub provider: Option<String>,
+}
+
+/// The one chat tier every model shared before ADR 0390. Read only to move it
+/// onto `chat_reasoning_efforts` (`PreferenceStore::move_legacy_chat_effort`).
+const LEGACY_CHAT_EFFORT_KEY: &str = "chat_reasoning_effort";
+
+/// Where an unpinned effort comes from when nothing stored names one: the
+/// registry's *default effort*, for the model a turn runs on.
+#[derive(Clone, Copy)]
+pub struct ModelDefaults<'a> {
+    pub registry: &'a crate::llm::ModelRegistry,
+    /// The model the router runs when nothing names one.
+    pub fallback_model: &'a str,
 }
 
 impl ResolvedModelSelection {
@@ -127,6 +140,7 @@ impl ResolvedModelSelection {
                 .and_then(crate::llm::model_registry::ProviderKind::from_name),
             // A turn: never capped, so a long valid stream runs to its end.
             attempt_timeout: None,
+            forced_tool: None,
         }
     }
 }
@@ -397,26 +411,92 @@ impl PreferenceStore {
         prefs::MAX_TOOL_CALLS.read(pool).await as usize
     }
 
-    /// The account's chat model and reasoning effort, for code paths that start
-    /// a chat without an explicit user request (spawn_thread, process_trigger).
+    /// The account's chat model, for code paths that start a chat without an
+    /// explicit user request (spawn_thread, process_trigger). `None` while
+    /// unset, because the provider layers `LUCIDOS_MODEL` over the catalog
+    /// default at boot.
+    pub async fn user_chat_model(pool: &PgPool) -> Option<String> {
+        prefs::CHAT_MODEL.stored(pool).await
+    }
+
+    /// The model a new Lucidos Agent thread would run with: the account's
+    /// `chat_model` preference, else the provider default.
     ///
-    /// The model is `None` while unset, because the provider layers
-    /// `LUCIDOS_MODEL` over the catalog default at boot. The effort always
-    /// resolves, to the catalog default while unset, so every route runs a
-    /// fresh thread at the same effort.
-    pub async fn user_chat_settings(pool: &PgPool) -> (Option<String>, String) {
-        (
-            prefs::CHAT_MODEL.stored(pool).await,
-            prefs::CHAT_REASONING_EFFORT.read(pool).await,
+    /// Mirrors the chat path's own order, so a report states the window the
+    /// request packer will size against. `LlmProvider::default_model()` alone
+    /// is NOT that window. It is `LUCIDOS_MODEL` or the `prefs::CHAT_MODEL`
+    /// default, fixed at boot, so it drops the `[1m]` marker a saved
+    /// preference carries.
+    pub async fn resolved_chat_model(pool: &PgPool, provider_default: &str) -> String {
+        Self::user_chat_model(pool)
+            .await
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| provider_default.to_string())
+    }
+
+    /// The tier the account stored for chatting on `model`, if any. A model
+    /// with none runs at its *default effort*.
+    pub async fn user_chat_effort(pool: &PgPool, model: &str) -> Option<String> {
+        let stored = prefs::CHAT_REASONING_EFFORTS.read(pool).await?;
+        let pairs = prefs::parse_model_efforts(&stored).ok()?;
+        pairs
+            .into_iter()
+            .rev()
+            .find(|(id, _)| *id == model)
+            .map(|(_, tier)| tier.to_string())
+    }
+
+    /// Move a stored `chat_reasoning_effort`, the one tier every model shared
+    /// before ADR 0390, onto the model the workspace chats with. That is its
+    /// `chat_model`, else `fallback_model`, the router's own. A tier already
+    /// stored for that model wins. The old row goes either way, so a re-run
+    /// does nothing.
+    pub async fn move_legacy_chat_effort(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        fallback_model: &str,
+    ) {
+        let legacy: Option<String> = match sqlx::query_scalar(
+            "SELECT value FROM preferences WHERE key = $1 AND device_id IS NULL",
         )
+        .bind(LEGACY_CHAT_EFFORT_KEY)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(legacy) => legacy,
+            Err(e) => {
+                log_read_failure(LEGACY_CHAT_EFFORT_KEY, &e);
+                return;
+            }
+        };
+        let Some(legacy) = legacy else { return };
+        if let Some(tier) = crate::llm::reasoning::tier(legacy.trim()) {
+            let model = Self::user_chat_model(pool)
+                .await
+                .unwrap_or_else(|| fallback_model.to_string());
+            if Self::user_chat_effort(pool, &model).await.is_none() {
+                let pair = format!("{model}={tier}");
+                let value = match prefs::CHAT_REASONING_EFFORTS.read(pool).await {
+                    Some(stored) => format!("{stored}, {pair}"),
+                    None => pair,
+                };
+                let key = prefs::CHAT_REASONING_EFFORTS.key();
+                if let Err(e) = Self::set(pool, event_bus, key, &value, None).await {
+                    log!("[Preferences] Could not move the legacy chat tier: {}", e);
+                    return;
+                }
+            }
+        }
+        if let Err(e) = Self::delete(pool, event_bus, LEGACY_CHAT_EFFORT_KEY, None).await {
+            log!("[Preferences] Could not delete the legacy chat tier: {}", e);
+        }
     }
 
     /// Read the model + reasoning effort a thread last ran with — the values
     /// stamped on the thread's most recent starter event that carried them.
     /// This is the per-thread memory: a follow-up with no explicit override
-    /// reuses these instead of snapping back to the account default. Resolved
-    /// per field independently (a legacy message with only one set still
-    /// contributes that field), newest-first by `sequence`.
+    /// reuses these instead of snapping back to the account default,
+    /// newest-first by `sequence`.
     ///
     /// Both starter kinds count. A chat turn starts with `MessageReceived`; a
     /// **trigger** fire starts with `TriggerStarted` and emits no
@@ -429,10 +509,11 @@ impl PreferenceStore {
     /// never read the current turn as its own "previous" value. DB errors are
     /// logged and treated as "no record" — callers fall through to preferences.
     ///
-    /// The provider is remembered WITH its model. It is the newest one stamped
-    /// beside the model this turn runs on: `model_override` when the caller
-    /// named one, else the remembered model. So a thread switched from Opus to
-    /// Sonnet drops the backend picked for Opus, and Sonnet's own row decides.
+    /// The effort and the provider are remembered WITH their model. Each is the
+    /// newest one stamped beside the model this turn runs on: `model_override`
+    /// when the caller named one, else the remembered model. So a thread
+    /// switched from Opus to Sonnet drops the tier and backend picked for Opus,
+    /// and Sonnet's own defaults decide.
     pub async fn last_thread_chat_settings(
         pool: &PgPool,
         thread_id: Uuid,
@@ -443,46 +524,37 @@ impl PreferenceStore {
         // so `payload->>'model'` reads the field directly on both variants.
         // `aggregate_id` is text; bind the thread id as its string.
         //
-        // One sub-select per field, because each is remembered independently: a
-        // thread can carry a model from one turn and an effort from another.
         let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
             r#"
+            WITH starters AS (
+              SELECT sequence, payload
+                FROM events
+               WHERE aggregate_id = $1
+                 AND event_type IN ('MessageReceived', 'TriggerStarted')
+                 AND ($2::uuid IS NULL OR id <> $2)
+            ),
+            remembered AS (
+              SELECT payload->>'model' AS model
+                FROM starters
+               WHERE payload->>'model' <> ''
+               ORDER BY sequence DESC
+               LIMIT 1
+            ),
+            running AS (
+              SELECT COALESCE($3, (SELECT model FROM remembered)) AS model
+            )
             SELECT
-              (SELECT payload->>'model'
-                 FROM events
-                WHERE aggregate_id = $1
-                  AND event_type IN ('MessageReceived', 'TriggerStarted')
-                  AND payload->>'model' IS NOT NULL
-                  AND payload->>'model' <> ''
-                  AND ($2::uuid IS NULL OR id <> $2)
-                ORDER BY sequence DESC
-                LIMIT 1) AS model,
+              (SELECT model FROM remembered) AS model,
               (SELECT payload->>'reasoning_effort'
-                 FROM events
-                WHERE aggregate_id = $1
-                  AND event_type IN ('MessageReceived', 'TriggerStarted')
-                  AND payload->>'reasoning_effort' IS NOT NULL
-                  AND payload->>'reasoning_effort' <> ''
-                  AND ($2::uuid IS NULL OR id <> $2)
+                 FROM starters
+                WHERE payload->>'reasoning_effort' <> ''
+                  AND payload->>'model' IS NOT DISTINCT FROM (SELECT model FROM running)
                 ORDER BY sequence DESC
                 LIMIT 1) AS effort,
               (SELECT payload->>'provider'
-                 FROM events
-                WHERE aggregate_id = $1
-                  AND event_type IN ('MessageReceived', 'TriggerStarted')
-                  AND payload->>'provider' IS NOT NULL
-                  AND payload->>'provider' <> ''
-                  AND payload->>'model' = COALESCE($3, (
-                        SELECT payload->>'model'
-                          FROM events
-                         WHERE aggregate_id = $1
-                           AND event_type IN ('MessageReceived', 'TriggerStarted')
-                           AND payload->>'model' IS NOT NULL
-                           AND payload->>'model' <> ''
-                           AND ($2::uuid IS NULL OR id <> $2)
-                         ORDER BY sequence DESC
-                         LIMIT 1))
-                  AND ($2::uuid IS NULL OR id <> $2)
+                 FROM starters
+                WHERE payload->>'provider' <> ''
+                  AND payload->>'model' IS NOT DISTINCT FROM (SELECT model FROM running)
                 ORDER BY sequence DESC
                 LIMIT 1) AS provider
             "#,
@@ -512,9 +584,11 @@ impl PreferenceStore {
     /// Resolve the *model selection* stamped on a chat exchange when the caller
     /// did not fully specify it, honoring per-thread memory.
     ///
-    /// Order per field: explicit caller override → the thread's last recorded
-    /// value → the user's account chat preference. Each DB read it does not
-    /// need is skipped.
+    /// The model: explicit caller override → the thread's last recorded model
+    /// → the account's `chat_model`. The effort, for the model the turn runs
+    /// on (the fallback model when nothing names one): explicit caller override
+    /// → the thread's last tier on that model → the account's tier for that
+    /// model → its *default effort*. `None` sends no effort.
     ///
     /// The provider has no account preference of its own, deliberately. It is
     /// remembered per MODEL, on the registry row, because a global one means
@@ -523,6 +597,7 @@ impl PreferenceStore {
     /// and the row decides.
     pub async fn resolve_chat_overrides_for_thread(
         pool: &PgPool,
+        defaults: ModelDefaults<'_>,
         thread_id: Option<Uuid>,
         exclude_event_id: Option<Uuid>,
         overrides: ResolvedModelSelection,
@@ -553,21 +628,30 @@ impl PreferenceStore {
             }
             None => ResolvedModelSelection::default(),
         };
-        let model = model_override.or(remembered.model);
-        let effort = effort_override.or(remembered.reasoning_effort);
-        let provider = provider_override.or(remembered.provider);
-        if model.is_some() && effort.is_some() {
-            return ResolvedModelSelection {
-                model,
-                reasoning_effort: effort,
-                provider,
-            };
-        }
-        let (pref_model, pref_effort) = Self::user_chat_settings(pool).await;
+        let (model, remembered_effort) = match model_override.or(remembered.model) {
+            Some(model) => (Some(model), remembered.reasoning_effort),
+            // The thread named no model, so it ran on the router's. Its tier
+            // stays there, and never carries onto a `chat_model` set since.
+            None => match Self::user_chat_model(pool).await {
+                Some(model) => (Some(model), None),
+                None => (None, remembered.reasoning_effort),
+            },
+        };
+        let effort = match effort_override.or(remembered_effort) {
+            Some(effort) => Some(effort),
+            None => {
+                let running = model.as_deref().unwrap_or(defaults.fallback_model);
+                match Self::user_chat_effort(pool, running).await {
+                    Some(effort) => Some(effort),
+                    None => crate::llm::model_registry::default_effort(defaults.registry, running)
+                        .map(str::to_string),
+                }
+            }
+        };
         ResolvedModelSelection {
-            model: model.or(pref_model),
-            reasoning_effort: effort.or(Some(pref_effort)),
-            provider,
+            model,
+            reasoning_effort: effort,
+            provider: provider_override.or(remembered.provider),
         }
     }
 }
@@ -1093,11 +1177,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_chat_settings_resolves_an_unset_effort_to_the_catalog_default() {
+    async fn the_chat_model_and_its_tier_are_unset_until_stored() {
         let (pool, db_name) = setup_test_db().await;
-        let (model, effort) = PreferenceStore::user_chat_settings(&pool).await;
-        assert_eq!(model, None);
-        assert_eq!(effort, prefs::CHAT_REASONING_EFFORT.default_text());
+        assert_eq!(PreferenceStore::user_chat_model(&pool).await, None);
+        assert_eq!(
+            PreferenceStore::user_chat_effort(&pool, "claude-opus-5").await,
+            None
+        );
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1233,29 +1319,108 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// Each model keeps its own stored tier, and an unlisted one has none.
     #[tokio::test]
-    async fn user_chat_settings_returns_stored_values() {
+    async fn the_account_stores_a_tier_per_model() {
         let (pool, db_name) = setup_test_db().await;
         crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-4-7[1m]")
             .await
             .unwrap();
-        crate::test_support::seed_preference(&pool, prefs::CHAT_REASONING_EFFORT.key(), "max")
-            .await
-            .unwrap();
-        let (model, effort) = PreferenceStore::user_chat_settings(&pool).await;
-        assert_eq!(model.as_deref(), Some("claude-opus-4-7[1m]"));
-        assert_eq!(effort, "max");
+        crate::test_support::seed_preference(
+            &pool,
+            prefs::CHAT_REASONING_EFFORTS.key(),
+            "claude-opus-4-7[1m]=max, claude-sonnet-5=low",
+        )
+        .await
+        .unwrap();
+        let effort = |model: &'static str| PreferenceStore::user_chat_effort(&pool, model);
+        assert_eq!(
+            PreferenceStore::user_chat_model(&pool).await.as_deref(),
+            Some("claude-opus-4-7[1m]")
+        );
+        assert_eq!(effort("claude-opus-4-7[1m]").await.as_deref(), Some("max"));
+        assert_eq!(effort("claude-sonnet-5").await.as_deref(), Some("low"));
+        assert_eq!(effort("claude-opus-4-7").await, None, "ids match exactly");
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
+
+    /// The upgrade keeps the tier a workspace stored, on the model it chats
+    /// with, and leaves no trace of the old key. A re-run changes nothing.
+    #[tokio::test]
+    async fn the_legacy_chat_tier_moves_onto_the_chat_model() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        for (key, value) in [
+            (prefs::CHAT_MODEL.key(), "claude-opus-5-5[1m]"),
+            (LEGACY_CHAT_EFFORT_KEY, "high"),
+        ] {
+            crate::test_support::seed_preference(&pool, key, value)
+                .await
+                .unwrap();
+        }
+        PreferenceStore::move_legacy_chat_effort(&pool, &bus, FALLBACK_MODEL).await;
+        PreferenceStore::move_legacy_chat_effort(&pool, &bus, FALLBACK_MODEL).await;
+        assert_eq!(
+            prefs::CHAT_REASONING_EFFORTS.read(&pool).await.as_deref(),
+            Some("claude-opus-5-5[1m]=high")
+        );
+        let old: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM preferences WHERE key = $1")
+            .bind(LEGACY_CHAT_EFFORT_KEY)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(old, 0);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// With no `chat_model` stored the workspace chats on the router's own
+    /// model, so the tier lands there. A tier already stored for it wins.
+    #[tokio::test]
+    async fn the_legacy_chat_tier_follows_the_router_model_and_never_overwrites() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        crate::test_support::seed_preference(&pool, LEGACY_CHAT_EFFORT_KEY, "max")
+            .await
+            .unwrap();
+        PreferenceStore::move_legacy_chat_effort(&pool, &bus, FALLBACK_MODEL).await;
+        assert_eq!(
+            PreferenceStore::user_chat_effort(&pool, FALLBACK_MODEL)
+                .await
+                .as_deref(),
+            Some("max")
+        );
+
+        crate::test_support::seed_preference(&pool, LEGACY_CHAT_EFFORT_KEY, "low")
+            .await
+            .unwrap();
+        PreferenceStore::move_legacy_chat_effort(&pool, &bus, FALLBACK_MODEL).await;
+        assert_eq!(
+            PreferenceStore::user_chat_effort(&pool, FALLBACK_MODEL)
+                .await
+                .as_deref(),
+            Some("max"),
+            "a stored tier wins"
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The router's own model, standing in for an unset `chat_model`.
+    const FALLBACK_MODEL: &str = "router-default";
 
     async fn seed_chat_prefs(pool: &PgPool, model: &str, effort: &str) {
         crate::test_support::seed_preference(pool, prefs::CHAT_MODEL.key(), model)
             .await
             .unwrap();
-        crate::test_support::seed_preference(pool, prefs::CHAT_REASONING_EFFORT.key(), effort)
-            .await
-            .unwrap();
+        crate::test_support::seed_preference(
+            pool,
+            prefs::CHAT_REASONING_EFFORTS.key(),
+            &format!("{model}={effort}"),
+        )
+        .await
+        .unwrap();
     }
 
     // The thread-less resolution path (thread_id = None): caller override →
@@ -1266,6 +1431,10 @@ mod tests {
         seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            ModelDefaults {
+                registry: &crate::llm::model_registry::empty(),
+                fallback_model: FALLBACK_MODEL,
+            },
             None,
             None,
             overrides(None, None),
@@ -1283,6 +1452,10 @@ mod tests {
         seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            ModelDefaults {
+                registry: &crate::llm::model_registry::empty(),
+                fallback_model: FALLBACK_MODEL,
+            },
             None,
             None,
             overrides(Some("claude-sonnet-4-6"), Some("medium")),
@@ -1294,38 +1467,76 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// A model named without a tier takes its own tier, never the account
+    /// model's: the stored one, else its default effort, else none.
     #[tokio::test]
-    async fn resolve_chat_overrides_mixes_caller_and_prefs() {
+    async fn a_model_override_takes_that_models_own_tier() {
         let (pool, db_name) = setup_test_db().await;
         seed_chat_prefs(&pool, "claude-opus-4-7[1m]", "xhigh").await;
-        let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
-            &pool,
-            None,
-            None,
-            overrides(Some("claude-sonnet-4-6"), None),
-        )
-        .await;
-        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(resolved.reasoning_effort.as_deref(), Some("xhigh"));
+        let registry = crate::llm::model_registry::empty();
+        let mut sonnet = crate::llm::model_registry::ModelRouting::single(
+            crate::llm::ProviderKind::Vertex,
+            "claude-sonnet-5",
+        );
+        sonnet.default_effort = Some("high");
+        registry
+            .write()
+            .unwrap()
+            .insert("claude-sonnet-5".to_string(), sonnet);
+        let effort = |model: &'static str| {
+            let (pool, registry) = (&pool, &registry);
+            async move {
+                PreferenceStore::resolve_chat_overrides_for_thread(
+                    pool,
+                    ModelDefaults {
+                        registry,
+                        fallback_model: FALLBACK_MODEL,
+                    },
+                    None,
+                    None,
+                    overrides(Some(model), None),
+                )
+                .await
+                .reasoning_effort
+            }
+        };
+        assert_eq!(effort("claude-sonnet-5").await.as_deref(), Some("high"));
+        assert_eq!(effort("claude-sonnet-4-6").await, None);
+        assert_eq!(
+            effort("claude-opus-4-7[1m]").await.as_deref(),
+            Some("xhigh")
+        );
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
 
+    /// With nothing stored, the router's own model runs at its default effort.
     #[tokio::test]
-    async fn resolve_chat_overrides_falls_to_the_catalog_effort_when_nothing_is_set() {
+    async fn an_unset_chat_runs_the_fallback_model_at_its_default_effort() {
         let (pool, db_name) = setup_test_db().await;
+        let registry = crate::llm::model_registry::empty();
+        let mut fallback = crate::llm::model_registry::ModelRouting::single(
+            crate::llm::ProviderKind::Vertex,
+            FALLBACK_MODEL,
+        );
+        fallback.default_effort = Some("medium");
+        registry
+            .write()
+            .unwrap()
+            .insert(FALLBACK_MODEL.to_string(), fallback);
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            ModelDefaults {
+                registry: &registry,
+                fallback_model: FALLBACK_MODEL,
+            },
             None,
             None,
             overrides(None, None),
         )
         .await;
         assert_eq!(resolved.model, None);
-        assert_eq!(
-            resolved.reasoning_effort.as_deref(),
-            Some(prefs::CHAT_REASONING_EFFORT.default_text())
-        );
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1404,17 +1615,68 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// A remembered tier belongs to the model it ran with. A thread that moved
+    /// to another model forgets it, and finds it again on switching back.
     #[tokio::test]
-    async fn last_thread_chat_settings_resolves_each_field_independently() {
-        // A newer message carrying only a model must NOT erase an older effort —
-        // each field is the latest non-empty value on its own.
+    async fn a_remembered_effort_never_outlives_its_model() {
         let (pool, db_name) = setup_test_db().await;
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("model-a"), Some("high")).await;
         insert_message_received(&pool, tid, Some("model-b"), None).await;
         let resolved = PreferenceStore::last_thread_chat_settings(&pool, tid, None, None).await;
         assert_eq!(resolved.model.as_deref(), Some("model-b"));
-        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(resolved.reasoning_effort, None);
+        let back =
+            PreferenceStore::last_thread_chat_settings(&pool, tid, None, Some("model-a")).await;
+        assert_eq!(back.reasoning_effort.as_deref(), Some("high"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A thread whose starters stamped no model (an unset `chat_model`) still
+    /// remembers its tier, since it stays on the same unnamed model.
+    #[tokio::test]
+    async fn a_thread_with_no_stamped_model_keeps_its_tier() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_message_received(&pool, tid, None, Some("max")).await;
+        let resolved = PreferenceStore::last_thread_chat_settings(&pool, tid, None, None).await;
+        assert_eq!(resolved.model, None);
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("max"));
+        let switched =
+            PreferenceStore::last_thread_chat_settings(&pool, tid, None, Some("model-b")).await;
+        assert_eq!(switched.reasoning_effort, None);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A model-less thread ran on the router's model, so its tier does not
+    /// follow it onto a `chat_model` the account set since.
+    #[tokio::test]
+    async fn a_model_less_thread_tier_stops_at_a_named_chat_model() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_message_received(&pool, tid, None, Some("max")).await;
+        let registry = crate::llm::model_registry::empty();
+        let resolve = || {
+            PreferenceStore::resolve_chat_overrides_for_thread(
+                &pool,
+                ModelDefaults {
+                    registry: &registry,
+                    fallback_model: FALLBACK_MODEL,
+                },
+                Some(tid),
+                None,
+                overrides(None, None),
+            )
+        };
+        assert_eq!(resolve().await.reasoning_effort.as_deref(), Some("max"));
+        crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "model-b")
+            .await
+            .unwrap();
+        let named = resolve().await;
+        assert_eq!(named.model.as_deref(), Some("model-b"));
+        assert_eq!(named.reasoning_effort, None);
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1444,6 +1706,10 @@ mod tests {
         insert_message_received(&pool, tid, Some("thread-model"), Some("thread-effort")).await;
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            ModelDefaults {
+                registry: &crate::llm::model_registry::empty(),
+                fallback_model: FALLBACK_MODEL,
+            },
             Some(tid),
             None,
             overrides(None, None),
@@ -1460,16 +1726,20 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("thread-model"), Some("thread-effort")).await;
-        // Override the model only → effort still comes from the thread (per field).
+        // Override the model only → the thread's tier stays with its old model.
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            ModelDefaults {
+                registry: &crate::llm::model_registry::empty(),
+                fallback_model: FALLBACK_MODEL,
+            },
             Some(tid),
             None,
             overrides(Some("override-model"), None),
         )
         .await;
         assert_eq!(resolved.model.as_deref(), Some("override-model"));
-        assert_eq!(resolved.reasoning_effort.as_deref(), Some("thread-effort"));
+        assert_eq!(resolved.reasoning_effort, None);
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1481,6 +1751,10 @@ mod tests {
         // A brand-new thread (no messages) → account preference.
         let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            ModelDefaults {
+                registry: &crate::llm::model_registry::empty(),
+                fallback_model: FALLBACK_MODEL,
+            },
             Some(Uuid::new_v4()),
             None,
             overrides(None, None),
@@ -1491,6 +1765,10 @@ mod tests {
         // Thread-less resolve behaves the same (caller override → preference).
         let threadless = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            ModelDefaults {
+                registry: &crate::llm::model_registry::empty(),
+                fallback_model: FALLBACK_MODEL,
+            },
             None,
             None,
             overrides(None, None),
@@ -1512,6 +1790,10 @@ mod tests {
         // The same model keeps the backend it was pinned to.
         let same = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            ModelDefaults {
+                registry: &crate::llm::model_registry::empty(),
+                fallback_model: FALLBACK_MODEL,
+            },
             Some(tid),
             None,
             overrides(None, None),
@@ -1522,6 +1804,10 @@ mod tests {
         // Switching the model drops it, so the new model's row decides.
         let switched = PreferenceStore::resolve_chat_overrides_for_thread(
             &pool,
+            ModelDefaults {
+                registry: &crate::llm::model_registry::empty(),
+                fallback_model: FALLBACK_MODEL,
+            },
             Some(tid),
             None,
             overrides(Some("sonnet"), None),

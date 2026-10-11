@@ -24,8 +24,9 @@
 # A cargo suite waits on the build memory gate before it starts, and exits 72
 # when the host never recovers (ADR 0351).
 #
-# The run stays in the caller's process group, so the turn-end teardown still
-# reaches it. `stop` walks the pid tree from the recorded pid, never by name.
+# The run carries the caller's agent run marker, so the turn-end teardown
+# still reaches it (ADR 0391). `stop` walks the pid tree from the recorded pid,
+# never by name.
 #
 # State and logs: .lucidos/harden-suites/ in the worktree (gitignored).
 #

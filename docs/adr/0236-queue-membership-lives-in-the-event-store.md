@@ -10,7 +10,7 @@ then handed to that turn's in-memory injection channel. The agentic loop drains
 the channel at its next round boundary.
 
 An engine restart killed the channel, and nothing on any resume path read the
-row back. The message was then named by no `UserPromptInjected`, no
+row back. The message was then named by no `PromptInjected`, no
 `QueuedMessageRemoved` and no response. It rendered as a "Queued" bubble pinned
 to the transcript that only the user's trash icon could clear. Dozens of such
 rows accumulated over 60 days in one workspace.
@@ -38,7 +38,7 @@ completely, and it loses them silently, because each item is still sitting in
 the database looking fine.
 
 The cursor was already written down here, in three markers nobody read: a
-`UserPromptInjected.injected_message_id` (consumed), a
+`PromptInjected.injected_message_id` (consumed), a
 `QueuedMessageRemoved.removed_message_id` (retracted), and any event's
 `request_event_id` (a turn picked it up). Turning those into a query is
 cheaper than inventing a queue table. It also cannot drift from the timeline

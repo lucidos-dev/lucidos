@@ -6,6 +6,7 @@
 //! the emit helpers are grouped by responsibility seam in the sibling modules.
 
 mod actor;
+mod capture;
 mod cause;
 mod channel;
 mod emit;
@@ -23,13 +24,14 @@ pub use actor::{
     ActorMode, AgentParticipant, EngineReason, EventWaitOutcome, MessageOrigin,
     PluginSetupOccasion, ThreadDirection,
 };
-pub use cause::{AbortCause, CancelCause, EventWaitCancelCause};
+pub use capture::CaptureFormat;
+pub use cause::{AbortCause, CancelCause, EventWaitCancelCause, UnproposedReason};
 pub use channel::{EventChannel, TriggerInvocation};
 pub use event::ThreadEvent;
 pub use form_request::FormRequestOutcome;
 pub use memory::RecalledMemory;
 pub use meta::EventMeta;
-pub use question::{AnswerKind, QuestionOption};
+pub use question::{AnswerKind, OwnerApproval, QuestionOption, WidgetEmbed};
 pub use session::{
     ChildCompletionStatus, SessionEndReason, SubThreadPendingChange, VoiceSessionEndReason,
 };

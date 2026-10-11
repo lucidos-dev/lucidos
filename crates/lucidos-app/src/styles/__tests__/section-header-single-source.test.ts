@@ -46,6 +46,18 @@ describe('the list panels share one section header', () => {
     expect(read('components/drawer/ThreadDrawer.tsx')).toContain('<SectionHeaderContent');
   });
 
+  it('gives every collapsible header the chevron, from the shared content', () => {
+    // The two components that mark a header collapsible. Each passes
+    // `collapsible`, which is what draws the chevron.
+    for (const path of ['components/shared/SectionHeader.tsx', 'components/drawer/ThreadDrawer.tsx']) {
+      const src = read(path);
+      expect(src, path).toContain('list-section-title-collapsible');
+      expect(src, path).toMatch(/<SectionHeaderContent\b[^>]*\bcollapsible\b/);
+    }
+    const panels = Object.values(PANELS).map(read);
+    expect(panels.some(src => src.includes('list-section-title-collapsible'))).toBe(false);
+  });
+
   it('leaves no panel its own header class', () => {
     const sources = [
       ...Object.values(PANELS),

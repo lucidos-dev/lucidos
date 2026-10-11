@@ -79,6 +79,10 @@ pub struct BackfillProgress {
     /// The ready flag is set, so turns read the trees while the older
     /// threads still fill in.
     pub ready: bool,
+    /// The order of the frame that announced this count, rising across one
+    /// engine's life. A snapshot carries the last frame's order, so a client
+    /// drops a frame its snapshot already counted.
+    pub seq: u64,
 }
 
 /// What `GET /api/v1/memory/tree-backfill` serves.
@@ -198,25 +202,14 @@ fn model_cap(caps: &str, model: &str) -> Option<usize> {
 
 /// Parse `model=bytes, model=bytes`. Blank parses to no caps.
 pub(crate) fn parse_model_caps(value: &str) -> Result<Vec<(String, usize)>, String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(|item| {
-            let (id, bytes) = item
-                .split_once('=')
-                .ok_or_else(|| format!("'{item}' is not model=bytes"))?;
-            let id = id.trim();
-            if id.is_empty() {
-                return Err(format!("'{item}' names no model"));
-            }
-            let bytes: usize = bytes
-                .trim()
-                .parse()
-                .map_err(|_| format!("'{item}' has no whole number of bytes"))?;
-            Ok((id.to_string(), bytes))
-        })
-        .collect()
+    let pairs = prefs::parse_model_pairs(value, "bytes", |raw| {
+        raw.parse::<usize>()
+            .map_err(|_| "has no whole number of bytes".to_string())
+    })?;
+    Ok(pairs
+        .into_iter()
+        .map(|(id, bytes)| (id.to_string(), bytes))
+        .collect())
 }
 
 #[cfg(test)]

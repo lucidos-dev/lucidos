@@ -5,34 +5,34 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { attentionTarget, deepLinkAnchorForEvent, stampedEventIds } from '../exchange-render';
+import { landingTarget, deepLinkAnchorForEvent, stampedEventIds } from '../exchange-render';
 import type { Exchange } from '../exchange';
 import type { StoredEvent } from '../thread-event-types';
 
 /**
- * A deep-link resolves in the DOM by `data-event-id`, and only two elements
- * ever carry one. `deepLinkAnchorForEvent` is what lets a link to an event that
- * carries NEITHER (any ordinary step, e.g. the `CodingAgentIdled` an event wait
+ * A deep-link resolves in the DOM by `data-event-id`, and only three kinds of
+ * element ever carry one. `deepLinkAnchorForEvent` is what lets a link to an event that
+ * carries none of them (any ordinary step, e.g. the `CodingAgentIdled` an event wait
  * usually matches) still land, by re-targeting it at the turn that holds it.
  *
- * The set of self-stamping ids is declared once in `stampedEventIds`; the last
- * test here is the tripwire that fails if `ChatExchange` grows a third stamp
- * without declaring it.
+ * The set of self-stamping ids is declared once in `stampedEventIds`; the
+ * tripwires here fail if `ChatExchange` or `WidgetCard` grows a stamp without
+ * declaring it.
  */
 
 const evt = (type: string, id: string, over: Record<string, unknown> = {}): StoredEvent =>
   ({ type, _eventId: id, ...over }) as unknown as StoredEvent;
 
 let seq = 0;
-function exchange(starterId: string, stepIds: [string, string][] = []): Exchange {
+function exchange(starterId: string, stepIds: [string, string, Record<string, unknown>?][] = []): Exchange {
   return {
     userEvent: evt('MessageReceived', starterId, { content: 'hi' }),
     userSeq: ++seq,
-    steps: stepIds.map(([type, id]) => ({
+    steps: stepIds.map(([type, id, fields]) => ({
       seq: ++seq,
       event: type === 'ResponseFailed'
         ? evt(type, id, { error: 'boom' })
-        : evt(type, id),
+        : evt(type, id, fields),
     })),
   } as unknown as Exchange;
 }
@@ -58,6 +58,13 @@ describe('deepLinkAnchorForEvent', () => {
     ];
     expect(deepLinkAnchorForEvent(exchanges, 'idle-1')).toBe('start-2');
     expect(deepLinkAnchorForEvent(exchanges, 'tool-1')).toBe('start-2');
+  });
+
+  /** "Show in thread" lands on the widget's card, not on the message before
+   *  it, so the card's stamp must be declared. */
+  it('returns the event itself for a WidgetShown, which stamps its own card', () => {
+    const exchanges = [exchange('start-1', [['ToolCalled', 'tool-1'], ['WidgetShown', 'widget-1']])];
+    expect(deepLinkAnchorForEvent(exchanges, 'widget-1')).toBe('widget-1');
   });
 
   it('returns null when no turn holds the event', () => {
@@ -119,6 +126,11 @@ describe('stampedEventIds', () => {
       .toEqual(['start-1', 'fail-1']);
   });
 
+  it('lists every widget card the turn showed', () => {
+    expect(stampedEventIds(exchange('start-1', [['WidgetShown', 'w-1'], ['ToolCalled', 't-1'], ['WidgetShown', 'w-2']])))
+      .toEqual(['start-1', 'w-1', 'w-2']);
+  });
+
   it('omits an id the DOM would not carry', () => {
     const noId = exchange('unused');
     (noId.userEvent as { _eventId?: string })._eventId = undefined;
@@ -133,17 +145,17 @@ describe('stampedEventIds', () => {
    * a source-scan, matching the `skeleton-guard` / `list-row-prose-guard`
    * precedent.
    *
-   * If this fails you added a `data-event-id` to `ChatExchange`: add the same id
-   * to `stampedEventIds`, then add its expression below.
+   * If this fails you added a `data-event-id` to one of these components: add
+   * the same id to `stampedEventIds`, then add its expression below.
    */
-  it('matches every data-event-id ChatExchange actually stamps', () => {
+  const stampsIn = (path: string) => {
     const here = dirname(fileURLToPath(import.meta.url));
-    const src = readFileSync(
-      resolve(here, '../../../components/chat/ChatExchange.tsx'),
-      'utf8',
-    );
-    const stamps = [...src.matchAll(/data-event-id=\{([^}]*)\}/g)].map(m => m[1].trim());
-    expect(stamps).toEqual([
+    const src = readFileSync(resolve(here, path), 'utf8');
+    return [...src.matchAll(/data-event-id=\{([^}]*)\}/g)].map(m => m[1].trim());
+  };
+
+  it('matches every data-event-id ChatExchange actually stamps', () => {
+    expect(stampsIn('../../../components/chat/ChatExchange.tsx')).toEqual([
       // The turn root: the exchange STARTER, and nothing for a turn with no
       // starter loaded (see `exchangeStarterId`).
       'exchangeStarterId(exchange)',
@@ -151,10 +163,15 @@ describe('stampedEventIds', () => {
       'error.eventId || undefined',
     ]);
   });
+
+  it('matches every data-event-id a widget card stamps', () => {
+    // The card and its "no longer exists" form: the `WidgetShown`'s own id.
+    expect(stampsIn('../../../components/widgets/WidgetCard.tsx')).toEqual(['eventId', 'eventId']);
+  });
 });
 
-/** Where opening a thread from Needs attention lands. */
-describe('attentionTarget', () => {
+/** Where opening a thread from Blocked lands. */
+describe('landingTarget from Blocked', () => {
   function question(id: string, toolUseId: string, answered = false): Exchange {
     return {
       userEvent: evt('UserQuestionAsked', id, { tool_use_id: toolUseId }),
@@ -167,12 +184,12 @@ describe('attentionTarget', () => {
 
   it('lands on the open question while the thread waits on the user', () => {
     const exchanges = [exchange('start-1'), question('q-1', 'tu-1'), exchange('start-2')];
-    expect(attentionTarget(exchanges, 'waiting_for_user_answer')).toEqual({ kind: 'card', eventId: 'q-1' });
+    expect(landingTarget(exchanges, 'waiting_for_user_answer', 'blocked')).toEqual({ kind: 'card', eventId: 'q-1' });
   });
 
   it('skips an answered question for the open one', () => {
     const exchanges = [question('q-old', 'tu-old', true), question('q-new', 'tu-new')];
-    expect(attentionTarget(exchanges, 'waiting_for_user_answer')).toEqual({ kind: 'card', eventId: 'q-new' });
+    expect(landingTarget(exchanges, 'waiting_for_user_answer', 'blocked')).toEqual({ kind: 'card', eventId: 'q-new' });
   });
 
   it('lands on the newest failure card when the thread failed', () => {
@@ -180,7 +197,7 @@ describe('attentionTarget', () => {
       exchange('start-1', [['ResponseFailed', 'fail-old']]),
       exchange('start-2', [['ResponseFailed', 'fail-new']]),
     ];
-    expect(attentionTarget(exchanges, 'failed')).toEqual({ kind: 'card', eventId: 'fail-new' });
+    expect(landingTarget(exchanges, 'failed', 'blocked')).toEqual({ kind: 'card', eventId: 'fail-new' });
   });
 
   /** History must not win: an old unanswered question or failure card stays in
@@ -191,19 +208,65 @@ describe('attentionTarget', () => {
       exchange('start-1', [['ResponseFailed', 'fail-old']]),
       exchange('start-2'),
     ];
-    expect(attentionTarget(exchanges, 'idle')).toEqual({ kind: 'turn', eventId: 'start-2' });
+    expect(landingTarget(exchanges, 'idle', 'blocked')).toEqual({ kind: 'turn', eventId: 'start-2' });
   });
 
   /** The card may be older than the loaded page, which the caller can fetch. */
   it('reports a card the loaded exchanges do not hold, with the newest turn as fallback', () => {
-    expect(attentionTarget([exchange('start-1'), exchange('start-2')], 'failed'))
+    expect(landingTarget([exchange('start-1'), exchange('start-2')], 'failed', 'blocked'))
       .toEqual({ kind: 'card-not-loaded', newestTurnId: 'start-2' });
   });
 
   it('carries no id when no turn has one', () => {
     const stray = exchange('unused');
     (stray.userEvent as { _eventId?: string })._eventId = undefined;
-    expect(attentionTarget([stray], 'idle')).toEqual({ kind: 'turn', eventId: null });
-    expect(attentionTarget([], 'failed')).toEqual({ kind: 'card-not-loaded', newestTurnId: null });
+    expect(landingTarget([stray], 'idle', 'blocked')).toEqual({ kind: 'turn', eventId: null });
+    expect(landingTarget([], 'failed', 'blocked')).toEqual({ kind: 'card-not-loaded', newestTurnId: null });
+  });
+});
+
+/** Where opening a thread from Review lands (ADR 0409): the turn that proposed
+ *  the ready change, else the newest turn, whose reply a read request names. */
+describe('landingTarget from Review', () => {
+  it('lands on the turn that proposed the change, not a later one', () => {
+    const exchanges = [
+      exchange('start-1', [['ChangeProposed', 'proposal', { change_id: 'c-1' }]]),
+      exchange('start-2'),
+    ];
+    expect(landingTarget(exchanges, 'idle', 'review', true)).toEqual({ kind: 'turn', eventId: 'start-1' });
+  });
+
+  /** An applied or discarded change stays in its turn, so a read request on a
+   *  later turn must not land on it. */
+  it('lands on the newest turn when the old proposal is no longer ready', () => {
+    const exchanges = [
+      exchange('start-1', [['ChangeProposed', 'proposal', { change_id: 'c-1' }]]),
+      exchange('start-2'),
+    ];
+    expect(landingTarget(exchanges, 'idle', 'review', false)).toEqual({ kind: 'turn', eventId: 'start-2' });
+  });
+
+  it('ignores a per-commit proposal, which carries no change id', () => {
+    const exchanges = [
+      exchange('start-1', [['ChangeProposed', 'commit', { change_id: '' }]]),
+      exchange('start-2'),
+    ];
+    expect(landingTarget(exchanges, 'idle', 'review', true)).toEqual({ kind: 'turn', eventId: 'start-2' });
+  });
+
+  /** One thread in both groups: a failed run with a ready change. Each tile
+   *  lands on its own target (plan invariant: target per group). */
+  it('lands a failed thread with a ready change by the tile it was opened from', () => {
+    const exchanges = [
+      exchange('start-1', [['ChangeProposed', 'proposal', { change_id: 'c-1' }], ['ResponseFailed', 'fail']]),
+    ];
+    expect(landingTarget(exchanges, 'failed', 'blocked', true)).toEqual({ kind: 'card', eventId: 'fail' });
+    expect(landingTarget(exchanges, 'failed', 'review', true)).toEqual({ kind: 'turn', eventId: 'start-1' });
+  });
+
+  it('lands on the newest turn for a read request, even on a failed thread', () => {
+    const exchanges = [exchange('start-1', [['ResponseFailed', 'fail']]), exchange('start-2')];
+    expect(landingTarget(exchanges, 'idle', 'review')).toEqual({ kind: 'turn', eventId: 'start-2' });
+    expect(landingTarget(exchanges, 'failed', 'review')).toEqual({ kind: 'turn', eventId: 'start-2' });
   });
 });

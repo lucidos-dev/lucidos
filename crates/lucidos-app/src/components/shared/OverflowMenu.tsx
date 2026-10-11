@@ -37,10 +37,28 @@ export interface OverflowMenuContext {
  *  menu belongs to. `at` opens it at the pointer instead of below `anchor`. */
 export type OverflowMenuOpener = (anchor: HTMLElement, at?: ViewportPoint) => void;
 
-/** Hands opening to a host. `trigger` says whether the ⋯ is drawn as well. */
+/** A mouse resting on the host this long opens the menu as a peek. */
+export const HOVER_OPEN_DELAY_MS = 300;
+/** A peek outlives the pointer leaving by this long, so the pointer can cross
+ *  the gap between the host and the menu. */
+export const PEEK_CLOSE_DELAY_MS = 250;
+
+/** The host element's handlers for opening on hover. */
+export interface HoverOpening {
+  onPointerEnter(e: PointerEvent): void;
+  onPointerLeave(): void;
+  onPointerDown(): void;
+}
+
+/** Hands opening to a host. `trigger` says whether the ⋯ is drawn as well.
+ *  `align` places a menu the host opened against its anchor, and defaults to
+ *  the anchor's leading edge. `hoverRef` asks for hover opening too: the menu
+ *  publishes the host element's handlers there. */
 export interface HostOpener {
   ref: { current: OverflowMenuOpener | null };
   trigger: boolean;
+  align?: AnchorAlign;
+  hoverRef?: { current: HoverOpening | null };
 }
 
 /** The host's own content drawn as the menu button in place of the ⋯, such as
@@ -48,6 +66,8 @@ export interface HostOpener {
 export interface TriggerFace {
   class: string;
   children: ComponentChildren;
+  /** An icon-only face names itself here: its accessible name and tooltip. */
+  label?: string;
 }
 
 /** One way in, at most: a face cannot be combined with a host opener, whose
@@ -57,11 +77,13 @@ type MenuOpening =
   | { face: TriggerFace; hostOpener?: never };
 
 /** An open popover: the element it belongs to, and the box it is placed
- *  against. The two differ only for a menu opened at the pointer. */
+ *  against. The two differ only for a menu opened at the pointer. A `peek` was
+ *  opened by hover, and closes once the pointer leaves both host and menu. */
 interface Placement {
   anchor: HTMLElement;
   box: AnchorBox;
   align: AnchorAlign;
+  peek: boolean;
 }
 
 /** Generic ⋯ overflow menu: a trigger button and an anchored menu popover, with
@@ -77,6 +99,10 @@ interface Placement {
  *  trigger against the pane's right edge is the hardest place on a phone to
  *  hit. The ⋯ can only be hidden through `hostOpener` or a `face`, so a menu
  *  nothing can open is unrepresentable.
+ *
+ *  **A host can also open it on hover, as a peek.** The Home icon does: a mouse
+ *  resting on it lists Home's widgets. A peek closes once the pointer leaves
+ *  both the host and the menu, and a press on the host ends it.
  *
  *  **`face` draws the host's content as the trigger.** The thread title is its
  *  own menu button on both title rows. It is a toggle, so it stays the
@@ -143,11 +169,25 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   //
   // A host's anchor is a whole row, not a button at its end. Right-aligning to
   // it puts the panel back in the corner the long press exists to leave, so it
-  // aligns to the row's leading edge instead.
-  const placeAt = (anchor: HTMLElement): Placement =>
-    ({ anchor, box: anchor, align: drawsDots && anchor === triggerRef.current ? 'end' : 'start' });
+  // aligns to the row's leading edge instead, unless the host asks otherwise.
+  const placeAt = (anchor: HTMLElement, peek = false): Placement =>
+    ({ anchor, box: anchor, align: drawsDots && anchor === triggerRef.current ? 'end' : hostOpener?.align ?? 'start', peek });
+
+  // One timer serves both hover delays: the open while closed, the close while
+  // peeking. A peek is never keyboard-opened, so it has no focus to restore.
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearHoverTimer = () => {
+    if (hoverTimer.current !== null) { clearTimeout(hoverTimer.current); hoverTimer.current = null; }
+  };
+  useEffect(() => clearHoverTimer, []);
+  const peeking = menu?.peek ?? false;
+  const closePeekSoon = () => {
+    clearHoverTimer();
+    if (peeking) hoverTimer.current = setTimeout(() => { hoverTimer.current = null; setMenu(null); }, PEEK_CLOSE_DELAY_MS);
+  };
 
   const close = () => {
+    clearHoverTimer();
     setMenu(null);
     // A keyboard-opened menu owns DOM focus (an item inside the portal); hand it
     // back to the opener so the drawer's ↑/↓/Enter list-nav (or the header) is
@@ -177,22 +217,46 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   };
 
   // The host's entry point, published for its own gesture. It only ever OPENS:
-  // the host cannot call it while the menu is up, because an open overlay makes
-  // the shell behind it inert and the gesture never starts. Always a
-  // pointer-open, since a gesture is what invokes it.
+  // an open overlay makes the shell behind it inert, so the gesture never
+  // starts. A peek is the exception, since its host stays live, and a gesture
+  // there turns the peek into an ordinary menu. Always a pointer-open, since a
+  // gesture is what invokes it.
   //
   // Assigned during render rather than in an effect, so it is live from the
   // first frame. Cleared on unmount, so a row scrolled out of the list cannot
   // be opened through a stale handle.
-  const openFromGesture = (el: HTMLElement, at?: ViewportPoint) => {
+  const openFromGesture = (el: HTMLElement, at?: ViewportPoint, peek = false) => {
+    clearHoverTimer();
     onOpen?.();
     setOpenedViaKeyboard(false);
     lastFocusedRef.current = null;
-    setMenu(at ? { anchor: el, box: pointAnchor(at), align: 'start' } : placeAt(el));
+    setMenu(at ? { anchor: el, box: pointAnchor(at), align: 'start', peek } : placeAt(el, peek));
   };
   const hostRef = hostOpener?.ref;
   if (hostRef) hostRef.current = openFromGesture;
   useEffect(() => () => { if (hostRef) hostRef.current = null; }, [hostRef]);
+
+  // Hover opens for a mouse only: touch has no hover, and its hold already
+  // opens the menu. A press on the host ends a peek before the press's own
+  // gesture runs, so a tap goes where a tap goes.
+  const hoverRef = hostOpener?.hoverRef;
+  if (hoverRef) {
+    hoverRef.current = {
+      onPointerEnter: (e) => {
+        if (e.pointerType !== 'mouse') return;
+        clearHoverTimer();
+        if (open) return;
+        const el = e.currentTarget as HTMLElement;
+        hoverTimer.current = setTimeout(() => { hoverTimer.current = null; openFromGesture(el, undefined, true); }, HOVER_OPEN_DELAY_MS);
+      },
+      onPointerLeave: closePeekSoon,
+      onPointerDown: () => {
+        clearHoverTimer();
+        if (peeking) setMenu(null);
+      },
+    };
+  }
+  useEffect(() => () => { if (hoverRef) hoverRef.current = null; }, [hoverRef]);
 
   // ↑/↓/Home/End rove focus across the menu items (the Overlay owns Escape;
   // Enter/Space activate the focused <button> natively → its onClick).
@@ -228,7 +292,11 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   // host's row is never the anchor: its click focuses the thread, so exempting
   // it would let one tap both dismiss the menu and navigate. The re-open race
   // the exemption guards cannot happen there, because a tap never opens it.
-  const overlayAnchor = drawsTrigger ? triggerRef.current : null;
+  //
+  // A peek's host IS the anchor (frontend.md § Modals & Popovers, the hover
+  // peek). It must stay live above the inert shell, or the resting pointer
+  // reads as leaving. Its press ends the peek through `onPointerDown`.
+  const overlayAnchor = drawsTrigger ? triggerRef.current : peeking ? menu!.anchor : null;
 
   return (
     <>
@@ -262,7 +330,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
         panelClass="surface-box thread-overflow-menu"
         panelRole="menu"
         panelRef={menuRef}
-        panelProps={{ onKeyDown: handleMenuKeyDown }}
+        panelProps={{ onKeyDown: handleMenuKeyDown, onPointerEnter: clearHoverTimer, onPointerLeave: closePeekSoon }}
         panelStyle={pos
           ? { position: 'fixed', top: `${pos.top}px`, left: `${pos.left}px` }
           : { visibility: 'hidden' }}
@@ -293,6 +361,8 @@ function FaceTrigger({ face, open, triggerRef, onTap, onGesture }: {
       ref={triggerRef}
       type="button"
       class={face.class}
+      aria-label={face.label}
+      data-tooltip={face.label}
       aria-haspopup="menu"
       aria-expanded={open}
       onPointerDown={press.onPointerDown}

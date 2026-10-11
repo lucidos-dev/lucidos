@@ -508,7 +508,6 @@ impl LucidosEngine {
         let purpose = crate::engine::ContextPurpose::ConversationSummary;
         let call = self.aux_call(purpose).await;
         let provider = call.provider();
-        let recorded_model = call.model().to_string();
         let capture = crate::engine::AuxCapture::new(&self.event_bus, thread_id, purpose);
         let bus = self.event_bus.clone();
         let effort = call.reasoning().map(str::to_string);
@@ -535,7 +534,9 @@ impl LucidosEngine {
                         summary: text,
                         covers_through_event_id: boundary,
                         covered_count: covered_count as u32,
-                        model: recorded_model,
+                        // The model that answered, which a retired default
+                        // moved off (ADR 0403).
+                        model: provider.default_model().to_string(),
                     },
                     meta: crate::engine::thread_events::EventMeta::NONE,
                 },

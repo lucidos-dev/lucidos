@@ -32,12 +32,6 @@ vi.mock('../actions/thread-loading', () => ({
   sectionMutatedAt: new Map<string, number>(),
 }));
 
-vi.mock('../../components/chat/scrollState', () => ({
-  followSentMessage: vi.fn(),
-  stopFollowingBottom: vi.fn(),
-  notAtTop: { value: false },
-}));
-
 vi.mock('../../components/chat/promptFocus', () => ({
   focusPromptNow: vi.fn(),
 }));
@@ -61,11 +55,8 @@ function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'wait
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
@@ -173,7 +164,7 @@ describe('Apply button never shows Requesting label', () => {
 describe('Discard hides Apply and shows "Discard..."', () => {
   it('returns discarding state when discardingCCThreadIds is set', () => {
     const thread = makeCCThread('t1', 'waiting', 'inbox');
-    thread.meta.codingAgentProposed = true;
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     discardingCCThreadIds.value = new Set(['t1']);
@@ -214,7 +205,7 @@ describe('WaitingForUserAnswer surfaces Cancel so the user can abandon the quest
     // Save/Archive must NOT show while the question is still pending —
     // mid-turn work hasn't terminated yet.
     const thread = makeCCThread('t1', 'waiting_for_user_answer', 'inbox');
-    thread.meta.codingAgentProposed = true; // even with mid-turn work staged
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false }; // even with mid-turn work staged
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
@@ -252,7 +243,7 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
     // External repo: can't Apply (changes are in a different repo).
     // Must show Done, not a lone Discard button.
     const thread = makeCCThread('t1', 'waiting', 'inbox');
-    thread.meta.codingAgentProposed = true;
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     thread.meta.codingAgentIsExternalRepo = true;
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -267,14 +258,12 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
     }
   });
 
-  it('shows Diff for external repo with branch diff even when codingAgentProposed is false', () => {
-    // codingAgentProposed can drift to false while the branch is still ahead of main;
-    // codingAgentHasDiff is the git-truth signal that survives that drift, so the
-    // Diff button stays shown.
+  it('shows Diff for an external repo whose branch holds unproposed work', () => {
+    // An external repo never proposes, so its work stays unproposed. The
+    // branch still differs from main, so the Diff button stays shown.
     const thread = makeCCThread('t1', 'idle', 'inbox');
-    thread.meta.codingAgentProposed = false;
+    thread.meta.codingAgentChangeState = { kind: 'unproposed', reason: null };
     thread.meta.codingAgentIsExternalRepo = true;
-    thread.meta.codingAgentHasDiff = true;
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
@@ -288,15 +277,12 @@ describe('External repo CC thread shows Done instead of lone Discard', () => {
 });
 
 describe('Diff button shows only when the CC thread has a diff', () => {
-  it('internal CC thread with codingAgentHasDiff=true shows Diff even without a Change row', () => {
-    // CC made commits on the branch and the projection saw the branch is
-    // ahead of main (codingAgentHasDiff=true), but the Change row hasn't
-    // materialized yet. Diff is still shown — the git-truth signal carries
-    // the affordance independently of the Change row's appearance.
+  it('internal CC thread with a proposal shows Diff even without a Change row', () => {
+    // The thread reads proposed, but the Change row hasn't materialized yet.
+    // Diff is still shown: only a row that lists no files hides it.
     const thread = makeCCThread('t1', 'waiting', 'inbox');
-    thread.meta.codingAgentProposed = true;
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     thread.meta.codingAgentIsExternalRepo = false;
-    thread.meta.codingAgentHasDiff = true;
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
@@ -313,7 +299,7 @@ describe('Diff button shows only when the CC thread has a diff', () => {
     // not rendered at all — there is nothing to look at, so the affordance
     // would only mislead.
     const thread = makeCCThread('t1', 'idle', 'inbox');
-    thread.meta.codingAgentProposed = false;
+    thread.meta.codingAgentChangeState = { kind: 'none' };
     thread.meta.codingAgentIsExternalRepo = false;
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -365,6 +351,8 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
       files: [],
       requires_restart: false,
       hardened: false,
+      needs_hardening: true,
+      apply_ready: false,
       status: 'pending',
       created_at: '',
       resolved_at: null,
@@ -402,6 +390,8 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
       files: ['a.ts', 'b.ts'],
       requires_restart: false,
       hardened: false,
+      needs_hardening: true,
+      apply_ready: false,
       status: 'pending',
       created_at: '',
       resolved_at: null,
@@ -425,15 +415,14 @@ describe('Pending change with file_count=0 must not show Apply/Discard', () => {
 
 describe('Apply* marker sources requires_restart from pending change', () => {
   // Regression: WaitingBanner used to read requiresRestart only from
-  // meta.codingAgentRequiresRestart (set by CodingAgentIdled). When a stale or fallback
-  // CodingAgentIdled set that flag to false but the actual pending change had
+  // the thread meta's restart flag. When a stale or fallback write set that
+  // flag to false but the actual pending change had
   // requires_restart=true (e.g. recovery hardcoded false, or mid-iteration
   // transition), the button incorrectly showed a plain "Apply" instead of "Apply*".
   // The change row's own requires_restart is the authoritative file-derived value.
   it('shows requiresRestart when pending change has requires_restart=true even if meta says false', () => {
     const thread = makeCCThread('t1', 'waiting', 'inbox');
-    thread.meta.codingAgentProposed = true;
-    thread.meta.codingAgentRequiresRestart = false; // stale meta
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false }; // stale meta
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     changes.value = { status: 'loaded', data: [{
@@ -448,6 +437,8 @@ describe('Apply* marker sources requires_restart from pending change', () => {
       files: ['crates/lucidos-engine/src/main.rs'],
       requires_restart: true, // authoritative file-derived value
       hardened: false,
+      needs_hardening: true,
+      apply_ready: false,
       status: 'pending',
       created_at: '',
       resolved_at: null,
@@ -475,8 +466,7 @@ describe('Apply* marker sources requires_restart from pending change', () => {
     // Symmetric: meta-only signal still works (e.g. before SSE delivers the
     // changes-updated broadcast).
     const thread = makeCCThread('t1', 'waiting', 'inbox');
-    thread.meta.codingAgentProposed = true;
-    thread.meta.codingAgentRequiresRestart = true;
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: true };
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
@@ -497,7 +487,7 @@ describe('Apply Now — SessionEnded must not clear applying state', () => {
     // THEN proposes the change (ChangeProposed). Between those two events,
     // applyingNowThreadIds must stay set so the banner keeps showing "Applying...".
     const thread = makeCCThread('t1', 'waiting', 'inbox');
-    thread.meta.codingAgentProposed = true;
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     applyingNowThreadIds.value = new Map([['t1', 'requesting']]);

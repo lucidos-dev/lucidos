@@ -48,6 +48,10 @@ const AUDITED: Record<string, { how: string; requires: RegExp | null }> = {
     how: 'a reconciler only: it corrects a drifted transform and gates nothing',
     requires: null,
   },
+  'hooks/useAnchoredPopover.ts': {
+    how: 'a reconciler only: it re-measures a panel whose anchor glided, after the open already measured it',
+    requires: null,
+  },
 };
 
 /** Code with comments removed, so a doc comment naming an event is not a use. */

@@ -3,9 +3,8 @@
  *  the card it answers rather than as a queued row below it. */
 import { describe, expect, it } from 'vitest';
 import { computeExchanges, type PendingUserMessage, type ThreadEvent, type ThreadStatus } from '../thread-events';
-import { questionTheSendAnswers } from '../../components/chat/prompt-input-helpers';
 import { makeThreadState, TS } from './thread-events-helpers';
-import { pendingAnswers } from '../pendingDecisions';
+import { pendingAnswers, questionTheSendAnswers } from '../pendingDecisions';
 
 const asked = {
   type: 'UserQuestionAsked',

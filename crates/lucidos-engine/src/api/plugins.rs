@@ -935,6 +935,7 @@ mod tests {
             engine_requirement: None,
             engine_compatible: true,
             engine_incompatible_reason: None,
+            media: Default::default(),
         }
     }
 

@@ -209,10 +209,10 @@ describe('Flow: Interrupted exchanges', () => {
     expect(getLabel(exchanges[0], '', false)).toBe('Done');
   });
 
-  it('chat exchange interrupted by mid-flight UPI shows interrupted, not Working', () => {
+  it('chat exchange interrupted by mid-flight PromptInjected shows interrupted, not Working', () => {
     // Reproduces the bug from the "Verifying Git Pull Permission Error" thread:
     // user sends MR1, agent starts processing (steps with req_id=MR1), user sends MR2
-    // mid-flight, engine emits UPI absorbed into MR2. Both panels showed "Working"
+    // mid-flight, engine emits a PromptInjected absorbed into MR2. Both panels showed "Working"
     // because the prior chat exchange had visible steps and no terminator — falling
     // through to 'streaming'. Only the LAST panel should be Working.
     const { map, id } = makeThread();
@@ -226,9 +226,9 @@ describe('Flow: Interrupted exchanges', () => {
       { type: 'ToolCalled', name: 'Read', args: {}, request_event_id: mr1Id, created: '2026-01-01T00:00:10Z' } as any,
       { type: 'ToolResult', name: 'Read', result: 'ok', request_event_id: mr1Id, created: '2026-01-01T00:00:11Z' } as any,
       { type: 'MessageReceived', text: 'Also use more horizontal space...', created: '2026-01-01T00:00:30Z', event_id: mr2Id },
-      // UPI absorbs into MR2's exchange and sets reqIdRedirect[mr1Id]=E2 —
+      // PromptInjected absorbs into MR2's exchange and sets reqIdRedirect[mr1Id]=E2 —
       // subsequent req_id=mr1Id events redirect to E2.
-      { type: 'UserPromptInjected', text: 'Also use more horizontal space...', mode: 'human',
+      { type: 'PromptInjected', text: 'Also use more horizontal space...', mode: 'human',
         request_event_id: mr1Id, injected_message_id: mr2Id, created: '2026-01-01T00:01:00Z' } as any,
       { type: 'ThoughtStreamed', request_event_id: mr1Id, text: 'more thinking', created: '2026-01-01T00:01:05Z' } as any,
     ]);
@@ -833,7 +833,7 @@ describe('Flow: post-restart resume reminder', () => {
         request_event_id: 'mr-1',
       },
       // The resumed turn continues the ORIGINAL request — no ContinuationStarted,
-      // no engine-note UserPromptInjected.
+      // no engine-note PromptInjected.
       { type: 'TextStreamed', text: 'You selected **Option A**.', request_event_id: 'mr-1' },
       { type: 'ResponseGenerated', text: 'You selected **Option A**.', request_event_id: 'mr-1' },
     ] as Array<ThreadEvent & { created?: string; event_id?: string }>);
@@ -862,7 +862,7 @@ describe('Flow: post-restart resume reminder', () => {
       // engine note tells them what the model was told about the aborted run.
       { type: 'ContinuationStarted', actor: { kind: 'device', device_id: 'd-1' }, event_id: 'cs-1' },
       {
-        type: 'UserPromptInjected',
+        type: 'PromptInjected',
         mode: 'engine',
         text: '[Engine note — this is a rerun]\n'
           + 'The interrupted run performed the following actions before the abort:\n'
@@ -906,9 +906,9 @@ describe('Flow: an engine-restart resume reads in clock order', () => {
       { type: 'ToolResult', name: 'read_file', result: 'ok', tool_called_event_id: 'call-1', request_event_id: 'mr-1', created: '2026-01-01T07:55:12Z' },
       { type: 'ResponseAborted', request_event_id: 'mr-1', cause: 'recovery_after_restart', created: '2026-01-01T08:00:09Z' },
       // The wait wakes the thread first, and the turn anchors on this prompt.
-      { type: 'UserPromptInjected', text: 'A subscribed event arrived.', mode: 'agent', event_id: 'wake-1', created: '2026-01-01T08:00:38Z' },
+      { type: 'PromptInjected', text: 'A subscribed event arrived.', mode: 'agent', event_id: 'wake-1', created: '2026-01-01T08:00:38Z' },
       { type: 'ContinuationStarted', event_id: 'cs-1', created: '2026-01-01T08:00:39Z' },
-      { type: 'UserPromptInjected', text: '[Engine note] 50 prior tool calls', mode: 'engine', request_event_id: 'cs-1', created: '2026-01-01T08:00:39.400Z' },
+      { type: 'PromptInjected', text: '[Engine note] 50 prior tool calls', mode: 'engine', request_event_id: 'cs-1', created: '2026-01-01T08:00:39.400Z' },
       // Everything the resumed turn emits still carries the wake prompt's id.
       { type: 'TextStreamed', text: 'Picking it back up.', request_event_id: 'wake-1', created: '2026-01-01T08:00:55Z' },
       { type: 'ToolCalled', name: 'read_file', args: {}, request_event_id: 'wake-1', event_id: 'call-2', created: '2026-01-01T08:16:36Z' },
@@ -921,12 +921,12 @@ describe('Flow: an engine-restart resume reads in clock order', () => {
   it('files the resumed work under the resume boundary, not above it', () => {
     const exchanges = resumedAfterRestart();
     expect(exchanges.map(e => e.userEvent.type)).toEqual([
-      'MessageReceived', 'ResponseAborted', 'UserPromptInjected', 'ContinuationStarted',
+      'MessageReceived', 'ResponseAborted', 'PromptInjected', 'ContinuationStarted',
     ]);
     // The wake prompt opened the card; the resume boundary holds the work.
     expect(exchanges[2].steps).toHaveLength(0);
     expect(exchanges[3].steps.map(s => s.event.type)).toEqual([
-      'UserPromptInjected', 'TextStreamed', 'ToolCalled', 'ToolResult', 'TextStreamed',
+      'PromptInjected', 'TextStreamed', 'ToolCalled', 'ToolResult', 'TextStreamed',
     ]);
   });
 

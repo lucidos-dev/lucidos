@@ -276,9 +276,9 @@ async fn thread_summary_and_aggregate_include_attributed_recency() {
 /// An ARCHIVED actionable thread beyond the contiguous newest-by-`created_at`
 /// window is NOT injected by `get_recent_threads` — the outer `WHERE` has no
 /// out-of-window bypass, so archived `failed` / `waiting_for_user_answer` /
-/// `coding_agent_proposed` rows reach the drawer only via `get_older_threads`
+/// `proposed` rows reach the drawer only via `get_older_threads`
 /// pagination, at their true date. This keeps the Archive pile gap-free: the old
-/// `status = ANY(...)` / `coding_agent_proposed` bypasses jammed months-old failed
+/// `status = ANY(...)` / `proposed` bypasses jammed months-old failed
 /// threads directly under the newest window (the "26 Jun → 15 Apr gap" report).
 ///
 /// Archived-proposed is itself an impossible state (a pending change blocks the
@@ -300,8 +300,8 @@ async fn get_recent_threads_excludes_actionable_threads_beyond_window() {
         sqlx::query(
             "INSERT INTO thread_summaries \
                  (thread_id, title, source, message_count, created_at, last_activity, \
-                  has_response, status, coding_agent_proposed, archive_state) \
-                 VALUES ($1, $2, 'claude_code', 1, $3, $3, TRUE, 'idle', FALSE, 'archived')",
+                  has_response, status, coding_agent_change_state, archive_state) \
+                 VALUES ($1, $2, 'claude_code', 1, $3, $3, TRUE, 'idle', 'none', 'archived')",
         )
         .bind(Uuid::new_v4())
         .bind(format!("Window thread {}", i))
@@ -314,7 +314,7 @@ async fn get_recent_threads_excludes_actionable_threads_beyond_window() {
     // Older than every window row (secs ≥ 100 > the 0..14 window offsets): one
     // per actionable signal.
     let actionable: [(Uuid, &str, bool, i64); 3] = [
-        (Uuid::new_v4(), ThreadStatus::Idle.as_str(), true, 100), // coding_agent_proposed
+        (Uuid::new_v4(), ThreadStatus::Idle.as_str(), true, 100), // proposed
         (
             Uuid::new_v4(),
             ThreadStatus::WaitingForUserAnswer.as_str(),
@@ -328,14 +328,14 @@ async fn get_recent_threads_excludes_actionable_threads_beyond_window() {
         sqlx::query(
             "INSERT INTO thread_summaries \
                  (thread_id, title, source, message_count, created_at, last_activity, \
-                  has_response, status, coding_agent_proposed, archive_state) \
+                  has_response, status, coding_agent_change_state, archive_state) \
                  VALUES ($1, $2, 'claude_code', 1, $3, $3, TRUE, $4, $5, 'archived')",
         )
         .bind(id)
         .bind(format!("Beyond {}", status))
         .bind(created_at)
         .bind(status)
-        .bind(proposed)
+        .bind(if proposed { "proposed" } else { "none" })
         .execute(&pool)
         .await
         .expect("insert beyond-window actionable thread");
@@ -369,7 +369,7 @@ async fn get_recent_threads_excludes_actionable_threads_beyond_window() {
 /// REVIEW must contain every inbox thread, not just the newest N.
 /// An inbox row is one the user hasn't dismissed; capping it would silently
 /// hide work — e.g. a CC thread whose subprocess crashed mid-flow without
-/// emitting a terminal event keeps `coding_agent_proposed=false` and would be
+/// emitting a terminal event is not `proposed` and would be
 /// gated out solely by recency.
 #[tokio::test]
 async fn get_recent_threads_returns_all_inbox_threads_beyond_window() {
@@ -388,8 +388,8 @@ async fn get_recent_threads_returns_all_inbox_threads_beyond_window() {
         sqlx::query(
             "INSERT INTO thread_summaries \
                  (thread_id, title, source, message_count, last_activity, has_response, \
-                  status, coding_agent_proposed, archive_state) \
-                 VALUES ($1, $2, 'claude_code', 1, $3, TRUE, 'idle', FALSE, 'inbox')",
+                  status, coding_agent_change_state, archive_state) \
+                 VALUES ($1, $2, 'claude_code', 1, $3, TRUE, 'idle', 'none', 'inbox')",
         )
         .bind(id)
         .bind(format!("Inbox thread {}", i))
@@ -423,9 +423,9 @@ async fn get_recent_threads_returns_all_inbox_threads_beyond_window() {
     teardown_test_db(&db).await;
 }
 
-/// An inbox `coding_agent_proposed` thread with `has_response = FALSE` and an
+/// An inbox `proposed` thread with `has_response = FALSE` and an
 /// inert status still surfaces: the INNER candidate filter
-/// (`... OR coding_agent_proposed = TRUE`) makes it a candidate, and the
+/// (`... OR coding_agent_change_state = 'proposed'`) makes it a candidate, and the
 /// unbounded inbox clause returns it. Removing the OUTER bypasses must not drop
 /// this real inbox path (a freshly-proposed coding-agent thread before any
 /// response row).
@@ -438,8 +438,8 @@ async fn get_recent_threads_returns_inbox_proposed_without_response() {
     sqlx::query(
         "INSERT INTO thread_summaries \
              (thread_id, title, source, message_count, has_response, \
-              status, coding_agent_proposed, archive_state) \
-             VALUES ($1, 'Proposed inbox', 'claude_code', 1, FALSE, 'idle', TRUE, 'inbox')",
+              status, coding_agent_change_state, archive_state) \
+             VALUES ($1, 'Proposed inbox', 'claude_code', 1, FALSE, 'idle', 'proposed', 'inbox')",
     )
     .bind(id)
     .execute(&pool)
@@ -454,7 +454,7 @@ async fn get_recent_threads_returns_inbox_proposed_without_response() {
         recent.iter().map(|t| t.thread_id.as_str()).collect();
     assert!(
         returned.contains(id.to_string().as_str()),
-        "inbox coding_agent_proposed thread with no response must surface; got {} entries",
+        "inbox proposed thread with no response must surface; got {} entries",
         recent.len()
     );
 
@@ -477,8 +477,8 @@ async fn get_recent_threads_caps_archived_threads_at_limit() {
         sqlx::query(
             "INSERT INTO thread_summaries \
                  (thread_id, title, source, message_count, created_at, last_activity, has_response, \
-                  status, coding_agent_proposed, archive_state) \
-                 VALUES ($1, $2, 'chat', 1, $3, $3, TRUE, 'idle', FALSE, 'archived')",
+                  status, coding_agent_change_state, archive_state) \
+                 VALUES ($1, $2, 'chat', 1, $3, $3, TRUE, 'idle', 'none', 'archived')",
         )
         .bind(Uuid::new_v4())
         .bind(format!("Archived chat {}", i))
@@ -892,27 +892,35 @@ async fn thread_summary_includes_saved() {
     teardown_test_db(&db).await;
 }
 
-// -- coding_agent_has_diff plumbing through ThreadSummary / ThreadAggregate ----------
+// -- coding_agent_change_state plumbing through ThreadSummary / ThreadAggregate
 
-/// `get_threads_by_ids` (the canonical "fetch one summary" read path) returns
-/// the new `coding_agent_has_diff` field populated from the `coding_agent_has_diff`
-/// column. Without this, the wire format would drop the signal even though
-/// the projection + sweep maintain the column reliably on the write side.
-#[tokio::test]
-async fn thread_summary_includes_coding_agent_has_diff() {
-    let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
-
+/// Insert a coding-agent row holding unproposed work a Stop withheld.
+async fn insert_withheld_thread(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO thread_summaries \
-             (thread_id, title, source, message_count, last_activity, has_response, coding_agent_has_diff) \
-             VALUES ($1, 'CC with diff', 'claude_code', 1, NOW(), TRUE, TRUE)",
+             (thread_id, title, source, message_count, last_activity, has_response, \
+              coding_agent_change_state, coding_agent_unproposed_reason) \
+             VALUES ($1, 'CC with work', 'claude_code', 1, NOW(), TRUE, \
+                     'unproposed', 'turn_incomplete')",
     )
     .bind(id)
-    .execute(&pool)
+    .execute(pool)
     .await
     .expect("insert thread_summaries");
+    id
+}
+
+/// `get_threads_by_ids` (the canonical "fetch one summary" read path) carries
+/// the change state with its reason, as one tagged object on the wire.
+#[tokio::test]
+async fn thread_summary_includes_the_change_state_and_its_reason() {
+    use crate::engine::thread_events::UnproposedReason;
+    use crate::engine::thread_lifecycle::CodingAgentChangeState;
+
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let id = insert_withheld_thread(&pool).await;
 
     let infos = store
         .get_threads_by_ids(&[id.to_string()])
@@ -920,49 +928,107 @@ async fn thread_summary_includes_coding_agent_has_diff() {
         .expect("get_threads_by_ids");
 
     assert_eq!(infos.len(), 1, "the seeded row must come back");
-    assert!(
-        infos[0].coding_agent_has_diff,
-        "coding_agent_has_diff=TRUE in DB must surface as coding_agent_has_diff=true on ThreadSummary"
+    assert_eq!(
+        infos[0].coding_agent_change_state,
+        CodingAgentChangeState::Unproposed {
+            reason: Some(UnproposedReason::TurnIncomplete)
+        }
+    );
+    let json = serde_json::to_value(&infos[0]).expect("serialize ThreadSummary");
+    assert_eq!(
+        json.get("coding_agent_change_state"),
+        Some(&serde_json::json!({"kind": "unproposed", "reason": "turn_incomplete"})),
+        "{json}"
     );
 
     teardown_test_db(&db).await;
 }
 
-/// `fetch_thread_aggregate` returns `coding_agent_has_diff` populated from the
-/// DB column, and the JSON serialization uses the `codingAgentHasDiff` camelCase
-/// key — that's the field the frontend `meta.codingAgentHasDiff` reads.
+/// `fetch_thread_aggregate` carries the same state under the camelCase key
+/// the frontend's `meta.codingAgentChangeState` reads.
 #[tokio::test]
-async fn thread_aggregate_includes_coding_agent_has_diff() {
-    let (pool, db) = setup_test_db().await;
+async fn thread_aggregate_includes_the_change_state_and_its_reason() {
+    use crate::engine::thread_events::UnproposedReason;
+    use crate::engine::thread_lifecycle::CodingAgentChangeState;
 
-    let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO thread_summaries \
-             (thread_id, title, source, message_count, last_activity, has_response, coding_agent_has_diff) \
-             VALUES ($1, 'CC with diff', 'claude_code', 1, NOW(), TRUE, TRUE)",
-    )
-    .bind(id)
-    .execute(&pool)
-    .await
-    .expect("insert thread_summaries");
+    let (pool, db) = setup_test_db().await;
+    let id = insert_withheld_thread(&pool).await;
 
     let agg = fetch_thread_aggregate(&pool, id)
         .await
         .expect("fetch_thread_aggregate")
         .expect("aggregate row exists");
 
-    assert!(
-        agg.coding_agent_has_diff,
-        "coding_agent_has_diff=TRUE in DB must surface as coding_agent_has_diff=true on ThreadAggregate"
+    assert_eq!(
+        agg.coding_agent_change_state,
+        CodingAgentChangeState::Unproposed {
+            reason: Some(UnproposedReason::TurnIncomplete)
+        }
     );
-
     let json = serde_json::to_value(&agg).expect("serialize ThreadAggregate");
     assert_eq!(
-        json.get("codingAgentHasDiff"),
-        Some(&serde_json::json!(true)),
-        "wire JSON must use camelCase key 'codingAgentHasDiff' (matches the frontend's meta.codingAgentHasDiff); got {}",
-        json
+        json.get("codingAgentChangeState"),
+        Some(&serde_json::json!({"kind": "unproposed", "reason": "turn_incomplete"})),
+        "{json}"
     );
+
+    teardown_test_db(&db).await;
+}
+
+/// I1: every row is exactly one of `none`, `unproposed`, `proposed`. The
+/// database refuses a reason off `unproposed`, an unknown reason or kind, and
+/// a restart flag off `proposed`, and admits every legal combination.
+#[tokio::test]
+async fn thread_summaries_refuse_every_illegal_change_state() {
+    let (pool, db) = setup_test_db().await;
+    let insert = |kind: &'static str, reason: Option<&'static str>, restart: bool| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO thread_summaries \
+                     (thread_id, title, source, message_count, last_activity, has_response, \
+                      coding_agent_change_state, coding_agent_unproposed_reason, \
+                      coding_agent_requires_restart) \
+                 VALUES ($1, 'I1', 'claude_code', 0, NOW(), FALSE, $2, $3, $4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(kind)
+            .bind(reason)
+            .bind(restart)
+            .execute(&pool)
+            .await
+        }
+    };
+
+    for (kind, reason, restart) in [
+        ("proposed", Some("turn_incomplete"), false),
+        ("none", Some("plan_missing"), false),
+        ("unproposed", Some("tired"), false),
+        ("half_done", None, false),
+        ("unproposed", None, true),
+        ("none", None, true),
+    ] {
+        assert!(
+            insert(kind, reason, restart).await.is_err(),
+            "({kind}, {reason:?}, restart={restart}) must not store"
+        );
+    }
+
+    let mut legal = vec![
+        ("none", None, false),
+        ("unproposed", None, false),
+        ("proposed", None, false),
+        ("proposed", None, true),
+    ];
+    for reason in crate::engine::thread_events::UnproposedReason::ALL {
+        legal.push(("unproposed", Some(reason.as_str()), false));
+    }
+    for (kind, reason, restart) in legal {
+        assert!(
+            insert(kind, reason, restart).await.is_ok(),
+            "({kind}, {reason:?}, restart={restart}) is legal"
+        );
+    }
 
     teardown_test_db(&db).await;
 }

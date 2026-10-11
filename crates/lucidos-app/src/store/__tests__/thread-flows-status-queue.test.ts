@@ -110,7 +110,7 @@ describe('Timestamps', () => {
 
     // First exchange (non-last, has steps, no terminator) → 'interrupted'.
     // The user moved on with the follow-up; the chat fast-path will fold the
-    // follow-up into the running loop via UPI, with post-UPI events redirected
+    // follow-up into the running loop via a PromptInjected, with post-injection events redirected
     // to the new exchange. Only the last panel shows "Working".
     const firstStatus = exchangeStatus(exchanges[0], '', false);
     expect(firstStatus).toBe('interrupted');
@@ -721,11 +721,8 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
         activeChildrenCount: 0,
         totalChildrenCount: 0,
         blockingDescendantCount: 0, attentionDescendantCount: 0,
-        codingAgentProposed: false,
-        codingAgentRequiresRestart: false,
-        codingAgentIncomplete: false,
+        codingAgentChangeState: { kind: 'none' },
         codingAgentIsExternalRepo: false,
-        codingAgentHasDiff: false,
         lastRevivedAt: '',
         state: 'active',
         latestTodoList: null,
@@ -919,7 +916,7 @@ describe('Queued follow-ups behind an active turn', () => {
   });
 
   // The reported shape. A background task finished, and the delivery re-entered
-  // the thread through its `UserPromptInjected` re-entry anchor. The turn that
+  // the thread through its `PromptInjected` re-entry anchor. The turn that
   // anchor started was 66 seconds into a `run_bash` when the reader typed.
   //
   // A re-entry is a turn like any other, so the message queues behind it. Left
@@ -929,7 +926,7 @@ describe('Queued follow-ups behind an active turn', () => {
   it('a follow-up queues behind a turn a re-entry anchor started', () => {
     const { map, id } = makeThread('reentry-queue', 'running');
     insertEvents(map, id, [
-      { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived', mode: 'system' } as any,
+      { type: 'PromptInjected', text: 'An event you subscribed to has arrived', mode: 'system' } as any,
       { type: 'ThoughtStreamed', text: 'Context: 117888 tokens' } as any,
       { type: 'ToolCalled', name: 'run_bash', args: { command: 'make test' } } as any,
       { type: 'MessageReceived', text: 'put it in todo' } as any,
@@ -939,7 +936,7 @@ describe('Queued follow-ups behind an active turn', () => {
     // The premise, so the assertions below cannot pass vacuously: the anchor
     // really did start its own exchange and really does hold the live steps.
     expect(exchanges).toHaveLength(2);
-    expect(exchanges[0].userEvent.type).toBe('UserPromptInjected');
+    expect(exchanges[0].userEvent.type).toBe('PromptInjected');
     expect(exchanges[0].steps).toHaveLength(2);
 
     const run = queuedFollowupRun(exchanges, /* busy */ true);
@@ -952,7 +949,7 @@ describe('Queued follow-ups behind an active turn', () => {
     expect(getLabel(exchanges[0])).toBe('Working');
   });
 
-  it('queuedFollowupRun releases a follow-up once UserPromptInjected is absorbed', () => {
+  it('queuedFollowupRun releases a follow-up once PromptInjected is absorbed', () => {
     const active = {
       userEvent: { type: 'MessageReceived', text: 'active', created: TS } as any,
       userSeq: 1,
@@ -964,7 +961,7 @@ describe('Queued follow-ups behind an active turn', () => {
       steps: [{
         seq: 4,
         event: {
-          type: 'UserPromptInjected',
+          type: 'PromptInjected',
           text: 'injected follow-up',
           mode: 'human',
           injected_message_id: 'mr-2',

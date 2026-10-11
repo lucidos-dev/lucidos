@@ -1,22 +1,23 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, collapsedExchanges, collapsedInitiators, openSubAgentGroups, OPEN_SUB_AGENT_GROUPS_KEY, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, engineRestarting, focusedThreadId, threadMap, isThreadStreaming, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
+import { pageTitle, visibleWorkspaceName, animationSpeed, toastPlacement, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, collapsedExchanges, collapsedInitiators, openSubAgentGroups, OPEN_SUB_AGENT_GROUPS_KEY, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
-import { installSeenTargetWatch } from './actions/notification-visit';
 import { installAppAppearanceSync } from './actions/app-appearance';
 import { installNotificationToastLifetime } from './actions/in-app-notification-toast';
 import { installUnregisteredRepoTargetReset } from './actions/compose';
 import { installLiveUtteranceRow } from './liveUtterance';
-import { watchTranscriptLiveness } from './transcriptLiveness';
-import { setTranscriptLive } from '../components/chat/scrollState';
-import { voiceCall } from './voiceCall';
-import { isOnCall } from '../voice/callState';
 import { syncWorkspaceAppBadge } from './actions/app-badge';
 import { pushNativeWindowTitle } from '../utils/windowTitle';
 import { installMotionAttribute } from '../utils/motion';
 import { installThemeEffectsAttribute } from '../utils/themeEffects';
 import { ANIMATION_SPEED_STORAGE_KEY } from '@lucidos/appearance';
+import { drawerGrouping, appsList } from './store';
+import { threadFilterPanelOpen, closeThreadFilterPanel } from './threadFilterPanel';
+import { appIdsMissingFromFacets } from './appFilters';
+import { reloadFacetsForApps } from './actions/thread-loading';
+import { appById } from './appsById';
+import { forgetAppById, readAppsById } from './actions/appsById';
 
 // Sync page title with unread count and workspace name
 effect(() => {
@@ -49,6 +50,41 @@ effect(() => {
 effect(() => {
   syncWorkspaceAppBadge();
 });
+
+// The thread filter shapes the Folders grouping only, so a switch to Ongoing
+// closes its panel. At load too, for a panel restored open.
+effect(() => {
+  if (drawerGrouping.value === 'ongoing' && untracked(() => threadFilterPanelOpen.value)) closeThreadFilterPanel();
+});
+
+// The engine labels the app filter's facets (ADR 0404). A new thread's app
+// it does not list yet, such as a widget, earns one reload.
+effect(() => {
+  const ids = appIdsMissingFromFacets.value;
+  if (ids.length > 0) untracked(() => reloadFacetsForApps(ids));
+});
+
+// Opening a notification retries its app's failed read, once per open: this
+// effect reads nothing but the notification.
+effect(() => {
+  const appId = viewingNotification.value?.app_id;
+  if (appId && untracked(() => appById(appId).status) === 'failed') forgetAppById(appId);
+});
+
+// A notification may link a widget, which the apps list never holds (ADR
+// 0402). Read it by id, so only a 404 makes it "Unknown app".
+effect(() => {
+  const appId = viewingNotification.value?.app_id;
+  const apps = appsList.value;
+  if (!appId || apps.status !== 'loaded' || apps.data.some(a => a.id === appId)) return;
+  if (appById(appId).status === 'not-loaded') untracked(() => void readAppsById([appId]));
+});
+
+// The retired status filter's choice, and the open group of the grouping once
+// called Status. A device that held either lands on Folders. A temporary
+// measure: docs/temporary-measures.md § Retired drawer keys cleared at load.
+localStorage.removeItem('lucidos-alt-view');
+localStorage.removeItem('lucidos-drawer-open-status-group');
 
 // Clean up stale localStorage keys — model/effort are now per-thread, not persisted
 localStorage.removeItem('lucidos-model');
@@ -266,20 +302,14 @@ effect(() => {
   }
 });
 
-// The *seen target* rule: a notification clears once the reader has looked at
-// what its tap points at. Its own module owns the subscriptions it needs
-// (location, unread set, transcript, scroll, page wake). They stay beside the
-// rules they feed rather than spread across this file. See
-// actions/notification-visit.ts and system-knowhow/notifications.md §4.
-installSeenTargetWatch();
 installAppAppearanceSync();
 
 // A toast is the third projection of the unread set, beside the bell badge and
-// the Unread tab. So a row that has been read can hold no toast. The rule the
-// watch above runs is the loudest reason it exists: reaching a tap target drops
-// the notification, and the toast has to go with it. Wired beside its own
-// toasts for the same reason the watch is wired beside its own rules. See
-// actions/in-app-notification-toast.ts and system-knowhow/notifications.md §4.
+// the Unread tab. So a row that has been read can hold no toast. The *seen
+// target* rule (shellStartup.ts) is the loudest reason it exists: reaching a
+// tap target drops the notification, and the toast has to go with it. Wired
+// beside its own toasts. See actions/in-app-notification-toast.ts and
+// system-knowhow/notifications.md §4.
 installNotificationToastLifetime();
 
 // A deleted repository stops being the composer's target. See
@@ -290,15 +320,3 @@ installUnregisteredRepoTargetReset();
 // words finally land. Its own module for the same reason as the watch above:
 // the rule belongs beside the call it reads. See store/liveUtterance.ts.
 installLiveUtteranceRow();
-
-// The transcript's follow parks on a scroll unless the thread on screen is
-// live streaming: the agent running, or a call up on it. A call writes no
-// turn, so the projection alone reads it as quiet. See transcriptLiveness.ts.
-watchTranscriptLiveness({
-  focused: focusedThreadId,
-  threads: threadMap,
-  isLive: (thread) => isThreadStreaming(thread)
-    || (isOnCall(voiceCall.value.phase) && voiceCall.value.threadId === thread.meta.id),
-  setLive: setTranscriptLive,
-});
-

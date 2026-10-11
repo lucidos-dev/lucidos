@@ -345,7 +345,7 @@ impl LucidosEngine {
             PrefScope::Device => " for this device",
             PrefScope::Global => "",
         };
-        // `chat_model` / `chat_reasoning_effort` are the DEFAULT for NEW Lucidos
+        // `chat_model` / `chat_reasoning_efforts` are the DEFAULT for NEW Lucidos
         // Agent threads only — a thread that's already running reuses its own
         // last-used model/effort, independent of this preference (per-thread model
         // memory; see `PreferenceStore::resolve_chat_overrides_for_thread`). So the
@@ -355,7 +355,7 @@ impl LucidosEngine {
         // a per-thread value, not this account default.)
         let effect_note = match key {
             k if k == prefs::CHAT_MODEL.key() => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current model (whatever it last used), so this preference change does NOT switch the current thread's model on its next turn. To change a running thread's model, use its in-thread model picker.",
-            k if k == prefs::CHAT_REASONING_EFFORT.key() => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current reasoning effort (whatever it last used), so this preference change does NOT change the current thread's effort on its next turn. To change a running thread's effort, use its in-thread picker.",
+            k if k == prefs::CHAT_REASONING_EFFORTS.key() => " These are the defaults for NEW Lucidos Agent threads. A thread that's already running, including this one, keeps its current reasoning effort while it stays on the same model, so this change does NOT move the current thread's effort on its next turn. To change a running thread's effort, use its in-thread picker.",
             // A turn builds its system prompt once, at setup. So the style the
             // user just asked for lands on their NEXT message, and claiming
             // otherwise makes this very reply read as a broken promise.

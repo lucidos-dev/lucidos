@@ -14,8 +14,9 @@ pub(super) fn workspace_preamble(workspace_name: &str) -> String {
 fn process_safety_rule(include_lucidos_scripts: bool) -> String {
     let scripts = if include_lucidos_scripts {
         " To stop a specific workspace: `./scripts/stop.sh -w <workspace-path>`. \
-         For e2e, run `./scripts/e2e.sh` directly — it builds and boots its own \
-         session-scoped engine and cleans up after itself. Do NOT pre-start with \
+         For e2e, run `./scripts/e2e.sh` directly. It runs on GitHub by default; \
+         with `--local` it builds and boots its own session-scoped engine and \
+         cleans up after itself. Do NOT pre-start with \
          `./scripts/web-dev.sh`: that launches the machine-global gateway, which is \
          refused from a worktree (ADR 0021)."
     } else {
@@ -147,9 +148,10 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     summary. The option pair is a \
     FLOOR: `Approve` first, `Request changes` second ONLY when the plan offers no real fork. If \
     it offers one (a narrower scope, one layer instead of two), that fork takes the second slot \
-    and `Request changes` is dropped, never carried alongside it as a third. The approval itself \
+    and `Request changes` is dropped, never carried alongside it as a third. \
+    `Implement in a new thread` counts as a fork. The approval itself \
     is a DECISION question, not a post-work confirmation: the edit gate is closed until they \
-    answer, so approval asked in plain prose just leaves the thread sitting idle. Once the user \
+    answer, so approval asked in prose leaves the thread idle. Once the user \
     approves, run `lucidos planned approve` to flip the marker to gate-satisfying. Only then do \
     source edits and Apply unblock. Picking a fork is an approval too: revise the plan file to \
     that variant, re-commit, then run `lucidos planned approve`. If the user requests changes \
@@ -159,9 +161,9 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     `lucidos planned mark --simple \"<one-line reason>\"` (no \
     approval needed). A gate-satisfying marker MUST \
     exist before the change can be applied: Claude \
-    Code blocks your first source edit until one is set and approved, and Apply refuses a \
-    marker-less or unapproved change. Writing the plan file itself under `docs/plans/` is never \
-    blocked. Keep the plan's load-bearing invariants in view while you edit; do not defer their \
+    Code blocks your first source edit until one is set and approved, and Lucidos neither \
+    proposes nor applies a change without one. Each Apply consumes it. Writing the plan file \
+    itself under `docs/plans/` is never blocked. Keep the plan's load-bearing invariants in view while you edit; do not defer their \
     first appearance to `/harden`.";
 
 /// Restart-is-not-rejection note shared by the three recovery system prompts.
@@ -203,9 +205,8 @@ const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run 
 /// started them, and name the two waits that work.
 ///
 /// A coding-agent session is a per-turn subprocess. When the turn goes idle the
-/// engine tears down the whole process group, the agent and every child it
-/// spawned (`lifecycle::terminate_decision`,
-/// `runtime::spawn_env::graceful_kill_child_process_group`). Left alone the
+/// engine tears down the agent and every process it started, whatever group it
+/// runs in (`lifecycle::terminate_decision`, `runtime::agent_run_marker`). Left alone the
 /// agent trusts its Bash tool's native "runs across turns" contract, which is
 /// true for the standalone CLI and false here. Claude Code also dropped its
 /// blocking `TaskOutput` wait, so the rule must not name one.
@@ -231,8 +232,8 @@ const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run 
 /// end the turn" with no named wait, one session improvised a filler subagent
 /// and then a fabricated question.
 const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN: When your turn \
-    ends (you go idle), the Lucidos engine terminates your whole process group: you and every \
-    process you spawned. A job you detach (`&`, `nohup`, any detached job) is therefore KILLED \
+    ends (you go idle), the Lucidos engine terminates you and every process you started, \
+    whatever process group it runs in. A job you detach (`&`, `nohup`, any detached job) is therefore KILLED \
     the instant you end the turn, and nothing re-invokes you when it would have finished. Under \
     Claude Code, Lucidos switches background mode OFF: the `Bash` and `Agent` tools have no \
     `run_in_background` parameter, passing one fails, and a command that outruns its timeout is \
@@ -281,13 +282,15 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
 /// second ONLY when the plan offers no real fork, never a third slot beside one.
 /// Stated unconditionally, the pair yields a three-option card whose last button
 /// means only "I will type what I want changed". The NEVER AUTHOR AN "OTHER"
-/// OPTION paragraph below bans exactly that shape.
+/// OPTION paragraph below bans exactly that shape. `Implement in a new thread`
+/// counts like a fork, but only the plan rule and the CLI name it: this rule also
+/// serves external-repo sessions, which have no plan marker.
 ///
 /// The "WHY THE TOOL AND NOT PROSE" paragraph is what makes the two halves
 /// cohere instead of reading as a contradiction. Both describe ONE mechanism: a
 /// tool call parks the thread in `WaitingForUserAnswer`, the only input to
 /// `thread_lifecycle::is_attention_needing`. That predicate lights the
-/// needs-attention badge, keeps the thread in `DisplaySection::Current` once
+/// Blocked badge, keeps the thread in `DisplaySection::Current` once
 /// archived, bubbles up the ancestor chain via `attention_descendant_count`, and
 /// fires the "When agent needs me" trigger. Parking is therefore the COST when
 /// the work is finished and the POINT when the agent is blocked. A prose
@@ -371,7 +374,7 @@ const ASK_USER_QUESTION_RULE: &str =
      instead\".\n\n\
      WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
      waiting. It parks the thread in the waiting-for-answer state, which is what lights the \
-     needs-attention badge, keeps the thread in the live working set, and can push a \
+     Blocked badge, keeps the thread in the live working set, and can push a \
      notification to the user's phone. A question you type into your final message instead does \
      none of that: the turn ends, the thread reads as FINISHED, and the user gets no signal \
      that you are stuck. So a prose question is not a lighter-touch version of the tool. When \
@@ -556,8 +559,9 @@ const CODEX_CLI_RULE: &str = "\n\n\
 /// Codex-only slash-command mapping appended by [`append_backend_rules`]
 /// alongside [`CODEX_CLI_RULE`]. Lucidos prompts name Claude Code slash
 /// commands — the shared [`HARDENING_RULE`] ("run `/harden`"), the
-/// merge-conflict prompt's harden step, and the engine's auto-harden
-/// follow-up (`AUTO_HARDEN_MESSAGE`, "Run /harden now.") — but Codex has no
+/// merge-conflict prompt's harden step, the engine's auto-harden follow-up
+/// (`AUTO_HARDEN_MESSAGE`, "Run /harden now.") and the turn-end gate's harden
+/// re-entry — but Codex has no
 /// slash-command runtime, so without this mapping it has to guess what
 /// `/harden` means. It guessed badly in practice: 17% of Codex changes hit
 /// Apply with no harden marker vs 0.6% for CC (dev workspace, 2026-06/07),
@@ -617,7 +621,7 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     \"I will type it instead\". \
     WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
     waiting. It parks the thread in the waiting-for-answer state, which lights the \
-    needs-attention badge, keeps the thread in the live working set, and can notify the user. A \
+    Blocked badge, keeps the thread in the live working set, and can notify the user. A \
     question typed into your final message instead ends the turn, so the thread reads as \
     FINISHED and the user gets no signal that you are stuck. Blocked on the user: ask with this \
     tool. Work finished: don't ask at all, just hand it off. What is always wrong is ending a \
@@ -713,7 +717,30 @@ const SHOWING_AN_IMAGE_RULE: &str = "\n\n\
     layout or type, render real ones. A headless-browser screenshot of the actual CSS works. \
     ASCII art shows no colour. Give each option its own picture of only that option. Put it in \
     that option's `preview` if your tool has one, else label it in the question. Never repeat \
-    one combined sheet on every option.";
+    one combined sheet on every option. The `!` on an `app:` link draws a live widget the same \
+    way (see Widget embeds).";
+
+/// How a coding agent links a line it cites, so a click opens the file
+/// preview modal there. It names the session's own repository id, which the
+/// agent cannot look up from inside its worktree, and its branch: the agent
+/// mostly cites its own work, which the clone's `HEAD` does not have yet.
+/// Empty for an unregistered Lucidos checkout, whose files have no link form.
+///
+/// Mirrored for the chat agent by the FILE REFERENCES section of
+/// `chat::process::system_prompt`. Change both together.
+pub(super) fn file_link_rule(repo_id: Option<&str>, app_id: Option<&str>, branch: &str) -> String {
+    let example = match (app_id, repo_id) {
+        (Some(app), _) => format!("[app.js:5-9](apps/{app}/app.js#L5-L9)"),
+        (None, Some(repo)) => {
+            format!("[main.rs:5-9](repo:{repo}:file#{branch}:src/main.rs#L5-L9)")
+        }
+        (None, None) => return String::new(),
+    };
+    format!(
+        "\n\nLINK A FILE YOU CITE, or it is not clickable: `{example}`, with the path from the \
+         repository root. The `#L` suffix opens it at those lines; `#L5` is one line."
+    )
+}
 
 /// Backend-INDEPENDENT teaching appended to every coding-agent prompt by
 /// [`append_backend_rules`], the same chokepoint [`REASONING_NOT_VISIBLE_RULE`]
@@ -778,6 +805,50 @@ const PERMISSION_ASK_RULE: &str = "\n\n\
     question (Codex: your escalation justification). Write it for the user: what it does and \
     why, like \"Read the triggers doc, to see how triggers install\", not \"Run sed\".";
 
+/// Backend-independent, riding [`append_backend_rules`] like the rules above.
+///
+/// Every turn makes a *read decision* (ADR 0417). A coding agent's ready
+/// change already lists its thread under Review. A session that ends with an
+/// answer instead, and no change, says yes to get there (ADR 0409). The
+/// turn-end gate forces a decision the session skipped. The chat agent learns
+/// the same from the `request_read` tool's own description.
+const READ_DECISION_RULE: &str = "\n\n\
+    READ DECISION: End every turn with `lucidos request-read yes|no` before your final message. \
+    Yes for an answer and no change (an investigation, a review), or one read later. Else no.";
+
+/// Told only to a session whose turn the owner did not open (ADR 0387).
+/// Without it the agent learns from the 403, after an ordinary card's answer
+/// that grants nothing.
+const NO_STANDING_INSTRUCTION_NOTE: &str = "\n\n\
+    THE OWNER DID NOT OPEN THIS TURN: another thread or an event did. So Lucidos refuses, with a \
+    403, any act in this workspace outside your own subtree. Examples are `lucidos spawn-thread \
+    --relation top`, and an Apply, archive or cancel on a thread outside your subtree. An \
+    ordinary question card cannot authorize one, even when the owner picks the option naming \
+    it. When the decision you would ask about is such an act, ask for an owner approval INSTEAD \
+    of an ordinary card. Run `lucidos ask-owner-approval create-top-thread --reason \"<why>\"` \
+    for a top-thread, or `lucidos ask-owner-approval <verb> --thread <uuid> --reason \"<why>\"` \
+    for an act on a thread (`lucidos ask-owner-approval --help` lists the verbs). Then ask your \
+    question tool with the id it prints as the only question. Lucidos shows its own owner \
+    approval card, with Allow once, in its place. A 409 from it means you hold the authority \
+    after all, for example because the owner has written to you since. Then go ahead as usual. \
+    `--relation child` stays in your subtree and needs neither.";
+
+/// The [`NO_STANDING_INSTRUCTION_NOTE`] section for a session on `thread_id`,
+/// or empty when its current turn carries the owner's standing instruction.
+/// Reads the gate's own definition, so the note and the 403 cannot disagree.
+pub(super) async fn standing_instruction_section(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+) -> &'static str {
+    if crate::api::standing_instruction::carries_standing_instruction(pool, Some(thread_id), None)
+        .await
+    {
+        ""
+    } else {
+        NO_STANDING_INSTRUCTION_NOTE
+    }
+}
+
 /// Append backend-specific rules — plus the backend-independent
 /// [`REASONING_NOT_VISIBLE_RULE`], which rides every prompt here — to a finished
 /// system prompt — the single
@@ -802,7 +873,7 @@ pub(super) fn append_backend_rules(
     let prompt = format!(
         "{prompt}{REASONING_NOT_VISIBLE_RULE}{SHOWING_AN_IMAGE_RULE}\
          {HTML_ARTIFACT_TYPE_SCALE_RULE}{NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}\
-         {PERMISSION_ASK_RULE}"
+         {PERMISSION_ASK_RULE}{READ_DECISION_RULE}"
     );
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
@@ -832,9 +903,10 @@ pub(super) fn worktree_system_prompt(branch_name: &str, workspace_name: &str) ->
          code, which is what you want. `cargo build` and `cargo test` from your worktree \
          compile your worktree's source (Cargo resolves from `Cargo.toml` in cwd). \
          E2E: just run `./scripts/e2e.sh` (full API + browser) or `./scripts/e2e-api.sh` / \
-         `./scripts/e2e-browser.sh` for one suite. Each builds the engine + SDK and boots its \
-         own session-scoped engine for the disposable `e2e-test` workspace, then cleans up — \
-         there is NO separate start step. \
+         `./scripts/e2e-browser.sh` for one suite. They run on GitHub by default; an \
+         uncommitted tree or `--local` runs here. A local run builds the engine + SDK and boots its \
+         own session-scoped engine for the disposable `e2e-test` workspace, then cleans up. \
+         There is NO separate start step. \
          NEVER run `./scripts/web-dev.sh` (or `run.sh` / `tauri-dev.sh`) from your worktree. \
          Unlike the e2e scripts, `web-dev.sh` starts the MACHINE-GLOBAL gateway — and `-b` \
          stops the user's running one and relaunches it from whatever checkout invoked it. \
@@ -1208,6 +1280,20 @@ pub(crate) fn build_merge_prompt(
 mod tests {
     use super::*;
 
+    /// A reply's file link opens the file preview modal only when the UI can
+    /// resolve it. So the rule names the session's own locator, at its branch.
+    #[test]
+    fn file_link_rule_names_the_sessions_own_locator() {
+        let repo = file_link_rule(Some("3f9c1b2e"), None, "feature/x");
+        assert!(
+            repo.contains("(repo:3f9c1b2e:file#feature/x:src/main.rs#L5-L9)"),
+            "{repo}"
+        );
+        let app = file_link_rule(None, Some("habit-tracker"), "feature/x");
+        assert!(app.contains("(apps/habit-tracker/app.js#L5-L9)"), "{app}");
+        assert_eq!(file_link_rule(None, None, "feature/x"), "");
+    }
+
     /// Only the chat card has a `message` field. A coding agent told to use it
     /// would write a field its card tool drops.
     #[test]
@@ -1303,7 +1389,7 @@ mod tests {
 
     #[test]
     fn app_worktree_prompt_inlines_manifest_and_branch() {
-        let manifest = r#"{"name":"Habit Tracker","icon":"target"}"#;
+        let manifest = r#"{"name":"Habit Tracker","icon":"assets/icon.svg"}"#;
         let prompt = app_worktree_system_prompt(
             "claude-code/app/habit-tracker/20260527-100000-abc123",
             "dev",
@@ -1525,7 +1611,7 @@ mod tests {
     #[test]
     fn coding_agent_prompts_warn_background_processes_die_at_turn_end() {
         // A coding-agent session is a per-turn subprocess: at idle the engine
-        // tears down its whole process group, so a detached job still running
+        // tears down every process it started, so a detached job still running
         // as the turn ends is killed, and nothing wakes the agent. Without this
         // guidance a DMG-build thread restarted its build three times and never
         // produced an artifact. Every chat-style prompt must carry the warning;
@@ -1689,8 +1775,18 @@ mod tests {
         // The same four rose by 185 more when `APPLY_RESTART_RULE` learned
         // that every file a binary embeds requires a restart. An agent that
         // misses it promises an Apply the running engine never picks up.
-        ("worktree", "claude-code", 26813),
-        ("worktree", "codex", 24936),
+        //
+        // EVERY row carries `READ_DECISION_RULE` (ADR 0409, ADR 0417), under
+        // 200 bytes. Six rows had no slack and rose by it: these four and both
+        // conflict_resolution rows. Without it the engine forces every
+        // session's read decision, which costs an auxiliary call per turn.
+        //
+        // EVERY row carries the widget embed sentence in `SHOWING_AN_IMAGE_RULE`
+        // (ADR 0415), 85 bytes. Six rows had no slack and rose by it: these four
+        // and both conflict_resolution rows. The embed is how an option carries
+        // a sample the user must hear or try, and it rides the picture rule.
+        ("worktree", "claude-code", 27052),
+        ("worktree", "codex", 25192),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
@@ -1698,8 +1794,8 @@ mod tests {
         // an instruction the session cannot use.
         ("external_repo", "claude-code", 19293),
         ("external_repo", "codex", 17433),
-        ("recovery", "claude-code", 25408),
-        ("recovery", "codex", 23531),
+        ("recovery", "claude-code", 25568),
+        ("recovery", "codex", 23708),
         ("external_repo_recovery", "claude-code", 19169),
         ("external_repo_recovery", "codex", 17309),
         ("app_worktree", "claude-code", 21895),
@@ -1710,8 +1806,8 @@ mod tests {
         // `SHOWING_AN_IMAGE_RULE` learned that saving a picture shows nothing
         // either. The other rows had the slack to absorb it. Both rose again,
         // by 384, for its visual-choice clause: a real picture per option.
-        ("conflict_resolution", "claude-code", 6935),
-        ("conflict_resolution", "codex", 8205),
+        ("conflict_resolution", "claude-code", 7203),
+        ("conflict_resolution", "codex", 8473),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
@@ -2300,11 +2396,11 @@ mod tests {
             // A prose question ends the turn, so the thread looks finished and
             // nothing tells the user someone is waiting. Only the tool call
             // parks it in `WaitingForUserAnswer`, which drives the
-            // needs-attention badge, Review routing, and the notification
+            // Blocked badge, Review routing, and the notification
             // trigger. Pin the general form, not just the plan-approval case.
             assert!(
                 prompt.contains("WHY THE TOOL AND NOT PROSE"),
-                "{label} must say that only the tool marks the thread as needing attention, \
+                "{label} must say that only the tool marks the thread as blocked, \
                  so a prose question reads as a finished turn",
             );
             assert!(
@@ -2497,6 +2593,9 @@ mod tests {
                 // The card renders under the agent's message. A card restating
                 // the summary makes the user read the plan twice.
                 "never repeats the summary",
+                // Handing the build to a fresh thread counts like a fork. The
+                // when-and-how lives in `lucidos planned mark`'s output, not here.
+                "`Implement in a new thread` counts as a fork",
             ] {
                 assert!(
                     base.contains(needle),
@@ -2922,5 +3021,54 @@ mod tests {
              a pre-commit summary would mislead the user about whether the merge \
              actually succeeded"
         );
+    }
+
+    use crate::api::standing_instruction::tests::open_turn;
+
+    /// The case that refused a spawn the owner had picked on an ordinary card:
+    /// a thread another thread spawned. Its session must learn the approval
+    /// path before it asks, not from the 403.
+    #[tokio::test]
+    async fn a_session_another_thread_opened_is_told_to_ask_for_an_owner_approval() {
+        use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        let thread = uuid::Uuid::new_v4();
+        let spawner = MessageOrigin::ThreadLink {
+            thread_id: uuid::Uuid::new_v4(),
+            title: None,
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            direction: ThreadDirection::Parent,
+        };
+        open_turn(&bus, thread, ActorMode::Agent, spawner).await;
+
+        let section = standing_instruction_section(&pool, thread).await;
+        assert_eq!(section, NO_STANDING_INSTRUCTION_NOTE);
+        // Pins the CLI contract the note must teach: the command and its 409.
+        assert!(section.contains("lucidos ask-owner-approval"), "{section}");
+        assert!(section.contains("409"), "{section}");
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A turn the owner opened already carries their instruction, so the note
+    /// would only cost context.
+    #[tokio::test]
+    async fn a_session_the_owner_opened_gets_no_standing_instruction_note() {
+        use crate::engine::thread_events::{ActorMode, MessageOrigin};
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        let thread = uuid::Uuid::new_v4();
+        let owner = MessageOrigin::Device {
+            device_id: "device-abc".into(),
+        };
+        open_turn(&bus, thread, ActorMode::Human, owner).await;
+
+        assert_eq!(standing_instruction_section(&pool, thread).await, "");
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 }

@@ -499,3 +499,28 @@ event or migration.
 Implementation: `engine/cc_permission.rs` (`human_acted_in`,
 `resolve_attend_mode`). Plan:
 `docs/plans/2026-09-28-a-human-in-the-spawn-tree-attends-the-session.md`.
+
+## Addendum (2026-10-09): a judge that fails asks
+
+**Context.** On the chat lane, a judge call that never answered fell to
+`fallback_classify`. That classifier runs everything outside its static
+shapes, including shapes the fast path refused on purpose. So a judge outage
+showed the user *fewer* cards, and only the engine log said why. Haiku 4.5's
+retirement on Vertex would have made that the steady state for a Vertex-only
+workspace with the guard on.
+
+**Decision.** A failed judge call resolves to `JudgeVerdict::judge_failed`:
+`IrreversibleDanger`, category `Other`, and a card summary naming the
+failure. An interactive turn asks. An unattended trigger fails the run unless
+it granted `other`. The judge-off switch still means the static classifier.
+The Codex escalation lane already rendered the card on a judge failure, so it
+is unchanged.
+
+**Cost accepted.** A judge outage now costs a card per ambiguous command, and
+an unattended run stops on one. Retries on 429 and 5xx already absorb the
+transient failures, and a retired default model moves on by itself (ADR 0403).
+What is left is a failure the user should hear about.
+
+Implementation: `engine/command_judge.rs` (`JudgeVerdict::judge_failed`),
+`engine/command_permission.rs` (`judge_or_fallback`). Plan:
+`docs/plans/2026-10-09-haiku-4-5-vertex-retirement.md`.

@@ -4,6 +4,7 @@ use super::app_ui::{
 };
 use super::frame_capability;
 use super::*;
+use crate::engine::event_bus::{BusEvent, SystemEvent};
 
 use std::path::PathBuf;
 
@@ -180,6 +181,46 @@ pub(super) async fn delete_app(
         )
             .into_response(),
     }
+}
+
+/// POST /api/v1/app/opened?id=... - Record that the user opened an app's UI.
+/// The workspace prompt footprint judges an app's use by `AppOpened` alone
+/// (ADR 0413). So a widget or a missing app is refused.
+pub(super) async fn record_app_opened(
+    State(state): State<AppState>,
+    Query(query): Query<AppQuery>,
+    headers: HeaderMap,
+) -> Result<StatusCode, super::error::ApiError> {
+    let actor = super::actor::require_user_actor(&headers, &state.pool, None).await?;
+    if !is_valid_id(&query.id) {
+        return Err(super::error::ApiError::bad_request("Invalid app ID"));
+    }
+    match state.app_manager.app_kind(&query.id) {
+        Some(crate::core::AppKind::App) => {}
+        Some(crate::core::AppKind::Widget) => {
+            return Err(super::error::ApiError::bad_request(
+                "A widget is shown in a thread, not opened as an app",
+            ))
+        }
+        None => {
+            return Err(super::error::ApiError::not_found(format!(
+                "No app \"{}\"",
+                query.id
+            )))
+        }
+    }
+    state
+        .engine
+        .event_bus
+        .emit_or_log(
+            BusEvent::System(SystemEvent::AppOpened {
+                app_id: query.id,
+                actor: Some(actor),
+            }),
+            "[Apps] AppOpened",
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// PUT /api/v1/app?id=... - Update app metadata (name, description)
@@ -424,11 +465,7 @@ pub(super) async fn serve_app_file(
             }
         }
     } else {
-        state
-            .workspace_path
-            .join("data/apps")
-            .join(&app_id)
-            .join(&file_path)
+        state.app_manager.app_file_path(&app_id, &file_path)
     };
 
     match std::fs::read(&full_path) {
@@ -605,36 +642,40 @@ pub(super) async fn get_git_history_with_paths(
     git_log_for_path(workspace, prefix, limit, offset, true).await
 }
 
+/// A page answers a capture request. Only the device the request names may
+/// answer it; any other is refused and the request stays open for that one.
 pub(super) async fn submit_app_capture(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<AppCaptureRequest>,
-) -> impl IntoResponse {
-    let sender = {
-        let mut captures = state.engine.pending_captures.lock().unwrap();
-        captures.remove(&body.request_id)
+) -> Result<StatusCode, super::error::ApiError> {
+    use crate::engine::tools::app_capture::{resolve_capture, CaptureRefusal};
+    let claimed = body.device_id.as_deref();
+    let answering = match super::actor::require_user_actor(&headers, &state.pool, claimed).await? {
+        crate::engine::thread_events::MessageOrigin::Device { device_id } => Some(device_id),
+        _ => None,
     };
-    match sender {
-        Some(tx) => {
-            let _ = tx.send(CaptureResult {
-                screenshot: body.screenshot,
-                dom: body.dom,
-            });
-            StatusCode::OK
-        }
-        None => StatusCode::NOT_FOUND,
+    let result = CaptureResult {
+        screenshot: body.screenshot,
+        dom: body.dom,
+    };
+    match resolve_capture(
+        &state.engine.pending_captures,
+        &body.request_id,
+        answering.as_deref(),
+        result,
+    ) {
+        Ok(()) => Ok(StatusCode::OK),
+        Err(CaptureRefusal::Unknown) => Err(super::error::ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("No capture is waiting under request {}", body.request_id),
+        )),
+        Err(CaptureRefusal::OtherDevice) => Err(super::error::ApiError::new(
+            StatusCode::CONFLICT,
+            format!("Capture request {} is for another device", body.request_id),
+        )
+        .with_reason("capture-for-another-device")),
     }
-}
-
-pub(super) async fn serve_html2canvas() -> impl IntoResponse {
-    let js = include_bytes!("../../static/html2canvas.min.js");
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/javascript"),
-            (header::CACHE_CONTROL, "public, max-age=31536000"),
-        ],
-        js.as_slice(),
-    )
 }
 
 /// What the renewal call names.
@@ -695,12 +736,12 @@ async fn mint_artifact_preview_capability(headers: HeaderMap) -> Json<FrameCapab
     })
 }
 
-/// Routes for the `/apps`, `/app*`, `/app-capture`, and `/static/*`
-/// surfaces (html2canvas is served for the app-capture flow).
+/// Routes for the `/apps`, `/app*` and `/app-capture` surfaces.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/apps", get(list_apps))
         .route("/app", get(get_app).put(update_app).delete(delete_app))
+        .route("/app/opened", post(record_app_opened))
         .route(
             "/app/:app_id/source",
             get(read_app_source).put(write_app_source),
@@ -712,7 +753,6 @@ pub(super) fn router() -> Router<AppState> {
             "/artifact-preview-capability",
             get(mint_artifact_preview_capability),
         )
-        .route("/static/html2canvas.min.js", get(serve_html2canvas))
 }
 
 /// App UI routes nested at top-level `/app/*` (NOT under `/api/v1/`) — file

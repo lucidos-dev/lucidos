@@ -1,7 +1,7 @@
 import { computed } from '@preact/signals';
-import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadNeedsAttention, threadInReview, type ThreadChannel } from '../../store/store';
+import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadIsBlocked, threadInReview, ONGOING_GROUPS, selectedOngoingGroup, ongoingFilter, ONGOING_PARTS, isSplitOngoingGroup, type OngoingFilter, type OngoingGroup, type OngoingPart, type SplitOngoingGroup, type ThreadChannel } from '../../store/store';
 import { threadVisualStatus } from '../shared/threadVisualStatus';
-import { byRecent, byCreated, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
+import { byRecent, byCreated, changeReadyToReview, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
 import type { ThreadState } from '../../store/thread-events';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
 import type { ThreadStatus } from '../../store/thread-events';
@@ -240,6 +240,13 @@ export function filterHiddenArchived(
         return result;
     };
     return threads.filter(t => isVisible(t.meta.id));
+}
+
+/** A live section's badge: its inbox threads, sub-threads included. An
+ *  archived thread the family placed here (a lifted parent, a dimmed or
+ *  revealed sub-thread) is not one. Archive all's confirm counts the same threads. */
+export function inboxThreadCount(threads: readonly ThreadState[]): number {
+    return threads.filter(t => t.meta.section !== 'archived').length;
 }
 
 /** `thread`'s direct-child count as the family tree actually renders it: the
@@ -639,7 +646,7 @@ export function nestByParent(threads: readonly ThreadState[]): NestedThread[] {
     return out;
 }
 
-/** Drafts view rows: composing threads with content + active threads with
+/** Drafts group rows: composing threads with content + active threads with
  *  follow-up content. Discarded skipped (stale compose fields lingering on
  *  tombstoned rows must not resurface). Composing (new) ahead of follow-ups,
  *  most recent first within each group. */
@@ -658,20 +665,20 @@ export function draftThreads(threads: ReadonlyMap<string, ThreadState>): ThreadS
     return out;
 }
 
-/** Needs-attention view rows: every Current/Saved thread where the agent is
+/** Blocked group rows: every Current/Saved thread where the agent is
  *  stuck waiting on the user — awaiting answer/permission or a failed turn (see
- *  `threadNeedsAttention`). Mirrors `draftThreads`: bypasses the
+ *  `threadIsBlocked`). Mirrors `draftThreads`: bypasses the
  *  channel/trigger/repo filters and the lifecycle section grouping. Ordered by
  *  `reviewTier` first — a User Q / permission request (tier 0, the agent is
  *  stalled until the user answers) floats above a failed turn (tier 1) — then
  *  most-recent-first within each tier. The tier is read with
- *  `effectiveThreadStatus` to match the `threadNeedsAttention` predicate that
- *  selected these rows. Shares that predicate with the selector's badge count
- *  (`attentionThreadCount`) so the two can never disagree. */
-export function attentionThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
+ *  `effectiveThreadStatus` to match the `threadIsBlocked` predicate that
+ *  selected these rows. Shares that predicate with the Blocked badge
+ *  (`blockedThreadCount`) so the two can never disagree. */
+export function blockedThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
     const out: ThreadState[] = [];
     for (const t of threads.values()) {
-        if (threadNeedsAttention(t)) out.push(t);
+        if (threadIsBlocked(t)) out.push(t);
     }
     out.sort((a, b) => {
         const ta = reviewTier(a, effectiveThreadStatus(a));
@@ -682,12 +689,10 @@ export function attentionThreads(threads: ReadonlyMap<string, ThreadState>): Thr
     return out;
 }
 
-/** Review view rows: every Current/Saved thread carrying a change ready to apply
- *  (see `threadInReview`). Mirrors `draftThreads`/`attentionThreads`: bypasses
- *  the channel/trigger/repo filters and the lifecycle section grouping. Single
- *  tier (all proposed), so ordered purely most-recent-first. Shares its
- *  predicate with the selector's badge count (`reviewThreadCount`) so the two
- *  can never disagree. */
+/** Review group rows: every settled Current/Saved thread with a change ready
+ *  to apply or a read request (see `threadInReview`). Mirrors
+ *  `draftThreads`/`blockedThreads`: bypasses the channel/trigger/repo filters
+ *  and the lifecycle section grouping. Ordered most-recent-first. */
 export function reviewThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
     const out: ThreadState[] = [];
     for (const t of threads.values()) {
@@ -701,23 +706,23 @@ export function reviewThreads(threads: ReadonlyMap<string, ThreadState>): Thread
  *  its status dot reads `running` or `waiting`. That is a running turn, its own
  *  event wait, or sub-threads that have not finished.
  *
- *  Reading the dot keeps the three status views disjoint. The dot puts a
- *  question, a failure and a pause ahead of `waiting`, and Needs attention owns
- *  those. A ready change with only sub-threads reads `changes`, which is
+ *  Reading the dot keeps In flight apart from the other ongoing groups. The
+ *  dot puts a question, a failure and a pause ahead of `waiting`, and Blocked
+ *  owns those. A ready change with only sub-threads reads `changes`, which is
  *  Review's. A stopped sub-thread needs the user even while its own children
- *  run, so Needs attention keeps it. */
+ *  run, so Blocked keeps it. */
 export function threadIsInFlight(thread: ThreadState): boolean {
     if (isExcludedFromSections(thread)) return false;
     const section = getThreadDisplaySection(thread);
     if (section !== 'current' && section !== 'saved') return false;
-    if (threadNeedsAttention(thread)) return false;
+    if (threadIsBlocked(thread)) return false;
     const dot = threadVisualStatus(thread);
     return dot === 'running' || dot === 'waiting';
 }
 
-/** In flight view rows: every thread `threadIsInFlight` takes, roots
+/** In flight group rows: every thread `threadIsInFlight` takes, roots
  *  most-recent-first, each sub-thread nested under its parent when the parent
- *  is in flight too. Mirrors `attentionThreads`/`reviewThreads`: bypasses the
+ *  is in flight too. Mirrors `blockedThreads`/`reviewThreads`: bypasses the
  *  channel/trigger/repo filters and the lifecycle section grouping. */
 export function inFlightThreads(threads: ReadonlyMap<string, ThreadState>): NestedThread[] {
     const out: ThreadState[] = [];
@@ -728,21 +733,82 @@ export function inFlightThreads(threads: ReadonlyMap<string, ThreadState>): Nest
     return nestByParent(out);
 }
 
-/** Whether the In flight header shimmers: only while a row's turn is running.
- *  A thread parked on a wait is in flight but doing nothing right now. */
-export function inFlightHasRunning(rows: readonly NestedThread[]): boolean {
-    return rows.some(n => effectiveThreadStatus(n.thread) === 'running');
+/** The part of its split group a row belongs to. A Review row holding both a
+ *  ready change and a read request counts as a change, so the parts always sum
+ *  to the group. An In flight row reads only `running` or `waiting`, because
+ *  `threadIsInFlight` takes only those two dots. */
+export function ongoingPartOf(group: SplitOngoingGroup, row: NestedThread): OngoingPart {
+    switch (group) {
+        case 'review': return changeReadyToReview(row.thread.meta) ? 'changes' : 'unread';
+        case 'in-flight': return effectiveThreadStatus(row.thread) === 'running' ? 'running' : 'waiting';
+    }
 }
 
-/** Number of rows the In flight view renders. Same predicate as
- *  `inFlightThreads`, so the selector count and the list never disagree. */
-export const inFlightThreadCount = computed<number>(() => {
-    let count = 0;
-    for (const t of threadMap.value.values()) {
-        if (threadIsInFlight(t)) count++;
+/** How a split group's rows divide between its parts, in step order. */
+export function ongoingBreakdown(group: SplitOngoingGroup, rows: readonly NestedThread[]): { part: OngoingPart; count: number }[] {
+    return ONGOING_PARTS[group].map(part => ({ part, count: rows.filter(n => ongoingPartOf(group, n) === part).length }));
+}
+
+/** The rows of `group` that `filter` keeps. In flight nests, so its kept rows
+ *  re-nest, and a row whose parent the filter drops stands at root level. */
+export function filterOngoingRows(group: OngoingGroup, rows: NestedThread[], filter: OngoingFilter): NestedThread[] {
+    if (filter === 'all' || !isSplitOngoingGroup(group)) return rows;
+    const kept = rows.filter(n => ongoingPartOf(group, n) === filter);
+    return group === 'in-flight' ? nestByParent(kept.map(n => n.thread)) : kept;
+}
+
+const flatRows = (threads: ThreadState[]): NestedThread[] => threads.map(thread => ({ thread, depth: 0 }));
+
+/** One ongoing group's rows, in the order the drawer renders them. Every group
+ *  reads its own predicate, so a thread shows in each group it matches. Only
+ *  In flight is disjoint from the others. Bypasses the thread-type filter. */
+export function ongoingGroupRows(threads: ReadonlyMap<string, ThreadState>, group: OngoingGroup): NestedThread[] {
+    switch (group) {
+        case 'blocked': return flatRows(blockedThreads(threads));
+        case 'review': return flatRows(reviewThreads(threads));
+        case 'in-flight': return inFlightThreads(threads);
+        case 'drafts': return flatRows(draftThreads(threads));
     }
-    return count;
+}
+
+export type OngoingGroupList = { group: OngoingGroup; rows: NestedThread[] };
+
+/** The loaded threads' ongoing groups, recomputed only when a thread or a
+ *  draft changes. The drawer's Ongoing list and the post-archive hand-off
+ *  both read it, so neither rebuilds the groups on an unrelated render. */
+export const ongoingGroupLists = computed<OngoingGroupList[]>(() => ongoingGroups(threadMap.value, ONGOING_GROUPS));
+
+/** The selected ongoing group's rows as the drawer lists them, after its
+ *  filter. The list, a tile press and the post-archive hand-off read
+ *  it, so all three walk the rows on screen. */
+export const selectedOngoingRows = computed<NestedThread[]>(() => {
+    const selected = selectedOngoingGroup.value;
+    const rows = ongoingGroupLists.value.find(g => g.group === selected)?.rows ?? [];
+    return filterOngoingRows(selected, rows, ongoingFilter.value);
 });
+
+/** Every ongoing group with its rows, in the order `groups` names. */
+export function ongoingGroups(
+    threads: ReadonlyMap<string, ThreadState>,
+    groups: readonly OngoingGroup[],
+): OngoingGroupList[] {
+    return groups.map(group => ({ group, rows: ongoingGroupRows(threads, group) }));
+}
+
+/** The group to select as the drawer switches to Ongoing. A badged grouping
+ *  button selects Blocked, the group its badge counts. Otherwise the
+ *  stored group stays if it has rows, else the first group with rows takes
+ *  over. With every group empty, the stored group stays. */
+export function ongoingGroupOnSwitch(
+    stored: OngoingGroup,
+    groups: readonly OngoingGroupList[],
+    badged: boolean,
+): OngoingGroup {
+    if (badged) return 'blocked';
+    const filled = groups.filter(g => g.rows.length > 0);
+    if (filled.some(g => g.group === stored)) return stored;
+    return filled[0]?.group ?? stored;
+}
 
 export type ThreadSections = {
     current: ThreadState[];
@@ -755,21 +821,3 @@ export function threadHasUnsentDraft(thread: ThreadState | undefined): boolean {
     if (!thread) return false;
     return draftPresentThreadIds.value.has(thread.meta.id);
 }
-
-/** Number of rows the drafts view would render — i.e. non-discarded threads
- *  carrying an unsent draft. Same predicate as `draftThreads`, but avoids
- *  building/sorting an array. Drives the drafts-icon badge in the thread
- *  headers. Memoized; recomputes only when `threadMap` or
- *  `draftPresentThreadIds` change. The empty-presence-set fast path keeps the
- *  common (no-drafts) case O(1). */
-export const draftThreadCount = computed<number>(() => {
-    const draftIds = draftPresentThreadIds.value;
-    if (draftIds.size === 0) return 0;
-    const threads = threadMap.value;
-    let count = 0;
-    for (const id of draftIds) {
-        const t = threads.get(id);
-        if (t && t.meta.state !== 'discarded') count += 1;
-    }
-    return count;
-});

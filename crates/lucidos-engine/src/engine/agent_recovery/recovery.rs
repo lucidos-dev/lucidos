@@ -2,7 +2,7 @@
 //! settlement and orphaned-worktree recovery.
 
 use super::super::agent_session::change_description_fallback;
-use super::super::change_ops::branch_is_hardened;
+use super::super::change_ops::{branch_is_hardened, ProposeOutcome};
 use super::super::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use super::super::git_ops::{
     add_paths_to_worktree_exclude, commit_worktree_or_err, default_local_branch,
@@ -63,29 +63,30 @@ impl LucidosEngine {
         repo_root: &Path,
         changed_files: &[String],
         origin: Option<MessageOrigin>,
-    ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
-        let incomplete = !last_turn_ended_cleanly(self.pool(), thread_id).await;
+    ) -> Result<ProposeOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let finished = last_turn_ended_cleanly(self.pool(), thread_id).await;
         self.propose_branch_work(
             thread_id,
             branch_name,
             repo_root,
             changed_files,
             origin,
-            incomplete,
+            finished,
         )
         .await
     }
 
-    /// Propose a branch's committed work, stating whether it is incomplete.
-    pub(super) async fn propose_branch_work(
+    /// Settle a branch's committed work as its turn ended: propose it if the
+    /// turn finished, withhold it if not (ADR 0400).
+    pub(crate) async fn propose_branch_work(
         &self,
         thread_id: Uuid,
         branch_name: &str,
         repo_root: &Path,
         changed_files: &[String],
         origin: Option<MessageOrigin>,
-        incomplete: bool,
-    ) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
+        finished: bool,
+    ) -> Result<ProposeOutcome, Box<dyn std::error::Error + Send + Sync>> {
         debug_assert!(
             !changed_files.is_empty(),
             "propose_branch_work called with empty file list; caller must filter"
@@ -99,19 +100,40 @@ impl LucidosEngine {
             changed_files,
         )
         .await;
-        self.propose_change(crate::engine::change_ops::ProposeChangeInput {
-            thread_id,
-            branch_name,
-            repo_root: &repo_root.to_string_lossy(),
-            description: &details.description,
-            files: changed_files,
-            requires_restart: details.requires_restart,
-            channel: EventChannel::ClaudeCode,
-            hardened: details.hardened,
-            origin,
-            incomplete,
-        })
+        self.propose_turn_work(
+            crate::engine::change_ops::ProposeChangeInput {
+                thread_id,
+                branch_name,
+                repo_root: &repo_root.to_string_lossy(),
+                description: &details.description,
+                files: changed_files,
+                requires_restart: details.requires_restart,
+                channel: EventChannel::ClaudeCode,
+                hardened: details.hardened,
+                origin,
+            },
+            finished,
+        )
         .await
+    }
+
+    /// Decide again what a branch's work is: re-read its files, then propose
+    /// or withhold it as `finished` says. `Ok(None)` when the branch holds no
+    /// proposable work.
+    pub(crate) async fn redecide_branch_work(
+        &self,
+        thread_id: Uuid,
+        branch_name: &str,
+        repo_root: &Path,
+        origin: Option<MessageOrigin>,
+        finished: bool,
+    ) -> Result<Option<ProposeOutcome>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(files) = proposal_files_for_branch(repo_root, branch_name).await else {
+            return Ok(None);
+        };
+        self.propose_branch_work(thread_id, branch_name, repo_root, &files, origin, finished)
+            .await
+            .map(Some)
     }
 
     /// `thread_summaries.coding_agent_is_external_repo`, failing open to
@@ -134,16 +156,16 @@ impl LucidosEngine {
         }
     }
 
-    /// Propose the stale branch's committed work, returning whether a change
-    /// landed. Thin wrapper so the settle's own body stays one decision per
-    /// line; `propose_branch_changes` above does the work.
+    /// Settle the stale branch's committed work. Thin wrapper so the settle's
+    /// own body stays one decision per line; `propose_branch_changes` above
+    /// does the work.
     async fn propose_stale_branch(
         &self,
         thread_id: Uuid,
         branch_name: &str,
         repo_root: &Path,
         changed_files: &[String],
-    ) -> bool {
+    ) {
         match self
             .propose_branch_changes(
                 thread_id,
@@ -154,19 +176,18 @@ impl LucidosEngine {
             )
             .await
         {
-            Ok(_) => {
+            Ok(ProposeOutcome::Proposed(_)) => {
                 log!(
                     "[Recovery] Proposed change from stale session (branch {})",
                     branch_name
                 );
-                true
             }
+            Ok(ProposeOutcome::Held(_) | ProposeOutcome::Unfinished) => {}
             Err(e) => {
                 log!(
                     "[Recovery] Failed to propose change from stale session: {}",
                     e
                 );
-                false
             }
         }
     }
@@ -255,7 +276,9 @@ impl LucidosEngine {
         );
         let is_external = matches!(repo, StaleSessionRepo::External);
 
-        let mut proposed_change = false;
+        // The idle below reports the branch's work whether a change carries
+        // it or a hold withheld it, so withheld work stays visible.
+        let mut branch_has_work = false;
         match &repo {
             StaleSessionRepo::External => {
                 log!(
@@ -273,14 +296,14 @@ impl LucidosEngine {
                     // no-op branch.
                     match proposal_files_for_branch(repo_root, &branch_name).await {
                         Some(changed_files) => {
-                            proposed_change = self
-                                .propose_stale_branch(
-                                    thread_id,
-                                    &branch_name,
-                                    repo_root,
-                                    &changed_files,
-                                )
-                                .await;
+                            branch_has_work = true;
+                            self.propose_stale_branch(
+                                thread_id,
+                                &branch_name,
+                                repo_root,
+                                &changed_files,
+                            )
+                            .await;
                         }
                         // Keep the branch. An unexplained `None` (a transient
                         // git failure, a projection gap) would otherwise strand
@@ -329,7 +352,7 @@ impl LucidosEngine {
                 crate::engine::event_bus::BusEvent::Thread {
                     thread_id,
                     event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
-                        has_changes: proposed_change,
+                        has_changes: branch_has_work,
                         // Authoritative for
                         // `thread_summaries.coding_agent_is_external_repo`, so a
                         // hardcoded `false` here cleared the flag on an external
@@ -842,13 +865,39 @@ impl LucidosEngine {
         for (wt_path, branch_name, marker_repo_id, repo_root) in to_recover {
             if let Some(pending_change) = pending_by_branch.get(&branch_name) {
                 if actively_running_branches.contains(&branch_name) {
-                    // The session was running at shutdown, so its pending row
-                    // describes half-finished work the user never confirmed.
-                    // Flip it to `incomplete` so Apply asks for confirmation.
-                    // The next clean idle clears the flag.
-                    log!("[Recovery] Resuming active session with pending change for branch {} — marking change incomplete", branch_name);
+                    // The session was running at shutdown, so the pending row
+                    // may not cover the commits its turn made. Withdraw it
+                    // without asking git, which a busy boot can time out, then
+                    // withhold the branch's work (ADR 0400).
+                    log!("[Recovery] Resuming active session with pending change {} for branch {} — withdrawing it and withholding its unfinished work", pending_change.id, branch_name);
                     if let Some(&tid) = branch_to_thread.get(&branch_name) {
-                        mark_pending_change_incomplete(&self.event_bus, tid, pending_change).await;
+                        let origin = Some(MessageOrigin::engine(EngineReason::OrphanRecovery));
+                        if let Err(e) = crate::engine::change_ops::emit_change_withdrawn(
+                            &self.event_bus,
+                            tid,
+                            pending_change.id,
+                            origin,
+                        )
+                        .await
+                        {
+                            log!("[Recovery] {}", e);
+                        }
+                        if let Err(e) = self
+                            .redecide_branch_work(
+                                tid,
+                                &branch_name,
+                                &repo_root,
+                                Some(MessageOrigin::engine(EngineReason::OrphanRecovery)),
+                                false,
+                            )
+                            .await
+                        {
+                            log!(
+                                "[Recovery] Failed to withhold unfinished work on {}: {}",
+                                branch_name,
+                                e
+                            );
+                        }
                     }
                 } else {
                     log!(
@@ -1273,12 +1322,15 @@ fn unanswered_question_predicate_sql(id_expr: &str) -> String {
 /// `tool_use_id` is here because it is what ANSWERS the question:
 /// `agent_question::answer_pending_question` takes it, and a reader that could
 /// read a question aloud but not settle it would be half a route.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OpenQuestion {
     pub tool_use_id: String,
     pub question: String,
     pub options: Vec<QuestionOption>,
     pub multi_select: bool,
+    /// An *owner approval card* (ADR 0387), whose Allow once only a tap on
+    /// screen may give.
+    pub owner_approval: bool,
 }
 
 /// The question this thread is parked on, or `None` when it is not parked.
@@ -1342,6 +1394,7 @@ pub(crate) async fn newest_open_question(
             .get("multi_select")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        owner_approval: payload.get("owner_approval").is_some(),
     })
 }
 
@@ -1356,14 +1409,26 @@ pub(crate) async fn newest_open_question(
 const PARK_ENDING_EXTRA_EVENT_TYPES: &[&str] =
     &["UserQuestionAnswered", "ResponseGenerated", "SessionEnded"];
 
+/// Every event type that ends a question park: the two lists above.
+fn park_ending_event_types() -> impl Iterator<Item = &'static str> {
+    crate::engine::thread_events::ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES
+        .iter()
+        .chain(PARK_ENDING_EXTRA_EVENT_TYPES.iter())
+        .copied()
+}
+
+/// Whether an event of this type ends the thread's question park, as the
+/// predicate above reads it. For a consumer that follows events one by one.
+pub(crate) fn ends_question_park(event_type: &str) -> bool {
+    park_ending_event_types().any(|t| t == event_type)
+}
+
 /// The park-ending event types as a SQL `IN (...)` body. Every name is a
 /// compile-time literal from the two lists above, so there is nothing to
 /// parameterize and nothing to escape. Built once: the predicate runs per
 /// candidate thread in both recovery sweeps, and the list never varies.
 static PARK_ENDING_EVENT_TYPES_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    crate::engine::thread_events::ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES
-        .iter()
-        .chain(PARK_ENDING_EXTRA_EVENT_TYPES.iter())
+    park_ending_event_types()
         .map(|t| format!("'{t}'"))
         .collect::<Vec<_>>()
         .join(",")
@@ -1530,8 +1595,23 @@ fn after_latest_thread_start_sql(id_expr: &str, seq_expr: &str) -> String {
 /// so once a resume has actually begun the abort stops counting anywhere. This is
 /// what stops an auto-resume that dies before emitting anything else from being
 /// resumed again on the next boot, forever.
+///
+/// The abort must also be the thread's newest `ResponseAborted`. The boot floor
+/// withdraws an unkept promise with a newer abort, and that is not a start
+/// event. Without this clause a later crash boot would still resume the thread.
+/// The subquery aliases its `events` as `ra`, for the same capture reason as
+/// [`after_latest_thread_start_sql`].
 pub(crate) fn switch_abort_unsuperseded_sql(id_expr: &str, seq_expr: &str) -> String {
-    after_latest_thread_start_sql(id_expr, seq_expr)
+    format!(
+        "{current_turn} AND {seq} = ( \
+             SELECT MAX(ra.sequence) FROM events ra \
+             WHERE ra.aggregate_id = {id} \
+               AND ra.event_type = 'ResponseAborted' \
+         )",
+        current_turn = after_latest_thread_start_sql(id_expr, seq_expr),
+        seq = seq_expr,
+        id = id_expr,
+    )
 }
 
 /// Coding-agent lifecycle events that mean **the turn is over**: the engine was
@@ -1628,16 +1708,14 @@ pub(crate) static BRANCH_CLASSIFICATION_SQL: std::sync::LazyLock<String> =
 /// thread the projection still shows `paused`. ADR 0045 records why the engine
 /// discharges its own promise, and which paths leave one unkept.
 ///
-/// Four clauses, each load-bearing:
+/// Three clauses, each load-bearing:
 ///
 /// * `t.status = 'paused'` scopes the sweep to threads still on the interruption.
 /// * `t.state = 'active'` is the compose lifecycle, NOT the archive curtain. A
 ///   composing row is a draft and a discarded one a tombstone.
-/// * The abort is the thread's newest `ResponseAborted`, the idempotency guard:
-///   the withdrawal emits a `RecoveryAfterRestart` abort, so the thread stops
-///   matching on the next boot.
-/// * No newer [`THREAD_START_EVENTS_SQL`] event, the loop-breaker both resume
-///   gates use.
+/// * [`switch_abort_unsuperseded_sql`], shared with both resume gates. Its
+///   newest-abort half is the idempotency guard: the withdrawal emits a
+///   `RecoveryAfterRestart` abort, so the thread stops matching on the next boot.
 ///
 /// **Archived threads are deliberately INCLUDED**, unlike the resume drains:
 /// this revives nothing, it corrects a promise the engine could not keep. The
@@ -1654,11 +1732,6 @@ fn unresumed_switch_threads_sql() -> String {
            AND t.state = 'active' \
            AND t.status = {paused} \
            AND {abort} \
-           AND e.sequence = ( \
-               SELECT MAX(a.sequence) FROM events a \
-               WHERE a.aggregate_id = e.aggregate_id \
-                 AND a.event_type = 'ResponseAborted' \
-           ) \
            AND {unsuperseded} \
          ORDER BY e.sequence ASC",
         paused = ThreadStatus::Paused.sql_literal(),

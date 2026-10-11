@@ -2,8 +2,8 @@ import { effect, signal } from '@preact/signals';
 import { ApiError } from '../../api/client';
 import { fetchEventLocation } from '../../api/threads';
 import { EVENT_RESOLVE_DEADLINE_MS } from '../../components/chat/scrollState';
-import { UNANCHORABLE_ASYNC_EVENTS, attentionTarget, computeExchanges, deepLinkAnchorInThread } from '../thread-events';
-import type { AttentionTarget } from '../thread-events';
+import { UNANCHORABLE_ASYNC_EVENTS, changeReadyToReview, landingTarget, computeExchanges, deepLinkAnchorInThread } from '../thread-events';
+import type { LandingGroup, LandingTarget } from '../thread-events';
 import { showToast, threadMap, focusedThreadId, effectiveThreadStatus } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
 import { ensureThreadByIdInMap, ensureWholeThreadLoaded, loadThreadEvents, threadEventsStillArriving } from './thread-loading';
@@ -337,8 +337,8 @@ export async function showEventWhereItLives(eventId: string): Promise<void> {
   }
 }
 
-/** Open a thread from the Needs attention view, landing on what waits for the
- *  user (`attentionEventId`) rather than on the saved reading position.
+/** Open a thread from the Blocked or Review group, landing on what waits for
+ *  the user (`landingTarget`) rather than on the saved reading position.
  *
  *  The target comes from the thread's events, so the thread opens at once and
  *  lands as soon as nothing more is arriving. A slow load never delays the tap.
@@ -348,16 +348,16 @@ export async function showEventWhereItLives(eventId: string): Promise<void> {
  *  slept is in that catch-up, so landing before it would pick an older turn.
  *
  *  A late landing is skipped if the user has opened another thread meanwhile. */
-export function openAttentionThread(threadId: string): void {
+export function openOngoingThread(threadId: string, group: LandingGroup): void {
   focusThread(threadId);
-  landOnAttention(threadId).catch(err => {
+  landOnTarget(threadId, group).catch(err => {
     showToast(`Could not open what needs your attention: ${errorDetail(err)}`, 'error');
   });
 }
 
 /** Lands in the same task as the focus when nothing has to be awaited, so the
  *  saved reading position is never painted first. */
-async function landOnAttention(threadId: string): Promise<void> {
+async function landOnTarget(threadId: string, group: LandingGroup): Promise<void> {
   const stillOpen = () => focusedThreadId.value === threadId;
   if (threadEventsStillArriving(threadId)) {
     await awaitThreadEvents(threadId);
@@ -365,22 +365,23 @@ async function landOnAttention(threadId: string): Promise<void> {
     // thread stays where it is rather than land on an older turn.
     if (!stillOpen() || threadEventsStillArriving(threadId)) return;
   }
-  let target = attentionTargetIn(threadId);
+  let target = landingTargetIn(threadId, group);
   // A paged thread holds only its newest page. Turns that came after the card
   // can push it behind that page.
   if (target?.kind === 'card-not-loaded' && threadMap.value.get(threadId)?.hasOlderEvents) {
     await ensureWholeThreadLoaded(threadId);
     if (!stillOpen()) return;
-    target = attentionTargetIn(threadId);
+    target = landingTargetIn(threadId, group);
   }
   const eventId = target?.kind === 'card-not-loaded' ? target.newestTurnId : target?.eventId;
   if (eventId) landOnEvent(threadId, eventId);
 }
 
-function attentionTargetIn(threadId: string): AttentionTarget | null {
+function landingTargetIn(threadId: string, group: LandingGroup): LandingTarget | null {
   const thread = threadMap.value.get(threadId);
   if (!thread?.eventsLoaded) return null;
-  return attentionTarget(computeExchanges(thread), effectiveThreadStatus(thread));
+  const changeReady = group === 'review' && changeReadyToReview(thread.meta);
+  return landingTarget(computeExchanges(thread), effectiveThreadStatus(thread), group, changeReady);
 }
 
 /** Resolve once nothing more of `threadId`'s events is on its way: the first

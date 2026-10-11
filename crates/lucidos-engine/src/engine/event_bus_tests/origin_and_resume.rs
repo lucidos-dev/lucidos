@@ -339,22 +339,22 @@ async fn cc_follow_up_after_exit_resumes_via_db() {
     })
     .await
     .unwrap();
-    // Replay the production lifecycle: ChangeProposed sets coding_agent_proposed
+    // Replay the production lifecycle: ChangeProposed makes the thread proposed
     // but keeps status='idle' (Option B — a proposed change is an artifact, not
     // a parked loop).
     emit_change_proposed(&bus, thread_id, "claude-code/feat", false).await;
 
     // 3. Thread status stays 'idle'; the pending-review state lives on
-    //    `coding_agent_proposed`.
+    //    the proposed state.
     let (status, proposed): (String, bool) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT status, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(status, "idle");
-    assert!(proposed, "ChangeProposed sets coding_agent_proposed");
+    assert!(proposed, "ChangeProposed makes the thread proposed");
 
     // 4. cc_session_id is recoverable from events (auto-resume detection query)
     let recovered: Option<String> = sqlx::query_scalar(

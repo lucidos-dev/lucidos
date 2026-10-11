@@ -1,9 +1,8 @@
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, setAsideChanges, changeIsReady, findChangeById, threadMap, threadUnsettled, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, applyAllBatch, applyPhases, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed, type ApplyAllBatch, type ApplyPhase, type ApplyPhaseReading } from '../../store/store';
+import { changes, appliedChanges, setAsideChanges, changeIsReady, threadMap, threadUnsettled, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, applyAllBatch, applyPhases, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed, type ApplyAllBatch, type ApplyPhase, type ApplyPhaseReading } from '../../store/store';
 import { applyPhaseOf, isBatchMember } from '../../store/actions/applyProgress';
 import { applySingleChange, discardSingleChange, setAsideSingleChange, bringBackSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, armStandingApplies, disarmStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
-import { APPLY_INCOMPLETE_CONFIRM } from '../../store/actions/threadActions';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
@@ -217,8 +216,7 @@ function ChangeRow({ change, markerClass, progressLabel, armed, onOpen, onDiff, 
             <>
               {formatFileCount(change.file_count)}
               {change.requires_restart && ' · Requires engine restart'}
-              {!change.hardened && ' · Not hardened'}
-              {change.incomplete && ' · Incomplete'}
+              {change.needs_hardening && ' · Not hardened'}
               {/* No action can resolve an unsettled change, so the reason is
                   read here rather than from a tooltip on a control that is
                   not drawn. */}
@@ -314,14 +312,6 @@ function rowActionLabel(action: ChangeRowAction): string {
   }
 }
 
-/** Apply one change from its row. Incomplete work confirms first, as the
- *  thread's own Apply does. */
-async function applyFromRow(id: string): Promise<void> {
-  const incomplete = findChangeById(id)?.incomplete ?? false;
-  if (incomplete && !(await showConfirm(APPLY_INCOMPLETE_CONFIRM, 'Apply', { variant: 'default' }))) return;
-  await applySingleChange(id);
-}
-
 export const BRING_BACK_ROW_TIP =
   'Return this change to pending, where it can be applied or discarded.';
 
@@ -385,9 +375,10 @@ export const SETTLE_ALL_ARMED_TIP =
 /** How the pending list splits into its two sections, and what each section's
  *  bulk row offers. Pure, so the answer is testable without a render.
  *
- *  **Ready** holds changes whose thread has finished. Its row offers Discard
- *  All and Apply All. **Not finished** holds the rest: a thread settling, or
- *  parked on a question, and every incomplete change (ADR 0346). Its row
+ *  **Ready** holds the *apply-ready* changes: a finished thread, and nothing
+ *  to harden. Its row offers Discard All and Apply All. **Not finished** holds
+ *  the rest: a thread settling or parked on a question, or an older change
+ *  that still needs hardening. Its row
  *  offers only "Apply all on settle", a TOGGLE over the settling changes it
  *  lists (ADR 0168). Discard never reaches it. */
 export interface PendingSections {
@@ -500,8 +491,10 @@ export function ChangesView() {
     ? pendingSections(pendingLoadable.data, armedThreadIds, applyAllInProgress.value)
     : null;
   const ids = (list: Change[] | undefined) => (allLoaded && list ? list.map(c => c.id) : null);
+  // A change that turns ready arrives in Ready. A change that drops back to
+  // Not finished was already here, so Not finished lights only a new change.
   const readyArrived = useArrivals(ids(sections?.ready));
-  const notFinishedArrived = useArrivals(ids(sections?.notFinished));
+  const pendingArrived = useArrivals(ids(pendingLoadable.status === 'loaded' ? pendingLoadable.data : undefined));
   const setAsideArrived = useArrivals(ids(setAsideLoadable.status === 'loaded' ? setAsideLoadable.data : undefined));
 
   if (pendingLoadable.status === 'failed' || appliedLoadable.status === 'failed' || setAsideLoadable.status === 'failed') {
@@ -543,7 +536,7 @@ export function ChangesView() {
                 onDiff={() => void viewChangeDiff(change)}
                 onDiscard={() => guardedAction(change.id, 'discard', discardSingleChange)}
                 onSetAside={() => guardedAction(change.id, 'set-aside', setAsideSingleChange)}
-                onApply={() => guardedAction(change.id, 'apply', applyFromRow)}
+                onApply={() => guardedAction(change.id, 'apply', applySingleChange)}
                 onStanding={() => {
                   if (!change.thread_id) return;
                   void (armed
@@ -633,7 +626,7 @@ export function ChangesView() {
                   </div>
                 </div>
               )}
-              <ArrivalList items={sections.notFinished} keyOf={(c) => c.id} arrived={notFinishedArrived}>
+              <ArrivalList items={sections.notFinished} keyOf={(c) => c.id} arrived={pendingArrived}>
                 {renderRow}
               </ArrivalList>
             </Disclosure>

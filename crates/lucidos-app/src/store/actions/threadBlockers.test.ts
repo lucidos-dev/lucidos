@@ -26,7 +26,7 @@ afterEach(() => {
 });
 
 const waiting: MetaPatch = { status: 'waiting_for_user_answer' };
-const pending: MetaPatch = { channel: 'claude_code', codingAgentProposed: true };
+const pending: MetaPatch = { channel: 'claude_code', codingAgentChangeState: { kind: 'proposed', requires_restart: false }};
 
 /** One family per blocker: the target is `t`, a sub-thread is `c`. */
 const FAMILIES: { blocker: HeldBlocker; threads: ThreadState[] }[] = [

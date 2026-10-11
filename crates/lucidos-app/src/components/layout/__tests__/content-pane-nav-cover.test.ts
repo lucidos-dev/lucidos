@@ -128,7 +128,7 @@ describe('content pane navigation cover', () => {
 describe('the pane titles switch word at once, with no fade of their own', () => {
   const desktop = readFileSync(resolve(here, '../AppHeader.tsx'), 'utf-8');
   const mobile = readFileSync(resolve(here, '../MobileAppHeader.tsx'), 'utf-8');
-  const filterButton = readFileSync(resolve(here, '../ThreadFilterButton.tsx'), 'utf-8');
+  const headerControls = readFileSync(resolve(here, '../ThreadsHeaderControls.tsx'), 'utf-8');
 
   it('no rule animates a title in', () => {
     expect(css).not.toMatch(/nav-arrive|crossfade-dip/);
@@ -139,8 +139,9 @@ describe('the pane titles switch word at once, with no fade of their own', () =>
   });
 
   it('the drawer title is one plain word, not a stack', () => {
-    const title = filterButton.slice(filterButton.indexOf('export function ThreadsPaneTitle'));
-    expect(title).toMatch(/return <span class=\{className\}>\{threadFilterPanelOpen\.value \? 'Filters' : 'Threads'\}<\/span>/);
+    const title = headerControls.slice(headerControls.indexOf('export function ThreadsPaneTitle'));
+    expect(title).toMatch(/const text = threadFilterPanelOpen\.value \? 'Filters' : GROUPING_LABEL\[drawerGrouping\.value\];/);
+    expect(title).toMatch(/return <span ref=\{ref\} class=\{className\} data-cramped=\{[^}]+\}>\{text\}<\/span>/);
     expect(title).not.toMatch(/CrossfadeStack/);
   });
 });

@@ -1,43 +1,7 @@
-import { apiUrl } from './_fetch';
-
-type Html2Canvas = (element: HTMLElement, opts: Record<string, unknown>) => Promise<HTMLCanvasElement>;
+import { CAPTURE_MAX_HEIGHT, rasterize } from './rasterize';
 
 const DOM_MAX = 48000;
 const TEXT_MAX = 150;
-
-let html2canvasPromise: Promise<Html2Canvas> | undefined;
-
-function loadHtml2Canvas(): Promise<Html2Canvas> {
-  if (html2canvasPromise) return html2canvasPromise;
-  const existing = (window as { html2canvas?: Html2Canvas }).html2canvas;
-  if (existing) {
-    html2canvasPromise = Promise.resolve(existing);
-    return html2canvasPromise;
-  }
-  // Resolved per call rather than at module load, because `apiUrl` reads a base
-  // URL that `configure({ baseUrl })` can still change.
-  const scriptUrl = apiUrl('/static/html2canvas.min.js');
-  // Clear the cached promise on failure so a later call can retry. Without
-  // this, transient network errors poison capture for the iframe's lifetime.
-  const promise = new Promise<Html2Canvas>((resolve, reject) => {
-    const fail = (err: Error) => {
-      if (html2canvasPromise === promise) html2canvasPromise = undefined;
-      reject(err);
-    };
-    const script = document.createElement('script');
-    script.src = scriptUrl;
-    script.async = true;
-    script.onload = () => {
-      const fn = (window as { html2canvas?: Html2Canvas }).html2canvas;
-      if (fn) resolve(fn);
-      else fail(new Error('html2canvas script loaded but window.html2canvas undefined'));
-    };
-    script.onerror = () => fail(new Error(`Failed to load ${scriptUrl}`));
-    document.head.appendChild(script);
-  });
-  html2canvasPromise = promise;
-  return promise;
-}
 
 function serializeNode(el: Node, depth: number, state: { len: number }, foldY: number): string {
   if (state.len >= DOM_MAX || depth > 8) return '';
@@ -79,44 +43,27 @@ function serializeNode(el: Node, depth: number, state: { len: number }, foldY: n
   return out;
 }
 
-export async function capture(): Promise<{ screenshot: string; dom: string }> {
-  const vpW = Math.min(document.body.scrollWidth, 1024);
-  const vpH = Math.min(window.innerHeight || 800, 1200);
-
-  // Build the DOM snapshot FIRST, independently of html2canvas. html2canvas
-  // throws on CSS Color 4 functions (color(), oklab(), oklch(), color-mix())
-  // that modern stylesheets routinely use — and if it ran first and threw, the
-  // whole capture rejected, so the agent lost this textual layout too and went
-  // fully blind (it would then ship UI it couldn't see and claim it "renders
-  // fine"). This DOM walk only reads geometry + classes, so it can't fail on
-  // CSS the rasterizer can't parse — it's the reliable fallback.
-  const foldY = vpH + 200;
+/** The viewport's picture and DOM text. With a `format` (a MIME subtype such
+ *  as `png`), the picture is a file at the device pixel ratio
+ *  (`renderingFor`). */
+export async function capture(format?: string): Promise<{ screenshot: string; dom: string }> {
+  // Built FIRST, independently of the screenshot, so a rasterizer failure never
+  // costs the agent this textual layout too. A blind agent ships UI it cannot
+  // see and claims it renders fine. This walk only reads geometry and classes,
+  // so it cannot fail on anything the page paints.
+  const foldY = Math.min(window.innerHeight || 800, CAPTURE_MAX_HEIGHT) + 200;
   const state = { len: 0 };
   const domSnapshot = serializeNode(document.body, 0, state, foldY);
   const truncated = state.len >= DOM_MAX
     ? `\n[DOM snapshot truncated at ~${Math.round(DOM_MAX / 1000)}KB]` : '';
   const dom = domSnapshot + truncated;
 
-  // Screenshot is best-effort. On any failure (unsupported CSS color function,
-  // script load error) degrade to DOM-only: empty screenshot + a note, and
-  // resolve rather than reject. The engine's `format_capture_result` drops the
-  // image marker when the screenshot is empty and passes the DOM text through,
-  // so the agent still sees the rendered layout (element positions reveal
-  // overlaps/clipping) instead of just an error string.
+  // The screenshot is best-effort. On any failure, degrade to DOM-only: an
+  // empty screenshot and a note, resolving rather than rejecting. The engine's
+  // `format_capture_result` drops the image marker for an empty screenshot and
+  // passes the DOM text through, so the agent still sees element positions.
   try {
-    const html2canvas = await loadHtml2Canvas();
-    const canvas = await html2canvas(document.body, {
-      scale: 1,
-      useCORS: true,
-      logging: false,
-      width: vpW,
-      height: vpH,
-      windowWidth: vpW,
-      windowHeight: vpH,
-      y: window.scrollY,
-    });
-    const screenshot = canvas.toDataURL('image/jpeg', 0.65).split(',')[1];
-    return { screenshot, dom };
+    return { screenshot: await rasterize(document, format), dom };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     return {

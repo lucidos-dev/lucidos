@@ -12,16 +12,16 @@
 # cost the work that caused it.
 #
 # Usage:
-#   ./scripts/e2e.sh [--packaged] [--no-webkit]
-#   ./scripts/e2e.sh --github [--no-webkit]   # on GitHub's runners, ADR 0382
+#   ./scripts/e2e.sh [--no-webkit]                   # on GitHub's runners when it can, ADR 0386
+#   ./scripts/e2e.sh --local [--packaged] [--no-webkit]   # on this host
 #
 # --no-webkit skips the mobile-webkit browser project. The compressor does not
 # drain between projects, so mobile-webkit spends the session's whole budget
 # whenever it runs. Splitting it out is what lets the other five finish and
 # lets it start from a cold host:
 #
-#   ./scripts/e2e.sh --no-webkit          # the five cheap projects
-#   ./scripts/e2e-browser.sh --webkit     # then mobile-webkit, on a cold host
+#   ./scripts/e2e.sh --local --no-webkit          # the five cheap projects
+#   ./scripts/e2e-browser.sh --local --webkit     # then mobile-webkit, on a cold host
 #
 # --packaged (or LUCIDOS_E2E_PACKAGED=1) appends the macOS packaged-build boot
 # smoke test (scripts/e2e-packaged.sh) as a final phase. OFF by default: it does a
@@ -48,6 +48,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/e2e_github.sh
 source "$SCRIPT_DIR/lib/e2e_github.sh"
 e2e_github_handoff all "$@"
+set -- ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
 
 # Opt-in: append the packaged-build boot smoke test as a final phase (default off).
 RUN_PACKAGED="${LUCIDOS_E2E_PACKAGED:-0}"

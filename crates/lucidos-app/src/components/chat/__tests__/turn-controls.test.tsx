@@ -258,7 +258,7 @@ describe('ResponsePanel', () => {
 });
 
 /** The initiator header carries the SAME collapse control. A turn's two headers
- *  are read as one widget. A fold announced by an icon on one and by nothing but
+ *  are read as one control. A fold announced by an icon on one and by nothing but
  *  a cursor on the other is two answers to one question. */
 describe('InitiatorPanel collapse control', () => {
   const initiator: InitiatorDescriptor = {

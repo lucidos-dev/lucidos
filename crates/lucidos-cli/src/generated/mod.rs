@@ -1310,3 +1310,203 @@ pub fn dispatch_webhooks(ws: &Workspace, cmd: WebhooksCmd) -> Result<(), BoxErro
         }
     }
 }
+
+/// A thread's widgets, shelf and reusable widgets. Make one with create_app kind='widget'.
+#[derive(clap::Subcommand)]
+pub enum WidgetsCmd {
+    /// The reusable widgets.
+    List,
+    /// Every widget in a thread.
+    Thread {
+        /// Thread uuid. Default: yours.
+        #[arg(long)]
+        thread_id: Option<String>,
+    },
+    /// Show a widget in a thread. Another thread's must be reusable.
+    Show {
+        /// The widget's id.
+        #[arg(long)]
+        app_id: String,
+        /// Thread uuid. Default: yours.
+        #[arg(long)]
+        thread_id: Option<String>,
+        /// Widget params, a JSON object. One set is one instance.
+        #[arg(long)]
+        params: Option<String>,
+        /// Chip label. Default: the widget's name.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Add its chip to the shelf.
+    Pin {
+        /// The widget's id.
+        #[arg(long)]
+        app_id: String,
+        /// Thread uuid. Default: yours.
+        #[arg(long)]
+        thread_id: Option<String>,
+        /// Widget params, a JSON object. One set is one instance.
+        #[arg(long)]
+        params: Option<String>,
+        /// Chip label. Default: the widget's name.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove its chip. The card stays.
+    Unpin {
+        /// The widget's id.
+        #[arg(long)]
+        app_id: String,
+        /// Thread uuid. Default: yours.
+        #[arg(long)]
+        thread_id: Option<String>,
+        /// Widget params, a JSON object. One set is one instance.
+        #[arg(long)]
+        params: Option<String>,
+        /// Chip label. Default: the widget's name.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Offer it to every thread.
+    MakeReusable {
+        /// The widget's id.
+        #[arg(long)]
+        app_id: String,
+    },
+    /// Hand it back to its origin thread.
+    StopReusing {
+        /// The widget's id.
+        #[arg(long)]
+        app_id: String,
+    },
+}
+
+/// Execute a `lucidos widgets <op>` command against the parent workspace.
+pub fn dispatch_widgets(ws: &Workspace, cmd: WidgetsCmd) -> Result<(), BoxError> {
+    match cmd {
+        WidgetsCmd::List => {
+            let url = format!("{}/api/v1/widgets", ws.base_url());
+            let req = client()?.get(&url);
+            send_and_print("GET", &url, req)
+        }
+        WidgetsCmd::Thread { thread_id } => {
+            let url = format!("{}/api/v1/widgets/thread", ws.base_url());
+            let mut params: Vec<(&str, String)> = Vec::new();
+            if let Some(v) = thread_id {
+                params.push(("thread_id", v.to_string()));
+            }
+            let req = client()?.get(&url).query(&params);
+            send_and_print("GET", &url, req)
+        }
+        WidgetsCmd::Show {
+            app_id,
+            thread_id,
+            params,
+            label,
+        } => {
+            let url = format!("{}/api/v1/widgets/show", ws.base_url());
+            let mut body = serde_json::Map::new();
+            body.insert("app_id".into(), serde_json::json!(app_id));
+            if let Some(v) = thread_id {
+                body.insert("thread_id".into(), serde_json::json!(v));
+            }
+            if let Some(v) = params {
+                body.insert(
+                    "params".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--params must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = label {
+                body.insert("label".into(), serde_json::json!(v));
+            }
+            let req = client()?.post(&url).json(&serde_json::Value::Object(body));
+            send_and_print("POST", &url, req)
+        }
+        WidgetsCmd::Pin {
+            app_id,
+            thread_id,
+            params,
+            label,
+        } => {
+            let url = format!("{}/api/v1/widgets/pin", ws.base_url());
+            let mut body = serde_json::Map::new();
+            body.insert("app_id".into(), serde_json::json!(app_id));
+            if let Some(v) = thread_id {
+                body.insert("thread_id".into(), serde_json::json!(v));
+            }
+            if let Some(v) = params {
+                body.insert(
+                    "params".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--params must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = label {
+                body.insert("label".into(), serde_json::json!(v));
+            }
+            let req = client()?.post(&url).json(&serde_json::Value::Object(body));
+            send_and_print("POST", &url, req)
+        }
+        WidgetsCmd::Unpin {
+            app_id,
+            thread_id,
+            params,
+            label,
+        } => {
+            let url = format!("{}/api/v1/widgets/unpin", ws.base_url());
+            let mut body = serde_json::Map::new();
+            body.insert("app_id".into(), serde_json::json!(app_id));
+            if let Some(v) = thread_id {
+                body.insert("thread_id".into(), serde_json::json!(v));
+            }
+            if let Some(v) = params {
+                body.insert(
+                    "params".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--params must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = label {
+                body.insert("label".into(), serde_json::json!(v));
+            }
+            let req = client()?.post(&url).json(&serde_json::Value::Object(body));
+            send_and_print("POST", &url, req)
+        }
+        WidgetsCmd::MakeReusable { app_id } => {
+            let url = format!("{}/api/v1/widgets/make-reusable", ws.base_url());
+            let mut body = serde_json::Map::new();
+            body.insert("app_id".into(), serde_json::json!(app_id));
+            let req = client()?.post(&url).json(&serde_json::Value::Object(body));
+            send_and_print("POST", &url, req)
+        }
+        WidgetsCmd::StopReusing { app_id } => {
+            let url = format!("{}/api/v1/widgets/stop-reusing", ws.base_url());
+            let mut body = serde_json::Map::new();
+            body.insert("app_id".into(), serde_json::json!(app_id));
+            let req = client()?.post(&url).json(&serde_json::Value::Object(body));
+            send_and_print("POST", &url, req)
+        }
+    }
+}
+
+/// The workspace prompt footprint: what the workspace's own content adds to every chat turn.
+#[derive(clap::Subcommand)]
+pub enum WorkspacePromptFootprintCmd {
+    /// Each workspace-grown prompt section's chars against its ceiling, with its items: clipped descriptions, unused apps and reusable widgets, and knowhow docs not loaded by name. Plus the system prompt footprint, for scale.
+    Show,
+}
+
+/// Execute a `lucidos workspace-prompt-footprint <op>` command against the parent workspace.
+pub fn dispatch_workspace_prompt_footprint(
+    ws: &Workspace,
+    cmd: WorkspacePromptFootprintCmd,
+) -> Result<(), BoxError> {
+    match cmd {
+        WorkspacePromptFootprintCmd::Show => {
+            let url = format!("{}/api/v1/workspace-prompt-footprint", ws.base_url());
+            let req = client()?.get(&url);
+            send_and_print("GET", &url, req)
+        }
+    }
+}

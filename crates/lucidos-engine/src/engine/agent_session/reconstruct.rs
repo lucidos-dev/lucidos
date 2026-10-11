@@ -303,6 +303,7 @@ mod tests {
             text: text.into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             parent_tool_use_id: None,
+            progress_note: false,
         }
     }
 

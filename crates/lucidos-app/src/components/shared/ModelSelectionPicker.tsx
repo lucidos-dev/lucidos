@@ -34,13 +34,23 @@ export function modelStepOptions(
   }));
 }
 
-/** One model's tiers, each carrying the encoded pair it commits. */
-export function tierStepOptions(row: ModelRow): ControlOption[] {
-  return row.tiers.map((tier) => ({
+/** The badge on the tier a surface recommends. */
+export const RECOMMENDED_TIER_BADGE = 'Recommended';
+
+/** One model's tiers, each carrying the encoded pair it commits. A surface
+ *  that names a Default row gets it first, committing no tier. */
+export function tierStepOptions(
+  row: ModelRow,
+  defaultLabel?: (model: string) => string,
+): ControlOption[] {
+  const tiers = row.tiers.map((tier) => ({
     value: encodePair(row.value, tier.value),
     label: tier.label,
     description: tier.description,
+    badge: tier.recommended ? RECOMMENDED_TIER_BADGE : undefined,
   }));
+  if (!defaultLabel || row.tiers.length === 0) return tiers;
+  return [{ value: encodePair(row.value, null), label: defaultLabel(row.value) }, ...tiers];
 }
 
 /** One model's backends. The one it would run on is the current value, and
@@ -187,7 +197,9 @@ export function ModelSelectionPicker({
   const openStep = openRow ? open.value : null;
   const stepOptions = !openStep || !openRow
     ? []
-    : openStep.step === 'tiers' ? tierStepOptions(openRow) : providerStepOptions(openRow);
+    : openStep.step === 'tiers'
+      ? tierStepOptions(openRow, selection.defaultEffortLabel)
+      : providerStepOptions(openRow);
   const rows = openStep ? stepOptions : modelOptions;
   const showsFilter = pickerShowsFilter({
     searching: searching.value, touch: isTouchDevice(), keyboard: keyboardHolder !== null,
@@ -218,13 +230,17 @@ export function ModelSelectionPicker({
     whenStepSettled(row, () => row?.scrollIntoView({ block: 'nearest' }));
   }, [highlight.value, open.value]);
 
-  /** Open a model's tiers, highlighting the one NEAREST the effort in force.
-   *  Switching model then keeps the user's usual tier under the cursor. It is
-   *  highlighted, never checked: only the pair in force wears the checkmark. */
-  function openTiers(row: ModelRow, effort: string | null = selection.effort) {
+  /** Open a model's tiers, highlighting the one NEAREST that model's own tier,
+   *  else the tier in force. Switching model then puts the tier it would run
+   *  at under the cursor. It is highlighted, never checked: only the pair in
+   *  force wears the checkmark. */
+  function openTiers(
+    row: ModelRow,
+    effort: string | null = selection.effortFor(row.value) ?? selection.effort,
+  ) {
     open.value = { model: row.value, step: 'tiers' };
-    const near = clampToOffered(effort, row.tiers);
-    const at = row.tiers.findIndex((t) => t.value === near);
+    const near = encodePair(row.value, clampToOffered(effort, row.tiers));
+    const at = tierStepOptions(row, selection.defaultEffortLabel).findIndex((o) => o.value === near);
     highlight.value = at >= 0 ? at : 0;
   }
 

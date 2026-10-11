@@ -27,7 +27,7 @@ const MIN_CONTENT_PANE = 360;
 const BELOW_FLOOR_X = 150;
 // Seeded before every drawer test so a narrowing drag has somewhere to travel
 // FROM. It has to clear the drawer's floor by a wide margin, and the floor is
-// 312 at these projects' 16px root now that it no longer varies by client
+// 320 at these projects' 16px root now that it no longer varies by client
 // (ADR 0058): opening at the default would put the drawer on its wall already,
 // and a drag that cannot move proves nothing about a clamp.
 const OPEN_DRAWER_WIDTH = 420;
@@ -290,7 +290,7 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
 
     // openDrawerAndSettle opened the drawer; the toggle is a plain show/hide, so
     // this second click simply hides it (no focus stage in between).
-    // Prefix match: the label carries a " (N needing attention)" suffix whenever
+    // Prefix match: the label carries a " (N blocked)" suffix whenever
     // the thread list is hidden and something is waiting on the user.
     await page.locator(`button[aria-label^="${DRAWER_TOGGLE_LABEL}"]:visible`).first().click();
     // The drawer header must pass through intermediate widths: it stays
@@ -403,8 +403,8 @@ async function openDrawerAtWidth(page: Page, width: number): Promise<void> {
 }
 
 /** Where the drawer header's title actually landed, against the band it is
- *  centred on and the controls it must clear: the drawer toggle resting over
- *  the row's leading end, and Filter at its trailing end. Scoped to
+ *  centred on and the controls it must clear: Filter, which leads the row
+ *  just past the drawer toggle, and Grouping at its trailing end. Scoped to
  *  `.desktop-header`: `MobileAppHeader` renders first and carries its own
  *  copies (the 0x0-rect trap in .claude/rules/frontend.md). */
 async function threadsHeaderGeometry(page: Page) {
@@ -413,7 +413,8 @@ async function threadsHeaderGeometry(page: Page) {
     const title = band?.querySelector('.threads-header-title');
     const toggle = document.querySelector('.desktop-header .thread-toggle-slot .thread-toggle');
     const filter = band?.querySelector('button[aria-label="Filter threads"]');
-    if (!band || !title || !toggle || !filter) return null;
+    const grouping = band?.querySelector('.grouping-btn');
+    if (!band || !title || !toggle || !filter || !grouping) return null;
     const b = band.getBoundingClientRect();
     const t = title.getBoundingClientRect();
     return {
@@ -423,7 +424,8 @@ async function threadsHeaderGeometry(page: Page) {
       titleRight: t.right,
       titleWidth: t.width,
       toggleRight: toggle.getBoundingClientRect().right,
-      filterLeft: filter.getBoundingClientRect().left,
+      filterRight: filter.getBoundingClientRect().right,
+      groupingLeft: grouping.getBoundingClientRect().left,
     };
   });
   expect(geo, 'desktop threads header not laid out').not.toBeNull();
@@ -449,8 +451,8 @@ test.describe('Threads header: a pane-centred title, and a band that answers no 
       `title centred at ${web.titleCentre.toFixed(1)}, the drawer pane at ${web.bandCentre.toFixed(1)}`)
       .toBeLessThanOrEqual(1);
     expect(web.titleWidth, 'the title clamped away to nothing').toBeGreaterThan(20);
-    expect(web.titleLeft, 'the title runs under the drawer toggle').toBeGreaterThanOrEqual(web.toggleRight);
-    expect(web.titleRight, 'the title runs under the Filter button').toBeLessThanOrEqual(web.filterLeft);
+    expect(web.titleLeft, 'the title runs under the Filter button').toBeGreaterThanOrEqual(web.filterRight);
+    expect(web.titleRight, 'the title runs under the Grouping button').toBeLessThanOrEqual(web.groupingLeft);
 
     // Now the packaged macOS layout, where the row's two ends differ the most:
     // the toggle rests after --titlebar-lights-reserve there. A title centred
@@ -469,10 +471,10 @@ test.describe('Threads header: a pane-centred title, and a band that answers no 
         + `the drawer pane at ${overlay.bandCentre.toFixed(1)}`)
       .toBeLessThanOrEqual(1);
     expect(overlay.titleWidth, 'the title clamped away to nothing').toBeGreaterThan(20);
-    expect(overlay.titleLeft, 'the title runs under the drawer toggle')
-      .toBeGreaterThanOrEqual(overlay.toggleRight);
-    expect(overlay.titleRight, 'the title runs under the Filter button')
-      .toBeLessThanOrEqual(overlay.filterLeft);
+    expect(overlay.titleLeft, 'the title runs under the Filter button')
+      .toBeGreaterThanOrEqual(overlay.filterRight);
+    expect(overlay.titleRight, 'the title runs under the Grouping button')
+      .toBeLessThanOrEqual(overlay.groupingLeft);
   });
 
   test('double-clicking the drawer header changes no pane geometry', async ({ page }) => {

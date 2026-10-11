@@ -1,4 +1,4 @@
-import { API, json } from './_core';
+import { API, API_BASE, json, text } from './_core';
 import type {
   InstalledPlugin,
   MarketplaceCatalog,
@@ -59,6 +59,17 @@ export function rescanPluginCatalog(): Promise<{ queued: boolean }> {
  *  Plugins → Installed tab. */
 export function fetchInstalledPlugins(): Promise<{ plugins: InstalledPlugin[] }> {
   return json(`${API}/plugins/installed`);
+}
+
+/** A *plugin media* URL as the engine sends it (`/api/v1/plugins/media/...`),
+ *  prefixed with the workspace's base path like every other API URL. */
+export function pluginMediaUrl(url: string): string {
+  return `${API_BASE}${url}`;
+}
+
+/** The plugin's `media/README.md`, as raw markdown for the detail page. */
+export function fetchPluginReadme(readmeUrl: string): Promise<string> {
+  return text(pluginMediaUrl(readmeUrl));
 }
 
 export function stagePluginInstall(source: string): Promise<PluginInstallRequest> {

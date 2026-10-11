@@ -134,14 +134,16 @@ pub(crate) fn trigger_dispatch(
 
     match &emitted.typed {
         BusEvent::Thread {
-            thread_id, event, ..
+            thread_id,
+            event,
+            meta,
         } => {
             if !is_subscribable(event) {
                 return None;
             }
             Some(TriggerDispatch {
                 event_type: event.event_type().to_string(),
-                payload: matchable_thread_payload(event, *thread_id),
+                payload: matchable_thread_payload(event, meta, *thread_id),
                 depth: emitted.depth,
                 emitting_trigger_id: emitted.emitting_trigger_id.clone(),
                 origin_thread_id: Some(*thread_id),
@@ -1107,10 +1109,15 @@ fn next_backup_fire(
     tz: chrono_tz::Tz,
     after: chrono::DateTime<chrono::Utc>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    schedule
-        .after(&after.with_timezone(&tz))
-        .next()
-        .map(|t| t.with_timezone(&chrono::Utc))
+    crate::engine::tools::scheduler::next_occurrences_after(
+        std::slice::from_ref(schedule),
+        tz,
+        after,
+        1,
+    )
+    .into_iter()
+    .next()
+    .map(|t| t.with_timezone(&chrono::Utc))
 }
 
 /// Run the scheduled backup on `cron_expr`, resolving each fire through `tz` at
@@ -1515,6 +1522,45 @@ mod tests {
         );
     }
 
+    /// A condition on a meta field gives one verdict live and on replay. The
+    /// live view dropped the carrier's meta, so `channel` matched the stored
+    /// row and never the live frame.
+    #[test]
+    fn a_condition_on_meta_gives_the_same_verdict_live_and_stored() {
+        use crate::core::event_subscription::{matchable_payload, EventSubscription};
+        use crate::engine::thread_events::EventChannel;
+
+        let thread_id = uuid::Uuid::new_v4();
+        let meta = EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        };
+        let event = response_generated();
+        let stored =
+            matchable_payload(event.event_type(), event.to_payload(&meta), Some(thread_id));
+        let live = trigger_dispatch(&emitted(
+            BusEvent::Thread {
+                thread_id,
+                event,
+                meta,
+            },
+            0,
+        ))
+        .expect("a lifecycle event is a trigger carrier")
+        .payload;
+
+        let on_coding_agent = EventSubscription {
+            event_type: "ResponseGenerated".into(),
+            condition: Some(serde_json::json!({"channel": "claude_code"})),
+        };
+        assert!(on_coding_agent.matches("ResponseGenerated", &stored));
+        assert!(
+            on_coding_agent.matches("ResponseGenerated", &live),
+            "the live frame must match what its stored row matches"
+        );
+        assert_eq!(live, stored);
+    }
+
     #[test]
     fn an_ordinary_turn_dispatches_at_zero() {
         // Nothing outside a trigger fire is a link in anyone's chain, so the
@@ -1705,6 +1751,31 @@ mod tests {
             trigger_dispatch(&frame),
             None,
             "a transient frame writes no row, so neither matcher may see it"
+        );
+    }
+
+    /// Regression: a backup at a wall time inside the repeated hour finished,
+    /// and its next fire resolved to the instant it had just used. The loop has
+    /// no grace, so it uploaded again and again until the hour was over. The
+    /// next fire is that wall time's second pass, then tomorrow.
+    #[test]
+    fn a_backup_in_the_repeated_hour_does_not_repeat_its_instant() {
+        let schedule = crate::engine::tools::scheduler::parse_standard_cron("0 30 2 * * *")
+            .expect("a daily 02:30 parses");
+        let oslo: chrono_tz::Tz = "Europe/Oslo".parse().expect("a known IANA zone");
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("a literal timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        // 02:30 CEST is 00:30 UTC, and the run finished in the repeated hour.
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-10-25T01:05:00Z")),
+            Some(at("2026-10-25T01:30:00Z"))
+        );
+        assert_eq!(
+            next_backup_fire(&schedule, oslo, at("2026-10-25T01:31:00Z")),
+            Some(at("2026-10-26T01:30:00Z"))
         );
     }
 

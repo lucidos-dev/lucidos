@@ -46,6 +46,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       const title = header.querySelector('.threads-header-title') as HTMLElement | null;
       const filter = header.querySelector('button[aria-label="Filter threads"]') as HTMLElement | null;
       const search = header.querySelector('button[aria-label="Search threads"]') as HTMLElement | null;
+      const grouping = header.querySelector('.grouping-btn') as HTMLElement | null;
       const selector = header.querySelector('button[aria-label="Switch thread view"]');
       const rect = (el: HTMLElement | null) => el ? el.getBoundingClientRect() : null;
       return {
@@ -55,6 +56,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
         filterWidth: rect(filter)?.width ?? 0,
         filterLeft: rect(filter)?.left ?? 0,
         filterRight: rect(filter)?.right ?? 0,
+        groupingRight: rect(grouping)?.right ?? 0,
         searchLeft: rect(search)?.left ?? 0,
         hasSeparateSelector: !!selector,
       };
@@ -66,21 +68,21 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // separate "Switch thread view" button anymore.
     expect(empty!.hasSeparateSelector, 'no separate view-selector button').toBe(false);
     expect(empty!.filterWidth, 'single Filter button is visible').toBeGreaterThan(20);
-    // Filter sits at the trailing end, right of the title and just left of
-    // Search. The row's leading end belongs to the drawer toggle.
-    expect(empty!.filterLeft, 'Filter button sits right of the Threads title')
-      .toBeGreaterThanOrEqual(empty!.titleRight - 1);
-    const filterToSearch = empty!.searchLeft - empty!.filterRight;
-    expect(filterToSearch, 'Filter button sits just left of Search').toBeGreaterThanOrEqual(0);
-    expect(filterToSearch, 'Filter button sits just left of Search').toBeLessThanOrEqual(8);
+    // Filter leads the row, just past the drawer toggle, left of the title.
+    // Grouping sits just left of Search at the trailing end.
+    expect(empty!.filterRight, 'Filter button sits left of the pane title')
+      .toBeLessThanOrEqual(empty!.titleLeft + 1);
+    const groupingToSearch = empty!.searchLeft - empty!.groupingRight;
+    expect(groupingToSearch, 'Grouping button sits just left of Search').toBeGreaterThanOrEqual(0);
+    expect(groupingToSearch, 'Grouping button sits just left of Search').toBeLessThanOrEqual(8);
     // The title is centred on the drawer pane (split-resize-desktop.spec.ts
     // measures that); its text centres in its own box.
     expect(empty!.titleTextAlign, 'Threads title text centres in its box').toBe('center');
 
-    // The needs-attention badge is absolutely positioned, so even a draft that
-    // surfaces per-view counts in the menu must not move the title.
+    // A draft changes the drawer's rows and counts, never the header row, so
+    // the title must not move.
     const input = await waitForVisibleInput(page);
-    await input.fill('an unsent draft to surface the drafts count');
+    await input.fill('an unsent draft that adds a drawer row');
     await page.waitForTimeout(100);
     const withDraft = await measure();
     expect(Math.abs(withDraft!.titleLeft - empty!.titleLeft), 'Threads title moved when a draft appeared')
@@ -91,18 +93,18 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // The packaged macOS build rests the drawer toggle past the traffic lights.
     // The row keeps that whole lead free for it, so the title gets the least
     // room there. The title is centred on the pane and clamped to clear the
-    // wider of the row's two ends: the toggle's room, or Filter and Search.
-    // This checks the clamp at the drawer floor, on the tightest build.
+    // wider of the row's two ends: the toggle's room and Filter, or Grouping
+    // and Search. A word that outgrows that room hides, never ellipsizes.
+    // This checks it at the drawer floor, on both builds.
     // Simulated by stamping what `titlebar_inset_script` stamps: nothing in the
     // CSS keys off Tauri itself, so this is the geometry the webview lays out.
     await sizeAndOpen(page);
     await page.locator('.threads-header button[aria-label="Filter threads"]').click();
     await expect(page.locator('.thread-drawer .thread-filter-panel')).toBeVisible();
 
-    // The TITLE's BOX, not its text run: the text is clipped to the box with an
-    // ellipsis, so a range measurement reports the unclipped extent and would
-    // read a legitimately truncated title as an overlap. The box is the
-    // structural property anyway, since the clamp is what keeps it clear.
+    // The TITLE's BOX, not its text run: the box is the structural property,
+    // since the clamp is what keeps it clear. A cramped title is hidden, so it
+    // overlaps nothing on screen whatever its box does.
     const measure = () => page.evaluate(() => {
       const header = Array.from(document.querySelectorAll('.threads-header'))
         .find((h) => h.getBoundingClientRect().width > 0) as HTMLElement | undefined;
@@ -122,16 +124,20 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
         // leading end from the header, so it is found from the header.
         toggle: overlapOf(document.querySelector('.desktop-header .thread-toggle-slot .thread-toggle')),
         filter: overlapOf(header.querySelector('button[aria-label="Filter threads"]')),
+        grouping: overlapOf(header.querySelector('.grouping-btn')),
         search: overlapOf(search),
-        titleWidth: box.width,
+        shown: getComputedStyle(title).visibility === 'visible',
+        whole: title.scrollWidth <= title.clientWidth + 0.5,
         searchInside: search.getBoundingClientRect().right
           <= header.getBoundingClientRect().right + 1,
       };
     });
 
     const divider = page.locator('.drawer-divider');
-    for (const overlay of [false, true]) {
-      const build = overlay ? 'packaged macOS' : 'web';
+    // 100% and 125% UI scale: the floor and the clamp both scale with the root.
+    for (const scale of [100, 125]) for (const overlay of [false, true]) {
+      const build = `${overlay ? 'packaged macOS' : 'web'} at ${scale}%`;
+      await page.evaluate((s) => document.documentElement.style.setProperty('--user-ui-scale', `${s}%`), scale);
       // Stamp the build FIRST: the two rows lay out differently (the packaged
       // one leads past the traffic lights), so a drag run before the attribute
       // would measure the other build's row. The FLOOR is the same on both
@@ -164,20 +170,24 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       const g = await measure();
       expect(g, `${build}: visible threads-header`).not.toBeNull();
       // The clamp refused to follow the pointer, which is the floor doing its
-      // job. 300 rather than the exact 312, so a UI-scale default or a row
+      // job. 300 rather than the exact 320, so a UI-scale default or a row
       // tweak does not re-tune this test: what it guards is the overlap below.
       expect(g!.drawerWidth, `${build}: the drawer stayed below its floor`)
         .toBeGreaterThan(300);
-      expect(g!.titleWidth, `${build}: the title has no room left at all`)
-        .toBeGreaterThan(20);
       expect(g!.searchInside, `${build}: the Search button is outside the drawer`).toBe(true);
+      // Whole or hidden, never an ellipsis. The web row has room for "Filters"
+      // at the floor; the packaged row, past the lights, has none.
+      expect(g!.shown, `${build}: the title shows`).toBe(!overlay);
+      if (!g!.shown) continue;
+      expect(g!.whole, `${build}: the title is cut`).toBe(true);
       expect(g!.toggle, `${build}: title overlaps the drawer toggle`).toBe(0);
       expect(g!.filter, `${build}: title overlaps the Filter button`).toBe(0);
+      expect(g!.grouping, `${build}: title overlaps the Grouping button`).toBe(0);
       expect(g!.search, `${build}: title overlaps the Search button`).toBe(0);
     }
   });
 
-  test('opens the merged Status + Thread type panel IN THE DRAWER PANE; picking a status closes it; a status greys the type section', async ({ page }) => {
+  test('opens the thread-type panel IN THE DRAWER PANE; a type narrows the list in place and keeps the panel up', async ({ page }) => {
     await sizeAndOpen(page);
 
     const filterBtn = page.locator('.threads-header button[aria-label="Filter threads"]');
@@ -198,141 +208,54 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await expect(panel.locator('.thread-filter-panel-footer')).toHaveCount(0);
     await expect(panel.locator('.thread-filter-close')).toHaveCount(0);
 
-    // Two headings and one rule: everything either side of the rule is a single
-    // set, and both sections are named.
-    expect(await panel.locator('.thread-filter-title').allTextContents())
-      .toEqual(['Status', 'By thread types']);
-    await expect(panel.locator('.thread-filter-or')).toHaveText('or');
-    // No hairline between "Include deleted" and that heading: a heading already
-    // opens a section.
+    // The type rows, then "Include deleted", and nothing else. No heading: the
+    // pane title already says Filters. No hairline either.
+    await expect(panel.locator('.thread-filter-title')).toHaveCount(0);
+    expect(await panel.evaluate((p) => Array.from(p.children).map(c => c.classList[0]))).toEqual([
+      'thread-filter-types', 'thread-filter-option',
+    ]);
     await expect(panel.locator('.thread-filter-divider')).toHaveCount(0);
 
-    // Five options: the four real statuses, then "All statuses" under the rule.
-    // The thread types below are NOT a sixth, they narrow this one.
-    const labels = await panel.locator('.drawer-view-option .drawer-view-label').allTextContents();
-    expect(labels).toEqual([
-      'Needs attention', 'Review', 'In flight', 'Drafts', 'All statuses',
-    ]);
-
-    // The channel section is a named group, and its knobs are live. They are
-    // live in EVERY view (asserted under a status view further down); here that
-    // is merely the unremarkable case.
+    // The channel section is a named group, and its knobs are live.
     const types = panel.locator('div.thread-filter-types');
     await expect(types).toHaveAttribute('role', 'group');
-    await expect(types).not.toHaveClass(/thread-filter-types-dimmed/);
-    const firstType = types.locator('input[type="checkbox"]').first();
-    await expect(firstType).toBeEnabled();
+    await expect(types).toHaveAttribute('aria-label', 'Thread types');
+    await expect(types.locator('input[type="checkbox"]').first()).toBeEnabled();
 
     // Excluding the child rows keeps the Lucidos locator off a repo or app that
     // happens to share the channel's name.
-    const allStatuses = panel.locator('.drawer-view-option', { hasText: 'All statuses' });
-    const typesHeading = panel.locator('.thread-filter-title', { hasText: 'By thread types' });
     const lucidos = panel.locator(
       '.thread-filter-option:not(.thread-filter-option-child)', { hasText: 'Lucidos' },
     );
     const includeDeleted = panel.locator(
       'label.thread-filter-option', { hasText: 'Include deleted' },
     );
-    await expect(allStatuses).toHaveAttribute('aria-checked', 'true');
-    await expect(panel.locator('.drawer-view-suffix')).toHaveCount(0);
-    await expect(panel.locator('button[aria-label="About Filtered"]')).toHaveCount(0);
+    // "Include deleted" sits after the types group, outside it.
+    await expect(types.locator('label', { hasText: 'Include deleted' })).toHaveCount(0);
+    // The checkbox itself: the row's centre can land on its explainer icon,
+    // which opens the explainer instead.
+    const includeDeletedBox = includeDeleted.locator('input[type="checkbox"]');
+    await includeDeletedBox.click();
+    await expect(includeDeletedBox).toBeChecked();
+    await includeDeletedBox.click();
+    await expect(includeDeletedBox).not.toBeChecked();
 
-    // "Include deleted" is off by default, and on this workspace nothing has
-    // been deleted, so it EXCLUDES nothing and the row stays quiet either way.
-    // What decides is the difference between what is SHOWN and all of it, never
-    // whether a switch is at its widest. (The store-level cases, including a
-    // deleted option that IS held back, are in
-    // `store/threadFilterActive.test.ts`; there is no deleted trigger, repo or
-    // app to make here without seeding one.)
-    await includeDeleted.click();
-    await expect(panel.locator('.drawer-view-suffix')).toHaveCount(0);
-    await includeDeleted.click();
-    await expect(panel.locator('.drawer-view-suffix')).toHaveCount(0);
-
-    // Dropping a channel NARROWS All statuses rather than picking something
-    // else, so the checkmark stays put and the row says "filtered": what is
-    // being shown now differs from all of it. No parentheses, and the explainer
-    // rides inside the note. The heading takes the accent AND its own checkmark,
-    // which is a different element from the single-select set's mark.
+    // Dropping a channel narrows the list, and the panel stays up: a type is
+    // not a terminal pick.
     await lucidos.click();
-    await expect(allStatuses).toHaveAttribute('aria-checked', 'true');
-    await expect(panel.locator('.drawer-view-suffix')).toHaveText(/^filtered$/);
-    await expect(panel.locator('.drawer-view-suffix button[aria-label="About Filtered"]'))
-      .toHaveCount(1);
-    await expect(typesHeading).toHaveClass(/thread-filter-title-active/);
-    await expect(panel.locator('.thread-filter-title-check')).toHaveCount(1);
-    // The single-select set's own mark stays on All statuses: the heading's is
-    // a different element, so exactly one of each and no doubling up there.
-    await expect(panel.locator('.drawer-view-check')).toHaveCount(1);
+    await expect(panel).toBeVisible();
+    await expect(lucidos.locator('input[type="checkbox"]')).not.toBeChecked();
 
-    // Taking All statuses closes the panel and KEEPS the types narrowing it:
-    // one choice, so the row cannot throw away the state it is describing.
-    await allStatuses.click();
-    await expect(panel).toBeHidden();
+    // Closing keeps the narrowing: reopening finds it as it was left.
     await filterBtn.click();
-    await expect(panel).toBeVisible();
-    await expect(panel.locator(
-      '.thread-filter-option:not(.thread-filter-option-child)', { hasText: 'Lucidos' },
-    ).locator('input[type="checkbox"]')).not.toBeChecked();
-    await expect(typesHeading).toHaveClass(/thread-filter-title-active/);
-    await expect(panel.locator('.drawer-view-suffix')).toHaveText(/^filtered$/);
-
-    // Picking a status applies it and closes the panel (a terminal choice, and
-    // closing is what reveals the list it just filtered). Deliberately taken
-    // while the type selection is STILL narrow, so reopening exercises the gate
-    // below rather than a neutral filter.
-    await panel.locator('.drawer-view-option', { hasText: 'Review' }).click();
-    await expect(panel).toBeHidden();
-
-    // Reopening under a non-All status shows the type section DIMMED in place,
-    // since that view bypasses it. Dim only: every knob in it stays live, here
-    // and in "Include deleted", which sits outside the group (under All
-    // statuses, inside the radiogroup) and dims to match.
-    await filterBtn.click();
-    await expect(panel).toBeVisible();
-    await expect(types).toHaveClass(/thread-filter-types-dimmed/);
-    await expect(types.locator('input[type="checkbox"]').first()).toBeEnabled();
-    await expect(panel.locator(
-      'label.thread-filter-option', { hasText: 'Include deleted' },
-    ).locator('input[type="checkbox"]')).toBeEnabled();
-    // The heading dims WITH its section and keeps both cues under the dim: the
-    // Lucidos channel is still off, and a knob the user can still reach has to
-    // keep reading as set. What the dim says is "not shaping this list", never
-    // "not available".
-    await expect(typesHeading).toHaveClass(/thread-filter-title-dimmed/);
-    await expect(typesHeading).toHaveClass(/thread-filter-title-active/);
-    await expect(panel.locator('.thread-filter-title-check')).toHaveCount(1);
-    // The row's own note is gated on the view, though: it reports what is on
-    // screen, and what is on screen here is Review.
-    await expect(panel.locator('.drawer-view-suffix')).toHaveCount(0);
-    await expect(panel.locator('button[aria-label="About Filtered"]')).toHaveCount(0);
-
-    // The point of leaving them live: set the types you want from here and take
-    // All statuses in one move. Ticking Lucidos back on under Review applies
-    // immediately (the heading's cues clear) and does NOT close the panel, which
-    // is what makes it one move rather than a trip through the `all` view.
-    await lucidos.click();
-    await expect(panel).toBeVisible();
-    await expect(lucidos.locator('input[type="checkbox"]')).toBeChecked();
-    await expect(typesHeading).not.toHaveClass(/thread-filter-title-active/);
-    await expect(panel.locator('.thread-filter-title-check')).toHaveCount(0);
-
-    // Take it off again from here, then take All statuses: the pick made under
-    // a status view is what the `all` view lands on.
-    await lucidos.click();
-    await panel.locator('.drawer-view-option', { hasText: 'All statuses' }).click();
     await expect(panel).toBeHidden();
     await filterBtn.click();
     await expect(panel).toBeVisible();
     await expect(lucidos.locator('input[type="checkbox"]')).not.toBeChecked();
-    await expect(panel.locator('.drawer-view-suffix')).toHaveText(/^filtered$/);
 
     // Tick the channel on again so the panel is left as this test found it.
     await lucidos.click();
-    await expect(panel.locator('.drawer-view-suffix')).toHaveCount(0);
-    await expect(panel.locator('.thread-filter-title', { hasText: 'By thread types' }))
-      .not.toHaveClass(/thread-filter-title-active/);
-    await expect(panel.locator('.thread-filter-title-check')).toHaveCount(0);
+    await expect(lucidos.locator('input[type="checkbox"]')).toBeChecked();
 
     await page.keyboard.press('Escape');
     await expect(panel).toBeHidden();
@@ -370,13 +293,13 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // is back, the pane title says so, and the button is released.
     await filterBtn.click();
     await expect(panel).toBeHidden();
-    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Threads');
+    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Folders');
     await expect(page.locator('.thread-drawer .thread-drawer-list')).toBeVisible();
     expect(await glyph.innerHTML()).toBe(funnel);
     await expect(filterBtn).not.toHaveClass(/view-selector-active/);
   });
 
-  test('pressed means the panel is open, and the glyph says what the list is filtered to', async ({ page }) => {
+  test('pressed means the panel is open, and the glyph says whether types narrow the list', async ({ page }) => {
     // A filtered list must not look like a panel left open. So the highlight
     // follows the panel alone, and the glyph carries the filter, open or closed.
     await sizeAndOpen(page);
@@ -388,41 +311,10 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await expect(glyph).toHaveAttribute('fill', 'none');
     const funnel = await glyph.innerHTML();
 
-    // Put a filter on: picking a status applies it and closes the panel, so the
-    // button comes back released, wearing that status's own glyph.
+    // Narrowing by thread type fills the funnel, the same glyph pressed or
+    // released.
     await filterBtn.click();
-    await panel.locator('.drawer-view-option', { hasText: 'Review' }).click();
-    await expect(panel).toBeHidden();
-    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
-    const review = await glyph.innerHTML();
-    expect(review, 'the closed button stopped reporting the status').not.toBe(funnel);
-
-    // Reopening presses the button and drops the badge, but the glyph stays the
-    // status's own: pressing never swaps what it reports.
-    await filterBtn.click();
-    await expect(panel).toBeVisible();
     await expect(filterBtn).toHaveClass(/view-selector-active/);
-    expect(await glyph.innerHTML(), 'opening swapped the status glyph').toBe(review);
-    // The badge stays mounted to fade, so what drops is its shown state.
-    await expect(filterBtn.locator('.badge[data-shown]')).toHaveCount(0);
-    await expect(filterBtn.locator('.badge')).toBeHidden();
-
-    // Closing releases it and keeps the glyph.
-    await filterBtn.click();
-    await expect(panel).toBeHidden();
-    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
-    expect(await glyph.innerHTML(), 'closing swapped the status glyph').toBe(review);
-
-    // Back on All statuses, the plain funnel returns.
-    await filterBtn.click();
-    await panel.locator('.drawer-view-option', { hasText: 'All statuses' }).click();
-    await expect(panel).toBeHidden();
-    expect(await glyph.innerHTML()).toBe(funnel);
-    await expect(glyph).toHaveAttribute('fill', 'none');
-
-    // Narrowing All statuses by thread type fills the funnel, the same glyph
-    // pressed or released.
-    await filterBtn.click();
     const lucidos = panel.locator(
       '.thread-filter-option:not(.thread-filter-option-child)', { hasText: 'Lucidos' },
     );
@@ -431,6 +323,17 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await filterBtn.click();
     await expect(panel).toBeHidden();
     await expect(filterBtn).not.toHaveClass(/view-selector-active/);
+    await expect(glyph).toHaveAttribute('fill', 'currentColor');
+
+    // The filter shapes Folders only. Under Ongoing the button fades out in
+    // its slot. Back under Folders, the glyph still reports the narrowing.
+    const slot = page.locator('.threads-header .filter-slot');
+    await page.locator('.threads-header .grouping-btn').click();
+    await expect(slot).not.toHaveAttribute('data-shown');
+    await expect(filterBtn).toBeHidden();
+    await page.locator('.threads-header .grouping-btn').click();
+    await expect(slot).toHaveAttribute('data-shown');
+    await expect(filterBtn).toBeVisible();
     await expect(glyph).toHaveAttribute('fill', 'currentColor');
 
     // Tick it back on, so the test leaves the list as it found it.
@@ -458,9 +361,9 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       // The cover is the box the panel shows in, so it carries the padding.
       const cover = document.querySelector('.thread-drawer .thread-filter-cover')!;
       const panel = cover.querySelector('.thread-filter-panel')!;
-      const statusRow = panel.querySelector('.drawer-view-option')!;
-      const typeRow = panel.querySelector('.thread-filter-option')!;
-      const heading = panel.querySelector('.thread-filter-title')!;
+      const typeRow = panel.querySelector('.thread-filter-types .thread-filter-option')!;
+      // "Include deleted", the one row outside the types group.
+      const deletedRow = panel.querySelector(':scope > .thread-filter-option')!;
       // The list's own column: the x a thread name starts at (`.thread-row`'s
       // padding-left at depth 0), read off the rule rather than hardcoded.
       const row = document.createElement('div');
@@ -468,34 +371,13 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
       list.appendChild(row);
       const listColumn = px(row, 'padding-left');
       row.remove();
-      // Where the words sit inside their heading row. A list heading is built
-      // here rather than found, since a cleared workspace may render none. It
-      // carries the count a real one always draws, since the count sets the
-      // heading's line height.
-      const wordsOffset = (title: Element) => {
-        const range = document.createRange();
-        range.selectNodeContents(title.querySelector('.section-label')!);
-        return range.getBoundingClientRect().top - title.getBoundingClientRect().top;
-      };
-      const listHeading = document.createElement('div');
-      listHeading.className = 'list-section-title list-section-title-collapsible';
-      listHeading.innerHTML = '<span class="section-icon"></span>'
-        + '<span class="section-label">Pinned</span>'
-        + '<span class="section-count"><span class="section-count-badge">3</span>'
-        + '<span class="section-count-open">3</span></span>';
-      list.prepend(listHeading);
-      const listWords = wordsOffset(listHeading);
-      listHeading.remove();
       return {
-        headingWords: wordsOffset(heading),
-        listWords,
         listColumn,
         panelTop: px(cover, 'padding-top'),
         listTop: px(list, 'padding-top'),
         panelLeft: px(cover, 'padding-left'),
-        statusLeft: px(statusRow, 'padding-left'),
         typeLeft: px(typeRow, 'padding-left'),
-        headingLeft: px(heading, 'padding-left'),
+        deletedLeft: px(deletedRow, 'padding-left'),
       };
     });
 
@@ -503,13 +385,9 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // so every row's inset is the row's own padding, as in the list.
     expect(geometry.panelTop).toBe(geometry.listTop);
     expect(geometry.panelLeft).toBe(0);
-    // Both row families (the single-select rows and the checkbox rows) and the
-    // section heading all start where a thread name does.
-    expect(geometry.statusLeft).toBe(geometry.listColumn);
+    // The type rows and "Include deleted" start where a thread name does.
     expect(geometry.typeLeft).toBe(geometry.listColumn);
-    expect(geometry.headingLeft).toBe(geometry.listColumn);
-    // And its words stand at the same height in their row as a list heading's.
-    expect(Math.abs(geometry.headingWords - geometry.listWords)).toBeLessThan(0.1);
+    expect(geometry.deletedLeft).toBe(geometry.listColumn);
   });
 
   test('the Filter button opens reliably and toggles closed (Chrome open-bug regression)', async ({ page }) => {
@@ -525,7 +403,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // Re-clicking the toggle closes it, and the pane title goes back.
     await filterBtn.click();
     await expect(panel).toBeHidden();
-    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Threads');
+    await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Folders');
 
     // And it opens again on the next click.
     await filterBtn.click();

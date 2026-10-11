@@ -20,6 +20,8 @@ function makeChange(over: Partial<Change> = {}): Change {
     files: ['a.ts'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-01-01T00:00:00Z',
     resolved_at: null,
@@ -48,11 +50,11 @@ describe('a single apply', () => {
   });
 
   it('says it is hardening for an unhardened change before any event lands', () => {
-    expect(rowProgressLabel(makeChange({ hardened: false }), 'apply', NO_PHASES, null)).toBe('Hardening...');
+    expect(rowProgressLabel(makeChange({ needs_hardening: true }), 'apply', NO_PHASES, null)).toBe('Hardening...');
   });
 
   it('goes back to applying once hardening hands over to the merge', () => {
-    expect(rowProgressLabel(makeChange({ hardened: false }), 'apply', phases('merging'), null)).toBe('Applying...');
+    expect(rowProgressLabel(makeChange({ needs_hardening: true }), 'apply', phases('merging'), null)).toBe('Applying...');
   });
 
   it('says it is resolving a conflict from the served flag alone', () => {
@@ -65,7 +67,7 @@ describe('a single apply', () => {
 // the cases below run with the lists empty, as an open page has them.
 describe('an Apply All member', () => {
   it('reads as applying while nothing places it, never as hardening ahead of its turn', () => {
-    expect(rowProgressLabel(makeChange({ hardened: false }), undefined, NO_PHASES, batch())).toBe('Applying...');
+    expect(rowProgressLabel(makeChange({ needs_hardening: true }), undefined, NO_PHASES, batch())).toBe('Applying...');
   });
 
   it('names the phase an event said, once the batch reaches it', () => {
@@ -78,7 +80,7 @@ describe('an Apply All member', () => {
 
   it('names its hardening after a reload, from what the engine served', () => {
     const served = batch({ applyingChangeIds: ['c-1'] });
-    expect(rowProgressLabel(makeChange({ hardened: false }), undefined, NO_PHASES, served)).toBe('Hardening...');
+    expect(rowProgressLabel(makeChange({ needs_hardening: true }), undefined, NO_PHASES, served)).toBe('Hardening...');
   });
 });
 

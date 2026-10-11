@@ -858,3 +858,60 @@ fn every_known_category_passes_is_valid() {
     }
     assert!(!is_valid_category("not-a-category"));
 }
+
+/// Invariant I15: a plugin ships a widget only as a reusable one that names
+/// this plugin. Every other shape fails validation, naming the folder.
+#[test]
+fn validate_tree_refuses_a_widget_a_plugin_cannot_ship() {
+    let shapes = [
+        (
+            serde_json::json!({"origin_plugin_id": "browser-skills"}),
+            "reusable",
+        ),
+        (serde_json::json!({"reusable": true}), "origin_plugin_id"),
+        (
+            serde_json::json!({"reusable": true, "origin_plugin_id": "other"}),
+            "origin_plugin_id",
+        ),
+        (
+            serde_json::json!({
+                "reusable": true, "origin_plugin_id": "browser-skills",
+                "origin_thread_id": uuid::Uuid::nil().to_string(),
+            }),
+            "origin_thread_id",
+        ),
+    ];
+    for (extra, needle) in shapes {
+        let dir = tmpdir("widget_shape");
+        write_valid_plugin(&dir);
+        let mut manifest = serde_json::json!({"name": "Board", "kind": "widget"});
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        fs::create_dir_all(dir.join("apps/board")).unwrap();
+        fs::write(dir.join("apps/board/manifest.json"), manifest.to_string()).unwrap();
+        match validate_tree(&dir) {
+            Err(ValidationError::InvalidWidget(path, reason)) => {
+                assert_eq!(path, "apps/board");
+                assert!(reason.contains(needle), "{needle}: {reason}");
+            }
+            other => panic!("expected InvalidWidget for {needle}, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn validate_tree_accepts_a_reusable_widget_that_names_its_plugin() {
+    let dir = tmpdir("widget_ok");
+    write_valid_plugin(&dir);
+    fs::create_dir_all(dir.join("apps/board")).unwrap();
+    fs::write(
+        dir.join("apps/board/manifest.json"),
+        r#"{"name": "Board", "kind": "widget", "reusable": true, "origin_plugin_id": "browser-skills"}"#,
+    )
+    .unwrap();
+    validate_tree(&dir).expect("a shippable widget");
+    let _ = fs::remove_dir_all(&dir);
+}

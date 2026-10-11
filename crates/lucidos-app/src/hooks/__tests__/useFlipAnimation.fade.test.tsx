@@ -17,15 +17,11 @@ let animations: { target: Element; keyframes: Keyframe[] }[];
 
 function Drawer({ ids, open }: { ids: string[]; open: boolean }) {
     const container = useRef<HTMLDivElement>(null);
-    const portal = useRef<HTMLDivElement>(null);
     const sections: FlipSection[] = [{ name: 'current', ids }];
-    useFlipTransitions(container, portal, sections, undefined, [open]);
+    useFlipTransitions(container, sections, undefined, [open]);
     return (
-        <div>
-            <div ref={container} class="thread-drawer-rows">
-                {ids.map(id => <div key={id} data-flip-id={id}>{id}</div>)}
-            </div>
-            <div ref={portal} />
+        <div ref={container} class="thread-drawer-rows">
+            {ids.map(id => <div key={id} data-flip-id={id}>{id}</div>)}
         </div>
     );
 }

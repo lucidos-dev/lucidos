@@ -2624,7 +2624,8 @@ stage_runtime_assemble "$STAGE" \
     "frontend=$APP_DIR/dist" \
     "postgres=$PG_PREFIX" \
     "sdk=$REPO_ROOT/packages/lucidos-sdk/dist" \
-    "system-knowhow=$REPO_ROOT/system-knowhow" >/dev/null \
+    "system-knowhow=$REPO_ROOT/system-knowhow" \
+    "system-widgets=$REPO_ROOT/system-widgets" >/dev/null \
     || die "failed to stage bundle resources into $STAGE"
 # What was actually written, against the contract. The named call above cannot
 # put a resource in the wrong place, but it can still omit one, and a bundle that

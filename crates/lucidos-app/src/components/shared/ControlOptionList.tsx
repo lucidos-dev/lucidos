@@ -13,6 +13,8 @@ export interface ControlOption {
   /** The heading this row sits under. A list whose rows carry sections shows
    *  each heading where its run begins, in place of the list's own label. */
   section?: string;
+  /** A short label drawn as a badge after the row's own label. */
+  badge?: string;
 }
 
 /** The heading to draw above `options[index]`, or `null` when the row
@@ -142,6 +144,7 @@ export function ControlOptionList({
               <span class="control-option-label">
                 {isCurrent && <span class="control-checkmark">&#10003;</span>}
                 {opt.label}
+                {opt.badge && <span class="label label-success control-option-badge">{opt.badge}</span>}
               </span>
               {opt.description && <span class="control-option-desc">{opt.description}</span>}
             </span>

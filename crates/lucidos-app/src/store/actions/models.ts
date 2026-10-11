@@ -1,5 +1,5 @@
 import {
-  chatModels, configuredProviders, currentModel, reasoningEffort, showToast, showConfirm,
+  chatModels, configuredProviders, showToast, showConfirm,
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
 import { MODELS, REASONING_LEVELS, providerLabel } from '../models';
@@ -27,24 +27,10 @@ export function isProviderConfigured(provider: string): boolean {
  *  (e.g. after a Model* SSE) keep showing existing data through the round trip
  *  and swap atomically — same flash-avoidance as `loadCredentials`. */
 export async function loadChatModels(): Promise<void> {
-  const firstLoad = chatModels.value.status !== 'loaded';
   setLoadingIfFresh(chatModels);
   try {
     const data = await listModels();
     chatModels.value = { status: 'loaded', data: data.models || [] };
-    // The registry is the authority on which tiers a model supports, and it
-    // lands AFTER `loadPreferences` has already clamped the effort against the
-    // whole ladder. Re-clamp so the picker never keeps displaying a tier
-    // the engine would silently snap on the way to the wire. Display only, like
-    // `loadPreferences`: the stored preference is left alone, since the model
-    // this clamps against may itself change again.
-    //
-    // First load only. A reload follows a `Model*` event, and every provider
-    // pick writes one. Re-clamping then would narrow the account default every
-    // draft falls back to, for a pick on one draft.
-    if (firstLoad) {
-      reasoningEffort.value = clampEffortFor(reasoningEffort.value, currentModel.value);
-    }
   } catch (error) {
     chatModels.value = toFailed(error);
   }
@@ -100,14 +86,30 @@ export function modelReasoningEfforts(modelId: string): string[] | undefined {
 /** The Lucidos Agent's tier vocabulary, for `useModelSelection`. */
 export const LUCIDOS_TIER_VOCABULARY: readonly TierChoice[] = REASONING_LEVELS;
 
-/** Snap an effort onto the closest tier a model supports. Call this on EVERY
- *  model change: an effort left over from the previous model is exactly what
- *  the engine has to clamp at the chokepoint, and a picker showing one value
- *  while the request carries another is the confusion this pairing removes.
+/** What a Lucidos Agent picker names the tier when none is in force: the model
+ *  has no default effort, so the engine sends none. */
+export const PROVIDER_DEFAULT_EFFORT_LABEL = 'Provider default';
+
+/** The tier `modelId` runs at when nothing stored names one, snapped onto what
+ *  it offers, or `null` when it has no *default effort*. */
+export function modelDefaultEffort(modelId: string): string | null {
+  const effort = modelRow(modelId)?.default_effort ?? null;
+  return effort === null ? null : clampEffortFor(effort, modelId);
+}
+
+/** The Default row's label: the tier `effort` it falls back to, or the
+ *  provider's own when there is none. */
+export function defaultTierLabel(effort: string | null): string {
+  if (effort === null) return PROVIDER_DEFAULT_EFFORT_LABEL;
+  const tier = LUCIDOS_TIER_VOCABULARY.find((t) => t.value === effort)?.label ?? effort;
+  return `Default (${tier})`;
+}
+
+/** Snap an effort onto the closest tier a model supports. A picker then never
+ *  shows a tier the engine would snap on the way to the wire.
  *
  *  Pickers get this through `useModelSelection`, which clamps as part of a
- *  pick. The two remaining direct callers are not pickers: saving the account
- *  model, and re-clamping the displayed effort once the registry lands. */
+ *  pick. `accountChatEffort` is the one direct caller. */
 export function clampEffortFor(effort: string, modelId: string): string {
   const offered = tierOptions(
     lucidosTiers(modelReasoningEfforts(modelId)),

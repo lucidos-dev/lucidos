@@ -96,13 +96,15 @@ impl LucidosEngine {
     /// This is the one route the entry-point check cannot cover. A resolution
     /// session edits AFTER that check, running `/harden` and fixing tests, and
     /// its work is auto-committed and published. Rechecking here is safe where
-    /// rechecking at the tier fast paths was not: `completion.rs` treats a
-    /// failure as terminal, emitting `ChangeApplyFailed`, rather than as a cue
-    /// to escalate to a slower merge.
+    /// rechecking at the tier fast paths was not. Both callers treat a refusal
+    /// as terminal, emitting `ChangeApplyFailed`, rather than as a cue to
+    /// escalate to a slower merge: `completion.rs` for Tiers 2 and 3, and
+    /// `cc_assisted_merge_then_ff` for Tier 1.
     ///
-    /// Two branch names, because they differ here. The marker lives on the
+    /// Two branch names, because they can differ. The marker lives on the
     /// CHANGE branch, while the merge publishes the session's own branch, which
-    /// for an original Tier-3 session is a temp one.
+    /// for an original Tier-3 session is a temp one. Tier 1 passes one name
+    /// twice, since its session runs on the change branch.
     pub(crate) async fn bounded_fix_refusal_for_resolution(
         &self,
         repo_root: &Path,
@@ -139,6 +141,32 @@ impl LucidosEngine {
             WorktreeLookup::NotFound => Ok(Vec::new()),
             WorktreeLookup::Unknown => {
                 Err("git worktree list gave no answer, so its uncommitted files are unknown".into())
+            }
+        }
+    }
+
+    /// The files an Apply of `branch_name` would land: its commits ahead of
+    /// `main`, plus its worktree's uncommitted files. `None` when git could not
+    /// answer either half.
+    pub(crate) async fn landing_files(
+        &self,
+        repo_root: &Path,
+        branch_name: &str,
+    ) -> Option<Vec<String>> {
+        let committed = branch_changed_files_checked(repo_root, branch_name).await;
+        let dirty = self.dirty_files_for_bound(repo_root, branch_name).await;
+        match (committed, dirty) {
+            (Ok(mut landing), Ok(dirty)) => {
+                landing.extend(dirty);
+                Some(landing)
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                log!(
+                    "[Changes] landing files of {}: {}. Treating them as unknown",
+                    branch_name,
+                    e
+                );
+                None
             }
         }
     }
@@ -323,7 +351,7 @@ impl LucidosEngine {
         let kind_ctx = load_apply_kind_context(&self.pool, change.thread_id).await;
         let effective_requires_restart = change.requires_restart && !kind_ctx.is_app();
 
-        if let ChangeState::Applied(shas) = &change.state {
+        if let ChangeStatusData::Applied(shas) = &change.state {
             // Echo the stored merge SHAs so a re-apply still gives callers
             // a verifiable reference to the original merge. Use the
             // effective restart flag here too — an app re-apply must never
@@ -487,39 +515,31 @@ impl LucidosEngine {
             }
         }
 
-        // Implementation-plan floor (Lucidos-source only). A gate-satisfying
-        // marker — an APPROVED plan (`planned`), or an explicit
-        // `lucidos planned mark --simple` acknowledgment — MUST exist before a
-        // Lucidos-source change can apply. A `proposed` (awaiting-approval)
-        // marker does NOT satisfy the floor: the human hasn't approved the plan
-        // yet. The Claude-Code `cc-plan-gate` PreToolUse hook and the prompt
-        // rule are meant to make a non-satisfying branch unreachable; this is
-        // the hard backstop (and the ONLY enforcement for Codex, which has no
-        // PreToolUse hook). App and external-repo changes are exempt — neither
-        // uses the `docs/plans/` convention or the marker. Per the resolved
-        // design decision: if the marker is Missing/Proposed here, refuse the
-        // apply (no auto-recovery).
-        if kind_ctx.is_lucidos_source() {
-            let plan_repo_root = std::path::PathBuf::from(&change.repo_root);
-            let plan_state = self
-                .plan_marker_state(&plan_repo_root, &change.branch_name)
-                .await;
-            if !plan_state.satisfies_gate() {
-                let msg = if plan_state.is_present() {
-                    // Present but not satisfying => Proposed (awaiting approval).
-                    "The implementation plan on this branch is awaiting approval. The user must \
-                     approve the plan, after which the coding agent runs `lucidos planned approve` \
-                     to unblock implementation. Approve the plan, then apply."
-                } else {
-                    "No implementation-plan marker on this branch. Before applying, the coding \
-                     agent must run the `implementation-plan` skill (records a plan for the user to \
-                     approve) or `lucidos planned mark --simple \"<reason>\"` (acknowledges a local \
-                     fix). Re-run the session to set the marker, then apply."
-                };
+        // The implementation-plan floor. The propose path asks the same
+        // question, so a change held there never reaches this point. This
+        // stays the backstop for a row proposed before that gate existed.
+        // Both it and the hardening gate below judge what will land,
+        // re-derived from git as the bound check is. An unanswered read keeps
+        // the hold and the hardening.
+        let plan_repo_root = std::path::PathBuf::from(&change.repo_root);
+        let landing = if kind_ctx.is_app() {
+            None
+        } else {
+            self.landing_files(&plan_repo_root, &change.branch_name)
+                .await
+        };
+        let floor = self
+            .plan_floor(&kind_ctx, &plan_repo_root, &change.branch_name)
+            .await
+            .with_landing(landing.as_deref().unwrap_or_default());
+        match floor {
+            PlanFloor::Exempt | PlanFloor::PlanOnly => {}
+            PlanFloor::Held(hold) => {
+                let msg = hold.apply_refusal();
                 log!(
-                    "[Changes] Apply blocked — plan marker not satisfying ({:?}) for branch {} (change {})",
-                    plan_state,
+                    "[Changes] Apply blocked: plan floor holds branch {} ({:?}, change {})",
                     change.branch_name,
+                    hold,
                     change_id
                 );
                 self.emit_apply_failed(
@@ -531,64 +551,53 @@ impl LucidosEngine {
                 .await;
                 return Err(msg.into());
             }
-
-            // The bounded-security-fix lane satisfied the gate above on a
-            // promise: an unattended run may commit a security fix WITHOUT a
-            // human plan decision, provided the branch stays inside the files
-            // it named. It refuses BEFORE the apply starts any merge, which
-            // is the only place a refusal reads as a refusal. An `Err` out of
-            // the merge helpers means "main diverged, escalate to a slower
-            // route". A bound enforced there would send the branch down the
-            // conflict tiers instead of stopping it. The boundary that leaves
-            // is recorded in ADR 0154.
+            // The bounded-security-fix lane clears the floor on a promise: an
+            // unattended run may commit a security fix WITHOUT a human plan
+            // decision, provided the branch stays inside the files it named.
+            // It refuses BEFORE the apply starts any merge, which is the only
+            // place a refusal reads as a refusal. An `Err` out of the merge
+            // helpers means "main diverged, escalate to a slower route". A
+            // bound enforced there would send the branch down the conflict
+            // tiers instead of stopping it. The boundary that leaves is
+            // recorded in ADR 0154.
             //
             // The list is re-derived from git rather than read off
             // `change.files`: the recorded list is a projection a later commit
             // can outrun, and the question here is what will land NOW. The
             // worktree goes in for the same reason, since this function
             // auto-commits it further down and merges the result.
-            if let PlanMarkerState::Present(kind) = plan_state {
-                if kind.is_file_bounded() {
-                    let dirty = self
-                        .dirty_files_for_bound(&plan_repo_root, &change.branch_name)
-                        .await;
-                    if let Some(msg) = self
-                        .bounded_fix_refusal(&plan_repo_root, dirty, &change.branch_name)
-                        .await
-                    {
-                        log!(
-                            "[Changes] Apply blocked: bounded security fix left its bound on branch {} (change {})",
-                            change.branch_name,
-                            change_id
-                        );
-                        self.emit_apply_failed(
-                            change.thread_id.unwrap_or(change_id),
-                            change_id,
-                            &msg,
-                            actor.clone(),
-                        )
-                        .await;
-                        return Err(msg.into());
-                    }
+            PlanFloor::Clear(kind) if kind.is_file_bounded() => {
+                let dirty = self
+                    .dirty_files_for_bound(&plan_repo_root, &change.branch_name)
+                    .await;
+                if let Some(msg) = self
+                    .bounded_fix_refusal(&plan_repo_root, dirty, &change.branch_name)
+                    .await
+                {
+                    log!(
+                        "[Changes] Apply blocked: bounded security fix left its bound on branch {} (change {})",
+                        change.branch_name,
+                        change_id
+                    );
+                    self.emit_apply_failed(
+                        change.thread_id.unwrap_or(change_id),
+                        change_id,
+                        &msg,
+                        actor.clone(),
+                    )
+                    .await;
+                    return Err(msg.into());
                 }
             }
+            PlanFloor::Clear(_) => {}
         }
 
-        // App threads skip the /harden gate entirely — apps own their own
-        // hardening (per the app's `.claude/commands/harden.md` if it ships
-        // one); the engine never invokes `/harden` for `data/apps/<id>/`
-        // changes and the changes.hardened flag is ignored for them.
-        let marker_hardened = if kind_ctx.is_app() {
-            true
-        } else {
-            is_harden_marker_present(
-                &self.pool,
-                &std::path::PathBuf::from(&change.repo_root),
-                &change.branch_name,
-            )
-            .await
-        };
-        if marker_hardened && !change.hardened && !kind_ctx.is_app() {
+        // The propose path holds unhardened work, so this is the backstop for
+        // a row proposed before that hold existed. `apply_must_harden` skips
+        // apps, which own their hardening, and a branch that lands only plans.
+        let marker_hardened = !kind_ctx.is_app()
+            && is_harden_marker_present(&self.pool, &plan_repo_root, &change.branch_name).await;
+        if marker_hardened && !change.hardened {
             log!(
                 "[Changes] Marker found but DB not set — marking change {} as hardened",
                 change_id
@@ -598,7 +607,8 @@ impl LucidosEngine {
                     .await;
             }
         }
-        if !change.hardened && !marker_hardened {
+        let hardened = change.hardened || marker_hardened;
+        if apply_must_harden(&kind_ctx, hardened, landing.as_deref()) {
             let thread_id = match change.thread_id {
                 Some(tid) => tid,
                 None => {

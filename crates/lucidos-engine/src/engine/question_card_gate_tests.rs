@@ -5,14 +5,13 @@ use serde_json::json;
 fn since(last_input: LastInput) -> SinceLastInput {
     SinceLastInput {
         last_input,
-        spoke: false,
         unreported_tool_calls: 0,
         refused: false,
         artifact_refused: false,
         words: String::new(),
         saved_artifacts: Vec::new(),
-        round_was_notes: false,
         card_has_message: false,
+        last_progress_note: None,
     }
 }
 
@@ -50,11 +49,11 @@ fn owes_words(s: SinceLastInput) -> bool {
 // The decision
 // ---------------------------------------------------------------------------
 
+/// A typed answer may answer the card, ask back or say something else. So
+/// the agent may ask its question again at once, as after any message.
 #[test]
-fn a_card_after_a_typed_reply_with_nothing_said_is_refused() {
-    // The Claude Code case: the user typed a question into a plan card and got
-    // "With that answered: approve the plan?" with no answer and no tool call.
-    assert!(owes_words(since(typed())));
+fn a_re_ask_right_after_a_typed_answer_passes() {
+    assert_eq!(should_refuse(&since(typed()), ""), None);
 }
 
 #[test]
@@ -80,18 +79,10 @@ fn a_pick_followed_at_once_by_the_next_card_passes() {
 }
 
 #[test]
-fn words_after_the_work_pass() {
-    assert!(!owes_words(SinceLastInput {
-        spoke: true,
-        ..since(typed())
-    }));
-}
-
-#[test]
 fn a_preamble_does_not_report_the_work_after_it() {
     // "Let me check the log", then git log, then a card: the log went unreported.
     assert!(owes_words(SinceLastInput {
-        spoke: true,
+        words: "Let me check the log.".to_string(),
         unreported_tool_calls: 1,
         ..since(message())
     }));
@@ -173,7 +164,6 @@ fn incident_card() -> serde_json::Value {
 
 fn after_words(words: &str) -> SinceLastInput {
     SinceLastInput {
-        spoke: !words.trim().is_empty(),
         words: words.to_string(),
         ..since(typed())
     }
@@ -293,15 +283,14 @@ fn a_chat_round_that_spoke_owes_nothing() {
         unreported_tool_calls: 3,
         ..since(typed())
     }
-    .with_round_text(RoundText::Reply("I found two fixes on main."));
-    assert!(s.spoke);
+    .with_round_text("I found two fixes on main.");
     assert_eq!(s.unreported_tool_calls, 0);
     assert_eq!(should_refuse(&s, ""), None);
 }
 
 #[test]
 fn a_chat_round_note_still_cannot_hold_what_the_card_points_at() {
-    let s = since(message()).with_round_text(RoundText::Notes(INCIDENT_NOTE));
+    let s = since(message()).with_round_text(INCIDENT_NOTE);
     assert!(matches!(
         should_refuse(&s, POINTS_ABOVE),
         Some(Refusal::PointsAboveAtNothing { .. })
@@ -314,7 +303,7 @@ fn a_persisted_round_is_not_counted_twice() {
         words: format!("Earlier. {INCIDENT_NOTE}"),
         ..since(message())
     }
-    .with_round_text(RoundText::Notes(INCIDENT_NOTE));
+    .with_round_text(INCIDENT_NOTE);
     assert_eq!(s.words, format!("Earlier. {INCIDENT_NOTE}"));
 
     // Only a prefix of the round reached the events: the overlap counts once.
@@ -323,7 +312,7 @@ fn a_persisted_round_is_not_counted_twice() {
         words: format!("Earlier. {saved}"),
         ..since(message())
     }
-    .with_round_text(RoundText::Notes(INCIDENT_NOTE));
+    .with_round_text(INCIDENT_NOTE);
     assert_eq!(partly.words, format!("Earlier. {INCIDENT_NOTE}"));
 
     // Nothing of the round is saved yet: it is appended whole.
@@ -331,148 +320,54 @@ fn a_persisted_round_is_not_counted_twice() {
         words: "Earlier. ".to_string(),
         ..since(message())
     }
-    .with_round_text(RoundText::Notes(INCIDENT_NOTE));
+    .with_round_text(INCIDENT_NOTE);
     assert_eq!(unsaved.words, format!("Earlier. {INCIDENT_NOTE}"));
 
-    let blank = since(typed()).with_round_text(RoundText::Notes(" \n"));
-    assert!(!blank.spoke);
+    let blank = SinceLastInput {
+        unreported_tool_calls: 1,
+        ..since(typed())
+    }
+    .with_round_text(" \n");
     assert!(blank.words.is_empty());
-    assert!(!blank.round_was_notes);
+    assert_eq!(blank.unreported_tool_calls, 1, "blank text reports nothing");
 }
 
 // ---------------------------------------------------------------------------
-// A typed reply answered only by a progress note
+// A re-ask after a typed answer and a progress note
 // ---------------------------------------------------------------------------
 
-/// The note the chat agent showed after the user asked where the promised
-/// message was. The message itself stayed in its reasoning.
-const REFUND_NOTE: &str = "You're right, I hadn't actually written it. Here it is now: steps \
-     to cancel your plan and request a refund via support, plus two caveats.";
+/// The incident: the user typed a correction into a card instead of picking.
+const CORRECTION: &str = "2. Sry ignored was wrong i mean theres no one to tell it to. I just \
+     post into the void";
 
-/// The card that followed it, which points nowhere.
-const TAP_WHEN_SENT: &str = "Tap one when you've sent it, and I'll update the notes to match.";
+/// The progress note the chat agent showed before it asked again.
+const BORROW_NOTE: &str = "Since you lack an audience, borrowing one is the path forward: get \
+     the principal engineer/CTO to post about it, pitch an engineering blog post, lean on \
+     Shorts' algorithmic reach, and reply to big accounts.";
+
+/// The card it asked again, which points nowhere.
+const DRAFT_EITHER: &str = "Want me to draft either of these?";
 
 #[test]
-fn a_typed_reply_answered_only_by_a_note_is_refused() {
-    let s = since(typed()).with_round_text(RoundText::Notes(REFUND_NOTE));
-    assert_eq!(
-        should_refuse(&s, TAP_WHEN_SENT),
-        Some(Refusal::OnlyNotes {
-            reply: TYPED_REPLY.to_string(),
-            words: REFUND_NOTE.to_string()
-        })
-    );
+fn a_re_ask_after_a_typed_answer_and_a_note_passes() {
+    let s = since(LastInput::Typed(CORRECTION.to_string())).with_round_text(BORROW_NOTE);
+    assert_eq!(should_refuse(&s, DRAFT_EITHER), None);
 }
 
 #[test]
-fn a_typed_reply_answered_by_a_real_reply_passes_at_any_length() {
-    for reply in ["Done. Next question:", REFUND_NOTE] {
-        let s = since(typed()).with_round_text(RoundText::Reply(reply));
-        assert_eq!(should_refuse(&s, TAP_WHEN_SENT), None, "{reply}");
-    }
-}
-
-#[test]
-fn a_note_after_anything_but_a_typed_reply_passes() {
-    for input in [LastInput::Picked, message(), LastInput::None] {
-        let s = since(input.clone()).with_round_text(RoundText::Notes(REFUND_NOTE));
-        assert_eq!(should_refuse(&s, TAP_WHEN_SENT), None, "{input:?}");
-    }
-}
-
-#[test]
-fn a_note_after_a_long_earlier_reply_passes() {
-    // An earlier round since the input wrote more than any note holds, so it
-    // was a reply.
-    let s = SinceLastInput {
-        words: "An earlier reply with the whole message. ".repeat(20),
-        ..since(typed())
-    }
-    .with_round_text(RoundText::Notes(REFUND_NOTE));
-    assert_eq!(should_refuse(&s, TAP_WHEN_SENT), None);
-}
-
-#[test]
-fn a_coding_agent_short_note_after_a_typed_reply_passes() {
-    // No round text: its notes and replies look the same, so only the old
-    // rules apply.
-    assert_eq!(
-        should_refuse(&after_words(REFUND_NOTE), TAP_WHEN_SENT),
-        None
-    );
-}
-
-#[test]
-fn only_notes_is_refused_once_per_input() {
-    let s = SinceLastInput {
-        refused: true,
-        ..since(typed())
-    }
-    .with_round_text(RoundText::Notes(REFUND_NOTE));
-    assert_eq!(should_refuse(&s, TAP_WHEN_SENT), None);
-}
-
-#[test]
-fn only_notes_comes_before_pointing_above() {
-    let s = since(typed()).with_round_text(RoundText::Notes(REFUND_NOTE));
+fn a_note_after_a_typed_answer_still_cannot_hold_what_the_card_points_at() {
+    let s = since(typed()).with_round_text(BORROW_NOTE);
     assert!(matches!(
         should_refuse(&s, POINTS_ABOVE),
-        Some(Refusal::OnlyNotes { .. })
+        Some(Refusal::PointsAboveAtNothing { .. })
     ));
-}
-
-#[test]
-fn the_only_notes_refusal_quotes_the_note_and_moves_the_reply_onto_the_card() {
-    let text = Refusal::OnlyNotes {
-        reply: TYPED_REPLY.to_string(),
-        words: format!(" {REFUND_NOTE}\n"),
-    }
-    .text();
-    assert!(text.starts_with(REFUSAL_MARKER));
-    assert!(text.contains(&format!("\"{REFUND_NOTE}\"")));
-    assert!(text.contains(&format!("on the card itself, {CARD_MESSAGE_HINT}")));
-    assert!(text.contains("unchanged"));
-    assert!(!text.contains('\u{2014}'));
-}
-
-/// Users often type a new request into a card instead of answering it. The
-/// agent must still ask its questions about that request.
-#[test]
-fn the_only_notes_refusal_keeps_the_question() {
-    let text = Refusal::OnlyNotes {
-        reply: "I also want to use it on days without the sauna".to_string(),
-        words: REFUND_NOTE.to_string(),
-    }
-    .text();
-    assert!(text.contains("Then send your card again"));
-    assert!(text.contains("Never end your turn without it"));
-    assert!(!text.contains("no card"));
-}
-
-/// The incident: "The user typed you a reply" read as a new message. So the
-/// agent asked the user to resend a reply it had already acted on.
-#[test]
-fn the_only_notes_refusal_names_the_reply_the_agent_already_has() {
-    let text = Refusal::OnlyNotes {
-        reply: format!("  {TYPED_REPLY}\n"),
-        words: REFUND_NOTE.to_string(),
-    }
-    .text();
-    assert!(text.contains(&format!(
-        "the reply they typed into your card: \"{TYPED_REPLY}\""
-    )));
-    assert!(text.contains("You already received it and acted on it."));
-    assert!(text.contains(NOTHING_NEW));
-    assert!(text.contains("This is not a new message. Do not ask the user to resend anything."));
-    assert!(!text.contains("The user typed you a reply"));
 }
 
 #[test]
 fn a_long_reply_is_quoted_cut_and_on_one_line() {
     let long = format!("first line\n\n{}", "word ".repeat(100));
-    let text = Refusal::OnlyNotes {
-        reply: long.clone(),
-        words: REFUND_NOTE.to_string(),
+    let text = Refusal::OwesWords {
+        input: LastInput::Typed(long.clone()),
     }
     .text();
     let quoted = quote(&long);
@@ -498,7 +393,10 @@ fn owing_words_quotes_the_input_it_means() {
 
     let after_typed = owes(typed());
     assert!(after_typed.starts_with(REFUSAL_MARKER));
-    assert!(after_typed.contains(&format!("\"{TYPED_REPLY}\"")));
+    assert!(after_typed.contains(&format!(
+        "the text they typed into your card: \"{TYPED_REPLY}\""
+    )));
+    assert!(!after_typed.contains("reply they typed"));
     assert!(after_typed.contains(NOTHING_NEW));
     assert!(after_typed.contains(OWES_WORDS));
 
@@ -521,8 +419,12 @@ fn owing_words_quotes_the_input_it_means() {
 
 #[test]
 fn a_refusal_carries_the_input_it_was_decided_on() {
+    let s = SinceLastInput {
+        unreported_tool_calls: 1,
+        ..since(typed())
+    };
     assert_eq!(
-        should_refuse(&since(typed()), ""),
+        should_refuse(&s, ""),
         Some(Refusal::OwesWords { input: typed() })
     );
     let s = SinceLastInput {
@@ -548,7 +450,6 @@ const INCIDENT_SUMMARY: &str = "I've generated a mockup comparing today's status
 
 fn saved_mockup(words: &str) -> SinceLastInput {
     SinceLastInput {
-        spoke: true,
         words: words.to_string(),
         saved_artifacts: vec![MOCKUP.to_string()],
         ..since(message())
@@ -685,8 +586,7 @@ fn a_missing_picture_comes_before_owing_words() {
         },
         SinceLastInput {
             last_input: typed(),
-            spoke: false,
-            words: String::new(),
+            unreported_tool_calls: 1,
             ..saved_mockup("")
         },
     ] {
@@ -717,7 +617,9 @@ fn the_artifact_refusal_names_the_path_and_the_card() {
     assert!(text.contains(&format!("`{MOCKUP}`, `artifacts/b.png`")));
     assert!(text.contains("short summary"));
     assert!(text.contains("ON the card"));
-    assert!(text.contains("`preview` if your tool has one"));
+    // Claude Code's tool has `preview`, the chat agent's has a description,
+    // and Codex's has neither, so it falls back to the question.
+    assert!(text.contains("its `preview` or description, whichever your tool has"));
     assert!(text.contains("its own picture of only that option"));
     assert!(text.contains("`[...](...)` link to any other file"));
     assert!(text.contains("an option shows a link as plain text"));
@@ -769,7 +671,6 @@ const EXPLAINER_SUMMARY: &str = "I've put together a one-page overview covering 
 
 fn saved_explainer(words: &str) -> SinceLastInput {
     SinceLastInput {
-        spoke: true,
         words: words.to_string(),
         saved_artifacts: vec![EXPLAINER.to_string()],
         ..since(typed())
@@ -912,16 +813,6 @@ fn a_card_whose_question_carries_the_report_owes_no_words() {
         ..saved_mockup("Both render correctly. Storing them so you can see them.")
     };
     assert_eq!(decide(s, &card), None);
-}
-
-/// A long card re-sent after a typed reply reads the same as before, so it
-/// answers nothing the user typed.
-#[test]
-fn a_card_question_does_not_answer_a_typed_reply() {
-    assert!(matches!(
-        decide(since(typed()), &reporting_card(MOCKUP)),
-        Some(Refusal::OwesWords { .. })
-    ));
 }
 
 #[test]
@@ -1070,12 +961,20 @@ async fn the_query_reads_what_each_agent_writes() {
     cc_text(&pool, t, "\n\n").await;
     cc_tool(&pool, t, crate::runtime::CC_NATIVE_ASK_USER_QUESTION_TOOL).await;
     cc_tool(&pool, t, "TodoWrite").await;
+    assert!(
+        refuse_card(&pool, t, "toolu_next", &json!([]), None, None)
+            .await
+            .is_none(),
+        "a re-ask after a typed answer passes, and question tools are not work"
+    );
+    cc_tool(&pool, t, "Grep").await;
+    cc_text(&pool, t, "\n\n").await;
     assert_eq!(
         refuse_card(&pool, t, "toolu_next", &json!([]), None, None).await,
         Some(Refusal::OwesWords {
             input: LastInput::Typed("is there a difference?".to_string())
         }),
-        "blank text is not speaking, and the refusal names the typed reply"
+        "blank text reports no work, and the refusal quotes the typed text"
     );
 
     // The refusal comes back as a tool result, so the re-sent card passes.
@@ -1176,8 +1075,8 @@ async fn the_query_reads_what_each_agent_writes() {
         json!({ "tool_use_id": "toolu_shown#q0", "question": "Approve?", "options": [] }),
     )
     .await;
-    cc_tool(&pool, t, "Read").await;
     answered(&pool, t, json!({ "kind": "FreeText", "text": "why?" })).await;
+    cc_tool(&pool, t, "Read").await;
     assert!(refuse_card(&pool, t, "toolu_shown", &json!([]), None, None)
         .await
         .is_none());
@@ -1566,14 +1465,6 @@ const CARD_MESSAGE: &str = "1. Open Web Analytics and press **Manage site**.\n\
      2. Change the setup choice to **Enable**.\n3. Save.";
 
 #[test]
-fn a_card_message_answers_a_typed_reply_after_a_note() {
-    let s = since(typed())
-        .with_round_text(RoundText::Notes(REFUND_NOTE))
-        .with_card_message(CARD_MESSAGE);
-    assert_eq!(should_refuse(&s, TAP_WHEN_SENT), None);
-}
-
-#[test]
 fn a_card_message_reports_the_tool_work_before_it() {
     let s = SinceLastInput {
         unreported_tool_calls: 3,
@@ -1624,14 +1515,185 @@ fn every_refusal_names_the_message_field() {
         Refusal::ArtifactNotShown {
             paths: vec![MOCKUP.to_string()],
         },
-        Refusal::OnlyNotes {
-            reply: TYPED_REPLY.to_string(),
-            words: REFUND_NOTE.to_string(),
-        },
     ];
     for refusal in refusals {
         let text = refusal.text();
         assert!(text.contains(CARD_MESSAGE_HINT), "{text}");
         assert!(!text.contains('\u{2014}'));
     }
+}
+
+// ---------------------------------------------------------------------------
+// A card after a progress note
+// ---------------------------------------------------------------------------
+
+/// The incident's only visible text: the provider's summary of the steps the
+/// agent wrote before its card. The steps never reached the user.
+const SUMMARY_NOTE: &str = "I've laid out the cancellation steps and what it affects here: \
+     coding agents keep working fine since they already run on Vertex, but you'd lose access \
+     to Fable 5/5.1 and the \"Anthropic sub\" button in the provider app would start \
+     failing after the paid period ends.";
+
+/// The incident's card, which carried no `message`.
+fn cancellation_card() -> serde_json::Value {
+    json!([{
+        "question": "Should I record the cancellation, so no thread or trigger switches to \
+                     the subscription later?",
+        "options": [
+            { "label": "Record it", "description": "Note the end of the subscription in the \
+              provider-switch knowhow and mark the Anthropic mode as dead." },
+            { "label": "Not now", "description": "Leave everything as it is." }
+        ]
+    }])
+}
+
+fn cancel_message() -> LastInput {
+    LastInput::Message("i need to cancel my anthropic sub, what do i do".to_string())
+}
+
+/// The incident round: tool work, then the summary as the round's only text.
+fn after_summary() -> SinceLastInput {
+    SinceLastInput {
+        unreported_tool_calls: 2,
+        ..since(cancel_message())
+    }
+    .with_round(ChatRound {
+        text: SUMMARY_NOTE,
+        progress_notes: &[SUMMARY_NOTE.to_string()],
+    })
+}
+
+/// Prose after the note is a reply the user read in full, so the card passes.
+#[test]
+fn text_after_a_progress_note_passes() {
+    let text = format!("{SUMMARY_NOTE}\nCancel at Settings > Billing.");
+    let s = since(cancel_message()).with_round(ChatRound {
+        text: &text,
+        progress_notes: &[SUMMARY_NOTE.to_string()],
+    });
+    assert_eq!(s.last_progress_note, None);
+    assert_eq!(should_refuse(&s, &card_text(&cancellation_card())), None);
+}
+
+#[test]
+fn the_incident_card_after_a_progress_note_is_refused() {
+    let card = card_text(&cancellation_card());
+    assert_eq!(
+        should_refuse(&after_summary(), &card),
+        Some(Refusal::NoteShownAsSummary {
+            note: SUMMARY_NOTE.to_string()
+        })
+    );
+}
+
+/// The same words as plain text are a real reply, so the length rule and
+/// the new rule both leave the card alone. This is why the old gate missed
+/// the incident: only the block type tells the two apart.
+#[test]
+fn the_same_words_as_text_pass() {
+    let s = SinceLastInput {
+        unreported_tool_calls: 2,
+        ..since(cancel_message())
+    }
+    .with_round_text(SUMMARY_NOTE);
+    assert_eq!(should_refuse(&s, &card_text(&cancellation_card())), None);
+}
+
+#[test]
+fn a_card_with_a_message_after_a_progress_note_passes() {
+    let s = after_summary().with_card_message("## How to cancel\n\n1. Open Settings > Billing.");
+    assert_eq!(should_refuse(&s, &card_text(&cancellation_card())), None);
+}
+
+#[test]
+fn a_second_card_after_a_progress_note_passes() {
+    let s = SinceLastInput {
+        refused: true,
+        ..after_summary()
+    };
+    assert_eq!(should_refuse(&s, &card_text(&cancellation_card())), None);
+}
+
+/// An unseen artifact still outranks the note: its refusal is the one a
+/// retry could otherwise drop a picture past.
+#[test]
+fn an_unseen_artifact_outranks_a_progress_note() {
+    let s = SinceLastInput {
+        saved_artifacts: vec!["artifacts/steps.png".to_string()],
+        ..after_summary()
+    };
+    assert_eq!(
+        should_refuse(&s, &card_text(&cancellation_card())),
+        Some(Refusal::ArtifactNotShown {
+            paths: vec!["artifacts/steps.png".to_string()]
+        })
+    );
+}
+
+#[test]
+fn the_note_refusal_quotes_the_summary_and_names_the_verbatim_places() {
+    let text = Refusal::NoteShownAsSummary {
+        note: SUMMARY_NOTE.to_string(),
+    }
+    .text();
+    assert!(text.starts_with(REFUSAL_MARKER));
+    assert!(text.contains("I've laid out the cancellation steps"));
+    assert!(text.contains(CARD_MESSAGE_HINT));
+    assert!(text.contains("in the question"));
+    assert!(text.contains("will not be refused twice"));
+}
+
+#[tokio::test]
+async fn the_query_reads_a_claude_code_progress_note() {
+    let (pool, db) = setup_test_db().await;
+    let t = Uuid::new_v4();
+    insert(
+        &pool,
+        t,
+        "MessageReceived",
+        json!({ "text": "explain it", "mode": "human" }),
+    )
+    .await;
+    cc_text(&pool, t, "Reading the code first.").await;
+    insert(
+        &pool,
+        t,
+        "CodingAgentTextStreamed",
+        json!({ "text": "\n\nI've put together a one-page overview.", "progress_note": true }),
+    )
+    .await;
+    assert_eq!(
+        refuse_card(&pool, t, "toolu_card", &cancellation_card(), None, None).await,
+        Some(Refusal::NoteShownAsSummary {
+            note: "I've put together a one-page overview.".to_string()
+        }),
+        "a progress note as the last words refuses the card"
+    );
+
+    // A sub-agent's narration is not the session's reply, so it hides nothing.
+    insert(
+        &pool,
+        t,
+        "CodingAgentTextStreamed",
+        json!({ "text": "Scanning the tests.", "parent_tool_use_id": "toolu_agent" }),
+    )
+    .await;
+    assert!(
+        matches!(
+            refuse_card(&pool, t, "toolu_card", &cancellation_card(), None, None).await,
+            Some(Refusal::NoteShownAsSummary { .. })
+        ),
+        "sub-agent text after the note leaves it the last thing the user read"
+    );
+
+    // Prose written after the note is what the user read last.
+    cc_text(&pool, t, "\n\nThe overview covers the three phases.").await;
+    assert!(
+        refuse_card(&pool, t, "toolu_card", &cancellation_card(), None, None)
+            .await
+            .is_none(),
+        "text after the note is a reply the user read in full"
+    );
+
+    teardown_test_db(&db).await;
 }

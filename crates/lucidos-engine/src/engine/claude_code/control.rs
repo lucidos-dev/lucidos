@@ -19,6 +19,24 @@ pub(crate) fn record_control_request(
     }
 }
 
+/// Record a control request on the session, and send it to the runtime unless
+/// the backend takes it only at spawn. Returns when the change takes effect.
+pub(crate) fn deliver_control_request(
+    session: &mut crate::engine::AgentSession,
+    request: crate::runtime::ControlRequest,
+) -> Result<crate::runtime::TakesEffect, &'static str> {
+    let reach = session.coding_agent.control_reach(&request);
+    let takes_effect = reach.takes_effect(session.is_in_flight());
+    record_control_request(session, &request);
+    if reach != crate::runtime::ControlReach::NextSpawn {
+        session
+            .control_tx
+            .send(request)
+            .map_err(|_| "Control channel closed")?;
+    }
+    Ok(takes_effect)
+}
+
 /// The thread-less half of `stop_agent`: stop every session in the map that
 /// `stop_refusal` lets go. A request that stopped nothing reports the refusal.
 pub(crate) fn stop_every_session(
@@ -295,10 +313,10 @@ impl LucidosEngine {
                     terminal,
                 )
                 .await?;
-                // No live session will propose what the stopped turn left, so
-                // this Stop does (ADR 0328).
+                // No live session will settle what the stopped turn left, so
+                // this Stop withholds it (ADR 0400).
                 if settled && terminal == SettleTerminal::CanceledQuestion {
-                    self.propose_stopped_work(tid, actor).await;
+                    self.withhold_stopped_work(tid, actor).await;
                 }
                 Ok(settled)
             }
@@ -317,28 +335,25 @@ impl LucidosEngine {
         }
     }
 
-    /// Send a control request to a running Claude Code session via its control channel.
+    /// Apply a control request to a thread's live coding-agent session, through
+    /// [`deliver_control_request`]. Returns when the change takes effect.
     pub async fn send_agent_control_request(
         &self,
         thread_id: Uuid,
         request: crate::runtime::ControlRequest,
         actor: Option<crate::engine::thread_events::MessageOrigin>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<crate::runtime::TakesEffect, Box<dyn std::error::Error + Send + Sync>> {
         let event = crate::engine::thread_events::ThreadEvent::from_control_request(
             &request,
             self.thread_coding_agent(thread_id).await,
         );
-        {
+        let takes_effect = {
             let mut guard = self.agent_sessions.lock().await;
             let session = guard
                 .get_mut(&thread_id)
                 .ok_or("No Claude Code session found for this thread")?;
-            record_control_request(session, &request);
-            session
-                .control_tx
-                .send(request)
-                .map_err(|_| "Control channel closed")?;
-        }
+            deliver_control_request(session, request)?
+        };
         if let Some(ev) = event {
             if let Err(e) = self
                 .event_bus
@@ -360,7 +375,7 @@ impl LucidosEngine {
                 );
             }
         }
-        Ok(())
+        Ok(takes_effect)
     }
 
     /// Query the latest CC settings (model, reasoning_effort) for a thread from events.

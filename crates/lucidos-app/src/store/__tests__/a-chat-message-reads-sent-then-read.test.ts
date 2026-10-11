@@ -31,7 +31,7 @@ describe('the read marker on a chat thread', () => {
     const exchanges = groupIntoExchanges(new Map([
       ev(1, { type: 'MessageReceived', text: 'start' }, 'm1'),
       ev(2, { type: 'MessageReceived', text: 'also check the totals' }, 'm2'),
-      ev(3, { type: 'UserPromptInjected', text: 'also check the totals', mode: 'human', injected_message_id: 'm2' } as ThreadEvent),
+      ev(3, { type: 'PromptInjected', text: 'also check the totals', mode: 'human', injected_message_id: 'm2' } as ThreadEvent),
     ]));
     const markers = readMarkers(exchanges, CHAT);
     const m2 = exchanges.findIndex(ex => ex.userEvent._eventId === 'm2');
@@ -63,7 +63,7 @@ describe('the read marker on a chat thread', () => {
     const injected = groupIntoExchanges(new Map([
       ev(1, { type: 'MessageReceived', text: 'start' }, 'm1'),
       ev(3, { type: 'MessageReceived', text: 'also check the totals' }, 'm2'),
-      ev(8, { type: 'UserPromptInjected', text: 'also check the totals', mode: 'human', injected_message_id: 'm2' } as ThreadEvent),
+      ev(8, { type: 'PromptInjected', text: 'also check the totals', mode: 'human', injected_message_id: 'm2' } as ThreadEvent),
     ]));
     const read = injected.find(ex => ex.userEvent._eventId === 'm2')!;
     expect(messageReadTimestamp(read)).toBe('2026-09-24T06:13:08Z');

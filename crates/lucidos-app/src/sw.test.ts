@@ -436,8 +436,57 @@ describe('Service Worker fetch handler — immutable /assets bundle caching', ()
     const event = makeEvent('https://example.com/assets/index-OLDHASH.js');
     sw.handlers.fetch(event);
     const response = await event.respondWith.mock.calls[0][0];
-    expect(response).toBe(html); // passed through, not swallowed
+    expect(await response.text()).toBe('<!doctype html><html></html>'); // passed through, not swallowed
     expect(sw.mockCache.put).not.toHaveBeenCalled();
+  });
+
+  // An iOS body can end early and still read as a success. A short copy cached
+  // under an immutable hash fails every later import of that chunk. No reload
+  // replaces it until a new build changes the hash.
+  function bundleResponse(body: string, declaredLength: number = body.length) {
+    return new Response(body, {
+      headers: { 'content-type': 'text/javascript', 'content-length': String(declaredLength) },
+    });
+  }
+
+  it('GET /assets/<hash>.js: a body shorter than its Content-Length is fetched again, and only the whole one cached', async () => {
+    const sw = loadSw();
+    sw.mockFetch
+      .mockResolvedValueOnce(bundleResponse('expo', 12))
+      .mockResolvedValueOnce(bundleResponse('export {};//'));
+    const event = makeEvent('https://example.com/assets/App-abc123.js');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(sw.mockFetch).toHaveBeenCalledTimes(2);
+    expect(sw.mockFetch.mock.calls[1][1].cache).toBe('reload');
+    expect(await response.text()).toBe('export {};//');
+    expect(sw.mockCache.put).toHaveBeenCalledTimes(1);
+    expect(await sw.cacheStore.get('https://example.com/assets/App-abc123.js')!.text())
+      .toBe('export {};//');
+  });
+
+  it('GET /assets/<hash>.js: short on every attempt is never cached, and answers a network error', async () => {
+    const sw = loadSw();
+    sw.mockFetch.mockImplementation(() => Promise.resolve(bundleResponse('expo', 12)));
+    const event = makeEvent('https://example.com/assets/App-abc123.js');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(response.type).toBe('error');
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
+  });
+
+  // A decoded body no longer matches the wire length, so it cannot be counted.
+  it('GET /assets/<hash>.js: an encoded body is accepted and cached', async () => {
+    const sw = loadSw();
+    sw.mockFetch.mockResolvedValue(new Response('export {};//', {
+      headers: { 'content-type': 'text/javascript', 'content-encoding': 'br', 'content-length': '5' },
+    }));
+    const event = makeEvent('https://example.com/assets/App-abc123.js');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(sw.mockFetch).toHaveBeenCalledTimes(1);
+    expect(await response.text()).toBe('export {};//');
+    expect(sw.mockCache.put).toHaveBeenCalledTimes(1);
   });
 
   it('GET /src/main.tsx (Vite dev module): does NOT call respondWith (no caching in dev)', () => {

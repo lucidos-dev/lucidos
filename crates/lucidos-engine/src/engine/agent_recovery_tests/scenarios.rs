@@ -41,7 +41,7 @@ fn lost_session_path_falls_back_to_cc_random_when_unmapped() {
 /// as internal, even when the marker file contains a `repo_id` for it.
 /// Pre-fix, the recovery sweep keyed on `marker_repo_id.is_some()` and
 /// skipped `propose_branch_changes` for crashed Claude Code sessions, leaving real
-/// commits with `coding_agent_proposed=false`.
+/// commits with an unproposed change state.
 #[test]
 fn lucidos_repo_worktree_is_not_external() {
     let lucidos = PathBuf::from("/Users/me/IdeaProjects/lucidos");
@@ -1071,11 +1071,15 @@ fn coding_agent_idled_engine_restart_interrupt_roundtrips() {
 fn continue_resume_exchange_gate_opens_for_user_continue_and_auto_recovery() {
     use super::{
         continue_should_open_resume_exchange, ANSWERED_AFTER_IDLE_REASON,
-        AUTO_RECOVERY_AFTER_HANG_REASON, USER_CLICKED_CONTINUE_REASON,
+        AUTO_RECOVERY_AFTER_HANG_REASON, HARDEN_REQUESTED_REASON, USER_CLICKED_CONTINUE_REASON,
     };
     assert!(continue_should_open_resume_exchange(Some(
         USER_CLICKED_CONTINUE_REASON
     )));
+    assert!(
+        continue_should_open_resume_exchange(Some(HARDEN_REQUESTED_REASON)),
+        "Harden starts a new turn the user asked for"
+    );
     assert!(
         continue_should_open_resume_exchange(Some(AUTO_RECOVERY_AFTER_HANG_REASON)),
         "watchdog-triggered auto-resume must open a fresh boundary so the timeline shows the user that work was interrupted and resumed"

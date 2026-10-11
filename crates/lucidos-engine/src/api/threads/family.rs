@@ -14,7 +14,8 @@ use axum::http::StatusCode;
 use uuid::Uuid;
 
 use crate::engine::thread_lifecycle::{
-    action_blocker, own_blocker, ArchiveState, Blocker, OwnBlocker, ThreadStatus, ThreadType,
+    action_blocker, own_blocker, ArchiveState, Blocker, ChangeStateKind, ChangeWork, OwnBlocker,
+    ThreadStatus, ThreadType,
 };
 
 /// Row shape pulled by the recursive CTE in [`load_family`]: the subset of
@@ -25,8 +26,9 @@ pub(in crate::api) struct FamilyRow {
     pub(in crate::api) is_coding_agent: bool,
     pub(in crate::api) status: String,
     pub(in crate::api) archive_state: String,
-    pub(in crate::api) coding_agent_proposed: bool,
+    pub(in crate::api) coding_agent_change_state: ChangeStateKind,
     pub(in crate::api) coding_agent_is_external_repo: bool,
+    pub(in crate::api) holds_live_wait: bool,
     /// The pin. An agent's archive leaves a pinned member open (ADR 0312).
     pub(in crate::api) is_saved: bool,
     /// The home thread, which neither verb may take (ADR 0362).
@@ -34,6 +36,10 @@ pub(in crate::api) struct FamilyRow {
 }
 
 impl FamilyRow {
+    pub(in crate::api) fn is_proposed(&self) -> bool {
+        self.coding_agent_change_state == ChangeStateKind::Proposed
+    }
+
     fn thread_type(&self) -> ThreadType {
         if self.is_coding_agent {
             ThreadType::CodingAgent
@@ -52,7 +58,7 @@ impl FamilyRow {
             self.thread_type(),
             self.status_enum(),
             archive_state,
-            self.coding_agent_proposed,
+            ChangeWork::of(self.coding_agent_change_state, self.holds_live_wait),
             self.coding_agent_is_external_repo,
         )
     }
@@ -122,7 +128,8 @@ pub(in crate::api) async fn load_family(
         ),
         locked AS MATERIALIZED (
             SELECT t.thread_id, t.is_coding_agent, t.status, t.archive_state,
-                   t.coding_agent_proposed, t.coding_agent_is_external_repo,
+                   t.coding_agent_change_state, t.coding_agent_is_external_repo,
+                   t.live_event_wait_count > 0 AS holds_live_wait,
                    t.is_saved, t.is_home, f.level
             FROM thread_summaries t
             JOIN family f ON f.thread_id = t.thread_id
@@ -130,7 +137,8 @@ pub(in crate::api) async fn load_family(
             FOR UPDATE OF t
         )
         SELECT thread_id, is_coding_agent, status, archive_state,
-               coding_agent_proposed, coding_agent_is_external_repo, is_saved, is_home
+               coding_agent_change_state, coding_agent_is_external_repo,
+               holds_live_wait, is_saved, is_home
         FROM locked
         ORDER BY level, thread_id",
     )
@@ -189,17 +197,19 @@ pub(in crate::api) fn classify_family(
         Blocker::None => return FamilyDecision::Proceed,
         Blocker::Home => serde_json::json!({ "reason": HOME_THREAD }),
         Blocker::Running | Blocker::Question => {
-            parent_blocked_body(verb, &parent_row.status, parent_row.coding_agent_proposed)
+            parent_blocked_body(verb, &parent_row.status, parent_row.is_proposed())
         }
         Blocker::PendingChange => serde_json::json!({ "reason": "parent_has_pending_changes" }),
+        Blocker::HeldProposal => serde_json::json!({ "reason": "parent_holds_held_proposal" }),
         Blocker::DescendantRunning
         | Blocker::DescendantQuestion
-        | Blocker::DescendantPendingChange => serde_json::json!({
+        | Blocker::DescendantPendingChange
+        | Blocker::DescendantHeldProposal => serde_json::json!({
             "reason": "descendants_blocking",
             "blocking": blockers.iter().map(|(r, _)| serde_json::json!({
                 "thread_id": r.thread_id,
                 "status": r.status,
-                "has_pending_changes": r.coding_agent_proposed,
+                "has_pending_changes": r.is_proposed(),
             })).collect::<Vec<_>>(),
         }),
     };
@@ -261,7 +271,7 @@ pub(in crate::api) fn external_repo_pending(family: &[FamilyRow]) -> Vec<Uuid> {
             r.archive_state_enum() != ArchiveState::Archived
                 && r.is_coding_agent
                 && r.coding_agent_is_external_repo
-                && r.coding_agent_proposed
+                && r.is_proposed()
         })
         .map(|r| r.thread_id)
         .collect()

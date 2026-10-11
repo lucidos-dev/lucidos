@@ -1,13 +1,14 @@
 /**
  * Structural guard against the exact drift this repo once shipped: a shared
  * component class (the host's dropdown, now also `lucidos.ui.Select`'s)
- * quietly grows an iframe-only visual override, and the two widgets drift
+ * quietly grows an iframe-only visual override, and the two controls drift
  * apart again. See docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md.
  *
  * `shared-components.css`, `surface.css` and `text-input.css` are the engine's
  * reusable layer (`crates/lucidos-engine/src/api/sdk.rs`). This test derives
- * every class they define as a base rule. Two iframe-only files are scanned:
- * `sdk_iframe.css` and `sdk_iframe_control_theme_parts.css`. Neither may set a
+ * every class they define as a base rule. Three iframe-only files are scanned:
+ * `sdk_iframe.css`, `sdk_iframe_shapes.css` and
+ * `sdk_iframe_control_theme_parts.css`. None may set a
  * VISUAL property (colour, background, border, radius, padding, font-size,
  * box-shadow) on a selector naming one of them. It does not compare values: a
  * class nobody has written an override for yet is still covered, because the
@@ -40,6 +41,7 @@ const SHARED_FILES = [
 
 const IFRAME_ONLY_FILES = [
   resolve(REPO_ROOT, 'crates/lucidos-engine/src/api/sdk_iframe.css'),
+  resolve(REPO_ROOT, 'crates/lucidos-engine/src/api/sdk_iframe_shapes.css'),
   resolve(REPO_ROOT, 'crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css'),
 ];
 

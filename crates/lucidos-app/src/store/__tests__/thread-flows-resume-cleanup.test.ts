@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { abortPromisesAutoResume, abortTookEngineDown, continuableAbortIndex, exchangeResponseEvents, exchangeStatus, exchangeSteps, hasRenderableResponseContent, responseAbortedSummary, type ThreadEvent } from '../thread-events';
+import { abortPromisesAutoResume, changeReadyToReview, abortTookEngineDown, continuableAbortIndex, exchangeResponseEvents, exchangeStatus, exchangeSteps, hasRenderableResponseContent, responseAbortedSummary, type ThreadEvent } from '../thread-events';
 import { isActive } from '../exchange-status';
 import { displaySection } from '../../generated/thread-lifecycle';
 import type { StepOutcome } from '../types';
@@ -100,7 +100,7 @@ describe('CC stale resume — SessionEnded(stale_resume) must not cause aborted 
     const thread = map.get(id)!;
     expect(thread.meta.status).toBe('running');
     // displaySection should be 'current', not 'archive'
-    expect(displaySection(thread.meta.section, thread.meta.status, thread.meta.saved, thread.meta.activeChildrenCount > 0, thread.meta.codingAgentProposed, false)).toBe('current');
+    expect(displaySection(thread.meta.section, thread.meta.status, thread.meta.saved, thread.meta.activeChildrenCount > 0, changeReadyToReview(thread.meta), false)).toBe('current');
   });
 });
 
@@ -206,14 +206,14 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
   // Regression: chat follow-up posted while a prior request was mid-flight ended
   // up showing "Aborted ⚠" once the agent finished and the thread idled.
   // The agentic loop folds the follow-up into the running prompt via
-  // UserPromptInjected (with injected_message_id matching the new MR), and the
+  // PromptInjected (with injected_message_id matching the new MR), and the
   // ResponseGenerated carries the ORIGINAL request_event_id — so it routes back
   // to the prior exchange. The follow-up exchange is left with only the
-  // absorbed UPI as its sole step, which the threadIdle stale-detection
+  // absorbed PromptInjected as its sole step, which the threadIdle stale-detection
   // fallback misread as a crash.
-  it('chat follow-up absorbed via UserPromptInjected is NOT aborted once thread idles', () => {
+  it('chat follow-up absorbed via PromptInjected is NOT aborted once thread idles', () => {
     resetSeqCounter();
-    const { map, id } = makeThread('upi-folded-1', 'idle');
+    const { map, id } = makeThread('injection-folded-1', 'idle');
 
     insertEvents(map, id, [
       // Prior message — agentic loop is mid-stream when the follow-up arrives.
@@ -227,7 +227,7 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
       { type: 'ToolCalled', name: 'check_creds', args: {}, description: 'Checking creds...', request_event_id: 'msg-A', created: t(-295000) } as ThreadEvent,
       { type: 'ToolResult', name: 'check_creds', result: 'ok', request_event_id: 'msg-A', created: t(-294000) } as ThreadEvent,
       // Engine injects the follow-up into the running prompt — split point.
-      { type: 'UserPromptInjected', text: 'men kan ikke ha dette hele tiden', injected_message_id: 'msg-B', request_event_id: 'msg-A', created: t(-293000) } as ThreadEvent,
+      { type: 'PromptInjected', text: 'men kan ikke ha dette hele tiden', injected_message_id: 'msg-B', request_event_id: 'msg-A', created: t(-293000) } as ThreadEvent,
       // Post-injection events answer B even though they keep A's req_id.
       { type: 'TextStreamed', text: 'Combined answer', request_event_id: 'msg-A', created: t(-292000) } as ThreadEvent,
       { type: 'ResponseGenerated', text: 'Combined answer', request_event_id: 'msg-A', created: t(-291000) } as ThreadEvent,
@@ -238,7 +238,7 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
 
     // Exchange A: pre-injection work only. No terminal — non-last with steps
     // → 'interrupted' ("Done ↳"). The response continues in the
-    // follow-up exchange after the UPI absorbed the new prompt.
+    // follow-up exchange after the PromptInjected absorbed the new prompt.
     expect(exchanges[0].userEvent.type).toBe('MessageReceived');
     expect((exchanges[0].userEvent as { text: string }).text).toBe('ferdig');
     expect(exchanges[0].steps.map(s => s.event.type)).toEqual([
@@ -246,11 +246,11 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
     ]);
     expect(exchangeStatus(exchanges[0], '', false, false, false, true)).toBe('interrupted');
 
-    // Exchange B: UPI + post-injection work + final response.
+    // Exchange B: PromptInjected + post-injection work + final response.
     expect(exchanges[1].userEvent.type).toBe('MessageReceived');
     expect((exchanges[1].userEvent as { text: string }).text).toBe('men kan ikke ha dette hele tiden');
     expect(exchanges[1].steps.map(s => s.event.type)).toEqual([
-      'UserPromptInjected', 'TextStreamed', 'ResponseGenerated',
+      'PromptInjected', 'TextStreamed', 'ResponseGenerated',
     ]);
     expect(exchangeStatus(exchanges[1], '', true, false, false, true)).toBe('done');
   });
@@ -314,10 +314,10 @@ describe('CC SessionEnded(changes_proposed) without preceding CodingAgentIdled',
 
 // ---------------------------------------------------------------------------
 // Chat mid-flight injection: a follow-up MR lands while the parent's agentic
-// loop is still running. The loop folds the new prompt in via UPI and keeps
+// loop is still running. The loop folds the new prompt in via a PromptInjected and keeps
 // emitting events under the parent's request_event_id; the parent must keep
 // its 'Working' state and pending spinners until the real terminator lands,
-// and the follow-up's absorbed UPI must read as 'done'.
+// and the follow-up's absorbed PromptInjected must read as 'done'.
 // ---------------------------------------------------------------------------
 describe('chat follow-up while parent loop still running', () => {
   const t = (offset: number) => new Date(Date.now() + offset).toISOString();
@@ -359,11 +359,11 @@ describe('chat follow-up while parent loop still running', () => {
 
   // Verbatim event shape from a production thread: parent emits two
   // run_python tool calls, follow-up MR lands while the second is in flight,
-  // engine drains injection and emits UPI absorbing into the follow-up,
+  // engine drains injection and emits a PromptInjected absorbing into the follow-up,
   // ResponseGenerated routes back to the parent via request_event_id.
-  it('production-style absorbed UPI: follow-up status is done, not aborted', () => {
+  it('production-style absorbed PromptInjected: follow-up status is done, not aborted', () => {
     resetSeqCounter();
-    const { map, id } = makeThread('upi-prod', 'idle');
+    const { map, id } = makeThread('injection-prod', 'idle');
     insertEvents(map, id, [
       { type: 'MessageReceived', text: "No way! I'm not going into the terminal, pls fix", channel: 'chat', created: '2026-05-04T11:51:39.438Z', event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31' },
       { type: 'MemorySearched', results: 5, request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:51:54.537Z' } as ThreadEvent,
@@ -378,7 +378,7 @@ describe('chat follow-up while parent loop still running', () => {
       // User sends follow-up while the second run_python is executing.
       { type: 'MessageReceived', text: 'Uuhh fix the script?', channel: 'chat', created: '2026-05-04T11:52:38.205Z', event_id: 'a7d179ab-f451-4ff7-89dd-61ed413aaa88' },
       { type: 'ToolResult', name: 'run_python', result: 'ok', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:01.080Z' } as ThreadEvent,
-      { type: 'UserPromptInjected', text: 'Uuhh fix the script?', mode: 'human', injected_message_id: 'a7d179ab-f451-4ff7-89dd-61ed413aaa88', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:01.092Z' } as ThreadEvent,
+      { type: 'PromptInjected', text: 'Uuhh fix the script?', mode: 'human', injected_message_id: 'a7d179ab-f451-4ff7-89dd-61ed413aaa88', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:01.092Z' } as ThreadEvent,
       { type: 'ThoughtStreamed', text: '', context_tokens:15806, context_messages: 8, request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:01.098Z' } as ThreadEvent,
       { type: 'ToolCalled', name: 'emit_event', args: {}, description: 'Emitting event…', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:27.707Z' } as ThreadEvent,
       { type: 'ToolResult', name: 'emit_event', result: 'ok', request_event_id: '1f2d02af-55ca-42c1-b52a-4e2067548d31', created: '2026-05-04T11:53:27.731Z' } as ThreadEvent,
@@ -394,9 +394,9 @@ describe('chat follow-up while parent loop still running', () => {
     // Parent owns pre-injection work only; the response splits to the follow-up.
     expect(exchanges[0].steps.length).toBeGreaterThan(0);
     expect(exchanges[0].steps.some(s => s.event.type === 'ResponseGenerated')).toBe(false);
-    // Follow-up: UPI plus everything from injection onwards.
+    // Follow-up: PromptInjected plus everything from injection onwards.
     const followupTypes = exchanges[1].steps.map(s => s.event.type);
-    expect(followupTypes[0]).toBe('UserPromptInjected');
+    expect(followupTypes[0]).toBe('PromptInjected');
     expect(followupTypes).toContain('ResponseGenerated');
 
     const followupStatus = exchangeStatus(exchanges[1], '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true);
@@ -429,7 +429,7 @@ describe('chat follow-up while parent loop still running', () => {
   });
 
   // Synthesized minimal version of the production scenario above.
-  it('follow-up with absorbed UPI is done after parent ResponseGenerated, not aborted', () => {
+  it('follow-up with absorbed PromptInjected is done after parent ResponseGenerated, not aborted', () => {
     resetSeqCounter();
     const { map, id } = makeThread('followup-absorbed-real', 'idle');
 
@@ -439,9 +439,9 @@ describe('chat follow-up while parent loop still running', () => {
       { type: 'ToolCalled', name: 'run_python', args: {}, description: 'Running Python code...', request_event_id: 'parent-mr-2', created: t(-25000) } as ThreadEvent,
       // Follow-up arrives mid-Python.
       { type: 'MessageReceived', text: 'Uuhh fix the script?', channel: 'chat', created: t(-22000), event_id: 'followup-mr-2' },
-      // Python finally returns; engine drains injection and emits UPI.
+      // Python finally returns; engine drains injection and emits a PromptInjected.
       { type: 'ToolResult', name: 'run_python', result: 'ok', request_event_id: 'parent-mr-2', created: t(-15000) } as ThreadEvent,
-      { type: 'UserPromptInjected', text: 'Uuhh fix the script?', mode: 'human', injected_message_id: 'followup-mr-2', request_event_id: 'parent-mr-2', created: t(-14990) } as ThreadEvent,
+      { type: 'PromptInjected', text: 'Uuhh fix the script?', mode: 'human', injected_message_id: 'followup-mr-2', request_event_id: 'parent-mr-2', created: t(-14990) } as ThreadEvent,
       { type: 'ThoughtStreamed', text: 'now incorporating user note', request_event_id: 'parent-mr-2', created: t(-14000) } as ThreadEvent,
       { type: 'TextStreamed', text: 'Released first…', request_event_id: 'parent-mr-2', created: t(-2000) } as ThreadEvent,
       { type: 'ResponseGenerated', text: 'Released first…', request_event_id: 'parent-mr-2', created: t(-1000) } as ThreadEvent,
@@ -450,12 +450,12 @@ describe('chat follow-up while parent loop still running', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // Follow-up owns the UPI marker plus the post-injection thinking, text
+    // Follow-up owns the PromptInjected marker plus the post-injection thinking, text
     // streaming, and final ResponseGenerated.
     expect(exchanges[1].userEvent.type).toBe('MessageReceived');
     expect((exchanges[1].userEvent as { text: string }).text).toBe('Uuhh fix the script?');
     expect(exchanges[1].steps.map(s => s.event.type)).toEqual([
-      'UserPromptInjected', 'ThoughtStreamed', 'TextStreamed', 'ResponseGenerated',
+      'PromptInjected', 'ThoughtStreamed', 'TextStreamed', 'ResponseGenerated',
     ]);
 
     const followupStatus = exchangeStatus(exchanges[1], '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true);
@@ -464,10 +464,10 @@ describe('chat follow-up while parent loop still running', () => {
 
   // Verbatim production payload from thread
   // a81d6adc-6647-4cf4-9589-edb58eb57571 (2026-05-05). Same MR1 → many tools →
-  // MR2 mid-flight → tools → UPI → tools → ResponseGenerated shape, but using
+  // MR2 mid-flight → tools → PromptInjected → tools → ResponseGenerated shape, but using
   // the actual UUIDs and timestamps so a regression that only hits a specific
   // ordering or id collision shows up here.
-  it('production thread: absorbed UPI follow-up resolves to done', () => {
+  it('production thread: absorbed PromptInjected follow-up resolves to done', () => {
     resetSeqCounter();
     const { map, id } = makeThread('audit-prod', 'idle');
     const MR1 = 'c4f1ef84-48c2-4f5a-8319-e79d954c3722';
@@ -489,8 +489,8 @@ describe('chat follow-up while parent loop still running', () => {
       { type: 'ToolResult', name: 'delete_file', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:41.568Z' } as ThreadEvent,
       { type: 'ToolCalled', name: 'grep_files', args: {}, description: 'Grepping...', request_event_id: MR1, created: '2026-05-05T06:11:41.572Z' } as ThreadEvent,
       { type: 'ToolResult', name: 'grep_files', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:42.239Z' } as ThreadEvent,
-      // Engine drains injection and emits UPI.
-      { type: 'UserPromptInjected', text: 'for calendar altså', mode: 'human', injected_message_id: MR2, request_event_id: MR1, created: '2026-05-05T06:11:42.244Z' } as ThreadEvent,
+      // Engine drains injection and emits a PromptInjected.
+      { type: 'PromptInjected', text: 'for calendar altså', mode: 'human', injected_message_id: MR2, request_event_id: MR1, created: '2026-05-05T06:11:42.244Z' } as ThreadEvent,
       { type: 'ThoughtStreamed', text: '', context_tokens: 8329, context_messages: 6, request_event_id: MR1, created: '2026-05-05T06:11:42.248Z' } as ThreadEvent,
       { type: 'ToolCalled', name: 'read_file', args: {}, description: 'Reading file...', request_event_id: MR1, created: '2026-05-05T06:11:47.792Z' } as ThreadEvent,
       { type: 'ToolResult', name: 'read_file', result: 'ok', request_event_id: MR1, created: '2026-05-05T06:11:47.802Z' } as ThreadEvent,
@@ -508,19 +508,19 @@ describe('chat follow-up while parent loop still running', () => {
       { type: 'ResponseGenerated', text: 'Ferdig.', request_event_id: MR1, created: '2026-05-05T06:12:00.046Z' } as ThreadEvent,
       // ThreadSaved lands AFTER ResponseGenerated as a metadata event with
       // no request_event_id. Without `current` being reset by the absorbed
-      // UPI, this leaks into exchange 2 and the onlyStep check fails
+      // PromptInjected, this leaks into exchange 2 and the onlyStep check fails
       // (length > 1), so the placeholder loses its 'done'.
       { type: 'ThreadSaved', created: '2026-05-05T06:12:00.056Z' } as ThreadEvent,
     ]);
 
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
-    // Exchange 2 starts with the UPI and includes everything after — the
+    // Exchange 2 starts with the PromptInjected and includes everything after — the
     // post-injection tools and the final ResponseGenerated.
     expect(exchanges[1].userEvent.type).toBe('MessageReceived');
     expect((exchanges[1].userEvent as { text: string }).text).toBe('for calendar altså');
     const followupTypes = exchanges[1].steps.map(s => s.event.type);
-    expect(followupTypes[0]).toBe('UserPromptInjected');
+    expect(followupTypes[0]).toBe('PromptInjected');
     expect(followupTypes[followupTypes.length - 1]).toBe('ResponseGenerated');
 
     const followupStatus = exchangeStatus(exchanges[1], '', /* isLast */ true, /* hasPriorActive */ false, /* threadIsCC */ false, /* threadIdle */ true);
@@ -528,13 +528,13 @@ describe('chat follow-up while parent loop still running', () => {
   });
 
   // The injection point is a real boundary: it's the moment the agentic loop
-  // actually saw the new prompt. Pre-UPI work still belongs to the original
-  // request; everything from UPI onwards (including the final response) is
+  // actually saw the new prompt. Pre-injection work still belongs to the original
+  // request; everything from PromptInjected onwards (including the final response) is
   // the answer to the absorbed follow-up. Without this split, the user can't
   // tell which steps reacted to which message.
-  it('post-UPI events route to the absorbed-into exchange, not the original request', () => {
+  it('post-injection events route to the absorbed-into exchange, not the original request', () => {
     resetSeqCounter();
-    const { map, id } = makeThread('upi-split', 'idle');
+    const { map, id } = makeThread('injection-split', 'idle');
     const MR1 = 'aaaaaaaa-1111-1111-1111-111111111111';
     const MR2 = 'bbbbbbbb-2222-2222-2222-222222222222';
     insertEvents(map, id, [
@@ -547,9 +547,9 @@ describe('chat follow-up while parent loop still running', () => {
       // Loop finishes its current tool, then the engine drains the injection.
       { type: 'ToolCalled', name: 'in_flight', args: {}, description: 'In-flight tool...', request_event_id: MR1, created: '2026-05-05T10:00:05.000Z' } as ThreadEvent,
       { type: 'ToolResult', name: 'in_flight', result: 'ok', request_event_id: MR1, created: '2026-05-05T10:00:06.000Z' } as ThreadEvent,
-      // UPI lands — split point. From here onwards the loop "knows about"
+      // PromptInjected lands — split point. From here onwards the loop "knows about"
       // the follow-up.
-      { type: 'UserPromptInjected', text: 'second', mode: 'human', injected_message_id: MR2, request_event_id: MR1, created: '2026-05-05T10:00:07.000Z' } as ThreadEvent,
+      { type: 'PromptInjected', text: 'second', mode: 'human', injected_message_id: MR2, request_event_id: MR1, created: '2026-05-05T10:00:07.000Z' } as ThreadEvent,
       { type: 'ToolCalled', name: 'post_tool', args: {}, description: 'Post tool...', request_event_id: MR1, created: '2026-05-05T10:00:08.000Z' } as ThreadEvent,
       { type: 'ToolResult', name: 'post_tool', result: 'ok', request_event_id: MR1, created: '2026-05-05T10:00:09.000Z' } as ThreadEvent,
       { type: 'TextStreamed', text: 'Combined', request_event_id: MR1, created: '2026-05-05T10:00:10.000Z' } as ThreadEvent,
@@ -559,7 +559,7 @@ describe('chat follow-up while parent loop still running', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(2);
 
-    // Exchange 1 owns the work BEFORE the injection: the pre-UPI tools and
+    // Exchange 1 owns the work BEFORE the injection: the pre-injection tools and
     // any work done while the prompt was sitting in the queue.
     const ex1Steps = exchanges[0].steps.map(s => s.event.type);
     expect(ex1Steps).toEqual([
@@ -568,11 +568,11 @@ describe('chat follow-up while parent loop still running', () => {
       'ToolCalled', 'ToolResult',  // in_flight
     ]);
 
-    // Exchange 2 owns the UPI itself plus everything from injection time on,
+    // Exchange 2 owns the PromptInjected itself plus everything from injection time on,
     // including the final response.
     const ex2Steps = exchanges[1].steps.map(s => s.event.type);
     expect(ex2Steps).toEqual([
-      'UserPromptInjected',
+      'PromptInjected',
       'ToolCalled', 'ToolResult',  // post_tool
       'TextStreamed',
       'ResponseGenerated',

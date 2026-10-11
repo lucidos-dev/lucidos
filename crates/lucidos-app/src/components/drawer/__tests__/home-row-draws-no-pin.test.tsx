@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * The filtered drawer views (In flight, Needs attention, Drafts) still list the
+ * The filtered drawer views (In flight, Blocked, Drafts) still list the
  * home thread when it qualifies. Its row there draws a house and no pin: the
  * engine refuses a pin on Home (ADR 0362).
  */
@@ -44,13 +44,13 @@ afterEach(() => {
 describe("the home thread's row in a filtered view", () => {
   it('draws a house and no pin', () => {
     mount(true);
-    expect(host.querySelector('.thread-row-home-icon svg')).not.toBeNull();
+    expect(host.querySelector('.thread-icon svg')).not.toBeNull();
     expect(host.querySelector('.pin-thread-btn')).toBeNull();
   });
 
   it('leaves the pin on every other row', () => {
     mount(false);
-    expect(host.querySelector('.thread-row-home-icon')).toBeNull();
+    expect(host.querySelector('.thread-icon')).toBeNull();
     expect(host.querySelector('.pin-thread-btn')).not.toBeNull();
   });
 });

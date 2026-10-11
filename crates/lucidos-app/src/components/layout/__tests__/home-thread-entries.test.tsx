@@ -2,19 +2,15 @@
 /**
  * The home thread's two entries (ADR 0362): the desktop thread header's Home
  * icon and the Lucidos menu's Home row, which only a phone draws. No thread
- * list draws Home, so these are the way to it. Both show only while the
- * experimental switch is on and the thread exists.
+ * list draws Home, so these are the way to it. Every workspace has Home
+ * (ADR 0411), and both show once the thread list carries it.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { render } from 'preact';
-import { focusedThreadId, preferences, threadMap } from '../../../store/store';
+import { focusedThreadId, threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { threadHeaderActions, threadHeaderHomeAction } from '../ThreadHeaderActions';
 import { HomeMenuGroup } from '../HeaderMark';
-
-function switchHome(on: boolean): void {
-  preferences.value = { status: 'loaded', data: { home_thread_enabled: on ? 'true' : 'false' } };
-}
 
 function seedThreads(withHome: boolean): void {
   const map = new Map([['other', makeThreadState('other')]]);
@@ -27,28 +23,19 @@ beforeEach(() => {
 });
 
 describe('the desktop thread header', () => {
-  it('leads with Home, outside the trailing actions, while the switch is on', () => {
-    switchHome(true);
+  it('leads with Home, outside the trailing actions', () => {
     seedThreads(true);
     expect(threadHeaderHomeAction()?.key).toBe('home');
     const order = threadHeaderActions().map((a) => a.key).filter((k) => k !== 'setup-interview');
     expect(order).toEqual(['new-thread', 'search-everywhere']);
   });
 
-  it('carries no Home while the switch is off', () => {
-    switchHome(false);
-    seedThreads(true);
-    expect(threadHeaderHomeAction()).toBeNull();
-  });
-
-  it('carries no Home before the thread exists', () => {
-    switchHome(true);
+  it('carries no Home before the thread list has it', () => {
     seedThreads(false);
     expect(threadHeaderHomeAction()).toBeNull();
   });
 
   it('opens the home thread', () => {
-    switchHome(true);
     seedThreads(true);
     threadHeaderHomeAction()!.onClick!(new MouseEvent('click'));
     expect(focusedThreadId.value).toBe('home');
@@ -72,15 +59,13 @@ describe('the Lucidos menu Home row', () => {
 
   const mount = () => render(<HomeMenuGroup onClose={() => { closed += 1; }} />, host);
 
-  it('renders nothing, separator included, while the switch is off', () => {
-    switchHome(false);
-    seedThreads(true);
+  it('renders nothing, separator included, before the thread list has Home', () => {
+    seedThreads(false);
     mount();
     expect(host.innerHTML).toBe('');
   });
 
   it('closes the menu and opens the home thread', () => {
-    switchHome(true);
     seedThreads(true);
     mount();
     const row = host.querySelector<HTMLButtonElement>('button.brand-menu-item');

@@ -11,6 +11,7 @@ pub(crate) fn opt(id: &str, label: &str) -> QuestionOption {
         label: label.into(),
         description: None,
         preview: None,
+        widget: None,
     }
 }
 
@@ -155,6 +156,7 @@ pub(crate) async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use
             options: vec![opt("opt-0", "A")],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: cc_meta(),
     })
@@ -190,6 +192,7 @@ pub(crate) async fn emit_answered_question(
             options,
             worktree_path: None,
             multi_select: matches!(answer, AnswerKind::MultiSelected { .. }),
+            owner_approval: None,
         },
         meta: cc_meta(),
     })

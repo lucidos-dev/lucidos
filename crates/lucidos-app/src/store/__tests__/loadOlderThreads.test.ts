@@ -40,10 +40,7 @@ function summary(over: Partial<ThreadSummary> & { thread_id: string; created_at:
     live_event_wait_count: 0,
     status: 'idle',
     summary_version: 0,
-    coding_agent_has_diff: false,
-    coding_agent_proposed: false,
-    coding_agent_requires_restart: false,
-    coding_agent_incomplete: false,
+    coding_agent_change_state: { kind: 'none' },
     coding_agent_is_external_repo: false,
     last_revived_at: null,
     parent_thread_id: null,
@@ -597,8 +594,8 @@ describe('filterChangedSinceLoad', () => {
 
   it('keeps reporting it until the reload actually happens, however often it is asked', async () => {
     // The whole point, and the bug it replaces. The drawer's list renders under
-    // the default `all` status only, while the Filter panel can change the
-    // selection under any of the four status views, with the list unmounted.
+    // the Folders grouping only, so a selection can change with the list
+    // unmounted.
     // The old guard was a `useRef` seeded at mount, so that change was seen by
     // nobody AND the ref then seeded with the new value, suppressing the
     // catch-up on the way back: pagination stayed armed for the old cursor

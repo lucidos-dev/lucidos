@@ -15,15 +15,8 @@ const MAX_MS = 450;
 // fast, so fading from the start leaves it half gone by the first frames.
 const LINGER: Keyframe = { opacity: '1', offset: 0.5 };
 
-/** A section's rows in render order, its header first. `tucked` holds the
- *  threads a collapsed section keeps out of view. */
-export interface FlipSection { name: string; ids: string[]; tucked?: string[] }
-
-/** The header a departing thread folds into: the first row of the section
- *  that now holds it out of view. Null when it left every section. */
-export function tuckTarget(id: string, sections: FlipSection[]): string | null {
-    return sections.find(s => s.tucked?.includes(id))?.ids[0] ?? null;
-}
+/** A section's rows in render order, its header first. */
+export interface FlipSection { name: string; ids: string[] }
 
 /** A run of adjacent rows that appear or disappear together, under `anchor`,
  *  the row just before them (their parent, for a sub-thread family). */
@@ -150,7 +143,7 @@ export function mountDisclosureMask(host: HTMLElement, line: number, rows: Discl
     return mask;
 }
 
-/** Mount copies of rows that left the list, each at its old box. The layer
+/** Mount copies of rows that left their section, each at its old box. The layer
  *  scrolls and clips with the list, and does not clip the copies itself. */
 export function mountDepartureLayer(host: HTMLElement, rows: DisclosureRow[]): HTMLElement {
     const layer = document.createElement('div');
@@ -194,8 +187,8 @@ export function startTogetherOnNextFrame(anims: Animation[], live: () => boolean
 }
 
 /** Run a departure layer's exits from the next frame, then remove the layer.
- *  No batch takes these over: the rows they stand for are gone either way, and
- *  a newer batch would only drop a copy mid-exit. */
+ *  No batch takes these over: the places they stand for are gone either way,
+ *  and a newer batch would only drop a copy mid-exit. */
 function playOutDeparture(layer: HTMLElement, exits: Animation[]) {
     startTogetherOnNextFrame(exits, () => layer.isConnected);
     Promise.allSettled(exits.map(a => a.finished)).then(() => layer.remove());
@@ -224,28 +217,20 @@ export function ghostOf(row: HTMLElement): HTMLElement {
 /**
  * FLIP animation for thread list transitions.
  *
- * Uses a portal div for the flying thread — a cloned element rendered at
- * position:fixed, completely outside the scroll container and stacking context
- * hierarchy, so it renders above all app chrome regardless of CSS transforms or
- * overflow clipping. The portal sits just below the modal/restart/toast layer
- * (see .flip-portal in drawer.css), so a thread whose status changes during an
- * engine restart can't fly above the restart overlay.
- *
  * A render where any of `disclosureKeys` changed is a disclosure: a family
  * showing or hiding its sub-threads, or a section its threads. Those rows
  * unroll from under the row above them, and hidden ones roll back up as
  * ghosts, in lockstep with the rows sliding below.
  *
- * A row that leaves on any other render departs as a copy. An archived thread
- * that lands in a collapsed section flies into that section's header. Any
- * other row folds away where it stood. The copy finishes its exit even when a
- * newer render starts another batch.
+ * On any other render, a row that left its section folds away where it stood,
+ * as a copy. Nothing flies between sections: a thread that lands in another
+ * one fades in there. The copy finishes its exit even when a newer render
+ * starts another batch.
  *
  * Speed setting: slider 0 = normal (1x), +10 = 10x faster, -10 = 10x slower.
  */
 export function useFlipTransitions(
     containerRef: { current: HTMLElement | null },
-    portalRef: { current: HTMLElement | null },
     sections: FlipSection[],
     resetKey?: unknown,
     disclosureKeys: readonly unknown[] = [],
@@ -261,12 +246,13 @@ export function useFlipTransitions(
     const runningAnims = useRef<Animation[]>([]);
     const animatedEls = useRef<HTMLElement[]>([]);
     const hiddenEls = useRef<HTMLElement[]>([]);
-    const portalClones = useRef<HTMLElement[]>([]);
+    const overlays = useRef<HTMLElement[]>([]);
     // What a running disclosure shows in place of each thread (its row copy),
     // and of each section's divider (its carried line).
     const standIns = useRef(new Map<string, HTMLElement>());
-    // Each thread whose copy is still leaving, and that copy's exit.
-    const departing = useRef(new Map<string, { ghost: HTMLElement; exit: Animation }>());
+    // Each thread whose copy is still leaving, that copy's exit, and the
+    // section it left.
+    const departing = useRef(new Map<string, { ghost: HTMLElement; exit: Animation; from: string }>());
 
     // ── Build flat ordered list and section map ──
     const currentOrder: string[] = [];
@@ -313,8 +299,8 @@ export function useFlipTransitions(
     // ── Build affected siblings: any existing item that isn't moved/new ──
     // When sections appear/disappear, index-range heuristics miss items outside
     // the source-dest range (e.g. a section header below the moved thread).
-    // Instead, mark ALL surviving items as potential siblings: the `noMovement`
-    // pixel-delta check below skips items that didn't actually move.
+    // Instead, mark ALL surviving items as potential siblings: the pixel-delta
+    // check below skips items that didn't actually move.
     const affectedSiblings = new Set<string>();
     const hasChanges = transitioned.size > 0 || newItems.size > 0 || removed.size > 0;
     if (hasChanges && prevOrder.current.length > 0) {
@@ -333,7 +319,7 @@ export function useFlipTransitions(
     // unmasked and must not start under a parent.
     const oldRects = new Map<string, Rect>();
     const ghosts = new Map<string, HTMLElement>();
-    // Copies of on-screen rows that left without a toggle.
+    // Copies of on-screen rows that left their section without a toggle.
     const departures = new Map<string, HTMLElement>();
     const seen = new Map<string, { rect: Rect; opacity: number }>();
     // Per section header: where the closing row's own hairline starts.
@@ -359,7 +345,8 @@ export function useFlipTransitions(
             oldRects.set(id, rect);
             if (hiding.has(id)) hidingRows.set(id, row);
             const onScreen = rect.top + rect.height > 0 && rect.top < window.innerHeight;
-            if (!disclosing && removed.has(id) && onScreen) departures.set(id, ghostOf(row));
+            const left = removed.has(id) || transitioned.has(id);
+            if (!disclosing && left && onScreen) departures.set(id, ghostOf(row));
         }
         for (const run of hideRuns) {
             const rects = run.ids.map(id => oldRects.get(id)).filter((r): r is Rect => !!r);
@@ -385,15 +372,13 @@ export function useFlipTransitions(
 
     useLayoutEffect(() => {
         const el = containerRef.current;
-        const portal = portalRef.current;
-        if (!el || !portal || !hasChanges || oldRects.size === 0) return;
+        if (!el || !hasChanges || oldRects.size === 0) return;
 
         if (isReducedMotion()) return;
 
-        // A row back in the list takes over from its own leaving copy.
-        for (const id of currentOrder) {
-            const copy = departing.current.get(id);
-            if (!copy) continue;
+        // A thread back in the section it left takes over from its copy.
+        for (const [id, copy] of departing.current) {
+            if (currentSections.get(id) !== copy.from) continue;
             copy.exit.cancel();
             copy.ghost.remove();
         }
@@ -408,13 +393,13 @@ export function useFlipTransitions(
         for (const h of hiddenEls.current) {
             h.style.opacity = '';
         }
-        for (const c of portalClones.current) {
+        for (const c of overlays.current) {
             c.remove();
         }
         runningAnims.current = [];
         animatedEls.current = [];
         hiddenEls.current = [];
-        portalClones.current = [];
+        overlays.current = [];
         standIns.current.clear();
 
         const mobile = isMobile();
@@ -430,7 +415,7 @@ export function useFlipTransitions(
         const newAnims: Animation[] = [];
         const touched: HTMLElement[] = [];
         const hidden: HTMLElement[] = [];
-        const clones: HTMLElement[] = [];
+        const created: HTMLElement[] = [];
 
         // The anchor's own slide, if the commit moved it (a scroll clamp, say).
         const anchorDrift = (anchor: string | null) => {
@@ -454,7 +439,7 @@ export function useFlipTransitions(
             host.appendChild(hairline);
             const top = rollEnd - 1;
             hairline.style.top = `${top - host.getBoundingClientRect().top}px`;
-            clones.push(hairline);
+            created.push(hairline);
             const box = hairline.getBoundingClientRect();
             const atRow = rowEndScale(box, rowLeft);
             const was = seen.get(key);
@@ -521,7 +506,7 @@ export function useFlipTransitions(
             // still style the copies and they scroll with the list.
             const host = (run.anchor ? rowById.get(run.anchor)?.parentElement : null) ?? el;
             const mask = mountDisclosureMask(host, line, blockRows);
-            clones.push(mask);
+            created.push(mask);
             for (const real of [...blockRows.map(r => r.real), ...waiting]) {
                 if (!real) continue;
                 real.style.opacity = '0';
@@ -597,38 +582,31 @@ export function useFlipTransitions(
             return nearest(stillAfter) > nearest(rollingAfter);
         };
 
-        // ── Departures: copies of rows that left the list. ──
-        // A thread tucked into a collapsed section flies onto its header, over
-        // the rows, and fades as it lands. Any other row folds up from its
-        // bottom edge on the same curve as the row below, which closes the gap.
-        // This runs before the rows below start sliding: a sliding header
-        // would report its old box, not the one the copy must land on.
-        if (departures.size > 0) {
-            const leaving = [...departures].map(([id, ghost]) => ({ id, ghost, rect: oldRects.get(id)! }));
+        // Threads whose new section draws them where they stood: none moved.
+        const settled = new Set([...transitioned].filter(id => {
+            const now = rowById.get(id)?.getBoundingClientRect();
+            const was = oldRects.get(id);
+            return !!now && !!was && Math.abs(now.left - was.left) < 1 && Math.abs(now.top - was.top) < 1;
+        }));
+
+        // ── Departures: copies of rows that left their section. ──
+        // Each folds up from its bottom edge on the same curve as the row
+        // below, which closes the gap. It never travels to where the thread
+        // went, even when that section is on screen.
+        const leaving = [...departures]
+            .filter(([id]) => !settled.has(id))
+            .map(([id, ghost]) => ({ id, ghost, rect: oldRects.get(id)! }));
+        if (leaving.length > 0) {
             const layer = mountDepartureLayer(el, leaving);
             const exits: Animation[] = [];
-            for (const { id, ghost, rect } of leaving) {
-                const header = tuckTarget(id, sections);
-                const target = header ? rowById.get(header)?.getBoundingClientRect() : undefined;
-                let exit: Animation;
-                if (target) {
-                    const dy = target.top - rect.top;
-                    ghost.style.background = 'var(--bg-primary)';
-                    ghost.style.zIndex = '1';
-                    exit = ghost.animate([
-                        { transform: 'translateY(0) scale(1)', opacity: '1' },
-                        LINGER,
-                        { transform: `translateY(${dy}px) scale(0.92)`, opacity: '0' },
-                    ], { duration: flightDurationMs(Math.abs(dy)) * scale, easing, fill: 'forwards' });
-                } else {
-                    exit = ghost.animate([
-                        { transform: 'scaleY(1)', transformOrigin: 'top', opacity: '1' },
-                        LINGER,
-                        { transform: 'scaleY(0)', transformOrigin: 'top', opacity: '0' },
-                    ], { duration: MIN_MS * scale, easing, fill: 'forwards' });
-                }
+            for (const { id, ghost } of leaving) {
+                const exit = ghost.animate([
+                    { transform: 'scaleY(1)', transformOrigin: 'top', opacity: '1' },
+                    LINGER,
+                    { transform: 'scaleY(0)', transformOrigin: 'top', opacity: '0' },
+                ], { duration: MIN_MS * scale, easing, fill: 'forwards' });
                 exits.push(exit);
-                departing.current.set(id, { ghost, exit });
+                departing.current.set(id, { ghost, exit, from: prev.get(id)! });
                 const forget = () => {
                     if (departing.current.get(id)?.exit === exit) departing.current.delete(id);
                 };
@@ -664,8 +642,20 @@ export function useFlipTransitions(
                 continue;
             }
 
-            if (!isMoved && !isAffected) continue;
-            if (!isMoved && belowStill(id)) continue;
+            if (isMoved) {
+                if (settled.has(id)) continue;
+                // A thread that changed sections fades in at its new place,
+                // while its copy folds away where it stood.
+                row.classList.add('flip-animating');
+                touched.push(row);
+                newAnims.push(row.animate(
+                    [{ opacity: '0' }, { opacity: '1' }],
+                    { duration: MIN_MS * scale, easing, fill: 'none' },
+                ));
+                continue;
+            }
+
+            if (!isAffected || belowStill(id)) continue;
 
             const newRect = row.getBoundingClientRect();
             const oldRect = oldRects.get(id);
@@ -673,83 +663,36 @@ export function useFlipTransitions(
 
             const deltaX = oldRect.left - newRect.left;
             const deltaY = oldRect.top - newRect.top;
-            const noMovement = Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1;
+            if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) continue;
 
-            // Displaced siblings with no pixel movement: skip
-            if (noMovement && !isMoved) continue;
-
-            const dist = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
-            const baseDuration = noMovement
-                ? MIN_MS  // Section-transitioned but same position: use min duration for scale-settle
-                : flightDurationMs(dist);
             // A row a disclosure pushed moves in lockstep with the block.
-            const pushed = disclosureDuration > 0 && !isMoved;
-            const duration = pushed ? disclosureDuration : baseDuration * scale;
+            const pushed = disclosureDuration > 0;
+            const duration = pushed
+                ? disclosureDuration
+                : flightDurationMs(Math.sqrt(deltaX * deltaX + deltaY * deltaY)) * scale;
 
-            if (isMoved) {
-                // ── Portal-based flight for moved threads ──
-                // 1. Clone the element into the portal (fixed position, above everything)
-                const clone = row.cloneNode(true) as HTMLElement;
-                clone.style.position = 'fixed';
-                clone.style.top = `${oldRect.top}px`;
-                clone.style.left = `${oldRect.left}px`;
-                clone.style.width = `${oldRect.width}px`;
-                clone.style.height = `${oldRect.height}px`;
-                clone.style.margin = '0';
-                clone.style.pointerEvents = 'none';
-                clone.style.boxSizing = 'border-box';
-                clone.style.borderBottom = '1px solid var(--border-color)';
-                clone.style.background = 'var(--bg-primary)';
-                clone.style.willChange = 'transform';
-                portal.appendChild(clone);
-                clones.push(clone);
-
-                // 2. Hide the real element at its destination
-                row.style.opacity = '0';
-                hidden.push(row);
-
-                // 3. Animate the clone from old position to new position
-                // Use transform instead of top/left to avoid layout thrashing (GPU-composited)
-                const flyDeltaX = newRect.left - oldRect.left;
-                const flyDeltaY = newRect.top - oldRect.top;
-                // On mobile: skip intermediate scale bounce for smoother animation
-                const flyKeyframes = mobile
-                    ? [
-                        { transform: 'translate(0, 0)' },
-                        { transform: `translate(${flyDeltaX}px, ${flyDeltaY}px)` },
-                    ]
-                    : [
-                        { transform: 'translate(0, 0) scale(1)' },
-                        { transform: `translate(${flyDeltaX}px, ${flyDeltaY}px) scale(1.03)`, offset: 0.7 },
-                        { transform: `translate(${flyDeltaX}px, ${flyDeltaY}px) scale(1)` },
-                    ];
-                const anim = clone.animate(flyKeyframes, { duration, easing, fill: 'forwards' });
-                newAnims.push(anim);
-            } else {
-                // Displaced sibling: slide to new position (stays in DOM)
-                row.classList.add('flip-animating');
-                touched.push(row);
-                const { start, end } = cutBelow(id);
-                const anim = row.animate([
-                    { transform: `translate(${deltaX}px, ${deltaY + start}px)` },
-                    { transform: `translate(0, ${end}px)` },
-                ], { duration, easing: pushed ? EASING_DISCLOSURE : easing, fill: 'none' });
-                newAnims.push(anim);
-            }
+            // A displaced sibling slides to its new position.
+            row.classList.add('flip-animating');
+            touched.push(row);
+            const { start, end } = cutBelow(id);
+            newAnims.push(row.animate([
+                { transform: `translate(${deltaX}px, ${deltaY + start}px)` },
+                { transform: `translate(0, ${end}px)` },
+            ], { duration, easing: pushed ? EASING_DISCLOSURE : easing, fill: 'none' }));
         }
 
         runningAnims.current = newAnims;
         startTogetherOnNextFrame(newAnims, () => runningAnims.current === newAnims);
         animatedEls.current = touched;
         hiddenEls.current = hidden;
-        portalClones.current = clones;
+        overlays.current = created;
 
         // Cleanup after all animations finish
         if (newAnims.length > 0) {
             Promise.allSettled(newAnims.map(a => a.finished)).then(() => {
                 // A newer batch cancelled these, which is what settled us, and
                 // its takeover above already did this batch's cleanup. Running
-                // it again would un-hide a row whose new clone is still flying,
+                // it again would un-hide a row whose new copy is still sliding,
                 // and would wipe the refs the NEXT batch cancels through.
                 if (runningAnims.current !== newAnims) return;
                 for (const r of touched) {
@@ -758,13 +701,13 @@ export function useFlipTransitions(
                 for (const h of hidden) {
                     h.style.opacity = '';
                 }
-                for (const c of clones) {
+                for (const c of created) {
                     c.remove();
                 }
                 runningAnims.current = [];
                 animatedEls.current = [];
                 hiddenEls.current = [];
-                portalClones.current = [];
+                overlays.current = [];
                 standIns.current.clear();
             });
         }

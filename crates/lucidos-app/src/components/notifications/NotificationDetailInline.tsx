@@ -10,7 +10,7 @@ import { navigateAdjacentNotification } from '../../store/actions/notifications'
 import { discussNotification } from '../../store/actions/notification-discuss';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
-import { composeHandlers } from '../chat/promptFocus';
+import { composeHandlers } from '../chat/composeHandlers';
 import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { formatNotificationDate } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
@@ -19,6 +19,7 @@ import { loadedOr } from '../../store/types';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { useSkeleton, SkText } from '../shared/Skeleton';
 import { resolveLinkedApp } from './resolveLinkedApp';
+import { appById } from '../../store/appsById';
 import { notificationPosition } from './notificationPosition';
 import { navigateTapLabel } from './notificationTapLabel';
 import { notificationActions, notificationTriggerId } from './notificationActions';
@@ -50,7 +51,7 @@ export function NotificationDetailInline() {
     notificationsHasMore.value,
   );
 
-  const linked = resolveLinkedApp(detail.app_id, appsList.value);
+  const linked = resolveLinkedApp(detail.app_id, appsList.value, appById(detail.app_id ?? ''));
   const apps = loadedOr(appsList.value, []);
   const content = linkifyPaths(renderMarkdown(detail.message), [], apps);
   const dateStr = formatNotificationDate(new Date(detail.created_at));

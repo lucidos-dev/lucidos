@@ -31,15 +31,17 @@ use sqlx::PgPool;
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
-use super::fold;
+use super::compaction_view::{self, CompactionView};
 use super::limit::{Lanes, MAX_LIMIT};
 use super::log::{self, EntryKind, LogEntry};
 use super::shape::LeafOrder;
 use super::store::{self, StoredNode};
+use super::view::ViewBlocks;
 use super::workspace_log::{WorkspaceLeaf, WorkspaceLog};
-use super::{prompt, shape, NodeAddr, SummaryScope, CONTEXT_BYTES, HORIZON_SECS, LIVE_DRAINS};
+use super::{prompt, shape, NodeAddr, SummaryScope, HORIZON_SECS, LIVE_DRAINS, RAW_CONTEXT_BYTES};
 use super::{BackfillProgress, NODE_BYTES, READS, READY_DAYS, RETRY, TRIES};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::ActorMode;
 use crate::engine::{AuxCapture, ContextPurpose};
 use crate::llm::provider::{LlmProvider, Message, MessageContent};
 
@@ -63,6 +65,7 @@ pub(crate) struct CompactionModel {
     pub(crate) provider: Arc<dyn LlmProvider>,
     /// The model every call names, so the capture records what actually ran.
     pub(crate) model: String,
+    /// The tier the route runs, already snapped, for the same reason.
     pub(crate) effort: Option<String>,
     /// Covers every round of one node.
     pub(crate) deadline: Duration,
@@ -103,18 +106,22 @@ impl From<sqlx::Error> for NodeError {
 /// What a leaf compresses.
 struct LeafInput {
     message: String,
-    context: Vec<String>,
+    context: LeafContext,
     source_event_id: Uuid,
     source_thread_id: Option<Uuid>,
 }
 
+/// What a leaf reads as context.
+enum LeafContext {
+    /// Its tree's compaction view, up to the leaf.
+    View,
+    /// Lines of its own, which no other call shares.
+    Raw(Vec<String>),
+}
+
 enum NodeInput {
     Leaf(LeafInput),
-    Merge {
-        a: String,
-        b: String,
-        context: Vec<String>,
-    },
+    Merge { a: String, b: String },
 }
 
 #[derive(Default)]
@@ -126,6 +133,9 @@ struct Queue {
     /// Scopes being drained, and whether one was marked dirty meanwhile.
     draining: HashMap<SummaryScope, bool>,
     backfill: Option<Backfill>,
+    /// Progress frames announced so far. Read with the count it orders, under
+    /// this lock, so a snapshot never pairs a newer count with an older order.
+    announced: u64,
 }
 
 /// A running backfill.
@@ -176,6 +186,9 @@ pub(crate) struct Compactor {
     /// Threads deleted since the last workspace drain, whose leaves it drops.
     deleted_threads: Mutex<HashSet<Uuid>>,
     reported: Mutex<HashSet<(SummaryScope, NodeAddr)>>,
+    /// Scopes whose verbatim nodes this process has re-derived. Nodes built
+    /// after that already render the current way, so once per tree is enough.
+    rederived: Mutex<HashSet<SummaryScope>>,
     /// Set while the workspace is off the Tree module. Workers take no scope,
     /// and a running drain launches no further node, so only the calls
     /// already in flight finish after a pause.
@@ -203,6 +216,7 @@ impl Compactor {
             workspace_stale: AtomicBool::new(false),
             deleted_threads: Mutex::default(),
             reported: Mutex::default(),
+            rederived: Mutex::default(),
             paused: AtomicBool::new(false),
             resumed: Notify::new(),
             waiting_for_model: AtomicBool::new(false),
@@ -210,9 +224,21 @@ impl Compactor {
         })
     }
 
-    /// The running backfill's count, or `None` when none runs.
+    /// The running backfill's count, or `None` when none runs. It carries the
+    /// order of the last frame announced, which it is at least as new as.
     pub(crate) fn backfill_progress(&self) -> Option<BackfillProgress> {
-        let q = self.queue.lock().unwrap();
+        self.count(&self.queue.lock().unwrap())
+    }
+
+    /// The count for the next frame, stamped with that frame's order.
+    fn next_announcement(&self) -> Option<BackfillProgress> {
+        let mut q = self.queue.lock().unwrap();
+        q.backfill.as_ref()?;
+        q.announced += 1;
+        self.count(&q)
+    }
+
+    fn count(&self, q: &Queue) -> Option<BackfillProgress> {
         let backfill = q.backfill.as_ref()?;
         let done = backfill.total - backfill.owed.len();
         let (nodes_done, nodes_total) = backfill
@@ -236,6 +262,7 @@ impl Compactor {
             waiting_for_model: self.waiting_for_model.load(Ordering::SeqCst),
             retrying: !backfill.failing.is_empty(),
             ready: backfill.ready,
+            seq: q.announced,
         })
     }
 
@@ -267,7 +294,7 @@ impl Compactor {
     /// counts the last scope ends the backfill.
     async fn announce_progress(&self) {
         let _order = self.announcing.lock().await;
-        let Some(progress) = self.backfill_progress() else {
+        let Some(progress) = self.next_announcement() else {
             return;
         };
         self.bus
@@ -636,6 +663,7 @@ impl Compactor {
             thread_id: id,
             entries: &loaded.log.entries,
         };
+        self.rederive_verbatim(scope, &source, &mut nodes).await?;
         let outcome = self.build(scope, urgent, &source, &mut nodes).await?;
         if matches!(outcome, Drained::Complete) {
             store::reflect(&self.pool, scope, loaded.through.unwrap_or(0)).await?;
@@ -691,6 +719,8 @@ impl Compactor {
         drop(reading);
 
         let source = WorkspaceSource::new(self, &state.log.leaves);
+        self.rederive_verbatim(scope, &source, &mut state.nodes)
+            .await?;
         let outcome = self.build(scope, urgent, &source, &mut state.nodes).await?;
         if matches!(outcome, Drained::Complete) {
             store::reflect(&self.pool, scope, state.log.through).await?;
@@ -781,6 +811,99 @@ impl Compactor {
         Ok(())
     }
 
+    /// Bring nodes no model wrote in line with how their source renders now.
+    /// A rebuild writes such a node verbatim, so it must equal that (I1). A
+    /// leaf is re-read only when it carries a retired kind tag, and a merge
+    /// is its two halves joined. Lines a model wrote keep their wording.
+    ///
+    /// A node whose source no longer fits needs a model call. Its old tag
+    /// may have credited an agent's or the engine's words to the user. Then
+    /// it goes with every line above it, and the build writes them again.
+    /// Otherwise it keeps its old text, whose tag names the right sender.
+    async fn rederive_verbatim(
+        &self,
+        scope: SummaryScope,
+        source: &(dyn TreeSource + '_),
+        nodes: &mut HashMap<NodeAddr, StoredNode>,
+    ) -> Result<(), BoxError> {
+        if self.rederived.lock().unwrap().contains(&scope) {
+            return Ok(());
+        }
+        let mut stale: Vec<NodeAddr> = nodes
+            .iter()
+            .filter(|(a, n)| a.is_leaf() && n.model.is_none() && carries_retired_tag(&n.text))
+            .map(|(a, _)| *a)
+            .collect();
+        stale.sort();
+        let mut rewritten: Vec<(NodeAddr, String)> = Vec::new();
+        let mut dropped: Vec<NodeAddr> = Vec::new();
+        let mut outgrown = 0;
+        for addr in stale {
+            let message = source.leaf(addr.start).await?.message;
+            if message.len() <= NODE_BYTES {
+                if message != nodes[&addr].text {
+                    rewritten.push((addr, message));
+                }
+            } else if names_another_sender(&message) {
+                dropped.extend(with_ancestors(addr, nodes));
+            } else {
+                outgrown += 1;
+            }
+        }
+        for (addr, text) in &rewritten {
+            nodes.get_mut(addr).expect("listed above").text = text.clone();
+        }
+        for addr in &dropped {
+            nodes.remove(addr);
+        }
+        let mut merges: Vec<NodeAddr> = nodes
+            .iter()
+            .filter(|(a, n)| !a.is_leaf() && n.model.is_none())
+            .map(|(a, _)| *a)
+            .collect();
+        merges.sort_by_key(|a| (a.span, a.start));
+        for addr in merges {
+            let (a, b) = addr.children().expect("a merge has children");
+            let (Some(a), Some(b), Some(own)) = (nodes.get(&a), nodes.get(&b), nodes.get(&addr))
+            else {
+                continue;
+            };
+            let joined = format!("{}\n{}", a.text, b.text);
+            if joined == own.text {
+                continue;
+            }
+            if joined.len() > NODE_BYTES {
+                if names_another_sender(&joined) {
+                    let above = with_ancestors(addr, nodes);
+                    for node in &above {
+                        nodes.remove(node);
+                    }
+                    dropped.extend(above);
+                } else {
+                    outgrown += 1;
+                }
+                continue;
+            }
+            nodes.get_mut(&addr).expect("listed above").text = joined.clone();
+            rewritten.push((addr, joined));
+        }
+        if !rewritten.is_empty() || !dropped.is_empty() || outgrown > 0 {
+            log!(
+                "[SummaryTree] Re-derived {} verbatim nodes of {}; dropped {} to rebuild an agent's or the engine's words; {} no longer fit a node and keep their text",
+                rewritten.len(),
+                scope.as_db(),
+                dropped.len(),
+                outgrown
+            );
+        }
+        dropped.sort();
+        dropped.dedup();
+        store::rewrite_verbatim(&self.pool, scope, &rewritten).await?;
+        store::realign(&self.pool, scope, None, &[], &dropped).await?;
+        self.rederived.lock().unwrap().insert(scope);
+        Ok(())
+    }
+
     /// Build every node the pump allows, at most [`MAX_LIMIT`] in flight.
     ///
     /// Finished nodes are applied in launch order. So which lines exist when
@@ -797,6 +920,10 @@ impl Compactor {
         let len = source.len();
         let mut texts: HashMap<NodeAddr, String> =
             nodes.iter().map(|(a, n)| (*a, n.text.clone())).collect();
+        let mut sizes: HashMap<NodeAddr, usize> = texts
+            .iter()
+            .map(|(a, t)| (*a, compaction_view::line_bytes(t)))
+            .collect();
         let mut pending = shape::Pending::new(len, &texts);
         if self.count_nodes(scope, pending.remaining()) {
             self.announce_progress().await;
@@ -804,15 +931,17 @@ impl Compactor {
         let mut busy = HashSet::new();
         let mut inflight = FuturesOrdered::new();
         let (mut failed, mut unavailable) = (false, false);
+        let mut view = CompactionView::default();
 
         loop {
             if !failed && !self.is_paused() {
+                let size = |a: NodeAddr| sizes.get(&a).copied();
                 let room = MAX_LIMIT - inflight.len();
                 for addr in pending.buildable(&texts, &busy, source.leaf_order(), room) {
                     let input = if addr.is_leaf() {
                         // A failed read ends the drain only once every
                         // launched node has landed.
-                        match source.leaf(addr.start, &texts).await {
+                        match source.leaf(addr.start).await {
                             Ok(leaf) => NodeInput::Leaf(leaf),
                             Err(e) => {
                                 self.report_once(scope, addr, &e.to_string());
@@ -825,14 +954,32 @@ impl Compactor {
                         NodeInput::Merge {
                             a: texts[&a].clone(),
                             b: texts[&b].clone(),
-                            context: tiling_lines(addr.end(), &texts),
+                        }
+                    };
+                    let context = match &input {
+                        NodeInput::Leaf(LeafInput {
+                            context: LeafContext::Raw(lines),
+                            ..
+                        }) => compaction_view::render(lines.iter().map(String::as_str), 0),
+                        _ => {
+                            let end = if addr.is_leaf() {
+                                addr.start.min(pending.first_unbuilt_leaf())
+                            } else {
+                                addr.end()
+                            };
+                            view.advance(pending.built_prefix_end(), &size);
+                            let tiles = view.tiles(end, &size);
+                            compaction_view::render(
+                                tiles.iter().map(|a| texts[a].as_str()),
+                                compaction_view::RUNGS,
+                            )
                         }
                     };
                     busy.insert(addr);
                     let this = self.clone();
                     let capture_thread = source.capture_thread(addr);
                     let node = tokio::spawn(async move {
-                        this.build_node(scope, addr, input, capture_thread, urgent)
+                        this.build_node(scope, addr, input, context, capture_thread, urgent)
                             .await
                     });
                     inflight.push_back(async move {
@@ -850,6 +997,7 @@ impl Compactor {
             match result {
                 Ok(node) => {
                     pending.mark_built(addr);
+                    sizes.insert(addr, compaction_view::line_bytes(&node.text));
                     texts.insert(addr, node.text.clone());
                     nodes.insert(addr, node);
                     if self.node_built(scope) {
@@ -898,24 +1046,20 @@ impl Compactor {
         scope: SummaryScope,
         addr: NodeAddr,
         input: NodeInput,
+        context: ViewBlocks,
         capture_thread: Option<Uuid>,
         urgent: bool,
     ) -> Result<StoredNode, NodeError> {
-        let (verbatim, step, context, source_event_id, source_thread_id) = match input {
+        let (verbatim, step, source_event_id, source_thread_id) = match input {
             NodeInput::Leaf(leaf) => (
                 leaf.message.clone(),
                 prompt::compress_step(&leaf.message),
-                leaf.context,
                 Some(leaf.source_event_id),
                 leaf.source_thread_id,
             ),
-            NodeInput::Merge { a, b, context } => (
-                format!("{a}\n{b}"),
-                prompt::merge_step(&a, &b),
-                context,
-                None,
-                None,
-            ),
+            NodeInput::Merge { a, b } => {
+                (format!("{a}\n{b}"), prompt::merge_step(&a, &b), None, None)
+            }
         };
         let (text, model) = if verbatim.len() <= NODE_BYTES {
             (verbatim, None)
@@ -939,7 +1083,7 @@ impl Compactor {
     /// the lane of the route it takes.
     async fn write_line(
         &self,
-        context: &[String],
+        context: &ViewBlocks,
         step: &str,
         capture_thread: Option<Uuid>,
         urgent: bool,
@@ -956,7 +1100,7 @@ impl Compactor {
             ContextPurpose::SummaryCompaction,
         );
         let request = prompt::request(context, step);
-        match fit_line(&model, &request, &capture).await {
+        match fit_line(&model, request, &capture).await {
             Ok(line) => {
                 permit.succeeded();
                 self.set_waiting_for_model(false).await;
@@ -1018,7 +1162,7 @@ fn enqueue(q: &mut Queue, scope: SummaryScope, urgent: bool) {
     }
 }
 
-/// Ask for a line until it fits, in one conversation (OptChat §4.3). After
+/// Ask for a line until it fits, in one conversation (OptChat §4). After
 /// [`TRIES`] answers the shortest wins, a few bytes over at worst: the size is
 /// a target nothing downstream relies on.
 ///
@@ -1026,12 +1170,12 @@ fn enqueue(q: &mut Queue, scope: SummaryScope, urgent: bool) {
 /// never its record, so a round that answered in time is never lost.
 async fn fit_line(
     model: &CompactionModel,
-    request: &str,
+    request: MessageContent,
     capture: &AuxCapture,
 ) -> Result<String, NodeError> {
     let mut messages = vec![Message {
         role: "user".to_string(),
-        content: MessageContent::Text(request.to_string()),
+        content: request,
     }];
     let mut tries: Vec<String> = Vec::new();
     let capture = capture.until(tokio::time::Instant::now() + model.deadline);
@@ -1074,29 +1218,62 @@ async fn fit_line(
         .expect("at least one try"))
 }
 
-/// The context lines for a node ending at `end`: the prefix's context tiling.
-fn tiling_lines(end: u64, texts: &HashMap<NodeAddr, String>) -> Vec<String> {
-    fold::context_tiling(end, |a| texts.get(&a).map(|t| t.len() + 1), CONTEXT_BYTES)
-        .iter()
-        .filter_map(|a| texts.get(a).cloned())
-        .collect()
-}
-
 /// The raw lines of a thread's entries before `end`, newest first until
-/// [`CONTEXT_BYTES`], returned oldest first.
+/// [`RAW_CONTEXT_BYTES`], returned oldest first.
 fn raw_context(entries: &[LogEntry], end: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut bytes = 0;
     for entry in entries[..end].iter().rev() {
         let line = entry.raw_line();
         bytes += line.len() + 1;
-        if bytes > CONTEXT_BYTES {
+        if bytes > RAW_CONTEXT_BYTES {
             break;
         }
         lines.push(line);
     }
     lines.reverse();
     lines
+}
+
+/// Kind tags the log no longer writes (`docs/temporary-measures.md`, "Retired
+/// entry kind tags in verbatim nodes").
+const RETIRED_TAGS: &[&str] = &["user: ", "talk: ", "tool: ", "echo: ", "work: "];
+
+/// Whether a node no model wrote may hold a retired kind tag: a leaf's own,
+/// or one of a workspace turn's lines. An artifact's content is not tagged.
+fn carries_retired_tag(text: &str) -> bool {
+    let artifact = format!("{}: ", EntryKind::Artifact.as_str());
+    !text.starts_with(&artifact)
+        && text
+            .lines()
+            .any(|line| RETIRED_TAGS.iter().any(|tag| line.starts_with(tag)))
+}
+
+/// Whether a message holds a prompt an agent or the engine sent, which a
+/// retired tag credited to the user.
+fn names_another_sender(message: &str) -> bool {
+    let tags = [ActorMode::Agent, ActorMode::Engine]
+        .map(|mode| format!("{}: ", EntryKind::Prompt(mode).as_str()));
+    message
+        .lines()
+        .any(|line| tags.iter().any(|tag| line.starts_with(tag.as_str())))
+}
+
+/// `node` and every stored merge above it.
+fn with_ancestors(node: NodeAddr, nodes: &HashMap<NodeAddr, StoredNode>) -> Vec<NodeAddr> {
+    let mut out = vec![node];
+    let mut span = 2 * node.span;
+    loop {
+        let parent = NodeAddr {
+            start: node.start - node.start % span,
+            span,
+        };
+        if !nodes.contains_key(&parent) {
+            return out;
+        }
+        out.push(parent);
+        span *= 2;
+    }
 }
 
 /// A workspace turn leaf's message: the thread's title, then the turn's lines.
@@ -1116,12 +1293,8 @@ trait TreeSource: Send + Sync {
     /// Whether a leaf reads the leaves before it, and so waits on them.
     fn leaf_order(&self) -> LeafOrder;
 
-    /// What leaf `index` compresses. `texts` is this tree's built lines.
-    async fn leaf(
-        &self,
-        index: u64,
-        texts: &HashMap<NodeAddr, String>,
-    ) -> Result<LeafInput, BoxError>;
+    /// What leaf `index` compresses.
+    async fn leaf(&self, index: u64) -> Result<LeafInput, BoxError>;
 
     /// The thread a node's model call is recorded on, for token accounting.
     /// `None` records it on the home thread.
@@ -1140,18 +1313,14 @@ impl TreeSource for ThreadSource<'_> {
     }
 
     fn leaf_order(&self) -> LeafOrder {
-        LeafOrder::InOrder
+        LeafOrder::Windowed
     }
 
-    async fn leaf(
-        &self,
-        index: u64,
-        texts: &HashMap<NodeAddr, String>,
-    ) -> Result<LeafInput, BoxError> {
+    async fn leaf(&self, index: u64) -> Result<LeafInput, BoxError> {
         let entry = &self.entries[index as usize];
         Ok(LeafInput {
             message: entry.message(),
-            context: tiling_lines(index, texts),
+            context: LeafContext::View,
             source_event_id: entry.event_id,
             source_thread_id: None,
         })
@@ -1228,11 +1397,7 @@ impl TreeSource for WorkspaceSource<'_> {
     /// line, so it never waits on a tree and lands the same whichever scope
     /// built first. It never reads another thread, so a delete leaves no line
     /// written from the deleted words.
-    async fn leaf(
-        &self,
-        index: u64,
-        _texts: &HashMap<NodeAddr, String>,
-    ) -> Result<LeafInput, BoxError> {
+    async fn leaf(&self, index: u64) -> Result<LeafInput, BoxError> {
         let (event_id, thread_id) = match &self.leaves[index as usize] {
             WorkspaceLeaf::Artifact {
                 event_id,
@@ -1248,7 +1413,7 @@ impl TreeSource for WorkspaceSource<'_> {
                 }
                 return Ok(LeafInput {
                     message,
-                    context: Vec::new(),
+                    context: LeafContext::Raw(Vec::new()),
                     source_event_id: *event_id,
                     source_thread_id: None,
                 });
@@ -1260,7 +1425,7 @@ impl TreeSource for WorkspaceSource<'_> {
         };
         let leaf = |message: String, context: Vec<String>| LeafInput {
             message,
-            context,
+            context: LeafContext::Raw(context),
             source_event_id: event_id,
             source_thread_id: Some(thread_id),
         };

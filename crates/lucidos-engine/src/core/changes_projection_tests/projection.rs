@@ -614,48 +614,43 @@ async fn empty_files_re_emit_zeroes_the_row_but_keeps_it_pending() {
     teardown_test_db(&db).await;
 }
 
-/// `coding_agent_has_diff` is derived from the file list the event carries, not
-/// hardcoded TRUE. Without this the reconcile would light the thread's Diff
-/// button on a branch whose live `git diff` is empty — the very disagreement
-/// the reconcile exists to remove.
+/// I7: an emptied pending change keeps the thread `proposed`. The old pair
+/// could say "proposed, branch empty"; that bit now lives on the change row's
+/// file list. The Diff button reads it, so the row must say it is empty.
 #[tokio::test]
-async fn has_diff_follows_the_proposed_file_list() {
+async fn an_emptied_pending_change_stays_proposed_and_its_row_reads_empty() {
     let (pool, db) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
     let thread = Uuid::new_v4();
     let change_id = Uuid::new_v4();
     start_cc_thread(&bus, thread).await;
 
-    let has_diff = |pool: sqlx::PgPool| async move {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT coding_agent_has_diff FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread)
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-    };
-
-    // Ordinary proposal (non-empty files) — unchanged behaviour.
     emit(
         &bus,
         thread,
         aggregate_proposed(change_id, "branch-a", "/repo"),
     )
     .await;
-    assert!(
-        has_diff(pool.clone()).await,
-        "a proposal with files must light the Diff button"
-    );
-
     let mut emptied = aggregate_proposed(change_id, "branch-a", "/repo");
     if let ThreadEvent::ChangeProposed { ref mut files, .. } = emptied {
         *files = vec![];
     }
     emit(&bus, thread, emptied).await;
+
     assert!(
-        !has_diff(pool.clone()).await,
-        "an emptied change must NOT claim the thread has a diff"
+        crate::test_support::read_change_state(&pool, thread)
+            .await
+            .is_proposed(),
+        "a pending change keeps the thread proposed, files or not"
+    );
+    let row = ChangesProjection::new(pool.clone())
+        .get_by_id(change_id)
+        .await
+        .unwrap()
+        .expect("row");
+    assert!(
+        row.files.is_empty() && row.file_count == 0,
+        "the Diff button reads this list, so the row must claim nothing"
     );
 
     teardown_test_db(&db).await;

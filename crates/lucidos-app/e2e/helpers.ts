@@ -1,5 +1,7 @@
 import { Page, APIResponse, expect, Locator, Request } from '@playwright/test';
 import { HARNESS_DEVICE_ID, ensurePageDeviceRegistered, registerHarnessDevice } from './harnessDevice';
+import { MODAL_EXIT_DRAWING_CLASS } from '../src/components/shared/overlayExitClass';
+import { homeThreadIdInDb } from './db-helpers';
 
 /** Where the app keeps this browser's device id (`utils/deviceIdHeader.ts`). */
 const DEVICE_ID_KEY = 'lucidos-device-id';
@@ -103,7 +105,7 @@ export const REAL_THREAD_ROW = '.thread-row:not(.compose-draft-row)';
 export const REAL_THREAD_NAV = '[data-thread-nav]:not([data-draft-id])';
 
 /** Start of the thread-drawer toggle's `aria-label`. Always match it as a
- *  PREFIX. `ThreadToggleButton` appends " (N needing attention)" whenever the
+ *  PREFIX. `ThreadToggleButton` appends " (N blocked)" whenever the
  *  thread list is hidden and a thread awaits the user, so an exact-match
  *  selector silently stops resolving. */
 export const DRAWER_TOGGLE_LABEL = 'Show or hide thread drawer';
@@ -257,6 +259,54 @@ export async function navigateToApp(page: Page): Promise<void> {
   await ensureOnThreadPane(page);
   await waitForVisibleInput(page);
   await waitForWorkspaceReady(page);
+  await leaveColdStartHome(page);
+}
+
+/** A fresh browser context stores no focus, so the cold start opens Home
+ *  (ADR 0411). Most specs start from the compose view, so step off Home
+ *  through New thread. A spec about Home opens it on purpose, or uses
+ *  `gotoWithRetry` to keep the cold start's landing.
+ *
+ *  No Home row means a spec truncated it, and then nothing opens Home. A spec
+ *  that seeded a focus keeps it: the cold start leaves a stored focus alone. */
+export async function leaveColdStartHome(page: Page): Promise<void> {
+  const home = homeThreadIdInDb();
+  if (!home) return;
+  // Polled, because the cold start decides once the thread list lands. It
+  // never fails: a stored focus for a thread that is gone ends with none.
+  const focusKey = 'lucidos-focused-thread';
+  let focused: string | null = null;
+  for (let waited = 0; waited < 10_000 && focused === null; waited += 100) {
+    focused = await page.evaluate((key) => localStorage.getItem(key), focusKey);
+    if (focused === null) await page.waitForTimeout(100);
+  }
+  if (focused !== home) return;
+  await newThread(page);
+  // New thread focuses the prompt, and a phone reads that as an open keyboard,
+  // which takes the header out of reach. A cold load focuses nothing, so the
+  // spec starts where it would have.
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  await expect(page.locator('html[data-keyboard-active]')).toHaveCount(0);
+  // With dynamic bars on, the header glides back from the keyboard hide.
+  await waitForHeaderAtRest(page);
+}
+
+/** Wait until the phone header has stopped gliding. With dynamic bars on it
+ *  slides on `translate` for `--duration-slow`, and a spec that measures it
+ *  mid-glide reads a fraction of a pixel off. Held across two frames, since a
+ *  transition starts on a style flush. No-op on desktop. */
+export async function waitForHeaderAtRest(page: Page): Promise<void> {
+  if (!isMobileViewport(page)) return;
+  const token = ++settleToken;
+  await page.waitForFunction((token) => {
+    const header = document.querySelector('.app-header');
+    const atRest = !header || !header.getAnimations()
+      .some(a => (a as CSSTransition).transitionProperty === 'translate');
+    const win = window as unknown as { __luHeaderSettle?: { token: number; atRest: boolean } };
+    const prev = win.__luHeaderSettle;
+    win.__luHeaderSettle = { token, atRest };
+    return atRest && prev?.token === token && prev.atRest;
+  }, token, { timeout: 5_000 });
 }
 
 /** Wait until the workspace has reported ready, which is when the boot splash
@@ -269,6 +319,16 @@ export async function waitForWorkspaceReady(page: Page): Promise<void> {
     undefined,
     { timeout: 30_000 },
   );
+}
+
+/** Wait until every closed backdrop modal has finished fading out.
+ *
+ *  A closing modal leaves an inert drawing of its last frame for the fade
+ *  (`overlayExitDrawing.ts`). The drawing keeps the dialog's classes. So until
+ *  it goes, a class locator matches it beside the live UI, and strict mode
+ *  fails. Call this after a close, before the next class-based assertion. */
+export async function waitForModalExitFade(page: Page): Promise<void> {
+  await expect(page.locator(`.${MODAL_EXIT_DRAWING_CLASS}`)).toHaveCount(0);
 }
 
 /** Start this page with the *follow seed* DISARMED, before the app boots.
@@ -647,18 +707,32 @@ export async function clickVisibleElement(page: Page, selector: string, text?: s
   }, { sel: selector, txt: text });
 }
 
-/** Open the unified Filter panel and pick a drawer view by its row label
- *  ("All statuses" | "Needs attention" | "Review" | "In flight" | "Drafts"). The rows live
- *  in the panel's Status section; picking one applies it and closes the panel.
- *  The panel renders inside the thread drawer pane, which is the same component
- *  on both layouts, so this is dual-layout safe: the single Filter button
- *  (`aria-label="Filter threads"`) lives in both threads headers. Throws if the
- *  button or row isn't visible. */
-export async function openDrawerView(page: Page, label: string): Promise<void> {
-  const opened = await clickVisibleElement(page, 'button[aria-label="Filter threads"]');
-  if (!opened) throw new Error('Filter threads button not visible');
-  const picked = await clickVisibleElement(page, '.thread-filter-panel .drawer-view-option', label);
-  if (!picked) throw new Error(`Drawer view option "${label}" not visible`);
+/** Switch the thread drawer to a grouping through the threads header's
+ *  grouping button, the same component on both layouts, so this is dual-layout
+ *  safe. A no-op when that grouping is already shown. Throws if the button is
+ *  not visible. */
+export async function showGrouping(page: Page, grouping: 'folders' | 'ongoing'): Promise<void> {
+  const label = grouping === 'ongoing' ? 'Show Ongoing' : 'Show Folders';
+  const other = grouping === 'ongoing' ? 'Show Folders' : 'Show Ongoing';
+  const shown = await page.locator(`.grouping-btn:visible[aria-label^="${other}"]`).count();
+  if (shown > 0) return;
+  const switched = await clickVisibleElement(page, `.grouping-btn[aria-label^="${label}"]`);
+  if (!switched) throw new Error('The threads header grouping button is not visible');
+  await expect(page.locator(`.grouping-btn:visible[aria-label^="${other}"]`)).toHaveCount(1);
+}
+
+/** Switch the thread drawer to the Ongoing grouping and select one ongoing
+ *  group by its tile label. The labels are "Blocked", "Review",
+ *  "Drafts" and "In flight". The tiles render in the thread drawer pane, which
+ *  is the same component on both layouts, so this is dual-layout safe. Every
+ *  tile is always drawn, empty or not. */
+export async function showOngoingGroup(page: Page, label: string): Promise<void> {
+  await showGrouping(page, 'ongoing');
+  const tile = page.locator('.drawer-ongoing-tiles .ongoing-tile:visible')
+    .filter({ has: page.locator('.ongoing-tile-label', { hasText: new RegExp(`^${label}$`) }) });
+  await expect(tile).toHaveCount(1);
+  if (await tile.getAttribute('aria-current') !== 'true') await tile.click();
+  await expect(tile).toHaveAttribute('aria-current', 'true');
 }
 
 /** Click compose button to start a new thread (dual-layout safe).
@@ -730,7 +804,7 @@ export async function openThreadDrawer(page: Page): Promise<void> {
     // mobile header's copy stays mounted under a desktop viewport.
     //
     // Match the label as a PREFIX, never exact. ThreadToggleButton appends the
-    // needs-attention count to its own aria-label, exactly while the thread
+    // Blocked count to its own aria-label, exactly while the thread
     // list is hidden. That is every case this branch runs in, so an `=` match
     // finds nothing the moment any thread awaits the user.
     await page.locator(`.thread-toggle-slot button[aria-label^="${DRAWER_TOGGLE_LABEL}"]`).click();

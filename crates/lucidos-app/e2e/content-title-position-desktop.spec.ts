@@ -65,6 +65,9 @@ interface HeaderMetrics {
   actionsLeft: number;  // the trailing cluster's inner edge
   minSpan: number;      // --desktop-nav-min-span, resolved to px
   sideReserve: number;  // --content-side-reserve, resolved to px
+  span: number;         // --desktop-nav-span, resolved to px
+  spanMax: number;      // --desktop-content-title-span-max, resolved to px
+  unfoldedReserve: number; // --content-unfolded-reserve, resolved to px
   titleText: string;    // the box's rendered text, ellipsis excluded (it is CSS)
   hasOverflow: boolean;
   trailingIcons: number;
@@ -117,6 +120,9 @@ async function measure(page: Page): Promise<HeaderMetrics | null> {
       actionsLeft: a.left,
       minSpan,
       sideReserve,
+      span: resolve('--desktop-nav-span'),
+      spanMax: resolve('--desktop-content-title-span-max'),
+      unfoldedReserve: resolve('--content-unfolded-reserve'),
       titleText: (box.querySelector('.pane-header-title-text')?.textContent ?? '').trim(),
       hasOverflow: actions.querySelectorAll('.content-header-more').length > 0,
       trailingIcons: actions.querySelectorAll('.icon-btn.header-icon').length,
@@ -327,5 +333,41 @@ test.describe('the desktop content title holds its position across views', () =>
     expect(narrow.trailingIcons, 'the narrow app view outgrew the reserve').toBeLessThanOrEqual(3);
     expect(narrow.hasRefresh, 'Refresh still leads the narrow row').toBe(true);
     expectCentredAndClear(narrow, 'canvas pane near its floor');
+  });
+
+  test('a wide Canvas pane grows the title box, up to its cap', async ({ page }) => {
+    // The ratio seeds the pane width, as in the test above. At 1920px, 0.5
+    // leaves the Canvas pane ~960px: past the width where the box starts to
+    // grow, short of its cap. 0.3 leaves ~1340px, past the cap.
+    await page.setViewportSize({ width: 1920, height: 1000 });
+    const atRatio = async (ratio: string): Promise<HeaderMetrics> => {
+      await page.evaluate(({ r, id }) => {
+        localStorage.removeItem('lucidos-nav-history');
+        localStorage.setItem('lucidos-split-ratio', r);
+        localStorage.setItem('lucidos-thread-drawer-open', 'false');
+        localStorage.setItem('app-window-open', id);
+      }, { r: ratio, id: APP_ID_LONG });
+      await gotoWithRetry(page, '/');
+      await expect(page.locator('iframe[data-role="app-ui-frame"]:visible')).toBeVisible({ timeout: 15_000 });
+      return settled(page);
+    };
+    // One load first, to put the page on the app's origin for localStorage.
+    await gotoWithRetry(page, '/');
+
+    const growing = await atRatio('0.5');
+    expect(growing.boxWidth, 'the box did not grow past the shared span').toBeGreaterThan(growing.span + 1);
+    expect(
+      growing.boxWidth,
+      `the box is ${growing.boxWidth.toFixed(1)} wide, not the room past the unfolded reserve`,
+    ).toBeCloseTo(growing.rowWidth - 2 * growing.unfoldedReserve, 0);
+    expect(growing.hasOverflow, 'growing folded the app view\'s actions').toBe(false);
+    expectCentredAndClear(growing, 'growing canvas pane');
+
+    const capped = await atRatio('0.3');
+    expect(capped.rowWidth - 2 * capped.unfoldedReserve, 'the seeded ratio did not reach the cap')
+      .toBeGreaterThan(capped.spanMax);
+    expect(capped.boxWidth, 'the box grew past its cap').toBeCloseTo(capped.spanMax, 0);
+    expect(capped.hasOverflow).toBe(false);
+    expectCentredAndClear(capped, 'capped canvas pane');
   });
 });

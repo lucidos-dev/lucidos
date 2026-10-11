@@ -5,7 +5,8 @@ import { useEffect, useRef } from 'preact/hooks';
 import { showToast, codingAgentSessionVersion, codingAgentPendingModel, codingAgentPendingReasoningEffort, scopeToRepoId, engineRestarting } from '../../store/store';
 import { resolveScope, resolveCodingAgent, getComposeSelectionOverride } from '../../store/composeSelections';
 import { updateComposeSelection } from '../../store/actions/compose';
-import { sendCodingAgentControl } from '../../store/actions/chat-claude-code';
+import { sendCodingAgentControl, sessionRecorded, type ControlSendResult } from '../../store/actions/chat-claude-code';
+import { controlPickToast } from './controlPickToast';
 import { sendMessage } from '../../store/actions/chat';
 import { fetchCodingAgentCommands, type CodingAgentCommandDef, type CodingAgentCommandOption, type CodingAgentCommandsResponse, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import type { CodingAgent } from '../../api/types';
@@ -532,15 +533,16 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
       [cmd.params[0].key]: value,
     });
     sending.value = false;
-    if (result !== 'error') showToast(`${cmd.label}: ${label}`, 'success');
+    if (result !== 'error') showToast(controlPickToast(cmd.label, label, result, null), 'success');
   }
 
   /** Apply a whole *model selection*, the picker's final answer.
    *
-   *  A live session is reconciled with TWO control requests. The channel
-   *  preserves request order, so the model lands before the tier it accepts. If
-   *  the session exits between them, the pending pick recorded above carries
-   *  the tier into the next spawn or follow-up instead. */
+   *  A live session is reconciled with TWO control requests, sent in order, so
+   *  the model is recorded before the tier it accepts. If the session exits
+   *  between them, the pending pick recorded above carries the tier into the
+   *  next spawn or follow-up instead. The menu shows the pick once the session
+   *  has recorded it, even when it takes effect only from the next turn. */
   async function pickModelSelection(encoded: string) {
     const cmd = controlCommands.value.find(c => c.subtype === 'set_model');
     if (!cmd) return;
@@ -560,19 +562,19 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
       subtype: cmd.subtype,
       [cmd.params[0].key]: pair.model,
     });
-    let tierResult: 'ok' | 'pending' | 'error' | null = null;
-    if (result === 'ok') currentModel.value = pair.model as CodingAgentModelValue;
-    if (result === 'ok' && pair.effort) {
+    let tierResult: ControlSendResult | null = null;
+    if (sessionRecorded(result)) currentModel.value = pair.model as CodingAgentModelValue;
+    if (sessionRecorded(result) && pair.effort) {
       const tier = pair.effort as CodingAgentReasoningEffort;
       tierResult = await sendCodingAgentControl(threadId, {
         subtype: 'set_reasoning_effort',
         effort: tier,
       });
-      if (tierResult === 'ok') currentReasoningEffort.value = tier;
+      if (sessionRecorded(tierResult)) currentReasoningEffort.value = tier;
     }
     sending.value = false;
     if (result !== 'error' && tierResult !== 'error') {
-      showToast(`${cmd.label}: ${label}`, 'success');
+      showToast(controlPickToast(cmd.label, label, result, tierResult), 'success');
     }
   }
 

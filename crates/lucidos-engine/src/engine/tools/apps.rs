@@ -47,35 +47,56 @@ impl LucidosEngine {
                     .as_str()
                     .or_else(|| args["instructions"].as_str())
                     .unwrap_or("");
-
-                match self
-                    .app_manager
-                    .create_app(&self.event_bus, id, name, description, html_content)
-                    .await
-                {
-                    Ok((path, commit)) => Ok(format!(
-                        "Created app '{}' at {} (commit: {})",
-                        name,
-                        crate::core::home_path::abbreviate(&path),
-                        &commit[..commit.floor_char_boundary(8)]
-                    )),
-                    Err(e) => Err(format!("creating app: {}", e).into()),
-                }
-            }
-            "list_apps" => match self.app_manager.list_apps() {
-                Ok(apps) => {
-                    if apps.is_empty() {
-                        Ok("No apps found.".to_string())
-                    } else {
-                        Ok(apps
-                            .iter()
-                            .map(|a| format!("- {} (id: `{}`): {}", a.name, a.id, a.description))
-                            .collect::<Vec<_>>()
-                            .join("\n"))
+                let kind = match args["kind"].as_str() {
+                    None | Some("app") => crate::core::NewAppKind::App,
+                    Some("widget") => crate::core::NewAppKind::Widget {
+                        origin_thread_id: thread_id,
+                    },
+                    Some(other) => {
+                        return Err(
+                            format!("kind must be 'app' or 'widget', not '{}'", other).into()
+                        )
                     }
+                };
+
+                let files = crate::core::AppFiles {
+                    html: html_content,
+                    icon_svg: args["icon_svg"].as_str(),
+                };
+                let (path, commit) = self
+                    .app_manager
+                    .create_app(&self.event_bus, id, name, description, files, kind)
+                    .await
+                    .map_err(|e| format!("creating app: {}", e))?;
+                let commit = &commit[..commit.floor_char_boundary(8)];
+                let path = crate::core::home_path::abbreviate(&path);
+                let lint =
+                    super::app_lint::app_lint_note(&format!("apps/{id}/index.html"), html_content)
+                        .unwrap_or_default();
+                if kind == crate::core::NewAppKind::App {
+                    return Ok(format!(
+                        "Created app '{}' at {} (commit: {}){}",
+                        name, path, commit, lint
+                    ));
                 }
-                Err(e) => Err(format!("listing apps: {}", e).into()),
-            },
+                // A widget shows where it was made: that is its whole point.
+                crate::engine::widgets::emit_widget_change(
+                    &self.event_bus,
+                    crate::engine::widgets::WidgetChange::Show,
+                    crate::engine::widgets::WidgetInstance {
+                        app_id: id.to_string(),
+                        ..Default::default()
+                    },
+                    thread_id,
+                    Some(super::agent_tool_actor(thread_id)),
+                )
+                .await?;
+                Ok(format!(
+                    "Created widget '{}' at {} (commit: {}) and showed it in this thread{}",
+                    name, path, commit, lint
+                ))
+            }
+            "list_apps" => list_apps_text(&self.app_manager),
             "load_knowhow" => {
                 load_knowhow_impl(
                     &self.knowhow_dirs(),
@@ -183,6 +204,23 @@ impl LucidosEngine {
     }
 }
 
+/// The `list_apps` tool's answer. Widgets are not apps here (ADR 0402).
+fn list_apps_text(
+    app_manager: &crate::core::AppManager,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let apps = app_manager
+        .list_apps()
+        .map_err(|e| format!("listing apps: {}", e))?;
+    if apps.is_empty() {
+        return Ok("No apps found.".to_string());
+    }
+    Ok(apps
+        .iter()
+        .map(|a| format!("- {} (id: `{}`): {}", a.name, a.id, a.description))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// Validation + side-effect core for the `load_knowhow` tool, factored out
 /// of the `LucidosEngine` impl so unit tests can exercise the loader and
 /// store-insertion semantics against fixture knowhow dirs without booting
@@ -229,6 +267,17 @@ mod tests {
     use crate::engine::loaded_knowhow::LoadedKnowhowStore;
     use serde_json::json;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn the_list_apps_tool_shows_no_widget() {
+        let bus = crate::test_support::offline_event_bus();
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = crate::core::AppManager::new(tmp.path()).unwrap();
+        crate::core::apps::tests::app_and_widget(&manager, &bus).await;
+        let text = list_apps_text(&manager).unwrap();
+        assert!(text.contains("habit-tracker"), "got: {text}");
+        assert!(!text.contains("fare-grid"), "a widget leaked: {text}");
+    }
 
     #[test]
     fn intent_nesting_guard_boundary() {

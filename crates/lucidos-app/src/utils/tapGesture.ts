@@ -262,7 +262,7 @@ export interface TouchActivateOptions {
  *  strip, and no click follows a `touchcancel`. `onTouchStart` and
  *  `onTouchMove` measure the press so `cancelledPressWasATap` can rule on it.
  *
- *  `composeHandlers` in `promptFocus.ts` wraps this with focus-first. A local
+ *  `composeHandlers` in `composeHandlers.ts` wraps this with focus-first. A local
  *  copy of the repair lives in `FileSearchModal.tsx`. */
 export function touchActivated(action: () => void, opts: TouchActivateOptions = {}) {
   const enabled = opts.enabled ?? (() => true);

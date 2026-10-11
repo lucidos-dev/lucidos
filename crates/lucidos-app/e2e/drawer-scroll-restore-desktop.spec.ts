@@ -41,7 +41,7 @@ test.describe('Drawer scroll position across a reload', () => {
         await context.addInitScript(() => {
             localStorage.setItem('lucidos-thread-drawer-open', 'true');
             localStorage.removeItem('lucidos-drawer-collapsed');
-            localStorage.removeItem('lucidos-alt-view');
+            localStorage.removeItem('lucidos-drawer-grouping');
         });
         clearAllThreads();
         seedArchive();

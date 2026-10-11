@@ -6,7 +6,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // this exact value. Must be hoisted above the import of the module under test.
 vi.mock('virtual:build-id', () => ({ CLIENT_BUILD_ID: 'build-current' }));
 
-import { refreshClient, isRunningServedBuild } from './sw-update';
+import {
+  refreshClient,
+  isRunningServedBuild,
+  reloadForStaleChunk,
+  SHELL_CACHE_PREFIX,
+} from './sw-update';
+
+const CURRENT_SHELL_CACHE = `${SHELL_CACHE_PREFIX}build-current`;
 
 describe('isRunningServedBuild', () => {
   it('true when the served build id equals the running bundle id', () => {
@@ -46,7 +53,7 @@ describe('refreshClient — build-id fast path', () => {
 
     cacheDelete = vi.fn(() => Promise.resolve(true));
     Object.defineProperty(globalThis, 'caches', {
-      value: { keys: () => Promise.resolve(['lucidos-shell-build-current']), delete: cacheDelete },
+      value: { keys: () => Promise.resolve([CURRENT_SHELL_CACHE]), delete: cacheDelete },
       configurable: true,
     });
   });
@@ -87,7 +94,57 @@ describe('refreshClient — build-id fast path', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(getRegistration).toHaveBeenCalledTimes(1);
-    expect(cacheDelete).toHaveBeenCalledWith('lucidos-shell-build-current');
+    expect(cacheDelete).toHaveBeenCalledWith(CURRENT_SHELL_CACHE);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  // A chunk that failed on the served build came out of the cache, so a
+  // cache-first reload would load the same bad copy again.
+  it('evicts the cached assets even on the served build when asked to', async () => {
+    stubServedBuildId('build-current');
+    refreshClient({ evictAssets: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(cacheDelete).toHaveBeenCalledWith(CURRENT_SHELL_CACHE);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(cacheDelete.mock.invocationCallOrder[0]).toBeLessThan(reload.mock.invocationCallOrder[0]);
+  });
+
+  // The UI stays locked until the reload, so a Cache API that never settles
+  // must not hold it.
+  it('still reloads when the eviction hangs', async () => {
+    stubServedBuildId('build-current');
+    Object.defineProperty(globalThis, 'caches', {
+      value: { keys: () => new Promise(() => {}), delete: cacheDelete },
+      configurable: true,
+    });
+    refreshClient({ evictAssets: true });
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(reload).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reload).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  // With no service worker there is no bundle cache, and nothing to swap.
+  it('reloads plainly when no service worker is registered', async () => {
+    globalThis.fetch = vi.fn(() => Promise.reject(new TypeError('Load failed'))) as unknown as typeof fetch;
+    getRegistration.mockReturnValue(Promise.resolve(undefined));
+    refreshClient({ evictAssets: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(cacheDelete).not.toHaveBeenCalled();
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('a stale-chunk reload evicts the cached assets', async () => {
+    stubServedBuildId('build-current');
+    sessionStorage.clear();
+    expect(reloadForStaleChunk()).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(cacheDelete).toHaveBeenCalledWith(CURRENT_SHELL_CACHE);
     expect(reload).toHaveBeenCalledTimes(1);
   });
 });

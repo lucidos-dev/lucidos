@@ -17,14 +17,15 @@ mod recovery;
 
 pub use has_diff::*;
 pub use helpers::*;
-pub use orphaned_branch_work::spawn_archive_net;
+pub use orphaned_branch_work::spawn_branch_work_net;
 // `recovery`'s free predicates stay in that file next to the recovery pass
 // that documents them; re-export the ones the teardown emit + its tests share
 // (`engine_impl/shutdown.rs`), so both sides of the preserve/resume contract
-// key on one definition.
+// key on one definition. `engine::pending_change_watch` reads the park the
+// same way.
 pub(crate) use recovery::{
-    newest_open_question, preserve_question_park_at_shutdown, thread_has_unanswered_question,
-    thread_parked_on_question, unanswered_question_exists_sql,
+    ends_question_park, newest_open_question, preserve_question_park_at_shutdown,
+    thread_has_unanswered_question, thread_parked_on_question, unanswered_question_exists_sql,
 };
 // The last two boot steps that touch thread status, called from `main.rs` once
 // every recovery sweep has run.

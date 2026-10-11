@@ -199,7 +199,7 @@ async fn change_proposed_on_cc_child_bumps_ancestor_count() {
 
     let (parent_id, child_id) = spawn_parent_with_idle_cc_child(&bus, &pool).await;
 
-    // ChangeProposed sets coding_agent_proposed=TRUE on the CC child.
+    // ChangeProposed sets the proposed state on the CC child.
     // is_blocking flips false → true via the (has_pending_changes && CC) clause.
     emit_change_proposed(&bus, child_id, "claude-code/test", false).await;
 
@@ -259,6 +259,7 @@ async fn user_question_lifecycle_propagates_count() {
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta::NONE,
     })
@@ -426,7 +427,7 @@ async fn change_proposed_lifecycle_propagates_attention_count() {
 
 // Note: external-repo + pending-changes is not a reachable state — the
 // runtime never emits `ChangeProposed` for external repos, so
-// `coding_agent_proposed` and `coding_agent_is_external_repo` are
+// the change state and `coding_agent_is_external_repo` are
 // mutually exclusive in practice. The external-repo carve-out in
 // `is_attention_needing` is structural parity with `is_blocking`
 // clause 3 (and inherits its correctness guarantee from

@@ -39,6 +39,7 @@ fn type_name(value: PrefValue) -> &'static str {
         | PrefValue::Text
         | PrefValue::ThemeId
         | PrefValue::ModelBytes
+        | PrefValue::ModelEfforts
         | PrefValue::FontFamily => "text",
     }
 }

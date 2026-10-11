@@ -2,8 +2,8 @@
 # Run the real-embedder integration tests in lucidos-engine.
 #
 # Usage:
-#   ./scripts/e2e-embedder.sh [-- cargo test args]
-#   ./scripts/e2e-embedder.sh --github        # on GitHub's runners, ADR 0382
+#   ./scripts/e2e-embedder.sh                              # on GitHub's runners when it can, ADR 0386
+#   ./scripts/e2e-embedder.sh --local [-- cargo test args]   # on this host
 #
 # Compiles lucidos-engine with `--features real-embedder-tests` and runs only
 # the tests gated behind that feature. They exercise properties of the real
@@ -19,6 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/e2e_github.sh
 source "$SCRIPT_DIR/lib/e2e_github.sh"
 e2e_github_handoff embedder "$@"
+set -- ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 

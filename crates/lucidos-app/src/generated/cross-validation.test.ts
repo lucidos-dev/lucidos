@@ -8,8 +8,8 @@
 // from the Rust implementation.
 
 import { describe, it, expect } from 'vitest';
-import { actionBlocker, availableThreadActions, displaySection, ownBlocker, OWN_BLOCKER_PRIORITY, THREAD_STATUSES } from './thread-lifecycle';
-import type { ThreadType, ThreadStatus, ArchiveState, Action, DisplaySection, OwnBlocker } from './thread-lifecycle';
+import { actionBlocker, availableThreadActions, changeWork, displaySection, ownBlocker, OWN_BLOCKER_PRIORITY, THREAD_STATUSES } from './thread-lifecycle';
+import type { ThreadType, ThreadStatus, ArchiveState, Action, ChangeStateKind, ChangeWork, DisplaySection, OwnBlocker } from './thread-lifecycle';
 import fixture from './cross-validation-fixture.json';
 
 interface AvailableThreadActionsCase {
@@ -24,9 +24,15 @@ interface DisplaySectionCase {
   expected: string;
 }
 
+interface ChangeWorkCase {
+  fn: 'changeWork';
+  args: [ChangeStateKind, boolean];
+  expected: string;
+}
+
 interface OwnBlockerCase {
   fn: 'ownBlocker';
-  args: [string, string, string, boolean, boolean];
+  args: [string, string, string, string, boolean];
   expected: string | null;
 }
 
@@ -36,12 +42,12 @@ interface ActionBlockerCase {
   expected: string;
 }
 
-type TestCase = AvailableThreadActionsCase | DisplaySectionCase | OwnBlockerCase | ActionBlockerCase;
+type TestCase = AvailableThreadActionsCase | DisplaySectionCase | ChangeWorkCase | OwnBlockerCase | ActionBlockerCase;
 
 // Meta-test: every generated function with logic (not just data lookups) must have
 // cross-validation cases in the fixture. If you add a new function to generate_typescript()
 // that has branching logic, add it to this set AND to generate_cross_validation_fixture().
-const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection', 'ownBlocker', 'actionBlocker']);
+const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection', 'changeWork', 'ownBlocker', 'actionBlocker']);
 
 // (section, isSaved) pairs a thread can hold: inbox unpinned, inbox pinned and
 // archived unpinned. A pinned thread is never archived (ADR 0312), so the
@@ -110,24 +116,40 @@ describe('Cross-validation: generated TS matches Rust', () => {
     }
   });
 
+  describe('changeWork', () => {
+    const workCases = cases.filter((c): c is ChangeWorkCase => c.fn === 'changeWork');
+
+    it(`has exhaustive coverage (${workCases.length} cases)`, () => {
+      // 3 change state kinds × 2 holdsLiveWait.
+      expect(workCases.length).toBe(3 * 2);
+    });
+
+    for (const tc of workCases) {
+      const [change, waits] = tc.args;
+      it(`(change=${change}, waits=${waits}) → ${tc.expected}`, () => {
+        expect(changeWork(change, waits)).toBe(tc.expected);
+      });
+    }
+  });
+
   describe('ownBlocker', () => {
     const ownCases = cases.filter((c): c is OwnBlockerCase => c.fn === 'ownBlocker');
 
     it(`has exhaustive coverage (${ownCases.length} cases)`, () => {
-      // 2 threadTypes × N statuses × 2 sections × 2 pending × 2 externalRepo.
-      expect(ownCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 3);
+      // 2 threadTypes × N statuses × 2 sections × 3 change work × 2 externalRepo.
+      expect(ownCases.length).toBe(2 * THREAD_STATUSES.length * 2 * 3 * 2);
     });
 
     for (const tc of ownCases) {
-      const [threadType, status, section, pending, externalRepo] = tc.args;
-      const label = `(${threadType}, ${status}, ${section}, pending=${pending}, external=${externalRepo})`;
+      const [threadType, status, section, change, externalRepo] = tc.args;
+      const label = `(${threadType}, ${status}, ${section}, change=${change}, external=${externalRepo})`;
 
       it(`${label} → ${tc.expected}`, () => {
         const result = ownBlocker(
           threadType as ThreadType,
           status as ThreadStatus,
           section as ArchiveState,
-          pending,
+          change as ChangeWork,
           externalRepo,
         );
         expect(result).toBe(tc.expected);

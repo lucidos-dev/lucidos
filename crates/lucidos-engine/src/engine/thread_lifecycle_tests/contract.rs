@@ -128,18 +128,35 @@ fn generate_cross_validation_fixture() -> String {
         }
     }
 
+    // changeWork: change state kind × holds_live_wait.
+    for kind in ChangeStateKind::ALL {
+        for &waits in &bools {
+            cases.push(format!(
+                r#"    {{ "fn": "changeWork", "args": [{:?}, {}], "expected": {:?} }}"#,
+                kind.as_str(),
+                waits,
+                ChangeWork::of(kind, waits).as_str()
+            ));
+        }
+    }
+
     // ownBlocker: the full cross product of thread_types × statuses × sections ×
-    // pending × external_repo.
+    // change work × external_repo.
     for (tt_str, tt) in &thread_types {
         for (st_str, st) in &statuses {
             for (sec_str, sec) in &sections {
-                for &pending in &bools {
+                for change in ChangeWork::ALL {
                     for &external in &bools {
                         let result =
-                            json_own_blocker(own_blocker(*tt, *st, *sec, pending, external));
+                            json_own_blocker(own_blocker(*tt, *st, *sec, change, external));
                         cases.push(format!(
-                            r#"    {{ "fn": "ownBlocker", "args": [{:?}, {:?}, {:?}, {}, {}], "expected": {} }}"#,
-                            tt_str, st_str, sec_str, pending, external, result
+                            r#"    {{ "fn": "ownBlocker", "args": [{:?}, {:?}, {:?}, {:?}, {}], "expected": {} }}"#,
+                            tt_str,
+                            st_str,
+                            sec_str,
+                            change.as_str(),
+                            external,
+                            result
                         ));
                     }
                 }
@@ -337,20 +354,36 @@ fn generate_typescript() -> String {
         "export type Blocker = {};\n",
         ts_union(Blocker::ALL.map(Blocker::as_str))
     ));
+    out.push_str(&format!(
+        "\nexport type ChangeWork = {};\n",
+        ts_union(ChangeWork::ALL.map(ChangeWork::as_str))
+    ));
+    out.push_str(&format!(
+        "\nexport type ChangeStateKind = {};\n",
+        ts_union(ChangeStateKind::ALL.map(ChangeStateKind::as_str))
+    ));
+    out.push_str("\nexport function changeWork(\n");
+    out.push_str("  change: ChangeStateKind,\n");
+    out.push_str("  holdsLiveWait: boolean,\n");
+    out.push_str("): ChangeWork {\n");
+    out.push_str("  if (change === 'proposed') return 'proposed';\n");
+    out.push_str("  return change === 'unproposed' && holdsLiveWait ? 'held' : 'none';\n");
+    out.push_str("}\n");
     out.push_str("\nexport function ownBlocker(\n");
     out.push_str("  threadType: ThreadType,\n");
     out.push_str("  status: ThreadStatus,\n");
     out.push_str("  archiveState: ArchiveState,\n");
-    out.push_str("  hasPendingChanges: boolean,\n");
+    out.push_str("  change: ChangeWork,\n");
     out.push_str("  isExternalRepo: boolean,\n");
     out.push_str("): OwnBlocker | null {\n");
     out.push_str("  if (status === 'running') return 'running';\n");
     out.push_str("  if (status === 'waiting_for_user_answer') return 'question';\n");
-    out.push_str("  if (archiveState === 'archived') return null;\n");
     out.push_str(
-        "  return hasPendingChanges && threadType === 'claude_code' && !isExternalRepo \
-         ? 'pending_change' : null;\n",
+        "  if (archiveState === 'archived' || threadType !== 'claude_code' || isExternalRepo) \
+         return null;\n",
     );
+    out.push_str("  if (change === 'proposed') return 'pending_change';\n");
+    out.push_str("  return change === 'held' ? 'held_proposal' : null;\n");
     out.push_str("}\n");
     out.push_str("\nexport function actionBlocker(\n");
     out.push_str("  own: OwnBlocker | null,\n");

@@ -188,7 +188,7 @@ async fn a_queued_message_counts_only_once_the_agent_read_it() {
 
     bus.emit(BusEvent::Thread {
         thread_id: caller,
-        event: ThreadEvent::UserPromptInjected {
+        event: ThreadEvent::PromptInjected {
             text: "reply".into(),
             mode: ActorMode::Human,
             origin: Some(device()),

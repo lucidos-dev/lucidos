@@ -154,6 +154,7 @@ fn settled_facts() -> RequestFacts {
         live_event_waits: false,
         turn_settle: TurnSettle::Settled,
         pending_change: false,
+        unproposed_work: false,
         blocking_descendants: false,
         pinned: false,
     }
@@ -172,7 +173,7 @@ fn the_verdict_archives_only_a_settled_thread_nothing_refuses() {
         assert_eq!(request_verdict(&facts), RequestVerdict::Closed, "{facts:?}");
     }
 
-    let holds: [fn(&mut RequestFacts); 11] = [
+    let holds: [fn(&mut RequestFacts); 12] = [
         |f| f.status = ThreadStatus::Running,
         |f| f.status = ThreadStatus::WaitingForUserAnswer,
         |f| f.status = ThreadStatus::Paused,
@@ -182,6 +183,7 @@ fn the_verdict_archives_only_a_settled_thread_nothing_refuses() {
         |f| f.turn_settle = TurnSettle::InFlight,
         |f| f.turn_settle = TurnSettle::CutOff,
         |f| f.pending_change = true,
+        |f| f.unproposed_work = true,
         |f| f.blocking_descendants = true,
         |f| f.pinned = true,
     ];
@@ -298,6 +300,7 @@ async fn a_question_holds_the_request_until_the_turn_after_it_ends() {
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         EventChannel::Chat,
     )

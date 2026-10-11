@@ -6,7 +6,7 @@
  *  `ResponseCanceled` finally arrives. B is recovered as an orphan and
  *  re-submitted as a turn of its own, anchored on the `MessageReceived` that
  *  already exists for it. The engine announces that ingestion with a
- *  `UserPromptInjected` naming B (`announce_orphan_batch` in `api/chat.rs`).
+ *  `PromptInjected` naming B (`announce_orphan_batch` in `api/chat.rs`).
  *
  *  Two things must come out of the fold: B is re-anchored BELOW the cancel
  *  boundary (the agent engaged with it after the cancel, not before), and B
@@ -49,7 +49,7 @@ function cancelThenOrphanReentry() {
     ev(2, { type: 'MessageReceived', text: 'actually, just the totals' }, MSG_B),
     ev(3, { type: 'ResponseCanceled', cause: 'user_stop', request_event_id: MSG_A } as ThreadEvent),
     ev(4, {
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'actually, just the totals',
       mode: 'human',
       injected_message_id: MSG_B,
@@ -71,13 +71,13 @@ describe('orphan re-entry after a user Stop', () => {
   it('absorbs the announcement instead of rendering a second panel for the follow-up', () => {
     const exchanges = groupIntoExchanges(cancelThenOrphanReentry());
 
-    // Three exchanges, not four: the UPI is a step of B, not a boundary.
+    // Three exchanges, not four: the PromptInjected is a step of B, not a boundary.
     expect(exchanges.map(e => e.userEvent.type)).toEqual([
       'MessageReceived',
       'ResponseCanceled',
       'MessageReceived',
     ]);
-    expect(exchanges[2].steps.map(s => s.event.type)).toEqual(['UserPromptInjected']);
+    expect(exchanges[2].steps.map(s => s.event.type)).toEqual(['PromptInjected']);
   });
 
   it('reads the cancelled turn as canceled and the follow-up as live', () => {
@@ -103,7 +103,7 @@ describe('orphan re-entry after a user Stop', () => {
   });
 });
 
-describe('absorbed-UPI placeholder, the mid-flight shape it exists for', () => {
+describe('absorbed-injection placeholder, the mid-flight shape it exists for', () => {
   /** The original case: the loop ingests a queued follow-up MID-TURN, so every
    *  event after it still carries the FIRST message's request id and the answer
    *  renders in that earlier exchange. The follow-up's panel is a placeholder
@@ -113,7 +113,7 @@ describe('absorbed-UPI placeholder, the mid-flight shape it exists for', () => {
       ev(1, { type: 'MessageReceived', text: 'first' }, MSG_A),
       ev(2, { type: 'MessageReceived', text: 'second' }, MSG_B),
       ev(3, {
-        type: 'UserPromptInjected',
+        type: 'PromptInjected',
         text: 'second',
         mode: 'human',
         injected_message_id: MSG_B,
@@ -134,7 +134,7 @@ describe('absorbed-UPI placeholder, the mid-flight shape it exists for', () => {
       ev(1, { type: 'MessageReceived', text: 'first' }, MSG_A),
       ev(2, { type: 'MessageReceived', text: 'second' }, MSG_B),
       ev(3, {
-        type: 'UserPromptInjected',
+        type: 'PromptInjected',
         text: 'second',
         mode: 'human',
         injected_message_id: MSG_B,
@@ -156,7 +156,7 @@ describe('absorbed-UPI placeholder, the mid-flight shape it exists for', () => {
     // boundary. What is under test is the status verdict, not the grouping.
     const followup = makeExchange({ type: 'MessageReceived', text: 'second' } as StoredEvent, [
       step(1, {
-        type: 'UserPromptInjected',
+        type: 'PromptInjected',
         text: 'second',
         injected_message_id: 'legacy-followup',
       } as StoredEvent),

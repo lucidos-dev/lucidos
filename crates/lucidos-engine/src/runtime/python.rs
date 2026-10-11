@@ -680,9 +680,12 @@ impl PythonRuntime {
         if packages.is_empty() {
             return Ok(());
         }
+        for spec in packages {
+            check_requirement_spec(spec)?;
+        }
         self.ensure_venv().await?;
 
-        let mut args = vec!["-m", "pip", "install", "--quiet"];
+        let mut args = vec!["-m", "pip", "install", "--quiet", "--"];
         args.extend(packages);
 
         let output = tokio::process::Command::new(&self.python_bin)
@@ -703,6 +706,43 @@ impl PythonRuntime {
                 String::from_utf8_lossy(&output.stderr)
             ))
         }
+    }
+}
+
+/// Refuse a package spec that is not a plain index requirement such as
+/// `pandas`, `numpy>=1.26` or `requests[socks]`. A leading `-` is a pip flag
+/// (`--index-url`, `-r file`). A URL, a path, an archive file name or a
+/// `name @ url` reference installs code from somewhere the user never chose.
+fn check_requirement_spec(spec: &str) -> Result<(), String> {
+    const ARCHIVE_SUFFIXES: &[&str] = &[
+        ".whl",
+        ".zip",
+        ".tar.gz",
+        ".tgz",
+        ".tar.bz2",
+        ".tbz",
+        ".tar.xz",
+        ".txz",
+        ".tar.lz",
+        ".tlz",
+        ".tar.lzma",
+        ".tar",
+        ".egg",
+    ];
+    let lowered = spec.to_ascii_lowercase();
+    let plain = spec
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && !spec.contains(['@', ':', '/', '\\'])
+        && !ARCHIVE_SUFFIXES.iter().any(|ext| lowered.ends_with(ext));
+    if plain {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{spec}' is not a package name: give a PyPI name with an optional version, \
+             such as 'pandas' or 'numpy>=1.26'"
+        ))
     }
 }
 
@@ -781,7 +821,24 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
 /// interpreter / importer frames the LLM doesn't act on. Trimming the
 /// middle here cuts each error's context cost without dropping the
 /// signal (exception line + the user frame where it fired).
+///
+/// The line trim cannot bound bytes: one multi-MB line counts as one line.
+/// So the result is then clamped to its last [`PY_ERROR_BYTE_BUDGET`] bytes,
+/// because a traceback ends in the exception line.
 pub(crate) fn truncate_python_error(stderr: &str) -> String {
+    clamp_to_byte_budget(trim_python_error_lines(stderr))
+}
+
+fn clamp_to_byte_budget(text: String) -> String {
+    let excess = text.len().saturating_sub(PY_ERROR_BYTE_BUDGET);
+    if excess == 0 {
+        return text;
+    }
+    let cut = text.ceil_char_boundary(excess);
+    format!("[... {cut} bytes of stderr omitted ...]\n{}", &text[cut..])
+}
+
+fn trim_python_error_lines(stderr: &str) -> String {
     let line_count = stderr.lines().count();
     if line_count <= PY_ERROR_LINE_BUDGET && stderr.len() <= PY_ERROR_BYTE_BUDGET {
         return stderr.to_string();

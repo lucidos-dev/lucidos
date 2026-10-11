@@ -144,7 +144,7 @@ pub(crate) async fn record_archive_request(
 }
 
 /// The target's row as the ladder reads it:
-/// `(parent_thread_id, state, status, coding_agent_proposed, is_saved, is_home)`.
+/// `(parent_thread_id, state, status, change state is proposed, is_saved, is_home)`.
 type TargetRow = (Option<Uuid>, Option<String>, String, bool, bool, bool);
 
 impl crate::engine::LucidosEngine {
@@ -161,10 +161,12 @@ impl crate::engine::LucidosEngine {
     ) -> Result<AgentArchiveTarget, AgentArchiveError> {
         let caller = caller.ok_or(AgentArchiveError::NoCaller)?;
         let row: Option<TargetRow> = sqlx::query_as(
-            "SELECT parent_thread_id, state, status, coding_agent_proposed, is_saved, is_home \
+            "SELECT parent_thread_id, state, status, coding_agent_change_state = $2, is_saved, \
+                    is_home \
              FROM thread_summaries WHERE thread_id = $1",
         )
         .bind(target)
+        .bind(crate::engine::thread_lifecycle::ChangeStateKind::Proposed)
         .fetch_optional(pool)
         .await
         .map_err(|e| AgentArchiveError::Internal(e.to_string()))?;

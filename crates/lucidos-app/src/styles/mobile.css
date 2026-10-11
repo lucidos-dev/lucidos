@@ -102,7 +102,6 @@
     left: 0;
     bottom: 0;
     width: fit-content;
-    min-width: 10rem;
     background: var(--bg-secondary);
     border-right: 1px solid var(--border-color);
     z-index: 201;
@@ -171,9 +170,9 @@
         animation-name: drawer-slide-out-right;
     }
 
-    /* The base row padding puts its wide gutter (and the safe-area inset) on the
-       LEFT, which is the drawer's open edge only in the left variant. Mirror it
-       so a landscape notch can't clip a row against the right edge either. */
+    /* The base row padding guards only the LEFT safe-area inset, which is the
+       drawer's open edge only in the left variant. Mirror the guard so a
+       landscape notch can't clip a row against the right edge either. */
     .drawer.drawer-right .drawer-item {
         padding-right: max(1.5rem, var(--safe-area-right));
     }
@@ -190,8 +189,10 @@
     to { opacity: 0; }
 }
 
+/* The drawer hugs its widest row, so equal side padding gives equal gaps on
+   both sides of the panel. */
 .drawer-item {
-    padding: 0.875rem 1.5rem 0.875rem max(2.5rem, var(--safe-area-left));
+    padding: 0.875rem 1.5rem 0.875rem max(1.5rem, var(--safe-area-left));
     font-size: var(--font-size-md);
     color: var(--text-secondary);
     cursor: pointer;
@@ -213,8 +214,46 @@
     font-weight: 600;
 }
 
+/* Every row leads with a picture: a pinned app its app icon, a fixed row its
+   glyph. Both take one slot width, so the labels line up. The glyph takes the
+   row's colour, so it follows hover and active. */
+.drawer-item {
+    --app-icon-size: 1.25rem;
+}
+
+.drawer-item > .app-icon {
+    margin-right: 0.75rem;
+}
+
+.drawer-item-glyph {
+    flex: none;
+    display: inline-flex;
+    justify-content: center;
+    width: var(--app-icon-size);
+    margin-right: 0.75rem;
+}
+
+.drawer-item-glyph svg {
+    width: 1.125rem;
+    height: 1.125rem;
+}
+
+/* Sets the pinned apps apart from the fixed rows. */
+.drawer-menu-divider {
+    flex: none;
+    height: 1px;
+    background: var(--border-color);
+}
+
+/* The badged row is often the widest row, which sets the drawer's width. An
+   `auto` margin there leaves no gap, so the label takes the free space and the
+   badge keeps a fixed gap. */
+.drawer-item-label {
+    flex: 1;
+}
+
 .drawer-badge {
-    margin-left: auto;
+    margin-left: 1.25rem;
     /* Blue notification accent, matching the base .badge. */
     background: var(--accent);
     color: var(--text-on-accent);
@@ -559,19 +598,20 @@
         position: relative;
     }
 
-    /* The threads row's "Threads" title, and the only user of this class left:
+    /* The threads row's title, and the only user of this class left:
        the thread and content rows carry a centred nav CLUSTER instead
        (styles/header-mark.css), which is centred the same way for the same
        reason but sized by its own span.
 
        TRUE-centered on the row's middle (like the pane dots and the desktop
        header), absolute so it sits on the viewport axis regardless of the
-       leading (filter) and trailing (search) cluster widths, NOT midway
+       leading (grouping, filter) and trailing (search) cluster widths, NOT midway
        between them: an in-flow title centers between the clusters, so it drifts
        off the viewport middle whenever the two differ in width, which is the
        off-center look this replaces. A symmetric `max-width` reserve keeps the
-       centered box clear of what flanks it, so a long title clamps and
-       ellipsizes at that edge instead of crossing it.
+       centered box clear of what flanks it, so a long title clamps at that
+       edge instead of crossing it. The threads title then hides rather than
+       ellipsizing (`ThreadsPaneTitle`, panels/shell.css).
 
        The binding neighbour is this row's Lucidos MARK, which no longer rides
        the trailing icon run: it sits on the nav cluster's trailing edge, the
@@ -583,14 +623,14 @@
        the row (at 150% the pair used to kiss). Clearing the mark clears the
        row's own edges with it, on the reserve arm for free: there the cluster
        keeps --header-nav-edge-reserve (two icon boxes and a gap) at each end,
-       wider than the Filter and Search buttons flanking it. On the floor arm
-       the ends keep only (row - 6.3rem)/2, which is the same regime where the
+       as wide as the two buttons at each end of the row. On the floor arm
+       the ends keep only (row - min span)/2, which is the same regime where the
        other two rows' chevrons reach their own edge controls, and it is what
        --header-nav-min-span's note is about.
 
        The title pays for the mark being further in: past ~137.5% ui-scale on a
-       375px phone the reserve is narrower than the word, so "Threads" starts
-       ellipsising where the old constant still fit it. That is honest rather
+       375px phone the reserve is narrower than the word, so the title hides
+       where the old constant still fit it. That is honest rather
        than a miss, the mark really is there, and it is the same thing the
        content row's title does at those scales.
 
@@ -826,7 +866,7 @@
         --title-icon-box: 1.25rem;
         display: flex;
         align-items: flex-start;
-        gap: 0.75rem;
+        gap: 0.25rem 0.75rem;
         /* Right padding matches `.pane-header`'s `--header-padding-x` so the
          * action icons land in the same slot as the mobile header above.
          * Symmetric 0.5rem top/bottom: just the title's own padding, with no
@@ -839,11 +879,8 @@
          * ::after fade below dissolves the content, kept out of the box so it
          * adds no at-rest gap. */
         background: var(--bg-primary);
-        transition: background-color var(--duration-normal) ease,
-            translate var(--bars-glide-duration, 0s) ease;
         -webkit-user-select: none;
         user-select: none;
-        flex-shrink: 0;
         position: sticky;
         /* Tracks the header's bottom edge via CSS vars from useHideOnScroll.
            The offset extends past -headerHeight by titleHeight so the title
@@ -854,23 +891,29 @@
            the whole transcript, the largest DOM in the app. `translate` is
            composited, and it is what the dynamic bars glide on.
 
-           Safe as a transform here because it makes this row the containing block
-           for any `position: fixed` descendant: the only one is the ⋯ menu, which
-           already portals to <body> for exactly this reason (see OverflowMenu).
-
            The row unsticks only near the top, where the header shows and the
-           offset is 0. So the translate never moves a row in normal flow.
+           offset is 0. So the translate never moves a row in normal flow. */
+        top: var(--mobile-header-height, 3rem);
+        z-index: 2;
+    }
+
+    .mobile-swipe-pane .mobile-thread-title-row {
+        flex-shrink: 0;
+        transition: background-color var(--duration-normal) ease,
+            translate var(--bars-glide-duration, 0s) ease;
+        will-change: translate;
+        /* Safe as a transform here because it makes this row the containing
+           block for any `position: fixed` descendant: the only one is the ⋯
+           menu, which already portals to <body> for exactly this reason (see
+           OverflowMenu).
 
            `transform` undoes the iOS repaint nudge's compensation, which cancels
            a scroll this sticky row never took. It stays off `translate` so the
            glide never animates it. utils/webkitRepaint.ts publishes the shift
            here, on this element alone. Why the two simply add:
            docs/plans/2026-08-16-the-sticky-title-undoes-the-repaint-nudge-compensation.md */
-        top: var(--mobile-header-height, 3rem);
         translate: 0 var(--mobile-header-offset, 0rem);
         transform: translateY(calc(-1 * var(--repaint-nudge-shift, 0px)));
-        will-change: translate;
-        z-index: 2;
         /* Stretch to full width, cancelling .thread-content's horizontal padding
            (the same token the transcript pads with, so the two can't drift).
            That token carries the side inset, so the band reaches both edges
@@ -881,6 +924,16 @@
         margin-right: calc(-1 * var(--thread-pane-gutter));
         /* No margin-bottom — the title's 0.5rem bottom padding is the only space
          * before the first message. */
+    }
+
+    /* A row scrolled into view clears the fixed header. */
+    .mobile-swipe-pane .thread-drawer-tree .thread-row {
+        scroll-margin-top: var(--mobile-header-height, 3rem);
+    }
+
+    /* The Ongoing tiles scroll with the rows here. */
+    .mobile-swipe-pane .drawer-ongoing-tiles {
+        position: static;
     }
 
     .mobile-swipe-pane .mobile-thread-title-row.scrolled {
@@ -1006,12 +1059,16 @@
     .mobile-swipe-container {
         flex: 1;
         min-height: 0;
+        /* `hidden`, never `clip`: under `clip` iOS stopped opening the
+           prompt box's edit menu (ADR 0420). A scroll into view can slide
+           this strip sideways, and MobileSwipeContainer's scroll reset puts
+           it back. */
         overflow: hidden;
         position: relative;
         /* Let the browser handle vertical pan natively; JS handles horizontal swipe.
            Without this, Android Chrome may fight for horizontal gestures (back nav). */
         touch-action: pan-y;
-        /* Force a compositor layer so overflow:hidden clips .mobile-swipe-track
+        /* Force a compositor layer so the overflow clip holds .mobile-swipe-track
            at composition time. The track has will-change:transform (own layer);
            without a layer here too, iOS Safari clips at paint time and during
            rapid back-and-forth swipes the full 300%-wide track can momentarily
@@ -1221,43 +1278,44 @@
         animation: none;
     }
 
-    /* The transcript's find bar floats on the header's visible bottom edge.
-       In flow it sat at viewport y=0, behind the fixed header, and under the
-       Dynamic Island once the header slid away. It covers the sticky title row
-       while open, and its floor keeps it clear of the status bar, as the
-       scroll-to-top chevron's does. The offset rides `translate`, never a
-       layout property, for the reason on .mobile-thread-title-row. */
+    /* The transcript's find bar docks under the header, over the sticky title
+       row. In flow it sat at viewport y=0, behind the fixed header. An open
+       find bar pins the header (`shouldKeepHeaderVisible`), so the bar never
+       moves while the reader steps through matches. */
     .mobile-swipe-pane .thread-view {
         position: relative;
     }
 
-    .mobile-swipe-pane .thread-view > .find-bar-slot {
-        position: absolute;
+    .mobile-swipe-pane .thread-view > .find-bar-slot,
+    .mobile-swipe-pane .file-preview-frame > .find-bar-slot {
         top: var(--mobile-header-height, 3rem);
-        left: 0;
-        right: 0;
-        translate: 0 max(
-            calc(var(--safe-area-top) - var(--mobile-header-height, 3rem)),
-            var(--mobile-header-offset, 0rem)
-        );
-        /* `top` moves only when the keyboard opens or closes, as the header
-           height swaps for the safe area. It glides with the header, which
-           would otherwise cover the bar on its way out. */
-        transition: top var(--bars-glide-duration, 0s) ease,
-            translate var(--bars-glide-duration, 0s) ease;
-        will-change: translate;
         /* Above .thread-content (z-index 2) and its sticky title row. */
         z-index: 3;
         background: var(--bg-secondary);
+    }
+
+    .mobile-swipe-pane .thread-view > .find-bar-slot {
+        position: absolute;
+        left: 0;
+        right: 0;
     }
 
     .mobile-swipe-pane .thread-view > .find-bar-slot .find-bar {
         padding-inline: calc(var(--space-lg) + var(--phone-side-inset));
     }
 
-    /* The up chevron rests below the title row, which the open bar replaces.
-       With the header away it lands on the bar's Close and Next buttons, so it
-       stands down while the bar is open. The bar's own steps move the reader. */
+    /* A file's find bar sticks under the same pinned header. It takes the top
+       slot from the path row, which scrolls away under it, as the transcript's
+       bar covers the title row. First in the column, it rests where it sticks. */
+    .mobile-swipe-pane .file-preview-frame > .find-bar-slot {
+        order: -1;
+        position: sticky;
+    }
+
+    /* The up chevron rests below the title row, which the open bar covers.
+       The bar can be taller than that row, and the chevron then lands on its
+       buttons, so it stands down while the bar is open. The bar's own steps
+       move the reader. */
     .mobile-swipe-pane .thread-view:has(> .find-bar-slot) .scroll-to-top.visible {
         opacity: 0;
         pointer-events: none;
@@ -1532,6 +1590,20 @@
        Centering causes the prompt to jump when the first message is sent. */
     .compose-empty .thread-pane-body {
         justify-content: flex-end;
+    }
+
+    /* An empty Home's title sits under the fixed header, where a thread's own
+       title row rests (shell.css places it). The row keeps its own rules: its
+       box is already where its sticky offset would hold it. */
+    .mobile-swipe-pane .home-welcome-title {
+        top: var(--app-header-bottom);
+    }
+
+    /* The row's negative margins cancel the transcript's gutter, and here it
+       sits outside the transcript, with no gutter to cancel. */
+    .mobile-swipe-pane .home-welcome-title .mobile-thread-title-row {
+        margin-left: 0;
+        margin-right: 0;
     }
 
     /* Dynamic bars: the prompt overlays the transcript's bottom so it can slide

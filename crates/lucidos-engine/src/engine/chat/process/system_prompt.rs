@@ -324,7 +324,7 @@ pub(crate) const WORKSPACE_ASSETS_KNOWHOW_RULE: &str =
      on the matching system-knowhow file:\n\
      - triggers, ANY action (create, update, pause/resume, or run one now, \
      off-schedule) -> `system-knowhow/triggers`\n\
-     - create_app -> `system-knowhow/building-an-app`\n\
+     - create_app, for an app or a widget -> `system-knowhow/building-an-app`\n\
      - a new file under knowhow/ -> `system-knowhow/building-knowhow`\n\
      - plugins, ANY action (package, publish, update) -> \
      `system-knowhow/plugins`\n\
@@ -509,7 +509,7 @@ __TRIGGER_VS_EVENT_WAIT_RULE__
 
 TRIGGERS:
 - Cron is 6 fields (sec min hour dom month dow) in the user's LOCAL timezone; DST is handled automatically.
-- In a trigger thread, send_notification only when there is something noteworthy to report. If nothing changed, just finish. Errors are reported automatically.
+- In a trigger thread, report only what is noteworthy: request_read true so the run waits under Review, and send_notification when the user should hear now. If nothing changed, just finish. Errors are reported automatically.
 
 IMPORTING DATA & CREDENTIALS:
 - API data: check credentials and the builtin provider proxies (proxy_request), request_credential only if neither has it, http_request, write_file to imported/<service>/. A local file is import_file with the full path.
@@ -555,7 +555,8 @@ REFRESHING OPEN WINDOWS:
 
 FILE REFERENCES:
 - Always use the full path ("artifacts/notes.md", not "notes.md"): a full path becomes a clickable link, a bare filename does not.
-- ONLY THE LEADING `!` DRAWS AN IMAGE: `![what it shows](artifacts/branding/card.png)`. Without it a path is a LINK the user must click, and `read_file` on an image shows it to YOU, never to them. When the point IS the picture, draw it. Same for a chart, diagram or page you rendered. Saving one shows nothing either. A picture shows only in text that ENDS your turn, in the card's `message`, or in an option's description. Text followed by any tool call may reach the user only as a short summary, which drops it. For a visual choice (colour, layout, type), render real pictures, never ASCII art. Give each option its own picture of only that option.
+- CITE LINES IN THE HREF: `[a.rs:5-9](repo:<name or id>:file:src/a.rs#L5-L9)`; `#L5` is one line.
+- ONLY THE LEADING `!` DRAWS AN IMAGE: `![what it shows](artifacts/branding/card.png)`. Without it a path is a LINK the user must click, and `read_file` on an image shows it to YOU, never to them. When the point IS the picture, draw it. Same for a chart, diagram or page you rendered. Saving one shows nothing either. A picture shows only in text that ENDS your turn, in the card's `message`, or in an option's description. Text followed by any tool call may reach the user only as a short summary, which drops it. For a visual choice (colour, layout, type), render real pictures, never ASCII art. Give each option its own picture of only that option, in its description, not in `message`. The `!` on an `app:` link draws a live widget the same way (see Widgets).
 - LINK EVERY APP YOU NAME, since a bare app name does not auto-link: `[Habit Tracker](app:habit-tracker)`. Not linking should be a rare exception. A `#fragment` arrives as the app's `location.hash`, so name the ITEM when the app reads one: `[Some report](app:pr-understanding#pr-1645)`.
 - LINK EVERY TRIGGER YOU NAME, at the trigger and not the panel: `[Nightly digest](trigger:<id>)`, id from `triggers` action 'list'. It lands on the row, where Run once is. `[Triggers](triggers)` is the LIST.
 - Link a UI panel by its bare name: `[Notifications](notifications)`, `[Plugins](plugins)`, or `[Plugins](app-store)` for its catalog. A Settings page takes its settings_view id: `[Backup](settings:backup)`. Call it the Plugins panel, never the retired "App Store" or "Store".
@@ -887,8 +888,12 @@ impl LucidosEngine {
         // renders the two identically. So the agent tells the user they have
         // none, and nothing anywhere says the scan broke. Same treatment as the
         // preference read above: degrade the turn, but name what happened.
-        let apps_section = match self.app_manager.list_apps() {
-            Ok(apps) => super::workspace_payload::build_apps_section(&apps),
+        let automatic_widgets = crate::core::prefs::AUTOMATIC_WIDGETS.read(&self.pool).await;
+        let apps_section = match super::workspace_prompt_footprint::apps_section(
+            &self.app_manager,
+            automatic_widgets,
+        ) {
+            Ok(section) => section,
             Err(e) => {
                 log!(
                     "[Chat] app list read failed ({}); this turn's prompt names no apps",
@@ -902,32 +907,17 @@ impl LucidosEngine {
         // second scan of `data/`. Two scans can disagree inside one turn, and
         // one direction is harmful: an intent created between them lists here
         // while the tool to run it was never offered.
-        let intents_section = if capabilities.intents.is_empty() {
-            String::new()
-        } else {
-            let mut section = String::from("\n\n## Available Intents\n\n");
-            section.push_str("Stored descriptions of what the user wants. Use execute_intent(intent_id) to fulfill one. Each intent is paired with knowhow that tells you how to achieve it.\n\n");
-            for p in &capabilities.intents {
-                section.push_str(&format!("- **{}** (id: `{}`)\n", p.name, p.id));
-            }
-            section
-        };
+        let intents_section =
+            super::workspace_prompt_footprint::build_intents_section(&capabilities.intents);
 
-        let kh_dirs = self.knowhow_dirs();
-        let knowhow_summaries = crate::core::KnowhowStore::load_merged_summaries(&kh_dirs);
-        let apps_dir = self.workspace_path.join(crate::core::APPS_DIR);
-        let app_knowhow_summaries = crate::core::KnowhowStore::load_app_summaries(&apps_dir);
-        let knowhow_section = super::workspace_payload::build_knowhow_section(
+        let (knowhow_summaries, app_knowhow_summaries) = self.workspace_knowhow_summaries();
+        let knowhow_section = super::workspace_prompt_footprint::build_knowhow_section(
             &knowhow_summaries,
             &app_knowhow_summaries,
         );
 
         // Engine-shipped reference, never overrideable by a workspace file.
-        let system_knowhow_summaries = self
-            .system_knowhow_dir()
-            .map(crate::core::SystemKnowhowStore::load_summaries)
-            .unwrap_or_default();
-        let system_knowhow_section = build_system_knowhow_section(&system_knowhow_summaries);
+        let system_knowhow_section = build_system_knowhow_section(&self.system_knowhow_summaries());
 
         let system_prompt = format!(
             "{}{}{}{}{}",
@@ -1028,6 +1018,149 @@ Do NOT refuse to discuss the user's own personal information from their own file
     )
 }
 
+/// The tools a chat turn offers under `gates`, in wire order, before the MCP
+/// slice: the flat schemas, the notification tool, the grouped manifest tools,
+/// then the chat tail.
+pub(crate) fn chat_tools(
+    gates: &crate::llm::ToolCapabilities,
+) -> Vec<crate::llm::provider::ToolDefinition> {
+    let mut tools = crate::llm::tools::get_default_tools(gates);
+    tools.push(crate::llm::tools::get_notification_tool());
+    tools.extend(crate::capability_manifest::llm_tools_for(gates));
+    tools.extend(crate::llm::tools::chat_tail_tools(gates));
+    tools
+}
+
+/// The hand-written flat tool schemas in [`chat_tools`]: everything but the
+/// grouped manifest tools, which have their own owner and meter area.
+pub(crate) fn flat_chat_tools(
+    gates: &crate::llm::ToolCapabilities,
+) -> Vec<crate::llm::provider::ToolDefinition> {
+    let grouped: std::collections::HashSet<String> =
+        crate::capability_manifest::llm_tools_for(gates)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+    chat_tools(gates)
+        .into_iter()
+        .filter(|t| !grouped.contains(&t.name))
+        .collect()
+}
+
+/// Characters a tool schema costs on the wire, as the provider sees it.
+pub(crate) fn wire_chars(tool: &crate::llm::provider::ToolDefinition) -> usize {
+    serde_json::to_string(tool)
+        .expect("a tool schema serializes")
+        .chars()
+        .count()
+}
+
+/// The *system prompt footprint*: the text Lucidos itself sends on every chat
+/// turn, area by area, so a report says WHICH one grew.
+///
+/// Only the tool schemas follow `gates`. Every other area is billed at its
+/// worst case, because it is engine text whose variant a workspace setting or
+/// build state picks. A user-written *response style* is workspace content, so
+/// the body bills the widest shipped style instead. The ratchet
+/// `always_loaded_context_stays_under_budget` calls this with its billed set.
+pub(crate) fn system_prompt_footprint(
+    gates: &crate::llm::ToolCapabilities,
+    system_knowhow: &[crate::core::KnowhowSummary],
+    built_in_widgets: &[crate::core::App],
+) -> Vec<(&'static str, usize)> {
+    use super::context_mode::{ContextMode, SweepSchedule};
+    use super::turn_tail::{
+        client_url_block, engine_build_block, version_status, BUILD_STATES, CLIENT_URL_POINTER,
+        ENGINE_BUILD_POINTER,
+    };
+
+    // Neither source variant nor memory module is uniformly larger, so all
+    // four bodies are measured. The context mode is billed OFF: its todo rule
+    // is 31 chars longer, against a `todo_write` schema it takes away.
+    let widest_style = crate::core::response_style::widest_shipped_section();
+    let child_cap = crate::engine::thread_queue::DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD;
+    let body = [(true, false), (false, false), (true, true), (false, true)]
+        .into_iter()
+        .map(|(source, memory_tree)| {
+            static_prompt_body(
+                source,
+                500,
+                child_cap,
+                ContextMode::Off,
+                memory_tree,
+                &widest_style,
+            )
+            .chars()
+            .count()
+        })
+        .max()
+        .expect("four bodies");
+
+    let flat: usize = flat_chat_tools(gates).iter().map(wire_chars).sum();
+    let grouped: usize = crate::capability_manifest::llm_tools_for(gates)
+        .iter()
+        .map(wire_chars)
+        .sum();
+    let knowhow = build_system_knowhow_section(system_knowhow).chars().count();
+
+    // Both halves of each ADR 0084 split: the pointer in the cached system
+    // block and the reading in the message tail.
+    let engine_build = ENGINE_BUILD_POINTER.chars().count()
+        + BUILD_STATES
+            .into_iter()
+            .map(|(update, behind, wedged)| {
+                engine_build_block(&version_status(update, behind, wedged))
+                    .chars()
+                    .count()
+            })
+            .max()
+            .expect("four states");
+    // The URL itself is a runtime reading, so only the pointer and the
+    // block's delimiters are engine text.
+    let client_url = CLIENT_URL_POINTER.chars().count() + client_url_block("").chars().count();
+
+    let context_mode =
+        super::context_mode::system_prompt_section(ContextMode::On, SweepSchedule::default())
+            .chars()
+            .count();
+
+    // Sent with or without a widget, at the wider `automatic_widgets` form.
+    let widgets_rules = [true, false]
+        .into_iter()
+        .map(|automatic| {
+            crate::engine::widget_guidance::widgets_rules(
+                crate::engine::widget_guidance::WidgetAudience::Chat { automatic },
+            )
+            .chars()
+            .count()
+        })
+        .max()
+        .expect("two forms");
+    // The built-in widgets ship with the engine, and every workspace lists
+    // them. So their lines and the list's header are engine text (ADR 0415).
+    let built_in_widgets = crate::engine::widget_guidance::widgets_list(built_in_widgets)
+        .chars()
+        .count();
+
+    vec![
+        ("static prompt body + rule consts", body),
+        ("## Widgets rules, wider form", widgets_rules),
+        ("built-in widgets list", built_in_widgets),
+        ("flat tool schemas, JSON wire form", flat),
+        ("grouped manifest tool schemas, JSON wire form", grouped),
+        ("System Knowhow routing list", knowhow),
+        (
+            "experimental context mode rule + note guidance",
+            context_mode,
+        ),
+        (
+            "ENGINE BUILD (dev): pointer + widest tail block",
+            engine_build,
+        ),
+        ("client URL: pointer + tail block delimiters", client_url),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::process_helpers::{
@@ -1035,16 +1168,12 @@ mod tests {
         MEMORY_LOOKUP_CLASSIC, MEMORY_LOOKUP_TREE,
     };
     use super::super::context_mode::ContextMode;
-    use super::super::turn_tail::{
-        client_url_block, engine_build_block, version_status, BUILD_STATES, CLIENT_URL_POINTER,
-        ENGINE_BUILD_POINTER,
-    };
     use super::{
         coding_surface_section, setup_device, setup_or_language_section, static_prompt_body,
-        workspace_identity_section, ASK_USER_QUESTION_RULE, MANDATORY_PREFS,
-        MEMORY_CORRECTIONS_RULE_CLASSIC, MEMORY_CORRECTIONS_RULE_TREE, NAMES_NOT_IDS_RULE,
-        NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE, TRIGGER_VS_EVENT_WAIT_RULE,
-        WORKSPACE_ASSETS_KNOWHOW_RULE,
+        system_prompt_footprint, wire_chars, workspace_identity_section, ASK_USER_QUESTION_RULE,
+        MANDATORY_PREFS, MEMORY_CORRECTIONS_RULE_CLASSIC, MEMORY_CORRECTIONS_RULE_TREE,
+        NAMES_NOT_IDS_RULE, NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE,
+        TRIGGER_VS_EVENT_WAIT_RULE, WORKSPACE_ASSETS_KNOWHOW_RULE,
     };
     use crate::core::prefs::{self, PrefScope};
     use crate::engine::thread_queue::DEFAULT_MAX_CONCURRENT_CHILDREN_PER_THREAD as CHILD_CAP;
@@ -1472,15 +1601,60 @@ mod tests {
     /// `thread_queue` schema gains `max_concurrent_children_per_thread`. An
     /// agent read a lifetime cap and moved its work out of the family
     /// (docs/plans/2026-10-06-child-cap-counts-live-children.md).
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 124_293;
+    ///
+    /// Raised by 91 to a measured 124,384 for the `#L` bullet in FILE
+    /// REFERENCES. The agent put a cited range only in a link's label, so a
+    /// click opened the file at the top
+    /// (docs/plans/2026-10-08-transcript-file-links-open-the-preview-modal.md).
+    ///
+    /// Raised by 15 to a measured 124,399 for the `threads` filter
+    /// `change_state`, whose three-value enum replaced the `has_diff` boolean
+    /// (ADR 0400). Its description was cut to the minimum first.
+    ///
+    /// Raised by 1,116 to a measured 125,515 for widgets (ADR 0402): the
+    /// grouped `widgets` tool, `create_app`'s `kind` arg, the routing row, and
+    /// `building-an-app`'s description naming widgets. Every widget action
+    /// needs an agent path (plan invariant 9), and each was cut first.
+    ///
+    /// Raised by 479 to a measured 125,994 for the `request_read` tool and its
+    /// trigger clause (ADR 0409). Only the thread knows whether its reply is
+    /// worth reading, and the description says when not to ask. Cut first.
+    ///
+    /// Raised by 858 to a measured 126,852, with no new text: the `## Widgets`
+    /// rules were sent all along and metered nowhere. They go out with or
+    /// without a widget, so they are system prompt footprint (ADR 0413).
+    ///
+    /// Raised by 161 to a measured 127,013 for `create_app`'s `icon_svg` arg
+    /// (ADR 0414). The agent draws an icon for every app and widget, and the
+    /// arg is how. Its description was cut to one sentence first.
+    ///
+    /// Raised by 1,159 to a measured 128,172 for widget params and embeds (ADR
+    /// 0415). It pays for the `widgets` tool's `params` and `label` args and
+    /// the embed in the question option's `description`. It also pays for one
+    /// FILE REFERENCES sentence, the embed rule in `## Widgets`, and the
+    /// built-in widgets' lines, which every workspace is sent. An agent must
+    /// name an instance and write an embed, and each text was cut first.
+    ///
+    /// Raised by 151 to a measured 128,323 for the read decision (ADR 0417):
+    /// `request_read`'s required `read` argument and the description saying
+    /// when to decide and when to leave it to the engine.
+    ///
+    /// Raised by 117 to a measured 128,440 for `capture_app`'s
+    /// `save_as_artifact`, which lets the agent take a plugin's screenshots
+    /// itself. The tool's own description was cut to pay for most of it.
+    ///
+    /// Raised by 207 to a measured 128,647 for the widget look in `## Widgets`:
+    /// one shape instead of a table, the three shape classes, no title and no
+    /// border inside the card. The full rules are in `building-an-app`; this
+    /// anchor keeps the core of them in view while the agent writes the HTML.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 128_647;
 
-    /// The hand-written flat tool schemas the chat agent is offered.
+    /// The gate set the ratchet bills.
     ///
     /// Mirrors the tool splice in `chat::process::run`, minus the two parts
     /// that are not engine-authored text: tools discovered from running MCP
     /// servers, and `generate_image` (present only when an image provider is
-    /// configured). The grouped manifest tools are billed separately because
-    /// they have a different owner, `crate::capability_manifest`.
+    /// configured).
     ///
     /// **Every capability gate is resolved OPEN here except two**, which is
     /// the same set this measured before ADR 0088 gated anything. The meter is
@@ -1496,124 +1670,35 @@ mod tests {
     /// The mode CLOSES a family rather than opening one: it takes `todo_write`
     /// away. Billing it on would reclaim a schema almost every workspace pays
     /// for, so the meter bills the mode OFF, which is the larger array.
+    const BILLED: ToolCapabilities = ToolCapabilities {
+        email_account: true,
+        intent: true,
+        image_provider: false,
+        judgment_provider: false,
+        context_mode: false,
+        memory_tree: false,
+    };
+
+    /// The flat tool schemas the ratchet bills.
     fn flat_chat_tools() -> Vec<crate::llm::provider::ToolDefinition> {
-        let billed = ToolCapabilities {
-            email_account: true,
-            intent: true,
-            image_provider: false,
-            judgment_provider: false,
-            context_mode: false,
-            memory_tree: false,
-        };
-        let mut flat = crate::llm::tools::get_default_tools(&billed);
-        flat.push(crate::llm::tools::get_notification_tool());
-        flat.extend(crate::llm::tools::chat_tail_tools(&billed));
-        flat
+        super::flat_chat_tools(&BILLED)
     }
 
-    /// Characters a tool schema costs on the wire, as the provider sees it.
-    fn wire_chars(tool: &crate::llm::provider::ToolDefinition) -> usize {
-        serde_json::to_string(tool)
-            .expect("a tool schema serializes")
-            .chars()
-            .count()
-    }
-
-    /// The four always-loaded areas, measured separately so a regression report
+    /// The always-loaded areas, measured separately so a regression report
     /// says WHICH one grew.
     fn always_loaded_areas() -> Vec<(&'static str, usize)> {
-        // Neither source variant is uniformly larger, so measure both and bill
-        // the worse case.
-        //
-        // The mode is billed OFF, for the reason `flat_chat_tools` bills it
-        // off: that is the configuration almost every workspace runs. Its
-        // todo rule is 31 chars longer, against a `todo_write` schema of
-        // nearly a thousand that a mode-on workspace does not pay at all.
-        // The *response style* is billed at its widest SHIPPED section, style
-        // and technical literacy together, the same worst-case rule the source
-        // variant takes. A style the user wrote
-        // is workspace content, like `user_profile.md`, and this meter measures
-        // the engine-authored surface.
-        // Both memory modules are billed too, at whichever body is longer.
-        let widest_style = crate::core::response_style::widest_shipped_section();
-        let body = [(true, false), (false, false), (true, true), (false, true)]
-            .into_iter()
-            .map(|(source, memory_tree)| {
-                static_prompt_body(
-                    source,
-                    500,
-                    CHILD_CAP,
-                    ContextMode::Off,
-                    memory_tree,
-                    &widest_style,
-                )
-                .chars()
-                .count()
-            })
-            .max()
-            .expect("four bodies");
-
-        let flat: usize = flat_chat_tools().iter().map(wire_chars).sum();
-        let grouped: usize = crate::capability_manifest::llm_tools()
-            .iter()
-            .map(wire_chars)
-            .sum();
-
         let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let knowhow = super::super::super::process_helpers::build_system_knowhow_section(
+        let ws = tempfile::tempdir().expect("temp workspace");
+        let built_in_widgets = crate::core::AppManager::new(ws.path())
+            .expect("app manager")
+            .with_system_widgets(Some(repo.join("system-widgets")))
+            .list_reusable_widgets()
+            .expect("built-in widgets load");
+        system_prompt_footprint(
+            &BILLED,
             &crate::core::SystemKnowhowStore::load_summaries(&repo.join("system-knowhow")),
+            &built_in_widgets,
         )
-        .chars()
-        .count();
-
-        // Both halves of each ADR 0084 split, because both are always-loaded:
-        // the pointer in the cached system block and the reading in the
-        // message tail. Built per turn rather than spliced into
-        // `static_prompt_body`, so without this they would be always-loaded
-        // text sitting outside the only meter that watches it.
-        //
-        // The build state is billed at its WORST case, like the body above.
-        let engine_build = ENGINE_BUILD_POINTER.chars().count()
-            + BUILD_STATES
-                .into_iter()
-                .map(|(update, behind, wedged)| {
-                    engine_build_block(&version_status(update, behind, wedged))
-                        .chars()
-                        .count()
-                })
-                .max()
-                .expect("four states");
-
-        // The URL itself is a runtime reading rather than engine-authored
-        // text, so only the pointer and the block's delimiters are billed.
-        let client_url = CLIENT_URL_POINTER.chars().count() + client_url_block("").chars().count();
-
-        // The mode's rule block and note guidance, billed at the same
-        // worst-case rule as the tool schemas above. It reaches only a
-        // workspace running the mode, and this meter measures the
-        // engine-authored surface rather than one workspace's prompt.
-        let context_mode = super::super::context_mode::system_prompt_section(
-            super::super::context_mode::ContextMode::On,
-            super::super::context_mode::SweepSchedule::default(),
-        )
-        .chars()
-        .count();
-
-        vec![
-            ("static prompt body + rule consts", body),
-            ("flat tool schemas, JSON wire form", flat),
-            ("grouped manifest tool schemas, JSON wire form", grouped),
-            ("System Knowhow routing list", knowhow),
-            (
-                "experimental context mode rule + note guidance",
-                context_mode,
-            ),
-            (
-                "ENGINE BUILD (dev): pointer + widest tail block",
-                engine_build,
-            ),
-            ("client URL: pointer + tail block delimiters", client_url),
-        ]
     }
 
     /// The `n` costliest tool schemas, so a breach names the tool that grew
@@ -1814,7 +1899,7 @@ mod tests {
         ),
         (
             "threads",
-            3_159,
+            3_172,
             "five more actions on a domain whose two existing schemas \
              are almost entirely a spelled-out `status` enum pinned to \
              `ThreadStatus::ALL` by a test, repeated across both because \
@@ -1825,7 +1910,9 @@ mod tests {
              `drafts` and `held_messages`, which reuse the union's properties, \
              and the two filters `has_draft` and `has_diff`. Raised from \
              2,737 for `triage` and `apply_triage` (ADR 0349), two short \
-             summaries and one `entries` array",
+             summaries and one `entries` array. Raised from 3,159 for \
+             `change_state`, the three-value enum that replaced `has_diff` \
+             (ADR 0400)",
         ),
         (
             "events",
@@ -2594,6 +2681,11 @@ mod tests {
             section.contains("never ASCII art")
                 && section.contains("its own picture of only that option"),
             "the section must show a visual choice as one picture per option:\n{section}"
+        );
+        // An option's picture belongs on its own option, never in `message`.
+        assert!(
+            section.contains("only that option, in its description, not in `message`"),
+            "an option's picture must go on its own option:\n{section}"
         );
     }
 

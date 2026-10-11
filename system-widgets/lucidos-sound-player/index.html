@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sound player</title>
+  <script src="/api/v1/sdk-prefs.js"></script>
+  <link rel="stylesheet" href="/api/v1/sdk-iframe.css">
+  <script src="/api/v1/sdk.js"></script>
+  <style>
+    body { margin: 0; background: transparent; }
+    .player {
+      display: flex;
+      align-items: center;
+      gap: 0.625rem;
+      padding: 0.375rem 0.625rem 0.375rem 0.375rem;
+      background: var(--bg-primary);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-control);
+    }
+    /* The SDK's own `button` and `input` rules pad and fill every control.
+       Override them all here: their padding squeezes the icon to zero width,
+       and their hover fill sticks grey after a tap. */
+    .play, .play:hover {
+      flex: none;
+      width: 1.5rem;
+      height: 1.5rem;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      border-radius: var(--radius-round);
+      background: var(--accent);
+      color: var(--text-on-accent);
+      cursor: pointer;
+    }
+    .play:focus-visible { box-shadow: var(--focus-ring); }
+    .play svg { width: 0.625rem; height: 0.625rem; fill: currentColor; }
+    .play .pause-icon, .playing .play .play-icon { display: none; }
+    .playing .play .pause-icon { display: block; }
+    /* The input stays tall so a tap anywhere near the thin track seeks. */
+    .scrub {
+      --track: 0.25rem;
+      --thumb: 0.75rem;
+      --played: 0;
+      flex: 1;
+      min-width: 0;
+      height: 1.5rem;
+      margin: 0;
+      padding: 0;
+      border: none;
+      background: transparent;
+      appearance: none;
+      -webkit-appearance: none;
+      cursor: pointer;
+    }
+    /* The played fill ends under the thumb's centre, which travels
+       between half a thumb from each end. */
+    .scrub::-webkit-slider-runnable-track {
+      height: var(--track);
+      border-radius: var(--radius-round);
+      background:
+        linear-gradient(var(--accent), var(--accent)) 0 / calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--played)) 100% no-repeat,
+        var(--bg-quaternary);
+    }
+    .scrub::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: var(--thumb);
+      height: var(--thumb);
+      margin-top: calc((var(--track) - var(--thumb)) / 2);
+      border: none;
+      border-radius: var(--radius-round);
+      background: var(--text-primary);
+    }
+    .scrub::-moz-range-track {
+      height: var(--track);
+      border-radius: var(--radius-round);
+      background: var(--bg-quaternary);
+    }
+    .scrub::-moz-range-progress {
+      height: var(--track);
+      border-radius: var(--radius-round);
+      background: var(--accent);
+    }
+    .scrub::-moz-range-thumb {
+      width: var(--thumb);
+      height: var(--thumb);
+      border: none;
+      border-radius: var(--radius-round);
+      background: var(--text-primary);
+    }
+    .scrub:focus-visible::-webkit-slider-thumb { box-shadow: var(--focus-ring); }
+    .scrub:focus-visible::-moz-range-thumb { box-shadow: var(--focus-ring); }
+    .time {
+      flex: none;
+      color: var(--text-secondary);
+      font-size: var(--font-size-xs);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .error {
+      color: var(--text-secondary);
+      font-size: var(--font-size-sm);
+      padding: 0.5rem 0.75rem;
+      border: 1px dashed var(--border-color);
+      border-radius: var(--radius-control);
+    }
+  </style>
+</head>
+<body>
+  <div class="player" id="player">
+    <button class="play" id="play" type="button" aria-label="Play" data-tooltip="Play">
+      <svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>
+      <svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5h3v11H4zM9 2.5h3v11H9z"/></svg>
+    </button>
+    <input class="scrub" id="scrub" type="range" min="0" max="0" step="0.01" value="0" aria-label="Position">
+    <span class="time" id="time">0:00</span>
+  </div>
+  <audio id="audio" preload="metadata"></audio>
+  <script>
+    lucidos.ui.applyPreferences();
+    lucidos.ui.watchPreferences();
+
+    const player = document.getElementById('player');
+    const play = document.getElementById('play');
+    const scrub = document.getElementById('scrub');
+    const time = document.getElementById('time');
+    const audio = document.getElementById('audio');
+
+    // A workspace path plays through the /data mount, which serves ranges, so
+    // Safari can seek. An https URL plays as given.
+    function clipUrl(clip) {
+      return /^https:\/\//i.test(clip) ? clip : lucidos.data.url(clip);
+    }
+
+    function clock(seconds) {
+      if (!Number.isFinite(seconds)) return '0:00';
+      const whole = Math.floor(seconds);
+      return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
+    }
+
+    function showPosition() {
+      time.textContent = audio.duration
+        ? `${clock(audio.currentTime)} / ${clock(audio.duration)}`
+        : clock(audio.currentTime);
+      const played = audio.duration ? audio.currentTime / audio.duration : 0;
+      scrub.style.setProperty('--played', String(played));
+    }
+
+    function fail(message) {
+      player.replaceChildren(Object.assign(document.createElement('div'), {
+        className: 'error',
+        textContent: message,
+      }));
+    }
+
+    const { clip } = lucidos.params();
+    if (typeof clip !== 'string' || clip.trim() === '') {
+      fail('No clip to play.');
+    } else {
+      audio.src = clipUrl(clip.trim());
+      play.addEventListener('click', () => {
+        if (audio.paused) audio.play().catch((e) => fail(`Could not play the clip: ${e.message}`));
+        else audio.pause();
+      });
+      audio.addEventListener('play', () => {
+        player.classList.add('playing');
+        play.setAttribute('aria-label', 'Pause');
+        play.dataset.tooltip = 'Pause';
+      });
+      audio.addEventListener('pause', () => {
+        player.classList.remove('playing');
+        play.setAttribute('aria-label', 'Play');
+        play.dataset.tooltip = 'Play';
+      });
+      audio.addEventListener('loadedmetadata', () => {
+        scrub.max = String(audio.duration || 0);
+        showPosition();
+      });
+      audio.addEventListener('timeupdate', () => {
+        scrub.value = String(audio.currentTime);
+        showPosition();
+      });
+      audio.addEventListener('error', () => fail(`Could not load ${clip}.`));
+      scrub.addEventListener('input', () => {
+        audio.currentTime = Number(scrub.value);
+        showPosition();
+      });
+    }
+  </script>
+</body>
+</html>

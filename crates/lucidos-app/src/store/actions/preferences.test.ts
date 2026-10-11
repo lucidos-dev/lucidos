@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts, llmConfigured } from '../store';
 import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule } from './preferences';
 import { motionPreference } from '../../utils/motion';
+import { SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS } from '@lucidos/appearance';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
@@ -578,6 +579,11 @@ describe("applyThemeMode('system'): following the OS", () => {
     for (const fn of [...mqListeners]) fn();
   }
 
+  /** Run past both reads, the settle read and the one confirming it. */
+  function settle(): void {
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS + SYSTEM_THEME_MODE_CONFIRM_MS);
+  }
+
   beforeEach(() => {
     vi.useFakeTimers();
     localStorage.clear();
@@ -628,7 +634,7 @@ describe("applyThemeMode('system'): following the OS", () => {
 
     mqLight = true;
     fireMediaQueryChange();
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(painted).toEqual(['light']);
   });
@@ -640,7 +646,7 @@ describe("applyThemeMode('system'): following the OS", () => {
     setVisibility('hidden');
     mqLight = true;
     fireMediaQueryChange();
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(painted).toEqual([]);
   });
@@ -654,7 +660,7 @@ describe("applyThemeMode('system'): following the OS", () => {
     mqLight = true;
     fireMediaQueryChange();
     mqLight = false;
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(painted).toEqual([]);
   });
@@ -666,13 +672,64 @@ describe("applyThemeMode('system'): following the OS", () => {
     setVisibility('hidden');
     mqLight = true;
     fireMediaQueryChange();
-    vi.advanceTimersByTime(500);
+    settle();
     expect(painted).toEqual([]);
 
     setVisibility('visible');
     document.dispatchEvent(new Event('visibilitychange'));
-    vi.advanceTimersByTime(500);
+    settle();
 
+    expect(painted).toEqual(['light']);
+  });
+
+  it('paints nothing a brief wake reads, when the page hides before the flip holds', () => {
+    // An iOS wake can last under a second. For that moment the media query
+    // still reports the snapshot pass's light, past the settle read. Painting
+    // it left the page light, and the next return opened on light.
+    applyThemeMode('system');
+    painted = [];
+
+    mqLight = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS);
+    expect(painted).toEqual([]);
+
+    setVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    mqLight = false;
+    settle();
+
+    expect(painted).toEqual([]);
+  });
+
+  it('paints nothing when the confirming read no longer sees the flip', () => {
+    applyThemeMode('system');
+    painted = [];
+
+    mqLight = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS);
+    mqLight = false;
+    settle();
+
+    expect(painted).toEqual([]);
+  });
+
+  it('starts over on a wake after a hide cancelled the confirming read', () => {
+    applyThemeMode('system');
+    painted = [];
+
+    mqLight = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS);
+    setVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    setVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_CONFIRM_MS);
+    expect(painted).toEqual([]);
+
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS);
     expect(painted).toEqual(['light']);
   });
 
@@ -684,7 +741,7 @@ describe("applyThemeMode('system'): following the OS", () => {
     document.dispatchEvent(new Event('visibilitychange'));
     window.dispatchEvent(new Event('focus'));
     window.dispatchEvent(new Event('pageshow'));
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(painted).toEqual(['light']);
   });
@@ -694,7 +751,7 @@ describe("applyThemeMode('system'): following the OS", () => {
     painted = [];
 
     document.dispatchEvent(new Event('visibilitychange'));
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(painted).toEqual([]);
   });
@@ -708,7 +765,7 @@ describe("applyThemeMode('system'): following the OS", () => {
     mqLight = true;
     document.dispatchEvent(new Event('visibilitychange'));
     window.dispatchEvent(new Event('focus'));
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(painted).toEqual([]);
   });
@@ -721,7 +778,7 @@ describe("applyThemeMode('system'): following the OS", () => {
     preferences.value = { status: 'loaded', data: { 'theme-mode': 'dark' } };
     applyThemeMode('dark');
     painted = [];
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(painted).toEqual([]);
   });
@@ -857,7 +914,7 @@ describe('retireWelcomeAfterUse: the welcome retires itself after enough threads
     expect(welcomeSuggestionsDismissed()).toBe(false);
   });
 
-  it('counts only top-level threads the user sent, not drafts, trigger runs or sub-threads', async () => {
+  it('counts only top-level threads the user sent, not drafts, trigger runs, sub-threads or Home', async () => {
     const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
 
     await retireWelcomeAfterUse([
@@ -866,6 +923,8 @@ describe('retireWelcomeAfterUse: the welcome retires itself after enough threads
       thread({ state: 'discarded' }),
       thread({ initiator: 'system' }),
       thread({ parentThreadId: 'parent' }),
+      // Boot makes Home with a user initiator (ADR 0411), so it is excluded by name.
+      thread({ home: true }),
     ]);
 
     expect(spy).not.toHaveBeenCalled();
@@ -1706,7 +1765,7 @@ describe('a stored background selection', () => {
   it('reads null for both halves while unset, whatever the keys it inherits hold', () => {
     preferences.value = {
       status: 'loaded',
-      data: { model_title: 'gemini-3.5-flash', reasoning_title: 'low' },
+      data: { model_title: 'gemini-3.8-flash', reasoning_title: 'low' },
     };
     expect(storedBackgroundSelection('model_change_summary', 'reasoning_change_summary'))
       .toEqual({ model: null, effort: null });

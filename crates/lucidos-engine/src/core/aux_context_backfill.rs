@@ -244,17 +244,13 @@ async fn image_describe_calls(
 /// instruction. The payload is a superset of the extracted text, so this one
 /// slightly over-counts where every other unknown under-counts.
 ///
-/// `memory_entries` is created at runtime by `MemoryIndex::init_schema`, not
-/// by a migration, so a workspace that never loaded an embedding model has no
-/// such table. That is an absence of memory calls, not a failure.
+/// A workspace with no `memory_entries` table made no memory calls, which is
+/// not a failure.
 async fn memory_calls(
     pool: &PgPool,
     until: DateTime<Utc>,
 ) -> Result<Vec<Reconstruction>, sqlx::Error> {
-    let indexed: bool = sqlx::query_scalar("SELECT to_regclass('memory_entries') IS NOT NULL")
-        .fetch_one(pool)
-        .await?;
-    if !indexed {
+    if !crate::memory::pgvector::PgVectorIndex::table_exists(pool).await? {
         return Ok(vec![]);
     }
     let rows: Vec<(Uuid, Uuid, DateTime<Utc>, i32)> = sqlx::query_as(

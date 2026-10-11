@@ -17,9 +17,9 @@
  * `360` they replace at a 16px root.
  *
  * The cost of deriving them is that the three no longer fit every window: they
- * sum to 1010px at 100% ui-scale, 1182 at 125%, 1355 at 150% and 1535 at 175%,
+ * sum to 1018px at 100% ui-scale, 1192 at 125%, 1367 at 150% and 1541 at 175%,
  * so from 150% on a 1280px screen `clampSplitRatio`'s empty-range branch is what
- * the user actually meets (137.5%, the step below, still fits at 1269). That
+ * the user actually meets (137.5%, the step below, just fits at 1280). That
  * branch is load-bearing, not a corner. Those sums hold on every desktop client,
  * because neither derived floor varies by build (see `computeMinDrawerWidth`
  * and `computeMinThreadPaneWidth`).
@@ -31,13 +31,11 @@
 import { getRemPx } from '../utils/dom';
 
 /** One control at an end of the threads header's row, in rem: a button and its
- *  gap. The leading end holds one, the drawer toggle resting over the row; the
- *  trailing end holds two, Filter and Search. Mirrors `.threads-header` in
- *  styles/panels/shell.css (`--header-icon-box` and `--pane-header-gap`). */
+ *  gap. Each end holds two. The leading end is the drawer toggle resting over
+ *  the row, then Filter; the trailing end is Grouping and Search. Mirrors
+ *  `.threads-header` in styles/panels/shell.css (`--header-icon-box` and
+ *  `--pane-header-gap`). */
 const DRAWER_ROW_BUTTON_REM = 2.25 + 0.25;
-/** The title's own room, in rem: wide enough to stay a title rather than an
- *  ellipsis. */
-const DRAWER_ROW_TITLE_REM = 4.5;
 /** The row's own trailing padding, in rem: `.threads-header`'s `0.5rem`. */
 const DRAWER_ROW_PAD_REM = 0.5;
 /** Fallback for the traffic-lights reserve if the property cannot be read (it
@@ -78,11 +76,12 @@ const MIN_CONTENT_PANE_REM = 22.5;
  *  header row is sized around. Pure, so the arithmetic is testable without a
  *  layout engine; the DOM read lives in `minDrawerWidth` below.
  *
- *  The row is sized around a title centred on the PANE (`.threads-header-title`
- *  in styles/panels/shell.css), not on the gap between the controls flanking
- *  it, so the title clears the WIDER of the row's two ends on BOTH sides and the
- *  floor is symmetric: `2 * side + title`. The leading end is the lead plus the
- *  drawer toggle; the trailing end is the padding plus Filter and Search.
+ *  The row centres its title on the PANE (`.threads-header-title` in
+ *  styles/panels/shell.css). So the title clears the WIDER of the row's two
+ *  ends on BOTH sides, and the floor is symmetric: `2 * side`. The leading end
+ *  is the lead plus the toggle and Filter; the trailing end is the padding plus
+ *  Grouping and Search. The floor keeps no room for the title: a title that
+ *  does not fit hides (`ThreadsPaneTitle`), so the controls are what must fit.
  *
  *  ONE floor for every desktop client: its only caller passes the traffic-lights
  *  reserve as the lead, on the web build that has no lights too (ADR 0058). That
@@ -96,14 +95,13 @@ const MIN_CONTENT_PANE_REM = 22.5;
  *  there paints against a light that is not there.
  *
  *  The reserve is PX (the lights are OS chrome and do not scale with our root
- *  font size) while everything else here is rem. So above about 166% ui-scale
- *  the all-rem trailing end is the wider one, and it sets the floor. It also
- *  covers the web row's leading end at every root: 0.5rem plus a button is
- *  always narrower than the padding plus two. */
+ *  font size) while everything else here is rem. Both ends hold two buttons,
+ *  and the reserve outweighs the trailing end's 0.5rem padding. So the leading
+ *  end sets the floor at every scale a user can pick. */
 export function computeMinDrawerWidth(remPx: number, leadPx: number): number {
-  const leadEndPx = leadPx + DRAWER_ROW_BUTTON_REM * remPx;
+  const leadEndPx = leadPx + 2 * DRAWER_ROW_BUTTON_REM * remPx;
   const trailEndPx = (DRAWER_ROW_PAD_REM + 2 * DRAWER_ROW_BUTTON_REM) * remPx;
-  return Math.ceil(2 * Math.max(leadEndPx, trailEndPx) + DRAWER_ROW_TITLE_REM * remPx);
+  return Math.ceil(2 * Math.max(leadEndPx, trailEndPx));
 }
 
 /** The lead both derived floors are sized around, read from CSS rather than
@@ -150,7 +148,7 @@ export function computeMinThreadPaneWidth(remPx: number, leadPx: number, homeSho
 /** Floor for the Conversation pane, at the CURRENT root font size. Reads the
  *  same lead the drawer's floor does, and by the same rule: the reserve decides
  *  how the row is LAID OUT, not how narrow the pane may get. Home leads the row
- *  only while the experimental switch is on, so its box counts only then. */
+ *  once the thread list carries it, so its box counts from then. */
 export function minThreadPanePx(): number {
   const homeShown = document.querySelector('.desktop-header .pane-header-brand > .home-thread-btn') !== null;
   return computeMinThreadPaneWidth(getRemPx(), titlebarLightsReservePx(), homeShown);

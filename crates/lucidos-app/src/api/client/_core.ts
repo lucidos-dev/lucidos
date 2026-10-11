@@ -229,6 +229,23 @@ export async function throwIfNotOk(res: Response): Promise<void> {
   );
 }
 
+/** Throw when a `200` body reports `{success: false}`, and return it otherwise.
+ *
+ *  Some engine handlers answer a refusal with `200 {success: false, error}`
+ *  rather than a 4xx, so `throwIfNotOk` passes it. A caller that ignores the
+ *  flag then reads the refusal as a save that worked.
+ *
+ *  A plain Error, not an `ApiError`: the HTTP call succeeded, so there is no
+ *  failing status to carry. `isTransientFetchError` reads it as a verdict, so
+ *  nothing retries it. */
+export function throwIfRefused<T extends { success: boolean; error?: string }>(
+  result: T,
+  fallback: string,
+): T {
+  if (!result.success) throw new Error(result.error || fallback);
+  return result;
+}
+
 /** AbortSignal.timeout fires with a TimeoutError DOMException, so errorDetail
  *  can distinguish it from a manual AbortError. When the caller supplies its
  *  own `init.signal` (e.g. for cancellable searches), it's composed with the

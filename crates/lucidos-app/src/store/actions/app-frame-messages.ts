@@ -1,5 +1,6 @@
 /** The host chrome an app frame can ask for: confirm, prompt, toast, file
- *  preview, pull to refresh, and the ready signal.
+ *  preview, pull to refresh, the ready signal, a widget's size and presses, and one
+ *  sound at a time.
  *
  *  Installed by shell startup, before `<App/>` first renders, so before any
  *  app frame can exist to ask (ADR 0288). The frame bridge that answers engine
@@ -12,6 +13,8 @@ import { openFilePreviewModal, filePreviewRequestError, filePreviewBlockedReason
 import { handleAppToastMessage } from './app-toast-bridge';
 import { handleAppPullMessage } from './app-pull-bridge';
 import { handleAppReadyMessage } from './app-ready-bridge';
+import { handleWidgetFrameMessage } from './widget-frame-bridge';
+import { handleAppSoundMessage, watchShellSound } from './app-sound-bridge';
 
 /** Answer every app frame message the host chrome handles. Returns the
  *  teardown. */
@@ -19,10 +22,16 @@ export function installAppFrameMessages(): () => void {
   window.addEventListener('message', onAppFrameMessage);
   window.addEventListener('message', handleAppPullMessage);
   window.addEventListener('message', handleAppReadyMessage);
+  window.addEventListener('message', handleWidgetFrameMessage);
+  window.addEventListener('message', handleAppSoundMessage);
+  const unwatchShellSound = watchShellSound();
   return () => {
     window.removeEventListener('message', onAppFrameMessage);
     window.removeEventListener('message', handleAppPullMessage);
     window.removeEventListener('message', handleAppReadyMessage);
+    window.removeEventListener('message', handleWidgetFrameMessage);
+    window.removeEventListener('message', handleAppSoundMessage);
+    unwatchShellSound();
   };
 }
 

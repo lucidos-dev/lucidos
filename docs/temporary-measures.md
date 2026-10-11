@@ -59,6 +59,43 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### Shared-fetch reload of app frames
+
+- **Added:** 2026-10-10
+- **Lives in:** `crates/lucidos-app/src/components/apps/appFrameSharedLoads.ts`,
+  wired into `AppFrame.tsx`. Pinned by
+  `components/apps/__tests__/app-frame-shared-loads.test.tsx`.
+- **Impermanent because:** WebKit shares one in-flight fetch of a subresource
+  between frames, owned by the frame that started it. Removing that frame mid-load
+  fails the fetch for every frame still waiting. Every app frame loads the SDK
+  script and stylesheet, so a sibling drew unstyled HTML with no SDK. Seen on
+  iPhone as a white sound player in a reply that held three of them. Chromium
+  fetches per frame and never hits it.
+- **Removal / resolution condition:** the canary
+  `crates/lucidos-app/e2e/webkit-shared-fetch-canary-mobile.spec.ts` fails its
+  first test on `mobile-webkit`, because the siblings keep their files or no
+  longer share the fetch. Verify the same on iOS Safari, then delete the module, its wiring in `AppFrame.tsx`,
+  its unit test and the canary.
+- **Status:** `active`.
+- **Investigation:** none.
+
+### Stale debug object prune
+
+- **Added:** 2026-10-10
+- **Lives in:** `prune_stale_debug_objects` in `scripts/lib/stale_objects.sh`,
+  called by `build_or_find_engine` in `scripts/lib/workspace.sh`.
+- **Impermanent because:** cargo and rustc never delete superseded debug
+  object generations under unpacked split-debuginfo. The pile made Gatekeeper's
+  check on each proc-macro load take minutes (ADR 0408).
+- **Removal / resolution condition:** a cargo build of a binary no longer
+  leaves its previous `.rcgu.o` generation in `target/<profile>/deps`. Verify on
+  a toolchain bump: build the engine twice with one edit in between, then count
+  the generations of `lucidos_engine-*` objects. One generation means upstream
+  cleans up, so delete the library, its test, its call sites and the
+  `dev-runtime.md` bullet.
+- **Status:** `active`.
+- **Investigation:** none.
+
 ### Left-packed button rows awaiting the sweep
 
 - **Added:** 2026-10-03
@@ -159,6 +196,29 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   imports it needs.
 - **Status:** active
 - **Investigation:** `ios-keyboard-reveal-placement`
+
+### Page health log
+
+- **Added:** 2026-10-10
+- **Lives in:** `crates/lucidos-app/src/utils/pageHealthLog.ts` (the
+  counters), `pageHealthLog.report.ts` (the reporter), their test, and
+  `pageHealthLog.install.ts`. `main.tsx` imports the install file second, and
+  `shellStartup.ts` calls `startPageHealthLog`.
+- **Impermanent because:** pure telemetry chasing a bug. On the iOS PWA, text
+  editing degrades over a long session: the edit menu (Paste) mostly stops
+  opening and caret moves lag, in the composer and in Search Everywhere alike. A
+  relaunch fixes it, and Safari on other sites is fine. The emulator does not
+  reproduce it, and a session-leak probe there found nothing piling up. So a
+  touch device writes one `[Client/page-health]` line every 30 s while visible:
+  main-thread lag, frame rate, animation-frame calls, DOM size, animations,
+  live listeners, intervals and observers.
+- **Removal / resolution condition:** the trend across a degraded session
+  names the cause and that cause is fixed, or two months pass with no episode.
+  Verify by confirming no open work reads the line. Then delete both modules,
+  the test, the install file, its import in `main.tsx`, and the call in
+  `shellStartup.ts`.
+- **Status:** active
+- **Investigation:** none.
 
 ### Toast press probe
 
@@ -1050,7 +1110,11 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   and `retry_while_repo_contended` re-stages. Add an engine test where a delete
   lands between `commit_all_dirty`'s staging and its commit, and asserts HEAD
   keeps the deletion. Then drop the loop and keep only the deletes.
-- **Status:** open
+- **Status:** removed 2026-10-10. `reset_index_to_head` now returns an
+  `IndexBase`, and every `commit_*` helper takes it as the only parent, so a
+  moved HEAD is refused and retried. `a_deletion_landing_mid_full_tree_commit_stays_deleted`
+  in `core/mod_tests.rs` is the named test. The settle loop is gone and
+  `remove_data_fixtures` keeps only the deletes.
 
 ### iOS-PWA liveness diagnostic
 
@@ -1428,7 +1492,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-08-07
 - **Lives in:** `build_file_list_section`
-  (`crates/lucidos-engine/src/engine/chat/process/workspace_payload.rs`), the
+  (`crates/lucidos-engine/src/engine/chat/process/workspace_prompt_footprint.rs`), the
   trailing advisory emitted whenever the workspace holds a vendored file. The
   block itself is never partial: it is an inventory or nothing (ADR 0086 as
   amended), and vendored paths are the one thing it names by count instead.
@@ -1650,7 +1714,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   - `system-knowhow/building-an-app.md`, the "Inline `<script>` and `<style>`,
     at any size" bullet. It REPLACED two bullets of permanent advice, about
     splitting a script past 100 lines and about external CSS for shared design.
-  - `system-knowhow/workspace-audit.md` check 2, the "The app's own files,
+  - `system-knowhow/workspace-audit/apps.md`, the "The app's own files,
     loaded as a separate subresource" bullet, plus the exempt-asset sentence
     above it.
 - **Impermanent because:** an app frame is opaque-origin (ADR 0227), so the
@@ -1804,6 +1868,37 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** n/a. An upstream gap with a checkable repro.
 
+### A progress note stands in for the text before a tool call
+
+- **Added:** 2026-10-08. Plan:
+  `docs/plans/2026-10-08-a-progress-note-never-stands-in-for-the-answer.md`.
+- **Lives in:** four sites.
+  - `LlmResponse::progress_notes`, filled by `parse_claude_stream` in
+    `llm/anthropic_wire.rs`.
+  - `instruction_after_round` in `engine/agentic_loop/helpers.rs`, called
+    from `agentic_loop/run.rs`.
+  - `Refusal::NoteShownAsSummary` in `engine/question_card_gate.rs`.
+  - The `progress_note` flag on `CodingAgentTextStreamed`, written by
+    `AgentEvent::ProgressNote` and `CodingAgentTextBuffer::flush_progress_note`.
+- **Impermanent because (works around):** the always-thinking models are Opus
+  5.5, Sonnet 5.5 and Fable 5.x. On them, longer text written before a tool
+  call comes back only as a provider-written summary. The full text is billed
+  but never returned. The agent reads its own text back in full, or reads the
+  summary as its own words, and believes the user saw it.
+
+  A chat agent on Opus 5.5 said
+  "I've laid out the cancellation steps here" before a card. No steps ever
+  reached the user. Public reports: claude-code issues #96288, #95764 and
+  #74558.
+- **Removal / resolution condition:** the provider returns text written before
+  a tool call in full, as a `text` block or under some `display` value. That
+  must hold for every model in the registry whose thinking mode is always-on. Verify with a
+  stream on each: three paragraphs of prose, then a tool call. When the prose
+  arrives whole, delete the four sites, their tests, the refusal text and this
+  entry's glossary paragraph.
+- **Status:** active
+- **Investigation:** n/a. An upstream behaviour with a checkable repro.
+
 ### Lucidos-source skill skip-worktree repair
 
 - **Added:** 2026-09-25. Plan:
@@ -1863,6 +1958,58 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** open
 
 ---
+
+### Retired entry kind tags in verbatim nodes
+
+- **Added:** 2026-10-08
+- **Lives in:** `engine/summary_tree/compactor.rs`: `RETIRED_TAGS`,
+  `carries_retired_tag`, `names_another_sender`, `with_ancestors`, and the
+  leaf half of `rederive_verbatim`.
+- **Impermanent because:** The entry kinds were renamed (ADR 0362, amendment
+  "the compactor follows OptChat revision 3c190e06"). A node no model wrote
+  holds its source verbatim. So a tree built before the rename stores `user:`,
+  `talk:`, `tool:`, `echo:` and `work:` lines that a rebuild would not write. Each drain re-reads only those leaves, so the check stays
+  cheap, and once they are rewritten nothing matches.
+- **Removal / resolution condition:** On a workspace, no verbatim node carries
+  a retired tag, except those too long to rewrite. The drain logs those as
+  "no longer fit a node". Check with
+  `SELECT count(*) FROM summary_tree_nodes WHERE model IS NULL AND text ~ '(^|\n)(user|talk|tool|echo|work): '`
+  against the logged count. Then delete `RETIRED_TAGS`,
+  `carries_retired_tag`, `names_another_sender` and `with_ancestors`. Keep the
+  merge half of `rederive_verbatim`, which holds for any rename.
+- **Status:** active.
+- **Investigation:** none.
+
+### Pane strip scroll reset
+
+- **Added:** 2026-10-09
+- **Lives in:** the `scroll` listener on the strip in
+  `crates/lucidos-app/src/components/layout/MobileSwipeContainer.tsx`, and the
+  `overflow: hidden` fallback before `overflow: clip` on
+  `.mobile-swipe-container` in `crates/lucidos-app/src/styles/mobile.css`.
+- **Impermanent because:** `overflow: clip` makes the strip no scroll
+  container, so a focus() or a scroll into view cannot slide the panes off
+  their transform. Two engines still treat it as one: WebKit before Safari 16
+  drops `clip`, and the packaged macOS webview makes a `clip` box scrollable
+  (see `.pane-header-brand` in `styles/panels/shell.css`). There the listener
+  puts `scrollLeft` back, a frame late.
+- **Removal / resolution condition:** Both halves hold:
+  - The packaged macOS webview stops scrolling a `clip` box. Playwright cannot
+    drive that webview (ADR 0016), so check by hand. Open the packaged app at
+    a narrow window, open Settings > Appearance, and run the spec's
+    `scrollIntoView` snippet in Web Inspector. The strip's `scrollLeft` must
+    read 0.
+  - Every supported WebKit has `clip` (Safari 16). The tree declares a macOS
+    floor only, `minimumSystemVersion` in `crates/lucidos-app/tauri.conf.json`,
+    so record an iOS floor there or in `README.md` first.
+
+  Then delete the listener and the `hidden` line. Drop the fallback clause
+  from the clip guard in
+  `components/layout/__tests__/mobile-swipe-container-clip.test.ts`.
+- **Status:** removed 2026-10-10. Under `clip` iOS stopped opening the prompt
+  box's edit menu, so the strip went back to `overflow: hidden` (ADR 0420).
+  The listener stays as the permanent answer, and the e2e clip spec is gone.
+- **Investigation:** none.
 
 ## 2. Model-tolerance measures
 
@@ -2343,7 +2490,9 @@ condition; fix the condition rather than acting on it.
   `docs/plans/2026-10-06-chat-pictures-go-in-the-card-message.md`. Widened
   on 2026-10-07 from pictures to every saved artifact: any other file needs
   its link in the words or on the card. No plan: the incident is under
-  "after a saved page" below.
+  "after a saved page" below. Narrowed later on 2026-10-07: text typed into
+  a card counts as a message, so both typed-answer refusals are gone. See
+  "A typed answer is a message" below.
 - **Lives in:** `crates/lucidos-engine/src/engine/question_card_gate.rs`
   (rule, query, refusal text, tests in the sibling `_tests.rs`). The chat
   loop calls it in `agentic_loop/run.rs`. Coding agents reach it through
@@ -2356,9 +2505,10 @@ condition; fix the condition rather than acting on it.
   - **Chat, after tool work.** Asked what the next patch would contain, the
     agent ran `git log`, then asked "How do you want to continue?". The answer
     lived only in option text.
-  - **Claude Code, after a typed reply.** The user typed a question into a
+  - **Claude Code, after a typed answer.** The user typed a question into a
     plan card and got "With that answered: approve the plan?", with no answer
-    and no tool call in between.
+    and no tool call in between. No longer refused: see "A typed answer is a
+    message" below.
   - **Claude Code on Opus 5.5, pointing above.** The card asked about "the
     card copy above". The agent had drafted it in its reasoning, and only a
     224-character progress note reached the user. A chat card offered "the
@@ -2374,7 +2524,8 @@ condition; fix the condition rather than acting on it.
     refund message, the agent said "here it is now" four times. The message
     stayed in its reasoning, and each card followed a note under 400
     characters. The agent reads its own reasoning back, so it believed it
-    had sent it.
+    had sent it. No longer refused: see "A typed answer is a message"
+    below.
   - **Chat on Opus 5.5, after a picture it looked at.** Twice, the agent
     rendered tee mockups with `run_python`, opened them with `read_file`, and
     asked which layout. Each card followed a one-line summary with no
@@ -2384,8 +2535,8 @@ condition; fix the condition rather than acting on it.
 
   `ASK_USER_QUESTION_RULE` already said "answer first", and
   `REASONING_NOT_VISIBLE_RULE` said the reasoning is not shown, so guidance
-  alone failed. The gate refuses such a card once per user input, plus once
-  more for an unseen artifact. A card that says "above" counts when every word
+  alone failed. The gate refuses a card in the remaining shapes once per user
+  input, plus once more for an unseen artifact. A card that says "above" counts when every word
   since the input is note-sized, under 600 characters. An artifact counts when
   this thread saved it under `artifacts/` through the data API since the
   input. It must then appear as a markdown target in the words or on the
@@ -2401,11 +2552,19 @@ condition; fix the condition rather than acting on it.
   a chat thread where steps with links, written before a card, reached the
   user twice as a one-line note.
 
-  In chat, a typed reply counts as unanswered when the round wrote only
-  progress notes (`LlmResponse::content_is_progress_notes`) and every word
-  since is note-sized. An unseen artifact outranks every other reason. A third
+  An unseen artifact outranks every other reason. A third
   session spent the one refusal on unreported work, the render that made the
   picture, and its retry passed without the picture.
+
+  The `message` did not hold on its own. On 2026-10-08 a chat agent on Opus
+  5.5 wrote cancellation steps before a card with no `message`. The user got
+  only the provider's one-line summary, which beat the length rule.
+
+  So a card raised right after a *progress note* with no
+  `message` is now refused, quoting the summary. The stream marks the note, so
+  nothing is guessed. Claude Code cards follow the same rule through the
+  `progress_note` flag. See § "A progress note stands in for the text before a
+  tool call".
 
   The gate itself caused the next loss. A Claude Code agent put its findings
   and both pictures in a card question 1,300 characters long. The gate refused
@@ -2413,7 +2572,7 @@ condition; fix the condition rather than acting on it.
   re-sent the card without the pictures, and that retry passed.
 
   So a card question of at least 600 characters now reports the tool work
-  before it. It answers no typed reply, since a re-sent card reads the same.
+  before it.
   Option text never counts, since the first chat case hid its answer there.
   The artifact check also runs after a refusal of any other kind, at most once
   per input. So one input can draw two refusals, and never more.
@@ -2423,19 +2582,22 @@ condition; fix the condition rather than acting on it.
   a new message. It then asked the user to resend a reply it had already
   acted on.
 
-  The notes-only refusal once said to end the turn with no card. Users often
-  type a new request into a card instead of answering it, and the agent then
-  dropped its questions about that request. It now moves the reply onto the
-  card and sends the card again.
+  **A typed answer is a message.** Users often type a counter-question, a
+  correction or something unrelated into a card instead of answering it. The
+  gate once refused a card after a typed answer in two cases: no words back,
+  or only a progress note back. Both read the typed text as an answer owed a
+  reply. On 2026-10-07 a chat agent re-asked after a typed correction and drew
+  a visible "Failed" step, so both cases were removed. The note that follows
+  a typed answer (`TYPED_REPLY_NOTE` in `agent_question.rs`) now routes the
+  agent's response into the card's `message` field instead.
 
   Before 2026-09-23 a refusal could also mean the agent did answer, invisibly.
   See § "Text before a tool call arrives as hidden reasoning", now removed.
   Refusals from Claude Code sessions before that date overstate model mistakes.
 - **Removal / resolution condition:** in a per-workspace audit, count question
-  cards raised after a typed reply or after tool work since the last input.
-  Add cards that say "above" after note-sized words, and cards after a saved
-  artifact. That is the denominator. A chat card after a typed reply with only
-  notes since is already among the first group.
+  cards raised after tool work since the last input. Add cards that say
+  "above" after note-sized words, and cards after a saved artifact. That is
+  the denominator.
   Count refusals among them: tool-result rows
   (`ToolResult` or `CodingAgentToolResult`) with "Question card not shown." in
   their first 200 chars, the gate's own window (`REFUSAL_WINDOW_CHARS`). A
@@ -2615,7 +2777,11 @@ event that retires it.
   flips the default to on. One release after that, delete the key, the gate
   and the filter, so every workspace has its home thread again. Verify from
   the tree: no `home_thread_enabled` outside this row and the ADRs.
-- **Status:** open
+- **Status:** removed 2026-10-10. ADR 0411 graduated the home thread and
+  removed the switch outright, with no release in between: every workspace
+  has Home. The catalog entry, the gate, `home_visible_sql`, the voice refusal
+  and the Experimental section are gone. A migration deletes stored rows, and
+  a write of the key is refused (`RETIRED_KEYS`).
 
 ### `self_curated_context_mode` flag (ADR 0085)
 
@@ -2693,7 +2859,7 @@ event that retires it.
   `system-knowhow/**` grep was clean. A fleet-wide "no recipe passes it" is
   unverifiable, so it was NOT part of the condition. Instead the removal ships a
   release notice whose action runs a workspace audit. The audit flags
-  `spawn-thread --parent` (`system-knowhow/workspace-audit.md`), so each install
+  `spawn-thread --parent` (`system-knowhow/workspace-audit/cross-cutting.md`), so each install
   catches its own stragglers.
 - **Status:** removed
 
@@ -2854,6 +3020,23 @@ event that retires it.
   dropping them makes an old workspace's triggers vanish at boot.
 - **Status:** active
 
+### Retired drawer keys cleared at load
+
+- **Added:** 2026-10-08
+- **Lives in:** `crates/lucidos-app/src/store/effects.ts`, the
+  `localStorage.removeItem` calls for `lucidos-alt-view` and
+  `lucidos-drawer-open-status-group`.
+- **Impermanent because:** A one-shot purge of keys nothing writes any more.
+  The drawer grouping (ADR 0393) replaced the status filter that wrote the
+  first. The Ongoing rename (ADR 0394) retired the second, the Status
+  grouping's open group. Without the purge, a stale value would sit in every
+  browser that used them. It is a no-op on every load after the first.
+- **Removal / resolution condition:** Drop the call once a release boundary has
+  passed after which no browser can still hold the key: every device that ran a
+  build before the grouping landed has loaded one since. Verify by checking
+  that no shipped build older than that boundary is still supported.
+- **Status:** active
+
 ### Superseded turn-control localStorage keys cleared at load
 
 - **Added:** 2026-08-11
@@ -2898,7 +3081,7 @@ event that retires it.
   `system-knowhow/**` grep was clean. A fleet-wide "no recipe passes it" is
   unverifiable, so it was NOT part of the condition. Instead the removal ships a
   release notice whose action runs a workspace audit. The audit flags `repo` on
-  `run_coding_agent` (`system-knowhow/workspace-audit.md`), so each install
+  `run_coding_agent` (`system-knowhow/workspace-audit/cross-cutting.md`), so each install
   catches its own stragglers.
 - **Status:** removed
 
@@ -3481,7 +3664,7 @@ measure now eligible for removal** — search this file for the id to find them 
 - **Removal / resolution condition:** the SDK carries a documented route for
   the storage half, or the decision is recorded that it will not. Verify from
   the tree: `system-knowhow/js-sdk.md` covers it, and
-  `system-knowhow/workspace-audit.md` check 2 recommends that route instead of
+  `system-knowhow/workspace-audit/apps.md` recommends that route instead of
   reporting the finding with none. Until then the audit names the break and
   stops there, which is the honest answer rather than a remedy that cannot run.
   The endpoint half is already verifiable that way: § `lucidos.request` and the

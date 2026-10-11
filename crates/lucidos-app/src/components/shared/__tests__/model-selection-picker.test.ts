@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import {
   modelStepCommit, modelStepOptions, pickerFocusTarget, pickerKeyAction,
-  pickerShowsFilter, providerStepCommit, providerStepOptions, tierStepOptions,
+  pickerShowsFilter, providerStepCommit, providerStepOptions, RECOMMENDED_TIER_BADGE,
+  tierStepOptions,
 } from '../ModelSelectionPicker';
-import type { ModelRow } from '../../../store/modelSelection';
+import { modelRows, type ModelRow } from '../../../store/modelSelection';
+import { LUCIDOS_TIER_VOCABULARY } from '../../../store/actions/models';
 
 const OPUS: ModelRow = {
   value: 'claude-opus-5[1m]',
@@ -84,6 +86,28 @@ describe('tierStepOptions', () => {
 
   it('is empty for a model with no tiers, so there is no step to open', () => {
     expect(tierStepOptions(IMAGEN)).toEqual([]);
+  });
+
+  it('leads with a Default row committing no tier, when the surface names one', () => {
+    const rows = tierStepOptions(OPUS, () => 'Default (High)');
+    expect(rows[0]).toEqual({ value: 'claude-opus-5[1m]|', label: 'Default (High)' });
+    expect(rows.slice(1).map((o) => o.label)).toEqual(['High', 'X-High']);
+    expect(tierStepOptions(IMAGEN, () => 'Default')).toEqual([]);
+  });
+
+  /** The recommended tier wears the badge; a model with none badges nothing. */
+  it('badges the tier the model choice recommends, and only that one', () => {
+    const choice = { value: 'gpt-6.1-sol', label: 'GPT-6.1 Sol', reasoningEfforts: ['low', 'medium', 'high'] };
+    const badges = (recommendedEffort?: string) => {
+      const [row] = modelRows([{ ...choice, recommendedEffort }], LUCIDOS_TIER_VOCABULARY);
+      return tierStepOptions(row).map((o) => [o.label, o.badge]);
+    };
+    expect(badges('low')).toEqual([
+      ['Low', RECOMMENDED_TIER_BADGE],
+      ['Med', undefined],
+      ['High', undefined],
+    ]);
+    expect(badges(undefined).every(([, badge]) => badge === undefined)).toBe(true);
   });
 });
 

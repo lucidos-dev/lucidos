@@ -1,7 +1,7 @@
 /**
  * The thread drawer showing its FILTER PANEL is a state of the drawer, and it
  * MUST survive a page reload the way every other drawer state does (the
- * selected view in `altView-persistence.test.ts`, the channel selection, the
+ * grouping in `drawer-grouping-persistence.test.ts`, the channel selection, the
  * drawer's own open/closed, its width). Without it, a reload drops the user out
  * of the filters they were editing and back onto the list, which on mobile is
  * the whole threads pane changing under them.

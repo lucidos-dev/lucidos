@@ -24,6 +24,7 @@ fn option(id: &str, label: &str, description: Option<&str>) -> QuestionOption {
         label: label.to_string(),
         description: description.map(str::to_string),
         preview: None,
+        widget: None,
     }
 }
 
@@ -48,11 +49,38 @@ fn ids(open: &[OpenDecision]) -> Vec<String> {
 // The choice sets
 // ---------------------------------------------------------------------------
 
+/// An owner approval card's Allow once is spendable authority, so only a tap
+/// on screen gives it (ADR 0387). Read aloud, the card keeps Don't allow and
+/// the caller's own words, and its choice ids still name the original options.
+#[test]
+fn an_owner_approval_card_offers_no_allow_once_aloud() {
+    let options = vec![
+        option("opt-0", crate::api::owner_approval::ALLOW_ONCE_LABEL, None),
+        option("opt-1", crate::api::owner_approval::DONT_ALLOW_LABEL, None),
+    ];
+    let decision =
+        OpenDecision::question("toolu_q0", "Let this thread act?", &options, false, true);
+    assert_eq!(
+        labels(&decision),
+        vec![
+            crate::api::owner_approval::DONT_ALLOW_LABEL,
+            THEIR_WORDS_LABEL
+        ]
+    );
+    assert_eq!(decision.choices[0].id, "question:toolu_q0#opt1");
+}
+
 /// The card's own options, plus the one the screen's prompt textarea stands in
 /// for. A free-text answer needs a choice, because the tool takes only an id.
 #[test]
 fn a_question_offers_its_options_and_one_for_their_own_words() {
-    let decision = OpenDecision::question("toolu_q0", "Do something now?", &two_options(), false);
+    let decision = OpenDecision::question(
+        "toolu_q0",
+        "Do something now?",
+        &two_options(),
+        false,
+        false,
+    );
     assert_eq!(
         labels(&decision),
         vec![
@@ -70,7 +98,7 @@ fn a_question_offers_its_options_and_one_for_their_own_words() {
 /// worth reading out.
 #[test]
 fn a_free_text_question_offers_only_their_own_words() {
-    let decision = OpenDecision::question("toolu_q1", "What should I call it?", &[], false);
+    let decision = OpenDecision::question("toolu_q1", "What should I call it?", &[], false, false);
     assert_eq!(labels(&decision), vec![THEIR_WORDS_LABEL]);
 }
 
@@ -78,7 +106,7 @@ fn a_free_text_question_offers_only_their_own_words() {
 /// belongs to before anything looks it up.
 #[test]
 fn every_choice_id_is_rooted_in_its_decisions_id() {
-    let decision = OpenDecision::question("toolu_q0", "Now?", &two_options(), false);
+    let decision = OpenDecision::question("toolu_q0", "Now?", &two_options(), false, false);
     assert_eq!(decision.id, "question:toolu_q0");
     for choice in &decision.choices {
         assert!(choice.id.starts_with("question:toolu_q0#"), "{}", choice.id);
@@ -91,7 +119,7 @@ fn every_choice_id_is_rooted_in_its_decisions_id() {
 #[test]
 fn a_choice_id_numbers_by_position_and_the_answer_carries_the_real_option_id() {
     let awkward = vec![option("weird#id", "Ship it", None)];
-    let decision = OpenDecision::question("toolu_q0", "Ready?", &awkward, false);
+    let decision = OpenDecision::question("toolu_q0", "Ready?", &awkward, false, false);
     assert_eq!(decision.choices[0].id, "question:toolu_q0#opt0");
     assert_eq!(
         decision.choices[0].act,
@@ -108,7 +136,7 @@ fn a_choice_id_numbers_by_position_and_the_answer_carries_the_real_option_id() {
 /// tool takes one id. Its answer still carries the shape that card accepts.
 #[test]
 fn a_multi_select_option_answers_in_the_shape_that_card_takes() {
-    let decision = OpenDecision::question("toolu_q0", "Which?", &two_options(), true);
+    let decision = OpenDecision::question("toolu_q0", "Which?", &two_options(), true, false);
     assert_eq!(
         decision.choices[0].act,
         Act::Answer {
@@ -126,7 +154,7 @@ fn a_multi_select_option_answers_in_the_shape_that_card_takes() {
 /// choice says so. Nothing promises a second id.
 #[test]
 fn picking_more_than_one_is_routed_through_their_own_words() {
-    let decision = OpenDecision::question("toolu_q0", "Which?", &two_options(), true);
+    let decision = OpenDecision::question("toolu_q0", "Which?", &two_options(), true, false);
     let their_words = decision.choices.last().expect("the last choice");
     assert_eq!(
         their_words.act,
@@ -147,6 +175,7 @@ fn the_question_survives_whole_and_a_long_description_does_not() {
         "toolu_q0",
         &long,
         &[option("opt-0", "Go", Some(&long))],
+        false,
         false,
     );
     assert_eq!(decision.prompt, long);
@@ -297,6 +326,7 @@ fn asks_the_caller(tool_use_id: &str) -> ThreadEvent {
         options: two_options(),
         worktree_path: None,
         multi_select: false,
+        owner_approval: None,
     }
 }
 

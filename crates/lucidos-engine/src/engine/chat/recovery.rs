@@ -334,6 +334,8 @@ const MAX_CHAT_SWITCH_RESUMES: usize = 16;
 /// * no newer `THREAD_START_EVENTS_SQL` event — the loop-breaker. `continue_chat`
 ///   emits `ContinuationStarted`, which is in that set, so a resume that dies before
 ///   producing anything else is not resumed a second time on the next boot.
+/// * the abort is the thread's newest `ResponseAborted`. The boot floor's
+///   withdrawal is a newer abort, so a promise it withdrew stays withdrawn.
 ///
 /// A question-parked thread needs no special case: the preserve guard means no abort
 /// was ever emitted for it, so it cannot match.
@@ -344,14 +346,11 @@ const MAX_CHAT_SWITCH_RESUMES: usize = 16;
 /// excluded for the same reason `ORPHAN_THREADS_SQL` excludes them: the user closed
 /// them, and resuming would revive the row.
 fn switch_resume_candidates_sql() -> String {
-    // GROUP BY (not DISTINCT) so the result is one row per THREAD. A thread with
-    // two unsuperseded switch aborts would otherwise yield two rows and drive
-    // `continue_chat` twice — harmless (the second is a no-op via that function's
-    // own idempotency check) but a duplicate-work path the query should not
-    // express. Oldest interruption first, so a boot resumes in the order the
+    // One row per thread: the unsuperseded clause admits only a thread's newest
+    // abort. Oldest interruption first, so a boot resumes in the order the
     // threads were interrupted.
     format!(
-        "SELECT e.aggregate_id::uuid AS thread_id, MAX(e.sequence) AS abort_sequence \
+        "SELECT e.aggregate_id::uuid AS thread_id, e.sequence AS abort_sequence \
          FROM events e \
          JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
          WHERE e.aggregate = 'thread' \
@@ -360,7 +359,6 @@ fn switch_resume_candidates_sql() -> String {
            AND t.archive_state != 'archived' \
            AND {abort} \
            AND {unsuperseded} \
-         GROUP BY e.aggregate_id \
          ORDER BY abort_sequence ASC",
         abort = crate::engine::agent_recovery::SWITCH_TEARDOWN_ABORT_SQL,
         unsuperseded = crate::engine::agent_recovery::switch_abort_unsuperseded_sql(

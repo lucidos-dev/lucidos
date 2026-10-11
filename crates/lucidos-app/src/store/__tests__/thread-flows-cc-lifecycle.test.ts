@@ -24,11 +24,8 @@ describe('CC thread follow-up: channel detection', () => {
         activeChildrenCount: 0,
         totalChildrenCount: 0,
         blockingDescendantCount: 0, attentionDescendantCount: 0,
-        codingAgentProposed: false,
-        codingAgentRequiresRestart: false,
-        codingAgentIncomplete: false,
+        codingAgentChangeState: { kind: 'none' },
         codingAgentIsExternalRepo: false,
-        codingAgentHasDiff: false,
         lastRevivedAt: '',
         state: 'active',
         latestTodoList: null,
@@ -66,11 +63,8 @@ describe('CC thread follow-up: channel detection', () => {
         activeChildrenCount: 0,
         totalChildrenCount: 0,
         blockingDescendantCount: 0, attentionDescendantCount: 0,
-        codingAgentProposed: false,
-        codingAgentRequiresRestart: false,
-        codingAgentIncomplete: false,
+        codingAgentChangeState: { kind: 'none' },
         codingAgentIsExternalRepo: false,
-        codingAgentHasDiff: false,
         lastRevivedAt: '',
         state: 'active',
         latestTodoList: null,
@@ -207,7 +201,7 @@ describe('MUST TEST 1: CC change proposal → apply/discard', () => {
       { type: 'SessionEnded' },
     ]);
 
-    // Status is idle; the pending change shows through codingAgentProposed
+    // Status is idle; the pending change shows through codingAgentChangeState
     const status = map.get(id)!.meta.status;
     expect(status).toBe('idle');
 

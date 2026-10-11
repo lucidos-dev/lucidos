@@ -285,6 +285,7 @@ describe('a marketplace mutation shows its own result', () => {
       files_count: 1,
       engine_compatible: true,
       status: 'available' as const,
+      media: { screenshots: [], videos: [], problems: [] },
     };
   }
 

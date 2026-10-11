@@ -520,6 +520,31 @@ fn ask_user_question_schema_parses_with_cc_parser() {
     assert!(!parsed[0].multi_select);
 }
 
+/// The chat tool has no `preview`, so an option's picture goes in its
+/// description, which the card renders as inline markdown.
+#[test]
+fn ask_user_question_schema_puts_an_option_picture_on_its_option() {
+    let tools = get_default_tools(&ToolCapabilities::all_open());
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::ASK_USER_QUESTION)
+        .expect("ask_user_question must be in the default chat tool set");
+    let schema_text = |pointer: &str| {
+        tool.parameters
+            .pointer(pointer)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("schema must describe {pointer}"))
+            .to_string()
+    };
+    let option_desc = schema_text(
+        "/properties/questions/items/properties/options/items/properties/description/description",
+    );
+    assert!(
+        option_desc.contains("this option's own picture") && option_desc.contains("!["),
+        "an option's description must invite that option's picture: {option_desc:?}"
+    );
+}
+
 /// The `tap` param in the `send_notification` tool schema is a structured
 /// `{kind, to?}` object (not an enum-of-strings) — see the locked plan-mode
 /// design. Verify the schema's `tap` property advertises type=object and the
@@ -1449,10 +1474,12 @@ const FROZEN_WIRE_ORDER: &[&str] = &[
     "manage_repositories",
     "mcp",
     "plugins",
+    "widgets",
     "navigate_ui",
     "save_thread_image",
     "view_image",
     "generate_image",
+    "request_read",
 ];
 
 /// The whole engine-authored array, in the order `chat::process::run` splices

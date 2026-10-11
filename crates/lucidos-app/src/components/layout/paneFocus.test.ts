@@ -222,7 +222,9 @@ describe('PANE_FOCUS_REGION', () => {
     // thread's transcript matches.
     expect(PANE_FOCUS_REGION.thread).toBe('.thread-view .thread-content');
     expect(PANE_FOCUS_REGION.content).toBe('.content-pane-body');
-    expect(PANE_FOCUS_REGION.drawer).toBe('.thread-drawer');
+    // The drawer's tree, never the pane. A child of the live list, so a
+    // leaving drawing's copy never matches.
+    expect(PANE_FOCUS_REGION.drawer).toBe('.thread-drawer-list > .thread-drawer-tree');
   });
 });
 
@@ -314,16 +316,16 @@ describe('visibleFocusables', () => {
   });
 
   it('counts the container itself when it is a tab stop', () => {
-    // The thread drawer is its own single tab stop (tabindex=0, role=tree).
-    // Without it, Tab in a status view bounces on "See all statuses" forever.
-    const drawer = document.createElement('div');
-    drawer.tabIndex = 0;
-    stubVisible(drawer);
+    // A stop that also holds controls, as a tree with a button inside would.
+    // Without it, Tab bounces on the control beside the stop forever.
+    const stop = document.createElement('div');
+    stop.tabIndex = 0;
+    stubVisible(stop);
     const link = document.createElement('button');
     stubVisible(link);
-    drawer.appendChild(link);
+    stop.appendChild(link);
 
-    expect(visibleFocusables(drawer)).toEqual([drawer, link]);
+    expect(visibleFocusables(stop)).toEqual([stop, link]);
   });
 
   it('skips a container removed from the tab order', () => {

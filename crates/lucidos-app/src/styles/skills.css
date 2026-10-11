@@ -7,11 +7,18 @@
     word-break: break-word;
 }
 
-/* App and trigger rows can grow tall (description, cron/event lists); the row
- * top-aligns its children, so pin the action buttons to the bottom edge. */
-.app-row .list-row-actions,
+/* Trigger rows can grow tall (cron/event lists); the row top-aligns its
+ * children, so pin the action buttons to the bottom edge. */
 .trigger-row .list-row-actions {
     align-self: flex-end;
+}
+
+/* On desktop an app row's actions sit level with its app icon and text
+ * block. A phone row stacks, with its actions bottom-right. */
+@media (--desktop-layout) {
+    .app-row .list-row-actions {
+        align-self: center;
+    }
 }
 
 /* Gated on the ROW's own width, not the viewport's. The two differ constantly on

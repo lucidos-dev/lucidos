@@ -49,8 +49,8 @@ function seedBoundaryBehindHugeTurn(): string {
   for (let i = 0; i < TOOL_CALLS; i++) steps.push(...callPair(row, messageId, `e2e-tool-${i}`, i));
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-      `VALUES ('${threadId}', 'E2E windowed transcript', 'claude_code', '${now}', 1, false, true, 'idle', 'archived', 'active', true, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', 'E2E windowed transcript', 'claude_code', '${now}', 1, false, true, 'idle', 'archived', 'active', true, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + [
       // The working turn: one prompt carrying every tool call as a step.
       `('${messageId}', 'MessageReceived', '{"text":"do the work","mode":"human","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
@@ -88,8 +88,8 @@ function seedTurnLongerThanAPage(): string {
   }
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-      `VALUES ('${threadId}', 'E2E paged transcript', 'claude_code', '${now}', 1, false, true, 'idle', 'archived', 'active', true, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', 'E2E paged transcript', 'claude_code', '${now}', 1, false, true, 'idle', 'archived', 'active', true, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + [
       // The ONLY boundary, and it sits more than a page behind the newest event.
       `('${messageId}', 'MessageReceived', '{"text":"${PROMPT_TEXT}","mode":"human","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
@@ -128,8 +128,8 @@ function seedThreadSeveralPagesLong(): string {
   }
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-      `VALUES ('${threadId}', 'E2E multi-page transcript', 'claude_code', '${new Date(base).toISOString()}', 1, false, true, 'idle', 'archived', 'active', true, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', 'E2E multi-page transcript', 'claude_code', '${new Date(base).toISOString()}', 1, false, true, 'idle', 'archived', 'active', true, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
   ].join(';\n'));
   return threadId;
@@ -171,8 +171,8 @@ function seedFragmentUnderOneShortTurn(): string {
   turn(LAST_TURN_TEXT, REPORTED_LAST_TURN_CALLS, 'last', true);
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-      `VALUES ('${threadId}', 'E2E fragment under one short turn', 'claude_code', '${new Date(base).toISOString()}', 2, false, true, 'idle', 'archived', 'active', true, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', 'E2E fragment under one short turn', 'claude_code', '${new Date(base).toISOString()}', 2, false, true, 'idle', 'archived', 'active', true, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
   ].join(';\n'));
   return threadId;
@@ -223,8 +223,8 @@ function seedSilentTurn(): string {
   for (let i = 0; i < SILENT_CALLS; i++) silentCall();
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-      `VALUES ('${threadId}', 'E2E silent turn', 'claude_code', '${new Date(base).toISOString()}', 1, false, true, 'idle', 'archived', 'active', true, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', 'E2E silent turn', 'claude_code', '${new Date(base).toISOString()}', 1, false, true, 'idle', 'archived', 'active', true, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
   ].join(';\n'));
   return threadId;

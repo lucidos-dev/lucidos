@@ -7,7 +7,11 @@ use super::*;
 pub(crate) use crate::engine::thread_events::{
     ActorMode, AnswerKind, EventChannel, EventMeta, MessageOrigin, SessionEndReason, ThreadEvent,
 };
-pub(crate) use crate::test_support::{setup_test_db, start_cc_session, teardown_test_db};
+pub(crate) use crate::engine::thread_lifecycle::CodingAgentChangeState;
+pub(crate) use crate::test_support::{
+    read_change_state, read_change_state_kind, seed_change_state, setup_test_db, start_cc_session,
+    teardown_test_db,
+};
 
 /// Create a parent Chat thread and a child thread, returning (parent_id, child_id).
 async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uuid, Uuid) {
@@ -225,7 +229,7 @@ async fn wait_until_blocked_on_locks(pool: &PgPool, n: i64) {
 
 /// Helper: emit CodingAgentIdled with the given flags. When `has_changes=true`,
 /// also emits a synthetic `ChangeProposed` to mirror the production CC
-/// lifecycle (idle → propose). `coding_agent_proposed` follows the pending
+/// lifecycle (idle → propose). The `proposed` change state follows the pending
 /// `changes` row that proposal writes. [`emit_cc_idled`] is the idle alone.
 async fn emit_cc_idle(
     bus: &EventBus,
@@ -344,15 +348,18 @@ async fn emit_change_proposed_per_commit(
     .unwrap();
 }
 
-/// Seed `thread_summaries.coding_agent_has_diff = TRUE` directly. In production
-/// `session_seed` sets this against on-disk git reality; tests that need it as
-/// a precondition (without going through the seed sweep) flip it manually.
-async fn force_has_diff(pool: &sqlx::PgPool, thread_id: Uuid) {
-    sqlx::query("UPDATE thread_summaries SET coding_agent_has_diff = TRUE WHERE thread_id = $1")
-        .bind(thread_id)
-        .execute(pool)
-        .await
-        .unwrap();
+/// Record that `thread_id`'s branch holds work, through the same SET fragment
+/// every branch-fact writer uses. In production `session_seed` writes it from
+/// on-disk git; tests that need it as a precondition write it directly.
+async fn force_branch_work(pool: &sqlx::PgPool, thread_id: Uuid) {
+    sqlx::query(&format!(
+        "UPDATE thread_summaries SET {} WHERE thread_id = $1",
+        crate::engine::event_bus::branch_work_sql("TRUE")
+    ))
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// Read `blocking_descendant_count` for `thread_id`.
@@ -509,12 +516,12 @@ async fn emit_cc_recovery_pair(bus: &EventBus, child_id: Uuid) {
 mod active_children_count;
 mod ancestor_rebroadcast;
 mod blocking_attention_counts;
+mod branch_work_and_actor;
 mod change_apply_archive;
 mod command_permission;
 mod committed_horizon;
 mod crash_cut_child;
 mod fan_out_callback;
-mod has_diff_and_actor;
 mod has_response;
 mod idle_reconcile_counts;
 mod initiator_actor;
@@ -522,10 +529,12 @@ mod live_event_waits;
 mod origin_and_resume;
 mod parked_question_delivery;
 mod parked_thread_archive;
+mod pending_change_watch;
 mod per_thread_commit_order;
 mod pinned_is_never_archived;
 mod proposal_follows_changes;
 mod proposed_apply_cycle;
+mod read_request;
 mod recovery_and_pipeline;
 mod recursion_guard;
 mod repo_names_projection;

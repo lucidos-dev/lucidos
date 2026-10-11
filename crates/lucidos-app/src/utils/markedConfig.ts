@@ -1,8 +1,7 @@
 import { marked } from 'marked';
 import type { Tokens } from 'marked';
-
-const COPY_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M3 10.5V3a1.5 1.5 0 0 1 1.5-1.5H10"/></svg>';
-const CHECK_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5 8.5 6.5 11.5 12.5 4.5"/></svg>';
+import { widgetEmbedAtStart, type EmbedMatch } from './widgetEmbed';
+import { COPY_ICON } from './copyIcons';
 
 export function escapeHtmlAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -27,13 +26,33 @@ export const COPY_ID_NONCE = ((): string => {
 /** Marks a code block this renderer wrote, so its Copy button gets a payload. */
 export const CODE_COPY_ATTR = 'data-code-copy';
 
+/** A language name, then only `key=value` or `{...}` attributes:
+ *  `python`, `c++`, `js title="a.js" lines=2`, `go {linenos=true}`. */
+const LANGUAGE_INFO = /^([\w#+.-]+)(?:\s+(?:[\w-]+=(?:"[^"]*"|'[^']*'|[^\s"']\S*)|\{[^{}]*\}))*$/;
+
+/** The opening fence and its indent, ahead of the info string. */
+const OPENING_FENCE = /^ {0,3}(?:`{3,}|~{3,})/;
+
+/** CommonMark names the language by the info string's first word. Any other
+ *  info string is code on the opening fence line, as Slack allows. That line
+ *  is then the block's first line, taken from `raw`, because marked strips
+ *  backslash escapes from `lang`. */
+function splitInfoString(info: string, raw: string): { lang: string; firstLine: string } {
+  if (!info) return { lang: '', firstLine: '' };
+  const language = LANGUAGE_INFO.exec(info)?.[1];
+  return language
+    ? { lang: language, firstLine: '' }
+    : { lang: '', firstLine: raw.split('\n', 1)[0].replace(OPENING_FENCE, '').trim() };
+}
+
 const renderer = new marked.Renderer();
-renderer.code = ({ text, lang, escaped }: Tokens.Code) => {
+renderer.code = ({ text, lang: info = '', escaped, raw }: Tokens.Code) => {
+  const { lang, firstLine } = splitInfoString(info, raw);
   const langLabel = lang ? `<span class="code-block-lang">${escapeHtmlAttr(lang)}</span>` : '';
-  const body = escaped ? text : escapeHtmlAttr(text);
-  // Lang label + copy button share one .code-block-header overlay — see
-  // chat.css `.code-block-header` for why this structure (not two absolute
-  // siblings of <pre>).
+  const body = [escapeHtmlAttr(firstLine), escaped ? text : escapeHtmlAttr(text)].filter(Boolean).join('\n');
+  // Lang label + copy button share one .code-block-header overlay. See
+  // `.code-block-header` in styles/chat/response.css for why this structure
+  // (not two absolute siblings of <pre>).
   return `<div class="code-block-wrapper" ${CODE_COPY_ATTR}="${COPY_ID_NONCE}"><div class="code-block-header">${langLabel}<button type="button" class="copy-btn code-block-copy-btn" aria-label="Copy code">${COPY_ICON}</button></div><pre><code>${body}</code></pre></div>`;
 };
 
@@ -68,4 +87,34 @@ marked.setOptions({
   renderer,
 });
 
-export { COPY_ICON, CHECK_ICON };
+/** Marks a *widget embed* this renderer wrote (ADR 0415), carrying the copy
+ *  nonce, so authored HTML cannot forge a slot. The slot holds the embed's
+ *  label until `useWidgetEmbedSlots` mounts its widget, which happens only in
+ *  a reply's final text: a streaming reply shows the label. */
+export const WIDGET_EMBED_SLOT_ATTR = 'data-widget-embed-slot';
+/** The slot's embed as JSON, or absent when its syntax is broken. */
+export const WIDGET_EMBED_ATTR = 'data-widget-embed';
+
+marked.use({
+  extensions: [{
+    name: 'widgetEmbed',
+    level: 'inline',
+    start(src: string) {
+      const at = src.indexOf('![');
+      return at < 0 ? undefined : at;
+    },
+    tokenizer(src: string) {
+      const match = widgetEmbedAtStart(src);
+      // A broken embed that never closes is left as text, so it cannot
+      // swallow the rest of its paragraph.
+      if (!match || (!match.embed.ok && src[match.end - 1] !== ')')) return undefined;
+      return { type: 'widgetEmbed', raw: src.slice(0, match.end), embed: match.embed };
+    },
+    renderer(token) {
+      const { embed } = token as unknown as { embed: EmbedMatch['embed'] };
+      const label = embed.ok ? embed.value.label ?? '' : '';
+      const data = embed.ok ? ` ${WIDGET_EMBED_ATTR}="${escapeHtmlAttr(JSON.stringify(embed.value))}"` : '';
+      return `<span class="widget-embed-slot" ${WIDGET_EMBED_SLOT_ATTR}="${COPY_ID_NONCE}"${data}>${escapeHtmlAttr(label)}</span>`;
+    },
+  }],
+});

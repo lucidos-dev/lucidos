@@ -386,7 +386,19 @@ pub enum ContextPurpose {
     /// The caller names the model in its own request, so it owns no
     /// preference.
     Proxy,
+    /// The turn-end gate's forced *read decision*, for a turn that ended
+    /// without one (ADR 0417). It owns `model_read_decision`, which follows
+    /// no other key.
+    ReadDecision,
 }
+
+/// SQL predicate over an `events` row: true for an *auxiliary capture*, a
+/// `ContextCaptured` whose payload names a purpose other than `turn`. A turn
+/// writes no key ([`ContextPurpose::is_turn`]). The store's page tests pin it
+/// against the serializer for every purpose. The transcript's twin is
+/// `isAuxiliaryCapture` in the app's `store/thread-events/exchange-grouping.ts`.
+pub(crate) const AUXILIARY_CAPTURE_SQL: &str = "(event_type = 'ContextCaptured' \
+     AND payload->>'purpose' IS NOT NULL AND payload->>'purpose' <> 'turn')";
 
 impl ContextPurpose {
     /// Skip-serializing predicate: a turn capture writes no `purpose` key.
@@ -418,6 +430,7 @@ impl ContextPurpose {
             Self::MemoryFind => "Memory Find Request",
             Self::WebSearch => "Web Search Request",
             Self::Proxy => "Proxied Request",
+            Self::ReadDecision => "Read Decision Request",
         }
     }
 }
@@ -437,9 +450,8 @@ impl ContextPurpose {
 /// the full input rate. That mistake overstated the eval's dollar figures
 /// fourfold, and `lucidos-eval`'s `InputSplit` is the type that now prevents it.
 ///
-/// `cache_creation_tokens` is Anthropic-only, since OpenAI charges nothing for
-/// a cache write and reports no count for one. `cache_read_tokens` is set by
-/// both. `output_tokens` may be zero on a snapshot emitted mid-stream, before
+/// `cache_read_tokens` is set by both providers. `cache_creation_tokens` is
+/// set by Anthropic, and by OpenAI from GPT-5.6 on. `output_tokens` may be zero on a snapshot emitted mid-stream, before
 /// the final delta.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiUsage {
@@ -451,7 +463,7 @@ pub struct ApiUsage {
     pub output_tokens: u32,
     /// Set by both providers.
     pub cache_read_tokens: u32,
-    /// Anthropic-only. OpenAI charges nothing for a cache write.
+    /// Anthropic, and OpenAI from GPT-5.6 on. Both bill a write above input.
     pub cache_creation_tokens: u32,
     /// How the four counts above split across text, audio and image. Only a
     /// realtime voice call reports one, so it is absent everywhere else and
@@ -500,7 +512,7 @@ pub struct ModalityUsage {
 
 /// Result of an App UI capture from the frontend
 pub struct CaptureResult {
-    pub screenshot: String, // base64-encoded image (JPEG from html2canvas; format sniffed downstream)
+    pub screenshot: String, // base64-encoded image (JPEG, or the requested save format; sniffed downstream)
     pub dom: String,        // condensed DOM text
 }
 
@@ -792,8 +804,9 @@ pub struct AgentSession {
     /// aborting the apply and tearing down the merge worktree underneath the
     /// continuation the watchdog just dispatched.
     pub external_continuation_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Channel for sending control requests (interrupt, set_model, set_reasoning_effort)
-    /// from outside the event loop. The event loop forwards them to the runtime.
+    /// Channel for sending control requests from outside the event loop. The
+    /// event loop forwards them to the runtime. `deliver_control_request` keeps
+    /// back the ones a backend takes only at spawn.
     pub control_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::ControlRequest>,
     /// Withdraws for this session's run loop, which owns the input ledger.
     pub withdraw_tx: tokio::sync::mpsc::UnboundedSender<

@@ -134,13 +134,23 @@ describe('computeHeaderCollapse', () => {
   // there the box stops shrinking and the cluster keeps coming, which is the
   // regime the collapse exists for.
   const SPAN = 320;                    // --desktop-nav-span, 20rem
+  const SPAN_MAX = 576;                // --desktop-content-title-span-max, 36rem
   const MIN_SPAN = 128;                // --desktop-nav-min-span, 8rem
   const RESERVE = 3 * ICON + 4 * GAP;  // --content-side-reserve
+  const UNFOLDED = 7 * ICON + 8 * GAP; // --content-unfolded-reserve
+
+  const clamp = (min: number, value: number, max: number) => Math.max(min, Math.min(value, max));
 
   /** The rendered width of the centred box at a given container width: the CSS
-   *  clamp, in JS. */
+   *  clamp, in JS. Its cap is itself a clamp, which grows past SPAN only out
+   *  of room beyond UNFOLDED at each end. */
   function boxWidth(container: number): number {
-    return Math.min(Math.max(MIN_SPAN, container - 2 * RESERVE), SPAN);
+    return clamp(MIN_SPAN, container - 2 * RESERVE, clamp(SPAN, container - 2 * UNFOLDED, SPAN_MAX));
+  }
+
+  /** The same box before it could grow: capped at SPAN. */
+  function fixedSpanBoxWidth(container: number): number {
+    return clamp(MIN_SPAN, container - 2 * RESERVE, SPAN);
   }
 
   it('non-overlap invariant: the centred box\'s right edge never reaches the icon row', () => {
@@ -149,7 +159,7 @@ describe('computeHeaderCollapse', () => {
     // min-span floor. That is ~296px here, well under the Canvas pane's own
     // 360px floor (MIN_CONTENT_PANE_REM), so no reachable pane width is left
     // out; below it nothing can hold the two apart and the box is clipped.
-    for (let w = 900; w >= 300; w -= 1) {
+    for (let w = 2000; w >= 300; w -= 1) {
       const centreWidth = boxWidth(w);
       const input = {
         ...base,
@@ -206,6 +216,27 @@ describe('computeHeaderCollapse', () => {
     expect(computeHeaderCollapse({
       ...three, containerWidth: wide, centreWidth: capped, leadingWidth: (wide - capped) / 2,
     })).toEqual({ collapsed: 0, titleEllipsized: false });
+  });
+
+  it('the title grows on a wide pane, up to its cap', () => {
+    expect(boxWidth(700), 'a mid-width pane keeps the shared span').toBe(SPAN);
+    expect(boxWidth(1000)).toBe(1000 - 2 * UNFOLDED);
+    expect(boxWidth(1000)).toBeGreaterThan(SPAN);
+    expect(boxWidth(2000)).toBe(SPAN_MAX);
+  });
+
+  it('growing never folds an action the fixed span let ride, up to six', () => {
+    // The title takes only room past UNFOLDED, and UNFOLDED holds six actions
+    // and the bell. So no set of up to six folds where it rode before.
+    for (let count = 0; count <= 6; count++) {
+      const actions = appUiInput({ actionWidths: Array.from({ length: count }, () => ICON) });
+      for (let w = 2000; w >= 360; w -= 1) {
+        const at = (centreWidth: number) => computeHeaderCollapse({
+          ...actions, containerWidth: w, centreWidth, leadingWidth: (w - centreWidth) / 2,
+        }).collapsed;
+        expect(at(boxWidth(w)), `${count} actions at ${w}`).toBe(at(fixedSpanBoxWidth(w)));
+      }
+    }
   });
 
   it('folds on the min-span arm, where the box stops giving way', () => {

@@ -18,6 +18,9 @@ export function ModelSelectionRow({
   vocabulary,
   model,
   effort,
+  effortFor,
+  unsetEffortLabel,
+  defaultEffortLabel,
   disabled,
   onChange,
 }: {
@@ -37,6 +40,12 @@ export function ModelSelectionRow({
   vocabulary: readonly TierChoice[];
   model: string;
   effort: string | null;
+  /** The tier the picker opens on for another model. */
+  effortFor?: (model: string) => string | null;
+  /** The tier's name when none is in force. */
+  unsetEffortLabel?: string;
+  /** Names a Default row that drops the stored tier. */
+  defaultEffortLabel?: (model: string) => string;
   disabled?: boolean;
   onChange: (patch: ModelSelectionPatch) => void;
 }) {
@@ -53,6 +62,9 @@ export function ModelSelectionRow({
         vocabulary={vocabulary}
         model={model}
         effort={effort}
+        effortFor={effortFor}
+        unsetEffortLabel={unsetEffortLabel}
+        defaultEffortLabel={defaultEffortLabel}
         disabled={disabled}
         onChange={onChange}
       />

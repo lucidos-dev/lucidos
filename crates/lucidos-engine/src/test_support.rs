@@ -76,11 +76,12 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             input_tokens: Some(self.input_tokens),
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            served_model: None,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: None,
-            content_is_progress_notes: false,
+            progress_notes: Vec::new(),
         })
     }
 
@@ -329,7 +330,7 @@ pub fn every_side_question_event() -> Vec<ThreadEvent> {
 /// `tmpdir` in scope for the test duration: dropping it `rm -rf`'s the repo.
 ///
 /// Shared by tests that need a real on-disk git repo + worktree pair (the
-/// `seed_coding_agent_has_diff` tests in `session_seed_tests.rs` and the startup
+/// `seed_branch_work` tests in `session_seed_tests.rs` and the startup
 /// sweep tests in `agent_recovery_tests.rs`). The same boilerplate also lives
 /// in git_ops_tests.rs / worktree_cleanup_tests.rs.
 pub async fn make_repo_and_worktree(branch: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -360,18 +361,62 @@ pub async fn make_repo_and_worktree(branch: &str) -> (tempfile::TempDir, PathBuf
     (tmp, repo, wt)
 }
 
-/// Read the `coding_agent_has_diff` projection column for a single thread.
-/// Panics if the row is missing — every caller seeds a `SessionStarted` first,
-/// so a missing row means the projection write didn't land and the test should
-/// fail loudly rather than silently observe `false`.
-pub async fn read_coding_agent_has_diff(pool: &PgPool, thread_id: Uuid) -> bool {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT coding_agent_has_diff FROM thread_summaries WHERE thread_id = $1",
+/// Read one thread's projected change state, reason and restart flag included.
+/// Panics if the row is missing: every caller seeds a `SessionStarted` first,
+/// so a missing row means the projection write did not land.
+pub async fn read_change_state(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> crate::engine::thread_lifecycle::CodingAgentChangeState {
+    let (kind, reason, requires_restart) = sqlx::query_as::<_, (String, Option<String>, bool)>(
+        "SELECT coding_agent_change_state, coding_agent_unproposed_reason, \
+                coding_agent_requires_restart \
+         FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(pool)
     .await
-    .unwrap()
+    .unwrap();
+    crate::engine::thread_lifecycle::CodingAgentChangeState::from_columns(
+        &kind,
+        reason.as_deref(),
+        requires_restart,
+    )
+}
+
+/// The coarse half of [`read_change_state`].
+pub async fn read_change_state_kind(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> crate::engine::thread_lifecycle::ChangeStateKind {
+    read_change_state(pool, thread_id).await.kind()
+}
+
+/// Set one thread's change state directly, as a fixture. The `CHECK`
+/// constraints still apply, so an illegal state fails the test.
+pub async fn seed_change_state(
+    pool: &PgPool,
+    thread_id: Uuid,
+    state: crate::engine::thread_lifecycle::CodingAgentChangeState,
+) {
+    use crate::engine::thread_lifecycle::CodingAgentChangeState as S;
+    let (reason, requires_restart) = match state {
+        S::None => (None, false),
+        S::Unproposed { reason } => (reason.map(|r| r.as_str()), false),
+        S::Proposed { requires_restart } => (None, requires_restart),
+    };
+    sqlx::query(
+        "UPDATE thread_summaries SET coding_agent_change_state = $2, \
+                coding_agent_unproposed_reason = $3, coding_agent_requires_restart = $4 \
+         WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .bind(state.kind().as_str())
+    .bind(reason)
+    .bind(requires_restart)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// Emit `SessionStarted` on the `CodingAgent` channel so the projection
@@ -405,6 +450,23 @@ pub async fn start_cc_session(
     })
     .await
     .unwrap();
+}
+
+/// An `EventWaitStarted` armed now, watching `BackgroundBashCompleted` for an
+/// hour: the wait a coding agent's `lucidos background-task run` arms.
+pub fn event_wait_started(wait_id: Uuid) -> ThreadEvent {
+    ThreadEvent::EventWaitStarted {
+        wait_id,
+        tool_use_id: format!("toolu_{}", wait_id.simple()),
+        on: vec![crate::core::event_subscription::EventSubscription {
+            event_type: "BackgroundBashCompleted".into(),
+            condition: None,
+        }],
+        reason: "the e2e suite to finish".into(),
+        armed_at: chrono::Utc::now(),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        watermark: 0,
+    }
 }
 
 /// Seed a credential for a test that only cares that one exists.
@@ -636,10 +698,15 @@ pub mod source_scan {
 
     /// Read a source file with its inline test module cut off. Inline
     /// `mod tests` sits at the end of the file by convention, so truncating at
-    /// the first top-level `#[cfg(test)]` drops it whole.
+    /// the first top-level `#[cfg(test)]` drops it whole. A file-level
+    /// `#![cfg(test)]` never compiles outside tests, so it has no production
+    /// text at all.
     pub fn read_production_source(path: &Path) -> String {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        if text.lines().any(|line| line.trim() == "#![cfg(test)]") {
+            return String::new();
+        }
         match text.find("\n#[cfg(test)]") {
             Some(idx) => text[..idx].to_string(),
             None => text,

@@ -1,9 +1,8 @@
 import { signal } from '@preact/signals';
-import { effectiveThreadStatus, focusedThreadId, isMidTurn } from '../../store/store';
-import { awaitedQuestionCard, computeExchanges, findQuestionAnswer } from '../../store/thread-events';
+import { focusedThreadId, isMidTurn } from '../../store/store';
+import { computeExchanges, findQuestionAnswer } from '../../store/thread-events';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 import { uploadsGate, type PendingUpload } from '../../store/pendingUploads';
-import { pendingAnswers } from '../../store/pendingDecisions';
 
 // Pure prompt-input logic + the optimistic-send signal. Extracted from
 // PromptInput.tsx (re-exported there); imported directly by *.test.ts.
@@ -511,19 +510,6 @@ export function findLatestPendingQuestion(
     return { toolUseId: ue.tool_use_id, multiSelect: !!ue.multi_select };
   }
   return null;
-}
-
-/** The question card a message sent now would answer, by tool-use id. The
- *  engine routes typed text to an open question as its `FreeText` answer.
- *
- *  Only the NEWEST card that awaits an answer counts. A permission card waits
- *  under the same status, and walking past it would reach a question an abort
- *  stranded. A send behind an answer already in flight answers nothing either,
- *  typed or tapped: the engine takes the later text as an ordinary message. */
-export function questionTheSendAnswers(thread: ThreadState): string | undefined {
-  if (effectiveThreadStatus(thread) !== 'waiting_for_user_answer') return undefined;
-  const card = awaitedQuestionCard(computeExchanges(thread));
-  return card && !pendingAnswers.map.peek().has(card) ? card : undefined;
 }
 
 /** Whether the optimistic `cancelingThreadIds` flag should be released.

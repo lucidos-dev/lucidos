@@ -1,20 +1,21 @@
-//! Tests for `seed_coding_agent_has_diff`.
+//! Tests for `seed_branch_work`.
 //!
 //! Each test builds a real `git init -b main` repo + a worktree on a CC-style
 //! branch, then drives the seed helper through the same shape the bootstrap
 //! site uses. We assert the column reflects the on-disk state after seeding.
 
-use super::seed_coding_agent_has_diff;
+use super::seed_branch_work;
 use crate::engine::event_bus::EventBus;
 use crate::engine::git_ops::git_cmd;
+use crate::engine::thread_lifecycle::ChangeStateKind;
 use crate::test_support::{
-    make_repo_and_worktree, read_coding_agent_has_diff, setup_test_db, start_cc_session,
+    make_repo_and_worktree, read_change_state_kind, setup_test_db, start_cc_session,
     teardown_test_db,
 };
 use uuid::Uuid;
 
 #[tokio::test]
-async fn session_bootstrap_seeds_coding_agent_has_diff_true_when_branch_has_commits() {
+async fn session_bootstrap_seeds_unproposed_when_branch_has_commits() {
     let branch = "claude-code/seed-true";
     let (_tmp, repo_root, wt) = make_repo_and_worktree(branch).await;
 
@@ -31,17 +32,18 @@ async fn session_bootstrap_seeds_coding_agent_has_diff_true_when_branch_has_comm
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, branch, None).await;
 
-    // Precondition: column default fired through SessionStarted is FALSE.
-    assert!(
-        !read_coding_agent_has_diff(&pool, thread_id).await,
-        "precondition: SessionStarted upsert must leave coding_agent_has_diff at the column default (false)"
+    assert_eq!(
+        read_change_state_kind(&pool, thread_id).await,
+        ChangeStateKind::None,
+        "precondition: the SessionStarted upsert leaves the column default"
     );
 
-    seed_coding_agent_has_diff(&pool, thread_id, &repo_root, branch).await;
+    seed_branch_work(&pool, thread_id, &repo_root, branch).await;
 
-    assert!(
-        read_coding_agent_has_diff(&pool, thread_id).await,
-        "seed must flip coding_agent_has_diff=true when branch has commits beyond main"
+    assert_eq!(
+        read_change_state_kind(&pool, thread_id).await,
+        ChangeStateKind::Unproposed,
+        "seed must read commits beyond main as unproposed work"
     );
 
     pool.close().await;
@@ -49,7 +51,7 @@ async fn session_bootstrap_seeds_coding_agent_has_diff_true_when_branch_has_comm
 }
 
 #[tokio::test]
-async fn session_bootstrap_leaves_coding_agent_has_diff_false_when_branch_is_fresh() {
+async fn session_bootstrap_leaves_change_state_none_when_branch_is_fresh() {
     let branch = "claude-code/seed-fresh";
     let (_tmp, repo_root, _wt) = make_repo_and_worktree(branch).await;
 
@@ -60,11 +62,12 @@ async fn session_bootstrap_leaves_coding_agent_has_diff_false_when_branch_is_fre
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, branch, None).await;
 
-    seed_coding_agent_has_diff(&pool, thread_id, &repo_root, branch).await;
+    seed_branch_work(&pool, thread_id, &repo_root, branch).await;
 
-    assert!(
-        !read_coding_agent_has_diff(&pool, thread_id).await,
-        "seed must write coding_agent_has_diff=false when the branch has no net diff against its diff base"
+    assert_eq!(
+        read_change_state_kind(&pool, thread_id).await,
+        ChangeStateKind::None,
+        "seed must read a branch with no net diff against its diff base as none"
     );
 
     pool.close().await;

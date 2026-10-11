@@ -263,7 +263,7 @@
     flex: 1;
     overflow: auto;
     /* Named so the pinned gutter can paint over it while the code pans; see
-       `.line-numbered-pan .line-number::before` in panels/content.css. The
+       `.line-numbered-gutter::before` in panels/content.css. The
        padding is written THROUGH the var so there is one source for the
        value. */
     --code-gutter-inset: 0.75rem;
@@ -378,7 +378,7 @@
     cursor: zoom-in;
 }
 
-/* Every child of this `<pre>` is a `.code-line`, which carries its own
+/* Every line of this `<pre>` is a `.code-line`, which carries its own
    white-space (panels/content.css § the two line-wrapping modes). So this rule
    is type and metrics only; a white-space value here would reach no text. */
 .file-preview-code {
@@ -981,7 +981,7 @@
    See MessageRoutePanel.tsx + useAnchoredPopover hook. */
 .message-route-panel {
     position: fixed;
-    z-index: var(--z-control-panel);
+    z-index: var(--z-popover);
     /* A body-only popover: its text sits on the surface inset. */
     padding: var(--space-md) var(--surface-inset);
     min-width: 0;
@@ -1086,31 +1086,25 @@
     flex-wrap: nowrap;
 }
 
-/* Holds EITHER the app's own manifest icon (user-authored, almost always an
-   emoji, which takes its size from the row's font) OR our `<AppsIcon/>` fallback
-   when the app declares none. The svg rule sizes only the latter.
+/* Holds the app's `AppIcon`.
 
-   `align-self` opts the slot out of the group's baseline alignment, which an
-   svg cannot answer. It has no baseline, so the browser synthesizes one at its
-   bottom edge. That parked the mark's bottom on the text baseline and left its
-   top above the cap, riding visibly high beside the name. Centring is a no-op
-   for an emoji, whose own box already matches the name's.
+   `align-self` opts the slot out of the group's baseline alignment, which a
+   tile cannot answer. It has no baseline, so the browser synthesizes one at its
+   bottom edge. That parked the tile's bottom on the text baseline and left its
+   top above the cap, riding visibly high beside the name.
+
+   The tile is the step below the row's `--font-size-md` text, as
+   `.explainer-btn` uses for a glyph inline with the same text, so it fits
+   the name's line box.
 
    The name carries no colour or weight of its own, so it inherits the same
    secondary as every other value in the panel. */
 .message-route-panel .route-app-icon {
+    --app-icon-size: var(--icon-size-sm);
     flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
     align-self: center;
-}
-
-/* The step below the row's `--font-size-md` text, as `.explainer-btn` uses for
-   a glyph inline with the same text. At `--icon-size-md` the mark overflowed
-   the name's line box and made the App row taller than every other row. */
-.message-route-panel .route-app-icon svg {
-    width: var(--icon-size-sm);
-    height: var(--icon-size-sm);
 }
 
 .message-route-panel .muted {

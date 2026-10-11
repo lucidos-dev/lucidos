@@ -11,8 +11,8 @@ export type RepoFileLocator = NonNullable<ReturnType<typeof parseRepoPath>>;
  *  the diff. That is the navigate router, and the Files panel behind it.
  *
  *  `file` means the caller renders the FILE whatever the locator names. That is
- *  the app-facing preview modal: the diff view is driven by the Files panel's
- *  global diff state, and loading it would rebind the panel behind the app,
+ *  the file preview modal: the diff view is driven by the Files panel's
+ *  global diff state, and loading it would rebind the panel behind the modal,
  *  which is the navigation the modal exists to avoid. It is an input rather than
  *  a rewrite of the locator string because the locator's change id is the right
  *  revision to read that file at, and rewriting `diff#<changeId>` into a plain

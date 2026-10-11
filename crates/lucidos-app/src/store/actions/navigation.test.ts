@@ -22,6 +22,7 @@ function overlaysEqual(a: PanelOverlay, b: PanelOverlay): boolean {
     case 'file-preview': return a.path === (b as typeof a).path;
     case 'url-preview': return a.url === (b as typeof a).url;
     case 'notification-detail': return a.notification.id === (b as typeof a).notification.id;
+    case 'plugin-detail': return a.marketplaceId === (b as typeof a).marketplaceId && a.pluginId === (b as typeof a).pluginId;
   }
 }
 
@@ -1012,7 +1013,7 @@ describe('foldEntry', () => {
 
 describe('pruneEntries', () => {
   const files = makeEntry();
-  const app = makeEntry({ overlay: { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' } } });
+  const app = makeEntry({ overlay: { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', kind: 'app', reusable: false } } });
   const apps = makeEntry({ menuItem: 'apps' });
   const isApp = (e: NavEntry) => e.overlay?.type === 'app-ui';
 
@@ -1041,7 +1042,7 @@ describe('pruneEntries', () => {
 // The prune edits the stack in memory, so no later save can write a deleted
 // app's rows back into the saved copy.
 describe('pruneNavHistory edits the live stack', () => {
-  const app: PanelOverlay = { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' } };
+  const app: PanelOverlay = { type: 'app-ui', app: { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', kind: 'app', reusable: false } };
 
   beforeEach(() => {
     vi.resetModules();

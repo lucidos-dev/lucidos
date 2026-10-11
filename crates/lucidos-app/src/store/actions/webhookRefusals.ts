@@ -16,7 +16,7 @@
 import { webhookRefusals } from '../store';
 import { failedIfFresh, setLoadingIfFresh } from '../types';
 import { fetchWebhookRefusals, type WebhookRefusal } from '../../api/client';
-import { elapsedSeconds } from '../../utils/formatTime';
+import { elapsedSeconds } from '../../utils/elapsed';
 
 export async function loadWebhookRefusals(): Promise<void> {
   setLoadingIfFresh(webhookRefusals);

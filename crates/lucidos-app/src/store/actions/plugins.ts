@@ -1,5 +1,8 @@
-import { installedPlugins } from '../store';
+import { installedPlugins, panelOverlay } from '../store';
 import { setLoadingIfFresh, toFailed } from '../types';
+import type { MarketplacePlugin } from '../types';
+import { revealContentPane } from './pane';
+import { pushNavState } from './navigation';
 import { fetchInstalledPlugins } from '../../api/client';
 
 let loadSeq = 0;
@@ -21,4 +24,16 @@ export async function loadInstalledPlugins(): Promise<void> {
     if (seq !== loadSeq) return;
     installedPlugins.value = toFailed(e);
   }
+}
+
+/** Open the *plugin detail page* for one Plugins panel row. */
+export function openPluginDetail(plugin: MarketplacePlugin): void {
+  panelOverlay.value = {
+    type: 'plugin-detail',
+    marketplaceId: plugin.marketplace_id,
+    pluginId: plugin.id,
+    name: plugin.name,
+  };
+  revealContentPane();
+  pushNavState();
 }

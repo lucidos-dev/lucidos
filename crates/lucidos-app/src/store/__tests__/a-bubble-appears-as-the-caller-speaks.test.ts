@@ -114,7 +114,7 @@ describe('the fold cannot see it', () => {
     const [, spoken] = heard(2, 'and the tests too');
     thread.events.set(2, spoken);
     put(thread.events, 3, {
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'check the deploy',
       mode: 'agent',
       injected_message_id: MSG,

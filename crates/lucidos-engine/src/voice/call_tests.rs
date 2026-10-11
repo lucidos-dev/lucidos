@@ -63,7 +63,9 @@ impl NoDecisions {
                     label: "Run it".to_string(),
                     description: None,
                     preview: None,
+                    widget: None,
                 }],
+                false,
                 false,
             )),
             ..Self::default()
@@ -3581,16 +3583,19 @@ fn asks_the_caller() -> ThreadEvent {
                 label: "Run the tail now".to_string(),
                 description: Some("Chunks 25-33, on the current main".to_string()),
                 preview: None,
+                widget: None,
             },
             QuestionOption {
                 id: "opt-1".to_string(),
                 label: "Leave it for tonight".to_string(),
                 description: None,
                 preview: None,
+                widget: None,
             },
         ],
         worktree_path: None,
         multi_select: false,
+        owner_approval: None,
     }
 }
 
@@ -3956,9 +3961,10 @@ fn the_choices_are_read_out_with_the_ids_that_settle_them() {
         label: "Ship it".to_string(),
         description: None,
         preview: None,
+        widget: None,
     }];
     let single = decision_to_ask(
-        &OpenDecision::question("toolu_q0", "Ready?", &one, false),
+        &OpenDecision::question("toolu_q0", "Ready?", &one, false, false),
         true,
     );
     assert!(
@@ -3968,7 +3974,7 @@ fn the_choices_are_read_out_with_the_ids_that_settle_them() {
     );
 
     let free = decision_to_ask(
-        &OpenDecision::question("toolu_q1", "What should I call it?", &[], false),
+        &OpenDecision::question("toolu_q1", "What should I call it?", &[], false, false),
         true,
     );
     assert!(free.contains("What should I call it?"), "{}", free);
@@ -3979,7 +3985,7 @@ fn the_choices_are_read_out_with_the_ids_that_settle_them() {
 /// handed over mid-call; `sections` covers the resident block.
 #[test]
 fn the_note_says_the_caller_answers_out_loud_and_never_on_screen() {
-    let decision = OpenDecision::question("toolu_q0", "Ready?", &[], false);
+    let decision = OpenDecision::question("toolu_q0", "Ready?", &[], false, false);
     let note = decision_to_ask(&decision, true);
     assert!(!note.to_lowercase().contains("on screen"), "{}", note);
     assert!(note.contains("hand its id back"), "{}", note);
@@ -3993,7 +3999,7 @@ fn the_note_says_the_caller_answers_out_loud_and_never_on_screen() {
 /// caller's words over, which is what settles a question card (ADR 0205).
 #[test]
 fn a_talker_with_no_answering_tool_is_told_to_hand_the_words_over() {
-    let decision = OpenDecision::question("toolu_q0", "Ready?", &[], false);
+    let decision = OpenDecision::question("toolu_q0", "Ready?", &[], false, false);
     let note = decision_to_ask(&decision, false);
     assert!(!note.contains("hand its id back"), "{}", note);
     assert!(note.contains("in their own words"), "{}", note);
@@ -4058,7 +4064,7 @@ fn a_permission_note_allows_only_on_the_callers_spoken_yes() {
     let card = OpenDecision::command_permission("req-1", "run_bash", "make build", "Runs a build.");
     assert!(decision_to_ask(&card, true).contains(rule));
 
-    let question = OpenDecision::question("toolu_q0", "Ready?", &[], false);
+    let question = OpenDecision::question("toolu_q0", "Ready?", &[], false, false);
     assert!(!decision_to_ask(&question, true).contains(rule));
 }
 

@@ -308,8 +308,8 @@ fn lower_own_priority(_increment: i32) {}
 ///
 /// Deliberately NOT in a process group of its own. Staying in ours is what
 /// makes a group signal reach the build too: a terminal Ctrl-C, and the
-/// engine's `BuildProcessGroupGuard`, which SIGKILLs the whole group when it
-/// coalesces an Apply. Calling `process_group` here would orphan the build.
+/// engine's `BuildProcessGroupGuard`, which SIGKILLs the whole group when an
+/// explicit Rebuild restarts the build. Calling `process_group` here would orphan the build.
 /// It would then compile on with its slot already freed (ADR 0070, and the
 /// "orphaned build outlives its wrapper" row in `docs/code-review-priors.md`).
 fn spawn_child(

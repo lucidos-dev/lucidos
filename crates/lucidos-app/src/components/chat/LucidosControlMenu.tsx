@@ -13,8 +13,10 @@ import {
 } from '../../store/threadModelSelections';
 import { updateComposeSelection } from '../../store/actions/compose';
 import {
-  loadChatModels, lucidosModelChoices, LUCIDOS_TIER_VOCABULARY, rememberProvider,
+  defaultTierLabel, loadChatModels, lucidosModelChoices, LUCIDOS_TIER_VOCABULARY,
+  PROVIDER_DEFAULT_EFFORT_LABEL, rememberProvider,
 } from '../../store/actions/models';
+import { accountChatEffort } from '../../store/actions/preferences';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import { pairLabelOf } from '../../store/modelSelection';
 import { LUCIDOS_AGENT_LABEL } from '../../store/thread-events';
@@ -38,7 +40,7 @@ import { keyboardHolder, returnKeyboard } from '../shared/keyboardHandoff';
  *  thread's pending pick ?? its last message ?? the account default) and a pick
  *  writes THIS thread's pending override (`threadModelSelections`) — it does NOT
  *  touch the account preference, so it never leaks to other threads. The account
- *  default (`chat_model` / `chat_reasoning_effort`) is set in Settings → Models
+ *  default (`chat_model` / `chat_reasoning_efforts`) is set in Settings → Models
  *  and is the fallback for a brand-new thread.
  *
  *  In the COMPOSE view, the pick is per-draft instead: it reads/writes THIS
@@ -86,7 +88,12 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
   const modelValue = perDraft ? resolveModel(threadId) : resolveActiveThreadModel(threadId);
   const effortValue = perDraft
     ? resolveReasoningEffort(threadId)
-    : resolveActiveThreadReasoningEffort(threadId);
+    : resolveActiveThreadReasoningEffort(threadId, modelValue);
+  // The tier another model would run at: the account's for a draft, and the
+  // thread's own memory for that model on an active thread.
+  const effortFor = (model: string) => (perDraft
+    ? accountChatEffort(model)
+    : resolveActiveThreadReasoningEffort(threadId, model));
   // A draft's pick belongs to the draft's model. A thread remembers one per
   // model, which the engine applies when the thread switches to it.
   const providerFor = (model: string) => (perDraft
@@ -102,7 +109,8 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
   function applyPick(patch: ModelSelectionPatch) {
     const write = {
       model: patch.model,
-      ...(patch.reasoningEffort != null ? { reasoningEffort: patch.reasoningEffort } : {}),
+      // `undefined` is the Default row, dropping this draft's own tier.
+      reasoningEffort: patch.reasoningEffort ?? undefined,
       // `undefined` clears a pick the new model cannot use.
       provider: patch.provider ?? undefined,
     };
@@ -117,6 +125,10 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
     model: modelValue,
     effort: effortValue,
     providerFor,
+    effortFor,
+    unsetEffortLabel: PROVIDER_DEFAULT_EFFORT_LABEL,
+    // A draft can drop its own pick. A thread cannot: its memory would win.
+    defaultEffortLabel: perDraft ? (m) => defaultTierLabel(accountChatEffort(m)) : undefined,
     onChange: applyPick,
   });
 

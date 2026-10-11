@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::core::git_auth::GitCredentials;
 use crate::core::plugin_marketplaces::InstalledPluginSummary;
+use crate::core::plugin_media::{self, MediaSource, PluginMedia};
 use crate::core::plugins::{self, compare_versions, PluginManifest, UpdateDecision};
 use crate::core::DATA_DIR;
 use crate::engine::release_notices::running_release;
@@ -109,9 +110,29 @@ pub(crate) async fn installed_plugin_summaries(
                 modified: status.modified,
                 modified_paths: status.modified_paths,
                 engine_requirement: rec.manifest().and_then(plugins::engine_requirement_of),
+                media: installed_media(workspace_path, &id),
             }
         })
         .collect())
+}
+
+/// The URLs of a plugin's installed media, read from its media copy.
+fn installed_media(workspace_path: &Path, plugin_id: &str) -> PluginMedia {
+    let copy = plugin_media::installed_dir(workspace_path, plugin_id);
+    match plugin_media::load_index(&copy) {
+        Ok(Some(index)) => MediaSource::Installed { plugin_id }.media(&index),
+        Ok(None) => PluginMedia::default(),
+        Err(e) => {
+            log!("[Plugins] could not read the media of '{plugin_id}': {e}");
+            PluginMedia {
+                problems: vec![plugin_media::MediaProblem {
+                    path: plugin_media::MEDIA_DIR.to_string(),
+                    reason: format!("could not be read: {e}"),
+                }],
+                ..PluginMedia::default()
+            }
+        }
+    }
 }
 
 /// Read the latest known install record for a plugin id by scanning the

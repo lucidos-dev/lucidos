@@ -56,6 +56,8 @@ pub(crate) struct CallDetail {
     pub(crate) reasoning_effort: Option<String>,
     /// How long the call took, wall clock.
     pub(crate) duration_ms: Option<u64>,
+    /// The model the reply named, when it named one.
+    pub(crate) served_model: Option<String>,
 }
 
 /// [`auxiliary_capture`], with what the caller knows about the call.
@@ -91,6 +93,7 @@ pub(crate) fn auxiliary_capture_detailed(
         api_call_id: None,
         reasoning_effort: detail.reasoning_effort,
         duration_ms: detail.duration_ms,
+        served_model: detail.served_model,
     }
 }
 
@@ -164,8 +167,7 @@ pub(crate) fn usage_from_image(
 /// there. A call no thread caused records on the workspace's home thread
 /// (ADR 0242): the compactor on an artifact leaf, the memory indexer on an
 /// artifact, a `find` from outside any thread. Home never ends and nothing
-/// can delete it. So the row has a stable place, even while the home thread
-/// switch hides it.
+/// can delete it. So the row has a stable place.
 ///
 /// Owns its `EventBus` clone so a spawned task can hold one. Image
 /// description and title generation both run detached from the turn.
@@ -234,8 +236,8 @@ impl AuxCapture {
     /// a timeout or a cancel drops mid-record leaves it running. So a deadline
     /// around a model call never costs the call its row.
     ///
-    /// The home thread resolves at record time, and is created hidden if the
-    /// switch never made one. A failed lookup drops this one row with a log
+    /// The home thread resolves at record time, and is created if boot has not
+    /// made it yet. A failed lookup drops this one row with a log
     /// line: a bookkeeping row never fails the call it observes.
     async fn emit(&self, event: ThreadEvent) {
         let bus = match &self.sink {
@@ -280,12 +282,25 @@ impl AuxCapture {
         request_chars: usize,
         usage: Option<ApiUsage>,
     ) {
-        self.emit(auxiliary_capture(
+        self.record_usage_detailed(model, request_chars, usage, CallDetail::default())
+            .await;
+    }
+
+    /// [`Self::record_usage`], with what the caller knows about the call.
+    pub(crate) async fn record_usage_detailed(
+        &self,
+        model: &str,
+        request_chars: usize,
+        usage: Option<ApiUsage>,
+        detail: CallDetail,
+    ) {
+        self.emit(auxiliary_capture_detailed(
             self.purpose,
             model,
             request_chars,
             usage,
             false,
+            detail,
         ))
         .await;
     }
@@ -307,6 +322,7 @@ impl CostSink for AuxCapture {
         let detail = CallDetail {
             reasoning_effort: cost.reasoning_effort.map(str::to_string),
             duration_ms: cost.duration_ms,
+            served_model: cost.reported.served_model().map(str::to_string),
         };
         self.emit(auxiliary_capture_detailed(
             self.purpose,
@@ -396,11 +412,12 @@ mod tests {
             input_tokens: input,
             cache_creation_tokens: cache_write,
             cache_read_tokens: cache_read,
+            served_model: None,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: None,
-            content_is_progress_notes: false,
+            progress_notes: Vec::new(),
         }
     }
 

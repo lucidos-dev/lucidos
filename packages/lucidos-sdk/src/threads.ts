@@ -1,5 +1,23 @@
 import { request } from './_fetch';
 
+/** Why a turn end left a coding agent's work unproposed. Mirrors the engine's
+ *  `UnproposedReason` wire names. */
+export type UnproposedReason =
+  | 'plan_missing'
+  | 'plan_awaiting_approval'
+  | 'outside_bound'
+  | 'hardening_missing'
+  | 'turn_incomplete';
+
+/** What a coding-agent thread's branch holds. Mirrors the engine wire (ADR
+ *  0400). `none`: no work. `unproposed`: work with no pending change, and
+ *  `reason` says why a turn end withheld it. `proposed`: a pending change the
+ *  user can apply. */
+export type CodingAgentChangeState =
+  | { kind: 'none' }
+  | { kind: 'unproposed'; reason: UnproposedReason | null }
+  | { kind: 'proposed'; requires_restart: boolean };
+
 /** Projected snapshot of a thread's metadata, derived from the event stream
  *  by the `thread_summaries` projection. Same shape the engine returns from
  *  `GET /api/v1/threads/list`, the `lucidos threads list` CLI, and the
@@ -27,9 +45,7 @@ export interface ThreadSummary {
    *  interrupted the turn: it either resumes on its own or offers the user a
    *  Continue button. */
   status: string;
-  coding_agent_has_diff: boolean;
-  coding_agent_proposed: boolean;
-  coding_agent_requires_restart: boolean;
+  coding_agent_change_state: CodingAgentChangeState;
   coding_agent_is_external_repo: boolean;
   last_revived_at: string | null;
   parent_thread_id?: string | null;

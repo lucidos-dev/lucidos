@@ -22,6 +22,7 @@ const focusedThreadId = signal<string | null>(null);
 vi.mock('../store', () => ({
   threadMap,
   focusedThreadId,
+  promptFootprintVersion: signal(0),
   changes: signal([]),
   appliedChanges: signal([]),
   changesHasMore: signal(false),
@@ -71,7 +72,6 @@ vi.mock('./menu', () => ({
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
 vi.mock('./devices', () => ({ getDeviceId: vi.fn() }));
-vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false) }));
 vi.mock('./entityReferences', () => ({

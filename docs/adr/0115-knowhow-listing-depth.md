@@ -49,12 +49,15 @@ body, or a user's habit can break.
 - A doc can carry references in a folder named after it. They cost nothing per
   thread, and the doc names their ids so a reader can load them.
 - A file placed too deep goes quiet: loadable, but in no routing list, and
-  nothing fails. `system-knowhow/workspace-audit.md` § 3 flags a reference no
-  doc names, so an audit is how the user learns a reorg is needed.
+  nothing fails. The workspace audit's knowhow check flags a reference no doc
+  names, so an audit is how the user learns a reorg is needed. (That check now
+  lives in `system-knowhow/workspace-audit/knowhow.md`, per ADR 0413.)
 - `/api/v1/knowhow` and `lucidos knowhow list` show docs, matching the routing
   list. One definition of "a doc" serves every surface.
 - Engine-shipped `system-knowhow/` still lists every file at any depth. That
   corpus is curated in the repo, where a stray depth is a bug we fix at source.
+  (Superseded by ADR 0413: it now lists top-level files only, so the audit's
+  sections can be references that cost no routing line.)
 - `load_app_knowhow` still recurses. It dumps bodies into an executing app
   intent instead of building a listing, so a reference folder under an app's
   knowhow reaches that prompt whole.

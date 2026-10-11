@@ -47,6 +47,15 @@ export interface ModelSelectionInput {
   /** How to name a selected model no row offers, such as a thread pinned to a
    *  model the picker has since dropped. Defaults to the bare id. */
   labelFor?: (model: string) => string;
+  /** The tier this surface would run another model at, so the tier step opens
+   *  on that model's own tier. Defaults to the effort in force. */
+  effortFor?: (model: string) => string | null;
+  /** How to name the tier when the model offers tiers but none is in force,
+   *  so the model runs at its provider's default. Defaults to naming none. */
+  unsetEffortLabel?: string;
+  /** When set, the tier step opens with a Default row so labelled, which
+   *  reports `reasoningEffort: null` to drop this surface's stored tier. */
+  defaultEffortLabel?: (model: string) => string;
   onChange: (patch: ModelSelectionPatch) => void;
 }
 
@@ -63,6 +72,10 @@ export interface ModelSelection {
   effort: string | null;
   /** The backend in force for `model`, or `null` when it has no routes here. */
   provider: string | null;
+  /** The tier the tier step opens on for `model`. */
+  effortFor: (model: string) => string | null;
+  /** The Default row's label for `model`, or `undefined` for no such row. */
+  defaultEffortLabel?: (model: string) => string;
   /** Take one encoded pair, and the backend when the provider step chose one.
    *  Reports every part, so nothing can be half-applied. */
   pick: (encoded: string, provider?: string) => void;
@@ -80,18 +93,25 @@ export function useModelSelection(input: ModelSelectionInput): ModelSelection {
   // elsewhere, or its tier set narrowed under it. A pick cannot leave one
   // behind any more, but a preference written before this could.
   const resolvedEffort = clampToOffered(effort, offered);
+  const effortLabel = offered.find((t) => t.value === resolvedEffort)?.label
+    ?? resolvedEffort
+    ?? (offered.length > 0 ? (input.unsetEffortLabel ?? null) : null);
 
   return {
     rows,
     value: encodePair(model ?? '', resolvedEffort),
     label: formatPair(
       current?.label ?? (model ? (input.labelFor?.(model) ?? model) : ''),
-      offered.find((t) => t.value === resolvedEffort)?.label ?? resolvedEffort,
+      effortLabel,
       current?.providerLabel,
     ),
     model,
     effort: resolvedEffort,
     provider: current?.provider ?? null,
+    effortFor: (other: string) => (other === model || !input.effortFor
+      ? resolvedEffort
+      : input.effortFor(other)),
+    defaultEffortLabel: input.defaultEffortLabel,
     pick: (encoded: string, provider?: string) => {
       const picked = decodePair(encoded);
       onChange({

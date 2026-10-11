@@ -28,7 +28,7 @@ vi.mock('../../api/client', () => ({
 const fakeApp: App = {
   id: 'test-app',
   name: 'Test App',
-  description: 'A test', reveal: 'on-load',
+  description: 'A test', reveal: 'on-load', kind: 'app', reusable: false,
 };
 const fakeNotification: Notification = {
   id: 'notif-1',

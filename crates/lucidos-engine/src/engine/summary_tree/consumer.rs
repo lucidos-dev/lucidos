@@ -13,7 +13,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
 use super::compactor::{CompactionModel, Compactor, CompactorDeps};
-use super::compactor_models::compactor_lane;
+use super::compactor_models::compactor_route;
 use super::log::{ENTRY_EVENT_TYPES, TURN_END_EVENT_TYPES};
 use super::module::MemoryModule;
 use super::store;
@@ -189,13 +189,18 @@ impl CompactorDeps for EngineDeps {
     async fn model(&self) -> Result<CompactionModel, String> {
         let call = self.0.aux_call(ContextPurpose::SummaryCompaction).await;
         let configured = configured_providers(&self.0);
-        let lane = compactor_lane(call.model(), self.0.model_registry(), &configured)?;
+        let route = compactor_route(
+            call.model(),
+            call.reasoning(),
+            self.0.model_registry(),
+            &configured,
+        )?;
         Ok(CompactionModel {
             provider: call.provider(),
             model: call.model().to_string(),
-            effort: call.reasoning().map(str::to_string),
+            effort: route.effort,
             deadline: call.deadline(),
-            lane,
+            lane: route.lane,
         })
     }
 

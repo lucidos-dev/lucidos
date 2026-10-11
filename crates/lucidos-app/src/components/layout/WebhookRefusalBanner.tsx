@@ -7,7 +7,7 @@ import {
 } from '../../store/actions/webhookRefusals';
 import { discussWebhookRefusal } from '../../store/actions/webhook-refusal-discuss';
 import { openWebhookSettings } from '../../store/actions/menu';
-import { composeHandlers } from '../chat/promptFocus';
+import { composeHandlers } from '../chat/composeHandlers';
 import { useCoarseClock } from '../../hooks/useCoarseClock';
 import { webhookRefusalNotice } from '../../utils/webhookRefusalNotice';
 import { viewportIsMobile } from '../../utils/viewport';

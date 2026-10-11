@@ -105,9 +105,8 @@ pub(crate) struct TurnTail<'a> {
 }
 
 /// The three flags [`engine_build_block`] branches on, with the rest of
-/// `VersionStatus` inert. Shared with the always-loaded budget meter, which
+/// `VersionStatus` inert. Shared with the system prompt footprint, which
 /// bills the widest of the four states.
-#[cfg(test)]
 pub(super) fn version_status(
     update_available: bool,
     source_behind_head: bool,
@@ -132,7 +131,6 @@ pub(super) fn version_status(
 }
 
 /// The four states, as the flag triples that select them.
-#[cfg(test)]
 pub(super) const BUILD_STATES: [(bool, bool, bool); 4] = [
     (false, false, false),
     (true, false, false),

@@ -427,11 +427,14 @@ const ENGINE_RESOURCE_NAME: &str = "lucidos-engine";
 const FRONTEND_RESOURCE_NAME: &str = "frontend";
 const SDK_RESOURCE_NAME: &str = "sdk";
 const POSTGRES_RESOURCE_NAME: &str = "postgres";
-/// The engine-shipped reference knowhow dir (`system-knowhow/`), staged as the
-/// 7th resource. The engine resolves it by absolute path via
+/// The engine-shipped reference knowhow dir (`system-knowhow/`), staged as
+/// a bundle resource. The engine resolves it by absolute path via
 /// `LUCIDOS_SYSTEM_KNOWHOW_DIR` (set in `spawn_gateway`); without it a packaged
 /// install silently loses the entire engine-facing reference set.
 const SYSTEM_KNOWHOW_RESOURCE_NAME: &str = "system-knowhow";
+/// The built-in widgets (`system-widgets/`, ADR 0415). The engine resolves it
+/// by absolute path via `LUCIDOS_SYSTEM_WIDGETS_DIR` (set in `spawn_gateway`).
+const SYSTEM_WIDGETS_RESOURCE_NAME: &str = "system-widgets";
 /// The `lucidos` CLI binary (cargo package `lucidos-cli` → bin `lucidos`),
 /// staged flat next to the engine. Backs the coding-agent permission/question
 /// MCP servers, the CC hooks, and chat-script `lucidos …` calls; the engine
@@ -1130,6 +1133,7 @@ struct BundledResources {
     frontend: PathBuf,
     sdk: PathBuf,
     system_knowhow: PathBuf,
+    system_widgets: PathBuf,
     pg_bin: PathBuf,
     pg_lib: PathBuf,
 }
@@ -1143,6 +1147,7 @@ fn bundled_resources(resources: &Path) -> BundledResources {
         frontend: resources.join(FRONTEND_RESOURCE_NAME),
         sdk: resources.join(SDK_RESOURCE_NAME),
         system_knowhow: resources.join(SYSTEM_KNOWHOW_RESOURCE_NAME),
+        system_widgets: resources.join(SYSTEM_WIDGETS_RESOURCE_NAME),
         pg_bin: postgres.join("bin"),
         pg_lib: postgres.join("lib"),
     }
@@ -3190,6 +3195,7 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
         .env("LUCIDOS_STATIC_DIR", &bundle.frontend)
         .env("LUCIDOS_SDK_DIR", &bundle.sdk)
         .env("LUCIDOS_SYSTEM_KNOWHOW_DIR", &bundle.system_knowhow)
+        .env("LUCIDOS_SYSTEM_WIDGETS_DIR", &bundle.system_widgets)
         .env("FASTEMBED_CACHE_DIR", &fastembed_cache)
         // Engines may boot before the user has configured a provider, into a
         // clear no-provider onboarding state and NOT mock output.
@@ -4481,6 +4487,10 @@ mod tests {
         assert_eq!(
             bundle.system_knowhow,
             resources.join(SYSTEM_KNOWHOW_RESOURCE_NAME)
+        );
+        assert_eq!(
+            bundle.system_widgets,
+            resources.join(SYSTEM_WIDGETS_RESOURCE_NAME)
         );
         assert_eq!(
             bundle.pg_bin,

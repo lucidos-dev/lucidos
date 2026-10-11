@@ -4,6 +4,8 @@ use crate::core::knowhow::{
     knowhow_not_found_body, load_one_knowhow_section, KnowhowStore, SYSTEM_KNOWHOW_PREFIX,
 };
 use crate::core::SystemKnowhowStore;
+use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
 
 /// Listing entry for knowhow surfaces — used by the file-preview "did you mean"
 /// suggestion when a stale knowhow link 404s, and by any other UI that needs
@@ -80,12 +82,51 @@ pub struct ReadKnowhowQuery {
 pub(super) async fn read_knowhow(
     State(state): State<AppState>,
     Query(query): Query<ReadKnowhowQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let kh_dirs = state.engine.knowhow_dirs();
     let sys_dir = state.engine.system_knowhow_dir();
     match load_one_knowhow_section(&kh_dirs, sys_dir, &query.id) {
-        Some(section) => section.into_response(),
+        Some(section) => {
+            record_knowhow_read(&state, &query.id, super::actor::user_actor(&headers, None)).await;
+            section.into_response()
+        }
         None => (StatusCode::NOT_FOUND, knowhow_not_found_body(&query.id)).into_response(),
+    }
+}
+
+/// Held across the check and the emit in [`record_knowhow_read`]. Without it
+/// two concurrent reads of one doc both see no row today, and both emit.
+static KNOWHOW_READ_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Record the read as use evidence for the workspace prompt footprint, which
+/// judges in whole days. So one `KnowhowRead` per doc per day is enough, and
+/// an app re-reading a doc in a loop adds no rows.
+async fn record_knowhow_read(state: &AppState, id: &str, actor: Option<MessageOrigin>) {
+    let _gate = KNOWHOW_READ_GATE.lock().await;
+    let recorded_today = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE event_type = 'KnowhowRead' \
+         AND aggregate_id = $1 AND created >= now() - make_interval(days => 1))",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await;
+    match recorded_today {
+        Ok(true) => {}
+        Ok(false) => {
+            state
+                .engine
+                .event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::KnowhowRead {
+                        knowhow_id: id.to_string(),
+                        actor,
+                    }),
+                    "[Knowhow] KnowhowRead",
+                )
+                .await
+        }
+        Err(e) => crate::log!("[Knowhow] Cannot check for today's read of {}: {}", id, e),
     }
 }
 

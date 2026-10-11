@@ -34,11 +34,9 @@ function localZIndexes(css: string): { selector: string; z: number }[] {
 
 /**
  * The filter panel COVERS the thread list inside one pane (`position: absolute;
- * inset: 0` over `.thread-drawer-list`). The trap: `.thread-drawer-list` is NOT
- * a stacking context and cannot become one, because `.flip-portal` is `position:
- * fixed` inside it and has to escape all app chrome to fly a thread between
- * sections. So a ROW's z-index competes directly with the panel's, and "the
- * panel covers the list" is not one layer against one layer.
+ * inset: 0` over `.thread-drawer-list`). The list is a stacking context, so its
+ * rows already stay under the panel. This keeps every local layer under the
+ * panel anyway, so a layer that ever lands outside the list cannot cross it.
  */
 describe('the filter panel covers every positioned layer inside the thread list', () => {
   const panel = localZIndexes(drawerCss).find(r => r.selector === '.thread-filter-cover');
@@ -48,11 +46,8 @@ describe('the filter panel covers every positioned layer inside the thread list'
   });
 
   it('outranks EVERY other local layer in the file, whatever gets added next', () => {
-    // The general form of the same bug: any new positioned layer on a row would
-    // paint over the panel. `.flip-portal` is token-valued, so the plain-number
-    // filter above already excludes it. It never crosses the panel anyway: it
-    // sits inside the list, which is hidden while the panel is up. The
-    // navigation cover is the one layer meant to be above it (next test).
+    // The navigation cover is the one layer meant to be above the panel (next
+    // test).
     const others = localZIndexes(drawerCss)
       .filter(r => r.selector !== '.thread-filter-cover' && r.selector !== NAV_COVER);
     if (others.length === 0) return; // Nothing to outrank: vacuously covered.
@@ -67,7 +62,7 @@ describe('the filter panel covers every positioned layer inside the thread list'
 /** The navigation cover hides the swap between the list and the panel, so it
  *  has to paint over both. Under the panel, opening would show the options at
  *  once with the cover fading behind them. */
-const NAV_COVER = '.thread-drawer > .nav-cover';
+const NAV_COVER = '.thread-drawer-body > .nav-cover';
 
 describe('the navigation cover lies over the filter panel', () => {
   it('outranks the filter cover', () => {

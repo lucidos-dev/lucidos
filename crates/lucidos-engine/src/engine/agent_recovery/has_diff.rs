@@ -1,18 +1,21 @@
 //! Resume-dispatch / startup reconciliation free functions: orphaned CC
-//! permission recovery, coding_agent_has_diff reconciliation, and
+//! permission recovery, branch-work reconciliation, and
 //! held-back change proposal on startup.
 
 use super::super::agent_session::change_description_fallback;
 use super::super::agent_session::resume::{deterministic_worktree_path, resolve_worktree_path};
-use super::super::change_ops::branch_is_hardened;
+use super::super::change_ops::{
+    branch_is_hardened, emit_change_withdrawn, emit_proposal_withheld, read_proposal_hold,
+};
 use super::super::event_bus::{BusEvent, EventBus};
 use super::super::git_ops::{
     default_local_branch, describe_branch_changes, files_require_restart, main_worktree,
     proposal_files_for_branch, worktrees_dir,
 };
 use super::super::thread_events::{
-    EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent, UnproposedReason,
 };
+use super::super::thread_lifecycle::ChangeStateKind;
 use super::helpers::*;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -94,20 +97,20 @@ pub(crate) fn lost_session_worktree_path(
     }
 }
 
-/// Reconcile `thread_summaries.coding_agent_has_diff` for one CC thread against
+/// Reconcile the branch-work half of one CC thread's change state against
 /// on-disk git state. Used by the engine-startup sweep
-/// (`refresh_coding_agent_has_diff_for_active_cc_threads`) to recover from
+/// (`refresh_branch_work_for_active_cc_threads`) to recover from
 /// commits that landed while the engine was down — the post-commit hook's
 /// curl call is best-effort `|| true`, so an engine-down commit leaves the
-/// projection at its pre-commit value (typically FALSE).
+/// projection at its pre-commit value (typically `none`).
 ///
 /// Decision tree:
-/// - Worktree dir is missing on disk → write `FALSE` explicitly. The branch
+/// - Worktree dir is missing on disk → write no work explicitly. The branch
 ///   ref may still exist in the main repo, but for a thread without a
-///   live worktree the user has nothing to diff against; leaving a stale
-///   `TRUE` here would render the WaitingBanner Diff button for a thread
+///   live worktree the user has nothing to diff against; leaving stale
+///   work here would render the WaitingBanner Diff button for a thread
 ///   that can't act on it.
-/// - Worktree dir exists → delegate to `session_seed::seed_coding_agent_has_diff`,
+/// - Worktree dir exists → delegate to `session_seed::seed_branch_work`,
 ///   which writes the explicit result of the Diff button's own computation
 ///   (`branch_changed_files` = `git diff <default_diff_base>...branch`): TRUE
 ///   when that net diff is non-empty, FALSE otherwise. Writing the explicit
@@ -117,9 +120,9 @@ pub(crate) fn lost_session_worktree_path(
 ///
 /// Failures are logged but not propagated — the engine startup sweep must
 /// not block on git or DB hiccups. `branch_changed_files` swallows git errors
-/// to an empty list, so a transient git failure writes FALSE; the next
+/// to an empty list, so a transient git failure writes no work; the next
 /// post-commit hook fire or the next engine restart reconciles.
-pub(crate) async fn reconcile_thread_coding_agent_has_diff(
+pub(crate) async fn reconcile_thread_branch_work(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     repo_root: &Path,
@@ -127,17 +130,18 @@ pub(crate) async fn reconcile_thread_coding_agent_has_diff(
     worktree_path: &Path,
 ) {
     if !worktree_path.exists() {
-        // No worktree on disk — clear the column. The Diff button has nothing
-        // to act on for a thread without a live workspace.
-        if let Err(e) = sqlx::query(
-            "UPDATE thread_summaries SET coding_agent_has_diff = FALSE WHERE thread_id = $1",
-        )
+        // No worktree on disk — clear the branch work. The Diff button has
+        // nothing to act on for a thread without a live workspace.
+        if let Err(e) = sqlx::query(&format!(
+            "UPDATE thread_summaries SET {} WHERE thread_id = $1",
+            crate::engine::event_bus::branch_work_sql("FALSE")
+        ))
         .bind(thread_id)
         .execute(pool)
         .await
         {
             log!(
-                "[Recovery] Failed to clear coding_agent_has_diff for thread {} (missing worktree {}): {}",
+                "[Recovery] Failed to clear the branch work for thread {} (missing worktree {}): {}",
                 thread_id,
                 worktree_path.display(),
                 e
@@ -145,22 +149,16 @@ pub(crate) async fn reconcile_thread_coding_agent_has_diff(
         }
         return;
     }
-    crate::engine::session_seed::seed_coding_agent_has_diff(
-        pool,
-        thread_id,
-        repo_root,
-        branch_name,
-    )
-    .await;
+    crate::engine::session_seed::seed_branch_work(pool, thread_id, repo_root, branch_name).await;
 }
 
 /// Engine-startup sweep that walks every active CC thread in
-/// `thread_summaries` and reconciles `coding_agent_has_diff` with on-disk git
+/// `thread_summaries` and reconciles its branch work with on-disk git
 /// state. Must run BEFORE the HTTP server starts accepting frontend
 /// connections — a frontend that hits a stale projection sees the wrong
 /// WaitingBanner Diff button state.
 ///
-/// Why this exists: live updates to `coding_agent_has_diff` flow through the
+/// Why this exists: live updates to the branch work flow through the
 /// `ChangeProposed` / `ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`
 /// projection handlers, fed by the per-commit `curl` call from the
 /// post-commit hook installed in every CC worktree. That `curl` call
@@ -173,7 +171,7 @@ pub(crate) async fn reconcile_thread_coding_agent_has_diff(
 /// The enumeration filters on `is_coding_agent=true AND state='active' AND
 /// archive_state!='archived'`. Discarded and archived threads are
 /// intentionally skipped — `ThreadArchived` already clears
-/// `coding_agent_has_diff` via its projection handler, and discarded threads
+/// the branch work via its projection handler, and discarded threads
 /// were never user-active. The archive filter is on `archive_state` (not
 /// `state`) because the state↔archive_state collapse left archived rows
 /// carrying `state='active'`. External-repo CC threads are included (the
@@ -188,7 +186,7 @@ pub(crate) async fn reconcile_thread_coding_agent_has_diff(
 /// bound to an external repo (`cc_repo_id IS NULL`). Tests inject a temp
 /// repo here; the engine boot path passes
 /// `crate::engine::git_ops::main_worktree().await`.
-pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
+pub(crate) async fn refresh_branch_work_for_active_cc_threads(
     pool: &sqlx::PgPool,
     workspace_path: &Path,
     lucidos_repo_root: &Path,
@@ -208,12 +206,12 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
         }
         Err(e) => {
             log!(
-                "[Recovery] Failed to list repositories for coding_agent_has_diff sweep: {}",
+                "[Recovery] Failed to list repositories for the branch-work sweep: {}",
                 e
             );
             // Continue with empty map — external-repo threads will fall back
             // to lucidos_repo_root (which will git-fail safely if the branch
-            // doesn't live there, leaving an optimistic TRUE that the next
+            // doesn't live there, leaving optimistic work that the next
             // restart cleans up).
         }
     }
@@ -236,7 +234,7 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
         Ok(rows) => rows,
         Err(e) => {
             log!(
-                "[Recovery] Failed to enumerate active CC threads for coding_agent_has_diff sweep: {}",
+                "[Recovery] Failed to enumerate active CC threads for the branch-work sweep: {}",
                 e
             );
             return;
@@ -275,7 +273,7 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
     let skipped_no_branch = count(HasDiffOutcome::NoBranch);
 
     log!(
-        "[Recovery] coding_agent_has_diff sweep: visited {}/{} active CC threads ({} skipped (no branch), {} missing worktree, {}ms)",
+        "[Recovery] branch-work sweep: visited {}/{} active CC threads ({} skipped (no branch), {} missing worktree, {}ms)",
         visited,
         total,
         skipped_no_branch,
@@ -318,7 +316,7 @@ async fn reconcile_one_active_thread(
         Ok(b) => b,
         Err(e) => {
             log!(
-                "[Recovery] Failed to look up branch for thread {} during coding_agent_has_diff sweep: {}",
+                "[Recovery] Failed to look up branch for thread {} during the branch-work sweep: {}",
                 thread_id,
                 e
             );
@@ -345,7 +343,7 @@ async fn reconcile_one_active_thread(
     // them to `workspace_path` BEFORE the `cc_repo_id` branch. Otherwise a NULL
     // `cc_repo_id` falls through to `lucidos_repo_root`, which lacks the branch.
     // `proposal_files_for_branch` then comes back empty, and every restart
-    // wipes `coding_agent_has_diff` to FALSE, hiding both Diff buttons. Mirrors
+    // wipes the branch work to `none`, hiding both Diff buttons. Mirrors
     // the kind routing in `propose_one_held_back_change`.
     let repo_root = if coding_agent_kind.as_deref() == Some("app") {
         workspace_path.to_path_buf()
@@ -368,7 +366,7 @@ async fn reconcile_one_active_thread(
     // `resolve_worktree_path`; using it directly here would skip the
     // (1) `CodingAgentIdled.worktree_path` lookup and the (2)
     // `git worktree list` branch match. Skipping (1)+(2) would make the
-    // sweep wipe `coding_agent_has_diff` for every legacy thread whose
+    // sweep wipe the branch work for every legacy thread whose
     // worktree lives at a non-deterministic path
     // (e.g. `.lucidos/worktrees/cc-<random>` from before Phase 6.1), which
     // is exactly the population the sweep is supposed to recover for.
@@ -382,14 +380,7 @@ async fn reconcile_one_active_thread(
     .await;
     let worktree_missing = !worktree_path.exists();
 
-    reconcile_thread_coding_agent_has_diff(
-        pool,
-        thread_id,
-        &repo_root,
-        &branch_name,
-        &worktree_path,
-    )
-    .await;
+    reconcile_thread_branch_work(pool, thread_id, &repo_root, &branch_name, &worktree_path).await;
     if worktree_missing {
         HasDiffOutcome::VisitedMissingWorktree
     } else {
@@ -397,9 +388,9 @@ async fn reconcile_one_active_thread(
     }
 }
 
-/// Engine-startup entry point for the `coding_agent_has_diff` reconciliation
+/// Engine-startup entry point for the branch-work reconciliation
 /// sweep. Resolves the Lucidos main repo root via `main_worktree()` and
-/// then defers to `refresh_coding_agent_has_diff_for_active_cc_threads`.
+/// then defers to `refresh_branch_work_for_active_cc_threads`.
 ///
 /// `main.rs` calls this once on every engine boot, after orphan worktree
 /// recovery and before the HTTP server starts. Free function (rather than
@@ -408,10 +399,9 @@ async fn reconcile_one_active_thread(
 /// keeping it standalone matches the shape of
 /// `recover_orphan_cc_permission_requests` which is also called free-form
 /// from `main.rs`.
-pub async fn refresh_coding_agent_has_diff_on_startup(pool: &sqlx::PgPool, workspace_path: &Path) {
+pub async fn refresh_branch_work_on_startup(pool: &sqlx::PgPool, workspace_path: &Path) {
     let lucidos_repo_root = main_worktree().await;
-    refresh_coding_agent_has_diff_for_active_cc_threads(pool, workspace_path, &lucidos_repo_root)
-        .await;
+    refresh_branch_work_for_active_cc_threads(pool, workspace_path, &lucidos_repo_root).await;
 }
 
 /// Engine-startup sweep that re-proposes any change that was never surfaced
@@ -433,7 +423,7 @@ pub async fn refresh_coding_agent_has_diff_on_startup(pool: &sqlx::PgPool, works
 /// is a no-op in steady state: a safety net for a missed idle proposal.
 ///
 /// Selection (column-independent): idle coding-agent threads, not archived,
-/// with `coding_agent_has_diff = TRUE` and `coding_agent_proposed = FALSE`,
+/// whose change state is `unproposed`,
 /// excluding external repos. Each candidate is then re-validated per-thread
 /// by `propose_one_held_back_change` (see its skip conditions).
 pub async fn propose_held_back_changes_on_startup(
@@ -456,19 +446,76 @@ pub async fn propose_held_back_changes_on_startup(
     .await;
 }
 
+/// Engine-startup sweep: a pending change still marked incomplete came from an
+/// unfinished turn before ADR 0400. No proposal is unfinished any more, so each
+/// goes back to unproposed work, its branch untouched, and says why. Runs
+/// before `propose_held_back_changes_on_startup`, which then finds the reason
+/// already projected.
+pub async fn withdraw_incomplete_pending_changes_on_startup(
+    pool: &sqlx::PgPool,
+    event_bus: &EventBus,
+) {
+    type IncompleteRow = (Uuid, Option<Uuid>, String, Vec<String>);
+    let rows: Vec<IncompleteRow> = match sqlx::query_as(
+        "SELECT id, thread_id, branch_name, files FROM changes \
+         WHERE status = $1 AND incomplete",
+    )
+    .bind(crate::core::changes::ChangeStatus::Pending)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log!(
+                "[Recovery] Failed to list incomplete pending changes: {}",
+                e
+            );
+            return;
+        }
+    };
+    for (change_id, thread_id, branch_name, files) in rows {
+        let Some(thread_id) = thread_id else { continue };
+        log!(
+            "[Recovery] Withdrawing incomplete change {} on branch {}",
+            change_id,
+            branch_name
+        );
+        if let Err(e) = emit_change_withdrawn(
+            event_bus,
+            thread_id,
+            change_id,
+            Some(MessageOrigin::engine(EngineReason::OrphanRecovery)),
+        )
+        .await
+        {
+            log!("[Recovery] {}", e);
+            continue;
+        }
+        emit_proposal_withheld(
+            event_bus,
+            thread_id,
+            &branch_name,
+            &files,
+            UnproposedReason::TurnIncomplete,
+        )
+        .await;
+    }
+}
+
 /// Candidate selection for `propose_held_back_changes_on_startup`: idle
 /// coding-agent threads with a committed diff but no proposed change yet.
 /// Broad on purpose — `propose_one_held_back_change` re-validates every row
-/// (clean-terminal, branch resolves, files non-empty, no existing pending).
+/// (clean or stopped terminal, no live event wait after a clean one, branch
+/// resolves, files non-empty, no existing pending).
 pub(crate) async fn select_unproposed_idle_cc_threads(pool: &sqlx::PgPool) -> Vec<Uuid> {
     match sqlx::query_scalar::<_, Uuid>(
         "SELECT thread_id FROM thread_summaries \
          WHERE is_coding_agent = TRUE \
            AND archive_state != 'archived' \
-           AND coding_agent_has_diff = TRUE \
-           AND coding_agent_proposed = FALSE \
+           AND coding_agent_change_state = $1 \
            AND coding_agent_is_external_repo = FALSE",
     )
+    .bind(ChangeStateKind::Unproposed.as_str())
     .fetch_all(pool)
     .await
     {
@@ -536,19 +583,24 @@ pub async fn propose_held_back_changes_on_startup_with_roots(
 }
 
 /// Per-thread worker for the held-back-propose helper. Returns `Ok(true)`
-/// if a `ChangeProposed` was emitted, `Ok(false)` if the thread was skipped.
+/// if a `ChangeProposed` was emitted, `Ok(false)` if the thread was skipped
+/// or its work withheld.
 ///
 /// Skip conditions (each emits zero `ChangeProposed`):
-///   - `coding_agent_proposed = TRUE` → already has an Apply button.
-///   - `coding_agent_has_diff = FALSE` → no work to propose.
+///   - change state other than `unproposed` → a pending change already
+///     carries the work, or there is none to propose.
 ///   - `coding_agent_is_external_repo = TRUE` → engine doesn't own proposals
 ///     for external repos (CC pushes/PRs from the session).
-///   - last turn neither finished nor was stopped by the user
-///     ([`last_turn_proposal`]) → a failed or aborted turn recovers via
-///     Continue. A stopped one proposes as incomplete (ADR 0328).
+///   - a live event wait after a clean turn → the idle held its proposal
+///     (ADR 0395), and the wait's delivery, expiry or cancel proposes later.
+///   - no turn end a sweep settles ([`last_turn_end`]).
 ///   - empty / missing SessionStarted branch → can't resolve a branch.
 ///   - `proposal_files_for_branch` returns `None` → no committed net diff.
 ///   - existing pending change for the branch → already rescued.
+///
+/// An unfinished turn, or a branch the proposal hold keeps, emits
+/// `ProposalWithheld` instead. It stays silent when the projection already
+/// carries that reason, so a restart repeats nothing (ADR 0400).
 ///
 /// Surviving threads emit `ChangeProposed` with
 /// `MessageOrigin::engine(EngineReason::StaleSession)` — the route popover
@@ -562,7 +614,7 @@ async fn propose_one_held_back_change(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Eligibility: re-read from the projection. The sweep narrowed by
     // is_coding_agent + archive_state, but the per-thread shape
-    // (proposed/has_diff/external/kind) still has to be checked here.
+    // (change state/external/waiting/kind) still has to be checked here.
     //
     // `coding_agent_kind` picks the repo to inspect: `'app'` → the workspace
     // git (where `data/apps/<id>/` lives), anything else → the Lucidos main
@@ -570,27 +622,32 @@ async fn propose_one_held_back_change(
     // out: their branch doesn't exist in the Lucidos repo, so
     // `proposal_files_for_branch(lucidos_repo_root, ...)` returns None and the
     // thread stays stuck — the same shape this whole helper exists to fix.
-    let row: Option<(bool, bool, bool, Option<String>)> = sqlx::query_as(
-        "SELECT coding_agent_proposed, coding_agent_has_diff, \
-                coding_agent_is_external_repo, coding_agent_kind \
+    type EligibilityRow = (String, Option<String>, bool, bool, Option<String>);
+    let row: Option<EligibilityRow> = sqlx::query_as(
+        "SELECT coding_agent_change_state, coding_agent_unproposed_reason, \
+                coding_agent_is_external_repo, live_event_wait_count > 0, \
+                coding_agent_kind \
          FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_optional(pool)
     .await?;
-    let (proposed, has_diff, is_external, kind) = match row {
+    let (change_state, projected_reason, is_external, holds_live_wait, kind) = match row {
         Some(r) => r,
         None => return Ok(false),
     };
-    if proposed || !has_diff || is_external {
+    if ChangeStateKind::parse(&change_state) != Some(ChangeStateKind::Unproposed) || is_external {
         return Ok(false);
     }
     // The same rule as the live idle gate, `idle_change_write`: this sweep
     // catches a proposal an engine death lost between the turn's end and its
     // `propose_change`.
-    let Some(incomplete) = last_turn_proposal(pool, thread_id).await else {
+    let Some(turn_end) = last_turn_end(pool, thread_id).await else {
         return Ok(false);
     };
+    if holds_live_wait && turn_end == TurnEnd::Finished {
+        return Ok(false);
+    }
     let repo_root: &Path = match kind.as_deref() {
         Some("app") => workspace_path,
         _ => lucidos_repo_root,
@@ -611,8 +668,8 @@ async fn propose_one_held_back_change(
     };
 
     // Dedup against an existing pending row keyed on the branch (covers
-    // re-entrant boot, legacy per-commit emits that never set
-    // coding_agent_proposed).
+    // re-entrant boot, legacy per-commit emits that never made the thread
+    // `proposed`).
     if event_bus
         .changes_projection()
         .get_open_by_branch(&branch_name)
@@ -629,6 +686,30 @@ async fn propose_one_held_back_change(
         Some(f) if !f.is_empty() => f,
         _ => return Ok(false),
     };
+
+    // An unfinished turn never proposes, and the floor `propose_change`
+    // applies holds what Apply would refuse.
+    let withheld = match turn_end {
+        TurnEnd::Unfinished => Some(UnproposedReason::TurnIncomplete),
+        TurnEnd::Finished => {
+            read_proposal_hold(pool, thread_id, repo_root, &branch_name, &changed_files)
+                .await
+                .map(UnproposedReason::from)
+        }
+    };
+    if let Some(reason) = withheld {
+        if projected_reason.as_deref() == Some(reason.as_str()) {
+            return Ok(false);
+        }
+        log!(
+            "[Recovery] Withholding held-back branch {} for thread {}: {}",
+            branch_name,
+            thread_id,
+            reason.as_str()
+        );
+        emit_proposal_withheld(event_bus, thread_id, &branch_name, &changed_files, reason).await;
+        return Ok(false);
+    }
 
     let change_id = Uuid::new_v4();
     let requires_restart = files_require_restart(&changed_files);
@@ -657,7 +738,7 @@ async fn propose_one_held_back_change(
                     branch_name,
                     repo_root: repo_root.to_string_lossy().to_string(),
                     hardened,
-                    incomplete,
+                    incomplete: false,
                     set_aside: false,
                     path: String::new(),
                     diff: String::new(),

@@ -42,7 +42,7 @@ tool, and:
 6. **Every resolution writes a wake anchor, and a stranded one is re-driven at
    boot.** A resolution is immediately followed by exactly one of two events:
    the paired `await_event` `ToolResult` when the wait was still attached, or a
-   `UserPromptInjected` carrying the payload as prose when it had detached.
+   `PromptInjected` carrying the payload as prose when it had detached.
 
 ## Rationale
 
@@ -109,7 +109,7 @@ its own anchor never woke, so re-drive it. Bounded by construction, since the
 re-driven turn's own events become the thread's later word.
 
 It also settles a question the design otherwise leaves open, which is how a
-detached delivery reads in the transcript. `UserPromptInjected` is already an
+detached delivery reads in the transcript. `PromptInjected` is already an
 exchange-start event on the frontend, so using it as the detached anchor makes
 the wake render as the new turn it genuinely is, with no new event type and no
 payload-aware exception in the exchange grouper.
@@ -227,10 +227,10 @@ left the indicator and the link is its only route there. (It sat on the arming
 row until 2026-08-10 and now sits on the wake; see the correction below.)
 
 **The detached wake shows the event, not the prompt.** The design leaves the
-wake's `UserPromptInjected.text` as the model's prompt, which necessarily spells
+wake's `PromptInjected.text` as the model's prompt, which necessarily spells
 the matched payload out as pretty-printed JSON, and the client rendered that
 text verbatim as markdown. On a 393px viewport a `CodingAgentIdled` delivery was
-a screen and a half of raw JSON. `UserPromptInjected` therefore gained an
+a screen and a half of raw JSON. `PromptInjected` therefore gained an
 optional `delivered_event_id` pointing back at the `EventWaitDelivered` that
 produced it, which already carries `event_type` and `payload` as fields; the
 transcript renders the event's name with the payload folded away, and falls back
@@ -239,7 +239,7 @@ An id rather than a copy, so there is still exactly one structured record of the
 delivery, and the client never parses engine-authored prose back apart.
 
 Neither half changes the wake mechanics: the anchor is still a
-`UserPromptInjected`, still an exchange-start event, and still what the lost-wake
+`PromptInjected`, still an exchange-start event, and still what the lost-wake
 sweep recognises.
 
 ## Amendment, 2026-08-10: the transcript surface is a row of its own, shared with three others

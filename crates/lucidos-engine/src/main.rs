@@ -768,6 +768,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &workspace_path,
     )
     .await;
+    // Move the pre-ADR-0390 chat tier onto the model the workspace chats with.
+    // Rust rather than SQL, since an unset `chat_model` runs `LUCIDOS_MODEL`.
+    lucidos_engine::core::PreferenceStore::move_legacy_chat_effort(
+        engine.pool(),
+        &engine.event_bus,
+        engine.current_provider().default_model(),
+    )
+    .await;
     // Apply stored env vars to the engine's OWN process env, so every
     // engine-internal shell-out that inherits it sees them. Runs after the
     // migration, so just-migrated vars are included. Reserved names are
@@ -859,45 +867,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await;
     }
 
-    // A credential the proxy would now refuse for want of a scope gets the one
-    // its own entry uses, once, and says so (ADR 0144). Two entries disagreeing
-    // is not an answer, so those are left for the user to settle.
-    for (name, scopes) in configured_credential_scopes {
-        let mut usable = scopes.iter().filter(|u| !u.trim().is_empty());
-        let (Some(base_url), None) = (usable.next(), usable.next()) else {
-            continue;
-        };
-        match lucidos_engine::core::CredentialStore::infer_scope_if_empty(
-            engine.pool(),
-            &engine.event_bus,
-            &name,
-            base_url,
-        )
-        .await
-        {
-            Ok(true) => log!("[Startup] scoped credential '{}' to {}", name, base_url),
-            Ok(false) => {}
-            Err(e) => log!("[Startup] could not scope credential '{}': {}", name, e),
+    // A credential stored before the proxy checked scopes gets the one its own
+    // entry uses, once per workspace, and says so (ADR 0144).
+    match lucidos_engine::core::CredentialStore::infer_undeclared_scopes(
+        engine.pool(),
+        &engine.event_bus,
+        &configured_credential_scopes,
+    )
+    .await
+    {
+        Ok(scoped) => {
+            for (name, base_url) in scoped {
+                log!("[Startup] scoped credential '{}' to {}", name, base_url);
+            }
         }
-    }
-
-    // The builtin `local` provider has no `apis.json` entry to read a scope
-    // from, so its credential gets the base URL the provider itself resolves.
-    // Same once-only inference, and it keeps a workspace that already stores a
-    // `local` key working after the proxy started checking scopes.
-    if let Some(local_base) = lucidos_engine::api::local_upstream_base_url(engine.pool()).await {
-        match lucidos_engine::core::CredentialStore::infer_scope_if_empty(
-            engine.pool(),
-            &engine.event_bus,
-            "local",
-            &local_base,
-        )
-        .await
-        {
-            Ok(true) => log!("[Startup] scoped credential 'local' to {}", local_base),
-            Ok(false) => {}
-            Err(e) => log!("[Startup] could not scope credential 'local': {}", e),
-        }
+        Err(e) => log!("[Startup] could not infer credential scopes: {}", e),
     }
 
     // Same two surfaces as the rejection announce above, and for the same
@@ -1052,9 +1036,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `source='claude_code'` scope is defensive.
     if let Err(e) = sqlx::query(&format!(
         "UPDATE thread_summaries SET status = {}, coding_agent_is_external_repo = FALSE \
-         WHERE status = {} AND coding_agent_proposed = FALSE AND source = 'claude_code'",
+         WHERE status = {} AND coding_agent_change_state <> '{}' AND source = 'claude_code'",
         ThreadStatus::Idle.sql_literal(),
         ThreadStatus::Waiting.sql_literal(),
+        lucidos_engine::engine::thread_lifecycle::ChangeStateKind::Proposed.as_str(),
     ))
     .execute(shared_engine.pool())
     .await
@@ -1072,8 +1057,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
-    // One home thread per workspace, created once while its switch is on.
-    if let Err(e) = lucidos_engine::engine::home_thread::ensure_home_thread_if_enabled(
+    // One home thread per workspace, created before the router serves, so a
+    // client's first thread list already carries it (ADR 0411).
+    if let Err(e) = lucidos_engine::engine::home_thread::ensure_home_thread(
         &shared_engine.event_bus,
         shared_engine.pool(),
     )
@@ -1161,13 +1147,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
-    // Reconcile `thread_summaries.coding_agent_has_diff` against on-disk git
+    // A pending change from an unfinished turn goes back to unproposed work
+    // (ADR 0400). Before the two sweeps below: the reconcile then drops work
+    // whose worktree is gone, and the held-back sweep finds the reason set.
+    lucidos_engine::engine::agent_recovery::withdraw_incomplete_pending_changes_on_startup(
+        shared_engine.pool(),
+        &shared_engine.event_bus,
+    )
+    .await;
+
+    // Reconcile each thread's branch work against on-disk git
     // for every active coding-agent thread. Live updates flow through the
     // change projection handlers, but a mid-turn commit does not, so this
     // sweep is the authoritative reconciliation. It runs before the HTTP server
     // serves SSE, because the Diff button must reflect git from the first
     // connection.
-    lucidos_engine::engine::agent_recovery::refresh_coding_agent_has_diff_on_startup(
+    lucidos_engine::engine::agent_recovery::refresh_branch_work_on_startup(
         shared_engine.pool(),
         shared_engine.workspace_path(),
     )
@@ -1175,9 +1170,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     boot_stages.lap("has-diff sweep");
 
     // Propose changes never surfaced at idle: an idle coding-agent thread with
-    // a committed branch diff but no pending change. A safety net for any
-    // missed idle-proposal, and a no-op in steady state, because
-    // `idle_change_write` already fires for every clean idle and user Stop.
+    // a committed branch diff but no pending change, or announce why not. A
+    // safety net for any missed idle settle, and a no-op in steady state,
+    // because `idle_change_write` already fires for every turn end.
     lucidos_engine::engine::agent_recovery::propose_held_back_changes_on_startup(
         shared_engine.pool(),
         &shared_engine.event_bus,
@@ -1289,8 +1284,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
     lucidos_engine::engine::change_summary_consumer::spawn(shared_engine.clone());
+    lucidos_engine::engine::pending_change_watch::spawn(shared_engine.clone());
     lucidos_engine::engine::summary_tree::spawn(shared_engine.clone());
-    lucidos_engine::engine::agent_recovery::spawn_archive_net(shared_engine.clone());
+    lucidos_engine::engine::agent_recovery::spawn_branch_work_net(shared_engine.clone());
 
     // Serve the last discovered Claude Code model list, and refresh it in the
     // background when it is missing or stale.

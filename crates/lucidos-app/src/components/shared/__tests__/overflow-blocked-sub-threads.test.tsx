@@ -31,7 +31,7 @@ function openMenu(): HTMLElement {
     return document.querySelector<HTMLElement>('.thread-overflow-menu')!;
 }
 
-const pending: Partial<ThreadMeta> = { channel: 'claude_code', codingAgentProposed: true };
+const pending: Partial<ThreadMeta> = { channel: 'claude_code', codingAgentChangeState: { kind: 'proposed', requires_restart: false }};
 
 function sub(id: string, title: string, meta: Partial<ThreadMeta>) {
     return makeThreadState(id, { meta: { parentThreadId: 't', title, section: 'inbox', ...meta } });

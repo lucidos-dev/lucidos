@@ -698,8 +698,11 @@ async fn a_wait_scopes_to_one_coding_agent_session_on_every_path() {
     };
 
     // 1. LIVE. The view the dispatcher builds, through the function it calls.
-    let live_watched =
-        crate::core::event_subscription::matchable_thread_payload(&an_idle(), watched);
+    let live_watched = crate::core::event_subscription::matchable_thread_payload(
+        &an_idle(),
+        &EventMeta::NONE,
+        watched,
+    );
     let waiter = Uuid::new_v4();
     let wait = wait_with(waiter, vec![scoped(watched)], before);
     let wait_id = wait.wait_id;
@@ -1802,13 +1805,13 @@ async fn delivery_emits_the_resolution_before_its_anchor() {
 
     let order: Vec<String> = sqlx::query_scalar(
         "SELECT event_type FROM events WHERE aggregate_id = $1 \
-           AND event_type IN ('EventWaitDelivered','UserPromptInjected') ORDER BY sequence",
+           AND event_type IN ('EventWaitDelivered','PromptInjected') ORDER BY sequence",
     )
     .bind(thread_id.to_string())
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(order, vec!["EventWaitDelivered", "UserPromptInjected"]);
+    assert_eq!(order, vec!["EventWaitDelivered", "PromptInjected"]);
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -1860,13 +1863,13 @@ async fn expiry_emits_the_resolution_and_then_its_anchor() {
 
     let order: Vec<String> = sqlx::query_scalar(
         "SELECT event_type FROM events WHERE aggregate_id = $1 \
-           AND event_type IN ('EventWaitExpired','UserPromptInjected') ORDER BY sequence",
+           AND event_type IN ('EventWaitExpired','PromptInjected') ORDER BY sequence",
     )
     .bind(thread_id.to_string())
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(order, vec!["EventWaitExpired", "UserPromptInjected"]);
+    assert_eq!(order, vec!["EventWaitExpired", "PromptInjected"]);
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -2076,11 +2079,11 @@ async fn a_thread_holding_a_subscription_is_idle() {
 // ── the re-entry anchor and the lost-re-entry sweep (I3b) ────────────────────
 
 /// A detached resolution has no tool-result slot, so `emit_resolution` writes a
-/// `UserPromptInjected` instead: the frontend's exchange-starter, which is what
+/// `PromptInjected` instead: the frontend's exchange-starter, which is what
 /// makes the delivery read as the new turn it genuinely is. The anchor id must be
 /// that event, since the re-entry hangs its whole exchange off it.
 #[tokio::test]
-async fn a_delivery_anchors_on_a_user_prompt_injected() {
+async fn a_delivery_anchors_on_a_prompt_injected() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
@@ -2107,7 +2110,7 @@ async fn a_delivery_anchors_on_a_user_prompt_injected() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(anchor_type, "UserPromptInjected");
+    assert_eq!(anchor_type, "PromptInjected");
     assert_eq!(
         anchor_text.as_deref(),
         Some(reentry.text.as_str()),

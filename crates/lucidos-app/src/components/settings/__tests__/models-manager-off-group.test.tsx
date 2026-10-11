@@ -43,6 +43,8 @@ function model(over: Partial<ModelInfo> & { id: string }): ModelInfo {
     routes: [{ provider: 'vertex', id: over.id, reasoning_efforts: [] }],
     preferred_provider: null,
     vision: false,
+    default_effort: null,
+    successor: null,
     sort_order: 0,
     source: 'builtin',
     enabled: true,

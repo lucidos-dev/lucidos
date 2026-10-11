@@ -86,8 +86,9 @@ it('opens a repo link in the answer in the app, never the OS', () => {
   anchor.dispatchEvent(click);
   expect(click.defaultPrevented).toBe(true);
   expect(openRepoFileLink).toHaveBeenCalledWith(
-    { locator: { repoId: 'lucidos', mode: 'file', ref: undefined, path: 'src/main.rs' } },
+    expect.objectContaining({ locator: { repoId: 'lucidos', mode: 'file', ref: undefined, path: 'src/main.rs' } }),
     undefined,
+    expect.any(Function),
   );
 });
 

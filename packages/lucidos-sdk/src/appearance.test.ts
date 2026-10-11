@@ -23,8 +23,11 @@ import {
   FONT_FEATURES_DEFAULT,
   MOTION_PREFS,
   REDUCED_MOTION_DURATION_SCALE,
+  SYSTEM_THEME_MODE_CONFIRM_MS,
+  SYSTEM_THEME_MODE_SETTLE_MS,
   THEME_MODE_BG,
   clampUiScale,
+  followSystemThemeMode,
   durationScaleFor,
   fontFeaturesFor,
   fontStackFor,
@@ -96,6 +99,63 @@ describe('resolving a theme against the OS', () => {
   it('every resolved theme has a background to paint before any stylesheet', () => {
     expect(THEME_MODE_BG.light).toBe('#ffffff');
     expect(THEME_MODE_BG.dark).toBe('#07172e');
+  });
+});
+
+describe('following the OS appearance', () => {
+  /** A page whose OS reads `light` once `osLight` is set, painted dark. */
+  function fakePage() {
+    const page = { shown: true, osLight: false, applied: 0 };
+    const follower = followSystemThemeMode({
+      visible: () => page.shown,
+      moved: () => page.osLight,
+      apply: () => { page.applied++; },
+    });
+    return { page, follower };
+  }
+
+  it('paints a move only once the confirming read still sees it', () => {
+    vi.useFakeTimers();
+    const { page, follower } = fakePage();
+    page.osLight = true;
+    follower.schedule();
+
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS);
+    expect(page.applied).toBe(0);
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_CONFIRM_MS);
+    expect(page.applied).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it('a hide between the two reads paints nothing', () => {
+    vi.useFakeTimers();
+    const { page, follower } = fakePage();
+    page.osLight = true;
+    follower.schedule();
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS);
+
+    page.shown = false;
+    follower.schedule();
+    page.shown = true;
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_CONFIRM_MS);
+
+    expect(page.applied).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('events during the confirming wait arm no second read', () => {
+    vi.useFakeTimers();
+    const { page, follower } = fakePage();
+    page.osLight = true;
+    follower.schedule();
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS);
+    follower.schedule();
+    follower.schedule();
+
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS + SYSTEM_THEME_MODE_CONFIRM_MS);
+
+    expect(page.applied).toBe(1);
+    vi.useRealTimers();
   });
 });
 

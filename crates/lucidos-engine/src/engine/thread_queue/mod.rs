@@ -346,7 +346,7 @@ pub struct ThreadQueueSnapshot {
 /// - **→ not-running** — parked on the user, terminal, or back to idle.
 ///   reconcile removes; removal is idempotent so these can never double-count.
 /// - **Excluded: gate-covered starts** (`MessageReceived`, `SessionStarted`,
-///   `CodingAgentUserMessageSent`, `UserPromptInjected`). These are always
+///   `CodingAgentUserMessageSent`, `PromptInjected`). These are always
 ///   preceded by [`Self::acquire_user_slot`] inserting the slot (or are
 ///   mid-flight into an already-counted thread), so reconcile must NOT also add
 ///   on them — `acquire_user_slot` adds unconditionally, so a reconcile add

@@ -49,6 +49,10 @@ export LUCIDOS_PIN_ENGINE_VERSION=1
 if [ -z "${LUCIDOS_SYSTEM_KNOWHOW_DIR:-}" ] && [ -d "$_E2E_PROJECT_DIR/system-knowhow" ]; then
     export LUCIDOS_SYSTEM_KNOWHOW_DIR="$_E2E_PROJECT_DIR/system-knowhow"
 fi
+# The built-in widgets follow the same rule, for the same reason (ADR 0415).
+if [ -z "${LUCIDOS_SYSTEM_WIDGETS_DIR:-}" ] && [ -d "$_E2E_PROJECT_DIR/system-widgets" ]; then
+    export LUCIDOS_SYSTEM_WIDGETS_DIR="$_E2E_PROJECT_DIR/system-widgets"
+fi
 
 # Use mock LLM provider by default for e2e tests (override with LUCIDOS_MODEL=... before calling)
 export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
@@ -117,6 +121,7 @@ source "$_E2E_LIB_DIR/e2e_lock.sh"
 source "$_E2E_LIB_DIR/webkit_reaper.sh"
 source "$_E2E_LIB_DIR/host_load_guard.sh"
 source "$_E2E_LIB_DIR/host_memory_guard.sh"
+source "$_E2E_LIB_DIR/e2e_gateway.sh"
 
 # ── assert_e2e_workspace_is_disposable ──────────────────────────────────
 # Refuse to proceed unless $E2E_WORKSPACE names a disposable e2e workspace.
@@ -341,6 +346,7 @@ ensure_workspace_running() {
         setup_postgres
         build_e2e_engine_once
         swap_ports
+        attach_e2e_gateway || return 1
         start_engine
     fi
 
@@ -574,13 +580,20 @@ project_runs_spec() {
     return 0
 }
 
-# ── e2e_spec_needs_claude_code ───────────────────────────────────────
-# Succeed when a spec spawns a real Claude Code session. The compose
-# destination picker is the entry point for spawning one, so a new spec
-# classifies itself. GitHub mode runs these on this host, where Claude Code is
-# logged in.
-e2e_spec_needs_claude_code() {
+# ── e2e_spec_spawns_claude_code ──────────────────────────────────────
+# Succeed when a spec spawns a Claude Code subprocess, real or fake. The
+# compose destination picker is the entry point for spawning one, so a new
+# spec classifies itself. The mobile-webkit run phases its memory on this.
+e2e_spec_spawns_claude_code() {
     grep -q "pickComposeDestination" "$1" 2>/dev/null
+}
+
+# ── e2e_spec_needs_real_claude_code ──────────────────────────────────
+# Succeed when a spec has a test tagged @real-claude-code. GitHub mode keeps
+# those on this host, where Claude Code is logged in. Every other spec runs
+# on GitHub, against the fake in crates/lucidos-app/e2e/fake-claude-code/.
+e2e_spec_needs_real_claude_code() {
+    grep -q "@real-claude-code" "$1" 2>/dev/null
 }
 
 # ── e2e_browser_projects ─────────────────────────────────────────────
@@ -965,6 +978,7 @@ setup_e2e_session() {
 stop_e2e_workspace() {
     echo "Stopping e2e workspace..."
     "$_E2E_SCRIPTS_DIR/stop.sh" -w "$E2E_WORKSPACE" 2>/dev/null || true
+    stop_e2e_gateway
     # ADR 0014: no long-lived frontend process to stop — the engine serves the
     # built dist/ directly and the one-shot `vite build` exits on its own.
 }

@@ -1,6 +1,7 @@
 // MUST be first: installs per-workspace localStorage namespacing before any
 // module-init localStorage read (for example store/store.ts).
 import './utils/workspaceStorage.install';
+import './utils/pageHealthLog.install';
 import { render, type ComponentChildren } from 'preact';
 import { lazyComponent } from './utils/lazyComponent';
 import { IS_PICKER, WORKSPACE_ID, baseContextIsValid } from './utils/basePath';

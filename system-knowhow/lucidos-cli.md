@@ -85,9 +85,10 @@ App UIs in the browser use the JS SDK (`lucidos.data.*`, `lucidos.events.*`). Th
 
 A git `post-commit` hook in Lucidos-managed coding-agent worktrees. When the
 process has `LUCIDOS_THREAD_ID` set, it posts the repo root and branch to the
-parent engine, so `coding_agent_has_diff` refreshes right after a commit. It is
-silent and best-effort. It creates no `ChangeProposed` event and no Apply-able
-change: the formal proposal still happens when the coding-agent turn idles.
+parent engine, which moves the thread's `coding_agent_change_state` between
+`none` and `unproposed` right after a commit. It is silent and best-effort. It
+creates no `ChangeProposed` event and no Apply-able change: the formal proposal
+still happens when the coding-agent turn idles.
 
 Do not call it from scripts. It needs the subprocess-origin headers the CLI
 attaches in spawned subprocesses.
@@ -332,7 +333,7 @@ $ lucidos events count --type ToolResult --since 2026-05-18T00:00:00Z
 
 `byte_total` is `SUM(octet_length(payload::text))`, the raw payload byte sum. It is a reliable proxy for the token cost of the matching `lucidos events query`. On a busy workspace, run it before `query` to pick which types to drill into. A `query --type ToolResult --limit 300` can return 2.3 MB and blow the next turn's prompt cap.
 
-### `lucidos threads list [--active | --status <list>] [--source <list>] [--limit N] [--parent <uuid> | --my-children] [--has-draft [false]] [--has-diff [false]]`
+### `lucidos threads list [--active | --status <list>] [--source <list>] [--limit N] [--parent <uuid> | --my-children] [--has-draft [false]] [--change-state <state>]`
 
 List thread summaries from the parent workspace. Outputs the raw JSON array on stdout, newest-first by `last_activity`. Each row is a full `ThreadSummary`, the shape `lucidos.threads.list()` returns in the JS SDK, plus the *reader fields*:
 
@@ -359,7 +360,9 @@ $ lucidos threads list --status running --limit 5 | jq '.[].title'
 - `--limit` clamps to `1..=1000` server-side, default 100.
 - `--parent <uuid>` restricts to that thread's **direct** children, never its grandchildren. A malformed uuid is a 400, never a silently unfiltered list.
 - `--my-children` is `--parent` with the calling thread's own id, read from `$LUCIDOS_THREAD_ID`. Use it to recover a child's `thread_id`, see which children still work, and spot one parked on a question. Outside a Lucidos-spawned subprocess it errors, rather than listing the whole workspace. Passing both child filters is refused: one filter, one answer.
-- `--has-draft` keeps threads holding an unsent draft, and `--has-draft false` keeps the rest. `--has-diff` does the same for a coding-agent branch that differs from main. A pending question and a failure are statuses: filter them with `--status waiting_for_user_answer` and `--status failed`.
+- `--has-draft` keeps threads holding an unsent draft, and `--has-draft false` keeps the rest.
+- `--change-state <state>` keeps coding-agent threads in one *change state*: `none` (no work on the branch), `unproposed` (branch work that no pending change carries) or `proposed` (a pending change). Each row's `coding_agent_change_state` field says which, and for `unproposed` its `reason`. Any other value is an error.
+- A pending question and a failure are statuses: filter them with `--status waiting_for_user_answer` and `--status failed`.
 
 ```bash
 # Which of my own children are still working, and what are they called?
@@ -376,9 +379,9 @@ Every row carries `pending_sub_thread_change_count`: the pending changes held by
 
 Use this when a script reacts to thread state ("is anything still running before I fire this trigger?"). It reads the projection's per-thread status, so never rebuild that from raw `query_events`.
 
-### `lucidos threads count [--active | --status <list>] [--source <list>] [--parent <uuid> | --my-children] [--has-draft [false]] [--has-diff [false]]`
+### `lucidos threads count [--active | --status <list>] [--source <list>] [--parent <uuid> | --my-children] [--has-draft [false]] [--change-state <state>]`
 
-Count thread summaries matching the same filters as `list`, including `--status`, the two child filters, `--has-draft` and `--has-diff`. Outputs `{"count": N}` on stdout.
+Count thread summaries matching the same filters as `list`, including `--status`, the two child filters, `--has-draft` and `--change-state`. Outputs `{"count": N}` on stdout.
 
 ```bash
 # Is anything still running? (the idle-detector form)
@@ -495,7 +498,8 @@ $ lucidos threads archive --thread current
 - **From inside a thread you can archive only yourself and your own DIRECT children.** The engine reads the calling thread off the origin token, and resolves `current` to it. Anything else is a 403 with `not_your_thread`, an unknown id a 404, and a discarded thread a 409. Outside a thread, with no origin token, it archives any thread, as the Archive button does.
 - **A child is archived now**, with its own sub-threads. **`current` is archived once this turn ends** and the thread has settled. A new message into it before then keeps it open.
 - **The home thread is never archived**, by anyone: a 409 with `home_thread`.
-- **The Archive button's refusals apply.** A running target or one waiting on the user is a 409 with `parent_not_archivable`. A pending change is `parent_has_pending_changes`, and a blocking sub-thread is `descendants_blocking`. Each body carries a `message` saying what to do. A pinned target is a 409 with `thread_pinned`: only the user archives a pinned thread. A pinned sub-thread of the target stays open and is listed under `skipped`.
+- **The Archive button's refusals apply.** A running target or one waiting on the user is a 409 with `parent_not_archivable`. A pending change is `parent_has_pending_changes`, and a blocking sub-thread is `descendants_blocking`. A target parked on an event wait with unproposed work is `parent_holds_held_proposal`: stop waiting first. Each body carries a `message` saying what to do.
+- **A pinned target is a 409 with `thread_pinned`**: only the user archives a pinned thread. A pinned sub-thread of the target stays open and is listed under `skipped`.
 - **Archiving lets the worktree be reclaimed**, so a later follow-up rebuilds it.
 
 ### `lucidos spawn-thread --to <WS> --message <M> [--image <path> ...] [--coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--coding-agent-model <M>] [--reasoning-effort <level>]`
@@ -508,7 +512,7 @@ A workspace on another install is not a sibling: a packaged app and a dev checko
 
 **A spawn needs something to say.** A blank `--message` with no `--image` exits non-zero before any request, and the target engine refuses one with a 400 too. No thread is created either way. The usual cause is `--message "$(cat brief.md)"` where `brief.md` was never written, so guard it: `test -s brief.md && lucidos spawn-thread … --message "$(cat brief.md)"`.
 
-A top-thread sits under the workspace, not under you, so creating one is the *workspace owner*'s call (ADR 0168). From a thread, `--relation top` needs their standing instruction: a turn they opened, or a trigger firing they authorized. Without one it exits non-zero on a 403 whose body names those two shapes. `--relation child` stays inside your own subtree and needs nothing.
+A top-thread sits under the workspace, not under you, so creating one is the *workspace owner*'s call (ADR 0168). From a thread, `--relation top` needs their standing instruction: a turn they opened, or a trigger firing they authorized. Failing that, it needs their *owner approval* for that one spawn. Without either it exits non-zero on a 403 that names them. Ask for an approval with `lucidos ask-owner-approval create-top-thread`, below. `--relation child` stays inside your own subtree and needs nothing.
 
 **Images:** `--image <path>` attaches an image file to the message. Repeat it for several. The target engine judges each one exactly as it judges an image attached in the app. It reads the format from the bytes, takes PNG, JPEG, WebP, GIF and HEIC, and fits a large image to the model's size limit. Any other format fails the whole spawn with a 415 naming it, before any thread starts. The file extension does not matter, and a missing file fails before any request.
 
@@ -554,6 +558,23 @@ $ lucidos spawn-thread --to dev --coding-agent claude-code \
     --message "Explore three designs for the capacity policy."
 [Ideation session](thread:dev/9b07…)
 ```
+
+### `lucidos ask-owner-approval <verb> [--thread <uuid>] --reason <R>`
+
+Ask the *workspace owner* to let this thread do one act outside its own subtree, once: an *owner approval* (ADR 0387). Use it when a clause-4 act was refused, or will be, and the owner has not opened your current turn. Examples: a top-thread, or applying another thread's change.
+
+It takes two steps, because a question card lives inside the turn that asks it:
+
+1. Run `lucidos ask-owner-approval create-top-thread --reason "The e2e fix belongs in its own thread."`. It records the request on your own thread and prints an id like `owner-approval:<uuid>`.
+2. Call `AskUserQuestion` (Codex: `ask_user_question`) with exactly one question whose text is that id, and any two options. Lucidos shows its own card in that question's place: it names the act, offers **Allow once** and **Don't allow**, and quotes your reason as yours.
+
+If the owner answers **Allow once**, do the act next, in this turn. The first matching call spends the approval. A second attempt, the same verb at another thread, or any other verb is refused again. The approval also ends when your thread's next turn starts. An engine resume and an event-wait wake do not count as one.
+
+- **Verbs**: `create-top-thread` takes no `--thread`. These each take `--thread <uuid>`: `archive`, `cancel`, `continue`, `apply`, `discard`, `set-aside`, `bring-back`, `revert`, `control`, `ask-side-question`, `dismiss-side-question`. `answer-question` and `resolve-permission` are refused: a card never asks to answer another card.
+- **Refusals**: a 409 when you already hold the authority (inside your own subtree, or your turn carries the standing instruction). A 403 outside a coding-agent session. A 400 for a missing reason or a target that does not fit the verb.
+- **Only the owner can allow it.** An agent answering the card is refused, including the agent that asked. "Don't allow", Cancel, a typed reply, or no answer allows nothing.
+
+Over `POST /api/v1/owner-approvals`, with body `{verb, target_thread_id?, reason}`. The request lands on the thread your origin token names.
 
 ### `lucidos await-event --on <EventType> [--on <EventType> ...] [--condition <JSON>] --timeout-secs <N> --reason <R>`
 
@@ -662,7 +683,7 @@ its output. Nothing waits in the meantime, so no turn re-reads its context.
 
 Use it for anything longer than a foreground call can hold: a full test suite,
 an e2e run, a release build. A command you background yourself (`&`, `nohup`)
-dies when your turn ends, because the engine stops your whole process group.
+dies when your turn ends, because the engine stops every process you started.
 Claude Code's own background mode is off in a Lucidos session, so a foreground
 call that outruns its timeout is killed. Anything that surely fits in 10 minutes is
 simpler as one foreground call with the maximum timeout.
@@ -865,6 +886,42 @@ machine-wide e2e lock runs `lucidos event-waits cancel --on E2ELockReleased`,
 since holding the lock answers any watch for its release. The call is best
 effort and its refusal is discarded, since most runs never subscribed.
 
+### `lucidos request-read yes|no`
+
+Record this turn's *read decision*: whether the user should read **this
+thread's** latest reply. Every turn ends with one, so run it before your final
+message. The answer is required, and the bare form is refused. It is the
+coding-agent counterpart of the chat agent's `request_read` tool, and records
+the same events: `ThreadReadRequested` for `yes`, `ThreadReadNotRequested` for
+`no` (ADR 0409, ADR 0417). It takes the thread from `$LUCIDOS_THREAD_ID` and
+has no thread flag, so it can only decide for your own reply.
+
+Say `yes` when you end with an answer the user asked for and no change to
+apply: an investigation, a review, a researched answer. Say it too when they
+said they would read it later. Once your turn ends, the thread waits under
+**Review** until they have seen your final reply. Say `no` for a plain "done",
+and when you propose a change, since a ready change already lists the thread
+under Review. Say `no` too for a progress report while your sub-threads still
+run or your event wait is still armed. Say `yes` then only for something the
+user should read before the work finishes, such as a failure or a finding.
+
+```bash
+$ lucidos request-read yes
+{"status":"requested","message":"Recorded. Once this turn ends, the thread is listed under Review until the user has read your reply. A ready change or a harden hold that lists it already takes its place."}
+$ lucidos request-read no
+{"status":"not-requested","message":"Recorded. The thread does not wait for the user to read this reply."}
+```
+
+A turn that ends without deciding is not left undecided. Lucidos asks a model
+once, from your turn's message and final reply, and records its answer. When a
+ready change or a harden hold already lists the thread, it records `no` without
+asking.
+
+It does not notify. Run `lucidos notify` as well only when the user should
+hear now. A request clears once the end of your reply has been on screen for
+a second. The user's next message or an archive also clears it. A later `no`
+never clears it.
+
 ### `lucidos notify --title <T> --message <M> [--app-id <APP>] [--tap <T>] [--thread-id <UUID>] [--event-id <UUID>] [--fragment <FRAG>]`
 
 Send a push notification via the parent workspace. It persists to the inbox AND fans out as a web push to subscribed devices, exactly like a `send_notification` LLM tool call. Any subprocess (Python script, bash script, scheduled `script:`-typed trigger) can call it without an LLM thread.
@@ -995,7 +1052,7 @@ $ lucidos triggers delete --id <uuid>
 # Fire an existing trigger once, right now, outside its schedule
 $ lucidos triggers run --id <uuid>
 # Pin an intent trigger to its own model and thinking budget
-$ lucidos triggers update --id <uuid> --model gemini-3.5-flash --reasoning-effort low
+$ lucidos triggers update --id <uuid> --model gemini-3.8-flash --reasoning-effort low
 # Pin which backend serves a model that has more than one route
 $ lucidos triggers update --id <uuid> --model claude-opus-5 --provider anthropic
 ```
@@ -1150,6 +1207,50 @@ $ lucidos recall date --id w/40+8
 The routes answer in any workspace, from whatever summary trees exist; a
 Classic workspace has none. The Lucidos Agent reaches the same four through its
 `recall` tool, offered only once a Tree workspace's trees are ready.
+
+### `lucidos widgets list | thread [--thread-id T] | show --app-id <ID> [--thread-id T] [--params JSON] [--label L] | pin … | unpin … | make-reusable --app-id <ID> | stop-reusing --app-id <ID>`
+
+A thread's widgets, the *widget shelf* in its title row, and *reusable
+widgets*. A widget is an app folder whose app manifest says
+`"kind": "widget"`. It shows inline in its thread as a *widget card*, never in
+the apps list. Only a pinned widget has a chip on the shelf. Home draws no shelf:
+its pins list in Home's long-press menu instead. `--thread-id` defaults to
+`$LUCIDOS_THREAD_ID`, the session's own thread.
+
+```bash
+$ lucidos widgets thread
+$ lucidos widgets pin --app-id fare-grid
+$ lucidos widgets unpin --app-id fare-grid
+$ lucidos widgets make-reusable --app-id fare-grid
+$ lucidos widgets show --app-id fare-grid --thread-id <uuid>
+$ lucidos widgets show --app-id lucidos-sound-player \
+    --params '{"clip":"artifacts/voices/marin.mp3"}' --label Marin
+$ lucidos widgets list
+```
+
+- `show`, `pin` and `unpin` name a *widget instance*: the widget plus
+  `--params`, a JSON object of the names its manifest declares (ADR 0415).
+  Two param sets are two instances, each with its own chip. `--label` names
+  the instance's chip; it is not part of the instance.
+- `thread` lists the *thread widgets*: every instance shown or pinned in the thread, and which are pinned.
+- `show` puts a *widget card* in the thread. It adds no chip to the shelf.
+  Another thread's widget must be reusable first.
+- `pin` puts the instance's chip on the shelf, and `unpin` takes it off. Each
+  writes one thread event (`WidgetPinned`, `WidgetUnpinned`). No file and no
+  commit change, and the widget card stays. A pin needs no earlier showing,
+  since a *widget embed* records none.
+- `make-reusable` and `stop-reusing` flip the `reusable` flag in the app
+  manifest and commit it. A widget that stops being reusable belongs to its
+  origin thread again, so Delete (a thread) on that thread removes it. When
+  that thread was deleted, `stop-reusing` is refused.
+- `list` names the reusable widgets.
+
+Make a widget with the chat agent's `create_app` (`kind="widget"`), or write
+the folder yourself with `kind`, `origin_thread_id` and `reusable` in its
+manifest. A widget a plugin ships is always reusable, so `stop-reusing`
+refuses it. The chat agent has the grouped `widgets` LLM tool with the same
+actions.
+
 ### `lucidos env-vars list | set --name <NAME> --value <V> | delete --name <NAME>`
 
 Manage **non-secret** environment variables injected into every subprocess
@@ -1231,6 +1332,11 @@ API-only: send `"context_window": null` to `PUT /api/v1/models`.
 defaults to and runs only such models. `add` without it means `false`, and
 `update` without it keeps the stored value. Builtins ship it on the Claude,
 Gemini and GPT-5/6 rows. The rest are unverified, so set it once you know.
+
+**`list` shows each model's default effort**: the reasoning effort it runs at
+when nothing stored names one, seeded from the provider's documented default.
+"provider default" means none is documented, so the engine sends no effort. It
+is not editable here; store a chat tier per model in `chat_reasoning_efforts`.
 
 Builtin models can be disabled (`update --enabled false`). They accept route
 edits (`--routes`, `--provider`, `--context-window`), `--vision` and a
@@ -1317,11 +1423,13 @@ $ CID=$(lucidos changes list | jq -r '.pending[0].id')
 $ lucidos changes apply "$CID"
 ```
 
-The response carries `pending`, `set_aside` (kept for later, newest first), `applied` (recently applied), `total_pending`, and `restart_required`. Each pending change has `id` / `branch_name` / `description` / `status` / `file_count` / `requires_restart` / `thread_id` / `thread_title`. Its apply state is `thread_unsettled` / `thread_settling` / `resolving_conflict` / `apply_phase_started_at` / `predicted_conflict`. Exit non-zero on transport / HTTP error.
+The response carries `pending`, `set_aside` (kept for later, newest first), `applied` (recently applied), `total_pending`, and `restart_required`. Each pending change has `id` / `branch_name` / `description` / `status` / `file_count` / `requires_restart` / `thread_id` / `thread_title`. Its apply state is `apply_ready` / `needs_hardening` / `thread_unsettled` / `thread_settling` / `resolving_conflict` / `apply_phase_started_at` / `predicted_conflict`. Exit non-zero on transport / HTTP error.
 
 `predicted_conflict` is `conflict`, `clean` or `unknown`: would merging the change into `main` right now conflict. `unknown` means git could not answer, so never read it as clean. `apply_phase_started_at` is when a running hardening or conflict resolution began.
 
 **`thread_unsettled: true` means the proposing thread is still working on the change**: mid-turn, on a question card, resolving a merge conflict, or watching an event. `apply` refuses it for exactly that reason, so never report such a change as finished. `thread_settling` is the part of that a *standing apply* can wait out. `resolving_conflict` means an apply of it is merging now.
+
+**`apply_ready: true` means Apply merges the change as it stands**: its thread has finished, and it needs no hardening. It is exactly the Changes panel's **Ready** section, and what Apply All and Discard All act on. `needs_hardening: true` means Apply would run `/harden` first. A branch that carries only implementation plans never needs it.
 
 Narrow `pending` to one subtree:
 
@@ -1351,6 +1459,8 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 
 > **Applying work that has not finished:** the agent also has two *standing apply* actions. `apply_when_settled` takes one thread's change, applied the moment that thread finishes. `apply_as_they_settle` takes everything pending that has settled, plus every *settling* thread as each one lands. Both arm the same instruction the Apply control arms from the UI. Both wait through an event wait, and drop with a report if a thread stops on a question or fails. LLM-only, with no CLI form.
 
+> **Only a proposal lands.** A standing apply also drops when the settle withholds the work (`ProposalWithheld`), and the report names the reason.
+
 > **Nothing to wait for, nothing armed.** `apply_when_settled` refuses a thread that has already settled with nothing pending, parked on a question, or failed. So never re-arm a thread whose change just landed.
 
 > **Neither reaches a repo Lucidos does not apply into.** An *external-repo coding-agent thread* proposes no *change* at all, so `apply_when_settled` refuses one and the `apply_as_they_settle` sweep passes it over. That work is reviewed and pushed from the repo itself.
@@ -1358,6 +1468,8 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 > **Taking one back:** `cancel_standing_apply` is the off for both. With a `thread_id` it cancels that thread's instruction. Without one it cancels every standing apply in the workspace. The Changes panel's Not finished toggle cancels only the changes it lists. It stops future applies only: a change already merging or hardening keeps going, and nothing already applied is reverted. Cancelling a running Apply All batch is a different action.
 
 > **Setting a change aside:** `set_aside` keeps a pending change for later, out of Review and Apply All, and lets its thread be archived. `bring_back` returns it to pending. Neither loses the branch. `set_aside` is refused where Discard is, and `apply` refuses a set-aside change until it is brought back. LLM-only, with no CLI form.
+
+> **Bringing back unfinished work:** an incomplete set-aside row, such as one the archive net filed, never returns to pending. `bring_back` withdraws it and decides again, and proposes under a fresh id only if the last turn finished.
 
 > **All six ask the same authority question the CLI does.** Applying a change from your own subtree needs nothing. Anything wider is the *workspace owner*'s, and the tool returns the refusal above rather than applying. `apply_as_they_settle` is always wider, since the sweep reaches every thread in the workspace, and so is a `cancel_standing_apply` naming no thread.
 
@@ -1457,7 +1569,9 @@ A wait still live means the session is not finished: say so, or stand it down wi
 
 ### `lucidos planned mark (--plan <path> | --simple "<reason>" | --security-fix "<reason>" --files <csv>)` / `lucidos planned approve` / `lucidos planned state`
 
-Record, approve, or query the *plan marker*. Before a *Lucidos-source* coding-agent branch is edited and applied, it proves the `implementation-plan` skill ran. It also proves the human approved its plan, or that a local fix was acknowledged. Without a **gate-satisfying** marker, Claude Code's first source edit is blocked (the `cc-plan-gate` PreToolUse hook) and Apply is refused (the engine's plan floor). Wraps `POST /api/v1/internal/mark-planned` / `POST /api/v1/internal/approve-plan` / `GET /api/v1/internal/planned-state`.
+Record, approve, or query the *plan marker*. Before a *Lucidos-source* coding-agent branch is edited and applied, it proves the `implementation-plan` skill ran. It also proves the human approved its plan, or that a local fix was acknowledged. Without a **gate-satisfying** marker, Claude Code's first source edit is blocked (the `cc-plan-gate` PreToolUse hook). The engine's plan floor also holds the branch: turn end proposes no change, and Apply is refused. Apply consumes the marker, so work after an Apply needs a new one.
+
+Wraps `POST /api/v1/internal/mark-planned` / `POST /api/v1/internal/approve-plan` / `GET /api/v1/internal/planned-state`.
 
 `mark` and `approve` accept the same callers as `hardened mark`, and refuse anyone else with 403.
 
@@ -1489,7 +1603,13 @@ lucidos planned state
 
 That option pair is a **floor**, not a fixed shape. The question tool needs at least two options, so `Request changes` fills the second slot only when the plan has no real fork. When it has one (a narrower scope, one layer instead of two), the fork takes the slot. `Request changes` is then dropped, not carried as a third option meaning only "I will type what I want changed".
 
+A heavy planning thread may also offer **`Implement in a new thread`**: one holding a long grill or many pictures, for a plan spanning several phases or layers. It counts like a fork, so `Request changes` is dropped whenever it appears. Picking it approves the plan. The agent runs `lucidos planned approve`, spawns a child coding-agent thread with `lucidos spawn-thread --to "$LUCIDOS_WORKSPACE" --relation child --coding-agent <claude-code|codex>`, and ends its turn. Without the backend flag the spawn starts a chat thread, which cannot build.
+
+The child's worktree starts from `main`, so its first step is `git merge <planning branch>` to get the plan commit. It then runs `mark --plan` and `approve` on the same plan without asking again. `mark --plan` prints this guidance, and so does the edit gate.
+
 Only after the user approves does the agent run `lucidos planned approve`, flipping `proposed` to `planned` (gate-satisfying). A fork answer is an approval too: revise the plan file to that variant, re-commit, then flip it. If the user requests changes, revise the plan file, re-commit, and ask again (the marker stays `proposed`). The message carries the plan summary, or on a re-ask only what changed. The card asks one short question and never repeats the message. `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval.
+
+`approve` also rewrites the plan file's `- **Status**: Proposed` line to `Approved` and commits it. A plan with no such line is left alone. A branch that changes only `docs/plans/` files may propose and apply while its plan is still `proposed`. It records the plan and carries no implementation. Apply keeps the `proposed` marker, so `approve` still works afterwards. A branch with any other file waits for approval.
 
 `mark --security-fix` is the **bounded security-fix lane**, for one case: a run nobody can be asked. An UNATTENDED session may commit a security fix with no prior plan decision. The fix must stay inside the files `--files` names, and ship a regression test. It records `bounded_security_fix`, which satisfies the gate at once.
 
@@ -1517,7 +1637,7 @@ lucidos frontend-preview status
 lucidos frontend-preview stop
 ```
 
-**Why the CLI rather than starting `vite` yourself:** when a coding-agent turn ends, the engine kills the session's whole process group, and a dev server the agent started dies with it. The engine owns the process so the preview outlives the turn.
+**Why the CLI rather than starting `vite` yourself:** when a coding-agent turn ends, the engine kills every process the session started, and a dev server the agent started dies with it. The engine owns the process so the preview outlives the turn.
 
 **One slot per workspace.** `start` on another thread moves the preview rather than adding a second one.
 
@@ -1547,7 +1667,7 @@ $ lucidos knowhow list
 
 ### `lucidos knowhow read <id>`
 
-Read one knowhow doc's full content by id. Wraps `GET /api/v1/knowhow/read?id=<id>` and prints the same `[KNOW-HOW: …]` / `[SYSTEM-KNOWHOW: …]` block the chat agent's `load_knowhow` tool returns. Exit non-zero (with the engine's not-found sentinel on stderr) when the id resolves to nothing.
+Read one knowhow doc's full content by id. Wraps `GET /api/v1/knowhow/read?id=<id>` and prints the same `[KNOW-HOW: …]` / `[SYSTEM-KNOWHOW: …]` block the chat agent's `load_knowhow` tool returns. Exit non-zero (with the engine's not-found sentinel on stderr) when the id resolves to nothing. A successful read records one `KnowhowRead` per doc per day, so the *workspace prompt footprint* sees the doc as read.
 
 ```bash
 $ lucidos knowhow read system-knowhow/building-an-app
@@ -1631,10 +1751,11 @@ lucidos proxy anthropic /messages -X POST \
 
 - **Not configured answers 404**, and the message names what to set (Settings → Models → Providers, or an env var).
 - **An `apis.json` entry with the same name wins**, so you can still point `openai` at a gateway.
-- **`vertex` takes only the suffix**, `/publishers/<publisher>/models/<model>:<method>`. The engine owns the project and region prefix.
+- **`vertex` takes only the suffix**, `/publishers/<publisher>/models/<model>:<method>`. The engine owns the project and region prefix, and any other path answers 400.
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, so nothing may build on it (ADR 0104).
 - The Lucidos Agent reaches the same proxies with `proxy_request`, and its context lists each one with its base and whether it is configured.
 - **A model call through the proxy records what it cost.** A builtin proxy, or an `apis.json` entry pointing at a model provider's host, writes a `ContextCaptured` with `purpose: "proxy"` from the usage block the reply carries. It lands on the thread that ran the script, else on the home thread. So a script never reports its own model spend, and the Token Cost app counts it like any other call. The engine asks a model provider for an uncompressed reply, so it can read that usage block.
+- **OpenAI speech (`/audio/speech`) records too.** OpenAI reports speech usage only on an SSE stream. So for `mp3`, `aac`, `pcm` and `wav` the engine asks for one and hands you plain audio. `tts-1` records its input's character count, which is what it is billed by. **`flac` and `opus` are refused with a 400**, because neither can report its cost: ask for another format (ADR 0423).
 
 The full table of bases and injected headers is in `system-knowhow/js-sdk.md` § `lucidos.proxy`.
 
@@ -1876,7 +1997,9 @@ The secret stays in the credential; the webhook holds only its name. Slack adds
 `"timestamp_header":"X-Slack-Request-Timestamp"` with
 `"template":"v0:{timestamp}:{body}"` and `"prefix":"v0="`. Stripe packs both
 fields into one header, so it takes `"signature_key":"v1"` and
-`"timestamp_key":"t"` with `"template":"{timestamp}.{body}"`.
+`"timestamp_key":"t"` with `"template":"{timestamp}.{body}"`. A template that
+signs `{timestamp}` always has a replay window: a delivery signed more than
+`tolerance_secs` from now is refused, and leaving it out gives a default.
 
 A webhook needs at least one verifier and every one it has must pass. There is
 no LLM tool and no SDK namespace for any of this, deliberately: a webhook opens
@@ -1974,6 +2097,26 @@ fail, and telling the sender "done" would lose the delivery. Omit `header`
 and the key is a digest of the body, which collapses two identical bodies inside
 the window. `window_secs` defaults to an hour and is capped at seven days;
 `0` switches deduping back off.
+
+### `lucidos workspace-prompt-footprint show`
+
+Prints the *workspace prompt footprint* as JSON: what this workspace's own
+content adds to every chat turn, section by section.
+
+```bash
+lucidos workspace-prompt-footprint show | jq '.sections[] | {id, chars, over_ceiling}'
+```
+
+Each section has its `chars`, whether it is `over_ceiling`, and its `items`. An
+item carries its own `chars` and `clipped_chars`, the part of its written
+description the prompt leaves out. Apps, reusable widgets and knowhow docs also
+carry `usage`: the days since last use and a `verdict` of `used`, `unused` or
+`not-yet-judged`. The top level carries the total against the total ceiling,
+the three preference values in force, and the *system prompt footprint* for
+scale.
+
+The *workspace audit* reads this in its prompt-footprint section. There is no
+LLM tool for it, so measuring the prompt adds nothing to it (ADR 0413).
 
 ## Workspace resolution
 

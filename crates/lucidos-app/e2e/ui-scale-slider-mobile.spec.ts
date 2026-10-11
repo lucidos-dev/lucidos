@@ -15,7 +15,7 @@
  * click never exercised the failing path.
  */
 import { test, expect, Page } from './fixtures';
-import { apiRequest, assertHealthy, isMobileViewport, navigateToApp, waitForEventStream } from './helpers';
+import { apiRequest, assertHealthy, isMobileViewport, navigateToApp, waitForEventStream, waitForPaneAtRest } from './helpers';
 
 const UI_SCALE_BUTTON = '[data-search-anchor="appearance:ui-scale"] .settings-option';
 
@@ -32,6 +32,10 @@ async function openScalePanel(page: Page): Promise<void> {
 
   const button = page.locator(UI_SCALE_BUTTON);
   await expect(button).toBeVisible({ timeout: 15_000 });
+  // The scroll into view can slide the pane strip for a frame (ADR 0420), so
+  // the tap waits until the strip is back.
+  await button.scrollIntoViewIfNeeded();
+  await waitForPaneAtRest(page);
   await button.tap();
   await expect(page.locator('.scale-modal')).toBeVisible();
 }

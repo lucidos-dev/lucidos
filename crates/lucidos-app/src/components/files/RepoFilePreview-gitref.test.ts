@@ -1,15 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import type { VNode } from 'preact';
-import { RepoFileContent, previewGitRef } from './RepoFilePreview';
+import { repoFileContentLeaf, previewGitRef } from './RepoFilePreview';
 import { repoFileUrl } from '../../api/client';
 
-// `RepoFileContent` is a hookless dispatcher, so it can be called as a plain
-// function and its returned vnode inspected (same approach as
+// `repoFileContentLeaf` is `RepoFileContent`'s hookless dispatch, so it can be
+// called as a plain function and its returned vnode inspected (same approach as
 // StoreTabSkeleton.test.tsx). The media leaf takes a `kind` prop and the text
 // leaf a `body` one, so the props tell them apart without depending on function
 // names.
 function dispatch(props: { repoId: string; path: string; changeId?: string; gitRef: string | null }) {
-  const node = RepoFileContent(props) as VNode<Record<string, unknown>>;
+  const node = repoFileContentLeaf(props, false) as VNode<Record<string, unknown>>;
   return node.props;
 }
 

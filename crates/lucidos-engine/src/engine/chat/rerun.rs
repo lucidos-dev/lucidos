@@ -9,9 +9,9 @@
 //!    completed `ToolCalled` + `ToolResult` pairs into a markdown bullet list.
 //! 3. Emits `ContinuationStarted { branch: "", actor }` so the frontend
 //!    opens a new "resume" exchange.
-//! 4. Emits `UserPromptInjected { text: <engine note>, mode: engine,
+//! 4. Emits `PromptInjected { text: <engine note>, mode: engine,
 //!    actor: engine }` carrying the side-effect-aware system note. The engine
-//!    note is what the LLM will read; persisting it as `UserPromptInjected`
+//!    note is what the LLM will read; persisting it as `PromptInjected`
 //!    leaves the audit trail visible in the UI.
 //! 5. Announces every queued follow-up the restart stranded, read back from
 //!    the event store by `chat::queued_recovery`.
@@ -69,7 +69,7 @@ pub(crate) enum ChatResumeAnchor {
     /// The previous turn really did end (a `ResponseAborted` sits in the
     /// timeline), and the user asked for a NEW attempt — so the resume opens
     /// its own boundary: `ContinuationStarted` ("Continued the response") plus
-    /// the engine note as `UserPromptInjected` ("Reminded the model about N
+    /// the engine note as `PromptInjected` ("Reminded the model about N
     /// prior tool calls"). That reminder is the point of this path: it tells
     /// the user what the engine told the model about the side effects the
     /// aborted run already performed.
@@ -149,12 +149,12 @@ pub(crate) async fn emit_resume_anchor(
         .expect("ContinuationStarted is persisted")
         .event_id;
 
-    // UserPromptInjected carries the engine note for the audit trail.
+    // PromptInjected carries the engine note for the audit trail.
     // request_event_id points at ContinuationStarted so the resume
     // exchange groups this event as its own step in the timeline.
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::UserPromptInjected {
+        event: ThreadEvent::PromptInjected {
             text: engine_note.to_string(),
             mode: ActorMode::Engine,
             origin: Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
@@ -176,7 +176,7 @@ pub(crate) async fn emit_resume_anchor(
 /// Outcome of `continue_chat` — used by the HTTP handler to log clearly.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ContinueChatOutcome {
-    /// Rerun was kicked off (ContinuationStarted + UserPromptInjected
+    /// Rerun was kicked off (ContinuationStarted + PromptInjected
     /// emitted, agentic loop spawned).
     Resumed,
     /// A ContinuationStarted already exists newer than the latest
@@ -465,7 +465,7 @@ pub(crate) struct RecoveredMessages {
 /// Announce every queued follow-up this resume still owes an answer for, and
 /// return what the resumed turn should carry.
 ///
-/// The announcement is a `UserPromptInjected` per message, awaited before the
+/// The announcement is a `PromptInjected` per message, awaited before the
 /// loop is spawned. That write is what a second resume reads, so it is the
 /// whole idempotency story: a double Continue finds the marker and recovers
 /// nothing.
@@ -526,7 +526,7 @@ pub(crate) async fn ingest_queued_messages_for_resume(
         let Some(prompt) = still_owed.into_iter().next() else {
             continue;
         };
-        crate::engine::emit_user_prompt_injected_event(bus, thread_id, &base_meta, &prompt).await;
+        crate::engine::emit_prompt_injected_event(bus, thread_id, &base_meta, &prompt).await;
         announced.push(prompt);
     }
     if announced.is_empty() {

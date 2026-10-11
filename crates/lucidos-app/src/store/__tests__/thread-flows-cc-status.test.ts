@@ -10,7 +10,7 @@ describe('Bug: aborted Claude Code session (engine restart) should be in inbox f
   it('ResponseAborted without pending changes → failed (red triangle indicates interruption)', () => {
     // Scenario: CC is actively working (tools running), engine restarts.
     // shutdown_agent_sessions sets shutting_down → ResponseAborted emitted.
-    // Without CodingAgentIdled, codingAgentProposed is false → status='failed' so the
+    // Without CodingAgentIdled, nothing is proposed → status='failed' so the
     // user sees the red triangle indicating the run was interrupted.
     const { map, id } = makeThread();
     const now = Date.now();
@@ -498,9 +498,8 @@ describe('CC idle session — getCodingAgentWaitingInfo state transitions', () =
 
     const thread = map.get(id)!;
 
-    // codingAgentProposed must be false — CodingAgentIdled { has_changes: false } should clear it
-    expect(thread.meta.codingAgentProposed).toBe(false);
-    expect(thread.meta.codingAgentRequiresRestart).toBe(false);
+    // CodingAgentIdled { has_changes: false } leaves the branch with no work.
+    expect(thread.meta.codingAgentChangeState).toEqual({ kind: 'none' });
     // Status should be 'idle' — no changes means nothing to act on
     expect(thread.meta.status).toBe('idle');
   });
@@ -525,9 +524,8 @@ describe('CC idle session — getCodingAgentWaitingInfo state transitions', () =
 
     const thread = map.get(id)!;
 
-    // codingAgentProposed must be false — SessionEnded with reason=discarded should clear flags
-    expect(thread.meta.codingAgentProposed).toBe(false);
-    expect(thread.meta.codingAgentRequiresRestart).toBe(false);
+    // SessionEnded with reason=discarded clears the change state.
+    expect(thread.meta.codingAgentChangeState).toEqual({ kind: 'none' });
     expect(thread.meta.codingAgentIsExternalRepo).toBe(false);
 
     // Thread should be idle, not waiting

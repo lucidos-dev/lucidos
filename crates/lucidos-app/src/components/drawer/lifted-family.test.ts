@@ -29,6 +29,7 @@ import { describe, it, expect } from 'vitest';
 import { computeFamilyGraph, computeFamilyDecorations } from './ThreadDrawer';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
 import type { ArchiveState } from '../../generated/thread-lifecycle';
+import type { CodingAgentChangeState } from '../../api/threads';
 
 type ThreadOpts = {
     parentId?: string;
@@ -36,7 +37,7 @@ type ThreadOpts = {
     status?: ThreadStatus;
     saved?: boolean;
     activeChildrenCount?: number;
-    codingAgentProposed?: boolean;
+    codingAgentChangeState?: CodingAgentChangeState;
 };
 
 function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
@@ -55,10 +56,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         activeChildrenCount: opts.activeChildrenCount ?? 0,
         totalChildrenCount: 0,
         blockingDescendantCount: 0, attentionDescendantCount: 0,
-        codingAgentHasDiff: false,
-        codingAgentProposed: opts.codingAgentProposed ?? false,
-        codingAgentRequiresRestart: false,
-        codingAgentIncomplete: false,
+        codingAgentChangeState: opts.codingAgentChangeState ?? { kind: 'none' },
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',
         parentThreadId: opts.parentId,
@@ -79,7 +77,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
 }
 
 const withCta = (id: string, opts: ThreadOpts = {}) =>
-    makeThread(id, { ...opts, codingAgentProposed: true, section: 'inbox' });
+    makeThread(id, { ...opts, codingAgentChangeState: { kind: 'proposed', requires_restart: false }, section: 'inbox' });
 const running = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, status: 'running' });
 const inSaved = (id: string, opts: ThreadOpts = {}) =>
@@ -217,7 +215,7 @@ describe('computeFamilyDecorations', () => {
         // would hide live work.
         const parent = running('parent');
         const runningChild = makeThread('running-child', { parentId: 'parent', section: 'archived', status: 'running' });
-        const ctaChild = makeThread('cta-child', { parentId: 'parent', section: 'archived', codingAgentProposed: true });
+        const ctaChild = makeThread('cta-child', { parentId: 'parent', section: 'archived', codingAgentChangeState: { kind: 'proposed', requires_restart: false }});
         const threads = [parent, runningChild, ctaChild];
         const graph = computeFamilyGraph(threads);
         const decorations = computeFamilyDecorations(threads, graph);

@@ -14,7 +14,7 @@ import { drawerClosing, drawerOpen } from '../drawerState';
 import type { Change } from '../../../api/client';
 
 function change(id: string, threadUnsettled: boolean): Change {
-  return { id, thread_unsettled: threadUnsettled } as Change;
+  return { id, thread_unsettled: threadUnsettled, apply_ready: !threadUnsettled } as Change;
 }
 
 function hamburger(): AnyVNode {
@@ -33,16 +33,6 @@ describe('the actionable change count', () => {
     changes.value = {
       status: 'loaded',
       data: [change('a', false), change('b', true), change('c', true)],
-    };
-    expect(actionableChangeCount.value).toBe(1);
-  });
-
-  // A stopped turn's change waits under Not finished, so it is not ready
-  // either, though its thread has settled (ADR 0346).
-  it('leaves out an incomplete change', () => {
-    changes.value = {
-      status: 'loaded',
-      data: [change('a', false), { ...change('b', false), incomplete: true }],
     };
     expect(actionableChangeCount.value).toBe(1);
   });

@@ -1,5 +1,6 @@
 import { hasHoverPointer } from '../../utils/platform';
-import { isElementOnScreen, isElementVisible, markRevealScroll } from './scrollState';
+import { isElementOnScreen, markRevealScroll } from './scrollState';
+import { isElementVisible } from '../../utils/elementVisibility';
 import { getVisiblePromptInput } from './promptFocus';
 import { focusedPane } from '../../store/store';
 import { focusIntoPane } from '../layout/paneFocus';

@@ -46,29 +46,6 @@ export function formatDateTime(date: Date): string {
   return formatInUserTz(DATE_TIME, date);
 }
 
-/** How long something has been running: "8s", "2m 14s", "1h 03m".
- *
- *  A DURATION, not a point in time, so it takes milliseconds rather than a
- *  `Date` and never touches the user's timezone. Seconds are kept in the minute
- *  range because that is where the value is read as a live counter (the status
- *  toast's build timer ticks once a second, and a counter that only changed each
- *  minute would read as frozen); past an hour they are noise, so the hour form
- *  zero-pads minutes instead and the string stops changing every second.
- *
- *  A negative or non-finite input clamps to "0s": the caller derives this from
- *  clock arithmetic, and a "-3s" build age is worse than a momentarily stalled
- *  one. */
-export function formatElapsed(ms: number): string {
-  if (!Number.isFinite(ms) || ms <= 0) return '0s';
-  const totalSeconds = Math.floor(ms / 1000);
-  const seconds = totalSeconds % 60;
-  const minutes = Math.floor(totalSeconds / 60) % 60;
-  const hours = Math.floor(totalSeconds / 3600);
-  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
-}
-
 /** "just now", "5m ago", "3h ago", "2d ago", or short date */
 export function formatTimeAgo(date: Date): string {
   const now = new Date();
@@ -111,7 +88,7 @@ function agoWords(count: number, unit: string): string {
 /** "under a minute", "3 minutes", "8 hours", "5 days": a SPAN, spelled out for
  *  the middle of a sentence.
  *
- *  The word half of `formatElapsed`, which is a dense live counter. This one is
+ *  The word half of `formatElapsed` (`elapsed.ts`), which is a dense live counter. This one is
  *  read once inside a clause, so it drops the smaller unit instead of carrying
  *  both.
  *
@@ -129,19 +106,6 @@ export function formatDurationPhrase(seconds: number): string {
 
 function countWords(count: number, unit: string): string {
   return `${count} ${unit}${count === 1 ? '' : 's'}`;
-}
-
-/** Whole seconds between two readings of the browser clock, never negative.
- *
- *  For advancing a span the SERVER measured, without ever subtracting a server
- *  instant from a local one (ADR 0053). Both arguments are readings of the one
- *  local clock: when an answer landed, and now.
- *
- *  The clamp matters because that clock can move backwards, and a fault must
- *  not read as younger than the engine measured it. Used by the ingress and
- *  refusal selectors, which both age a standing fault forward while it stands. */
-export function elapsedSeconds(since: number, now: number): number {
-  return Math.max(0, Math.floor((now - since) / 1000));
 }
 
 /** "14:30" — short HH:MM time in user's timezone */

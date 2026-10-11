@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { composingThreads, draftThreadCount, draftThreads } from './ThreadDrawer';
+import { composingThreads, draftThreads } from './ThreadDrawer';
 import type { ThreadState, ThreadMeta } from '../../store/thread-events';
 import { _resetComposeDraftsForTesting, setDraft, type ComposeDraft } from '../../store/composeDrafts';
 import { threadMap } from '../../store/store';
@@ -49,11 +49,8 @@ function makeThread(id: string, overrides: MakeThreadOpts = {}): ThreadState {
       updatedAt: '2026-05-01T00:00:00Z',
       status: 'idle',
       summaryVersion: 0,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 1,
       section: 'archived',
@@ -200,8 +197,8 @@ describe('composingThreads', () => {
   });
 });
 
-describe('draftThreadCount', () => {
-  it('counts only draft rows the Drafts view would render', () => {
+describe('the Drafts group count', () => {
+  it('counts only the draft rows the group renders', () => {
     threadMap.value = asMap([
       makeThread('new-draft', { state: 'composing', composeText: 'hi' }),
       makeThread('follow-up-draft', { state: 'active', composeText: 'follow-up' }),
@@ -211,7 +208,7 @@ describe('draftThreadCount', () => {
       makeThread('idle', { state: 'active' }),
     ]);
 
-    expect(draftThreadCount.value).toBe(3);
+    expect(draftThreads(threadMap.value)).toHaveLength(3);
   });
 
   it('returns zero when no thread has a visible draft', () => {
@@ -221,6 +218,6 @@ describe('draftThreadCount', () => {
       makeThread('idle', { state: 'active' }),
     ]);
 
-    expect(draftThreadCount.value).toBe(0);
+    expect(draftThreads(threadMap.value)).toHaveLength(0);
   });
 });

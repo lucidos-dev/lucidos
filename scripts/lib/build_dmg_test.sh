@@ -21,7 +21,7 @@ else
     fail "--check exited $rc; output: $out"
 fi
 
-for name in lucidos-gateway lucidos-engine frontend postgres sdk system-knowhow; do
+for name in lucidos-gateway lucidos-engine frontend postgres sdk system-knowhow system-widgets; do
     if echo "$out" | grep -q "$name"; then
         pass "mentions $name"
     else

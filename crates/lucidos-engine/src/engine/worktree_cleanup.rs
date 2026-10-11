@@ -303,6 +303,9 @@ pub struct WorktreeCleanup {
     /// Grace before an orphaned temp worktree is removed. Defaults to
     /// [`TEMP_WORKTREE_GRACE`]; overridable in tests for the same reason.
     temp_worktree_grace: Duration,
+    /// Measures each entry, on the blocking pool. Defaults to
+    /// [`walk_directory_size_bytes`]; tests swap in a walk that blocks.
+    size_walk: fn(&Path) -> u64,
     free_disk: FreeDiskProbe,
     /// Tier 0 needs `pending_for_thread`; constructed per-worker so the
     /// `spawn` signature stays pool-only.
@@ -334,6 +337,7 @@ impl WorktreeCleanup {
             force_tier1_idle: FORCE_TIER_1_IDLE,
             stranded_grace: STRANDED_GRACE,
             temp_worktree_grace: TEMP_WORKTREE_GRACE,
+            size_walk: walk_directory_size_bytes,
             changes,
             active_threads,
             cleanup_wake,
@@ -403,7 +407,7 @@ impl WorktreeCleanup {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let pre_size = directory_size_bytes(&path);
+            let pre_size = measure_on_blocking_pool(&path, self.size_walk).await;
 
             // Orphaned temporary worktrees (`harden-`/`apply-`/`merge-`) left by
             // a crashed apply/harden/merge flow. Checked before `parse_thread_short`
@@ -626,7 +630,7 @@ impl WorktreeCleanup {
                 return None;
             }
             let pressure = self.disk_pressure();
-            let freed = remove_stranded_worktree(worktrees_dir, worktree, pre_size)?;
+            let freed = remove_stranded_worktree(worktrees_dir, worktree, pre_size).await?;
             log!(
                 "[WorktreeCleanup] stranded orphan-path freed {} bytes at {} (git admin dir missing)",
                 freed,
@@ -696,7 +700,7 @@ impl WorktreeCleanup {
         if age < self.stranded_grace {
             return None;
         }
-        let freed = remove_stranded_worktree(worktrees_dir, worktree, pre_size)?;
+        let freed = remove_stranded_worktree(worktrees_dir, worktree, pre_size).await?;
         log!(
             "[WorktreeCleanup] stranded freed {} bytes for thread {} (git admin dir missing)",
             freed,

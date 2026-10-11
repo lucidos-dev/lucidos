@@ -832,6 +832,7 @@ async fn orphan_pass_leaves_a_question_parked_thread_alone() {
             question: "Postgres or SQLite?".into(),
             options: vec![],
             multi_select: false,
+            owner_approval: None,
             tool_use_id: "tu-park".into(),
             cc_session_id: "sid-test".into(),
             worktree_path: None,

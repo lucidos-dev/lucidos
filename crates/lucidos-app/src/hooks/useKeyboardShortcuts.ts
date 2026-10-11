@@ -11,8 +11,8 @@ import { shortcutDef, type ShortcutId } from '../utils/shortcuts';
 import { toggleFollowLiveEdge, pressCallToggleIfShown } from '../components/chat/PromptRowControls';
 import { showFocusedThreadDiff, applyFocusedThreadChange } from '../components/chat/WaitingBanner';
 import { toggleAppFullscreenIfShown, toggleSourceView, toggleLineWrap } from '../components/layout/ContentHeaderActions';
-import { isKnownAppFrame } from '../utils/appFrame';
-import { findAvailable, focusedFindSurface, openFocusedFind } from '../store/actions/find-bar';
+import { appFrameFor, isCanvasAppFrame } from '../utils/appFrame';
+import { findAvailable, findSurface, focusedFindSurface, toggleFocusedFind } from '../store/actions/find-bar';
 import { adjustUiScale, resetUiScale, scaleModalOpen, dismissScaleModal } from '../components/shared/scaleModalState';
 import { UI_SCALE_STEP } from '../store/actions/preferences';
 import { isMobile } from '../utils/viewport';
@@ -157,7 +157,7 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   resetPaneLayout,
   refreshPanel: refreshPanelIfLive,
   toggleAppFullscreen: toggleAppFullscreenIfShown,
-  findInView: openFocusedFind,
+  findInView: toggleFocusedFind,
   toggleSourceView,
   toggleLineWrap,
   zoomIn: () => adjustUiScale(UI_SCALE_STEP),
@@ -273,9 +273,11 @@ function escapePolicyHasWork(): boolean {
  *  key keeps its browser default, so Mod+F opens the browser's own find.
  *  `inContent` says the keydown came from a frame in the content pane. */
 const CLAIMS_ONLY_WHEN: Partial<Record<ShortcutId, (inContent: boolean) => boolean>> = {
-  // Never under a modal: what it shows is not the pane behind it.
+  // Never under a modal: what it shows is not the pane behind it. An open bar
+  // takes the chord from anywhere, since pressing it again closes the bar.
   findInView: (inContent) => topPanelOverlay() === null
-    && (inContent ? findAvailable('content') : focusedFindSurface() !== null),
+    && (findSurface.value !== null
+      || (inContent ? findAvailable('content') : focusedFindSurface() !== null)),
 };
 
 function claimsChord(id: ShortcutId, inContent: boolean): boolean {
@@ -295,19 +297,20 @@ export function classifyChord(chord: ChordLike, inContent = false): ShortcutId |
 }
 
 /** Run a chord forwarded from an app iframe against the host registry. The
- *  forward itself is proof the content pane is the focused pane — the app lives
- *  there and just received the keydown — but pointer events inside the iframe
+ *  forward itself is proof the frame's pane is the focused pane: the Canvas
+ *  pane for an app, the thread pane for a widget on the shelf (`pane`). The frame
+ *  just received the keydown — but pointer events inside the iframe
  *  never reach the host's `focusPane('content')` handler, so `focusedPane` is
  *  stale. Reconcile it BEFORE dispatching, or the three-state pane toggles read
  *  the wrong state: notably `toggleContentPane` (⌘⇧3) would "focus" the
  *  already-focused pane (a no-op) instead of CLOSING it. Exported for testing. */
-export function dispatchForwardedChord(chord: ChordLike): void {
-  const result = classifyChord(chord, true);
+export function dispatchForwardedChord(chord: ChordLike, pane: 'content' | 'thread' = 'content'): void {
+  const result = classifyChord(chord, pane === 'content');
   if (result === null) return;
   // The frame's own script can post this message, so a host-only shortcut
   // (Apply, the voice call) never runs from it.
   if (result !== 'escape' && shortcutDef(result).hostOnly) return;
-  focusedPane.value = 'content';
+  focusedPane.value = pane;
   if (result === 'escape') {
     // Focus is in the iframe, so activeElement is the <iframe>. The policy
     // dismisses any open host overlay (e.g. an SDK confirm) and otherwise
@@ -468,14 +471,15 @@ export function useKeyboardShortcuts(): void {
       if (typeof data.key !== 'string') return;
       // Only honor chords from a current app iframe — a nested embed/ad inside an
       // app, or an unrelated window, must not drive host shortcuts.
-      if (!isKnownAppFrame(e.source)) return;
+      const frame = appFrameFor(e.source);
+      if (!frame) return;
       dispatchForwardedChord({
         key: data.key,
         metaKey: data.metaKey === true,
         ctrlKey: data.ctrlKey === true,
         shiftKey: data.shiftKey === true,
         altKey: data.altKey === true,
-      });
+      }, isCanvasAppFrame(frame) ? 'content' : 'thread');
     }
 
     document.addEventListener('keydown', handleKeyDown);

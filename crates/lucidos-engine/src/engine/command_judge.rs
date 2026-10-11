@@ -11,9 +11,8 @@
 //! **The fail-safe is a Rust threshold** (I13 of
 //! `docs/plans/2026-10-04-tree-memory-module-and-the-home-thread.md`). A
 //! missing, malformed or unsure answer resolves to `IrreversibleDanger`, on
-//! every provider. Only a call that never answered is an `Err`, and the caller
-//! then falls back to the static list
-//! ([`fallback_classify`](crate::engine::command_guard::fallback_classify)).
+//! every provider. A call that never answered is an `Err`, and the caller
+//! asks too, through [`JudgeVerdict::judge_failed`] (ADR 0002, last addendum).
 
 use std::time::Duration;
 
@@ -23,6 +22,7 @@ use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
 use crate::llm::judgment::{
     for_site, system_one_for, ChatJudgmentProvider, JudgmentProvider, JudgmentSite,
 };
+use crate::llm::ModelNotServed;
 
 /// The judge's classification of one ambiguous command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +50,31 @@ impl JudgeVerdict {
             reason: "the judge gave no readable lane".to_string(),
         }
     }
+
+    /// The verdict when the judge never answered: ask, and say why on the card.
+    /// Running the command on the static list instead would weaken the guard
+    /// the user turned on, with nothing to show for it.
+    pub(crate) fn judge_failed(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Self {
+        let why = if err.is::<ModelNotServed>() {
+            "its model is no longer served; pick another under Settings, Models".to_string()
+        } else {
+            let text = err.to_string();
+            let first = text.lines().next().unwrap_or_default();
+            first[..first.floor_char_boundary(FAILURE_SUMMARY_CHARS)].to_string()
+        };
+        Self {
+            lane: RiskLane::IrreversibleDanger,
+            category: Some(SideEffectCategory::Other),
+            summary: format!(
+                "The command judge could not run ({why}), so this command needs your approval."
+            ),
+            reason: format!("the judge failed: {err}"),
+        }
+    }
 }
+
+/// How much of a judge failure the card quotes. The engine log keeps it all.
+const FAILURE_SUMMARY_CHARS: usize = 120;
 
 /// Run one judge classification as two typed Choice questions, on any
 /// judgment provider.
@@ -79,13 +103,67 @@ pub(crate) async fn judge_with<J: JudgmentProvider + ?Sized>(
     Ok(command_judge_questions::read(&judgment.answers))
 }
 
+/// What `lucidos-eval`'s command judge check reads from one classification.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalVerdict {
+    /// `safe`, `reversible` or `irreversible`, after ADR 0002's tie-break.
+    pub lane: &'static str,
+    /// The side-effect category, snake_case, on the irreversible lane only.
+    pub category: Option<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+/// One classification for `lucidos-eval`'s command judge check: the guard's
+/// own questions and thresholds over `provider`, recording nothing. The eval
+/// hands in its own token, since no engine source may mint one.
+#[doc(hidden)]
+pub async fn classify_for_eval(
+    provider: std::sync::Arc<dyn crate::llm::LlmProvider>,
+    reasoning: Option<String>,
+    python: bool,
+    command: &str,
+    out_of_workspace: bool,
+    call: crate::llm::metered::CallToken,
+) -> Result<EvalVerdict, Box<dyn std::error::Error + Send + Sync>> {
+    let input = JudgeInput {
+        tool_name: if python {
+            crate::llm::tool_names::RUN_PYTHON
+        } else {
+            crate::llm::tool_names::RUN_BASH
+        }
+        .to_string(),
+        command: command.to_string(),
+        out_of_workspace,
+        fast_path_refused: false,
+    };
+    let judgment = ChatJudgmentProvider::new(provider, reasoning)
+        .ask(
+            command_judge_questions::state(&input),
+            command_judge_questions::questions(),
+            call,
+        )
+        .await?;
+    let verdict = command_judge_questions::read(&judgment.answers);
+    Ok(EvalVerdict {
+        lane: command_judge_questions::lane_name(verdict.lane),
+        category: verdict.category.and_then(|category| {
+            serde_json::to_value(category)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+        }),
+        input_tokens: judgment.usage.input_tokens,
+        output_tokens: judgment.usage.output_tokens,
+    })
+}
+
 impl LucidosEngine {
     /// Ask the picked judgment provider to classify one ambiguous command.
     ///
     /// Returns `Err` only when nothing answered: the call failed, or it ran out
-    /// of time. The caller then falls back to
-    /// the static "dangerous" list. A reply it cannot read is `Ok` with
-    /// [`JudgeVerdict::uncertain`] (ask).
+    /// of time. The caller then asks, through [`JudgeVerdict::judge_failed`].
+    /// A reply it cannot read is `Ok` with [`JudgeVerdict::uncertain`] (ask).
     ///
     /// `judgment_command_guard` picks the backend and is `chat` unless the
     /// user set it. A System One pick has the chat model behind it, inside the
@@ -279,8 +357,7 @@ mod tests {
         assert!(body.contains("select 1"), "{body}");
     }
 
-    /// A call that never answered is `Err`, so the caller falls back to the
-    /// static dangerous list.
+    /// A call that never answered is `Err`, so the caller asks.
     #[tokio::test]
     async fn a_failing_system_one_call_is_an_infra_error() {
         struct Failing;
@@ -563,8 +640,35 @@ mod tests {
             )
             .await
             .is_err(),
-            "a call that never answered falls back to the static list"
+            "a call that never answered is the caller's to resolve"
         );
+    }
+
+    /// A judge that never answered asks, on every failure, and the card says
+    /// why. A retired model gets its own sentence, since the fix is a pick
+    /// (I7 of the Haiku 4.5 retirement plan).
+    #[test]
+    fn a_failed_judge_asks_and_says_why() {
+        let retired: Box<dyn std::error::Error + Send + Sync> = Box::new(ModelNotServed::new(
+            "Vertex has no `claude-haiku-4-5` in region `eu`",
+        ));
+        let down: Box<dyn std::error::Error + Send + Sync> =
+            format!("network down {}\nsecond line", "é".repeat(200)).into();
+        for err in [&retired, &down] {
+            let v = JudgeVerdict::judge_failed(err.as_ref());
+            assert_eq!(v.lane, RiskLane::IrreversibleDanger);
+            assert_eq!(v.category, Some(SideEffectCategory::Other));
+            assert!(v.summary.starts_with("The command judge could not run ("));
+        }
+        let retired = JudgeVerdict::judge_failed(retired.as_ref());
+        assert!(
+            retired.summary.contains("no longer served"),
+            "{}",
+            retired.summary
+        );
+        let down = JudgeVerdict::judge_failed(down.as_ref());
+        assert!(down.summary.contains("network down"), "{}", down.summary);
+        assert!(!down.summary.contains("second line"), "{}", down.summary);
     }
 
     #[tokio::test]

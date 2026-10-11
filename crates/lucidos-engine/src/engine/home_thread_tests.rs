@@ -1,9 +1,9 @@
-//! One home thread per workspace (ADR 0362, invariant I10): created once,
+//! One home thread per workspace (ADR 0362, ADR 0411): created once,
 //! unique in the database, and never archived or auto-titled by any emitter.
 
 use super::*;
 use crate::engine::thread_lifecycle::LifecycleViolation;
-use crate::test_support::{seed_preference, setup_test_db, teardown_test_db};
+use crate::test_support::{setup_test_db, teardown_test_db};
 
 async fn home_rows(pool: &sqlx::PgPool) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM thread_summaries WHERE is_home")
@@ -12,53 +12,144 @@ async fn home_rows(pool: &sqlx::PgPool) -> i64 {
         .unwrap()
 }
 
-/// Boot creates nothing in a workspace that never turned the switch on.
+/// The key the migration retires, as it was stored: a wire contract.
+const RETIRED_SWITCH: &str = "home_thread_enabled";
+
+/// The migration that retires the switch, run against a seeded workspace.
+const RETIRE_SWITCH_MIGRATION: &str =
+    include_str!("../../migrations/20261010082810_retire_home_thread_switch.sql");
+
+/// What boot does in a fresh workspace: one Home, and the lookup finds it.
 #[tokio::test]
-async fn boot_creates_no_home_thread_while_the_switch_is_off() {
+async fn boot_creates_the_home_thread_in_a_fresh_workspace() {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
-    let created = ensure_home_thread_if_enabled(&bus, &pool).await.unwrap();
+    let home = ensure_home_thread(&bus, &pool).await.unwrap();
 
-    assert_eq!(created, None);
-    assert_eq!(home_rows(&pool).await, 0);
+    assert_eq!(home_rows(&pool).await, 1);
+    assert_eq!(home_thread_id(&pool).await.unwrap(), Some(home));
+    assert!(is_home_thread(&pool, home).await.unwrap());
 
     teardown_test_db(&db).await;
 }
 
-/// Off hides the marked thread from every gated reader. On again brings the
-/// same thread back, and ensuring never makes a second one.
+/// A workspace upgraded from a release with the switch: Home was made hidden
+/// by a threadless call, and the switch was stored off. The migration drops
+/// the switch, and boot then finds the same Home, history and all.
 #[tokio::test]
-async fn the_switch_hides_the_home_thread_and_brings_the_same_one_back() {
+async fn the_migration_keeps_an_upgraded_home_and_its_history() {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
-    let home = enabled_home_thread(&bus, &pool).await;
-    assert_eq!(home_thread_id(&pool).await.unwrap(), Some(home));
+    crate::engine::AuxCapture::for_thread_or_home(
+        &bus,
+        None,
+        crate::engine::ContextPurpose::Memory,
+    )
+    .record_usage("gemini-3-flash-preview", 120, None)
+    .await;
+    let hidden = home_thread_id(&pool)
+        .await
+        .unwrap()
+        .expect("the call made Home");
+    for device in [None, Some("dev-1")] {
+        sqlx::query("INSERT INTO preferences (key, value, device_id) VALUES ($1, 'false', $2)")
+            .bind(RETIRED_SWITCH)
+            .bind(device)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let events_before = events_on(&pool, hidden).await;
 
-    seed_preference(
+    sqlx::raw_sql(RETIRE_SWITCH_MIGRATION)
+        .execute(&pool)
+        .await
+        .expect("the migration runs");
+    let booted = ensure_home_thread(&bus, &pool).await.unwrap();
+
+    assert_eq!(booted, hidden, "boot adopts the same Home");
+    assert_eq!(home_rows(&pool).await, 1);
+    assert_eq!(home_thread_id(&pool).await.unwrap(), Some(hidden));
+    assert_eq!(
+        events_on(&pool, hidden).await,
+        events_before,
+        "history kept"
+    );
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM preferences WHERE key = $1")
+        .bind(RETIRED_SWITCH)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0, "no switch row survives, global or per device");
+
+    teardown_test_db(&db).await;
+}
+
+/// The id and type of every event on `thread_id`, in order.
+async fn events_on(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<(Uuid, String)> {
+    sqlx::query_as("SELECT id, event_type FROM events WHERE thread_id = $1 ORDER BY sequence")
+        .bind(thread_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// The summary columns a turn or a badge would move.
+async fn summary_of(pool: &sqlx::PgPool, thread_id: Uuid) -> (String, String, i64, bool, String) {
+    sqlx::query_as(
+        "SELECT status, archive_state, message_count::bigint, has_response, \
+                last_activity::text \
+         FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// An unused Home costs nothing (ADR 0411). The calls no thread made still
+/// record on it. But they start no turn and move nothing in its summary. They
+/// give the summary tree nothing to build, so the compactor never calls a
+/// model for it.
+#[tokio::test]
+async fn an_unused_home_costs_nothing() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let home = ensure_home_thread(&bus, &pool).await.unwrap();
+    let before = summary_of(&pool, home).await;
+
+    for purpose in [
+        crate::engine::ContextPurpose::Memory,
+        crate::engine::ContextPurpose::Title,
+    ] {
+        crate::engine::AuxCapture::for_thread_or_home(&bus, None, purpose)
+            .record_usage("gemini-3-flash-preview", 50, None)
+            .await;
+    }
+
+    assert_eq!(summary_of(&pool, home).await, before, "no badge, no move");
+    let types: Vec<String> = events_on(&pool, home)
+        .await
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect();
+    assert_eq!(
+        types,
+        ["HomeThreadCreated", "ContextCaptured", "ContextCaptured"],
+        "no turn ever started"
+    );
+    let log = crate::engine::summary_tree::store::load_thread_log_now(
         &pool,
-        crate::core::prefs::HOME_THREAD_ENABLED.key(),
-        "false",
+        home,
+        crate::engine::summary_tree::log::ThreadKind::LucidosAgent,
     )
     .await
     .unwrap();
-    assert_eq!(home_thread_id(&pool).await.unwrap(), None);
-    assert!(!is_home_thread(&pool, home).await.unwrap());
-    assert_eq!(
-        home_rows(&pool).await,
-        1,
-        "off hides the row, never removes it"
+    assert!(
+        log.entries.is_empty() && log.turns.is_empty(),
+        "nothing to summarize"
     );
-
-    seed_preference(&pool, crate::core::prefs::HOME_THREAD_ENABLED.key(), "true")
-        .await
-        .unwrap();
-    assert_eq!(
-        ensure_home_thread_if_enabled(&bus, &pool).await.unwrap(),
-        Some(home)
-    );
-    assert!(is_home_thread(&pool, home).await.unwrap());
-    assert_eq!(home_rows(&pool).await, 1);
 
     teardown_test_db(&db).await;
 }
@@ -69,7 +160,7 @@ async fn ensuring_the_home_thread_twice_creates_one() {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
-    let first = enabled_home_thread(&bus, &pool).await;
+    let first = ensure_home_thread(&bus, &pool).await.unwrap();
     let second = ensure_home_thread(&bus, &pool).await.unwrap();
 
     assert_eq!(first, second);
@@ -204,8 +295,6 @@ async fn the_home_thread_takes_a_rename_and_refuses_a_generated_title() {
 
     assert!(bus.emit(generated("Another topic")).await.is_err());
     assert_eq!(title_of(&pool, home).await, "Kitchen table");
-    assert!(is_marked_home_thread(&pool, home).await.unwrap());
-    assert!(!is_marked_home_thread(&pool, Uuid::new_v4()).await.unwrap());
 
     teardown_test_db(&db).await;
 }

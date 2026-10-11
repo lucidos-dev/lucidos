@@ -141,6 +141,20 @@ pub(crate) fn read_build_id(dir: &Path) -> Option<String> {
     Some(chars.as_str().split_once(quote)?.0.to_string())
 }
 
+/// The file the dev build stamps into `dist/`. Generated into the SDK's
+/// `engine-constants.ts`, which `crates/lucidos-app/vite/sourceCommitStamp.ts`
+/// reads to write it.
+pub(crate) const SOURCE_COMMIT_FILE: &str = "source-commit";
+
+/// The commit `dir` was built from, or `None` when it carries no stamp or a
+/// malformed one. A snapshot is a hardlink copy of `dist/`, so it keeps the
+/// stamp of the build it copied.
+pub(crate) fn read_source_commit(dir: &Path) -> Option<String> {
+    let stamp = std::fs::read_to_string(dir.join(SOURCE_COMMIT_FILE)).ok()?;
+    let sha = stamp.trim();
+    (sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
 /// Hardlink-copy `static_dir` → `dst`, replacing any prior contents of `dst`.
 ///
 /// Hardlinks first (`cp -al`: instant, zero disk, and — crucially — the frozen
@@ -310,6 +324,22 @@ mod tests {
         assert_eq!(read_build_id(&tmp), None, "no BUILD_ID marker → None");
         write(&tmp.join("sw.js"), "const BUILD_ID = '__DEV__';\n// rest");
         assert_eq!(read_build_id(&tmp).as_deref(), Some("__DEV__"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn read_source_commit_takes_only_a_full_sha() {
+        let tmp = std::env::temp_dir().join(format!("lucidos-fe-snap-src-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(read_source_commit(&tmp), None, "no stamp is unknown");
+        let stamp = tmp.join(SOURCE_COMMIT_FILE);
+        for bad in ["", "\n", "not a commit\n", "abc123\n", &"g".repeat(40)] {
+            write(&stamp, bad);
+            assert_eq!(read_source_commit(&tmp), None, "{bad:?} is unknown");
+        }
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        write(&stamp, &format!("{sha}\n"));
+        assert_eq!(read_source_commit(&tmp).as_deref(), Some(sha));
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

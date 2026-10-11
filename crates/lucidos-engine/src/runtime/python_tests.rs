@@ -3,6 +3,42 @@ use crate::api::actor::{ENV_AGENT_ORIGIN_TOKEN, HEADER_AGENT_ORIGIN_TOKEN};
 use std::time::Duration;
 use tempfile::tempdir;
 
+/// Regression: `packages` went to `pip install` verbatim, so a pip flag or a
+/// URL installed code from wherever the model named. The refusal comes before
+/// the venv is built, so no pip process starts.
+#[tokio::test]
+async fn ensure_packages_refuses_flags_urls_and_paths() {
+    let dir = tempdir().unwrap();
+    let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
+    for spec in [
+        "--index-url=http://x",
+        "-r",
+        "git+https://evil.example/x.git",
+        "x @ https://evil.example/x.whl",
+        "./local-pkg",
+        "/abs/pkg",
+        "file:pkg",
+        "evil-1.0.tar.gz",
+        "evil-1.0-py3-none-any.whl",
+        "",
+    ] {
+        let err = runtime
+            .ensure_packages(&["pandas", spec])
+            .await
+            .expect_err(spec);
+        assert!(err.contains("is not a package name"), "{spec}: {err}");
+    }
+    assert!(!runtime.venv_path.exists(), "no venv, so no pip ran");
+    for spec in [
+        "pandas",
+        "numpy>=1.26,<2",
+        "requests[socks]",
+        "pywin32; sys_platform == \"win32\"",
+    ] {
+        assert!(check_requirement_spec(spec).is_ok(), "{spec}");
+    }
+}
+
 #[tokio::test]
 async fn test_execute_simple_python() {
     let dir = tempdir().unwrap();
@@ -972,7 +1008,7 @@ fn the_sweep_spares_every_entry_it_cannot_name_as_a_run_dir() {
 // user frame, so the truncator must always preserve those two.
 // -----------------------------------------------------------------
 
-use super::truncate_python_error;
+use super::{truncate_python_error, PY_ERROR_BYTE_BUDGET};
 
 #[test]
 fn short_error_returns_verbatim() {
@@ -1156,6 +1192,53 @@ fn exception_preserved_when_last_frame_has_no_source_line() {
         trimmed.contains("frames omitted"),
         "trim marker present: {trimmed:?}"
     );
+}
+
+/// The byte budget binds every branch, not only the early return. A line
+/// count of one is no bound: a script that writes one multi-MB line to stderr
+/// must not persist it in the tool error.
+fn assert_within_byte_budget(input: &str, trimmed: &str) {
+    // The marker text pins the contract system-knowhow/running-python.md quotes.
+    // The omitted count is below the input length, so this marker is the longest.
+    let longest_marker = format!("[... {} bytes of stderr omitted ...]\n", input.len());
+    assert!(
+        trimmed.len() <= PY_ERROR_BYTE_BUDGET + longest_marker.len(),
+        "result must fit the byte budget plus the marker, got {} bytes",
+        trimmed.len()
+    );
+    assert!(
+        trimmed.starts_with("[... ") && trimmed.contains("bytes of stderr omitted ...]\n"),
+        "byte-trim marker required: {:?}",
+        &trimmed[..trimmed.floor_char_boundary(120)]
+    );
+    let tail = &input[input.floor_char_boundary(input.len() - 64)..];
+    assert!(
+        trimmed.ends_with(tail),
+        "the input's tail must survive: {:?}",
+        &trimmed[trimmed.floor_char_boundary(trimmed.len() - 120)..]
+    );
+}
+
+#[test]
+fn one_huge_stderr_line_is_clamped_to_the_byte_budget() {
+    let line: String = (0..100 * 1024)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    assert_within_byte_budget(&line, &truncate_python_error(&line));
+}
+
+#[test]
+fn a_huge_exception_line_is_clamped_to_the_byte_budget() {
+    let mut tb = String::from("Traceback (most recent call last):\n");
+    for i in 0..6 {
+        tb.push_str(&format!(
+            "  File \"/x/mod_{i}.py\", line {i}, in f\n    g()\n"
+        ));
+    }
+    tb.push_str("ValueError: ");
+    // A multi-byte char per step, so the cut must find a char boundary.
+    tb.extend((0..50 * 1024).map(|i| if i % 2 == 0 { 'é' } else { 'x' }));
+    assert_within_byte_budget(&tb, &truncate_python_error(&tb));
 }
 
 #[test]

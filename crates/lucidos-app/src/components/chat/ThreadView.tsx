@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { WidgetShelf } from '../widgets/WidgetShelf';
 import { focusedThreadId, threadMap, stepsExpanded, detailsExpanded, collapsedExchanges, activeStreamingBuffer, threadsLoaded, awaitedThreadId, promptAnimating, revealOnFocus, connectionStatus, scaledDurationMs, effectiveThreadStatus, isMidTurn } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
@@ -16,15 +17,17 @@ import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, exchangeKey, exchangeResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
 import { rowsDrawnByClamp } from '../../store/event-rendering';
 import { statusLabel } from '../../store/exchange-status';
-import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isElementVisible, isNavigationScroll, isScrollbarHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollbarReleased, scrollbarReleased, deepLinkRenderAll, scrolledFromTop } from './scrollState';
-import { EMPTY_FILL_LEDGER, WHOLE_THREAD, chargeFillRound, drawnRowsInWindow, fillRoundAllowed, settleFillLedger, anythingAbove, atScrollTop, canSeedRenderWindow, deepLinkMustPersist, edgeHasMoreAbove, edgeMustReachRow, exchangeRenderCost, readingChaseAction, READING_CHASE_PAGE_SIZE, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, transcriptScrolls, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type FillLedger, type RowsAt, type WindowEdge } from './threadWindow';
+import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isNavigationScroll, isScrollbarHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollbarReleased, scrollbarReleased, deepLinkRenderAll, scrolledFromTop } from './scrollState';
+import { isElementVisible } from '../../utils/elementVisibility';
+import { EMPTY_FILL_LEDGER, WHOLE_THREAD, chargeFillRound, drawnRowsInWindow, fillRoundAllowed, settleFillLedger, anythingAbove, atScrollTop, clampedScrollTop, scrollAsksForOlder, canSeedRenderWindow, deepLinkMustPersist, edgeHasMoreAbove, edgeMustReachRow, exchangeRenderCost, readingChaseAction, READING_CHASE_PAGE_SIZE, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type FillLedger, type RowsAt, type WindowEdge } from './threadWindow';
+import { transcriptScrolls } from './transcriptScrolls';
 import { anchorTargetTop, readScrollAnchor, type ScrollAnchor } from './scrollAnchor';
 import { useScrollMemory, readSavedScroll, type SavedScroll } from '../../hooks/useScrollMemory';
 import { threadScrollKey } from '../../store/savedScroll';
 import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
-import { showThreadSkeletonNow, threadIsLoadingNow, type ThreadLoadingState } from './threadSkeletonGate';
+import { wholeHistoryLoaded, showThreadSkeletonNow, threadIsLoadingNow, type ThreadLoadingState } from './threadSkeletonGate';
 import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle, repaintNudgeShift, settledScrollTop } from '../../utils/webkitRepaint';
 import { isWebKit } from '../../utils/platform';
 import { onPageResume } from '../../utils/pageResume';
@@ -531,7 +534,8 @@ export type EmptyReason =
  *  CreateThreadView. */
 export function emptyReason(
     animating: boolean,
-    eventsLoaded: boolean,
+    /** `wholeHistoryLoaded`: loaded, and nothing older left on the server. */
+    historyLoaded: boolean,
     eventsLoadFailed: boolean,
     hasContent: boolean,
     threadId: string,
@@ -542,14 +546,14 @@ export function emptyReason(
 ): EmptyReason {
     if (animating) return { kind: 'animating' };
     if (eventsLoadFailed) return { kind: 'failed', threadId };
-    if (eventsLoaded && hasContent) return { kind: 'corrupt', threadId };
+    if (historyLoaded && hasContent) return { kind: 'corrupt', threadId };
     // Loaded, nothing to draw, and work is running. That is not an empty
     // thread, and "No messages in this thread" over a live turn is the blank
     // this whole change exists to stop. Two ways in: a voice thread whose
     // first content event has yet to be written, and a thread opened fresh
     // mid-turn. See docs/plans/2026-09-05-a-turn-is-never-blank.md.
-    if (eventsLoaded && turnInFlight) return { kind: 'working' };
-    if (eventsLoaded) return { kind: 'empty' };
+    if (historyLoaded && turnInFlight) return { kind: 'working' };
+    if (historyLoaded) return { kind: 'empty' };
     // The thread never loaded AND the engine is unreachable (the dot is red). Show
     // an honest "can't reach this workspace" state instead of a spinner that
     // degrades to "Tap to reload" — a full reload from the SW cache just re-renders
@@ -694,6 +698,7 @@ export function ThreadView() {
     // edge answers a narrower question. Reading it for this one is what stuck a
     // reported thread with no scroll and no chevron.
     const hasOlderEvents = eventThread?.hasOlderEvents === true;
+    const historyLoaded = wholeHistoryLoaded(eventsLoaded, hasOlderEvents);
 
     const animating = promptAnimating.value;
     // Fallback: if loadThreadEvents failed (e.g. iOS Safari PWA resume),
@@ -1192,24 +1197,14 @@ export function ThreadView() {
     // texture. This dep ensures a repaint fires on the 0→N transition.
     const hasExchanges = exchanges.length > 0;
 
-    // Drives the fading skeleton overlay (ThreadSkeletonOverlay): we're in the
-    // 'loading' empty state — no exchanges yet, and not animating / failed /
-    // loaded-empty. This mirrors emptyReason(...).kind === 'loading' but is also
-    // valid before the thread is in the map (cold start: eventsLoaded and
-    // eventsLoadFailed are false). Suppressed when disconnected so the shimmer
-    // doesn't sit over the honest "Can't reach this workspace" state
-    // (emptyReason maps that same case to 'disconnected', not 'loading').
-    //
-    // Two clocks arm it, and the second is why the first is not enough. The
-    // delay gate keeps a fast / prefetched open from flashing it. A big snapshot
-    // landing INSIDE that delay raises the flag itself: the render it triggers
-    // blocks the main thread, and the gate's timer cannot fire during it (see
-    // threadSkeletonGate.ts).
+    // Drives the fading skeleton overlay (ThreadSkeletonOverlay) through the
+    // one delay gate. It mirrors emptyReason's `loading` verdict, so it stays up
+    // while a loaded page drew nothing and older pages remain on the server.
     const loadingState: ThreadLoadingState = {
         hasExchanges,
         animating,
         eventsLoadFailed,
-        eventsLoaded,
+        historyLoaded,
         disconnected: connectionStatus.value === 'disconnected',
     };
     const delayElapsed = useDelayedFlag(threadIsLoadingNow(loadingState));
@@ -1302,7 +1297,7 @@ export function ThreadView() {
     // legitimately empty and don't need self-healing.
     const watchdogRef = useRef<ThreadRetryRef>(null);
     useEffect(() => {
-        if (!threadId || !eventsLoaded || !eventThread || exchanges.length > 0) return;
+        if (!threadId || !historyLoaded || !eventThread || exchanges.length > 0) return;
         if (!hasContentEvents(eventThread.events)) return;
         if (hasExhaustedRetries(watchdogRef, threadId, 2)) return;
         const timer = setTimeout(() => {
@@ -1318,7 +1313,7 @@ export function ThreadView() {
             rebuildCorruptedThreadEvents(threadId);
         }, 300);
         return () => clearTimeout(timer);
-    }, [threadId, eventsLoaded, exchanges.length, eventCount]);
+    }, [threadId, historyLoaded, exchanges.length, eventCount]);
 
     // Settle probe + late repaint (WebKit): a fixed delay after a thread is focused,
     // sample the render state and re-fire the open repaint burst ONCE. Armed on
@@ -1460,6 +1455,7 @@ export function ThreadView() {
                 reachForOlder();
             });
         });
+        let lastTop = clampedScrollTop(el);
         const onScroll = () => {
             // A page in flight is held against the reader's LAST known frame,
             // so keep that reading current. The capture is taken when the
@@ -1486,6 +1482,10 @@ export function ThreadView() {
                 // still beats the delta this exists to avoid.
                 if (inFlight.anchor) inFlight.anchor = readSettledAnchor(el) ?? inFlight.anchor;
             }
+            // The direction baseline moves on every scroll, ours included, so
+            // the reader's next move is measured from where we left them.
+            const previousTop = lastTop;
+            lastTop = clampedScrollTop(el);
             // Only the READER asking for older turns may grow the window.
             // Our own positioning fires scroll events too. Opening a thread
             // lands at the TOP of the rendered slice, inside the margin by
@@ -1503,7 +1503,7 @@ export function ThreadView() {
             // render can push a restore's event past the clock, and the
             // repaint nudge moves a pixel off it. Neither is the reader.
             if (isNavigationScroll(el) || isWhereWeLastScrolledIt(el)) return;
-            if (el.scrollTop > WINDOW_EXPAND_MARGIN_PX) return;
+            if (!scrollAsksForOlder(previousTop, lastTop)) return;
             reachForOlder();
         };
         // A reader pinned at the very top fires NO further scroll events, so
@@ -2004,7 +2004,7 @@ export function ThreadView() {
                             <StoppedChildNotice meta={eventThread.meta} />
                         </div>
                     ) : (
-                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />
+                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, historyLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />
                     )}
                 </div>
                 <ThreadSkeletonOverlay key="skeleton" show={showThreadSkeleton} />
@@ -2092,6 +2092,7 @@ export function DesktopThreadTitleBar({ threadId }: { threadId: string }) {
         <div class={`thread-view-header${scrolledFromTop.value ? ' scrolled' : ''}`}>
             <ThreadTitleMenu thread={thread} title={title} status={threadVisualStatus(thread)} />
             <ThreadTitlePin thread={thread} />
+            <WidgetShelf threadId={threadId} />
         </div>
     );
 }

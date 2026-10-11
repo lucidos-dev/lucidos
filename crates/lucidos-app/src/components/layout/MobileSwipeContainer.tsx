@@ -10,7 +10,7 @@ import {
   viewportIsKeyboardShrunk,
 } from '../../utils/dom';
 import { SwipeTouch } from '@lucidos/pane-swipe';
-import { parseAppSwipeMessage } from '../../store/actions/app-swipe-bridge';
+import { subscribeFrameSwipes } from '../../store/actions/frame-swipe-bridge';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import {
   noteKeyboardClosed,
@@ -379,7 +379,7 @@ export function MobileSwipeContainer() {
     wasPseudoFullscreen.current = isPseudo;
   }, [appPseudoFullscreen.value]);
 
-  // ── Drag and release, shared by host touches and app-frame drags ───────
+  // ── Drag and release, shared by host touches and frame drags ───────────
 
   /** Follow a live sideways drag `dx` px from where it locked. */
   const dragTrack = useCallback((dx: number) => {
@@ -423,7 +423,7 @@ export function MobileSwipeContainer() {
   // ── Touch event handlers ───────────────────────────────────────────────
 
   const touchTargetScrollable = useRef(false);
-  /** The app-frame drag being followed, if any. See the message effect below. */
+  /** The frame drag being followed, if any. See the frame-swipe effect below. */
   const frameDrag = useRef<{ source: MessageEventSource | null; following: boolean } | null>(null);
 
   const onTouchStart = useCallback((e: TouchEvent) => {
@@ -503,9 +503,10 @@ export function MobileSwipeContainer() {
     };
   }, [onTouchStart, onTouchMove, onTouchEnd]);
 
-  // A drag inside an app frame. The frame captures its touches, so the SDK
-  // tracks them and posts the drag up (`app-swipe-bridge.ts`). The frame has
-  // already locked the drag horizontal, so the host's only gates are its own.
+  // A drag inside an app frame or the HTML artifact preview. A frame captures
+  // its touches, so code inside it tracks them and posts the drag up
+  // (`frame-swipe-bridge.ts`). The frame has already locked the drag
+  // horizontal, so the host's only gates are its own.
   //
   // A natively fullscreen app counts as fullscreen here too. A host touch can
   // never reach the container then, but a frame drag can.
@@ -513,28 +514,24 @@ export function MobileSwipeContainer() {
   // A frame that went away mid-drag never sends its release. A drag from a
   // different frame is therefore gated afresh, and a host touch clears it.
   useEffect(() => {
-    const onMessage = (e: MessageEvent) => {
-      const message = parseAppSwipeMessage(e);
-      if (!message) return;
+    return subscribeFrameSwipes((source, message) => {
       const drag = frameDrag.current;
       if (message.kind === 'release') {
         if (drag?.following) releaseTrack(message.paneDelta);
         frameDrag.current = null;
         return;
       }
-      if (drag?.source !== e.source) {
+      if (drag?.source !== source) {
         const following = shouldStartPaneSwipe({
           textInputFocused: opensSoftwareKeyboard(document.activeElement),
           targetScrollable: false,
           appFullscreen: appPseudoFullscreen.value || nativeFullscreenElement() !== null,
         });
-        frameDrag.current = { source: e.source, following };
+        frameDrag.current = { source, following };
         if (following && trackRef.current) trackRef.current.style.transition = 'none';
       }
       if (frameDrag.current?.following) dragTrack(message.dx);
-    };
-    window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
+    });
   }, [dragTrack, releaseTrack]);
 
   // ── Keyboard-active: block accidental taps on other elements ─────────
@@ -583,10 +580,9 @@ export function MobileSwipeContainer() {
     return () => window.removeEventListener('scroll', onWindowScroll);
   }, []);
 
-  // iOS Safari auto-scrolls overflow:hidden containers when focus() targets
-  // an offscreen element (e.g. prompt input on pane 1 while pane 0 is visible).
-  // This sets container.scrollLeft to a non-zero value, permanently offsetting
-  // the view from the CSS transform position. Reset it immediately.
+  // The strip is `overflow: hidden` (ADR 0420), so a focus() or a scroll into
+  // view can slide every pane off its transform. Put it back on the next scroll
+  // event.
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;

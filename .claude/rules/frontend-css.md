@@ -3,6 +3,8 @@ paths:
   - "crates/lucidos-app/src/**/*.css"
   - "crates/lucidos-app/src/**/*.tsx"
   - "crates/lucidos-engine/src/api/sdk_iframe.css"
+  - "crates/lucidos-engine/src/api/sdk_iframe_shapes.css"
+  - "crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css"
 ---
 
 # Frontend CSS & Component Conventions
@@ -30,7 +32,7 @@ which is the same failure `.claude/rules/system-knowhow.md` gates elsewhere.
 |---|---|---|
 | Color | `--bg-{primary,secondary,tertiary}`, `--border-color`, `--text-{primary,secondary,muted,on-accent,strong}`, `--accent`, `--accent-{green,yellow,red}` | Never hardcode a color. Two exceptions, both `#fff` / `rgba(255,255,255,*)`: a translucent overlay over image content, and a surface whose colour is functional rather than thematic (the pairing QR's white field, which a camera needs). The second takes a comment at the site saying what breaks if it follows the theme. |
 | Type scale | `--font-size-{3xs,2xs,xs,sm,md,lg,xl,2xl,3xl,display}` | `font-size` takes a token, never a raw `rem`. `em`, percentages, `inherit` and `var(--user-ui-scale)` stay literal on purpose, as does a value deliberately pinned to a computed-px threshold, which must carry a comment saying why. |
-| Z-index | `--z-{float,dropdown,sticky,drawer,control-panel,app-fullscreen,modal,toast,tooltip}` | Raw values 1 to 10 are fine inside a component's own stacking context. Anything higher must use a token. `--z-float` (20) is the lowest step, for a popover anchored inside its own pane. |
+| Z-index | `--z-{float,dropdown,sticky,drawer,control-panel,widget-window,popover,app-fullscreen,modal,toast,tooltip}` | Raw values 1 to 10 are fine inside a component's own stacking context. Anything higher must use a token. `--z-float` (20) is the lowest step, for a popover anchored inside its own pane. |
 | Duration | `--duration-{fast,normal,slow,emphasis}` | `emphasis` is for a deliberate state-change cue the user must register; reach for `normal` or `slow` first. A new one is declared as `calc(<literal> * var(--duration-scale))`, see below. |
 | Icon size | `--icon-size-{sm,md,lg}` | Do not set inline `width`/`height` on an SVG inside `.icon-btn`; the class sizes it. |
 | Shadow | `--shadow-{sm,md,lg,up}` | Never hardcode a `box-shadow`. `up` casts upward, for a surface docked under the content it lifts off. |
@@ -76,7 +78,7 @@ Two consequences beyond the token block:
   - **Reusable (host + apps)** → `styles/global/shared-components.css` (the `.action-btn` family, `.icon-btn`, `.label` and its tones, `.title`, `.list-row*`, `.segmented-control`, `.pill-bar`, `.toggle-switch`, `.mini-spinner`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`, `h1`–`h6`). A component apps also need is the host's own, moved here, never an app-only copy: `styles/__tests__/exported-components-single-source.test.ts` fails on a second definition. SINGLE SOURCE OF TRUTH: the engine `include_str!`s this exact file and appends it to `/api/v1/sdk-iframe.css` (`crates/lucidos-engine/src/api/sdk.rs`). So a class added or changed here ships to the host AND every app iframe at once. **Never copy these rules into `sdk_iframe.css`, edit the shared file.**
     - The host's dropdown (`.dropdown-trigger`/`.dropdown-chevron`/`.dropdown-placeholder`/`.dropdown-option`) lives here too. `lucidos.ui.Select` renders those exact classes. Two more reusable files join this one the engine-served way: `surface.css` (`.surface-box`, the menu/popover box `lucidos.ui.Select`'s own menu also wears) and `text-input.css` (`.text-input`, the opt-in text-field look). `styles/__tests__/iframe-css-no-shared-component-restyle.test.ts` fails on a restyle of any of the three files' classes. A colour, background, border, radius, padding, font-size or box-shadow in `sdk_iframe.css` is banned on such a class.
   - **Host-chrome only (host bundle, NEVER served to apps)** → `styles/global/host-components.css` (the custom `<Dropdown>`'s positioning and form-field sizing, `.nav-history-*`, `.send-cancel-*` morph, `.icon-btn.header-icon`/`.filter-active`/`.pinned` variants, `.list-row.flip-animating`). Imported by `global.css` AFTER `shared-components.css` so source-order overrides of a shared base class still win.
-  - **Iframe-only (apps, not the host)** → the engine's `crates/lucidos-engine/src/api/sdk_iframe.css` (e.g. `lucidos.ui.Select`'s own non-portaled menu positioning). Keeps it out of the host bundle as dead code.
+  - **Iframe-only (apps, not the host)** → the engine's `crates/lucidos-engine/src/api/sdk_iframe.css` (e.g. `lucidos.ui.Select`'s own non-portaled menu positioning), or `sdk_iframe_shapes.css` for the widget shapes. Keeps it out of the host bundle as dead code.
   - Structural host chrome (`#app`, `body`, the `:root`/theme token blocks) stays in `base.css`. `#tooltip` is NOT host chrome and left this file: apps get the same tooltip, so its rules are in `shared-components.css` and `styles/__tests__/tooltip-single-source.test.ts` fails on a second copy anywhere.
   - When you add an app-facing class to `shared-components.css`, also add it to the component-class table in `system-knowhow/js-sdk.md` (the app-author-facing contract).
 - **List rows**: `.list-row` / `.list-row-info` / `.list-row-actions` (in `shared-components.css`)

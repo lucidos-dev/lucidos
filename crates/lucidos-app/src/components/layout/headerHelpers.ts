@@ -1,6 +1,7 @@
 import { activeMenuItem, panelOverlay, panelUrl, panelTitle, settingsSubview, settingsSubviewLabel, settingsSubviewShortLabel, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
 import { CODING_AGENT_CHANNEL, type ThreadChannel, type InlineForm, type SettingsNavKey } from '../../store/store';
 import { MENU_ITEM_LABELS } from '../../store/types';
+import type { App } from '../../store/types';
 import type { NavEntry } from '../../store/actions/navigation';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
@@ -42,6 +43,15 @@ function getHostname(url: string): string {
   try { return new URL(url).hostname; } catch { return url; }
 }
 
+/** An app's title in the Canvas header. A widget says so, and its full form
+ *  names the thread it came from (ADR 0402). */
+function appTitle(app: App, short: boolean): string {
+  if (app.kind !== 'widget') return app.name;
+  const origin = app.origin_thread_id ? threadMap.value.get(app.origin_thread_id)?.meta.title : undefined;
+  if (short || !origin || origin === PENDING_TITLE_PLACEHOLDER) return `${app.name} (widget)`;
+  return `${app.name} (widget from ${origin})`;
+}
+
 /** Title of whatever the content pane is showing, in one of two forms.
  *
  *  `short` is what the header BAR renders, and the rule for it is: a title WE
@@ -77,7 +87,7 @@ function contentTitle(short: boolean): string {
       }
       if (wipTitle) return `${overlay.app.name} (WIP)`;
     }
-    return overlay.app.name;
+    return appTitle(overlay.app, short);
   }
   if (overlay?.type === 'file-preview') {
     const fileName = previewFileName(overlay.path);
@@ -93,6 +103,7 @@ function contentTitle(short: boolean): string {
     if (short || !overlay.notification.title) return 'Notification';
     return `Notification - ${overlay.notification.title}`;
   }
+  if (overlay?.type === 'plugin-detail') return overlay.name;
   if (!overlay && active === 'settings' && settingsSubview.value !== 'main') {
     return settingsLabel(settingsSubview.value) || '';
   }
@@ -126,11 +137,12 @@ export function navEntryTitle(entry: NavEntry): string {
       if (wipTitle && wipTitle !== PENDING_TITLE_PLACEHOLDER) return `${overlay.app.name} (WIP by ${wipTitle})`;
       if (wipTitle) return `${overlay.app.name} (WIP)`;
     }
-    return overlay.app.name;
+    return appTitle(overlay.app, false);
   }
   if (overlay?.type === 'file-preview') return previewFileName(overlay.path);
   if (overlay?.type === 'url-preview') return getHostname(overlay.url);
   if (overlay?.type === 'notification-detail') return overlay.notification.title || 'Notification';
+  if (overlay?.type === 'plugin-detail') return overlay.name;
   if (!overlay && entry.menuItem === 'settings' && entry.settingsSubview !== 'main') {
     return settingsSubviewLabel(entry.settingsSubview) || 'Settings';
   }
@@ -167,6 +179,7 @@ export function navEntryCategory(entry: NavEntry): string {
   if (overlay?.type === 'file-preview') return 'files';
   if (overlay?.type === 'url-preview') return 'web';
   if (overlay?.type === 'notification-detail') return 'notifications';
+  if (overlay?.type === 'plugin-detail') return 'plugins';
   // No overlay → the active menu item is the destination; its name is also the
   // category icon's key (files / apps / triggers / settings / changes /
   // notifications).

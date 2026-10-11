@@ -4,7 +4,7 @@
 //! Safe means exactly what triage's apply means for `archive`: nothing busy,
 //! nothing the user still has to do, and no pin. One rule, two callers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -20,17 +20,39 @@ pub(crate) struct SafeThread {
     pub(crate) title: String,
 }
 
-/// What the confirm says. `kept` counts each kept thread once, under its first
-/// reason, so the counts add up to `kept_count`.
+/// What the confirm says. It counts inbox threads, sub-threads included, as
+/// the Current badge does, so the two totals add up to that badge.
+///
+/// `safe` lists the family roots the press sends back; `safe_thread_count`
+/// counts every inbox thread their archives take. `kept` counts every inbox
+/// thread that stays, so its values add up to `kept_thread_count`. A kept
+/// family counts once under its first reason, and its other inbox threads
+/// under [`SAME_FAMILY`]. A pinned sub-thread of a safe family counts under
+/// [`PINNED_SUB_THREAD`], because the archive leaves it open.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ArchiveAllPreflight {
     pub(crate) safe: Vec<SafeThread>,
+    pub(crate) safe_thread_count: usize,
     pub(crate) kept: BTreeMap<&'static str, usize>,
-    pub(crate) kept_count: usize,
+    pub(crate) kept_thread_count: usize,
 }
 
-/// The slug a kept thread is counted under in the confirm: busy first, then
-/// its first need. Pinned rows never reach here.
+/// The other inbox threads of a kept family.
+pub(crate) const SAME_FAMILY: &str = "same_family";
+/// A pinned sub-thread the archive of its safe root leaves open.
+pub(crate) const PINNED_SUB_THREAD: &str = "pinned_sub_thread";
+
+impl TriageRow {
+    /// The threads this family counts: the root, wherever it sits, and its
+    /// inbox sub-threads. A root archived since the confirm still counts once,
+    /// so the result names it under `archived`.
+    pub(crate) fn counted_threads(&self) -> usize {
+        1 + self.inbox_sub_threads
+    }
+}
+
+/// The slug a kept family's root is counted under in the confirm: busy first,
+/// then its first need. Its other threads count under [`SAME_FAMILY`]. Pinned rows never reach here.
 fn kept_slug(row: &TriageRow) -> &'static str {
     let facts = &row.facts;
     if facts.busy_reason().is_some() {
@@ -51,37 +73,62 @@ fn kept_slug(row: &TriageRow) -> &'static str {
     }
 }
 
-/// The confirm for the Current section. A pinned thread sits in Pinned, not
-/// Current, so it is neither archived nor counted.
+/// The confirm for the Current section, family by family as the drawer draws
+/// them. A family whose root is pinned sits in Pinned, so it is neither
+/// archived nor counted. A pinned root in a family that also holds an unpinned
+/// one renders in Current, so it is counted as kept.
 pub(crate) fn preflight(rows: &[TriageRow]) -> ArchiveAllPreflight {
+    let current_families: HashSet<Uuid> = rows
+        .iter()
+        .filter(|r| !r.facts.is_pinned)
+        .map(|r| r.family_root)
+        .collect();
     let mut safe = Vec::new();
+    let mut safe_thread_count = 0;
     let mut kept = BTreeMap::new();
-    let mut kept_count = 0;
-    for row in rows.iter().filter(|r| !r.facts.is_pinned) {
+    let mut count = |slug: &'static str, n: usize| {
+        if n > 0 {
+            *kept.entry(slug).or_insert(0) += n;
+        }
+    };
+    for row in rows {
+        if row.facts.is_pinned {
+            if !row.family_pinned && current_families.contains(&row.family_root) {
+                count(PINNED_SUB_THREAD, 1);
+                count(SAME_FAMILY, row.inbox_sub_threads);
+            }
+            continue;
+        }
         if refuse_apply(TriageAction::Archive, &row.facts).is_none() {
             safe.push(SafeThread {
                 thread_id: row.facts.thread_id,
                 title: row.title.clone(),
             });
+            safe_thread_count += row.counted_threads() - row.pinned_sub_threads;
+            count(PINNED_SUB_THREAD, row.pinned_sub_threads);
         } else {
-            *kept.entry(kept_slug(row)).or_insert(0) += 1;
-            kept_count += 1;
+            count(kept_slug(row), 1);
+            count(SAME_FAMILY, row.inbox_sub_threads);
         }
     }
+    let kept_thread_count = kept.values().sum();
     ArchiveAllPreflight {
         safe,
+        safe_thread_count,
         kept,
-        kept_count,
+        kept_thread_count,
     }
 }
 
 /// A confirmed id Archive all did not archive, and why: `reason` in words for
 /// an agent, `slug` for the client to word as the confirm does.
+/// `thread_count` is the root plus its inbox sub-threads ([`TriageRow::counted_threads`]).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct KeptThread {
     pub(crate) thread_id: Uuid,
     pub(crate) reason: String,
     pub(crate) slug: &'static str,
+    pub(crate) thread_count: usize,
 }
 
 /// The slug for a confirmed id that changed since the confirm: the preflight's
@@ -130,6 +177,7 @@ pub(crate) fn still_safe(rows: &[TriageRow], confirmed: &[Uuid]) -> (Vec<Uuid>, 
                 thread_id: *id,
                 reason,
                 slug: fresh_kept_slug(row),
+                thread_count: row.map_or(1, TriageRow::counted_threads),
             }),
         }
     }

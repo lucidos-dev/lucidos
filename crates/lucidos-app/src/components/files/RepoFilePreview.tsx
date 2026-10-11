@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import type { DiffFile, RepoDiff, RepoLocator } from '../../store/store';
-import { repoDiff, repoPending, filePreviewSource, filePreviewWrap, diffSideBySide, repoSelectedChangeId, openFilePreviewRevision, encodeRepoPath } from '../../store/store';
+import { repoDiff, repoPending, filePreviewWrap, diffSideBySide, repoSelectedChangeId, openFilePreviewRevision, encodeRepoPath } from '../../store/store';
 import { diffBodyKind } from '../../store/diffBody';
 import type { Loadable } from '../../store/types';
 import { getRepoFileContent, getChangeFileContent, repoFileUrl, changeFileUrl } from '../../api/client';
@@ -27,6 +27,7 @@ import { FileSourceSkeleton, ProseSkeleton } from './previewSkeletons';
 import { LoadingFade } from '../shared/LoadingFade';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 import { withPreviewRevision } from './previewRevision';
+import { usePreviewViewState } from './previewViewState';
 import { IframeTabExit } from '../shared/IframeTabExit';
 
 interface Props {
@@ -124,7 +125,7 @@ function RepoFilePreview({ locator, layout }: Props) {
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   const showDiffLoading = useDelayedLoading(repoDiff.value);
   // Resolved once here and passed down rather than read inside the leaves: the
-  // same leaves render in the app-facing preview modal, whose surface default is
+  // same leaves render in the file preview modal, whose surface default is
   // not this one (see `previewGitRef`).
   const gitRef = previewGitRef(locator, repoPending.value?.branch_name ?? null);
   // What the header's Refresh button moves. Read here rather than in the leaves
@@ -193,7 +194,7 @@ interface RepoFileContentProps {
   /** Which revision of the file to read: a branch name, or `null` for the
    *  clone's current `HEAD`. Always explicit, never read from the bound
    *  repository's state, because this component also renders for a repository
-   *  the Files panel is not bound to (the app-facing file preview modal), where
+   *  the Files panel is not bound to (the file preview modal), where
    *  the bound repository's branch would fetch the wrong revision or 404. */
   gitRef: string | null;
   /** Cache-buster for the header's Refresh button, 0 when it has never been
@@ -212,12 +213,18 @@ interface RepoFileContentProps {
  *  string. Fetching a PNG as text was the bug: it rendered the raw bytes
  *  line-numbered.
  *
- *  Exported because the file preview modal renders the same content over an app
- *  without navigating to the Files panel (see `FilePreviewModal`). It is the
+ *  Exported because the file preview modal renders the same content without
+ *  navigating to the Files panel (see `FilePreviewModal`). It is the
  *  content alone: the panel's chrome (the changed-files sidebar, the diff modes)
  *  stays with `RepoFilePreviewWithSidebar`. */
-export function RepoFileContent({ repoId, path, changeId, gitRef, revision }: RepoFileContentProps) {
-  const body = repoPreviewBody(path, { sourceToggle: filePreviewSource.value });
+export function RepoFileContent(props: RepoFileContentProps) {
+  return repoFileContentLeaf(props, usePreviewViewState().source.value);
+}
+
+/** The leaf `RepoFileContent` renders, given the preview's Source toggle. Pure
+ *  and exported so the dispatch is checkable without rendering. */
+export function repoFileContentLeaf({ repoId, path, changeId, gitRef, revision }: RepoFileContentProps, sourceToggle: boolean) {
+  const body = repoPreviewBody(path, { sourceToggle });
   if (body === 'image' || body === 'pdf' || body === 'video' || body === 'audio') {
     return <RepoFileMedia repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} kind={body} />;
   }

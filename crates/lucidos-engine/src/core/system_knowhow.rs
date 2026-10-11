@@ -14,15 +14,16 @@
 use std::path::{Path, PathBuf};
 
 use crate::core::knowhow::{Knowhow, KnowhowListDepth, KnowhowStore, KnowhowSummary};
+use crate::core::shipped_dir::{resolve_shipped_dir, ShippedDir};
 
 pub struct SystemKnowhowStore;
 
 impl SystemKnowhowStore {
-    /// Every `.md` in the shipped tree, at any depth. A workspace root lists
-    /// docs only, but this corpus is curated in the repo: what ships is the
-    /// catalog, and a stray depth is a bug we fix at the source.
+    /// The top-level docs of the shipped tree: what the System Knowhow
+    /// routing list names on every turn. A file in a folder is a reference.
+    /// Its top-level doc names its id, and it costs no routing line (ADR 0413).
     pub fn load_summaries(dir: &Path) -> Vec<KnowhowSummary> {
-        KnowhowStore::load_summaries(dir, KnowhowListDepth::Unbounded)
+        KnowhowStore::load_summaries(dir, KnowhowListDepth::FilesOnly)
     }
 
     pub fn load(dir: &Path, id: &str) -> Option<Knowhow> {
@@ -43,62 +44,23 @@ pub fn is_system_knowhow_path(data_path: &str) -> bool {
     data_path.starts_with("system-knowhow/")
 }
 
-/// Resolve the engine-shipped `system-knowhow/` directory at boot, returning the
-/// resolved dir (if any) plus at most one loud warning to log.
-///
-/// Resolution order (INV-3 of the "package system-knowhow" plan):
-///   1. `LUCIDOS_SYSTEM_KNOWHOW_DIR` set (non-empty) → **authoritative**: it MUST
-///      exist. Set-but-missing is a mis-staged bundle — warn loudly and treat as
-///      unavailable; NEVER silently fall back to `repo_root` (bogus in packaged).
-///   2. Env var unset/empty → today's `<repo_root>/system-knowhow` fallback,
-///      byte-identical to the dev/source-checkout behavior.
-///   3. Neither resolves → unavailable. On a packaged build (`is_packaged`) this
-///      is a real defect (there is no checkout), so warn loudly naming the env
-///      var (INV-4); dev/e2e without the dir is expected and stays quiet.
-///
-/// Pure over its inputs (env value + repo root + packaged flag) so it is
-/// unit-testable offline; the caller does the I/O of reading the env var and
-/// logging the returned warnings.
+/// The engine-shipped `system-knowhow/` reference set, as a bundle resource.
+pub const SYSTEM_KNOWHOW_DIR: ShippedDir = ShippedDir {
+    name: "system-knowhow",
+    env_var: "LUCIDOS_SYSTEM_KNOWHOW_DIR",
+    log_tag: "[Knowhow]",
+    degrades: "the engine-shipped reference set is missing (load_knowhow('system-knowhow/…'), \
+               GET /api/v1/knowhow, and the data-API read path all degrade)",
+};
+
+/// Resolve the engine-shipped `system-knowhow/` directory at boot. See
+/// [`resolve_shipped_dir`] for the order and the warnings.
 pub fn resolve_system_knowhow_dir(
     env_value: Option<&str>,
     repo_root: &Path,
     is_packaged: bool,
 ) -> (Option<PathBuf>, Option<String>) {
-    // 1. The env var is authoritative when set — the packaged launcher points it
-    //    at <resources>/system-knowhow. Trim only to DETECT a blank value
-    //    (= unset); the path is built from the original bytes — a legitimate
-    //    dir path may carry edge whitespace.
-    if let Some(value) = env_value.filter(|v| !v.trim().is_empty()) {
-        let candidate = PathBuf::from(value);
-        if candidate.is_dir() {
-            return (Some(candidate), None);
-        }
-        return (None, Some(format!(
-            "[Knowhow] LUCIDOS_SYSTEM_KNOWHOW_DIR is set to '{value}' but that directory does not \
-             exist — the engine-shipped reference set is UNAVAILABLE (load_knowhow('system-knowhow/…'), \
-             GET /api/v1/knowhow, and the data-API read path all degrade). This is a packaging bug: \
-             the bundle must stage system-knowhow/ at that path."
-        )));
-    }
-
-    // 2. No env var: the dev/source-checkout fallback, unchanged.
-    let candidate = repo_root.join("system-knowhow");
-    if candidate.is_dir() {
-        return (Some(candidate), None);
-    }
-
-    // 3. Unresolvable. Loud only when packaged — a source checkout without the
-    //    dir is expected (matches the prior silent `None`).
-    if is_packaged {
-        return (None, Some(
-            "[Knowhow] system-knowhow directory is UNAVAILABLE: LUCIDOS_SYSTEM_KNOWHOW_DIR is unset \
-             and no <repo>/system-knowhow exists. The engine-shipped reference set is missing \
-             (load_knowhow('system-knowhow/…'), GET /api/v1/knowhow, and the data-API read path all \
-             degrade). This is a packaging bug: the bundle must set LUCIDOS_SYSTEM_KNOWHOW_DIR."
-                .to_string(),
-        ));
-    }
-    (None, None)
+    resolve_shipped_dir(&SYSTEM_KNOWHOW_DIR, env_value, repo_root, is_packaged)
 }
 
 #[cfg(test)]
@@ -128,15 +90,15 @@ mod tests {
         assert!(ids.contains(&"lucidos-cli".to_string()));
     }
 
-    /// A workspace root lists docs only, and the shipped corpus does not. The
-    /// depth cap is about a user's own files, so it must not reach this tree:
-    /// `shipped_system_knowhow_files_all_parse` walks every file at any depth.
+    /// The shipped corpus lists docs only, like an app's knowhow root. A file
+    /// in a folder is a reference that still loads by its full id.
     #[test]
-    fn load_summaries_lists_a_doc_at_any_depth() {
+    fn load_summaries_lists_top_level_docs_only() {
         let tmp = tempfile::tempdir().unwrap();
+        write_doc(&tmp.path().join("guide.md"), "Guide", "Body.");
         write_doc(
-            &tmp.path().join("scripts").join("deep").join("helper.md"),
-            "Helper",
+            &tmp.path().join("guide").join("section.md"),
+            "Section",
             "Body.",
         );
 
@@ -144,7 +106,11 @@ mod tests {
             .into_iter()
             .map(|s| s.id)
             .collect();
-        assert_eq!(ids, vec!["scripts/deep/helper".to_string()]);
+        assert_eq!(ids, vec!["guide".to_string()]);
+        assert!(
+            SystemKnowhowStore::load(tmp.path(), "guide/section").is_some(),
+            "a reference still loads by its full id"
+        );
     }
 
     #[test]
@@ -339,21 +305,69 @@ mod tests {
     fn shipped_system_knowhow_files_all_parse() {
         let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
         let dir = repo.join("system-knowhow");
-        let summary_ids: std::collections::HashSet<String> =
-            SystemKnowhowStore::load_summaries(&dir)
-                .into_iter()
-                .map(|s| s.id)
-                .collect();
         let missing: Vec<String> = crate::core::knowhow::collect_md_files(&dir)
             .into_iter()
             .filter_map(|path| crate::core::knowhow::id_from_path(&dir, &path))
-            .filter(|id| !summary_ids.contains(id))
+            .filter(|id| SystemKnowhowStore::load(&dir, id).is_none())
             .collect();
         assert!(
             missing.is_empty(),
             "system-knowhow files missing valid `---\\nname: ...\\n---` frontmatter \
              (load_knowhow returns missing for these): {:?}",
             missing
+        );
+    }
+
+    /// The Workspace Prompt Footprint page's Run audit button sends a sentence
+    /// as an ordinary message. The audit root must route on its words, or the
+    /// button starts a general chat instead of the audit.
+    #[test]
+    fn the_footprint_page_prompt_routes_to_the_audit_root() {
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        let page = std::fs::read_to_string(
+            repo.join("crates/lucidos-app/src/components/settings/promptFootprint.ts"),
+        )
+        .expect("the page helpers exist");
+        let prompt = page
+            .lines()
+            .find_map(|l| l.strip_prefix("export const PROMPT_FOOTPRINT_AUDIT_PROMPT = "))
+            .expect("the page names its audit prompt")
+            .to_lowercase();
+        let root = SystemKnowhowStore::load_summaries(&repo.join("system-knowhow"))
+            .into_iter()
+            .find(|s| s.id == "workspace-audit")
+            .expect("the audit root is listed");
+        let description = root.description.to_lowercase();
+        for word in ["audit", "workspace", "prompt footprint"] {
+            assert!(prompt.contains(word), "the button's prompt drops {word:?}");
+            assert!(
+                description.contains(word),
+                "the audit root's description drops {word:?}, so the button may not reach it"
+            );
+        }
+    }
+
+    /// A shipped file in a folder is in no routing list, so only its owning
+    /// doc can tell the agent the id exists. One named by no top-level doc is
+    /// unreachable: it ships and nothing ever loads it.
+    #[test]
+    fn every_nested_shipped_file_is_named_by_a_top_level_doc() {
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        let dir = repo.join("system-knowhow");
+        let top_level: String = SystemKnowhowStore::load_summaries(&dir)
+            .iter()
+            .filter_map(|s| std::fs::read_to_string(dir.join(format!("{}.md", s.id))).ok())
+            .collect();
+        let unnamed: Vec<String> = crate::core::knowhow::collect_md_files(&dir)
+            .into_iter()
+            .filter_map(|path| crate::core::knowhow::id_from_path(&dir, &path))
+            .filter(|id| id.contains('/'))
+            .filter(|id| !top_level.contains(&format!("system-knowhow/{id}")))
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "nested system-knowhow files no top-level doc names by \
+             `system-knowhow/<id>`, so nothing can reach them: {unnamed:?}"
         );
     }
 }

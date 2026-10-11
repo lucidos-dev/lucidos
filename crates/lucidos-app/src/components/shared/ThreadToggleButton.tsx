@@ -1,7 +1,7 @@
 import { toggleThreads } from '../../store/actions/pane';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { shortcutDef } from '../../utils/shortcuts';
-import { attentionThreadCount, mobileView, threadDrawerOpen, type MobileView } from '../../store/store';
+import { blockedThreadCount, mobileView, threadDrawerOpen, type MobileView } from '../../store/store';
 import { viewportIsMobile } from '../../utils/viewport';
 import { SidebarIcon, ThreadListIcon } from './icons';
 import { GlyphBadge } from './GlyphBadge';
@@ -22,29 +22,34 @@ export function threadListVisible(mobile: boolean, view: MobileView, drawerOpen:
   return mobile ? view === 'threads' : drawerOpen;
 }
 
-/** The needs-attention count the toggle should badge (0 means no badge). It
- *  rides this toggle only while the thread list is HIDDEN: with the list on
- *  screen its own header's Filter button already carries the same count, and two
- *  badges for one number read as two separate problems. Same rule on both
+/** The Blocked count the toggle should badge (0 means no badge). It
+ *  rides this toggle only while the thread list is HIDDEN. With the list on
+ *  screen, the grouping button (under Folders) or the Blocked group
+ *  (under Ongoing) already carries it. Two badges for one number read as two
+ *  separate problems. Same rule on both
  *  layouts, which is what makes the mobile thread pane header (where the list is
  *  always a pane away) badge whenever anything needs the user. */
 export function threadToggleBadgeCount(
-  attentionCount: number, mobile: boolean, view: MobileView, drawerOpen: boolean,
+  blockedCount: number, mobile: boolean, view: MobileView, drawerOpen: boolean,
 ): number {
-  return threadListVisible(mobile, view, drawerOpen) ? 0 : attentionCount;
+  return threadListVisible(mobile, view, drawerOpen) ? 0 : blockedCount;
+}
+
+/** `label` with the Blocked count a badge beside it draws. The badge is
+ *  decorative markup, so the count reaches assistive tech only this way. */
+export function labelWithBlockedCount(label: string, blockedCount: number): string {
+  return blockedCount > 0 ? `${label} (${blockedCount} blocked)` : label;
 }
 
 export function ThreadToggleButton({ class: cls }: Props) {
   const mobile = viewportIsMobile.value;
   const badgeCount = threadToggleBadgeCount(
-    attentionThreadCount.value, mobile, mobileView.value, threadDrawerOpen.value,
+    blockedThreadCount.value, mobile, mobileView.value, threadDrawerOpen.value,
   );
   // A sidebar glyph where the list IS a sidebar. On a phone the toggle swipes
   // to a whole pane of threads, so it draws the list it takes you to.
   const Glyph = mobile ? ThreadListIcon : SidebarIcon;
-  // The badge is decorative markup, so the count has to reach assistive tech
-  // through the label or it's invisible there.
-  const label = badgeCount > 0 ? `${LABEL} (${badgeCount} needing attention)` : LABEL;
+  const label = labelWithBlockedCount(LABEL, badgeCount);
 
   return (
     <button

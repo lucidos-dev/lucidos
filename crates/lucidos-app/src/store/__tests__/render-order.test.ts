@@ -92,8 +92,8 @@ describe('every boundary type carries a continuation-handoff decision', () => {
 const MID_TURN_BOUNDARIES: Array<{ name: string; event: ThreadEvent }> = [
   { name: 'ContinuationStarted', event: { type: 'ContinuationStarted' } as ThreadEvent },
   {
-    name: 'UserPromptInjected (a wait waking the thread)',
-    event: { type: 'UserPromptInjected', text: 'An event arrived.', mode: 'agent' } as ThreadEvent,
+    name: 'PromptInjected (a wait waking the thread)',
+    event: { type: 'PromptInjected', text: 'An event arrived.', mode: 'agent' } as ThreadEvent,
   },
   {
     name: 'UserQuestionAsked',
@@ -175,7 +175,7 @@ describe('the named exceptions', () => {
       // The turn keeps writing while the follow-up waits in the queue.
       { type: 'TextStreamed', text: 'still on the first', request_event_id: 'mr-1', created: at(4) },
       // The loop picks it up here, and everything after reads below the card.
-      { type: 'UserPromptInjected', text: 'also this', injected_message_id: 'mr-2', request_event_id: 'mr-1', created: at(5) },
+      { type: 'PromptInjected', text: 'also this', injected_message_id: 'mr-2', request_event_id: 'mr-1', created: at(5) },
       { type: 'TextStreamed', text: 'on the second now', request_event_id: 'mr-1', created: at(6) },
       { type: 'ResponseGenerated', request_event_id: 'mr-1', created: at(7) },
     ] as Array<ThreadEvent & { created?: string; event_id?: string }>);

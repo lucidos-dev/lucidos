@@ -17,6 +17,7 @@ import { isTauri } from '../../utils/platform';
 import { webviewGoBack, webviewGoForward } from '../../utils/tauri';
 import { MenuIcon, CloseIcon } from '../shared/icons';
 import { CategoryIcon } from '../shared/CategoryIcon';
+import { AppIcon } from '../shared/AppIcon';
 import { NavChevron, type NavHistoryItem } from '../shared/NavChevron';
 import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
 import { GlyphBadge } from '../shared/GlyphBadge';
@@ -69,7 +70,9 @@ function contentNavItem(i: number, entry: NavEntry): NavHistoryItem {
   return {
     key: String(i),
     label: navEntryTitle(entry),
-    icon: <CategoryIcon category={navEntryCategory(entry)} />,
+    icon: entry.overlay?.type === 'app-ui'
+      ? <AppIcon appId={entry.overlay.app.id} name={entry.overlay.app.name} icon={entry.overlay.app.icon} />
+      : <CategoryIcon category={navEntryCategory(entry)} />,
     onSelect: () => navGoTo(i),
   };
 }

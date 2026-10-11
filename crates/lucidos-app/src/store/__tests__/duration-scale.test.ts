@@ -102,7 +102,7 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     what: 'keeps the thread skeleton overlay mounted through its fade',
   },
   {
-    file: '../../components/apps/AppUiInline.tsx',
+    file: '../../components/apps/AppFrame.tsx',
     expr: /scaledDurationMs\(COVER_FADE_MS\) \+ COVER_FADE_SLACK_MS/,
     what: "keeps the app frame's load cover mounted through its fade",
   },
@@ -167,6 +167,11 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     what: "runs the image viewer's swipe cleanup if transitionend never fires",
   },
   {
+    file: '../../components/widgets/WidgetWindows.tsx',
+    expr: /scaledDurationMs\(WIDGET_WINDOW_FADE_MS\) \+ WIDGET_WINDOW_FADE_SLACK_MS/,
+    what: 'keeps a closing widget window mounted through its fade out',
+  },
+  {
     file: '../../hooks/panelStepMorph.ts',
     expr: /scaledDurationMs\(STEP_MORPH_MS\) \+ STEP_MORPH_SLACK_MS/,
     what: 'settles a step morph if its finish event never arrives',
@@ -175,6 +180,11 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     file: '../../components/layout/Drawer.tsx',
     expr: /scaledDurationMs\(DRAWER_SLIDE_OUT_MS\) \+ DRAWER_SLIDE_OUT_SLACK_MS/,
     what: 'closes the menu drawer if its slide-out end never arrives',
+  },
+  {
+    file: '../../components/shared/overlayExitDrawing.ts',
+    expr: /scaledDurationMs\(MODAL_FADE_MS\) \+ MODAL_FADE_SLACK_MS/,
+    what: "removes a closed modal's exit drawing once its fade has run",
   },
   // The only entry whose transition is INLINE rather than a token. The FLIP
   // writes `transform` and `height` durations onto the element itself, so

@@ -63,6 +63,14 @@ const CONSUMER_EXEMPT: Record<string, Exemption> = {
   'components/settings/ProviderBlock.tsx': { tag: 'structure-first', why: 'switch drawn at once; config rows stay shut until known' },
   'components/settings/SystemOneProviderFrame.tsx': { tag: 'structure-first', why: 'real controls; defer their values' },
   'components/settings/CustomSystemOneSettings.tsx': { tag: 'structure-first', why: 'real controls; defer their values' },
+  'components/apps/ReusableWidgetsSection.tsx': { tag: 'single-value', why: 'a group under the apps list, which draws its own skeleton' },
+  'components/widgets/WidgetCard.tsx': { tag: 'single-value', why: "a widget's bar holds its name empty until the thread's widgets load" },
+  'components/widgets/HomeWidgetsMenu.tsx': { tag: 'structure-first', why: "anchored popover; a hidden note holds a line until Home's widgets land" },
+  'components/widgets/WidgetShelf.tsx': { tag: 'single-value', why: 'the title row stays as it was until its widget chips land' },
+  'components/widgets/WidgetWindows.tsx': { tag: 'no-visual', why: "a widget window draws once Home's widgets name it, and nothing before" },
+  'components/widgets/useWidgetEmbedSlots.tsx': { tag: 'single-value', why: "a reply embed's bar names it by its label until its widget's name is read" },
+  'components/widgets/WidgetEmbedFrame.tsx': { tag: 'structure-first', why: "an embed's frame box holds its room until the manifest says how it reveals" },
+  'components/shared/AppIcon.tsx': { tag: 'single-value', why: 'an icon slot shows the monogram tile until the apps list lands' },
 };
 
 /** "Loading…" literals that may stay, keyed by file. */

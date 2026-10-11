@@ -87,6 +87,8 @@ CSS already says so at `:root[data-titlebar-overlay] .threads-header-title`.
 clamp its title instead. Rejected: at 312px the title has 4.5rem to stay a
 title, and below that the drawer stops at a width where the thing it reserved
 room for is an ellipsis. That is the regression the derived floor replaced.
+*Superseded in part 2026-10-09 (ADR 0396): the floor keeps no title room, and a
+title that does not fit hides rather than ellipsizing.*
 
 **Set a minimum window width on the packaged build instead**, and leave the
 drawer alone. Rejected as an answer to a different question: `tauri.conf.json`

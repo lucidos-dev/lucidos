@@ -1,22 +1,34 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { APP_PULL_MESSAGE_TYPE, APP_REFRESH_MESSAGE_TYPE } from '@lucidos/pull-to-refresh';
 
-const isKnownAppFrame = vi.fn();
+const CANVAS_FRAME = { canvas: true };
+const WIDGET_FRAME = { canvas: false };
+const appFrameFor = vi.fn();
+const isCanvasAppFrame = (frame: { canvas: boolean } | null) => frame?.canvas === true;
 const runPanelRefresh = vi.fn();
 const showPullTravel = vi.fn();
-vi.mock('../../utils/appFrame', () => ({ isKnownAppFrame }));
+vi.mock('../../utils/appFrame', () => ({ appFrameFor, isCanvasAppFrame }));
 vi.mock('../panelRefresh', () => ({ runPanelRefresh, showPullTravel }));
 
 const { handleAppPullMessage } = await import('./app-pull-bridge');
 
 const APP = { name: 'the app frame' };
+const WIDGET = { name: 'a shelf widget' };
 const message = (data: unknown, source: unknown = APP) => ({ data, source }) as unknown as MessageEvent;
 
 describe('handleAppPullMessage', () => {
   beforeEach(() => {
-    isKnownAppFrame.mockReset().mockImplementation((s) => s === APP);
+    appFrameFor.mockReset().mockImplementation((s) =>
+      s === APP ? CANVAS_FRAME : s === WIDGET ? WIDGET_FRAME : null);
     runPanelRefresh.mockReset();
     showPullTravel.mockReset();
+  });
+
+  it('ignores a pull from a shelf widget, which is not the Canvas app', () => {
+    handleAppPullMessage(message({ type: APP_REFRESH_MESSAGE_TYPE }, WIDGET));
+    handleAppPullMessage(message({ type: APP_PULL_MESSAGE_TYPE, travel: 40 }, WIDGET));
+    expect(runPanelRefresh).not.toHaveBeenCalled();
+    expect(showPullTravel).not.toHaveBeenCalled();
   });
 
   it('runs the app panel\'s refresh on a release', () => {
@@ -51,7 +63,7 @@ describe('handleAppPullMessage', () => {
   it('ignores every other message', () => {
     handleAppPullMessage(message({ type: 'lucidos:ui:toast' }));
     handleAppPullMessage(message(null));
-    expect(isKnownAppFrame).not.toHaveBeenCalled();
+    expect(appFrameFor).not.toHaveBeenCalled();
     expect(runPanelRefresh).not.toHaveBeenCalled();
   });
 });

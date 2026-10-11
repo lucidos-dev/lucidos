@@ -160,7 +160,7 @@ fn indexable_text_covers_what_the_caller_said_on_a_call() {
     );
 }
 
-/// A `UserPromptInjected` is indexable only when it carries ORIGINAL text.
+/// A `PromptInjected` is indexable only when it carries ORIGINAL text.
 ///
 /// With `injected_message_id` set it is an acknowledgement of a
 /// `MessageReceived` that is already persisted and already indexed, with the
@@ -171,7 +171,7 @@ fn indexable_text_covers_what_the_caller_said_on_a_call() {
 /// child-thread callback) and is the only record of its own content.
 #[test]
 fn indexable_text_skips_an_injection_that_echoes_a_persisted_message() {
-    let echo = ThreadEvent::UserPromptInjected {
+    let echo = ThreadEvent::PromptInjected {
         text: "and the totals too".into(),
         mode: ActorMode::Human,
         origin: None,
@@ -184,7 +184,7 @@ fn indexable_text_skips_an_injection_that_echoes_a_persisted_message() {
         "an acknowledgement of an already-indexed MessageReceived must not be indexed again"
     );
 
-    let engine_note = ThreadEvent::UserPromptInjected {
+    let engine_note = ThreadEvent::PromptInjected {
         text: "Reminded the model about 3 prior tool calls".into(),
         mode: ActorMode::Engine,
         origin: None,

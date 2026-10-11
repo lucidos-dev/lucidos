@@ -821,3 +821,198 @@ async fn migrate_on_to_subscription_list_is_idempotent() {
 
     teardown_test_db(&db_name).await;
 }
+
+const RENAME_USER_PROMPT_INJECTED_SQL: &str =
+    include_str!("../migrations/20261008112539_rename_user_prompt_injected_to_prompt_injected.sql");
+
+async fn event_row(pool: &PgPool, event_id: Uuid) -> (String, Value) {
+    sqlx::query_as::<_, (String, Value)>("SELECT event_type, payload FROM events WHERE id = $1")
+        .bind(event_id)
+        .fetch_one(pool)
+        .await
+        .expect("read event")
+}
+
+/// The old name in a subscription list, between two entries the migration
+/// must leave alone, one of them with a condition of its own.
+fn subscriptions_naming(name: &str) -> Value {
+    json!([
+        { "event_type": "ChangeApplied" },
+        { "event_type": name, "condition": { "mode": "human" } },
+        { "event_type": "ToolCalled", "condition": { "name": "Bash" } },
+    ])
+}
+
+/// Rows, trigger configs, waits and the drawer's wait list all move to the new
+/// name, and nothing the migration does not name moves with them.
+#[tokio::test]
+async fn rename_user_prompt_injected_reaches_rows_and_every_subscription() {
+    let (pool, db_name) = setup_test_db().await;
+    let old = "UserPromptInjected";
+
+    let injected = insert_event_with_payload(
+        &pool,
+        old,
+        json!({ "type": old, "text": "carry on", "mode": "engine" }),
+    )
+    .await;
+    // The current shape: `to_payload` strips the serde tag.
+    let untagged =
+        insert_event_with_payload(&pool, old, json!({ "text": "carry on", "mode": "agent" })).await;
+    let trigger_id = "55555555-5555-5555-5555-555555555555";
+    let created = insert_event_with_payload(
+        &pool,
+        "TriggerCreated",
+        json!({
+            "trigger_id": trigger_id,
+            "name": "Watch interjections",
+            "run": { "type": "intent", "intent": "Tell me", "knowhow": [] },
+            "on": subscriptions_naming(old),
+        }),
+    )
+    .await;
+    let updated = insert_event_with_payload(
+        &pool,
+        "TriggerUpdated",
+        json!({ "trigger_id": trigger_id, "on": subscriptions_naming(old) }),
+    )
+    .await;
+    let wait_started = insert_event_with_payload(
+        &pool,
+        "EventWaitStarted",
+        json!({ "type": "EventWaitStarted", "on": subscriptions_naming(old), "reason": "r" }),
+    )
+    .await;
+    let wait_canceled = insert_event_with_payload(
+        &pool,
+        "EventWaitCanceled",
+        json!({ "type": "EventWaitCanceled", "on": subscriptions_naming(old), "reason": "r" }),
+    )
+    .await;
+    let delivered = insert_event_with_payload(
+        &pool,
+        "EventWaitDelivered",
+        json!({ "type": "EventWaitDelivered", "event_type": old, "payload": {} }),
+    )
+    .await;
+
+    // Controls: another type's rows and an unrelated subscription list.
+    let other_row = insert_event_with_payload(
+        &pool,
+        "MessageReceived",
+        json!({ "type": "MessageReceived", "text": "UserPromptInjected" }),
+    )
+    .await;
+    let other_trigger_payload = json!({
+        "trigger_id": "66666666-6666-6666-6666-666666666666",
+        "name": "Unrelated",
+        "run": { "type": "intent", "intent": "x", "knowhow": [] },
+        "on": [{ "event_type": "ChangeApplied" }],
+    });
+    let other_trigger =
+        insert_event_with_payload(&pool, "TriggerCreated", other_trigger_payload.clone()).await;
+
+    let watching = Uuid::new_v4();
+    let unrelated = Uuid::new_v4();
+    let untouched_waits = json!([{ "wait_id": "b", "on": [{ "event_type": "ChangeApplied" }] }]);
+    sqlx::query(
+        "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, live_event_waits) \
+         VALUES ($1, 't', 'chat', 1, NOW(), $2), ($3, 'u', 'chat', 1, NOW(), $4)",
+    )
+    .bind(watching)
+    .bind(json!([
+        { "wait_id": "a", "on": subscriptions_naming(old), "reason": "r" },
+        { "wait_id": "c", "on": [], "reason": "empty" },
+    ]))
+    .bind(unrelated)
+    .bind(&untouched_waits)
+    .execute(&pool)
+    .await
+    .expect("insert thread_summaries");
+
+    // Twice: the rewrite converges.
+    for _ in 0..2 {
+        sqlx::raw_sql(RENAME_USER_PROMPT_INJECTED_SQL)
+            .execute(&pool)
+            .await
+            .expect("run migration");
+    }
+
+    let (event_type, payload) = event_row(&pool, injected).await;
+    assert_eq!(event_type, "PromptInjected");
+    assert_eq!(payload["type"], "PromptInjected");
+    let event: crate::engine::thread_events::ThreadEvent =
+        serde_json::from_value(payload).expect("the rewritten row deserializes");
+    assert_eq!(event.event_type(), "PromptInjected");
+
+    let (event_type, payload) = event_row(&pool, untagged).await;
+    assert_eq!(event_type, "PromptInjected");
+    assert_eq!(
+        payload,
+        json!({ "text": "carry on", "mode": "agent" }),
+        "an untagged payload gains no tag",
+    );
+    let event = crate::engine::thread_events::ThreadEvent::from_stored(&event_type, payload)
+        .expect("the untagged row reads back");
+    assert_eq!(event.event_type(), "PromptInjected");
+
+    let renamed = subscriptions_naming("PromptInjected");
+    for id in [created, updated, wait_started, wait_canceled] {
+        assert_eq!(
+            event_row(&pool, id).await.1["on"],
+            renamed,
+            "order and conditions kept"
+        );
+    }
+    assert_eq!(
+        event_row(&pool, delivered).await.1["event_type"],
+        "PromptInjected"
+    );
+
+    let (_, created_payload) = event_row(&pool, created).await;
+    let config = crate::triggers::config::TriggerConfig::from_created_payload(&created_payload)
+        .expect("the rewritten trigger replays");
+    assert!(
+        crate::core::event_subscription::EventSubscription::any_matches(
+            &config.on,
+            "PromptInjected",
+            &json!({ "mode": "human" }),
+        )
+    );
+
+    let waits: Value =
+        sqlx::query_scalar("SELECT live_event_waits FROM thread_summaries WHERE thread_id = $1")
+            .bind(watching)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        waits,
+        json!([
+            { "wait_id": "a", "on": renamed, "reason": "r" },
+            { "wait_id": "c", "on": [], "reason": "empty" },
+        ])
+    );
+
+    assert_eq!(
+        event_row(&pool, other_row).await,
+        (
+            "MessageReceived".to_string(),
+            json!({ "type": "MessageReceived", "text": "UserPromptInjected" })
+        ),
+        "prose naming the old event stays as written",
+    );
+    assert_eq!(
+        event_row(&pool, other_trigger).await.1,
+        other_trigger_payload
+    );
+    let other_waits: Value =
+        sqlx::query_scalar("SELECT live_event_waits FROM thread_summaries WHERE thread_id = $1")
+            .bind(unrelated)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(other_waits, untouched_waits);
+
+    teardown_test_db(&db_name).await;
+}

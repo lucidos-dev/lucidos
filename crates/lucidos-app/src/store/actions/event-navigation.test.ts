@@ -39,7 +39,7 @@ const {
   ensureEventTargetResolved,
   eventHasTarget,
   jumpableEventId,
-  openAttentionThread,
+  openOngoingThread,
   resolveEventTarget,
   showEventWhereItLives,
 } = await import('./event-navigation');
@@ -537,9 +537,9 @@ describe('eventHasTarget', () => {
   });
 });
 
-/** A tap in the Needs attention view lands on what waits for the user, not on
+/** A tap in the Blocked view lands on what waits for the user, not on
  *  the saved reading position. */
-describe('openAttentionThread', () => {
+describe('openOngoingThread from Blocked', () => {
   beforeEach(resetAll);
 
   /** A thread parked on a question: one ordinary turn, then the open question. */
@@ -559,7 +559,7 @@ describe('openAttentionThread', () => {
   it('lands on the open question at once when the events are loaded', () => {
     threadMap.value = new Map([['waiting', waitingThread()]]);
 
-    openAttentionThread('waiting');
+    openOngoingThread('waiting', 'blocked');
 
     expect(focusThread).toHaveBeenCalledWith('waiting');
     expect(landOnEvent).toHaveBeenCalledWith('waiting', 'q-1');
@@ -575,7 +575,7 @@ describe('openAttentionThread', () => {
     let refreshing = true;
     threadEventsStillArriving.mockImplementation(() => refreshing);
 
-    openAttentionThread('waiting');
+    openOngoingThread('waiting', 'blocked');
     focusedThreadId.value = 'waiting';
     await settle();
     expect(landOnEvent).not.toHaveBeenCalled();
@@ -593,7 +593,7 @@ describe('openAttentionThread', () => {
       ['waiting', { ...waitingThread(), events: new Map(), eventsLoaded: false } as unknown as ThreadState],
     ]);
 
-    openAttentionThread('waiting');
+    openOngoingThread('waiting', 'blocked');
     expect(focusThread).toHaveBeenCalledWith('waiting');
     focusedThreadId.value = 'waiting';
 
@@ -612,7 +612,7 @@ describe('openAttentionThread', () => {
     });
 
     focusedThreadId.value = 'waiting';
-    openAttentionThread('waiting');
+    openOngoingThread('waiting', 'blocked');
 
     await vi.waitFor(() => expect(landOnEvent).toHaveBeenCalledWith('waiting', 'q-1'));
     expect(ensureWholeThreadLoaded).toHaveBeenCalledWith('waiting');
@@ -627,7 +627,7 @@ describe('openAttentionThread', () => {
       threadEventsStillArriving.mockImplementation(() => true);
 
       focusedThreadId.value = 'waiting';
-      openAttentionThread('waiting');
+      openOngoingThread('waiting', 'blocked');
       await vi.runAllTimersAsync();
 
       expect(landOnEvent).not.toHaveBeenCalled();
@@ -641,12 +641,39 @@ describe('openAttentionThread', () => {
       ['waiting', { ...waitingThread(), events: new Map(), eventsLoaded: false } as unknown as ThreadState],
     ]);
 
-    openAttentionThread('waiting');
+    openOngoingThread('waiting', 'blocked');
     focusedThreadId.value = 'elsewhere';
     threadMap.value = new Map([['waiting', waitingThread()]]);
     await settle();
 
     expect(landOnEvent).not.toHaveBeenCalled();
+  });
+});
+
+/** A tap in the Review view lands on the reply to read. It lands at once, so
+ *  the saved reading position is never painted first. */
+describe('openOngoingThread from Review', () => {
+  beforeEach(resetAll);
+
+  it('lands on the newest turn of a thread that asked to be read', () => {
+    const events = new Map<number, unknown>([
+      [1, { type: 'MessageReceived', content: 'first', _eventId: 'start-1', created: '2026-08-06T10:00:00Z' }],
+      [2, { type: 'ResponseGenerated', text: 'one', _eventId: 'reply-1', created: '2026-08-06T10:00:01Z' }],
+      [3, { type: 'MessageReceived', content: 'write the report', _eventId: 'start-2', created: '2026-08-06T10:01:00Z' }],
+      [4, { type: 'ThreadReadRequested', _eventId: 'asked', created: '2026-08-06T10:01:01Z' }],
+      [5, { type: 'ResponseGenerated', text: 'the report', _eventId: 'reply-2', created: '2026-08-06T10:01:02Z' }],
+    ]);
+    threadMap.value = new Map([['asked', {
+      meta: { id: 'asked', status: 'idle', readRequested: true, codingAgentChangeState: { kind: 'none' } },
+      events,
+      pendingUserMessages: [],
+      eventsLoaded: true,
+    } as unknown as ThreadState]]);
+
+    openOngoingThread('asked', 'review');
+
+    expect(focusThread).toHaveBeenCalledWith('asked');
+    expect(landOnEvent).toHaveBeenCalledWith('asked', 'start-2');
   });
 });
 

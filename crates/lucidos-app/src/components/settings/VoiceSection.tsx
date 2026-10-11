@@ -194,8 +194,7 @@ export function VoiceSection() {
               turn, and a short call can cost several.
             </p>
             <p>
-              It needs the home thread, switched on under Appearance &amp; Behavior,
-              Experimental. It also needs the OpenAI provider configured.
+              It needs the OpenAI provider configured.
               Experimental: the shape of a call is still settling, and what it costs is
               not capped.
             </p>

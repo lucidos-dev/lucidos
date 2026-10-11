@@ -180,14 +180,16 @@ fn app_created_serializes_for_sse() {
 }
 
 #[test]
-fn app_deleted_serializes_for_sse() {
+fn app_deleted_persists_with_the_kind() {
     let event = SystemEvent::AppDeleted {
         app_id: "habit-tracker".to_string(),
+        kind: Some(crate::core::AppKind::Widget),
         actor: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "AppDeleted");
-    assert!(!event.is_persisted());
+    assert_eq!(json["data"]["kind"], "widget");
+    assert!(event.is_persisted());
 }
 
 #[test]

@@ -1,4 +1,6 @@
 import { Fragment, type ComponentChildren } from 'preact';
+import { WidgetCard } from '../widgets/WidgetCard';
+import { ReplyHtml } from '../widgets/useWidgetEmbedSlots';
 import type { ReadonlySignal, Signal } from '@preact/signals';
 import { memo } from 'preact/compat';
 import { useMemo, useState } from 'preact/hooks';
@@ -13,7 +15,7 @@ import { discardUnsentMessage, editQueuedMessage, removeQueuedMessage, retryUnse
 import { unsentMessages } from '../../store/unsentMessages';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
-import { originPopoverHasContent } from './MessageRoutePanel';
+import { originPopoverHasContent } from './messageOrigin';
 import { pendingAnswers, unsentPicks } from '../../store/pendingDecisions';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody, engineResolutionNote, pendingVerdicts } from './PermissionCard';
 import { ChildCompletionRow, ChildMovedOutRow, ChildStoppedRow } from './ChildCompletionRow';
@@ -129,7 +131,7 @@ interface Props {
   proposedChangeSummary?: string;
   /** The event a *thread subscription* delivered, resolved once per thread in
    *  `renderExchanges` by following this exchange's
-   *  `UserPromptInjected.delivered_event_id`. Resolved THERE because the target
+   *  `PromptInjected.delivered_event_id`. Resolved THERE because the target
    *  `EventWaitDelivered` sits in a different exchange. Reading `threadMap` from
    *  this component would undo the memo keeping a 29-exchange thread from
    *  re-parsing every markdown body per SSE event. All undefined unless this
@@ -588,10 +590,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         // `.response-chunk` in chat/response.css.
         return (
           <Disclosure key={`t${row.key}`} open={row.open}>
-            <div
+            <ReplyHtml
               class="response-chunk"
-              data-text-seq={row.event.seq}
-              dangerouslySetInnerHTML={{ __html: chunkHtmls.get(row.event) ?? '' }}
+              textSeq={row.event.seq}
+              html={chunkHtmls.get(row.event) ?? ''}
+              final
+              threadId={threadId}
             />
           </Disclosure>
         );
@@ -629,6 +633,18 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   function renderMarker(evt: ResponseEvent, k: number) {
     if (evt.type === 'image') return <GeneratedImage key={`img${k}`} event={evt} />;
     if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
+    if (evt.type === 'widget') {
+      return (
+        <WidgetCard
+          key={`wg${k}`}
+          threadId={threadId}
+          appId={evt.app_id}
+          params={evt.params}
+          label={evt.label}
+          eventId={evt.event_id}
+        />
+      );
+    }
     // Ungated, like the event row below. It is what the caller HEARD, no
     // audio is kept, and the written answer beside it is a different thing:
     // the talker says what an answer means rather than reading it out.
@@ -731,7 +747,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
             ...(isResume ? [<div class="response-content" key="resume"><ResumeCard exchange={exchange} /></div>] : []),
             ...(hasEvents ? [] : [
               <div class="response-content markdown-content" key="streamed" onClick={handleLinkClick}>
-                <div dangerouslySetInnerHTML={{ __html: responseHtmlLinkified }} />
+                <ReplyHtml html={responseHtmlLinkified} final={!streamingBuffer} threadId={threadId} />
               </div>,
             ]),
             ...bodyPieces.map((piece) => (piece.kind === 'cards'
@@ -1035,7 +1051,7 @@ function initiatorSummary(exchange: Exchange): string {
     case 'ChangeDiscarded':
     case 'ChangeReverted':
     case 'ChangeApplyFailed':        return '';
-    case 'UserPromptInjected':       return injectedMessageSummary(ev);
+    case 'PromptInjected':           return injectedMessageSummary(ev);
     case 'EventWaitCanceled':        return eventWaitStoppedSummary(ev.reason);
     case 'MessageReceived': {
       if (ev.origin?.kind === 'api') return 'API message';
@@ -1061,7 +1077,7 @@ function initiatorSummary(exchange: Exchange): string {
 }
 
 /** Who handed the running agent these words, and why, in one line. */
-function injectedMessageSummary(ev: Extract<StoredEvent, { type: 'UserPromptInjected' }>): string {
+function injectedMessageSummary(ev: Extract<StoredEvent, { type: 'PromptInjected' }>): string {
   const reentry = waitReentryReason(ev);
   if (reentry) return reentry.outcome === 'expired' ? 'Wait timed out' : 'Event arrived';
   if (ev.origin?.kind === 'device') return 'Your message, read while the agent worked';
@@ -1257,7 +1273,7 @@ export function describeInitiator(
    *  same-typed positional neighbours mis-order with no type error. */
   proposedChange: ProposedChangeSeed = {},
   /** The event a *thread subscription* delivered, already resolved through
-   *  this exchange's `UserPromptInjected.delivered_event_id` (see
+   *  this exchange's `PromptInjected.delivered_event_id` (see
    *  `buildDeliveredEventInfo`). Undefined for every exchange that is not such
    *  a delivery.
    *
@@ -1375,7 +1391,7 @@ export function describeInitiator(
           />
         ),
       };
-    case 'UserPromptInjected':
+    case 'PromptInjected':
       // Legacy rows lack `origin` and fall back to the engine label. A
       // device-origin injection (you re-prompted) renders iconless like a
       // cancel, keeping the injected prompt as the body.

@@ -37,7 +37,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   live.value = false;
   seed.value = false;
-  preferences.value = { status: 'loaded', data: { voice_enabled: 'true', home_thread_enabled: 'true' } };
+  preferences.value = { status: 'loaded', data: { voice_enabled: 'true' } };
 });
 
 describe('the follow shortcut', () => {

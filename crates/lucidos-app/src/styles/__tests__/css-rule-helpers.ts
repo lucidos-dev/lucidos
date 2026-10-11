@@ -26,7 +26,22 @@ import postcss, { type AtRule, type Container, type Declaration, type Document }
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readdirSync, statSync } from 'node:fs';
 // @ts-expect-error: same
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+
+/** Repo root, from `crates/lucidos-app/src/styles/__tests__/`. */
+export const REPO_ROOT: string = resolve(dirname(fileURLToPath(import.meta.url)), '../../../../..');
+
+/** Stylesheets the engine embeds and serves to app frames, relative to the
+ *  repo root. Add a new one here in the same change that adds the
+ *  `include_str!`. */
+export const ENGINE_SERVED_CSS = [
+  'crates/lucidos-engine/src/api/sdk_iframe.css',
+  'crates/lucidos-engine/src/api/sdk_iframe_shapes.css',
+  'crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css',
+  'crates/lucidos-app/src/styles/generated/theme-parts-frame.css',
+] as const;
 
 /** Every stylesheet under `root`, recursively, as absolute paths. It skips
  *  `__tests__` so a fixture never reads as shipping CSS. Shared because a scan

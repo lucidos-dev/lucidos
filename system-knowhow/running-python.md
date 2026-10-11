@@ -188,7 +188,7 @@ Some waits are unbounded: a 30-minute backtest, an all-night sweep, a download
 you can't size. When several `wait_secs=120` drains show no end in sight
 (judge by `elapsed_secs`, not call count), stop draining. **`await_event` on `BackgroundBashCompleted`, with a `condition` on the `task_id`**, then end the turn. A finished background task persists that event, so the subscription costs nothing and re-opens the thread when the task ends. Prose like "I'll report when it finishes" cannot wake you.
 
-Do **not** use a one-option `ask_user_question` to get resumed instead. That makes the human your scheduler, lights the needs-attention badge, and blocks Apply until they tap. The one-option *wake question* is only for an unbounded wait with **no** Lucidos event to subscribe to.
+Do **not** use a one-option `ask_user_question` to get resumed instead. That makes the human your scheduler, lights the Blocked badge, and blocks Apply until they tap. The one-option *wake question* is only for an unbounded wait with **no** Lucidos event to subscribe to.
 
 ## The command guard (dangerous commands are gated)
 
@@ -211,13 +211,13 @@ When a workspace turns on the command guard, every `run_bash` / `run_bash_backgr
 
 **In a scheduled trigger there's no one to ask.** On a trigger fire, the irreversible lane checks the trigger's *side-effect grant* instead of prompting. The grant lists the categories the user authorized in the trigger's settings. A granted category runs. An ungranted one is **blocked and fails the trigger run**, and the user gets a failure notification naming the blocked command and the missing grant. So a trigger that must send mail or call a mutating API needs that grant first: see `system-knowhow/triggers.md` § Side-effect grant.
 
-The guard is deliberately narrow. These all run with no prompt: reads anywhere on the machine (outside the workspace too, by design), a plain `curl https://…` GET, writes under `data/`, redirects to `/dev/null`, and pure-compute Python. An in-workspace *deletion* also runs unprompted, with the Undo above. The judge asks only when it can't tell a command is safe. The guard is off by default, so most workspaces never see it.
+The guard is deliberately narrow. These all run with no prompt: reads anywhere on the machine (outside the workspace too, by design), a plain `curl https://…` GET, writes under `data/`, and redirects to `/dev/null`. Pure-compute Python that installs no packages runs unprompted too. An in-workspace *deletion* also runs unprompted, with the Undo above. The judge asks only when it can't tell a command is safe. The guard is off by default, so most workspaces never see it.
 
 ## The per-workspace venv
 
 Lucidos provisions one Python venv per workspace at `.lucidos/runtime/python/venv/`. The `run_python*` tools run scripts inside it automatically. Don't activate it, reference it, or reach for `subprocess.run(["python", ...])`. Pass plain Python as the `code` arg.
 
-- **Packages**: declare in the tool call's `packages: ["numpy", "pandas", ...]` arg. They're installed into the workspace venv before the script runs; already-installed packages are no-ops. Don't `pip install` from inside `code`.
+- **Packages**: declare in the tool call's `packages: ["numpy", "pandas", ...]` arg. They're installed into the workspace venv before the script runs; already-installed packages are no-ops. Give PyPI names with an optional version (`numpy>=1.26`, `requests[socks]`). A URL, a path, an archive file or a pip flag is refused. A call with packages goes to the guard's judge, because installing one runs its build code. Don't `pip install` from inside `code`.
 - **Working directory**: scripts execute with cwd = workspace root. So `open("data/artifacts/foo.csv")` is correct; `open("/Users/.../data/...")` is brittle.
 - **Env vars**: `LUCIDOS_WORKSPACE` (workspace root, absolute), `CRED_*` for credentials, `OAUTH_*_ACCESS_TOKEN` for connected OAuth accounts. All are auto-injected.
 
@@ -250,7 +250,7 @@ Each looks reasonable alone, fails the same way every time, and wastes a turn:
 
 ## Errors
 
-`run_python` (the sync foreground tool) auto-trims long tracebacks. It keeps the first and last `File "..."` frame and the final `ExceptionClass: message` line, and drops the middle. The full traceback stays on disk at `.lucidos/exhaust/<run_id>/stderr.txt` for seven days.
+`run_python` (the sync foreground tool) auto-trims long tracebacks. It keeps the first and last `File "..."` frame and the final `ExceptionClass: message` line, and drops the middle. Then it caps the error at its last 4 KB, behind a `[... N bytes of stderr omitted ...]` marker, so one huge line cannot flood your context. The stderr tail stays on disk at `.lucidos/exhaust/<run_id>/stderr.txt` for seven days.
 
 `run_python_background` does NOT auto-trim. Its stderr flows through `bash_output` raw, and a chained import error can dump many KB of frames into your context. For a backtest or long script that might crash loudly, wrap the body in your own `try / except`. Re-raise a short fingerprint: `print(f"FAIL: {type(e).__name__}: {e}", file=sys.stderr); raise`. The full traceback still lands on disk at `.lucidos/exhaust/<task_id>/stderr.txt`, kept for seven days.
 

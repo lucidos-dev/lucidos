@@ -1,7 +1,7 @@
 //! Bootstrap-time projection seeding for coding-agent sessions.
 //!
-//! The `thread_summaries.coding_agent_has_diff` column is the single signal that
-//! drives the WaitingBanner Diff button. Live updates flow through the
+//! Whether the branch holds work is half of `thread_summaries`' change state
+//! (ADR 0400), and drives the WaitingBanner Diff button. Live updates flow through the
 //! coding-agent post-commit hook's direct refresh plus the `ChangeProposed` /
 //! `ChangeApplied` / `ChangeDiscarded` / `ThreadArchived` handlers in
 //! `event_bus_projection_thread.rs`. Those paths are the steady-state truth,
@@ -9,10 +9,10 @@
 //!
 //! When the engine restarts, no new event fires for an idle CC thread that
 //! already has commits on its branch. The projection row would stay at the
-//! column default (`FALSE`) until the next commit, hiding the Diff button for
+//! column default (`none`) until the next commit, hiding the Diff button for
 //! a thread that absolutely has a diff to show.
 //!
-//! `seed_coding_agent_has_diff` closes that gap. The CC bootstrap path emits
+//! `seed_branch_work` closes that gap. The CC bootstrap path emits
 //! `SessionStarted` (initial start AND resume both go through
 //! `run_direct_agent` → `run_session`), and immediately afterwards calls this
 //! helper. The git lookup runs OUTSIDE the projection tx — projections must
@@ -32,13 +32,13 @@ use sqlx::PgPool;
 use std::path::Path;
 use uuid::Uuid;
 
-/// Reconcile `thread_summaries.coding_agent_has_diff` for `thread_id` against
+/// Reconcile the branch-work half of `thread_id`'s change state against
 /// the branch's on-disk git state, using the EXACT proposal-worthiness test the
 /// recovery sweep uses: `proposal_files_for_branch` (authored commits ahead of
 /// main AND a non-empty `git diff <default_diff_base>...<branch>`). Writes the
-/// explicit result — TRUE when the branch warrants a proposal, FALSE otherwise —
-/// so a stale TRUE left by a prior `ChangeProposed` is corrected on the next
-/// session start / restart sweep.
+/// explicit result through `branch_work_sql`, so stale work left by a prior
+/// `ChangeProposed` is corrected on the next session start / restart sweep. A
+/// pending change keeps the state `proposed` whatever the branch says.
 ///
 /// Sharing `proposal_files_for_branch` (and through it `branch_changed_files` /
 /// `default_diff_base`) with both the Diff button and the propose path is the
@@ -50,14 +50,14 @@ use uuid::Uuid;
 /// — a branch can carry commits that produce zero net diff against its true fork
 /// point (commit+revert, a force-rewritten local default), or carry *only*
 /// engine back-merge commits of already-applied work whose three-dot diff
-/// re-surfaces the applied files (real thread `bb9e68d6`); both must read FALSE.
+/// re-surfaces the applied files (real thread `bb9e68d6`); both must read as no work.
 ///
 /// Failures are logged but never propagated — the Claude Code session must keep
 /// starting even if Postgres or git hiccups. `branch_changed_files` swallows
-/// git errors to an empty list, so a transient git failure writes FALSE; the
+/// git errors to an empty list, so a transient git failure writes no work; the
 /// next commit hook or restart sweep reconciles once git is healthy. DB
 /// failures log at `[SessionSeed]`.
-pub(crate) async fn seed_coding_agent_has_diff(
+pub(crate) async fn seed_branch_work(
     pool: &PgPool,
     thread_id: Uuid,
     repo_root: &Path,
@@ -67,15 +67,17 @@ pub(crate) async fn seed_coding_agent_has_diff(
         .await
         .is_some();
 
-    if let Err(e) =
-        sqlx::query("UPDATE thread_summaries SET coding_agent_has_diff = $2 WHERE thread_id = $1")
-            .bind(thread_id)
-            .bind(has_diff)
-            .execute(pool)
-            .await
+    if let Err(e) = sqlx::query(&format!(
+        "UPDATE thread_summaries SET {} WHERE thread_id = $1",
+        crate::engine::event_bus::branch_work_sql("$2")
+    ))
+    .bind(thread_id)
+    .bind(has_diff)
+    .execute(pool)
+    .await
     {
         log!(
-            "[SessionSeed] Failed to seed coding_agent_has_diff for thread {} branch {}: {}",
+            "[SessionSeed] Failed to seed the branch work for thread {} branch {}: {}",
             thread_id,
             branch_name,
             e

@@ -3,13 +3,13 @@ import { buildCCThread, makeThreadState } from './thread-events-helpers';
 import { describeCCTool, exchangeResponseEvents, exchangeSteps, fullCommandForCCTool, fullCommandForEngineTool, groupIntoExchanges, handleEvent, shellScriptBody, type StoredEvent, type ThreadEvent } from '../thread-events';
 import type { StepOutcome } from '../types';
 
-describe('UserPromptInjected in groupIntoExchanges', () => {
-  it('UserPromptInjected starts a new exchange', () => {
+describe('PromptInjected in groupIntoExchanges', () => {
+  it('PromptInjected starts a new exchange', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'do X' }],
       [2, { type: 'ToolCalled', name: 'web_search', args: {} }],
       [3, { type: 'ToolResult', name: 'web_search', result: 'ok' }],
-      [4, { type: 'UserPromptInjected', text: 'actually do Y' }],
+      [4, { type: 'PromptInjected', text: 'actually do Y' }],
       [5, { type: 'TextStreamed', text: 'doing Y now' }],
       [6, { type: 'ResponseGenerated' }],
     ]);
@@ -17,7 +17,7 @@ describe('UserPromptInjected in groupIntoExchanges', () => {
     expect(exchanges).toHaveLength(2);
     expect(exchanges[0].userEvent).toEqual({ type: 'MessageReceived', text: 'do X' });
     expect(exchanges[0].steps).toHaveLength(2); // ToolCalled + ToolResult
-    expect(exchanges[1].userEvent).toEqual({ type: 'UserPromptInjected', text: 'actually do Y' });
+    expect(exchanges[1].userEvent).toEqual({ type: 'PromptInjected', text: 'actually do Y' });
     expect(exchanges[1].steps).toHaveLength(2); // TextStreamed + ResponseGenerated
   });
 
@@ -25,26 +25,26 @@ describe('UserPromptInjected in groupIntoExchanges', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'start' }],
       [2, { type: 'ToolCalled', name: 'search', args: {} }],
-      [3, { type: 'UserPromptInjected', text: 'correction 1' }],
+      [3, { type: 'PromptInjected', text: 'correction 1' }],
       [4, { type: 'ToolCalled', name: 'read', args: {} }],
-      [5, { type: 'UserPromptInjected', text: 'correction 2' }],
+      [5, { type: 'PromptInjected', text: 'correction 2' }],
       [6, { type: 'ResponseGenerated' }],
     ]);
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(3);
     expect(exchanges[0].userEvent.type).toBe('MessageReceived');
-    expect(exchanges[1].userEvent.type).toBe('UserPromptInjected');
+    expect(exchanges[1].userEvent.type).toBe('PromptInjected');
     expect((exchanges[1].userEvent as { text: string }).text).toBe('correction 1');
-    expect(exchanges[2].userEvent.type).toBe('UserPromptInjected');
+    expect(exchanges[2].userEvent.type).toBe('PromptInjected');
     expect((exchanges[2].userEvent as { text: string }).text).toBe('correction 2');
   });
 
-  it('UserPromptInjected with injected_message_id absorbs into matching MessageReceived exchange', () => {
+  it('PromptInjected with injected_message_id absorbs into matching MessageReceived exchange', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'first', _eventId: 'msg-1' }],
       [2, { type: 'ResponseGenerated', text: 'first response' }],
       [3, { type: 'MessageReceived', text: 'follow-up', _eventId: 'msg-2' }],
-      [4, { type: 'UserPromptInjected', text: 'follow-up', injected_message_id: 'msg-2' }],
+      [4, { type: 'PromptInjected', text: 'follow-up', injected_message_id: 'msg-2' }],
       [5, { type: 'TextStreamed', text: 'working on it' }],
       [6, { type: 'ResponseGenerated', text: 'done' }],
     ]);
@@ -55,34 +55,34 @@ describe('UserPromptInjected in groupIntoExchanges', () => {
     expect(exchanges[1].userEvent.type).toBe('MessageReceived');
     expect((exchanges[1].userEvent as { text: string }).text).toBe('follow-up');
     expect(exchanges[1].steps.map(s => s.event.type)).toEqual([
-      'UserPromptInjected', 'TextStreamed', 'ResponseGenerated',
+      'PromptInjected', 'TextStreamed', 'ResponseGenerated',
     ]);
   });
 
-  it('UserPromptInjected without injected_message_id still starts its own exchange (legacy)', () => {
+  it('PromptInjected without injected_message_id still starts its own exchange (legacy)', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'start', _eventId: 'msg-1' }],
-      [2, { type: 'UserPromptInjected', text: 'inject' }],
+      [2, { type: 'PromptInjected', text: 'inject' }],
     ]);
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(2);
-    expect(exchanges[1].userEvent.type).toBe('UserPromptInjected');
+    expect(exchanges[1].userEvent.type).toBe('PromptInjected');
   });
 
-  it('UserPromptInjected with injected_message_id and no matching MessageReceived falls back to its own exchange', () => {
+  it('PromptInjected with injected_message_id and no matching MessageReceived falls back to its own exchange', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'start', _eventId: 'msg-1' }],
-      [2, { type: 'UserPromptInjected', text: 'orphan', injected_message_id: 'missing' }],
+      [2, { type: 'PromptInjected', text: 'orphan', injected_message_id: 'missing' }],
     ]);
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(2);
-    expect(exchanges[1].userEvent.type).toBe('UserPromptInjected');
+    expect(exchanges[1].userEvent.type).toBe('PromptInjected');
     expect((exchanges[1].userEvent as { text: string }).text).toBe('orphan');
   });
 
   // Real thread ab70366f: the chat agentic loop never re-anchors request_event_id,
   // so a message the user types mid-flight (emitted optimistically as its own
-  // exchange) is only ingested via UserPromptInjected AFTER the agent asked — and
+  // exchange) is only ingested via PromptInjected AFTER the agent asked — and
   // the user answered — a question. The absorb must re-anchor that queued exchange
   // to its ingestion point, otherwise its reply renders ABOVE the question card.
   it('queued mid-flight message ingested AFTER a question renders its reply below the question card', () => {
@@ -94,8 +94,8 @@ describe('UserPromptInjected in groupIntoExchanges', () => {
       // agent (still on the original turn) asks a question before ingesting the queue
       [4, { type: 'UserQuestionAsked', question: 'pick one', tool_use_id: 'tuid-q', _eventId: 'uqa' } as StoredEvent],
       [5, { type: 'UserQuestionAnswered', tool_use_id: 'tuid-q' } as StoredEvent],
-      // loop ingests the queued message — UPI carries the ORIGINAL turn's req id
-      [6, { type: 'UserPromptInjected', text: 'cancel button broke', injected_message_id: 'msg-cancel', request_event_id: 'req-orig' } as StoredEvent],
+      // loop ingests the queued message — PromptInjected carries the ORIGINAL turn's req id
+      [6, { type: 'PromptInjected', text: 'cancel button broke', injected_message_id: 'msg-cancel', request_event_id: 'req-orig' } as StoredEvent],
       [7, { type: 'TextStreamed', text: 'analyzing the cancel bug', request_event_id: 'req-orig' } as StoredEvent],
       [8, { type: 'ResponseGenerated', text: 'done', request_event_id: 'req-orig' } as StoredEvent],
     ]);
@@ -767,7 +767,7 @@ describe('tool description from event', () => {
         type: 'ContextCaptured',
         producer: 'auxiliary',
         purpose,
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.8-flash',
         context_window: 0,
         sections: [],
         tools: [],

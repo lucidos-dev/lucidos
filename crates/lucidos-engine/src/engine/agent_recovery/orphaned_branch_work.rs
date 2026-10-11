@@ -1,22 +1,27 @@
 //! Work on a coding-agent branch that no change carries (ADR 0328).
 //!
-//! Three moments can leave it: a Stop with no live session to propose, an
-//! archive, and anything an engine death cut short. The first proposes the
-//! work as incomplete. The other two set it aside, because the user has
-//! already put the thread out of the way.
+//! Four moments can leave it:
+//! - A Stop with no live session to propose proposes the work as incomplete,
+//!   unless the proposal hold keeps it (ADR 0397, ADR 0416).
+//! - A canceled event wait that held the idle proposal (ADR 0395) proposes it
+//!   as the idle would have.
+//! - An archive, and anything an engine death cut short, set it aside, because
+//!   the user has already put the thread out of the way.
 //!
 //! The set-aside `ChangeProposed` is a first record, never a re-sync. Once a
 //! change row names the branch, neither the archive nor the boot pass emits
 //! for it again. So a trigger on `ChangeProposed` hears each branch once.
 
+use super::super::change_ops::{read_proposal_hold, ProposalHold, ProposeOutcome};
 use super::super::event_bus::{BusEvent, EventBus};
 use super::super::git_ops::{git_cmd, main_worktree, proposal_files_for_branch};
 use super::super::thread_events::{
-    EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent, UnproposedReason,
 };
 use super::super::LucidosEngine;
 use super::recovery::branch_proposal_details;
 use super::*;
+use crate::core::changes::ChangeStatus;
 use crate::engine::change_ops::thread_is_external_repo;
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -85,10 +90,34 @@ impl BranchWorkScope<'_> {
         })
     }
 
+    /// The work a canceled event wait held back from the idle proposal, and
+    /// how its turn ended (ADR 0395). `None` unless the thread is an idle,
+    /// unarchived coding-agent thread with no wait left, whose last turn ended
+    /// in a way a sweep settles.
+    async fn work_a_canceled_wait_held(&self, thread_id: Uuid) -> Option<(BranchWork, TurnEnd)> {
+        let released: Option<bool> = sqlx::query_scalar(
+            "SELECT COALESCE(is_coding_agent AND archive_state <> 'archived' \
+                    AND status = 'idle' AND live_event_wait_count = 0, FALSE) \
+             FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            log!("[BranchWork] wait-release lookup for {}: {}", thread_id, e);
+            None
+        });
+        if released != Some(true) {
+            return None;
+        }
+        let turn_end = last_turn_end(self.pool, thread_id).await?;
+        Some((self.thread_branch_work(thread_id).await?, turn_end))
+    }
+
     /// Set aside the net work on an archived thread's branch, when no change
-    /// row names that branch. Any row, in any status, means the user already
-    /// decided, so this never resurrects a discarded change. Returns whether
-    /// it recorded a change.
+    /// row names that branch. Any row but a withdrawn one means the user
+    /// already decided, so this never resurrects a discarded change. Returns
+    /// whether it recorded a change.
     async fn set_aside_archived_branch_work(
         &self,
         thread_id: Uuid,
@@ -107,7 +136,7 @@ impl BranchWorkScope<'_> {
             return Ok(false);
         };
         let changes = self.event_bus.changes_projection();
-        if changes.any_for_branch(&work.branch_name).await? {
+        if changes.branch_has_decided_change(&work.branch_name).await? {
             return Ok(false);
         }
         let details = branch_proposal_details(
@@ -166,8 +195,10 @@ impl BranchWorkScope<'_> {
              WHERE t.is_coding_agent AND t.archive_state = 'archived' \
                AND NOT t.coding_agent_is_external_repo \
                AND s.branch IS NOT NULL AND s.branch <> '' \
-               AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.branch_name = s.branch)",
+               AND NOT EXISTS (SELECT 1 FROM changes c \
+                               WHERE c.branch_name = s.branch AND c.status <> $1)",
         )
+        .bind(ChangeStatus::Withdrawn)
         .fetch_all(self.pool)
         .await
         {
@@ -217,9 +248,14 @@ impl LucidosEngine {
         }
     }
 
-    /// Propose what a user Stop left on the branch when no live session was
-    /// there to do it. A Stop cut the turn short, so the change is incomplete.
-    pub(crate) async fn propose_stopped_work(&self, thread_id: Uuid, actor: Option<MessageOrigin>) {
+    /// Withhold what a user Stop left on the branch when no live session was
+    /// there to do it. A Stop cut the turn short, so it proposes nothing
+    /// (ADR 0400).
+    pub(crate) async fn withhold_stopped_work(
+        &self,
+        thread_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) {
         let lucidos_repo_root = main_worktree().await;
         let Some(work) = self
             .branch_work_scope(&lucidos_repo_root)
@@ -228,23 +264,114 @@ impl LucidosEngine {
         else {
             return;
         };
+        self.propose_thread_work(thread_id, work, actor, false)
+            .await;
+    }
+
+    /// Propose the work a canceled event wait held back from the idle
+    /// proposal, credited to whoever canceled it. A delivery or an expiry
+    /// re-opens the thread instead, and that turn's idle proposes.
+    ///
+    /// A waiting child's card for its parent defers to this, so the card can
+    /// list the change. It is sent after the proposal, whether that landed or
+    /// not.
+    pub(crate) async fn propose_work_a_canceled_wait_held(
+        &self,
+        thread_id: Uuid,
+        canceled_by: Option<MessageOrigin>,
+    ) {
+        let card_awaits = self.event_bus.held_card_awaits_proposal(thread_id).await;
+        let lucidos_repo_root = main_worktree().await;
+        if let Some((work, turn_end)) = self
+            .branch_work_scope(&lucidos_repo_root)
+            .work_a_canceled_wait_held(thread_id)
+            .await
+        {
+            self.propose_thread_work(thread_id, work, canceled_by, turn_end == TurnEnd::Finished)
+                .await;
+        }
+        if card_awaits {
+            self.event_bus
+                .send_held_card_after_proposal(thread_id)
+                .await;
+        }
+    }
+
+    async fn propose_thread_work(
+        &self,
+        thread_id: Uuid,
+        work: BranchWork,
+        origin: Option<MessageOrigin>,
+        finished: bool,
+    ) {
         match self
             .propose_branch_work(
                 thread_id,
                 &work.branch_name,
                 &work.repo_root,
                 &work.files,
-                actor,
-                true,
+                origin,
+                finished,
             )
             .await
         {
-            Ok(_) => self.broadcast_changes_updated().await,
+            Ok(ProposeOutcome::Proposed(_)) => self.broadcast_changes_updated().await,
+            Ok(ProposeOutcome::Held(_) | ProposeOutcome::Unfinished) => {}
             Err(e) => log!(
-                "[BranchWork] Failed to propose stopped work on {}: {}",
+                "[BranchWork] Failed to propose work on {}: {}",
                 work.branch_name,
                 e
             ),
+        }
+    }
+
+    /// Why nothing was proposed for the thread's branch work, when the
+    /// proposal hold is the reason. `None` when there is no work or nothing
+    /// holds it.
+    pub(crate) async fn branch_work_hold(&self, thread_id: Uuid) -> Option<ProposalHold> {
+        let lucidos_repo_root = main_worktree().await;
+        let work = self
+            .branch_work_scope(&lucidos_repo_root)
+            .thread_branch_work(thread_id)
+            .await?;
+        read_proposal_hold(
+            self.pool(),
+            thread_id,
+            &work.repo_root,
+            &work.branch_name,
+            &work.files,
+        )
+        .await
+    }
+
+    /// Whether the thread rests with work a turn end held for
+    /// `hardening_missing`: exactly what the Not ready strip offers **Harden**
+    /// for. It reads the recorded reason, never a fresh verdict, so a stopped
+    /// turn is never resumed as a hardening run. An unanswered read is a no.
+    pub(crate) async fn work_awaits_hardening(&self, thread_id: Uuid) -> bool {
+        let held: Result<bool, sqlx::Error> = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1 \
+               AND coding_agent_change_state = $2 \
+               AND coding_agent_unproposed_reason = $3)",
+        )
+        .bind(thread_id)
+        .bind(crate::engine::thread_lifecycle::ChangeStateKind::Unproposed.as_str())
+        .bind(UnproposedReason::HardeningMissing.as_str())
+        .fetch_one(self.pool())
+        .await;
+        let unsettled =
+            crate::core::changes::unsettled_thread_ids(self.pool(), std::iter::once(thread_id))
+                .await;
+        match (held, unsettled) {
+            (Ok(held), Ok(unsettled)) => held && unsettled.is_empty(),
+            (Err(e), _) => {
+                log!("[BranchWork] change-state read for {}: {}", thread_id, e);
+                false
+            }
+            (_, Err(e)) => {
+                log!("[BranchWork] unsettled read for {}: {}", thread_id, e);
+                false
+            }
         }
     }
 
@@ -295,14 +422,35 @@ async fn local_branches(repo_root: &Path) -> HashSet<String> {
     }
 }
 
-/// Run the archive net: set aside unproposed branch work after every
-/// `ThreadArchived`, outside the archive request so it stays fast.
-pub fn spawn_archive_net(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
+/// The bus moments after which a thread's branch work may need recording.
+#[derive(Debug, Clone, PartialEq)]
+enum BranchWorkMoment {
+    Archived,
+    /// Carries who canceled the wait.
+    WaitCanceled(Option<MessageOrigin>),
+}
+
+impl BranchWorkMoment {
+    fn of(event: &ThreadEvent, meta: &EventMeta) -> Option<Self> {
+        match event {
+            ThreadEvent::ThreadArchived => Some(Self::Archived),
+            ThreadEvent::EventWaitCanceled { cause, .. } if cause.leaves_thread_open() => {
+                Some(Self::WaitCanceled(meta.actor.clone()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Run the branch-work net, outside the request that caused each moment so it
+/// stays fast: set aside unproposed work after every `ThreadArchived`, and
+/// propose held work after an `EventWaitCanceled` that left the thread open.
+pub fn spawn_branch_work_net(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
     let rx = engine.event_bus.subscribe();
     tokio::spawn(async move {
         let stream = BroadcastStream::new(rx);
         tokio::pin!(stream);
-        // A lag skips those archives here. The boot pass catches them later.
+        // A lag skips those moments here. The boot passes catch them later.
         while let Some(result) = stream.next().await {
             let emitted = match result {
                 Ok(e) => e,
@@ -313,20 +461,32 @@ pub fn spawn_archive_net(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<
             };
             let BusEvent::Thread {
                 thread_id,
-                event: ThreadEvent::ThreadArchived,
-                ..
+                event,
+                meta,
             } = &emitted.typed
             else {
                 continue;
             };
+            let Some(moment) = BranchWorkMoment::of(event, meta) else {
+                continue;
+            };
             let (engine, thread_id) = (engine.clone(), *thread_id);
             tokio::spawn(async move {
-                if let Err(e) = engine.set_aside_archived_branch_work(thread_id).await {
-                    log!(
-                        "[BranchWork] Failed to set aside work on thread {}: {}",
-                        thread_id,
-                        e
-                    );
+                match moment {
+                    BranchWorkMoment::Archived => {
+                        if let Err(e) = engine.set_aside_archived_branch_work(thread_id).await {
+                            log!(
+                                "[BranchWork] Failed to set aside work on thread {}: {}",
+                                thread_id,
+                                e
+                            );
+                        }
+                    }
+                    BranchWorkMoment::WaitCanceled(canceled_by) => {
+                        engine
+                            .propose_work_a_canceled_wait_held(thread_id, canceled_by)
+                            .await;
+                    }
                 }
             });
         }

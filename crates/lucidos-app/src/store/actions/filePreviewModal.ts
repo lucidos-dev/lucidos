@@ -1,10 +1,4 @@
-import {
-  filePreviewModal,
-  filePreviewSource,
-  filePreviewEditing,
-  selectedLines,
-  lineScrollTarget,
-} from '../store';
+import { filePreviewModal, createPreviewViewState } from '../store';
 import { describeOverlayTarget, fullscreenBlocksHostOverlays } from '../appFullscreenHost';
 import { resolveFileTarget } from './fileTarget';
 import { handleNavigationRequest } from './navigation-request';
@@ -60,37 +54,25 @@ export function filePreviewBlockedReason(
 
 let openCounter = 0;
 
-/** Puts the four preview view-state signals back the way the modal found them.
- *  Null while no modal is open. Set on the FIRST open only: a second
- *  `previewFile` replacing a showing modal must restore the state from before
- *  the first one, not the state the first one applied. */
-let restoreViewState: (() => void) | null = null;
-
 /** Show a file over whatever the content pane is showing, without navigating.
  *
  *  The rendering is the Files panel's own (`FilePreviewInline` /
- *  `RepoFileContent`), and those components read the preview view state from
- *  signals: `selectedLines` and `lineScrollTarget` are what `LineNumberedCode`
- *  highlights and scrolls to, and `filePreviewSource` is what picks source over
- *  a rendered document. So the modal borrows those signals for its lifetime and
- *  hands them back on close. That is safe because the panel's own preview is
- *  never mounted at the same time (the modal is reachable only from an app
- *  iframe, so the content pane is showing that app), and the hand-back is what
- *  keeps the user's persisted Source toggle and any panel-side selection exactly
- *  as they left them.
+ *  `RepoFileContent`). Each open gets a fresh `PreviewViewState`, which the
+ *  modal provides to those components. A Files preview behind the modal keeps
+ *  its own selection, scroll target, Source toggle and edit state untouched.
  *
  *  Source view is applied iff a line was honoured, rather than inheriting the
  *  user's Source toggle: the modal renders none of the Files header's controls,
  *  so a reader who arrived with the toggle on would otherwise be stuck looking
- *  at raw markdown with no way to switch. Deterministic for the app author too:
+ *  at raw markdown with no way to switch. Deterministic for the caller too:
  *  pass a line and get highlighted source, pass none and get the document. */
 export function openFilePreviewModal(request: FilePreviewRequest): void {
-  // One resolver, shared with the navigate router: an app must not be able to
+  // One resolver, shared with the navigate router: a caller must not be able to
   // reach a file through this modal that `navigate('file', …)` would not open.
   //
   // `'file'` says this caller renders the FILE, whatever the locator names. A
   // diff is rendered from the panel's global `repoDiff` / `repoSelectedChangeId`
-  // state, and loading that would rebind the Files panel behind the app, which
+  // state, and loading that would rebind the Files panel behind the modal, which
   // is the navigation this whole feature exists to avoid. So a diff locator
   // previews the file itself, and `navigate` stays the way to reach the diff.
   //
@@ -103,54 +85,20 @@ export function openFilePreviewModal(request: FilePreviewRequest): void {
   // applied post-merge sha alike.
   const target = resolveFileTarget(request.file_path, request.line, request.line_end, 'file');
 
-  if (!restoreViewState) {
-    const source = filePreviewSource.peek();
-    const selection = selectedLines.peek();
-    const scroll = lineScrollTarget.peek();
-    const editing = filePreviewEditing.peek();
-    restoreViewState = () => {
-      filePreviewSource.value = source;
-      selectedLines.value = selection;
-      lineScrollTarget.value = scroll;
-      filePreviewEditing.value = editing;
-    };
-  }
+  // A fresh view starts with `editing` off, which keeps the modal read-only:
+  // the Edit toggle lives in the Files header, which the modal does not render.
+  const view = createPreviewViewState();
+  view.source.value = target.range !== null;
+  view.selectedLines.value = target.range;
+  view.lineScrollTarget.value = target.range && { path: target.path, line: target.range.start };
 
-  // Read-only: `FilePreviewInline` mounts its editor off this signal, and the
-  // Edit toggle lives in the Files header, which the modal does not render.
-  filePreviewEditing.value = false;
-  filePreviewSource.value = target.range !== null;
-  selectedLines.value = target.range;
-  lineScrollTarget.value = target.range?.start ?? null;
-
-  filePreviewModal.value = { id: ++openCounter, path: target.path, range: target.range };
+  filePreviewModal.value = { id: ++openCounter, path: target.path, range: target.range, view };
 }
 
-/** Dismiss the modal and hand the borrowed view state back. Idempotent, so the
- *  Esc / backdrop / close-control paths can all call it without coordinating.
- *
- *  Gated on the BORROW, not on the modal signal: the borrow is what this
- *  function exists to undo, so making it the one "is a modal open" test keeps
- *  the pair from drifting. Gating on the signal instead would let a caller that
- *  cleared `filePreviewModal` directly strand the snapshot, and the next open
- *  would then skip its own (see the guard there) and restore a stale pair.
- *
- *  `navigated: true` says the content pane has moved on and the destination
- *  already OWNS the view state: `openFilePreview` clears the selection, the
- *  scroll target and the source toggle and only then sets `panelOverlay`, which
- *  is what the modal's watcher sees. Handing the snapshot back on top of that
- *  would overwrite the destination's cleared state with the panel's pre-modal
- *  one, which is precisely the cross-file highlight leak the openers clear it to
- *  prevent (a range picked in one file highlighting whatever rows sit at those
- *  numbers in the next). So that path drops the borrow instead of applying it.
- *  Every other dismissal restores, the escalation included: it closes BEFORE it
- *  navigates, so the router's writes land after the hand-back, not under it. */
-export function closeFilePreviewModal(opts?: { navigated?: boolean }): void {
-  if (restoreViewState === null) return;
-  const restore = restoreViewState;
-  restoreViewState = null;
+/** Dismiss the modal. Idempotent, so the Esc / backdrop / close-control paths
+ *  can all call it without coordinating. Its view state goes with it. */
+export function closeFilePreviewModal(): void {
   filePreviewModal.value = null;
-  if (!opts?.navigated) restore();
 }
 
 /** Promote the glance into a real navigation: the same Files preview
@@ -159,8 +107,7 @@ export function closeFilePreviewModal(opts?: { navigated?: boolean }): void {
  *  Routed through `handleNavigationRequest` rather than the HTTP navigate, so
  *  the destination and every degradation rule are the router's, not a second
  *  copy of them. Closes first, so the reader lands on the Files panel with
- *  nothing over it (and the borrowed view state is handed back before the
- *  router sets its own). */
+ *  nothing over it. */
 export function escalateFilePreviewModal(): void {
   const state = filePreviewModal.peek();
   if (!state) return;

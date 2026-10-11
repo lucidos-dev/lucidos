@@ -2,9 +2,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // jsdom lays nothing out, so every turn would read as hidden.
+vi.mock('../../utils/elementVisibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/elementVisibility')>()),
+  isElementVisible: () => true,
+}));
 vi.mock('../../components/chat/scrollState', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../components/chat/scrollState')>()),
-  isElementVisible: () => true,
   stopFollowingBottom: vi.fn(),
 }));
 vi.mock('./thread-loading', async (importOriginal) => ({
@@ -13,7 +16,7 @@ vi.mock('./thread-loading', async (importOriginal) => ({
 }));
 
 import { createPainter, type FindPainter } from '@lucidos/find';
-import { markdownText, transcriptPassages, transcriptRenderRequest, transcriptTarget } from './transcript-find';
+import { clearBand, markdownText, transcriptPassages, transcriptRenderRequest, transcriptTarget } from './transcript-find';
 import { ensureWholeThreadLoaded } from './thread-loading';
 import { collapsedExchanges, detailsExpanded, threadMap } from '../store';
 import { makeThreadState } from '../__tests__/thread-events-helpers';
@@ -67,6 +70,8 @@ function drawTurns() {
 }
 
 beforeEach(() => {
+  // The session is the module's, so each test starts its own.
+  transcriptTarget(ID, recordingPainter()).clear();
   document.body.innerHTML = '';
   collapsedExchanges.value = new Set();
   transcriptRenderRequest.value = null;
@@ -105,6 +110,23 @@ describe('the transcript target', () => {
     const target = transcriptTarget(ID, recordingPainter());
     await target.run('apple');
     await target.run('apples');
+    expect(ensureWholeThreadLoaded).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds a step until the history it asked for has folded in', async () => {
+    thread(conversation, { hasOlderEvents: true });
+    drawTurns();
+    let land!: (added: boolean) => void;
+    vi.mocked(ensureWholeThreadLoaded).mockImplementationOnce(() => new Promise((resolve) => { land = resolve; }));
+    const target = transcriptTarget(ID, recordingPainter());
+    void target.run('apple');
+    let stepped = false;
+    const step = target.run('apple', 1).then(() => { stepped = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(stepped, 'the fold would put a scrolled step back').toBe(false);
+    land(false);
+    await step;
+    expect(stepped).toBe(true);
     expect(ensureWholeThreadLoaded).toHaveBeenCalledTimes(1);
   });
 
@@ -185,5 +207,41 @@ describe('the transcript target', () => {
   it('reports no matches as zero of zero', async () => {
     thread(conversation);
     expect(await transcriptTarget(ID, recordingPainter()).run('banana')).toEqual({ total: 0, current: 0, capped: false });
+  });
+});
+
+describe('clearBand', () => {
+  const box = (el: Element, top: number, bottom: number) => {
+    el.getBoundingClientRect = () => new DOMRect(0, top, 100, bottom - top);
+  };
+
+  it('is the transcript\'s box less the find bar over its top and the prompt over its bottom', () => {
+    document.body.innerHTML = `<div class="pane">
+      <div class="thread-view-clip"><div class="thread-view">
+        <div class="find-bar-slot"></div>
+        <div class="thread-content-wrap"><div class="thread-content"></div></div>
+      </div></div>
+      <div class="prompt-area"></div>
+    </div>`;
+    const scroller = document.querySelector<HTMLElement>('.thread-content')!;
+    box(scroller, 0, 800);
+    box(document.querySelector('.find-bar-slot')!, 60, 160);
+    box(document.querySelector('.prompt-area')!, 650, 800);
+    expect(clearBand(scroller)).toEqual({ top: 160, bottom: 650 });
+  });
+
+  it('is the transcript\'s own box where nothing floats over it, as on desktop', () => {
+    document.body.innerHTML = `<div class="pane">
+      <div class="thread-view-clip"><div class="thread-view">
+        <div class="find-bar-slot"></div>
+        <div class="thread-content-wrap"><div class="thread-content"></div></div>
+      </div></div>
+      <div class="prompt-area"></div>
+    </div>`;
+    const scroller = document.querySelector<HTMLElement>('.thread-content')!;
+    box(scroller, 100, 600);
+    box(document.querySelector('.find-bar-slot')!, 50, 100);
+    box(document.querySelector('.prompt-area')!, 600, 700);
+    expect(clearBand(scroller)).toEqual({ top: 100, bottom: 600 });
   });
 });

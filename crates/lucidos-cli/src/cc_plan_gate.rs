@@ -11,8 +11,7 @@
 //!     would make the skill impossible to run.
 //!   * **No skill, no gate.** External repos (and app worktrees) don't ship
 //!     `.claude/skills/implementation-plan/SKILL.md`; there the hook is a
-//!     silent no-op, mirroring how `cc-stop-reminder` skips when
-//!     `.claude/commands/harden.md` is absent.
+//!     silent no-op.
 //!
 //! Wired into `<workspace>/.lucidos/cc-settings.json` via `cc_settings.rs`,
 //! on the Edit/Write matchers. Fails OPEN on parse / I/O / engine-unreachable
@@ -23,7 +22,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
 
-use crate::planned::{query_state, PlannedState};
+use crate::planned::{query_state, PlannedState, NEW_THREAD_HANDOFF};
 use crate::workspace::{resolve_from_env, BoxError};
 
 #[derive(Debug, Deserialize)]
@@ -117,8 +116,9 @@ pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
          revise the plan file to that variant, re-commit, then run `lucidos planned approve`. If \
          the user requests changes instead, revise the plan file under docs/plans/, re-commit, \
          and ask again: the new message names only what changed, and the plan file holds the rest \
-         (the marker stays `proposed` until approved).",
+         (the marker stays `proposed` until approved). {handoff}",
         path = file_path,
+        handoff = NEW_THREAD_HANDOFF,
     );
     deny_envelope(&reason)
 }
@@ -314,6 +314,16 @@ mod tests {
             // The card renders under the agent's message. A card restating the
             // summary makes the user read the plan twice.
             "never repeats the summary",
+            // A heavy planning thread can hand the build to a fresh child. The
+            // option drops `Request changes` exactly as a fork does, and the
+            // builder merges this branch to get the plan commit.
+            "`Implement in a new thread`",
+            "`Request changes` is dropped whenever it appears",
+            // Without a backend flag the spawn starts a chat thread, which
+            // has no worktree to merge into or build in.
+            "--relation child --coding-agent",
+            "git merge <this branch>",
+            "without asking again",
         ] {
             assert!(
                 reason.contains(needle),

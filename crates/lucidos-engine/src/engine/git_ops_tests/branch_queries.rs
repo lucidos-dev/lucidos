@@ -321,7 +321,7 @@ async fn commit_plus_revert_branch_has_no_changed_files() {
 }
 
 /// `branch_changed_files` must diff against the SAME base the Diff button uses
-/// (`default_diff_base`), so the `coding_agent_has_diff` gate it feeds can never
+/// (`default_diff_base`), so the branch-work gate it feeds can never
 /// disagree with the diff the button renders.
 ///
 /// Regression for the `example-repo` migration report: a migration tool
@@ -459,7 +459,7 @@ async fn proposal_files_for_branch_rejects_no_commits() {
 /// the original fork point — re-surfacing the already-applied file as a phantom
 /// diff. `has_branch_commits` (two-dot existence) is fooled by the merge commit,
 /// so the startup recovery sweep re-proposed the already-applied change as a new
-/// pending change (and `coding_agent_has_diff` reconciled to TRUE). A branch
+/// pending change (and the change state reconciled to unproposed work). A branch
 /// whose only commits ahead of main are merge commits has no authored work left
 /// to propose — `proposal_files_for_branch` must return `None`.
 #[tokio::test]

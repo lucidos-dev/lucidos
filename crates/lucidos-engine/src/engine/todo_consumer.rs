@@ -21,7 +21,7 @@
 //!
 //! **A terminator is not the only moment a thread stops being parked**, which
 //! is why `EventWaitCanceled` is the second trigger. A delivery and an expiry
-//! each write a `UserPromptInjected` re-entry anchor, so the re-entered turn's own
+//! each write a `PromptInjected` re-entry anchor, so the re-entered turn's own
 //! terminator settles the list; a cancel is "the one resolution that re-enters nothing
 //! behind it" (`event_wait::emit_cancel`), so on an idle thread there is never
 //! a next terminator and a `Waiting` list reads parked forever. That stranding
@@ -82,7 +82,7 @@ pub async fn handle_event(
             settle_open_todos(bus, pool, *thread_id, seq, holds_background_work).await;
         }
         // The unpark that no turn follows. Deliberately the ONLY `EventWait*`
-        // arm: a delivery and an expiry each write a `UserPromptInjected` re-entry
+        // arm: a delivery and an expiry each write a `PromptInjected` re-entry
         // anchor, so the re-entered turn's terminator settles the list, and handling
         // them here would race it and could write terminal `Abandoned`
         // over a list the agent is picking back up.
@@ -836,7 +836,7 @@ mod tests {
         assert_a_turn_owning_the_list_blocks_the_settle("paused").await;
     }
 
-    /// A delivery and an expiry each write a `UserPromptInjected` re-entry anchor,
+    /// A delivery and an expiry each write a `PromptInjected` re-entry anchor,
     /// so the re-entered turn's own terminator settles the list. Handling them
     /// here would race it and could stamp terminal `Abandoned` over a list the
     /// agent is in the middle of picking back up.

@@ -74,8 +74,7 @@ export const triggerFilterOptionsAll = computed<TriggerFilterOption[]>(() => {
 });
 
 /** The visible slice: unselected deleted entries dropped unless the user opts in
- *  (`visibleFilterOptions`), which is also what `deletedOptionsHidden` reports
- *  on. */
+ *  (`visibleFilterOptions`). */
 export const triggerFilterOptions = computed<TriggerFilterOption[]>(() =>
   visibleFilterOptions(triggerFilterOptionsAll.value, selectedTriggerIds.value));
 

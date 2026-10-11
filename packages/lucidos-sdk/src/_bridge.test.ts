@@ -6,14 +6,16 @@
  * And the two wire conversions, because a `Response` and a `FormData` cannot
  * cross a structured clone and every SDK caller expects them back intact.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   isBridged,
   toWireBody,
   fromWireResponse,
   headersToRecord,
   _setBridgedForTesting,
+  _resetHostServingForTesting,
 } from './_bridge';
+import { installHostOps } from './hostOps';
 
 describe('isBridged', () => {
   const saved: Record<string, unknown> = {};
@@ -59,6 +61,65 @@ describe('isBridged', () => {
     // The trap: a parent check alone is true here too.
     setFrame({ hasParent: true, origin: 'https://localhost:5251' });
     expect(isBridged()).toBe(false);
+  });
+});
+
+describe('a host request', () => {
+  const APP_DOC = 'https://localhost:5251/app/habit-tracker/';
+  const saved: Record<string, unknown> = {};
+  let listener: ((event: MessageEvent) => void) | null = null;
+  let loc: { href: string; origin: string; replace: ReturnType<typeof vi.fn> };
+
+  beforeEach(() => {
+    saved.window = (globalThis as any).window;
+    saved.location = Object.getOwnPropertyDescriptor(globalThis, 'location');
+    _resetHostServingForTesting();
+    loc = {
+      href: APP_DOC,
+      origin: new URL(APP_DOC).origin,
+      replace: vi.fn((url: string) => { loc.href = url; }),
+    };
+    (globalThis as any).window = {
+      parent: { postMessage: vi.fn() },
+      addEventListener: (type: string, fn: (e: MessageEvent) => void) => {
+        if (type === 'message') listener = fn;
+      },
+    };
+    Object.defineProperty(globalThis, 'location', { value: loc, configurable: true, writable: true });
+    installHostOps();
+  });
+
+  afterEach(() => {
+    _resetHostServingForTesting();
+    (globalThis as any).window = saved.window;
+    if (saved.location) {
+      Object.defineProperty(globalThis, 'location', saved.location as PropertyDescriptor);
+    } else {
+      delete (globalThis as any).location;
+    }
+  });
+
+  async function parentSays(origin: string) {
+    listener?.({
+      data: { type: 'lucidos:bridge:host', op: 'hash', args: { fragment: 'today' } },
+      source: (globalThis as any).window.parent,
+      origin,
+    } as unknown as MessageEvent);
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  it('from a parent on another origin leaves the frame where it is', async () => {
+    // A foreign page that frames an engine-served app IS its parent, so the
+    // source check alone admits it.
+    await parentSays('https://foreign.example');
+    expect(loc.replace).not.toHaveBeenCalled();
+    expect(loc.href).toBe(APP_DOC);
+  });
+
+  it('from the real host, which shares the frame origin, moves it', async () => {
+    await parentSays(loc.origin);
+    expect(loc.href).toBe(`${APP_DOC}#today`);
   });
 });
 

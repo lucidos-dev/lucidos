@@ -42,6 +42,7 @@ import {
   AUTO_RESUME_AFTER_API_ERROR_REASON,
   AUTO_RESUME_AFTER_SWITCH_REASON,
   ENGINE_RESTART_INTERRUPT_REASON,
+  HARDEN_REQUESTED_REASON,
   USER_CLICKED_CONTINUE_REASON,
 } from '@lucidos/engine-constants';
 export { THREAD_EVENT_TYPE_NAMES } from '../../generated/thread-event-wire';
@@ -82,6 +83,20 @@ export type SideQuestionEvent = Extract<
 
 export function isSideQuestionEvent(event: { type: string }): event is SideQuestionEvent {
   return (SIDE_QUESTION_TYPES as readonly string[]).includes(event.type);
+}
+
+/** The events that pin a widget's chip to a thread's widget shelf or unpin it
+ *  (ADR 0407). They draw nothing in a turn. The last two are their legacy
+ *  names, which the snapshot serves raw from rows written before the rename. */
+export const WIDGET_SHELF_CHANGE_TYPES = ['WidgetPinned', 'WidgetUnpinned', 'WidgetRestored', 'WidgetHidden'] as const;
+
+/** Every widget event: a widget shown in a thread, and its chip pinned or unpinned. */
+export const WIDGET_EVENT_TYPES = ['WidgetShown', ...WIDGET_SHELF_CHANGE_TYPES] as const;
+
+export type WidgetEvent = Extract<ThreadEvent, { type: (typeof WIDGET_EVENT_TYPES)[number] }>;
+
+export function isWidgetEvent(event: { type: string }): event is WidgetEvent {
+  return (WIDGET_EVENT_TYPES as readonly string[]).includes(event.type);
 }
 
 export type ThreadInitiator = 'user' | 'system';
@@ -355,6 +370,10 @@ export const CONTINUATION_USER_CLICKED_REASON = USER_CLICKED_CONTINUE_REASON;
  *  the teardown `ResponseAborted`, not here, so the resume carries no actor. */
 export const CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON = AUTO_RESUME_AFTER_SWITCH_REASON;
 
+/** ContinuationStarted.reason emitted when the user pressed **Harden** on the
+ *  Not ready strip, and the thread resumed to run `/harden`. */
+export const CONTINUATION_HARDEN_REQUESTED_REASON = HARDEN_REQUESTED_REASON;
+
 /** ContinuationStarted.reason emitted when the engine resumes a coding-agent
  *  turn the backend ended on a TRANSIENT upstream failure it reported itself
  *  (its own `API Error: …`, e.g. a connection closed mid-response). Nothing
@@ -394,10 +413,11 @@ export function continuationStartedSummary(
   if (reason === CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON) {
     return 'Resumed after the model connection dropped';
   }
+  if (reason === CONTINUATION_HARDEN_REQUESTED_REASON) return 'Hardening the work';
   return originMode(actor) === 'human' ? 'Continued the response' : 'Resumed after engine restart';
 }
 
-/** The same four causes as `continuationStartedSummary`, as the short state
+/** The same causes as `continuationStartedSummary`, as the short state
  *  word a resume card carries beside its "Resumed" pill. */
 export function continuationCause(
   reason: string | undefined,
@@ -405,6 +425,7 @@ export function continuationCause(
 ): string {
   if (reason === CONTINUATION_AUTO_RECOVERY_REASON) return 'Stopped responding';
   if (reason === CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON) return 'Connection dropped';
+  if (reason === CONTINUATION_HARDEN_REQUESTED_REASON) return 'You asked to harden';
   return originMode(actor) === 'human' ? 'You continued' : 'After restart';
 }
 

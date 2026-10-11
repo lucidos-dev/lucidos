@@ -144,9 +144,9 @@ pub struct TriggerConfig {
     pub model: Option<String>,
     /// Reasoning effort for this trigger's intent fires, one of
     /// [`crate::core::preference_catalog::REASONING_EFFORTS`]. `None` = the
-    /// account `chat_reasoning_effort` preference. Resolved independently of
-    /// [`Self::model`], so a trigger may pin one and leave the other on the
-    /// account default. Intent-only, like `model`.
+    /// account's tier for the model the fire runs on, else that model's
+    /// *default effort*. So a trigger may pin one and leave the other to the
+    /// default. Intent-only, like `model`.
     pub reasoning_effort: Option<String>,
     /// The backend this trigger's model runs on, when the model has more than
     /// one route. `None` (the default) lets the model's own *preferred
@@ -159,7 +159,7 @@ pub struct TriggerConfig {
 }
 
 /// True if `effort` is a reasoning tier a trigger may pin. Shares the closed set
-/// with the `chat_reasoning_effort` preference so the two vocabularies cannot
+/// with the `chat_reasoning_efforts` preference so the two vocabularies cannot
 /// drift. Per-*model* availability is deliberately not checked here: the engine
 /// clamps an unsupported tier at call time, and a stored trigger must not break
 /// when a model's supported tiers change under it.

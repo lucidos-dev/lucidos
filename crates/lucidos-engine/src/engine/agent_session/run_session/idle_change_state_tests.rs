@@ -68,14 +68,17 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
     .unwrap();
 }
 
-/// What the worktree's post-commit hook does mid-turn: reconcile
-/// `coding_agent_has_diff` from the branch the worktree is really on.
+/// What the worktree's post-commit hook does mid-turn: record branch work
+/// from the branch the worktree is really on.
 async fn hook_recorded_a_diff(pool: &sqlx::PgPool, thread_id: Uuid) {
-    sqlx::query("UPDATE thread_summaries SET coding_agent_has_diff = TRUE WHERE thread_id = $1")
-        .bind(thread_id)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(&format!(
+        "UPDATE thread_summaries SET {} WHERE thread_id = $1",
+        crate::engine::event_bus::branch_work_sql("TRUE")
+    ))
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 fn input<'a>(

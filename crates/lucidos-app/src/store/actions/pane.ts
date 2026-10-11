@@ -4,6 +4,7 @@ import {
   MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, type MobileView,
   focusedPane, type FocusedPane,
   activeMenuItem, panelOverlay, settingsSubview,
+  drawerGrouping, setDrawerGrouping,
 } from '../store';
 import { contentViewKey } from '../../components/layout/contentViewKey';
 import { minDrawerWidth, minThreadPanePx, minContentPanePx, splitBounds } from '../paneMinimums';
@@ -270,10 +271,16 @@ export function threadListShown(): boolean {
 }
 
 /** The filter shortcut. A hidden thread list comes back with its filters up,
- *  and a shown one toggles them. The drawer takes focus, so Tab walks what it
- *  now shows. Showing the filters puts thread search away, as the reverse does. */
+ *  and a shown one toggles them. The filter shapes the Folders grouping only,
+ *  so under Ongoing the shortcut switches to Folders and opens it. The drawer
+ *  takes focus, so Tab walks what it now shows. Showing the filters puts
+ *  thread search away, as the reverse does. */
 export function toggleThreadFilter(): void {
-  if (threadListShown()) toggleThreadFilterPanel();
+  if (drawerGrouping.value === 'ongoing') {
+    setDrawerGrouping('folders');
+    showThreadList();
+    openThreadFilterPanel();
+  } else if (threadListShown()) toggleThreadFilterPanel();
   else {
     showThreadList();
     openThreadFilterPanel();

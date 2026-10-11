@@ -1,3 +1,4 @@
+pub(crate) mod agent_run_marker;
 pub mod agent_runtime;
 pub mod browser;
 mod browser_consent;
@@ -7,6 +8,7 @@ pub mod codex;
 mod codex_app_server;
 mod codex_app_server_parse;
 mod codex_parse;
+pub(crate) mod compile_mode;
 pub mod lucidos_cli;
 pub mod python;
 pub(crate) mod spawn_env;
@@ -16,7 +18,8 @@ use std::sync::Arc;
 
 pub use agent_runtime::{
     AccountPin, AgentEvent, AgentInput, AgentPermissionRequest, AgentRuntime, CodingAgent,
-    ControlRequest, InputWithdrawal, ReplayedInput, RunningAgent, SpawnArgs, WithdrawRequest,
+    ControlReach, ControlRequest, InputWithdrawal, ReplayedInput, RunningAgent, SpawnArgs,
+    TakesEffect, WithdrawRequest,
 };
 pub use browser::{BrowserLogins, BrowserRuntime, HeadlessBlocklist};
 // The three CC wire names are re-exported beside Codex's so every consumer

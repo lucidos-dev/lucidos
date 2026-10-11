@@ -220,24 +220,21 @@ impl LucidosEngine {
         }
         let (event_type, payload) = match &emitted.typed {
             BusEvent::Thread {
-                thread_id, event, ..
+                thread_id,
+                event,
+                meta,
             } => {
                 if !is_awaitable_event(event) {
                     return;
                 }
                 // The *matchable payload*, which is the same object the
                 // trigger matcher builds (I8) and the same view the catch-up
-                // scan reconstructs from the row. The meta a particular emit
-                // stamped is deliberately not in it: the persisted column
-                // carries it and this path cannot, so a `condition` on a meta
-                // field would match one path and not the other. `thread_id` is
-                // the one attribute both paths CAN supply authoritatively, the
-                // carrier here and the `events.thread_id` column there, which
-                // is why it is the one cross-cutting field a condition may
-                // name.
+                // scan reconstructs from the row. The carrier's meta goes in
+                // because the row was persisted with it, and `thread_id` comes
+                // from the carrier where the scan reads the column.
                 (
                     event.event_type().to_string(),
-                    matchable_thread_payload(event, *thread_id),
+                    matchable_thread_payload(event, meta, *thread_id),
                 )
             }
             // The system-side gate, shared with the trigger fan-out so the two
@@ -638,7 +635,7 @@ impl LucidosEngine {
     ///
     /// "Never ran" means the thread has no event after the resolution other
     /// than the resolution's own anchor, which is exactly one shape (see
-    /// `emit_resolution`): the `UserPromptInjected`. Anything else after it (a
+    /// `emit_resolution`): the `PromptInjected`. Anything else after it (a
     /// `TextStreamed`, a `ToolCalled`, a terminator, a later `MessageReceived`)
     /// means the re-entry was consumed, so nothing is re-driven.
     pub async fn refire_unresolved_wait_reentries(&self) -> usize {

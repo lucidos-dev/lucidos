@@ -234,7 +234,7 @@ pub enum Step {
 ///
 /// A wait resolves a few milliseconds before the thread starts its next round.
 /// In the run that motivated this, `EventWaitDelivered` and
-/// `UserPromptInjected` were six milliseconds apart. One poll landing in that
+/// `PromptInjected` were six milliseconds apart. One poll landing in that
 /// gap sees an idle thread with no wait and would leave, which is the bug
 /// again, one round later. Two polls put four seconds against six
 /// milliseconds.

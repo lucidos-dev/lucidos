@@ -444,6 +444,14 @@ pub const TABLES: &[TableRule] = &[
         },
     },
     TableRule {
+        table: "app_kinds",
+        owners: &["engine/event_bus_projection_system.rs"],
+        announcement: Announcement::Projection {
+            of: "AppDeleted, so the thread filter still lists a removed widget \
+                 as a widget (ADR 0404)",
+        },
+    },
+    TableRule {
         table: "repo_names",
         owners: &[
             "core/store/threads/backfill.rs",

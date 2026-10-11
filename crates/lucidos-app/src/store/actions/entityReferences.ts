@@ -5,7 +5,10 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, marketplaceScanning, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion, memoryEntriesVersion } from '../store';
+import { refreshThreadWidgetsNaming } from './widgets';
+import { forgetAppById } from './appsById';
+import { reloadFilterFacetsIfLoaded } from './thread-loading';
+import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, marketplaceScanning, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion, memoryEntriesVersion, promptFootprintVersion } from '../store';
 import { checkHealth } from '../../api/client';
 import { loadApps } from './apps';
 import { loadInstalledPlugins } from './plugins';
@@ -30,6 +33,13 @@ import { pruneNavHistory, type NavEntry } from './navigation';
 import { clearAppStorage } from './app-bridge';
 
 export const RECENTS_KEY = 'lucidos-search-recents';
+
+/** An app was created, changed or deleted. Its by-id read and the filter
+ *  facets both carry its label (ADR 0404), so each is read afresh. */
+function forgetAppLabels(appId: string): void {
+  forgetAppById(appId);
+  reloadFilterFacetsIfLoaded();
+}
 
 /** Re-probe `/health` and update `llmConfigured` after a provider credential
  *  change. The backend hot-swaps the active LLM provider in an in-process
@@ -205,14 +215,27 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       void loadTriggerGroups();
       break;
     // App events
-    case 'AppCreated':
+    case 'AppCreated': {
+      const appId = data.app_id as string;
+      if (appId) forgetAppLabels(appId);
       void loadApps();
+      promptFootprintVersion.value++;
+      break;
+    }
+    // Use evidence: only the footprint page reads opens and knowhow reads.
+    case 'AppOpened':
+    case 'KnowhowRead':
+      promptFootprintVersion.value++;
       break;
     case 'AppUpdated': {
       const appId = data.app_id as string;
       const name = data.name as string | undefined;
+      if (appId) forgetAppLabels(appId);
       if (appId && name) patchRecentsMetadata(appId, 'apps', name);
       void loadApps();
+      // A widget's name or reusable flag may have changed (ADR 0402).
+      if (appId) refreshThreadWidgetsNaming(appId);
+      promptFootprintVersion.value++;
       break;
     }
     case 'AppDeleted': {
@@ -223,8 +246,12 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
         removePinnedAppLocal(appId);
         closeOverlayIfStale('app', appId);
         clearAppStorage(appId);
+        forgetAppLabels(appId);
       }
       void loadApps();
+      // Delete (a thread) removes its widgets: re-read every thread that showed one.
+      if (appId) refreshThreadWidgetsNaming(appId);
+      promptFootprintVersion.value++;
       break;
     }
     // File events. `ArtifactImported` is the user-driven import flow;

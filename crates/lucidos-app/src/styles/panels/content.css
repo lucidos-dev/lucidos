@@ -869,6 +869,12 @@
 
 .code-line {
     display: flex;
+}
+
+/* Pan mode's gutter cells sit in their own column (see below), and must be
+   exactly as tall as the code rows they number. */
+.code-line,
+.line-numbered-gutter .line-number {
     line-height: 1.4;
 }
 
@@ -880,6 +886,12 @@
     user-select: none;
     cursor: pointer;
     flex-shrink: 0;
+}
+
+/* The number is generated content, never a text node, so find in file and a
+   copied selection see only code (LineNumberedCode.tsx, `layoutCells`). */
+.line-number::before {
+    content: attr(data-line-number);
 }
 
 @media (hover: hover) {
@@ -907,7 +919,8 @@
     background: color-mix(in srgb, var(--accent) 15%, transparent);
 }
 
-.line-selected .line-number {
+.line-selected .line-number,
+.line-number.line-selected {
     color: var(--accent);
 }
 
@@ -933,50 +946,53 @@
 /* Pan: the code slides horizontally inside its own scroll container, under a
    gutter pinned to the left edge the way a code host does it.
 
-   The `<pre>` is sized to its widest row so every row is that wide, which is
-   what keeps a selected row's tint painted all the way across the scroll
-   width. The `100%` floor covers the other direction, a file narrower than the
-   view. Both rows and gutter then need an OPAQUE background, since a sticky
-   cell paints over whatever passes beneath it.
+   The `<pre>` holds two columns, the gutter and the code, and only the gutter
+   COLUMN is sticky. Never make a per-line element sticky here: WebKit
+   repositions each sticky box on every scroll frame, and one per line made a
+   phone pan stutter (docs/plans/2026-10-07-line-numbered-pan-single-gutter.md).
 
-   The third mode, `caller`, carries NO class and so reaches none of this. That
-   is what keeps the opaque surface below off a side-by-side diff column, whose
-   rows carry their own green and red tints on a single class this would
-   outrank. */
+   The `<pre>` is sized to its widest row so every code row is that wide, which
+   is what keeps a selected row's tint painted all the way across the scroll
+   width. The `100%` floor covers the other direction, a file narrower than the
+   view.
+
+   The third mode, `caller`, carries NO class and so reaches none of this. A
+   side-by-side diff column keeps its gutter inside each row, where the row's
+   green and red tints cover the number too. */
 .line-numbered-pan {
+    display: flex;
     width: max-content;
     min-width: 100%;
 }
 
-.line-numbered-pan .code-line {
+/* Opaque, since the code pans beneath it. A selected cell's translucent
+   `.line-selected` tint lands on this surface, which is also what the code row
+   beside it shows through, so the highlight reads as one band. */
+.line-numbered-gutter {
+    position: sticky;
+    left: 0;
+    flex-shrink: 0;
     background: var(--code-surface);
 }
 
-/* The opaque twin of `.line-selected`'s translucent tint: the same 15% accent,
-   mixed over the surface instead of over nothing. */
-.line-numbered-pan .line-selected {
-    background: color-mix(in srgb, var(--accent) 15%, var(--code-surface));
+.line-numbered-gutter .line-number {
+    display: block;
 }
 
-/* `inherit` rather than a colour of its own, so the gutter wears whichever of
-   the two backgrounds above its row is wearing and the highlight stays
-   unbroken across it. */
-.line-numbered-pan .line-number {
-    position: sticky;
-    left: 0;
-    background: inherit;
+.line-numbered-code {
+    flex: 1;
 }
 
 /* A scroll container's own inline padding is INSIDE its scrollport, so panned
    code slides through it and appears in the strip left of the pinned gutter.
-   This paints that strip with the row's background, so the gutter reads as an
+   This paints that strip with the gutter's surface, so the gutter reads as an
    edge rather than as a column with code sliding past it.
 
    `--code-gutter-inset` is the container's own inline padding, declared beside
    that padding so the two cannot drift (`.file-preview-content` in
    panels/previews.css, `.repo-file-content` below). A container that declares
-   none falls back to painting nothing, which is the old behaviour. */
-.line-numbered-pan .line-number::before {
+   none falls back to painting nothing. */
+.line-numbered-gutter::before {
     content: '';
     position: absolute;
     top: 0;
@@ -996,7 +1012,7 @@
     overflow: auto;
     height: 100%;
     /* Named so the pinned gutter can paint over it while the code pans; see
-       `.line-numbered-pan .line-number::before`. The padding is written THROUGH
+       `.line-numbered-gutter::before`. The padding is written THROUGH
        the var so there is one source for the value. */
     --code-gutter-inset: 1.25rem;
     padding: 1rem var(--code-gutter-inset);

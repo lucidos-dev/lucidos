@@ -38,10 +38,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::agent_run_marker::reap_marked_groups;
 use super::agent_runtime::{
     AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
 };
-use super::claude_code::{format_exit_status, CcMenuOption};
+use super::claude_code::{format_exit_status, CcMenuOption, GROUP_TEARDOWN_GRACE};
 use super::codex_parse::{parse_codex_line, TurnTracker};
 use super::lucidos_cli::{ensure_workspace_bin_symlink, lucidos_cli_dir};
 use super::spawn_env::{apply_lucidos_env, drain_stderr};
@@ -234,9 +235,9 @@ impl AgentRuntime for CodexRuntime {
             sandbox_writable_roots(args.worktree_path, args.workspace_path).await;
 
         // Bake the Lucidos env contract once; each per-turn child re-applies it.
-        let (env, env_removed) = {
+        let (env, env_removed, run_marker) = {
             let mut probe = tokio::process::Command::new("true");
-            apply_lucidos_env(&mut probe, &args, cli_dir, "Codex");
+            let run_marker = apply_lucidos_env(&mut probe, &args, cli_dir, "Codex");
             let mut env = Vec::new();
             let mut env_removed = Vec::new();
             for (k, v) in probe.as_std().get_envs() {
@@ -245,7 +246,7 @@ impl AgentRuntime for CodexRuntime {
                     None => env_removed.push(k.to_owned()),
                 }
             }
-            (env, env_removed)
+            (env, env_removed, run_marker)
         };
 
         // A user-configured `codex` path must point at a real executable —
@@ -280,26 +281,34 @@ impl AgentRuntime for CodexRuntime {
         let permission_rx = match protocol {
             CodexProtocol::AppServer => {
                 let (permission_tx, permission_rx) = mpsc::unbounded_channel();
-                tokio::spawn(super::codex_app_server::app_server_driver_task(
-                    config,
-                    resume_session_id,
-                    events_tx,
-                    input_rx,
-                    control_rx,
-                    permission_tx,
-                    cancel,
-                ));
+                tokio::spawn(async move {
+                    super::codex_app_server::app_server_driver_task(
+                        config,
+                        resume_session_id,
+                        events_tx,
+                        input_rx,
+                        control_rx,
+                        permission_tx,
+                        cancel,
+                    )
+                    .await;
+                    reap_marked_groups(run_marker, GROUP_TEARDOWN_GRACE).await;
+                });
                 Some(permission_rx)
             }
             CodexProtocol::Exec => {
-                tokio::spawn(driver_task(
-                    config,
-                    resume_session_id,
-                    events_tx,
-                    input_rx,
-                    control_rx,
-                    cancel,
-                ));
+                tokio::spawn(async move {
+                    driver_task(
+                        config,
+                        resume_session_id,
+                        events_tx,
+                        input_rx,
+                        control_rx,
+                        cancel,
+                    )
+                    .await;
+                    reap_marked_groups(run_marker, GROUP_TEARDOWN_GRACE).await;
+                });
                 // The exec protocol has no approval channel — the OS sandbox
                 // is the only guard (ADR 0004 §4; ADR 0005 keeps this as the
                 // escape-hatch model).
@@ -983,11 +992,7 @@ async fn run_turn(
         // exactly as the CC driver does after the 2026-06-24 WebKit pile-up.
         #[cfg(unix)]
         if let Some(pid) = child_pid {
-            super::spawn_env::graceful_kill_child_process_group(
-                pid,
-                super::claude_code::GROUP_TEARDOWN_GRACE,
-            )
-            .await;
+            super::spawn_env::graceful_kill_child_process_group(pid, GROUP_TEARDOWN_GRACE).await;
         }
         let _ = child.start_kill();
         child.wait().await

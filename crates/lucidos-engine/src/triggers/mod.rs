@@ -171,6 +171,7 @@ mod tests {
     #[test]
     fn a_trigger_can_scope_on_event_to_one_thread() {
         use crate::core::event_subscription::matchable_thread_payload;
+        use crate::engine::thread_events::EventMeta;
 
         let watched = uuid::Uuid::new_v4();
         let other = uuid::Uuid::new_v4();
@@ -201,14 +202,14 @@ mod tests {
         let hit = matching(
             &configs,
             "CodingAgentIdled",
-            &matchable_thread_payload(&idle, watched),
+            &matchable_thread_payload(&idle, &EventMeta::NONE, watched),
         );
         assert_eq!(hit.len(), 1, "the watched thread's idle must fire it");
 
         let miss = matching(
             &configs,
             "CodingAgentIdled",
-            &matchable_thread_payload(&idle, other),
+            &matchable_thread_payload(&idle, &EventMeta::NONE, other),
         );
         assert!(
             miss.is_empty(),

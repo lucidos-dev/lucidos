@@ -25,6 +25,7 @@ The `lucidos` CLI is on your `PATH`. Use it whenever you need to:
 | Apply a pending change | `lucidos changes apply <id>` |
 | Spawn a sub-thread or hand a task to another workspace | `lucidos spawn-thread` |
 | Wait on something the engine will emit, without polling | `lucidos await-event` |
+| End every turn with the read decision: `yes` for an answer with no change to apply, else `no` | `lucidos request-read yes\|no` |
 
 **This rule extends to bash and python you write.** A Python script using `open('artifacts/foo.html', 'w')` from inside the worktree has the same problem your `Write` tool has — the file lands in the worktree, not the workspace. Inside scripts, shell out to `lucidos`:
 
@@ -207,7 +208,9 @@ The CLI reads `$LUCIDOS_WORKSPACE`, `$LUCIDOS_THREAD_ID`, `$LUCIDOS_EVENT_ID`, a
 - **`--relation child` — same-workspace child thread.** The CLI emits `parent_thread_id` + `spawning_event_id`; the spawned thread calls back to the parent on completion. `--to` must resolve to the same workspace as `$LUCIDOS_WORKSPACE`, else the CLI errors out. (`--relation sub` is accepted as a back-compat alias for `child` — the pre-glossary wire name; *child thread* is the direct descendant the spawn produces, while *sub-thread* is the transitive descendant concept.)
 - **`--relation top` (default) — top-thread, fire-and-forget.** The CLI emits `caller_workspace` + `caller_thread_id` + `caller_event_id`. There is no callback, no progress signal, no completion notification. The thread appears in the target workspace's UI as an independent top-level thread; that's the only confirmation you get. Works for both same-workspace and cross-workspace targets.
 
-  **Same-workspace `top` needs the owner behind you.** A top-thread sits under the workspace rather than under you, so creating one is the workspace owner's (ADR 0168). Called from a thread, it needs their standing instruction: a turn they opened, or a trigger firing they authorized. Without one it exits non-zero on a 403. `--relation child` stays in your own subtree and needs nothing, and a genuinely cross-workspace `--to` is unaffected, since that engine minted no token for you.
+  **Same-workspace `top` needs the owner behind you.** A top-thread sits under the workspace rather than under you, so creating one is the workspace owner's (ADR 0168). Called from a thread, it needs their standing instruction: a turn they opened, or a trigger firing they authorized. Failing that, it needs their *owner approval* for that one spawn (ADR 0387). Without either it exits non-zero on a 403. `--relation child` stays in your own subtree and needs nothing, and a genuinely cross-workspace `--to` is unaffected, since that engine minted no token for you.
+
+  **An ordinary question card cannot stand in.** Its answer grants nothing, even when the owner picks "spawn a thread". Your system prompt says when your turn carries no standing instruction. Then ask with `lucidos ask-owner-approval create-top-thread --reason "<why>"` instead. Pass the id it prints as your question card's only question (`system-knowhow/lucidos-cli.md` § `lucidos ask-owner-approval`).
 
 `--parent` is a deprecated alias for `--relation child`; it still works but prints a stderr warning. Migrate to `--relation child`.
 

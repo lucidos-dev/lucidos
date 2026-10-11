@@ -701,6 +701,12 @@
     color: var(--text-primary);
 }
 
+/* The body scrolls, so a child never shrinks to fit. A code block is a scroll
+   box with a minimum height of 0, and a tall diff below it squeezed it shut. */
+.step-detail-body > * {
+    flex-shrink: 0;
+}
+
 /* The step's outcome, as the head's tone icon: the same thin mark the transcript
    row draws, and the only coloured thing on the surface (ADR 0290). It is drawn
    smaller than the icon box, since a 12-unit stroke scaled to the full box

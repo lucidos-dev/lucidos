@@ -90,6 +90,17 @@ const RESERVED_EXACT: &[&str] = &[
     "LUCIDOS_API_BASE_URL",
     "LUCIDOS_EVENT_ID",
     "LUCIDOS_SESSION_KIND",
+    crate::runtime::agent_run_marker::AGENT_RUN_ENV,
+    // Network exposure switches. The engine reads them after
+    // `apply_to_process_env`, so a stored row would change how the NEXT boot
+    // binds, serves TLS, or gates cross-origin browsers. Only the launcher sets
+    // these, never a user row an agent can write.
+    "LUCIDOS_BIND_LOOPBACK",
+    "LUCIDOS_BIND_ALL",
+    "LUCIDOS_BIND_ADDR",
+    "LUCIDOS_TLS_CERT",
+    "LUCIDOS_TLS_KEY",
+    "LUCIDOS_PERMISSIVE_CORS",
 ];
 
 /// Reserved name prefixes — the injection namespaces owned by the credential
@@ -627,6 +638,29 @@ mod tests {
         ] {
             assert!(is_reserved_name(name), "{name} should be reserved");
             assert_eq!(validate_name(name), Err(NameRejection::Reserved));
+        }
+    }
+
+    /// Regression: an agent could store `LUCIDOS_PERMISSIVE_CORS=1` as a user
+    /// variable. The next boot copied it into the engine's own env and dropped
+    /// the same-origin gate, so any web page could read the loopback API.
+    /// The literals pin the names the launcher sets and the engine reads, so
+    /// they stay independent of `RESERVED_EXACT` on purpose.
+    #[test]
+    fn network_exposure_switches_are_reserved() {
+        for name in [
+            "LUCIDOS_BIND_LOOPBACK",
+            "LUCIDOS_BIND_ALL",
+            "LUCIDOS_BIND_ADDR",
+            "LUCIDOS_TLS_CERT",
+            "LUCIDOS_TLS_KEY",
+            "LUCIDOS_PERMISSIVE_CORS",
+        ] {
+            assert_eq!(
+                validate_name(name),
+                Err(NameRejection::Reserved),
+                "{name} must not be storable as a user variable"
+            );
         }
     }
 

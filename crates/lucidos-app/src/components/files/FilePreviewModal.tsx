@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'preact/hooks';
 import { useSignalEffect } from '@preact/signals';
 import type { VNode } from 'preact';
-import { filePreviewModal, filePreviewSource, filePreviewWrap, panelOverlay, parseRepoPath, type PanelOverlay } from '../../store/store';
+import { filePreviewModal, filePreviewWrap, panelOverlay, parseRepoPath, type PanelOverlay } from '../../store/store';
 import { previewShowsSource } from '../../store/previewWrap';
 import { closeFilePreviewModal, escalateFilePreviewModal } from '../../store/actions/filePreviewModal';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
@@ -12,6 +12,7 @@ import { SurfaceHead } from '../shared/Surface';
 import { FilePreviewInline } from './FilePreviewInline';
 import { RepoFileContent, previewGitRef } from './RepoFilePreview';
 import { previewFilePath, previewFileName } from '../../utils/previewPath';
+import { PreviewPathContext, PreviewViewStateContext } from './previewViewState';
 import { filePreviewCopyPathAction } from '../layout/ContentHeaderActions';
 
 type LineRange = { start: number; end: number } | null;
@@ -67,9 +68,10 @@ export function filePreviewModalBody(path: string, layout: 'desktop' | 'mobile')
 
 /** A read-only glance at a file, over whatever the content pane is showing.
  *
- *  Opened by an app through `lucidos.ui.previewFile` so a reader following a
- *  citation in a report does not lose their place: the shell does not navigate,
- *  and the app is still there when the modal closes. The escalation in the
+ *  Opened by an app through `lucidos.ui.previewFile`, and by a file link in
+ *  agent prose (`handleMarkdownLinkClick`). A reader following a citation keeps
+ *  their place: the shell does not navigate, and what they were reading is
+ *  still there when the modal closes. The escalation in the
  *  header promotes the glance into the real thing, the same Files preview
  *  `lucidos.ui.navigate('file', …)` would have opened.
  *
@@ -102,16 +104,11 @@ export function FilePreviewModal() {
   // moved on, so close when the content pane changes. Declared after the capture
   // effect so its first run (effects fire in declaration order) already sees the
   // captured value and cannot self-close.
-  //
-  // `navigated` is what stops the close from clobbering where we just landed:
-  // the opener configures the destination's view state BEFORE it sets
-  // `panelOverlay`, so by the time this fires the borrowed state is already the
-  // destination's, and handing the snapshot back would overwrite it.
   useSignalEffect(() => {
     const showing = panelOverlay.value;
     if (filePreviewModal.peek() === null) return;
     if (openedOver.current === undefined) return;
-    if (showing !== openedOver.current) closeFilePreviewModal({ navigated: true });
+    if (showing !== openedOver.current) closeFilePreviewModal();
   });
 
   if (!state) return null;
@@ -120,11 +117,11 @@ export function FilePreviewModal() {
   const layout = viewportIsMobile.value ? 'mobile' : 'desktop';
   // The modal renders none of the Files header's controls, so this is the only
   // place a reader can choose here. Both constants are true by construction:
-  // the opener clears `filePreviewEditing`, and a diff locator always renders
-  // the whole file here (see `filePreviewModalBody`).
+  // the modal's view never edits, and a diff locator always renders the whole
+  // file here (see `filePreviewModalBody`).
   const wrapOn = filePreviewWrap.value;
   const canWrap = previewShowsSource(state.path, {
-    sourceToggle: filePreviewSource.value,
+    sourceToggle: state.view.source.value,
     editing: false,
     diffShowsWholeFile: true,
   });
@@ -133,10 +130,7 @@ export function FilePreviewModal() {
   return (
     <Overlay
       open
-      // Arrow-wrapped, not passed by reference: `closeFilePreviewModal` takes an
-      // options object, and a handler bound directly would hand it the DOM event
-      // as those options.
-      onClose={() => closeFilePreviewModal()}
+      onClose={closeFilePreviewModal}
       panelClass="surface surface-raised file-preview-modal"
       panelRole="dialog"
       ariaModal
@@ -178,7 +172,7 @@ export function FilePreviewModal() {
             </button>
           </>
         }
-        onClose={() => closeFilePreviewModal()}
+        onClose={closeFilePreviewModal}
         closeLabel="Close preview"
       />
       {/* A declared scroll region, mirroring `.content-pane-body`. The modal's
@@ -195,7 +189,11 @@ export function FilePreviewModal() {
         role="region"
         aria-label="File preview"
       >
-        {filePreviewModalBody(state.path, layout)}
+        <PreviewViewStateContext.Provider value={state.view}>
+          <PreviewPathContext.Provider value={state.path}>
+            {filePreviewModalBody(state.path, layout)}
+          </PreviewPathContext.Provider>
+        </PreviewViewStateContext.Provider>
       </div>
     </Overlay>
   );

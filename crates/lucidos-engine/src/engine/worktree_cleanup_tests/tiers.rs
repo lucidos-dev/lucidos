@@ -874,6 +874,43 @@ async fn always_deletes_the_branch_even_holding_commits() {
     );
 }
 
+/// Regression: the removal deleted whatever branch the worktree had checked
+/// out. With the root on another branch, an agent can check out the default
+/// branch in its worktree. That branch is always merged into itself, so even
+/// reclamation deleted it, and its unpushed commits with it.
+#[tokio::test]
+async fn the_default_branch_is_never_deleted() {
+    use crate::engine::worktree_cleanup::{
+        remove_worktree_and_optionally_delete_branch, BranchDisposal,
+    };
+
+    for disposal in [BranchDisposal::WhenMerged, BranchDisposal::Always] {
+        let (_tmp, root) = fresh_workspace().await;
+        git_cmd(&["checkout", "-b", "dev"], &root)
+            .await
+            .expect("move the root off main");
+        let worktree = worktrees_dir(&root).join("thread-on-main");
+        let added = git_cmd(
+            &["worktree", "add", &worktree.to_string_lossy(), "main"],
+            &root,
+        )
+        .await
+        .expect("git worktree add");
+        assert!(added.status.success(), "precondition: worktree on main");
+
+        let outcome = remove_worktree_and_optionally_delete_branch(&worktree, None, disposal)
+            .await
+            .expect("the repo root resolves");
+
+        assert!(!worktree.exists(), "the tree is still reclaimed");
+        assert!(!outcome.branch_deleted, "{disposal:?} must keep main");
+        assert!(
+            branch_exists(&root, "main").await,
+            "{disposal:?}: main survives"
+        );
+    }
+}
+
 /// Does `branch` exist in `repo_root`? Asks git, so the assertions above cannot
 /// pass by reading our own return value twice.
 async fn branch_exists(repo_root: &std::path::Path, branch: &str) -> bool {
@@ -1010,4 +1047,48 @@ async fn a_session_that_starts_during_tier_2_checks_keeps_the_worktree() {
     );
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+/// Hands the walk below the receiver it waits on. One test uses it.
+static WALK_RELEASE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(None);
+/// Set once the walk below got its release.
+static WALK_FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A walk that returns only once another task on the runtime has run.
+fn walk_waiting_for_another_task(_: &std::path::Path) -> u64 {
+    let release = WALK_RELEASE
+        .lock()
+        .unwrap()
+        .take()
+        .expect("one walk per test run");
+    release
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a task spawned beside the walk never ran: the walk blocked the runtime");
+    WALK_FINISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    7
+}
+
+/// The cycle measures each entry off the async worker. A walk over tens of GB
+/// on the worker stalls every task scheduled there. On this single-threaded
+/// runtime, the spawned task would then never send, and the walk times out.
+#[tokio::test]
+async fn the_cycle_size_walk_leaves_the_runtime_free_for_other_tasks() {
+    let (bus, _rx) = EventBus::new(unresponsive_pool().await);
+    let (_tmp, root) = fresh_workspace().await;
+    // Not a `thread-<short>` name, so the cycle measures it, then skips it
+    // without asking the database.
+    std::fs::create_dir_all(worktrees_dir(&root).join("not-a-thread")).unwrap();
+    let (release, waits) = std::sync::mpsc::channel();
+    *WALK_RELEASE.lock().unwrap() = Some(waits);
+    let mut worker = make_worker(unresponsive_pool().await, Arc::new(bus), root);
+    worker.size_walk = walk_waiting_for_another_task;
+
+    let other_task = tokio::spawn(async move { release.send(()).unwrap() });
+    worker.run_once().await;
+    other_task.await.unwrap();
+    assert!(
+        WALK_FINISHED.load(std::sync::atomic::Ordering::SeqCst),
+        "the cycle ran the walk to its end"
+    );
 }

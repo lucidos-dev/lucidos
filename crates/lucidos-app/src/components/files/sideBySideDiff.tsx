@@ -148,8 +148,8 @@ function cellRow(cell: SideBySideCell | null, highlighted: string[], change: 'de
  *
  *  Hence `wideLines="caller"`. It says the column's own scroller owns the
  *  overflow AND its own rules own the row backgrounds, so neither file-preview
- *  mode reaches these rows. The `pan` mode's opaque surface is two classes
- *  deep and would paint over every green and red tint below. */
+ *  mode reaches these rows. Each gutter cell stays inside its row, so the green
+ *  and red tints cover the number too. */
 export function SideBySideDiff({ file }: { file: DiffFile }) {
   const ext = file.path.split('.').pop()?.toLowerCase() || '';
   const { left, right } = sideBySideColumns(file, ext);

@@ -69,11 +69,10 @@ function measureLiveTranscript(doc: Document): number | null {
   for (let i = 0; i < els.length; i++) {
     const el = els[i];
     // A 0-width copy is an inactive layout's, not the one on screen. Not
-    // `isElementVisible` (components/chat/scrollState.ts): this module is
-    // imported by main.tsx before anything mounts, so it must not depend on the
-    // component/store layer, and it takes `doc` injected so the unit tests can
-    // run without a layout engine. A transcript clipped by an ancestor also
-    // still reserves its gutter, which is all this asks.
+    // `isElementVisible` (utils/elementVisibility.ts): that reads the global
+    // document and its computed styles, and this module takes `doc` injected so
+    // the unit tests can run without a layout engine. A transcript clipped by an
+    // ancestor also still reserves its gutter, which is all this asks.
     if (!(el.offsetWidth > 0)) continue;
     const style = view.getComputedStyle(el);
     // The compose-empty welcome reuses `.thread-content` with `overflow:

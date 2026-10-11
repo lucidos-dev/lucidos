@@ -183,7 +183,7 @@ describe('openThreadInWorkspace: a workspace on another install', () => {
     install: 'Lucidos.app in /Applications',
     gateway_port: 5252,
     scheme: 'http',
-    slug: 'work',
+    slug: 'peer-ws',
   };
 
   beforeEach(() => {
@@ -198,12 +198,12 @@ describe('openThreadInWorkspace: a workspace on another install', () => {
   it("opens the peer gateway's own origin, on the scheme it answered", async () => {
     mocks.locateWorkspace.mockResolvedValue(PEER);
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('peer-ws', TID);
 
-    expect(mocks.locateWorkspace).toHaveBeenCalledWith('work');
+    expect(mocks.locateWorkspace).toHaveBeenCalledWith('peer-ws');
     expect(mocks.windowOpen).toHaveBeenCalledWith(
-      `http://localhost:5252/work/#thread=${TID}`,
-      'lucidos-ws-5252-work',
+      `http://localhost:5252/peer-ws/#thread=${TID}`,
+      'lucidos-ws-5252-peer-ws',
     );
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
@@ -222,11 +222,11 @@ describe('openThreadInWorkspace: a workspace on another install', () => {
     stubLocation('https://tail.host:5251');
     mocks.locateWorkspace.mockResolvedValue(PEER);
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('peer-ws', TID);
 
     expect(mocks.windowOpen).toHaveBeenCalledWith(
-      `http://tail.host:5252/work/#thread=${TID}`,
-      'lucidos-ws-5252-work',
+      `http://tail.host:5252/peer-ws/#thread=${TID}`,
+      'lucidos-ws-5252-peer-ws',
     );
   });
 
@@ -236,7 +236,7 @@ describe('openThreadInWorkspace: a workspace on another install', () => {
     stubLocation('https://tail.host'); // 443, fronting 5251
     mocks.locateWorkspace.mockResolvedValue(PEER);
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('peer-ws', TID);
 
     expect(mocks.windowOpen).not.toHaveBeenCalled();
     expect(mocks.showToast).toHaveBeenCalledWith(
@@ -250,10 +250,10 @@ describe('openThreadInWorkspace: a workspace on another install', () => {
       status: 'install-not-running',
       install: 'Lucidos.app in /Applications',
       gateway_port: 5252,
-      slug: 'work',
+      slug: 'peer-ws',
     });
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('peer-ws', TID);
 
     expect(mocks.windowOpen).not.toHaveBeenCalled();
     expect(mocks.showToast).toHaveBeenCalledWith(
@@ -268,7 +268,7 @@ describe('openThreadInWorkspace: a workspace on another install', () => {
       installs: ['Lucidos.app in /Applications', 'install.sh instance "alt"'],
     });
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('peer-ws', TID);
 
     expect(mocks.windowOpen).not.toHaveBeenCalled();
     expect(mocks.showToast).toHaveBeenCalledWith(
@@ -290,7 +290,7 @@ describe('openThreadInWorkspace: a workspace on another install', () => {
   it('surfaces the cause when the lookup itself fails', async () => {
     mocks.locateWorkspace.mockRejectedValue(new Error('boom'));
 
-    await openThreadInWorkspace('work', TID);
+    await openThreadInWorkspace('peer-ws', TID);
 
     expect(mocks.windowOpen).not.toHaveBeenCalled();
     expect(mocks.showToast).toHaveBeenCalledWith(
@@ -450,11 +450,11 @@ describe('ensureCrossWorkspaceThreadTitle', () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
 
-    await ensureCrossWorkspaceThreadTitle('work', t);
+    await ensureCrossWorkspaceThreadTitle('peer-ws', t);
 
     expect(mocks.locateWorkspace).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(crossWorkspaceThreadTitle('work', t)).toBeUndefined();
+    expect(crossWorkspaceThreadTitle('peer-ws', t)).toBeUndefined();
   });
 
   it('caches nothing (and never throws) when the source workspace is not running', async () => {

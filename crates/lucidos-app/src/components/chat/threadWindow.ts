@@ -15,6 +15,8 @@
  *  Measured costs and the budget they picked:
  *  docs/plans/2026-08-26-the-transcript-window-counts-steps-not-turns.md. */
 
+import { transcriptScrolls } from './transcriptScrolls';
+
 /** Most trailing exchanges to render on first open, whatever the step budget
  *  allows. On a step-heavy thread the budget is the binding limit. This cap is
  *  what holds an ordinary chat to the window it has always had.
@@ -59,17 +61,6 @@ export const STEP_BUDGET = 160;
  *  through `markAnchorScroll`, so landing back inside this band cannot read as
  *  a fresh request for older turns. */
 export const WINDOW_EXPAND_MARGIN_PX = 1600;
-
-/** How much overflow (px) a container must have before anybody can scroll it. A
- *  hair from a border or a rounded line height does not count.
- *
- *  ONE definition, read by `transcriptScrolls` below and by
- *  `scrollState.isScrollable`, which asks the same question for the up chevron.
- *  The fill grows the window until the transcript scrolls, so the two must mean
- *  the same thing by the number. A matching literal in each is not that. It
- *  lives here because this module imports nothing, so `scrollState` can read it
- *  without a cycle. */
-export const SCROLLABLE_SLACK_PX = 10;
 
 /** Most fill expansions that DREW something one thread may take. A backstop,
  *  not a budget.
@@ -458,14 +449,6 @@ export function expandRenderCount(costs: readonly number[], renderCount: number)
   return Math.min(total, shown + countWithinBudget(costs, total - shown, STEP_BUDGET, WINDOW_STEP));
 }
 
-/** Can the reader scroll this transcript at all?
- *
- *  The same question `scrollState.isScrollable` asks for the up chevron, by the
- *  same slack, and the reason they must agree is on `SCROLLABLE_SLACK_PX`. */
-export function transcriptScrolls(view: { scrollHeight: number; clientHeight: number }): boolean {
-  return view.scrollHeight > view.clientHeight + SCROLLABLE_SLACK_PX;
-}
-
 /** A scroll container reports fractional offsets on a scaled display, and it
  *  never resolves to a clean zero there. So "pinned at the top" is a rounding
  *  question, not an equality one.
@@ -489,6 +472,24 @@ export const UPWARD_SCROLL_KEYS: ReadonlySet<string> = new Set([
  *  gesture, which is why the transcript listens for the gesture itself. */
 export function atScrollTop(view: { scrollTop: number }): boolean {
   return view.scrollTop <= AT_TOP_SLACK_PX;
+}
+
+/** Where the reader sits, clamped to the range they can rest in. iOS reports an
+ *  overscroll past either end, and the spring back from the bottom would read
+ *  as a move up. */
+export function clampedScrollTop(view: { scrollTop: number; scrollHeight: number; clientHeight: number }): number {
+  return Math.max(0, Math.min(view.scrollTop, view.scrollHeight - view.clientHeight));
+}
+
+/** Does a scroll from `previousTop` to `top` ask for older history?
+ *
+ *  Only a move TOWARD the top, inside `WINDOW_EXPAND_MARGIN_PX`. The margin is
+ *  measured from the top, so a short window puts a reader at its bottom inside
+ *  it. Scrolling down there asks for nothing. Fetching anyway lands a page
+ *  above them mid-gesture, which is the moment a hold is least likely to win.
+ *  The wheel, touch and key handlers keep the same rule. */
+export function scrollAsksForOlder(previousTop: number, top: number): boolean {
+  return top < previousTop && top <= WINDOW_EXPAND_MARGIN_PX;
 }
 
 /** What a transcript owes the reader before they can reach the rest of it.

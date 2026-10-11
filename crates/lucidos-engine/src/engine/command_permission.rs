@@ -31,6 +31,7 @@ use crate::engine::command_guard::{
     self, CommandSite, GuardDecision, JudgeInput, JudgedClassification, RiskLane,
     SideEffectCategory, StaticVerdict,
 };
+use crate::engine::command_judge::JudgeVerdict;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::git_ops::CheckpointEffects;
 use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
@@ -620,6 +621,22 @@ fn checkpoint_outcome(effects: Result<Option<CheckpointEffects>, String>) -> Che
     }
 }
 
+/// What a judge call resolves to. A call that never answered asks, with the
+/// failure on the card, rather than weakening the guard (ADR 0002 addendum).
+fn judged(
+    outcome: Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>>,
+) -> JudgedClassification {
+    let verdict = outcome.unwrap_or_else(|e| {
+        crate::log!("[CommandGuard] judge failed ({}); asking the user", e);
+        JudgeVerdict::judge_failed(e.as_ref())
+    });
+    JudgedClassification {
+        lane: verdict.lane,
+        summary: Some(verdict.summary),
+        category: verdict.category,
+    }
+}
+
 impl LucidosEngine {
     /// The command guard's pre-dispatch decision for one bash/python tool call
     /// (ADR 0002). Always `Proceed` when the guard is off (`ctx.enabled` false),
@@ -944,8 +961,9 @@ impl LucidosEngine {
         }
     }
 
-    /// Resolve one ambiguous command via the judge (or the static fallback when
-    /// the judge is off / unavailable), memoized in the per-turn cache.
+    /// Resolve one ambiguous command via the judge, memoized in the per-turn
+    /// cache. With the judge off, the static fallback decides. With it on but
+    /// failing, the command asks: a failure must not weaken the guard.
     ///
     /// `thread_id` is the turn the judge's own spend is recorded against. A
     /// cache hit spends nothing and records nothing.
@@ -961,20 +979,7 @@ impl LucidosEngine {
         }
         let site = CommandSite::Workspace(self.workspace_path());
         let resolved = if ctx.judge_enabled {
-            match self.judge_command(&ji, thread_id).await {
-                Ok(verdict) => JudgedClassification {
-                    lane: verdict.lane,
-                    summary: Some(verdict.summary),
-                    category: verdict.category,
-                },
-                Err(e) => {
-                    crate::log!(
-                        "[CommandGuard] judge failed ({}); falling back to the static classifier",
-                        e
-                    );
-                    command_guard::fallback_classify(&ji, site)
-                }
-            }
+            judged(self.judge_command(&ji, thread_id).await)
         } else {
             command_guard::fallback_classify(&ji, site)
         };
@@ -1636,6 +1641,21 @@ mod tests {
         );
         assert!(!msg.contains("What it tried"), "{msg}");
         assert!(msg.contains("was NOT run"), "{msg}");
+    }
+
+    /// The judge-on path: a call that never answered asks with its failure on
+    /// the card, where it once fell to the static list (I7).
+    #[test]
+    fn a_judge_that_never_answered_asks() {
+        let c = judged(Err("network down".into()));
+        assert_eq!(c.lane, RiskLane::IrreversibleDanger);
+        assert_eq!(c.category, Some(SideEffectCategory::Other));
+        assert!(
+            c.summary
+                .as_deref()
+                .is_some_and(|s| s.contains("network down")),
+            "{c:?}"
+        );
     }
 
     #[test]

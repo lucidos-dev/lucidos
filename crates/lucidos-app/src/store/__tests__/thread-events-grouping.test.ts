@@ -18,11 +18,8 @@ describe('aggregate-takes-precedence over event-type lookups', () => {
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
       isSaved: false,
       hasResponse: true,
       lastRevivedAt: null,
@@ -56,7 +53,7 @@ describe('aggregate-takes-precedence over event-type lookups', () => {
     applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'running');
     const map = new Map([['thread-1', thread]]);
     // ResponseGenerated with no CC changes would normally drive status='idle' —
-    // aggregate says 'waiting' (e.g. coding_agent_proposed was set in the same exchange).
+    // aggregate says 'waiting' (e.g. a change was proposed in the same exchange).
     handleEvent(
       map,
       'thread-1',
@@ -253,9 +250,9 @@ describe('groupIntoExchanges', () => {
       [1, { type: 'MessageReceived', text: 'fix the bug' }],
       [2, { type: 'ResponseAborted', text: '' }],
       [3, { type: 'ContinuationStarted' }],
-      // Engine-mode UserPromptInjected (the engine note) — must absorb into the
+      // Engine-mode PromptInjected (the engine note) — must absorb into the
       // ContinuationStarted exchange as a step, not start a new exchange.
-      [4, { type: 'UserPromptInjected', text: '[Engine note]', mode: 'engine' }],
+      [4, { type: 'PromptInjected', text: '[Engine note]', mode: 'engine' }],
       [5, { type: 'TextStreamed', text: 'On it.' }],
       [6, { type: 'ResponseGenerated' }],
     ]);
@@ -265,20 +262,20 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[1].userEvent.type).toBe('ResponseAborted'); // boundary
     expect(exchanges[2].userEvent.type).toBe('ContinuationStarted');
     expect(exchanges[2].steps.map(s => s.event.type)).toEqual([
-      'UserPromptInjected', 'TextStreamed', 'ResponseGenerated',
+      'PromptInjected', 'TextStreamed', 'ResponseGenerated',
     ]);
   });
 
-  it('Human-mode UserPromptInjected after ContinuationStarted does NOT absorb (legacy correction)', () => {
+  it('Human-mode PromptInjected after ContinuationStarted does NOT absorb (legacy correction)', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'ContinuationStarted' }],
-      [2, { type: 'UserPromptInjected', text: 'human correction', mode: 'human' }],
+      [2, { type: 'PromptInjected', text: 'human correction', mode: 'human' }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    // Two exchanges: ContinuationStarted, then UserPromptInjected as its own boundary.
+    // Two exchanges: ContinuationStarted, then PromptInjected as its own boundary.
     expect(exchanges).toHaveLength(2);
     expect(exchanges[0].userEvent.type).toBe('ContinuationStarted');
-    expect(exchanges[1].userEvent.type).toBe('UserPromptInjected');
+    expect(exchanges[1].userEvent.type).toBe('PromptInjected');
   });
 
   // Engine-restart-then-recovered: abort + later same-id terminal must stay
@@ -318,16 +315,16 @@ describe('groupIntoExchanges', () => {
   // Mid-flight misattribution: chat agentic loop's request_event_id never
   // re-anchors, so A's late events land after B's MessageReceived in the DB
   // but must still route to A by request_event_id, not chronological position.
-  it('routes pre-injection events to A and post-injection events to B (UPI is the split)', () => {
+  it('routes pre-injection events to A and post-injection events to B (PromptInjected is the split)', () => {
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'A', _eventId: 'A' }],
       [2, { type: 'ToolCalled', name: 'web_search', args: {}, request_event_id: 'A' } as StoredEvent],
       [3, { type: 'MessageReceived', text: 'B', _eventId: 'B' }],
       [4, { type: 'ToolResult', name: 'web_search', result: 'ok', request_event_id: 'A' } as StoredEvent],
-      // UPI is the moment the loop ingested the queued prompt — every event
+      // PromptInjected is the moment the loop ingested the queued prompt — every event
       // after this is part of B's answer even though the loop keeps stamping
       // them with A's req_id.
-      [5, { type: 'UserPromptInjected', text: 'B', injected_message_id: 'B', request_event_id: 'A' } as StoredEvent],
+      [5, { type: 'PromptInjected', text: 'B', injected_message_id: 'B', request_event_id: 'A' } as StoredEvent],
       [6, { type: 'TextStreamed', text: 'final answer', request_event_id: 'A' } as StoredEvent],
       [7, { type: 'ResponseGenerated', text: 'final answer', request_event_id: 'A' }],
     ]);
@@ -343,7 +340,7 @@ describe('groupIntoExchanges', () => {
     expect(exchanges[1].userEvent.type).toBe('MessageReceived');
     expect((exchanges[1].userEvent as { text: string }).text).toBe('B');
     expect(exchanges[1].steps.map(s => s.event.type)).toEqual([
-      'UserPromptInjected', 'TextStreamed', 'ResponseGenerated',
+      'PromptInjected', 'TextStreamed', 'ResponseGenerated',
     ]);
   });
 
@@ -889,7 +886,7 @@ describe('resumeEngineNote', () => {
   it('reads the engine note from a ContinuationStarted exchange and counts tool bullets', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'ContinuationStarted' }],
-      [2, { type: 'UserPromptInjected', mode: 'engine', text:
+      [2, { type: 'PromptInjected', mode: 'engine', text:
         '[Engine note — this is a rerun]\n' +
         'Your previous attempt at this turn was interrupted by an engine restart.\n' +
         'The interrupted run performed the following actions before the abort:\n' +
@@ -905,7 +902,7 @@ describe('resumeEngineNote', () => {
     expect(note!.text).toContain('Engine note');
   });
 
-  it('returns null when the ContinuationStarted has no engine UserPromptInjected step', () => {
+  it('returns null when the ContinuationStarted has no engine PromptInjected step', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'ContinuationStarted' }],
       // CC resume path emits ContinuationStarted alone (no engine note).
@@ -1184,7 +1181,7 @@ describe('handleEvent', () => {
     expect((exchanges[0].userEvent as Extract<ThreadEvent, { type: 'MessageReceived' }>).text).toBe('active');
   });
 
-  it('does not hide a removed message once UserPromptInjected already attached', () => {
+  it('does not hide a removed message once PromptInjected already attached', () => {
     const thread = makeThreadState();
     const threadMap = new Map([['thread-1', thread]]);
 
@@ -1196,7 +1193,7 @@ describe('handleEvent', () => {
       removed_message_id: 'msg-2',
     } as ThreadEvent, TS, 'remove-1');
     handleEvent(threadMap, 'thread-1', 5, {
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'queued',
       mode: 'human',
       injected_message_id: 'msg-2',
@@ -1205,15 +1202,15 @@ describe('handleEvent', () => {
     const exchanges = computeExchanges(thread);
     expect(exchanges).toHaveLength(2);
     expect((exchanges[1].userEvent as Extract<ThreadEvent, { type: 'MessageReceived' }>).text).toBe('queued');
-    expect(exchanges[1].steps.map(step => step.event.type)).toEqual(['UserPromptInjected']);
+    expect(exchanges[1].steps.map(step => step.event.type)).toEqual(['PromptInjected']);
   });
 
-  it('clears matching pendingUserMessage on UserPromptInjected with matching event_id', () => {
+  it('clears matching pendingUserMessage on PromptInjected with matching event_id', () => {
     const thread = makeThreadState();
     thread.pendingUserMessages = [{ text: 'fix the bug', eventId: 'inject-1', created: '2026-01-01T00:00:00Z' }];
     const threadMap = new Map([['thread-1', thread]]);
 
-    const result = handleEvent(threadMap, 'thread-1', 10, { type: 'UserPromptInjected', text: 'fix the bug' }, TS, 'inject-1');
+    const result = handleEvent(threadMap, 'thread-1', 10, { type: 'PromptInjected', text: 'fix the bug' }, TS, 'inject-1');
     expect(thread.pendingUserMessages).toEqual([]);
     expect(result.clearedPendingUserMessage).toBe(true);
   });
@@ -1300,7 +1297,7 @@ describe('handleEvent', () => {
 });
 
 // ===========================================================================
-// UserPromptInjected — groupIntoExchanges
+// PromptInjected — groupIntoExchanges
 // ===========================================================================
 
 // ===========================================================================

@@ -282,6 +282,88 @@ pub(crate) async fn emit_card_message(
     .map(|_| ())
 }
 
+/// Who asks a question batch, and on what terms.
+pub(crate) struct QuestionAsker {
+    /// The Claude Code session to resume. Empty for chat and Codex.
+    pub(crate) cc_session_id: String,
+    pub(crate) channel: crate::engine::thread_events::EventChannel,
+    /// Set only when the batch is an *owner approval card* (ADR 0387).
+    pub(crate) owner_approval: Option<crate::engine::thread_events::OwnerApproval>,
+}
+
+/// Refuse a batch whose option carries a widget that cannot draw: a
+/// broken or doubled embed, a missing or non-widget id, another thread's
+/// widget that is not reusable, or params its manifest does not take.
+pub(crate) fn check_option_widgets(
+    app_manager: &crate::core::AppManager,
+    parsed: &[crate::engine::agent_session::ParsedQuestion],
+    thread_id: Uuid,
+) -> Result<(), QuestionWalkError> {
+    use crate::engine::widgets::{check_widget_embed, WidgetCheckFailed};
+    for (idx, q) in parsed.iter().enumerate() {
+        for option in &q.options {
+            let refuse = |reason: String| -> QuestionWalkError {
+                format!(
+                    "Option '{}' in question {idx} cannot be asked: {reason}. Fix the \
+                     embed, written ![label](app:<id>?params={{...}}), and re-ask.",
+                    option.label
+                )
+                .into()
+            };
+            if let Some(problem) = crate::engine::agent_session::option_embed_problem(option) {
+                return Err(refuse(problem));
+            }
+            let Some(widget) = &option.widget else {
+                continue;
+            };
+            match check_widget_embed(
+                app_manager,
+                &widget.app_id,
+                widget.params.as_ref(),
+                thread_id,
+            ) {
+                Ok(()) => {}
+                Err(WidgetCheckFailed::Refused(reason)) => return Err(refuse(reason)),
+                Err(e @ WidgetCheckFailed::ReadFailed(_)) => {
+                    return Err(format!("Checking option '{}': {e}", option.label).into())
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a batch whose card message draws a widget named like one of its
+/// options. That sample belongs in the option, where the user picks it. A
+/// list above the card makes them match samples to buttons by name.
+pub(crate) fn check_message_embeds(
+    message: Option<&str>,
+    parsed: &[crate::engine::agent_session::ParsedQuestion],
+) -> Result<(), QuestionWalkError> {
+    let Some(message) = message else {
+        return Ok(());
+    };
+    for found in crate::engine::widget_embed::scan(message) {
+        let Some(label) = found.embed.ok().and_then(|embed| embed.label) else {
+            continue;
+        };
+        let named = parsed
+            .iter()
+            .flat_map(|q| &q.options)
+            .find(|option| option.label.trim().eq_ignore_ascii_case(&label));
+        if let Some(option) = named {
+            return Err(format!(
+                "Option '{}' has its widget drawn in the card's message. Move that \
+                 ![label](app:<id>?params={{...}}) embed into that option's description, \
+                 drop it from the message, and re-ask.",
+                option.label
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 impl LucidosEngine {
     /// Walk a batch of questions sequentially (one card on screen at a
     /// time), emit `UserQuestionAsked` for each, and block until each is
@@ -292,7 +374,7 @@ impl LucidosEngine {
     /// re-entry (e.g. CC's hook re-firing after restart) sees the cancel
     /// for every trailing sub_id and doesn't re-ask.
     ///
-    /// `channel` is stamped onto every emitted `UserQuestionAsked` and on
+    /// `asker.channel` is stamped onto every emitted `UserQuestionAsked` and on
     /// the trailing Canceled padding answers so `answer_pending_question`
     /// can branch on the originating channel — coding-agent threads (CC and
     /// Codex both ride `EventChannel::ClaudeCode`, the coding-agent channel)
@@ -307,9 +389,13 @@ impl LucidosEngine {
         outer_tool_use_id: &str,
         questions: &serde_json::Value,
         message: Option<CardMessage<'_>>,
-        cc_session_id: String,
-        channel: crate::engine::thread_events::EventChannel,
+        asker: QuestionAsker,
     ) -> Result<QuestionWalkOutcome, QuestionWalkError> {
+        let QuestionAsker {
+            cc_session_id,
+            channel,
+            owner_approval,
+        } = asker;
         let parser_input = serde_json::json!({ "questions": questions });
         let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
         let total = parsed.len();
@@ -334,6 +420,21 @@ impl LucidosEngine {
                  ask_user_question with the full question text filled in."
             )
             .into());
+        }
+        // A broken option widget, or one drawn in the message instead of its
+        // option, refuses the whole batch before any card is asked (ADR 0415).
+        // A batch already asked is a re-fire after a restart: its cards and any
+        // answers stand, whatever happened to a widget since.
+        let first_asked = user_question_already_asked(
+            self.pool(),
+            thread_id,
+            &synth_question_id(outer_tool_use_id, 0),
+        )
+        .await
+        .map_err(|e| format!("DB lookup for question state failed: {e}"))?;
+        if !first_asked {
+            check_option_widgets(&self.app_manager, &parsed, thread_id)?;
+            check_message_embeds(message.as_ref().map(|m| m.text), &parsed)?;
         }
 
         let mut answer_kinds: Vec<serde_json::Value> = Vec::with_capacity(total);
@@ -403,6 +504,7 @@ impl LucidosEngine {
                                 .collect(),
                             worktree_path: None,
                             multi_select: q.multi_select,
+                            owner_approval: owner_approval.clone(),
                         },
                         meta: EventMeta {
                             channel: Some(channel),
@@ -473,6 +575,25 @@ impl LucidosEngine {
 
         Ok(QuestionWalkOutcome { answer_kinds })
     }
+}
+
+/// Is this card an *owner approval card* (ADR 0387)? `Err` when the read
+/// failed, so a caller deciding who may answer it can fail closed.
+pub(crate) async fn is_owner_approval_card(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM events \
+           WHERE aggregate_id = $1 AND event_type = 'UserQuestionAsked' \
+             AND payload->>'tool_use_id' = $2 \
+             AND payload ? 'owner_approval')",
+    )
+    .bind(thread_id.to_string())
+    .bind(tool_use_id)
+    .fetch_one(pool)
+    .await
 }
 
 /// Read the `channel` field from the most recent `UserQuestionAsked` for
@@ -654,9 +775,12 @@ const SUPERSEDED_HOOK_VALUE: &str = "(superseded) The user did not answer this \
 
 /// Follows a typed reply that picks no option. The engine records it as the
 /// card's answer, but users often type a new request instead of answering.
+/// Prose before a tool call can reach the user as a one-line note, so the
+/// response goes on the card where the tool allows it.
 pub(crate) const TYPED_REPLY_NOTE: &str = "The user typed this instead of picking an \
     option. It may answer your question, or it may ask or say something else. If it \
-    leaves your question open, respond to what they said, then ask the question again.";
+    leaves your question open, respond to what they said, then ask the question again. \
+    Put that response in the card's `message` field if your tool has one.";
 
 /// How an answer's images are written into the text its agent reads.
 #[derive(Clone, Copy)]
@@ -1425,7 +1549,7 @@ pub(crate) fn resume_anchor_for_ask(
 /// The resume is anchored on the interrupted turn's OWN `request_event_id`
 /// ([`ChatResumeAnchor::ExistingTurn`], read off the originating
 /// `ToolCalled{ask_user_question}`), so it emits **no** `ContinuationStarted` /
-/// `UserPromptInjected` boundary: this thread was never aborted (the restart
+/// `PromptInjected` boundary: this thread was never aborted (the restart
 /// preserve guard, `agent_recovery::thread_has_unanswered_question`, is what
 /// kept the card live) and the user already did the one thing that was needed —
 /// they answered. Opening the manual-Continue boundary here mislabelled the

@@ -38,8 +38,8 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const routerSource = readFileSync(resolve(here, '../../shared/markdownLinkClick.ts'), 'utf-8');
 
 const APPS: App[] = [
-  { id: 'work-tracker', name: 'Lucidos Work', description: 'x', reveal: 'on-load' },
-  { id: 'habit-tracker', name: 'Habit Tracker', description: 'y', reveal: 'on-load' },
+  { id: 'work-tracker', name: 'Lucidos Work', description: 'x', reveal: 'on-load', kind: 'app', reusable: false },
+  { id: 'habit-tracker', name: 'Habit Tracker', description: 'y', reveal: 'on-load', kind: 'app', reusable: false },
 ];
 
 interface MockAnchor {
@@ -849,7 +849,7 @@ describe('chat link click — handler structure pin', () => {
     expect(routerSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
   });
 
-  it('fallback branch calls openAppById, openApp, openRepoFileLink, handleNavigationRequest, openFilePreview and openLocalFileOnConfirm with preventDefault', () => {
+  it('fallback branch calls openAppById, openApp, openRepoFileLink, handleNavigationRequest, the file preview modal and openLocalFileOnConfirm with preventDefault', () => {
     const m = routerSource.match(/closest\('a'\)[\s\S]*?\n\}\n/);
     expect(m).not.toBeNull();
     const body = m![0];
@@ -861,9 +861,9 @@ describe('chat link click — handler structure pin', () => {
     );
     expect(body).toContain('openApp(app)');
     expect(body).toContain('navigateToTrigger(triggerId, source)');
-    expect(body).toContain('openRepoFileLink(repoFile, source)');
+    expect(body).toMatch(/openRepoFileLink\([\s\S]*?openFilePreviewModal,?\s*\)/);
     expect(body).toContain('handleNavigationRequest({ target: navName })');
-    expect(body).toContain('openFilePreview(dataPath)');
+    expect(body).toContain('previewDataFile(dataPath, ');
     expect(body).toContain('openLocalFileOnConfirm(localFile, source)');
     expect(body).toContain('e.preventDefault()');
   });

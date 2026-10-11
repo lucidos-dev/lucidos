@@ -2,7 +2,7 @@ import { useRef, useState } from 'preact/hooks';
 import { getBackgroundModels } from '../../api/client';
 import type { BackgroundModel } from '../../api/types';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
-import { chatModels, configuredProviders, preferences } from '../../store/store';
+import { backgroundModelsVersion, chatModels, configuredProviders, preferences } from '../../store/store';
 
 /** What the engine resolves, read once for every background row on a surface.
  *  `row` is `null` until the read lands, and `error` says why it failed. */
@@ -36,9 +36,11 @@ export function useBackgroundModels(): BackgroundRows {
   const providers = configuredProviders.value?.join(',') ?? null;
   // A registry edit can move which route serves a model, so it re-reads too.
   const registry = chatModels.value.status === 'loaded' ? chatModels.value.data : null;
+  // A provider refusing a model moves an unset row, so that re-reads too.
+  const refused = backgroundModelsVersion.value;
   const [epoch, setEpoch] = useState(0);
   const settle = useRef<(() => void) | null>(null);
-  const { loadable } = useLoadableFetch(getBackgroundModels, [inputs, providers, registry, epoch], {
+  const { loadable } = useLoadableFetch(getBackgroundModels, [inputs, providers, registry, refused, epoch], {
     keepLoadedWhileRefetching: true,
     onSettled: () => {
       settle.current?.();

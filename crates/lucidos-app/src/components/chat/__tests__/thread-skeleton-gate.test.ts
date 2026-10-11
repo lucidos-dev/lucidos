@@ -6,6 +6,7 @@
  *  reported as. */
 import { describe, it, expect } from 'vitest';
 import {
+  wholeHistoryLoaded,
   showThreadSkeletonNow,
   threadIsLoadingNow,
   type ThreadLoadingState,
@@ -16,9 +17,24 @@ const LOADING: ThreadLoadingState = {
   hasExchanges: false,
   animating: false,
   eventsLoadFailed: false,
-  eventsLoaded: false,
+  historyLoaded: false,
   disconnected: false,
 };
+
+describe('wholeHistoryLoaded', () => {
+  it('needs the first page loaded', () => {
+    expect(wholeHistoryLoaded(false, false)).toBe(false);
+  });
+
+  it('needs nothing older left on the server', () => {
+    // A loaded page can draw nothing while older pages hold the messages.
+    expect(wholeHistoryLoaded(true, true)).toBe(false);
+  });
+
+  it('holds once loaded with nothing older', () => {
+    expect(wholeHistoryLoaded(true, false)).toBe(true);
+  });
+});
 
 describe('threadIsLoadingNow', () => {
   it('is true with nothing on screen and no terminal state', () => {
@@ -32,7 +48,7 @@ describe('threadIsLoadingNow', () => {
   it.each([
     ['the compose to thread FLIP', { animating: true }],
     ['a failed load', { eventsLoadFailed: true }],
-    ['a loaded but empty thread', { eventsLoaded: true }],
+    ['a thread whose whole history is empty', { historyLoaded: true }],
     ['an unreachable workspace', { disconnected: true }],
   ] as const)('is false for %s', (_name, patch) => {
     expect(threadIsLoadingNow({ ...LOADING, ...patch })).toBe(false);
@@ -52,7 +68,7 @@ describe('showThreadSkeletonNow', () => {
 
   it.each([
     ['content', { hasExchanges: true }],
-    ['a loaded but empty thread', { eventsLoaded: true }],
+    ['a thread whose whole history is empty', { historyLoaded: true }],
     ['a failed load', { eventsLoadFailed: true }],
     ['an unreachable workspace', { disconnected: true }],
   ] as const)('never covers %s', (_name, patch) => {

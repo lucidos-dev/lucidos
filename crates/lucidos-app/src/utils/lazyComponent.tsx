@@ -2,6 +2,7 @@ import { signal } from '@preact/signals';
 import { h, type ComponentType } from 'preact';
 import { showToast } from '../store/store';
 import { reloadForStaleChunk } from '../hooks/sw-update';
+import { postClientLog } from './clientLog';
 
 /** A code-split component, plus a way to load its chunk before anything mounts it. */
 export type LazyComponent<P> = ComponentType<P> & {
@@ -42,6 +43,7 @@ export function lazyComponent<P>(
       (err) => {
         loading = null;
         console.error('[lazyComponent] load failed', err);
+        postClientLog('chunk', 'load_failed', { message: String(err).slice(0, 300) });
         // Almost always a stale chunk after a rebuild, so reload to the new build.
         // Toast only if the loop guard already reloaded us recently.
         if (!reloadForStaleChunk()) {

@@ -1,7 +1,8 @@
 //! A coding agent's *background task*: work that has to outlive the turn.
 //!
 //! A coding agent cannot keep a job running past its own turn, because the
-//! engine tears its process group down when the turn ends. So the engine runs
+//! engine stops every process the agent started when the turn ends
+//! (`runtime::agent_run_marker`). So the engine runs
 //! the job itself, through the registry behind the chat agent's
 //! `run_bash_background`, and arms an *event wait* on its
 //! `BackgroundBashCompleted`. The agent ends its turn, and the wait re-opens the
@@ -127,7 +128,7 @@ impl LucidosEngine {
             .unwrap_or(BG_MAX_TIMEOUT_SECS)
             .clamp(1, BG_MAX_TIMEOUT_SECS);
 
-        let env_vars = self.build_agent_task_env_vars(thread_id).await;
+        let env_vars = self.build_agent_task_env_vars(thread_id, &cwd).await;
         let (task_id, _started_at) = self
             .start_background_task(
                 thread_id,

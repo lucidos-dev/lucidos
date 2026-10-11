@@ -53,9 +53,14 @@ async fn side_question_target(
     let thread_id =
         uuid::Uuid::parse_str(thread_id).map_err(|_| ApiError::bad_request("Invalid thread_id"))?;
     let actor = super::actor::require_user_actor(headers, &state.pool, None).await?;
-    super::thread_reach::refuse_without_authority(&state.pool, headers, Some(thread_id), verb)
-        .await
-        .map_err(|e| ApiError::new(e.status_code(), e.to_string()))?;
+    super::thread_reach::refuse_without_authority(
+        &state.engine.event_bus,
+        headers,
+        Some(thread_id),
+        verb,
+    )
+    .await
+    .map_err(|e| ApiError::new(e.status_code(), e.to_string()))?;
     Ok((thread_id, actor))
 }
 

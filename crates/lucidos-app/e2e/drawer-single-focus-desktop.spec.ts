@@ -35,7 +35,7 @@ async function highlightRow(page: Page, id: string): Promise<void> {
   await expect.poll(async () => {
     await page.keyboard.press('ArrowDown');
     return await page.evaluate(() => document
-      .querySelector('.thread-drawer:not(.thread-drawer-collapsed)')
+      .querySelector('.thread-drawer:not(.thread-drawer-collapsed) .thread-drawer-list > .thread-drawer-tree')
       ?.getAttribute('aria-activedescendant') ?? '<none>');
   }, {
     intervals: [50],
@@ -43,13 +43,11 @@ async function highlightRow(page: Page, id: string): Promise<void> {
   }).toBe(`drawer-nav-${id}`);
 }
 
-// The thread drawer used to carry TWO competing focuses: the ↑/↓ "highlight"
-// (a signal) and native Tab focus on each row's pin/⋯ buttons — Enter could act
-// on either. The fix collapses them into ONE: the drawer is a single tab stop
+// The thread drawer has ONE keyboard focus. Its tree is a single tab stop
 // (role="tree", tabindex=0) whose `aria-activedescendant` points at the
-// highlighted row, the per-row buttons leave the Tab order (tabindex=-1), and
-// the keyboard reaches row actions through the ⋯ menu via the customizable
-// "Open thread actions" shortcut.
+// highlighted row. The per-row buttons leave the Tab order (tabindex=-1). The
+// keyboard reaches row actions through the ⋯ menu, via the customizable "Open
+// thread actions" shortcut.
 //
 // Desktop-only (`-desktop.spec.ts`): the drawer's keyboard list-nav + focused
 // pane model is desktop-only (mobile uses a dedicated threads pane and navigates,
@@ -80,7 +78,7 @@ test.describe('Thread drawer — single keyboard focus (aria-activedescendant)',
     await expect(row.locator('button[aria-haspopup="menu"]')).toHaveAttribute('tabindex', '-1');
   });
 
-  test('focusing the drawer sets aria-activedescendant; ↓ moves it (= the highlight); Tab stays on it', async ({ page }) => {
+  test('focusing the drawer sets aria-activedescendant; ↓ moves it (= the highlight); Tab stays on the tree', async ({ page }) => {
     // Enough rows to overflow the list, because the Tab assertion below only
     // bites on a list that scrolls. Chromium hands a scroll container its own
     // tab stop once it has somewhere to scroll to, and two rows never did. That
@@ -96,7 +94,7 @@ test.describe('Thread drawer — single keyboard focus (aria-activedescendant)',
 
     await openSettledDrawer(page);
 
-    const drawer = page.locator('.thread-drawer:not(.thread-drawer-collapsed)').first();
+    const tree = page.locator('.thread-drawer:not(.thread-drawer-collapsed) .thread-drawer-list > .thread-drawer-tree').first();
 
     // The premise of the Tab assertion. A list that stopped overflowing would
     // pass it for the wrong reason and guard nothing.
@@ -107,39 +105,42 @@ test.describe('Thread drawer — single keyboard focus (aria-activedescendant)',
       }), { message: 'the drawer list never overflowed' })
       .toBeGreaterThan(0);
 
-    // ⌘⇧1 / Ctrl+Shift+1 — the focus-aware drawer toggle focuses the container
-    // and seeds the highlight, so the container (not a row) holds DOM focus.
+    // ⌘⇧1 / Ctrl+Shift+1 — the focus-aware drawer toggle focuses the tree
+    // and seeds the highlight, so the tree (not a row) holds DOM focus.
     await page.keyboard.press('Control+Shift+1');
-    await expect(drawer).toBeFocused();
-    await expect(drawer).toHaveAttribute('aria-activedescendant', /.+/);
+    await expect(tree).toBeFocused();
+    await expect(tree).toHaveAttribute('aria-activedescendant', /.+/);
 
     // ↓ lands on a thread row: the active-descendant id and the visually
     // highlighted row are the SAME element — one focus, not two.
     await page.keyboard.press('ArrowDown');
     const highlighted = page.locator('.thread-row.thread-row-highlighted').first();
     await expect(highlighted).toBeVisible();
-    const activeDesc = await drawer.getAttribute('aria-activedescendant');
+    const activeDesc = await tree.getAttribute('aria-activedescendant');
     const highlightedId = await highlighted.getAttribute('id');
     expect(activeDesc).toBe(highlightedId);
-    // DOM focus never moved onto a row/button — it stays on the container.
-    await expect(drawer).toBeFocused();
+    // DOM focus never moved onto a row/button — it stays on the tree.
+    await expect(tree).toBeFocused();
 
-    // The drawer is the pane's single tab stop, and the per-pane Tab trap
-    // cycles the focused pane. So Tab wraps onto the drawer itself. No row
-    // button grabs focus, and focus stays in the pane the marker points at.
+    // The tree is the list's single tab stop, and the per-pane Tab trap cycles
+    // the focused pane. The grouping is picked in the header, so the tree is
+    // the pane's only stop and Tab stays on it. No row button grabs focus, and
+    // the scroller never becomes a stop of its own.
     //
     // Names the node it stopped on rather than answering yes or no, so a row
     // button stealing focus and focus escaping the pane read differently.
-    await page.keyboard.press('Tab');
-    const stopped = await page.evaluate(() => {
+    const stoppedOn = () => page.evaluate(() => {
       const d = document.querySelector('.thread-drawer:not(.thread-drawer-collapsed)');
       const a = document.activeElement;
       if (!d || !a || !d.contains(a)) return 'outside';
-      if (a === d) return 'the drawer itself';
+      if (a.matches('.thread-drawer-tree')) return 'the tree';
       const cls = typeof a.className === 'string' ? a.className : '';
       return `${a.tagName.toLowerCase()}${cls ? `.${cls.trim().split(/\s+/).join('.')}` : ''}`;
     });
-    expect(stopped).toBe('the drawer itself');
+    await page.keyboard.press('Tab');
+    expect(await stoppedOn()).toBe('the tree');
+    await page.keyboard.press('Shift+Tab');
+    expect(await stoppedOn()).toBe('the tree');
   });
 
   test('the "Open thread actions" shortcut opens the highlighted row\'s ⋯ menu (with Pin)', async ({ page }) => {
@@ -179,6 +180,6 @@ test.describe('Thread drawer — single keyboard focus (aria-activedescendant)',
 
     await page.keyboard.press('Control+Shift+M');
     // Only the title's menu offers this item; a drawer row's menu never does.
-    await expect(page.getByRole('menuitem', { name: 'Show in thread list' })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: 'Show in Folders' })).toBeVisible();
   });
 });

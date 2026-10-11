@@ -7,9 +7,10 @@
 
 use serde::Serialize;
 
+use super::reach::Reach;
 use super::{model_source, needs_vision, AuxModelSource, ContextPurpose};
-use crate::engine::summary_tree::COMPACTOR_DEFAULTS;
-use crate::llm::model_registry::{reads_images, resolve_route, ModelRegistry, ProviderKind};
+use crate::engine::summary_tree::{default_effort_for, COMPACTOR_DEFAULTS};
+use crate::llm::model_registry::{reads_images, ModelRegistry};
 
 /// Where a selection's model came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -17,7 +18,8 @@ use crate::llm::model_registry::{reads_images, resolve_route, ModelRegistry, Pro
 pub enum ModelSource {
     /// The purpose's model preference, as the user set it.
     Preference,
-    /// The first recommended model a configured provider serves.
+    /// The first recommended model a configured provider serves, skipping
+    /// any it answered not-found for (ADR 0403).
     Default,
     /// No recommended model is reachable, so the call runs on the chat model.
     ChatModel,
@@ -32,24 +34,15 @@ pub(crate) const AUX_FALLBACKS: &[&str] =
 /// The operator's override of every purpose's first choice but the judge's.
 const EXTRACTION_MODEL_ENV: &str = "LUCIDOS_EXTRACTION_MODEL";
 
-/// Whether a configured provider serves `model`.
-pub(crate) fn is_reachable(
-    model: &str,
-    registry: &ModelRegistry,
-    is_configured: impl Fn(ProviderKind) -> bool,
-) -> bool {
-    resolve_route(registry, model, None, is_configured).is_ok()
-}
-
-/// The first of `candidates` a configured provider serves.
+/// The first of `candidates` that `reach` serves.
 fn first_reachable<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     registry: &ModelRegistry,
-    is_configured: impl Fn(ProviderKind) -> bool,
+    reach: &Reach,
 ) -> Option<&'a str> {
     candidates
         .into_iter()
-        .find(|model| is_reachable(model, registry, &is_configured))
+        .find(|model| reach.serves(registry, model))
 }
 
 /// What a purpose's measured comparison put ahead of its catalog default.
@@ -80,6 +73,16 @@ pub(crate) fn recommended(purpose: ContextPurpose, registry: &ModelRegistry) -> 
         .ok()
         .filter(|model| !model.trim().is_empty());
     keep_capable(purpose, recommended_with(purpose, env.as_deref()), registry)
+}
+
+/// The tier the badge in `purpose`'s picker marks as recommended for `model`.
+/// Only the compactor has one: its tiers are the measured *compactor
+/// default*'s. Every other purpose's default tier was never benchmarked.
+pub(crate) fn recommended_effort(purpose: ContextPurpose, model: &str) -> Option<&'static str> {
+    match model_source(purpose) {
+        AuxModelSource::ProviderResolved => default_effort_for(model),
+        _ => None,
+    }
 }
 
 /// `list` without the models `purpose` cannot run on.
@@ -138,19 +141,57 @@ pub(crate) fn select(
     recommended: &[String],
     chat_model: &str,
     registry: &ModelRegistry,
-    is_configured: impl Fn(ProviderKind) -> bool,
+    reach: &Reach,
 ) -> (String, ModelSource) {
     if let Some(model) = stored {
         return (model, ModelSource::Preference);
     }
-    match first_reachable(
-        recommended.iter().map(String::as_str),
-        registry,
-        is_configured,
-    ) {
+    match first_reachable(recommended.iter().map(String::as_str), registry, reach) {
         Some(model) => (model.to_string(), ModelSource::Default),
         None => (chat_model.to_string(), ModelSource::ChatModel),
     }
+}
+
+/// The reachable recommended model after `model`: where a default call moves
+/// when `model` answers not-found. A stored pick and the chat model move
+/// nowhere, so only a [`ModelSource::Default`] selection asks.
+pub(crate) fn next_reachable(
+    model: &str,
+    recommended: &[String],
+    registry: &ModelRegistry,
+    reach: &Reach,
+) -> Option<String> {
+    let after = recommended
+        .iter()
+        .skip_while(|candidate| *candidate != model)
+        .skip(1)
+        .map(String::as_str);
+    first_reachable(after, registry, reach).map(str::to_string)
+}
+
+/// The models `purpose` would run on ahead of the one in force, plus that one,
+/// whose provider answered not-found. Settings names them.
+pub(crate) fn passed_over(
+    model: &str,
+    source: ModelSource,
+    recommended: &[String],
+    registry: &ModelRegistry,
+    reach: &Reach,
+) -> Vec<String> {
+    let ahead: Vec<&str> = match source {
+        ModelSource::Preference => Vec::new(),
+        ModelSource::Default | ModelSource::ChatModel => recommended
+            .iter()
+            .map(String::as_str)
+            .take_while(|candidate| *candidate != model)
+            .collect(),
+    };
+    ahead
+        .into_iter()
+        .chain(std::iter::once(model))
+        .filter(|candidate| reach.answered_not_found(registry, candidate))
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]

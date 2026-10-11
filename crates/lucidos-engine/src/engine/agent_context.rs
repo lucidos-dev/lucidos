@@ -16,7 +16,7 @@ const SAFE_PREFERENCE_KEYS: &[&str] = &[
     "font-size",
     prefs::PUSH_NOTIFICATIONS.key(),
     prefs::CHAT_MODEL.key(),
-    prefs::CHAT_REASONING_EFFORT.key(),
+    prefs::CHAT_REASONING_EFFORTS.key(),
     prefs::IMAGE_MODEL.key(),
 ];
 
@@ -39,11 +39,8 @@ async fn build_user_device_preferences_context(pool: &PgPool, device_id: Option<
 
 /// The events a user acts through inside a turn. Each carries the device it
 /// came from, as an `actor`, an `origin`, or a bare `device_id`.
-const USER_ACTION_EVENT_TYPES: &[&str] = &[
-    "MessageReceived",
-    "UserPromptInjected",
-    "UserQuestionAnswered",
-];
+const USER_ACTION_EVENT_TYPES: &[&str] =
+    &["MessageReceived", "PromptInjected", "UserQuestionAnswered"];
 
 /// The *last used device*: the device of the user's newest action in the
 /// current turn, from `turn_anchor` (the event that started it) on.
@@ -197,7 +194,7 @@ pub(crate) fn prepend_user_device_preferences_context(context: &str, text: &str)
 }
 
 fn device_from_event_row(row: &EventRow) -> Option<String> {
-    if row.event_type != "MessageReceived" && row.event_type != "UserPromptInjected" {
+    if row.event_type != "MessageReceived" && row.event_type != "PromptInjected" {
         return None;
     }
     row.payload
@@ -613,7 +610,7 @@ mod tests {
     #[test]
     fn device_from_event_row_reads_injected_prompt_origin() {
         let row = EventRow::new(
-            "UserPromptInjected",
+            "PromptInjected",
             serde_json::json!({
                 "origin": {
                     "device_id": "device-ios",

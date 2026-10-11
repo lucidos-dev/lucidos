@@ -122,9 +122,8 @@ One row per language, every file counted exactly once. Two things are outside th
 by design. There is no `.html` row, because the counter has no HTML mode and would fall
 back to C-style tokens on the four HTML files. Markdown is documentation, not code.
 
-Two things are inside it, deliberately. Generated sources under `src/generated/` are
-tracked code and cloc counts them, and they are about 3K lines. The one vendored bundle,
-`html2canvas.min.js`, is minified into 20 lines, so it distorts nothing.
+One thing is inside it, deliberately. Generated sources under `src/generated/` are
+tracked code and cloc counts them, and they are about 3K lines.
 
 ```bash
 for lang in 'Rust:\.rs$' 'TypeScript:\.tsx?$' 'Shell:\.sh$' 'CSS:\.css$' \

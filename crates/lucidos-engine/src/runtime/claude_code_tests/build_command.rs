@@ -498,10 +498,24 @@ fn build_command_uses_permission_prompt_tool_not_skip_permissions() {
          serves Codex's `ask_user_question`, which CC would otherwise see as a \
          duplicate of its native AskUserQuestion and have to ask permission for"
     );
+}
+
+/// The strict flag would hide every plugin MCP server from the thread. The
+/// permission gate never needed it: each MCP tool call still meets
+/// `--allowedTools`, then `lucidos_perm` (ADR 0398).
+#[test]
+fn build_command_lets_claude_code_load_its_own_mcp_sources() {
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let args = collect_args(&session_command(&test_spawn_args(p, p, thread_id), None));
 
     assert!(
-        args.iter().any(|a| a == "--strict-mcp-config"),
-        "--strict-mcp-config keeps the permission server isolated from the user's global MCP config"
+        !args.iter().any(|a| a == "--strict-mcp-config"),
+        "--strict-mcp-config stops plugin MCP servers from starting (ADR 0398)"
+    );
+    assert!(
+        args.iter().any(|a| a == "--mcp-config"),
+        "the permission server still rides on --mcp-config"
     );
 }
 

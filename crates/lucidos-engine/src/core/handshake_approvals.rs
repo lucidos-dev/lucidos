@@ -319,12 +319,12 @@ pub enum BindOutcome<T = String> {
 
 /// Bind `rel_path`'s token to `base_url`, but only while it has no scope.
 ///
-/// Trust on first sight, exactly as [`CredentialStore::infer_scope_if_empty`]
+/// Trust on first sight, exactly as [`CredentialStore::infer_undeclared_scopes`]
 /// does for a credential that predates ADR 0144. A script authored now has no
 /// `apis.json` entry yet, so authorship has nothing to record. The first
 /// request that would use it decides, and every later one is checked.
 ///
-/// [`CredentialStore::infer_scope_if_empty`]: crate::core::CredentialStore::infer_scope_if_empty
+/// [`CredentialStore::infer_undeclared_scopes`]: crate::core::CredentialStore::infer_undeclared_scopes
 pub fn bind_scope_if_absent(
     workspace_path: &Path,
     rel_path: &str,

@@ -268,10 +268,30 @@ pub struct HmacConfig {
     /// Defaults to the body alone.
     #[serde(default = "default_template")]
     pub template: String,
-    /// How far the signed timestamp may be from now, in seconds. `None` skips
-    /// the check, which is right only for a scheme with no timestamp.
+    /// How far the signed timestamp may be from now, in seconds. Read it
+    /// through [`Self::replay_tolerance_secs`], which fills in the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tolerance_secs: Option<i64>,
+}
+
+/// The replay window for a template that signs `{timestamp}` and names none.
+/// Slack and Stripe both document five minutes.
+pub const DEFAULT_REPLAY_TOLERANCE_SECS: i64 = 300;
+
+impl HmacConfig {
+    /// The window [`verify`] enforces, `None` only for a scheme that signs no
+    /// timestamp.
+    ///
+    /// A signed timestamp exists only to bound replay. With no window, a
+    /// captured delivery verifies forever. So the default applies at read
+    /// time, and a stored hook that never named a tolerance gets it too.
+    pub fn replay_tolerance_secs(&self) -> Option<i64> {
+        self.tolerance_secs.or_else(|| {
+            self.template
+                .contains("{timestamp}")
+                .then_some(DEFAULT_REPLAY_TOLERANCE_SECS)
+        })
+    }
 }
 
 fn default_template() -> String {
@@ -477,7 +497,7 @@ pub fn sign(cfg: &HmacConfig, secret: &str, canonical: &str) -> String {
 
 /// Is a signed timestamp close enough to now?
 ///
-/// A missing tolerance means the scheme carries no timestamp, so there is
+/// A missing tolerance means the scheme signs no timestamp, so there is
 /// nothing to check. A tolerance with an unparseable timestamp is a refusal:
 /// the configuration asked for a replay window and did not get one.
 ///
@@ -540,7 +560,7 @@ pub fn verify(
         .ok_or(DeliveryRefusal::SignatureMissing)?;
     let signature = extract_signature(cfg, header).ok_or(DeliveryRefusal::SignatureMissing)?;
     let timestamp = extract_timestamp(cfg, header, presented.timestamp_header);
-    if !timestamp_within_tolerance(cfg.tolerance_secs, timestamp, presented.now_unix) {
+    if !timestamp_within_tolerance(cfg.replay_tolerance_secs(), timestamp, presented.now_unix) {
         return Err(DeliveryRefusal::TimestampOutsideTolerance);
     }
     let canonical = canonical_string(&cfg.template, timestamp, presented.body);

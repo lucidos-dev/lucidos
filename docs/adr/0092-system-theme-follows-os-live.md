@@ -75,11 +75,33 @@ snapshot pass, which is fast, and 300ms is imperceptible on a theme change. If
 the residual above turns out to be common, the breadcrumbs are what would say
 so, and the delay is the knob.
 
+### Amendment: a moved theme must hold through a confirming read
+
+The breadcrumbs did say so, though not by turning the settle knob. Gateway logs
+caught the same shape twice on an iPhone set to dark under `system`:
+
+1. A wake lasts under a second: a visible presence post, then a hidden one.
+2. Inside it, the settle read sees `mqLight: true` and paints light.
+3. The page hides, and iOS snapshots it light.
+4. The next real return opens on that light page. The resume read then paints
+   dark, which the user reports as a light blink on coming back.
+
+So on a brief wake the media query still reports the snapshot pass's
+appearance, past the settle delay. A longer settle delay would only move the
+race. A **confirming read** closes it instead: a read that sees a move arms a
+second read `SYSTEM_THEME_MODE_CONFIRM_MS` later, and only a move still there
+then paints. A hide cancels both, so a brief wake paints nothing.
+
+The cost is that a real flip found on resume paints about a second later than
+before. One helper, `followSystemThemeMode` in
+`packages/lucidos-sdk/src/appearance.ts`, now carries the timers for the shell
+and every app iframe, so the two cannot drift apart.
+
 ## Consequences
 
-- A theme flip is applied a few hundred milliseconds after the OS announces it,
-  on every platform. That is the price of one code path instead of two, and it
-  is imperceptible on a theme change.
+- A theme flip is applied about 1.3 seconds after the OS announces it, on every
+  platform: the settle delay plus the confirming read. That is the price of one
+  code path instead of two, and of never painting a brief wake's stale value.
 - The shell and every app iframe run the same contract. An open app cannot sit
   on a stale theme while the shell around it moves.
 - The two guards are load-bearing rather than defensive. Dropping the visibility

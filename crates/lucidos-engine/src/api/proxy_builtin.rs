@@ -30,7 +30,8 @@
 //! `https://<host>/v1/projects/<project>/locations/<region>` (project + region
 //! from the engine's boot-resolved Vertex config), so the app sends only the
 //! `/publishers/<publisher>/models/<model>:<method>` suffix; the access token is
-//! minted/refreshed server-side per request via the shared token cache.
+//! minted/refreshed server-side per request via the shared token cache. Any
+//! other suffix is a 400, refused before a token exists.
 
 use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHint, ScopeBinding};
 use crate::api::proxy_static_layers::StaticHeaderLayer;
@@ -501,40 +502,7 @@ enum LocalKeySource {
     Environment(String),
 }
 
-/// The upstream the builtin `local` provider resolves to: the preference,
-/// then `LUCIDOS_LOCAL_BASE_URL`, then the built-in default.
-///
-/// `None` when the preference read failed, so a caller cannot mistake a broken
-/// database for a configured host. `None` too when the preference names a host
-/// off the user's own network, which the provider refuses. The boot pass reads
-/// this to give an unscoped `local` credential the scope it needs (ADR 0144).
-pub async fn local_upstream_base_url(pool: &sqlx::PgPool) -> Option<String> {
-    let base_pref = prefs::LOCAL_BASE_URL
-        .try_stored(pool)
-        .await
-        .ok()?
-        .filter(|s| !s.trim().is_empty());
-    if let Some(reason) = base_pref.as_deref().and_then(local_base_url_rejection) {
-        crate::log!("[Proxy] Not scoping the 'local' key: {}", reason);
-        return None;
-    }
-    Some(
-        base_pref
-            .or_else(|| {
-                std::env::var("LUCIDOS_LOCAL_BASE_URL")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            })
-            .unwrap_or_else(|| prefs::LOCAL_BASE_URL.default_text().to_string()),
-    )
-}
-
 async fn resolve_local(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, String)> {
-    // Reads the preference and the env var itself rather than calling
-    // `local_upstream_base_url`: the two halves are needed apart, for the
-    // unconfigured check below and for the env key's own pairing. Keep the
-    // pref-then-env-then-default order in step with that function.
-    //
     // Opt-in, mirroring `build_local_provider`: only resolve when a base URL
     // (pref or env) or key is configured — otherwise a default localhost
     // backend isn't conjured for a workspace that never asked for one.
@@ -670,6 +638,29 @@ impl VertexAdcLayer {
     }
 }
 
+/// Whether `url` is `base_url` plus `/publishers/<p>/models/<m>:<method>`,
+/// with any query. Read off the URL the layer signs, so no other route can
+/// reach the token. The label alphabets leave no room for encoding.
+fn is_publisher_model_call(base_url: &str, url: &str) -> bool {
+    let Some(rest) = url.strip_prefix(base_url) else {
+        return false;
+    };
+    let path = rest.split_once('?').map_or(rest, |(path, _)| path);
+    let segments: Vec<&str> = path.split('/').collect();
+    let ["", "publishers", publisher, "models", model_method] = segments.as_slice() else {
+        return false;
+    };
+    let Some((model, method)) = model_method.split_once(':') else {
+        return false;
+    };
+    let is_label = |s: &str, extra: &[u8]| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    };
+    is_label(publisher, b"-_") && is_label(model, b"-_.@") && is_label(method, b"")
+}
+
 #[async_trait]
 impl AuthLayer for VertexAdcLayer {
     fn output_namespace(&self) -> &str {
@@ -690,7 +681,16 @@ impl AuthLayer for VertexAdcLayer {
         }
     }
 
-    async fn apply(&self, _input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
+    async fn apply(&self, input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
+        // Before the mint: the token may manage every resource in the project.
+        if !is_publisher_model_call(&self.base_url, input.url) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "proxy 'vertex' forwards only publisher model calls, \
+                 /publishers/<publisher>/models/<model>:<method>"
+                    .to_string(),
+            ));
+        }
         let token = vertex::get_cached_access_token(&self.token_cache)
             .await
             .map_err(|e| {
@@ -729,14 +729,24 @@ mod tests {
         body: &'a Bytes,
         prior: &'a HashMap<String, serde_json::Value>,
     ) -> LayerInput<'a> {
+        input_for("https://example.com/x", body, prior)
+    }
+
+    fn input_for<'a>(
+        url: &'a str,
+        body: &'a Bytes,
+        prior: &'a HashMap<String, serde_json::Value>,
+    ) -> LayerInput<'a> {
         LayerInput {
             method: &Method::POST,
-            url: "https://example.com/x",
+            url,
             headers: &[],
             body: BodyView::Raw(body),
             prior_layer_outputs: prior,
         }
     }
+
+    const MODEL_CALL: &str = "/publishers/anthropic/models/claude-opus-4-8@default:rawPredict";
 
     #[test]
     fn vertex_base_url_uses_engine_owned_prefix_per_region() {
@@ -762,11 +772,7 @@ mod tests {
     #[test]
     fn vertex_base_url_composes_with_app_supplied_suffix() {
         let base = vertex_base_url("proj", "europe-west1");
-        let full = crate::api::proxy::build_target_url(
-            &base,
-            "/publishers/anthropic/models/claude-opus-4-8@default:rawPredict",
-            None,
-        );
+        let full = crate::api::proxy::build_target_url(&base, MODEL_CALL, None);
         assert_eq!(
             full,
             "https://europe-west1-aiplatform.googleapis.com/v1/projects/proj/locations/europe-west1/publishers/anthropic/models/claude-opus-4-8@default:rawPredict"
@@ -782,10 +788,12 @@ mod tests {
             "tok-123".to_string(),
             Instant::now(),
         ))));
-        let layer = VertexAdcLayer::new(cache.clone(), "https://x.googleapis.com".to_string());
+        let base = vertex_base_url("proj", "europe-west1");
+        let layer = VertexAdcLayer::new(cache.clone(), base.clone());
+        let url = crate::api::proxy::build_target_url(&base, MODEL_CALL, None);
         let body = Bytes::new();
         let prior = HashMap::new();
-        let m = layer.apply(&dummy_input(&body, &prior)).await.unwrap();
+        let m = layer.apply(&input_for(&url, &body, &prior)).await.unwrap();
         assert_eq!(m.add_headers.len(), 1);
         assert_eq!(m.add_headers[0].0.as_str(), "authorization");
         assert_eq!(m.add_headers[0].1, "Bearer tok-123");
@@ -798,6 +806,71 @@ mod tests {
             cache.lock().unwrap().is_none(),
             "cache cleared on invalidate"
         );
+    }
+
+    /// The token reaches publisher model calls only. Any other resource under
+    /// the project prefix is a 400, and the empty cache proves the refusal
+    /// came before a token was minted.
+    #[tokio::test]
+    async fn vertex_layer_refuses_a_non_model_path_before_minting() {
+        let base = vertex_base_url("proj", "europe-west1");
+        let cache: TokenCache = Arc::new(std::sync::Mutex::new(None));
+        let layer = VertexAdcLayer::new(cache.clone(), base.clone());
+        let body = Bytes::new();
+        let prior = HashMap::new();
+        for path in [
+            "",
+            "/",
+            "/customJobs",
+            "/endpoints/123",
+            "/models/123",
+            "/publishers/google/models",
+            "/publishers/google/models/gemini-3-flash",
+            "/publishers/google/models/gemini-3-flash:",
+            "/publishers/google/models/:generateContent",
+            "/publishers/google/models/gemini-3-flash:generateContent/extra",
+            "/publishers/google/models/gemini%2F3:generateContent",
+            "/projects/other/locations/eu/publishers/google/models/m:predict",
+        ] {
+            let url = crate::api::proxy::build_target_url(&base, path, None);
+            let Err((status, message)) = layer.apply(&input_for(&url, &body, &prior)).await else {
+                panic!("'{path}' must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {message}");
+            assert!(message.contains("/publishers/"), "{path}: {message}");
+        }
+        assert!(cache.lock().unwrap().is_none(), "no token was minted");
+    }
+
+    /// A model call keeps working, with or without a query string.
+    #[tokio::test]
+    async fn vertex_layer_serves_publisher_model_calls() {
+        let base = vertex_base_url("proj", "europe-west1");
+        let cache: TokenCache = Arc::new(std::sync::Mutex::new(Some((
+            "tok-123".to_string(),
+            Instant::now(),
+        ))));
+        let layer = VertexAdcLayer::new(cache, base.clone());
+        let body = Bytes::new();
+        let prior = HashMap::new();
+        for (path, query) in [
+            (MODEL_CALL, None),
+            (
+                "/publishers/google/models/gemini-3-flash:streamGenerateContent",
+                Some("alt=sse"),
+            ),
+            (
+                "/publishers/google/models/imagen-4.0-generate-001:predict",
+                None,
+            ),
+        ] {
+            let url = crate::api::proxy::build_target_url(&base, path, query);
+            let m = layer
+                .apply(&input_for(&url, &body, &prior))
+                .await
+                .unwrap_or_else(|e| panic!("'{url}' refused: {e:?}"));
+            assert_eq!(m.add_headers[0].1, "Bearer tok-123", "{url}");
+        }
     }
 
     // ---- The catalog and the agent's context block --------------------------
@@ -1262,9 +1335,8 @@ mod tests {
     /// A keyless call attaches no layer, so the scope gate never runs for it.
     /// A public host stored before the write path checked it must therefore
     /// be refused here, or the route forwards anywhere and hands back the body.
-    /// The boot pass must not scope the `local` key to that host either.
     #[tokio::test]
-    async fn a_stored_public_local_base_url_is_not_forwarded_or_scoped() {
+    async fn a_stored_public_local_base_url_is_not_forwarded() {
         let (pool, db) = setup_test_db().await;
         crate::test_support::seed_preference(
             &pool,
@@ -1280,7 +1352,6 @@ mod tests {
         };
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert!(err.1.contains("attacker.example"), "msg: {}", err.1);
-        assert_eq!(local_upstream_base_url(&pool).await, None);
         teardown_test_db(&db).await;
     }
 

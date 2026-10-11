@@ -2,10 +2,11 @@
 # Run Playwright browser e2e tests against the e2e-test workspace.
 #
 # Usage:
-#   ./scripts/e2e-browser.sh [options] [-- playwright args]
-#   ./scripts/e2e-browser.sh --github [options]   # on GitHub's runners, ADR 0382
+#   ./scripts/e2e-browser.sh [options] [-- playwright args]   # on GitHub's runners when it can, ADR 0386
+#   ./scripts/e2e-browser.sh --local [options]                # on this host
 #
 # Options:
+#   --local          Run on this host, not on GitHub. Local-only flags imply it.
 #   -h, --headed     Run with visible browser
 #   -f <file>        Run specific test file (e.g., chat.spec.ts)
 #   --no-reset       Skip DB reset AND leave the workspace running for the next
@@ -40,6 +41,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/e2e_github.sh
 source "$SCRIPT_DIR/lib/e2e_github.sh"
 e2e_github_handoff browser "$@"
+set -- ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$SCRIPT_DIR/lib/e2e.sh"
@@ -771,7 +773,7 @@ _run_browser_project_body() {
             # ignored files would make `playwright test` exit "no tests found" (rc 1)
             # and fail the chunk spuriously. Excluding them keeps every chunk real.
             case "$base" in *-desktop.spec.ts) continue ;; esac
-            if e2e_spec_needs_claude_code "$f"; then
+            if e2e_spec_spawns_claude_code "$f"; then
                 cc_specs+=("$base")
             else
                 nav_specs+=("$base")

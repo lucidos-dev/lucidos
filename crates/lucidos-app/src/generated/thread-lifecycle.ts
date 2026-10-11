@@ -55,6 +55,9 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ThreadArchived: 'terminal',
   ThreadArchiveRequested: 'metadata',
   ThreadUnarchived: 'metadata',
+  ThreadReadRequested: 'metadata',
+  ThreadReadNotRequested: 'metadata',
+  ThreadReplySeen: 'metadata',
   ThreadTriageProposed: 'metadata',
   ThreadStarted: 'metadata',
   ThreadDiscarded: 'metadata',
@@ -68,13 +71,15 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ChangeReverted: 'terminal',
   ChangeSetAside: 'metadata',
   ChangeBroughtBack: 'metadata',
+  ChangeWithdrawn: 'metadata',
+  ProposalWithheld: 'metadata',
   ChangeApplyFailed: 'terminal',
   ChangeHardened: 'metadata',
   ChangeSummarized: 'metadata',
   MergeConflictDetected: 'start',
   MergeResolutionStarted: 'metadata',
   MergeResolutionCleared: 'metadata',
-  UserPromptInjected: 'start',
+  PromptInjected: 'start',
   CredentialRequested: 'activity',
   PluginInstallRequested: 'activity',
   PluginUninstallRequested: 'activity',
@@ -99,6 +104,8 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ContextKeptOpen: 'metadata',
   BackgroundBashStarted: 'metadata',
   BackgroundBashCompleted: 'metadata',
+  OwnerApprovalRequested: 'metadata',
+  OwnerApprovalSpent: 'metadata',
   ImageDescribed: 'metadata',
   ConversationSummarized: 'metadata',
   CommandCheckpointed: 'metadata',
@@ -116,6 +123,9 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   SideQuestionAnswered: 'metadata',
   SideQuestionFailed: 'metadata',
   SideQuestionDismissed: 'metadata',
+  WidgetShown: 'metadata',
+  WidgetPinned: 'metadata',
+  WidgetUnpinned: 'metadata',
 } as const;
 
 export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([
@@ -144,7 +154,7 @@ export const LAST_ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
   'ChangeApplied',
   'ChangeDiscarded',
   'CodingAgentUserMessageSent',
-  'UserPromptInjected',
+  'PromptInjected',
   'TriggerCompleted',
   'UserQuestionAsked',
   'UserQuestionAnswered',
@@ -220,21 +230,34 @@ export function availableThreadActions(
   return actions;
 }
 
-export type OwnBlocker = 'running' | 'question' | 'pending_change';
-export const OWN_BLOCKER_PRIORITY: readonly OwnBlocker[] = ['running', 'question', 'pending_change'] as const;
-export type Blocker = 'none' | 'home' | 'running' | 'question' | 'pending_change' | 'descendant_running' | 'descendant_question' | 'descendant_pending_change';
+export type OwnBlocker = 'running' | 'question' | 'pending_change' | 'held_proposal';
+export const OWN_BLOCKER_PRIORITY: readonly OwnBlocker[] = ['running', 'question', 'pending_change', 'held_proposal'] as const;
+export type Blocker = 'none' | 'home' | 'running' | 'question' | 'pending_change' | 'held_proposal' | 'descendant_running' | 'descendant_question' | 'descendant_pending_change' | 'descendant_held_proposal';
+
+export type ChangeWork = 'none' | 'proposed' | 'held';
+
+export type ChangeStateKind = 'none' | 'unproposed' | 'proposed';
+
+export function changeWork(
+  change: ChangeStateKind,
+  holdsLiveWait: boolean,
+): ChangeWork {
+  if (change === 'proposed') return 'proposed';
+  return change === 'unproposed' && holdsLiveWait ? 'held' : 'none';
+}
 
 export function ownBlocker(
   threadType: ThreadType,
   status: ThreadStatus,
   archiveState: ArchiveState,
-  hasPendingChanges: boolean,
+  change: ChangeWork,
   isExternalRepo: boolean,
 ): OwnBlocker | null {
   if (status === 'running') return 'running';
   if (status === 'waiting_for_user_answer') return 'question';
-  if (archiveState === 'archived') return null;
-  return hasPendingChanges && threadType === 'claude_code' && !isExternalRepo ? 'pending_change' : null;
+  if (archiveState === 'archived' || threadType !== 'claude_code' || isExternalRepo) return null;
+  if (change === 'proposed') return 'pending_change';
+  return change === 'held' ? 'held_proposal' : null;
 }
 
 export function actionBlocker(
@@ -251,5 +274,5 @@ export const MESSAGE_COUNT_EVENTS: ReadonlySet<string> = new Set([
   'MessageReceived',
   'TriggerStarted',
   'CodingAgentUserMessageSent',
-  'UserPromptInjected',
+  'PromptInjected',
 ]);

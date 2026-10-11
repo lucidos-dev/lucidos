@@ -2,6 +2,7 @@ import {
   CONTINUATION_AUTO_RECOVERY_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON,
+  CONTINUATION_HARDEN_REQUESTED_REASON,
   CONTINUATION_USER_CLICKED_REASON,
   plainEventName,
   type AbortCause,
@@ -77,6 +78,8 @@ export function describeContinuationReason(reason: string | undefined): string |
       return 'The agent stopped responding, or a stray signal closed it. Nothing restarted: Lucidos started that one agent again and carried on.';
     case CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON:
       return 'You chose Switch on the new version, which stopped this reply. Lucidos picked it back up once the new version was running.';
+    case CONTINUATION_HARDEN_REQUESTED_REASON:
+      return 'You pressed Harden. Lucidos picked the thread back up to review the work and run its tests, and proposes the change when that finishes.';
     case CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON:
       return 'The connection to the model dropped part-way through the reply above, so it stopped unfinished. Nothing restarted: Lucidos picked the reply back up. It does this a few times in a row at most, then leaves the failure standing.';
     default:
@@ -106,6 +109,8 @@ export function describeEngineReason(reason: EngineReason): string {
       return 'Your changes conflict with newer changes in the project: a merge conflict. Lucidos asked the agent to resolve it before your changes can be applied.';
     case 'missing_hardening':
       return `${REVIEW_RULE} It had not run yet, so Lucidos asked the agent to run it.`;
+    case 'missing_plan':
+      return 'Changes to Lucidos itself need an approved implementation plan, or a note that the fix is local, before they are offered. This work had neither, so Lucidos held it back and asked the agent for one.';
     case 'plugin_auto_update':
       return `Lucidos found a newer version of ${reason.plugin_id} in ${reason.marketplace_name} and updated the installed plugin.`;
     case 'plugin_setup':

@@ -127,7 +127,7 @@ describe('resolveFileTarget: the line range', () => {
   });
 });
 
-/** The navigate router and the app-facing preview modal share this resolver so
+/** The navigate router and the file preview modal share this resolver so
  *  the modal cannot reach a file, or honour a line, that `navigate('file', …)`
  *  would not. The view input is the ONE thing they differ by, and this is what
  *  pins how far that difference reaches: exactly one line rule, and never the

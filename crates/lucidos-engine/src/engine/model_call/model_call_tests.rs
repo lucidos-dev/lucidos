@@ -54,11 +54,10 @@ async fn each_chat_attempt_records_one_row() {
     teardown_test_db(&db).await;
 }
 
-/// A call no thread caused still records, on the home thread. While the
-/// switch is off that thread is created hidden: the switch stays off and the
-/// gated lookup still answers "none".
+/// A call no thread caused still records, on the home thread. Made before
+/// boot created Home, it creates Home itself, and that is the one Home.
 #[tokio::test]
-async fn a_call_with_no_thread_records_on_a_hidden_home_thread() {
+async fn a_call_with_no_thread_records_on_the_home_thread() {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let capture = AuxCapture::for_thread_or_home(&bus, None, ContextPurpose::Memory);
@@ -77,8 +76,7 @@ async fn a_call_with_no_thread_records_on_a_hidden_home_thread() {
         crate::engine::home_thread::home_thread_id(&pool)
             .await
             .unwrap(),
-        None,
-        "the switch is still off, so the home thread stays hidden"
+        Some(homes[0]),
     );
     teardown_test_db(&db).await;
 }
@@ -89,7 +87,9 @@ async fn a_call_with_no_thread_records_on_a_hidden_home_thread() {
 async fn a_call_records_on_its_own_thread_and_reuses_home() {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
-    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
     let thread = Uuid::new_v4();
 
     AuxCapture::for_thread_or_home(&bus, None, ContextPurpose::Title)
@@ -147,6 +147,101 @@ async fn an_unfinished_turn_capture_still_records() {
     assert_eq!(rows[0]["model"], "turn-model");
     assert_eq!(rows[0]["producer"], "main_llm");
     assert!(rows[0]["usage"]["input_tokens"].is_u64());
+    teardown_test_db(&db).await;
+}
+
+/// A provider whose reply names another model than the one asked for, the
+/// way Google answers a retired Gemini id.
+struct Rerouting(ScriptedProvider);
+
+#[async_trait::async_trait]
+impl LlmProvider for Rerouting {
+    async fn chat(
+        &self,
+        messages: Vec<Message>,
+        tools: Vec<ToolDefinition>,
+        selection: ModelSelection<'_>,
+        system_prompt: Option<&str>,
+        on_token: Option<TokenCallback>,
+        call: crate::llm::metered::CallToken,
+    ) -> Result<LlmResponse, BoxError> {
+        let response = self
+            .0
+            .chat(messages, tools, selection, system_prompt, on_token, call)
+            .await?;
+        Ok(LlmResponse {
+            served_model: Some("gemini-3.6-flash".to_string()),
+            ..response
+        })
+    }
+}
+
+/// Both rows keep the model Lucidos asked for and the one the reply named.
+#[tokio::test]
+async fn a_capture_records_the_model_that_served_the_call() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let provider = Rerouting(ScriptedProvider::new("gemini-3.5-flash", vec!["a", "b"]));
+
+    AuxCapture::new(&bus, thread, ContextPurpose::Title)
+        .chat(
+            &provider,
+            ask("title"),
+            vec![],
+            ModelSelection::model("gemini-3.5-flash"),
+            None,
+            None,
+        )
+        .await
+        .expect("the scripted model answers");
+    let rows = aux_captures(&pool, thread, "title").await;
+    assert_eq!(rows[0]["model"], "gemini-3.5-flash");
+    assert_eq!(rows[0]["served_model"], "gemini-3.6-flash");
+
+    let (_, capture) = turn_chat(
+        &bus,
+        thread,
+        &provider,
+        ask("hi"),
+        vec![],
+        ModelSelection::model("gemini-3.5-flash"),
+        None,
+        None,
+    )
+    .await
+    .expect("the scripted model answers");
+    capture
+        .finish(EventMeta::NONE, |usage, served_model| {
+            ThreadEvent::ContextCaptured {
+                producer: ContextProducer::MainLlm,
+                model: "gemini-3.5-flash".to_string(),
+                context_window: 0,
+                sections: Vec::new(),
+                tools: Vec::new(),
+                estimated_total_tokens: 0,
+                usage,
+                trimmed: false,
+                trim_passes: Vec::new(),
+                purpose: ContextPurpose::Turn,
+                reconstructed: false,
+                parent_tool_use_id: None,
+                api_call_id: None,
+                reasoning_effort: None,
+                duration_ms: None,
+                served_model,
+            }
+        })
+        .await;
+    let turn: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM events WHERE thread_id = $1 \
+           AND event_type = 'ContextCaptured' AND payload->>'producer' = 'main_llm'",
+    )
+    .bind(thread)
+    .fetch_one(&pool)
+    .await
+    .expect("read the turn row");
+    assert_eq!(turn["served_model"], "gemini-3.6-flash");
     teardown_test_db(&db).await;
 }
 

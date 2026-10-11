@@ -553,6 +553,29 @@ fn a_threadless_subprocess_is_refused_rather_than_given_every_thread() {
     );
 }
 
+/// The read request route takes the same guard (ADR 0409): an agent can only
+/// ask for its own reply to be read.
+#[test]
+fn an_agent_may_only_ask_for_its_own_reply_to_be_read() {
+    use super::actions::refuse_an_agent_from_another_thread;
+    use super::read_request::READ_REQUEST_IS_THE_CALLERS;
+    let mine = Uuid::new_v4();
+    assert!(refuse_an_agent_from_another_thread(
+        &agent_headers(Some(mine)),
+        mine,
+        READ_REQUEST_IS_THE_CALLERS
+    )
+    .is_ok());
+    let refused = refuse_an_agent_from_another_thread(
+        &agent_headers(Some(mine)),
+        Uuid::new_v4(),
+        READ_REQUEST_IS_THE_CALLERS,
+    )
+    .expect_err("another thread's id must be refused");
+    assert_eq!(refused.0, axum::http::StatusCode::FORBIDDEN);
+    assert!(refused.1.contains("lucidos request-read"), "{}", refused.1);
+}
+
 /// A caller presenting no token is not an agent claiming to be another thread.
 /// It is the ordinary local API surface, which every other `/threads/:id/...`
 /// route treats the same way, so this check leaves it exactly where it was
@@ -581,9 +604,9 @@ async fn seed_parked_cc_thread(
 ) {
     sqlx::query(
         "INSERT INTO thread_summaries
-            (thread_id, is_coding_agent, status, coding_agent_proposed,
+            (thread_id, is_coding_agent, status, coding_agent_change_state,
              live_event_wait_count, active_children_count)
-         VALUES ($1, true, 'idle', true, $2, $3)",
+         VALUES ($1, true, 'idle', 'proposed', $2, $3)",
     )
     .bind(thread_id)
     .bind(live_event_waits)

@@ -28,6 +28,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BROWSER_SH="$PROJECT_DIR/scripts/e2e-browser.sh"
+E2E_LIB_SH="$PROJECT_DIR/scripts/lib/e2e.sh"
 
 SANDBOX="$(mktemp -d)"
 cleanup() { rm -rf "$SANDBOX"; }
@@ -88,11 +89,11 @@ assert_before() {
 LIFTED="$SANDBOX/lifted.sh"
 : > "$LIFTED"
 
-lift() {
-    local fn="$1" body depth
-    body="$(sed -n "/^$fn() {/,/^}/p" "$BROWSER_SH")"
+lift() { # <function> [<script>, default scripts/e2e-browser.sh]
+    local fn="$1" from="${2:-$BROWSER_SH}" body depth
+    body="$(sed -n "/^$fn() {/,/^}/p" "$from")"
     if [ -z "$body" ]; then
-        echo "FATAL: could not lift $fn() out of scripts/e2e-browser.sh." >&2
+        echo "FATAL: could not lift $fn() out of ${from#"$PROJECT_DIR"/}." >&2
         echo "It was renamed or reshaped. Fix this test rather than deleting it:" >&2
         echo "a lift that silently returns nothing tests nothing." >&2
         exit 1
@@ -114,6 +115,7 @@ lift() {
 }
 
 lift merge_rc
+lift e2e_spec_spawns_claude_code "$E2E_LIB_SH"
 lift webkit_chunk_size
 lift memory_resume_budget
 lift recover_after_memory_stop

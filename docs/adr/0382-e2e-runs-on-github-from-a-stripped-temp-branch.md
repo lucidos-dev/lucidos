@@ -1,7 +1,9 @@
 # 0382: The e2e suites may run on GitHub, from a stripped e2e run branch of the mirror
 
 - **Status**: Accepted. Widens the "GitHub Actions is release-only" rule and
-  supersedes ADR 0175's rejection of hosted macOS runners.
+  supersedes ADR 0175's rejection of hosted macOS runners. ADR 0386 makes
+  GitHub mode the default. ADR 0388 moves the Claude Code specs that need no
+  real session onto GitHub, against a fake.
 - **Date**: 2026-10-07
 
 ## Context

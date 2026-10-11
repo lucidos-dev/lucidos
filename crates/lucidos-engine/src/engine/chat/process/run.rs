@@ -13,7 +13,7 @@ use crate::engine::context::{agent_context_char_budget, trim_history_from_oldest
 use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
 use crate::engine::types::*;
 use crate::engine::{InjectedPrompt, LucidosEngine, ThreadGuard};
-use crate::llm::{chat_tail_tools, get_default_tools, get_notification_tool, Message};
+use crate::llm::Message;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -36,7 +36,7 @@ const ADMISSION_ATTEMPTS: u32 = 2;
 
 pub(super) async fn resolve_route_overrides(
     pool: &sqlx::PgPool,
-    registry: &crate::llm::ModelRegistry,
+    defaults: crate::core::ModelDefaults<'_>,
     // Which backends the router holds, so the clamp measures the route the
     // router will actually take.
     is_configured: impl Fn(crate::llm::ProviderKind) -> bool,
@@ -63,8 +63,10 @@ pub(super) async fn resolve_route_overrides(
     // reuses the model/effort this thread last ran with. `exclude_event_id`
     // drops the current turn's own MessageReceived when it was pre-emitted
     // upstream, so the thread never reads itself as its "previous" value.
+    let registry = defaults.registry;
     let resolved = PreferenceStore::resolve_chat_overrides_for_thread(
         pool,
+        defaults,
         thread_id,
         exclude_event_id,
         overrides,
@@ -133,16 +135,9 @@ impl LucidosEngine {
         gates: &crate::llm::ToolCapabilities,
         context_window: usize,
     ) -> crate::engine::agentic_loop::TurnTools {
-        let mut tools = get_default_tools(gates);
-        tools.push(get_notification_tool());
-        // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
-        // any other manifest-declared LLM tools, from one source of truth.
-        tools.extend(crate::capability_manifest::llm_tools_for(gates));
-        // navigate_ui, save_thread_image, view_image and generate_image, each
-        // with its gate declared beside it in `llm::tools::CHAT_TAIL`.
-        tools.extend(chat_tail_tools(gates));
-        // MCP server management is the grouped `mcp` manifest tool (spliced via
-        // llm_tools() above). Tools discovered from running servers join here.
+        let tools = super::system_prompt::chat_tools(gates);
+        // MCP server management is the grouped `mcp` manifest tool, one of
+        // `chat_tools`. Tools discovered from running servers join here.
         // The stamp rides with the tools so the loop can tell whether what it
         // holds is still current. It is the only part of the array that can
         // move mid-turn; see `TurnTools`.
@@ -201,18 +196,22 @@ struct SetupCancel {
 }
 
 impl LucidosEngine {
-    /// Settle this turn's exchange as failed, then hand the error back so the
-    /// caller can `return Err(..)` in one line.
+    /// Settle this turn's exchange as failed, run the shared turn tail, then
+    /// hand the error back so the caller can `return Err(..)` in one line.
     ///
     /// Idempotent: the gate skips the emit when a terminator already landed
     /// for `anchor`. A turn is finished either way by the time this returns,
     /// which is the promise `process_message_with_steps` makes to its callers.
+    // The turn's anchor plus the guard and channel its tail consumes.
+    #[allow(clippy::too_many_arguments)]
     async fn fail_turn(
         &self,
         thread_id: Uuid,
         anchor: Uuid,
         channel: Option<EventChannel>,
         error: Box<dyn std::error::Error + Send + Sync>,
+        guard: ThreadGuard,
+        injection_rx: &mut mpsc::UnboundedReceiver<InjectedPrompt>,
     ) -> Box<dyn std::error::Error + Send + Sync> {
         crate::engine::agentic_loop::ensure_failure_terminator_emitted(
             &self.event_bus,
@@ -223,7 +222,38 @@ impl LucidosEngine {
             &error.to_string(),
         )
         .await;
+        let orphans = self
+            .drain_turn_orphans(thread_id, guard, injection_rx)
+            .await;
+        self.resubmit_orphans_of_failed_turn(thread_id, orphans);
         error
+    }
+
+    /// Re-submit the follow-ups a failed turn drained. An `Err` carries no
+    /// `ProcessResult` back to the caller, so the engine runs the orphan
+    /// chain itself. Otherwise a message typed mid-turn is never answered.
+    ///
+    /// Must stay a plain `fn`: the spawned chain re-enters this turn's own
+    /// future type, and an `async` caller holding it would be a type cycle.
+    pub(in crate::engine::chat) fn resubmit_orphans_of_failed_turn(
+        &self,
+        thread_id: Uuid,
+        orphans: Vec<InjectedPrompt>,
+    ) {
+        if orphans.is_empty() {
+            return;
+        }
+        let Some(engine) = self.try_clone_arc() else {
+            log!(
+                "[Chat] Dropped {} follow-up(s) on thread {}: no engine handle to re-submit them",
+                orphans.len(),
+                thread_id
+            );
+            return;
+        };
+        tokio::spawn(crate::api::chat::process_orphan_chain(
+            engine, thread_id, orphans,
+        ));
     }
 
     /// Internal: Process a message with optional trigger context
@@ -292,10 +322,14 @@ impl LucidosEngine {
         // turn's already-persisted MessageReceived (`events.id`); exclude it so
         // the per-thread lookup reads the PRIOR message, not this one. In the
         // normal path it's `None` and the current turn isn't emitted until later.
-        let configured = self.current_provider().configured_providers();
+        let router = self.current_provider();
+        let configured = router.configured_providers();
         let resolved = resolve_route_overrides(
             &self.pool,
-            &self.model_registry,
+            crate::core::ModelDefaults {
+                registry: &self.model_registry,
+                fallback_model: router.default_model(),
+            },
             |kind| configured.as_ref().is_none_or(|set| set.contains(&kind)),
             use_coding_agent,
             thread_id,
@@ -449,7 +483,6 @@ impl LucidosEngine {
                     break 'describe None;
                 }
                 let provider = call.provider();
-                let recorded_model = call.model().to_string();
                 let effort = call.reasoning().map(str::to_string);
                 let deadline = call.deadline();
                 let imgs: Vec<crate::api::ChatImage> = imgs.to_vec();
@@ -463,7 +496,9 @@ impl LucidosEngine {
                     )
                     .await;
                     match described {
-                        Ok(Ok(desc)) => Some((desc, recorded_model)),
+                        // Read after the call: a default can move off a
+                        // model its provider no longer serves (ADR 0403).
+                        Ok(Ok(desc)) => Some((desc, provider.default_model().to_string())),
                         Ok(Err(e)) => {
                             log!("[Chat] Image description failed: {}", e);
                             None
@@ -939,8 +974,8 @@ impl LucidosEngine {
                     break;
                 }
                 // Emit MessageReceived FIRST — same ordering guarantee as the CC
-                // fast-path. The agentic loop emits UserPromptInjected when it
-                // picks up the injection; without this ordering, UserPromptInjected
+                // fast-path. The agentic loop emits PromptInjected when it
+                // picks up the injection; without this ordering, PromptInjected
                 // can race ahead and create a duplicate exchange boundary.
                 //
                 // Skip the emit whenever the caller already persisted the
@@ -949,7 +984,7 @@ impl LucidosEngine {
                 // `PreEmittedOrigin::inject_kind` and the `InjectedPromptKind`
                 // docs). A pre-emitted user message still injects as
                 // `UserText`, so the loop acknowledges it with a
-                // `UserPromptInjected`.
+                // `PromptInjected`.
                 use crate::engine::thread_events::EventMeta;
                 let inject_kind = if let Some(pre) = pre_emitted_origin {
                     pre.inject_kind()
@@ -1058,10 +1093,9 @@ impl LucidosEngine {
 
         // Wait for any in-progress request on this thread to finish, then register.
         // This queues follow-up messages instead of cancelling in-progress work.
-        // `guard` ensures the thread is unregistered on every exit path: the
-        // normal path drops it explicitly via `finalize_turn_and_drain_injections`
-        // (remove-then-drain, see below), and the error/panic paths fall back to
-        // its Drop impl.
+        // `guard` ensures the thread is unregistered on every exit path. Every
+        // return drops it via `finalize_turn_and_drain_injections`
+        // (remove-then-drain, see below). Only a panic falls back to its Drop impl.
         let (cancel_token, mut injection_rx, guard) = match admitted {
             Some(registration) => registration,
             None => self.register_thread_queued(thread_id).await,
@@ -1142,15 +1176,26 @@ impl LucidosEngine {
                 )
             };
 
-            let emit_result = self
+            let emitted = self
                 .event_bus
                 .emit(crate::engine::event_bus::BusEvent::Thread {
                     thread_id,
                     event: user_thread_event,
                     meta: user_meta,
                 })
-                .await?
-                .expect("persisted event must return EmitResult");
+                .await;
+            // No exchange exists yet, so there is nothing to settle. A
+            // follow-up injected since registration still needs its turn.
+            let emit_result = match emitted {
+                Ok(result) => result.expect("persisted event must return EmitResult"),
+                Err(e) => {
+                    let orphans = self
+                        .drain_turn_orphans(thread_id, guard, &mut injection_rx)
+                        .await;
+                    self.resubmit_orphans_of_failed_turn(thread_id, orphans);
+                    return Err(e);
+                }
+            };
             emit_result.event_id
         };
         // Recorded, and the thread is registered, so a later follow-up now
@@ -1192,7 +1237,14 @@ impl LucidosEngine {
             .await
         {
             return Err(self
-                .fail_turn(thread_id, origin_id, response_channel, e)
+                .fail_turn(
+                    thread_id,
+                    origin_id,
+                    response_channel,
+                    e,
+                    guard,
+                    &mut injection_rx,
+                )
                 .await);
         }
 
@@ -1232,7 +1284,14 @@ impl LucidosEngine {
                 .await;
             return match cc_result {
                 Err(e) => Err(self
-                    .fail_turn(thread_id, origin_id, response_channel, e)
+                    .fail_turn(
+                        thread_id,
+                        origin_id,
+                        response_channel,
+                        e,
+                        guard,
+                        &mut injection_rx,
+                    )
                     .await),
                 ok => ok,
             };
@@ -1795,15 +1854,10 @@ impl LucidosEngine {
         // 0195), so a server the agent starts mid-turn leaves this list wrong.
         // The loop corrects it in the round's tail rather than here, via
         // `agentic_loop::mcp_surface_correction`.
-        let stopped_summaries = self.mcp_manager.get_stopped_server_summaries().await;
-        let mcp_stopped_context = if !stopped_summaries.is_empty() {
-            format!(
-                "[STOPPED MCP SERVERS]\nThese MCP servers are configured but not running:\n{}\n[END STOPPED MCP SERVERS]",
-                stopped_summaries.join("\n")
-            )
-        } else {
-            String::new()
-        };
+        let mcp_stopped_context =
+            super::workspace_prompt_footprint::build_stopped_mcp_servers_section(
+                &self.mcp_manager.get_stopped_server_summaries().await,
+            );
         if !mcp_stopped_context.is_empty() {
             user_message_parts.push(&mcp_stopped_context);
         }
@@ -1994,10 +2048,16 @@ impl LucidosEngine {
             .drain_turn_orphans(thread_id, guard, &mut injection_rx)
             .await;
 
-        result.map(|mut r| {
-            r.orphaned_injections = orphans;
-            r
-        })
+        match result {
+            Ok(mut r) => {
+                r.orphaned_injections = orphans;
+                Ok(r)
+            }
+            Err(e) => {
+                self.resubmit_orphans_of_failed_turn(thread_id, orphans);
+                Err(e)
+            }
+        }
     }
 
     /// The turn tail EVERY exit shares, normal or cancelled.

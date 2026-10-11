@@ -82,11 +82,8 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
           activeChildrenCount: 0,
           totalChildrenCount: 0,
           blockingDescendantCount: 0, attentionDescendantCount: 0,
-          codingAgentProposed: false,
-          codingAgentRequiresRestart: false,
-          codingAgentIncomplete: false,
+          codingAgentChangeState: { kind: 'none' },
           codingAgentIsExternalRepo: false,
-          codingAgentHasDiff: false,
           lastRevivedAt: '',
           state: 'active',
           latestTodoList: null,
@@ -229,7 +226,7 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
     it('running, idle, and active-children inbox threads all share the Current section', () => {
       // The merge collapsed the former Active + Review split: a thread no longer
       // changes section when it starts or stops running. Attention is now a
-      // per-row signal (reviewTier), not a section — see attentionThreadCount.
+      // per-row signal (reviewTier), not a section — see blockedThreadCount.
       const inbox: Array<{ status: ThreadStatus; hasActiveChildren: boolean }> = [
         { status: 'running', hasActiveChildren: false },
         { status: 'idle', hasActiveChildren: false },

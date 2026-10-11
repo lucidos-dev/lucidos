@@ -1,4 +1,5 @@
-//! The context-handling benchmark (ADR 0110).
+//! The context-handling benchmark (ADR 0110), and the command judge check
+//! (`command_judge`).
 //!
 //! One configuration at a time, scored on five absolute axes. `analyse` and
 //! `report` pool several runs, which is how a budget sweep is read.
@@ -14,6 +15,7 @@ mod analyse;
 mod arm;
 mod assertions;
 mod calls;
+mod command_judge;
 mod config;
 mod driver;
 #[cfg(feature = "fixture-gen")]
@@ -53,7 +55,7 @@ const HANDOVER_PATH: &str = "artifacts/build-health/HANDOVER.md";
 #[derive(Parser)]
 #[command(
     name = "lucidos-eval",
-    about = "The ADR 0110 context-handling benchmark"
+    about = "The ADR 0110 context-handling benchmark, and the command judge check"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -140,6 +142,17 @@ enum Command {
         /// List the run's threads and stop.
         #[arg(long, default_value_t = false)]
         list: bool,
+    },
+    /// Classify `eval/command-judge/commands.toml` with each candidate, through
+    /// the command guard's own judge, and print the table. Spends real tokens.
+    #[command(name = "command-judge")]
+    JudgeCheck {
+        /// Candidates as `model@tier`, comma separated.
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
+        /// Where each answer is appended, as JSON lines.
+        #[arg(long, default_value = "/tmp/command-judge-results.jsonl")]
+        out: PathBuf,
     },
     /// Re-embed the seeded memory rows from `memory-seed.toml`.
     #[cfg(feature = "fixture-gen")]
@@ -287,6 +300,11 @@ async fn dispatch() -> Fallible<()> {
                 },
             )
             .await
+        }
+        Command::JudgeCheck { models, out } => {
+            let set = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../eval/command-judge/commands.toml");
+            command_judge::run(&set, &models, &out).await
         }
         Command::Report { run_id } => {
             let paths = Paths::resolve()?;

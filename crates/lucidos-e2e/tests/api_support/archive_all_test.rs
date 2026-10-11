@@ -18,10 +18,10 @@ async fn seed(pool: &sqlx::PgPool, id: Uuid, parent: Option<Uuid>, set: &str) {
         "INSERT INTO thread_summaries (\
              thread_id, parent_thread_id, source, is_coding_agent, title, \
              created_at, last_activity, message_count, status, archive_state, \
-             coding_agent_proposed, coding_agent_is_external_repo, \
+             coding_agent_change_state, coding_agent_is_external_repo, \
              has_response, state \
          ) VALUES ($1, $2, 'chat', FALSE, 'archive all e2e', NOW(), NOW(), 2, 'idle', \
-                   'inbox', FALSE, FALSE, TRUE, 'active')",
+                   'inbox', 'none', FALSE, TRUE, 'active')",
     )
     .bind(id)
     .bind(parent)

@@ -162,6 +162,53 @@ describe('renderMarkdown', () => {
     expect(html).toContain('&lt;script&gt;');
   });
 
+  it('labels a code block with the first word of its info string', () => {
+    const html = renderMarkdown('```js title="my file.js" lines=2\nx\n```');
+    expect(html).toContain('<span class="code-block-lang">js</span>');
+    expect(html).toContain('<pre><code>x</code></pre>');
+  });
+
+  it('labels a code block whose attributes sit in braces', () => {
+    const html = renderMarkdown('```python {linenos=true hl_lines=[2]}\nx\n```');
+    expect(html).toContain('<span class="code-block-lang">python</span>');
+    expect(html).toContain('<pre><code>x</code></pre>');
+  });
+
+  it.each(['c++', 'c#', 'objective-c', 'shell-session', 'node.js'])('labels a code block in %s', (lang) => {
+    expect(renderMarkdown('```' + lang + '\nx\n```')).toContain(`<span class="code-block-lang">${lang}</span>`);
+  });
+
+  // A paste written Slack-style, with the code on the opening fence line,
+  // which CommonMark reads as the info string.
+  it('renders text on the opening fence line as code, not as a label', () => {
+    const html = renderMarkdown('Schema:\n```{"agent":"Mozilla/5.0 (Mac)","id":"<brand>"}\n```');
+    expect(html).not.toContain('code-block-lang');
+    expect(html).toContain('<pre><code>{"agent":"Mozilla/5.0 (Mac)","id":"&lt;brand&gt;"}</code></pre>');
+  });
+
+  it.each(['const x = 1', 'SELECT * FROM users', 'ls -la'])('renders %s on the opening fence line as code', (line) => {
+    const html = renderMarkdown('```' + line + '\n```');
+    expect(html).not.toContain('code-block-lang');
+    expect(html).toContain(`<pre><code>${line}</code></pre>`);
+  });
+
+  // An ambiguous attribute pattern backtracks exponentially and hangs here.
+  it('reads a long attribute-like fence line in linear time', () => {
+    const line = 'js' + ' a="b c=d"'.repeat(40) + ' !';
+    expect(renderMarkdown('```' + line + '\n```')).not.toContain('code-block-lang');
+  });
+
+  it('keeps the backslashes in code on the opening fence line', () => {
+    const html = renderMarkdown('```{"msg":"say \\"hi\\""}\n```');
+    expect(html).toContain('<pre><code>{"msg":"say \\"hi\\""}</code></pre>');
+  });
+
+  it('keeps the lines under a fence line that carries code', () => {
+    const html = renderMarkdown('```{\n  "a": 1\n}\n```');
+    expect(html).not.toContain('code-block-lang');
+    expect(html).toContain('<pre><code>{\n  "a": 1\n}</code></pre>');
+  });
+
   it('renders code blocks without language', () => {
     const html = renderMarkdown('```\nsome code\n```');
     expect(html).toContain('code-block-wrapper');

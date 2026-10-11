@@ -13,72 +13,22 @@ import type { InstalledPlugin, Loadable, MarketplacePlugin } from '../../store/t
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { LoadableError } from '../shared/LoadableError';
-import { ListSkeletonOf, useSkeleton, SkText, SkBlock, SkeletonProvider } from '../shared/Skeleton';
+import { ListSkeletonOf, useSkeleton, SkText, SkeletonProvider } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { refreshPluginCatalog, rescanPluginCatalogAndSettle } from '../../store/actions/plugin-marketplaces';
 import { installMarketplacePlugin } from '../../store/actions/plugin-install';
-import { loadInstalledPlugins } from '../../store/actions/plugins';
-import { openAppById } from '../../store/actions/apps';
-import { focusSpawnedThread } from '../../store/actions/threads';
-import { uninstallMarketplacePlugin } from '../../store/actions/plugin-uninstall';
-import { ProposeUpstreamButton } from './ProposeUpstreamButton';
+import { loadInstalledPlugins, openPluginDetail } from '../../store/actions/plugins';
+import { categoryLabel, PluginActions, PluginIcon, PluginMeta, PluginTitle } from './pluginCard';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
-import { contentLabel } from './pluginContent';
-import { NO_ENGINE_REQUIREMENT_CHIP, NO_ENGINE_REQUIREMENT_SENTENCE } from './engineRequirement';
 import { applyNavFocus } from '../shared/focusMarker';
 import { scrollBehavior } from '../../utils/motion';
-import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** Jump to Settings → Marketplaces from anywhere. One call: `openSettingsSubview`
  *  lands the Settings panel and the sub-section together, so the jump is a single
  *  nav-history entry (the same shape the navigate_ui settings deep link uses). */
 export function openMarketplaceSettings() {
   openSettingsSubview('marketplaces');
-}
-
-function statusLabel(plugin: MarketplacePlugin): string {
-  switch (plugin.status) {
-    case 'installed': return `Installed v${plugin.installed_version ?? plugin.version}`;
-    case 'update_available': return `Update from v${plugin.installed_version} to v${plugin.version}`;
-    case 'available': return `v${plugin.version}`;
-  }
-}
-
-function actionLabel(plugin: MarketplacePlugin): string {
-  return plugin.status === 'update_available' ? 'Update' : 'Install';
-}
-
-/** The card's primary button. Progresses Install/Update → Setup → Open:
- *  - not installed → Install (or Update for an out-of-date install), disabled
- *    with the engine's reason when this Lucidos cannot install that version
- *  - installed with an unfinished setup thread → Setup (opens that thread)
- *  - installed and setup done (or none) with an app → Open (launches it)
- *  - installed with nothing to open → no button; the status badge says it
- *  An out-of-date install always shows Update first, before Setup/Open. */
-type CardAction =
-  | { kind: 'install'; label: string; blockedReason?: string }
-  | { kind: 'setup'; threadId: string }
-  | { kind: 'open'; appId: string }
-  | { kind: 'none' };
-
-export function cardPrimaryAction(plugin: MarketplacePlugin): CardAction {
-  if (plugin.status !== 'installed') {
-    return {
-      kind: 'install',
-      label: actionLabel(plugin),
-      blockedReason: plugin.engine_compatible ? undefined : plugin.engine_incompatible_reason,
-    };
-  }
-  if (plugin.setup_thread_id && !plugin.setup_complete) {
-    return { kind: 'setup', threadId: plugin.setup_thread_id };
-  }
-  if (plugin.app_id) return { kind: 'open', appId: plugin.app_id };
-  return { kind: 'none' };
-}
-
-function fileCountLabel(count: number): string {
-  return `${count} ${count === 1 ? 'file' : 'files'}`;
 }
 
 /** Widths of the placeholder pills in the loading skeleton, one per label of a
@@ -139,19 +89,6 @@ export function StoreTabSkeleton() {
   );
 }
 
-/** Tooltip for the "Modified" badge, listing the changed paths (capped so the
- *  tooltip stays readable).
- *
- *  It used to warn that a future update would overwrite these changes. An
- *  update now merges them, so saying so would be exactly backwards. */
-function modifiedTooltip(paths?: string[]): string {
-  const base = 'You have locally changed this plugin. An update merges your changes into the new version where it can.';
-  if (!paths || paths.length === 0) return base;
-  const shown = paths.slice(0, 6).join(', ');
-  const more = paths.length > 6 ? `, +${paths.length - 6} more` : '';
-  return `${base} Changed: ${shown}${more}`;
-}
-
 function matchesQuery(plugin: MarketplacePlugin, query: string): boolean {
   if (!query) return true;
   return (
@@ -159,13 +96,6 @@ function matchesQuery(plugin: MarketplacePlugin, query: string): boolean {
     plugin.description.toLowerCase().includes(query) ||
     plugin.marketplace_name.toLowerCase().includes(query)
   );
-}
-
-/** Title-case a kebab-case category id for display: `developer-tools` →
- *  `Developer tools`. */
-function categoryLabel(category: string): string {
-  const spaced = category.replace(/-/g, ' ');
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
 /** Marks an orphan row's synthetic `marketplace_id`. The engine builds a real id
@@ -200,6 +130,7 @@ function orphanRow(p: InstalledPlugin): MarketplacePlugin {
     engine_requirement: p.engine_requirement,
     // Already installed, so there is nothing to install and nothing to block.
     engine_compatible: true,
+    media: p.media,
   };
 }
 
@@ -334,7 +265,7 @@ export function emptyCatalogMessage(scanning: boolean): string {
 
 /** The panel's refresh. The catalog half asks for a fresh scan: the
  *  mount's re-read returns the cached scan. */
-function refreshPluginsPanel(): Promise<unknown> {
+export function refreshPluginsPanel(): Promise<unknown> {
   return Promise.all([
     rescanPluginCatalogAndSettle(),
     loadInstalledPlugins(),
@@ -591,120 +522,30 @@ interface PluginStoreRowProps {
  *  SkeletonProvider (`<PluginStoreRow />`) it draws itself as a loading
  *  placeholder via the Sk* leaves; with real props it renders the catalog row
  *  normally. Props are optional only to support the skeleton call; real call
- *  sites pass them all. */
+ *  sites pass them all. A tap on the row opens the plugin detail page. */
 export function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<PluginStoreRowProps>) {
   const sk = useSkeleton();
-  // 'available' is the only not-yet-installed state; 'installed' and
-  // 'update_available' both mean the plugin is on disk → uninstallable.
-  const isInstalled = !!plugin && plugin.status !== 'available';
-  const busy = !!plugin && installingSource === plugin.source;
-  const action = plugin ? cardPrimaryAction(plugin) : { kind: 'none' as const };
-  let primary: { label: string; onClick: () => void; blockedReason?: string } | null = null;
-  switch (action.kind) {
-    case 'install':
-      primary = {
-        label: action.label,
-        onClick: () => plugin && void stageInstall?.(plugin),
-        blockedReason: action.blockedReason,
-      };
-      break;
-    case 'setup':
-      // The catalog surfaces this button for a present-or-queued setup thread;
-      // a gone one resolves to Open. A QUEUED one has no thread_summaries row
-      // at all. So a bootstrap fetch would 404, and a plain focusThread would
-      // be undone by ThreadView's stale-pointer cleanup and land on the compose
-      // view. `focusSpawnedThread` holds the focus until the row arrives,
-      // exactly as the confirm path in plugin-install.ts does.
-      primary = { label: 'Setup', onClick: () => focusSpawnedThread(action.threadId) };
-      break;
-    case 'open':
-      primary = { label: 'Open', onClick: () => void openAppById(action.appId) };
-      break;
-    case 'none':
-      break;
-  }
   return (
     <div
-      class="list-row app-store-plugin-row"
+      class={`list-row app-store-plugin-row${sk ? '' : ' clickable'}`}
       data-plugin-id={sk ? undefined : plugin?.id}
+      onClick={plugin ? () => openPluginDetail(plugin) : undefined}
     >
+      <div class="app-store-plugin-icon">
+        <PluginIcon plugin={plugin} />
+      </div>
       <div class="list-row-info">
-        <div class="app-store-plugin-title-row">
-          <SkText class="title list-row-name" w="9rem">{plugin?.name}</SkText>
-          {(sk || plugin) && (
-            <SkBlock w="5rem" h="1rem" round>
-              <GlyphBadge class={`app-store-status app-store-status-${plugin?.status}`}>
-                {plugin && statusLabel(plugin)}
-              </GlyphBadge>
-            </SkBlock>
-          )}
-          {plugin?.modified && (
-            <GlyphBadge class="app-store-modified-chip" data-tooltip={modifiedTooltip(plugin.modified_paths)}>
-              Modified
-            </GlyphBadge>
-          )}
-        </div>
+        <PluginTitle plugin={plugin} nameClass="title list-row-name" />
         {(sk || plugin?.description) && (
           <SkText class="app-store-plugin-description" as="div" w="18rem">{plugin?.description}</SkText>
         )}
-        <div class="app-store-plugin-meta">
-          {(sk || plugin?.marketplace_name) && (
-            <SkText w="6rem">{plugin?.marketplace_name}</SkText>
-          )}
-          <SkText w="3rem">{plugin && fileCountLabel(plugin.files_count)}</SkText>
-          {sk && <SkBlock w="4rem" h="1rem" round />}
-          {plugin?.content.map((kind) => (
-            <span class="label label-neutral" key={kind}>
-              {contentLabel(kind)}
-            </span>
-          ))}
-          {plugin?.categories.map((c) => (
-            <span class="label label-neutral" key={`cat-${c}`}>
-              {categoryLabel(c)}
-            </span>
-          ))}
-          {primary?.blockedReason && (
-            <span class="label label-warning" data-role="engine-requirement">
-              {primary.blockedReason}
-            </span>
-          )}
-          {plugin && plugin.engine_requirement == null && (
-            <span
-              class="label label-neutral"
-              data-role="engine-undeclared"
-              data-tooltip={NO_ENGINE_REQUIREMENT_SENTENCE}
-            >
-              {NO_ENGINE_REQUIREMENT_CHIP}
-            </span>
-          )}
-        </div>
+        <PluginMeta plugin={plugin} />
       </div>
-      <div class="list-row-actions">
-        {plugin?.modified && (
-          <ProposeUpstreamButton pluginId={plugin.id} pluginName={plugin.name} />
-        )}
-        {isInstalled && (
-          <button
-            class="action-btn action-btn-secondary"
-            type="button"
-            onClick={() => plugin && void uninstallMarketplacePlugin(plugin)}
-          >
-            Uninstall
-          </button>
-        )}
-        {(sk || primary) && (
-          <SkBlock w="4.5rem" h="2rem" round>
-            <button
-              class="action-btn"
-              type="button"
-              disabled={busy || !!primary?.blockedReason}
-              onClick={primary?.onClick}
-            >
-              {busy ? 'Staging' : primary?.label}
-            </button>
-          </SkBlock>
-        )}
-      </div>
+      <PluginActions
+        plugin={plugin}
+        busy={!!plugin && installingSource === plugin.source}
+        onInstall={stageInstall}
+      />
     </div>
   );
 }

@@ -288,9 +288,32 @@ fn legacy_rows_without_parent_tool_use_id_read_as_top_level() {
         text,
         ThreadEvent::CodingAgentTextStreamed {
             parent_tool_use_id: None,
+            progress_note: false,
             ..
         }
     ));
+}
+
+/// The flag is written only on a note, so prose payloads keep their shape.
+#[test]
+fn cc_text_progress_note_round_trips_and_is_omitted_on_prose() {
+    let event = |progress_note| ThreadEvent::CodingAgentTextStreamed {
+        text: "I mapped the flow.".into(),
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        parent_tool_use_id: None,
+        progress_note,
+    };
+    let note = serde_json::to_value(event(true)).unwrap();
+    assert_eq!(note["progress_note"], true);
+    assert!(matches!(
+        serde_json::from_value(note).unwrap(),
+        ThreadEvent::CodingAgentTextStreamed {
+            progress_note: true,
+            ..
+        }
+    ));
+    let prose = serde_json::to_value(event(false)).unwrap();
+    assert!(prose.get("progress_note").is_none());
 }
 
 #[test]

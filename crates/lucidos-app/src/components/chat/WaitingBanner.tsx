@@ -1,15 +1,14 @@
 import type { ComponentChildren } from 'preact';
-import { threadMap, focusedThreadId, getThreadDisplaySection, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, threadUnsettled, standingApplyThreadIds, armingStandingApplyThreadIds, setAsideChangeForThread } from '../../store/store';
+import { threadMap, focusedThreadId, getThreadDisplaySection, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, threadUnsettled, standingApplyThreadIds, armingStandingApplyThreadIds, setAsideChangeForThread, pendingChangeForThread } from '../../store/store';
 import { bringBackSingleChange, discardSingleChange } from '../../store/actions/chat-changes';
-import { resolveThreadActions, threadHasIncompleteChange, type TaggedAction } from '../../store/actions/threadActions';
+import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
 import { handleArchiveThread, handleUnarchiveThread, showBlockedToast } from '../../store/actions/threads';
 import { BLOCKER_REASON, isDescendantBlocker, type BlockedRefusal } from '../../store/actions/blockerCopy';
 import { exitItems, threadBlocker } from '../../store/actions/threadBlockers';
-import { continueStoppedThread } from './continueStoppedThread';
 import type { ThreadState } from '../../store/thread-events';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
-import { ArchiveIcon, CheckIcon, ContinuedIcon, DiffIcon, InboxIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
+import { ArchiveIcon, CheckIcon, CurrentIcon, DiffIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
 import type { HeaderActionSpec } from '../layout/headerActions';
 import type { OverflowMenuContext } from '../shared/OverflowMenu';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
@@ -46,9 +45,6 @@ type WaitingState =
       /** The thread's set-aside change, which the banner offers to bring back,
        *  and to discard unless the thread is unsettled. */
       setAside?: { changeId: string; discardable: boolean };
-      /** The pending change is incomplete, so Continue leads and Apply moves
-       *  into the caret menu (ADR 0346). */
-      incomplete?: boolean;
       /** An archived thread offers Move to Current where Archive was. */
       unarchive?: boolean;
       /** A sub-thread holds Archive back. The thread's own blockers already
@@ -139,11 +135,9 @@ export function getWaitingState(): WaitingState | null {
   }
   if (actions.length === 0 && !setAside && !unarchive && !blockedArchive) return null;
 
-  // The Diff button is shown only when the CC branch actually has a diff on
-  // disk (`codingAgentHasDiff` — single git-truth signal maintained by the
-  // backend projection + recovery sweep, computed by the SAME algorithm the
-  // Diff viewer renders). No diff → no button, so it can never drop the user
-  // into an empty diff. `getStandaloneActions` reads the same gate.
+  // The Diff button is shown only when the branch holds work (`hasCcDiff`), so
+  // it can never drop the user into an empty diff. `getStandaloneActions`
+  // reads the same gate.
   const showDiff = hasCcDiff(thread);
 
   return {
@@ -153,7 +147,6 @@ export function getWaitingState(): WaitingState | null {
     isArchiving: false,
     showDiff,
     setAside,
-    incomplete: threadHasIncompleteChange(focused),
     unarchive,
     blockedArchive,
   };
@@ -229,10 +222,7 @@ export function getBannerActions(state: BannerState): HeaderActionSpec[] {
     const others = state.actions
       .filter((a) => a !== applyAction)
       .sort((a, b) => Number(a.kind === 'discard') - Number(b.kind === 'discard'));
-    // An incomplete change is not ready to review, so the turn's own way
-    // forward leads and Apply, which confirms, joins the caret (ADR 0346).
-    const primary: SplitFace = state.incomplete ? continueFace(state.threadId) : applyFace(applyAction);
-    const menuActions = state.incomplete ? [applyAction, ...others] : others;
+    const primary = applyFace(applyAction);
     members.push({
       key: 'change-actions',
       label: primary.label,
@@ -241,13 +231,13 @@ export function getBannerActions(state: BannerState): HeaderActionSpec[] {
       render: (attrs) => (
         <ChangeActionSplitButton
           primary={primary}
-          menuActions={menuActions}
+          menuActions={others}
           attrs={{ ...attrs, 'data-thread-action': '' }}
         />
       ),
       menuRows: (ctx) => [
         faceMenuRow(primary, ctx),
-        ...menuActions.map((a) => actionMenuRow(a, ctx)),
+        ...others.map((a) => actionMenuRow(a, ctx)),
       ],
     });
     return members;
@@ -270,7 +260,7 @@ function unarchiveAction(threadId: string): HeaderActionSpec {
     key: 'unarchive',
     label: 'Move to Current',
     tooltip: UNARCHIVE_TOOLTIP,
-    icon: () => <InboxIcon />,
+    icon: () => <CurrentIcon />,
     extraClass: PROTECTED_SURFACE,
     render: (attrs) => (
       <button
@@ -348,9 +338,16 @@ export function getStandaloneActions(): HeaderActionSpec[] {
 }
 
 /** The one Diff gate, shared by the banner and the standalone row so both
- *  surfaces show and hide Diff together. */
+ *  surfaces show and hide Diff together. It shows while the branch holds work.
+ *  A pending change the engine emptied still reads `proposed`, so its file
+ *  list is what hides Diff there (ADR 0400). */
 function hasCcDiff(thread: ThreadState): boolean {
-  return thread.meta.channel === 'claude_code' && thread.meta.codingAgentHasDiff;
+  if (thread.meta.channel !== 'claude_code') return false;
+  switch (thread.meta.codingAgentChangeState.kind) {
+    case 'none': return false;
+    case 'unproposed': return true;
+    case 'proposed': return pendingChangeForThread(thread.meta.id)?.file_count !== 0;
+  }
 }
 
 function diffAction(threadId: string): HeaderActionSpec {
@@ -520,15 +517,12 @@ function closeSetAction(action: TaggedAction): HeaderActionSpec {
   };
 }
 
-const CONTINUE_TOOLTIP =
-  'The turn that made this change did not finish. Continue resumes it. Apply, Set aside and Discard are in the menu.';
-
 /** The one-tap face of the change split button. */
 interface SplitFace {
   key: string;
   label: string;
   tooltip: string;
-  /** The face's colour: green for Apply, the neutral blue for Continue. */
+  /** The face's button classes, which set its colour. */
   className: string;
   icon: () => ComponentChildren;
   invoke: () => void | Promise<unknown>;
@@ -542,17 +536,6 @@ function applyFace(apply: TaggedAction): SplitFace {
     className: 'action-btn action-btn-confirm',
     icon: () => <CheckIcon />,
     invoke: apply.invoke,
-  };
-}
-
-function continueFace(threadId: string): SplitFace {
-  return {
-    key: 'continue',
-    label: 'Continue',
-    tooltip: CONTINUE_TOOLTIP,
-    className: 'action-btn',
-    icon: () => <ContinuedIcon />,
-    invoke: () => continueStoppedThread(threadId),
   };
 }
 
@@ -572,8 +555,8 @@ function faceMenuRow(face: SplitFace, ctx: OverflowMenuContext) {
   );
 }
 
-/** Change-action split button: a one-tap face (Apply / Apply*, or Continue for
- *  an incomplete change) plus a caret menu holding the remaining close-set
+/** Change-action split button: a one-tap face (Apply / Apply*) plus a caret
+ *  menu holding the remaining close-set
  *  actions. Diff is NOT in here: it lives permanently outside this cluster as
  *  its own member of `getBannerActions`. It is built on the generic
  *  `SplitButton`, the control behind the prompt's multi-select answer Submit.

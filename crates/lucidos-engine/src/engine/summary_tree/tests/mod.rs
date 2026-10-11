@@ -3,6 +3,7 @@
 //! (I1, I3, I8, I9) run against a real Postgres on a scripted model.
 
 mod browse_tests;
+mod compaction_view_tests;
 mod compactor_tests;
 mod fold_tests;
 mod log_tests;
@@ -126,9 +127,9 @@ impl LlmProvider for EchoProvider {
         }
         let request = messages[0].content.as_text();
         let step = request
-            .split_once("bytes:\n")
-            .and_then(|(_, rest)| rest.rsplit_once("bytes:\n"))
-            .map(|(_, step)| step.to_string())
+            .rsplit_once("<input>\n")
+            .and_then(|(_, rest)| rest.rsplit_once("\n</input>"))
+            .map(|(input, _)| input.to_string())
             .unwrap_or(request.clone());
         if step.contains("POISON") {
             return Err("the model refused".into());
@@ -159,11 +160,12 @@ pub(super) fn line_response(line: String) -> LlmResponse {
         input_tokens: Some(100),
         cache_creation_tokens: None,
         cache_read_tokens: None,
+        served_model: None,
         thinking_chars: None,
         thinking_blocks: None,
         unknown_sse_dropped: 0,
         model_only_text: None,
-        content_is_progress_notes: false,
+        progress_notes: Vec::new(),
     }
 }
 
@@ -216,9 +218,14 @@ pub(super) fn deps_with(provider: Arc<EchoProvider>) -> Arc<TestDeps> {
     })
 }
 
+/// The size is shown by a ruler with nothing on it to copy, beside the input.
 #[test]
-fn the_scale_line_is_exactly_the_node_size() {
-    assert_eq!(super::prompt::SCALE.len(), super::NODE_BYTES);
+fn the_ruler_is_exactly_the_node_size() {
+    let ruler = super::prompt::ruler();
+    assert_eq!(ruler.len(), super::NODE_BYTES);
+    assert!(ruler.chars().all(|c| c == '-'));
+    assert!(super::prompt::compress_step("m").contains(&format!("{ruler}\n<input>\nm\n</input>")));
+    assert!(super::prompt::merge_step("a", "b").contains(&ruler));
 }
 
 /// The partial index only serves a query whose literal list matches it.

@@ -7,7 +7,9 @@ description: Use when the user wants Lucidos set up around their own life rather
 
 Interview the user about their life, then **build them a real starting kit in
 this session**. Not a plan, a tour or a list of features: apps, triggers and
-knowhow that exist in their workspace when the thread ends.
+knowhow that exist in their workspace when the interview ends. It usually runs
+in the *home thread*, which never ends, so the interview's end is yours to
+mark: say what you built and stop asking.
 
 **This is not a job interview.** Work is one area, and the ladder drifts toward
 it if you let it. Personal admin, health and training, learning, a side project

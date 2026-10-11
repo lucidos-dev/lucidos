@@ -1,15 +1,14 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import {
-  resolveOrigin,
   executorExtras,
   resolveThreadLinkTitle,
   renderChannelSection,
   renderEngineExplainerSection,
   renderExecutorSection,
   renderOriginSection,
-  originPopoverHasContent,
 } from './MessageRoutePanel';
+import { originPopoverHasContent, resolveOrigin } from './messageOrigin';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { appsList, contextViewer, repositories } from '../../store/store';
 import { devices } from '../../store/actions/devices';
@@ -669,10 +668,10 @@ describe('Technical details', () => {
     withoutTechnical(renderOriginSection(exch(userEvent), undefined, () => undefined));
 
   it('holds the raw event type, which no other line of the panel shows', () => {
-    const { body, technical } = section({ type: 'UserPromptInjected', text: 'x', mode: 'human', origin: { kind: 'device', device_id: 'd1' } });
+    const { body, technical } = section({ type: 'PromptInjected', text: 'x', mode: 'human', origin: { kind: 'device', device_id: 'd1' } });
     expect(technical).toContain('Event type');
-    expect(technical).toContain('UserPromptInjected');
-    expect(body).not.toContain('UserPromptInjected');
+    expect(technical).toContain('PromptInjected');
+    expect(body).not.toContain('PromptInjected');
   });
 
   it('holds the ids and client strings an origin carried, and only there', () => {
@@ -846,7 +845,7 @@ describe('an event wait re-entry says where its words came from', () => {
 
   it('names the engine, what the agent waited for, and the story', () => {
     const s = origin({
-      type: 'UserPromptInjected', text: 'A subscription you registered has timed out.', mode: 'agent',
+      type: 'PromptInjected', text: 'A subscription you registered has timed out.', mode: 'agent',
       origin: { kind: 'engine', reason: { kind: 'event_wait', outcome: 'expired', watched: ['BenchSlotReleased'], wait_reason: 'the bench slot' } },
     });
     expect(s).toContain('Issued by');
@@ -861,8 +860,8 @@ describe('an event wait re-entry says where its words came from', () => {
   // Rows from before the engine stamped an origin: every delivery and expiry
   // in a real workspace read "Unknown" here.
   it.each([
-    { type: 'UserPromptInjected', text: 'A subscription you registered has timed out.\n\nTimed out.', mode: 'agent' },
-    { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived (you were waiting because: x).', mode: 'agent', delivered_event_id: 'e1' },
+    { type: 'PromptInjected', text: 'A subscription you registered has timed out.\n\nTimed out.', mode: 'agent' },
+    { type: 'PromptInjected', text: 'An event you subscribed to has arrived (you were waiting because: x).', mode: 'agent', delivered_event_id: 'e1' },
   ] as StoredEvent[])('an older re-entry anchor still names the engine and why', (userEvent) => {
     const s = origin(userEvent);
     expect(s).toContain('Lucidos Engine');
@@ -885,6 +884,7 @@ const EVERY_ENGINE_REASON: { [K in EngineReason['kind']]: Extract<EngineReason, 
   archived_branch_work: { kind: 'archived_branch_work' },
   merge_conflict: { kind: 'merge_conflict' },
   missing_hardening: { kind: 'missing_hardening' },
+  missing_plan: { kind: 'missing_plan' },
   plugin_auto_update: {
     kind: 'plugin_auto_update', plugin_id: 'habit-tracker', marketplace_id: 'm1', marketplace_name: 'Example Market',
   },
@@ -1151,7 +1151,7 @@ describe('route rows contribute exactly two grid cells', () => {
     };
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', icon: '\u{1F9ED}' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', kind: 'app', reusable: false, icon: '\u{1F9ED}' }],
     };
     const created = '2026-08-10T12:00:00.000Z';
     const userEvent: StoredEvent = { type: 'MessageReceived', text: 'go', created };
@@ -1277,7 +1277,7 @@ describe('the App row names its app in ordinary value text', () => {
   it('gives the name no class of its own', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', icon: '\u{1F9ED}' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', kind: 'app', reusable: false, icon: '\u{1F9ED}' }],
     };
     expect(appNameSpan(render()).props.class).toBeUndefined();
   });

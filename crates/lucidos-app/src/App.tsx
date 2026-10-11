@@ -41,6 +41,7 @@ import { scaleModalOpen } from './components/shared/scaleModalState';
 import { releaseNoticeModalOpen } from './store/releaseNotices';
 import { viewportIsMobile } from './utils/viewport';
 import { CameraCaptureSlot } from './components/chat/PromptInput';
+import { WidgetWindows } from './components/widgets/WidgetWindows';
 
 // Re-exported so it ships in the shell chunk, which `main.tsx` runs it from.
 export { startShell } from './shellStartup';
@@ -167,6 +168,7 @@ export function App() {
         <ReleaseNoticeSlot />
         <SearchEverywhereSlot />
         <CameraCaptureSlot />
+        <WidgetWindows />
       </OverlayLayer>
       <DropZone />
       <UiBlockingOverlay />

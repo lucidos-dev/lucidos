@@ -38,8 +38,9 @@ import { composerBannerState, getBannerActions, getWaitingState, getStandaloneAc
 import { composeHasContent, sideQuestionModeActive, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, type UploadSendIntent } from './prompt-input-helpers';
 import { canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting } from '../../store/canceledQuestions';
 import { SplitButton } from '../shared/SplitButton';
+import { NotReadyStrip } from './NotReadyStrip';
 export * from './prompt-input-helpers';
-import { composeHandlers } from './promptFocus';
+import { composeHandlers } from './composeHandlers';
 import { focusIfNeeded } from '../../utils/dom';
 import { threadEntryFocusTarget } from './choiceCardNav';
 import { focusIntoPane } from '../layout/paneFocus';
@@ -217,10 +218,10 @@ export function CameraCaptureSlot() {
 
 /** The WIP app preview toggle, or null on a thread that has nothing to preview.
  *
- *  It stands whenever the focused thread is an app coding-agent thread with an
- *  in-flight diff. `codingAgentHasDiff` is the same git-truth signal the Diff
- *  button reads, and it clears when the worktree is removed. So the toggle can
- *  never point at a gone worktree.
+ *  It stands whenever the focused thread is an app coding-agent thread whose
+ *  branch holds work, proposed or not (`codingAgentChangeState`). The state
+ *  falls to `none` when the worktree is removed, so the toggle can never point
+ *  at a gone worktree.
  *
  *  NOT gated on the app already being open. The preview swaps the app's
  *  panel-overlay iframe, so gating it would strand a user reviewing the change
@@ -233,7 +234,7 @@ export function CameraCaptureSlot() {
  *  SSE handlers call `clearWipIfMatches`). */
 function wipPreviewAction(ft: ThreadState | undefined): HeaderActionSpec | null {
   if (!ft || ft.meta.codingAgentKind !== 'app') return null;
-  if (!ft.meta.codingAgentHasDiff) return null;
+  if (ft.meta.codingAgentChangeState.kind === 'none') return null;
   const folder = ft.meta.codingAgentFolder;
   const appId = folder ? folder.split('/').filter(Boolean).pop() : undefined;
   if (!appId) return null;
@@ -1658,6 +1659,7 @@ export function PromptInput() {
           </button>
         </div>
       </Disclosure>
+      <NotReadyStrip key="not-ready" />
       <div key="prompt-box" class="prompt-box">
         <div class="prompt-row">
           <textarea

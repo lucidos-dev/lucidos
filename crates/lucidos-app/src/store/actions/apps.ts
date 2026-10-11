@@ -1,7 +1,9 @@
+import type { WidgetParams } from '../../utils/widgetParams';
 import {
   appsList,
   currentApp,
   currentAppFragment,
+  currentAppParams,
   panelOverlay,
   closeInlineForm,
   pendingChatMessage,
@@ -18,13 +20,16 @@ import {
 import { nativeFullscreenElement } from '../appFullscreenHost';
 import { APP_FRAME_ISOLATED } from '../../components/apps/appFrameSandbox';
 import { askFrame } from './app-bridge';
+import { CANVAS_APP_FRAME_SELECTOR } from '../../utils/appFrame';
+import { reloadWidgetFrames } from '../widgets';
 
-/** How long a capture may take. `html2canvas` can hang on an external resource,
+/** How long a capture may take. Embedding a slow font or image can stall it,
  *  and an isolated frame can hang on being wedged. Same deadline either way. */
 const CAPTURE_TIMEOUT_MS = 5_000;
 import { clearWipIfMatches } from './wipPreview';
 import { toFailed, setLoadingIfFresh } from '../types';
 import type { App } from '../types';
+import type { CaptureFormat } from '../../generated/thread-event-wire';
 import { revealContentPane } from './pane';
 import {
   ApiError,
@@ -35,11 +40,13 @@ import {
   appUrl,
   postAppCapture,
   retryTransientRead,
+  getAppApi,
+  recordAppOpenedApi,
 } from '../../api/client';
 import { pushNavState, replaceNavState } from './navigation';
 import { setAppFrameHash } from '../../components/apps/iframeNav';
 import { openPluginUninstallRequest } from './plugin-uninstall';
-import { isElementVisible } from '../../components/chat/scrollState';
+import { isElementVisible } from '../../utils/elementVisibility';
 import { errorDetail } from '../../utils/errorDetail';
 import { openExternal } from '../../utils/tauri';
 
@@ -100,15 +107,34 @@ async function loadAppsInner(): Promise<void> {
         if (saved) {
           panelOverlay.value = { type: 'app-ui', app: saved };
         } else {
-          // App was deleted while not open here, so drop the stale pointer and
-          // the next reload won't keep probing for a missing id.
-          localStorage.removeItem('app-window-open');
+          void restoreOpenWidget(savedAppId);
         }
       }
     }
   } catch (error) {
     appsList.value = toFailed(error);
   }
+}
+
+/** The reload restore for an id the apps list does not hold. A widget open in
+ *  Canvas is one (ADR 0402), so it is read by id. Anything else was deleted
+ *  while not open here, so the stale pointer goes and the next reload stops
+ *  probing for it. */
+async function restoreOpenWidget(appId: string): Promise<void> {
+  try {
+    const app = await getAppApi(appId);
+    // The user opened something else meanwhile, and that wrote its own pointer.
+    if (currentApp.value) return;
+    if (app.kind === 'widget') {
+      panelOverlay.value = { type: 'app-ui', app };
+      return;
+    }
+  } catch (error) {
+    // Only a definite "not found" retires the pointer. A transient failure
+    // keeps it, so the next reload tries again.
+    if (!(error instanceof ApiError && error.httpCode === 404)) return;
+  }
+  localStorage.removeItem('app-window-open');
 }
 
 /** Open an app, optionally at an app fragment (docs/glossary.md): the place
@@ -124,19 +150,33 @@ async function loadAppsInner(): Promise<void> {
  *  `history.replaceState` leaves the src identical, so re-clicking the link the
  *  reader arrived on would otherwise deliver nothing. `setAppFrameHash` is
  *  idempotent, so the two writers cannot fight. */
-export function openApp(app: App, fragment?: string): void {
+export function openApp(app: App, fragment?: string, params?: WidgetParams): void {
   const wasOpen = currentApp.value?.id === app.id;
-  panelOverlay.value = { type: 'app-ui', app, fragment };
+  panelOverlay.value = { type: 'app-ui', app, fragment, params };
   cancelPendingRefresh();
   if (appRefreshKey.value) appRefreshKey.value = 0;
   localStorage.setItem('app-window-open', app.id);
   revealContentPane();
   pushNavState();
-  if (!wasOpen) return;
+  if (!wasOpen) {
+    recordAppOpened(app);
+    return;
+  }
   replaceNavState();
   if (!fragment) return;
   const frame = getVisibleAppFrame();
   if (frame) setAppFrameHash(frame, fragment);
+}
+
+/** One `AppOpened` per real open of an app UI (ADR 0413). Only `openApp`
+ *  calls it: a reload restore and a history step set the panel directly, and
+ *  a widget is shown rather than opened. Losing one record costs a little
+ *  evidence, so a failure is logged, never shown. */
+function recordAppOpened(app: App): void {
+  if (app.kind === 'widget') return;
+  recordAppOpenedApi(app.id).catch((error) => {
+    console.warn(`[apps] could not record opening ${app.id}: ${errorDetail(error)}`);
+  });
 }
 
 /** Open an app by ID — loads apps first if needed, then opens.
@@ -196,7 +236,17 @@ export async function openAppById(
   }
   if (app) {
     openApp(app, fragment);
-  } else {
+    return;
+  }
+  // The apps list never holds a widget (ADR 0402), so read the id itself
+  // before calling it gone. This is how `navigate_ui` opens one in Canvas.
+  try {
+    openApp(await getAppApi(appId), fragment);
+  } catch (error) {
+    if (!(error instanceof ApiError && error.httpCode === 404)) {
+      showToast(`Couldn't open app "${appId}"${from}: ${errorDetail(error)}`, 'error');
+      return;
+    }
     // Disk re-scanned and the app genuinely isn't there. Name the id + source
     // so the user knows what was missing and where the navigate came from.
     console.warn(`[apps] navigate to missing app "${appId}"${from}`);
@@ -310,6 +360,8 @@ export async function refreshAppUI(appId?: string, options: RefreshAppUiOptions 
   // Predicate gates on the *requested* appId (closure arg) — using
   // currentApp.id wouldn't fire when no app is open.
   const refreshedAppId = appId ?? currentApp.value?.id;
+  // A dropped open widget showing this id reloads too (ADR 0402).
+  if (refreshedAppId) reloadWidgetFrames(refreshedAppId);
   if (refreshedAppId && !options.preserveWip) {
     clearWipIfMatches((wipTid) => {
       const wipThread = threadMap.value.get(wipTid);
@@ -376,7 +428,7 @@ export function getAppFrameSrc(): string | null {
   // WIP preview (an app coding-agent thread's worktree) vs. the live workspace
   // copy. When no preview thread is set, serve live.
   const tid = wipPreviewThreadId.value;
-  return appUrl(app.id, tid ?? undefined, currentAppFragment.value ?? undefined);
+  return appUrl(app.id, tid ?? undefined, currentAppFragment.value ?? undefined, currentAppParams.value);
 }
 
 /** Open the app that's in the content pane as a top-level page of its own,
@@ -411,14 +463,16 @@ export function popOutApp(): void {
   );
 }
 
-export async function captureAppUI(appId: string, requestId: string): Promise<void> {
+/** Capture the open app for the agent. With `saveFormat`, the frame renders a
+ *  sharp picture in that format, which the engine saves as a file. */
+export async function captureAppUI(appId: string, requestId: string, saveFormat?: CaptureFormat): Promise<void> {
   // Safety-net: ensure we always respond before the backend's 10s timeout
   const deadline = new Promise<never>((_, reject) =>
     setTimeout(() => reject(new Error('Frontend capture deadline exceeded (8s)')), 8_000),
   );
 
   try {
-    await Promise.race([captureAppUIInner(appId, requestId), deadline]);
+    await Promise.race([captureAppUIInner(appId, requestId, saveFormat), deadline]);
   } catch (err) {
     // Telemetry carve-out (.claude/rules/frontend.md): the user-facing error
     // surface for capture is the LLM — postAppCapture below delivers it to
@@ -430,10 +484,13 @@ export async function captureAppUI(appId: string, requestId: string): Promise<vo
   }
 }
 
-async function captureAppUIInner(appId: string, requestId: string): Promise<void> {
+async function captureAppUIInner(appId: string, requestId: string, saveFormat?: CaptureFormat): Promise<void> {
   const iframe = getVisibleAppFrame();
 
   if (!iframe) {
+    // A hidden tab stays silent. It shares the device id of the visible one,
+    // which may have the app open, and its quick "no app" would win the race.
+    if (document.visibilityState !== 'visible') return;
     await postAppCapture(requestId, '', 'Error: No app UI is currently open. Ask the user to open the app, or use navigate_ui (target=app-ui) first. refresh_app no longer opens.');
     return;
   }
@@ -449,7 +506,7 @@ async function captureAppUIInner(appId: string, requestId: string): Promise<void
   await new Promise(r => setTimeout(r, 50));
 
   // An isolated frame denies `contentWindow.lucidos`, so it captures itself and
-  // sends the pair back. `html2canvas` runs inside the frame over the frame's
+  // sends the pair back. The capture runs inside the frame over the frame's
   // own DOM either way, so only who calls it changes.
   //
   // The retry loop is what the reach-in path needed, for an SDK that has not
@@ -460,14 +517,14 @@ async function captureAppUIInner(appId: string, requestId: string): Promise<void
   let result: CaptureResult;
   if (APP_FRAME_ISOLATED) {
     try {
-      result = await askFrame(iframe, 'capture', {}, CAPTURE_TIMEOUT_MS) as CaptureResult;
+      result = await askFrame(iframe, 'capture', { format: saveFormat }, CAPTURE_TIMEOUT_MS) as CaptureResult;
     } catch (e) {
       await postAppCapture(requestId, '', `Error: ${errorDetail(e)}`);
       return;
     }
   } else {
     // Wait for lucidos._capture to become available (iframe may still be loading)
-    type LucidosCaptureApi = { _capture: () => Promise<CaptureResult> };
+    type LucidosCaptureApi = { _capture: (format?: CaptureFormat) => Promise<CaptureResult> };
     type LucidosWindow = Window & { lucidos?: Partial<LucidosCaptureApi> };
     let lucidosApi: LucidosCaptureApi | null = null;
     for (let i = 0; i < 15; i++) {
@@ -484,19 +541,20 @@ async function captureAppUIInner(appId: string, requestId: string): Promise<void
       return;
     }
 
-    // Timeout the actual capture (html2canvas can hang on external resources)
+    // Bound the capture itself, which waits on every font and image it embeds.
     const captureTimeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('html2canvas capture timed out (5s)')), CAPTURE_TIMEOUT_MS),
+      setTimeout(() => reject(new Error('capture timed out (5s)')), CAPTURE_TIMEOUT_MS),
     );
-    result = await Promise.race([lucidosApi._capture(), captureTimeout]);
+    result = await Promise.race([lucidosApi._capture(saveFormat), captureTimeout]);
   }
   await postAppCapture(requestId, result.screenshot, mismatchNote + result.dom);
 }
 
-/** Find the visible app-ui iframe — tolerates transient duplicates during a
- *  layout swap by preferring non-zero dimensions. */
+/** Find the visible Canvas app iframe, never a shelf widget's. Tolerates
+ *  transient duplicates during a layout swap by preferring non-zero
+ *  dimensions. */
 export function getVisibleAppFrame(): HTMLIFrameElement | null {
-  const frames = document.querySelectorAll('[data-role="app-ui-frame"]') as NodeListOf<HTMLIFrameElement>;
+  const frames = document.querySelectorAll<HTMLIFrameElement>(CANVAS_APP_FRAME_SELECTOR);
   let fallback: HTMLIFrameElement | null = null;
   for (const frame of frames) {
     if (!frame.contentWindow) continue;

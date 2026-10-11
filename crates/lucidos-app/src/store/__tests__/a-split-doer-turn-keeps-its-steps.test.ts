@@ -420,7 +420,7 @@ describe('an injection absorbed after the caller spoke', () => {
         _eventId: MSG,
       }),
       heard(5, 'Are you still there?'),
-      ev(6, { type: 'UserPromptInjected', text: 'How long will the release take?', mode: 'engine', injected_message_id: MSG }),
+      ev(6, { type: 'PromptInjected', text: 'How long will the release take?', mode: 'engine', injected_message_id: MSG }),
       said(7, 'Still working on it.'),
       // A quarter of a minute later, which is a second remark rather than the
       // same breath cut in two.
@@ -453,7 +453,7 @@ describe('an injection absorbed after the caller spoke', () => {
         summary: 'Done.',
       }),
       heard(6, 'Are you still there?'),
-      ev(7, { type: 'UserPromptInjected', text: 'How long will the release take?', mode: 'engine', injected_message_id: MSG }),
+      ev(7, { type: 'PromptInjected', text: 'How long will the release take?', mode: 'engine', injected_message_id: MSG }),
     ]);
     expect(groupIntoExchanges(events).map(e => e.userEvent.type)).toEqual([
       'SpokenReplyGenerated',
@@ -496,7 +496,7 @@ describe('an injection absorbed after the caller spoke', () => {
   // by name.
   it('keeps the turn on the message and the speech at the bottom', () => {
     const exchanges = groupIntoExchanges(theCall());
-    expect(stepTypes(exchanges[1])).toEqual(['UserPromptInjected']);
+    expect(stepTypes(exchanges[1])).toEqual(['PromptInjected']);
     expect(stepTypes(exchanges[2])).toEqual([
       'SpokenReplyGenerated',
       'SpokenReplyGenerated',

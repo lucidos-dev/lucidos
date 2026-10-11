@@ -19,7 +19,9 @@
 
 mod capture;
 
-pub(crate) use capture::{auxiliary_capture, usage_from_provider, usage_from_response, AuxCapture};
+pub(crate) use capture::{
+    auxiliary_capture, usage_from_provider, usage_from_response, AuxCapture, CallDetail,
+};
 
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
@@ -128,20 +130,32 @@ pub(crate) async fn turn_chat(
         on_token,
     )
     .await?;
-    let (model, usage) = slot.0.into_inner().unwrap_or_else(|p| p.into_inner());
+    let TurnCall {
+        model,
+        usage,
+        served_model,
+    } = slot.0.into_inner().unwrap_or_else(|p| p.into_inner());
     let capture = TurnCapture {
         bus: bus.clone(),
         thread_id,
         model,
         usage,
+        served_model,
         finished: false,
     };
     Ok((response, capture))
 }
 
-/// Holds what a turn's call cost until [`TurnCapture`] records it.
+/// What a turn's call reported, held until [`TurnCapture`] records it.
 #[derive(Default)]
-struct TurnSlot(std::sync::Mutex<(String, Option<ApiUsage>)>);
+struct TurnCall {
+    model: String,
+    usage: Option<ApiUsage>,
+    served_model: Option<String>,
+}
+
+#[derive(Default)]
+struct TurnSlot(std::sync::Mutex<TurnCall>);
 
 #[async_trait::async_trait]
 impl CostSink for TurnSlot {
@@ -150,7 +164,11 @@ impl CostSink for TurnSlot {
             Reported::Chat(response) => usage_from_response(response),
             _ => None,
         };
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = (cost.model.to_string(), usage);
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = TurnCall {
+            model: cost.model.to_string(),
+            usage,
+            served_model: cost.reported.served_model().map(str::to_string),
+        };
     }
 }
 
@@ -164,6 +182,7 @@ pub(crate) struct TurnCapture {
     thread_id: Uuid,
     model: String,
     usage: Option<ApiUsage>,
+    served_model: Option<String>,
     finished: bool,
 }
 
@@ -174,14 +193,15 @@ impl TurnCapture {
     }
 
     /// Emit the round's row. `build` receives the usage the provider reported
-    /// and returns the `ContextCaptured` to persist.
+    /// and the *served model* its reply named, and returns the
+    /// `ContextCaptured` to persist.
     pub(crate) async fn finish(
         mut self,
         meta: EventMeta,
-        build: impl FnOnce(Option<ApiUsage>) -> ThreadEvent,
+        build: impl FnOnce(Option<ApiUsage>, Option<String>) -> ThreadEvent,
     ) {
         self.finished = true;
-        let event = build(self.usage.take());
+        let event = build(self.usage.take(), self.served_model.take());
         self.bus
             .emit_or_log(
                 BusEvent::Thread {
@@ -222,6 +242,7 @@ impl Drop for TurnCapture {
             api_call_id: None,
             reasoning_effort: None,
             duration_ms: None,
+            served_model: self.served_model.take(),
         };
         runtime.spawn(async move {
             bus.emit_or_log(

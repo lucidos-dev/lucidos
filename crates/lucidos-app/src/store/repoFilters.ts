@@ -11,7 +11,7 @@ import {
   CODING_AGENT_CHANNEL,
 } from './store';
 import { toggleChannel } from './triggerFilters';
-import { appFilterOptions } from './appFilters';
+import { appFilterOptions, widgetFilterOptions } from './appFilters';
 import { loadedOr } from './types';
 import { visibleFilterOptions } from './deletedFilterOptions';
 
@@ -73,8 +73,7 @@ export const repoFilterOptionsAll = computed<RepoFilterOption[]>(() => {
 });
 
 /** The visible slice: unselected deleted entries dropped unless the user opts in
- *  (`visibleFilterOptions`), which is also what `deletedOptionsHidden` reports
- *  on. */
+ *  (`visibleFilterOptions`). */
 export const repoFilterOptions = computed<RepoFilterOption[]>(() =>
   visibleFilterOptions(repoFilterOptionsAll.value, selectedRepoIds.value));
 
@@ -93,7 +92,8 @@ export function toggleRepoId(id: string): void {
 export function toggleCodingAgentChannel(): void {
   const channelOn = threadChannelFilter.value.has(CODING_AGENT_CHANNEL);
   const hasSelection = selectedRepoIds.value.size + selectedAppIds.value.size > 0;
-  const lockstep = repoFilterOptions.value.length + appFilterOptions.value.length === 1;
+  const lockstep = repoFilterOptions.value.length + appFilterOptions.value.length
+    + widgetFilterOptions.value.length === 1;
   if (channelOn && hasSelection && !lockstep) {
     setSelectedRepoIds(new Set());
     setSelectedAppIds(new Set());

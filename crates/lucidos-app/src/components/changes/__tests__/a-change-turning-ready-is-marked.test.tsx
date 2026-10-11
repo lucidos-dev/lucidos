@@ -35,6 +35,8 @@ function makeChange(over: Partial<Change> = {}): Change {
     files: ['a.rs'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-01-01T00:00:00Z',
     resolved_at: null,
@@ -47,7 +49,7 @@ function makeChange(over: Partial<Change> = {}): Change {
   };
 }
 
-const working = makeChange({ id: 'working', description: 'Working', thread_unsettled: true, thread_settling: true });
+const working = makeChange({ id: 'working', description: 'Working', thread_unsettled: true, apply_ready: false, thread_settling: true });
 const ready = makeChange({ id: 'ready', description: 'Ready one', thread_id: 'thread-2' });
 
 let host: HTMLDivElement;
@@ -86,15 +88,31 @@ describe('a change turning ready', () => {
   });
 
   it('wears the arrival marker once it lands in Ready', async () => {
-    await serve([ready, { ...working, thread_unsettled: false, thread_settling: false }]);
+    await serve([ready, { ...working, thread_unsettled: false, apply_ready: true, thread_settling: false }]);
     expect(isMarked('Working')).toBe(true);
     expect(isMarked('Ready one')).toBe(false);
   });
 
   it('is not marked when it turned ready while the panel was shut', async () => {
     await act(() => { render(null, host); });
-    await serve([ready, { ...working, thread_unsettled: false, thread_settling: false }]);
+    await serve([ready, { ...working, thread_unsettled: false, apply_ready: true, thread_settling: false }]);
     await act(() => { render(<ChangesView />, host); });
     expect(isMarked('Working')).toBe(false);
+  });
+});
+
+describe('a change leaving Ready', () => {
+  it('is not marked when it drops back to Not finished', async () => {
+    // A merge conflict or a resumed thread sends a Ready change back. It was
+    // already in the list, so it is no arrival.
+    await serve([{ ...ready, thread_unsettled: true, apply_ready: false, resolving_conflict: true }, working]);
+    expect(rowFor('Ready one')).not.toBeNull();
+    expect(isMarked('Ready one')).toBe(false);
+  });
+
+  it('still marks a brand-new change that lands in Not finished', async () => {
+    const fresh = makeChange({ id: 'fresh', description: 'Fresh', thread_id: 'thread-3', thread_unsettled: true, apply_ready: false, thread_settling: true });
+    await serve([ready, working, fresh]);
+    expect(isMarked('Fresh')).toBe(true);
   });
 });

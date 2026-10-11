@@ -27,12 +27,13 @@ new_repo() {
     git -C "$dir" config user.name  Test
 
     mkdir -p "$dir/crates/lucidos-engine/src" "$dir/crates/lucidos-app/src" \
-             "$dir/packages/lucidos-sdk/src" "$dir/system-knowhow" \
+             "$dir/packages/lucidos-sdk/src" "$dir/system-knowhow" "$dir/system-widgets/w" \
              "$dir/scripts/lib" "$dir/docs"
     printf 'fn main() {}\n'        > "$dir/crates/lucidos-engine/src/main.rs"
     printf 'export const x = 1;\n' > "$dir/crates/lucidos-app/src/App.tsx"
     printf 'export const s = 1;\n' > "$dir/packages/lucidos-sdk/src/index.ts"
     printf '# knowhow\n'           > "$dir/system-knowhow/guide.md"
+    printf '<h1>w\n'               > "$dir/system-widgets/w/index.html"
     printf 'lock\n'                > "$dir/Cargo.lock"
     printf '[workspace]\n'         > "$dir/Cargo.toml"
     printf '{}\n'                  > "$dir/package.json"
@@ -127,7 +128,7 @@ rm -rf "$REPO"
 echo "test: each tracked compiled-input path changes the fingerprint"
 for target in Cargo.lock Cargo.toml package.json package-lock.json \
               packages/lucidos-sdk/src/index.ts system-knowhow/guide.md \
-              crates/lucidos-app/src/App.tsx; do
+              system-widgets/w/index.html crates/lucidos-app/src/App.tsx; do
     REPO="$(new_repo)"
     BEFORE="$(release_build_fingerprint_compute "$REPO")"
     printf 'mutated\n' >> "$REPO/$target"

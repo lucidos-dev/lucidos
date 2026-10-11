@@ -35,7 +35,10 @@ import { fileURLToPath } from 'node:url';
 // content-pane-webkit-repaint.test.ts.
 
 const here: string = dirname(fileURLToPath(import.meta.url));
-const src = readFileSync(resolve(here, 'AppUiInline.tsx'), 'utf-8');
+// The frame element lives in AppFrame.tsx, which the Canvas pane and a shelf
+// widget both draw. So the pins read the two files together.
+const src = readFileSync(resolve(here, 'AppUiInline.tsx'), 'utf-8')
+  + readFileSync(resolve(here, 'AppFrame.tsx'), 'utf-8');
 const css = readFileSync(resolve(here, '../../styles/panels/previews.css'), 'utf-8');
 const mobileCss = readFileSync(resolve(here, '../../styles/mobile.css'), 'utf-8');
 

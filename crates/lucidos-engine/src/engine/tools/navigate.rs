@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// A device's name, the way Settings → Devices shows it.
-async fn device_label(pool: &PgPool, device_id: &str) -> String {
+pub(super) async fn device_label(pool: &PgPool, device_id: &str) -> String {
     crate::core::DeviceStore::friendly_name(pool, device_id).await
 }
 
@@ -177,7 +177,7 @@ fn sent_line(what: &str, who: &Recipient) -> String {
 
 /// The target device as the Known devices list sees it. A failed lookup is
 /// unknown, so it yields `None` and the result says nothing about presence.
-async fn device_presence(pool: &PgPool, device_id: &str) -> Option<SeenDevice> {
+pub(super) async fn device_presence(pool: &PgPool, device_id: &str) -> Option<SeenDevice> {
     match crate::core::DeviceStore::seen(pool, device_id).await {
         Ok(seen) => seen,
         Err(e) => {

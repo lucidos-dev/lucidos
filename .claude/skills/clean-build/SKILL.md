@@ -146,14 +146,16 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-10-07. The cfg_attr
-grep found one new silencer, on the test-only `label` field of
-`summary_tree/compactor_models.rs`. That run moved the labels into the test
-that reads them, and the grep now prints nothing again.
+The currently-accepted categories, re-counted on 2026-10-10. The audit
+found one new silencer: a `too_many_arguments` on the saved-capture test
+helper in `tools/app_capture_tests.rs`, whose doc comment did not justify
+it. Every caller passed the same last three arguments, so that run pinned
+them and removed the attribute.
 
-Every Rust `#[allow]` category was unchanged. `@ts-expect-error` fell 3 with
-the test suite, in one fewer `*.test.ts` file. The ten `eslint-disable` sites
-were unchanged.
+The Rust counts are unchanged. `@ts-expect-error` grew with the test suite,
+and it reached one file outside test code: the Vite plugin
+`vite/sourceCommitStamp.ts` (see its entry below). The ten
+`eslint-disable` sites were unchanged.
 
 **The first grep and the bare-allow audit both print one false hit.** It is
 `git_ops_tests/branch_queries.rs`, where `#[allow(dead_code)]` sits inside
@@ -165,7 +167,7 @@ silencers from the gateway's slowness watcher, which the first grep above
 had missed. The cfg_attr grep now covers that form.
 Anything not on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 83 sites across 51 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 86 sites across 54 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -173,9 +175,9 @@ Anything not on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 83 shares an attribute with `format_in_format_args`, which is
+  One of the 86 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 82 across 50 files. Both numbers here count the shared attribute.
+  reports 85 across 53 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
   (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
@@ -197,8 +199,8 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 878 sites across 303 files, every one of them
-  test-only code: 289 `*.test.ts`, twelve `*.test.tsx`
+  `@types/node` in project**, 905 sites across 313 files, all but one of
+  them test-only code: 295 `*.test.ts`, fourteen `*.test.tsx`
   (`components/changes/__tests__/bulk-row-layout.test.tsx`,
   `components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/typed-answer-spins-on-its-card.test.tsx`,
@@ -207,14 +209,19 @@ Anything not on this list is fair game to remove and re-fix:
   `components/chat/__tests__/the-bubble-pulses-before-the-words.test.tsx`,
   `components/chat/__tests__/pure-voice-draws-no-turn-header.test.tsx`,
   `components/picker/__tests__/pairing-code-boxes.test.tsx`,
+  `components/plugins/__tests__/plugin-detail-page.test.tsx`,
   `components/settings/__tests__/mcp-servers-page.test.tsx`,
   `components/shared/__tests__/apps-glyph-single-source.test.tsx`,
+  `components/shared/__tests__/overlay-exit-fade.test.tsx`,
   `components/shared/__tests__/system-attention-badge.test.tsx` and
-  `styles/__tests__/brand-mark-tokens.test.tsx`), and two
-  Vitest-only helpers. `styles/__tests__/css-rule-helpers.ts` imports
-  `node:fs` for two of the sites, and
-  `components/shared/__tests__/loading-guard-scan.ts` carries three. The
-  expectation is real: TS does not know about Node globals, but Vitest
+  `styles/__tests__/brand-mark-tokens.test.tsx`), and three
+  Vitest-only helpers. `styles/__tests__/css-rule-helpers.ts`,
+  `components/shared/__tests__/loading-guard-scan.ts` and
+  `components/search/__tests__/renderedSearchAnchors.ts` carry three each.
+  The one file outside test code is `vite/sourceCommitStamp.ts`, with three
+  sites. It is a Vite plugin, so it runs in Node at build time, and `tsc`
+  reaches it only because its test imports it. No browser code imports it.
+  The expectation is real: TS does not know about Node globals, but Vitest
   provides them. Adding
   `@types/node` to the project would contaminate the browser type-graph.
   Only the first site in a file spells the reason out; the rest say
@@ -224,9 +231,9 @@ Anything not on this list is fair game to remove and re-fix:
   older wording asserted there were none, and nothing checked it. The
   count grows with the test suite, so treat a mismatch here as ordinary
   drift to restate rather than as a finding, and check only that every
-  leftover the snippet prints is still test-only code. The helpers are why
-  that says test-only code rather than a test file: each lives under
-  `__tests__/` and only test files import it.
+  leftover the snippet prints is still test-only code or that one plugin.
+  The helpers are why that says test-only code rather than a test file:
+  each lives under `__tests__/` and only test files import it.
 - **`// eslint-disable-next-line`**, 10 sites across 6 files and 5 rules:
   `react-hooks/exhaustive-deps` in `hooks/useLoadableFetch.ts` (the deps
   list is intentionally narrow), `no-console` five times in
@@ -327,8 +334,27 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   the store imported the drawer's family graph, which pulled the whole icon
   set in through `ThreadStatusIcon.tsx`. Splitting out
   `components/shared/threadVisualStatus.ts` took it to 523.35 kB. On
-  2026-10-07 it measured 537.38 kB, 89.6 % of the budget, 2.6 kB from the
-  warning.
+  2026-10-08 it measured 570.36 kB, past the warning: the navigation router
+  imported the find bar, which pulled in the transcript find and the
+  markdown renderer. `store/actions/find-request.ts` took the request out,
+  and two smaller cuts took it to 536.48 kB, 3.5 kB from the warning.
+  On 2026-10-09 it measured 546.27 kB. The SSE widget handlers shared a
+  module with the widget menu actions, which pulled in `event-navigation.ts`.
+  `promptFocus.ts` carried the JSX helper `composeHandlers`, which pulled in
+  `tapGesture.ts`. Moving both out (`store/actions/widget-actions.ts`,
+  `components/chat/composeHandlers.ts`) took it to 539.31 kB.
+  On 2026-10-10 it measured 553.58 kB. The page health log had put its
+  reporter and `keyboardCloseRelayout.ts` in the entry, and startup took
+  two icons from `markedConfig.ts`. Three more modules came in whole for one
+  small export each: `webkitRepaint.ts`, `threadWindow.ts` and
+  `formatTime.ts`. The reporter now starts from `startShell`, and the small
+  exports moved to `copyIcons.ts`, `repaintBurst.ts`,
+  `transcriptScrolls.ts` and `elapsed.ts`. That took it to 539.27 kB.
+  On 2026-10-11 it measured 539.82 kB, 180 bytes under the warning. The
+  store called into `scrollState.ts`, the transcript's whole scroll engine.
+  It now goes through the *scroll state handle*, which `startShell` fills,
+  and a static-graph test keeps `scrollState.ts` out of the entry. That took
+  it to 517.37 kB.
 
   The entry chunk is the data layer and startup. The UI is the shell chunk,
   loaded beside it under the boot splash.
@@ -346,7 +372,8 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
 
   - **The store needs one export of a UI module.** Move that export into its
     own small module, as `utils/dataPathPrefixes.ts` and `store/savedScroll.ts`
-    did.
+    did. Rollup places a module in one chunk, whole. So one import from the
+    entry brings every export the shell uses with it.
   - **A listener only a drawn UI can need.** Install it from `startShell`
     (`src/shellStartup.ts`), not from client startup or `main.tsx`.
 
@@ -364,7 +391,9 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
     ```
   - **Find why a module is in the entry.** Rollup's `getModuleInfo` gives
     each module's importers. A dominator tree over the static graph inside the
-    entry gives what a cut would actually free.
+    entry gives what a cut would actually free. Walk the graph through
+    re-export barrels such as `api/client.ts`. A barrel renders no code, so it
+    is missing from the chunk's module list, and skipping it hides real edges.
   - **Ask the two regression questions.** Does any module sit in two chunks?
     Does any `import()` target sit in the entry chunk?
   - **Do not reach for `manualChunks` for our own code.** It moves shared code

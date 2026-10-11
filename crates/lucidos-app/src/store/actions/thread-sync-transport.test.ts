@@ -54,6 +54,7 @@ const diskUsageVersion = signal(0);
 vi.mock('../store', () => ({
   threadMap,
   focusedThreadId,
+  promptFootprintVersion: signal(0),
   changes: signal([]),
   appliedChanges: signal([]),
   changesHasMore: signal(false),
@@ -84,7 +85,10 @@ vi.mock('../thread-events', () => ({
 }));
 const loadUnreadNotifications = vi.fn(async () => {});
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn(), loadUnreadNotifications }));
-vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn() }));
+const refreshChangesState = vi.fn(async () => {});
+vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn(), refreshChangesState }));
+const loadThreadQueue = vi.fn(async () => {});
+vi.mock('./threadQueue', () => ({ loadThreadQueue }));
 const loadPreferences = vi.fn(async () => {});
 vi.mock('./preferences', () => ({ loadPreferences }));
 const refreshArtifacts = vi.fn();
@@ -108,7 +112,6 @@ vi.mock('./menu', () => ({
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
 vi.mock('./devices', () => ({ getDeviceId: vi.fn() }));
-vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false) }));
 
@@ -130,6 +133,7 @@ vi.mock('./entityReferences', () => ({
 }));
 
 const { connectThreadEvents, disconnectThreadEvents } = await import('./thread-sync');
+const { NO_BACKFILL_PROGRESS, applyTreeBackfillProgress, treeBackfill } = await import('./treeBackfill');
 
 /** What the shell reports to the DOM, which is the only thing telling a user
  *  the stream is down. */
@@ -200,6 +204,46 @@ describe('the shell attaching to a transport', () => {
     await vi.runAllTimersAsync();
 
     expect(refreshThreadList).toHaveBeenCalledTimes(1);
+  });
+
+  describe('the backfill frame order', () => {
+    const at = (seq: number, done: number) => ({ ...NO_BACKFILL_PROGRESS, total: 2, done, seq });
+    const shows = (progress: ReturnType<typeof at>) =>
+      expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'running', progress } });
+
+    it('takes a restarted engine\'s frames after a resume sync', () => {
+      connectThreadEvents();
+      opened?.handlers.onOpen();
+      applyTreeBackfillProgress(at(40, 0));
+
+      disconnectThreadEvents();
+      connectThreadEvents();
+      opened?.handlers.onOpen();
+      applyTreeBackfillProgress(at(1, 1));
+      shows(at(1, 1));
+    });
+
+    it('takes a restarted engine\'s frames after a dropped stream', () => {
+      connectThreadEvents();
+      opened?.handlers.onOpen();
+      applyTreeBackfillProgress(at(40, 0));
+
+      opened?.handlers.onError();
+      vi.runOnlyPendingTimers();
+      opened?.handlers.onOpen();
+      applyTreeBackfillProgress(at(1, 1));
+      shows(at(1, 1));
+    });
+
+    /** A snapshot can land before the first open, and a frame it already
+     *  counted can still arrive after. */
+    it('keeps the order a snapshot set before the first open', () => {
+      applyTreeBackfillProgress(at(5, 1));
+      connectThreadEvents();
+      opened?.handlers.onOpen();
+      applyTreeBackfillProgress(at(4, 0));
+      shows(at(5, 1));
+    });
   });
 
   it('re-checks the served client build on the open that follows an error', () => {
@@ -286,6 +330,29 @@ describe('the shell attaching to a transport', () => {
     connectThreadEvents();
     opened?.handlers.onFrame('{"type":"Lagged","data":{"count":12}}');
     expect(syncPendingFormRequests).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads the changes and the queue on the open that follows an error, not on the first one', () => {
+    // An ApplyAllBatchCompleted sent during the gap is never replayed, so the
+    // Apply All row would read "in progress" until a wake or a reload.
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    expect(refreshChangesState).not.toHaveBeenCalled();
+    expect(loadThreadQueue).not.toHaveBeenCalled();
+
+    opened?.handlers.onError();
+    opened?.handlers.onOpen();
+    expect(refreshChangesState).toHaveBeenCalledTimes(1);
+    expect(loadThreadQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads the changes and the queue when the broadcast lags', () => {
+    // A lag drops frames with the stream still open, so no reconnect follows.
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    opened?.handlers.onFrame('{"type":"Lagged","data":{"count":12}}');
+    expect(refreshChangesState).toHaveBeenCalledTimes(1);
+    expect(loadThreadQueue).toHaveBeenCalledTimes(1);
   });
 });
 

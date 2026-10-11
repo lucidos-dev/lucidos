@@ -608,6 +608,7 @@ async fn lookup_question_channel_returns_chat_for_chat_emitter() {
             options: vec![opt("opt-0", "A")],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),
@@ -758,6 +759,9 @@ fn free_text_passes_through_with_the_typed_reply_note() {
 #[test]
 fn a_typed_reply_that_picks_no_option_tells_the_agent_to_re_ask() {
     assert!(TYPED_REPLY_NOTE.contains("ask the question again"));
+    // The card gate lets a re-ask after a typed answer through, even after
+    // a mere note. So the note itself routes the response onto the card.
+    assert!(TYPED_REPLY_NOTE.contains("in the card's `message` field"));
     let typed = [
         serde_json::json!({"kind": "FreeText", "text": "can it also do X?"}),
         serde_json::json!({"kind": "MultiSelected", "option_ids": [], "text": "can it also do X?"}),
@@ -1186,6 +1190,7 @@ async fn coding_agent_text_streamed_orphans_only_active_lookup() {
                     text: "carrying on with parallel work\n".into(),
                     coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                     parent_tool_use_id: None,
+                    progress_note: false,
                 },
                 meta: cc_meta(),
             })
@@ -1298,6 +1303,7 @@ async fn chat_text_streamed_orphans_active_lookup_on_chat_thread() {
             options: vec![opt("opt-0", "A")],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),
@@ -1346,7 +1352,7 @@ async fn chat_text_streamed_orphans_active_lookup_on_chat_thread() {
 // A chat thread parked on `ask_user_question` survives a restart WITHOUT an
 // abort (the preserve guard). When the user then answers, the engine re-enters
 // the dead loop. It used to do that through the manual-Continue machinery,
-// which emitted `ContinuationStarted` + an engine-note `UserPromptInjected` —
+// which emitted `ContinuationStarted` + an engine-note `PromptInjected` —
 // rendering a "Continued the response" boundary plus a "Reminded the model that
 // no actions had completed" note under a card the user had just answered. The
 // resume now continues the turn that asked, so nothing is surfaced; the
@@ -1395,7 +1401,7 @@ async fn answered_after_restart_resume_emits_no_boundary_or_reminder() {
         "an answered question needs no 'Continued the response' boundary"
     );
     assert_eq!(
-        count_events_of_type(&pool, thread_id, "UserPromptInjected").await,
+        count_events_of_type(&pool, thread_id, "PromptInjected").await,
         0,
         "no engine-note reminder may land under an already-answered question"
     );
@@ -1437,7 +1443,7 @@ async fn interrupted_response_continue_still_emits_boundary_and_reminder() {
     );
     let (injected_text, injected_req): (String, Option<Uuid>) = sqlx::query_as(
         "SELECT payload->>'text', NULLIF(payload->>'request_event_id','')::uuid \
-         FROM events WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected'",
+         FROM events WHERE aggregate_id = $1 AND event_type = 'PromptInjected'",
     )
     .bind(thread_id.to_string())
     .fetch_one(&pool)
@@ -1751,4 +1757,132 @@ fn the_walk_shows_the_message_just_before_the_first_card() {
     let message = walk.find("message.as_ref().filter(|_| i == 0)").unwrap();
     let card = walk.find("ThreadEvent::UserQuestionAsked {").unwrap();
     assert!(asked < message && message < card);
+}
+
+// ---- Option widgets (ADR 0415) ----
+
+/// A workspace with the shipped sound player plus one non-reusable widget
+/// made in `origin`.
+fn widgets_workspace(origin: Uuid) -> (tempfile::TempDir, crate::core::AppManager) {
+    let ws = tempfile::tempdir().unwrap();
+    let mine = ws.path().join("data/apps/fare-grid");
+    std::fs::create_dir_all(&mine).unwrap();
+    std::fs::write(
+        mine.join("manifest.json"),
+        serde_json::json!({"name": "Fare grid", "kind": "widget", "origin_thread_id": origin})
+            .to_string(),
+    )
+    .unwrap();
+    let app = ws.path().join("data/apps/notes");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("manifest.json"), r#"{"name": "Notes"}"#).unwrap();
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../system-widgets");
+    let manager = crate::core::AppManager::new(ws.path())
+        .unwrap()
+        .with_system_widgets(Some(shipped));
+    (ws, manager)
+}
+
+fn one_option(description: &str) -> Vec<crate::engine::agent_session::ParsedQuestion> {
+    crate::engine::agent_session::parse_ask_user_question_inputs(&serde_json::json!({
+        "questions": [{
+            "question": "Which voice?",
+            "options": [{"label": "Marin", "description": description}, {"label": "Ash"}]
+        }]
+    }))
+}
+
+#[test]
+fn an_option_embed_lifts_into_its_widget_and_leaves_the_text() {
+    let parsed = one_option(
+        r#"Bright and quick. ![Marin](app:lucidos-sound-player?params={"clip": "artifacts/voices/marin.mp3"})"#,
+    );
+    let option = &parsed[0].options[0];
+    assert_eq!(option.description.as_deref(), Some("Bright and quick."));
+    let widget = option.widget.as_ref().expect("lifted");
+    assert_eq!(widget.app_id, "lucidos-sound-player");
+    assert_eq!(widget.label.as_deref(), Some("Marin"));
+    assert_eq!(
+        widget.params.as_ref().unwrap()["clip"],
+        "artifacts/voices/marin.mp3"
+    );
+    assert!(parsed[0].options[1].widget.is_none());
+}
+
+#[test]
+fn a_good_option_widget_passes_the_check() {
+    let thread = Uuid::new_v4();
+    let (_ws, apps) = widgets_workspace(thread);
+    let parsed = one_option(r#"![Marin](app:lucidos-sound-player?params={"clip": "a.mp3"})"#);
+    check_option_widgets(&apps, &parsed, thread).expect("a good widget passes");
+    let own = one_option("![](app:fare-grid)");
+    check_option_widgets(&apps, &own, thread).expect("the thread's own widget passes");
+}
+
+/// Each bad embed refuses the batch, and the reason names the option.
+#[test]
+fn a_bad_option_widget_refuses_the_card() {
+    let thread = Uuid::new_v4();
+    let (_ws, apps) = widgets_workspace(Uuid::new_v4());
+    let cases = [
+        ("![x](app:no-such-widget)", "No widget"),
+        ("![x](app:notes)", "is an app"),
+        ("![x](app:fare-grid)", "belongs to another thread"),
+        ("![x](app:lucidos-sound-player)", "needs the param 'clip'"),
+        (
+            r#"![x](app:lucidos-sound-player?params={"clip":"a","speed":2})"#,
+            "no param 'speed'",
+        ),
+        ("![x](app:lucidos-sound-player?params=[1])", "broken"),
+        (
+            r#"![a](app:lucidos-sound-player?params={"clip":"a"}) ![b](app:lucidos-sound-player?params={"clip":"b"})"#,
+            "2 widget embeds",
+        ),
+    ];
+    for (description, why) in cases {
+        let err = check_option_widgets(&apps, &one_option(description), thread)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Option 'Marin'"), "{description}: {err}");
+        assert!(err.contains(why), "{description}: {err}");
+    }
+    let big = "x".repeat(crate::engine::widgets::WIDGET_PARAMS_MAX_BYTES);
+    let over = format!(r#"![x](app:lucidos-sound-player?params={{"clip":"{big}"}})"#);
+    let err = check_option_widgets(&apps, &one_option(&over), thread).unwrap_err();
+    assert!(err.to_string().contains("cap"), "{err}");
+}
+
+/// The check runs before the first card is asked, so a refusal writes no
+/// `UserQuestionAsked`. Pinned in the source, as the message order is above.
+#[test]
+fn the_walk_checks_option_widgets_before_any_card() {
+    let src = include_str!("../agent_question.rs");
+    let walk = &src[src.find("pub(crate) async fn walk_question_batch").unwrap()..];
+    let card = walk.find("ThreadEvent::UserQuestionAsked {").unwrap();
+    for check in ["check_option_widgets(", "check_message_embeds("] {
+        assert!(walk.find(check).unwrap() < card, "{check}");
+    }
+}
+
+/// A sample drawn above the card, named like an option, belongs in that
+/// option: the user then hears it where they pick it.
+#[test]
+fn a_message_embed_named_like_an_option_refuses_the_card() {
+    let parsed = one_option("Bright and quick.");
+    let message = r#"Two takes. ![marin ](app:lucidos-sound-player?params={"clip": "marin.mp3"})"#;
+    let err = check_message_embeds(Some(message), &parsed)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Option 'Marin'"), "{err}");
+    assert!(err.contains("into that option"), "{err}");
+}
+
+/// One sample to judge, above a card whose options name no sample, stands.
+#[test]
+fn a_message_embed_no_option_names_passes() {
+    let parsed = one_option("Bright and quick.");
+    let message =
+        r#"The full take: ![Full VO](app:lucidos-sound-player?params={"clip": "vo.mp3"})"#;
+    check_message_embeds(Some(message), &parsed).expect("no option names it");
+    check_message_embeds(None, &parsed).expect("no message");
 }

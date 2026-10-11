@@ -235,11 +235,10 @@ export function useHeaderActionCollapse(
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(container);
-    // The centred box too, and not because the container's resize misses a
-    // split drag (it does not): its width is `clamp(min, 100% - 2 * reserve,
-    // span)`, and the live style remote can rewrite any of those three tokens
-    // on a running app, which moves the box's edges with the row standing
-    // still. Observing the box is also what lets the title TEXT go unwatched:
+    // The centred box too, though the container's resize does catch a split
+    // drag. The box's width is a `clamp` over CSS tokens. The live style
+    // remote can rewrite any of them on a running app, which moves the box's
+    // edges with the row standing still. Observing the box is also what lets the title TEXT go unwatched:
     // a MutationObserver used to re-measure on every title change, back when
     // the input was the content's natural width rather than the box's.
     if (titleZone) ro.observe(titleZone);

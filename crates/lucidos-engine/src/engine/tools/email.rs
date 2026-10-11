@@ -45,37 +45,15 @@ impl LucidosEngine {
         Ok(account)
     }
 
-    /// Resolve an OAuth access token for an email account, refreshing if needed.
-    /// Returns None if no OAuth account is linked.
+    /// The OAuth access token for an email account, or the tool's error result.
+    /// See [`oauth::linked_account_token`].
     async fn resolve_email_oauth_token(
         &self,
         account: &crate::core::EmailAccount,
-    ) -> Option<String> {
-        let oauth_id = account.oauth_account_id?;
-
-        let mut oauth_account = match OAuthStore::get_by_id(&self.pool, oauth_id).await {
-            Ok(Some(a)) => a,
-            Ok(None) => {
-                log!("[Email] Linked OAuth account {} not found", oauth_id);
-                return None;
-            }
-            Err(e) => {
-                log!("[Email] Failed to fetch OAuth account {}: {}", oauth_id, e);
-                return None;
-            }
-        };
-
-        // Refresh if expired or expiring within 60s
-        match oauth::refresh_oauth_if_needed(&self.pool, &mut oauth_account).await {
-            Ok(()) => {}
-            Err(e) => log!(
-                "[Email] OAuth token refresh failed for {}: {}",
-                oauth_account.provider,
-                e
-            ),
-        }
-
-        Some(oauth_account.access_token)
+    ) -> Result<Option<String>, String> {
+        oauth::linked_account_token(&self.pool, account.oauth_account_id)
+            .await
+            .map_err(|e| format!("Error: {e}"))
     }
 
     /// The base provider whose token endpoint issues `provider`'s tokens, from
@@ -379,7 +357,10 @@ impl LucidosEngine {
                 )
                 .map_err(|e| format!("Error: {}", e))?;
 
-                let oauth_token = self.resolve_email_oauth_token(&account).await;
+                let oauth_token = match self.resolve_email_oauth_token(&account).await {
+                    Ok(token) => token,
+                    Err(e) => return Ok(e),
+                };
 
                 let to_str = to.join(", ");
                 let cc_str = cc.join(", ");
@@ -429,7 +410,10 @@ impl LucidosEngine {
                     Err(e) => return Ok(e),
                 };
 
-                let oauth_token = self.resolve_email_oauth_token(&account).await;
+                let oauth_token = match self.resolve_email_oauth_token(&account).await {
+                    Ok(token) => token,
+                    Err(e) => return Ok(e),
+                };
 
                 match EmailClient::read_emails(
                     &account,
@@ -482,7 +466,10 @@ impl LucidosEngine {
                     Err(e) => return Ok(e),
                 };
 
-                let oauth_token = self.resolve_email_oauth_token(&account).await;
+                let oauth_token = match self.resolve_email_oauth_token(&account).await {
+                    Ok(token) => token,
+                    Err(e) => return Ok(e),
+                };
 
                 match EmailClient::read_email(&account, uid, folder, oauth_token.as_deref()).await {
                     Ok(email) => {
@@ -534,7 +521,10 @@ impl LucidosEngine {
                     Err(e) => return Ok(e),
                 };
 
-                let oauth_token = self.resolve_email_oauth_token(&account).await;
+                let oauth_token = match self.resolve_email_oauth_token(&account).await {
+                    Ok(token) => token,
+                    Err(e) => return Ok(e),
+                };
 
                 let (filename, mime_type, data) = match EmailClient::fetch_attachment(
                     &account,

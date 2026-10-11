@@ -42,6 +42,7 @@ const {
   PREVIEW_BRIDGE_SOURCE,
   newBridgeNonce,
   PREVIEW_FIND_LOCAL,
+  PREVIEW_SWIPE_LOCAL,
   previewBridgeScript,
   previewMayNavigate,
   readPreviewFrameMessage,
@@ -52,6 +53,10 @@ const {
 const { repositories } = await import('../../store/store');
 const { PREVIEW_HOST_SCHEMES, classifyPreviewLink, withPreviewBase } = await import('./previewIframeLinks');
 const { PREVIEW_FRAME_MESSAGE, PREVIEW_HOST_MESSAGE, askPreviewFind } = await import('../../utils/previewFrameProtocol');
+const { subscribeFrameSwipes } = await import('../../store/actions/frame-swipe-bridge');
+const PREVIEW_SWIPE_SOURCE = (await import('../../../../../packages/lucidos-sdk/src/generated/preview-swipe.js?raw')).default;
+/** The committed swipe bundle, run as the bridge runs it. */
+const realSwiper = new Function(`${PREVIEW_SWIPE_SOURCE}\nreturn ${PREVIEW_SWIPE_LOCAL};`)() as object;
 
 const TID = '961b9b83-53b7-47cd-8982-3c959d7f1137';
 const NONCE = 'n0nce';
@@ -120,6 +125,9 @@ interface FakeFrame {
 function installBridge(opts: {
   ids?: string[]; baseHref?: string | null; topLevel?: boolean; mac?: boolean;
   finder?: { serve(args: unknown): unknown };
+  paneSwipe?: boolean;
+  /** How wide the artifact's page lays out, against a 300px frame. */
+  pageWidth?: number;
 } = {}): FakeFrame {
   const posted: Record<string, unknown>[] = [];
   const scrolled: string[] = [];
@@ -141,6 +149,8 @@ function installBridge(opts: {
   const win: Record<string, unknown> = {
     addEventListener: on('win'),
     scrollTo: () => { frame.scrolledToTop = true; },
+    innerWidth: 300,
+    getComputedStyle: () => ({ overflowX: 'visible' }),
   };
   win.parent = opts.topLevel ? win : host;
   const removed: unknown[] = [];
@@ -163,17 +173,24 @@ function installBridge(opts: {
         : null;
     },
   };
+  win.document = {
+    ...doc,
+    scrollingElement: { scrollWidth: opts.pageWidth ?? 300, clientWidth: 300 },
+    documentElement: {},
+    body: {},
+  };
   const cfg = {
     nonce: NONCE,
     bindings: [MAXIMIZE, ZOOM_IN, SEARCH],
     mac: opts.mac ?? false,
     schemes: PREVIEW_HOST_SCHEMES,
+    paneSwipe: opts.paneSwipe ?? false,
     frameType: PREVIEW_FRAME_MESSAGE,
     hostType: PREVIEW_HOST_MESSAGE,
   };
   const install = new Function(`return (${PREVIEW_BRIDGE_SOURCE});`)() as
-    (c: typeof cfg, w: unknown, d: unknown, f: unknown) => void;
-  install(cfg, win, doc, opts.finder);
+    (c: typeof cfg, w: unknown, d: unknown, f: unknown, s: unknown) => void;
+  install(cfg, win, doc, opts.finder, realSwiper);
   frame.scriptRemoved = removed.includes(script);
   return frame;
 }
@@ -422,6 +439,49 @@ describe('the in-frame finder', () => {
   });
 });
 
+describe('the in-frame pane swipe', () => {
+  /** A one-finger touch in screen coordinates, as the user's own. */
+  const touch = (points: Array<[number, number]>, over: Record<string, unknown> = {}) => ({
+    isTrusted: true,
+    defaultPrevented: false,
+    cancelable: true,
+    touches: points.map(([screenX, screenY]) => ({ screenX, screenY })),
+    target: { localName: 'p', parentElement: null },
+    preventDefault() {},
+    ...over,
+  });
+  const drag = (frame: FakeFrame, start = touch([[200, 100]])) => {
+    frame.fire('win', 'touchstart', start);
+    frame.fire('win', 'touchmove', touch([[150, 100]]));
+    frame.fire('win', 'touchmove', touch([[50, 100]]));
+    frame.fire('win', 'touchend', touch([]));
+  };
+
+  it('posts a sideways drag and its release, under the nonce', () => {
+    const frame = installBridge({ paneSwipe: true });
+    drag(frame);
+    expect(frame.posted[0]).toEqual({ type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'swipe', dx: -42 });
+    expect(frame.posted[frame.posted.length - 1]).toEqual({ type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'swipe-end', paneDelta: 1 });
+  });
+
+  it('posts nothing for a touch the artifact dispatched itself', () => {
+    const frame = installBridge({ paneSwipe: true });
+    drag(frame, touch([[200, 100]], { isTrusted: false }));
+    expect(frame.posted).toEqual([]);
+  });
+
+  it('leaves a sideways drag to an artifact page wider than its frame', () => {
+    const frame = installBridge({ paneSwipe: true, pageWidth: 1000 });
+    drag(frame);
+    expect(frame.posted).toEqual([]);
+  });
+
+  it('installs nothing where it must not swipe the panes, such as the modal', () => {
+    const frame = installBridge({ paneSwipe: false });
+    expect(frame.listenerCount('win', 'touchstart')).toBe(0);
+  });
+});
+
 describe('readPreviewFrameMessage', () => {
   const frameWindow = {} as Window;
   const link = { type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'link', href: 'notes.md', baseUri: 'https://x/' };
@@ -439,6 +499,27 @@ describe('readPreviewFrameMessage', () => {
     });
     expect(readPreviewFrameMessage(from({ type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'fragment-missing', id: 'x' }),
       frameWindow, NONCE)).toEqual({ kind: 'fragment-missing', id: 'x' });
+    expect(readPreviewFrameMessage(from({ type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'swipe', dx: -40 }),
+      frameWindow, NONCE)).toEqual({ kind: 'swipe', dx: -40 });
+    expect(readPreviewFrameMessage(from({ type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'swipe-end', paneDelta: -1 }),
+      frameWindow, NONCE)).toEqual({ kind: 'swipe-end', paneDelta: -1 });
+  });
+
+  it('drops a swipe no gesture could produce, and ends a release as a snap back', () => {
+    for (const dx of ['far', Number.NaN, Infinity, undefined]) {
+      expect(readPreviewFrameMessage(from({ type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'swipe', dx }),
+        frameWindow, NONCE)).toBeNull();
+    }
+    for (const paneDelta of [2, 'next', undefined]) {
+      expect(readPreviewFrameMessage(from({ type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'swipe-end', paneDelta }),
+        frameWindow, NONCE)).toEqual({ kind: 'swipe-end', paneDelta: 0 });
+    }
+  });
+
+  it('drops a swipe from another frame or under another nonce', () => {
+    const swipe = { type: PREVIEW_FRAME_MESSAGE, nonce: NONCE, kind: 'swipe', dx: -40 };
+    expect(readPreviewFrameMessage(from(swipe, { source: {} }), frameWindow, NONCE)).toBeNull();
+    expect(readPreviewFrameMessage(from({ ...swipe, nonce: 'stale' }), frameWindow, NONCE)).toBeNull();
   });
 
   it('takes a find result, leaving its count for the find bar to check', () => {
@@ -632,6 +713,20 @@ describe('routePreviewFrameMessage', () => {
     expect(mocks.dispatchForwardedChord).toHaveBeenCalledWith(chord);
   });
 
+  it('hands a swipe to the frame-swipe channel, as coming from this frame', () => {
+    const seen: unknown[] = [];
+    const unsubscribe = subscribeFrameSwipes((source, message) => { seen.push({ source, message }); });
+    const ctx = { artifactPath: ARTIFACT, declaresOwnBase: false, frameWindow };
+    routePreviewFrameMessage({ kind: 'swipe', dx: -40 }, ctx);
+    routePreviewFrameMessage({ kind: 'swipe-end', paneDelta: 1 }, ctx);
+    unsubscribe();
+    routePreviewFrameMessage({ kind: 'swipe', dx: -50 }, ctx);
+    expect(seen).toEqual([
+      { source: frameWindow, message: { kind: 'drag', dx: -40 } },
+      { source: frameWindow, message: { kind: 'release', paneDelta: 1 } },
+    ]);
+  });
+
   it('reports a missing anchor, naming the document', () => {
     routePreviewFrameMessage({ kind: 'fragment-missing', id: 'nope' }, { artifactPath: ARTIFACT, declaresOwnBase: false, frameWindow });
     expect(mocks.showToast.mock.calls[0][0]).toContain('nope');
@@ -663,7 +758,7 @@ describe('withPreviewCapability', () => {
 });
 
 describe('the stamped bridge script', () => {
-  const cfg = { nonce: NONCE, bindings: [MAXIMIZE], hostSchemes: PREVIEW_HOST_SCHEMES };
+  const cfg = { nonce: NONCE, bindings: [MAXIMIZE], hostSchemes: PREVIEW_HOST_SCHEMES, paneSwipe: true };
 
   it('runs first: ahead of the base, and ahead of the artifact\'s own script', () => {
     const html = '<!DOCTYPE html><html><head><script>window.mine=1</script></head><body></body></html>';
@@ -696,13 +791,14 @@ describe('the stamped bridge script', () => {
     expect(out.endsWith('</script>')).toBe(true);
   });
 
-  it('carries the finder inside its own function, where the artifact cannot reach it', async () => {
+  it('carries the finder and the swipe inside its own function, where the artifact cannot reach them', async () => {
     const out = previewBridgeScript(cfg);
-    const bundle = (await import('../../../../../packages/lucidos-sdk/src/generated/preview-find.js?raw')).default;
-    // Pinned: the bundle's own name for its result is what the bridge reads.
-    expect(bundle).toContain(`var ${PREVIEW_FIND_LOCAL} =`);
+    const finder = (await import('../../../../../packages/lucidos-sdk/src/generated/preview-find.js?raw')).default;
+    // Pinned: each bundle's own name for its result is what the bridge reads.
+    expect(finder).toContain(`var ${PREVIEW_FIND_LOCAL} =`);
+    expect(PREVIEW_SWIPE_SOURCE).toContain(`var ${PREVIEW_SWIPE_LOCAL} =`);
     expect(out.startsWith('<script>(function(){')).toBe(true);
-    expect(out).toContain(`, window, document, ${PREVIEW_FIND_LOCAL});})();</script>`);
+    expect(out).toContain(`, window, document, ${PREVIEW_FIND_LOCAL}, ${PREVIEW_SWIPE_LOCAL});})();</script>`);
   });
 
   it('mints a fresh 128-bit nonce each render', () => {

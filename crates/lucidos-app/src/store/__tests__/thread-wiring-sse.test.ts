@@ -39,7 +39,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // Frontend connects to SSE late, misses MessageReceived, gets later CC events.
     // SSE creates skeleton with eventsLoaded=true, so loadThreadEvents skips DB load.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIncomplete: false, codingAgentIsExternalRepo: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: true, // Old CodingAgentThreadSpawned behavior — now fixed to false
@@ -65,7 +65,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // After the fix: skeleton.eventsLoaded=false, so loadThreadEvents runs,
     // loads MessageReceived from DB, and the thread shows its messages.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIncomplete: false, codingAgentIsExternalRepo: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', summaryVersion: 0, status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: false, // Fix: allows DB backfill
@@ -368,15 +368,14 @@ describe('getCodingAgentWaitingInfo', () => {
     const thread = makeThread();
     applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'waiting');
     thread.meta.channel = 'claude_code';
-    thread.meta.codingAgentProposed = true;
-    thread.meta.codingAgentRequiresRestart = false;
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     thread.meta.codingAgentIsExternalRepo = false;
 
     const info = getCodingAgentWaitingInfo(thread.meta);
     expect(info).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: false });
   });
 
-  it('CodingAgentIdled with has_changes=true updates meta', () => {
+  it('CodingAgentIdled with has_changes=true and no proposal leaves unproposed work', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
     handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
@@ -384,18 +383,18 @@ describe('getCodingAgentWaitingInfo', () => {
     handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
 
     expect(thread.meta.status).toBe('idle');
-    expect(thread.meta.codingAgentProposed).toBe(true);
-    const info = getCodingAgentWaitingInfo(thread.meta);
-    expect(info).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: false });
+    expect(thread.meta.codingAgentChangeState).toEqual({ kind: 'unproposed', reason: null });
+    expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
   });
 
-  it('CodingAgentIdled with requires_restart=true updates meta', () => {
+  it('ChangeProposed with requires_restart=true carries it on the proposal', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
     handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'fix it' }, '2026-01-01T00:00:00Z');
-    handleEventWithAgg(map, 't1', 2, { type: 'CodingAgentIdled', has_changes: true, requires_restart: true } as any, '2026-01-01T00:00:02Z');
+    handleEventWithAgg(map, 't1', 2, { type: 'ChangeProposed', change_id: 'c-1', requires_restart: true } as any, '2026-01-01T00:00:01Z');
+    handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
 
-    expect(thread.meta.codingAgentRequiresRestart).toBe(true);
+    expect(thread.meta.codingAgentChangeState).toEqual({ kind: 'proposed', requires_restart: true });
     const info = getCodingAgentWaitingInfo(thread.meta);
     expect(info).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: true });
   });
@@ -407,7 +406,7 @@ describe('getCodingAgentWaitingInfo', () => {
     handleEventWithAgg(map, 't1', 2, { type: 'ResponseGenerated' }, '2026-01-01T00:00:01Z');
     handleEventWithAgg(map, 't1', 3, { type: 'SessionEnded' }, '2026-01-01T00:00:02Z');
 
-    // ResponseGenerated without codingAgentProposed → idle
+    // ResponseGenerated without a proposal → idle
     expect(thread.meta.status).toBe('idle');
     expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
   });
@@ -433,11 +432,11 @@ describe('getCodingAgentWaitingInfo', () => {
     handleEventWithAgg(map, 't1', 4, { type: 'ChangeApplied', change_id: 'c-1' } as any, '2026-01-01T00:00:04Z');
 
     expect(thread.meta.status).toBe('idle');
-    expect(thread.meta.codingAgentProposed).toBe(false);
+    expect(thread.meta.codingAgentChangeState.kind).not.toBe('proposed');
     expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
   });
 
-  it('ChangeProposed sets codingAgentProposed=true but does not change status', () => {
+  it('ChangeProposed makes the change state proposed but does not change status', () => {
     const thread = makeThread({ meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
     handleEventWithAgg(map, 't1', 1, { type: 'MessageReceived', text: 'implement feature' }, '2026-01-01T00:00:00Z');
@@ -447,7 +446,7 @@ describe('getCodingAgentWaitingInfo', () => {
     // This prevents Apply/Discard buttons from appearing while CC is still active
     // (e.g., mid-session commits during hardening).
     expect(thread.meta.status).toBe('running');
-    expect(thread.meta.codingAgentProposed).toBe(true);
+    expect(thread.meta.codingAgentChangeState.kind).toBe('proposed');
   });
 });
 
@@ -506,11 +505,8 @@ describe('Focused thread preserved across reload', () => {
       blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'idle',
       summary_version: 0,
-      coding_agent_proposed: false,
-      coding_agent_requires_restart: false,
-      coding_agent_incomplete: false,
+      coding_agent_change_state: { kind: 'none' },
       coding_agent_is_external_repo: false,
-      coding_agent_has_diff: false,
       last_revived_at: null,
       state: 'active',
       compose_text: '',
@@ -555,11 +551,8 @@ describe('Focused thread preserved across reload', () => {
       blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'waiting',
       summary_version: 0,
-      coding_agent_proposed: true,
-      coding_agent_requires_restart: false,
-      coding_agent_incomplete: false,
+      coding_agent_change_state: { kind: 'proposed', requires_restart: false },
       coding_agent_is_external_repo: false,
-      coding_agent_has_diff: false,
       last_revived_at: null,
       state: 'active',
       compose_text: '',

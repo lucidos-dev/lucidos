@@ -15,7 +15,7 @@ An *event wait* shipped with two shapes (S5b of
   model resumed mid-thought inside the same exchange.
 - **detached**, the fallback once anything closed the pair: the thread was an
   ordinary idle thread holding a live subscription, and the delivery arrived as
-  a `UserPromptInjected` that started a new turn.
+  a `PromptInjected` that started a new turn.
 
 On 2026-08-06 the nightly orchestration thread was force-aborted, and both
 halves of that failure were properties of the attached shape alone.
@@ -46,7 +46,7 @@ cannot leave a dangling `tool_use` in one.
 Delete the attached shape. `await_event` registers a subscription and returns
 immediately, like any other tool; the turn carries on and ends with an ordinary
 terminator; the thread is plain `idle` while it watches; and every delivery and
-expiry wakes it as a `UserPromptInjected`, injected into a live turn or starting
+expiry wakes it as a `PromptInjected`, injected into a live turn or starting
 a new one, exactly as a child completion or a user follow-up does.
 
 `ThreadStatus::WaitingForEvent` is deleted with it. A subscription surfaces

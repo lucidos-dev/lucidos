@@ -341,7 +341,8 @@ pub async fn get_oauth_account(
                     provider
                 )
                 .into(),
-                AccountLookupError::DbError(err) | AccountLookupError::RefreshFailed(err) => err,
+                AccountLookupError::DbError(err) => err,
+                AccountLookupError::RefreshFailed(msg) => msg.into(),
             }
         })
 }

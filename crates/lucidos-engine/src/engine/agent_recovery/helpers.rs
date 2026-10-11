@@ -3,60 +3,9 @@
 //! `agent_recovery::X` paths keep resolving.
 
 use super::super::agent_session::CodingAgentKind;
-use super::super::event_bus::{BusEvent, EventBus};
 use super::super::git_ops::{git_answer, git_cmd, GitAnswer};
-use super::super::thread_events::{
-    EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
-};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-/// Re-emit `ChangeProposed` flipping the row to `incomplete: true`. Called
-/// by orphan recovery for branches that were mid-CC-turn at engine restart
-/// — the existing pending row was populated by per-commit emits during the
-/// dying turn, so its description / files reflect work the user never
-/// confirmed. Apply must require explicit confirmation; the `incomplete`
-/// flag is the existing signal for that (see commit `1e8736839`).
-///
-/// Caller passes the already-loaded `Change` so this avoids re-querying
-/// what recover_orphaned_worktrees just fetched via `list_pending`. No-op
-/// when the row is already flagged.
-pub(crate) async fn mark_pending_change_incomplete(
-    event_bus: &EventBus,
-    thread_id: Uuid,
-    change: &crate::core::changes::Change,
-) {
-    if change.incomplete {
-        return;
-    }
-    event_bus
-        .emit_or_log(
-            BusEvent::Thread {
-                thread_id,
-                event: ThreadEvent::ChangeProposed {
-                    change_id: change.id.to_string(),
-                    description: Some(change.description.clone()),
-                    files: change.files.clone(),
-                    requires_restart: change.requires_restart,
-                    origin: Some(MessageOrigin::engine(EngineReason::OrphanRecovery)),
-                    commit_sha: None,
-                    branch_name: change.branch_name.clone(),
-                    repo_root: change.repo_root.clone(),
-                    hardened: change.hardened,
-                    incomplete: true,
-                    set_aside: false,
-                    path: String::new(),
-                    diff: String::new(),
-                },
-                meta: EventMeta {
-                    channel: Some(EventChannel::ClaudeCode),
-                    ..EventMeta::NONE
-                },
-            },
-            "[Recovery] ChangeProposed re-emit marking incomplete",
-        )
-        .await;
-}
 
 /// Tag stamped on `CodingAgentIdled.reason` when the engine surfaces a
 /// mid-turn-crashed Claude Code session as "interrupted, click to continue" instead of
@@ -121,6 +70,13 @@ pub const AUTO_RESUME_AFTER_API_ERROR_REASON: &str = "auto_resume_after_api_erro
 /// "Resumed" boundary exchange like the other automatic-resume reasons.
 pub const AUTO_RESUME_AFTER_SWITCH_REASON: &str = "auto_resume_after_switch";
 
+/// Tag stamped on `ContinuationRequested.reason` when the user presses
+/// **Harden** on a thread whose work was held for `hardening_missing`. The
+/// resume carries `AUTO_HARDEN_MESSAGE` ([`continue_input_for_reason`]). The
+/// user pressed a button that starts a new turn, so it opens a resume
+/// exchange, as Continue does.
+pub const HARDEN_REQUESTED_REASON: &str = "harden_requested";
+
 /// Should the SpawnConsumer's `Continue` handler emit `ContinuationStarted`
 /// for a `ContinuationRequested` carrying this `reason`?
 ///
@@ -146,6 +102,7 @@ pub fn continue_should_open_resume_exchange(reason: Option<&str>) -> bool {
     matches!(
         reason,
         Some(USER_CLICKED_CONTINUE_REASON)
+            | Some(HARDEN_REQUESTED_REASON)
             | Some(AUTO_RECOVERY_AFTER_HANG_REASON)
             | Some(AUTO_RESUME_AFTER_SWITCH_REASON)
             | Some(AUTO_RESUME_AFTER_API_ERROR_REASON)
@@ -282,6 +239,9 @@ pub(crate) async fn continue_input_for_reason(
     thread_id: Uuid,
     reason: Option<&str>,
 ) -> String {
+    if reason == Some(HARDEN_REQUESTED_REASON) {
+        return crate::engine::claude_code::AUTO_HARDEN_MESSAGE.to_string();
+    }
     if reason != Some(ANSWERED_AFTER_IDLE_REASON) {
         return CONTINUE_RESUME_USER_MESSAGE.to_string();
     }
@@ -652,13 +612,9 @@ pub(crate) fn stale_discard_branch_delete_root<'a>(
 /// Did the most recent **Claude Code** turn for this thread end cleanly?
 ///
 /// Returns `true` iff the latest CC-channel terminal event is
-/// `ResponseGenerated`. Used by stale-session recovery to decide whether a
-/// freshly-proposed change should carry `incomplete: true` (mid-turn crash /
-/// abort / cancel) or `incomplete: false` (clean Generated, but the per-turn
-/// `propose_change` never landed — e.g. the engine died between the idle and
-/// the proposal). Without this distinction the recovery flags a clean change
-/// as incomplete and the Apply UI surfaces a misleading "this came from a
-/// failed turn" confirm dialog.
+/// `ResponseGenerated`. Stale-session recovery reads it to propose a finished
+/// turn's work and withhold an unfinished one's (ADR 0400). A Tier-1 conflict
+/// resolution reads it to tell a finished resolving turn from a cut-off one.
 ///
 /// **Channel-scoped.** A thread can mix chat-agent, trigger, and CC
 /// terminal events (verified empirically: `payload->>'channel'` takes
@@ -677,39 +633,23 @@ pub(crate) fn stale_discard_branch_delete_root<'a>(
 /// Pure DB query — exposed at module scope so tests can exercise it without
 /// instantiating a full `LucidosEngine`.
 pub(crate) async fn last_turn_ended_cleanly(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
-    let row: Option<String> = sqlx::query_scalar(
-        "SELECT event_type FROM events \
-         WHERE thread_id = $1 \
-           AND event_type IN ('ResponseGenerated', 'ResponseAborted', 'ResponseCanceled', 'ResponseFailed') \
-           AND payload->>'channel' = 'claude_code' \
-         ORDER BY sequence DESC LIMIT 1",
-    )
-    .bind(thread_id)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or_else(|e| {
-        // Mirrors the recovery sweep's other best-effort queries
-        // (`list_pending` in `recover_orphaned_worktrees`): log and fall
-        // through. Returning
-        // None here biases the caller toward `incomplete: true`, which is
-        // the safe direction — Apply will require explicit confirmation
-        // rather than auto-applying possibly-mid-turn work.
-        log!(
-            "[Recovery] last_turn_ended_cleanly({}): {} — defaulting to not-clean (incomplete=true)",
-            thread_id,
-            e
-        );
-        None
-    });
-    matches!(row.as_deref(), Some("ResponseGenerated"))
+    last_turn_end(pool, thread_id).await == Some(TurnEnd::Finished)
 }
 
-/// What a recovery sweep may propose for a thread, read from how its last
-/// coding-agent turn ended: `Some(false)` for complete work, `Some(true)` for
-/// incomplete work, `None` for nothing. It mirrors the live idle gate: a clean
-/// turn proposes, a user Stop proposes as incomplete (ADR 0328), and a failed,
-/// aborted or redirected turn proposes nothing. A failed read proposes nothing.
-pub(crate) async fn last_turn_proposal(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<bool> {
+/// How a thread's last coding-agent turn ended, for a recovery sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnEnd {
+    /// It finished, so its work is proposed.
+    Finished,
+    /// A Stop, a failure or an abort cut it short, so its work is withheld
+    /// (ADR 0400).
+    Unfinished,
+}
+
+/// How the thread's last coding-agent turn ended, mirroring the live idle
+/// gate. `None` for a redirect, an Apply or Discard stop, no turn at all, or a
+/// failed read: a sweep then settles nothing.
+pub(crate) async fn last_turn_end(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<TurnEnd> {
     let row: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT event_type, payload->>'cause' FROM events \
          WHERE thread_id = $1 \
@@ -722,18 +662,17 @@ pub(crate) async fn last_turn_proposal(pool: &sqlx::PgPool, thread_id: Uuid) -> 
     .await
     .unwrap_or_else(|e| {
         log!(
-            "[Recovery] last_turn_proposal({}): {}; proposing nothing",
+            "[Recovery] last_turn_end({}): {}; settling nothing",
             thread_id,
             e
         );
         None
     });
-    match row {
-        Some((event_type, _)) if event_type == "ResponseGenerated" => Some(false),
-        Some((event_type, Some(cause)))
-            if event_type == "ResponseCanceled" && cause == "user_stop" =>
-        {
-            Some(true)
+    let (event_type, cause) = row?;
+    match (event_type.as_str(), cause.as_deref()) {
+        ("ResponseGenerated", _) => Some(TurnEnd::Finished),
+        ("ResponseCanceled", Some("user_stop")) | ("ResponseFailed" | "ResponseAborted", _) => {
+            Some(TurnEnd::Unfinished)
         }
         _ => None,
     }

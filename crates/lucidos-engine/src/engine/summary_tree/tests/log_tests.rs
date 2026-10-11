@@ -7,6 +7,7 @@ use super::event;
 use crate::engine::summary_tree::log::{
     cap, project, EntryKind, StoredEvent, ThreadKind, ENTRY_EVENT_TYPES, TURN_END_EVENT_TYPES,
 };
+use crate::engine::thread_events::ActorMode;
 
 fn stored(values: Vec<serde_json::Value>) -> Vec<StoredEvent> {
     values
@@ -44,13 +45,16 @@ fn a_lucidos_agent_turn_logs_at_full_fidelity() {
     assert_eq!(
         entries,
         vec![
-            (EntryKind::User, "find the plan".to_string()),
             (
-                EntryKind::Tool,
+                EntryKind::Prompt(ActorMode::Human),
+                "find the plan".to_string()
+            ),
+            (
+                EntryKind::Call,
                 r#"read_file {"path":"plan.md"}"#.to_string()
             ),
-            (EntryKind::Echo, "[read_file] # Plan".to_string()),
-            (EntryKind::Talk, "The plan has one heading.".to_string()),
+            (EntryKind::Result, "[read_file] # Plan".to_string()),
+            (EntryKind::Response, "The plan has one heading.".to_string()),
         ]
     );
 }
@@ -76,11 +80,11 @@ fn a_rounds_text_deltas_are_one_entry() {
     assert_eq!(
         entries,
         vec![
-            (EntryKind::User, "go".to_string()),
-            (EntryKind::Talk, "First, the plan.".to_string()),
-            (EntryKind::Tool, "read_file {}".to_string()),
-            (EntryKind::Echo, "[read_file] ok".to_string()),
-            (EntryKind::Talk, "P1\n\nP2".to_string()),
+            (EntryKind::Prompt(ActorMode::Human), "go".to_string()),
+            (EntryKind::Response, "First, the plan.".to_string()),
+            (EntryKind::Call, "read_file {}".to_string()),
+            (EntryKind::Result, "[read_file] ok".to_string()),
+            (EntryKind::Response, "P1\n\nP2".to_string()),
         ]
     );
 }
@@ -104,8 +108,14 @@ fn a_coding_agent_turn_logs_one_prompt_and_one_reply() {
     assert_eq!(
         entries,
         vec![
-            (EntryKind::User, "fix the bug".to_string()),
-            (EntryKind::Talk, "Fixed it, and the tests pass.".to_string()),
+            (
+                EntryKind::Prompt(ActorMode::Human),
+                "fix the bug".to_string()
+            ),
+            (
+                EntryKind::Response,
+                "Fixed it, and the tests pass.".to_string()
+            ),
         ]
     );
 }
@@ -132,20 +142,59 @@ fn a_coding_agent_question_and_its_answer_are_entries() {
     assert_eq!(
         entries,
         vec![
-            (EntryKind::User, "plan it".to_string()),
+            (EntryKind::Prompt(ActorMode::Human), "plan it".to_string()),
             (
-                EntryKind::Talk,
+                EntryKind::Response,
                 "The plan is ready.\n\nAsked: Approve the plan? [Approve | Request changes]"
                     .to_string()
             ),
-            (EntryKind::User, "Answered: Approve".to_string()),
-            (EntryKind::Talk, "Done.".to_string()),
+            (
+                EntryKind::Prompt(ActorMode::Human),
+                "Answered: Approve".to_string()
+            ),
+            (EntryKind::Response, "Done.".to_string()),
         ]
     );
 }
 
 /// A turn is the entries its settle event closed. A second settle event with
 /// nothing new between closes an empty turn.
+/// A prompt names the ActorMode its event recorded: a person's message, an
+/// agent's, a trigger the engine fired, and an image description. A turn that
+/// failed before any reply is its response.
+#[test]
+fn a_prompt_names_its_sender_and_a_failed_turn_is_a_response() {
+    let device = json!({"kind": "device", "device_id": "phone"});
+    let entries = kinds_and_texts(
+        ThreadKind::LucidosAgent,
+        vec![
+            json!({"type": "MessageReceived", "text": "stop the downloads", "mode": "agent"}),
+            json!({"type": "ResponseFailed", "error": "overloaded"}),
+            json!({"type": "TriggerStarted", "trigger_id": "t1", "trigger_name": "Mail", "prompt": "check the mail"}),
+            json!({"type": "ResponseGenerated", "text": "No new mail."}),
+            json!({"type": "TriggerStarted", "trigger_id": "t1", "trigger_name": "Mail", "prompt": "check again", "origin": device}),
+            json!({"type": "ImageDescribed", "source_event_id": Uuid::new_v4(), "hash": "h", "description": "a red door", "model": "m"}),
+            json!({"type": "PromptInjected", "text": "the wait delivered", "mode": "engine"}),
+            json!({"type": "ResponseGenerated", "text": "Checked."}),
+        ],
+    );
+    let kinds: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "prompt (agent)",
+            "response",
+            "prompt (engine)",
+            "response",
+            "prompt (human)",
+            "prompt (engine)",
+            "prompt (engine)",
+            "response",
+        ]
+    );
+    assert_eq!(entries[1].1, "failed: overloaded");
+}
+
 #[test]
 fn turns_cover_the_entries_their_settle_event_closed() {
     let events = stored(vec![
@@ -209,7 +258,7 @@ fn an_injected_acknowledgement_is_not_logged_twice() {
         ThreadKind::LucidosAgent,
         vec![
             json!({"type": "MessageReceived", "text": "and also this", "mode": "human"}),
-            json!({"type": "UserPromptInjected", "text": "and also this",
+            json!({"type": "PromptInjected", "text": "and also this",
                    "injected_message_id": Uuid::new_v4()}),
         ],
     );

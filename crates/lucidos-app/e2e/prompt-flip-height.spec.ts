@@ -1,7 +1,7 @@
 import { test, expect, type Page } from './fixtures';
 import {
   navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy,
-  newThread, openThreadDrawer, openDrawerView, waitForVisibleInput, ensureOnThreadPane,
+  newThread, openThreadDrawer, showOngoingGroup, waitForVisibleInput, ensureOnThreadPane,
   clickVisibleElement, isMobileViewport, userMessageBody,
 } from './helpers';
 
@@ -92,7 +92,7 @@ test.describe('prompt textarea height survives the compose FLIP', () => {
     // dedicated Drafts view if the default listing doesn't surface it.
     let wentToDraft = await clickVisibleElement(page, `[data-thread-nav="${draftId}"]`);
     if (!wentToDraft) {
-      await openDrawerView(page, 'Drafts');
+      await showOngoingGroup(page, 'Drafts');
       wentToDraft = await clickVisibleElement(page, `[data-thread-nav="${draftId}"]`);
     }
     expect(wentToDraft, 'draft row must be clickable').toBe(true);
@@ -147,7 +147,7 @@ test.describe('prompt textarea height survives the compose FLIP', () => {
     await openThreadDrawer(page);
     let wentToA = await clickVisibleElement(page, `[data-thread-nav="${aId}"]`);
     if (!wentToA) {
-      await openDrawerView(page, 'Drafts');
+      await showOngoingGroup(page, 'Drafts');
       wentToA = await clickVisibleElement(page, `[data-thread-nav="${aId}"]`);
     }
     expect(wentToA, 'draft A row must be clickable').toBe(true);
@@ -210,7 +210,7 @@ test.describe('prompt textarea height survives the compose FLIP', () => {
     await openThreadDrawer(page);
     let back = await clickVisibleElement(page, `[data-thread-nav="${draftId}"]`);
     if (!back) {
-      await openDrawerView(page, 'Drafts');
+      await showOngoingGroup(page, 'Drafts');
       back = await clickVisibleElement(page, `[data-thread-nav="${draftId}"]`);
     }
     expect(back, 'draft row clickable').toBe(true);

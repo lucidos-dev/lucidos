@@ -1,4 +1,5 @@
-import { signal, computed, batch, type ReadonlySignal } from '@preact/signals';
+import { signal, computed, batch, type ReadonlySignal, type Signal } from '@preact/signals';
+import type { WidgetParams } from '../utils/widgetParams';
 import { hydratePinnedAppsFromStorage } from './actions/pinnedApps';
 import { minDrawerWidth } from './paneMinimums';
 import type {
@@ -49,6 +50,7 @@ import { DEFAULT_CHAT_MODEL } from './models';
 import { PREFERENCE_CATALOG, type PreferenceValues } from '@lucidos/preference-catalog';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
+import type { UnproposedReason } from '../generated/thread-event-wire';
 import { resetContentScroll } from './savedScroll';
 import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort, PendingCommits, ReleaseNoticeView } from '../api/client';
 import type { UpdateRelay, ReleaseCheck } from '../api/client/control';
@@ -96,10 +98,13 @@ export type PanelOverlay =
   /** `fragment` is the app fragment (docs/glossary.md): the place inside the
    *  app a link named, delivered to the iframe as `location.hash`. It lives on
    *  the overlay so a target that outlives its app open is unrepresentable. */
-  | { type: 'app-ui'; app: App; fragment?: string }
+  | { type: 'app-ui'; app: App; fragment?: string; params?: WidgetParams }
   | { type: 'file-preview'; path: string }
   | { type: 'url-preview'; url: string }
   | { type: 'notification-detail'; notification: Notification }
+  /** The *plugin detail page*: one catalog row, by its marketplace and id.
+   *  `name` titles the nav history without a catalog lookup. */
+  | { type: 'plugin-detail'; marketplaceId: string; pluginId: string; name: string }
   | null;
 
 export const panelOverlay = signal<PanelOverlay>(null);
@@ -112,6 +117,11 @@ export const activeInlineForm = computed(() => {
 export const currentApp = computed(() => {
   const o = panelOverlay.value;
   return o?.type === 'app-ui' ? o.app : null;
+});
+/** The *widget params* of the open widget instance (ADR 0415). */
+export const currentAppParams = computed(() => {
+  const o = panelOverlay.value;
+  return o?.type === 'app-ui' ? o.params : undefined;
 });
 /** The app fragment of the open app, or null when the link named no target. */
 export const currentAppFragment = computed(() => {
@@ -136,7 +146,7 @@ export const filePreviewSource = signal(localStorage.getItem('lucidos-file-previ
  *  Persisted, and deliberately NOT in `store/effects.ts`'s per-file reset: this
  *  is a way of READING a file rather than a per-file override, the same class
  *  as `diffSideBySide`. Shared by both surfaces that render the view, the Files
- *  panel's preview pane and the app-facing preview modal. */
+ *  panel's preview pane and the file preview modal. */
 export const filePreviewWrap = signal(localStorage.getItem('lucidos-file-preview-wrap') !== 'false');
 
 /** User override for the diff whole-file toggle. `null` means no explicit
@@ -226,7 +236,7 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 // `system` is the System submenu, the list of the sub-pages below it. Overview
 // is one of those sub-pages and holds `system-overview`, so it is reached as a
 // row like every sibling.
-export type SettingsSubview = 'main' | 'system' | 'system-overview' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
+export type SettingsSubview = 'main' | 'system' | 'system-overview' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'prompt-footprint' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -276,6 +286,7 @@ export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
   { key: 'backup', label: 'Backup' },
   { key: 'memory', label: 'Memory' },
   { key: 'disk-usage', label: 'Disk Usage' },
+  { key: 'prompt-footprint', label: 'Workspace Prompt Footprint', short: 'Footprint' },
   { key: 'environment-variables', label: 'Environment Variables', short: 'Env Vars' },
   { key: 'debugging', label: 'Debugging' },
   { key: 'communication-surfaces', label: 'Communication Surfaces', short: 'Surfaces' },
@@ -598,8 +609,6 @@ export const configuredProviders = signal<string[] | null>(null);
 // --- Model (persisted via preferences; populated by loadPreferences) ---
 export const currentModel = signal(DEFAULT_CHAT_MODEL);
 
-// --- Reasoning Effort (persisted via preferences; populated by loadPreferences) ---
-export const reasoningEffort = signal<string>(PREFERENCE_CATALOG.chat_reasoning_effort.fallback);
 
 // --- Animation speed and reduced motion ---
 // Owned by utils/motion.ts, a lean module that timers outside the store can
@@ -650,42 +659,100 @@ export const toastPlacement = signal<ToastPlacement>(storedToastPlacement());
 export const threadDrawerOpen = signal(
   localStorage.getItem('lucidos-thread-drawer-open') === 'true'
 );
-/** The active drawer view, picked from the drawer view selector and persisted
- *  across reloads. Five mutually-exclusive views:
- *    - `all`: the default sectioned list (Current/Saved/Archive).
- *    - `attention`: the agent is stuck and the user must act, awaiting an
- *      answer or permission, or holding a failed turn (`threadNeedsAttention`).
- *    - `review`: carrying a change ready to apply (`threadInReview`).
- *    - `in-flight`: running, or waiting on its own event wait or on
- *      sub-threads (`threadIsInFlight`).
- *    - `drafts`: threads with an unsent draft (`draftThreads`).
+/** How the thread drawer groups its list, picked on the drawer's title band
+ *  and persisted per device:
+ *    - `folders`: the Pinned / Current / Archive sections, shaped by the
+ *      thread-type filter.
+ *    - `ongoing`: the ongoing groups (`ONGOING_GROUPS`), every thread type.
  *
- *  The badge counts are recomputed from the rehydrated `threadMap`, so only
- *  the active SELECTION is persisted. One key stores the choice and encodes
- *  the one-active invariant. A stored `running` is the view's old name and
- *  restores as `in-flight`. Any unknown value falls back to `all`. */
-const ALT_VIEW_KEY = 'lucidos-alt-view';
-export type DrawerView = 'all' | 'attention' | 'review' | 'in-flight' | 'drafts';
+ *  Any unknown stored value restores `folders`. */
+const DRAWER_GROUPING_KEY = 'lucidos-drawer-grouping';
+export type DrawerGrouping = 'folders' | 'ongoing';
 
-function restoreDrawerView(): DrawerView {
-  const saved = localStorage.getItem(ALT_VIEW_KEY);
-  if (saved === 'running') return 'in-flight';
-  return saved === 'attention' || saved === 'review' || saved === 'in-flight' || saved === 'drafts' ? saved : 'all';
+function restoreDrawerGrouping(): DrawerGrouping {
+  return localStorage.getItem(DRAWER_GROUPING_KEY) === 'ongoing' ? 'ongoing' : 'folders';
 }
 
-const drawerViewState = signal<DrawerView>(restoreDrawerView());
+const drawerGroupingState = signal<DrawerGrouping>(restoreDrawerGrouping());
 
-/** Read-only, so `setDrawerView` stays the one writer. The drawer's transition
- *  keys on this value (`drawerSwapKey`), so every write plays it, whoever made
- *  it. `__tests__/drawer-view-owner-guard.test.ts` pins both halves. */
-export const drawerView: ReadonlySignal<DrawerView> = drawerViewState;
+/** Read-only, so `setDrawerGrouping` stays the one writer. The drawer's
+ *  transition keys on this value (`drawerSwapKey`), so every write plays it,
+ *  whoever made it. `__tests__/drawer-grouping-owner-guard.test.ts` pins both
+ *  halves. */
+export const drawerGrouping: ReadonlySignal<DrawerGrouping> = drawerGroupingState;
 
-/** Select a drawer view, the one way to change it. Persists the choice
- *  (clearing the key for `all`, so a pristine state restores to the default). */
-export function setDrawerView(view: DrawerView): void {
-  drawerViewState.value = view;
-  if (view === 'all') localStorage.removeItem(ALT_VIEW_KEY);
-  else localStorage.setItem(ALT_VIEW_KEY, view);
+/** Pick the drawer grouping, the one way to change it. Persists the choice,
+ *  clearing the key for `folders` so a pristine state restores the default. */
+export function setDrawerGrouping(grouping: DrawerGrouping): void {
+  drawerGroupingState.value = grouping;
+  if (grouping === 'folders') localStorage.removeItem(DRAWER_GROUPING_KEY);
+  else localStorage.setItem(DRAWER_GROUPING_KEY, grouping);
+}
+
+/** The Ongoing grouping's groups, in the one order they always render in.
+ *  Each reads its own predicate (`ongoingGroups` in
+ *  components/drawer/family-graph.ts). */
+export const ONGOING_GROUPS = ['blocked', 'review', 'drafts', 'in-flight'] as const;
+export type OngoingGroup = typeof ONGOING_GROUPS[number];
+
+/** The Ongoing grouping's selected group, whose threads list below its tiles.
+ *  Exactly one is selected, empty or not. Persisted per device; a missing or
+ *  unknown stored value restores Blocked, which is how a device that
+ *  stored the group's old name, `attention`, lands on it. */
+const SELECTED_ONGOING_GROUP_KEY = 'lucidos-drawer-selected-ongoing-group';
+
+function restoreSelectedOngoingGroup(): OngoingGroup {
+  const saved = localStorage.getItem(SELECTED_ONGOING_GROUP_KEY);
+  return ONGOING_GROUPS.find(g => g === saved) ?? 'blocked';
+}
+
+const selectedOngoingGroupState = signal<OngoingGroup>(restoreSelectedOngoingGroup());
+
+/** Read-only, so `setSelectedOngoingGroup` stays the one writer. */
+export const selectedOngoingGroup: ReadonlySignal<OngoingGroup> = selectedOngoingGroupState;
+
+/** Select one ongoing group. Persists the choice, and lists the whole group. */
+export function setSelectedOngoingGroup(group: OngoingGroup): void {
+  selectedOngoingGroupState.value = group;
+  ongoingFilterState.value = 'all';
+  localStorage.setItem(SELECTED_ONGOING_GROUP_KEY, group);
+}
+
+/** The parts a group's rows split into, in the order a press on its selected
+ *  tile lists them. Every row belongs to exactly one part. A group without an
+ *  entry does not split. */
+export const ONGOING_PARTS = {
+  review: ['changes', 'unread'],
+  'in-flight': ['running', 'waiting'],
+} as const satisfies Partial<Record<OngoingGroup, readonly string[]>>;
+export type SplitOngoingGroup = keyof typeof ONGOING_PARTS;
+export type OngoingPart = typeof ONGOING_PARTS[SplitOngoingGroup][number];
+
+/** Which of the selected group's rows list: all of them, or one part. Not
+ *  persisted: a reload lists the whole group. */
+export type OngoingFilter = 'all' | OngoingPart;
+
+export function isSplitOngoingGroup(group: OngoingGroup): group is SplitOngoingGroup {
+  return group in ONGOING_PARTS;
+}
+
+/** The filters a press on `group`'s selected tile steps through, in order. */
+export function ongoingFilterSteps(group: OngoingGroup): readonly OngoingFilter[] {
+  return isSplitOngoingGroup(group) ? ['all', ...ONGOING_PARTS[group]] : ['all'];
+}
+
+const ongoingFilterState = signal<OngoingFilter>('all');
+
+/** Read-only, so `stepOngoingFilter` and `setSelectedOngoingGroup` stay the
+ *  only writers. Selecting a group resets it, and stepping walks only the
+ *  selected group's steps, so it always names one of them. */
+export const ongoingFilter: ReadonlySignal<OngoingFilter> = ongoingFilterState;
+
+/** Step the selected group's filter: all, then each part, then all again. */
+export function stepOngoingFilter(): void {
+  const steps = ongoingFilterSteps(selectedOngoingGroupState.value);
+  const next = (steps.indexOf(ongoingFilterState.value) + 1) % steps.length;
+  ongoingFilterState.value = steps[next];
 }
 export const DEFAULT_DRAWER_WIDTH = 300;
 export const THREAD_DRAWER_WIDTH_KEY = 'lucidos-thread-drawer-width';
@@ -1013,23 +1080,24 @@ export function getThreadDisplaySection(thread: ThreadState): DisplaySection {
     effectiveThreadStatus(thread),
     thread.meta.saved,
     thread.meta.activeChildrenCount > 0,
-    thread.meta.codingAgentProposed,
+    changeReadyToReview(thread.meta),
     thread.meta.attentionDescendantCount > 0,
   );
 }
 
-/** Whether a thread needs the user's attention. It sits in the Current or
+/** Whether a thread is blocked on the user. It sits in the Current or
  *  Saved section AND the agent is stuck waiting on the user: a question or a
  *  permission request, both of which surface as `waiting_for_user_answer`, a
- *  failed turn, or a *stopped child* whose parent waits on it (ADR 0252). This
+ *  failed turn, a *stopped child* whose parent waits on it (ADR 0252), or work
+ *  a turn end held because it was not hardened. This
  *  is the "nothing progresses until you act" subset, where a change merely
  *  READY to apply is `threadInReview`, a separate view.
  *
  *  Both statuses are mutually exclusive with `running`, so no running guard is
  *  needed. A composing or discarded thread never qualifies. Shared by
- *  `attentionThreadCount` and `attentionThreads`, so the badge and the
+ *  `blockedThreadCount` and `blockedThreads`, so the badge and the
  *  filtered list cannot disagree. */
-export function threadNeedsAttention(thread: ThreadState): boolean {
+export function threadIsBlocked(thread: ThreadState): boolean {
   if (isExcludedFromSections(thread)) return false;
   const section = getThreadDisplaySection(thread);
   if (section !== 'current' && section !== 'saved') return false;
@@ -1051,14 +1119,60 @@ export function threadNeedsAttention(thread: ThreadState): boolean {
   //
   // A stopped child is idle, so no status says it. Its parent is asleep until
   // the user continues, archives or discards it, and nothing else will.
+  //
+  // Work a turn end held for `hardening_missing` waits on the Harden press, so
+  // a resting thread holding it is blocked too. A thread still settling is
+  // not: its next turn end may harden by itself.
   return status === 'waiting_for_user_answer' || status === 'failed'
-    || thread.meta.isStoppedChild === true;
+    || thread.meta.isStoppedChild === true
+    || notReadyReason(thread) === 'hardening_missing';
 }
 
-/** Whether a thread is ready for review. It sits in the Current or Saved
- *  section, carries a finished coding-agent change (`changeReadyToReview`),
- *  AND the engine offers Apply for it. An incomplete change is left out: its
- *  banner leads with Continue, and it waits under Not finished (ADR 0346).
+/** Why the thread's work is not ready, while it rests: unproposed work a turn
+ *  end withheld, on a coding-agent thread. Resting means not mid-turn, not
+ *  watching an event, and not about to start a queued message. `null`
+ *  otherwise. The Not ready strip and Blocked both read it, so the strip's
+ *  Harden and the Blocked badge agree. */
+export function notReadyReason(thread: ThreadState | undefined): UnproposedReason | null {
+  if (!thread || thread.meta.channel !== 'claude_code' || threadUnsettled(thread)) return null;
+  const change = thread.meta.codingAgentChangeState;
+  if (change.kind !== 'unproposed' || change.reason === null) return null;
+  return agentHoldsUnreadMessage(thread) ? null : change.reason;
+}
+
+/** Whether an idle coding agent still holds the newest message unread, so its
+ *  next turn starts by itself (ADR 0268). A message queued behind a turn that
+ *  ended unfinished is the case. Only `idle` counts: a failed session reads
+ *  nothing. The agent reads oldest first, so a message logged after the newest
+ *  input it read is unread. A thread with no read events predates them and
+ *  never qualifies. `UNREAD_HOLD_EVENT_TYPES` must flush `threadMap`. */
+function agentHoldsUnreadMessage(thread: ThreadState): boolean {
+  if (thread.meta.status !== 'idle') return false;
+  const seqById = new Map<string, number>();
+  const messageIds: string[] = [];
+  const readIds: string[] = [];
+  const removed = new Set<string>();
+  for (const [seq, event] of thread.events) {
+    if (event._eventId) seqById.set(event._eventId, seq);
+    if (event.type === 'CodingAgentInputRead') readIds.push(event.input_event_id);
+    else if (event.type === 'QueuedMessageRemoved') removed.add(event.removed_message_id);
+    else if (event.type === 'MessageReceived' && event._eventId) messageIds.push(event._eventId);
+  }
+  const newestSeq = (ids: string[]) => ids.reduce((max, id) => Math.max(max, seqById.get(id) ?? -1), -1);
+  const newestRead = newestSeq(readIds);
+  return newestRead !== -1 && newestSeq(messageIds.filter(id => !removed.has(id))) > newestRead;
+}
+
+/** The events that can end an unread hold without changing thread meta. */
+export const UNREAD_HOLD_EVENT_TYPES: ReadonlySet<string> = new Set(['CodingAgentInputRead', 'QueuedMessageRemoved']);
+
+/** Whether a thread is ready for review: it is the user's turn to look. It
+ *  sits in the Current or Saved section, its turn has ended, and it carries a
+ *  pending coding-agent change (`changeReadyToReview`) or a *read request*
+ *  (ADR 0409).
+ *
+ *  A read request lists whatever the thread still waits on, since it has no
+ *  Apply to guard (ADR 0424). A change lists only once the thread has settled.
  *  The badge must never claim a thread with no Apply button showing, so this
  *  mirrors the three states in which `available_thread_actions` withholds
  *  Apply:
@@ -1066,37 +1180,32 @@ export function threadNeedsAttention(thread: ThreadState): boolean {
  *  - `running`: a follow-up turn is in flight, so the WaitingBanner shows
  *    Cancel rather than Apply.
  *  - `waiting_for_user_answer`: the open question holds the turn. The thread
- *    is in Needs attention instead, and returns here once answered.
+ *    is in Blocked instead, and returns here once answered.
  *  - a live event wait: the thread wakes on the delivery and commits on to the
  *    same branch, so its dot reads Waiting.
  *
- *  A failed thread keeps Apply, so it is in both this view and Needs
- *  attention. */
+ *  A failed thread keeps Apply, so it is in both this view and Blocked. */
 export function threadInReview(thread: ThreadState): boolean {
   if (isExcludedFromSections(thread)) return false;
   const section = getThreadDisplaySection(thread);
   if (section !== 'current' && section !== 'saved') return false;
-  if (threadUnsettled(thread)) return false;
-  return changeReadyToReview(thread.meta);
+  if (changeReadyToReview(thread.meta)) return !threadUnsettled(thread);
+  return readRequestStanding(thread);
+}
+
+/** A read request whose turn has ended: Review lists it, and the reply's end
+ *  coming into view clears it. A wait it still holds does not matter. */
+export function readRequestStanding(thread: ThreadState): boolean {
+  return thread.meta.readRequested === true && !isMidTurn(effectiveThreadStatus(thread));
 }
 
 /** Count of threads where the agent is stuck waiting on the user (see
- *  `threadNeedsAttention`), across the Current and Saved sections. Drives the
- *  selector's needs-attention badge. */
-export const attentionThreadCount = computed(() => {
+ *  `threadIsBlocked`), across the Current and Saved sections. Drives the
+ *  selector's Blocked badge. */
+export const blockedThreadCount = computed(() => {
   let count = 0;
   for (const thread of threadMap.value.values()) {
-    if (threadNeedsAttention(thread)) count++;
-  }
-  return count;
-});
-
-/** Count of threads carrying a change ready to apply (see `threadInReview`)
- *  across the Current and Saved sections. Drives the selector's review badge. */
-export const reviewThreadCount = computed(() => {
-  let count = 0;
-  for (const thread of threadMap.value.values()) {
-    if (threadInReview(thread)) count++;
+    if (threadIsBlocked(thread)) count++;
   }
   return count;
 });
@@ -1133,15 +1242,39 @@ export const activeThreadIsComposing = computed(() => {
   return threadMap.value.get(id)?.meta.state === 'composing';
 });
 
-// True when the prompt is in the centered "compose" layout: either the blank
-// view, with no focused thread and no exchanges, or a focused composing draft.
+// True when the prompt is in the centered "compose" layout: the blank view,
+// with no focused thread and no exchanges, a focused composing draft, or an
+// empty Home showing the welcome.
 // One source of truth for ThreadPane's FLIP and PromptInput's height
 // animation, so they agree by construction. The FLIP fires only when this
 // CHANGES; the height animation runs only while it STAYS true.
 export const composeViewActive = computed(() => {
   const id = focusedThreadId.value;
   const isEmpty = activeExchanges.value.length === 0;
-  return (!id && isEmpty) || activeThreadIsComposing.value;
+  return (!id && isEmpty) || activeThreadIsComposing.value || homeWelcomeActive.value;
+});
+
+/** Whether the new-workspace welcome has been retired, by the user's "Don't
+ *  show this again" or by `retireWelcomeAfterUse`. Not-yet-loaded and failed
+ *  preferences read as retired, so a returning user who retired it never sees
+ *  it flash during the fetch. An onboarding surface fails closed. */
+export const welcomeDismissed = computed(() => {
+  const prefs = preferences.value;
+  return prefs.status !== 'loaded' || prefs.data['welcome_suggestions_dismissed'] === 'true';
+});
+
+/** The focused thread is the home thread, empty, with the welcome showing in
+ *  it (ADR 0411). It then takes the compose layout, the welcome above a
+ *  centred prompt, until its first message or a dismissal. Waits for Home's
+ *  events, so a Home with history never flashes the welcome while they load. */
+export const homeWelcomeActive = computed(() => {
+  const id = focusedThreadId.value;
+  if (!id) return false;
+  const thread = threadMap.value.get(id);
+  return !!thread?.meta.home
+    && thread.eventsLoaded
+    && activeExchanges.value.length === 0
+    && !welcomeDismissed.value;
 });
 
 // --- Split layout ---
@@ -1378,23 +1511,80 @@ export const repoPending = signal<RepoPendingInfo | null>(null);
 export const repoViewMode = signal<'all' | 'changes'>('all');
 export const selectedLines = signal<{ start: number; end: number } | null>(null);
 
-/** A one-shot "scroll this line into view" request, consumed and cleared by
- *  whichever file preview renders next (see `consumeLineScrollTarget`). Written
- *  only by the navigate-to-a-line path; a manual line click never sets it.
+/** A one-shot "scroll this line into view" request for the file at `path`,
+ *  consumed and cleared by that file's preview (see `consumeLineScrollTarget`).
+ *  Written only by the navigate-to-a-line path; a manual line click never sets
+ *  it.
+ *
+ *  `path` is the one the opener showed, so the preview's host provides the same
+ *  string (`PreviewPathContext`). It must name its file: the router writes it
+ *  before the new file renders, while the previous file's rows are still live.
  *
  *  Deliberately NOT derived from `selectedLines`. An effect keyed on the
  *  selection would re-scroll on every unrelated re-render that keeps the
  *  selection alive, yanking a user who had scrolled away. It would also fight
  *  a shift-click that extends a selection upward. Mirrors
  *  `pluginScrollTarget`. */
-export const lineScrollTarget = signal<number | null>(null);
+export interface LineScrollTarget {
+  path: string;
+  line: number;
+}
 
-/** Take the pending scroll target, clearing it so the same navigate can't
- *  scroll twice. Returns null when nothing is pending. */
-export function consumeLineScrollTarget(): number | null {
-  const target = lineScrollTarget.value;
-  if (target !== null) lineScrollTarget.value = null;
-  return target;
+export const lineScrollTarget = signal<LineScrollTarget | null>(null);
+
+/** A find a navigation asked for: the content pane's find bar opens on `query`
+ *  once it shows `scope`, starting at `line` (see `takeFindRequest`). Like
+ *  `lineScrollTarget`, every file opener drops it, and the router sets it after. */
+export interface FindRequest {
+  scope: string;
+  query: string;
+  line: number;
+}
+
+export const findRequest = signal<FindRequest | null>(null);
+
+/** Take the line pending for the file at `path`, clearing it so the same
+ *  navigate can't scroll twice. Returns null when nothing is pending for that
+ *  file, and leaves a target naming another file for its own preview. */
+export function consumeLineScrollTarget(
+  pending: Signal<LineScrollTarget | null>, path: string | null,
+): number | null {
+  const target = pending.value;
+  if (target === null || target.path !== path) return null;
+  pending.value = null;
+  return target.line;
+}
+
+/** What one file preview reads to decide how it shows: the selected range, the
+ *  pending scroll target, Source over rendered, and the editor.
+ *
+ *  The Files panel's set is the global signals (`panelPreviewViewState`). The
+ *  file preview modal holds a set of its own. So a modal over a Files preview
+ *  never shares a highlight or a scroll target with it. The preview components
+ *  read whichever set `PreviewViewStateContext` provides. */
+export interface PreviewViewState {
+  selectedLines: Signal<{ start: number; end: number } | null>;
+  lineScrollTarget: Signal<LineScrollTarget | null>;
+  source: Signal<boolean>;
+  editing: Signal<boolean>;
+}
+
+export const panelPreviewViewState: PreviewViewState = {
+  selectedLines,
+  lineScrollTarget,
+  source: filePreviewSource,
+  editing: filePreviewEditing,
+};
+
+/** A fresh, unshared set: nothing selected, no scroll pending, rendered view,
+ *  not editing. */
+export function createPreviewViewState(): PreviewViewState {
+  return {
+    selectedLines: signal(null),
+    lineScrollTarget: signal(null),
+    source: signal(false),
+    editing: signal(false),
+  };
 }
 
 /** Turn a navigate's `line` / `line_end` pair into a selectable range, or null
@@ -1566,6 +1756,12 @@ export const appliedChanges = signal<Loadable<Change[]>>({ status: 'not-loaded' 
 export const setAsideChanges = signal<Loadable<Change[]>>({ status: 'not-loaded' });
 /** A thread's set-aside change, if it has one. A thread holds at most one
  *  open change, so the first match is the only one. */
+export function pendingChangeForThread(threadId: string): Change | undefined {
+  const loadable = changes.value;
+  return loadable.status === 'loaded'
+    ? loadable.data.find((c) => c.thread_id === threadId && c.status === 'pending')
+    : undefined;
+}
 export function setAsideChangeForThread(threadId: string): Change | undefined {
   const loadable = setAsideChanges.value;
   return loadable.status === 'loaded'
@@ -1595,11 +1791,11 @@ export function findChangeById(id: string): Change | undefined {
   const lazy = lazyChanges.value.get(id);
   return lazy?.status === 'loaded' ? lazy.data : undefined;
 }
-/** A pending change is ready when its thread has settled and its turn
- *  finished. An incomplete change waits under Not finished instead (ADR 0346).
- *  The Changes panel's Ready section and the badge share this, so they agree. */
+/** A pending change is ready when it is *apply-ready*: its thread has
+ *  finished and it needs no hardening. The engine decides it. The Changes
+ *  panel's Ready section and the badge share this, so they agree. */
 export function changeIsReady(change: Change): boolean {
-  return !change.thread_unsettled && !change.incomplete;
+  return change.apply_ready;
 }
 
 /** Pending changes the reader can act on now: the ready ones. A change still
@@ -2122,13 +2318,13 @@ export const promptState = signal<PromptState>({
 });
 
 // --- File preview modal ---
-/** A file an app asked the host to show over it, without navigating the shell
- *  away (`lucidos.ui.previewFile`). Read-only, and deliberately NOT a
- *  `panelOverlay` variant: that is the content pane's nav-history unit, and a
- *  glance at a cited file is not a destination Back should walk onto.
+/** A file shown over the shell without navigating it away: an app's
+ *  `lucidos.ui.previewFile`, or a file link in agent prose. Read-only, and
+ *  deliberately NOT a `panelOverlay` variant: that is the content pane's
+ *  nav-history unit, and a glance at a cited file is not a destination Back
+ *  should walk onto.
  *
- *  Opened and closed through `store/actions/filePreviewModal`, which owns the
- *  view-state borrowing that makes the shared preview components render it. */
+ *  Opened and closed through `store/actions/filePreviewModal`. */
 export interface FilePreviewModalState {
   /** Bumped per open, so a second `previewFile` that replaces a showing modal
    *  re-runs the component's per-open effects instead of looking unchanged. */
@@ -2140,6 +2336,8 @@ export interface FilePreviewModalState {
   /** The line range the modal opened at, or null when the citation named none.
    *  Kept so the escalation into the Files panel carries the same lines. */
   range: { start: number; end: number } | null;
+  /** This open's own view state, never the Files panel's. */
+  view: PreviewViewState;
 }
 export const filePreviewModal = signal<FilePreviewModalState | null>(null);
 
@@ -2512,6 +2710,14 @@ export const recommendedCleanupProgress = signal<{ done: number; total: number }
 /** Bumped when a recommended cleanup ends, and on an SSE reconnect. The Disk
  *  Usage page re-reads its figures on it. */
 export const diskUsageVersion = signal(0);
+
+/** Bumped on an app change or open, a preference change, and an SSE
+ *  reconnect. The Workspace Prompt Footprint page re-reads its report on it. */
+export const promptFootprintVersion = signal(0);
+
+/** Bumped on `ModelNotServedObserved`: a provider no longer serves a model a
+ *  background task ran on. The background rows re-read what runs (ADR 0403). */
+export const backgroundModelsVersion = signal(0);
 
 /** Bumped when a `PreferencesChanged` carries one of the three keys the Backup
  *  page renders: `backup_provider`, `backup_schedule`, `backup_retention`.

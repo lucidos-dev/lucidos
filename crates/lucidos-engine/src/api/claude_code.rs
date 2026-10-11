@@ -65,7 +65,7 @@ pub(super) async fn claude_code_stop(
     // a refusal leaves the turn exactly as it found it. Apply and Discard reach
     // this route too, and each is gated as itself.
     super::thread_reach::refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         thread_id,
         stop_verb(query.reason()),
@@ -203,7 +203,7 @@ pub(super) async fn claude_code_apply_now(
     // Apply by another route, so it takes the same gate. Before the merge, so a
     // refusal lands nothing on main.
     super::thread_reach::refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         Some(thread_id),
         super::thread_reach::ThreadReachVerb::Apply,
@@ -316,7 +316,7 @@ pub(super) async fn claude_code_control(
     // A thread-bound subprocess may drive only its own session or a
     // descendant's, never a sibling's. Runs before the request reaches the session.
     super::thread_reach::refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         Some(thread_id),
         super::thread_reach::ThreadReachVerb::Control,
@@ -333,7 +333,7 @@ pub(super) async fn claude_code_control(
         .engine
         .send_agent_control_request(thread_id, body.request, actor)
         .await
-        .map(|_| Json(serde_json::json!({ "ok": true })))
+        .map(|takes_effect| Json(serde_json::json!({ "ok": true, "takes_effect": takes_effect })))
         .map_err(|e| {
             (
                 StatusCode::NOT_FOUND,
@@ -442,7 +442,7 @@ pub(super) async fn claude_code_discard(
     // Discard by another route, so it takes the same gate. Before the branch
     // and worktree go.
     super::thread_reach::refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
         super::thread_reach::ThreadReachVerb::Discard,
@@ -468,7 +468,7 @@ pub(super) async fn claude_code_interrupt(
     let thread_id = super::parse_optional_uuid(query.thread_id.as_deref())?;
     // Cancel by another route, so it takes the same gate.
     super::thread_reach::refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         thread_id,
         super::thread_reach::ThreadReachVerb::Cancel,

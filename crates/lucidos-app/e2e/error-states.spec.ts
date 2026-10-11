@@ -80,7 +80,7 @@ test.describe('Error display states', () => {
 
     try {
       psql([
-        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Recovery rerun e2e', 'chat', '${t3}', 1, false, true, 'idle', 'archived', false, 0, false, false, false)`,
+        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Recovery rerun e2e', 'chat', '${t3}', 1, false, true, 'idle', 'archived', false, 0, 'none', false)`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${userMsgId}', 'MessageReceived', '${userPayload}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${abortedId}', 'ResponseAborted', '${abortedPayload}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${textStreamedId}', 'TextStreamed', '${textStreamedPayload}'::jsonb, '${t2}', 'thread', '${threadId}', '${threadId}')`,
@@ -139,7 +139,7 @@ test.describe('Resume after restart — boundary panels', () => {
 
     try {
       psql([
-        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Engine abort e2e', 'chat', '${t1}', 1, false, false, 'idle', 'inbox', false, 0, false, false, false)`,
+        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Engine abort e2e', 'chat', '${t1}', 1, false, false, 'idle', 'inbox', false, 0, 'none', false)`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${userMsgId}', 'MessageReceived', '${userPayload}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${abortedId}', 'ResponseAborted', '${abortedPayload}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
       ].join(';\n'));
@@ -190,7 +190,7 @@ test.describe('Resume after restart — boundary panels', () => {
 
     try {
       psql([
-        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Device abort e2e', 'chat', '${t1}', 1, false, false, 'idle', 'inbox', false, 0, false, false, false)`,
+        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Device abort e2e', 'chat', '${t1}', 1, false, false, 'idle', 'inbox', false, 0, 'none', false)`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${userMsgId}', 'MessageReceived', '${userPayload}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${abortedId}', 'ResponseAborted', '${abortedPayload}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
       ].join(';\n'));
@@ -247,7 +247,7 @@ test.describe('Resume after restart — boundary panels', () => {
 
     try {
       psql([
-        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Resumed e2e', 'chat', '${t2}', 1, false, false, 'idle', 'archived', false, 0, false, false, false)`,
+        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Resumed e2e', 'chat', '${t2}', 1, false, false, 'idle', 'archived', false, 0, 'none', false)`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${userMsgId}', 'MessageReceived', '{"text":"hi","channel":"chat"}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${abortedId}', 'ResponseAborted', '${abortedPayload}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${recoveredId}', 'ContinuationStarted', '${recoveredPayload}'::jsonb, '${t2}', 'thread', '${threadId}', '${threadId}')`,
@@ -322,11 +322,11 @@ test.describe('Resume after restart — boundary panels', () => {
 
     try {
       psql([
-        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Engine note e2e', 'chat', '${t3}', 1, false, false, 'idle', 'archived', false, 0, false, false, false)`,
+        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Engine note e2e', 'chat', '${t3}', 1, false, false, 'idle', 'archived', false, 0, 'none', false)`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${userMsgId}', 'MessageReceived', '{"text":"hi","channel":"chat"}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${abortedId}', 'ResponseAborted', '${abortedPayload}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${recoveredId}', 'ContinuationStarted', '${recoveredPayload}'::jsonb, '${t2}', 'thread', '${threadId}', '${threadId}')`,
-        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${injectedId}', 'UserPromptInjected', '${injectedPayload}'::jsonb, '${t3}', 'thread', '${threadId}', '${threadId}')`,
+        `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${injectedId}', 'PromptInjected', '${injectedPayload}'::jsonb, '${t3}', 'thread', '${threadId}', '${threadId}')`,
       ].join(';\n'));
 
       await page.addInitScript((tid: string) => {
@@ -386,7 +386,7 @@ test.describe('Question-parked thread preserved across restart', () => {
 
     try {
       psql([
-        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Preserved question e2e', 'chat', '${t1}', 1, false, false, 'waiting_for_user_answer', 'inbox', false, 0, false, false, false)`,
+        `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Preserved question e2e', 'chat', '${t1}', 1, false, false, 'waiting_for_user_answer', 'inbox', false, 0, 'none', false)`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${userMsgId}', 'MessageReceived', '${userPayload}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
         `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${askId}', 'UserQuestionAsked', '${askPayload}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
       ].join(';\n'));

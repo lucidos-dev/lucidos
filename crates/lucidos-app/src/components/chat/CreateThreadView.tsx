@@ -13,8 +13,10 @@ import {
   promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
+import { homeThreadId } from '../../store/actions/homeThread';
 import { anchorSpacer, setAnchorSpacer, splitAnchorCorrection } from './anchorCorrection';
-import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, readerGestureSince } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, readerGestureSince } from './scrollState';
+import { isElementVisible } from '../../utils/elementVisibility';
 import { ChatExchange } from './ChatExchange';
 import type { ProposedChangeSeed } from './ChatExchange';
 import { NO_SIDE_QUESTIONS, placeSideQuestions, sideQuestionOwners } from './SideQuestionCard';
@@ -67,7 +69,7 @@ export function buildProposedChangeInfo(exchanges: Exchange[]): Map<string, Prop
 const NO_PROPOSED_CHANGE_INFO = new Map<string, ProposedChangeSeed>();
 
 /** The matched event of a delivery, keyed by the `EventWaitDelivered`'s own
- *  event id, which is what the anchor's `UserPromptInjected.delivered_event_id`
+ *  event id, which is what the anchor's `PromptInjected.delivered_event_id`
  *  names.
  *
  *  Resolved at thread level because the two events land in DIFFERENT exchanges.
@@ -124,7 +126,7 @@ const NO_DELIVERED_EVENT_INFO = new Map<string, DeliveredEventInfo>();
  *  the per-exchange lookup can't drift apart. */
 function deliveryEventId(ex: Exchange): string | undefined {
   const ev = ex.userEvent;
-  return ev.type === 'UserPromptInjected' ? ev.delivered_event_id : undefined;
+  return ev.type === 'PromptInjected' ? ev.delivered_event_id : undefined;
 }
 
 /** Threads the last model/effort across exchanges so each child sees its predecessors' state. */
@@ -691,19 +693,23 @@ export function useScrollObservers(ref: preact.RefObject<HTMLDivElement>, ready:
   }, []);
 }
 
-/** Whether the welcome surface (`WelcomeMessage`) shows on the empty compose
- *  view. One rule: show it until it is dismissed, by the user or by
- *  `retireWelcomeAfterUse` after their third thread. The dismissal is stored
- *  in the DB-backed `welcome_suggestions_dismissed` preference, so it sticks
- *  across reloads and devices. `WelcomeMessage` still adapts its body to whether
- *  an LLM provider is configured (provider-setup CTA vs. starter prompts), but
- *  that's content, not gating — both are gated the same way here.
- *  Pure so the gating is unit-testable without rendering the hook-heavy view. */
-export function showWelcomeSurface(opts: {
-  isEmpty: boolean;
+/** Where the welcome surface (`WelcomeMessage`) belongs: in the home thread,
+ *  on the empty compose view, or nowhere (ADR 0411).
+ *
+ *  Home holds it whenever Home exists, which is every workspace once boot ran.
+ *  The compose view holds it only when there is no Home, if creating it
+ *  failed. Nothing holds it while the thread list loads, since only then is it
+ *  known whether Home exists, nor once it is dismissed. The dismissal lives in
+ *  the DB-backed `welcome_suggestions_dismissed` preference, so it sticks
+ *  across reloads and devices. A surface also shows the welcome only while it
+ *  is empty. Pure, so the rule is unit-testable without the hook-heavy view. */
+export function welcomePlacement(opts: {
+  threadsLoaded: boolean;
+  homeId: string | null;
   welcomeDismissed: boolean;
-}): boolean {
-  return opts.isEmpty && !opts.welcomeDismissed;
+}): 'home' | 'compose' | 'none' {
+  if (!opts.threadsLoaded || opts.welcomeDismissed) return 'none';
+  return opts.homeId ? 'home' : 'compose';
 }
 
 export function CreateThreadView() {
@@ -720,15 +726,14 @@ export function CreateThreadView() {
   const animating = promptAnimating.value;
 
   const isEmpty = exchanges.length === 0;
-  // Show the welcome until it is dismissed. `welcomeSuggestionsDismissed()`
-  // reads the DB-backed preference and fails closed while preferences load, so
-  // a returning user who dismissed it never sees a flash. A fresh workspace
-  // gets it back once preferences settle and read unset. Reactive on both
-  // `exchanges` and the preferences signal.
-  const showWelcome = showWelcomeSurface({
-    isEmpty,
+  // This view is the compose view, or an empty Home in its compose layout.
+  // Either way it shows the welcome only if the welcome belongs here.
+  const here = threadId && threadId === homeThreadId.value ? 'home' : 'compose';
+  const showWelcome = isEmpty && welcomePlacement({
+    threadsLoaded: loaded,
+    homeId: homeThreadId.value,
     welcomeDismissed: welcomeSuggestionsDismissed(),
-  });
+  }) === here;
 
   // Sequenced welcome entrance. The surface stays hidden on its CSS
   // `opacity: 0` base until the prompt textarea finishes sliding up, then

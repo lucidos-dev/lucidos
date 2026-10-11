@@ -57,11 +57,17 @@ has to line up with. Render inside the running app, in the workspace's theme.
    ```
 
    `--into` and `--capture` take selectors for a surface outside the thread
-   feed. `--hover` shows a hover state.
-5. **The running build still carries the old rules.** Injected CSS adds to
+   feed. `--hover` shows a hover state. `--ui-scale 125` renders at the
+   user's UI scale.
+5. **A desktop header change also renders the packaged macOS app.** Its
+   traffic lights take room at the header's leading end, so a row that fits on
+   the web can collide there. Pass `--packaged mac --capture viewport`. It
+   stamps the overlay title bar the app stamps and paints the lights. Show the
+   drawer floor and a slightly wider drawer.
+6. **The running build still carries the old rules.** Injected CSS adds to
    them, so cancel any old declaration a variant drops. A stale `min-width`
    once made a correct X look misplaced by 22px.
-6. `Read` every picture before you show it. Fix what looks wrong first.
+7. `Read` every picture before you show it. Fix what looks wrong first.
 
 ## Show it
 

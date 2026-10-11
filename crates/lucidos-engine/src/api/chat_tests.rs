@@ -1021,7 +1021,7 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
 
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::UserPromptInjected {
+        event: ThreadEvent::PromptInjected {
             text: "queued".into(),
             mode: ActorMode::Human,
             origin: None,
@@ -1034,7 +1034,7 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
         },
     })
     .await
-    .expect("UserPromptInjected must persist");
+    .expect("PromptInjected must persist");
 
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
@@ -1200,7 +1200,7 @@ async fn announce_orphan_batch_revives_a_thread_the_cancel_left_idle() {
 
     let named: Vec<String> = sqlx::query_scalar(
         "SELECT payload->>'injected_message_id' FROM events \
-         WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected' ORDER BY sequence",
+         WHERE aggregate_id = $1 AND event_type = 'PromptInjected' ORDER BY sequence",
     )
     .bind(thread_id.to_string())
     .fetch_all(&pool)
@@ -1236,7 +1236,7 @@ async fn announce_orphan_batch_announces_every_orphan_in_the_batch() {
 
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT payload->>'injected_message_id', payload->>'request_event_id' FROM events \
-         WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected' ORDER BY sequence",
+         WHERE aggregate_id = $1 AND event_type = 'PromptInjected' ORDER BY sequence",
     )
     .bind(thread_id.to_string())
     .fetch_all(&pool)
@@ -1268,7 +1268,7 @@ async fn announce_orphan_batch_is_a_noop_for_an_empty_batch() {
     announce_orphan_batch(&bus, thread_id, &[]).await;
 
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected'",
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'PromptInjected'",
     )
     .bind(thread_id.to_string())
     .fetch_one(&pool)

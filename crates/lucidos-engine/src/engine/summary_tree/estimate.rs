@@ -6,12 +6,11 @@
 //! takes about a second on millions of events. That size carries field
 //! overhead and compression, so every figure is a range.
 //!
-//! **Token counts per call come from history where there is enough of it.**
-//! [`measured_for_catalog`] averages real `ContextCaptured` rows for the
-//! compactor, per model. A model with too little history uses its own seed,
-//! measured per model and kept beside its price in [`COMPACTOR_MODELS`]. So two
-//! models at one price are told apart by what each actually spends. Output
-//! further scales with the reasoning tier: see [`scaled_output_tokens`].
+//! **Each tier is priced on its own measurement.** [`measured_for_catalog`]
+//! averages real `ContextCaptured` rows for the compactor, per model and tier.
+//! A tier with too little history uses its seed, kept beside the model's price
+//! in [`COMPACTOR_MODELS`]. A tier measured neither way is a range: see
+//! [`tier_price`].
 //!
 //! **A tier is priced as the tier the model runs at.** Routing snaps a tier
 //! the model cannot run onto one it can, so the estimate clamps the same way.
@@ -19,8 +18,8 @@
 //! **Time follows the compactor's lanes.** Calls run [`START_LIMIT`] at once,
 //! and a thread's leaves run one after another, so the longest thread sets a
 //! floor. *Usable* is when the ready flag sets: the workspace tree and the
-//! threads active within [`READY_DAYS`]. *Complete* is every tree. A model's
-//! seconds per call come from its timed history where there is enough of it.
+//! threads active within [`READY_DAYS`]. *Complete* is every tree. Seconds per
+//! call follow the tier, like the tokens.
 
 use std::collections::HashMap;
 
@@ -28,12 +27,15 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::compactor_models::{MeasuredUsage, COMPACTOR_MODELS};
+use super::compaction_view;
+use super::compactor_models::{CompactorModel, MeasuredUsage, TierSeed, COMPACTOR_MODELS};
 use super::limit::START_LIMIT;
 use super::log::{ENTRY_EVENT_TYPES, TURN_END_EVENT_TYPES};
+use super::shape::LEAF_WINDOW;
 use super::store::{ready_window_sql, THREAD_IN_SCOPE_SQL};
+use super::view::ViewBlocks;
 use super::workspace_log::{sql_list, WORKSPACE_LEAF_EVENT_TYPES};
-use super::{fold, prompt, CAP_CHARS, CONTEXT_BYTES, NODE_BYTES, READY_DAYS};
+use super::{prompt, CAP_CHARS, NODE_BYTES, RAW_CONTEXT_BYTES, READY_DAYS};
 use crate::engine::LucidosEngine;
 use crate::llm::model_registry::{
     provider_kind_for, resolve_route, ModelRegistry, ProviderKind, RouteEntry,
@@ -51,12 +53,7 @@ const COMPRESSION: i64 = 3;
 
 const BYTES_PER_TOKEN: u64 = 4;
 
-/// A single-line answer's own tokens, independent of reasoning tier: what
-/// [`scaled_output_tokens`] falls back to at `none`, and the floor every
-/// other tier is built on top of.
-const LINE_TOKENS: u64 = 128;
-
-/// Seconds one call takes, wall clock, for a model with no timed history.
+/// Seconds one call takes, wall clock, for a model with no timed tier.
 const SECS_PER_CALL: Bounds<f64> = Bounds {
     low: 1.0,
     high: 4.0,
@@ -65,9 +62,9 @@ const SECS_PER_CALL: Bounds<f64> = Bounds {
 /// Days of activity the daily figure averages over.
 const RECENT_DAYS: u64 = 7;
 
-/// A model's measured history counting fewer calls than this is too thin to
+/// A tier's measured history counting fewer calls than this is too thin to
 /// trust: one unusually long or short call could swing the average either
-/// way. Below it, the model's seed applies instead.
+/// way. Below it, the tier's seed applies instead.
 const MIN_MEASURED_CALLS: i64 = 20;
 
 /// Entry types only a Lucidos Agent thread logs.
@@ -93,14 +90,15 @@ pub struct Bounds<T> {
 pub struct TreeBackfillEstimate {
     /// Compactor calls the backfill makes.
     pub calls: Bounds<u64>,
-    /// Until turns read the trees, at the default seconds per call.
+    /// Until turns read the trees, at the default seconds per call: what a
+    /// model the estimate does not price shows.
     pub usable_secs: Bounds<u64>,
     /// Until every tree is built, at the default seconds per call.
     pub complete_secs: Bounds<u64>,
     /// Calls a day once the backfill is done, from the last week's activity.
     pub daily_calls: Bounds<u64>,
-    /// The cost of both, for each compactor model, at every reasoning tier
-    /// the compactor preference accepts. A tier the model cannot run is
+    /// The cost and time of both, for each compactor model, at every reasoning
+    /// tier the compactor preference accepts. A tier the model cannot run is
     /// priced as the tier routing snaps it to.
     pub costs: Vec<ModelCost>,
 }
@@ -108,16 +106,16 @@ pub struct TreeBackfillEstimate {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelCost {
     pub model: String,
-    /// [`TreeBackfillEstimate::usable_secs`] at this model's seconds per call.
-    pub usable_secs: Bounds<u64>,
-    /// [`TreeBackfillEstimate::complete_secs`] at this model's seconds per call.
-    pub complete_secs: Bounds<u64>,
     pub by_effort: Vec<EffortCost>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffortCost {
     pub effort: String,
+    /// [`TreeBackfillEstimate::usable_secs`] at this tier's seconds per call.
+    pub usable_secs: Bounds<u64>,
+    /// [`TreeBackfillEstimate::complete_secs`] at this tier's seconds per call.
+    pub complete_secs: Bounds<u64>,
     pub backfill_usd: Bounds<f64>,
     /// The single figure the panel leads with. From measured (or
     /// seeded) per-call tokens, not the low/high guesses that make the
@@ -153,9 +151,14 @@ impl Tree {
         tree_work(self.all, merge_count(self.all.count), self.all.count)
     }
 
-    /// Its leaf calls, which run one after another.
+    /// Its leaf calls in rounds, [`LEAF_WINDOW`] at a time, which run one
+    /// after another.
     fn chain(&self) -> Bounds<u64> {
-        self.all.calls
+        let rounds = |calls: u64| calls.div_ceil(LEAF_WINDOW as u64);
+        Bounds {
+            low: rounds(self.all.calls.low),
+            high: rounds(self.all.calls.high),
+        }
     }
 
     /// The calls its recent leaves cost: those leaves, and the merges they
@@ -247,18 +250,15 @@ impl Work {
 /// Bytes every call sends besides its message: the system prompt and the
 /// request's frame.
 fn frame_bytes() -> u64 {
-    (prompt::COMPACT.len() + prompt::request(&[], &prompt::compress_step("")).len()) as u64
+    let request = prompt::request(&ViewBlocks::default(), &prompt::compress_step(""));
+    (prompt::COMPACT.len() + request.as_text().len()) as u64
 }
 
-/// The real context-tiling bytes a call at tree position `tree_len` sends,
-/// assuming every stored node is [`NODE_BYTES`] big (the compactor's cap on a
-/// written line). Calls [`fold::context_tiling`], the exact function the
-/// compactor itself calls to build a node's context, so this is no longer a
-/// flat `0..CONTEXT_BYTES` guess: a small tree gets a small figure, and only a
-/// tree past the budget converges on [`CONTEXT_BYTES`].
-fn context_tiling_bytes(tree_len: u64) -> u64 {
-    fold::context_tiling(tree_len, |_| Some(NODE_BYTES), CONTEXT_BYTES).len() as u64
-        * NODE_BYTES as u64
+/// The most context a call in a tree of `tree_len` leaves reads: every line
+/// before it at [`NODE_BYTES`], up to the compaction view's most. A small tree
+/// gets a small figure.
+fn compaction_view_bytes(tree_len: u64) -> u64 {
+    (tree_len * NODE_BYTES as u64).min(compaction_view::MAX_BYTES as u64)
 }
 
 /// The merges a full tree over `n` leaves holds (`shape::complete_addresses`
@@ -274,10 +274,10 @@ pub(crate) fn merge_count(n: u64) -> u64 {
 
 /// A tree's leaf calls, and `merges` merge calls at most. At best each pair
 /// of leaves that costs no call merges for free too. `tree_len` is the whole
-/// tree's leaf count, which sets how deep a call's context tiling reaches.
+/// tree's leaf count, which bounds how much context a call reads.
 fn tree_work(leaves: Leaves, merges: u64, tree_len: u64) -> Work {
     let frame = frame_bytes();
-    let context_bytes = context_tiling_bytes(tree_len);
+    let context_bytes = compaction_view_bytes(tree_len);
     let free_pairs = leaves.count.saturating_sub(leaves.calls.high) / 2;
     let merges = Bounds {
         low: merges.saturating_sub(free_pairs),
@@ -302,17 +302,15 @@ fn tree_work(leaves: Leaves, merges: u64, tree_len: u64) -> Work {
 }
 
 /// A relative thinking-budget weight for each reasoning tier, used only to
-/// scale a measured tier's average onto another tier.
+/// stretch a measured tier's output onto an unmeasured tier above it.
 ///
 /// `none` is true zero: no thinking is requested at that tier, so its weight
 /// must be lower than every other, not
 /// [`crate::llm::thinking_budget_for_effort`]'s catch-all fallback.
 ///
 /// Every other tier keeps that function's numeric ceiling: the one real,
-/// code-defined scale between tiers this crate has. Only the budget-token
-/// Claude path exposes a number today. Adaptive Claude and Gemini's
-/// qualitative tiers do not, so for them this ratio is the estimate's one
-/// remaining guess, not its direction.
+/// code-defined scale between tiers this crate has. For a tier the comparison
+/// did not measure it is a guess, so it only ever sets the top of a range.
 fn tier_weight(effort: &str) -> u32 {
     match effort {
         "none" => 0,
@@ -320,33 +318,22 @@ fn tier_weight(effort: &str) -> u32 {
     }
 }
 
-/// Output tokens of one call at `effort`, from a `low`-tier baseline (today's
-/// `reasoning_summary_compaction` default, which is what historical,
-/// tier-unlabeled usage implicitly measures). The line itself
-/// ([`LINE_TOKENS`]) does not scale; only the thinking portion above it does,
-/// by the ratio of `effort`'s weight to `low`'s. Monotonic in
-/// [`EFFORT_LADDER`] order, since [`tier_weight`] is.
-fn scaled_output_tokens(baseline_low_output: u64, effort: &str) -> u64 {
-    let thinking = baseline_low_output.saturating_sub(LINE_TOKENS);
-    let low_weight = f64::from(tier_weight("low"));
-    let weight = f64::from(tier_weight(effort));
-    LINE_TOKENS + ((thinking as f64) * weight / low_weight).round() as u64
-}
-
-/// Real per-call compactor usage and time for one model, from
-/// `ContextCaptured` history: count and averages of the compactor's calls, per
-/// model in `$1`. Only timed calls count toward the time.
+/// Real per-call compactor usage and time, from `ContextCaptured` history:
+/// count and averages of the compactor's calls, per model in `$1` and per
+/// tier. Only timed calls count toward the time.
 ///
 /// The first two conditions are `idx_events_summary_compaction_captures`'s
 /// predicate, spelled exactly as its migration does. Change one and the read
 /// falls back to scanning every event.
 ///
 /// A row with no `reasoning_effort` predates the field and ran at the
-/// preference's then-default, `low`. A labelled higher tier must not dilute
-/// that baseline. `avg(bigint)` is `numeric`, which sqlx cannot decode into
-/// `f64`, so each average casts to FLOAT8.
-const MEASURED_USAGE_SQL: &str = "SELECT payload->>'model', count(*), \
+/// preference's then-default, `low`. `avg(bigint)` is `numeric`, which sqlx
+/// cannot decode into `f64`, so each average casts to FLOAT8.
+const MEASURED_USAGE_SQL: &str = "SELECT payload->>'model', \
+       COALESCE(payload->>'reasoning_effort', 'low'), count(*), \
        avg((payload->'usage'->>'input_tokens')::bigint)::float8, \
+       avg(COALESCE((payload->'usage'->>'cache_read_tokens')::bigint, 0))::float8, \
+       avg(COALESCE((payload->'usage'->>'cache_creation_tokens')::bigint, 0))::float8, \
        avg((payload->'usage'->>'output_tokens')::bigint)::float8, \
        count(payload->'duration_ms'), \
        avg((payload->>'duration_ms')::float8) \
@@ -355,8 +342,7 @@ const MEASURED_USAGE_SQL: &str = "SELECT payload->>'model', count(*), \
        AND payload->>'purpose' = 'summary_compaction' \
        AND payload->>'model' = ANY($1) \
        AND payload ? 'usage' \
-       AND COALESCE(payload->>'reasoning_effort', 'low') = 'low' \
-     GROUP BY 1";
+     GROUP BY 1, 2";
 
 /// The models [`MEASURED_USAGE_SQL`] reads: the compactor's, which the
 /// estimate prices.
@@ -364,49 +350,146 @@ fn compactor_model_ids() -> Vec<&'static str> {
     COMPACTOR_MODELS.iter().map(|m| m.id).collect()
 }
 
-/// What the compactor's history says about each model.
+/// What the compactor's history says about one model at one tier. Each half
+/// is absent until it counts [`MIN_MEASURED_CALLS`] calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct TierMeasure {
+    pub(crate) usage: Option<MeasuredUsage>,
+    /// Seconds one call took on average.
+    pub(crate) secs_per_call: Option<f64>,
+}
+
+/// What the compactor's history says, keyed by model and tier.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Measured {
-    pub(crate) usage: HashMap<String, MeasuredUsage>,
-    /// Seconds one call took on average.
-    pub(crate) secs_per_call: HashMap<String, f64>,
+    pub(crate) tiers: HashMap<(String, String), TierMeasure>,
 }
 
 impl Measured {
-    /// This model's seconds per call: measured, or the default range.
-    fn secs_per_call(&self, model: &str) -> Bounds<f64> {
-        self.secs_per_call
-            .get(model)
-            .map_or(SECS_PER_CALL, |&secs| Bounds {
-                low: secs,
-                high: secs,
-            })
+    fn at(&self, model: &str, tier: &str) -> TierMeasure {
+        self.tiers
+            .get(&(model.to_string(), tier.to_string()))
+            .copied()
+            .unwrap_or_default()
     }
 }
 
-/// Measured usage and time for every compactor model, in one query. Each
-/// needs at least [`MIN_MEASURED_CALLS`] calls: fewer are not enough to trust
-/// an average from, and the model's seed or the default time applies instead.
+/// Measured usage and time for every compactor model and tier, in one query.
+/// A tier with too few calls gets no entry, and its seed applies instead.
 pub(crate) async fn measured_for_catalog(pool: &PgPool) -> Result<Measured, sqlx::Error> {
-    type Row = (String, i64, Option<f64>, Option<f64>, i64, Option<f64>);
+    type Row = (
+        String,
+        String,
+        i64,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        i64,
+        Option<f64>,
+    );
     let rows: Vec<Row> = sqlx::query_as(MEASURED_USAGE_SQL)
         .bind(compactor_model_ids())
         .fetch_all(pool)
         .await?;
     let mut measured = Measured::default();
-    for (model, calls, avg_input, avg_output, timed, avg_ms) in rows {
-        if calls >= MIN_MEASURED_CALLS {
-            let usage = MeasuredUsage {
-                avg_input: avg_input.unwrap_or_default().round() as u64,
-                avg_output_low: avg_output.unwrap_or_default().round() as u64,
-            };
-            measured.usage.insert(model.clone(), usage);
-        }
-        if let (true, Some(ms)) = (timed >= MIN_MEASURED_CALLS, avg_ms) {
-            measured.secs_per_call.insert(model, ms / 1000.0);
+    for (model, tier, calls, avg_input, avg_read, avg_write, avg_output, timed, avg_ms) in rows {
+        let tokens = |avg: Option<f64>| avg.unwrap_or_default().round() as u64;
+        let measure = TierMeasure {
+            usage: (calls >= MIN_MEASURED_CALLS).then(|| MeasuredUsage {
+                avg_input: tokens(avg_input),
+                avg_cache_read: tokens(avg_read),
+                avg_cache_write: tokens(avg_write),
+                avg_output: tokens(avg_output),
+            }),
+            secs_per_call: avg_ms
+                .filter(|_| timed >= MIN_MEASURED_CALLS)
+                .map(|ms| ms / 1000.0),
+        };
+        if measure != TierMeasure::default() {
+            measured.tiers.insert((model, tier), measure);
         }
     }
     Ok(measured)
+}
+
+/// One tier's per-call figures, as the estimate prices them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TierPrice {
+    /// Input of the tier the figures were measured at. Its output is not this
+    /// tier's: `output` is.
+    usage: MeasuredUsage,
+    output: Bounds<u64>,
+    secs: Bounds<f64>,
+}
+
+impl TierPrice {
+    fn central_output(&self) -> f64 {
+        (self.output.low + self.output.high) as f64 / 2.0
+    }
+}
+
+/// `model`'s seed at `tier`, if the comparison measured that tier.
+fn seed(model: &CompactorModel, tier: &str) -> Option<TierSeed> {
+    model.seeds.iter().find(|s| s.effort == tier).copied()
+}
+
+/// The nearest tier at or below `tier` that `figure` knows, else the lowest
+/// above it.
+fn nearest<T>(tier: &str, figure: impl Fn(&str) -> Option<T>) -> Option<(&'static str, T)> {
+    let rung = EFFORT_LADDER.iter().position(|t| *t == tier).unwrap_or(0);
+    let found = |t: &&'static str| figure(t).map(|f| (*t, f));
+    EFFORT_LADDER[..=rung]
+        .iter()
+        .rev()
+        .find_map(found)
+        .or_else(|| EFFORT_LADDER[rung..].iter().find_map(found))
+}
+
+/// What one call at `tier` costs `model`, in tokens and seconds.
+///
+/// A tier measured in history, or seeded, is exact. Any other tier is a range:
+/// from the nearest measured tier below it, up to that tier's output stretched
+/// by [`tier_weight`]. Seconds scale with output from the nearest timed tier,
+/// since a reply takes longer the more it writes.
+fn tier_price(model: &CompactorModel, measured: &Measured, tier: &str) -> TierPrice {
+    let usage_at = |t: &str| {
+        measured
+            .at(model.id, t)
+            .usage
+            .or_else(|| seed(model, t).map(|s| s.usage))
+    };
+    let secs_at = |t: &str| {
+        measured
+            .at(model.id, t)
+            .secs_per_call
+            .or_else(|| seed(model, t).and_then(|s| s.secs_per_call))
+    };
+    let (base, usage) = nearest(tier, usage_at).unwrap_or(("low", MeasuredUsage::default()));
+    let (from, to) = (tier_weight(base), tier_weight(tier));
+    let stretched = if from > 0 && to > from {
+        usage.avg_output * u64::from(to) / u64::from(from)
+    } else {
+        usage.avg_output
+    };
+    let output = Bounds {
+        low: usage.avg_output,
+        high: stretched,
+    };
+    let secs = nearest(tier, secs_at).map_or(SECS_PER_CALL, |(timed, secs)| {
+        let reference = usage_at(timed)
+            .map_or(usage.avg_output, |u| u.avg_output)
+            .max(1) as f64;
+        Bounds {
+            low: secs * output.low as f64 / reference,
+            high: secs * output.high as f64 / reference,
+        }
+    });
+    TierPrice {
+        usage,
+        output,
+        secs,
+    }
 }
 
 /// Seconds to run `calls` [`START_LIMIT`] at a time, never under the longest
@@ -473,37 +556,27 @@ pub(crate) fn estimate(
             .iter()
             .map(|model| {
                 let (input_price, output_price) = model.price;
-                let usage = measured.usage.get(model.id).copied().unwrap_or(model.seed);
-                let (usable_secs, complete_secs) = times(measured.secs_per_call(model.id));
                 let route = route_for(registry, model.id, configured);
                 let by_effort = EFFORT_LADDER
                     .iter()
                     .map(|&effort| {
                         let runs_at =
                             clamp_effort(effort, route.provider, &route.wire_id).unwrap_or(effort);
-                        let output_per_call = scaled_output_tokens(usage.avg_output_low, runs_at);
+                        let price = tier_price(model, measured, runs_at);
                         let backfill_usd =
-                            ranged_usd(input_price, output_price, output_per_call, &work);
-                        let daily_usd =
-                            ranged_usd(input_price, output_price, output_per_call, &daily);
+                            ranged_usd(input_price, output_price, price.output, &work);
+                        let daily_usd = ranged_usd(input_price, output_price, price.output, &daily);
+                        let central = |work: &Work| {
+                            central_usd(model, &price.usage, price.central_output(), work)
+                        };
+                        let (usable_secs, complete_secs) = times(price.secs);
                         EffortCost {
                             effort: effort.to_string(),
-                            backfill_usd_central: central_usd(
-                                input_price,
-                                output_price,
-                                &usage,
-                                output_per_call,
-                                &work,
-                            )
-                            .clamp(backfill_usd.low, backfill_usd.high),
-                            daily_usd_central: central_usd(
-                                input_price,
-                                output_price,
-                                &usage,
-                                output_per_call,
-                                &daily,
-                            )
-                            .clamp(daily_usd.low, daily_usd.high),
+                            usable_secs,
+                            complete_secs,
+                            backfill_usd_central: central(&work)
+                                .clamp(backfill_usd.low, backfill_usd.high),
+                            daily_usd_central: central(&daily).clamp(daily_usd.low, daily_usd.high),
                             backfill_usd,
                             daily_usd,
                         }
@@ -511,8 +584,6 @@ pub(crate) fn estimate(
                     .collect();
                 ModelCost {
                     model: model.id.to_string(),
-                    usable_secs,
-                    complete_secs,
                     by_effort,
                 }
             })
@@ -529,43 +600,49 @@ fn route_for(registry: &ModelRegistry, model: &str, configured: &[ProviderKind])
         .unwrap_or_else(|_| RouteEntry::new(provider_kind_for(registry, model), model))
 }
 
-/// The low/high range: measured (or seeded) output tokens a call, over the
-/// work's own call-count range. Input stays the deterministic byte-based
-/// estimate; only the call count and the per-call token figures move the
-/// range now, not a second independent output-token guess.
+/// The low/high range: the tier's output range over the work's own call-count
+/// range. Input stays the deterministic byte-based estimate.
 fn ranged_usd(
     input_price: f64,
     output_price: f64,
-    output_per_call: u64,
+    output_per_call: Bounds<u64>,
     work: &Work,
 ) -> Bounds<f64> {
-    let usd = |calls: u64, input_tokens: u64| {
-        (input_tokens as f64 * input_price + (calls * output_per_call) as f64 * output_price)
-            / 1_000_000.0
+    let usd = |calls: u64, input_tokens: u64, output: u64| {
+        (input_tokens as f64 * input_price + (calls * output) as f64 * output_price) / 1_000_000.0
     };
     let input = work.input_tokens();
     Bounds {
-        low: usd(work.calls.low, input.low),
-        high: usd(work.calls.high, input.high),
+        low: usd(work.calls.low, input.low, output_per_call.low),
+        high: usd(work.calls.high, input.high, output_per_call.high),
     }
 }
 
 /// The one central figure: the work's midpoint call count, times the
-/// measured (or seeded) per-call input and output tokens. Neither side
+/// measured (or seeded) per-call input and the tier's central output. Neither side
 /// comes from a low/high guess, so the caller clamps the result into
 /// `ranged_usd`'s own range: that range is the byte-size heuristic, a
 /// different measurement from this one, and the two are not guaranteed to
 /// agree once real usage history exists.
+///
+/// Input read from or written to the prompt cache is priced at the model's
+/// own rates. The byte range prices every token as plain input.
 fn central_usd(
-    input_price: f64,
-    output_price: f64,
+    model: &CompactorModel,
     usage: &MeasuredUsage,
-    output_per_call: u64,
+    output_per_call: f64,
     work: &Work,
 ) -> f64 {
-    let calls = work.central_calls();
-    (calls * usage.avg_input) as f64 * input_price / 1_000_000.0
-        + (calls * output_per_call) as f64 * output_price / 1_000_000.0
+    let (input_price, output_price) = model.price;
+    let plain = usage
+        .avg_input
+        .saturating_sub(usage.avg_cache_read + usage.avg_cache_write);
+    let input_per_call = plain as f64
+        + usage.avg_cache_read as f64 * model.cache.read
+        + usage.avg_cache_write as f64 * model.cache.write;
+    let calls = work.central_calls() as f64;
+    calls * input_per_call * input_price / 1_000_000.0
+        + calls * output_per_call * output_price / 1_000_000.0
 }
 
 /// One thread's events in one window: the recent days, or before them.
@@ -616,7 +693,7 @@ impl ThreadRow {
             },
             bytes: Bounds {
                 low: self.long_replies as u64 * NODE_BYTES as u64,
-                high: turns * (4 * NODE_BYTES + CONTEXT_BYTES) as u64,
+                high: turns * (4 * NODE_BYTES + RAW_CONTEXT_BYTES) as u64,
             },
         };
         (thread, workspace)
@@ -757,14 +834,14 @@ async fn built_nodes(pool: &PgPool) -> Result<u64, sqlx::Error> {
 }
 
 /// An artifact leaf carries the file's content, capped, so it always costs a
-/// call.
+/// call. It reads no context.
 fn artifact_leaves(n: u64) -> Leaves {
     Leaves {
         count: n,
         calls: Bounds { low: n, high: n },
         bytes: Bounds {
             low: n * NODE_BYTES as u64,
-            high: n * (CAP_CHARS + CONTEXT_BYTES) as u64,
+            high: n * CAP_CHARS as u64,
         },
     }
 }
@@ -809,31 +886,44 @@ mod tests {
 
     /// No registry row: every model routes by its id's shape, as on a
     /// workspace whose rows are missing.
-    fn estimate_measured(
-        counts: &Counts,
-        usage: &HashMap<String, MeasuredUsage>,
-    ) -> TreeBackfillEstimate {
+    fn estimate_measured(counts: &Counts, measured: &Measured) -> TreeBackfillEstimate {
         estimate(
             counts,
-            &Measured {
-                usage: usage.clone(),
-                ..Measured::default()
-            },
+            measured,
             &crate::llm::model_registry::empty(),
             &ProviderKind::ALL,
         )
     }
 
     fn estimate_with(counts: &Counts) -> TreeBackfillEstimate {
-        estimate_measured(counts, &HashMap::new())
+        estimate_measured(counts, &Measured::default())
     }
 
-    fn seed_of(model: &str) -> MeasuredUsage {
+    /// History of `usage` for each `(model, tier)`.
+    fn measured_usage(entries: &[(&str, &str, MeasuredUsage)]) -> Measured {
+        Measured {
+            tiers: entries
+                .iter()
+                .map(|(model, tier, usage)| {
+                    let measure = TierMeasure {
+                        usage: Some(*usage),
+                        ..TierMeasure::default()
+                    };
+                    ((model.to_string(), tier.to_string()), measure)
+                })
+                .collect(),
+        }
+    }
+
+    fn model(id: &str) -> &'static CompactorModel {
         COMPACTOR_MODELS
             .iter()
-            .find(|m| m.id == model)
-            .unwrap_or_else(|| panic!("{model} is not a compactor model"))
-            .seed
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("{id} is not a compactor model"))
+    }
+
+    fn seed_of(id: &str) -> MeasuredUsage {
+        seed(model(id), "low").expect("a low seed").usage
     }
 
     fn cost_at<'a>(e: &'a TreeBackfillEstimate, model: &str, effort: &str) -> &'a EffortCost {
@@ -866,14 +956,13 @@ mod tests {
             for ec in &c.by_effort {
                 assert!(ec.backfill_usd.low <= ec.backfill_usd.high, "{ec:?}");
                 assert!(ec.daily_usd.low <= ec.daily_usd.high, "{ec:?}");
-                assert!(
-                    ec.backfill_usd_central >= ec.backfill_usd.low - 1e-9,
-                    "{ec:?}"
-                );
-                assert!(
-                    ec.backfill_usd_central <= ec.backfill_usd.high + 1e-9,
-                    "{ec:?}"
-                );
+                assert!(ec.usable_secs.low <= ec.usable_secs.high, "{ec:?}");
+                assert!(ec.complete_secs.low <= ec.complete_secs.high, "{ec:?}");
+                let inside = |central: f64, range: Bounds<f64>| {
+                    (range.low - 1e-9..=range.high + 1e-9).contains(&central)
+                };
+                assert!(inside(ec.backfill_usd_central, ec.backfill_usd), "{ec:?}");
+                assert!(inside(ec.daily_usd_central, ec.daily_usd), "{ec:?}");
             }
         }
         assert!(e.calls.low > 0);
@@ -967,12 +1056,11 @@ mod tests {
     /// apart, in the direction the measurements point.
     #[test]
     fn two_models_at_one_price_are_told_apart_by_their_seeds() {
-        let sol = COMPACTOR_MODELS.iter().find(|m| m.id == "gpt-6.1-sol");
-        let sonnet = COMPACTOR_MODELS
-            .iter()
-            .find(|m| m.id == "claude-sonnet-5-5");
-        let price = |m: Option<&super::super::compactor_models::CompactorModel>| m.map(|m| m.price);
-        assert_eq!(price(sol), price(sonnet), "the premise: one list price");
+        assert_eq!(
+            model("gpt-6.1-sol").price,
+            model("claude-sonnet-5-5").price,
+            "the premise: one list price"
+        );
         assert_ne!(seed_of("gpt-6.1-sol"), seed_of("claude-sonnet-5-5"));
 
         let e = estimate_with(&Counts {
@@ -1029,6 +1117,8 @@ mod tests {
                     ],
                     preferred: None,
                     vision: false,
+                    default_effort: None,
+                    successor: None,
                 },
             )]
             .into_iter()
@@ -1038,18 +1128,15 @@ mod tests {
             threads: vec![old(leaves(100, 50, 80))],
             ..Counts::default()
         };
-        // Enough thinking output that the tiers above `low` price apart.
-        let measured = HashMap::from([(
-            "gpt-6.1-sol".to_string(),
+        let measured = measured_usage(&[(
+            "gpt-6.1-sol",
+            "low",
             MeasuredUsage {
                 avg_input: 3_000,
-                avg_output_low: 1_000,
+                avg_output: 1_000,
+                ..MeasuredUsage::default()
             },
         )]);
-        let measured = Measured {
-            usage: measured,
-            ..Measured::default()
-        };
         let cost = |configured: &[ProviderKind], effort: &str| {
             let e = estimate(&counts, &measured, &registry, configured);
             cost_at(&e, "gpt-6.1-sol", effort).backfill_usd.high
@@ -1071,9 +1158,8 @@ mod tests {
         assert_eq!(cost_ids, compactor_ids);
     }
 
-    /// A higher reasoning tier never costs less, for the same model and the
-    /// same work: thinking tokens bill as output, so more thinking budget
-    /// never prices under less.
+    /// On the seeds, a higher reasoning tier never costs less, for the same
+    /// model and the same work. Measured history may say otherwise, and wins.
     #[test]
     fn a_higher_tier_never_costs_less() {
         let e = estimate_with(&Counts {
@@ -1094,8 +1180,8 @@ mod tests {
         }
     }
 
-    /// Measured history replaces the seed for a model with enough calls. A
-    /// bigger measured average costs more than the same model's seeded run.
+    /// Measured history replaces the seed for a tier with enough calls. A
+    /// bigger measured average costs more than the same tier's seeded run.
     #[test]
     fn measured_usage_overrides_the_seed() {
         let counts = Counts {
@@ -1103,14 +1189,15 @@ mod tests {
             ..Counts::default()
         };
         let seed = seed_of("gemini-3.8-flash");
-        let mut measured = HashMap::new();
-        measured.insert(
-            "gemini-3.8-flash".to_string(),
+        let measured = measured_usage(&[(
+            "gemini-3.8-flash",
+            "low",
             MeasuredUsage {
                 avg_input: seed.avg_input * 10,
-                avg_output_low: seed.avg_output_low * 10,
+                avg_output: seed.avg_output * 10,
+                ..MeasuredUsage::default()
             },
-        );
+        )]);
         let e = estimate_measured(&counts, &measured);
         let measured_cost = cost_at(&e, "gemini-3.8-flash", "low").backfill_usd_central;
         let e_seeded = estimate_with(&counts);
@@ -1128,26 +1215,22 @@ mod tests {
             threads: vec![old(leaves(100, 50, 80))],
             ..Counts::default()
         };
-        let mut measured = HashMap::new();
-        measured.insert(
-            "gemini-3.8-flash".to_string(),
-            MeasuredUsage {
-                avg_input: 100_000_000,
-                avg_output_low: 100_000_000,
-            },
-        );
-        let estimate_high = estimate_measured(&counts, &measured);
+        let flash_at = |avg: u64| {
+            measured_usage(&[(
+                "gemini-3.8-flash",
+                "low",
+                MeasuredUsage {
+                    avg_input: avg,
+                    avg_output: avg,
+                    ..MeasuredUsage::default()
+                },
+            )])
+        };
+        let estimate_high = estimate_measured(&counts, &flash_at(100_000_000));
         let high = cost_at(&estimate_high, "gemini-3.8-flash", "low");
         assert_eq!(high.backfill_usd_central, high.backfill_usd.high);
 
-        measured.insert(
-            "gemini-3.8-flash".to_string(),
-            MeasuredUsage {
-                avg_input: 0,
-                avg_output_low: 0,
-            },
-        );
-        let estimate_low = estimate_measured(&counts, &measured);
+        let estimate_low = estimate_measured(&counts, &flash_at(0));
         let low = cost_at(&estimate_low, "gemini-3.8-flash", "low");
         assert_eq!(low.backfill_usd_central, low.backfill_usd.low);
     }
@@ -1184,8 +1267,8 @@ mod tests {
         }
     }
 
-    /// Calls run [`START_LIMIT`] at once, but one thread's leaves run one
-    /// after another, so its leaf calls set a floor.
+    /// Calls run [`START_LIMIT`] at once, but one thread's leaves run
+    /// [`LEAF_WINDOW`] at a time, so its leaf calls set a floor.
     #[test]
     fn the_longest_thread_sets_a_floor_on_the_time_to_complete() {
         let parallel = Counts {
@@ -1203,44 +1286,154 @@ mod tests {
             ..Counts::default()
         };
         let e = estimate_with(&serial);
-        assert_eq!(e.complete_secs.low, 500 * SECS_PER_CALL.low as u64);
-        assert_eq!(e.complete_secs.high, 900 * SECS_PER_CALL.high as u64);
+        let rounds = |calls: u64| calls.div_ceil(LEAF_WINDOW as u64);
+        assert_eq!(e.complete_secs.low, rounds(500) * SECS_PER_CALL.low as u64);
+        assert_eq!(
+            e.complete_secs.high,
+            rounds(900) * SECS_PER_CALL.high as u64
+        );
     }
 
-    /// A model's timed history replaces the default seconds per call, for
-    /// that model only.
+    /// A tier's timed history replaces its seeded seconds per call, for that
+    /// model and tier only.
     #[test]
-    fn measured_call_time_sets_that_models_durations() {
+    fn measured_call_time_sets_that_tiers_durations() {
         let counts = Counts {
             threads: vec![old(leaves(1_000, 500, 900))],
             ..Counts::default()
         };
         let measured = Measured {
-            secs_per_call: HashMap::from([("gemini-3.8-flash".to_string(), 2.5)]),
-            ..Measured::default()
+            tiers: HashMap::from([(
+                ("gemini-3.8-flash".to_string(), "low".to_string()),
+                TierMeasure {
+                    secs_per_call: Some(2.5),
+                    ..TierMeasure::default()
+                },
+            )]),
         };
-        let e = estimate(
-            &counts,
-            &measured,
-            &crate::llm::model_registry::empty(),
-            &ProviderKind::ALL,
-        );
-        let model = |id: &str| e.costs.iter().find(|c| c.model == id).unwrap();
-        assert_eq!(
-            model("gemini-3.8-flash").complete_secs,
+        let e = estimate_measured(&counts, &measured);
+        let at = |secs_per_call: f64| {
+            let secs = |calls: u64| {
+                (calls.div_ceil(LEAF_WINDOW as u64) as f64 * secs_per_call).ceil() as u64
+            };
             Bounds {
-                low: 1_250,
-                high: 2_250
+                low: secs(500),
+                high: secs(900),
+            }
+        };
+        assert_eq!(
+            cost_at(&e, "gemini-3.8-flash", "low").complete_secs,
+            at(2.5)
+        );
+        let sol_seed = seed(model("gpt-6.1-sol"), "low").unwrap().secs_per_call;
+        assert_eq!(
+            cost_at(&e, "gpt-6.1-sol", "low").complete_secs,
+            at(sol_seed.unwrap())
+        );
+        let flash_medium = seed(model("gemini-3.8-flash"), "medium").unwrap();
+        assert_eq!(
+            cost_at(&e, "gemini-3.8-flash", "medium").complete_secs,
+            at(flash_medium.secs_per_call.unwrap()),
+            "low's history leaves medium on its own seed"
+        );
+    }
+
+    /// On the seeds alone, each tier whose usage differs prices apart.
+    #[test]
+    fn tiers_with_different_usage_price_apart_on_the_seeds() {
+        let e = estimate_with(&Counts {
+            threads: vec![tree(leaves(200, 100, 160), leaves(30, 15, 24))],
+            ..Counts::default()
+        });
+        let central = |model: &str, effort: &str| cost_at(&e, model, effort).backfill_usd_central;
+        for m in COMPACTOR_MODELS {
+            assert!(central(m.id, "low") < central(m.id, "medium"), "{}", m.id);
+        }
+        for id in ["gpt-6.1-sol", "gemini-3.8-flash"] {
+            assert!(central(id, "medium") < central(id, "high"), "{id}");
+        }
+    }
+
+    /// Time follows the tier: a slower measured tier takes longer, and an
+    /// unmeasured one can take longer than the tier below it.
+    #[test]
+    fn time_follows_the_tier() {
+        let e = estimate_with(&Counts {
+            threads: vec![recent_thread(leaves(1_000, 500, 900))],
+            workspace: old(leaves(100, 50, 90)),
+            built: 0,
+        });
+        let flash = |effort: &str| cost_at(&e, "gemini-3.8-flash", effort);
+        assert!(flash("medium").usable_secs.low > flash("low").usable_secs.low);
+        assert!(flash("medium").complete_secs.low > flash("low").complete_secs.low);
+        let sol = |effort: &str| cost_at(&e, "gpt-6.1-sol", effort);
+        assert_eq!(
+            sol("medium").complete_secs.low,
+            sol("low").complete_secs.low
+        );
+        assert!(sol("medium").complete_secs.high > sol("low").complete_secs.high);
+    }
+
+    /// An unmeasured tier spans from the nearest measured tier below it up to
+    /// that tier's output stretched by the budget ratio, seconds alike.
+    #[test]
+    fn an_unmeasured_tier_spans_from_the_tier_below_to_the_stretched_guess() {
+        let sol = model("gpt-6.1-sol");
+        let low = seed(sol, "low").unwrap();
+        let price = tier_price(sol, &Measured::default(), "high");
+        let ratio = tier_weight("high") / tier_weight("low");
+        let output = low.usage.avg_output;
+        assert_eq!(
+            price.output,
+            Bounds {
+                low: output,
+                high: output * u64::from(ratio)
             }
         );
-        assert_eq!(model("gpt-6.1-sol").complete_secs, e.complete_secs);
+        let secs = low.secs_per_call.unwrap();
+        assert!((price.secs.low - secs).abs() < 1e-9, "{price:?}");
+        assert!(
+            (price.secs.high - secs * f64::from(ratio)).abs() < 1e-9,
+            "{price:?}"
+        );
+        assert_eq!(
+            tier_price(sol, &Measured::default(), "low").output.high,
+            output
+        );
+    }
+
+    /// One tier's history prices that tier only.
+    #[test]
+    fn a_tiers_history_moves_only_that_tier() {
+        let counts = Counts {
+            threads: vec![old(leaves(100, 50, 80))],
+            ..Counts::default()
+        };
+        let medium = MeasuredUsage {
+            avg_input: 9_000,
+            avg_output: 2_000,
+            ..MeasuredUsage::default()
+        };
+        let seeded = estimate_with(&counts);
+        let measured = estimate_measured(
+            &counts,
+            &measured_usage(&[("gemini-3.8-flash", "medium", medium)]),
+        );
+        let at = |e: &TreeBackfillEstimate, effort: &str| {
+            cost_at(e, "gemini-3.8-flash", effort).backfill_usd_central
+        };
+        assert_eq!(at(&measured, "low"), at(&seeded, "low"));
+        assert!(at(&measured, "medium") > at(&seeded, "medium"));
     }
 
     #[test]
-    fn context_tiling_bytes_is_bounded_by_the_budget_and_grows_with_the_tree() {
-        assert_eq!(context_tiling_bytes(0), 0);
-        assert!(context_tiling_bytes(4) <= context_tiling_bytes(4_000));
-        assert!(context_tiling_bytes(4_000) <= CONTEXT_BYTES as u64);
+    fn compaction_view_bytes_is_bounded_by_the_view_and_grows_with_the_tree() {
+        assert_eq!(compaction_view_bytes(0), 0);
+        assert!(compaction_view_bytes(4) < compaction_view_bytes(4_000));
+        assert_eq!(
+            compaction_view_bytes(4_000),
+            compaction_view::MAX_BYTES as u64
+        );
     }
 
     /// One compactor call's capture, shaped as `AuxCapture` writes it.
@@ -1262,7 +1455,18 @@ mod tests {
         output_tokens: u64,
         duration_ms: Option<u64>,
     ) {
-        let mut payload = serde_json::json!({
+        let mut payload = capture_payload(model, input_tokens, output_tokens);
+        if let Some(effort) = effort {
+            payload["reasoning_effort"] = effort.into();
+        }
+        if let Some(ms) = duration_ms {
+            payload["duration_ms"] = ms.into();
+        }
+        insert_capture(pool, payload).await;
+    }
+
+    fn capture_payload(model: &str, input_tokens: u64, output_tokens: u64) -> serde_json::Value {
+        serde_json::json!({
             "type": "ContextCaptured",
             "producer": "auxiliary",
             "purpose": "summary_compaction",
@@ -1276,13 +1480,10 @@ mod tests {
                 "cache_read_tokens": 0,
                 "cache_creation_tokens": 0,
             },
-        });
-        if let Some(effort) = effort {
-            payload["reasoning_effort"] = effort.into();
-        }
-        if let Some(ms) = duration_ms {
-            payload["duration_ms"] = ms.into();
-        }
+        })
+    }
+
+    async fn insert_capture(pool: &PgPool, payload: serde_json::Value) {
         sqlx::query(
             "INSERT INTO events (id, event_type, payload, created) VALUES ($1, 'ContextCaptured', $2, now())",
         )
@@ -1293,10 +1494,74 @@ mod tests {
         .expect("insert");
     }
 
+    /// Measured usage splits out the cache: reads and writes average as parts
+    /// of the input, and a row from before the split counts as neither.
+    #[tokio::test]
+    async fn measured_usage_splits_out_cache_reads_and_writes() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        for i in 0..MIN_MEASURED_CALLS {
+            let mut payload = capture_payload("gpt-6.1-sol", 6_000, 100);
+            payload["usage"]["cache_read_tokens"] = 5_000.into();
+            payload["usage"]["cache_creation_tokens"] = 600.into();
+            if i == 0 {
+                payload["usage"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cache_read_tokens");
+            }
+            insert_capture(&pool, payload).await;
+        }
+        let measured = measured_for_catalog(&pool).await.expect("query decodes");
+        let sol = measured.at("gpt-6.1-sol", "low").usage.expect("measured");
+        let calls = MIN_MEASURED_CALLS as u64;
+        assert_eq!(sol.avg_input, 6_000);
+        assert_eq!(
+            sol.avg_cache_read,
+            (5_000.0 * (calls - 1) as f64 / calls as f64).round() as u64
+        );
+        assert_eq!(sol.avg_cache_write, 600);
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The central figure prices a cache read below plain input and a cache
+    /// write above it, at the model's own rates.
+    #[test]
+    fn the_central_figure_prices_cached_input_at_the_models_rates() {
+        let sol = COMPACTOR_MODELS
+            .iter()
+            .find(|m| m.id == "gpt-6.1-sol")
+            .unwrap();
+        let work = Work {
+            calls: Bounds {
+                low: 1_000,
+                high: 1_000,
+            },
+            input_bytes: Bounds::default(),
+        };
+        let plain = MeasuredUsage {
+            avg_input: 6_000,
+            ..MeasuredUsage::default()
+        };
+        let price = |usage: MeasuredUsage| central_usd(sol, &usage, 0.0, &work);
+        let read = price(MeasuredUsage {
+            avg_cache_read: 5_000,
+            ..plain
+        });
+        let written = price(MeasuredUsage {
+            avg_cache_write: 5_000,
+            ..plain
+        });
+        let per_token = sol.price.0 / 1_000_000.0 * 1_000.0;
+        assert!((price(plain) - 6_000.0 * per_token).abs() < 1e-9);
+        assert!((read - (1_000.0 + 5_000.0 * sol.cache.read) * per_token).abs() < 1e-9);
+        assert!((written - (1_000.0 + 5_000.0 * sol.cache.write) * per_token).abs() < 1e-9);
+    }
+
     /// Postgres's `avg(bigint)` is `numeric`, a wire type sqlx cannot decode
     /// into `f64` uncast. A zero-row average is NULL, so the bug only shows
-    /// with real rows. One query reads every model: a labelled higher tier
-    /// stays out of the baseline, and a thin model gets no entry.
+    /// with real rows. One query reads every model and tier: an unlabelled row
+    /// counts as `low`, another tier stays out of it, and a thin one gets no
+    /// entry.
     #[tokio::test]
     async fn measured_usage_reads_every_model_in_one_query() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1312,23 +1577,57 @@ mod tests {
 
         let measured = measured_for_catalog(&pool).await.expect("query decodes");
 
-        let usage = |model: &str| measured.usage.get(model).copied();
+        let usage = |model: &str| measured.at(model, "low").usage;
         let flash = MeasuredUsage {
             avg_input: 3000,
-            avg_output_low: 400,
+            avg_output: 400,
+            ..MeasuredUsage::default()
         };
         let sonnet = MeasuredUsage {
             avg_input: 2000,
-            avg_output_low: 300,
+            avg_output: 300,
+            ..MeasuredUsage::default()
         };
         assert_eq!(usage("gemini-3.8-flash"), Some(flash));
         assert_eq!(usage("claude-sonnet-5-5"), Some(sonnet));
         assert_eq!(usage("gpt-6.1-sol"), None, "too thin to trust");
+        assert_eq!(
+            measured.at("gemini-3.8-flash", "high"),
+            TierMeasure::default(),
+            "one high call is too thin as well"
+        );
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Seconds per call average only the timed calls, and a model needs
-    /// enough of them before its own time replaces the default.
+    /// Calls at one tier measure that tier alone: medium's history leaves low
+    /// unmeasured, so low stays on its seed.
+    #[tokio::test]
+    async fn measured_usage_keeps_each_tier_apart() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        for _ in 0..MIN_MEASURED_CALLS {
+            insert_timed_capture(
+                &pool,
+                "gemini-3.8-flash",
+                Some("medium"),
+                3000,
+                900,
+                Some(7_000),
+            )
+            .await;
+        }
+        let measured = measured_for_catalog(&pool).await.expect("read");
+        let medium = measured.at("gemini-3.8-flash", "medium");
+        assert_eq!(medium.usage.map(|u| u.avg_output), Some(900));
+        assert_eq!(medium.secs_per_call, Some(7.0));
+        assert_eq!(
+            measured.at("gemini-3.8-flash", "low"),
+            TierMeasure::default()
+        );
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Seconds per call average only the timed calls, and a tier needs
+    /// enough of them before its own time replaces its seed.
     #[tokio::test]
     async fn measured_call_time_averages_only_timed_calls() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1340,14 +1639,11 @@ mod tests {
         insert_timed_capture(&pool, "claude-sonnet-5-5", None, 3000, 400, Some(9_000)).await;
 
         let measured = measured_for_catalog(&pool).await.expect("read");
-        assert_eq!(measured.secs_per_call.get("gemini-3.8-flash"), Some(&2.5));
-        assert_eq!(measured.secs_per_call.get("gpt-6.1-sol"), None, "untimed");
-        assert_eq!(
-            measured.secs_per_call.get("claude-sonnet-5-5"),
-            None,
-            "thin"
-        );
-        assert!(measured.usage.contains_key("gpt-6.1-sol"));
+        let secs = |model: &str| measured.at(model, "low").secs_per_call;
+        assert_eq!(secs("gemini-3.8-flash"), Some(2.5));
+        assert_eq!(secs("gpt-6.1-sol"), None, "untimed");
+        assert_eq!(secs("claude-sonnet-5-5"), None, "thin");
+        assert!(measured.at("gpt-6.1-sol", "low").usage.is_some());
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
@@ -1393,7 +1689,10 @@ mod tests {
 
         let measured = measured_for_catalog(&pool).await.expect("read");
         assert_eq!(
-            measured.usage.get("gemini-3.8-flash").map(|u| u.avg_input),
+            measured
+                .at("gemini-3.8-flash", "low")
+                .usage
+                .map(|u| u.avg_input),
             Some(3000),
             "filler without the compaction purpose stays out of the average"
         );

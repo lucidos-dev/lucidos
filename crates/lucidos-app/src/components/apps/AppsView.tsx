@@ -19,6 +19,8 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { AppRow, type AppPluginInfo } from './AppCard';
 import { AppSearchBar } from './AppSearchBar';
 import { resolvePluginInfo } from './pluginInfo';
+import { ReusableWidgetsSection } from './ReusableWidgetsSection';
+import { loadReusableWidgets } from '../../store/actions/widgets';
 
 /** Installed app id → marketplace provenance + update status, from the loaded
  *  catalog. Best-effort: empty until the catalog loads, so the app list never
@@ -28,11 +30,13 @@ function pluginInfoByAppId(): Map<string, AppPluginInfo> {
   return cat.status === 'loaded' ? resolvePluginInfo(cat.data.plugins) : new Map();
 }
 
-/** The apps list, and the catalog its rows read their plugin labels from. */
+/** The apps list, the catalog its rows read their plugin labels from, and
+ *  the reusable widgets under it. */
 function refreshAppsPanel(): Promise<unknown> {
   return Promise.all([
     refreshApps(),
     refreshPluginCatalog(),
+    loadReusableWidgets(),
   ]);
 }
 
@@ -100,6 +104,7 @@ export function AppsView() {
     <div class="content-view active apps-view">
       <AppSearchBar placeholder="Search apps…" dataRole="apps-search-input" />
       {body}
+      <ReusableWidgetsSection />
     </div>
   );
 }

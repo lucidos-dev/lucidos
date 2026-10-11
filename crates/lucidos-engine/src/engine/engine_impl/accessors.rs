@@ -68,6 +68,11 @@ impl LucidosEngine {
             return Ok((normalized.clone(), dir.join(rel)));
         }
 
+        // A built-in widget's files ship in `system-widgets/` (ADR 0415).
+        if let Some(full_path) = self.app_manager.built_in_data_path(&normalized) {
+            return Ok((normalized, full_path));
+        }
+
         // Ephemeral scratch sits beside `data/` at the workspace root, so it
         // joins onto the root rather than onto `data/`. [`normalize_data_path`]
         // has already narrowed `.lucidos/` to the readable tmp subtree.
@@ -240,6 +245,28 @@ impl LucidosEngine {
         }
     }
 
+    /// The engine-shipped docs the System Knowhow routing list names.
+    pub fn system_knowhow_summaries(&self) -> Vec<crate::core::KnowhowSummary> {
+        self.system_knowhow_dir()
+            .map(crate::core::SystemKnowhowStore::load_summaries)
+            .unwrap_or_default()
+    }
+
+    /// The docs the Know-how routing list names: the workspace's own, then
+    /// each app's, keyed by app id. One loader for the turn and the footprint
+    /// report, so the two count the same docs.
+    pub fn workspace_knowhow_summaries(
+        &self,
+    ) -> (
+        Vec<crate::core::KnowhowSummary>,
+        Vec<(String, crate::core::KnowhowSummary)>,
+    ) {
+        let summaries = crate::core::KnowhowStore::load_merged_summaries(&self.knowhow_dirs());
+        let apps_dir = self.workspace_path.join(crate::core::APPS_DIR);
+        let app_summaries = crate::core::KnowhowStore::load_app_summaries(&apps_dir);
+        (summaries, app_summaries)
+    }
+
     /// Get the user-level Lucidos directory (~/.lucidos), if available
     pub fn user_dir(&self) -> Option<&std::path::Path> {
         self.user_dir.as_deref()
@@ -263,6 +290,11 @@ impl LucidosEngine {
     /// Get reference to the app manager
     pub fn app_manager(&self) -> &AppManager {
         &self.app_manager
+    }
+
+    /// The app manager as a shared handle, so the router reads the same one.
+    pub fn shared_app_manager(&self) -> Arc<AppManager> {
+        self.app_manager.clone()
     }
 
     /// The Tree memory module's compactor handle.
@@ -366,7 +398,7 @@ impl LucidosEngine {
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<Option<crate::engine::git_ops::ApprovedPlan>, sqlx::Error> {
         crate::engine::git_ops::approve_plan(&self.pool, repo_root, branch_name).await
     }
 
@@ -423,6 +455,19 @@ impl LucidosEngine {
             purpose,
         )
         .await
+        .reporting_to(&self.event_bus, &self.pool, &self.model_registry, purpose)
+    }
+
+    /// The model a new chat turn resolves to, and its context window: what the
+    /// MCP tool ceiling and the cost reports size against.
+    pub(crate) async fn chat_model_and_window(&self) -> (String, usize) {
+        let model = crate::core::PreferenceStore::resolved_chat_model(
+            &self.pool,
+            self.current_provider().default_model(),
+        )
+        .await;
+        let window = self.context_window_for(&model, None);
+        (model, window)
     }
 
     /// Context window (tokens) for `model`: the window declared on the *route*

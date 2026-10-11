@@ -35,6 +35,9 @@ mod workspace_fonts_test;
 #[path = "api_support/frame_file_cors_test.rs"]
 mod frame_file_cors_test;
 
+#[path = "api_support/app_icon_test.rs"]
+mod app_icon_test;
+
 #[path = "api_support/served_document_sandbox_test.rs"]
 mod served_document_sandbox_test;
 
@@ -92,8 +95,18 @@ mod data_mount_test;
 #[path = "api_support/event_wait_test.rs"]
 mod event_wait_test;
 
+#[path = "api_support/failed_turn_follow_up_test.rs"]
+mod failed_turn_follow_up_test;
+#[path = "api_support/read_decision_test.rs"]
+mod read_decision_test;
+#[path = "api_support/read_request_test.rs"]
+mod read_request_test;
+
 #[path = "api_support/agent_question_test.rs"]
 mod agent_question_test;
+
+#[path = "api_support/owner_approval_test.rs"]
+mod owner_approval_test;
 
 #[path = "api_support/prose_question_nudge_test.rs"]
 mod prose_question_nudge_test;
@@ -178,6 +191,12 @@ mod cascade_archive_test;
 
 #[path = "api_support/delete_thread_test.rs"]
 mod delete_thread_test;
+
+#[path = "api_support/widgets_test.rs"]
+mod widgets_test;
+
+#[path = "api_support/workspace_prompt_footprint_test.rs"]
+mod workspace_prompt_footprint_test;
 
 #[path = "api_support/archive_all_test.rs"]
 mod archive_all_test;

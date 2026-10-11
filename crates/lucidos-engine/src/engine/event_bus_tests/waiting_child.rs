@@ -66,7 +66,7 @@ async fn wake_from_wait(bus: &EventBus, thread_id: Uuid, wait_id: Uuid) {
     .unwrap();
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::UserPromptInjected {
+        event: ThreadEvent::PromptInjected {
             text: "An event you subscribed to has arrived".into(),
             mode: ActorMode::Engine,
             origin: None,
@@ -164,6 +164,57 @@ async fn stopping_the_last_wait_on_an_idle_child_sends_the_held_card() {
     );
     assert_eq!(drain_callbacks(&mut callback_rx), 1);
     assert!(!callback_pending(&pool, child_id).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The idle held its proposal while the wait was live (ADR 0395). So a child
+/// with branch work has no change yet when its last wait is stopped. The cancel
+/// defers its card to the branch-work net. The net reads the deferral, proposes
+/// the work, then sends one card that lists the change.
+#[tokio::test]
+async fn a_held_card_waits_for_the_proposal_and_lists_the_change() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    let wait_id = emit_wait_started(&bus, child_id).await;
+    emit_cc_idled(&bus, child_id, true, None).await;
+
+    emit_wait_canceled(&bus, child_id, wait_id, EventWaitCancelCause::UserStop).await;
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        0,
+        "the card waits for the held work to be proposed"
+    );
+    assert!(bus.held_card_awaits_proposal(child_id).await);
+
+    emit_change_proposed(&bus, child_id, "claude-code/held-child", false).await;
+    bus.send_held_card_after_proposal(child_id).await;
+    bus.send_held_card_after_proposal(child_id).await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "exactly one card"
+    );
+    let (status, ids): (String, serde_json::Value) = sqlx::query_as(
+        "SELECT payload->>'status', payload->'pending_change_ids' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted'",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "success");
+    assert_eq!(
+        ids,
+        serde_json::json!([test_change_id(child_id).to_string()]),
+        "the card lists the held change"
+    );
+    assert_eq!(drain_callbacks(&mut callback_rx), 1);
 
     pool.close().await;
     teardown_test_db(&db_name).await;

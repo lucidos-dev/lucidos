@@ -31,12 +31,11 @@ describe('the executor popover App row', () => {
       .toBe('center');
   });
 
-  it('sizes the fallback mark to fit the row text line box', () => {
-    // The step below the row's `--font-size-md`. At `--icon-size-md` the mark
-    // overflowed the name's line box and made the App row taller than the rest.
-    const body = block(css, '.message-route-panel .route-app-icon svg {');
-    expect(decl(body, 'width')).toBe('var(--icon-size-sm)');
-    expect(decl(body, 'height')).toBe('var(--icon-size-sm)');
+  it('sizes the app icon to fit the row text line box', () => {
+    // The step below the row's `--font-size-md`, so the tile fits the name's
+    // line box and the App row stays as tall as the rest.
+    const body = block(css, '.message-route-panel .route-app-icon {');
+    expect(decl(body, '--app-icon-size')).toBe('var(--icon-size-sm)');
   });
 
   it('keeps the icon and the name on one line', () => {

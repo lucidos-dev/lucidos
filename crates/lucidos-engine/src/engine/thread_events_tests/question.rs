@@ -12,16 +12,19 @@ fn user_question_asked_serialization() {
                 label: "First".into(),
                 description: Some("desc".into()),
                 preview: Some("![first](artifacts/first.png)".into()),
+                widget: None,
             },
             QuestionOption {
                 id: "o2".into(),
                 label: "Second".into(),
                 description: None,
                 preview: None,
+                widget: None,
             },
         ],
         worktree_path: Some("/tmp/cc-abc".into()),
         multi_select: false,
+        owner_approval: None,
     };
     let v = serde_json::to_value(&event).unwrap();
     assert_eq!(v["type"], "UserQuestionAsked");
@@ -102,6 +105,7 @@ fn user_question_asked_empty_options_skipped() {
         options: vec![],
         worktree_path: None,
         multi_select: false,
+        owner_approval: None,
     };
     let v = serde_json::to_value(&event).unwrap();
     assert!(
@@ -123,6 +127,7 @@ fn user_question_asked_event_type() {
         options: vec![],
         worktree_path: None,
         multi_select: false,
+        owner_approval: None,
     };
     assert_eq!(event.event_type(), "UserQuestionAsked");
     assert!(event.is_persisted(), "UserQuestionAsked must be persisted");
@@ -137,6 +142,7 @@ fn user_question_asked_carries_multi_select() {
         options: vec![],
         worktree_path: None,
         multi_select: true,
+        owner_approval: None,
     };
     let v = serde_json::to_value(&event).unwrap();
     assert_eq!(v["multi_select"], true);

@@ -159,6 +159,11 @@ pub(crate) async fn unregister_with_bus(
     }
     save_registry(workspace_path, &registry)
         .map_err(|e| format!("write marketplace registry: {e}"))?;
+    // Its catalog media goes with it. A failure leaves a cache the next scan
+    // prunes, so it is logged rather than failing the removal.
+    if let Err(e) = crate::core::plugin_media::remove_marketplace_cache(workspace_path, id) {
+        log!("[Plugins] could not delete the media cache of marketplace '{id}': {e}");
+    }
 
     let commit = artifact_manager
         .commit_data_path(MARKETPLACES_DATA_PATH, "Remove plugin marketplace")

@@ -107,7 +107,7 @@ fn status_transition_classification_consistency() {
 
 /// Cross-validate: CcFlagRule != None should only appear on CC-relevant events
 /// (Change*, ClaudeCode*, MergeConflict*, ThreadArchived). This catches accidental
-/// coding_agent_proposed mutations on chat-only events.
+/// change-state mutations on chat-only events.
 #[test]
 fn cc_flag_rules_only_on_cc_relevant_events() {
     let cc_relevant_prefixes = ["Change", "CodingAgent", "MergeConflict", "ThreadArchived"];
@@ -255,21 +255,153 @@ fn own_blocker_names_the_clause() {
     use ThreadType::*;
     let cc = CodingAgent;
 
+    let (none, proposed, held) = (ChangeWork::None, ChangeWork::Proposed, ChangeWork::Held);
     assert_eq!(
-        own_blocker(Chat, Running, Archived, false, false),
+        own_blocker(Chat, Running, Archived, none, false),
         Some(OwnBlocker::Running)
     );
     assert_eq!(
-        own_blocker(cc, WaitingForUserAnswer, Inbox, true, false),
+        own_blocker(cc, WaitingForUserAnswer, Inbox, proposed, false),
         Some(OwnBlocker::Question)
     );
     assert_eq!(
-        own_blocker(cc, Idle, Inbox, true, false),
+        own_blocker(cc, Idle, Inbox, proposed, false),
         Some(OwnBlocker::PendingChange)
     );
-    assert_eq!(own_blocker(cc, Idle, Archived, true, false), None);
-    assert_eq!(own_blocker(cc, Idle, Inbox, true, true), None);
-    assert_eq!(own_blocker(Chat, Idle, Inbox, true, false), None);
+    assert_eq!(own_blocker(cc, Idle, Archived, proposed, false), None);
+    assert_eq!(own_blocker(cc, Idle, Inbox, proposed, true), None);
+    assert_eq!(own_blocker(Chat, Idle, Inbox, proposed, false), None);
+    // A parked agent with an unproposed diff keeps Archive and Delete back
+    // until Stop waiting proposes it (ADR 0395).
+    assert_eq!(
+        own_blocker(cc, Idle, Inbox, held, false),
+        Some(OwnBlocker::HeldProposal)
+    );
+    assert_eq!(own_blocker(cc, Idle, Inbox, held, true), None);
+    assert_eq!(own_blocker(cc, Idle, Inbox, none, false), None);
+}
+
+/// Only a live wait turns unproposed work into held work. A proposal wins
+/// over a wait, and unproposed work with no wait is not held (ADR 0395).
+#[test]
+fn change_work_is_held_only_while_a_wait_is_live() {
+    use ChangeStateKind::{None as NoWork, Proposed, Unproposed};
+    assert_eq!(ChangeWork::of(Proposed, true), ChangeWork::Proposed);
+    assert_eq!(ChangeWork::of(Proposed, false), ChangeWork::Proposed);
+    assert_eq!(ChangeWork::of(Unproposed, true), ChangeWork::Held);
+    assert_eq!(ChangeWork::of(Unproposed, false), ChangeWork::None);
+    assert_eq!(ChangeWork::of(NoWork, true), ChangeWork::None);
+    assert_eq!(ChangeWork::of(NoWork, false), ChangeWork::None);
+}
+
+/// The quoted values inside the migration's `CHECK (<column> ... IN (...))`.
+fn check_values(migration: &str, column: &str) -> Vec<String> {
+    let from = migration
+        .find(&format!("{column} IN ("))
+        .unwrap_or_else(|| panic!("no CHECK list for {column}"));
+    let list = &migration[from..];
+    let list = &list[list.find('(').unwrap() + 1..list.find(')').unwrap()];
+    list.split(',')
+        .map(|v| v.trim().trim_matches('\'').to_string())
+        .collect()
+}
+
+const CHANGE_STATE_MIGRATION: &str =
+    include_str!("../../../migrations/20261009125328_coding_agent_change_state.sql");
+
+/// The migration that last redefined the unproposed-reason CHECK.
+const UNPROPOSED_REASON_MIGRATION: &str = include_str!(
+    "../../../migrations/20261010131513_allow_hardening_missing_unproposed_reason.sql"
+);
+
+/// I2: the database admits exactly the Rust state kinds and reasons. A variant
+/// added on one side only fails here, before a row can carry it.
+#[test]
+fn the_migration_check_lists_equal_the_rust_enums() {
+    let kinds: Vec<String> = ChangeStateKind::ALL
+        .iter()
+        .map(|k| k.as_str().to_string())
+        .collect();
+    assert_eq!(
+        check_values(CHANGE_STATE_MIGRATION, "coding_agent_change_state"),
+        kinds
+    );
+    let reasons: Vec<String> = UnproposedReason::ALL
+        .iter()
+        .map(|r| r.as_str().to_string())
+        .collect();
+    assert_eq!(
+        check_values(
+            UNPROPOSED_REASON_MIGRATION,
+            "coding_agent_unproposed_reason"
+        ),
+        reasons
+    );
+}
+
+/// I2: each wire name is the column text, so the serde form and `as_str`
+/// never drift, and `parse` reads back what `as_str` wrote.
+#[test]
+fn the_state_and_reason_wire_names_equal_their_column_text() {
+    for kind in ChangeStateKind::ALL {
+        assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+        assert_eq!(ChangeStateKind::parse(kind.as_str()), Some(kind));
+    }
+    for reason in UnproposedReason::ALL {
+        assert_eq!(serde_json::to_value(reason).unwrap(), reason.as_str());
+        assert_eq!(UnproposedReason::parse(reason.as_str()), Some(reason));
+    }
+}
+
+/// I2: the hold reasons derive from `ProposalHold`, never restated. Every
+/// hold maps to its own reason, and only `TurnIncomplete` comes from elsewhere.
+#[test]
+fn every_proposal_hold_maps_to_its_own_reason() {
+    use crate::engine::change_ops::{PlanHold, ProposalHold};
+    let from_holds: Vec<UnproposedReason> = [
+        ProposalHold::Plan(PlanHold::Missing),
+        ProposalHold::Plan(PlanHold::AwaitingApproval),
+        ProposalHold::Plan(PlanHold::OutsideBound),
+        ProposalHold::HardeningMissing,
+    ]
+    .into_iter()
+    .map(UnproposedReason::from)
+    .collect();
+    let expected: Vec<UnproposedReason> = UnproposedReason::ALL
+        .into_iter()
+        .filter(|r| *r != UnproposedReason::TurnIncomplete)
+        .collect();
+    assert_eq!(from_holds, expected);
+}
+
+/// I1 in the type: each detail rides only on its own kind, and the column
+/// reader maps every legal row back to the state that wrote it.
+#[test]
+fn the_column_reader_round_trips_every_legal_state() {
+    let mut states = vec![
+        CodingAgentChangeState::None,
+        CodingAgentChangeState::Unproposed { reason: None },
+        CodingAgentChangeState::Proposed {
+            requires_restart: false,
+        },
+        CodingAgentChangeState::Proposed {
+            requires_restart: true,
+        },
+    ];
+    states.extend(
+        UnproposedReason::ALL.map(|r| CodingAgentChangeState::Unproposed { reason: Some(r) }),
+    );
+    for state in states {
+        let (reason, restart) = match state {
+            CodingAgentChangeState::Unproposed { reason } => (reason.map(|r| r.as_str()), false),
+            CodingAgentChangeState::Proposed { requires_restart } => (None, requires_restart),
+            CodingAgentChangeState::None => (None, false),
+        };
+        assert_eq!(
+            CodingAgentChangeState::from_columns(state.kind().as_str(), reason, restart),
+            state
+        );
+    }
 }
 
 /// The home thread outranks everything, the thread's own blocker outranks a

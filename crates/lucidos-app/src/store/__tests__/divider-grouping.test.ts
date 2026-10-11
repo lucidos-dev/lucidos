@@ -525,7 +525,7 @@ describe('groupIntoExchanges — response continuation after a mid-flight ChildT
       [1, { type: 'MessageReceived', text: 'make a gif', _eventId: 'msg-1', created: '2026-06-16T12:00:00Z' } as StoredEvent],
       [2, { type: 'ThoughtStreamed', text: 'thinking', request_event_id: 'msg-1', created: '2026-06-16T12:00:01Z' } as StoredEvent],
       [3, { type: 'MessageReceived', text: 'or any way', _eventId: 'msg-2', created: '2026-06-16T12:00:02Z' } as StoredEvent],
-      [4, { type: 'UserPromptInjected', text: 'or any way', mode: 'human', injected_message_id: 'msg-2', request_event_id: 'msg-1', created: '2026-06-16T12:00:03Z' } as StoredEvent],
+      [4, { type: 'PromptInjected', text: 'or any way', mode: 'human', injected_message_id: 'msg-2', request_event_id: 'msg-1', created: '2026-06-16T12:00:03Z' } as StoredEvent],
       [5, { type: 'ThoughtStreamed', text: 'thinking more', request_event_id: 'msg-1', created: '2026-06-16T12:00:04Z' } as StoredEvent],
       [6, { type: 'ChildThreadCompleted', child_thread_id: 'child-1', child_thread_title: 'icons', status: 'success', summary: 'icons landed', _eventId: 'ctc-1', created: '2026-06-16T12:00:05Z' } as StoredEvent],
       [7, { type: 'ToolCalled', name: 'run_python', args: {}, _eventId: 'tc-1', request_event_id: 'msg-1', created: '2026-06-16T12:00:06Z' } as StoredEvent],
@@ -839,7 +839,7 @@ describe('continuationMoved — stale Thinking marker after a mid-flight handoff
   it('clears the mark when the handed-off exchange takes the continuation back', () => {
     // A queued follow-up can be `previousCurrent` when a divider is raised (real
     // thread 194474de), so it gets marked without ever having owned the turn.
-    // When its `UserPromptInjected` is absorbed it becomes the active turn — the
+    // When its `PromptInjected` is absorbed it becomes the active turn — the
     // mark must not survive and freeze its live spinner.
     const events = new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'first', _eventId: 'msg-1', created: '2026-07-28T09:20:00Z' } as StoredEvent],
@@ -849,7 +849,7 @@ describe('continuationMoved — stale Thinking marker after a mid-flight handoff
       [5, { type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'Selected', option_id: 'a' }, created: '2026-07-28T09:20:04Z' } as StoredEvent],
       [6, { type: 'ToolResult', name: 'ask_user_question', result: 'a', tool_called_event_id: 'tc-1', request_event_id: 'msg-1', created: '2026-07-28T09:20:05Z' } as StoredEvent],
       // The queued follow-up is ingested — it now owns the turn.
-      [7, { type: 'UserPromptInjected', text: 'second', mode: 'human', injected_message_id: 'msg-2', request_event_id: 'msg-1', created: '2026-07-28T09:20:06Z' } as StoredEvent],
+      [7, { type: 'PromptInjected', text: 'second', mode: 'human', injected_message_id: 'msg-2', request_event_id: 'msg-1', created: '2026-07-28T09:20:06Z' } as StoredEvent],
       [8, { type: 'ThoughtStreamed', text: 'on the follow-up now', request_event_id: 'msg-1', created: '2026-07-28T09:20:07Z' } as StoredEvent],
     ]);
     const exchanges = groupIntoExchanges(events);
@@ -1038,7 +1038,7 @@ describe('groupIntoExchanges — question asked while a queued follow-up message
   // Real thread 194474de ("Trenger jeg underlag til bassenget"): the user sends
   // a message ("Trenger vi håv?", msg-1) and, while that turn streams, types a
   // second follow-up ("Til hva?", msg-2) which QUEUES — it becomes the `current`
-  // exchange but is never ingested (no UserPromptInjected). The first turn then
+  // exchange but is never ingested (no PromptInjected). The first turn then
   // calls ask_user_question (req_id = msg-1) and parks on the divider. The user
   // answers; the agent resumes and completes — every continuation event still
   // carries the turn's req_id (msg-1).

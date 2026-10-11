@@ -64,7 +64,7 @@ describe('pickInitialHighlight', () => {
 });
 
 describe('navKeyDomId', () => {
-  // The drawer container's aria-activedescendant points at the highlighted node's
+  // The drawer tree's aria-activedescendant points at the highlighted node's
   // DOM id; rows + section headers carry the matching id. They must agree, so the
   // derivation lives in one pure place.
   it('namespaces a thread id', () => {

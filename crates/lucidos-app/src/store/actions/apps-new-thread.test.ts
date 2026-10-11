@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// Polyfill localStorage / document / rAF before store.ts loads at module level.
+// Polyfill localStorage before store.ts loads at module level.
 // vi.hoisted runs before any imports resolve (mirrors threads-focus-loading.test.ts).
 vi.hoisted(() => {
   const storage = new Map<string, string>();
@@ -12,20 +12,6 @@ vi.hoisted(() => {
     get length() { return storage.size; },
     key: (_i: number) => null,
   };
-  // followSentMessage() (reached via addPendingMessage) resolves the visible
-  // transcript through the document, so these have to exist.
-  if (typeof globalThis.document === 'undefined') {
-    (globalThis as any).document = {};
-  }
-  if (!(globalThis.document as any).querySelector) {
-    (globalThis.document as any).querySelector = () => null;
-  }
-  if (!(globalThis.document as any).querySelectorAll) {
-    (globalThis.document as any).querySelectorAll = () => [];
-  }
-  if (typeof globalThis.requestAnimationFrame === 'undefined') {
-    (globalThis as any).requestAnimationFrame = (cb: any) => { cb(); return 0; };
-  }
 });
 
 import { connectionStatus, focusedPane, focusedThreadId, mobileView, pendingChatMessage, threadMap, threadsLoaded } from '../store';

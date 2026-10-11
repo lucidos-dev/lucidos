@@ -12,15 +12,18 @@ pub enum ChangeStatus {
     Applied,
     Discarded,
     Reverted,
+    /// Back to unproposed work, its branch untouched (ADR 0400).
+    Withdrawn,
 }
 
 impl ChangeStatus {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Pending,
         Self::SetAside,
         Self::Applied,
         Self::Discarded,
         Self::Reverted,
+        Self::Withdrawn,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -30,6 +33,7 @@ impl ChangeStatus {
             Self::Applied => "applied",
             Self::Discarded => "discarded",
             Self::Reverted => "reverted",
+            Self::Withdrawn => "withdrawn",
         }
     }
 }
@@ -115,6 +119,7 @@ pub struct PendingThreadState {
     unsettled: bool,
     settling: bool,
     resolving_conflict: bool,
+    owns_hardening: bool,
 }
 
 impl PendingThreadState {
@@ -126,6 +131,15 @@ impl PendingThreadState {
             unsettled,
             settling,
             resolving_conflict: conflict_pairing_open && (unsettled || settling),
+            owns_hardening: false,
+        }
+    }
+
+    /// The thread is an app coding-agent thread, which owns its hardening.
+    pub fn owning_hardening(self, owns_hardening: bool) -> Self {
+        Self {
+            owns_hardening,
+            ..self
         }
     }
 
@@ -200,7 +214,7 @@ pub struct PendingApplyOutlook {
 
 /// A change's status together with the data only that status has.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChangeState {
+pub enum ChangeStatusData {
     Pending {
         /// Set while a Tier-3 conflict resolution is in progress.
         merge: Option<MergeWorktree>,
@@ -213,9 +227,11 @@ pub enum ChangeState {
     Applied(MergeShas),
     Reverted(MergeShas),
     Discarded,
+    /// Back to unproposed work on its branch (ADR 0400).
+    Withdrawn,
 }
 
-impl ChangeState {
+impl ChangeStatusData {
     pub fn status(&self) -> ChangeStatus {
         match self {
             Self::Pending { .. } => ChangeStatus::Pending,
@@ -223,6 +239,7 @@ impl ChangeState {
             Self::Applied(_) => ChangeStatus::Applied,
             Self::Reverted(_) => ChangeStatus::Reverted,
             Self::Discarded => ChangeStatus::Discarded,
+            Self::Withdrawn => ChangeStatus::Withdrawn,
         }
     }
 }
@@ -239,7 +256,7 @@ pub struct Change {
     pub file_count: i32,
     pub files: Vec<String>,
     pub requires_restart: bool,
-    pub state: ChangeState,
+    pub state: ChangeStatusData,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
     pub hardened: bool,
@@ -248,9 +265,9 @@ pub struct Change {
     /// The *change summary*, when a model has written one for the current
     /// commit list. `None` for a single-commit change and until it lands.
     pub summary: Option<String>,
-    /// `true` when the work did not come from a finished turn: a user Stop
-    /// cut it short, or recovery found it after a turn was killed. Apply
-    /// confirms first, and Apply All passes it over.
+    /// `true` when nobody saw the work finish: the archive net's set-aside
+    /// rows, and rows from before ADR 0400. Bring back withdraws such a row
+    /// instead of making it pending.
     pub incomplete: bool,
 }
 
@@ -260,12 +277,12 @@ impl Change {
     }
 
     pub fn is_pending(&self) -> bool {
-        matches!(self.state, ChangeState::Pending { .. })
+        matches!(self.state, ChangeStatusData::Pending { .. })
     }
 
     pub fn merge_worktree(&self) -> Option<&MergeWorktree> {
         match &self.state {
-            ChangeState::Pending { merge, .. } => merge.as_ref(),
+            ChangeStatusData::Pending { merge, .. } => merge.as_ref(),
             _ => None,
         }
     }
@@ -273,21 +290,35 @@ impl Change {
     /// The merge commit of an applied or reverted change.
     pub fn merge_shas(&self) -> Option<&MergeShas> {
         match &self.state {
-            ChangeState::Applied(shas) | ChangeState::Reverted(shas) => Some(shas),
+            ChangeStatusData::Applied(shas) | ChangeStatusData::Reverted(shas) => Some(shas),
             _ => None,
         }
     }
 
     pub fn thread_state(&self) -> Option<PendingThreadState> {
         match self.state {
-            ChangeState::Pending { thread, .. } => Some(thread),
+            ChangeStatusData::Pending { thread, .. } => Some(thread),
             _ => None,
         }
     }
 
+    /// Apply would have to harden this change before it merges. App threads
+    /// own their hardening, and a change of plan files alone has none.
+    pub fn needs_hardening(&self) -> bool {
+        let owns_hardening = self.thread_state().is_some_and(|t| t.owns_hardening);
+        !owns_hardening && crate::engine::git_ops::needs_hardening(self.hardened, &self.files)
+    }
+
+    /// *Apply-ready*: a pending change whose thread has finished and that
+    /// needs no hardening. Exactly the Changes panel's **Ready** section, and
+    /// what Apply All and Discard All act on.
+    pub fn apply_ready(&self) -> bool {
+        self.thread_state().is_some_and(|t| !t.unsettled()) && !self.needs_hardening()
+    }
+
     pub fn apply_outlook(&self) -> Option<PendingApplyOutlook> {
         match self.state {
-            ChangeState::Pending { apply, .. } => Some(apply),
+            ChangeStatusData::Pending { apply, .. } => Some(apply),
             _ => None,
         }
     }
@@ -341,15 +372,16 @@ impl TryFrom<ChangeRow> for Change {
             post: row.post_merge_sha,
         };
         let state = match row.status {
-            ChangeStatus::Pending => ChangeState::Pending {
+            ChangeStatus::Pending => ChangeStatusData::Pending {
                 merge,
                 thread: PendingThreadState::default(),
                 apply: PendingApplyOutlook::default(),
             },
-            ChangeStatus::SetAside => ChangeState::SetAside,
-            ChangeStatus::Applied => ChangeState::Applied(shas),
-            ChangeStatus::Reverted => ChangeState::Reverted(shas),
-            ChangeStatus::Discarded => ChangeState::Discarded,
+            ChangeStatus::SetAside => ChangeStatusData::SetAside,
+            ChangeStatus::Applied => ChangeStatusData::Applied(shas),
+            ChangeStatus::Reverted => ChangeStatusData::Reverted(shas),
+            ChangeStatus::Discarded => ChangeStatusData::Discarded,
+            ChangeStatus::Withdrawn => ChangeStatusData::Withdrawn,
         };
         Ok(Change {
             id: row.id,
@@ -409,6 +441,8 @@ struct ChangeWire<'a> {
     resolving_conflict: bool,
     apply_phase_started_at: Option<chrono::DateTime<chrono::Utc>>,
     predicted_conflict: Option<ConflictPrediction>,
+    needs_hardening: bool,
+    apply_ready: bool,
 }
 
 impl Serialize for Change {
@@ -444,6 +478,8 @@ impl Serialize for Change {
             resolving_conflict: thread.resolving_conflict(),
             apply_phase_started_at: apply.and_then(|a| a.phase_started_at),
             predicted_conflict: apply.map(|a| a.predicted_conflict),
+            needs_hardening: self.needs_hardening(),
+            apply_ready: self.apply_ready(),
         }
         .serialize(serializer)
     }
@@ -625,20 +661,57 @@ pub async fn current_statuses(
     Ok(rows.into_iter().collect())
 }
 
-/// Return the subset of `changes` whose thread has settled: the ones Apply All
-/// and Discard All may act on. Acting on the rest in bulk would merge, or delete
-/// the worktree of, a branch the coding agent is still working on. The
-/// per-change endpoints 409 that same hazard via `guard_change_action`, so the
-/// bulk paths cannot become the quiet way around it. One batch query.
-pub async fn drop_unsettled_thread_changes(
+/// Return the subset of `changes` Apply All and Discard All may act on: the
+/// *apply-ready* ones, the Changes panel's Ready section. Acting on the rest in
+/// bulk would merge a branch the coding agent is still working on, or delete
+/// its worktree. A change that needs hardening would start a run nobody
+/// pressed. The per-change
+/// endpoints 409 the unsettled half via `guard_change_action`, so the bulk
+/// paths cannot become the quiet way around it.
+///
+/// It fills only the two facts `apply_ready` reads, so a bulk press waits on
+/// two queries and no merge probe.
+pub async fn keep_apply_ready_changes(
     pool: &PgPool,
-    changes: Vec<Change>,
+    mut changes: Vec<Change>,
 ) -> Result<Vec<Change>, sqlx::Error> {
-    let unsettled = unsettled_thread_ids(pool, changes.iter().filter_map(|c| c.thread_id)).await?;
-    Ok(changes
-        .into_iter()
-        .filter(|c| !c.thread_id.is_some_and(|tid| unsettled.contains(&tid)))
-        .collect())
+    let thread_ids: Vec<Uuid> = changes
+        .iter()
+        .filter(|c| c.is_pending())
+        .filter_map(|c| c.thread_id)
+        .collect();
+    let unsettled = unsettled_thread_ids(pool, thread_ids.iter().copied()).await?;
+    let apps = app_thread_ids(pool, thread_ids.into_iter()).await?;
+    for change in changes.iter_mut() {
+        let (Some(tid), ChangeStatusData::Pending { thread, .. }) =
+            (change.thread_id, &mut change.state)
+        else {
+            continue;
+        };
+        *thread = PendingThreadState::new(unsettled.contains(&tid), false, false)
+            .owning_hardening(apps.contains(&tid));
+    }
+    Ok(changes.into_iter().filter(Change::apply_ready).collect())
+}
+
+/// The app coding-agent threads among `thread_ids`. One batch query.
+async fn app_thread_ids(
+    pool: &PgPool,
+    thread_ids: impl Iterator<Item = Uuid>,
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    let ids: Vec<Uuid> = thread_ids.collect();
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT thread_id FROM thread_summaries \
+         WHERE thread_id = ANY($1) AND coding_agent_kind = $2",
+    )
+    .bind(&ids)
+    .bind(crate::engine::agent_session::CodingAgentKind::App.as_str())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// A pending change with nothing in it: its branch's commits cancelled out, so
@@ -665,13 +738,6 @@ pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
         .into_iter()
         .filter(|c| !is_empty_pending_change(c))
         .collect()
-}
-
-/// Return the subset of `changes` a bulk apply may land: everything except
-/// incomplete work. A Stop or a killed turn left it, so only a per-change Apply,
-/// which confirms first, lands it (ADR 0328).
-pub fn drop_incomplete_changes(changes: Vec<Change>) -> Vec<Change> {
-    changes.into_iter().filter(|c| !c.incomplete).collect()
 }
 
 /// Which pending changes a reader asked for.
@@ -722,7 +788,7 @@ pub async fn list_set_aside_for_readers(
 }
 
 /// Fill the [`PendingThreadState`] and [`PendingApplyOutlook`] of each pending
-/// Change. Four batch queries, no N+1, and one cached git probe per change.
+/// Change. Five batch queries, no N+1, and one cached git probe per change.
 ///
 /// Every query always runs, because `settling` is NOT a subset of
 /// `unsettled`. A `paused` coding-agent thread is settling, and its status is
@@ -749,10 +815,11 @@ async fn enrich_pending_state(pool: &PgPool, changes: &mut [Change]) -> Result<(
         &thread_ids().collect::<Vec<_>>(),
     )
     .await?;
+    let apps = app_thread_ids(pool, thread_ids()).await?;
     let predictions = predict_conflicts(changes).await;
     for change in changes.iter_mut() {
         let id = change.id;
-        let ChangeState::Pending { thread, apply, .. } = &mut change.state else {
+        let ChangeStatusData::Pending { thread, apply, .. } = &mut change.state else {
             continue;
         };
         apply.predicted_conflict = predictions.get(&id).copied().unwrap_or_default();
@@ -763,7 +830,8 @@ async fn enrich_pending_state(pool: &PgPool, changes: &mut [Change]) -> Result<(
             unsettled.contains(&tid),
             settling.contains(&tid),
             conflicts.contains_key(&id),
-        );
+        )
+        .owning_hardening(apps.contains(&tid));
         // The same rule the phase label follows, so a pairing a crash left open
         // never lends its start time to a hardening.
         apply.phase_started_at = if thread.resolving_conflict() {
@@ -883,14 +951,14 @@ mod tests {
             file_count: 1,
             files: vec!["a.rs".into()],
             requires_restart: false,
-            state: ChangeState::Pending {
+            state: ChangeStatusData::Pending {
                 merge: None,
                 thread: PendingThreadState::default(),
                 apply: PendingApplyOutlook::default(),
             },
             created_at: chrono::Utc::now(),
             resolved_at: None,
-            hardened: false,
+            hardened: true,
             thread_title: None,
             commits: vec![],
             summary: None,
@@ -900,6 +968,44 @@ mod tests {
 
     fn unsettled(change: &Change) -> bool {
         change.thread_state().is_some_and(|t| t.unsettled())
+    }
+
+    /// *Apply-ready* is the Ready section: a settled thread and nothing to
+    /// harden. A plan has nothing to harden, and an app thread owns its own.
+    #[test]
+    fn apply_ready_needs_a_settled_thread_and_nothing_to_harden() {
+        let with = |hardened: bool, files: &[&str], thread: PendingThreadState| Change {
+            hardened,
+            files: files.iter().map(|f| f.to_string()).collect(),
+            state: ChangeStatusData::Pending {
+                merge: None,
+                thread,
+                apply: PendingApplyOutlook::default(),
+            },
+            ..make_change(Some(Uuid::new_v4()))
+        };
+        let settled = PendingThreadState::new(false, false, false);
+        let running = PendingThreadState::new(true, true, false);
+
+        let unhardened = with(false, &["src/a.rs"], settled);
+        assert!(unhardened.needs_hardening() && !unhardened.apply_ready());
+        assert!(with(true, &["src/a.rs"], settled).apply_ready());
+        let plan = with(false, &["docs/plans/2026-10-10-x.md"], settled);
+        assert!(!plan.needs_hardening() && plan.apply_ready());
+        let app = with(
+            false,
+            &["apps/habit-tracker/index.html"],
+            settled.owning_hardening(true),
+        );
+        assert!(!app.needs_hardening() && app.apply_ready());
+        assert!(!with(true, &["src/a.rs"], running).apply_ready());
+
+        let mut applied = with(true, &["src/a.rs"], settled);
+        applied.state = ChangeStatusData::Applied(MergeShas::default());
+        assert!(
+            !applied.apply_ready(),
+            "only a pending change is apply-ready"
+        );
     }
 
     fn settling(change: &Change) -> bool {
@@ -942,7 +1048,7 @@ mod tests {
             make_change(None),
             {
                 let mut c = make_change(Some(running_but_applied));
-                c.state = ChangeState::Applied(MergeShas::default());
+                c.state = ChangeStatusData::Applied(MergeShas::default());
                 c
             },
         ];
@@ -1012,7 +1118,7 @@ mod tests {
 
         // The bulk paths read the same predicate, so Apply All drops the
         // watching one and keeps the delegating parent and the settled one.
-        let kept = drop_unsettled_thread_changes(&pool, changes)
+        let kept = keep_apply_ready_changes(&pool, changes)
             .await
             .expect("filter");
         let kept_threads: Vec<_> = kept.iter().map(|c| c.thread_id).collect();
@@ -1256,26 +1362,12 @@ mod tests {
         // re-applying it must stay the idempotent Noop rather than a refusal.
         let mut applied_zero = make_change(None);
         applied_zero.file_count = 0;
-        applied_zero.state = ChangeState::Applied(MergeShas::default());
+        applied_zero.state = ChangeStatusData::Applied(MergeShas::default());
 
         let (normal_id, applied_id) = (normal.id, applied_zero.id);
         let kept = drop_empty_changes(vec![normal, emptied, applied_zero]);
         let kept_ids: Vec<_> = kept.iter().map(|c| c.id).collect();
         assert_eq!(kept_ids, vec![normal_id, applied_id]);
-    }
-
-    /// O4: a bulk apply never lands incomplete work, which a Stop or a killed
-    /// turn left. Only its own Apply, which confirms first, lands it.
-    #[test]
-    fn drop_incomplete_changes_keeps_only_finished_work() {
-        let finished = make_change(None);
-        let mut stopped = make_change(None);
-        stopped.incomplete = true;
-
-        let finished_id = finished.id;
-        let kept = drop_incomplete_changes(vec![finished, stopped]);
-        let kept_ids: Vec<_> = kept.iter().map(|c| c.id).collect();
-        assert_eq!(kept_ids, vec![finished_id]);
     }
 
     /// Every surface that serves a pending list reads it through
@@ -1316,7 +1408,7 @@ mod tests {
         let mut c = make_change(None);
         c.file_count = 0;
         assert!(is_empty_pending_change(&c));
-        c.state = ChangeState::Discarded;
+        c.state = ChangeStatusData::Discarded;
         assert!(
             !is_empty_pending_change(&c),
             "only a pending change can be refused an Apply"
@@ -1328,7 +1420,14 @@ mod tests {
         let wire: Vec<&str> = ChangeStatus::ALL.iter().map(|s| s.as_str()).collect();
         assert_eq!(
             wire,
-            ["pending", "set_aside", "applied", "discarded", "reverted"]
+            [
+                "pending",
+                "set_aside",
+                "applied",
+                "discarded",
+                "reverted",
+                "withdrawn"
+            ]
         );
         for status in ChangeStatus::ALL {
             assert_eq!(status.as_str().parse::<ChangeStatus>(), Ok(status));
@@ -1417,7 +1516,7 @@ mod tests {
         assert!(!PendingThreadState::new(true, true, false).resolving_conflict());
     }
 
-    fn fixed_change(state: ChangeState) -> Change {
+    fn fixed_change(state: ChangeStatusData) -> Change {
         let at = |s: &str| {
             chrono::DateTime::parse_from_rfc3339(s)
                 .unwrap()
@@ -1451,7 +1550,7 @@ mod tests {
     /// had, so the API, SSE frames and the `changes` tool stay byte-stable.
     #[test]
     fn a_pending_change_serializes_to_the_flat_wire_shape() {
-        let change = fixed_change(ChangeState::Pending {
+        let change = fixed_change(ChangeStatusData::Pending {
             merge: Some(MergeWorktree {
                 path: "/tmp/wt".into(),
                 temp_branch: "merge-tmp/x".into(),
@@ -1467,19 +1566,19 @@ mod tests {
             },
         });
         let expected = format!(
-            r#"{{{IDS},{HEAD},"status":"pending","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":"/tmp/wt","merge_temp_branch":"merge-tmp/x","hardened":true,"pre_merge_sha":null,"post_merge_sha":null,"thread_title":"T","commits":["c"],"summary":"S","incomplete":false,"thread_unsettled":true,"thread_settling":true,"resolving_conflict":true,"apply_phase_started_at":"2026-01-02T03:10:00Z","predicted_conflict":"conflict"}}"#
+            r#"{{{IDS},{HEAD},"status":"pending","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":"/tmp/wt","merge_temp_branch":"merge-tmp/x","hardened":true,"pre_merge_sha":null,"post_merge_sha":null,"thread_title":"T","commits":["c"],"summary":"S","incomplete":false,"thread_unsettled":true,"thread_settling":true,"resolving_conflict":true,"apply_phase_started_at":"2026-01-02T03:10:00Z","predicted_conflict":"conflict","needs_hardening":false,"apply_ready":false}}"#
         );
         assert_eq!(serde_json::to_string(&change).unwrap(), expected);
     }
 
     #[test]
     fn an_applied_change_serializes_to_the_flat_wire_shape() {
-        let change = fixed_change(ChangeState::Applied(MergeShas {
+        let change = fixed_change(ChangeStatusData::Applied(MergeShas {
             pre: Some("aaa".into()),
             post: Some("bbb".into()),
         }));
         let expected = format!(
-            r#"{{{IDS},{HEAD},"status":"applied","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":null,"merge_temp_branch":null,"hardened":true,"pre_merge_sha":"aaa","post_merge_sha":"bbb","thread_title":"T","commits":["c"],"summary":"S","incomplete":false,"thread_unsettled":false,"thread_settling":false,"resolving_conflict":false,"apply_phase_started_at":null,"predicted_conflict":null}}"#
+            r#"{{{IDS},{HEAD},"status":"applied","created_at":"2026-01-02T03:04:05Z","resolved_at":null,"merge_worktree_path":null,"merge_temp_branch":null,"hardened":true,"pre_merge_sha":"aaa","post_merge_sha":"bbb","thread_title":"T","commits":["c"],"summary":"S","incomplete":false,"thread_unsettled":false,"thread_settling":false,"resolving_conflict":false,"apply_phase_started_at":null,"predicted_conflict":null,"needs_hardening":false,"apply_ready":false}}"#
         );
         assert_eq!(serde_json::to_string(&change).unwrap(), expected);
     }

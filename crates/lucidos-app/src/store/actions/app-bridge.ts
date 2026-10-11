@@ -29,13 +29,19 @@ import { registrationToAwait } from '../../utils/deviceRegistration';
 import { appFrameFor, appIdForFrame } from '../../utils/appFrame';
 import { WORKSPACE_ID } from '../../utils/basePath';
 import { rawStorageKey } from '../../utils/workspaceStorage';
-import { showToast } from '../store';
-
-/** Mirrors `packages/lucidos-sdk/src/_bridge.ts`. Two copies, because the SDK
- *  bundles standalone for app frames and cannot import the host. */
-const BRIDGE_TYPE = 'lucidos:bridge';
-const BRIDGE_REPLY_TYPE = 'lucidos:bridge:reply';
-const BRIDGE_PUSH_TYPE = 'lucidos:bridge:push';
+import { focusedThreadId, showToast } from '../store';
+// The app half of the protocol. Relative, because the barrel does not export
+// the bridge; it has no import-time side effects.
+import {
+  BRIDGE_PUSH_TYPE,
+  BRIDGE_REPLY_TYPE,
+  BRIDGE_TYPE,
+  HOST_REPLY_TYPE,
+  HOST_REQUEST_TYPE,
+  type BridgeOp,
+  type WireBody,
+  type WireRequest,
+} from '../../../../../packages/lucidos-sdk/src/_bridge';
 
 /**
  * The path this request will actually be sent to, or null if this app may not
@@ -113,20 +119,6 @@ function sanitizeHeaders(headers: Record<string, string> | undefined): Record<st
     out[name] = value;
   }
   return out;
-}
-
-type WireBody =
-  | { kind: 'none' }
-  | { kind: 'text'; value: string }
-  | { kind: 'binary'; value: ArrayBuffer | Blob }
-  | { kind: 'form'; entries: Array<[string, string | File]> };
-
-interface WireRequest {
-  path: string;
-  method: string;
-  headers: Record<string, string>;
-  body: WireBody;
-  timeoutMs: number;
 }
 
 /** Rebuild the body the app flattened. `FormData` cannot cross a structured
@@ -250,17 +242,14 @@ export function fanOutEventStreamStatus(kind: 'open' | 'error'): void {
 // The other direction: asking a frame to act
 // ---------------------------------------------------------------------------
 
-const HOST_REQUEST_TYPE = 'lucidos:bridge:host';
-const HOST_REPLY_TYPE = 'lucidos:bridge:host:reply';
-
 let askCounter = 0;
 
 /**
  * Ask one app frame to do something, and wait for its answer.
  *
  * The shell used to reach through `contentWindow` for these: reading
- * `lucidos._capture`, and driving `location.replace` to switch apps and deliver
- * a fragment. An isolated frame denies all three, so it does them for itself.
+ * `lucidos._capture`, and driving `location.replace` to deliver a fragment. An
+ * isolated frame denies both, so it does them for itself.
  *
  * `timeoutMs` bounds the wait, because the frame answering is the very thing
  * that may be wedged. A capture already had a deadline for that reason.
@@ -494,8 +483,11 @@ function runStorageOp(
 // The router
 // ---------------------------------------------------------------------------
 
+/** `op` is typed by the app half's own list, so an arm naming an op the SDK
+ *  does not send fails to compile. The value came off the wire, so the default
+ *  arm still answers anything else. */
 async function runOp(
-  op: string,
+  op: BridgeOp,
   args: unknown,
   source: MessageEventSource,
   frame: HTMLIFrameElement,
@@ -508,6 +500,7 @@ async function runOp(
     case 'storage.set': return runStorageOp(frame, args, storageSet);
     case 'storage.remove': return runStorageOp(frame, args, storageRemove);
     case 'storage.clear': return runStorageOp(frame, args, storageClear);
+    case 'ui.focused-thread': return focusedThreadId.value;
     default: throw new Error(`The app bridge has no operation "${op}"`);
   }
 }
@@ -531,7 +524,7 @@ export function installAppBridge(): () => void {
     const frame = appFrameFor(source);
     if (!source || !frame) return;
     if (typeof data.op !== 'string') return;
-    void runOp(data.op, data.args, source, frame).then(
+    void runOp(data.op as BridgeOp, data.args, source, frame).then(
       (value) => {
         if (!data.id) return;
         postToFrame(source, { type: BRIDGE_REPLY_TYPE, id: data.id, ok: true, value });

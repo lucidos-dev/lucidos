@@ -176,9 +176,9 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
   test('titles sit on the row middle and never overlap the leading cluster', async ({ page }) => {
     await navigateToApp(page);
 
-    // Thread header: the nav cluster (back chevron, Lucidos mark, forward
-    // chevron) is centered on the row middle and clears BOTH edge controls, the
-    // thread-drawer toggle leading and the menu hamburger trailing.
+    // Thread header: the nav cluster holds the back chevron, the Home and mark
+    // pair, and the forward chevron. It is centered on the row middle and
+    // clears both edge controls: the drawer toggle and the hamburger.
     //
     // This cluster is FIXED WIDTH, unlike the title it replaced: it cannot
     // ellipsise its way out of a collision, so the clearance below is a hard
@@ -211,11 +211,12 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     expect(markLabel, 'the mark has no accessible name').not.toBeNull();
     expect(markLabel!.toLowerCase()).toMatch(/connect/);
 
-    // Threads header: "Threads" is centered on the row middle, not truncated, and
-    // clear of the Filter control.
+    // Threads header: the grouping's name is centered on the row middle, not
+    // truncated, and clear of the Grouping and Filter controls that lead it.
+    // The Filter slot is the rightmost of the two, and keeps its box.
     await openThreadDrawer(page);
     const threads = await measure(
-      page, '.mobile-threads-header', '.pane-header-title', '.view-selector-slot', TRAILING_LEFTMOST, 'Threads',
+      page, '.mobile-threads-header', '.pane-header-title', '.filter-slot', TRAILING_LEFTMOST, 'Folders',
     );
     expect(threads, 'Threads title / filter slot not found').not.toBeNull();
     expect(
@@ -224,7 +225,7 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     ).toBeLessThan(2.5);
     expect(
       threads!.left,
-      `Threads title left=${threads!.left} overlaps filter right=${threads!.leadingRight}`,
+      `Threads title left=${threads!.left} overlaps filter slot right=${threads!.leadingRight}`,
     ).toBeGreaterThanOrEqual(threads!.leadingRight - 0.5);
     expect(
       threads!.right,
@@ -242,7 +243,7 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     // the parser rejects, and a `var()` naming a property nothing defines, each
     // leave `max-width: none`. That drops the only structural guarantee that a
     // title cannot cross the mark, while every assertion above still passes,
-    // because this row's two titles ("Threads", "Filters") are short enough
+    // because this row's titles ("Folders", "Ongoing", "Filters") are short enough
     // never to reach it.
     //
     // `none` is the whole assertion, and the computed value must NOT be read as
@@ -294,8 +295,8 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     //
     // Swept across both ARMS of the cluster's width. At 375px the arm is a pure
     // function of the root. The edge reserve places the chevrons at 100% and at
-    // 137.5%. At 200% the row cannot hold the pair at all, so the min-span floor
-    // takes over and the ends do reach their edge controls.
+    // 125%. At 200% the row cannot hold the cluster at all, so the min-span
+    // floor takes over and the ends do reach their edge controls.
     await navigateToApp(page);
 
     // Both thread chevrons carry the same class, so they are told apart by
@@ -305,7 +306,7 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     ] as const;
     const contentArgs = ['.mobile-content-header', '.content-back-btn', '.content-forward-btn'] as const;
 
-    for (const [scale, rootPx, expected] of [[100, 16, 'reserve'], [137.5, 22, 'reserve'], [200, 32, 'floor']] as const) {
+    for (const [scale, rootPx, expected] of [[100, 16, 'reserve'], [125, 20, 'reserve'], [200, 32, 'floor']] as const) {
       await ensureMobileView(page, 'thread');
       await setScale(page, scale, rootPx);
       await expect
@@ -587,7 +588,7 @@ test.describe('the reserve clears the widest trailing cluster by less than a but
     // constant would happen to agree with. The arm is asserted because only the
     // reserve arm places the chevrons: on the floor the row has run out of room
     // and the ends reach their edge controls by design.
-    await setScale(page, 137.5, 22);
+    await setScale(page, 125, 20);
     const geometry = (await navGeometry(page, '.mobile-content-header'))!;
     expect(geometry.arm, 'the reserve is what places the chevrons here').toBe('reserve');
 

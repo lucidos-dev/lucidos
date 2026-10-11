@@ -1,6 +1,6 @@
 import { test, expect, type Page } from './fixtures';
 import { randomUUID } from 'crypto';
-import { navigateToApp, assertHealthy, openThreadDrawer, openDrawerView, openSettingsView, waitForEventStream } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, showOngoingGroup, openSettingsView, waitForEventStream } from './helpers';
 import { psql, clearAllThreads, seedThreadRow } from './db-helpers';
 
 /** Where DOM focus sits, named so a failure says where Tab went. */
@@ -8,7 +8,7 @@ async function focusPlace(page: Page): Promise<string> {
   return await page.evaluate(() => {
     const a = document.activeElement as HTMLElement | null;
     if (!a || a === document.body) return 'body';
-    if (a.matches('.thread-drawer')) return 'drawer';
+    if (a.matches('.thread-drawer-tree')) return 'drawer';
     if (a.closest('.scale-modal')) return 'scale-modal';
     if (a.closest('.thread-drawer')) return `drawer:${a.textContent?.trim()}`;
     if (a.closest('.pane-content')) return 'content';
@@ -25,9 +25,10 @@ test.describe('Keyboard Tab', () => {
     await assertHealthy(page);
   });
 
-  test('Tab reaches the thread list from "See all statuses" in a status view', async ({ page }) => {
-    // The drawer is its own single tab stop. The trap never counted it, so in
-    // a status view Tab bounced on the link and the list was unreachable.
+  test('the thread list is the drawer pane\'s one tab stop, and Tab keeps it there', async ({ page }) => {
+    // The grouping is picked in the header, so the list is the pane's only
+    // stop. The trap once never counted the list, so Tab bounced on the
+    // control beside it and the list was unreachable.
     clearAllThreads();
     psql(seedThreadRow({
       id: randomUUID(), title: `attention-${Date.now()}`, now: new Date().toISOString(),
@@ -36,14 +37,14 @@ test.describe('Keyboard Tab', () => {
     await navigateToApp(page);
     await waitForEventStream(page);
     await openThreadDrawer(page);
-    await openDrawerView(page, 'Needs attention');
+    await showOngoingGroup(page, 'Blocked');
 
-    // Picking the view focused the drawer pane, so ⌘⇧1 would close it now.
-    await page.locator('.thread-drawer:not(.thread-drawer-collapsed)').focus();
+    // Opening the group focused the drawer pane, so ⌘⇧1 would close it now.
+    await page.locator('.thread-drawer:not(.thread-drawer-collapsed) .thread-drawer-list > .thread-drawer-tree').focus();
     await expect.poll(() => focusPlace(page)).toBe('drawer');
     await page.keyboard.press('Tab');
-    expect(await focusPlace(page)).toBe('drawer:See all statuses');
-    await page.keyboard.press('Tab');
+    expect(await focusPlace(page)).toBe('drawer');
+    await page.keyboard.press('Shift+Tab');
     expect(await focusPlace(page)).toBe('drawer');
   });
 

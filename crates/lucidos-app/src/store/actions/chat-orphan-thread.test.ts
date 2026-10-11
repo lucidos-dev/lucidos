@@ -62,10 +62,6 @@ vi.mock('./thread-navigation', () => ({
   removeThreadNavEntries: vi.fn(),
 }));
 
-vi.mock('../../components/chat/scrollState', () => ({
-  followSentMessage: vi.fn(),
-  stopFollowingBottom: vi.fn(),
-}));
 
 vi.mock('./thread-loading', () => ({
   refreshThreadEvents: vi.fn().mockResolvedValue(true),
@@ -125,11 +121,8 @@ function makeActiveThread(id: string, overrides: Partial<ThreadState['meta']> = 
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,

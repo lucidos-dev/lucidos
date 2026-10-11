@@ -14,8 +14,9 @@
  *
  * The header is `position: fixed` and sits above the swipe panes. The
  * threads pane's scroll container (`.thread-drawer-list`) uses a `::before`
- * pseudo-element spacer sized to `--mobile-header-height` so the first row
- * starts BELOW the header instead of behind it.
+ * pseudo-element spacer sized to `--mobile-header-height` so its first item
+ * starts BELOW the header instead of behind it. That first item is the first
+ * section header or row, so it is what the header would clip first.
  *
  * Bug seen on iPhone PWA: the first thread row's title text was sliced
  * by the fixed header bar — the top half of the topmost line was hidden
@@ -48,7 +49,7 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
     await assertHealthy(page);
   });
 
-  test('first row stays below header after safe-area-inset-top appears', async ({ page }) => {
+  test('the first item stays below header after safe-area-inset-top appears', async ({ page }) => {
     await navigateToApp(page);
 
     // Ensure at least one real thread exists so the drawer renders rows.
@@ -59,7 +60,7 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
     // Switch to the threads pane (pane 0).
     await ensureMobileView(page, 'threads');
 
-    // Wait for the scroll container and at least one row to be rendered.
+    // Wait for the scroll container and at least one row.
     await page.waitForFunction(() => {
       const list = document.querySelector('.mobile-swipe-pane .thread-drawer-list');
       const row = document.querySelector('.mobile-swipe-pane .thread-row');
@@ -92,10 +93,10 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
     const result = await page.evaluate(() => {
       const header = document.querySelector('.app-header');
       const list = document.querySelector('.mobile-swipe-pane .thread-drawer-list');
-      const rows = Array.from(document.querySelectorAll('.mobile-swipe-pane .thread-row'));
+      const items = Array.from(document.querySelectorAll('.mobile-swipe-pane .thread-drawer-tree :is(.list-section-title, .thread-row)'));
       if (!header || !list) return { error: 'missing header or list' };
-      const firstRow = rows.find((r) => r.getBoundingClientRect().height > 0);
-      if (!firstRow) return { error: 'no visible row' };
+      const firstItem = items.find((r) => r.getBoundingClientRect().height > 0);
+      if (!firstItem) return { error: 'no visible item' };
       const cssVar = getComputedStyle(document.documentElement).getPropertyValue('--mobile-header-height').trim();
       const remSize = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
       const cssVarPx = cssVar.endsWith('rem')
@@ -104,7 +105,7 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
       return {
         headerBottom: header.getBoundingClientRect().bottom,
         headerHeight: header.getBoundingClientRect().height,
-        rowTop: firstRow.getBoundingClientRect().top,
+        itemTop: firstItem.getBoundingClientRect().top,
         listScrollTop: (list as HTMLElement).scrollTop,
         cssVar,
         cssVarPx,
@@ -112,8 +113,8 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
     });
 
     expect(result).not.toHaveProperty('error');
-    const { headerBottom, headerHeight, rowTop, listScrollTop, cssVar, cssVarPx } = result as {
-      headerBottom: number; headerHeight: number; rowTop: number;
+    const { headerBottom, headerHeight, itemTop, listScrollTop, cssVar, cssVarPx } = result as {
+      headerBottom: number; headerHeight: number; itemTop: number;
       listScrollTop: number; cssVar: string; cssVarPx: number;
     };
 
@@ -125,12 +126,12 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
       `header height (${headerHeight}) did not include simulated safe-area (${SIMULATED_SAFE_AREA_TOP_PX}px)`)
       .toBeGreaterThanOrEqual(SIMULATED_SAFE_AREA_TOP_PX);
 
-    // The first row's top must be at or below the header's bottom.
-    // 1px subpixel tolerance.
+    // The first item's top must be at or below the header's bottom. 1px
+    // subpixel tolerance.
     expect(
-      rowTop,
-      `first thread row top (${rowTop}) is above header bottom (${headerBottom}) — ` +
-      `row is clipped under header. header height=${headerHeight}px, ` +
+      itemTop,
+      `first item top (${itemTop}) is above header bottom (${headerBottom}): ` +
+      `the item is clipped under the header. header height=${headerHeight}px, ` +
       `--mobile-header-height=${cssVar} (${cssVarPx}px). ` +
       `Either useHideOnScroll's ResizeObserver missed the padding change ` +
       `(needs box: 'border-box') or the CSS fallback is too short.`,
@@ -142,13 +143,13 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
    * on its own (`.thread-filter-cover`, position:absolute inset:0 over
    * `.thread-drawer-list`). So it inherits nothing from the list's header
    * spacer and needs its own, which it shipped without: the panel's first
-   * Status rows rendered behind the fixed header.
+   * rows rendered behind the fixed header.
    *
    * No safe-area simulation here. This half fails with the header at its
    * ordinary height, because the pane starts at the viewport top and a panel
    * with no spacer starts there with it.
    */
-  test('filter panel Status rows start below the header', async ({ page }) => {
+  test('filter panel heading starts below the header', async ({ page }) => {
     await navigateToApp(page);
     await ensureMobileView(page, 'threads');
 
@@ -161,8 +162,9 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
     const opened = await clickVisibleElement(page, 'button[aria-label="Filter threads"]');
     expect(opened, 'Filter threads button not visible in the mobile threads header').toBe(true);
 
+    // The panel's first row is its first thread type.
     await page.waitForFunction(() => {
-      const row = document.querySelector('.mobile-swipe-pane .thread-filter-cover[data-open] .drawer-view-option');
+      const row = document.querySelector('.mobile-swipe-pane .thread-filter-cover[data-open] .thread-filter-panel > :first-child');
       return !!row && row.getBoundingClientRect().height > 0;
     }, undefined, { timeout: 10_000 });
 
@@ -170,7 +172,7 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
       const header = document.querySelector('.app-header');
       // The cover is the panel's scroller.
       const panel = document.querySelector('.mobile-swipe-pane .thread-filter-cover');
-      const firstRow = document.querySelector('.mobile-swipe-pane .thread-filter-panel .drawer-view-option');
+      const firstRow = document.querySelector('.mobile-swipe-pane .thread-filter-panel > :first-child');
       if (!header || !panel || !firstRow) return { error: 'missing header, panel or row' };
       return {
         headerBottom: header.getBoundingClientRect().bottom,
@@ -192,7 +194,7 @@ test.describe('Mobile threads pane: top content not clipped under header', () =>
     // 1px subpixel tolerance, as in the list test above.
     expect(
       rowTop,
-      `first Status row ("${rowLabel}") top (${rowTop}) is above header bottom ` +
+      `first panel row ("${rowLabel}") top (${rowTop}) is above header bottom ` +
       `(${headerBottom}), so the row is hidden under the fixed header. The panel ` +
       `is a scroll container of its own and must carry the ::before header ` +
       `spacer (mobile.css, the .mobile-swipe-pane …::before group).`,

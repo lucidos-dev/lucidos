@@ -95,17 +95,28 @@ describe('the content title is centred on the row, not between the icons', () =>
     // controls' own width.
     expect(desktopRule(TITLE).props.get('width')).toBe(
       'clamp( var(--desktop-nav-min-span), calc(100% - 2 * var(--content-side-reserve)),'
-      + ' var(--desktop-nav-span) )',
+      + ' clamp( var(--desktop-nav-span), calc(100% - 2 * var(--content-unfolded-reserve)),'
+      + ' var(--desktop-content-title-span-max) ) )',
     );
   });
 
-  it('holds the chevrons the same distance apart as the thread pane\'s', () => {
-    // One span, two panes. The tokens are shared rather than restated, so a
-    // retune moves both rows' chevrons together instead of splitting them.
+  it('holds the chevrons the same distance apart as the thread pane\'s until it grows', () => {
+    // One span, two panes, up to the width where the Canvas title starts to
+    // grow. The tokens are shared rather than restated, so a retune moves both
+    // rows' chevrons together instead of splitting them.
     const brand = desktopRule('.app-header .pane-header-brand .pane-header-brand-label');
     for (const token of ['--desktop-nav-min-span', '--desktop-nav-span']) {
       expect(brand.props.get('width'), `${token} is not shared`).toContain(token);
     }
+    expect(brand.props.get('width'), 'the Conversation brand grows with the Canvas title')
+      .not.toContain('--desktop-content-title-span-max');
+  });
+
+  it('grows on a wide pane, but only up to its cap', () => {
+    const cap = desktopRoot().props.get('--desktop-content-title-span-max');
+    const span = desktopRoot().props.get('--desktop-nav-span');
+    expect(cap, '--desktop-content-title-span-max is gone').toBeDefined();
+    expect(parseFloat(cap!), 'the cap does not let the title grow').toBeGreaterThan(parseFloat(span!));
   });
 
   it('states no height of its own, so it cannot hang out of the row', () => {
@@ -214,6 +225,38 @@ describe('the reserve is derived from the controls, never guessed', () => {
     const boxes = Number(/calc\((\d+) \* var\(--header-icon-box\)/.exec(reserve())?.[1]);
     const gaps = Number(/\+ (\d+) \* [\d.]+rem\)$/.exec(reserve())?.[1]);
     expect(boxes * iconBox + gaps * gapRem).toBeGreaterThanOrEqual(widestCluster + 2 * gapRem);
+  });
+});
+
+describe('the title grows only out of room no action cluster needs', () => {
+  const unfolded = (): string => {
+    const value = desktopRoot().props.get('--content-unfolded-reserve');
+    expect(value, '--content-unfolded-reserve is gone').toBeDefined();
+    return value!;
+  };
+
+  it('is seven icon boxes and eight gaps', () => {
+    // Seven: the widest action set a content view shows unfolded (a file
+    // preview's six) plus the bell. Eight gaps: the six between those boxes and
+    // the two the collapse measurement charges the centred box. Where the box
+    // grows past --desktop-nav-span it leaves exactly this much at each end, so
+    // growing never folds an action the 20rem box let ride.
+    expect(unfolded()).toBe('calc(7 * var(--header-icon-box) + 8 * 0.25rem)');
+  });
+
+  it('counts the row\'s OWN gap, like the side reserve', () => {
+    const gap = desktopRule(ROW).props.get('gap');
+    const term = /\+ 8 \* ([\d.]+rem)\)$/.exec(unfolded())?.[1];
+    expect(term, `--content-unfolded-reserve drifted from the row's ${gap} gap`).toBe(gap);
+  });
+
+  it('is wider than the side reserve, so growing never undercuts the clamp', () => {
+    // The outer clamp's middle arm is the non-overlap guarantee. A grown span
+    // leaves this reserve at each end. It stays inside that arm only while
+    // this reserve is the wider of the two.
+    const boxes = (value: string) => Number(/calc\((\d+) \* var\(--header-icon-box\)/.exec(value)?.[1]);
+    const side = desktopRoot().props.get('--content-side-reserve')!;
+    expect(boxes(unfolded())).toBeGreaterThan(boxes(side));
   });
 });
 

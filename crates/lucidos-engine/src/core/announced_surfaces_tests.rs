@@ -20,8 +20,9 @@
 //!
 //! Test modules are excluded by path convention (`*_test.rs`, `*_tests.rs`, a
 //! `*_tests/` directory, `bin/`) and each remaining file is truncated at its
-//! first top-level `#[cfg(test)]`. A test fixture writing a row directly is
-//! setup, not a production write path.
+//! first top-level `#[cfg(test)]`. A file-level `#![cfg(test)]` drops the whole
+//! file. A test fixture writing a row directly is setup, not a production
+//! write path.
 //!
 //! **`.sql` migrations are out of scope**, and safely so: they run before the
 //! `EventBus` exists. See the registry's module doc, § "Migrations are outside
@@ -521,6 +522,26 @@ fn inline_test_modules_are_cut_before_scanning() {
         "a fixture inside #[cfg(test)] must not read as a production write"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A file-level `#![cfg(test)]` never compiles outside tests, so a fixture
+/// write in it is no production write. `test_support.rs` is that file.
+#[test]
+fn a_test_only_file_has_no_production_text() {
+    let dir = std::env::temp_dir().join(format!("lucidos-scan-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("helpers.rs");
+    std::fs::write(
+        &path,
+        "//! Helpers.\n\n#![cfg(test)]\n\npub fn seed() { \"DELETE FROM models\"; }\n",
+    )
+    .unwrap();
+    assert_eq!(read_production_source(&path), "");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        read_production_source(&src_root().join("test_support.rs")),
+        ""
+    );
 }
 
 /// The registry is documentation as much as a gate, so every entry has to say

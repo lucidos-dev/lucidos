@@ -65,8 +65,7 @@ async fn load_family_threads<'a>(
         })
 }
 
-/// The home thread's summary, or `None` while its switch is off or before one
-/// exists.
+/// The home thread's summary, or `None` before one exists.
 async fn home_thread_summary(
     store: &EventStore,
     pool: &sqlx::PgPool,
@@ -146,7 +145,7 @@ pub(in crate::api) async fn list_threads(
             format!("Failed to get recent threads: {}", e),
         )
     })?;
-    let mut active_threads = active_result.map_err(|e| {
+    let active_threads = active_result.map_err(|e| {
         log!("[API] Failed to get active thread info: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -169,11 +168,6 @@ pub(in crate::api) async fn list_threads(
     })?;
 
     let home_thread = home_result?;
-    // A summary still marked home while `home_thread` is None is the hidden
-    // home thread. Only a by-id read can carry it (active, focused, family),
-    // since every list query filters it, so those three drop it here.
-    let hidden_home = |t: &ThreadSummary| t.home && home_thread.is_none();
-    active_threads.retain(|t| !hidden_home(t));
 
     // If the frontend has a focused thread, ensure it's in the response.
     // The focused thread may fall outside the global newest-30 archive slice
@@ -202,7 +196,6 @@ pub(in crate::api) async fn list_threads(
     } else {
         None
     };
-    let focused_thread = focused_thread.filter(|t| !hidden_home(t));
 
     // Load any family members (ancestors + descendants) of the base set
     // that aren't already in it. The drawer's family-aware routing
@@ -217,8 +210,7 @@ pub(in crate::api) async fn list_threads(
         .chain(active_threads.iter())
         .chain(composing.iter())
         .chain(focused_thread.iter());
-    let mut family_threads = load_family_threads(store, family_base).await?;
-    family_threads.retain(|t| !hidden_home(t));
+    let family_threads = load_family_threads(store, family_base).await?;
 
     let mut response = serde_json::json!({
         "saved": saved,
@@ -291,10 +283,29 @@ pub struct ListThreadSummariesQuery {
     /// `true` keeps threads holding an unsent draft, `false` keeps the rest.
     #[serde(default)]
     pub has_draft: Option<bool>,
-    /// `true` keeps coding-agent threads whose branch differs from main,
-    /// `false` keeps the rest.
+    /// Keeps coding-agent threads whose change state has this kind.
     #[serde(default)]
-    pub has_diff: Option<bool>,
+    pub change_state: Option<crate::engine::thread_lifecycle::ChangeStateKind>,
+    /// The retired filter `change_state` replaced. Read only to refuse it.
+    #[serde(default)]
+    pub has_diff: Option<String>,
+}
+
+/// Refuse the retired `has_diff` filter by name (ADR 0400). Ignoring it would
+/// answer an old caller with every thread.
+fn refuse_retired_filters(q: &ListThreadSummariesQuery) -> Result<(), (StatusCode, String)> {
+    match q.has_diff {
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "has_diff was replaced by change_state, which takes one of {}.",
+                crate::engine::thread_lifecycle::ChangeStateKind::ALL
+                    .map(crate::engine::thread_lifecycle::ChangeStateKind::as_str)
+                    .join(", ")
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Resolve the `active` / `status` query params into the single filter the
@@ -397,6 +408,7 @@ pub(in crate::api) async fn list_thread_summaries(
 ) -> Result<Json<Vec<ThreadSummary>>, (StatusCode, String)> {
     let sources = parse_source_filter(&q.source);
     let parent = parse_thread_id_param(&q.parent, "parent")?;
+    refuse_retired_filters(&q)?;
     let statuses = parse_status_filter(&q)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let mut summaries = state
@@ -407,7 +419,7 @@ pub(in crate::api) async fn list_thread_summaries(
             sources: sources.as_deref(),
             parent,
             has_draft: q.has_draft,
-            has_diff: q.has_diff,
+            change_state: q.change_state,
             limit,
         })
         .await
@@ -538,6 +550,7 @@ pub(in crate::api) async fn count_thread_summaries(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sources = parse_source_filter(&q.source);
     let parent = parse_thread_id_param(&q.parent, "parent")?;
+    refuse_retired_filters(&q)?;
     let statuses = parse_status_filter(&q)?;
     let count = state
         .engine
@@ -550,7 +563,7 @@ pub(in crate::api) async fn count_thread_summaries(
             sources: sources.as_deref(),
             parent,
             has_draft: q.has_draft,
-            has_diff: q.has_diff,
+            change_state: q.change_state,
             limit: 0,
         })
         .await
@@ -696,14 +709,15 @@ pub(in crate::api) async fn get_older_threads(
 
 /// GET /api/v1/threads/filter-facets — distinct triggers / repos / apps that
 /// have at least one thread, powering the drawer "Show" dropdown's complete
-/// option lists. Labels are resolved client-side from the existing registries.
+/// option lists. Repo and app facets carry their labels; trigger labels are
+/// resolved client-side.
 pub(in crate::api) async fn get_filter_facets(
     State(state): State<AppState>,
 ) -> Result<Json<FilterFacets>, (StatusCode, String)> {
     let facets = state
         .engine
         .event_store()
-        .get_filter_facets()
+        .get_filter_facets(&state.app_manager)
         .await
         .map_err(|e| {
             log!("[API] Failed to get filter facets: {}", e);
@@ -732,8 +746,21 @@ mod tests {
             limit: None,
             parent: None,
             has_draft: None,
+            change_state: None,
             has_diff: None,
         }
+    }
+
+    #[test]
+    fn the_retired_has_diff_filter_is_refused_by_name() {
+        assert!(super::refuse_retired_filters(&query(None, None)).is_ok());
+        let retired = ListThreadSummariesQuery {
+            has_diff: Some("true".to_string()),
+            ..query(None, None)
+        };
+        let (code, msg) = super::refuse_retired_filters(&retired).expect_err("has_diff is retired");
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("change_state"), "{msg}");
     }
 
     #[test]

@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 const mocks = vi.hoisted(() => ({
-  openFilePreview: vi.fn(),
+  openFilePreviewModal: vi.fn(),
   openLocalFileOnConfirm: vi.fn(async () => {}),
   openApp: vi.fn(),
   openAppById: vi.fn(async () => {}),
@@ -25,8 +25,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../../store/actions/artifacts', () => ({
-  openFilePreview: mocks.openFilePreview,
   openLocalFileOnConfirm: mocks.openLocalFileOnConfirm,
+}));
+vi.mock('../../store/actions/filePreviewModal', () => ({
+  openFilePreviewModal: mocks.openFilePreviewModal,
 }));
 vi.mock('../../store/actions/apps', () => ({
   openApp: mocks.openApp,
@@ -47,7 +49,7 @@ import { linkifyPaths } from '../../utils/linkifyPaths';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import type { App } from '../../store/types';
 
-const APPS: App[] = [{ id: 'pr-understanding', name: 'PR Understanding', description: '', reveal: 'on-load' }];
+const APPS: App[] = [{ id: 'pr-understanding', name: 'PR Understanding', description: '', reveal: 'on-load', kind: 'app', reusable: false }];
 
 /** Render markdown the way the notification detail does (no known artifact
  *  paths), click its first anchor, and report whether the default was stopped. */
@@ -74,13 +76,28 @@ describe('handleMarkdownLinkClick', () => {
     for (const m of Object.values(mocks)) m.mockClear();
   });
 
-  it('opens an artifact link in the file preview (the reported bug)', () => {
+  it('opens an artifact link in the file preview modal (the reported bug)', () => {
     const prevented = clickFirstLink(
       'Changelog: [artifacts/releases/changelog-v0.40.1.md](artifacts/releases/changelog-v0.40.1.md)',
       'a notification',
     );
     expect(prevented).toBe(true);
-    expect(mocks.openFilePreview).toHaveBeenCalledWith('artifacts/releases/changelog-v0.40.1.md');
+    expect(mocks.openFilePreviewModal).toHaveBeenCalledWith({
+      file_path: 'artifacts/releases/changelog-v0.40.1.md', line: undefined, line_end: undefined,
+    });
+  });
+
+  // A data link's `#L` used to be cut off at render and again at click.
+  it.each([
+    ['an href line', '[the notes](artifacts/notes.md#L10-L20)', 10, 20],
+    ['a single href line', '[the notes](artifacts/notes.md#L7)', 7, undefined],
+    ['a label line', '[notes.md:10-20](artifacts/notes.md)', 10, 20],
+    ['an href line over a label line', '[notes.md:1-2](artifacts/notes.md#L10)', 10, undefined],
+  ])('keeps the cited lines of a data link from %s', (_label, markdown, line, lineEnd) => {
+    clickFirstLink(markdown);
+    expect(mocks.openFilePreviewModal).toHaveBeenCalledWith({
+      file_path: 'artifacts/notes.md', line, line_end: lineEnd,
+    });
   });
 
   it('hands a file:// link to the OS opener, behind the confirm', () => {
@@ -127,18 +144,39 @@ describe('handleMarkdownLinkClick', () => {
     ['repo:lucidos:file:crates/lucidos-app/src/main.tsx', { locator: { repoId: 'lucidos', mode: 'file', ref: undefined, path: 'crates/lucidos-app/src/main.tsx' } }],
     ['repo:6f1c2a90-0000-5000-8000-000000000001:file:README.md', { locator: { repoId: '6f1c2a90-0000-5000-8000-000000000001', mode: 'file', ref: undefined, path: 'README.md' } }],
     ['repo:lucidos:file#origin/main:src/a.rs#L5', { locator: { repoId: 'lucidos', mode: 'file', ref: 'origin/main', path: 'src/a.rs' }, line: 5, lineEnd: undefined }],
-  ])('opens %s in the repository file preview', (href, target) => {
+  ])('opens %s in the file preview modal', (href, target) => {
     const prevented = clickFirstLink(`See [the file](${href}).`, 'a notification');
     expect(prevented).toBe(true);
-    expect(mocks.openRepoFileLink).toHaveBeenCalledWith(target, 'a notification');
+    expect(mocks.openRepoFileLink).toHaveBeenCalledWith(
+      { line: undefined, lineEnd: undefined, ...target },
+      'a notification',
+      mocks.openFilePreviewModal,
+    );
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
   it('decodes a repo link whose destination markdown percent-encoded', () => {
     clickFirstLink('[notes](<repo:My Repo:file:docs/read me.md>)');
     expect(mocks.openRepoFileLink).toHaveBeenCalledWith(
-      { locator: { repoId: 'My Repo', mode: 'file', ref: undefined, path: 'docs/read me.md' } },
+      { locator: { repoId: 'My Repo', mode: 'file', ref: undefined, path: 'docs/read me.md' }, line: undefined, lineEnd: undefined },
       undefined,
+      mocks.openFilePreviewModal,
+    );
+  });
+
+  // The reported link: the agent named the lines in the label only.
+  it.each([
+    ['[Consumer.kt:184-204](repo:svc:file:src/Consumer.kt)', 184, 204],
+    ['[Consumer.kt:184\u2013204](repo:svc:file:src/Consumer.kt)', 184, 204],
+    ['[Consumer.kt:7](repo:svc:file:src/Consumer.kt)', 7, undefined],
+    ['[Consumer.kt](repo:svc:file:src/Consumer.kt)', undefined, undefined],
+    ['[Consumer.kt:1-2](repo:svc:file:src/Consumer.kt#L184-L204)', 184, 204],
+  ])('takes the lines of %s from its href, else its label', (markdown, line, lineEnd) => {
+    clickFirstLink(markdown);
+    expect(mocks.openRepoFileLink).toHaveBeenCalledWith(
+      { locator: { repoId: 'svc', mode: 'file', ref: undefined, path: 'src/Consumer.kt' }, line, lineEnd },
+      undefined,
+      mocks.openFilePreviewModal,
     );
   });
 

@@ -1,4 +1,5 @@
 import { signal } from '@preact/signals';
+import type { ComponentChildren } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { answerThreadQuestion, retryUnsentPick } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
@@ -13,6 +14,7 @@ import { RetryIcon } from '../shared/icons';
 import { Disclosure } from '../shared/Disclosure';
 import { unsentMessages } from '../../store/unsentMessages';
 import { sendFailureDetail, type SendFailure } from '../../store/actions/sendRetry';
+import { WidgetEmbedFrame } from '../widgets/WidgetEmbedFrame';
 
 /** Local name for the wire `AnswerKind`. Aliased rather than restated, because
  *  this card renders every kind the engine can persist. A second copy of the
@@ -121,6 +123,25 @@ function OptionContent({
         />
       )}
     </>
+  );
+}
+
+/** An option that draws a widget is one bordered box: its label row, then the
+ *  widget under it (ADR 0415). The frame is the row's sibling, never inside
+ *  it, so only the row carries the pick and the arrow keys step over the
+ *  frame. `state` is the option's selected or dimmed class, which the box
+ *  wears in place of the row. An option with no widget draws its row alone. */
+function OptionSlot({ option, state, children }: {
+  option: QuestionOption;
+  state?: string;
+  children: ComponentChildren;
+}) {
+  if (!option.widget) return <>{children}</>;
+  return (
+    <div class={state ? `question-option-boxed ${state}` : 'question-option-boxed'} data-option-id={option.id}>
+      {children}
+      <WidgetEmbedFrame embed={option.widget} place="option" />
+    </div>
   );
 }
 
@@ -393,22 +414,27 @@ function LiveOptions({
       onKeyDown={(e) => handleChoiceCardKeyDown(e, ref.current)}
     >
       {options.map(opt => {
+        const pressed = selectedIds ? selectedIds.includes(opt.id) : undefined;
+        const unsentHere = unsentIds.includes(opt.id);
         const button = (
           <OptionButton
-            key={opt.id}
             option={opt}
-            pressed={selectedIds ? selectedIds.includes(opt.id) : undefined}
-            unsent={unsentIds.includes(opt.id)}
+            pressed={pressed}
+            unsent={unsentHere}
             onActivate={onActivate}
           />
         );
-        // A sibling of the option, never inside it: the notice holds buttons.
-        return unsent && opt.id === noticeOn ? (
-          <div key={opt.id} class="question-option-unsent">
-            {button}
-            <UnsentNotice failure={unsent.failure} onRetry={() => void retryPick(unsent.threadId, toolUseId)} />
-          </div>
-        ) : button;
+        return (
+          <OptionSlot key={opt.id} option={opt} state={pressed || unsentHere ? 'question-option-selected' : undefined}>
+            {/* A sibling of the option, never inside it: the notice holds buttons. */}
+            {unsent && opt.id === noticeOn ? (
+              <div class="question-option-unsent">
+                {button}
+                <UnsentNotice failure={unsent.failure} onRetry={() => void retryPick(unsent.threadId, toolUseId)} />
+              </div>
+            ) : button}
+          </OptionSlot>
+        );
       })}
     </div>
   );
@@ -502,14 +528,16 @@ export function AnsweredBody({
       <QuestionText question={question} />
       {options.length > 0 && (
         <div class="question-options">
-          {options.map(opt => (
-            <div
-              key={opt.id}
-              class={`question-option-static${isSelected(opt.id) ? ' question-option-selected' : ' question-option-dimmed'}`}
-            >
-              <OptionContent option={opt} multiSelect={!!multiSelect} selected={isSelected(opt.id)} mark={mark} />
-            </div>
-          ))}
+          {options.map(opt => {
+            const state = isSelected(opt.id) ? 'question-option-selected' : 'question-option-dimmed';
+            return (
+              <OptionSlot key={opt.id} option={opt} state={state}>
+                <div class={opt.widget ? 'question-option-static' : `question-option-static ${state}`}>
+                  <OptionContent option={opt} multiSelect={!!multiSelect} selected={isSelected(opt.id)} mark={mark} />
+                </div>
+              </OptionSlot>
+            );
+          })}
         </div>
       )}
       {((customText && customText.length > 0) || imageHashes.length > 0) && (
@@ -559,9 +587,11 @@ export function TerminatedQuestionBody({
       {options.length > 0 && (
         <div class="question-options">
           {options.map(opt => (
-            <button key={opt.id} type="button" class="question-option" disabled>
-              <OptionContent option={opt} multiSelect={!!multiSelect} selected={false} />
-            </button>
+            <OptionSlot key={opt.id} option={opt}>
+              <button type="button" class="question-option" disabled>
+                <OptionContent option={opt} multiSelect={!!multiSelect} selected={false} />
+              </button>
+            </OptionSlot>
           ))}
         </div>
       )}

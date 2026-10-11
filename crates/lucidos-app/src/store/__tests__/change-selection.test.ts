@@ -40,6 +40,8 @@ const mockChange: Change = {
   files: ['a.rs', 'b.rs', 'c.rs'],
   requires_restart: false,
   hardened: true,
+  needs_hardening: false,
+  apply_ready: true,
   status: 'pending',
   created_at: '2026-04-07T10:00:00Z',
   resolved_at: null,

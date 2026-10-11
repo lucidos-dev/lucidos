@@ -27,6 +27,8 @@ function change(id: string, over: Record<string, unknown> = {}) {
     files: ['a.rs'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-01-01T00:00:00Z',
     resolved_at: null,
@@ -43,7 +45,7 @@ const CHANGES_STATE = {
   pending: [
     change('ready'),
     change('ready-2'),
-    change('settling', { thread_unsettled: true, thread_settling: true }),
+    change('settling', { thread_unsettled: true, apply_ready: false, thread_settling: true }),
   ],
   applied: [],
   total_pending: 3,

@@ -7,7 +7,10 @@
 //! threads are identified by `coding_agent_kind='app'` + a
 //! `<ws>/data/apps/<id>` folder; the app id is the last path segment.
 
-use crate::support::{base_url, db_url, http_client, unique_marker};
+use crate::support::{
+    base_url, db_url, http_client, unique_marker, user_client, workspace_tree_lock,
+    write_data_fixture,
+};
 
 /// Seed an app coding-agent thread on `data/apps/<app_id>` with the given
 /// archive state and an age offset (older = larger `minutes_ago`).
@@ -67,6 +70,70 @@ async fn filter_facets_lists_app_with_only_archived_thread() {
         app_ids.contains(&marker.as_str()),
         "archived-only app `{marker}` must appear in facets.apps, got {app_ids:?}"
     );
+}
+
+/// The app facet with `id`, from a fresh `GET /threads/filter-facets`.
+async fn app_facet(client: &reqwest::Client, id: &str) -> serde_json::Value {
+    let url = format!("{}/api/v1/threads/filter-facets", base_url());
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .expect("facets request")
+        .json()
+        .await
+        .expect("invalid JSON");
+    body["apps"]
+        .as_array()
+        .expect("apps array")
+        .iter()
+        .find(|f| f["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no app facet `{id}` in {body}"))
+}
+
+/// A widget never reaches the apps list (ADR 0402), so the engine labels it.
+/// Once deleted it keeps its kind, which `AppDeleted` recorded (ADR 0404).
+#[tokio::test]
+async fn filter_facets_label_a_widget_live_and_deleted() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
+    let marker = unique_marker("facets-widget").replace('-', "");
+    seed_app_thread(&pool, &format!("{marker}-cc"), &marker, 10, false).await;
+    {
+        let _tree = workspace_tree_lock().read().await;
+        write_data_fixture(
+            &client,
+            &format!("apps/{marker}/manifest.json"),
+            r#"{"name": "Fare grid", "kind": "widget"}"#,
+        )
+        .await
+        .expect("write the widget manifest");
+    }
+
+    let live = app_facet(&client, &marker).await;
+    assert_eq!(live["name"], "Fare grid", "got {live}");
+    assert_eq!(live["kind"], "widget", "got {live}");
+    assert_eq!(live["deleted"], false, "got {live}");
+
+    {
+        let _tree = workspace_tree_lock().read().await;
+        let resp = client
+            .delete(format!("{}/api/v1/app?id={marker}", base_url()))
+            .send()
+            .await
+            .expect("delete request");
+        assert!(
+            resp.status().is_success(),
+            "delete returned {}",
+            resp.status()
+        );
+    }
+
+    let gone = app_facet(&client, &marker).await;
+    assert_eq!(gone["kind"], "widget", "a deleted widget stays one: {gone}");
+    assert_eq!(gone["deleted"], true, "got {gone}");
+    assert!(gone["name"].is_null(), "got {gone}");
 }
 
 #[tokio::test]

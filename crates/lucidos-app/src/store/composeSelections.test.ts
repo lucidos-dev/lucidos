@@ -24,7 +24,7 @@ import {
   codingAgentPendingModel,
   codingAgentPendingReasoningEffort,
   currentModel,
-  reasoningEffort,
+  preferences,
   selectedCodingAgent,
   selectedScope,
 } from './store';
@@ -42,7 +42,7 @@ describe('resolve* falls back to the current global default', () => {
   it('returns the live global when no override is stored', () => {
     selectedCodingAgent.value = 'codex';
     currentModel.value = 'model-x';
-    reasoningEffort.value = 'medium';
+    preferences.value = { status: 'loaded', data: { chat_reasoning_efforts: 'model-x=medium' } };
     expect(resolveCodingAgent('t-1')).toBe('codex');
     expect(resolveModel('t-1')).toBe('model-x');
     expect(resolveReasoningEffort('t-1')).toBe('medium');
@@ -133,7 +133,8 @@ describe('editing a draft never writes the globals', () => {
     selectedScope.value = { kind: 'lucidos' };
     selectedCodingAgent.value = 'claude-code';
     currentModel.value = 'g-model';
-    reasoningEffort.value = 'g-effort';
+    const account = { status: 'loaded' as const, data: { chat_reasoning_efforts: 'g-model=low' } };
+    preferences.value = account;
     patchComposeSelection('t-1', {
       scope: { kind: 'external', repoId: 'repo-a' },
       codingAgent: 'codex',
@@ -145,7 +146,7 @@ describe('editing a draft never writes the globals', () => {
     expect(selectedScope.value).toEqual({ kind: 'lucidos' });
     expect(selectedCodingAgent.value).toBe('claude-code');
     expect(currentModel.value).toBe('g-model');
-    expect(reasoningEffort.value).toBe('g-effort');
+    expect(preferences.value).toBe(account);
     expect(codingAgentPendingModel.value).toBeNull();
     expect(codingAgentPendingReasoningEffort.value).toBeNull();
   });

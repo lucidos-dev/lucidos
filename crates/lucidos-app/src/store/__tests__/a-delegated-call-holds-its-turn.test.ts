@@ -75,12 +75,12 @@ describe('a delegated call', () => {
   });
 
   /** The loop acknowledges a message it picked up mid-turn with a
-   *  `UserPromptInjected` naming the anchor. Unabsorbed it opens a boundary of
+   *  `PromptInjected` naming the anchor. Unabsorbed it opens a boundary of
    *  its own, and the reader meets their own sentence twice. */
   it('absorbs the acknowledgement rather than drawing the words twice', () => {
     const events = aDelegatedCall();
     put(events, 20, {
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: "What's going on in the codebase today?",
       mode: 'human',
       injected_message_id: DELEGATION,
@@ -90,7 +90,7 @@ describe('a delegated call', () => {
       'SpokenReplyGenerated',
       'SpokenMessageReceived',
     ]);
-    expect(stepTypes(theCard(exchanges))).toEqual(['WorkDelegated', 'UserPromptInjected']);
+    expect(stepTypes(theCard(exchanges))).toEqual(['WorkDelegated', 'PromptInjected']);
   });
 
   /** The talker stalls while the doer works, routinely before the doer has

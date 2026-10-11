@@ -131,7 +131,11 @@ impl Stores {
         let event = completion_event(task_id.to_string(), record);
         (
             event.event_type().to_string(),
-            matchable_thread_payload(&event, owner),
+            matchable_thread_payload(
+                &event,
+                &crate::engine::thread_events::EventMeta::NONE,
+                owner,
+            ),
         )
     }
 

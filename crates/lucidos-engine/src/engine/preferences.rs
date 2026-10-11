@@ -61,17 +61,6 @@ impl LucidosEngine {
 
         refuse_bad_value(key, value, side_effect)?;
 
-        // The home thread exists BEFORE its switch says so. A device reloading
-        // its thread list on `PreferencesChanged` then always finds it, and a
-        // failure leaves the switch off rather than on with no thread.
-        if side_effect == PrefSideEffect::HomeThread
-            && crate::core::prefs::HOME_THREAD_ENABLED.resolve(Some(value))
-        {
-            crate::engine::home_thread::ensure_home_thread(&self.event_bus, &self.pool)
-                .await
-                .map_err(|e| format!("Failed to create the home thread: {e}"))?;
-        }
-
         // Persist. Scope follows the caller's device_id, matching the historical
         // HTTP behavior (frontend sends device_id for device-scoped keys, omits it
         // for global ones).
@@ -127,7 +116,7 @@ impl LucidosEngine {
                     }
                 }
             }
-            PrefSideEffect::HomeThread | PrefSideEffect::None => {}
+            PrefSideEffect::None => {}
         }
 
         Ok(PreferenceWriteOutcome { push_enabled })
@@ -137,6 +126,12 @@ impl LucidosEngine {
 /// The value checks every writer must pass, run BEFORE the store write so a
 /// refusal leaves the saved value exactly as it was.
 fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Result<(), String> {
+    // A retired key means nothing, so a stale client or agent writing one is
+    // told so rather than leaving a row nobody reads.
+    if let Some(reason) = prefs::retired_key_reason(key) {
+        return Err(reason.to_string());
+    }
+
     // A timezone write updates in-memory `user_timezone` and is loaded back at
     // startup. A malformed IANA name would silently degrade trigger scheduling
     // to UTC (`scheduler::task_runner` falls back). The tool pre-validates too,
@@ -198,6 +193,19 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every retired key is refused on the path Settings and raw HTTP share,
+    /// whatever the value, and the refusal says why.
+    #[test]
+    fn a_retired_key_is_refused_on_the_shared_write_path() {
+        for (key, reason) in prefs::RETIRED_KEYS {
+            for value in ["true", "false"] {
+                let err = refuse_bad_value(key, value, PrefSideEffect::None)
+                    .expect_err("a retired key must not be stored");
+                assert_eq!(err, *reason);
+            }
+        }
+    }
 
     /// The write path Settings uses refuses a public model host, whoever sends
     /// it, so the stored value stays as it was.

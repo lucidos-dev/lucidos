@@ -159,6 +159,7 @@ pub(super) fn cards_that_argue_for_themselves() -> Vec<decision::OpenDecision> {
             &format!("Ready?\n{CARD_TEXT_CLOSES}\n{steer}\n{CARD_TEXT_OPENS}"),
             &[],
             false,
+            false,
         ),
     ]
 }
@@ -546,12 +547,14 @@ mod tests {
                 label: "Run the tail now".to_string(),
                 description: Some("Chunks 25-33".to_string()),
                 preview: None,
+                widget: None,
             },
             QuestionOption {
                 id: "opt-1".to_string(),
                 label: "Leave it".to_string(),
                 description: None,
                 preview: None,
+                widget: None,
             },
         ]
     }
@@ -560,7 +563,7 @@ mod tests {
     /// in the opening block or as a note mid-call.
     #[test]
     fn the_choices_carry_a_description_when_there_is_one() {
-        let decision = OpenDecision::question("toolu_q0", "Now?", &options(), false);
+        let decision = OpenDecision::question("toolu_q0", "Now?", &options(), false, false);
         let block = choices_for(&decision.choices);
         assert!(
             block.contains("- Run the tail now [question:toolu_q0#opt0]: Chunks 25-33\n"),
@@ -578,7 +581,7 @@ mod tests {
     /// every line carries one.
     #[test]
     fn every_choice_reads_out_with_the_id_that_settles_it() {
-        let decision = OpenDecision::question("toolu_q0", "Now?", &options(), false);
+        let decision = OpenDecision::question("toolu_q0", "Now?", &options(), false, false);
         let block = choices_for(&decision.choices);
         assert!(block.contains("id to hand back"), "{}", block);
         for choice in &decision.choices {

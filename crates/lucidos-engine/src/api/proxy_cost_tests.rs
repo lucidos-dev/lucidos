@@ -29,17 +29,18 @@ fn a_model_provider_host_is_recognised_and_a_plain_api_is_not() {
     assert!(Upstream::Builtin.is_model_provider());
 }
 
-/// The reply names the model that served the call, which beats an alias the
-/// request asked for.
+/// The row keeps both: the model the request asked for, and the one the
+/// reply says served it.
 #[test]
 fn a_json_reply_reports_its_usage_and_serving_model() {
     let reply = body(
         json!({"model": "gpt-6.1-2026", "usage": {"prompt_tokens": 30, "completion_tokens": 4}}),
     );
     let request = body(json!({"model": "gpt-6.1"}));
-    let (usage, model) = reported(&reply, false, &request, "/chat/completions").unwrap();
-    assert_eq!((usage.input_tokens, usage.output_tokens), (30, 4));
-    assert_eq!(model, "gpt-6.1-2026");
+    let call = reported(&reply, false, &request, "/chat/completions").unwrap();
+    assert_eq!((call.usage.input_tokens, call.usage.output_tokens), (30, 4));
+    assert_eq!(call.model, "gpt-6.1");
+    assert_eq!(call.served_model.as_deref(), Some("gpt-6.1-2026"));
 }
 
 #[test]
@@ -48,9 +49,23 @@ fn a_streamed_reply_takes_its_model_from_the_request() {
         b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n\
         data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
     let request = body(json!({"model": "claude-sonnet-5", "stream": true}));
-    let (usage, model) = reported(reply, true, &request, "/messages").unwrap();
-    assert_eq!((usage.input_tokens, usage.output_tokens), (7, 9));
-    assert_eq!(model, "claude-sonnet-5");
+    let call = reported(reply, true, &request, "/messages").unwrap();
+    assert_eq!((call.usage.input_tokens, call.usage.output_tokens), (7, 9));
+    assert_eq!(call.model, "claude-sonnet-5");
+    assert_eq!(call.served_model, None);
+}
+
+/// The stream `api::proxy_speech` asks OpenAI's speech endpoint for. Its last
+/// frame carries the usage, and the model comes from the request.
+#[test]
+fn a_speech_stream_reports_its_usage_and_requested_model() {
+    let reply = b"data: {\"type\":\"speech.audio.delta\",\"audio\":\"SUQz\"}\n\n\
+        data: {\"type\":\"speech.audio.done\",\"usage\":{\"input_tokens\":2,\"output_tokens\":48}}\n\n\
+        data: [DONE]\n\n";
+    let request = body(json!({"model": "gpt-4o-mini-tts", "stream_format": "sse"}));
+    let call = reported(reply, true, &request, "audio/speech").unwrap();
+    assert_eq!((call.usage.input_tokens, call.usage.output_tokens), (2, 48));
+    assert_eq!(call.model, "gpt-4o-mini-tts");
 }
 
 /// Vertex names its model in the path, not the body.
@@ -59,8 +74,20 @@ fn a_vertex_reply_takes_its_model_from_the_path() {
     let reply = body(json!({"usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 2}}));
     let path =
         "/projects/p/locations/global/publishers/google/models/gemini-3-flash:generateContent";
-    let (_, model) = reported(&reply, false, b"{}", path).unwrap();
-    assert_eq!(model, "gemini-3-flash");
+    assert_eq!(
+        reported(&reply, false, b"{}", path).unwrap().model,
+        "gemini-3-flash"
+    );
+}
+
+/// A request that names no model, on a path that names none, is priced
+/// under the model the reply names.
+#[test]
+fn a_request_naming_no_model_takes_the_replys() {
+    let reply = body(json!({"model": "gpt-6.1-2026", "usage": {"prompt_tokens": 3}}));
+    let call = reported(&reply, false, b"{}", "/responses").unwrap();
+    assert_eq!(call.model, "gpt-6.1-2026");
+    assert_eq!(call.served_model.as_deref(), Some("gpt-6.1-2026"));
 }
 
 /// A quota read or an error page spent nothing measurable, so nothing is
@@ -74,21 +101,24 @@ fn a_reply_without_usage_records_nothing() {
 /// The proxy route captures its path with no leading slash, and Gemini names
 /// the serving model as `modelVersion`.
 #[test]
-fn a_gemini_reply_takes_its_model_from_model_version_or_the_bare_path() {
+fn a_gemini_reply_takes_its_model_from_the_bare_path_and_model_version() {
     let path = "models/gemini-2.5-flash:generateContent";
-    let plain = body(json!({"usageMetadata": {"promptTokenCount": 4}}));
-    assert_eq!(
-        reported(&plain, false, b"{}", path).unwrap().1,
-        "gemini-2.5-flash"
-    );
+    let plain = reported(
+        &body(json!({"usageMetadata": {"promptTokenCount": 4}})),
+        false,
+        b"{}",
+        path,
+    )
+    .unwrap();
+    assert_eq!(plain.model, "gemini-2.5-flash");
+    assert_eq!(plain.served_model, None);
     let versioned = body(json!({
         "modelVersion": "gemini-2.5-flash-002",
         "usageMetadata": {"promptTokenCount": 4},
     }));
-    assert_eq!(
-        reported(&versioned, false, b"{}", path).unwrap().1,
-        "gemini-2.5-flash-002"
-    );
+    let call = reported(&versioned, false, b"{}", path).unwrap();
+    assert_eq!(call.model, "gemini-2.5-flash");
+    assert_eq!(call.served_model.as_deref(), Some("gemini-2.5-flash-002"));
 }
 
 /// `streamGenerateContent` without `alt=sse` answers with one JSON array of
@@ -100,9 +130,10 @@ fn a_gemini_stream_sent_as_a_json_array_reports_its_usage() {
         {"usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 9},
          "modelVersion": "gemini-3-flash"},
     ]));
-    let (usage, model) = reported(&reply, false, b"{}", "models/x:streamGenerateContent").unwrap();
-    assert_eq!((usage.input_tokens, usage.output_tokens), (20, 9));
-    assert_eq!(model, "gemini-3-flash");
+    let call = reported(&reply, false, b"{}", "models/x:streamGenerateContent").unwrap();
+    assert_eq!((call.usage.input_tokens, call.usage.output_tokens), (20, 9));
+    assert_eq!(call.model, "x");
+    assert_eq!(call.served_model.as_deref(), Some("gemini-3-flash"));
 }
 
 /// A model provider is asked for a plain reply, which the cost parse can

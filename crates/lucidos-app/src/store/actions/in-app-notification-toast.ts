@@ -381,8 +381,8 @@ function reconcileToastsWithUnread(set: Loadable<Notification[]>): void {
 
 let lifetimeInstalled = false;
 
-/** Subscribe the toasts to the unread set. Wired from `store/effects.ts`,
- *  beside the seen target watch that is the loudest reason it exists.
+/** Subscribe the toasts to the unread set. Wired from `store/effects.ts`.
+ *  The seen target watch (`shellStartup.ts`) is the loudest reason it exists.
  *
  *  Reading the set IS the subscription, and the work runs `untracked` because
  *  it writes `toasts` after reading it. Tracked, the first drop would make

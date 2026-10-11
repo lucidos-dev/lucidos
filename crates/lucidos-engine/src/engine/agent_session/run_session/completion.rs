@@ -10,7 +10,7 @@ use crate::engine::agent_session::lifecycle::{
 use crate::engine::agent_session::resume::{
     api_error_auto_resumes_spent, change_description_fallback,
 };
-use crate::engine::change_ops::branch_is_hardened;
+use crate::engine::change_ops::{branch_is_hardened, ProposeOutcome};
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, branch_changed_files, commits_in_range, consume_harden_marker,
     default_local_branch, describe_branch_changes, ff_merge_to_main, files_have_client_update,
@@ -49,10 +49,11 @@ fn own_session_entry<'a>(
         .filter(|s| std::ptr::eq(Arc::as_ptr(&s.external_terminal_emitted), token))
 }
 
-/// The model and reasoning effort a terminal event reports: what this run's
-/// session runs on now. `send_agent_control_request` changes them mid-session
-/// and never tells the run loop, so only the entry knows. An entry that is gone
-/// or replaced reports neither.
+/// The model and reasoning effort a terminal event reports: the latest this
+/// run's session was asked for. `send_agent_control_request` changes them
+/// mid-session and never tells the run loop, so only the entry knows. An entry
+/// that is gone or replaced reports neither. An effort change made mid-turn
+/// lands on the next turn: `docs/plans/2026-10-08-claude-code-effort-is-a-spawn-setting.md`.
 pub(in crate::engine::agent_session) fn own_model_settings(
     sessions: &HashMap<Uuid, AgentSession>,
     thread_id: Uuid,
@@ -981,7 +982,7 @@ impl LucidosEngine {
                 // A redirect keeps its partial work off the change list, since
                 // the follow-up turn continues it. That holds even when the
                 // follow-up never ran and the redirect is the final terminal.
-                // A Stop proposes what it left as incomplete (ADR 0328).
+                // A Stop or a failure withholds what it left (ADR 0400).
                 match classify_session_end_action(
                     has_commits,
                     changed_files.is_empty(),
@@ -1007,7 +1008,7 @@ impl LucidosEngine {
                             effective_branch
                         );
                     }
-                    SessionEndAction::Propose { incomplete } => {
+                    action @ (SessionEndAction::Propose | SessionEndAction::WithholdUnfinished) => {
                         let requires_restart = files_require_restart(&changed_files);
 
                         log!(
@@ -1030,23 +1031,25 @@ impl LucidosEngine {
                             describe_branch_changes(&repo_root, &log_range, &fallback, None).await;
 
                         match self
-                            .propose_change(crate::engine::change_ops::ProposeChangeInput {
-                                thread_id,
-                                branch_name: effective_branch,
-                                repo_root: &repo_root_str,
-                                description: &description,
-                                files: &changed_files,
-                                requires_restart,
-                                channel: EventChannel::ClaudeCode,
-                                hardened: was_hardened,
-                                // Live agent proposal at session end — origin is
-                                // carried by the surrounding MessageReceived.
-                                origin: None,
-                                incomplete,
-                            })
+                            .propose_turn_work(
+                                crate::engine::change_ops::ProposeChangeInput {
+                                    thread_id,
+                                    branch_name: effective_branch,
+                                    repo_root: &repo_root_str,
+                                    description: &description,
+                                    files: &changed_files,
+                                    requires_restart,
+                                    channel: EventChannel::ClaudeCode,
+                                    hardened: was_hardened,
+                                    // Live agent proposal at session end — origin is
+                                    // carried by the surrounding MessageReceived.
+                                    origin: None,
+                                },
+                                action == SessionEndAction::Propose,
+                            )
                             .await
                         {
-                            Ok(_change_id) => {
+                            Ok(ProposeOutcome::Proposed(_)) => {
                                 proposed_change = true;
                                 if was_hardened {
                                     consume_harden_marker(&self.pool, &repo_root, effective_branch)
@@ -1072,6 +1075,9 @@ impl LucidosEngine {
                                     .await;
                                 }
                             }
+                            // No agent is left to nudge. The next session on
+                            // this branch proposes once the hold clears.
+                            Ok(ProposeOutcome::Held(_) | ProposeOutcome::Unfinished) => {}
                             Err(e) => {
                                 log!("[AgentSession] Failed to propose change: {}", e);
                             }

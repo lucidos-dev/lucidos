@@ -85,3 +85,31 @@ async fn knowhow_read_unknown_id_is_404() {
         "404 body must carry the not-found sentinel; got: {text}",
     );
 }
+
+/// A read records use evidence for the workspace prompt footprint, at most
+/// once per doc per day. A caller reading in a loop adds no rows.
+#[tokio::test]
+async fn knowhow_read_records_one_read_per_doc_per_day() {
+    let client = http_client();
+    for _ in 0..2 {
+        let resp = client
+            .get(format!("{}/api/v1/knowhow/read", base_url()))
+            .query(&[("id", BUILDING_AN_APP_ID)])
+            .send()
+            .await
+            .expect("GET /api/v1/knowhow/read failed");
+        assert_eq!(resp.status(), 200);
+    }
+    let pool = sqlx::PgPool::connect(&crate::support::db_url())
+        .await
+        .expect("connect");
+    let recorded: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'KnowhowRead' AND aggregate_id = $1 \
+         AND created >= now() - make_interval(days => 1)",
+    )
+    .bind(BUILDING_AN_APP_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count KnowhowRead");
+    assert_eq!(recorded, 1, "two reads in one day record one KnowhowRead");
+}

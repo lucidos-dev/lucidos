@@ -28,6 +28,18 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                     "html_content": {
                         "type": "string",
                         "description": "Initial HTML for index.html. Make it native to Lucidos: inherit the theme, theme CSS vars NOT hardcoded colors, shared component classes NOT bare elements, rem NOT px, and a fluid layout holding at PHONE WIDTH (one column first, no fixed px width, nothing top-right, where the host draws its fullscreen exit). load_knowhow('system-knowhow/building-an-app') for the scaffold, tokens, components and responsive rules. Opt out only for an app with its own complete visual identity."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["app", "widget"],
+                        "description": "'widget': a small answer shown inline in this thread. Default 'app'."
+                    },
+                    "icon_svg": {
+                        "type": "string",
+                        "description": format!(
+                            "SVG app icon, for every app and widget: square, one bold motif, legible at 18px, no text. Saved as {}.",
+                            crate::core::apps::APP_ICON_DEFAULT_PATH
+                        )
                     }
                 },
                 "required": ["id", "name", "description", "html_content"]
@@ -76,13 +88,20 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::CAPTURE_APP.to_string(),
-            description: "Screenshot and DOM snapshot of the currently open app UI, to check the visual result of your changes or when the user asks you to look.".to_string(),
+            description: "Screenshot and DOM snapshot of the open app UI, to check your changes or when the user asks you to look.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "app_id": {
                         "type": "string",
                         "description": "App id to capture."
+                    },
+                    "save_as_artifact": {
+                        "type": "string",
+                        "description": format!(
+                            "Also save a sharp screenshot file here, under data/artifacts/. Ends in {}.",
+                            crate::engine::thread_events::CaptureFormat::extensions()
+                        )
                     }
                 },
                 "required": ["app_id"]

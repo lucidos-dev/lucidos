@@ -12,10 +12,8 @@ export const CONTINUE_GUARD_MS = 5000;
  *  the thread reads running would start a second resume. */
 const continuingThreadIds = new Set<string>();
 
-/** Resume a thread whose turn was cut short: by an abort, or by a Stop that
- *  left an incomplete change. Shared by `ContinueButton` and the thread
- *  banner's Continue, so a press on either guards both. Returns false when a
- *  Continue is already in flight, or when it failed, which toasts. */
+/** Resume a thread whose turn was cut short. `ContinueButton` calls it. Returns
+ *  false when a Continue is already in flight, or when it failed, which toasts. */
 export async function continueStoppedThread(threadId: string): Promise<boolean> {
   if (continuingThreadIds.has(threadId)) return false;
   continuingThreadIds.add(threadId);

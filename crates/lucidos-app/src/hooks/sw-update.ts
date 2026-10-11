@@ -139,6 +139,12 @@ const REFRESH_SWAP_TIMEOUT_MS = 4000;
  *  past this, bust the cached shell and reload anyway. */
 const REFRESH_DEADLINE_MS = 15_000;
 
+/** How long a refresh waits on a cache bust before reloading anyway (ms). */
+const BUST_BOUND_MS = 2000;
+
+/** The service worker's bundle caches. Must match SHELL_CACHE in public/sw.js. */
+export const SHELL_CACHE_PREFIX = 'lucidos-shell-';
+
 /** Delete the `lucidos-shell-*` caches (the cache-first content-hashed
  *  `/assets/*` bundles plus the offline navigation-shell fallback, both written
  *  by public/sw.js) so the next reload refetches them from the network. The shell
@@ -154,7 +160,7 @@ export async function bustShellCaches(): Promise<void> {
   try {
     const names = await caches.keys();
     await Promise.all(
-      names.filter((n) => n.startsWith('lucidos-shell-')).map((n) => caches.delete(n)),
+      names.filter((n) => n.startsWith(SHELL_CACHE_PREFIX)).map((n) => caches.delete(n)),
     );
   } catch {
     /* best-effort — the reload still proceeds */
@@ -233,8 +239,13 @@ function markSplashQuiet(): void {
  *         couldn't be read). A manual refresh is an explicit request for fresh
  *         content, so we bust the shell cache first so the reload can't be
  *         served stale assets, then reload.
- *  A `reloaded` guard ensures exactly one reload if multiple paths race. */
-export function refreshClient(): void {
+ *  A `reloaded` guard ensures exactly one reload if multiple paths race.
+ *
+ *  `evictAssets` is for a caller that has seen a cached asset fail. It turns the
+ *  fast path into a bust and reload, because there the server just answered and
+ *  can serve what was dropped. Without it, a bad copy of a chunk survives every
+ *  reload, because each one serves it cache-first again. */
+export function refreshClient(opts: { evictAssets?: boolean } = {}): void {
   // Block the UI immediately — before any async SW work — so the screen locks
   // the instant the refresh is requested, mirroring an engine restart.
   clientRefreshing.value = true;
@@ -252,15 +263,23 @@ export function refreshClient(): void {
     clearTimeout(deadlineTimer);
     window.location.reload();
   };
-  const deadlineTimer = setTimeout(() => {
+  // Bounded: a Cache API that never settles must not hold the locked UI.
+  const bustThenReload = (): void => {
+    setTimeout(reloadOnce, BUST_BOUND_MS);
     void bustShellCaches().finally(reloadOnce);
-  }, REFRESH_DEADLINE_MS);
+  };
+  const deadlineTimer = setTimeout(bustThenReload, REFRESH_DEADLINE_MS);
   navigator.serviceWorker.addEventListener('controllerchange', reloadOnce, { once: true });
   getServedBuildId()
     .then(async (served) => {
       // Fast path: already on the served build — reload cache-first, no SW
-      // round-trip and no asset-cache bust (see isRunningServedBuild).
-      if (isRunningServedBuild(served)) { reloadOnce(); return; }
+      // round-trip and no asset-cache bust (see isRunningServedBuild). The
+      // server just answered, so an eviction here can be refetched.
+      if (isRunningServedBuild(served)) {
+        if (opts.evictAssets) bustThenReload();
+        else reloadOnce();
+        return;
+      }
       const reg = await navigator.serviceWorker.getRegistration();
       if (!reg) { reloadOnce(); return; } // no SW registered — plain reload
       await reg.update().catch(() => { /* offline / 404 during swap — handled below */ });
@@ -270,16 +289,15 @@ export function refreshClient(): void {
         // the fallback reload pulls the new build from the network.
         swapTimer = setTimeout(() => {
           swapTimer = null;
-          void bustShellCaches().finally(reloadOnce);
+          bustThenReload();
         }, REFRESH_SWAP_TIMEOUT_MS);
       } else {
         // Stale or unknown build and nothing swapping — bust the cached shell so
         // a stale/wedged SW can't serve the old build straight back, then reload.
-        await bustShellCaches();
-        reloadOnce();
+        bustThenReload();
       }
     })
-    .catch(() => reloadOnce()); // getServedBuildId / getRegistration failed — reload anyway
+    .catch(reloadOnce); // getServedBuildId / getRegistration failed — reload anyway
 }
 
 /** Loop guard window (ms): at most one stale-chunk auto-reload per window, so a
@@ -310,6 +328,22 @@ export function shouldReloadForStaleChunk(now: number): boolean {
 
 let staleChunkReloadStarted = false;
 
+/** WebKit cancels a page's loads as a navigation starts, just after
+ *  `beforeunload`. A chunk failing then is that cancel, not a stale build, and
+ *  a reload would cancel the navigation. The window closes on its own, since a
+ *  `beforeunload` can end with the page still here, as a download does. */
+export const NAVIGATION_CANCEL_WINDOW_MS = 2000;
+let leavingAt: number | null = null;
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    leavingAt = Date.now();
+  });
+}
+
+function pageIsLeaving(now: number): boolean {
+  return leavingAt !== null && now - leavingAt < NAVIGATION_CANCEL_WINDOW_MS;
+}
+
 /** Handle a failed dynamic `import()` of a content-hashed chunk. The
  *  overwhelmingly common cause is a newer build shipping while this tab kept the
  *  old one in memory: the in-memory entry chunk still references the OLD chunk
@@ -319,13 +353,19 @@ let staleChunkReloadStarted = false;
  *  `refreshClient()` swaps the SW to the new build first, so the fresh
  *  index.html requests the new chunk hashes.
  *
- *  Returns true if a reload was initiated (caller suppresses its error UI),
- *  false if the loop guard tripped (caller should surface a toast). */
+ *  The other cause is a bad cached copy of a chunk on the current build. So the
+ *  reload evicts the cached assets rather than serving that copy again.
+ *
+ *  Returns true if a reload was initiated or the page is leaving, so the
+ *  caller suppresses its error UI. Returns false if the loop guard tripped,
+ *  and the caller should surface a toast. */
 export function reloadForStaleChunk(): boolean {
+  const now = Date.now();
+  if (pageIsLeaving(now)) return true;
   if (staleChunkReloadStarted) return true; // a reload is already in flight this page-life
-  if (!shouldReloadForStaleChunk(Date.now())) return false;
+  if (!shouldReloadForStaleChunk(now)) return false;
   staleChunkReloadStarted = true;
-  refreshClient();
+  refreshClient({ evictAssets: true });
   return true;
 }
 

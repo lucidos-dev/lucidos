@@ -386,7 +386,12 @@ async fn get_filter_facets_returns_distinct_sessions() {
     insert_app_thread(&pool, "habit", 90, true).await; // archived-only → still a facet
     insert_app_thread(&pool, "habit-tracker", 30, false).await;
 
-    let facets = store.get_filter_facets().await.expect("get_filter_facets");
+    let ws = tempfile::tempdir().unwrap();
+    let apps = crate::core::AppManager::new(ws.path()).unwrap();
+    let facets = store
+        .get_filter_facets(&apps)
+        .await
+        .expect("get_filter_facets");
 
     let repo_ids: std::collections::HashSet<&str> = facets
         .repos
@@ -404,7 +409,7 @@ async fn get_filter_facets_returns_distinct_sessions() {
     assert!(trigger_ids.contains("trig-a"));
 
     let app_ids: std::collections::HashSet<&str> =
-        facets.apps.iter().filter_map(|f| f.id.as_deref()).collect();
+        facets.apps.iter().map(|f| f.id.as_str()).collect();
     assert!(
         app_ids.contains("habit"),
         "archived-only app must still be a facet"
@@ -416,7 +421,7 @@ async fn get_filter_facets_returns_distinct_sessions() {
 
 /// The repos facet resolves a `name`: the live registry for a registered repo,
 /// the durable `repo_names` projection for a removed one — so the dropdown lists
-/// a deleted repo under its historical name instead of its UUID. Trigger/app
+/// a deleted repo under its historical name instead of its UUID. Trigger
 /// facets carry NULL names (resolved client-side).
 #[tokio::test]
 async fn get_filter_facets_resolves_repo_names_including_deleted() {
@@ -432,7 +437,12 @@ async fn get_filter_facets_resolves_repo_names_including_deleted() {
     insert_repo_name(&pool, dead_repo, "Dead Repo").await; // registered then removed
     insert_cc_repo_thread(&pool, &dead_repo.to_string(), 60).await;
 
-    let facets = store.get_filter_facets().await.expect("get_filter_facets");
+    let ws = tempfile::tempdir().unwrap();
+    let apps = crate::core::AppManager::new(ws.path()).unwrap();
+    let facets = store
+        .get_filter_facets(&apps)
+        .await
+        .expect("get_filter_facets");
 
     let by_id: std::collections::HashMap<&str, Option<&str>> = facets
         .repos
@@ -538,7 +548,7 @@ fn filters(status: StatusFilter<'_>) -> ThreadSummaryFilters<'_> {
         sources: None,
         parent: None,
         has_draft: None,
-        has_diff: None,
+        change_state: None,
         limit: 1000,
     }
 }
@@ -660,6 +670,66 @@ async fn count_agrees_with_list_for_every_status_filter_shape() {
             "count and list must apply the same predicate for {status:?}"
         );
     }
+
+    teardown_test_db(&db).await;
+}
+
+/// App facets carry the engine's label. A live app or widget answers from its
+/// manifest. A removed one keeps the kind its `AppDeleted` recorded, through
+/// either delete path (ADR 0404). Only a missing folder is deleted.
+#[tokio::test]
+async fn get_filter_facets_labels_apps_and_widgets_including_removed_ones() {
+    use crate::core::{AppKind, NewAppKind};
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let ws = tempfile::tempdir().unwrap();
+    let apps = crate::core::AppManager::new(ws.path()).unwrap();
+    crate::core::apps::tests::app_and_widget(&apps, &bus).await;
+    for id in ["removed-widget", "owned-widget"] {
+        apps.create_app(
+            &bus,
+            id,
+            "Removed",
+            "",
+            "<h1>w",
+            NewAppKind::Widget {
+                origin_thread_id: Uuid::from_u128(2),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    apps.delete_app(&bus, "removed-widget", None).await.unwrap();
+    apps.delete_widgets(&bus, &["owned-widget".to_string()], None)
+        .await
+        .unwrap();
+    for id in [
+        "habit-tracker",
+        "fare-grid",
+        "removed-widget",
+        "owned-widget",
+        "never-recorded",
+    ] {
+        insert_app_thread(&pool, id, 30, false).await;
+    }
+
+    let facets = store.get_filter_facets(&apps).await.expect("facets");
+    let label = |id: &str| {
+        let f = facets.apps.iter().find(|f| f.id == id).expect(id);
+        (f.name.as_deref(), f.kind, f.deleted)
+    };
+    assert_eq!(
+        label("habit-tracker"),
+        (Some("Habit Tracker"), Some(AppKind::App), false)
+    );
+    assert_eq!(
+        label("fare-grid"),
+        (Some("Fare grid"), Some(AppKind::Widget), false)
+    );
+    assert_eq!(label("removed-widget"), (None, Some(AppKind::Widget), true));
+    assert_eq!(label("owned-widget"), (None, Some(AppKind::Widget), true));
+    assert_eq!(label("never-recorded"), (None, None, true));
 
     teardown_test_db(&db).await;
 }

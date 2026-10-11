@@ -48,8 +48,8 @@ const shimmering = (el: Element | undefined) =>
   el!.querySelector('.loading-fade-skeleton:not(.loading-fade-out) .sk-bar') !== null;
 
 it('draws its labels at once and no skeleton before the gate opens', () => {
-  expect(host.querySelector('.disk-usage-reclaim-title')?.textContent).toBe('Free up space');
-  expect(host.querySelector('.disk-usage-key-label')?.textContent).toContain('Worktrees');
+  expect(host.querySelector('.settings-overview-card-title')?.textContent).toBe('Free up space');
+  expect(host.querySelector('.settings-overview-key-label')?.textContent).toContain('Worktrees');
   expect(host.querySelector('.sk-bar')).toBeNull();
 });
 
@@ -57,7 +57,7 @@ it('draws every owed skeleton together once the gate opens', () => {
   act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
   // The headline, three key rows and the cleanup card's figure.
   expect(bars('.disk-usage-figure')).toBe(5);
-  expect(host.querySelector('.loading-fade-skeleton .disk-usage-bar .sk-bar')).not.toBeNull();
+  expect(host.querySelector('.loading-fade-skeleton .settings-overview-bar .sk-bar')).not.toBeNull();
   expect(host.querySelectorAll('.loading-fade-skeleton .disk-usage-row')).toHaveLength(3);
   expect(host.querySelector('.loading-spinner, .mini-spinner')).toBeNull();
 });
@@ -65,11 +65,11 @@ it('draws every owed skeleton together once the gate opens', () => {
 it('clears the worktree slots when the inventory lands, while the summary still shimmers', async () => {
   act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
   await answer('worktrees', { worktrees: [] });
-  const [worktrees, data] = [...host.querySelectorAll('.disk-usage-key-value')];
+  const [worktrees, data] = [...host.querySelectorAll('.settings-overview-key-value')];
   expect(shimmering(worktrees)).toBe(false);
   expect(shimmering(data)).toBe(true);
-  expect(shimmering(host.querySelector('.disk-usage-headline-value')!)).toBe(true);
-  expect(host.querySelector('.disk-usage-reclaim-figure .loading-fade-content')?.textContent)
+  expect(shimmering(host.querySelector('.settings-overview-headline-value')!)).toBe(true);
+  expect(host.querySelector('.settings-overview-card-figure .loading-fade-content')?.textContent)
     .toBe('Nothing to free right now');
   expect(host.querySelector('.disk-usage-reclaim-btn')).toBeNull();
   expect(host.textContent).toContain('No worktrees on disk');

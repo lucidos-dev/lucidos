@@ -42,23 +42,26 @@ async function rereadAndMatch(ref: string): Promise<RepositoryMatch | { kind: 'f
   return { kind: 'failed', error: reread.status === 'failed' ? reread.error : 'the list did not load' };
 }
 
-/** Open a `repo:` link from rendered markdown in the Files panel's repository
- *  file preview. The link may name its repository by id or by name.
+/** Open a `repo:` link, naming its repository by id or by name, with `open`.
+ *  That is the Files panel's preview unless the caller passes another opener
+ *  (a link in agent prose passes the file preview modal's).
  *
  *  A cache hit opens before the first `await`, inside the click's own task.
  *  An unresolvable repository toasts, naming the file, the repository and the
  *  link's origin. A missing file or ref is the preview's own load error. */
-export async function openRepoFileLink(target: RepoFileHrefTarget, source?: string): Promise<void> {
+export async function openRepoFileLink(
+  target: RepoFileHrefTarget,
+  source?: string,
+  open: (request: { file_path: string; line?: number; line_end?: number }) => void = (request) =>
+    handleNavigationRequest({ target: 'file', ...request }, { source }),
+): Promise<void> {
   const { locator, line, lineEnd } = target;
   const cached = repositories.value.status === 'loaded'
     ? matchRepository(repositories.value.data, locator.repoId)
     : null;
   const match = cached?.kind === 'found' ? cached : await rereadAndMatch(locator.repoId);
   if (match.kind === 'found') {
-    handleNavigationRequest(
-      { target: 'file', file_path: encodeRepoPath({ ...locator, repoId: match.repo.id }), line, line_end: lineEnd },
-      { source },
-    );
+    open({ file_path: encodeRepoPath({ ...locator, repoId: match.repo.id }), line, line_end: lineEnd });
     return;
   }
   const reason = match.kind === 'missing'

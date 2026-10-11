@@ -207,8 +207,9 @@ Archive a child by its id with the `threads` tool's `archive` action (or
 
 - **It runs the Archive button's cascade.** The child's own sub-threads go
   with it, and the same states refuse it: a running child, one waiting on the
-  user (`parent_not_archivable`), one holding a pending change, or one with a
-  blocking sub-thread.
+  user (`parent_not_archivable`), one holding a pending change, one parked on
+  an event wait with unproposed work (`parent_holds_held_proposal`), or one
+  with a blocking sub-thread.
 - **You reach only your own direct children.** A grandchild is its own
   parent's to archive. Anything else is refused with `not_your_thread`.
 - **The home thread is never archived**, by anyone, and is refused with
@@ -281,8 +282,13 @@ Say what is true, and do not lean on what is not.
   comes back refused. The user still does all six from their own device. So
   none of them is a supervision tool you can point sideways.
 - **Enforced.** Anything wider than your own subtree is the workspace owner's
-  to press. You may press it only while carrying their standing instruction: a
-  turn they opened, or a trigger firing they authorized. Creating a top-thread
-  is always in that group, because a top-thread sits under the workspace, not
+  to press. You may press it while carrying their standing instruction: a turn
+  they opened, or a trigger firing they authorized. Creating a top-thread is
+  always in that group, because a top-thread sits under the workspace, not
   under you. Do not tell a sibling's problem to your parent, which most threads
   here do not have. Report what you found, and let the owner decide.
+  Without a standing instruction, a coding agent may ask for one act with
+  `lucidos ask-owner-approval` (`system-knowhow/lucidos-cli.md`). The owner's
+  **Allow once** on the card Lucidos writes lets your thread do that act, at
+  that thread, once. A card you word yourself grants nothing, whatever the
+  owner answers.

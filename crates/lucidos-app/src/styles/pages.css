@@ -620,6 +620,21 @@
     flex: 1;
 }
 
+/* An app or widget row leads with its app icon. The lead takes the row's
+   width, so the actions still wrap under it on a narrow pane. */
+.app-row-lead {
+    --app-icon-size: 2.25rem;
+    --app-icon-radius: calc(var(--radius-control) * 1.2);
+    display: flex;
+    gap: 0.75rem;
+    flex: 1;
+    min-width: 0;
+}
+
+.app-row-lead > .app-icon {
+    margin-top: 0.125rem;
+}
+
 /* Installed-app marketplace + update labels */
 .app-row-title-line {
     display: flex;
@@ -771,17 +786,26 @@
 }
 
 .list-row.app-store-plugin-row {
+    --app-icon-size: 2.5rem;
+    --app-icon-radius: calc(var(--radius-control) * 1.2);
     position: relative;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
     grid-template-areas:
-        "title actions"
-        "description description"
-        "meta meta";
+        "icon title actions"
+        "icon description description"
+        "icon meta meta";
     align-items: center;
     gap: 0 var(--space-md);
     padding-top: var(--space-lg);
     padding-bottom: var(--space-lg);
+}
+
+/* The plugin icon leads the row, as an app icon leads an apps panel row. */
+.app-store-plugin-icon {
+    grid-area: icon;
+    align-self: start;
+    display: flex;
 }
 
 .app-store-plugin-row .list-row-info {
@@ -796,12 +820,12 @@
 
 @container (max-width: 30rem) {
     .list-row.app-store-plugin-row {
-        grid-template-columns: minmax(0, 1fr);
+        grid-template-columns: auto minmax(0, 1fr);
         grid-template-areas:
-            "actions"
-            "title"
-            "description"
-            "meta";
+            "actions actions"
+            "icon title"
+            "icon description"
+            "icon meta";
     }
 
     .app-store-plugin-row .list-row-actions {
@@ -897,6 +921,146 @@
     font-size: var(--font-size-xs);
     line-height: 1.55;
     overflow-wrap: anywhere;
+}
+
+/* The list shows two lines. The plugin detail page holds the whole text. */
+.app-store-plugin-row .app-store-plugin-description {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+}
+
+/* ── Plugin detail page (ADR 0414) ──────────────────────────────────────────
+   Media only: the header the row has, one sideways strip of every screenshot
+   and video, the README, and what was left out. */
+.plugin-detail {
+    container-type: inline-size;
+    padding: var(--space-lg);
+}
+
+/* Inside the loading fade's wrapper, so the gap reaches each section. */
+.plugin-detail-column {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xl);
+}
+
+.plugin-detail-head {
+    --app-icon-size: 3.5rem;
+    --app-icon-radius: calc(var(--radius-control) * 1.6);
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: "icon heading actions";
+    align-items: start;
+    gap: var(--space-lg);
+}
+
+.plugin-detail-icon {
+    grid-area: icon;
+    display: flex;
+}
+
+.plugin-detail-heading {
+    grid-area: heading;
+    min-width: 0;
+}
+
+.plugin-detail-head .list-row-actions {
+    grid-area: actions;
+}
+
+.plugin-detail-head .app-store-plugin-meta {
+    margin-top: var(--space-sm);
+}
+
+.title.plugin-detail-name {
+    margin: 0;
+    font-size: var(--font-size-xl);
+}
+
+.plugin-detail-description {
+    margin-top: var(--space-xs);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+}
+
+@container (max-width: 30rem) {
+    .plugin-detail-head {
+        grid-template-columns: auto minmax(0, 1fr);
+        grid-template-areas:
+            "actions actions"
+            "icon heading";
+    }
+}
+
+/* Every item is one height and keeps its own shape. The padding is ring room
+   for a focused screenshot, handed back by the margin. */
+.plugin-detail-strip {
+    display: flex;
+    gap: var(--space-md);
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    padding: var(--focus-ring-width);
+    margin: calc(-1 * var(--focus-ring-width));
+    list-style: none;
+}
+
+.plugin-detail-strip > li {
+    flex: none;
+    max-width: 100%;
+    scroll-snap-align: start;
+}
+
+.plugin-detail-shot,
+.plugin-detail-video {
+    display: block;
+    height: 15rem;
+    max-width: 100%;
+    box-sizing: border-box;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-control);
+    background: var(--bg-tertiary);
+    overflow: hidden;
+}
+
+.plugin-detail-shot {
+    padding: 0;
+    cursor: zoom-in;
+}
+
+.plugin-detail-shot img {
+    display: block;
+    height: 100%;
+    width: auto;
+    max-width: 100%;
+    object-fit: contain;
+}
+
+.plugin-detail-video {
+    aspect-ratio: 16 / 10;
+}
+
+.plugin-detail-readme {
+    font-size: var(--font-size-sm);
+}
+
+.plugin-detail-problems {
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+    line-height: 1.5;
+}
+
+.plugin-detail-problems p,
+.plugin-detail-problems ul {
+    margin: 0;
+}
+
+.plugin-detail-problems ul {
+    padding-left: var(--space-lg);
 }
 
 .app-store-plugin-meta {

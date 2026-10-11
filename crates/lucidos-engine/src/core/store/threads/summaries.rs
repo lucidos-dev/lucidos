@@ -49,12 +49,12 @@ impl EventStore {
     /// rows never consume the archive budget.
     ///
     /// The outer `WHERE` has exactly two clauses, unbounded inbox + the contiguous
-    /// archived window, plus the hidden home thread filter. There is NO
+    /// archived window. There is NO
     /// out-of-window bypass. An archived thread is NEVER
     /// injected ahead of its `created_at` position; archived `failed` /
     /// `waiting_for_user_answer` threads reach the drawer purely via
     /// `get_older_threads` pagination, at their true date (so the Archive pile stays
-    /// gap-free). There is no `coding_agent_proposed` bypass because the archive
+    /// gap-free). There is no proposed-change bypass because the archive
     /// endpoint cannot produce an archived-proposed thread: a thread with a pending
     /// in-workspace change has no Archive action (`is_blocking` → `[Discard, Apply]`
     /// only), and external-repo archiving emits `ChangeApplied` for each pending
@@ -62,8 +62,8 @@ impl EventStore {
     /// pages in at its date like any archived row. Active threads (`running` / `waiting_for_user_answer`) likewise
     /// surface via the unbounded inbox clause — they can't be archived while active.
     ///
-    /// The INNER candidate filter (`has_response OR status = ANY($1) OR
-    /// coding_agent_proposed`) is unrelated to the window: it scopes which rows are
+    /// The INNER candidate filter (`has_response OR status = ANY($1) OR` a
+    /// proposed change state) is unrelated to the window: it scopes which rows are
     /// candidates at all (so an inbox proposed/active row with no response still
     /// surfaces) and mirrors the `has_response` gate in `get_older_threads`.
     pub async fn get_recent_threads(
@@ -77,16 +77,15 @@ impl EventStore {
                     PARTITION BY (archive_state = '{archived}') ORDER BY created_at DESC\
                 ) AS rn \
                 FROM thread_summaries \
-                WHERE has_response = TRUE OR status = ANY($1) OR coding_agent_proposed = TRUE\
+                WHERE has_response = TRUE OR status = ANY($1) OR coding_agent_change_state = '{proposed}'\
             ) t \
             WHERE (t.archive_state = '{inbox}' \
                OR (t.archive_state = '{archived}' AND t.rn <= $2)) \
-              AND {home_visible} \
             ORDER BY t.last_user_action DESC",
             cols = THREAD_COLS.as_str(),
             archived = ArchiveState::Archived.as_str(),
             inbox = ArchiveState::Inbox.as_str(),
-            home_visible = home_visible_sql("t"),
+            proposed = crate::engine::thread_lifecycle::ChangeStateKind::Proposed.as_str(),
         );
         let rows = sqlx::query_as::<_, ThreadRow>(&sql)
             .bind(&active_statuses[..])
@@ -163,14 +162,15 @@ impl EventStore {
     /// Distinct filter facets — every trigger / repo / app that has stamped at
     /// least one thread. Powers the drawer "Show" dropdown so it lists the
     /// COMPLETE set of selectable triggers/repos/apps (not just whatever is in
-    /// the currently-loaded window). Labels are resolved client-side from the
-    /// trigger / repository / app registries; this returns only ids +
-    /// `last_activity` (newest thread per facet, for ordering deleted entries).
+    /// the currently-loaded window). Trigger labels are resolved client-side.
+    /// Repo and app facets carry their labels, and `last_activity` (newest
+    /// thread per facet) orders the deleted entries.
     pub async fn get_filter_facets(
         &self,
+        apps: &crate::core::AppManager,
     ) -> Result<FilterFacets, Box<dyn std::error::Error + Send + Sync>> {
-        // Trigger / app labels are resolved client-side, so `name` is NULL
-        // here (the column must still exist for `FilterFacet`'s FromRow).
+        // Trigger labels are resolved client-side, so `name` is NULL here (the
+        // column must still exist for `FilterFacet`'s FromRow).
         let triggers = sqlx::query_as::<_, FilterFacet>(
             "SELECT trigger_id AS id, NULL::text AS name, MAX(last_activity) AS last_activity \
              FROM thread_summaries \
@@ -208,15 +208,32 @@ impl EventStore {
         // whose folder isn't under `data/apps/` — without it `split_part`
         // would yield an empty-string facet id.
         let apps_sql = format!(
-            "SELECT {APP_ID_EXPR} AS id, NULL::text AS name, MAX(last_activity) AS last_activity \
-             FROM thread_summaries \
-             WHERE coding_agent_kind = 'app' AND coding_agent_folder LIKE '%/data/apps/%' \
-             GROUP BY {APP_ID_EXPR}",
+            "SELECT sub.id, k.kind AS recorded_kind, sub.last_activity \
+             FROM ( \
+                SELECT {APP_ID_EXPR} AS id, MAX(last_activity) AS last_activity \
+                FROM thread_summaries \
+                WHERE coding_agent_kind = 'app' AND coding_agent_folder LIKE '%/data/apps/%' \
+                GROUP BY {APP_ID_EXPR} \
+             ) sub \
+             LEFT JOIN app_kinds k ON k.app_id = sub.id",
             APP_ID_EXPR = app_id_sql_expr("thread_summaries"),
         );
-        let apps = sqlx::query_as::<_, FilterFacet>(&apps_sql)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
+        >(&apps_sql)
+        .fetch_all(&self.pool)
+        .await?;
+        let apps = rows
+            .into_iter()
+            .map(|(id, recorded_kind, last_activity)| {
+                app_filter_facet(apps, id, recorded_kind.as_deref(), last_activity)
+            })
+            .collect();
 
         Ok(FilterFacets {
             triggers,
@@ -432,7 +449,7 @@ impl EventStore {
             .bind(filters.sources)
             .bind(filters.parent)
             .bind(filters.has_draft)
-            .bind(filters.has_diff)
+            .bind(filters.change_state.map(ChangeStateKind::as_str))
             .bind(filters.limit)
             .fetch_all(&self.pool)
             .await?;
@@ -481,7 +498,7 @@ impl EventStore {
             .bind(filters.sources)
             .bind(filters.parent)
             .bind(filters.has_draft)
-            .bind(filters.has_diff)
+            .bind(filters.change_state.map(ChangeStateKind::as_str))
             .fetch_one(&self.pool)
             .await?;
         Ok(count)
@@ -537,5 +554,35 @@ impl EventStore {
             .fetch_one(&self.pool)
             .await?;
         Ok(count)
+    }
+}
+
+/// Labels one app facet: from the manifest while the folder lives, else from
+/// the kind `AppDeleted` recorded. Reads the one manifest by id, never the
+/// apps list, which holds no widget (ADR 0402).
+fn app_filter_facet(
+    apps: &crate::core::AppManager,
+    id: String,
+    recorded_kind: Option<&str>,
+    last_activity: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppFilterFacet {
+    if !apps.app_exists(&id) {
+        let kind = recorded_kind
+            .and_then(|k| serde_json::from_value(serde_json::Value::String(k.to_string())).ok());
+        return AppFilterFacet {
+            id,
+            name: None,
+            kind,
+            deleted: true,
+            last_activity,
+        };
+    }
+    let app = apps.get_app(&id).ok();
+    AppFilterFacet {
+        name: app.as_ref().map(|a| a.name.clone()),
+        kind: app.map(|a| a.kind),
+        id,
+        deleted: false,
+        last_activity,
     }
 }

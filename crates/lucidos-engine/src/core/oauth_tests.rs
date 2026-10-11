@@ -1768,6 +1768,120 @@ fn client_provider_name_keeps_derived_provider_names_distinct() {
     );
 }
 
+/// Answer one token-endpoint POST with `access_token`, the way a provider
+/// redeems an authorization code. Returns the endpoint's URL.
+async fn serve_one_token_grant(access_token: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/token", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // Read the whole request, so the client never sees a reset mid-send.
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&request);
+            let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if body.len() >= length {
+                break;
+            }
+        }
+        let grant =
+            serde_json::json!({"access_token": access_token, "token_type": "bearer"}).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{grant}",
+            grant.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+    url
+}
+
+/// A flow started with the legacy `oauth:` spelling must connect the SAME
+/// account a bare-name flow connects. Every reader of `dropbox` asks for that
+/// one row.
+///
+/// Binds the real `CALLBACK_PORT`, because that is what `prepare_oauth_flow`
+/// listens on.
+#[tokio::test]
+async fn a_flow_started_with_a_legacy_prefix_connects_the_canonical_account() {
+    const ACCESS_TOKEN: &str = "granted-token";
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let token_url = serve_one_token_grant(ACCESS_TOKEN).await;
+    crate::test_support::seed_credential(
+        &pool,
+        "dropbox",
+        "https://api.dropboxapi.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": "secret",
+            "auth_url": "https://www.dropbox.com/oauth2/authorize",
+            "token_url": token_url,
+        })
+        .to_string(),
+    )
+    .await;
+
+    // Stands in for the browser: the provider redirects back with this flow's
+    // state and a code.
+    let open_auth_url = async |auth_url: &str, _request_id: uuid::Uuid| -> Result<(), BoxError> {
+        let state = authorize_param(auth_url, "state").expect("the URL carries a state");
+        send_callback_request(
+            std::net::SocketAddr::from(([127, 0, 0, 1], CALLBACK_PORT)),
+            format!(
+                "GET {CALLBACK_PATH}?code=granted-code&state={state} \
+                 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            ),
+            None,
+        )
+        .await;
+        Ok(())
+    };
+    run_oauth_flow(
+        &pool,
+        &bus,
+        "oauth:Dropbox",
+        "files.content.read",
+        None,
+        open_auth_url,
+    )
+    .await
+    .expect("the flow completes");
+
+    let account = OAuthStore::get_by_provider(&pool, "dropbox")
+        .await
+        .unwrap()
+        .expect("the account is stored under the canonical provider name");
+    assert_eq!(account.access_token, ACCESS_TOKEN);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_accounts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "no second row under the prefixed spelling");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 // ---------------------------------------------------------------------------
 // callback_page: the last screen of the flow
 // ---------------------------------------------------------------------------
@@ -2849,4 +2963,96 @@ fn host_is_anchors_on_a_label_boundary() {
     ));
     assert!(!host_is("github.com.evil", "github.com"));
     assert!(!host_is("xgithub.com", "github.com"));
+}
+
+// ----- linked_account_token: the token an email account presents -----
+
+/// An account with no OAuth link sends on its stored password, exactly as
+/// before. This is the only arm that may answer "no token".
+#[tokio::test]
+async fn an_unlinked_account_needs_no_token() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    assert_eq!(linked_account_token(&pool, None).await, Ok(None));
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The reported shape: a transient pool error used to read as "no OAuth
+/// token". The send then went out without XOAUTH2 and the user met a
+/// generic SMTP authentication failure naming nothing.
+#[tokio::test]
+async fn a_failed_lookup_refuses_the_send() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let linked = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        None,
+        "live-token",
+        Some("refresh-token"),
+        Some(Utc::now() + chrono::Duration::seconds(3600)),
+        "https://mail.google.com/",
+    )
+    .await
+    .unwrap();
+
+    pool.close().await;
+    let error = linked_account_token(&pool, Some(linked))
+        .await
+        .expect_err("a read the engine could not make is not an answer");
+    assert!(
+        error.contains("Could not read the linked OAuth account"),
+        "the refusal has to name the failure: {error}"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A link pointing at a row that is gone is a broken account, not an
+/// account without OAuth. Saying so beats an SMTP failure the user cannot
+/// act on.
+#[tokio::test]
+async fn a_link_to_a_missing_account_refuses_the_send() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let error = linked_account_token(&pool, Some(Uuid::new_v4()))
+        .await
+        .expect_err("a dangling link is not a send");
+    assert!(error.contains("no longer exists"), "{error}");
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// An expired token with no refresh token cannot be renewed, so the send
+/// refuses rather than hand IMAP or SMTP a dead token.
+#[tokio::test]
+async fn a_token_that_cannot_be_refreshed_refuses_the_send() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let linked = crate::test_support::seed_oauth_account(
+        &pool,
+        "google",
+        Some("user@example.com"),
+        None,
+        "stale-token",
+        None,
+        Some(Utc::now() - chrono::Duration::seconds(120)),
+        "https://mail.google.com/",
+    )
+    .await
+    .unwrap();
+
+    let error = linked_account_token(&pool, Some(linked))
+        .await
+        .expect_err("a token known to be dead is not a token");
+    assert!(
+        error.contains("could not be refreshed"),
+        "the refusal has to name the failure: {error}"
+    );
+    assert!(
+        error.contains("user@example.com") && error.contains("reconnect"),
+        "the refusal has to name the account and the fix: {error}"
+    );
+    assert!(
+        !error.contains("stale-token"),
+        "a refusal never carries token material: {error}"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
 }

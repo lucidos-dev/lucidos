@@ -14,6 +14,7 @@ use std::path::Path;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use super::agent_run_marker::{AgentRunMarker, AGENT_RUN_ENV};
 use super::agent_runtime::SpawnArgs;
 use super::lucidos_cli::path_with_prefixes;
 
@@ -31,8 +32,11 @@ use super::lucidos_cli::path_with_prefixes;
 ///   `LUCIDOS_THREAD_ID`) — see `api::actor::subprocess_origin_env_vars`.
 /// - `LUCIDOS_EVENT_ID` / `LUCIDOS_REPO` / `LUCIDOS_SESSION_KIND` spawn
 ///   metadata consumed by `lucidos spawn-thread` and `cc-stop-reminder`.
+/// - A fresh agent run marker (`LUCIDOS_AGENT_RUN`). It is returned, so the
+///   caller can reap what outlives the agent (`agent_run_marker`).
 /// - The compile env from `agent_compile_env`: `RUSTC_WRAPPER` (sccache when
-///   on PATH, explicitly empty otherwise) and the agents' own sccache daemon.
+///   on PATH, explicitly empty otherwise), the agents' own sccache daemon, and
+///   a Lucidos source tree's compile mode.
 /// - `PATH` prefixed with the `lucidos` CLI dir when one was found, AND the
 ///   bundled Postgres bin dir (`LUCIDOS_PG_BIN_DIR`) when set — a packaged
 ///   build's `psql` lives there, not on the service manager's minimal PATH,
@@ -43,7 +47,7 @@ pub(super) fn apply_lucidos_env(
     args: &SpawnArgs<'_>,
     cli_dir: Option<&Path>,
     log_label: &str,
-) {
+) -> AgentRunMarker {
     // User-managed env vars FIRST so every engine-owned var below overrides on
     // collision (e.g. a user `LUCIDOS_REPO` is replaced by the spawn's repo
     // context). The pairs are already reserved-name-filtered by `env_pairs`.
@@ -90,6 +94,8 @@ pub(super) fn apply_lucidos_env(
     if args.interactive {
         cmd.env("LUCIDOS_SESSION_KIND", "interactive");
     }
+    let marker = AgentRunMarker::mint();
+    cmd.env(AGENT_RUN_ENV, marker.value());
     // sccache speeds up the heavy lucidos-engine rebuilds an agent session
     // triggers, but it's a dev-machine optimization (installed by
     // scripts/lib/preflight.sh), not a runtime dependency of the shipped
@@ -102,7 +108,7 @@ pub(super) fn apply_lucidos_env(
     // `build.rustc-wrapper = "sccache"`, which cargo falls back to when
     // RUSTC_WRAPPER is unset — only an explicit empty value overrides it to
     // a plain (uncached) build. See `sccache_on_path` and `agent_compile_env`.
-    for (key, value) in agent_compile_env() {
+    for (key, value) in agent_compile_env(args.worktree_path) {
         cmd.env(key, value);
     }
     let prefixes = agent_path_prefixes(
@@ -119,6 +125,7 @@ pub(super) fn apply_lucidos_env(
             }
         }
     }
+    marker
 }
 
 /// The dirs to prepend to an agent child's PATH: the `lucidos` CLI dir first
@@ -196,7 +203,7 @@ pub(super) fn resolve_binary_override(
 /// [`spawn_below_engine`]. Three callers use it directly and keep the engine's
 /// priority. One is the dev background engine build
 /// (`engine::engine_version::run_engine_build`). Its group is the only handle
-/// that reaches the `cargo` GRANDCHILD when a coalescing Apply supersedes it
+/// that reaches the `cargo` GRANDCHILD when an explicit Rebuild restarts it
 /// (ADR 0304). The others are the Vite preview (`engine::frontend_preview`)
 /// and MCP servers (`mcp::client`), whose `npx`/`uvx` launchers fork the real
 /// server as a grandchild.
@@ -371,7 +378,7 @@ pub(crate) async fn graceful_kill_child_process_group_or_sooner(
 ///
 /// The `Drop`-safe sibling of [`graceful_kill_child_process_group`]: a drop
 /// handler cannot await, so a caller tearing a subtree down from `Drop` (the dev
-/// background engine build, cancelled by a coalescing Apply) gets the force half
+/// background engine build, cancelled by an explicit Rebuild) gets the force half
 /// only. That is the right trade for a build: `cargo` is crash-safe by
 /// construction (atomic renames plus fingerprints), so it has no teardown worth
 /// granting a SIGTERM grace, and the alternative is leaving it compiling against
@@ -498,12 +505,17 @@ pub(crate) fn agent_compile_env_from(
     env
 }
 
-/// [`agent_compile_env_from`] over the engine's own PATH and cache root.
-pub(crate) fn agent_compile_env() -> Vec<(&'static str, String)> {
-    agent_compile_env_from(
-        std::env::var_os("PATH").as_deref(),
-        crate::paths::user_cache_root().as_deref(),
-    )
+/// [`agent_compile_env_from`] over the engine's own PATH and cache root, plus
+/// the *compile mode* of a Lucidos source tree at `worktree` (ADR 0392).
+pub(crate) fn agent_compile_env(worktree: &Path) -> Vec<(&'static str, String)> {
+    let cache_root = crate::paths::user_cache_root();
+    let mut env =
+        agent_compile_env_from(std::env::var_os("PATH").as_deref(), cache_root.as_deref());
+    env.extend(super::compile_mode::env_for_worktree(
+        worktree,
+        cache_root.as_deref(),
+    ));
+    env
 }
 
 #[cfg(test)]
@@ -558,6 +570,32 @@ mod tests {
             permission_mode: None,
             additional_directories: &[],
         }
+    }
+
+    /// The teardown reaps by the marker it was handed. If that differed from
+    /// the one in the agent's environment, nothing would ever match.
+    #[tokio::test]
+    async fn every_agent_spawn_carries_the_fresh_marker_it_returns() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
+        let stamped = |cmd: &tokio::process::Command| {
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == AGENT_RUN_ENV)
+                .and_then(|(_, value)| value?.to_str().map(str::to_string))
+        };
+
+        let mut first = tokio::process::Command::new("true");
+        let first_marker = apply_lucidos_env(&mut first, &args, None, "SpawnEnvTest");
+        let mut second = tokio::process::Command::new("true");
+        let second_marker = apply_lucidos_env(&mut second, &args, None, "SpawnEnvTest");
+
+        assert_eq!(stamped(&first).as_deref(), Some(first_marker.value()));
+        assert_eq!(stamped(&second).as_deref(), Some(second_marker.value()));
+        assert_ne!(
+            first_marker, second_marker,
+            "each spawn gets its own marker"
+        );
     }
 
     /// Guards the exclusion, so widening it fails here rather than in a

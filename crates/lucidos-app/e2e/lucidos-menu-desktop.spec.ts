@@ -75,9 +75,10 @@ test.describe('Lucidos menu from the desktop mark', () => {
     // Workspaces names the workspace you are in, in all three shapes that row
     // can take. THIS harness is the middle one: `scripts/lib/e2e.sh` runs the
     // engine standalone and serves `dist/` at `/`, so the page is a direct
-    // engine port. Its shell carries the gateway-port meta but base `/`, so the
-    // picker is addressable absolutely while `/~/api/v1/control/*` would resolve
-    // to the engine and 404. The row therefore links out here, becoming the
+    // engine port. A real gateway lists that engine (`e2e_gateway.sh`), so its
+    // shell carries the gateway-port meta. With base `/`, the picker is
+    // addressable absolutely while `/~/api/v1/control/*` would resolve to the
+    // engine and 404. The row therefore links out here, becoming the
     // in-app switcher only under `/<slug>/`, which this suite cannot reach.
     // `computeGatewayPickerHref`'s unit tests own the three-way derivation; this
     // pins what must hold in EVERY shape.

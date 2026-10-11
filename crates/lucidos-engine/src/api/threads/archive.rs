@@ -174,9 +174,13 @@ fn gate_refusal_message(body: &serde_json::Value, thread_id: Uuid) -> String {
         Some("parent_has_pending_changes") => format!(
             "Thread {thread_id} holds a pending change. Apply or discard it before archiving."
         ),
+        Some("parent_holds_held_proposal") => format!(
+            "Thread {thread_id} is waiting on an event with unproposed work. Stop waiting first, \
+             so its change is proposed."
+        ),
         Some("descendants_blocking") => format!(
-            "A sub-thread of {thread_id} is running, waiting on the user, or holds a pending \
-             change, so the family cannot be archived yet."
+            "A sub-thread of {thread_id} is running, waiting on the user, or holds a change, \
+             so the family cannot be archived yet."
         ),
         _ => format!("Thread {thread_id} cannot be archived right now."),
     }
@@ -201,7 +205,7 @@ pub(in crate::api) async fn archive_thread(
     // Before the cascade, so a refusal writes nothing at all: no locked
     // family, no cleared pending change, no cancel-stamped question card.
     crate::api::thread_reach::refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
         crate::api::thread_reach::ThreadReachVerb::Archive,
@@ -613,6 +617,7 @@ pub(crate) async fn archive_family(
 mod tests {
     use super::*;
     use crate::engine::claude_code::{APPLY_IN_PROGRESS_MESSAGE, DISCARD_IN_PROGRESS_MESSAGE};
+    use crate::engine::thread_lifecycle::ChangeStateKind;
     use crate::engine::types::ChangeClaim;
 
     /// A member a change claim kept from being archived is reported with the
@@ -640,8 +645,9 @@ mod tests {
             is_coding_agent: false,
             status: ThreadStatus::Idle.as_str().to_string(),
             archive_state: "inbox".to_string(),
-            coding_agent_proposed: false,
+            coding_agent_change_state: ChangeStateKind::None,
             coding_agent_is_external_repo: false,
+            holds_live_wait: false,
             is_saved,
             is_home: false,
         }
@@ -686,8 +692,9 @@ mod tests {
             is_coding_agent: true,
             status: ThreadStatus::WaitingForUserAnswer.as_str().to_string(),
             archive_state: "inbox".to_string(),
-            coding_agent_proposed: false,
+            coding_agent_change_state: ChangeStateKind::None,
             coding_agent_is_external_repo: false,
+            holds_live_wait: false,
             is_saved: false,
             is_home: false,
         };
@@ -721,6 +728,10 @@ mod tests {
         assert!(
             message(serde_json::json!({ "reason": "parent_has_pending_changes" }))
                 .contains("Apply or discard")
+        );
+        assert!(
+            message(serde_json::json!({ "reason": "parent_holds_held_proposal" }))
+                .contains("Stop waiting first")
         );
         assert!(
             message(serde_json::json!({ "reason": "descendants_blocking" })).contains("sub-thread")

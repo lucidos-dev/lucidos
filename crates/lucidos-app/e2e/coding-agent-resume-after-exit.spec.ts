@@ -98,7 +98,7 @@ test.describe('CC resume after process exit', () => {
    * unit test in resume.rs already exercises the resolver mechanics; this
    * test guards the user-visible promise that conversation context survives.
    */
-  test('revival preserves conversation content (codeword round-trip)', async ({ page }) => {
+  test('revival preserves conversation content (codeword round-trip)', { tag: '@real-claude-code' }, async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
     await pickComposeDestination(page);

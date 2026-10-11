@@ -147,10 +147,10 @@ pub(crate) async fn emit_response_aborted(
 }
 
 /// Fire-and-forget `ContinuationRequested` emit with consistent meta shape.
-/// Two callers today: `agent_question`'s answered-after-idle resume and
-/// the safety-net watchdog auto-recovery. The third source —
-/// `/api/v1/threads/{id}/continue` — emits inline because it propagates
-/// `Err` to an HTTP 500. `reason` must be one of the `*_REASON`
+/// Its callers include `agent_question`'s answered-after-idle resume, the
+/// safety-net watchdog auto-recovery and the strip's **Harden**. The continue
+/// endpoint `/api/v1/threads/{id}/continue` emits inline, because it
+/// propagates `Err` to an HTTP 500. `reason` must be one of the `*_REASON`
 /// constants in `agent_recovery`; new reasons must opt in to
 /// `continue_should_open_resume_exchange` deliberately.
 ///

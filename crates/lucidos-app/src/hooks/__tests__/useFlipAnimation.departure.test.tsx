@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 /**
- * A row that leaves the drawer exits as a copy. A newer batch must not cut
- * that exit short: another row can land while the copy is still leaving, and
- * the row it stands for is gone either way. Every other animation of the older
- * batch is still taken over, as before.
+ * A row that leaves its section exits as a copy, folding where it stood. A
+ * thread that lands in another section never flies there. A newer batch must
+ * not cut that exit short: another row can land while the copy is still
+ * leaving. Every other animation of the older batch is still taken over.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -14,6 +14,7 @@ const ROW_HEIGHT = 50;
 
 interface FakeAnimation {
     target: Element;
+    keyframes: Keyframe[];
     cancelled: boolean;
     finish: () => void;
 }
@@ -21,17 +22,13 @@ interface FakeAnimation {
 let host: HTMLElement;
 let animations: FakeAnimation[];
 
-function Drawer({ ids }: { ids: string[] }) {
+function Drawer({ ids, archive = [] }: { ids: string[]; archive?: string[] }) {
     const container = useRef<HTMLDivElement>(null);
-    const portal = useRef<HTMLDivElement>(null);
-    const sections: FlipSection[] = [{ name: 'current', ids }];
-    useFlipTransitions(container, portal, sections);
+    const sections: FlipSection[] = [{ name: 'current', ids }, { name: 'archive', ids: archive }];
+    useFlipTransitions(container, sections);
     return (
-        <div>
-            <div ref={container} class="thread-drawer-rows">
-                {ids.map(id => <div key={id} data-flip-id={id}>{id}</div>)}
-            </div>
-            <div ref={portal} />
+        <div ref={container} class="thread-drawer-rows">
+            {[...ids, ...archive].map(id => <div key={id} data-flip-id={id}>{id}</div>)}
         </div>
     );
 }
@@ -45,12 +42,12 @@ function rowRect(this: HTMLElement): DOMRect {
     return { top, left: 0, width: id ? 300 : 0, height, bottom: top + height, right: 300, x: 0, y: top, toJSON: () => ({}) } as DOMRect;
 }
 
-function fakeAnimate(this: Element): Animation {
+function fakeAnimate(this: Element, keyframes: Keyframe[]): Animation {
     let resolve!: () => void;
     let reject!: (e: unknown) => void;
     const finished = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
     finished.catch(() => {});
-    const record: FakeAnimation = { target: this, cancelled: false, finish: () => resolve() };
+    const record: FakeAnimation = { target: this, keyframes, cancelled: false, finish: () => resolve() };
     animations.push(record);
     return {
         finished,
@@ -107,6 +104,45 @@ describe('a departing row copy', () => {
         exit.finish();
         await nextFrame();
         expect(layer!.isConnected, 'the layer goes once its exit ends').toBe(false);
+    });
+
+    it('folds a thread that changes sections where it stood, and never flies it there', () => {
+        render(<Drawer ids={['a', 'b', 'c']} />, host);
+        render(<Drawer ids={['a', 'c']} archive={['b']} />, host);
+
+        const layer = host.querySelector('.flip-departure-layer');
+        expect(layer, 'b leaves its old place as a copy').not.toBeNull();
+        const exit = animations.find(a => layer!.contains(a.target))!;
+        expect(exit.keyframes[exit.keyframes.length - 1].transform, 'the copy folds up').toBe('scaleY(0)');
+        const arrival = animations.filter(a => (a.target as HTMLElement).dataset?.flipId === 'b');
+        expect(arrival, 'b animates once, in its new section').toHaveLength(1);
+        expect(arrival[0].keyframes.map(k => k.transform), 'b fades in without moving').toEqual([undefined, undefined]);
+    });
+
+    it('gives way to a moved thread that comes back to the section it left', async () => {
+        render(<Drawer ids={['a', 'b', 'c']} />, host);
+        render(<Drawer ids={['a', 'c']} archive={['b']} />, host);
+        const layer = host.querySelector('.flip-departure-layer')!;
+        const exit = animations.find(a => layer.contains(a.target))!;
+
+        // An unrelated change keeps b in Archive: its copy keeps folding.
+        render(<Drawer ids={['n', 'a', 'c']} archive={['b']} />, host);
+        await nextFrame();
+        expect(exit.cancelled, 'the exit runs on while b stays moved').toBe(false);
+
+        // A rejected archive puts b back in Current.
+        render(<Drawer ids={['n', 'a', 'b', 'c']} />, host);
+        await nextFrame();
+        expect(exit.cancelled, 'the copy stops leaving').toBe(true);
+        expect(layer.isConnected, 'and goes, so b shows once').toBe(false);
+    });
+
+    it('leaves a thread alone when its new section draws it where it stood', () => {
+        render(<Drawer ids={['a', 'b']} />, host);
+        render(<Drawer ids={['a']} archive={['b']} />, host);
+
+        expect(host.querySelector('.flip-departure-layer')).toBeNull();
+        expect(animations.filter(a => (a.target as HTMLElement).dataset?.flipId === 'b')).toHaveLength(0);
     });
 
     it('gives way to its own row when that row comes back mid-exit', async () => {

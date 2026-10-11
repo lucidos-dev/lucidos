@@ -33,10 +33,36 @@ fn every_state_but_proposed_satisfies_the_gate() {
         !PlanMarkerKind::Proposed.satisfies_gate(),
         "a proposed plan awaits approval and must NOT satisfy the gate"
     );
-    // State-level mirror.
-    assert!(PlanMarkerState::Present(PlanMarkerKind::Planned).satisfies_gate());
-    assert!(!PlanMarkerState::Present(PlanMarkerKind::Proposed).satisfies_gate());
-    assert!(!PlanMarkerState::Missing.satisfies_gate());
+}
+
+#[test]
+fn only_a_nonempty_list_of_plan_files_lands_plan_files_only() {
+    let plan = "docs/plans/2026-10-10-x.md".to_string();
+    assert!(lands_plan_files_only(std::slice::from_ref(&plan)));
+    assert!(!lands_plan_files_only(&[plan, "src/main.rs".to_string()]));
+    assert!(!lands_plan_files_only(&[]), "no files is no evidence");
+}
+
+#[test]
+fn only_unhardened_work_beyond_a_plan_needs_hardening() {
+    let plan = vec!["docs/plans/2026-10-10-x.md".to_string()];
+    let code = vec![plan[0].clone(), "src/main.rs".to_string()];
+    assert!(!needs_hardening(false, &plan), "a plan has nothing to test");
+    assert!(needs_hardening(false, &code));
+    assert!(!needs_hardening(true, &code));
+    assert!(
+        needs_hardening(false, &[]),
+        "an unknown or empty list is no evidence of a plan"
+    );
+}
+
+/// Whether the plan floor clears a Lucidos-source branch in this state.
+fn satisfies(state: PlanMarkerState) -> bool {
+    use crate::engine::change_ops::{ApplyKindContext, PlanFloor};
+    matches!(
+        PlanFloor::decide(&ApplyKindContext::default(), state),
+        PlanFloor::Clear(_)
+    )
 }
 
 /// The lane is a fourth value, not a reuse of a neighbour. Reusing
@@ -297,9 +323,9 @@ async fn plan_marker_missing_when_no_db_row() {
         PlanMarkerState::Missing,
         "No DB row should report Missing"
     );
-    assert!(!plan_marker_state(&pool, &repo_path, "any-branch")
-        .await
-        .satisfies_gate());
+    assert!(!satisfies(
+        plan_marker_state(&pool, &repo_path, "any-branch").await
+    ));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -335,9 +361,9 @@ async fn plan_marker_present_after_record_planned() {
         plan_marker_state(&pool, &repo_path, "feature").await,
         PlanMarkerState::Present(PlanMarkerKind::Planned),
     );
-    assert!(plan_marker_state(&pool, &repo_path, "feature")
-        .await
-        .satisfies_gate());
+    assert!(satisfies(
+        plan_marker_state(&pool, &repo_path, "feature").await
+    ));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -406,9 +432,7 @@ async fn plan_marker_stays_present_after_new_commit() {
     let _ = git_cmd(&["commit", "-m", "later work"], &repo_path).await;
 
     assert!(
-        plan_marker_state(&pool, &repo_path, "feature")
-            .await
-            .satisfies_gate(),
+        satisfies(plan_marker_state(&pool, &repo_path, "feature").await),
         "a follow-up commit must not invalidate a settled plan decision",
     );
     pool.close().await;
@@ -434,15 +458,51 @@ async fn plan_marker_consumed_returns_to_missing() {
     )
     .await
     .unwrap();
-    assert!(plan_marker_state(&pool, &repo_path, "feature")
-        .await
-        .satisfies_gate());
+    assert!(satisfies(
+        plan_marker_state(&pool, &repo_path, "feature").await
+    ));
 
     consume_plan_marker(&pool, &repo_path, "feature").await;
     assert_eq!(
         plan_marker_state(&pool, &repo_path, "feature").await,
         PlanMarkerState::Missing,
         "consume must delete the row so a later branch reuse starts fresh",
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A plan-only Apply lands an unapproved plan. Its `proposed` marker must
+/// survive, or the approval that follows finds nothing to flip.
+#[tokio::test]
+async fn consuming_leaves_a_proposed_marker_for_the_approval() {
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db_name) = setup_test_db().await;
+    let (_tmp, repo_path) = make_test_repo().await;
+
+    record_planned(
+        &pool,
+        &repo_path,
+        "feature",
+        PlanMarkerKind::Proposed,
+        Some("docs/plans/x.md"),
+        None,
+        &[],
+        "abc",
+    )
+    .await
+    .unwrap();
+    consume_plan_marker(&pool, &repo_path, "feature").await;
+    assert_eq!(
+        plan_marker_state(&pool, &repo_path, "feature").await,
+        PlanMarkerState::Present(PlanMarkerKind::Proposed),
+    );
+    assert_eq!(
+        approve_plan(&pool, &repo_path, "feature").await.unwrap(),
+        Some(ApprovedPlan {
+            plan_path: Some("docs/plans/x.md".into())
+        }),
+        "the approval hands back the file the CLI marks approved",
     );
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -518,22 +578,23 @@ async fn proposed_plan_does_not_satisfy_gate_until_approved() {
         PlanMarkerState::Present(PlanMarkerKind::Proposed),
     );
     assert!(
-        !plan_marker_state(&pool, &repo_path, "feature")
-            .await
-            .satisfies_gate(),
+        !satisfies(plan_marker_state(&pool, &repo_path, "feature").await),
         "a proposed (unapproved) plan must NOT satisfy the gate",
     );
 
     // Approve flips proposed -> planned and now satisfies the gate.
-    let approved = approve_plan(&pool, &repo_path, "feature").await.unwrap();
+    let approved = approve_plan(&pool, &repo_path, "feature")
+        .await
+        .unwrap()
+        .is_some();
     assert!(approved, "approving a proposed plan must report a flip");
     assert_eq!(
         plan_marker_state(&pool, &repo_path, "feature").await,
         PlanMarkerState::Present(PlanMarkerKind::Planned),
     );
-    assert!(plan_marker_state(&pool, &repo_path, "feature")
-        .await
-        .satisfies_gate());
+    assert!(satisfies(
+        plan_marker_state(&pool, &repo_path, "feature").await
+    ));
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -550,7 +611,10 @@ async fn approve_plan_is_targeted_and_preserves_plan_path() {
     let head_sha = current_head_sha(&repo_path).await.unwrap();
 
     // No row: approve is a no-op and must not fabricate a marker.
-    assert!(!approve_plan(&pool, &repo_path, "feature").await.unwrap());
+    assert!(approve_plan(&pool, &repo_path, "feature")
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         plan_marker_state(&pool, &repo_path, "feature").await,
         PlanMarkerState::Missing,
@@ -570,7 +634,10 @@ async fn approve_plan_is_targeted_and_preserves_plan_path() {
     .await
     .unwrap();
     assert!(
-        !approve_plan(&pool, &repo_path, "feature").await.unwrap(),
+        approve_plan(&pool, &repo_path, "feature")
+            .await
+            .unwrap()
+            .is_none(),
         "approve must only flip a proposed row, never a simple ack",
     );
     assert_eq!(
@@ -591,7 +658,10 @@ async fn approve_plan_is_targeted_and_preserves_plan_path() {
     )
     .await
     .unwrap();
-    assert!(approve_plan(&pool, &repo_path, "feature").await.unwrap());
+    assert!(approve_plan(&pool, &repo_path, "feature")
+        .await
+        .unwrap()
+        .is_some());
     let stored_path: Option<String> =
         sqlx::query_scalar("SELECT plan_path FROM planned_branches WHERE branch_name = $1")
             .bind("feature")
@@ -639,9 +709,7 @@ async fn bounded_security_fix_stores_and_returns_its_bound() {
         PlanMarkerState::Present(PlanMarkerKind::BoundedSecurityFix),
     );
     assert!(
-        plan_marker_state(&pool, &repo_path, "feature")
-            .await
-            .satisfies_gate(),
+        satisfies(plan_marker_state(&pool, &repo_path, "feature").await),
         "the lane exists so an unattended run can edit; it must satisfy the gate",
     );
     assert_eq!(

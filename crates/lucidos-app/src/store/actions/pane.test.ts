@@ -566,7 +566,7 @@ describe('resetPaneLayout', () => {
   });
 
   it('restores the default split ratio and drawer width, persisting the width', () => {
-    // The reset is `max(default, floor)`, and at a 16px root the floor (312)
+    // The reset is `max(default, floor)`, and at a 16px root the floor (320)
     // already leads the constant (300), so this is the floor. That is the
     // ordinary case since the drawer's floor became one number for every
     // desktop client; the constant only leads below 100% ui-scale, pinned below.

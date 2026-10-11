@@ -2,6 +2,18 @@ import { API, ApiError, json, mutatingFetch, throwIfNotOk } from './client';
 import type { ThreadSection, ThreadInitiator, ThreadAggregate, EventWaitSummary, ThreadComposeState } from '../store/thread-events';
 import type { ThreadStatus } from '../generated/thread-lifecycle';
 import type { ComposeSelectionOverride } from '../store/composeSelections';
+import type { UnproposedReason } from '../generated/thread-event-wire';
+import type { AppKind } from '../store/types';
+
+/** What a coding-agent thread's branch holds, as the engine projects it (ADR
+ *  0400). `none`: no work against main. `unproposed`: work with no pending
+ *  change, and `reason` says why a turn end withheld it. `proposed`: a pending
+ *  change, which Apply acts on. The summary and the aggregate carry the same
+ *  object, so its inner keys stay snake_case in both. */
+export type CodingAgentChangeState =
+  | { kind: 'none' }
+  | { kind: 'unproposed'; reason: UnproposedReason | null }
+  | { kind: 'proposed'; requires_restart: boolean };
 
 export interface ThreadSummary {
   thread_id: string;
@@ -50,6 +62,8 @@ export interface ThreadSummary {
   /** Whether this thread is a *stopped child* (ADR 0252). Absent on an engine
    *  that predates the field. */
   is_stopped_child?: boolean;
+  /** The *read request* (ADR 0409). Absent on an engine that predates it. */
+  read_requested?: boolean;
   /** How many event waits this thread holds unresolved. Consumed by
    *  `resolveVisualStatus` via `count > 0` to paint the Waiting status dot: a
    *  thread watching for an event is not finished, and this is what says so on
@@ -70,19 +84,8 @@ export interface ThreadSummary {
   status: ThreadStatus;
   /** The row's version (`ThreadMeta.summaryVersion`). */
   summary_version: number;
-  /** Whether the coding-agent branch has any diff against main on disk — pure git
-   *  truth. Backs the WaitingBanner Diff button independently of the
-   *  proposal lifecycle. */
-  coding_agent_has_diff: boolean;
-  /** The thread holds a pending change, complete or incomplete. Backs the
-   *  Apply / Discard buttons and blocks Archive. See `ThreadMeta.codingAgentProposed`. */
-  coding_agent_proposed: boolean;
-  /** Whether the proposed change requires an engine restart. Only meaningful
-   *  when `coding_agent_proposed` is true. */
-  coding_agent_requires_restart: boolean;
-  /** Whether the proposed change is incomplete, so not ready to review
-   *  (ADR 0346). Only meaningful when `coding_agent_proposed` is true. */
-  coding_agent_incomplete: boolean;
+  /** What the coding-agent branch holds (ADR 0400). See `CodingAgentChangeState`. */
+  coding_agent_change_state: CodingAgentChangeState;
   /** Whether the coding-agent thread is working on an external repo. */
   coding_agent_is_external_repo: boolean;
   /** When the thread last entered 'running' state (ISO string or null). */
@@ -229,14 +232,30 @@ export async function archiveThread(
     return res.json();
 }
 
-/** What Archive all would do to the Current section (ADR 0349). `kept`
- *  counts each thread that stays once, under its first reason:
- *  `question` | `pending_change` | `unproposed_work` | `draft` | `failed_run` |
- *  `busy`. Pinned threads sit in Pinned and are not counted. */
+/** What Archive all would do to the Current section (ADR 0349). It counts
+ *  inbox threads, sub-threads included, as the Current badge does. `safe`
+ *  lists the family roots to send back; `safe_thread_count` counts the threads
+ *  their archives take. A pinned family sits in Pinned and is not counted.
+ *
+ *  `kept` counts each inbox thread that stays. A kept family counts once under
+ *  its first reason: `question` | `pending_change` | `unproposed_work` |
+ *  `draft` | `failed_run` | `busy`. Its other threads count under
+ *  `ARCHIVE_ALL_SAME_FAMILY`. A pinned sub-thread of a safe family counts under
+ *  `ARCHIVE_ALL_PINNED_SUB_THREAD`. */
 export interface ArchiveAllPreflight {
   safe: { thread_id: string; title: string }[];
+  safe_thread_count: number;
   kept: Record<string, number>;
-  kept_count: number;
+  kept_thread_count: number;
+}
+
+/** A confirmed family Archive all left open: `thread_count` is its inbox
+ *  threads, root included. */
+export interface ArchiveAllKept {
+  thread_id: string;
+  reason: string;
+  slug: string;
+  thread_count: number;
 }
 
 export async function archiveAllPreflight(): Promise<ArchiveAllPreflight> {
@@ -247,7 +266,7 @@ export async function archiveAllPreflight(): Promise<ArchiveAllPreflight> {
  *  member the cascades took, which is what Undo hands back to `unarchiveThreads`. */
 export async function archiveAll(
   threadIds: string[],
-): Promise<{ archived: string[]; kept: { thread_id: string; reason: string; slug: string }[] }> {
+): Promise<{ archived: string[]; kept: ArchiveAllKept[] }> {
     const res = await postThreadAction('archive-all', { thread_ids: threadIds });
     return res.json();
 }
@@ -315,6 +334,18 @@ export async function deleteThreadFamily(
 export async function detachThread(threadId: string): Promise<void> {
     const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/detach`, {
         method: 'POST',
+    });
+    await throwIfNotOk(res);
+}
+
+/** Report that the user saw the reply a *read request* points at (ADR 0409),
+ *  as of the thread's `summaryVersion`. Clears the request; a second device
+ *  seeing the same reply adds nothing. A 409 means the thread changed since. */
+export async function markReplySeen(threadId: string, summaryVersion: number): Promise<void> {
+    const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/read-request/seen`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ summary_version: summaryVersion }),
     });
     await throwIfNotOk(res);
 }
@@ -397,23 +428,35 @@ export async function fetchArchivedCount(
   return data.count;
 }
 
-/** One selectable drawer-filter facet (trigger / repo / app) returned by
- *  `/api/v1/threads/filter-facets`. `id` is the trigger id / repo UUID / app
- *  id; `last_activity` is the newest thread for that facet (ISO8601), used to
+/** One selectable drawer-filter facet (trigger / repo) returned by
+ *  `/api/v1/threads/filter-facets`. `id` is the trigger id / repo UUID;
+ *  `last_activity` is the newest thread for that facet (ISO8601), used to
  *  order deleted entries. `name` is populated for the repos facet (resolved
  *  server-side from the live registry → `repo_names` projection, so a removed
- *  repo carries its historical name); NULL for trigger / app facets, whose
- *  labels the client resolves from its own registries. */
+ *  repo carries its historical name); NULL for trigger facets, whose labels
+ *  the client resolves from its own registry. */
 export interface FilterFacet {
   id: string | null;
   name: string | null;
   last_activity: string | null;
 }
 
+/** An app folder a coding-agent thread worked in, labelled by the engine
+ *  (`AppFilterFacet` in `core/store/threads/mod.rs`). The apps list never holds a widget
+ *  (ADR 0402), so only the engine can say what a facet is. A removed folder has
+ *  no `name`, and keeps the `kind` its deletion recorded (ADR 0404). */
+export interface AppFilterFacet {
+  id: string;
+  name: string | null;
+  kind: AppKind | null;
+  deleted: boolean;
+  last_activity: string | null;
+}
+
 export interface FilterFacets {
   triggers: FilterFacet[];
   repos: FilterFacet[];
-  apps: FilterFacet[];
+  apps: AppFilterFacet[];
 }
 
 /** Complete set of selectable filter facets — every trigger/repo/app that has

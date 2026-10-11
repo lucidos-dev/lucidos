@@ -54,6 +54,53 @@ $(request_field 'r["browser"]["specs"]')
 EOF
 }
 
+# A runner has no logged-in Claude Code, only the fake, so a spec tagged
+# @real-claude-code must never reach one. Needs e2e_spec_needs_real_claude_code.
+refuse_real_claude_code_specs() {
+    local spec refused=""
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        if e2e_spec_needs_real_claude_code "$PROJECT_DIR/crates/lucidos-app/e2e/$spec"; then
+            refused="$refused $spec"
+        fi
+    done <<EOF
+$(request_field 'r["browser"]["specs"]')
+EOF
+    [ -z "$refused" ] || {
+        echo "ERROR: these specs need the real Claude Code and run only on the local leg:$refused" >&2
+        return 1
+    }
+}
+
+# Where resolve_claude_binary (runtime/claude_code.rs) looks first, under the
+# home directory. e2e_github_test.sh pins it to that function.
+FAKE_CLAUDE_CODE_HOME_PATH=".local/bin/claude"
+FAKE_CLAUDE_CODE="$PROJECT_DIR/crates/lucidos-app/e2e/fake-claude-code/claude.mjs"
+
+# install_fake_claude_code [<home>]: link the fake Claude Code where the engine
+# looks first. Only on a GitHub runner, and never over an existing claude.
+install_fake_claude_code() {
+    local target="${1:-$HOME}/$FAKE_CLAUDE_CODE_HOME_PATH"
+    if [ "${GITHUB_ACTIONS:-}" != true ]; then
+        echo "ERROR: the fake Claude Code installs only on a GitHub runner." >&2
+        return 1
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        echo "ERROR: $target already exists, and the fake never replaces a claude." >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$target")" && ln -s "$FAKE_CLAUDE_CODE" "$target"
+}
+
+# ensure_main_branch [<repo>]: a coding-agent worktree branches from main, and
+# the runner checks out only the e2e run branch. Name its HEAD main when no
+# main exists. An existing main is never moved.
+ensure_main_branch() {
+    local repo="${1:-$PROJECT_DIR}"
+    git -C "$repo" rev-parse --verify --quiet refs/heads/main >/dev/null \
+        || git -C "$repo" branch main HEAD
+}
+
 cmd_plan() {
     # shellcheck source=scripts/lib/e2e.sh
     source "$SCRIPT_DIR/lib/e2e.sh"
@@ -67,6 +114,7 @@ cmd_plan() {
                 linux="$linux{\"id\":\"$suite\",\"suite\":\"$suite\",\"project\":\"-\",\"shard\":1,\"total\":1},"
                 ;;
             browser)
+                refuse_real_claude_code_specs || return 1
                 while IFS= read -r project; do
                     [ -n "$project" ] || continue
                     count="$(project_specs "$project" | grep -c .)"
@@ -160,6 +208,8 @@ cmd_run() {
     export LUCIDOS_E2E_ENGINE_BUILT=1
     export LUCIDOS_E2E_FREE_FLOOR_MIN_GB=1
     export HOST_LOAD_GUARD_DISABLE=1
+    # A shard IS the GitHub run, so its e2e scripts must never hand off again.
+    export LUCIDOS_E2E_LOCAL=1
 
     local cmd=()
     case "$suite" in
@@ -174,6 +224,11 @@ EOF
         browser)
             # shellcheck source=scripts/lib/e2e.sh
             source "$SCRIPT_DIR/lib/e2e.sh"
+            # A real gateway lists and adopts the engine, as on an install, so
+            # the gateway-dependent specs test something real (ADR 0385).
+            export LUCIDOS_E2E_GATEWAY=own
+            install_fake_claude_code || return 1
+            ensure_main_branch || return 1
             cmd=("$SCRIPT_DIR/e2e-browser.sh")
             [ "$project" = mobile-webkit ] || cmd+=(--no-webkit)
             cmd+=(-- "--project=$project" "--shard=$shard/$total")

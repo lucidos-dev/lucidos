@@ -80,6 +80,14 @@ pub struct Model {
     /// The *vision flag*: whether this model reads images. Image description
     /// refuses a model without it, and its picker hides one.
     pub vision: bool,
+    /// The *default effort*: the reasoning effort this model runs at when
+    /// nothing stored names one. `None` sends no effort. Seeded by migration
+    /// from the provider's docs, and not editable.
+    pub default_effort: Option<String>,
+    /// The model this one was retired to, or `None` for a current model. The
+    /// router sends its successor instead, and `retire_model` (the SQL
+    /// function) moved every saved setting off it. Not editable.
+    pub successor: Option<String>,
     pub sort_order: i32,
     /// [`SOURCE_BUILTIN`] or [`SOURCE_USER`].
     pub source: String,
@@ -150,32 +158,47 @@ pub fn validate_routes(routes: &[Route]) -> Result<(), String> {
     Ok(())
 }
 
-/// Raw DB row: (id, label, routes, preferred_provider, vision, sort_order,
-/// source, enabled, created_at).
+/// Raw DB row: (id, label, routes, preferred_provider, vision,
+/// default_effort, successor, sort_order, source, enabled, created_at).
 type ModelRow = (
     String,
     String,
     sqlx::types::Json<Vec<Route>>,
     Option<String>,
     bool,
+    Option<String>,
+    Option<String>,
     i32,
     String,
     bool,
     chrono::DateTime<chrono::Utc>,
 );
 
-const SELECT_COLS: &str =
-    "id, label, routes, preferred_provider, vision, sort_order, source, enabled, created_at";
+const SELECT_COLS: &str = "id, label, routes, preferred_provider, vision, default_effort, \
+     successor, sort_order, source, enabled, created_at";
 
 fn row_to_model(row: ModelRow) -> Model {
-    let (id, label, routes, preferred_provider, vision, sort_order, source, enabled, created_at) =
-        row;
+    let (
+        id,
+        label,
+        routes,
+        preferred_provider,
+        vision,
+        default_effort,
+        successor,
+        sort_order,
+        source,
+        enabled,
+        created_at,
+    ) = row;
     Model {
         id,
         label,
         routes: routes.0,
         preferred_provider,
         vision,
+        default_effort,
+        successor,
         sort_order,
         source,
         enabled,
@@ -489,6 +512,28 @@ mod tests {
                 "{id} builtin must be seeded on vertex and anthropic, enabled"
             );
         }
+        let haiku55 = models
+            .iter()
+            .find(|m| m.id == "claude-haiku-5-5")
+            .expect("Haiku 5.5 builtin must be seeded");
+        assert!(haiku55.is_builtin() && haiku55.enabled && haiku55.vision);
+        assert_eq!(
+            haiku55
+                .routes
+                .iter()
+                .map(|r| (r.provider.as_str(), r.id.as_deref(), r.context_window))
+                .collect::<Vec<_>>(),
+            [
+                ("vertex", None, Some(1_000_000)),
+                ("anthropic", None, Some(1_000_000)),
+                (
+                    "openrouter",
+                    Some("anthropic/claude-haiku-5.5"),
+                    Some(1_000_000)
+                ),
+            ],
+            "first party first, so a configured one never leaves for OpenRouter"
+        );
         assert!(
             models.iter().any(|m| m.id == "claude-opus-5"
                 && routes_to(m, "vertex")
@@ -510,9 +555,9 @@ mod tests {
             "Sonnet 4.6 is still SEEDED, and switched off by the prior-generation prune"
         );
         // Ordered by sort_order, newest first: Fable 5.1 (-2), Fable 5 (0),
-        // Opus 5.5 (2), Sonnet 5.5 (4), Opus 5 (5), Sonnet 5 (7), Opus 4.8
-        // (10). That groups the current generation at the top of the picker.
-        // The Sonnet 5.5 pair shares 4, so the label breaks the tie.
+        // Opus 5.5 (2), Sonnet 5.5 (4), Opus 5 (5), Sonnet 5 (7), Haiku 5.5
+        // (9), Opus 4.8 (10). That groups the current generation at the top of
+        // the picker. The Sonnet 5.5 pair shares 4, so the label breaks the tie.
         let fable51 = models
             .iter()
             .position(|m| m.id == "claude-fable-5-1")
@@ -538,6 +583,10 @@ mod tests {
             .iter()
             .position(|m| m.id == "claude-sonnet-5")
             .unwrap();
+        let haiku55 = models
+            .iter()
+            .position(|m| m.id == "claude-haiku-5-5")
+            .unwrap();
         let opus = models
             .iter()
             .position(|m| m.id == "claude-opus-4-8")
@@ -549,7 +598,8 @@ mod tests {
                 && sonnet55 < sonnet55_1m
                 && sonnet55_1m < opus5
                 && opus5 < sonnet5
-                && sonnet5 < opus,
+                && sonnet5 < haiku55
+                && haiku55 < opus,
             "sort_order must drive display order"
         );
         pool.close().await;
@@ -704,6 +754,7 @@ mod tests {
             "claude-sonnet-5-5[1m]",
             "claude-opus-5",
             "claude-sonnet-5",
+            "claude-haiku-5-5",
             "gpt-6-astra",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -1008,6 +1059,141 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// The builtins whose provider documents no default effort, so the seed
+    /// leaves them `NULL` and the engine sends no effort. A builtin seeded
+    /// later lands here or declares one, so its seed has to decide.
+    const BUILTINS_WITH_NO_DOCUMENTED_EFFORT: &[&str] = &[
+        "gpt-6-astra",
+        "gpt-5.2-codex",
+        "gpt-5.3-codex-spark",
+        "grok-4.20",
+        "z-ai/glm-5.2",
+        "laguna-s-2.1-free",
+        "nemotron-3.5-lightning-free",
+        "x-preview-f-free",
+        "nemotron-3-ultra-free",
+        "muse-spark-1.2-contributor-free",
+        "hy3-free",
+    ];
+
+    /// Every builtin is decided: it declares a default effort, or it is listed
+    /// as having none documented. A declared one runs unchanged on the row's
+    /// first route, so the tier a picker shows is the tier the engine sends.
+    #[tokio::test]
+    async fn every_builtin_declares_its_default_effort() {
+        let (pool, db_name) = setup_test_db().await;
+        let builtins: Vec<Model> = ModelStore::list(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(Model::is_builtin)
+            .collect();
+        for m in &builtins {
+            let undocumented = BUILTINS_WITH_NO_DOCUMENTED_EFFORT.contains(&m.id.as_str());
+            let Some(effort) = m.default_effort.as_deref() else {
+                assert!(
+                    undocumented,
+                    "builtin '{}' has no default effort; seed one, or list it in \
+                     BUILTINS_WITH_NO_DOCUMENTED_EFFORT",
+                    m.id
+                );
+                continue;
+            };
+            assert!(!undocumented, "'{}' is listed but seeds {effort}", m.id);
+            let route = &m.routes[0];
+            let provider = crate::llm::ProviderKind::parse(&route.provider);
+            assert_eq!(
+                crate::llm::reasoning::clamp_effort(effort, provider, route.wire_id(&m.id)),
+                Some(effort),
+                "'{}' at {effort} snaps on its first route",
+                m.id
+            );
+        }
+        for id in BUILTINS_WITH_NO_DOCUMENTED_EFFORT {
+            assert!(
+                builtins.iter().any(|m| m.id == *id),
+                "'{id}' is listed but is no builtin row"
+            );
+        }
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The seed is a no-op on re-run, and never touches a user's own row, even
+    /// one whose id matches a seeded builtin's family.
+    #[tokio::test]
+    async fn the_default_effort_seed_reruns_cleanly_and_leaves_user_rows_alone() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        ModelStore::create(
+            &pool,
+            &bus,
+            "claude-my-own",
+            &fields("Mine", "anthropic", 1000, None),
+            None,
+        )
+        .await
+        .unwrap();
+        let before = ModelStore::list(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20261008115918_add_default_effort_to_models.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let after = ModelStore::list(&pool).await.unwrap();
+        let efforts = |rows: &[Model]| -> Vec<(String, Option<String>)> {
+            rows.iter()
+                .map(|m| (m.id.clone(), m.default_effort.clone()))
+                .collect()
+        };
+        assert_eq!(efforts(&before), efforts(&after));
+        let mine = after.iter().find(|m| m.id == "claude-my-own").unwrap();
+        assert_eq!(mine.default_effort, None);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The column's CHECK spells the ladder, since SQL cannot import it. A pin,
+    /// so a tier added to `EFFORT_LADDER` cannot be refused by the schema.
+    #[tokio::test]
+    async fn the_default_effort_check_allows_exactly_the_ladder() {
+        let (pool, db_name) = setup_test_db().await;
+        let check: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conrelid = 'models'::regclass AND contype = 'c' \
+               AND pg_get_constraintdef(oid) LIKE '%default_effort%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let allowed: Vec<&str> = check
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .filter(|word| !word.is_empty())
+            .collect();
+        assert_eq!(allowed, crate::llm::EFFORT_LADDER, "{check}");
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The registry carries a row's default effort, and nothing for a model it
+    /// has no row for.
+    #[tokio::test]
+    async fn the_default_effort_reaches_the_registry() {
+        let (pool, db_name) = setup_test_db().await;
+        let registry: crate::llm::ModelRegistry = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::llm::model_registry::load_from_db(&pool).await,
+        ));
+        use crate::llm::model_registry::default_effort;
+        assert_eq!(default_effort(&registry, "claude-opus-5-5"), Some("medium"));
+        assert_eq!(default_effort(&registry, "gpt-6-astra"), None);
+        assert_eq!(default_effort(&registry, "no-such-model"), None);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
     /// The flag round-trips through create and update, and reaches the
     /// in-memory registry the engine routes with.
     #[tokio::test]
@@ -1052,7 +1238,8 @@ mod tests {
     /// its own `[1m]` id suffix (the 1M-context beta in `build_claude_request`).
     /// A bare id sends no beta, so most bare rows run at the 200k the prefix
     /// map infers. The exception is a family whose DEFAULT window is 1M (Opus
-    /// 5, Opus 5.5, Sonnet 5.5, Fable 5.x): its bare request is 1M too.
+    /// 5, Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.x): its bare request is 1M
+    /// too.
     #[tokio::test]
     async fn migration_declares_context_window_on_verified_builtins() {
         let (pool, db_name) = setup_test_db().await;
@@ -1081,6 +1268,7 @@ mod tests {
             ("claude-opus-5-5", 1_000_000),
             ("claude-sonnet-5-5", 1_000_000),
             ("claude-opus-5", 1_000_000),
+            ("claude-haiku-5-5", 1_000_000),
             // OpenAI — no context opt-in either; the 400k guess understates these.
             ("gpt-5.5-pro", 1_050_000),
             ("gpt-5.5", 1_050_000),
@@ -1615,3 +1803,7 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 }
+
+#[cfg(test)]
+#[path = "retired_models_tests.rs"]
+mod retired_models_tests;

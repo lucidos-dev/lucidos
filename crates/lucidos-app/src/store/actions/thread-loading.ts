@@ -3,7 +3,7 @@ import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThrea
 import { threadPassesChannelFilter } from '../threadFilter';
 import { settleDeliveredUnsentMessage } from './sendSettlement';
 import { noteImageLanded } from '../landedImages';
-import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
+import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, NO_CHANGE, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -27,7 +27,7 @@ type DraftBatch = Map<string, ComposeDraft | null>;
 
 /** Per-thread timestamp of the last local archive or pin flip. Mirrors
  *  `composeEditedAt`: `upsertThread` consults it and skips overwriting
- *  `section`, `saved` and `codingAgentProposed` when the GET went out before
+ *  `section`, `saved` and `codingAgentChangeState` when the GET went out before
  *  the flip. The pin rides with the section because a pinned thread is never
  *  archived (ADR 0312), so the two flip together.
  *  Without it, a stale GET landing after the optimistic flip overwrites
@@ -67,11 +67,9 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       blockingDescendantCount: info.blocking_descendant_count || 0,
       attentionDescendantCount: info.attention_descendant_count || 0,
       isStoppedChild: info.is_stopped_child === true,
+      readRequested: info.read_requested === true,
       liveEventWaitCount: info.live_event_wait_count || 0,
-      codingAgentHasDiff: info.coding_agent_has_diff || false,
-      codingAgentProposed: info.coding_agent_proposed || false,
-      codingAgentRequiresRestart: info.coding_agent_requires_restart || false,
-      codingAgentIncomplete: info.coding_agent_incomplete || false,
+      codingAgentChangeState: info.coding_agent_change_state,
       codingAgentIsExternalRepo: info.coding_agent_is_external_repo || false,
       lastRevivedAt: info.last_revived_at || '',
       parentThreadId: info.parent_thread_id || undefined,
@@ -199,13 +197,13 @@ export function upsertThread(
     if (summaryIsCurrent) {
       if (info.message_count) existing.meta.messageCount = info.message_count;
       // A local archive or pin flip AT OR AFTER this GET went out makes its
-      // section, pin and codingAgentProposed stale, so skip them. See
+      // section, pin and change state stale, so skip them. See
       // `sectionMutatedAt`.
       const sectionEditedSinceRequest = (sectionMutatedAt.get(info.thread_id) ?? 0) >= requestStartedAt;
       if (!sectionEditedSinceRequest) {
         if (saved) existing.meta.saved = true;
         if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
-        existing.meta.codingAgentProposed = info.coding_agent_proposed || false;
+        existing.meta.codingAgentChangeState = info.coding_agent_change_state;
       }
       existing.meta.activeChildrenCount = info.active_children_count || 0;
       existing.meta.waitingChildrenCount = info.waiting_children_count || 0;
@@ -213,14 +211,12 @@ export function upsertThread(
       existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
       existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
       existing.meta.isStoppedChild = info.is_stopped_child === true;
+      existing.meta.readRequested = info.read_requested === true;
       existing.meta.liveEventWaitCount = info.live_event_wait_count || 0;
       // Absence is not emptiness: an older engine or a partial test fixture
       // omits the field, and must leave a populated list alone. Only an
       // explicit `[]` clears it.
       if (info.live_event_waits) existing.meta.liveEventWaits = info.live_event_waits;
-      existing.meta.codingAgentHasDiff = info.coding_agent_has_diff || false;
-      existing.meta.codingAgentRequiresRestart = info.coding_agent_requires_restart || false;
-      existing.meta.codingAgentIncomplete = info.coding_agent_incomplete || false;
       existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
       if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
       // A null clears: a thread moved to top level has no parent any more, and
@@ -349,6 +345,25 @@ export async function loadFilterFacets(): Promise<void> {
   } catch (e) {
     filterFacets.value = toFailed(e);
   }
+}
+
+/** Re-read the facets once something has read them: an app's label in them
+ *  changed. */
+export function reloadFilterFacetsIfLoaded(): void {
+  if (filterFacets.value.status !== 'not-loaded') void loadFilterFacets();
+}
+
+/** App ids a facet reload was already asked for, so an id the engine still
+ *  does not list costs one reload, not one per render. */
+const facetReloadsAsked = new Set<string>();
+
+/** Reload the facets once for app ids they do not label yet: a widget a
+ *  brand-new coding-agent thread works in. */
+export function reloadFacetsForApps(ids: readonly string[]): void {
+  const fresh = ids.filter(id => !facetReloadsAsked.has(id));
+  if (fresh.length === 0) return;
+  for (const id of fresh) facetReloadsAsked.add(id);
+  void loadFilterFacets();
 }
 
 async function loadAllThreadsInner(): Promise<void> {
@@ -1282,11 +1297,10 @@ function stampLoadedFilterSelection(selection: ThreadFilterSelection): void {
  *  so `reloadAfterFilterChange` still owes it a re-arm and a first page.
  *
  *  **A STORE fact, not a per-component one.** The drawer's list only mounts
- *  under the default `all` status, `ThreadDrawer` rendering the four other
- *  lists instead. The Filter panel can change the selection under any of them.
- *  A per-mount marker answers only whether the filter changed while that mount
- *  was watching. A change made under a status view would be seen by nobody, and
- *  the catch-up suppressed on the way back too.
+ *  under the Folders grouping, and a reload can restore a selection made
+ *  before it unmounted. A per-mount marker answers only whether the filter
+ *  changed while that mount was watching. A change it missed would be seen by
+ *  nobody, and the catch-up suppressed on the way back too.
  *
  *  It also answers from any moment, which a mount-independent marker still
  *  would not give. A claim taken when the reload is REQUESTED goes quiet even
@@ -1814,7 +1828,7 @@ function applyEventRows(
       // aggregate that would otherwise revert the optimistic flip.
       if (archivingThreadIds.value.has(threadId)) {
         thread.meta.section = 'archived';
-        thread.meta.codingAgentProposed = false;
+        thread.meta.codingAgentChangeState = NO_CHANGE;
       }
     }
   }

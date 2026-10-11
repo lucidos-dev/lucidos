@@ -27,14 +27,14 @@ async fn seed_thread(
     is_coding_agent: bool,
     status: &str,
     archive_state: &str,
-    coding_agent_proposed: bool,
+    proposed: bool,
     coding_agent_is_external_repo: bool,
 ) {
     sqlx::query(
         "INSERT INTO thread_summaries (\
              thread_id, parent_thread_id, source, is_coding_agent, \
              created_at, last_activity, message_count, status, archive_state, \
-             coding_agent_proposed, coding_agent_is_external_repo, \
+             coding_agent_change_state, coding_agent_is_external_repo, \
              has_response, state \
          ) VALUES ($1, $2, $3, $4, NOW(), NOW(), 0, $5, $6, $7, $8, TRUE, 'active') \
          ON CONFLICT (thread_id) DO UPDATE SET \
@@ -43,7 +43,7 @@ async fn seed_thread(
              is_coding_agent = EXCLUDED.is_coding_agent, \
              status = EXCLUDED.status, \
              archive_state = EXCLUDED.archive_state, \
-             coding_agent_proposed = EXCLUDED.coding_agent_proposed, \
+             coding_agent_change_state = EXCLUDED.coding_agent_change_state, \
              coding_agent_is_external_repo = EXCLUDED.coding_agent_is_external_repo",
     )
     .bind(thread_id)
@@ -56,7 +56,7 @@ async fn seed_thread(
     .bind(is_coding_agent)
     .bind(status)
     .bind(archive_state)
-    .bind(coding_agent_proposed)
+    .bind(if proposed { "proposed" } else { "none" })
     .bind(coding_agent_is_external_repo)
     .execute(pool)
     .await
@@ -330,8 +330,8 @@ async fn archive_rejects_when_descendant_has_pending_changes() {
     let child_id = Uuid::new_v4();
 
     seed_thread(&pool, parent_id, None, false, "idle", "inbox", false, false).await;
-    // CC sub-thread with a pending change: status=waiting,
-    // coding_agent_proposed=true. is_external_repo=false so the carve-out for
+    // CC sub-thread with a pending change: status=waiting, change state
+    // proposed. is_external_repo=false so the carve-out for
     // external-repo pending CC doesn't bypass the blocking predicate.
     seed_thread(
         &pool,

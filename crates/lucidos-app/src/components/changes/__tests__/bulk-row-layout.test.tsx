@@ -60,6 +60,8 @@ function makeChange(over: Partial<Change> = {}): Change {
     files: ['a.rs'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-01-01T00:00:00Z',
     resolved_at: null,
@@ -80,7 +82,7 @@ beforeEach(() => {
     status: 'loaded',
     data: [
       makeChange({ id: 'ready', thread_id: 'thread-ready' }),
-      makeChange({ id: 'settling', thread_id: 'thread-settling', thread_unsettled: true, thread_settling: true }),
+      makeChange({ id: 'settling', thread_id: 'thread-settling', thread_unsettled: true, apply_ready: false, thread_settling: true }),
       makeChange({ id: 'ready-2', thread_id: 'thread-ready-2' }),
     ],
   };
@@ -155,7 +157,7 @@ describe('the two sections', () => {
   it('draws the armed face alone when nothing else can act', () => {
     changes.value = {
       status: 'loaded',
-      data: [makeChange({ id: 'settling', thread_unsettled: true, thread_settling: true })],
+      data: [makeChange({ id: 'settling', thread_unsettled: true, apply_ready: false, thread_settling: true })],
     };
     standingApplyThreadIds.value = new Set(['thread-1']);
     render(<ChangesView />, host);

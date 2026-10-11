@@ -1086,6 +1086,24 @@ fn an_agent_archive_names_what_it_left_open() {
     assert!(left_open.contains("was left open"), "{left_open}");
 }
 
+/// `change_state` takes a change state kind. The retired `has_diff` is refused
+/// by name, so an old caller is told rather than handed every thread.
+#[test]
+fn the_change_state_filter_refuses_has_diff_and_unknown_kinds() {
+    use crate::engine::thread_lifecycle::ChangeStateKind;
+    let arg = |v: serde_json::Value| super::change_state_arg(&v);
+    assert_eq!(arg(serde_json::json!({})), Ok(None));
+    assert_eq!(
+        arg(serde_json::json!({ "change_state": "unproposed" })),
+        Ok(Some(ChangeStateKind::Unproposed))
+    );
+    let retired = arg(serde_json::json!({ "has_diff": true })).expect_err("has_diff is retired");
+    assert!(retired.contains("change_state"), "{retired}");
+    let unknown =
+        arg(serde_json::json!({ "change_state": "held" })).expect_err("not a change state");
+    assert!(unknown.contains("none, unproposed, proposed"), "{unknown}");
+}
+
 /// A filter the model spells wrongly is refused, never read as "no filter":
 /// that would answer with the whole workspace.
 #[test]

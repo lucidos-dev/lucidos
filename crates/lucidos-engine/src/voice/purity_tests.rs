@@ -43,7 +43,7 @@ const PROMPT_ASSEMBLY_FILES: &[&str] = &[
     "engine/chat/process/history.rs",
     "engine/chat/process/system_prompt.rs",
     "engine/chat/process/working_understanding.rs",
-    "engine/chat/process/workspace_payload.rs",
+    "engine/chat/process/workspace_prompt_footprint.rs",
     "engine/agent_session/prompts.rs",
     "engine/context.rs",
     "engine/tools/capabilities.rs",

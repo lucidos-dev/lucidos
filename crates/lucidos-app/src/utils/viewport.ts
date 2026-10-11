@@ -77,11 +77,10 @@ window.matchMedia?.(PHONE_LAYOUT_QUERY).addEventListener?.('change', syncViewpor
  *  the visible viewport on this device. Filters dual-mount copies so a
  *  hidden layout's offscreen card doesn't accidentally count.
  *
- *  Backed by the production-grade implementation in
- *  `components/chat/scrollState.ts`; re-exported here so consumers
- *  (notification routing, audit logging) can pull from `utils/viewport`
- *  without reaching into chat internals. See
+ *  Backed by `components/chat/scrollState.ts`, through the scroll state
+ *  handle, so consumers (notification routing, audit logging) can pull from
+ *  `utils/viewport` without reaching into chat internals. See
  *  `system-knowhow/notifications.md` §3 — used to compute
  *  `event_in_viewport` in the PresenceCheck pong.
  */
-export { isEventInViewport as isInViewport } from '../components/chat/scrollState';
+export { isEventInViewport as isInViewport, isReplyEndInViewport, lastExchangeOf } from '../components/chat/scrollStateHandle';

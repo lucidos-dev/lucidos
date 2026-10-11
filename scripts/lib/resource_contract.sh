@@ -59,6 +59,7 @@ frontend
 postgres
 sdk
 system-knowhow
+system-widgets
 EOF
 }
 

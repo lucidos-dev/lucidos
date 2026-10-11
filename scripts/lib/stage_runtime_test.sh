@@ -62,9 +62,9 @@ echo "test: the macOS PG_SYSROOT dance is keyed on a Darwin host only"
 if stage_runtime_needs_macos_sysroot Darwin; then pass "Darwin needs the sysroot override"; else fail "Darwin should need the override"; fi
 if stage_runtime_needs_macos_sysroot Linux; then fail "Linux must NOT use the sysroot override"; else pass "Linux skips the override (system gcc)"; fi
 
-# ── assemble: the 7-resource staging tree ─────────────────────────────────────
+# ── assemble: the 8-resource staging tree ─────────────────────────────────────
 # A fake set of already-built inputs: three "binaries" (engine, gateway, the
-# `lucidos` CLI), three static dirs (frontend, sdk, system-knowhow), and a
+# `lucidos` CLI), four static dirs (frontend, sdk, system-knowhow, system-widgets), and a
 # relocatable-PG-like nested tree with a symlink.
 new_inputs() {
     local dir; dir="$(mktemp -d)"
@@ -74,6 +74,7 @@ new_inputs() {
     mkdir -p "$dir/frontend" && printf '<html>\n' > "$dir/frontend/index.html"
     mkdir -p "$dir/sdk"      && printf 'sdk\n'     > "$dir/sdk/sdk.js"
     mkdir -p "$dir/system-knowhow" && printf '# glossary\n' > "$dir/system-knowhow/glossary.md"
+    mkdir -p "$dir/system-widgets/lucidos-sound-player" && printf '{}\n' > "$dir/system-widgets/lucidos-sound-player/manifest.json"
     mkdir -p "$dir/pg/bin" "$dir/pg/lib"
     printf 'postgres\n' > "$dir/pg/bin/postgres"; chmod +x "$dir/pg/bin/postgres"
     printf 'libpq\n'    > "$dir/pg/lib/libpq.so.5"
@@ -94,15 +95,16 @@ set_args() {
         "postgres=$dir/pg"
         "sdk=$dir/sdk"
         "system-knowhow=$dir/system-knowhow"
+        "system-widgets=$dir/system-widgets"
     )
 }
 
 echo ""
-echo "test: stage_runtime_assemble lays down exactly the 7 RESOURCE_NAMES"
+echo "test: stage_runtime_assemble lays down exactly the 8 RESOURCE_NAMES"
 IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
 OUT="$(stage_runtime_assemble "$STAGE" "${ARGS[@]}")"; rc=$?
 if [ $rc -eq 0 ] && [ "$OUT" = "$STAGE" ]; then pass "assemble exits 0 and prints the stage dir"; else fail "assemble failed (rc=$rc, out=$OUT)"; fi
-for n in lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow; do
+for n in lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow system-widgets; do
     if [ -e "$STAGE/$n" ]; then pass "staged $n"; else fail "missing $n in stage"; fi
 done
 if [ -x "$STAGE/lucidos-engine" ]; then pass "lucidos-engine is executable"; else fail "lucidos-engine not executable"; fi
@@ -111,9 +113,9 @@ if [ -x "$STAGE/lucidos" ]; then pass "lucidos CLI is executable"; else fail "lu
 if [ -x "$STAGE/postgres/bin/postgres" ]; then pass "nested postgres/bin/postgres present + executable"; else fail "nested postgres binary missing"; fi
 if [ -L "$STAGE/postgres/lib/libpq.so" ]; then pass "PG symlink preserved"; else fail "PG symlink not preserved"; fi
 if [ -f "$STAGE/system-knowhow/glossary.md" ]; then pass "system-knowhow contents copied"; else fail "system-knowhow contents missing"; fi
-# No extra top-level entries beyond the 7 resources.
+# No extra top-level entries beyond the 8 resources.
 count="$(find "$STAGE" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
-if [ "$count" = "7" ]; then pass "stage has exactly 7 top-level entries"; else fail "stage has $count top-level entries (want 7)"; fi
+if [ "$count" = "8" ]; then pass "stage has exactly 8 top-level entries"; else fail "stage has $count top-level entries (want 8)"; fi
 
 echo ""
 echo "test: stage_runtime_assemble re-stages cleanly (removes stale entries)"
@@ -127,7 +129,7 @@ echo "test: the argument ORDER carries nothing"
 # two inputs of the same kind could be swapped and the stage still looked fine.
 STAGE2="$(mktemp -d)/stage"
 stage_runtime_assemble "$STAGE2" \
-    "system-knowhow=$IN/system-knowhow" "sdk=$IN/sdk" "postgres=$IN/pg" \
+    "system-widgets=$IN/system-widgets" "system-knowhow=$IN/system-knowhow" "sdk=$IN/sdk" "postgres=$IN/pg" \
     "frontend=$IN/frontend" "lucidos=$IN/cli" "lucidos-gateway=$IN/gateway" \
     "lucidos-engine=$IN/engine" >/dev/null
 if diff -r "$STAGE" "$STAGE2" >/dev/null 2>&1; then pass "a reordered call stages an identical tree"; else fail "argument order changed the tree"; fi
@@ -177,50 +179,58 @@ if [ $rc -ne 0 ] && echo "$out" | grep -qi "neither a directory nor an executabl
 if [ -d "$STAGE" ]; then fail "stage dir should not exist after a refusal"; else pass "no stage written on any refusal"; fi
 rm -rf "$IN"
 
-# ── staged-knowhow freshness (the hand-run-build guard) ──────────────────────
+# ── staged source-tree freshness (the hand-run-build guard) ─────────────────
 # The stage survives between builds, so a `cargo tauri build` typed by hand can
 # package a months-old copy. Clean must mean "absent OR identical", never
 # "absent" alone: a developer who has never run build-dmg.sh has no stage at all
 # and their build must not go red.
 
 echo ""
-echo "test: stage_runtime_staged_knowhow_fresh accepts an absent or knowhow-less stage"
+echo "test: stage_runtime_staged_copy_fresh accepts an absent or knowhow-less stage"
 IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
-if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "absent stage is clean"; else fail "absent stage should be clean"; fi
+if stage_runtime_staged_copy_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "absent stage is clean"; else fail "absent stage should be clean"; fi
 mkdir -p "$STAGE"
-if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "stage with no system-knowhow/ is clean"; else fail "knowhow-less stage should be clean"; fi
+if stage_runtime_staged_copy_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "stage with no system-knowhow/ is clean"; else fail "knowhow-less stage should be clean"; fi
 # ABSENT is the only thing the fast path waves through: a staged system-knowhow
 # that is not a directory is drift, not "nothing to check".
 printf 'not a directory\n' > "$STAGE/system-knowhow"
-if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a non-directory staged system-knowhow must not read as clean"; else pass "non-directory staged copy caught"; fi
+if stage_runtime_staged_copy_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a non-directory staged system-knowhow must not read as clean"; else pass "non-directory staged copy caught"; fi
 rm -rf "$IN" "$STAGE"
 
 echo ""
-echo "test: stage_runtime_staged_knowhow_fresh accepts a stage assemble just wrote"
+echo "test: stage_runtime_staged_copy_fresh accepts a stage assemble just wrote"
 IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
 stage_runtime_assemble "$STAGE" "${ARGS[@]}" >/dev/null
-if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "freshly staged copy is clean"; else fail "a copy assemble just made must be clean"; fi
+if stage_runtime_staged_copy_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "freshly staged copy is clean"; else fail "a copy assemble just made must be clean"; fi
 
 echo ""
-echo "test: stage_runtime_staged_knowhow_fresh catches every shape of drift"
+echo "test: stage_runtime_staged_copy_fresh catches every shape of drift"
 printf '# glossary v2\n' > "$IN/system-knowhow/glossary.md"
-out="$(stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>&1)"; rc=$?
+out="$(stage_runtime_staged_copy_fresh "$STAGE" "$IN/system-knowhow" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -qi "drifted from the live tree"; then pass "changed file caught"; else fail "expected changed-file drift (rc=$rc): $out"; fi
 if echo "$out" | grep -q "rm -rf"; then pass "drift message says how to fix it"; else fail "drift message must name the remedy: $out"; fi
 stage_runtime_assemble "$STAGE" "${ARGS[@]}" >/dev/null
 printf '# new doc\n' > "$IN/system-knowhow/triggers.md"
-if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a doc added since staging should be drift"; else pass "added file caught"; fi
+if stage_runtime_staged_copy_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a doc added since staging should be drift"; else pass "added file caught"; fi
 stage_runtime_assemble "$STAGE" "${ARGS[@]}" >/dev/null
 rm -f "$IN/system-knowhow/triggers.md"
-if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a doc deleted since staging should be drift"; else pass "removed file caught"; fi
+if stage_runtime_staged_copy_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a doc deleted since staging should be drift"; else pass "removed file caught"; fi
 rm -rf "$IN" "$STAGE"
 
 echo ""
-echo "test: stage_runtime_staged_knowhow_fresh refuses a missing live tree"
+echo "test: stage_runtime_staged_copy_fresh checks the tree its live dir names"
+IN2="$(new_inputs)"; STAGE2="$(mktemp -d)/stage"; set_args "$IN2"
+stage_runtime_assemble "$STAGE2" "${ARGS[@]}" >/dev/null
+printf '{"changed":1}\n' > "$IN2/system-widgets/lucidos-sound-player/manifest.json"
+if stage_runtime_staged_copy_fresh "$STAGE2" "$IN2/system-widgets" 2>/dev/null; then fail "a drifted system-widgets copy must not read as clean"; else pass "system-widgets drift caught"; fi
+if stage_runtime_staged_copy_fresh "$STAGE2" "$IN2/system-knowhow" 2>/dev/null; then pass "an untouched system-knowhow stays clean"; else fail "system-knowhow did not change"; fi
+rm -rf "$IN2" "$STAGE2"
+
+echo "test: stage_runtime_staged_copy_fresh refuses a missing live tree"
 IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
 stage_runtime_assemble "$STAGE" "${ARGS[@]}" >/dev/null
 rm -rf "$IN/system-knowhow"
-out="$(stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>&1)"; rc=$?
+out="$(stage_runtime_staged_copy_fresh "$STAGE" "$IN/system-knowhow" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -qi "system-knowhow dir not found"; then pass "missing live tree refused, never read as clean"; else fail "expected missing-live-tree refusal (rc=$rc): $out"; fi
 rm -rf "$IN" "$STAGE"
 

@@ -75,7 +75,7 @@ test.describe('side questions in a Claude Code thread', () => {
     await assertHealthy(page);
   });
 
-  test('a side question answers on a card and never enters the thread', async ({ page }) => {
+  test('a side question answers on a card and never enters the thread', { tag: '@real-claude-code' }, async ({ page }) => {
     const chatPosts: string[] = [];
     page.on('request', (req) => {
       if (req.method() === 'POST' && /\/api\/v1\/chat\b/.test(req.url())) chatPosts.push(req.url());

@@ -500,12 +500,13 @@ pub(super) async fn engine_changelog() -> Json<serde_json::Value> {
 /// `POST /api/v1/engine/rebuild` kicks off the dev background engine rebuild,
 /// the escape hatch behind the frontend "Rebuild & Switch" affordance. A wedged
 /// workspace (source behind HEAD with a stale binary) can then produce the new
-/// binary without a manual `web-dev.sh -b`. Coordinated and coalesced by
-/// `trigger_background_rebuild`, which holds the checkout-shared build lock.
-/// No-op packaged, and 202 regardless, so the caller is not error-handling a
-/// no-op. The resulting `version-status` `build_state` transitions drive the UI.
+/// binary without a manual `web-dev.sh -b`. It RESTARTS a build in flight,
+/// unlike an Apply, which joins one: this is the user's escape from a hung
+/// build (`restart_background_rebuild`, ADR 0412). No-op packaged, and 202
+/// regardless, so the caller is not error-handling a no-op. The resulting
+/// `version-status` `build_state` transitions drive the UI.
 pub(super) async fn engine_rebuild(State(state): State<AppState>) -> StatusCode {
-    state.engine.trigger_background_rebuild();
+    state.engine.restart_background_rebuild();
     StatusCode::ACCEPTED
 }
 

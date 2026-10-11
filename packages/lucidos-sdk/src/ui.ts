@@ -10,9 +10,9 @@ import {
   APPEARANCE_CHANNEL, EMPTY_THEME, FONT_FAMILY_STORAGE_KEY,
   THEME_EFFECTS_STORAGE_KEY, THEME_KEY, THEME_SEED_KEY, THEME_STORAGE_KEY, MORE_CONTRAST_QUERY,
   MOTION_STORAGE_KEY, REDUCED_MOTION_QUERY, REDUCED_TRANSPARENCY_QUERY, STYLE_OVERRIDES_STORAGE_KEY,
-  FONT_BOLD_ATTRIBUTE, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_ATTRIBUTE, THEME_MODE_BG, THEME_MODE_KEY,
+  FONT_BOLD_ATTRIBUTE, THEME_MODE_ATTRIBUTE, THEME_MODE_BG, THEME_MODE_KEY,
   THEME_MODE_STORAGE_KEY, UI_SCALE_STORAGE_KEY, WORKSPACE_FONT_SEED_KEY,
-  fontBoldMark, fontEntry, isFontId, isWorkspaceFontId, themeBackground, themeEffectsAttribute, themeTokenNames,
+  followSystemThemeMode, fontBoldMark, fontEntry, isFontId, isWorkspaceFontId, themeBackground, themeEffectsAttribute, themeTokenNames,
   motionAttribute, parseThemeEffects, parseMotion, resolveReducedThemeEffects,
   parseResolvedTheme, parseStyleOverrides, parseUiScale, parseWorkspaceFont, sanitizeAppearancePush,
   replaceInlineTokens, resolveFont, resolveThemeMode, sanitizeResolvedTheme, sanitizeWorkspaceFonts,
@@ -28,6 +28,7 @@ import { applyAutocorrectPreference } from './autocorrectStamp';
 import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
 import { disableTooltips } from './tooltip';
+import { focusedThread, onFocusedThreadChange } from './focusedThread';
 import type { NavigateTarget, NavigateUi } from './notifications';
 
 /** Params for `lucidos.ui.navigate`: the `NavigateUi` payload minus `target`,
@@ -60,7 +61,6 @@ let watchingPrefs = false;
 /** The theme mode PREFERENCE the last `applyPreferences()` settled on, which is what
  *  says whether this frame follows the OS at all. `null` until the first run. */
 let lastThemeModePreference: ThemeMode | null = null;
-let systemThemeModeSettleTimer: ReturnType<typeof setTimeout> | null = null;
 /** Kept alive for as long as its listener must be. See `watchPreferences`. */
 let systemThemeModeQuery: MediaQueryList | null = null;
 /** The motion preference at the last apply, so an OS flip can re-resolve it. */
@@ -640,27 +640,22 @@ export const ui = {
 
     // An OS light/dark flip under a `system` preference emits no
     // PreferencesChanged, so the media query and the resume events drive it
-    // instead. Both guards mirror the host shell, and both are load-bearing
-    // (`crates/lucidos-app/src/store/actions/preferences.ts` carries the full
-    // reasoning): an iOS snapshot pass announces an appearance that exists only
-    // while the app is backgrounded, and a resumed iOS PWA is never reloaded.
+    // instead. The follower and its guards are the host shell's own, and
+    // `crates/lucidos-app/src/store/actions/preferences.ts` carries the full
+    // reasoning.
     //
     // Sampling here rather than inside `applyPreferences` is what keeps a wake
     // that changed nothing free: `applyPreferences` fetches. A pushed frame
     // already holds everything it paints, so it repaints with no fetch at all.
-    const refreshSystemThemeMode = () => {
-      systemThemeModeSettleTimer = null;
-      if (currentThemeModePreference() !== 'system') return;
-      if (document.visibilityState !== 'visible') return;
-      const resolved = resolveThemeMode('system', osPrefersLight());
-      if (document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) === resolved) return;
-      if (hostAppearance) paint(hostAppearance);
-      else reapply();
-    };
-    const scheduleRefresh = () => {
-      if (systemThemeModeSettleTimer !== null) return;
-      systemThemeModeSettleTimer = setTimeout(refreshSystemThemeMode, SYSTEM_THEME_MODE_SETTLE_MS);
-    };
+    const { schedule: scheduleRefresh } = followSystemThemeMode({
+      visible: () => document.visibilityState === 'visible',
+      moved: () => currentThemeModePreference() === 'system'
+        && document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) !== resolveThemeMode('system', osPrefersLight()),
+      apply: () => {
+        if (hostAppearance) paint(hostAppearance);
+        else reapply();
+      },
+    });
     // Held in a variable rather than subscribed to inline. A `MediaQueryList`
     // with no strong reference has historically been collected in WebKit, which
     // takes its listener with it. `preferences.ts` keeps its own for the same
@@ -980,6 +975,23 @@ export const ui = {
       window.parent.postMessage({ type: 'lucidos:ui:preview-file', id, payload }, '*');
     });
   },
+
+  /**
+   * The id of the thread the user has open in the thread pane, or `null` on the
+   * empty compose view. A widget window floating over a thread reads that
+   * thread, not the widget's own. A compose draft and Home are threads too.
+   *
+   * An app or a panel in the Canvas pane leaves the value alone: the thread is
+   * still open beside it. Rejects with no host around the app (its own tab).
+   */
+  focusedThread,
+
+  /**
+   * Call `callback` with the new id (or `null`) each time the user opens
+   * another thread. Returns the unsubscribe. Subscribe BEFORE the first
+   * `focusedThread()` read, so no change can land between the two.
+   */
+  onFocusedThreadChange,
 
   /** Themed dropdown, replacing native `<select>` so popups can be styled. */
   Select,

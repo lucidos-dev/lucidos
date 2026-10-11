@@ -4,7 +4,8 @@ use crate::engine::agent_session::node_modules_setup::{
 use crate::engine::agent_session::prompts::{
     app_worktree_recovery_system_prompt, app_worktree_system_prompt, append_backend_rules,
     conflict_resolution_system_prompt, external_repo_recovery_system_prompt,
-    external_repo_system_prompt, recovery_system_prompt, worktree_system_prompt,
+    external_repo_system_prompt, file_link_rule, recovery_system_prompt,
+    standing_instruction_section, worktree_system_prompt,
 };
 use crate::engine::agent_session::spawn::{
     resolve_branch_for_resume, BranchResolution, FreshBranch,
@@ -749,6 +750,10 @@ impl LucidosEngine {
         // Codex session needs the CLI + question teaching just as much as a
         // fresh one.
         let system_prompt = append_backend_rules(system_prompt, coding_agent);
+        let system_prompt = format!(
+            "{system_prompt}{}",
+            file_link_rule(repo_id.as_deref(), app_spawn_id.as_deref(), &branch_name)
+        );
         // Every flavor talks to the same user. Read at spawn, so a change
         // reaches the next session rather than a running one.
         let literacy = crate::core::technical_literacy::read(&self.pool).await;
@@ -756,9 +761,18 @@ impl LucidosEngine {
             "{system_prompt}{}",
             crate::core::technical_literacy::coding_agent_section(literacy)
         );
+        // Callers write any turn start before the spawn, so this weighs the
+        // turn this session runs, as the 403 gate would.
+        let system_prompt = format!(
+            "{system_prompt}{}",
+            standing_instruction_section(&self.pool, thread_id).await
+        );
         // ADR 0362: on the Tree memory module the session starts from the
         // workspace memory view. Only this appended prompt changes (I15).
         let system_prompt = format!("{system_prompt}{}", self.coding_agent_memory().await);
+        // The same widgets section the chat agent reads, so a coding agent
+        // embeds widgets in its options and replies the same way (ADR 0415).
+        let system_prompt = format!("{system_prompt}{}", self.coding_agent_widgets());
         Ok(SpawnWorktreeContext {
             cwd,
             system_prompt,
@@ -774,6 +788,26 @@ impl LucidosEngine {
 }
 
 impl LucidosEngine {
+    /// The widgets section for a coding agent's appended prompt: the embed
+    /// rule and every built-in and reusable widget. A failed read leaves the
+    /// section without its list rather than failing the spawn.
+    fn coding_agent_widgets(&self) -> String {
+        let widgets = self
+            .app_manager
+            .list_reusable_widgets()
+            .unwrap_or_else(|e| {
+                log!(
+                    "[AgentSession] The reusable widgets could not be read: {}",
+                    e
+                );
+                Vec::new()
+            });
+        crate::engine::widget_guidance::build_widgets_section(
+            &widgets,
+            crate::engine::widget_guidance::WidgetAudience::CodingAgent,
+        )
+    }
+
     /// The workspace memory view section for a coding agent's appended
     /// prompt, or empty on Classic, or empty while
     /// `workspace_view_bytes_coding_agent` stays at its default of 0 (ADR

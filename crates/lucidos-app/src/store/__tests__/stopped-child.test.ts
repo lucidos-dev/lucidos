@@ -7,7 +7,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getExchanges, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
 import { exchangeStatus, isTurnlessBoundary, type ThreadEvent } from '../thread-events';
-import { threadNeedsAttention } from '../store';
+import { threadIsBlocked } from '../store';
 
 beforeEach(resetSeqCounter);
 
@@ -73,9 +73,26 @@ describe('a stopped child and the attention badge', () => {
     const thread = map.get(id)!;
     thread.meta.section = 'inbox';
     thread.meta.parentThreadId = 'parent';
-    expect(threadNeedsAttention(thread)).toBe(false);
+    expect(threadIsBlocked(thread)).toBe(false);
 
     thread.meta.isStoppedChild = true;
-    expect(threadNeedsAttention(thread)).toBe(true);
+    expect(threadIsBlocked(thread)).toBe(true);
+  });
+});
+
+describe('work held for hardening and the attention badge', () => {
+  it('counts a resting thread whose work waits on hardening as blocked', () => {
+    const { map, id } = makeThread('held', 'idle');
+    const thread = map.get(id)!;
+    thread.meta.section = 'inbox';
+    thread.meta.channel = 'claude_code';
+    thread.meta.codingAgentChangeState = { kind: 'unproposed', reason: 'turn_incomplete' };
+    expect(threadIsBlocked(thread)).toBe(false);
+
+    thread.meta.codingAgentChangeState = { kind: 'unproposed', reason: 'hardening_missing' };
+    expect(threadIsBlocked(thread)).toBe(true);
+
+    thread.meta.liveEventWaitCount = 1;
+    expect(threadIsBlocked(thread)).toBe(false);
   });
 });

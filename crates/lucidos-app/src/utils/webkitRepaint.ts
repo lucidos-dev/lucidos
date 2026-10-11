@@ -1,6 +1,7 @@
 import { isWebKit } from './platform';
-import { hasPendingEventScroll } from '../components/chat/scrollState';
+import { deepLinkHasResolved, hasPendingEventScroll } from '../components/chat/scrollState';
 import { isUserScrolling } from './scrollActivity';
+import { OPEN_REPAINT_BURST_DELAYS_MS } from './repaintBurst';
 
 /** Force WebKit to repaint a compositor layer whose backing texture it has
  *  blanked: the content is in the DOM but renders blank. WebKit stops
@@ -51,7 +52,7 @@ interface InFlightToggle {
   prev: string;
   /** "Should we nudge `scrollTop`?", decided ONCE at burst start and reused on
    *  every superseding call. So rAF1 (nudge) and rAF2 (restore) always agree
-   *  even though `hasPendingEventScroll()` can flip mid-burst. Never
+   *  even though the deep-link state can flip mid-burst. Never
    *  nudge-then-skip-restore or skip-then-restore. */
   nudgeScroll: boolean;
   /** The LIVE scrollTop this toggle's raf1 nudged FROM, and the value it nudged
@@ -202,6 +203,10 @@ export function settledScrollTop(el: HTMLElement): number {
   return el.scrollTop - repaintNudgeShift(el);
 }
 
+function deepLinkSeekingTarget(): boolean {
+  return hasPendingEventScroll() && !deepLinkHasResolved();
+}
+
 export function forceWebKitRepaint(el: HTMLElement | null | undefined): (() => void) | undefined {
   if (!el?.isConnected || !isWebKit()) return;
 
@@ -219,15 +224,18 @@ export function forceWebKitRepaint(el: HTMLElement | null | undefined): (() => v
   const prev = existing ? existing.prev : el.style.transform;
   // Decide ONCE at burst start whether to nudge `scrollTop`, and reuse that
   // decision on every superseding call so rAF1 and rAF2 always agree. Three
-  // gates. The element must be scrollable. No notification deep-link scroll
-  // claim may be in flight: this fires on the same iOS resume signals a
-  // notification-tap foreground triggers, and a nudge would fight
-  // scrollToEventAndPulse's landing. And no user drag or momentum scroll may
-  // be in flight, since iOS cancels a fling on ANY scrollTop write. The
-  // transform round-trip and forced layout read below repaint regardless.
+  // gates. The element must be scrollable. No notification deep link may still
+  // be looking for its target, because a nudge then would race its landing.
+  // And no user drag or momentum scroll may be in flight, since iOS cancels a
+  // fling on ANY scrollTop write. The transform round-trip and forced layout
+  // read below repaint regardless.
+  //
+  // The deep-link gate ends at the resolve, not at the claim's release. The
+  // claim stays held for seconds after the landing. A landing that moved
+  // nothing re-committed nothing, and only the nudge can.
   const nudgeScroll = existing
     ? existing.nudgeScroll
-    : el.scrollHeight > el.clientHeight && !hasPendingEventScroll() && !isUserScrolling();
+    : el.scrollHeight > el.clientHeight && !deepLinkSeekingTarget() && !isUserScrolling();
 
   if (existing) {
     cancelAnimationFrame(existing.raf1);
@@ -296,19 +304,6 @@ export function forceWebKitRepaint(el: HTMLElement | null | undefined): (() => v
     done();
   };
 }
-
-/** Delays (ms) for the thread-OPEN repaint burst: an immediate toggle plus
- *  setTimeout-spaced retries. setTimeout rather than chained rAFs is
- *  load-bearing, because it survives the frame coalescing that can swallow a
- *  one-shot toggle on a cold open. The span also covers a layer that blanks a
- *  beat AFTER the initial paint.
- *
- *  The tail reaches 1000ms because a long-lived iOS PWA session degrades:
- *  WKWebView blanks an already-loaded thread's layer noticeably later than a
- *  cold open does. Each attempt is a full supersede-safe toggle, so they never
- *  accumulate and cost nothing on a healthy layer. Exported for the invariant
- *  test. */
-export const OPEN_REPAINT_BURST_DELAYS_MS = [0, 100, 300, 600, 1000];
 
 /** Drop-resilient repaint for the thread-OPEN path. The streaming path re-fires
  *  on a trailing throttle and the resume path on visibilitychange / pageshow /

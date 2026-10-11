@@ -8,7 +8,6 @@ import { fileURLToPath } from 'node:url';
 import {
     INITIAL_WINDOW,
     MAX_FILL_EXPANSIONS,
-    SCROLLABLE_SLACK_PX,
     STEP_BUDGET,
     WINDOW_STEP,
     ROW_BUDGET,
@@ -33,7 +32,6 @@ import {
     scrollToTopNeedsRenderAll,
     reseedOnReopen,
     fillAction,
-    transcriptScrolls,
     MAX_FILL_BACKFILLS,
     EMPTY_FILL_LEDGER,
     chargeFillRound,
@@ -43,6 +41,7 @@ import {
     type FillLedger,
     type WindowEdge,
 } from './threadWindow';
+import { SCROLLABLE_SLACK_PX, transcriptScrolls } from './transcriptScrolls';
 
 /** `n` exchanges each costing `cost` steps. */
 const flat = (n: number, cost: number): number[] => Array.from({ length: n }, () => cost);

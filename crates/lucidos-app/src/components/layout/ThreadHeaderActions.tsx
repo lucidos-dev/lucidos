@@ -8,6 +8,7 @@ import { focusSearchInput } from '../search/searchEverywhereActions';
 import { ComposeIcon, HelpIcon, HomeIcon, SearchIcon } from '../shared/icons';
 import { CollapsingActions, renderHeaderAction, type HeaderActionSpec } from './headerActions';
 import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
+import { useHomeWidgetsPress } from '../widgets/HomeWidgetsMenu';
 
 /** The boxes the thread row's collapse is measured against: the region, and the
  *  brand cluster centred on it. The room these actions have is half of what
@@ -83,10 +84,10 @@ export function threadHeaderActions(): HeaderActionSpec[] {
   return actions;
 }
 
-/** The Home action, which leads the desktop thread pane's header rather than
- *  joining the trailing cluster. Home has no row in the thread list, so this is
- *  the way to it. Present only while the experimental switch is on and the
- *  thread exists. */
+/** The Home action. It leads the desktop thread pane's header rather than
+ *  joining the trailing cluster, and pairs with the mark on the phone's.
+ *  Home has no row in the thread list, so this is the way to it. Present once
+ *  the thread list carries it. */
 export function threadHeaderHomeAction(): HeaderActionSpec | null {
   if (!homeThreadId.value) return null;
   return {
@@ -98,11 +99,46 @@ export function threadHeaderHomeAction(): HeaderActionSpec | null {
   };
 }
 
-/** The leading control of the DESKTOP thread pane's header. It never folds:
- *  the brand cluster's reserve and the pane's floor both count its box. */
+/** Home as a header icon. On desktop it leads the thread pane's row and never
+ *  folds: the brand cluster's reserve and the pane's floor both count its box.
+ *  On the phone it sits beside the mark (`MobileThreadHeader`). */
 export function ThreadHeaderHomeButton() {
   const home = threadHeaderHomeAction();
-  return home ? renderHeaderAction(home) : null;
+  return home ? <HomeButtonWithWidgets home={home} /> : null;
+}
+
+/** A tap opens Home; a hover, a hold or a right-click lists Home's widgets,
+ *  and so does a tap in Home. The list stands in for a tooltip, so the button
+ *  carries none. The menu is portaled, so the button stays its row's direct
+ *  child, which the header's layout rules select on. */
+function HomeButtonWithWidgets({ home }: { home: HeaderActionSpec }) {
+  const { press, hover, menu } = useHomeWidgetsPress((e) => home.onClick?.(e), { homeIcon: true });
+  return (
+    <>
+      {renderHeaderAction({
+        ...home,
+        render: (attrs) => (
+          <button
+            {...attrs}
+            type="button"
+            class={`icon-btn header-icon ${home.extraClass}`}
+            aria-label={home.label}
+            onPointerEnter={hover.onPointerEnter}
+            onPointerDown={(e) => { hover.onPointerDown(); press.onPointerDown(e); }}
+            onPointerMove={press.onPointerMove}
+            onPointerUp={press.onPointerUp}
+            onPointerLeave={(e) => { hover.onPointerLeave(); press.onPointerLeave(e); }}
+            onPointerCancel={press.onPointerCancel}
+            onContextMenu={(e) => { if (!e.altKey) press.onContextMenu(e); }}
+            onClick={press.onClick}
+          >
+            {home.icon()}
+          </button>
+        ),
+      })}
+      {menu}
+    </>
+  );
 }
 
 /**

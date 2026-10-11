@@ -142,6 +142,7 @@ fn context_captured_event_type_and_persistence() {
         api_call_id: None,
         reasoning_effort: None,
         duration_ms: None,
+        served_model: Some("claude-opus-4-7-20260101".to_string()),
     };
     assert_eq!(event.event_type(), "ContextCaptured");
     assert!(event.is_persisted());
@@ -159,6 +160,7 @@ fn context_captured_event_type_and_persistence() {
     assert_eq!(serialized["usage"]["output_tokens"], 678);
     assert_eq!(serialized["usage"]["cache_read_tokens"], 10_000);
     assert_eq!(serialized["usage"]["cache_creation_tokens"], 200);
+    assert_eq!(serialized["served_model"], "claude-opus-4-7-20260101");
 
     // Pre-call capture: usage absent, content omitted (capture_context off).
     let pre_call_json = r#"{
@@ -215,6 +217,7 @@ fn a_capture_row_without_the_new_keys_reads_as_a_turn() {
         purpose,
         reconstructed,
         sections,
+        served_model,
         ..
     } = parsed
     else {
@@ -222,6 +225,7 @@ fn a_capture_row_without_the_new_keys_reads_as_a_turn() {
     };
     assert_eq!(purpose, crate::engine::ContextPurpose::Turn);
     assert!(!reconstructed, "a recorded row is not a reconstruction");
+    assert_eq!(served_model, None, "an old row names no served model");
     // The stored value always was the delta, so the alias puts it where a
     // delta belongs. Nobody measured the region, so that stays unknown.
     assert_eq!(sections[0].budget_delta_chars, 500);
@@ -277,10 +281,12 @@ fn a_turn_capture_writes_neither_new_key() {
         api_call_id: None,
         reasoning_effort: None,
         duration_ms: None,
+        served_model: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert!(json.get("purpose").is_none());
     assert!(json.get("reconstructed").is_none());
+    assert!(json.get("served_model").is_none());
 }
 
 /// An auxiliary row does write the key, which is what the transcript filter
@@ -578,6 +584,7 @@ fn is_per_token_streaming_blocks_text_chunk_variants() {
         text: String::new(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         parent_tool_use_id: None,
+        progress_note: false,
     }
     .is_per_token_streaming());
 }
@@ -595,6 +602,7 @@ fn is_per_token_streaming_allows_per_action_lifecycle_and_blocking_request_varia
         options: Vec::new(),
         worktree_path: None,
         multi_select: false,
+        owner_approval: None,
     }
     .is_per_token_streaming());
     assert!(!ThreadEvent::CodingAgentPermissionRequest {
@@ -763,4 +771,46 @@ fn a_voice_session_moves_neither_status_nor_section() {
         classify_event("VoiceSessionEnded"),
         Some(EventClass::Metadata)
     );
+}
+
+/// Invariant 3 of the widgets plan: the transcript stores only the app id. A
+/// widget's HTML and data stay in `data/apps/<id>/` (ADR 0402).
+#[test]
+fn widget_events_carry_the_app_id_and_nothing_else() {
+    let events = [
+        (
+            ThreadEvent::WidgetShown {
+                app_id: "fare-grid".into(),
+                params: None,
+                label: None,
+            },
+            "WidgetShown",
+        ),
+        (
+            ThreadEvent::WidgetPinned {
+                app_id: "fare-grid".into(),
+                params: None,
+                label: None,
+            },
+            "WidgetPinned",
+        ),
+        (
+            ThreadEvent::WidgetUnpinned {
+                app_id: "fare-grid".into(),
+                params: None,
+                label: None,
+            },
+            "WidgetUnpinned",
+        ),
+    ];
+    for (evt, name) in events {
+        let v = serde_json::to_value(&evt).unwrap();
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 2, "{name} payload is type plus app_id: {v}");
+        assert_eq!(v["type"], name);
+        assert_eq!(v["app_id"], "fare-grid");
+        let back: ThreadEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back.event_type(), name);
+        assert!(evt.is_persisted());
+    }
 }

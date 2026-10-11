@@ -12,6 +12,8 @@ use axum::routing::{get, post, put};
 use axum::Router;
 use uuid::Uuid;
 
+use crate::engine::thread_lifecycle::ChangeStateKind;
+
 mod actions;
 pub(crate) mod archive;
 pub(crate) mod archive_all;
@@ -22,12 +24,13 @@ mod events_snapshot;
 mod family;
 mod follow_up;
 mod list;
+mod read_request;
 mod search;
 
 // Handler functions consumed by the router and the SearchEverywhere endpoint.
 pub(super) use actions::{
-    answer_thread_question, continue_thread, get_thread_messages, rename_thread, save_thread,
-    suggest_title, unsave_thread,
+    answer_thread_question, continue_thread, get_thread_messages, harden_thread, rename_thread,
+    save_thread, suggest_title, unsave_thread,
 };
 pub(super) use archive::archive_thread;
 pub(super) use events_snapshot::{
@@ -39,6 +42,11 @@ pub(super) use list::{
     get_thread_summary, list_drafts, list_held_messages, list_thread_summaries, list_threads,
 };
 pub(super) use search::search_threads;
+
+/// Parse a `:thread_id` path segment, refusing a malformed one with a 400.
+fn parse_thread_id(raw: &str) -> Result<Uuid, (StatusCode, String)> {
+    Uuid::parse_str(raw).map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))
+}
 
 /// Extract a `thread_id` UUID from a JSON body that uses the
 /// `{"thread_id": "<uuid>"}` shape. Used by save/unsave/rename/archive handlers.
@@ -56,7 +64,8 @@ struct ThreadActionFacts {
     is_coding_agent: bool,
     status: String,
     archive_state: String,
-    coding_agent_proposed: bool,
+    coding_agent_change_state: ChangeStateKind,
+    coding_agent_is_external_repo: bool,
     blocking_descendant_count: i32,
     live_event_wait_count: i32,
     is_saved: bool,
@@ -75,10 +84,11 @@ pub(in crate::api) async fn available_thread_actions_for(
     thread_id: Uuid,
 ) -> Result<Vec<crate::engine::thread_lifecycle::Action>, sqlx::Error> {
     use crate::engine::thread_lifecycle::{
-        available_thread_actions, ArchiveState, ThreadStatus, ThreadType,
+        available_thread_actions, ArchiveState, ChangeWork, ThreadStatus, ThreadType,
     };
     let facts: Option<ThreadActionFacts> = sqlx::query_as(
-        "SELECT is_coding_agent, status, archive_state, coding_agent_proposed,
+        "SELECT is_coding_agent, status, archive_state, coding_agent_change_state,
+                coding_agent_is_external_repo,
                 blocking_descendant_count, live_event_wait_count,
                 is_saved, compose_text, compose_images
          FROM thread_summaries WHERE thread_id = $1",
@@ -100,13 +110,18 @@ pub(in crate::api) async fn available_thread_actions_for(
             .as_ref()
             .unwrap_or(&serde_json::Value::Null),
     );
+    let holds_live_wait = f.live_event_wait_count > 0;
+    // Held work outranks Archive the way a proposed change does (ADR 0395).
+    // An external repo never proposes, so its diff holds nothing back.
+    let has_change_work = !f.coding_agent_is_external_repo
+        && ChangeWork::of(f.coding_agent_change_state, holds_live_wait) != ChangeWork::None;
     Ok(available_thread_actions(
         thread_type,
         ThreadStatus::parse(&f.status),
         ArchiveState::parse(&f.archive_state),
-        f.coding_agent_proposed,
+        has_change_work,
         f.blocking_descendant_count > 0,
-        f.live_event_wait_count > 0,
+        holds_live_wait,
         has_unsent_draft,
         f.is_saved,
     ))
@@ -155,6 +170,7 @@ pub(super) fn router() -> Router<super::AppState> {
             get(get_thread_events_snapshot),
         )
         .route("/threads/:thread_id/continue", post(continue_thread))
+        .route("/threads/:thread_id/harden", post(harden_thread))
         .route(
             "/threads/:thread_id/event-waits",
             post(actions::register_thread_event_wait).get(actions::list_thread_event_waits),
@@ -171,6 +187,16 @@ pub(super) fn router() -> Router<super::AppState> {
         .route(
             "/threads/:thread_id/event-waits/:wait_id/cancel",
             post(actions::cancel_thread_event_wait),
+        )
+        // A coding agent asking for its own reply to be read (ADR 0409), and
+        // the drawer reporting that the user saw it.
+        .route(
+            "/threads/:thread_id/read-request",
+            post(read_request::request_thread_read),
+        )
+        .route(
+            "/threads/:thread_id/read-request/seen",
+            post(read_request::mark_thread_reply_seen),
         )
         .route(
             "/threads/:thread_id/background-tasks",

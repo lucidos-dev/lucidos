@@ -60,9 +60,21 @@ pub(crate) enum Reported<'a> {
     Usage(Option<ProviderUsage>),
 }
 
+impl Reported<'_> {
+    /// The *served model* a chat reply named. Every other shape already
+    /// reports the serving model as the call's `model`.
+    pub(crate) fn served_model(&self) -> Option<&str> {
+        match self {
+            Self::Chat(response) => response.served_model.as_deref(),
+            Self::Judgment(_) | Self::Image { .. } | Self::Usage(_) => None,
+        }
+    }
+}
+
 /// What one call cost.
 pub(crate) struct CallCost<'a> {
-    /// The model that served the call.
+    /// The model the call asked for. A chat reply names the one that served
+    /// it in [`Reported::served_model`].
     pub(crate) model: &'a str,
     /// The size of what was sent. A chat call is sized by
     /// `engine::context::request_chars`, the same count a turn's budget uses.
@@ -103,8 +115,9 @@ async fn within<T>(
 /// Make one chat call and record what it cost.
 ///
 /// The cost names the model the selection pins, else the provider's default,
-/// and the tier and time the call took. A failed call reported nothing, so it
-/// records nothing.
+/// and the tier the call went out at and the time it took. Both are read after
+/// the call, since an auxiliary call can move off a not-served model. A failed
+/// call reported nothing, so it records nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat<P: LlmProvider + ?Sized>(
     sink: &dyn CostSink,
@@ -116,11 +129,6 @@ pub(crate) async fn chat<P: LlmProvider + ?Sized>(
     system_prompt: Option<&str>,
     on_token: Option<TokenCallback>,
 ) -> Result<LlmResponse, BoxError> {
-    let model = selection
-        .model
-        .unwrap_or(provider.default_model())
-        .to_string();
-    let effort = selection.reasoning_effort.map(str::to_string);
     let started = std::time::Instant::now();
     let call = provider.chat(
         messages,
@@ -131,6 +139,11 @@ pub(crate) async fn chat<P: LlmProvider + ?Sized>(
         CallToken::mint(),
     );
     let response = within(sink, call).await?;
+    let model = selection
+        .model
+        .unwrap_or(provider.default_model())
+        .to_string();
+    let effort = provider.effort_sent(&selection);
     sink.record(CallCost {
         model: &model,
         request_chars,

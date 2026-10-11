@@ -99,14 +99,18 @@ impl LucidosEngine {
     /// workspace's secrets. A task it starts through the engine must not
     /// either, or the route would hand them over. The compile env follows the
     /// agent's rule, so a build that works in its shell works here too.
-    pub(crate) async fn build_agent_task_env_vars(&self, thread_id: Uuid) -> Vec<(String, String)> {
+    pub(crate) async fn build_agent_task_env_vars(
+        &self,
+        thread_id: Uuid,
+        worktree: &std::path::Path,
+    ) -> Vec<(String, String)> {
         let depth =
             crate::scheduler::user_tasks::chain_depth_for_thread(thread_id).unwrap_or_default();
         let mut env_vars = self
             .build_env_without_secrets(Some(thread_id), depth, None)
             .await;
         env_vars.extend(
-            crate::runtime::spawn_env::agent_compile_env()
+            crate::runtime::spawn_env::agent_compile_env(worktree)
                 .into_iter()
                 .map(|(key, value)| (key.to_string(), value)),
         );

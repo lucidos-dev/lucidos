@@ -51,7 +51,6 @@ vi.mock('../../api/threads', async (importOriginal) => ({
 vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../components/chat/promptFocus')>()),
   focusPromptNow: vi.fn(),
-  composeHandlers: vi.fn(),
 }));
 
 /** Nothing to warn about, nothing blocking: the plain dialog. */

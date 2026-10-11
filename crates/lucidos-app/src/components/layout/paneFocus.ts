@@ -36,9 +36,7 @@ function canTakeFocus(el: HTMLElement): boolean {
 }
 
 /** Tabbable elements within `container`, in DOM order. The container comes
- *  first when it is a tab stop itself: the thread drawer is one (`tabindex=0`),
- *  while `.pane-thread` / `.pane-content` are `tabindex=-1`. Exported for unit
- *  testing. */
+ *  first when it is a tab stop itself. Exported for unit testing. */
 export function visibleFocusables(container: HTMLElement): HTMLElement[] {
   const self = container.matches(FOCUSABLE) ? [container] : [];
   return [...self, ...container.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(canTakeFocus);
@@ -70,9 +68,8 @@ export function focusIntoPane(el: HTMLElement | null): void {
  *  when the focused-pane marker points at the pane, so native scroll keys (Arrow/Page/
  *  Home/End/Space) and the pane's own keydown nav act on it. thread → the
  *  transcript scroll region; content → the content-body scroller; drawer → the
- *  drawer container (its ↑/↓/Enter list-nav keydown handler lives on it). For the
- *  drawer the selector IS the pane container itself, so `paneScrollRegion` matches
- *  it via `container.matches(...)` rather than a descendant query.
+ *  drawer's tree (its ↑/↓/Enter list-nav keydown handler lives on it). The tree
+ *  is inside the drawer pane, never the pane itself.
  *
  *  The thread selector is scoped to `.thread-view .thread-content` on purpose:
  *  only a REAL thread (ThreadView, loading or loaded) renders `.thread-content`
@@ -84,7 +81,7 @@ export function focusIntoPane(el: HTMLElement | null): void {
  *  `.thread-view`) so the mover retries until its `tabindex=0` version mounts.
  *  Exported for the region-map unit test. */
 export const PANE_FOCUS_REGION: Record<FocusedPane, string> = {
-  drawer: '.thread-drawer',
+  drawer: '.thread-drawer-list > .thread-drawer-tree',
   thread: '.thread-view .thread-content',
   content: '.content-pane-body',
 };
@@ -114,17 +111,14 @@ const RECONCILE_MAX_FRAMES = 30;
 
 /** The pane's SCROLL surface if it's present and laid out, else null. This is the
  *  element native Arrow/Page/Home/End keys should scroll (thread → transcript,
- *  content → body scroller) or the drawer whose keydown list-nav needs focus.
+ *  content → body scroller) or the drawer tree whose keydown list-nav needs focus.
  *  For a real thread it returns even the loading-state `.thread-content` (a box
  *  with no tabindex yet) so the caller retries until the focusable one mounts; it
  *  returns null for the compose/welcome view (its `.thread-content` isn't inside a
  *  `.thread-view`, so the selector excludes it) so the caller falls back to the
  *  prompt (force) or leaves focus alone (gentle) instead of retrying forever. */
 function paneScrollRegion(pane: FocusedPane, container: HTMLElement): HTMLElement | null {
-  const selector = PANE_FOCUS_REGION[pane];
-  const region = container.matches(selector)
-    ? container
-    : container.querySelector<HTMLElement>(selector);
+  const region = container.querySelector<HTMLElement>(PANE_FOCUS_REGION[pane]);
   // A collapsed/hidden region (ratio 0/1, or the inactive dual-mount copy) has no
   // box — treat it as absent so we don't strand focus on an off-screen element.
   return region && region.getClientRects().length > 0 ? region : null;

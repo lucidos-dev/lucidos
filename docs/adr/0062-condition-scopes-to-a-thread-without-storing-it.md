@@ -71,9 +71,13 @@ prevent.
   thread on the live path alone would recreate the live-versus-replay split this
   decision closes. If a workspace's own `emit_event` should record its calling
   thread, that is a change to the event, not to the matcher.
-- **`EventMeta` fields stay unconditionable**, one step further out for the same
-  reason: `EmittedEvent` does not carry the meta to live subscribers, so `actor`
-  and `channel` could only ever be matched on replay.
+- **`EventMeta` fields are conditionable, on both paths.** This bullet first
+  said they stay unconditionable because `EmittedEvent` does not carry the meta
+  live. That premise was false: `BusEvent::Thread` carries `meta`, and the bus
+  persists the row from that same value. The replay paths read `channel`,
+  `actor` and `request_event_id` from the stored payload, so a condition on them
+  matched on replay and never live. `matchable_thread_payload` now takes the
+  carrier's meta, and the live view equals the stored one.
 - **One exception to the live/replay parity, and it is deliberate.**
   `EventBus::replay_historical_event` writes a row that carries a `thread_id`
   and broadcasts it as a system `DomainEvent`, because a backfilled historical

@@ -6,6 +6,7 @@ import {
   claimsHorizontalPan,
   horizontalDragClaimed,
   installAppPaneSwipe,
+  pageScrollsSideways,
   trackPaneSwipe,
   type DragNode,
   type PaneSwipeEnv,
@@ -100,9 +101,11 @@ describe('horizontalDragClaimed', () => {
 function touch(
   type: string,
   points: Array<[number, number]>,
-  opts: { target?: DragNode; prevented?: boolean; cancelable?: boolean; frameShift?: number } = {},
+  opts: { target?: DragNode; prevented?: boolean; cancelable?: boolean; frameShift?: number; scripted?: boolean } = {},
 ): Event {
   const e = new Event(type, { cancelable: opts.cancelable ?? true });
+  // A synthetic Event is untrusted; stand in for the user's own touch.
+  Object.defineProperty(e, 'isTrusted', { value: !opts.scripted });
   const shift = opts.frameShift ?? 0;
   const touches = points.map(([screenX, screenY]) => ({ screenX, screenY, clientX: screenX - shift, clientY: screenY }));
   Object.defineProperty(e, 'touches', { value: touches });
@@ -119,6 +122,7 @@ describe('trackPaneSwipe', () => {
     const cleanup = trackPaneSwipe(surface, { onDrag, onRelease }, {
       paneWidth: () => 300,
       textFieldFocused: () => false,
+      pageScrollsSideways: () => false,
       styleOf,
       ...env,
     });
@@ -161,7 +165,7 @@ describe('trackPaneSwipe', () => {
     const t = setup();
     t.start([200, 100]);
     t.move([100, 100]);
-    t.surface.dispatchEvent(new Event('pagehide'));
+    t.surface.dispatchEvent(touch('pagehide', []));
     expect(t.onRelease).toHaveBeenCalledExactlyOnceWith(0);
   });
 
@@ -215,6 +219,41 @@ describe('trackPaneSwipe', () => {
     t.surface.dispatchEvent(touch('touchstart', [[200, 100]], { target: chain({}), prevented: true }));
     t.move([50, 100]);
     expect(t.onDrag).not.toHaveBeenCalled();
+  });
+
+  it('posts nothing for a scripted touch', () => {
+    const t = setup();
+    t.surface.dispatchEvent(touch('touchstart', [[200, 100]], { target: chain({}), scripted: true }));
+    t.move([50, 100]);
+    t.release();
+    expect(t.onDrag).not.toHaveBeenCalled();
+    expect(t.onRelease).not.toHaveBeenCalled();
+  });
+
+  it('lets no scripted touch steer, end or cancel a live drag', () => {
+    const t = setup();
+    t.start([200, 100]);
+    t.move([190, 100]);
+    t.onDrag.mockClear();
+    for (const type of ['touchmove', 'touchend', 'touchcancel', 'pagehide']) {
+      t.surface.dispatchEvent(touch(type, [[50, 100]], { scripted: true }));
+    }
+    t.surface.dispatchEvent(touch('touchstart', [[10, 100]], { target: chain({}), scripted: true }));
+    expect(t.onDrag).not.toHaveBeenCalled();
+    expect(t.onRelease).not.toHaveBeenCalled();
+    t.move([50, 100]);
+    t.release();
+    expect(t.onDrag).toHaveBeenLastCalledWith(-142);
+    expect(t.onRelease).toHaveBeenCalledWith(1);
+  });
+
+  it('leaves every sideways drag to a page that pans sideways', () => {
+    const t = setup({ pageScrollsSideways: () => true });
+    t.start([200, 100]);
+    t.move([50, 100]);
+    t.release();
+    expect(t.onDrag).not.toHaveBeenCalled();
+    expect(t.onRelease).not.toHaveBeenCalled();
   });
 
   it('snaps back when the app claims the drag midway', () => {
@@ -288,5 +327,31 @@ describe('installAppPaneSwipe', () => {
     cleanup = installAppPaneSwipe();
     expect(add).not.toHaveBeenCalled();
     add.mockRestore();
+  });
+});
+
+describe('pageScrollsSideways', () => {
+  const el = (overflowX: string) => ({ overflowX }) as unknown as Element;
+  const page = (scrollWidth: number, root = el('visible'), body = el('visible')) => ({
+    scrollingElement: { scrollWidth, clientWidth: 300 },
+    documentElement: root,
+    body,
+  });
+  const overflowXOf = (e: Element) => (e as unknown as { overflowX: string }).overflowX;
+
+  it('reads a page wider than its frame as panning', () => {
+    expect(pageScrollsSideways(page(1000), overflowXOf)).toBe(true);
+  });
+
+  it('reads a page that fits as not panning', () => {
+    expect(pageScrollsSideways(page(300), overflowXOf)).toBe(false);
+    expect(pageScrollsSideways({ scrollingElement: null, documentElement: null, body: null }, overflowXOf)).toBe(false);
+  });
+
+  it('reads a root or body that hides its sideways overflow as not panning', () => {
+    for (const hidden of ['hidden', 'clip']) {
+      expect(pageScrollsSideways(page(1000, el(hidden)), overflowXOf)).toBe(false);
+      expect(pageScrollsSideways(page(1000, el('visible'), el(hidden)), overflowXOf)).toBe(false);
+    }
   });
 });

@@ -4,7 +4,7 @@ import type { ThreadMeta, ThreadState } from '../thread-events';
 import type { Change } from '../../api/client';
 import { makeThreadState } from './threads-test-helpers';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
-import { resolveThreadActions, resolveChangeMenuActions, nextCloseLayer, runCloseCascade, discardDraft, APPLY_INCOMPLETE_CONFIRM, type TaggedAction } from './threadActions';
+import { resolveThreadActions, resolveChangeMenuActions, nextCloseLayer, runCloseCascade, discardDraft, type TaggedAction } from './threadActions';
 import { ARCHIVE_PINNED_CONFIRM } from './threads';
 import {
   pushOverlay,
@@ -75,9 +75,33 @@ describe('resolveThreadActions', () => {
     expect(kinds(resolveThreadActions('t1'))).toEqual(['archive', 'unsave']);
   });
 
+  // ADR 0395: a coding agent parked on an event wait with an unproposed diff
+  // holds its proposal. That work outranks Archive the way a proposed change
+  // did, so the thread keeps only the standing apply and the pin.
+  it('a parked coding-agent thread with held work is not offered Archive', () => {
+    setThread(makeThreadState('t1', {
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'unproposed', reason: null }, liveEventWaitCount: 1 },
+    }));
+    expect(kinds(resolveThreadActions('t1'))).toEqual(['apply_when_settled', 'save']);
+  });
+
+  it('a parked external-repo coding-agent thread with a diff keeps Archive', () => {
+    setThread(makeThreadState('t1', {
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentKind: 'external', codingAgentChangeState: { kind: 'unproposed', reason: null }, liveEventWaitCount: 1 },
+    }));
+    expect(kinds(resolveThreadActions('t1'))).toContain('archive');
+  });
+
+  it('a parked coding-agent thread with no diff keeps Archive', () => {
+    setThread(makeThreadState('t1', {
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'none' }, liveEventWaitCount: 1 },
+    }));
+    expect(kinds(resolveThreadActions('t1'))).toContain('archive');
+  });
+
   it('CC thread with a pending change → Discard (close) + Apply (primary) + Set aside + Pin', () => {
     setThread(makeThreadState('t1', {
-      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
     const actions = resolveThreadActions('t1');
@@ -91,7 +115,7 @@ describe('resolveThreadActions', () => {
   // pending list, and then Apply and Discard show but Set aside waits.
   it('offers no Set aside until the pending list names the change', () => {
     setThread(makeThreadState('t1', {
-      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
     }));
     changes.value = { status: 'loaded', data: [] };
     expect(kinds(resolveThreadActions('t1'))).toEqual(['discard', 'apply', 'save']);
@@ -103,7 +127,7 @@ describe('resolveThreadActions', () => {
   // apply in their place: the wait ends by itself (ADR 0266).
   it('a running sub-thread does not withhold Apply or Discard; an event wait swaps them for the standing apply', () => {
     const parent = makeThreadState('t1', {
-      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true, activeChildrenCount: 2 },
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, activeChildrenCount: 2 },
     });
     setThread(parent);
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
@@ -117,7 +141,7 @@ describe('resolveThreadActions', () => {
 
   it('Apply gets a compact "Apply*" marker for a restart-requiring change (restart is the separate switch)', () => {
     setThread(makeThreadState('t1', {
-      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1', { requires_restart: true })] };
     const apply = resolveThreadActions('t1').find((a) => a.kind === 'apply');
@@ -130,13 +154,13 @@ describe('resolveThreadActions', () => {
   });
 
   it('external-repo CC swaps the change layer for Archive', () => {
-    // External-repo: coding_agent_proposed=true but no pending changes row.
+    // External-repo: the thread reads proposed but has no pending changes row.
     setThread(makeThreadState('t1', {
       meta: {
         channel: 'claude_code',
         section: 'inbox',
         status: 'idle',
-        codingAgentProposed: true,
+        codingAgentChangeState: { kind: 'proposed', requires_restart: false },
         codingAgentIsExternalRepo: true,
       },
     }));
@@ -196,7 +220,7 @@ describe('resolveThreadActions', () => {
           channel: 'claude_code',
           section: 'inbox',
           status: 'running',
-          codingAgentProposed: false,
+          codingAgentChangeState: { kind: 'none' },
           codingAgentKind: 'external',
         },
       }));
@@ -240,7 +264,7 @@ describe('resolveThreadActions', () => {
 describe('resolveChangeMenuActions', () => {
   function proposedCcThread(extra: Partial<ThreadMeta> = {}): void {
     setThread(makeThreadState('t1', {
-      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true, ...extra },
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, ...extra },
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
   }
@@ -334,7 +358,7 @@ describe('runCloseCascade no-op gates', () => {
     // A thread with a pending change would normally open the change choice, but
     // an in-flight apply must gate the cascade to a no-op (async bridge).
     setThread(makeThreadState('t1', {
-      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
     focusedThreadId.value = 't1';
@@ -359,7 +383,7 @@ describe('runCloseCascade no-op gates', () => {
 
   it('opens the apply/discard choice for a thread with a pending change', async () => {
     setThread(makeThreadState('t1', {
-      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
     focusedThreadId.value = 't1';
@@ -372,26 +396,6 @@ describe('runCloseCascade no-op gates', () => {
     expect(confirmState.value.okLabel).toBe('Apply');
     expect(confirmState.value.extraAction?.label).toBe('Discard');
     confirmState.value.resolve?.(false);
-  });
-});
-
-describe('the close shortcut on incomplete work', () => {
-  it('asks the incomplete confirm after the apply/discard choice', async () => {
-    setThread(makeThreadState('t1', {
-      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentProposed: true },
-    }));
-    changes.value = { status: 'loaded', data: [pendingChangeRow('t1', { incomplete: true })] };
-    focusedThreadId.value = 't1';
-
-    const pending = runCloseCascade();
-    await Promise.resolve();
-    confirmState.value.resolve?.(true);
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(confirmState.value.visible).toBe(true);
-    expect(confirmState.value.message).toBe(APPLY_INCOMPLETE_CONFIRM);
-    confirmState.value.resolve?.(false);
-    await pending;
   });
 });
 

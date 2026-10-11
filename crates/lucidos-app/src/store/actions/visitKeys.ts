@@ -2,7 +2,7 @@
  *
  *  A notification's tap names a destination as a `NavigateUi`. The shell names
  *  where the reader currently is from its own signals. The *seen target* rule
- *  (`notification-visit.ts`) compares the two, so a place they spell differently
+ *  (`seen-target.ts`) compares the two, so a place they spell differently
  *  is a notification that never clears. The constructors below are the only
  *  place either spelling is written, which is what makes them agree.
  *

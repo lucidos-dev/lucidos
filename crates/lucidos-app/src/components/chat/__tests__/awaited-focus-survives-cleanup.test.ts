@@ -10,7 +10,7 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const threadView = readFileSync(resolve(here, '../ThreadView.tsx'), 'utf-8');
 const threads = readFileSync(resolve(here, '../../../store/actions/threads.ts'), 'utf-8');
 const pluginInstall = readFileSync(resolve(here, '../../../store/actions/plugin-install.ts'), 'utf-8');
-const storeTab = readFileSync(resolve(here, '../../plugins/StoreTab.tsx'), 'utf-8');
+const storeTab = readFileSync(resolve(here, '../../plugins/pluginCard.tsx'), 'utf-8');
 
 /**
  * Two halves of one contract, which only work together.

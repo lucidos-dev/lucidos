@@ -165,6 +165,105 @@ async fn test_last_user_and_agent_action_attributed_separately() {
     teardown_test_db(&db_name).await;
 }
 
+/// A `PromptInjected` is a user action only when a human sent it. An agent's
+/// follow-up or an engine note (a wait delivery) is agent activity, so it must
+/// leave the drawer's sort key where it is.
+#[tokio::test]
+async fn a_prompt_injected_is_a_user_action_only_from_a_human() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    type Stamp = chrono::DateTime<chrono::Utc>;
+
+    let fetch = |pool: PgPool| async move {
+        sqlx::query_as::<_, (Stamp, Stamp, Stamp)>(
+            "SELECT last_user_action, last_agent_action, last_activity \
+             FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let inject = |mode: ActorMode| BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::PromptInjected {
+            text: "carry on".into(),
+            mode,
+            origin: None,
+            injected_message_id: None,
+            delivered_event_id: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    };
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            provider: None,
+            voice_session_id: None,
+            text: "do the thing".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    for mode in [ActorMode::Agent, ActorMode::Engine] {
+        let (user_before, agent_before, activity_before) = fetch(pool.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        bus.emit(inject(mode)).await.unwrap();
+        let (user_after, agent_after, activity_after) = fetch(pool.clone()).await;
+        assert!(
+            activity_after > activity_before,
+            "{mode:?} must bump last_activity"
+        );
+        assert_eq!(
+            user_after, user_before,
+            "{mode:?} must not bump last_user_action"
+        );
+        assert!(
+            agent_after > agent_before,
+            "{mode:?} must bump last_agent_action"
+        );
+    }
+
+    let (user_before, agent_before, activity_before) = fetch(pool.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    bus.emit(inject(ActorMode::Human)).await.unwrap();
+    let (user_after, agent_after, activity_after) = fetch(pool.clone()).await;
+    assert!(
+        activity_after > activity_before,
+        "a human prompt must bump last_activity"
+    );
+    assert!(
+        user_after > user_before,
+        "a human prompt must bump last_user_action"
+    );
+    assert_eq!(
+        agent_after, agent_before,
+        "a human prompt must not bump last_agent_action"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 #[tokio::test]
 async fn test_session_started_does_not_update_last_activity() {
     let (pool, db_name) = setup_test_db().await;

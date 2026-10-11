@@ -6,7 +6,7 @@
 //! - I9: a delete leaves no words in any tree.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,8 +43,9 @@ struct Fixture {
 /// A chat thread at full fidelity, a coding-agent thread, a trigger run nobody
 /// talked to, and two artifact writes, one of them a binary.
 ///
-/// The hidden home thread comes first. An artifact leaf's call records there,
-/// so a build would otherwise create it midway and change the tree count.
+/// The home thread comes first, as boot makes it. An artifact leaf's call
+/// records there, so a build would otherwise create it midway and change the
+/// tree count.
 async fn seed_workspace(pool: &PgPool, bus: &EventBus) -> Fixture {
     let home = crate::engine::home_thread::ensure_home_thread(bus, pool)
         .await
@@ -112,14 +113,24 @@ async fn seed_workspace(pool: &PgPool, bus: &EventBus) -> Fixture {
 /// Seed and drain until the queue is empty.
 async fn run_to_rest(compactor: &Arc<Compactor>) -> Vec<(SummaryScope, Drained)> {
     compactor.seed().await.expect("seed");
+    drain_to_rest(compactor).await
+}
+
+/// More rounds than any fixture here needs to rest.
+const MAX_DRAIN_ROUNDS: usize = 1_000;
+
+/// Drain until the queue is empty. A scope that requeues itself every round
+/// fails the test here, rather than spinning until something kills the run.
+async fn drain_to_rest(compactor: &Arc<Compactor>) -> Vec<(SummaryScope, Drained)> {
     let mut outcomes = Vec::new();
-    loop {
+    for _ in 0..MAX_DRAIN_ROUNDS {
         let round = compactor.drain_queue().await;
         if round.is_empty() {
             return outcomes;
         }
         outcomes.extend(round);
     }
+    panic!("the queue never came to rest in {MAX_DRAIN_ROUNDS} rounds");
 }
 
 fn compactor(pool: &PgPool, bus: &EventBus, deps: Arc<dyn CompactorDeps>) -> Arc<Compactor> {
@@ -423,7 +434,13 @@ async fn every_leaf_is_reachable_from_the_root_down_to_its_event() {
     }
     assert_eq!(
         nodes[&NodeAddr::leaf(0)].text,
-        format!("user: {SHORT_USER_TEXT}")
+        format!(
+            "{}: {SHORT_USER_TEXT}",
+            crate::engine::summary_tree::log::EntryKind::Prompt(
+                crate::engine::thread_events::ActorMode::Human
+            )
+            .as_str()
+        )
     );
 
     // A workspace turn leaf zooms on into its thread's tree.
@@ -758,7 +775,7 @@ async fn a_deleted_thread_leaves_no_words_in_any_tree() {
 
     // What `ThreadsDeleted` tells the compactor.
     c.forget_threads(&[fixture.chat]);
-    while !c.drain_queue().await.is_empty() {}
+    drain_to_rest(&c).await;
     // The leaves after the deleted ones moved up with their text: the
     // artifact leaf a model wrote cost no second call.
     assert_eq!(model.calls.load(Ordering::SeqCst), calls_before);
@@ -870,8 +887,8 @@ fn progress_of(frames: &[SystemEvent]) -> Vec<BackfillProgress> {
         .collect()
 }
 
-/// The count covers every tree: three in-scope threads, the hidden home
-/// thread among them, and the workspace. It never goes back. Every thread is
+/// The count covers every tree: three in-scope threads, the home thread
+/// among them, and the workspace. It never goes back. Every thread is
 /// recent, so the ready flag waits on all four: one completion, then the
 /// frame that counts the last tree.
 #[tokio::test]
@@ -941,6 +958,30 @@ async fn the_count_moves_within_a_scope_and_never_goes_back() {
     let last = progress.last().expect("frames");
     assert_eq!(last.done_milli, last.total as u64 * 1000);
     assert_eq!((last.nodes_done, last.nodes_total), (0, 0));
+    teardown_test_db(&db_name).await;
+}
+
+/// Each frame carries its announcement order, and a snapshot carries the
+/// order of the last frame before it. So the page can tell a frame still in
+/// flight from one its snapshot already counted.
+#[tokio::test]
+async fn frames_and_snapshots_carry_the_announcement_order() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let mut rx = bus.subscribe();
+    let c = compactor(&pool, &bus, deps(EchoProvider::new()));
+
+    c.seed().await.unwrap();
+    let seeded = progress_of(&backfill_frames(&mut rx));
+    let snapshot = c.backfill_progress().expect("a backfill runs");
+    assert_eq!(Some(snapshot.seq), seeded.last().map(|p| p.seq));
+
+    run_to_rest(&c).await;
+    let later = progress_of(&backfill_frames(&mut rx));
+    assert!(later.first().is_some_and(|p| p.seq > snapshot.seq));
+    let seqs: Vec<u64> = seeded.iter().chain(&later).map(|p| p.seq).collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
     teardown_test_db(&db_name).await;
 }
 
@@ -1149,6 +1190,7 @@ fn the_progress_frame_carries_the_rest_shape() {
         waiting_for_model: true,
         retrying: false,
         ready: false,
+        seq: 7,
     };
     let rest = serde_json::to_value(TreeBackfill::Running { progress }).unwrap();
     let frame = serde_json::to_value(SystemEvent::TreeBackfillProgressed { progress }).unwrap();
@@ -1269,7 +1311,7 @@ async fn build_in_order(
     for scope in order {
         c.mark_dirty(*scope, false);
     }
-    while !c.drain_queue().await.is_empty() {}
+    drain_to_rest(&c).await;
     snapshot(pool).await
 }
 
@@ -1372,10 +1414,17 @@ async fn the_workspace_is_ready_before_an_old_thread_is_built() {
         ready: true,
         ..BackfillProgress::default()
     };
+    let TreeBackfill::Ready {
+        filling: Some(read),
+    } = tree_backfill(&pool, &runtime).await.unwrap()
+    else {
+        panic!("a ready backfill still filling in");
+    };
     assert_eq!(
-        tree_backfill(&pool, &runtime).await.unwrap(),
-        TreeBackfill::Ready {
-            filling: Some(filling)
+        read,
+        BackfillProgress {
+            seq: read.seq,
+            ..filling
         }
     );
 
@@ -1385,7 +1434,14 @@ async fn the_workspace_is_ready_before_an_old_thread_is_built() {
     };
     let lines = recall::zoom(&pool, whole, 2, &|_, _| None).await.unwrap();
     assert!(
-        lines.iter().any(|l| l.text == "user: fix the parser"),
+        lines.iter().any(|l| l.text
+            == format!(
+                "{}: fix the parser",
+                crate::engine::summary_tree::log::EntryKind::Prompt(
+                    crate::engine::thread_events::ActorMode::Human
+                )
+                .as_str()
+            )),
         "{lines:?}"
     );
 
@@ -1430,15 +1486,25 @@ async fn a_restart_after_early_ready_keeps_the_flag_and_keeps_filling() {
     teardown_test_db(&db_name).await;
 }
 
-/// A model that takes a while and counts the calls it holds at once.
-#[derive(Default)]
-struct SlowProvider {
-    in_flight: AtomicUsize,
-    peak: AtomicUsize,
+/// A model that holds every call until the test opens it, and counts the
+/// calls it holds. No call returns while the count grows, so the count is how
+/// many calls the compactor runs at once, however slowly it launched them.
+struct HeldProvider {
+    held: tokio::sync::watch::Sender<usize>,
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for HeldProvider {
+    fn default() -> Self {
+        Self {
+            held: tokio::sync::watch::Sender::new(0),
+            open: tokio::sync::watch::Sender::new(false),
+        }
+    }
 }
 
 #[async_trait::async_trait]
-impl LlmProvider for SlowProvider {
+impl LlmProvider for HeldProvider {
     async fn chat(
         &self,
         _messages: Vec<Message>,
@@ -1448,21 +1514,42 @@ impl LlmProvider for SlowProvider {
         _on_token: Option<crate::llm::provider::TokenCallback>,
         _call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(now, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let _holding = Holding::new(&self.held);
+        self.open
+            .subscribe()
+            .wait_for(|open| *open)
+            .await
+            .expect("the sender lives in self");
         Ok(line_response("a line".to_string()))
     }
 
     fn default_model(&self) -> &str {
-        "slow-model"
+        "held-model"
     }
 }
 
-/// On the running workers, a backfill runs many calls at once.
+/// Counts one held call until it drops, so a call its deadline cancels stops
+/// counting too.
+struct Holding<'a>(&'a tokio::sync::watch::Sender<usize>);
+
+impl<'a> Holding<'a> {
+    fn new(held: &'a tokio::sync::watch::Sender<usize>) -> Self {
+        held.send_modify(|n| *n += 1);
+        Self(held)
+    }
+}
+
+impl Drop for Holding<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// On the running workers, a backfill fills its lane: it wants more calls
+/// than a new lane allows, and runs every one the lane allows at once.
 #[tokio::test]
 async fn a_backfill_runs_many_calls_at_once() {
+    use crate::engine::summary_tree::limit::START_LIMIT;
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     for i in 0..48 {
@@ -1479,18 +1566,29 @@ async fn a_backfill_runs_many_calls_at_once() {
         .await;
     }
     age_events(&pool).await;
-    let model = Arc::new(SlowProvider::default());
+    let model = Arc::new(HeldProvider::default());
     let c = compactor(&pool, &bus, Arc::new(ProviderDeps(model.clone())));
 
     c.start();
+    let mut held = model.held.subscribe();
+    // `is_ok` drops the guard `wait_for` returns, which would hold the lock a
+    // released call needs to count itself out.
+    let filled = tokio::time::timeout(
+        Duration::from_secs(60),
+        held.wait_for(|n| *n >= START_LIMIT),
+    )
+    .await
+    .is_ok();
+    assert!(filled, "only {} calls ran at once", *model.held.borrow());
+    assert_eq!(c.lane(TEST_LANE).in_flight(), START_LIMIT);
+
+    model.open.send_replace(true);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while !store::is_ready(&pool).await.unwrap() {
         assert!(std::time::Instant::now() < deadline, "the backfill stalled");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     c.pause();
-    let peak = model.peak.load(Ordering::SeqCst);
-    assert!(peak >= 32, "only {peak} calls ran at once");
     teardown_test_db(&db_name).await;
 }
 
@@ -1610,5 +1708,293 @@ async fn a_live_only_worker_reaches_past_the_backfills_workspace() {
         c.pop_live(),
         Some((SummaryScope::Thread(fixture.coding), true))
     );
+    teardown_test_db(&db_name).await;
+}
+
+// ── The compaction view ───────────────────────────────────────────────
+
+/// A model that keeps every request it was sent and answers with a line no
+/// entry could hold.
+#[derive(Default)]
+struct RecordingProvider {
+    requests: std::sync::Mutex<Vec<crate::llm::provider::MessageContent>>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for RecordingProvider {
+    async fn chat(
+        &self,
+        messages: Vec<Message>,
+        _tools: Vec<crate::llm::provider::ToolDefinition>,
+        _selection: crate::llm::ModelSelection<'_>,
+        _system_prompt: Option<&str>,
+        _on_token: Option<crate::llm::provider::TokenCallback>,
+        _call: crate::llm::metered::CallToken,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let mut requests = self.requests.lock().unwrap();
+        requests.push(messages[0].content.clone());
+        Ok(line_response(format!("written line {}", requests.len())))
+    }
+
+    fn default_model(&self) -> &str {
+        "recording-model"
+    }
+}
+
+/// Every line a compactor call reads in `<chat>` is a built node's text,
+/// never a raw entry, and the view's marked blocks reach the request. A
+/// workspace turn leaf reads its thread's raw entries instead, by design.
+#[tokio::test]
+async fn a_call_reads_only_built_lines_as_its_view() {
+    use crate::llm::provider::{ContentBlock, MessageContent};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    // Long enough that leaves past the window read a view of whole blocks.
+    let turns = (0..8).flat_map(|i| {
+        [
+            json!({"type": "MessageReceived", "mode": "human", "text": format!("Step {i}: {}", "check the door. ".repeat(40))}),
+            json!({"type": "ToolCalled", "name": "read_file", "args": {"path": format!("door-{i}.md")}}),
+            json!({"type": "ToolResult", "name": "read_file", "result": "a door note. ".repeat(60)}),
+            json!({"type": "ResponseGenerated", "text": format!("Step {i} done. {}", "Checked. ".repeat(70))}),
+        ]
+    });
+    seed(&bus, fixture.chat, EventChannel::Chat, turns.collect()).await;
+    age_events(&pool).await;
+    let model = Arc::new(RecordingProvider::default());
+    let c = compactor(&pool, &bus, Arc::new(ProviderDeps(model.clone())));
+    run_to_rest(&c).await;
+    assert_every_scope_complete(&pool, &fixture).await;
+
+    let mut built = std::collections::HashSet::new();
+    for scope in [
+        SummaryScope::Workspace,
+        SummaryScope::Thread(fixture.chat),
+        SummaryScope::Thread(fixture.coding),
+    ] {
+        for node in store::load_nodes(&pool, scope).await.unwrap().values() {
+            built.insert(crate::engine::summary_tree::prompt::flatten(&node.text));
+        }
+    }
+    let requests = model.requests.lock().unwrap().clone();
+    let mut marked = 0;
+    for request in &requests {
+        let MessageContent::Blocks(blocks) = request else {
+            panic!("a compactor request is blocks");
+        };
+        marked += blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::MemoryView { .. }))
+            .count();
+        let text = request.as_text();
+        if text.contains("<input>\nturn: [") {
+            continue;
+        }
+        let Some((_, rest)) = text.split_once("<chat>\n") else {
+            continue;
+        };
+        let (chat, _) = rest.split_once("</chat>").expect("a closed view");
+        for line in chat.lines().filter(|l| !l.is_empty()) {
+            assert!(built.contains(line), "{line:?} is no built line");
+        }
+    }
+    assert!(marked > 0, "some view is long enough to carry a mark");
+
+    teardown_test_db(&db_name).await;
+}
+
+// ── Trees built before a rename ───────────────────────────────────────
+
+/// A tree built before the entry kinds were renamed holds retired tags in
+/// the nodes no model wrote. The next drain rewrites those from the log, so
+/// each again equals what a rebuild would write, and leaves every line a
+/// model wrote alone.
+#[tokio::test]
+async fn a_drain_rederives_verbatim_nodes_with_retired_tags() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    let c = compactor(&pool, &bus, deps(EchoProvider::new()));
+    run_to_rest(&c).await;
+    let built = snapshot(&pool).await;
+
+    let aged = sqlx::query(
+        "UPDATE summary_tree_nodes SET text = regexp_replace(text, \
+           '(^|\\n)prompt \\(human\\): ', '\\1user: ', 'g') \
+         WHERE model IS NULL AND text ~ '(^|\\n)prompt \\(human\\): '",
+    )
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert!(aged > 0, "the fixture holds verbatim prompt nodes");
+    let model_written: Vec<(String, i64, i64, String)> = sqlx::query_as(
+        "SELECT scope, start, span, text FROM summary_tree_nodes WHERE model IS NOT NULL ORDER BY 1, 2, 3",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    // An upgraded engine starts afresh, and re-derives once per tree.
+    let c = compactor(&pool, &bus, deps(EchoProvider::new()));
+    c.mark_dirty(SummaryScope::Workspace, false);
+    for id in [fixture.chat, fixture.coding, fixture.home] {
+        c.mark_dirty(SummaryScope::Thread(id), false);
+    }
+    run_to_rest(&c).await;
+
+    assert_eq!(
+        snapshot(&pool).await,
+        built,
+        "every node is what it was before"
+    );
+    let after: Vec<(String, i64, i64, String)> = sqlx::query_as(
+        "SELECT scope, start, span, text FROM summary_tree_nodes WHERE model IS NOT NULL ORDER BY 1, 2, 3",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, model_written, "no model-written line changed");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// An agent's message that fit a node under its retired `user:` tag, but not
+/// under `prompt (agent):`, is dropped with every line above it. The build
+/// writes them again, so no line credits the agent's words to the user.
+#[tokio::test]
+async fn an_outgrown_agent_prompt_is_rebuilt_with_the_lines_above_it() {
+    use crate::engine::summary_tree::log::EntryKind;
+    use crate::engine::thread_events::ActorMode;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    let retired = "user: ";
+    let text = "a".repeat(NODE_BYTES - retired.len() - 2);
+    let agent = EntryKind::Prompt(ActorMode::Agent).as_str();
+    assert!(format!("{agent}: {text}").len() > NODE_BYTES);
+    let ids = seed(
+        &bus,
+        fixture.chat,
+        EventChannel::Chat,
+        vec![
+            json!({"type": "MessageReceived", "mode": "agent", "text": text}),
+            json!({"type": "ResponseGenerated", "text": "ok"}),
+        ],
+    )
+    .await;
+    age_events(&pool).await;
+    let c = compactor(&pool, &bus, deps(EchoProvider::new()));
+    run_to_rest(&c).await;
+
+    let scope = SummaryScope::Thread(fixture.chat).as_db();
+    sqlx::query(
+        "UPDATE summary_tree_nodes SET text = $3, model = NULL \
+         WHERE scope = $1 AND span = 1 AND source_event_id = $2",
+    )
+    .bind(&scope)
+    .bind(ids[0])
+    .bind(format!("{retired}{text}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let c = compactor(&pool, &bus, deps(EchoProvider::new()));
+    c.mark_dirty(SummaryScope::Thread(fixture.chat), false);
+    run_to_rest(&c).await;
+
+    let (leaf_text, model): (String, Option<String>) = sqlx::query_as(
+        "SELECT text, model FROM summary_tree_nodes \
+         WHERE scope = $1 AND span = 1 AND source_event_id = $2",
+    )
+    .bind(&scope)
+    .bind(ids[0])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(model.is_some(), "a model wrote the leaf again");
+    assert!(!leaf_text.starts_with(retired), "{leaf_text}");
+    let len = thread_len(&pool, fixture.chat).await;
+    assert_complete(&pool, SummaryScope::Thread(fixture.chat), len).await;
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Two short entries whose joined lines fit a node under the retired tags,
+/// but not under the current ones, made a verbatim merge. One of them is an
+/// agent's prompt here. So the merge goes with every line above it, and the
+/// build writes them again: no line credits the agent's words to the user.
+#[tokio::test]
+async fn an_outgrown_merge_over_an_agent_prompt_is_rebuilt() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    let mut events = Vec::new();
+    if thread_len(&pool, fixture.chat).await % 2 == 1 {
+        events.push(json!({"type": "MessageReceived", "mode": "human", "text": "next"}));
+    }
+    let (asked, answered) = ("b".repeat(245), "c".repeat(245));
+    events.push(json!({"type": "MessageReceived", "mode": "agent", "text": asked}));
+    events.push(json!({"type": "ResponseGenerated", "text": answered}));
+    seed(&bus, fixture.chat, EventChannel::Chat, events).await;
+    age_events(&pool).await;
+    let c = compactor(&pool, &bus, deps(EchoProvider::new()));
+    run_to_rest(&c).await;
+
+    let len = thread_len(&pool, fixture.chat).await;
+    let pair = NodeAddr {
+        start: len - 2,
+        span: 2,
+    };
+    let scope = SummaryScope::Thread(fixture.chat);
+    let old = [format!("user: {asked}"), format!("talk: {answered}")];
+    for (i, text) in old.iter().enumerate() {
+        sqlx::query(
+            "UPDATE summary_tree_nodes SET text = $4, model = NULL \
+             WHERE scope = $1 AND span = $2 AND start = $3",
+        )
+        .bind(scope.as_db())
+        .bind(1i64)
+        .bind((pair.start + i as u64) as i64)
+        .bind(text)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let joined = old.join("\n");
+    assert!(
+        joined.len() <= NODE_BYTES,
+        "the pair fit a node before the rename"
+    );
+    sqlx::query(
+        "UPDATE summary_tree_nodes SET text = $4, model = NULL \
+         WHERE scope = $1 AND span = $2 AND start = $3",
+    )
+    .bind(scope.as_db())
+    .bind(pair.span as i64)
+    .bind(pair.start as i64)
+    .bind(&joined)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let c = compactor(&pool, &bus, deps(EchoProvider::new()));
+    c.mark_dirty(scope, false);
+    run_to_rest(&c).await;
+
+    let nodes = store::load_nodes(&pool, scope).await.unwrap();
+    assert!(
+        nodes[&pair].model.is_some(),
+        "a model wrote the merge again"
+    );
+    assert!(
+        !nodes[&pair].text.contains("user: "),
+        "{}",
+        nodes[&pair].text
+    );
+    assert_complete(&pool, scope, len).await;
+
     teardown_test_db(&db_name).await;
 }

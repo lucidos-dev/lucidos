@@ -459,6 +459,37 @@ describe('easeEmptiedTextarea', () => {
     expect(el.style.height).toBe('44px');
   });
 
+  // WebKit keeps a just-started transition running after `transition` is
+  // cleared, and a measurement then reads its height. A typed answer followed
+  // at once by the next question kept the box at the sent text's height.
+  it('re-aims an ease whose transition just started without keeping its height', () => {
+    const { el, content } = emptiedBox();
+    let live: { transitionProperty: string; cancel: () => void } | null = null;
+    const startedHeight = 120;
+    Object.defineProperty(el, 'scrollHeight', {
+      get: () => Math.max(
+        content.height,
+        Math.min(Math.max(parseInt(el.style.height) || 0, 44), 400),
+        live ? startedHeight : 0,
+      ),
+    });
+    const opacity = { transitionProperty: 'opacity', cancel: vi.fn() };
+    Object.assign(el, { getAnimations: () => (live ? [live, opacity] : [opacity]) });
+    easeEmptiedTextarea(el);
+    frames.shift()?.();
+    frames.shift()?.();
+    live = { transitionProperty: 'height', cancel: () => { live = null; } };
+    const computed = vi.spyOn(globalThis, 'getComputedStyle')
+      .mockReturnValue({ height: `${startedHeight}px` } as CSSStyleDeclaration);
+    remeasureTextareaForPlaceholder(el);
+    computed.mockRestore();
+    expect(live).toBeNull();
+    expect(opacity.cancel).not.toHaveBeenCalled();
+    frames.shift()?.();
+    frames.shift()?.();
+    expect(el.style.height).toBe('44px');
+  });
+
   it('just re-measures with no ease in flight', () => {
     const { el } = emptiedBox();
     remeasureTextareaForPlaceholder(el);

@@ -51,6 +51,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { BackupSection } from './BackupSection';
 import { InstallsSection } from './InstallsSection';
 import { DiskUsagePage } from './DiskUsagePage';
+import { PromptFootprintPage } from './PromptFootprintPage';
 import { MemoryPage } from './MemoryPage';
 import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
 import { DebuggingSection } from './DebuggingSection';
@@ -68,7 +69,7 @@ function getApiUrl(): string {
 
 /** Which sub-page this renders. `SystemSubmenu` is the list that reaches them,
  *  and `SettingsView.renderSubview` maps each subview key onto one of these. */
-export type SystemPanel = 'overview' | 'release-notices' | 'whats-new' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging' | 'communication-surfaces';
+export type SystemPanel = 'overview' | 'release-notices' | 'whats-new' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'prompt-footprint' | 'environment-variables' | 'debugging' | 'communication-surfaces';
 
 /** A pull asks now, as the Check button does. Forced, so a failed check is
  *  recorded on the page rather than only logged: the user asked for it. */
@@ -193,6 +194,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
       case 'backup': return <BackupSection />;
       case 'memory': return <MemoryPage />;
       case 'disk-usage': return <DiskUsagePage />;
+      case 'prompt-footprint': return <PromptFootprintPage />;
       case 'environment-variables': return <EnvironmentVariablesPage />;
       case 'debugging': return <DebuggingSection />;
       case 'communication-surfaces': return <CommunicationSurfacesPage />;

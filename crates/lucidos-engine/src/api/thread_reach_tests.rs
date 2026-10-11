@@ -308,6 +308,12 @@ async fn seed_thread_opened_by(
     .unwrap();
 }
 
+/// A bus over `pool`, for a gate call that emits only when it spends an
+/// owner approval.
+fn bus_for(pool: &PgPool) -> EventBus {
+    EventBus::new(pool.clone()).0
+}
+
 fn owner_device() -> MessageOrigin {
     MessageOrigin::Device {
         device_id: "device-abc".into(),
@@ -394,7 +400,7 @@ async fn a_thread_cannot_reach_its_sibling() {
         .unwrap());
 
     let err = refuse_without_authority(
-        &pool,
+        &bus_for(&pool),
         &agent_headers(Some(f.child)),
         Some(f.sibling),
         ThreadReachVerb::Archive,
@@ -429,7 +435,7 @@ async fn a_thread_cannot_reach_its_own_parent_or_grandparent() {
 
     for (caller, target) in [(f.child, f.root), (f.grandchild, f.root)] {
         let err = refuse_without_authority(
-            &pool,
+            &bus_for(&pool),
             &agent_headers(Some(caller)),
             Some(target),
             ThreadReachVerb::Cancel,
@@ -463,7 +469,7 @@ async fn a_thread_reaches_neither_an_unrelated_thread_nor_a_missing_one() {
 
     for target in [unrelated, missing] {
         let err = refuse_without_authority(
-            &pool,
+            &bus_for(&pool),
             &agent_headers(Some(f.root)),
             Some(target),
             ThreadReachVerb::Archive,
@@ -489,7 +495,7 @@ async fn a_user_device_reaches_every_thread_exactly_as_before() {
         for verb in EVERY_VERB {
             for target in [Some(f.root), Some(f.sibling), Some(f.grandchild), None] {
                 assert!(
-                    refuse_without_authority(&pool, &headers, target, *verb)
+                    refuse_without_authority(&bus_for(&pool), &headers, target, *verb)
                         .await
                         .is_ok(),
                     "an untokened caller keeps the reach it has always had"
@@ -511,16 +517,24 @@ async fn a_tokened_agent_is_bound_to_its_own_subtree() {
     let headers = agent_headers(Some(f.child));
 
     for target in [f.child, f.grandchild] {
-        assert!(
-            refuse_without_authority(&pool, &headers, Some(target), ThreadReachVerb::Archive)
-                .await
-                .is_ok()
-        );
+        assert!(refuse_without_authority(
+            &bus_for(&pool),
+            &headers,
+            Some(target),
+            ThreadReachVerb::Archive
+        )
+        .await
+        .is_ok());
     }
     for target in [f.root, f.sibling] {
-        let err = refuse_without_authority(&pool, &headers, Some(target), ThreadReachVerb::Archive)
-            .await
-            .expect_err("outside its own subtree");
+        let err = refuse_without_authority(
+            &bus_for(&pool),
+            &headers,
+            Some(target),
+            ThreadReachVerb::Archive,
+        )
+        .await
+        .expect_err("outside its own subtree");
         assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
     }
 
@@ -539,7 +553,8 @@ async fn every_verb_refuses_outside_the_subtree_with_no_standing_instruction() {
     let headers = agent_headers(Some(f.child));
 
     for verb in EVERY_VERB {
-        let Err(err) = refuse_without_authority(&pool, &headers, Some(f.sibling), *verb).await
+        let Err(err) =
+            refuse_without_authority(&bus_for(&pool), &headers, Some(f.sibling), *verb).await
         else {
             panic!("{verb:?} must refuse a sibling");
         };
@@ -562,7 +577,7 @@ async fn every_verb_reaches_the_caller_s_own_subtree_with_no_owner_turn() {
     for verb in EVERY_VERB {
         for target in [f.root, f.child, f.grandchild] {
             assert!(
-                refuse_without_authority(&pool, &headers, Some(target), *verb)
+                refuse_without_authority(&bus_for(&pool), &headers, Some(target), *verb)
                     .await
                     .is_ok(),
                 "{verb:?} inside the caller's own subtree needs nobody's instruction"
@@ -587,16 +602,21 @@ async fn a_turn_the_owner_opened_reaches_past_the_subtree() {
 
     for verb in EVERY_VERB {
         assert!(
-            refuse_without_authority(&pool, &headers, Some(f.sibling), *verb)
+            refuse_without_authority(&bus_for(&pool), &headers, Some(f.sibling), *verb)
                 .await
                 .is_ok(),
             "{verb:?} rides the owner's standing instruction"
         );
     }
     assert!(
-        refuse_without_authority(&pool, &headers, None, ThreadReachVerb::CreateTopThread)
-            .await
-            .is_ok(),
+        refuse_without_authority(
+            &bus_for(&pool),
+            &headers,
+            None,
+            ThreadReachVerb::CreateTopThread
+        )
+        .await
+        .is_ok(),
         "so does an act aimed at the root, which is nobody's subtree"
     );
 
@@ -648,15 +668,25 @@ async fn a_trigger_fire_reaches_its_own_subtree_and_wider() {
     let headers = agent_headers(Some(trigger_thread));
 
     assert!(
-        refuse_without_authority(&pool, &headers, Some(its_child), ThreadReachVerb::Apply)
-            .await
-            .is_ok(),
+        refuse_without_authority(
+            &bus_for(&pool),
+            &headers,
+            Some(its_child),
+            ThreadReachVerb::Apply
+        )
+        .await
+        .is_ok(),
         "its own subtree, which clause 3 already covered"
     );
     assert!(
-        refuse_without_authority(&pool, &headers, Some(f.sibling), ThreadReachVerb::Apply)
-            .await
-            .is_ok(),
+        refuse_without_authority(
+            &bus_for(&pool),
+            &headers,
+            Some(f.sibling),
+            ThreadReachVerb::Apply
+        )
+        .await
+        .is_ok(),
         "and wider, on the firing the owner authorized"
     );
 
@@ -684,7 +714,7 @@ async fn a_script_trigger_fire_carries_the_instruction_with_no_thread() {
     .unwrap();
 
     assert!(refuse_without_authority(
-        &pool,
+        &bus_for(&pool),
         &agent_headers_for_fire(None, Some("nightly")),
         Some(f.sibling),
         ThreadReachVerb::Apply,
@@ -705,9 +735,14 @@ async fn a_threadless_subprocess_is_refused_rather_than_given_every_thread() {
     let f = family(&pool).await;
     let headers = agent_headers(None);
 
-    let err = refuse_without_authority(&pool, &headers, Some(f.child), ThreadReachVerb::Archive)
-        .await
-        .expect_err("no thread of its own");
+    let err = refuse_without_authority(
+        &bus_for(&pool),
+        &headers,
+        Some(f.child),
+        ThreadReachVerb::Archive,
+    )
+    .await
+    .expect_err("no thread of its own");
     assert_eq!(
         err,
         ThreadReachError::NoCallerThread(ThreadReachVerb::Archive)
@@ -727,7 +762,7 @@ async fn a_tokened_agent_cannot_cancel_the_whole_workspace() {
     let f = family(&pool).await;
 
     let err = refuse_without_authority(
-        &pool,
+        &bus_for(&pool),
         &agent_headers(Some(f.child)),
         None,
         ThreadReachVerb::Cancel,
@@ -757,7 +792,8 @@ async fn no_refusal_sends_a_top_thread_to_a_parent_it_does_not_have() {
 
     for verb in EVERY_VERB {
         for target in [Some(f.child), None] {
-            let Err(err) = refuse_without_authority(&pool, &headers, target, *verb).await else {
+            let Err(err) = refuse_without_authority(&bus_for(&pool), &headers, target, *verb).await
+            else {
                 panic!("{verb:?} at {target:?} must refuse");
             };
             let msg = err.to_string();
@@ -812,7 +848,9 @@ async fn the_home_thread_follows_up_any_thread_and_a_sibling_does_not() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let f = family(&pool).await;
-    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
     let home_child = Uuid::new_v4();
     seed_thread(&bus, home_child, Some(home)).await;
 
@@ -846,12 +884,15 @@ async fn the_home_thread_gains_reach_but_not_authority() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let f = family(&pool).await;
-    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
     let headers = agent_headers(Some(home));
 
     seed_thread_opened_by(&bus, home, None, None).await;
     for verb in EVERY_VERB {
-        let Err(err) = refuse_without_authority(&pool, &headers, Some(f.sibling), *verb).await
+        let Err(err) =
+            refuse_without_authority(&bus_for(&pool), &headers, Some(f.sibling), *verb).await
         else {
             panic!("{verb:?} must refuse with no owner words in the turn");
         };
@@ -861,7 +902,7 @@ async fn the_home_thread_gains_reach_but_not_authority() {
     seed_thread_opened_by(&bus, home, None, Some(owner_device())).await;
     for verb in EVERY_VERB {
         assert!(
-            refuse_without_authority(&pool, &headers, Some(f.sibling), *verb)
+            refuse_without_authority(&bus_for(&pool), &headers, Some(f.sibling), *verb)
                 .await
                 .is_ok(),
             "{verb:?} rides the owner's words in this turn"
@@ -888,6 +929,42 @@ fn an_agent_never_presses_an_always_allow_grant() {
         assert!(
             refuse_agent_always_allow(&agent, scope).is_ok(),
             "{scope:?}"
+        );
+    }
+}
+
+/// Regression: the Settings routes write the same permission grants the card's
+/// Always-allow writes, and only asked whether the caller was identified. An
+/// agent token passed, so `PUT /cc-allowed-tools` with `Bash(*)` answered 204.
+#[test]
+fn an_agent_never_writes_a_permission_grant_through_settings() {
+    let err = refuse_agent_permission_grant(&agent_headers(Some(Uuid::new_v4()))).unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+    assert!(refuse_agent_permission_grant(&device_headers()).is_ok());
+
+    for (path, source, handler, write) in [
+        (
+            "settings.rs",
+            include_str!("settings.rs"),
+            "write_grant_file",
+            "grants::write_raw(",
+        ),
+        (
+            "mcp.rs",
+            include_str!("mcp.rs"),
+            "set_mcp_auto_approve",
+            ".set_auto_approve(",
+        ),
+    ] {
+        let body = handler_body(source, handler)
+            .unwrap_or_else(|| panic!("{path}: no handler named {handler}"));
+        let gate = body
+            .find("refuse_agent_permission_grant")
+            .unwrap_or_else(|| panic!("{path}: {handler} never refuses an agent"));
+        let mutation = body.find(write).expect("the handler writes the grant");
+        assert!(
+            gate < mutation,
+            "{path}: the refusal must come before the write"
         );
     }
 }
@@ -932,10 +1009,12 @@ async fn a_permission_answer_outside_the_subtree_needs_the_owners_words() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let f = family(&pool).await;
-    let home = crate::engine::home_thread::enabled_home_thread(&bus, &pool).await;
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
     let answer = |headers: HeaderMap, card: Uuid, scope: Option<AllowScope>| {
         let pool = pool.clone();
-        async move { refuse_permission_answer(&pool, &headers, Some(card), true, scope).await }
+        async move { refuse_permission_answer(&bus_for(&pool), &headers, Some(card), true, scope).await }
     };
 
     let child = agent_headers(Some(f.child));
@@ -966,7 +1045,7 @@ async fn a_permission_answer_outside_the_subtree_needs_the_owners_words() {
     assert_eq!(err.status, StatusCode::FORBIDDEN);
     // A denial carrying a scope grants nothing, so it is not an Always allow.
     assert!(refuse_permission_answer(
-        &pool,
+        &bus_for(&pool),
         &from_home,
         Some(f.sibling),
         false,

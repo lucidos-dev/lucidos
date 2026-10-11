@@ -3,7 +3,7 @@ import { threadSearchQuery, threadSearchResults } from '../store/store';
 import { threadSearchOpen, threadSearchSession, openThreadSearch, closeThreadSearch } from '../store/threadSearch';
 import { searchThreads } from '../api/threads';
 import { toFailed } from '../store/types';
-import { composeHandlers } from '../components/chat/promptFocus';
+import { composeHandlers } from '../components/chat/composeHandlers';
 import { moveHighlight, selectHighlighted } from '../components/drawer/ThreadDrawer';
 
 /** Shared thread search state and handlers for desktop and mobile headers. */

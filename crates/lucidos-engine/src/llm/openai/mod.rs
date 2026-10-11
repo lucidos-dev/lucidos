@@ -11,7 +11,7 @@
 //! `crate::llm::openai::OpenAiProvider` (and re-exported from `crate::llm`).
 
 use crate::core::AuthType;
-use crate::llm::model_registry::gpt_major_version;
+use crate::llm::model_registry::{gpt_major_version, gpt_version};
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolCall, ToolDefinition,
 };
@@ -21,6 +21,7 @@ use std::time::Duration;
 mod chat;
 pub mod codex_detect;
 mod responses;
+pub(crate) use responses::MAX_BREAKPOINTS;
 
 const CHUNK_TIMEOUT_SECS: u64 = 300;
 /// The `[tag]` a stream failure logs under, shared by both wire formats.
@@ -142,6 +143,12 @@ pub fn resolve_bearer_key(
 /// and the same would happen to every family after it.
 pub(crate) fn uses_responses_api(model: &str) -> bool {
     model.contains("codex") || gpt_major_version(model).is_some_and(|major| major >= 5)
+}
+
+/// Whether a Responses request may mark a content part as a cache breakpoint.
+/// GPT-5.6 on takes one; an older model refuses the whole request with a 400.
+pub(crate) fn takes_cache_breakpoints(model: &str) -> bool {
+    gpt_version(model).is_some_and(|version| version >= (5, 6))
 }
 
 pub struct OpenAiProvider {
@@ -321,18 +328,17 @@ impl OpenAiProvider {
             stop_reason: meta.stop_reason,
             output_tokens: meta.output_tokens,
             input_tokens: meta.input_tokens,
-            // OpenAI's usage block doesn't separate cache writes the way
-            // Anthropic's does; cache_read is the only cached-tokens count
-            // they expose (via `prompt_tokens_details.cached_tokens`), and
-            // we leave cache_creation_tokens unset to honor that distinction.
-            cache_creation_tokens: None,
+            // Both are parts of `input_tokens`, as OpenAI reports them. Only
+            // the Responses API reports writes, from GPT-5.6 on.
+            cache_creation_tokens: meta.cache_write_tokens,
             cache_read_tokens: meta.cache_read_tokens,
+            served_model: meta.served_model,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,
             // Like Anthropic: text always rides in `content`, printable.
             model_only_text: None,
-            content_is_progress_notes: false,
+            progress_notes: Vec::new(),
         })
     }
 }
@@ -348,13 +354,17 @@ struct AccumulatedToolCall {
 /// surface `finish_reason` / `status` and token usage near the end of the
 /// stream rather than per-chunk; the parser stashes them here so
 /// `build_llm_response` can populate `LlmResponse.{stop_reason,
-/// input_tokens, output_tokens, cache_read_tokens}` in one place.
+/// input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens}` in
+/// one place.
 #[derive(Default)]
 struct StreamMeta {
     stop_reason: Option<String>,
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     cache_read_tokens: Option<u32>,
+    cache_write_tokens: Option<u32>,
+    /// The *served model*: what a chunk, or the completed response, names.
+    served_model: Option<String>,
 }
 
 impl StreamMeta {
@@ -386,6 +396,9 @@ impl StreamMeta {
     /// reports completion shape via `status` + optional
     /// `incomplete_details.reason`.
     fn absorb_responses_completion(&mut self, resp: &serde_json::Value) {
+        if let Some(model) = crate::llm::served_model::served_model_of(resp) {
+            self.served_model = Some(model);
+        }
         if let Some(usage) = resp.get("usage") {
             if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
                 self.input_tokens = Some(crate::llm::clamp_provider_token_count(input, "OpenAI"));
@@ -400,6 +413,15 @@ impl StreamMeta {
                 if cached > 0 {
                     self.cache_read_tokens =
                         Some(crate::llm::clamp_provider_token_count(cached, "OpenAI"));
+                }
+            }
+            if let Some(written) = usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                if written > 0 {
+                    self.cache_write_tokens =
+                        Some(crate::llm::clamp_provider_token_count(written, "OpenAI"));
                 }
             }
         }

@@ -655,7 +655,7 @@ pub fn expiry_reentry_text(wait: &LiveWait, never_seen: &[String]) -> String {
 /// anchor and the dispatcher just actuates the re-entry.
 #[derive(Debug, Clone)]
 pub struct WaitReentry {
-    /// The already-persisted `UserPromptInjected` this re-entry anchors to.
+    /// The already-persisted `PromptInjected` this re-entry anchors to.
     /// Never a fresh `MessageReceived`: nobody said anything.
     pub anchor_event_id: Uuid,
     /// The prompt for the re-entry, the same prose the anchor carries.
@@ -694,7 +694,7 @@ pub struct WaitReentryRequest {
 /// dispatcher should re-enter with.
 ///
 /// The anchor is the second event of the pair, and there is exactly one shape:
-/// a `UserPromptInjected` carrying the payload as prose. It is an
+/// a `PromptInjected` carrying the payload as prose. It is an
 /// `EXCHANGE_START_TYPES` member on the frontend, so the delivery reads as the
 /// new turn it genuinely is, exactly like the child-completion fan-in.
 ///
@@ -836,7 +836,7 @@ async fn emit_resolution(
     let anchor_event_id = emit_persisted(
         bus,
         wait.thread_id,
-        ThreadEvent::UserPromptInjected {
+        ThreadEvent::PromptInjected {
             text: text.clone(),
             // Agent mode with an engine origin, by design: see `MessageOrigin`.
             mode: crate::engine::thread_events::ActorMode::Agent,
@@ -956,7 +956,7 @@ pub async fn lost_wait_reentries(
          WHERE e.aggregate = 'thread' \
            AND e.event_type IN ('EventWaitDelivered','EventWaitExpired') \
            AND t.state IS DISTINCT FROM 'discarded' \
-           AND anchor.event_type = 'UserPromptInjected' \
+           AND anchor.event_type = 'PromptInjected' \
            AND NOT EXISTS ( \
                SELECT 1 FROM events later \
                WHERE later.aggregate = 'thread' \

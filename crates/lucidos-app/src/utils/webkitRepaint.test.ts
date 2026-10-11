@@ -10,14 +10,19 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 let webKitValue = true;
 vi.mock('./platform', () => ({ isWebKit: () => webKitValue, isIOS: () => false }));
 
-// scrollState owns the notification deep-link scroll claim. The repaint now gates
-// its scrollTop nudge on hasPendingEventScroll() so it stops fighting a deep-link's
-// smooth scroll on iOS resume. Mock it to a controllable boolean — mirrors the
-// isIOS mock and avoids pulling in @preact/signals for a single flag. (The real
+// scrollState owns the notification deep-link scroll claim. The repaint skips
+// its scrollTop nudge while a held claim has not yet resolved, so it cannot race
+// the landing. Mock both flags as controllable booleans, which avoids pulling in
+// @preact/signals. `deepLinkResolved` defaults false, so a bare
+// `pendingEventScroll = true` is a link still looking for its target. (The real
 // claim can't be set here: scrollToEventAndPulse bails before setting it when
 // `document` is undefined, which is the case in this DOM-less suite.)
 let pendingEventScroll = false;
-vi.mock('../components/chat/scrollState', () => ({ hasPendingEventScroll: () => pendingEventScroll }));
+let deepLinkResolved = false;
+vi.mock('../components/chat/scrollState', () => ({
+  hasPendingEventScroll: () => pendingEventScroll,
+  deepLinkHasResolved: () => pendingEventScroll && deepLinkResolved,
+}));
 
 // scrollActivity tracks whether a user touch-drag / momentum scroll is in flight.
 // The repaint gates its scrollTop nudge on it so a nudge can't cancel an in-flight
@@ -26,7 +31,8 @@ vi.mock('../components/chat/scrollState', () => ({ hasPendingEventScroll: () => 
 let userScrolling = false;
 vi.mock('./scrollActivity', () => ({ isUserScrolling: () => userScrolling }));
 
-import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS, isRepaintNudging, NUDGE_EVENT_WINDOW_MS, PINNED_SHIFT_PROP, SCROLLER_PINNED_ATTR, repaintNudgeShift, settledScrollTop } from './webkitRepaint';
+import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle, isRepaintNudging, NUDGE_EVENT_WINDOW_MS, PINNED_SHIFT_PROP, SCROLLER_PINNED_ATTR, repaintNudgeShift, settledScrollTop } from './webkitRepaint';
+import { OPEN_REPAINT_BURST_DELAYS_MS } from './repaintBurst';
 
 describe('OPEN_REPAINT_BURST_DELAYS_MS', () => {
   it('starts with an immediate (0ms) attempt', () => {
@@ -65,6 +71,7 @@ function flushFrame() {
 beforeEach(() => {
   webKitValue = true;
   pendingEventScroll = false;
+  deepLinkResolved = false;
   userScrolling = false;
   rafQueue = [];
   rafIdSeq = 0;
@@ -605,6 +612,22 @@ describe('forceWebKitRepaint', () => {
     flushFrame(); // frame 2: scroll still untouched (not stranded), transform restored
     expect(el.scrollTop).toBe(500);
     expect(el.style.transform).toBe('');
+  });
+
+  it('nudges once the deep link has LANDED, though its claim is still held', () => {
+    // The claim outlives the landing by the resolve deadline. A landing onto
+    // the clamped bottom moves nothing, so it re-commits nothing. Skipping the
+    // nudge for that whole window left the transcript blank until the reader
+    // scrolled. Reported from an in-app toast tap.
+    pendingEventScroll = true;
+    deepLinkResolved = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceWebKitRepaint(el);
+
+    flushFrame();
+    expect(el.scrollTop).toBe(499);
+    flushFrame();
+    expect(el.scrollTop).toBe(500);
   });
 
   it('still nudges + restores scrollTop when NO claim is held (repaint not regressed)', () => {

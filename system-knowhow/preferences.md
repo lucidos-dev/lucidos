@@ -41,15 +41,22 @@ persisted **`PreferencesChanged`** event (or `LanguageSet` / `TimezoneSet` for
 locale). Open Lucidos pages live-apply on those events, with no reload, no
 transient event and no restart.
 
-**`chat_model` / `chat_reasoning_effort` are the default for NEW threads only.**
+**`chat_model` / `chat_reasoning_efforts` are the default for NEW threads only.**
 A Lucidos Agent thread reuses the model and reasoning effort it last ran with
 (*per-thread model memory*). So a running thread keeps its model and effort,
 **including the thread you are in when you make the change**. These keys only
-set the fallback for a brand-new thread's first message. Resolution order per
-turn: explicit per-request override → the thread's last recorded value → this
-preference → provider default. To change a *running* thread's model or effort,
-use its in-thread model picker in the compose bar. That writes a per-thread
-value and never touches this account default.
+set the fallback for a brand-new thread's first message.
+
+The effort is remembered per model. Resolution order for the model the turn
+runs on: explicit per-request override → the thread's last tier on that model
+→ that model's entry in `chat_reasoning_efforts` → its *default effort*. A
+model with no default effort sends none. Switching a thread to another model
+never carries the old model's tier. To change a *running* thread's model or
+effort, use its in-thread model picker in the compose bar. That writes a
+per-thread value and never touches this account default.
+
+`chat_reasoning_efforts` REPLACES THE WHOLE LIST. Read the current value first
+and send it back with your edit applied, or the other models lose their tiers.
 
 **The style library.** `response_styles` holds ONLY what the user changed. An
 entry whose id is `concise`, `minimal` or `learning` overrides that shipped
@@ -93,8 +100,8 @@ override. `get_preferences` shows the per-device effective value and the global 
 
 **Every background task runs on whichever configured provider serves its
 model.** That covers titles, change summaries, image descriptions, memory,
-query classification, conversation summaries, `find`, the command judge and
-the compactor.
+query classification, conversation summaries, `find`, the command judge, the
+read decision and the compactor.
 
 - **Unset, a key resolves for the providers the user has.** Its own default
   runs if a configured provider serves it. Otherwise the first of
@@ -106,10 +113,19 @@ the compactor.
   three first. Each memory task has its own key, and none follows another.
 - **A key the user set is never moved to another model.** If no configured
   provider serves it, those calls fail, and Settings says so on the row.
+- **The one exception is a retired model.** A provider retired it, so an
+  engine update moves every key, trigger pin and thread off it. They move to
+  its *successor*, named on its row in `GET /api/v1/models`. A call that still
+  names it is sent as the successor. Lucidos never leaves a retired id for the
+  provider to reroute.
 - **`GET /api/v1/models/background` says which model each task runs on**, and
   why: the preference, the default, or the chat model.
 - **Settings offers every model on every row**, with the task's recommended
   models first. Image description is the exception.
+- **Unset, a task's reasoning tier binds its recommended models.** Title runs
+  at `none` on `gemini-3-flash-preview`, for example. Any other model runs at
+  its own *default effort*, and one with none sends no effort at all. The
+  compactor keeps `low` on its three measured models.
 - **Image description runs only on a model that reads images**, by the model's
   vision flag (`manage_models` `vision`, the image icon in Settings → Models).
   Its picker lists only those, and its default skips the rest. A set key that
@@ -141,14 +157,14 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
   on Classic until it has.
 - **The backfill costs money, so Settings asks first.** The first time,
   tapping Tree opens a
-  panel with the compactor model and an estimate for this workspace: calls,
+  dialog with the compactor model and an estimate for this workspace: calls,
   cost, the time until turns use Tree ("Usable in"), the time until every tree
   is built ("Complete in"), and the cost a day after that. Each figure is a
   range. Only its
   Start Tree button writes `tree`; Cancel spends nothing. The estimate is
   `GET /api/v1/memory/tree-backfill/estimate`. Once a backfill has stored
   summaries, tapping Tree again writes `tree` at once and resumes it.
-- **Writing `tree` yourself skips that panel and starts spending at once.**
+- **Writing `tree` yourself skips that dialog and starts spending at once.**
   When a user asks for Tree, send them to Settings → System → Memory. There
   they read the estimate and press Start, rather than you setting it.
 - **While Tree is chosen, the page shows a progress bar** in place of the
@@ -179,7 +195,7 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `language` | global | text | (detected from conversation) | Language for responses + session summaries (e.g. "English", "Norwegian"). A *voice session* speaks it. On a Realtime talker it also pins the transcriber to the matching ISO-639-1 code; a Live one has no such setting (ADR 0198). |
 | `timezone` | global | IANA timezone | (unset) | Timezone for triggers + time display (e.g. "Europe/Oslo"). Set before creating triggers. |
 | `chat_model` | global | a model id from the registry | `claude-opus-5` | Default chat model for NEW threads (see "How a write propagates"). `manage_models(action='list')` shows the options. |
-| `chat_reasoning_effort` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `high` | Default thinking budget for NEW threads, clamped per model. |
+| `chat_reasoning_efforts` | global | `model=tier` pairs, comma separated | (unset: each model's default effort) | Thinking budget for NEW threads per chat model, for example `claude-opus-5-5=high`. A model not listed runs at its default effort (`manage_models` `list` shows it). Clamped per model. |
 | `response_style` | global | the id of a style in the library | `standard` | The shape of a chat or trigger answer: how much comes back, and what it is for. `standard` adds nothing. Shipped beside it: `concise`, `minimal` (the outcome, not the process) and `learning` (explains the why as it goes). The user can edit those and add their own, so the set is OPEN: read `response_styles` or `GET /api/v1/response-styles` for the ids here. An undefined id falls back to `standard`. |
 | `response_styles` | global | JSON array of `{id, label, instruction}` | (unset: the shipped styles only) | The user's own styles, and their edits to the shipped ones. See "The style library" above. |
 | `technical_literacy` | global | `not-set` \| `non-technical` \| `technical` \| `developer` | `not-set` (adds nothing; set it to clear a level) | How technical the words are in every answer, from plain words with no jargon (`non-technical`, shown as Keep it plain) to engineering terms with no explanation (`developer`). It never sets how much to say. An old `everyday` value reads as `non-technical`. Reaches chat, triggers, coding-agent sessions and voice calls. See "Technical literacy" above. |
@@ -189,9 +205,11 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `model_change_summary` | global | a model id | (the `model_title` model) | Background model that writes a *change summary*: one line saying what a coding-agent change of several commits does. It heads the change card, the change toasts and the Changes panel. A single-commit change makes no call: its commit subject is the line. Inherits `model_title` while unset. |
 | `reasoning_change_summary` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | (the `reasoning_title` value, else `none`) | Thinking budget for the change summary, which condenses commit subjects into one line. Inherits `reasoning_title` while unset. |
 | `model_summary_compaction` | global | a model id | (resolved from the configured providers) | Background model for the compactor, which writes the summary lines of the Tree memory module. It runs only while `memory_module` is `tree`. While unset, the engine picks the first of `gpt-6.1-sol`, `gemini-3.8-flash` and `claude-sonnet-5-5` that a configured provider serves, and falls back to the chat model. `GET /api/v1/models/background` says which model that is. Settings recommends those three first. |
-| `reasoning_summary_compaction` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | (the default model's tier, `low`) | Thinking budget for the compactor. While unset it runs at the tier its default model names, which is `low` for all three. |
+| `reasoning_summary_compaction` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | (`low` on the default models, else the model's default effort) | Thinking budget for the compactor. While unset it runs its three default models at `low`, the tier their comparison measured, and any other model at its own default effort. |
 | `model_memory_find` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model the recall tool's `find` asks its yes/no questions on, when `judgment_memory_find` leaves it on chat. Each call judges about 40 summary lines. |
 | `reasoning_memory_find` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for `find`, which answers short yes/no questions. |
+| `model_read_decision` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model that makes a turn's *read decision* when the turn ended without one: it sees the turn's message and reply, and must call `request_read`. A Claude model that always thinks cannot be made to, so with one set here every such reply waits under Review. |
+| `reasoning_read_decision` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for the read decision, one yes or no. A forced call on Claude runs without thinking whatever this says. |
 | `memory_module` | global | `classic` \| `tree` | `classic` | How a turn gets its past. See "The memory module" above. Applies from the next turn. |
 | `workspace_view_bytes_home` | global | number 0–262144 | `65536` | Bytes of workspace memory view a home thread turn reads, under the `tree` module. `0` turns the view off there. |
 | `workspace_view_bytes_chat` | global | number 0–262144 | `16384` | The same for a chat thread turn. |
@@ -207,8 +225,7 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `reasoning_conversation_summary` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `low` | Thinking budget for the conversation summary. Raising it is unlikely to help: output length does not track it, and the summariser's failures are calls that never complete. |
 | `model_query_classification` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model that decides what a turn needs retrieved: long-term memory, the file list, credentials. Settings offers the System One models (Jev, Clef, Clef-flash, a custom endpoint) in the same control, which write `judgment_query_classification` instead. |
 | `reasoning_query_classification` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for query classification, which answers three yes/no questions before every turn. |
-| `voice_enabled` | global | `true` \| `false` | `false` | Experimental. `true` puts a call control in the *home thread*'s composer and lets `/api/v1/voice` accept a socket there, so Home can be spoken to. A call runs on the home thread alone, so it also needs `home_thread_enabled`. It rents a speech-to-speech talker and needs the OpenAI provider configured. Every spoken utterance starts an ordinary agent turn, so a short call can cost several. With this off, nothing voice-shaped is reachable and the voice keys below do nothing. |
-| `home_thread_enabled` | global | `true` \| `false` | `false` | Experimental. `true` gives the workspace a *home thread*: one chat thread that never ends, opened from a Home entry rather than the drawer, which can follow up any thread and hosts voice calls. Turning it on creates Home if none exists. Turning it off hides Home and its powers; the thread and its history stay, and come back when it is on again. |
+| `voice_enabled` | global | `true` \| `false` | `false` | Experimental. `true` puts a call control in the *home thread*'s composer and lets `/api/v1/voice` accept a socket there, so Home can be spoken to. A call runs on the home thread alone, which every workspace has. It rents a speech-to-speech talker and needs the OpenAI provider configured. Every spoken utterance starts an ordinary agent turn, so a short call can cost several. With this off, nothing voice-shaped is reachable and the voice keys below do nothing. |
 | `model_voice_talker` | global | a model id | `gpt-realtime-2.1` | Speech-to-speech model a *voice session* speaks through; the id also picks the call's protocol. It holds the conversation only, so every action goes through the ordinary agent. Settings offers the realtime family newest first: `gpt-realtime-2.1`, `gpt-realtime-2.1-mini`, `gpt-realtime-2` and `gpt-realtime-1.5`. These bill by the token, and the caller can settle a card or ring off out loud. `gpt-live-1` follows: it takes an interruption better, holds no tools, and bills by the minute. A Live caller answers a question out loud, and taps for a permission or to ring off. |
 | `model_voice_transcriber` | global | a model id | `gpt-4o-mini-transcribe` | Model turning the caller's speech into text in a realtime *voice session*. A `gpt-live-1` talker transcribes the caller itself and ignores this key. The second and last model in the voice loop: nothing translates or summarises, and `language` sets its pin. Settings offers six ids. The two built for a live microphone lead and stream as the caller speaks: `gpt-live-transcribe` and `gpt-realtime-whisper`. The engine sends `gpt-live-transcribe`'s language pin as `languages`, an array; every other model reads the singular `language`. The rest transcribe a turn once committed: `gpt-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe` and `whisper-1`. |
 | `voice_talker_voice` | global | a provider voice name | `marin` | The voice a call is spoken in. Not a model and not the language: `language` decides what is spoken, this decides who speaks it. A name the provider does not know refuses the call, so pick one the talker model offers. |
@@ -219,11 +236,15 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `notifications_filter` | global | `all` \| `unread` | `all` | Which notifications the bell shows. |
 | `notification_toasts` | global | `true` \| `false` | `true` | Whether a notification pops an in-app toast on a device the user is looking at. `false` silences the pop-up only: the notification still counts on the bell badge and waits in the Notifications panel. No OS push replaces it, because a present device never gets one. Unlike `push_notifications`, one write covers every device. |
 | `mobile_dynamic_bars` | global | `true` \| `false` | `false` | *Dynamic bars* on a phone. `true` glides the header, the thread title and the prompt away while scrolling down a thread, and back on scroll up or a pane swipe. `false` keeps them always visible. |
+| `automatic_widgets` | global | `true` \| `false` | `true` | Whether you may choose a *widget* on your own: a small interactive answer shown inline in the thread as a *widget card* (`create_app` with `kind="widget"`). `false` stops only your own choice, and a widget the user asks for is still made. Set it to `false` when the user tells you to stop making widgets. |
 | `external_link_target` | global | `safari` \| `ask` \| `in-app` | `safari` | Where an external http(s) link goes when tapped in an **installed iOS PWA**. Desktop, Android and a normal Safari tab always open a new tab. `safari` hands it to the Safari app. `ask` opens the OS share sheet, so iOS offers every installed browser, including the user's real default. `in-app` keeps it in the PWA's in-app web view (no address bar, no shared Safari session). |
 | `welcome_suggestions_dismissed` | global | `true` \| `false` | `false` | Hide the new-workspace welcome message. Set `false` to SHOW it again. |
 | `self_curated_context_mode` | global | `true` \| `false` | `false` | **Experimental**: set it only if the user asked. `true` puts a chat or trigger thread in *self-curated context mode*. A sweep then removes tool results in batches: every ten rounds it takes everything more than five rounds old, with the call that made each one. Nothing stands in their place. The agent keeps its picture of the job in a *working understanding*, written as ordinary text in its own reply. It holds one item longer by naming its `evt-<hex>` address under a `[KEEP OPEN]` heading there. A *context panel* at the tail of every round states how full the prompt is, what each item costs and how long it has left. Three other changes: the previous turn's tool calls are not re-sent, the conversation summariser does not run, and `todo_write` is withdrawn (the checklist moved into the same block). The cost is a re-fetch: a result the agent needed and did not write down takes a round to read back. Coding-agent threads are unaffected. |
 | `self_curated_context_expire_after_rounds` | global | number 1–1000 | `5` | How many rounds old a tool result must be before a sweep may take it. Only read when `self_curated_context_mode` is `true`. With the default sweep interval an item lives 6 to 15 rounds, ten on average. Provisional: the prompt and the panel both quote the value in force. |
 | `self_curated_context_sweep_every_rounds` | global | number 1–1000 | `10` | How often the sweep runs, in rounds. Only read when `self_curated_context_mode` is `true`. Removing a pair from the middle of the request invalidates every cached byte after it, so the sweep is scheduled: nine rounds in ten are pure appends. `1` drops every round and pays that cost every round. |
+| `workspace_prompt_footprint_section_ceiling` | global | number 100–1000000 | `6000` | Chars one section of the *workspace prompt footprint* may take before the *workspace audit* flags it. Nothing is cut: the prompt still carries the whole section. Change it only when the user asks, never to clear an audit finding. |
+| `workspace_prompt_footprint_total_ceiling` | global | number 100–1000000 | `20000` | Chars the whole *workspace prompt footprint* may take before the *workspace audit* flags it. Nothing is cut. Change it only when the user asks, never to clear an audit finding. |
+| `workspace_prompt_footprint_unused_days` | global | number 1–3650 | `60` | Days without use after which the *workspace prompt footprint* calls an app or reusable widget unused, and a knowhow doc not loaded by name. An item younger than this is not judged. Change it only when the user asks. |
 | `coding_agent_default` | global | `claude-code` \| `codex` | `claude-code` | Default coding agent the compose picker pre-selects. |
 | `coding_agent_claude_path` | global | absolute path | (auto-detected) | Path to the `claude` CLI for Claude Code threads. Unset = auto-detect (`~/.local/bin`, `~/.claude/local`, Homebrew, PATH). A set path that does not resolve fails the spawn and names this key; it never falls back silently. |
 | `coding_agent_codex_path` | global | absolute path | (auto-detected) | Path to the `codex` CLI for Codex threads. Unset = auto-detect (`~/.local/bin`, Homebrew, PATH). A set path that does not resolve fails the spawn and names this key; it never falls back silently. |

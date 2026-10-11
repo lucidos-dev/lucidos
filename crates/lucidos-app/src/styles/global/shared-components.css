@@ -1240,7 +1240,7 @@ html[data-font-bold="none"] .markdown-content :is(strong, b) {
 
 /* Shared dropdown trigger/chevron/placeholder/option — the host's custom
    <Dropdown> AND the app SDK's `lucidos.ui.Select` render these exact classes,
-   so the two widgets share one look with nothing to keep in sync. See
+   so the two controls share one look with nothing to keep in sync. See
    docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. The menu's own box
    (background/border/radius/shadow) is `.surface-box`, in `surface.css`.
 

@@ -53,7 +53,8 @@ import { refreshRepositories } from './repositoriesLoader';
 import { forgetThreadEventsFailures } from './thread-loading';
 // Same shape of cycle (`compose -> threads -> thread-loading -> compose`), same
 // reason it is safe: called at runtime, never at module init.
-import { unfocusThread } from './threads';
+import { focusThread, unfocusThread } from './threads';
+import { homeThreadId } from './homeThread';
 import type { ChatContext } from './chatContext';
 // Not a new edge at all: `./chat` above already imports this same function, so
 // `compose -> pane` was in the graph before this line. The property to re-check
@@ -359,8 +360,9 @@ function markLocallyEdited(threadId: string): void {
  *  free-form answer path emits no `MessageReceived`, chat/process/run.rs
  *  rerouting typed text straight to `UserQuestionAnswered`.
  *
- *  Agent- and engine-authored entries, `UserPromptInjected` above all, are NOT
- *  user submissions and must never supersede a draft. */
+ *  A `PromptInjected` is never a submission and must never supersede a draft.
+ *  A human one only echoes the `MessageReceived` above, and any other is an
+ *  agent's or the engine's words. */
 function submittedUserInput(event: StoredEvent): { text: string; imageHashes: string[] } | null {
   if (event.type === 'MessageReceived') {
     return { text: event.text ?? '', imageHashes: event.user_image_hashes ?? [] };
@@ -1271,18 +1273,29 @@ export const SETUP_INTERVIEW_PROMPT =
   'Help me get the most out of Lucidos: interview me about my work and my life, '
   + 'then build me the apps and automations that fit, here in my workspace.';
 
-/** Start the setup interview: seed {@link SETUP_INTERVIEW_PROMPT} and SEND it.
+/** Start the setup interview: send {@link SETUP_INTERVIEW_PROMPT} as the user.
  *
- *  Unlike {@link seedSuggestion}, this does not stop at the draft. A first-run
- *  user staring at a prefilled box they did not write has to decide whether to
- *  send it. That hesitation is what the entry point exists to remove, so the
- *  click is the whole gesture. Nothing is hidden by sending: the seeded
- *  sentence is what appears in the transcript, on the same code path a typed
- *  message takes.
+ *  It does not stop at a draft. A first-run user staring at a prefilled box
+ *  they did not write has to decide whether to send it. That hesitation is
+ *  what the entry point exists to remove, so the click is the whole gesture.
+ *  Nothing is hidden by sending: the sentence is what appears in the
+ *  transcript, on the same code path a typed message takes.
+ *
+ *  It runs in the home thread, where everything starts (ADR 0411), so it
+ *  creates no thread of its own. Only a workspace whose Home could not be
+ *  created starts it in a new thread, as a seeded prompt.
  *
  *  Returns true when the interview was sent, false when the send failed. */
 export async function startSetupInterview(): Promise<boolean> {
-  return sendSeededPrompt(SETUP_INTERVIEW_PROMPT, 'start the setup interview');
+  const home = homeThreadId.value;
+  if (!home) return sendSeededPrompt(SETUP_INTERVIEW_PROMPT, 'start the setup interview');
+  focusThread(home);
+  try {
+    return (await sendMessage(SETUP_INTERVIEW_PROMPT, undefined, { threadId: home })) === 'sent';
+  } catch (err) {
+    showToast(`Failed to start the setup interview: ${errorDetail(err)}`, 'error');
+    return false;
+  }
 }
 
 /** Seed `text` into the composer and SEND it, as the user.
@@ -1545,7 +1558,7 @@ export async function sendCompose(
   // path uses ccModel/ccReasoningEffort. sendMessage falls back to the globals
   // when an override is absent (raw-new sends + follow-ups keep the old path).
   const modelOverride = resolveModel(threadId);
-  const reasoningEffortOverride = resolveReasoningEffort(threadId);
+  const reasoningEffortOverride = resolveReasoningEffort(threadId) ?? undefined;
   const providerOverride = resolveProvider(threadId) ?? undefined;
   const ccModelOverride = resolveCcModel(threadId);
   const ccReasoningEffortOverride = resolveCcReasoningEffort(threadId);

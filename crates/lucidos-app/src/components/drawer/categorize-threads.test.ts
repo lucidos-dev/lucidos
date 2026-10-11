@@ -10,6 +10,7 @@ import { describe, it, expect } from 'vitest';
 import { categorizeThreads, computeFamilyKeys, THREAD_DRAWER_SECTION_ORDER } from './ThreadDrawer';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
 import type { ArchiveState } from '../../generated/thread-lifecycle';
+import type { CodingAgentChangeState } from '../../api/threads';
 
 type ThreadOpts = {
     parentId?: string;
@@ -17,7 +18,7 @@ type ThreadOpts = {
     status?: ThreadStatus;
     saved?: boolean;
     activeChildrenCount?: number;
-    codingAgentProposed?: boolean;
+    codingAgentChangeState?: CodingAgentChangeState;
     updatedAt?: string;
     lastRevivedAt?: string;
 };
@@ -38,10 +39,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         activeChildrenCount: opts.activeChildrenCount ?? 0,
         totalChildrenCount: 0,
         blockingDescendantCount: 0, attentionDescendantCount: 0,
-        codingAgentHasDiff: false,
-        codingAgentProposed: opts.codingAgentProposed ?? false,
-        codingAgentRequiresRestart: false,
-        codingAgentIncomplete: false,
+        codingAgentChangeState: opts.codingAgentChangeState ?? { kind: 'none' },
         codingAgentIsExternalRepo: false,
         lastRevivedAt: opts.lastRevivedAt ?? '',
         parentThreadId: opts.parentId,
@@ -61,14 +59,14 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
     };
 }
 
-// Convenience builders. A running thread and a CTA (codingAgentProposed) thread
+// Convenience builders. A running thread and a CTA (proposed change) thread
 // both land in Current — the former is the system's turn, the latter the
 // user's — distinguished at the row level (status icon / attention filter), not
 // by a separate section. Current itself sorts purely by creation time.
 const running = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, status: 'running' });
 const withCta = (id: string, opts: ThreadOpts = {}) =>
-    makeThread(id, { ...opts, codingAgentProposed: true, section: 'inbox' });
+    makeThread(id, { ...opts, codingAgentChangeState: { kind: 'proposed', requires_restart: false }, section: 'inbox' });
 const inSaved = (id: string, opts: ThreadOpts = {}) =>
     makeThread(id, { ...opts, saved: true });
 const inArchive = (id: string, opts: ThreadOpts = {}) =>
@@ -91,7 +89,7 @@ describe('categorizeThreads — family-aware section routing', () => {
 
     it('keeps a family in Current when idle no-CTA siblings sit under a running child', () => {
         // A CC parent with one running child and two idle children (changes
-        // applied, codingAgentProposed=false) renders as one family unit in
+        // applied, nothing proposed) renders as one family unit in
         // Current — no member splits off into another section.
         const parent = makeThread('parent', { activeChildrenCount: 1 });
         const runningChild = running('running-child', { parentId: 'parent' });

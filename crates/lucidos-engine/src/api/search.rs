@@ -261,8 +261,16 @@ async fn search_apps_internal(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResultItem>, String> {
-    let apps = state
-        .app_manager
+    search_apps(&state.app_manager, query, limit)
+}
+
+/// Widgets are not apps here (ADR 0402): `list_apps` already leaves them out.
+fn search_apps(
+    app_manager: &crate::core::AppManager,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResultItem>, String> {
+    let apps = app_manager
         .list_apps()
         .map_err(|e| format!("App listing failed: {}", e))?;
 
@@ -378,6 +386,21 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn app_search_finds_no_widget() {
+        let bus = crate::test_support::offline_event_bus();
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = crate::core::AppManager::new(tmp.path()).unwrap();
+        crate::core::apps::tests::app_and_widget(&manager, &bus).await;
+        let ids: Vec<String> = search_apps(&manager, "", 50)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect();
+        assert_eq!(ids, vec!["habit-tracker".to_string()]);
+        assert!(search_apps(&manager, "fare", 50).unwrap().is_empty());
+    }
 
     #[test]
     fn a_category_defaults_to_its_page_and_all_to_its_slice() {

@@ -164,8 +164,10 @@ html[data-theme-mode="light"] {
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
 }
 
+/* No WebKit grey flash under a finger, as on the host's root (base.css). */
 html {
     font-size: var(--user-ui-scale, 100%);
+    -webkit-tap-highlight-color: transparent;
 }
 
 *, *::before, *::after {
@@ -188,6 +190,19 @@ body {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
+}
+
+/* A minimal widget window draws the widget alone (ADR 0419). The page is
+   see-through, so the widget's own drawing is its shape, and the body takes
+   its content's width, which the SDK reports so the window fits it. */
+html[data-widget-mode="minimal"],
+html[data-widget-mode="minimal"] body {
+    background: transparent;
+}
+
+html[data-widget-mode="minimal"] body {
+    width: max-content;
+    max-width: 100%;
 }
 
 /* A shared row title names no size and inherits the body's. The host body is
@@ -232,8 +247,10 @@ a {
     text-decoration: none;
 }
 
-a:hover {
-    text-decoration: underline;
+@media (hover: hover) {
+    a:hover {
+        text-decoration: underline;
+    }
 }
 
 input, textarea, select {
@@ -268,9 +285,13 @@ button {
     transition: background var(--transition), border-color var(--transition);
 }
 
-button:hover {
-    background: var(--border-color);
-    border-color: var(--text-muted);
+/* Gated: on touch an ungated hover latches onto the last button tapped and
+   paints it grey, so an unpicked control reads as disabled. */
+@media (hover: hover) {
+    button:hover {
+        background: var(--border-color);
+        border-color: var(--text-muted);
+    }
 }
 
 /* Themed dropdown — lucidos.ui.Select (replaces native <select> popup).
@@ -279,7 +300,7 @@ button:hover {
    menu's box, so the look has one source with the host's own dropdown and
    nothing to keep in sync. See
    docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md. What stays here is
-   only what those classes do not cover: the widget's own non-portaled
+   only what those classes do not cover: the control's own non-portaled
    positioning and its open/closed toggle. */
 .lucidos-select {
     position: relative;
@@ -330,9 +351,14 @@ button:hover {
     opacity: 0.6;
 }
 
-.lucidos-select-option.disabled:hover,
 .lucidos-select-option.disabled.focused {
     background: transparent;
+}
+
+@media (hover: hover) {
+    .lucidos-select-option.disabled:hover {
+        background: transparent;
+    }
 }
 
 /* Scrollbar */
@@ -350,8 +376,10 @@ button:hover {
     border-radius: 0.1875rem;
 }
 
-::-webkit-scrollbar-thumb:hover {
-    background: var(--text-muted);
+@media (hover: hover) {
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--text-muted);
+    }
 }
 
 /* Find in app: every match, and the current one, as the host's find bar

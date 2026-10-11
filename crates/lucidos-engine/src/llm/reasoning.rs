@@ -58,9 +58,10 @@ use crate::llm::vertex::VertexProvider;
 /// load-bearing: [`clamp_effort`] measures distance along it, and every set
 /// below is a subset of it in the same order.
 ///
-/// Also the allow-list the preference catalog validates `chat_reasoning_effort`
-/// against (`core::preference_catalog::REASONING_EFFORTS`) and the vocabulary a
-/// trigger's `reasoning_effort` is checked against, so the accepted values and
+/// Also the allow-list the preference catalog validates each
+/// `chat_reasoning_efforts` tier against
+/// (`core::preference_catalog::REASONING_EFFORTS`), and the vocabulary a
+/// trigger's `reasoning_effort` is checked against. So the accepted values and
 /// the offered tiers cannot drift apart.
 pub const EFFORT_LADDER: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
 
@@ -194,6 +195,11 @@ pub fn clamp_effort<'a>(effort: &'a str, provider: ProviderKind, model: &str) ->
         .map(|(tier, _)| *tier)
 }
 
+/// `effort` as the ladder's own string, or `None` when it is not a tier.
+pub fn tier(effort: &str) -> Option<&'static str> {
+    EFFORT_LADDER.iter().find(|t| **t == effort).copied()
+}
+
 /// Position of `effort` on [`EFFORT_LADDER`], or `None` if it is not a tier.
 fn rung(effort: &str) -> Option<usize> {
     EFFORT_LADDER.iter().position(|tier| *tier == effort)
@@ -252,6 +258,7 @@ mod tests {
             "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-sonnet-5",
+            "claude-haiku-5-5",
         ] {
             assert_eq!(
                 supported_efforts(ProviderKind::Vertex, adaptive),

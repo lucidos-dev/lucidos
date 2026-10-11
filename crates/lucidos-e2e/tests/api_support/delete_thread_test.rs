@@ -19,7 +19,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 /// Seed one family member, covering every column the cascade gate consults.
-async fn seed_thread(
+pub(crate) async fn seed_thread(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     parent_thread_id: Option<Uuid>,
@@ -29,10 +29,10 @@ async fn seed_thread(
         "INSERT INTO thread_summaries (\
              thread_id, parent_thread_id, source, is_coding_agent, title, \
              created_at, last_activity, message_count, status, archive_state, \
-             coding_agent_proposed, coding_agent_is_external_repo, \
+             coding_agent_change_state, coding_agent_is_external_repo, \
              has_response, state \
          ) VALUES ($1, $2, 'chat', FALSE, 'delete e2e', NOW(), NOW(), 0, $3, 'inbox', \
-                   FALSE, FALSE, TRUE, 'active')",
+                   'none', FALSE, TRUE, 'active')",
     )
     .bind(thread_id)
     .bind(parent_thread_id)
@@ -64,7 +64,7 @@ async fn rows_left(pool: &sqlx::PgPool, table: &str, ids: &[Uuid]) -> i64 {
     .expect("count failed")
 }
 
-async fn cleanup(pool: &sqlx::PgPool, ids: &[Uuid]) {
+pub(crate) async fn cleanup(pool: &sqlx::PgPool, ids: &[Uuid]) {
     let _ = sqlx::query("DELETE FROM events WHERE thread_id = ANY($1)")
         .bind(ids)
         .execute(pool)

@@ -528,7 +528,7 @@ describe('Phase 4 — thread lifecycle under terminal-only SessionEnded', () => 
 
   it('thread is active after ChangeProposed', () => {
     // ChangeProposed now fires per commit and does not terminate the thread.
-    // The status rule is 'no_change' — only codingAgentProposed flips on. Multiple
+    // The status rule is 'no_change' — only the change state flips to proposed. Multiple
     // ChangeProposed events for the same branch must accumulate without
     // overwriting each other (they live in the events Map keyed by seq).
     const thread = makeThreadState();
@@ -544,9 +544,9 @@ describe('Phase 4 — thread lifecycle under terminal-only SessionEnded', () => 
     handleEventWithAgg(map, 't1', 5, { type: 'ChangeProposed', change_id: 'c1', commit_sha: 'ccc333', description: 'third' } as ThreadEvent, '2026-04-24T10:00:04Z');
 
     // Status is unchanged from 'running' (ChangeProposed has 'no_change' rule),
-    // codingAgentProposed flips on, all three events are preserved (no overwrites).
+    // the change state flips to proposed, all three events are preserved (no overwrites).
     expect(thread.meta.status).toBe('running');
-    expect(thread.meta.codingAgentProposed).toBe(true);
+    expect(thread.meta.codingAgentChangeState.kind).toBe('proposed');
     const proposed = [...thread.events.values()].filter(e => e.type === 'ChangeProposed');
     expect(proposed).toHaveLength(3);
     expect(proposed.map(e => (e as { commit_sha?: string }).commit_sha)).toEqual(['aaa111', 'bbb222', 'ccc333']);

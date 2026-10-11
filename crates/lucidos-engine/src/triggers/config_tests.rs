@@ -1244,8 +1244,8 @@ fn created_with_model_and_effort_carries_both() {
 /// trigger that only wanted a cheaper model would also freeze its effort.
 #[test]
 fn created_with_only_one_of_the_pair_leaves_the_other_none() {
-    let model_only = created_with(json!({ "model": "gemini-3.5-flash" }));
-    assert_eq!(model_only.model.as_deref(), Some("gemini-3.5-flash"));
+    let model_only = created_with(json!({ "model": "gemini-3.8-flash" }));
+    assert_eq!(model_only.model.as_deref(), Some("gemini-3.8-flash"));
     assert_eq!(model_only.reasoning_effort, None);
 
     let effort_only = created_with(json!({ "reasoning_effort": "max" }));
@@ -1294,8 +1294,8 @@ fn apply_update_model_and_effort_triple_state() {
     assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
 
     // String: set.
-    config.apply_update(&json!({ "model": "gemini-3.5-flash", "reasoning_effort": "high" }));
-    assert_eq!(config.model.as_deref(), Some("gemini-3.5-flash"));
+    config.apply_update(&json!({ "model": "gemini-3.8-flash", "reasoning_effort": "high" }));
+    assert_eq!(config.model.as_deref(), Some("gemini-3.8-flash"));
     assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
 
     // Null: cleared back to the account default.
@@ -1385,6 +1385,8 @@ fn two_route_registry() -> crate::llm::ModelRegistry {
             ],
             preferred: None,
             vision: false,
+            default_effort: None,
+            successor: None,
         },
     );
     registry

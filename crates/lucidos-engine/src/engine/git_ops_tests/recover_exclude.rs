@@ -710,6 +710,163 @@ async fn commit_worktree_or_err_commits_dirty_worktree() {
     );
 }
 
+/// `main` and `side` both rewrite `init.txt`, and `main` merges `side`, so
+/// the repo is left mid-merge with markers in `init.txt`.
+async fn make_conflicted_merge() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, repo) = make_test_repo().await;
+    let _ = git_cmd(&["checkout", "-b", "side"], &repo).await;
+    tokio::fs::write(repo.join("init.txt"), "side")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["commit", "-am", "side edit"], &repo).await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    tokio::fs::write(repo.join("init.txt"), "main")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["commit", "-am", "main edit"], &repo).await;
+    let merge = git_cmd(&["merge", "side"], &repo).await.unwrap();
+    assert!(!merge.status.success(), "precondition: the merge conflicts");
+    (tmp, repo)
+}
+
+async fn head_sha(repo: &Path) -> String {
+    let out = git_cmd(&["rev-parse", "HEAD"], repo).await.unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Regression: `git add -A` marks a conflicted path resolved with its markers
+/// in, and the commit after it finished the merge. Every apply path commits
+/// through here before it fast-forwards main, so the markers reached main.
+#[tokio::test]
+async fn commit_worktree_or_err_refuses_a_path_holding_conflict_markers() {
+    let (_tmp, repo) = make_conflicted_merge().await;
+    let before = head_sha(&repo).await;
+
+    let err = commit_worktree_or_err(&repo, "should refuse")
+        .await
+        .expect_err("conflict markers must not be committed");
+    assert!(err.contains("init.txt"), "the error names the path: {err}");
+    assert_eq!(head_sha(&repo).await, before, "nothing was committed");
+    assert!(
+        repo.join(".git/MERGE_HEAD").exists(),
+        "the merge is left for the agent to finish"
+    );
+}
+
+/// Git quotes a path holding a space in plain porcelain output. Read that way,
+/// the quoted name was not found and the markers were committed anyway.
+#[tokio::test]
+async fn commit_worktree_or_err_refuses_markers_in_a_path_with_a_space() {
+    let (_tmp, repo) = make_test_repo().await;
+    let name = "my notes.md";
+    tokio::fs::write(repo.join(name), "base").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "base"], &repo).await;
+    let _ = git_cmd(&["checkout", "-b", "side"], &repo).await;
+    tokio::fs::write(repo.join(name), "side").await.unwrap();
+    let _ = git_cmd(&["commit", "-am", "side edit"], &repo).await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    tokio::fs::write(repo.join(name), "main").await.unwrap();
+    let _ = git_cmd(&["commit", "-am", "main edit"], &repo).await;
+    let merge = git_cmd(&["merge", "side"], &repo).await.unwrap();
+    assert!(!merge.status.success(), "precondition: the merge conflicts");
+
+    let err = commit_worktree_or_err(&repo, "should refuse")
+        .await
+        .expect_err("markers in a quoted path must not be committed");
+    assert!(
+        err.contains(name),
+        "the error names the path unquoted: {err}"
+    );
+}
+
+/// Staging a conflicted path marks it resolved, markers and all, so it no
+/// longer reads as unmerged. During a merge the staged paths are checked too.
+#[tokio::test]
+async fn commit_worktree_or_err_refuses_markers_staged_mid_merge() {
+    let (_tmp, repo) = make_conflicted_merge().await;
+    let _ = git_cmd(&["add", "init.txt"], &repo).await;
+
+    let err = commit_worktree_or_err(&repo, "should refuse")
+        .await
+        .expect_err("staged markers must not be committed");
+    assert!(err.contains("init.txt"), "the error names the path: {err}");
+}
+
+/// The `conflict-marker-size` attribute writes markers longer than seven
+/// characters, which an exact seven-character prefix missed.
+#[tokio::test]
+async fn commit_worktree_or_err_refuses_long_conflict_markers() {
+    let (_tmp, repo) = make_test_repo().await;
+    tokio::fs::write(repo.join(".gitattributes"), "* conflict-marker-size=10\n")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "long markers"], &repo).await;
+    let _ = git_cmd(&["checkout", "-b", "side"], &repo).await;
+    tokio::fs::write(repo.join("init.txt"), "side")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["commit", "-am", "side edit"], &repo).await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    tokio::fs::write(repo.join("init.txt"), "main")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["commit", "-am", "main edit"], &repo).await;
+    let merge = git_cmd(&["merge", "side"], &repo).await.unwrap();
+    assert!(!merge.status.success(), "precondition: the merge conflicts");
+    let text = tokio::fs::read_to_string(repo.join("init.txt"))
+        .await
+        .unwrap();
+    assert!(
+        text.contains("<<<<<<<<<< "),
+        "precondition: ten-character markers"
+    );
+
+    let err = commit_worktree_or_err(&repo, "should refuse")
+        .await
+        .expect_err("long markers must not be committed");
+    assert!(err.contains("init.txt"), "the error names the path: {err}");
+}
+
+/// Git writes no markers into a binary file it cannot merge, so the marker
+/// scan saw nothing and `git add -A` committed one side as the resolution.
+#[tokio::test]
+async fn commit_worktree_or_err_refuses_an_unmerged_binary_file() {
+    let (_tmp, repo) = make_test_repo().await;
+    let name = "image.bin";
+    tokio::fs::write(repo.join(name), b"base\0").await.unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "base"], &repo).await;
+    let _ = git_cmd(&["checkout", "-b", "side"], &repo).await;
+    tokio::fs::write(repo.join(name), b"side\0").await.unwrap();
+    let _ = git_cmd(&["commit", "-am", "side edit"], &repo).await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    tokio::fs::write(repo.join(name), b"main\0").await.unwrap();
+    let _ = git_cmd(&["commit", "-am", "main edit"], &repo).await;
+    let merge = git_cmd(&["merge", "side"], &repo).await.unwrap();
+    assert!(!merge.status.success(), "precondition: the merge conflicts");
+
+    let err = commit_worktree_or_err(&repo, "should refuse")
+        .await
+        .expect_err("an unmerged binary file must not be committed");
+    assert!(err.contains(name), "the error names the path: {err}");
+}
+
+/// A conflict the agent fixed in the file but never staged still commits,
+/// which finishes the merge as it did before the marker check.
+#[tokio::test]
+async fn commit_worktree_or_err_finishes_a_merge_resolved_in_place() {
+    let (_tmp, repo) = make_conflicted_merge().await;
+    tokio::fs::write(repo.join("init.txt"), "resolved")
+        .await
+        .unwrap();
+
+    let committed = commit_worktree_or_err(&repo, "finish merge").await;
+    assert_eq!(committed.ok(), Some(true));
+    assert!(!repo.join(".git/MERGE_HEAD").exists(), "the merge is done");
+}
+
 /// Edits inside a submodule cannot be committed from the superproject, and
 /// that state never changes on its own. Counting them as uncommitted work
 /// refused every Apply on the worktree, the wedge 70c9aaa87e backed out of.

@@ -51,10 +51,7 @@ function makeThread(state: ThreadMeta['state'] = 'active'): ThreadState {
     totalChildrenCount: 0,
     blockingDescendantCount: 0,
     attentionDescendantCount: 0,
-    codingAgentHasDiff: false,
-    codingAgentProposed: false,
-    codingAgentRequiresRestart: false,
-    codingAgentIncomplete: false,
+    codingAgentChangeState: { kind: 'none' },
     codingAgentIsExternalRepo: false,
     lastRevivedAt: '',
     state,
@@ -259,17 +256,17 @@ describe('the menu it opens', () => {
     expect(handleSaveThread).toHaveBeenCalledWith(THREAD_ID);
   });
 
-  it('leads with Show in thread list', async () => {
+  it('leads with Show in Folders', async () => {
     mount();
     await tap(titleButton());
-    expect(menuItems()[0]).toBe('Show in thread list');
+    expect(menuItems()[0]).toBe('Show in Folders');
   });
 
-  it('offers a draft neither Pin nor Show in thread list', async () => {
+  it('offers a draft neither Pin nor Show in Folders', async () => {
     mount('composing');
     await tap(titleButton());
     expect(menuItems()).not.toContain('Pin thread');
-    expect(menuItems()).not.toContain('Show in thread list');
+    expect(menuItems()).not.toContain('Show in Folders');
   });
 });
 

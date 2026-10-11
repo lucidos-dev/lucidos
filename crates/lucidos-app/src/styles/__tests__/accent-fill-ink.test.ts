@@ -32,14 +32,15 @@ describe('ink on the accent fill', () => {
   });
 
   it('a badge never inks with a literal, even where its fill comes from .badge', () => {
-    // `.badge.drawer-view-count` sets no background of its own, so the scan
-    // above cannot see it. Only the header bar's badges repaint the fill.
+    // A badge that sets no background of its own takes its fill from `.badge`,
+    // so the scan above cannot see it. Only the header bar's badges repaint
+    // the fill.
     const allowed = ['var(--text-on-accent)', 'var(--header-badge-fg)'];
     const inked = sheets.flatMap(([file, css]) => rulesTargeting(css, 'badge')
       .filter(r => r.props.has('color'))
       .map(r => ({ file, r })));
-    expect(inked.map(({ r }) => r.selector), 'the scan lost the drawer pill')
-      .toContain('.badge.drawer-view-count');
+    expect(inked.map(({ r }) => r.selector), 'the scan lost the base badge')
+      .toContain('.badge');
     for (const { file, r } of inked) {
       expect(allowed, `${file}: ${r.selector}`).toContain(r.props.get('color'));
     }

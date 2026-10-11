@@ -17,10 +17,11 @@
 #
 #   1. a backtick-quoted repo path that does not exist
 #   2. a sibling knowhow file or id that does not resolve
-#   3. an event name in workspace-audit.md / workspace-learning.md that is
-#      neither a live event, a retired alias, nor one of the two the recipes
-#      emit themselves
-#   4. a severity word in workspace-audit.md outside its own legend
+#   3. an event name in workspace-audit.md, its audit sections or
+#      workspace-learning.md that is neither a live event, a retired alias,
+#      nor one of the two the recipes emit themselves
+#   4. a severity word in workspace-audit.md or an audit section outside the
+#      root's own legend
 #
 # Arm 3 is the one with a scar. workspace-audit.md told a workspace that
 # ContextAssembled and ContextTokensMeasured were retired event renames. They
@@ -76,6 +77,7 @@ EVENT_IMPL = "crates/lucidos-engine/src/engine/thread_events/event_impl.rs"
 SYSTEM_ENUM = "crates/lucidos-engine/src/engine/event_bus_system_event.rs"
 AUDIT = "system-knowhow/workspace-audit.md"
 LEARNING = "system-knowhow/workspace-learning.md"
+AUDIT_SECTIONS_GLOB = "system-knowhow/workspace-audit/**/*.md"
 
 # Prefixes that name a real tracked path. A backtick span starting with
 # anything else is prose, a data/ path inside a workspace, or a shell snippet.
@@ -186,6 +188,12 @@ for source, count in (
         fatal("only %d names parsed where at least %d were expected" % (len(source), count))
     known_events |= source
 
+# The audit's sections carry its checks, so they share its event and severity
+# rules. None found means the split went missing, which must not read as clean.
+audit_sections = sorted(glob.glob(AUDIT_SECTIONS_GLOB, recursive=True))
+if not audit_sections:
+    fatal("no audit sections under %s" % AUDIT_SECTIONS_GLOB)
+
 # --- arms 1 and 2: every path and knowhow id resolves ----------------------
 
 for path in knowhow_files:
@@ -206,7 +214,7 @@ for path in knowhow_files:
 
 # --- arm 3: every event name the two recipes cite is a real one ------------
 
-for path in (AUDIT, LEARNING):
+for path in [AUDIT, LEARNING] + audit_sections:
     # read() fails closed on a missing recipe. Opening it directly would raise a
     # traceback instead, which reads as the gate crashing rather than the recipe
     # having been renamed or deleted.
@@ -222,27 +230,31 @@ for path in (AUDIT, LEARNING):
 
 # --- arm 4: the audit's severity vocabulary is closed ----------------------
 
-audit = read(AUDIT)
 legend = set()
-used = set()
-for line in audit.splitlines():
-    cells = table_cells(line)
-    for index, cell in enumerate(cells):
-        bold = re.match(r"^\*\*([a-z]+)\*\*", cell)
-        if not bold:
-            continue
-        if index == 0 and cell == bold.group(0):
-            legend.add(bold.group(1))
-        elif index > 0:
-            used.add(bold.group(1))
-used |= set(re.findall(r"[Ss]everity: \*\*([a-z]+)\*\*", audit))
+used = {}
+for path in [AUDIT] + audit_sections:
+    text = read(path)
+    for line in text.splitlines():
+        cells = table_cells(line)
+        for index, cell in enumerate(cells):
+            bold = re.match(r"^\*\*([a-z]+)\*\*", cell)
+            if not bold:
+                continue
+            if index == 0 and cell == bold.group(0) and path == AUDIT:
+                legend.add(bold.group(1))
+            elif index > 0:
+                used.setdefault(bold.group(1), path)
+    for word in re.findall(r"[Ss]everity: \*\*([a-z]+)\*\*", text):
+        used.setdefault(word, path)
 
 # A missing legend is a finding, not an inability to run: reporting it as a
 # problem keeps arms 1 to 3 visible in the same pass.
 if not legend:
     problems.append("%s: no severity legend table, so no severity is defined" % AUDIT)
-for word in sorted(used - legend):
-    problems.append("%s: severity `%s` is used but not in the legend" % (AUDIT, word))
+for word in sorted(set(used) - legend):
+    problems.append(
+        "%s: severity `%s` is used but not in %s's legend" % (used[word], word, AUDIT)
+    )
 
 # --- report ----------------------------------------------------------------
 

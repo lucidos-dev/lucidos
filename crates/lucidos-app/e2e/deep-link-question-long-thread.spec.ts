@@ -35,7 +35,7 @@ function seedLongQuestionThread(): { threadId: string; questionId: string } {
     options: [{ id: 'a', label: 'Yes' }, { id: 'b', label: 'No' }],
   }, asked));
   stmts.unshift(
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Long question thread', 'chat', '${asked}', ${EXCHANGES}, false, true, 'waiting_for_user_answer', 'inbox', 'active', false, 0, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Long question thread', 'chat', '${asked}', ${EXCHANGES}, false, true, 'waiting_for_user_answer', 'inbox', 'active', false, 0, 0, 'none', false)`,
   );
   psql(stmts.join(';\n'));
   return { threadId, questionId };

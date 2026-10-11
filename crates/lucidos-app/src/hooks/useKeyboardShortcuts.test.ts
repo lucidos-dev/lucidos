@@ -41,6 +41,7 @@ import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
 import { focusedPane, focusedThreadId, panelOverlay, splitRatio, searchEverywhereAnchor, searchEverywhereOpen, threadMap } from '../store/store';
 import { makeThreadState } from '../store/__tests__/thread-events-helpers';
+import { findSurface } from '../store/actions/find-bar';
 import { openHighlightedThreadActions } from '../components/drawer/ThreadDrawer';
 import { openThreadTitleMenu } from '../components/chat/ThreadTitle';
 import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
@@ -252,6 +253,17 @@ describe('classifyChord (host keydowns, app-frame forwards, the PDF preview)', (
     panelOverlay.value = { type: 'file-preview', path: 'artifacts/report.pdf' };
     expect(classifyChord(modF, true), 'the PDF preview keeps its own find').toBeNull();
     panelOverlay.value = null;
+    focusedPane.value = 'thread';
+  });
+
+  it('claims Mod+F to close an open find bar, wherever focus is', () => {
+    const modF = chord({ metaKey: true, key: 'f' });
+    focusedPane.value = 'drawer';
+    findSurface.value = 'content';
+    expect(classifyChord(modF)).toBe('findInView');
+    pushOverlay({ id: 'modal', dismiss: vi.fn(), hasPanel: true });
+    expect(classifyChord(modF), 'a modal still covers it').toBeNull();
+    findSurface.value = null;
     focusedPane.value = 'thread';
   });
 

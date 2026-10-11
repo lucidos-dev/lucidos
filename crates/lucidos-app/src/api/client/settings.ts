@@ -1,4 +1,4 @@
-import { API, ApiError, json, text } from './_core';
+import { API, ApiError, json, text, throwIfRefused } from './_core';
 import { repoFileUrl } from './fileUrls';
 import type { FormRequestEvent } from '../../store/thread-events/thread-event-types';
 import { lucidos } from '@lucidos/sdk';
@@ -308,15 +308,7 @@ export async function setPreference(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ value, device_id: deviceId }),
   });
-  if (!result.success) {
-    // A plain Error, deliberately not an `ApiError`. The HTTP call SUCCEEDED,
-    // so there is no status code to carry. `ApiError`'s message reads
-    // `200 <reason>`, putting a success code in front of a refusal.
-    // `isTransientFetchError` wants a TypeError for transport, so this still
-    // reads as the verdict it is and nothing retries it.
-    throw new Error(result.error || `the engine refused the '${key}' preference`);
-  }
-  return result;
+  return throwIfRefused(result, `the engine refused the '${key}' preference`);
 }
 
 // --- Devices ---
@@ -704,4 +696,45 @@ export interface BrowseResult {
 export async function browseDirectories(path?: string): Promise<BrowseResult> {
   const params = path ? `?path=${encodeURIComponent(path)}` : '';
   return json(`${API}/browse-directories${params}`);
+}
+
+// --- Workspace prompt footprint (ADR 0413) ---
+// Mirrors `engine::prompt_footprint::WorkspacePromptFootprint`.
+
+export type FootprintVerdict = 'used' | 'unused' | 'not-yet-judged' | 'not-loaded-by-name';
+
+export interface FootprintItem {
+  kind: 'app' | 'reusable-widget' | 'knowhow' | 'intent' | 'response-style' | 'user-profile'
+    | 'email-account' | 'oauth-account' | 'credential' | 'mcp-server' | 'mcp-tool' | 'app-knowhow';
+  id: string;
+  name: string;
+  chars: number;
+  clipped_chars: number;
+  usage?: { last_used_days_ago: number | null; verdict: FootprintVerdict };
+  /** A knowhow doc's file, relative to `data/`. */
+  path?: string;
+}
+
+export interface FootprintSection {
+  id: string;
+  title: string;
+  when: 'every-turn' | 'gated' | 'open-app' | 'tools-dropped';
+  chars: number;
+  over_ceiling: boolean;
+  items: FootprintItem[];
+}
+
+export interface WorkspacePromptFootprint {
+  sections: FootprintSection[];
+  total_chars: number;
+  over_total_ceiling: boolean;
+  section_ceiling: number;
+  total_ceiling: number;
+  unused_days: number;
+  system_prompt_chars: number;
+  system_prompt_areas: { label: string; chars: number }[];
+}
+
+export function fetchWorkspacePromptFootprint(): Promise<WorkspacePromptFootprint> {
+  return json(`${API}/workspace-prompt-footprint`);
 }

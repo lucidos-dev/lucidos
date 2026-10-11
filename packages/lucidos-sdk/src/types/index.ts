@@ -9,7 +9,7 @@ export type { Trigger, CreateTrigger, UpdateTrigger, TriggerRun, EventSubscripti
 export type { Preferences } from '../preferences';
 export type { Notification, NotificationListResult, Tap, NavigateUi, NavigateTarget, SettingsViewTarget } from '../notifications';
 export type { App } from '../apps';
-export type { ThreadSummary, ThreadsListOptions } from '../threads';
+export type { CodingAgentChangeState, ThreadSummary, ThreadsListOptions, UnproposedReason } from '../threads';
 export type { SseEvent, SseThreadEvent, SseSystemEvent } from '../sse';
 export type { SelectOption, SelectCreateOptions, SelectInstance } from '../select';
 export type { NavigateParams, ConfirmOptions, ToastType, ToastOptions, PromptOptions, FilePreviewParams } from '../ui';

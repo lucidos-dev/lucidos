@@ -22,6 +22,8 @@
 //! have joined the first in silence.
 
 mod default;
+mod not_served_report;
+mod reach;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,12 +32,15 @@ use sqlx::PgPool;
 
 use crate::core::prefs::{self, Optional, Pref, Text};
 use crate::engine::ContextPurpose;
-use crate::llm::model_registry::{ModelRegistry, ProviderKind};
+use crate::llm::model_registry::{default_effort, ModelRegistry, ProviderKind};
 use crate::llm::LlmProvider;
 
+use crate::engine::event_bus::EventBus;
 use crate::llm::AuxProvider;
 pub use default::ModelSource;
-pub(crate) use default::{is_reachable, recommended, select as select_model};
+pub(crate) use default::{recommended, recommended_effort, select as select_model};
+use not_served_report::NotServedRecorder;
+pub(crate) use reach::{NotServed, Reach};
 
 /// The preference pair one auxiliary purpose reads.
 ///
@@ -70,12 +75,20 @@ pub(crate) const SUMMARY_COMPACTION_PREFS: ProviderResolvedPrefs = ProviderResol
 pub(crate) struct AuxSelection {
     /// The model every request names. Never empty.
     pub(crate) model: String,
-    /// `None` means send no effort and let the provider decide.
+    /// `None` leaves the tier to the router: the model's *default effort*,
+    /// else no effort at all.
     pub(crate) reasoning: Option<String>,
     pub(crate) source: ModelSource,
-    /// Whether a configured provider serves `model`. Only a stored pick can
-    /// be unreachable, and its call then fails naming what to configure.
+    /// Whether a configured provider serves `model` and has not answered
+    /// not-found for it. Only a stored pick or the chat model can be
+    /// unreachable, and their calls then fail naming why.
     pub(crate) reachable: bool,
+    /// Where a default call moves when `model` answers not-found. `None` for a
+    /// stored pick or the chat model, which move nowhere (ADR 0403).
+    pub(crate) fallback: Option<String>,
+    /// The models this purpose would run on ahead of `model`, plus `model`,
+    /// whose provider answered not-found within the window.
+    pub(crate) not_served: Vec<String>,
     /// Whether the purpose sends images, so `model` must read them.
     pub(crate) needs_vision: bool,
     /// Whether `model` reads images, by its row's *vision flag*.
@@ -201,6 +214,11 @@ pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
             reasoning: Some(&prefs::REASONING_MEMORY_FIND),
             needs_vision: false,
         },
+        ContextPurpose::ReadDecision => AuxModelPrefs {
+            model: &prefs::MODEL_READ_DECISION,
+            reasoning: Some(&prefs::REASONING_READ_DECISION),
+            needs_vision: false,
+        },
         ContextPurpose::QueryClassification => AuxModelPrefs {
             model: &prefs::MODEL_QUERY_CLASSIFICATION,
             reasoning: Some(&prefs::REASONING_QUERY_CLASSIFICATION),
@@ -222,8 +240,8 @@ pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
             reasoning: None,
             needs_vision: false,
         },
-        // The safety gate. Its catalog default, Haiku 4.5, leads its
-        // recommended list, so an install that serves Haiku keeps judging on it.
+        // The safety gate. Its catalog default is the measured one, Gemini 3
+        // Flash (ADR 0406), which also leads the shared fallbacks.
         ContextPurpose::CommandJudge => AuxModelPrefs {
             model: &prefs::MODEL_COMMAND_JUDGE,
             reasoning: Some(&prefs::REASONING_COMMAND_JUDGE),
@@ -252,7 +270,8 @@ pub(crate) async fn resolve_selection(
     let configured = router
         .configured_providers()
         .unwrap_or_else(|| ProviderKind::ALL.to_vec());
-    let is_configured = |kind| configured.contains(&kind);
+    let reach = Reach::new(configured, NotServed::recent(pool).await);
+    let recommended = recommended(purpose, registry);
     // The model turns run on: the stored one, else the router's own default,
     // which already carries `LUCIDOS_MODEL`.
     let chat_model = prefs::CHAT_MODEL
@@ -264,17 +283,13 @@ pub(crate) async fn resolve_selection(
             let compactor = crate::engine::summary_tree::compactor_selection(
                 pool,
                 registry,
-                &configured,
+                &reach,
                 &chat_model,
             )
             .await;
-            (compactor.model, Some(compactor.effort), compactor.source)
+            (compactor.model, compactor.effort, compactor.source)
         }
         AuxModelSource::Preferences(pair) => {
-            let reasoning = match pair.reasoning {
-                Some(pref) => Some(pref.read(pool).await),
-                None => None,
-            };
             // Settings once wrote `default` for "the extractor's own model",
             // which is what unset means now.
             let stored = pair
@@ -282,13 +297,18 @@ pub(crate) async fn resolve_selection(
                 .stored_or_inherited(pool)
                 .await
                 .filter(|model| model != "default");
-            let (model, source) = default::select(
-                stored,
-                &recommended(purpose, registry),
-                &chat_model,
-                registry,
-                is_configured,
-            );
+            let (model, source) =
+                default::select(stored, &recommended, &chat_model, registry, &reach);
+            let reasoning = match pair.reasoning {
+                Some(pref) => {
+                    let stored = pref
+                        .stored_or_inherited(pool)
+                        .await
+                        .filter(|tier| crate::llm::reasoning::tier(tier).is_some());
+                    stored.or_else(|| task_effort(pref, &model, &recommended, registry))
+                }
+                None => None,
+            };
             (model, reasoning, source)
         }
         AuxModelSource::Turn
@@ -305,17 +325,45 @@ pub(crate) async fn resolve_selection(
             reasoning,
             source: ModelSource::ChatModel,
             reachable: true,
+            fallback: None,
+            not_served: Vec::new(),
             needs_vision: needs_vision(purpose),
             vision: true,
         };
     }
+    // Only a purpose reading its own pair moves. The compactor re-resolves per
+    // node instead, each model at its own measured tier.
+    let fallback = match (source, model_source(purpose)) {
+        (ModelSource::Default, AuxModelSource::Preferences(_)) => {
+            default::next_reachable(&model, &recommended, registry, &reach)
+        }
+        _ => None,
+    };
     AuxSelection {
-        reachable: is_reachable(&model, registry, is_configured),
+        reachable: reach.serves(registry, &model),
+        not_served: default::passed_over(&model, source, &recommended, registry, &reach),
+        fallback,
         needs_vision: needs_vision(purpose),
         vision: crate::llm::model_registry::reads_images(registry, &model),
         model,
         reasoning,
         source,
+    }
+}
+
+/// The tier a task runs `model` at when no tier is stored. The task's own tier
+/// was chosen for its recommended models, so it binds only those. Any other
+/// model runs at its *default effort*.
+fn task_effort(
+    pref: &Pref<Text>,
+    model: &str,
+    recommended: &[String],
+    registry: &ModelRegistry,
+) -> Option<String> {
+    if recommended.iter().any(|m| m == model) {
+        Some(pref.default_text().to_string())
+    } else {
+        default_effort(registry, model).map(str::to_string)
     }
 }
 
@@ -330,6 +378,7 @@ pub(crate) const BACKGROUND_ROWS: &[ContextPurpose] = &[
     ContextPurpose::SummaryCompaction,
     ContextPurpose::MemoryFind,
     ContextPurpose::CommandJudge,
+    ContextPurpose::ReadDecision,
 ];
 
 /// The model preference key `purpose` reads, which names its Settings row.
@@ -436,7 +485,8 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
         | ContextPurpose::Memory
         | ContextPurpose::QueryClassification
         | ContextPurpose::ImageGen
-        | ContextPurpose::CommandJudge => SHORT_CALL_BUDGET,
+        | ContextPurpose::CommandJudge
+        | ContextPurpose::ReadDecision => SHORT_CALL_BUDGET,
         // Eight that never ask. None is an auxiliary HTTP call this module
         // times: a turn and the four `AgentModel` purposes run on the agent's
         // own provider and its timeout, and the talker holds a socket. Web
@@ -460,6 +510,8 @@ pub(crate) struct AuxCall {
     selection: AuxSelection,
     budget: AuxBudget,
     router: Arc<dyn LlmProvider>,
+    /// Who hears a not-found answer. Unset in tests that build no engine.
+    report: Option<Arc<NotServedRecorder>>,
 }
 
 impl AuxCall {
@@ -475,7 +527,32 @@ impl AuxCall {
             selection: resolve_selection(pool, registry, router.as_ref(), purpose).await,
             budget: budget_for(purpose),
             router,
+            report: None,
         }
+    }
+
+    /// Report a not-found answer on `bus`: the event that moves later
+    /// defaults, and a notification when a stored pick failed (ADR 0403).
+    pub(crate) fn reporting_to(
+        mut self,
+        bus: &EventBus,
+        pool: &PgPool,
+        registry: &ModelRegistry,
+        purpose: ContextPurpose,
+    ) -> Self {
+        let configured = self
+            .router
+            .configured_providers()
+            .unwrap_or_else(|| ProviderKind::ALL.to_vec());
+        self.report = Some(Arc::new(NotServedRecorder {
+            bus: bus.clone(),
+            pool: pool.clone(),
+            registry: registry.clone(),
+            reach: Reach::new(configured, NotServed::default()),
+            purpose,
+            source: self.selection.source,
+        }));
+        self
     }
 
     /// A call over `provider` at the purpose's declared defaults, with no
@@ -492,22 +569,29 @@ impl AuxCall {
                 reasoning,
                 source: ModelSource::Default,
                 reachable: true,
+                fallback: None,
+                not_served: Vec::new(),
                 needs_vision: needs_vision(purpose),
                 vision: true,
             },
             budget: budget_for(purpose),
             router: provider,
+            report: None,
         }
     }
 
     /// The provider every request of this call goes out on: the router, with
     /// the selected model and the purpose's attempt cap pinned.
     pub(crate) fn provider(&self) -> Arc<dyn LlmProvider> {
-        Arc::new(AuxProvider::new(
+        let provider = AuxProvider::new(
             self.router.clone(),
             self.selection.model.clone(),
             self.budget.attempt_timeout,
-        ))
+        );
+        Arc::new(match &self.report {
+            Some(report) => provider.reporting(report.clone(), self.selection.fallback.clone()),
+            None => provider,
+        })
     }
 
     pub(crate) fn selection(&self) -> &AuxSelection {
@@ -554,6 +638,7 @@ pub(crate) const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::MemoryFind,
     ContextPurpose::WebSearch,
     ContextPurpose::Proxy,
+    ContextPurpose::ReadDecision,
 ];
 
 #[cfg(test)]
@@ -589,10 +674,11 @@ mod tests {
                 | ContextPurpose::SummaryCompaction
                 | ContextPurpose::MemoryFind
                 | ContextPurpose::WebSearch
-                | ContextPurpose::Proxy => {}
+                | ContextPurpose::Proxy
+                | ContextPurpose::ReadDecision => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 19);
+        assert_eq!(ALL_PURPOSES.len(), 20);
     }
 
     /// The key an unset handle inherits, if any.

@@ -12,8 +12,9 @@ export const DEFAULT_CHAT_MODEL: string = PREFERENCE_CATALOG.chat_model.fallback
  *  on `enabled`, so a retired model listed here is offered until `/models`
  *  lands, then vanishes. Keep it in step with the seeds
  *  (`20260610152555_create_models_registry.sql` and the later per-family ones)
- *  MINUS whatever the disable migrations switched off, most recently
- *  `20260823080956_disable_prior_generation_builtin_models.sql`. */
+ *  MINUS whatever the disable migrations switched off, and every model a
+ *  migration retired with `retire_model` (ADR 0418). An engine test fails
+ *  while this list still offers a retired id. */
 export const MODELS = [
   { value: 'claude-fable-5-1', label: 'Fable 5.1' },
   { value: 'claude-fable-5-1[1m]', label: 'Fable 5.1 (1M)' },
@@ -27,8 +28,9 @@ export const MODELS = [
   { value: 'claude-opus-5[1m]', label: 'Opus 5 (1M)' },
   { value: 'claude-sonnet-5', label: 'Sonnet 5' },
   { value: 'claude-sonnet-5[1m]', label: 'Sonnet 5 (1M)' },
+  { value: 'claude-haiku-5-5', label: 'Haiku 5.5' },
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
-  { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+  { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
   { value: 'gpt-6-astra', label: 'GPT-6 Astra' },
   { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },

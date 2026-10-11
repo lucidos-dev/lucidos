@@ -41,7 +41,7 @@ pub(super) async fn submit_command_consent(
         .unwrap()
         .thread_of(&body.request_id);
     if let Err(e) = super::thread_reach::refuse_permission_answer(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         card_thread,
         body.allowed,

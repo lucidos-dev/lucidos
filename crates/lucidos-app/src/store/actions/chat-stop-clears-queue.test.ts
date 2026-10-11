@@ -44,8 +44,8 @@ function makeQueuedThread(pending: QueuedFixture[]): ThreadState {
     meta: {
       id: 't-1', title: '', channel: 'chat', initiator: 'user', saved: false,
       createdAt: '', updatedAt: '', summaryVersion: 0, status: 'running',
-      codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIncomplete: false,
-      codingAgentIsExternalRepo: false, codingAgentHasDiff: false,
+      codingAgentChangeState: { kind: 'none' },
+      codingAgentIsExternalRepo: false,
       lastRevivedAt: '', messageCount: 0, section: 'archived',
       activeChildrenCount: 0, totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0,

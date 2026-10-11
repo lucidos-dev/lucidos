@@ -41,12 +41,11 @@ export const PREF_CHAT_MODEL = {
   fallback: "claude-opus-5",
 } as const;
 
-export const PREF_CHAT_REASONING_EFFORT = {
-  key: "chat_reasoning_effort",
+export const PREF_CHAT_REASONING_EFFORTS = {
+  key: "chat_reasoning_efforts",
   scope: "global",
-  type: "enum",
-  values: ["none", "low", "medium", "high", "xhigh", "max"],
-  fallback: "high",
+  type: "text",
+  fallback: null,
 } as const;
 
 export const PREF_RESPONSE_STYLE = {
@@ -156,6 +155,21 @@ export const PREF_REASONING_MEMORY_FIND = {
   fallback: "none",
 } as const;
 
+export const PREF_MODEL_READ_DECISION = {
+  key: "model_read_decision",
+  scope: "global",
+  type: "text",
+  fallback: "gemini-3-flash-preview",
+} as const;
+
+export const PREF_REASONING_READ_DECISION = {
+  key: "reasoning_read_decision",
+  scope: "global",
+  type: "enum",
+  values: ["none", "low", "medium", "high", "xhigh", "max"],
+  fallback: "none",
+} as const;
+
 export const PREF_MODEL_MEMORY = {
   key: "model_memory",
   scope: "global",
@@ -195,13 +209,6 @@ export const PREF_MODEL_CONVERSATION_SUMMARY = {
 
 export const PREF_VOICE_ENABLED = {
   key: "voice_enabled",
-  scope: "global",
-  type: "flag",
-  fallback: "false",
-} as const;
-
-export const PREF_HOME_THREAD_ENABLED = {
-  key: "home_thread_enabled",
   scope: "global",
   type: "flag",
   fallback: "false",
@@ -288,6 +295,13 @@ export const PREF_MOBILE_DYNAMIC_BARS = {
   fallback: "false",
 } as const;
 
+export const PREF_AUTOMATIC_WIDGETS = {
+  key: "automatic_widgets",
+  scope: "global",
+  type: "flag",
+  fallback: "true",
+} as const;
+
 export const PREF_EXTERNAL_LINK_TARGET = {
   key: "external_link_target",
   scope: "global",
@@ -326,6 +340,33 @@ export const PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS = {
   min: 1,
   max: 1000,
   fallback: "10",
+} as const;
+
+export const PREF_WORKSPACE_PROMPT_FOOTPRINT_SECTION_CEILING = {
+  key: "workspace_prompt_footprint_section_ceiling",
+  scope: "global",
+  type: "number",
+  min: 100,
+  max: 1000000,
+  fallback: "6000",
+} as const;
+
+export const PREF_WORKSPACE_PROMPT_FOOTPRINT_TOTAL_CEILING = {
+  key: "workspace_prompt_footprint_total_ceiling",
+  scope: "global",
+  type: "number",
+  min: 100,
+  max: 1000000,
+  fallback: "20000",
+} as const;
+
+export const PREF_WORKSPACE_PROMPT_FOOTPRINT_UNUSED_DAYS = {
+  key: "workspace_prompt_footprint_unused_days",
+  scope: "global",
+  type: "number",
+  min: 1,
+  max: 3650,
+  fallback: "60",
 } as const;
 
 export const PREF_MEMORY_MODULE = {
@@ -529,7 +570,7 @@ export const PREF_MODEL_COMMAND_JUDGE = {
   key: "model_command_judge",
   scope: "global",
   type: "text",
-  fallback: "claude-haiku-4-5",
+  fallback: "gemini-3-flash-preview",
 } as const;
 
 export const PREF_REASONING_COMMAND_JUDGE = {
@@ -700,7 +741,7 @@ export const PREFERENCE_CATALOG = {
   "language": PREF_LANGUAGE,
   "timezone": PREF_TIMEZONE,
   "chat_model": PREF_CHAT_MODEL,
-  "chat_reasoning_effort": PREF_CHAT_REASONING_EFFORT,
+  "chat_reasoning_efforts": PREF_CHAT_REASONING_EFFORTS,
   "response_style": PREF_RESPONSE_STYLE,
   "response_styles": PREF_RESPONSE_STYLES,
   "technical_literacy": PREF_TECHNICAL_LITERACY,
@@ -715,13 +756,14 @@ export const PREFERENCE_CATALOG = {
   "reasoning_summary_compaction": PREF_REASONING_SUMMARY_COMPACTION,
   "model_memory_find": PREF_MODEL_MEMORY_FIND,
   "reasoning_memory_find": PREF_REASONING_MEMORY_FIND,
+  "model_read_decision": PREF_MODEL_READ_DECISION,
+  "reasoning_read_decision": PREF_REASONING_READ_DECISION,
   "model_memory": PREF_MODEL_MEMORY,
   "reasoning_memory": PREF_REASONING_MEMORY,
   "model_query_classification": PREF_MODEL_QUERY_CLASSIFICATION,
   "reasoning_query_classification": PREF_REASONING_QUERY_CLASSIFICATION,
   "model_conversation_summary": PREF_MODEL_CONVERSATION_SUMMARY,
   "voice_enabled": PREF_VOICE_ENABLED,
-  "home_thread_enabled": PREF_HOME_THREAD_ENABLED,
   "model_voice_talker": PREF_MODEL_VOICE_TALKER,
   "model_voice_transcriber": PREF_MODEL_VOICE_TRANSCRIBER,
   "voice_talker_voice": PREF_VOICE_TALKER_VOICE,
@@ -733,11 +775,15 @@ export const PREFERENCE_CATALOG = {
   "notifications_filter": PREF_NOTIFICATIONS_FILTER,
   "notification_toasts": PREF_NOTIFICATION_TOASTS,
   "mobile_dynamic_bars": PREF_MOBILE_DYNAMIC_BARS,
+  "automatic_widgets": PREF_AUTOMATIC_WIDGETS,
   "external_link_target": PREF_EXTERNAL_LINK_TARGET,
   "welcome_suggestions_dismissed": PREF_WELCOME_SUGGESTIONS_DISMISSED,
   "self_curated_context_mode": PREF_SELF_CURATED_CONTEXT_MODE,
   "self_curated_context_expire_after_rounds": PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS,
   "self_curated_context_sweep_every_rounds": PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS,
+  "workspace_prompt_footprint_section_ceiling": PREF_WORKSPACE_PROMPT_FOOTPRINT_SECTION_CEILING,
+  "workspace_prompt_footprint_total_ceiling": PREF_WORKSPACE_PROMPT_FOOTPRINT_TOTAL_CEILING,
+  "workspace_prompt_footprint_unused_days": PREF_WORKSPACE_PROMPT_FOOTPRINT_UNUSED_DAYS,
   "memory_module": PREF_MEMORY_MODULE,
   "workspace_view_bytes_home": PREF_WORKSPACE_VIEW_BYTES_HOME,
   "workspace_view_bytes_chat": PREF_WORKSPACE_VIEW_BYTES_CHAT,

@@ -8,9 +8,6 @@ import {
   selectedAppIds,
 } from './store';
 import { triggerFilterOptionsAll } from './triggerFilters';
-import { repoFilterOptionsAll } from './repoFilters';
-import { appFilterOptionsAll } from './appFilters';
-import { hasHiddenDeleted } from './deletedFilterOptions';
 
 /** `total === 0` is the registry-loading window: the localStorage-restored
  *  selection IS narrowing the backend query, so a non-empty selection
@@ -27,7 +24,7 @@ export const threadFilterActive = computed<boolean>(() => {
     // every row on screen read as `selected === total` and reported neutral.
     // `threadPassesChannelFilter` still hides the deleted trigger's threads on
     // any non-empty selection, so the Filter button went dark over a narrowed
-    // list. The panel already ORs in `deletedOptionsHidden` and disagreed.
+    // list.
     const total = triggerFilterOptionsAll.value.length;
     if (selected > 0 && (total === 0 || selected < total)) return true;
   }
@@ -46,19 +43,3 @@ export const threadFilterActive = computed<boolean>(() => {
   return false;
 });
 
-/** Whether "Include deleted" being off is actually holding an option back right
- *  now: a deleted trigger, repo or app that exists and is not selected.
- *
- *  The distinction the filter panel's "(filtered)" note is built on, and the
- *  same one `threadFilterActive` draws for the channels: the question is never
- *  whether a setting is at its widest, but whether it EXCLUDES anything. A
- *  workspace that has never deleted a trigger, repo or app has nothing to
- *  include, so the switch being off narrows nothing and the panel must not say
- *  the list is filtered.
- *
- *  False while the registries are still loading, since the `*All` lists return
- *  [] until then: the honest answer at that moment is "nothing known to hide". */
-export const deletedOptionsHidden = computed<boolean>(() =>
-  hasHiddenDeleted(triggerFilterOptionsAll.value, selectedTriggerIds.value)
-  || hasHiddenDeleted(repoFilterOptionsAll.value, selectedRepoIds.value)
-  || hasHiddenDeleted(appFilterOptionsAll.value, selectedAppIds.value));

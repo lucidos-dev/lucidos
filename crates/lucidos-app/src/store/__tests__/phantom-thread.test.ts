@@ -41,11 +41,8 @@ function makeThread(id: string, overrides: Partial<ThreadState['meta']> = {}): T
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
@@ -246,7 +243,7 @@ describe('Phantom thread prevention', () => {
     map.set(threadId, makeThread(threadId, {
       channel: 'claude_code',
       updatedAt: ownLastActivity,
-      codingAgentHasDiff: false,
+      codingAgentChangeState: { kind: 'none' },
     }));
     threadMap.value = new Map(map);
 
@@ -258,12 +255,12 @@ describe('Phantom thread prevention', () => {
         channel: 'claude_code',
         lastActivity: ownLastActivity,
         section: 'archived',
-        codingAgentHasDiff: true,
+        codingAgentChangeState: { kind: 'unproposed', reason: null },
       }),
     });
 
     const thread = threadMap.value.get(threadId)!;
-    expect(thread.meta.codingAgentHasDiff).toBe(true);
+    expect(thread.meta.codingAgentChangeState).toEqual({ kind: 'unproposed', reason: null });
     expect(thread.meta.updatedAt).toBe(ownLastActivity);
   });
 

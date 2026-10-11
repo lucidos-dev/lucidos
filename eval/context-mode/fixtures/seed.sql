@@ -28,7 +28,6 @@ BEGIN;
 DELETE FROM preferences;
 INSERT INTO preferences (key, value, device_id, updated_at) VALUES
   ('chat_model',            :'model',            NULL, '2026-01-01 00:00:00+00'),
-  ('chat_reasoning_effort', :'reasoning_effort', NULL, '2026-01-01 00:00:00+00'),
   ('timezone',              'Europe/Oslo',       NULL, '2026-01-01 00:00:00+00'),
   ('language',              'English',           NULL, '2026-01-01 00:00:00+00'),
   -- The memory tasks lead with models chosen by the configured providers
@@ -48,6 +47,13 @@ INSERT INTO preferences (key, value, device_id, updated_at) VALUES
   -- ADR 0110 recorded nothing replayable. It is seeded here rather than per
   -- arm, so both arms carry it and the digest still matches.
   ('capture_context',       'true',              NULL, '2026-01-01 00:00:00+00');
+
+-- The tier pinned for the model under test. `default` stores none, so the
+-- model runs at its default effort.
+INSERT INTO preferences (key, value, device_id, updated_at)
+SELECT 'chat_reasoning_efforts', :'model' || '=' || :'reasoning_effort', NULL,
+       '2026-01-01 00:00:00+00'
+ WHERE :'reasoning_effort' <> 'default';
 
 -- The model registry holds the pinned entry and nothing else, so the picker
 -- cannot resolve to a different model between arms or between repeats.

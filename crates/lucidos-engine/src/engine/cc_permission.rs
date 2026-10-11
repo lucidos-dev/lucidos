@@ -111,7 +111,9 @@ pub const UNATTENDED_DENY_UNCLASSIFIED_REASON: &str =
      refused to settle this request as safe. It refuses a command whose head is not what runs, \
      or not all of it: command substitution, a code-injecting VAR=value preamble, a \
      path-qualified command head (./x, bin/x), a redirect or a write outside the workspace, an \
-     executable git config or git output flag, and a payload it could not read. Retry with a \
+     executable git config or git output flag, and a payload it could not read. It also refuses \
+     a file write into a .git directory, or into the engine's .lucidos directory outside its \
+     worktrees and tmp: write your own worktree instead. Retry with a \
      shape the guard can read: a bare command head, no substitution, and any output kept inside \
      the workspace. To read a file outside the workspace use cat, head or grep, which stay on \
      the safe fast path.";
@@ -725,7 +727,8 @@ pub enum RequestVerdict {
     SideEffect(SideEffectCategory),
     /// The static pass REFUSED to settle this request rather than merely not
     /// recognising it. `command_guard::FastPathDecline::Refusal` owns the full
-    /// list; a payload that could not be read joins it here.
+    /// list. A payload that could not be read, and a file write into engine
+    /// state ([`writes_engine_state`]), join it here.
     ///
     /// Denied unattended, whatever the grant. Nobody is watching, which is the
     /// strongest reason to refuse a shape the guard cannot see through, not a
@@ -893,15 +896,67 @@ fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
     }
 }
 
+/// True when a write to `path` changes what the engine runs rather than work
+/// the user reviews:
+///
+///   * a `.git` directory, where a hook runs on the engine's next commit;
+///   * the engine's runtime directory outside its worktrees and scratch tree.
+///     It holds the grant files, the `lucidos` CLI and the backup key.
+///
+/// Checked on the input path with each `..` folded away, then on the resolved
+/// path. So neither a `..` nor a symlink in the workspace hides the target. A
+/// relative path is placed against the workspace root, the one reading that
+/// can reach the engine's own directory.
+fn writes_engine_state(path: &str, workspace_path: &Path) -> bool {
+    let p = workspace_path.join(path);
+    let p = p.as_path();
+    let in_engine_state = |target: &Path, root: &Path| {
+        target.strip_prefix(root).is_ok_and(has_git_component)
+            || (target.starts_with(crate::core::grants_dir(root))
+                && !target.starts_with(root.join(crate::paths::WORKTREES_SUBPATH))
+                && !target.starts_with(root.join(crate::core::TMP_DIR)))
+    };
+    if in_engine_state(&without_parent_dirs(p), workspace_path) {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(workspace_path),
+        canonical_existing_prefix(p),
+    ) {
+        (Ok(root), ExistingPrefix::Resolved(resolved)) => in_engine_state(&resolved, &root),
+        _ => false,
+    }
+}
+
+/// `p` with each `..` folded into its parent, as text. Only a lower bound on
+/// where a write lands, because a symlink before the `..` moves it; the
+/// resolved check covers that.
+fn without_parent_dirs(p: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn has_git_component(p: &Path) -> bool {
+    p.components()
+        .any(|c| matches!(c, std::path::Component::Normal(name) if name == ".git"))
+}
+
 /// A path component that disqualifies a target from the in-worktree fast path:
 /// `..`, which cannot be proven contained lexically, or `.git` (see
 /// [`path_inside_worktree`]).
 fn has_rejected_component(p: &Path) -> bool {
-    p.components().any(|c| match c {
-        std::path::Component::ParentDir => true,
-        std::path::Component::Normal(name) => name == ".git",
-        _ => false,
-    })
+    has_git_component(p)
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 /// What the longest existing prefix of a path resolves to.
@@ -1063,6 +1118,8 @@ fn static_command_verdict(tool_name: &str, input: &serde_json::Value) -> Command
 ///   destruction, which is grant-gated. A `file_change` whose targets are
 ///   unknown is grant-gated too: codex raises that approval because the patch
 ///   escaped its sandbox, so "I could not see the paths" is not permission.
+///   A target that [`writes_engine_state`] is [`RequestVerdict::Unclassified`],
+///   because no grant names it and a write there outlives the session.
 /// * Anything else is benign.
 pub fn classify_coding_agent_request(
     tool_name: &str,
@@ -1113,6 +1170,14 @@ pub fn classify_coding_agent_request(
     }
     match coding_agent_file_targets(tool_name, input) {
         FileTargets::Known(targets) => {
+            // First, so a grant for out-of-workspace writes never covers one:
+            // `<ws>/.lucidos/worktrees/t/../../cc-allowed-tools` is both.
+            if targets
+                .iter()
+                .any(|path| writes_engine_state(path, workspace_path))
+            {
+                return RequestVerdict::Unclassified;
+            }
             if targets
                 .iter()
                 .any(|path| path_outside_workspace(path, workspace_path))
@@ -3281,6 +3346,65 @@ mod tests {
             canonical_existing_prefix(Path::new(&link)),
             ExistingPrefix::DanglingLink
         );
+    }
+
+    /// Regression: an in-workspace file write was benign wherever it landed.
+    /// So an unattended session could write `Bash` into the grant file that
+    /// every later spawn reads. It could also plant a git hook that the
+    /// engine's next commit runs. Neither raised a card.
+    #[test]
+    fn a_write_into_engine_state_is_denied_unattended() {
+        let ws = Path::new("/ws");
+        let write = |path: &str| {
+            classify_coding_agent_request(
+                "Write",
+                &serde_json::json!({ "file_path": path, "content": "x" }),
+                ws,
+            )
+        };
+        for path in [
+            "/ws/.lucidos/cc-allowed-tools",
+            "/ws/.lucidos/agent-allowed-commands",
+            "/ws/.lucidos/bin/lucidos",
+            "/ws/data/.git/hooks/pre-commit",
+            "/ws/.lucidos/worktrees/thread-abc/.git",
+            "data/.git/config",
+            ".lucidos/cc-allowed-tools",
+            "/ws/.lucidos/worktrees/thread-abc/../../cc-allowed-tools",
+        ] {
+            assert_eq!(write(path), RequestVerdict::Unclassified, "{path}");
+            // Not even a grant for out-of-workspace writes covers it.
+            let grant = [SideEffectCategory::OutOfWorkspaceDestruction];
+            let (allowed, _) = decide_unattended(write(path), &grant);
+            assert!(!allowed, "{path} must not be auto-allowed");
+        }
+        for path in [
+            "/ws/data/artifacts/notes.md",
+            "/ws/.lucidos/worktrees/thread-abc/src/main.rs",
+            "/ws/.lucidos/tmp/scratch.json",
+            ".lucidos/tmp/scratch.json",
+            "/ws/data/.gitignore",
+        ] {
+            assert_eq!(write(path), RequestVerdict::Benign, "{path}");
+        }
+    }
+
+    /// The same check through a symlink: a link inside the workspace into the
+    /// engine's runtime directory reads as an ordinary path lexically.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_into_engine_state_is_denied_unattended() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let runtime = crate::core::grants_dir(ws.path());
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        std::fs::create_dir_all(ws.path().join("data")).expect("data dir");
+        std::os::unix::fs::symlink(&runtime, ws.path().join("data/link")).expect("symlink");
+        let target = ws.path().join("data/link/cc-allowed-tools");
+        assert!(writes_engine_state(&target.to_string_lossy(), ws.path()));
+        assert!(!writes_engine_state(
+            &ws.path().join("data/notes.md").to_string_lossy(),
+            ws.path()
+        ));
     }
 
     // --- decision matrix (pure, no DB) -------------------------------------

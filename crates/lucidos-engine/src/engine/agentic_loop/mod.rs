@@ -80,5 +80,9 @@ mod turn_tools_unit_tests;
 mod parallel_reads_unit_tests;
 
 #[cfg(test)]
+#[path = "../agentic_loop_unit_tests/read_decision.rs"]
+mod read_decision_unit_tests;
+
+#[cfg(test)]
 #[path = "../agentic_loop_tests.rs"]
 mod agentic_loop_db_tests;

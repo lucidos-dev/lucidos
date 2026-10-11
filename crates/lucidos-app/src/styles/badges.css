@@ -36,7 +36,6 @@
  * Stated for every badge, so the next one to land inside a tracked host does
  * not acquire the lean. NOT gated below: this half needs no new feature. */
 .badge,
-.drawer-view-count,
 .section-count-badge,
 .drawer-badge,
 .brand-menu-ws-badge,
@@ -78,7 +77,6 @@
  * A heavier rule that restates `will-change` keeps `transform` in it.
  * Measured in Chrome, `opacity` alone leaves the digit drifting at rest. */
 .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
-.drawer-view-count,
 .section-count-badge,
 .drawer-badge,
 .brand-menu-ws-badge,
@@ -97,7 +95,6 @@
    own `min-width` still sets the floor, which is why none states a `width`. */
 @supports (width: calc-size(fit-content, size)) {
     .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
-    .drawer-view-count,
     .section-count-badge,
     .drawer-badge,
     .brand-menu-ws-badge,
@@ -149,10 +146,8 @@
        `:not()` around it, and this still ties with every rule it re-homes.
 
        A badge with no `--badge-height` gets an invalid box, so its height and
-       padding stay at their initial values. The plain per-view count is one,
-       since it draws no pill. */
+       padding stay at their initial values. */
     .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
-    .drawer-view-count,
     .section-count-badge,
     .drawer-badge,
     .brand-menu-ws-badge,

@@ -261,17 +261,25 @@ export async function retryUnsentPick(toolUseId: string): Promise<AnswerOutcome 
   return outcome;
 }
 
-/** Send a control request to a running Claude Code session.
- *  Generic: works with any control subtype the engine serves (set_model, set_reasoning_effort).
- *  Returns:
- *    'ok'      — applied to the live session
- *    'pending' — 404 (no live session, caller falls back to pending preference);
- *                no toast shown so a benign race doesn't look like a UX error
- *    'error'   — hard failure (toast already shown) */
-export async function sendCodingAgentControl(threadId: string, request: Record<string, string>): Promise<'ok' | 'pending' | 'error'> {
+/** What a control request did, as `sendCodingAgentControl` reports it.
+ *  - `ok`: the live session takes it now.
+ *  - `next-turn`: recorded, and it takes effect from the session's next turn.
+ *  - `pending`: a 404, so no live session. The caller falls back to the
+ *    pending pick, with no toast, so a benign race never looks like an error.
+ *  - `error`: a hard failure, already toasted. */
+export type ControlSendResult = 'ok' | 'next-turn' | 'pending' | 'error';
+
+/** Whether the live session recorded the change, now or for its next turn. */
+export function sessionRecorded(result: ControlSendResult): boolean {
+  return result === 'ok' || result === 'next-turn';
+}
+
+/** Send a control request to a running coding-agent session. Generic: works
+ *  with any control subtype the engine serves (set_model, set_reasoning_effort). */
+export async function sendCodingAgentControl(threadId: string, request: Record<string, string>): Promise<ControlSendResult> {
   try {
-    await sendControlRequest(threadId, request);
-    return 'ok';
+    const res = await sendControlRequest(threadId, request);
+    return res.takes_effect === 'next-turn' ? 'next-turn' : 'ok';
   } catch (err) {
     if (err instanceof ApiError && err.httpCode === 404) {
       return 'pending';

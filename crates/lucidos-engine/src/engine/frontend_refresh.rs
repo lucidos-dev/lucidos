@@ -14,7 +14,7 @@
 //! swaps what `api::serve_frontend` serves — so the served `sw.js` BUILD_ID
 //! advances and the EXISTING client-update surface (`syncClientUpdateFromBuild`
 //! → badge + Refresh toast) fires, with no engine respawn. Mixed changes still go
-//! through the Switch flow (`trigger_background_rebuild`), which re-snapshots at
+//! through the Switch flow (`join_or_start_background_rebuild`), which re-snapshots at
 //! the new engine's boot — untouched here.
 //!
 //! When the advance is DEFERRED instead (INV-A: an engine version change is
@@ -263,29 +263,19 @@ impl LucidosEngine {
     /// Register the swappable served-frontend handle + its source dir. Called once
     /// by `api::create_router` when `LUCIDOS_STATIC_DIR` is set. A second call
     /// (e.g. a second router in a test) is ignored: the first registration wins.
-    ///
-    /// The boot snapshot's served commit stays unknown. `dist/` may be stale
-    /// (a failed build, a stopped build-watch, one still running), and nothing
-    /// records which commit it was built from. The first swap records one.
     pub fn init_served_frontend(&self, handle: Arc<RwLock<PathBuf>>, source: PathBuf) {
         let _ = self.served_frontend.set(handle);
         let _ = self.served_frontend_source.set(source);
     }
 
-    /// `candidate` when a client built from it runs on this engine, else
-    /// `None`. See [`compatible_served_commit`].
+    /// The commit the served snapshot was built from, read from its stamp, or
+    /// `None` when nothing is served or the snapshot carries no stamp.
     ///
-    /// [`compatible_served_commit`]: crate::engine::engine_version::compatible_served_commit
-    async fn compatible_served_commit(candidate: &str) -> Option<String> {
-        let running = crate::engine::engine_version::build_id_commit(crate::ENGINE_BUILD_ID)?;
-        let root = crate::paths::repo_root().ok()?;
-        crate::engine::engine_version::compatible_served_commit(running, candidate, &root).await
-    }
-
-    /// The trunk HEAD the served snapshot was taken at, or `None` when unknown
-    /// or incompatible with the running engine.
-    pub(crate) fn served_frontend_commit(&self) -> Option<String> {
-        self.served_frontend_commit.lock().unwrap().clone()
+    /// Not yet checked against the running engine. `pending_commits_since` in
+    /// `engine_version` makes that check before it trusts the commit.
+    pub(crate) fn served_frontend_source_commit(&self) -> Option<String> {
+        let served_dir = self.served_frontend.get()?.read().unwrap().clone();
+        frontend_snapshot::read_source_commit(&served_dir)
     }
 
     fn frontend_refresh_superseded(&self, generation: u64) -> bool {
@@ -433,7 +423,7 @@ impl LucidosEngine {
     ///
     /// No-op in packaged (never rebuilds) or when the frontend isn't served
     /// (no `LUCIDOS_STATIC_DIR`). Coalesces: a later call supersedes an in-flight
-    /// one (only the latest generation swaps). Mirrors `trigger_background_rebuild`.
+    /// one (only the latest generation swaps).
     pub fn refresh_served_frontend_after_rebuild(self: &Arc<Self>) {
         if crate::runtime::is_packaged() {
             return;
@@ -624,16 +614,6 @@ impl LucidosEngine {
         workspace: &Path,
         generation: u64,
     ) {
-        // Read BEFORE the copy: `dist/` can only hold this commit or an older
-        // one. An unreadable or incompatible HEAD records `None`, which lists
-        // everything since the running commit.
-        let served_commit = match crate::paths::repo_root() {
-            Ok(root) => match crate::engine::git_ops::current_head_sha(&root).await {
-                Some(head) => Self::compatible_served_commit(&head).await,
-                None => None,
-            },
-            Err(_) => None,
-        };
         match frontend_snapshot::pin_generation(source, workspace, generation) {
             Ok(new_dir) => {
                 if self.frontend_refresh_superseded(generation) {
@@ -645,7 +625,6 @@ impl LucidosEngine {
                     let mut guard = handle.write().unwrap();
                     std::mem::replace(&mut *guard, new_dir.clone())
                 };
-                *self.served_frontend_commit.lock().unwrap() = served_commit;
                 crate::log!(
                     "[Frontend] serving re-snapshotted dist at {}",
                     new_dir.display()

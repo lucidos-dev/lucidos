@@ -4,7 +4,8 @@ if (typeof globalThis.requestAnimationFrame === 'undefined') {
   (globalThis as any).requestAnimationFrame = (cb: any) => { cb(); return 0; };
 }
 
-import { focusPromptNow, composeHandlers, isComposeFocusedHere, blurPromptInputIfFocused } from '../promptFocus';
+import { focusPromptNow, isComposeFocusedHere, blurPromptInputIfFocused } from '../promptFocus';
+import { composeHandlers } from '../composeHandlers';
 import { takePressOutcome } from '../../../utils/tapGesture';
 
 describe('focusPromptNow', () => {

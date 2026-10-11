@@ -261,3 +261,50 @@ async fn create_sparse_app_worktree_recovers_from_missing_but_registered_path() 
         "app folder not materialised on re-spawn",
     );
 }
+
+/// A git step after the add that cannot run at all (a spawn error or the
+/// timeout) must still remove the worktree the add registered. Left behind, the
+/// path stays registered and the next spawn trips over it.
+#[tokio::test]
+async fn create_sparse_app_worktree_removes_its_worktree_when_a_later_step_errors() {
+    let (_tmp, ws) = make_test_repo().await;
+    tokio::fs::create_dir_all(ws.join("data/apps/habit-tracker"))
+        .await
+        .unwrap();
+    tokio::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<h1>m</h1>")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &ws).await;
+    let _ = git_cmd(&["commit", "-m", "scaffold"], &ws).await;
+
+    // A relative path splits the steps. The add runs in `ws`, so git creates
+    // the worktree under it. Step 2 runs in the path itself, which resolves
+    // against the test process's cwd. Nothing exists there, so the spawn fails.
+    let rel = PathBuf::from(format!("sparse-wt-{}", uuid::Uuid::new_v4()));
+    assert!(
+        !rel.exists(),
+        "precondition: path must not resolve from cwd"
+    );
+
+    let err = create_sparse_app_worktree(&ws, "habit-tracker", &app_branch("habit-tracker"), &rel)
+        .await
+        .expect_err("step 2 cannot spawn, so the call must fail");
+    assert!(
+        err.contains("sparse-checkout init"),
+        "unexpected error: {err}"
+    );
+
+    let list = git_cmd(&["worktree", "list", "--porcelain"], &ws)
+        .await
+        .unwrap();
+    let registered = String::from_utf8_lossy(&list.stdout);
+    let rel_str = rel.to_str().unwrap();
+    assert!(
+        !registered.contains(rel_str),
+        "failed spawn left its worktree registered:\n{registered}",
+    );
+    assert!(
+        !ws.join(&rel).exists(),
+        "failed spawn left its worktree dir"
+    );
+}

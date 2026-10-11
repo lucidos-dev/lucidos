@@ -4,6 +4,9 @@
 - **Date**: 2026-09-23
 - **Amended by**: [0369](0369-a-threads-own-stop-is-not-news.md). A thread's own stop
   no longer wakes it, and `lucidos hardened mark` stops the thread's leftover tasks.
+- **Amended by**: [0391](0391-agent-teardown-reaps-by-agent-run-marker.md). The
+  group teardown below never reached a Bash call, which runs in a group of its
+  own. The teardown now also reaps by agent run marker.
 
 ## Context
 

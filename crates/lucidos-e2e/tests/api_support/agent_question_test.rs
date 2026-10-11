@@ -709,11 +709,12 @@ async fn stop_with_pending_question_and_no_live_agent_emits_canceled_not_stale_s
 }
 
 /// The case that lost a plan: a question card parked with no live agent, the
-/// user presses Stop, and the thread later gets archived. Stop now proposes
-/// what the turn committed, marked incomplete, so the work keeps an Apply
-/// (ADR 0328).
+/// user presses Stop, and the thread later gets archived. An unfinished turn
+/// never proposes (ADR 0400): Stop withholds what the turn committed and says
+/// so. The work no longer blocks Archive, and the archive net sets it aside, so
+/// nothing is lost.
 #[tokio::test]
-async fn stop_on_a_parked_question_proposes_the_branch_work_as_incomplete() {
+async fn stop_on_a_parked_question_withholds_the_branch_work() {
     let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
@@ -726,7 +727,7 @@ async fn stop_on_a_parked_question_proposes_the_branch_work_as_incomplete() {
     let tool_use_id = format!("tu-stopplan-{suffix}");
     insert_session_started(&pool, thread_id, &branch).await;
     // An earlier turn that finished cleanly. The Stop must still read as
-    // the newest coding-agent terminal, so the work stays incomplete.
+    // the newest coding-agent terminal, so the work is withheld.
     sqlx::query(
         "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
          VALUES ($1, 'thread', $2::text, 'ResponseGenerated', $3, NOW(), $2)",
@@ -750,34 +751,26 @@ async fn stop_on_a_parked_question_proposes_the_branch_work_as_incomplete() {
         .expect("stop request failed");
     assert_eq!(resp.status().as_u16(), 200, "stop should return 200");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let row = loop {
-        let row: Option<(String, bool, i32)> = sqlx::query_as(
-            "SELECT status, incomplete, file_count FROM changes WHERE branch_name = $1",
-        )
-        .bind(&branch)
-        .fetch_optional(&pool)
-        .await
-        .expect("changes lookup");
-        if row.is_some() || std::time::Instant::now() >= deadline {
-            break row;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    };
+    let withheld = await_event_payload(&pool, thread_id, "ProposalWithheld").await;
+    assert_eq!(withheld["branch_name"], branch.as_str());
+    assert_eq!(withheld["reason"], "turn_incomplete");
     assert_eq!(
-        row,
-        Some(("pending".to_string(), true, 1)),
-        "the stopped turn's commit must be a pending, incomplete change"
+        withheld["files"],
+        serde_json::json!([format!("e2e-plan-{suffix}.md")])
     );
     let cancel = await_event_payload(&pool, thread_id, "ResponseCanceled").await;
     assert_eq!(
         cancel["channel"], "claude_code",
         "the Stop reads as the newest coding-agent terminal"
     );
-
-    // ADR 0346: the change is not ready to review, yet it still blocks Archive.
-    let (proposed, incomplete): (bool, bool) = sqlx::query_as(
-        "SELECT coding_agent_proposed, coding_agent_incomplete \
+    let changes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM changes WHERE branch_name = $1")
+        .bind(&branch)
+        .fetch_one(&pool)
+        .await
+        .expect("changes lookup");
+    assert_eq!(changes, 0, "an unfinished turn proposes nothing");
+    let (state, reason): (String, Option<String>) = sqlx::query_as(
+        "SELECT coding_agent_change_state, coding_agent_unproposed_reason \
          FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -785,18 +778,34 @@ async fn stop_on_a_parked_question_proposes_the_branch_work_as_incomplete() {
     .await
     .expect("thread summary");
     assert_eq!(
-        (proposed, incomplete),
-        (true, true),
-        "the thread holds a pending change, marked incomplete"
+        (state.as_str(), reason.as_deref()),
+        ("unproposed", Some("turn_incomplete"))
     );
+
     let resp = post_archive(thread_id).await;
     assert_eq!(
         resp.status().as_u16(),
-        409,
-        "an incomplete change still blocks Archive"
+        200,
+        "withheld work no longer blocks Archive"
     );
-    let body: serde_json::Value = resp.json().await.expect("json body");
-    assert_eq!(body["reason"], "parent_has_pending_changes");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let set_aside = loop {
+        let row: Option<String> =
+            sqlx::query_scalar("SELECT status FROM changes WHERE branch_name = $1")
+                .bind(&branch)
+                .fetch_optional(&pool)
+                .await
+                .expect("changes lookup");
+        if row.is_some() || std::time::Instant::now() >= deadline {
+            break row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    assert_eq!(
+        set_aside.as_deref(),
+        Some("set_aside"),
+        "the archive net keeps the stopped work"
+    );
 
     let _ = git(&["branch", "-D", &branch]);
     let _ = sqlx::query("DELETE FROM changes WHERE branch_name = $1")

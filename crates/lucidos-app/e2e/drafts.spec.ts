@@ -1,5 +1,5 @@
 import { test, expect, type Page, type Locator } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, openDrawerView, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, clickThreadRow, threadRowFor, isMobileViewport } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, showGrouping, showOngoingGroup, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, clickThreadRow, threadRowFor, isMobileViewport } from './helpers';
 import { clearAllThreads, psql } from './db-helpers';
 
 /** Send a first message, then click Compose and type a draft. Returns the
@@ -298,9 +298,9 @@ test.describe('Per-thread drafts', () => {
     if (isMobileViewport(page)) {
       // Mobile hides the textarea from the threads pane, so a focused thread's
       // follow-up draft only surfaces in the dedicated Drafts view.
-      await openDrawerView(page, 'Drafts');
-      const draftsSection = page.locator('.list-section-title:visible', { hasText: 'Drafts' });
-      await expect(draftsSection).toBeVisible({ timeout: 5_000 });
+      await showOngoingGroup(page, 'Drafts');
+      const draftsTile = page.locator('.ongoing-tile:visible', { hasText: 'Drafts' });
+      await expect(draftsTile).toBeVisible({ timeout: 5_000 });
     } else {
       // On desktop, the focused thread's follow-up draft is shown inline in the
       // visible textarea — no drafts view needed to see it.
@@ -592,19 +592,12 @@ test.describe('Per-thread drafts', () => {
     await expect(page.getByText('Empty draft')).toHaveCount(0);
   });
 
-  test('Filter control is always present and opens an empty Drafts view with no drafts', async ({ page }) => {
-    // beforeEach cleared all threads, so there are zero drafts. The Filter
-    // control is always present, and picking the Drafts view opens it to its
-    // own empty state.
+  test('an empty Ongoing still draws every tile, and the selected one says it is empty', async ({ page }) => {
+    // beforeEach cleared all threads, so every group is empty.
     await navigateToApp(page);
     await openThreadDrawer(page);
-
-    const headerSel = isMobileViewport(page) ? '.mobile-threads-header' : '.threads-header';
-    const filterBtn = page.locator(`${headerSel} button[aria-label="Filter threads"]`);
-    await expect(filterBtn).toBeVisible({ timeout: 5_000 });
-
-    await openDrawerView(page, 'Drafts');
-    await expect(page.locator('.empty-state:visible', { hasText: 'No drafts' }))
-      .toBeVisible({ timeout: 5_000 });
+    await showGrouping(page, 'ongoing');
+    await expect(page.locator('.drawer-ongoing-tiles .ongoing-tile:visible')).toHaveCount(4);
+    await expect(page.locator('.ongoing-grouping .empty-state:visible')).toHaveText('Nothing is blocked');
   });
 });

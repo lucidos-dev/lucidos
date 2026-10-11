@@ -1,5 +1,5 @@
 import type { VisualStatus } from './threadVisualStatus';
-import { PauseIcon } from './icons';
+import { DiffIcon, PauseIcon } from './icons';
 
 /** User-facing label + one-line explanation for each status dot, shown in its
  *  hover tooltip. Single source of truth so the dot and its explanation can
@@ -14,6 +14,7 @@ const STATUS_INFO: { status: VisualStatus; label: string; desc: string }[] = [
   { status: 'waiting', label: 'Waiting', desc: 'Not finished: it is waiting for a child thread, or for an event it subscribed to. While it waits on an event, any proposed change waits with it.' },
   { status: 'question', label: 'Waiting for your answer', desc: 'Paused until you answer its question.' },
   { status: 'changes', label: 'Changes to review', desc: 'A coding agent proposed changes to open and Apply.' },
+  { status: 'read-request', label: 'Asked you to read', desc: 'Its agent asked you to read the latest reply. This clears once you have seen it.' },
   { status: 'paused', label: 'Paused', desc: 'Your switch to a new version interrupted this turn. It resumes on its own, so there is nothing to do.' },
   { status: 'failed', label: 'Failed', desc: 'The last response failed.' },
 ];
@@ -52,7 +53,12 @@ export function ThreadStatusIcon({ status }: Props) {
         <span class="progress-dot progress-dot-waiting" />
       )}
       {status === 'changes' && (
-        <span class="progress-dot progress-dot-changes" />
+        <span class="thread-status-changes-icon" aria-label="Changes to review">
+          <DiffIcon />
+        </span>
+      )}
+      {status === 'read-request' && (
+        <span class="progress-dot progress-dot-read-request" aria-label="Asked you to read" />
       )}
       {status === 'question' && (
         <span class="thread-status-question-badge" aria-label="Waiting for your answer" />

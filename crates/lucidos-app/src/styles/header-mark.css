@@ -15,6 +15,7 @@
     --header-mark-size: 1.6rem;      /* the glyph, inside its tap target */
     --header-mark-tap: 2.1rem;       /* the tap target */
     --header-nav-gap: 0.35rem;       /* minimum chevron to mark, see the span */
+    --header-mark-pair-gap-max: 1rem; /* Home to mark at most, see .header-mark-pair */
     /* How much of its own viewBox the mark's artwork fills. `LucidosMarkIcon`
        draws inside a `translate(13 13) scale(0.74)` group, so the ink is inset
        by 13% on every side and the glyph reads smaller than a stroke icon given
@@ -38,9 +39,10 @@
          slot, and the chevron does not move. The thread pane's edges are
          narrower and could spare more, but spending it there is what would
          break the two panes' placements matching.
-       - min span: the floor, the cluster's natural width, so the chevrons never
-         squeeze themselves. It engages past ~160% ui-scale on a phone, where
-         the row cannot fit two chevrons and both edge clusters at all. */
+       - min span: the floor, the thread row's narrowest width. That is two
+         chevrons around the Home and mark pair with no gap inside the pair, so
+         no control in it squeezes. It engages past ~140% ui-scale on a 375px
+         phone, where the row cannot fit the cluster and both edge clusters. */
     /* Arithmetic on the button box, never a rem constant, so retuning the
        button moves the chevrons with it. That is also why
        --mobile-header-icon-box is declared for every width (styles/mobile.css)
@@ -50,7 +52,10 @@
        styles/__tests__/header-mark-geometry.test.ts holds it to the trailing
        cluster's own gap. */
     --header-nav-edge-reserve: calc(2 * var(--mobile-header-icon-box) + 0.25rem);
-    --header-nav-min-span: 6.3rem;
+    --header-nav-min-span: calc(
+        3 * var(--mobile-header-icon-box) + var(--header-mark-tap)
+        + 2 * var(--header-nav-gap)
+    );
     /* The two above, resolved into the one width every cluster takes. Named
        because the width is not only the cluster's own business: the threads
        row's title is bounded by where that row's mark lands, and the mark lands
@@ -240,12 +245,34 @@
     pointer-events: none;
 }
 
-/* The chevrons and the mark hold their size; only a title may shrink. Without
-   this the flex default (shrink: 1) lets a long title squeeze a chevron, which
-   would move the very thing the fixed span exists to hold still. */
+/* The chevrons and the mark hold their size; only a title, or the gap inside
+   the Home and mark pair, may shrink. Without this, the flex default
+   (shrink: 1) lets a long title squeeze a chevron. That moves the very thing
+   the fixed span exists to hold still. */
 .header-nav-cluster > .icon-btn,
-.header-nav-cluster > .brand-mark-slot {
+.header-nav-cluster > .brand-mark-slot,
+.header-nav-cluster > .header-mark-pair {
     flex: 0 0 auto;
+}
+
+/* The thread row's middle member: Home and the mark as one box. The chevrons
+   are equal width, so `space-between` centres the PAIR on the row. The mark
+   then sits right of the axis by half of Home's box plus the gap. Without a
+   home thread the pair is the mark alone, back on the axis. */
+.header-nav-cluster > .header-mark-pair {
+    display: flex;
+    align-items: center;
+}
+
+/* With Home in it, the pair asks for the max gap and may shrink. It shrinks
+   only once the chevrons reach it, down to no gap at all, which is the floor
+   --header-nav-min-span counts. So a roomy row spaces the pair out, and a
+   narrow phone or a high ui-scale closes it up before anything else gives. */
+.header-nav-cluster > .header-mark-pair:has(> .home-thread-btn) {
+    flex: 0 1 calc(
+        var(--mobile-header-icon-box) + var(--header-mark-tap) + var(--header-mark-pair-gap-max)
+    );
+    justify-content: space-between;
 }
 
 /* Each chevron's tap target reaches past its button into the empty space
@@ -268,9 +295,10 @@
     bottom: calc(-1 * var(--nav-chevron-reach));
 }
 
-/* The chevrons' neighbours inside the cluster: the mark and the content
-   title. */
+/* The chevrons' neighbours inside the cluster: the mark (alone, or paired
+   with Home) and the content title. */
 .header-nav-cluster > .brand-mark-slot,
+.header-nav-cluster > .header-mark-pair,
 .header-title-cluster > .mobile-content-title {
     position: relative;
     z-index: 1;
@@ -982,8 +1010,8 @@
     /* Asymmetric on purpose. The left is the indent that makes these satellites
        of the row above; the right resolves to the SAME column that row's value
        pill ends on (--space-md from the panel frame, which the list's own
-       margin does not eat into), so the checks and counts here line up under
-       the pill rather than sitting a few pixels outside it. */
+       margin does not eat into), so the check here lines up under the pill
+       rather than sitting a few pixels outside it. */
     padding: 0 var(--space-md) 0 var(--space-sm);
     border: none;
     background: none;
@@ -1033,12 +1061,10 @@ div.brand-menu-ws-row {
     white-space: nowrap;
 }
 
-/* A workspace's unread count. The same blue every count in the app uses (see
+/* A workspace's unread count, on the notifications group's rows
+   (`NotificationsMenuRows.tsx`). The same blue every count in the app uses (see
    `.badge` in header.css), but not that rule: `.badge` is `position: absolute`,
-   for pinning to an icon's corner, and this one sits in the row's flow.
-   Worn by two surfaces, the switcher list's rows and the notifications group's
-   (`NotificationsMenuRows.tsx`), which show the same thing and must look the
-   same. Same for `.brand-menu-ws-name` above. */
+   for pinning to an icon's corner, and this one sits in the row's flow. */
 .brand-menu-ws-badge {
     flex: 0 0 auto;
     /* As tall as the row's line. styles/badges.css rounds it to whole pixels,

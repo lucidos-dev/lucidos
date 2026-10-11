@@ -27,23 +27,23 @@
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
-import { dirname, resolve, join } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { FOLLOW_THEME, FONT_CATALOG } from '@lucidos/appearance';
 import { PREF_FONT_FAMILY } from '@lucidos/preference-catalog';
 import { fontOptions } from '../fontOptions';
 import { SETTINGS_SUBVIEW_ITEMS } from '../../../store/store';
 import { findSettingsEntry, settingsSearchEntryIds } from '../../search/searchIndex';
+import { renderedSearchAnchors } from '../../search/__tests__/renderedSearchAnchors';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_VIEW = readFileSync(resolve(here, '..', 'SettingsView.tsx'), 'utf8');
 const SYSTEM_SUBMENU = readFileSync(resolve(here, '..', 'SystemSubmenu.tsx'), 'utf8');
 const NAV_ROW = readFileSync(resolve(here, '..', 'SettingsNavRow.tsx'), 'utf8');
 const SETTINGS_HOME = readFileSync(resolve(here, '..', 'SettingsHome.tsx'), 'utf8');
-const COMPONENTS_DIR = resolve(here, '..', '..');
 
 /** Strip comments so the prose explaining a call can never stand in for it. */
 function stripComments(src: string): string {
@@ -62,36 +62,6 @@ function functionBody(src: string, declaration: string): string {
     else if (stripped[i] === '}' && --depth === 0) return stripped.slice(open + 1, i);
   }
   throw new Error(`unbalanced braces in \`${declaration}\``);
-}
-
-/** Every anchor value rendered anywhere under `components/`. The anchors live
- *  across a dozen files (SettingsView, SystemPage's panels, LocaleSection,
- *  MobileAccessPage, …), so the sweep is by tree, not by list: a list would be
- *  the very thing that goes stale.
- *
- *  Two spellings, because two components own the attribute. Most sites write
- *  `data-search-anchor="…"` inline; `AllowlistEditor` takes the value as an
- *  `anchor` PROP and renders `data-search-anchor={props.anchor}`, so the
- *  literal only ever appears at the call site. Missing the second spelling
- *  would report the two Permissions allowlists as unrendered. */
-function renderedAnchors(): Set<string> {
-  const anchors = new Set<string>();
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const path = join(dir, entry.name);
-      if (entry.isDirectory()) { walk(path); continue; }
-      if (!entry.name.endsWith('.tsx')) continue;
-      const src = readFileSync(path, 'utf8');
-      // Any prop whose name ends in `anchor`, so a component that renders the
-      // attribute on the caller's behalf still counts. `ModelSelectionRow` is
-      // one, taking the anchor for the row it draws. Over-matching an unrelated
-      // `*Anchor` prop only adds a name to the set, and the set is read with
-      // `.has`.
-      for (const m of src.matchAll(/\b[\w-]*[Aa]nchor="([^"]+)"/g)) anchors.add(m[1]);
-    }
-  };
-  walk(COMPONENTS_DIR);
-  return anchors;
 }
 
 /** No `key` comparison stands between a list's `.map(` and the row it renders.
@@ -246,7 +216,7 @@ describe('the Font dropdown', () => {
 });
 
 describe('Settings leaf-setting reachability', () => {
-  const anchors = renderedAnchors();
+  const anchors = renderedSearchAnchors();
 
   // Each setting that MOVED in the 2026-08-05 restructure, with the anchor it
   // must still render under. A moved control that renders nowhere is exactly

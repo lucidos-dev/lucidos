@@ -27,23 +27,90 @@ E2E_GITHUB_NO_VERDICT_EXIT=76
 
 e2e_github_now() { date +%s; }
 
-# e2e_github_handoff <suite> "$@": when the flags before any `--` include
-# --github, replace this process with the driver, minus that flag. Each e2e
-# script calls it first, before it takes the e2e lock.
-e2e_github_handoff() {
-    local suite="$1" arg seen="" past_dashes=""
-    shift
-    local args=()
-    for arg in "$@"; do
-        if [ -z "$past_dashes" ] && [ "$arg" = --github ]; then
-            seen=1
-            continue
-        fi
-        [ "$arg" != -- ] || past_dashes=1
-        args+=("$arg")
+# e2e_github_is_spec_arg <previous-arg> <arg>: whether a Playwright argument
+# names a spec file. A local run hands it to Playwright as a file filter, so
+# GitHub mode narrows both legs to it rather than forwarding it. A value of an
+# option that takes one is never a spec, whatever it ends in.
+e2e_github_is_spec_arg() {
+    case "$1" in
+        -g | --grep | --grep-invert | -c | --config | --output | --reporter | --shard | -j | --workers) return 1 ;;
+    esac
+    case "$2" in
+        -*) return 1 ;;
+        *.spec.ts) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Flags that only mean something on this host, so they keep a run here.
+E2E_GITHUB_LOCAL_ONLY_FLAGS=(--no-reset -h --headed --ios --device --screenshot --pwa --packaged)
+
+# e2e_github_local_only_env: name the first set environment variable that
+# changes what a run tests or produces. The driver forwards no environment, so
+# GitHub would silently ignore it. Any `*_SHOTS` switch counts.
+e2e_github_local_only_env() {
+    local name
+    for name in $(compgen -e); do
+        case "$name" in
+            *_SHOTS | LUCIDOS_E2E_PACKAGED | LUCIDOS_E2E_DEBUG | LUCIDOS_E2E_WEBKIT_PHASE | LUCIDOS_E2E_WEBKIT_CHUNKS) ;;
+            *) continue ;;
+        esac
+        case "${!name}" in
+            '' | 0) ;;
+            *) echo "$name"; return 0 ;;
+        esac
     done
-    [ -n "$seen" ] || return 0
-    exec "$(dirname "${BASH_SOURCE[0]}")/../e2e-github.sh" "$suite" ${args[@]+"${args[@]}"}
+}
+
+# e2e_github_handoff <suite> "$@": GitHub is the default. Replace this process
+# with the driver unless the run must stay here: --local, a local-only flag or
+# variable, an inherited LUCIDOS_E2E_LOCAL, or an unmet precondition. Only flags before
+# any `--` count. Staying here exports LUCIDOS_E2E_LOCAL=1, so every nested e2e
+# script stays too. Each e2e script calls this first, before the e2e lock, and
+# then parses E2E_ARGS: its arguments minus --local and --github.
+e2e_github_handoff() {
+    local suite="$1" arg github="" local_run="" past_dashes="" reason="" env_name
+    shift
+    E2E_ARGS=()
+    for arg in "$@"; do
+        if [ -z "$past_dashes" ]; then
+            case "$arg" in
+                --github) github=1; continue ;;
+                --local) local_run=1; continue ;;
+                --) past_dashes=1 ;;
+                *) [[ " ${E2E_GITHUB_LOCAL_ONLY_FLAGS[*]} " != *" $arg "* ]] || local_run=1 ;;
+            esac
+        fi
+        E2E_ARGS+=("$arg")
+    done
+    # GitHub mode passes no cargo arguments to wasm or embedder.
+    case "$suite" in
+        wasm | embedder) [ -z "${E2E_ARGS[0]+x}" ] || local_run=1 ;;
+    esac
+    env_name="$(e2e_github_local_only_env)"
+    if [ -n "$env_name" ] && [ -z "$local_run" ] && [ -z "$github" ] && [ -z "${LUCIDOS_E2E_LOCAL:-}" ]; then
+        echo "[e2e] running on this host: $env_name is set, and GitHub mode does not forward it." >&2
+    fi
+    [ -z "$env_name" ] || local_run=1
+    if [ -n "$github" ] && [ -n "$local_run" ] && [ -z "${LUCIDOS_E2E_LOCAL:-}" ]; then
+        echo "ERROR: --github contradicts --local, or a flag or variable that only works on this host." >&2
+        exit 1
+    fi
+    if [ "${LUCIDOS_E2E_LOCAL:-}" = 1 ]; then
+        local_run=1
+    elif [ -z "$local_run" ] && [ -z "$github" ]; then
+        reason="$(e2e_github_unavailable_reason "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)")"
+        if [ -n "$reason" ]; then
+            echo "[e2e] running on this host: $reason." >&2
+            local_run=1
+        fi
+    fi
+    if [ -n "$local_run" ]; then
+        export LUCIDOS_E2E_LOCAL=1
+        return 0
+    fi
+    echo "[e2e] running on GitHub (ADR 0386). Pass --local to run on this host." >&2
+    exec "$(dirname "${BASH_SOURCE[0]}")/../e2e-github.sh" "$suite" ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
 }
 
 # A run id sorts by time and carries its own start, so the sweep can age a
@@ -68,28 +135,29 @@ e2e_github_branch_started() {
         "${stamp:0:15}"
 }
 
-# e2e_github_preflight <repo>: refuse what GitHub mode cannot test honestly.
-e2e_github_preflight() {
+# e2e_github_unavailable_reason <repo>: print why GitHub mode cannot test
+# <repo> honestly, or nothing when it can.
+e2e_github_unavailable_reason() {
     local repo="$1"
     if [ ! -f "$repo/scripts/lib/release_tree.sh" ]; then
-        echo "ERROR: GitHub mode needs the maintainer checkout: scripts/lib/release_tree.sh is missing." >&2
-        echo "       The public mirror does not ship the release libraries." >&2
-        return 1
+        echo "this checkout has no scripts/lib/release_tree.sh, which the public mirror does not ship"
+    elif [ -n "$(git -C "$repo" status --porcelain)" ]; then
+        echo "the tree has uncommitted changes, and GitHub mode tests the committed HEAD"
+    elif ! git -C "$repo" remote get-url "$E2E_GITHUB_REMOTE" >/dev/null 2>&1; then
+        echo "there is no '$E2E_GITHUB_REMOTE' remote for $E2E_GITHUB_REPO"
+    elif ! command -v gh >/dev/null 2>&1; then
+        echo "the gh CLI is not installed"
     fi
-    if [ -n "$(git -C "$repo" status --porcelain)" ]; then
-        echo "ERROR: GitHub mode tests the committed HEAD, and this tree has uncommitted changes." >&2
-        echo "       Commit them first, or run the suite locally." >&2
-        return 1
-    fi
-    if ! git -C "$repo" remote get-url "$E2E_GITHUB_REMOTE" >/dev/null 2>&1; then
-        echo "ERROR: no '$E2E_GITHUB_REMOTE' remote for $E2E_GITHUB_REPO in $repo." >&2
-        return 1
-    fi
-    if ! command -v gh >/dev/null 2>&1; then
-        echo "ERROR: GitHub mode needs the gh CLI." >&2
-        return 1
-    fi
-    return 0
+}
+
+# e2e_github_preflight <repo>: refuse what GitHub mode cannot test honestly.
+e2e_github_preflight() {
+    local reason
+    reason="$(e2e_github_unavailable_reason "$1")"
+    [ -n "$reason" ] || return 0
+    echo "ERROR: GitHub mode cannot run: $reason." >&2
+    echo "       Fix that, or run the suite with --local." >&2
+    return 1
 }
 
 # e2e_github_build_commit <repo> <request-file> <run-id>: print the commit to

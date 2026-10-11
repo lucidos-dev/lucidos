@@ -1,4 +1,4 @@
-import { enginePackaged, type SettingsSubview } from '../../store/store';
+import { enginePackaged, releaseCheck, type SettingsSubview } from '../../store/store';
 import type { SearchResultItem } from '../../api/client';
 import { SHORTCUT_DEFS, bindingSearchText, shortcutSearchAnchor } from '../../utils/shortcuts';
 import { displayBinding, bindingFor } from '../../store/actions/keybindings';
@@ -8,7 +8,13 @@ import { WORKSPACE_ID } from '../../utils/basePath';
 // The one definition of "this client can actually act on the external-link
 // target", shared with the Settings row and its nav entry so search can never
 // offer a result that lands on nothing.
-import { externalLinkTargetConfigurable } from '../../store/actions/preferences';
+import {
+  externalLinkTargetConfigurable,
+  currentMemoryModule,
+  currentStyleOverrides,
+  VOICE_RESIDENT_SECTIONS,
+} from '../../store/actions/preferences';
+import { SYSTEM_ONE_PROVIDERS, SYSTEM_ONE_PROVIDER_LOCATION } from '../settings/judgmentBackend';
 import { rankByTitle } from './titleMatch';
 
 type Subview = Exclude<SettingsSubview, 'main'>;
@@ -54,14 +60,20 @@ interface SettingsSearchEntry {
    *  renders nothing when there is no gateway to ask. A page on a direct
    *  engine port resolves that path against the engine and gets a 404. */
   gatewayOnly?: boolean;
+  /** Only surfaced while this holds, for a row whose render condition no flag
+   *  above names. Pass the same predicate the row renders on. */
+  when?: () => boolean;
 }
 
 /**
  * Searchable Settings entries. Top-level entries (no anchor) just open the subview.
  * Nested entries scroll to a `[data-search-anchor]` element and pulse it.
  *
- * Keep this list in sync with the labels rendered in SettingsView.tsx and BackupSection.tsx.
+ * Labels match the UI. `settings-anchors-searchable.test.ts` fails on a
+ * rendered search anchor that no entry covers.
  */
+const hasStyleOverrides = () => Object.keys(currentStyleOverrides()).length > 0;
+
 const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Top-level subviews (one per SETTINGS_NAV_ITEMS entry)
   { id: 'models', label: 'Models', subview: 'models', path: 'Settings' },
@@ -91,6 +103,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'memory:module', label: 'Memory module', subview: 'memory', path: 'Settings → System → Memory', anchor: 'memory:module', keywords: 'memory module classic tree summary trees compactor compaction backfill recall zoom' },
   { id: 'memory:summary-trees', label: 'Summary trees', subview: 'memory', path: 'Settings → System → Memory', anchor: 'memory:summary-trees', keywords: 'summary trees tree memory browser browse workspace threads zoom lines' },
   { id: 'disk-usage', label: 'Disk Usage', subview: 'disk-usage', path: 'Settings → System', keywords: 'storage space disk usage data' },
+  { id: 'prompt-footprint', label: 'Workspace Prompt Footprint', subview: 'prompt-footprint', path: 'Settings → System', keywords: 'prompt footprint context size tokens unused apps knowhow ceiling audit' },
   { id: 'environment-variables', label: 'Environment Variables', subview: 'environment-variables', path: 'Settings → System', keywords: 'env var environment variable config' },
   { id: 'debugging', label: 'Debugging', subview: 'debugging', path: 'Settings → System', keywords: 'debug developer diagnostics perf performance instrumentation telemetry lag latency profiling capture context' },
 
@@ -105,6 +118,17 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'system:connection', label: 'Connection', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:connection', keywords: 'status workspace path api url' },
   { id: 'system:versions', label: 'Versions', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:versions', keywords: 'lucidos engine client build release uptime' },
   { id: 'system:maintenance', label: 'Maintenance', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:maintenance', keywords: 'restart rebuild refresh update client engine' },
+  { id: 'system:update-check', label: 'Check for updates automatically', subview: 'system-overview', path: 'Settings → System → Overview → Maintenance', anchor: 'system:update-check', keywords: 'update check automatic new version release', when: () => releaseCheck.value?.supported === true },
+  { id: 'system:installs', label: 'Installs', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:installs', keywords: 'installs install machines desktop app versions' },
+
+  // What's New, and the Communication Surfaces sample page Debugging opens
+  { id: 'whats-new:releases', label: 'Releases', subview: 'whats-new', path: "Settings → System → What's New", anchor: 'whats-new:releases', keywords: 'releases release notes changelog versions' },
+  { id: 'debugging:communication-surfaces', label: 'Communication surfaces', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:communication-surfaces', keywords: 'communication surfaces toast banner popover dialog samples gallery' },
+  { id: 'surfaces:toasts', label: 'Toasts', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces', anchor: 'surfaces:toasts', keywords: 'toast toasts samples' },
+  { id: 'surfaces:toast-placement', label: 'Placement', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces → Toasts', anchor: 'surfaces:toast-placement', keywords: 'toast placement position corner top bottom' },
+  { id: 'surfaces:popovers', label: 'Popovers', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces', anchor: 'surfaces:popovers', keywords: 'popover popovers samples' },
+  { id: 'surfaces:dialogs', label: 'Dialogs', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces', anchor: 'surfaces:dialogs', keywords: 'dialog dialogs confirm modal samples' },
+  { id: 'surfaces:banners', label: 'Banners', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces', anchor: 'surfaces:banners', keywords: 'banner banners samples' },
 
   // Locale subview
   { id: 'locale:language', label: 'Language', subview: 'locale', path: 'Settings → Locale', anchor: 'locale:language', keywords: 'language locale respond reply' },
@@ -123,6 +147,10 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'access:add-device', label: 'Add a device', subview: 'access', path: 'Settings → Access', anchor: 'access:add-device', keywords: 'pair pairing code qr scan phone new device enrol add' },
   { id: 'access:tailscale', label: 'Tailscale', subview: 'access', path: 'Settings → Access', anchor: 'access:tailscale', keywords: 'tailscale tailnet vpn magicdns serve https sign in' },
   { id: 'access:network', label: 'Network access', subview: 'access', path: 'Settings → Access', anchor: 'access:network', keywords: 'network bind loopback lan address listen expose engine' },
+  // Its heading changes with the device's state, so the label names the section.
+  { id: 'access:steps', label: 'Getting Lucidos onto a device', subview: 'access', path: 'Settings → Access', anchor: 'access:steps', keywords: 'install set up setup steps another device this device home screen' },
+  { id: 'access:machine', label: 'The machine running Lucidos', subview: 'access', path: 'Settings → Access', anchor: 'access:machine', keywords: 'host machine tailscale tailnet serve https' },
+  { id: 'access:device', label: 'This device', subview: 'access', path: 'Settings → Access', anchor: 'access:device', keywords: 'this device tailscale join tailnet phone' },
 
   // Models subview
   { id: 'models:chat', label: 'Chat & triggers', subview: 'models', path: 'Settings → Models', anchor: 'models:chat' },
@@ -143,11 +171,36 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:memory-extraction', label: 'Memory extraction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:memory-extraction' },
   { id: 'models:query-classification', label: 'Query classification', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:query-classification', keywords: 'query classification retrieval memory typesafe jev clef system one judgment' },
   { id: 'models:conversation-summary', label: 'Conversation summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:conversation-summary' },
+  { id: 'models:read-decision', label: 'Read decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:read-decision' },
   // Lands on the Vertex header, not on the Region row itself. That row sits
   // inside the provider's block, which renders only while Vertex is switched
   // on. An anchor pointing at it scrolls to nothing whenever it is off. The
   // header is always there, and carries the switch that brings the row back.
   { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Providers → Vertex AI', anchor: 'models:vertex-ai' },
+  { id: 'models:voice', label: 'Voice', subview: 'models', path: 'Settings → Models', anchor: 'models:voice', keywords: 'voice call talk speak speech audio microphone realtime talker transcriber experimental' },
+  { id: 'models:voice-enabled', label: 'Voice (experimental)', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'voice call enable turn on off home thread' },
+  // The rows below render only while voice is on. So, like Region above, they
+  // land on the switch row, which always renders.
+  { id: 'models:voice-talker', label: 'Talker model', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'talker speech to speech realtime voice model' },
+  { id: 'models:voice-transcriber', label: 'Transcriber model', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'transcriber transcription speech to text whisper voice model' },
+  { id: 'models:voice-talker-voice', label: 'Spoken voice', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'spoken voice sounds like speaker persona' },
+  { id: 'models:voice-resident-sections', label: 'Resident context', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'resident context call knows voice sections' },
+  ...VOICE_RESIDENT_SECTIONS.map((s): SettingsSearchEntry => ({ id: `models:voice-section-${s.id}`, label: s.title, subview: 'models', path: 'Settings → Models → Voice → Resident context', anchor: 'models:voice-enabled', keywords: 'voice resident context call knows' })),
+  { id: 'models:change-summary', label: 'Change summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:change-summary', keywords: 'change summary pending change diff describe' },
+  { id: 'models:summary-compaction', label: 'Summary compaction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:summary-compaction', keywords: 'summary compaction compactor tree memory', when: () => currentMemoryModule() === 'tree' },
+  { id: 'models:response-style-picker', label: 'Style', subview: 'models', path: 'Settings → Models → Response style', anchor: 'models:response-style-picker', keywords: 'response style pick choose preset library' },
+  { id: 'models:manage', label: 'Manage models', subview: 'models', path: 'Settings → Models', anchor: 'models:manage', keywords: 'manage models registry add custom model context window remove' },
+  { id: 'models:anthropic', label: 'Anthropic (direct)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:anthropic', keywords: 'anthropic claude api key direct' },
+  { id: 'models:openai', label: 'OpenAI (direct)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:openai', keywords: 'openai gpt api key direct' },
+  { id: 'models:openrouter', label: 'OpenRouter', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:openrouter', keywords: 'openrouter router api key' },
+  { id: 'models:xai', label: 'xAI', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:xai', keywords: 'xai grok api key' },
+  { id: 'models:local', label: 'Local (OpenAI-compatible)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:local', keywords: 'local ollama lm studio llama vllm openai compatible base url self-hosted' },
+  // A provider's "In use by" row sits in its folded body, so it lands on the
+  // provider's header, which always renders.
+  ...Object.values(SYSTEM_ONE_PROVIDERS).flatMap((p): SettingsSearchEntry[] => [
+    { id: p.anchor, label: p.label, subview: 'models', path: `Settings → ${SYSTEM_ONE_PROVIDER_LOCATION}`, anchor: p.anchor, keywords: 'system one judgment provider api key' },
+    { id: `${p.anchor}-usage`, label: `${p.label}: in use by`, subview: 'models', path: `Settings → ${SYSTEM_ONE_PROVIDER_LOCATION} → ${p.label}`, anchor: p.anchor, keywords: 'in use by sites command guard query classification judgment' },
+  ]),
 
   // Appearance & Behavior subview (Links absorbed the retired Links and
   // Experimental categories, so its two rows keep their own platform flags)
@@ -168,14 +221,14 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // "banner" and "popup" are what people call a toast when they want it gone.
   // Neither is the canonical word, and both have to find this row.
   { id: 'appearance:in-app-toasts', label: 'In-app toasts', subview: 'appearance', path: 'Settings → Appearance & Behavior → Notifications', anchor: 'appearance:in-app-toasts', keywords: 'toast toasts banner banners popup pop-up in-app notifications disable turn off silence quiet distracting interruption' },
-  // No entry for the Links SECTION itself: it renders only when one of the two
-  // rows below does, and `visible` ANDs its flags, so a section entry could not
-  // express "iOS PWA OR Tauri" without a one-off predicate. The rows carry the
-  // gates, and the `appearance` top-level entry keeps `links` in its keywords so
-  // a search for it still lands somewhere true.
+  // The Links section renders when either of its two rows does.
+  { id: 'appearance:links', label: 'Links', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:links', keywords: 'links open external browser', when: () => externalLinkTargetConfigurable() || isTauri() },
   { id: 'appearance:external-link-target', label: 'Open links in', subview: 'appearance', path: 'Settings → Appearance & Behavior → Links', anchor: 'appearance:external-link-target', keywords: 'external links safari ask share sheet in-app browser open link default browser', iosPwaOnly: true },
   { id: 'appearance:in-app-browser', label: 'Open links in the in-app browser', subview: 'appearance', path: 'Settings → Appearance & Behavior → Links', anchor: 'appearance:in-app-browser', keywords: 'in-app browser pane experimental drawer external link', tauriOnly: true },
-  { id: 'appearance:home-thread', label: 'Home thread', subview: 'appearance', path: 'Settings → Appearance & Behavior → Experimental', anchor: 'appearance:home-thread', keywords: 'experimental home thread main conversation boss voice' },
+  { id: 'appearance:workspace-fonts', label: 'Workspace fonts', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:workspace-fonts', keywords: 'workspace fonts install font custom typeface' },
+  // Rendered only while the live style remote has tuned something.
+  { id: 'appearance:style-overrides', label: 'Style overrides', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:style-overrides', keywords: 'style remote overrides custom properties tuned reset', when: hasStyleOverrides },
+  { id: 'appearance:style-overrides-clear', label: 'Clear style overrides', subview: 'appearance', path: 'Settings → Appearance & Behavior → Style overrides', anchor: 'appearance:style-overrides-clear', keywords: 'clear all reset style remote overrides tuned values', when: hasStyleOverrides },
 
   // Backup subview (restore moved to the workspace picker — no in-app entry)
   { id: 'backup:provider', label: 'Provider', subview: 'backup', path: 'Settings → System → Backup', anchor: 'backup:provider' },
@@ -235,7 +288,8 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
     && (!e.iosPwaOnly || externalLinkTargetConfigurable())
     && (!e.iosOnly || isIOS())
     && (!e.tauriOnly || isTauri())
-    && (!e.gatewayOnly || WORKSPACE_ID !== null);
+    && (!e.gatewayOnly || WORKSPACE_ID !== null)
+    && (!e.when || e.when());
   const matches = q
     ? rankByTitle(
         allSettingsEntries().filter(e => visible(e) && `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q)),
@@ -254,6 +308,12 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
 
 export function findSettingsEntry(id: string): SettingsSearchEntry | undefined {
   return allSettingsEntries().find(e => e.id === id);
+}
+
+/** Whether some entry lands on `anchor`, or takes it as its id and lands on an
+ *  ancestor that always renders. */
+export function settingsSearchCovers(anchor: string): boolean {
+  return allSettingsEntries().some(e => e.anchor === anchor || e.id === anchor);
 }
 
 /** Ids of the STATIC index. The settings-nav guard walks them to check each

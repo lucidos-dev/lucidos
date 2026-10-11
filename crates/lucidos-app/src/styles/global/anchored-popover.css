@@ -56,7 +56,7 @@
     /* The box (fill, hairline, radius, shadow) is `.surface`, and so is the
        head, a `SurfaceHead` that sits outside the scrolling body. No padding on
        the shell: the head and the body carry their own. */
-    z-index: var(--z-control-panel);
+    z-index: var(--z-popover);
 }
 
 /* The scrolling pane. `min-height: 0` is load-bearing: a flex item's automatic

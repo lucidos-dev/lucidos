@@ -4,7 +4,7 @@ import { clearAllThreads, psql, resetWelcomePreference } from './db-helpers';
 
 /** Press the setup-interview button the way the running device would.
  *
- *  A touch project TAPS. `composeHandlers` (promptFocus.ts) runs the action on
+ *  A touch project TAPS. `composeHandlers` (composeHandlers.ts) runs the action on
  *  `touchend`, the gesture a phone actually produces, and the only one that
  *  survives a reflow mid-press.
  *

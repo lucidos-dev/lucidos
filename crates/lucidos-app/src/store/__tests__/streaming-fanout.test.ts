@@ -2,7 +2,7 @@
  * Contract: SSE event arrivals split fan-out into two signals.
  *
  *   - `threadMap` (wide) fires ONLY when a meta-shape field actually changed
- *     value. `attentionThreadCount`, `ThreadDrawer.ThreadList`, every
+ *     value. `blockedThreadCount`, `ThreadDrawer.ThreadList`, every
  *     subscribed `ChatExchange`, and every `PromptInput` effect read this
  *     signal — they must stop re-executing per CC streaming token.
  *
@@ -17,7 +17,7 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { effect } from '@preact/signals';
-import { threadMap, focusedThreadId, attentionThreadCount, activeExchanges } from '../store';
+import { threadMap, focusedThreadId, blockedThreadCount, activeExchanges } from '../store';
 import { handleThreadEvent } from '../actions/thread-sync';
 import { bumpThreadEvents } from '../threadActivity';
 import {
@@ -51,11 +51,8 @@ function makeThread(id: string, overrides: Partial<ThreadState['meta']> = {}): T
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
       liveEventWaitCount: 0,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
@@ -88,11 +85,8 @@ function makeAggregate(id: string, overrides: Partial<ThreadAggregate> = {}): Th
     blockingDescendantCount: 0,
     attentionDescendantCount: 0,
     liveEventWaitCount: 0,
-    codingAgentProposed: false,
-    codingAgentRequiresRestart: false,
-    codingAgentIncomplete: false,
+    codingAgentChangeState: { kind: 'none' },
     codingAgentIsExternalRepo: false,
-    codingAgentHasDiff: false,
     isSaved: false,
     hasResponse: true,
     lastRevivedAt: null,
@@ -157,7 +151,31 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     }, 10);
   }));
 
-  it('20 CodingAgentTextStreamed events on a non-focused thread do not re-execute attentionThreadCount', () => {
+  // The Not ready strip and Blocked read whether the agent still holds a
+  // message. A read or a withdrawal ends that hold without touching meta.
+  it.each([
+    ['CodingAgentInputRead', { type: 'CodingAgentInputRead', input_event_id: 'm2', started_turn: false }],
+    ['QueuedMessageRemoved', { type: 'QueuedMessageRemoved', removed_message_id: 'm2' }],
+  ])('%s publishes a fresh threadMap reference', (_, event) => new Promise<void>((resolve) => {
+    const id = 'thread-hold';
+    threadMap.value.set(id, makeThread(id, { channel: 'claude_code' }));
+    const mapBefore = threadMap.value;
+
+    handleThreadEvent({
+      thread_id: id,
+      seq: 9,
+      event,
+      created: '2026-04-17T00:00:03Z',
+      aggregate: makeAggregate(id, { channel: 'claude_code', lastActivity: '2026-04-17T00:00:03Z' }),
+    });
+
+    setTimeout(() => {
+      expect(threadMap.value).not.toBe(mapBefore);
+      resolve();
+    }, 10);
+  }));
+
+  it('20 CodingAgentTextStreamed events on a non-focused thread do not re-execute blockedThreadCount', () => {
     const streamId = 'streaming-thread';
     const otherId = 'other-thread';
     const map = threadMap.value;
@@ -170,7 +188,7 @@ describe('SSE streaming fan-out — split between threadMap and threadEventsBump
     let runs = 0;
     const dispose = effect(() => {
       // Read the computed to subscribe; .value is the contract.
-      void attentionThreadCount.value;
+      void blockedThreadCount.value;
       runs += 1;
     });
     const baseline = runs;

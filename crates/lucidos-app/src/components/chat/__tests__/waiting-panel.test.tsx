@@ -72,10 +72,7 @@ function thread(id: string, over: Partial<ThreadMeta> = {}): ThreadState {
       attentionDescendantCount: 0,
       liveEventWaitCount: 0,
       liveEventWaits: [],
-      codingAgentHasDiff: false,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
       lastRevivedAt: '',
       state: 'active',
@@ -114,7 +111,7 @@ describe('unfinishedSubThreads', () => {
       // (ADR 0254), and the engine counts it in `waiting_children_count`.
       thread('subscribed', { parentThreadId: 'p', status: 'idle', liveEventWaitCount: 1 }),
       // Idle with a proposed change: it reported, and waits only for the user.
-      thread('proposed', { parentThreadId: 'p', status: 'waiting', codingAgentProposed: true }),
+      thread('proposed', { parentThreadId: 'p', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }}),
       thread('finished', { parentThreadId: 'p', status: 'idle' }),
       thread('elsewhere', { parentThreadId: 'other', status: 'running' }),
     );

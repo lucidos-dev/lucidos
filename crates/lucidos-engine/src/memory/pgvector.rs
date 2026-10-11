@@ -133,6 +133,21 @@ impl PgVectorIndex {
         Ok(index)
     }
 
+    /// Does this workspace have a `memory_entries` table at all?
+    ///
+    /// [`Self::new`] creates it at runtime, not a migration, and that call may
+    /// fail. A workspace whose pgvector extension will not load boots with no
+    /// table. A query naming a missing relation fails outright, and inside a
+    /// transaction it aborts every statement after it.
+    pub async fn table_exists<'e, E>(executor: E) -> Result<bool, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        sqlx::query_scalar("SELECT to_regclass('public.memory_entries') IS NOT NULL")
+            .fetch_one(executor)
+            .await
+    }
+
     /// The width `memory_entries.embedding` ACTUALLY has, read from the live
     /// table rather than assumed from [`VECTOR_DIM`].
     ///

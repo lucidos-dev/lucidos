@@ -824,6 +824,33 @@
         })();
         function wsKey(name) { return workspaceSlug ? 'ws:' + workspaceSlug + ':' + name : name; }
         var recovered = false;
+        var handedOver = false;
+        // The service worker's bundle caches. Must match SHELL_CACHE in sw.js.
+        var SHELL_CACHE_PREFIX = 'lucidos-shell-';
+        var EVICT_BOUND_MS = 2000;
+
+        /* Every reload below exists because a bundle failed, and the service
+           worker serves bundles cache-first. A bad cached copy would load again
+           on each reload, so drop the bundle caches first. Offline, keep them:
+           nothing could refetch the shell. Best effort: a missing, failing or
+           hung Cache API still reloads, within the bound. */
+        function evictBundlesThen(next) {
+          var done = false;
+          function go() {
+            if (done) return;
+            done = true;
+            next();
+          }
+          if (typeof caches === 'undefined' || navigator.onLine === false) { go(); return; }
+          window.setTimeout(go, EVICT_BOUND_MS);
+          try {
+            caches.keys().then(function (names) {
+              return Promise.all(names
+                .filter(function (name) { return name.indexOf(SHELL_CACHE_PREFIX) === 0; })
+                .map(function (name) { return caches.delete(name); }));
+            }).then(go, go);
+          } catch (e) { go(); }
+        }
 
         function metaContent(name) {
           var el = document.querySelector('meta[name="' + name + '"]');
@@ -898,7 +925,8 @@
             try { sessionStorage.setItem(wsKey(RETRY_KEY), '1'); } catch (e) {}
             var retryUrl = new URL(location.href);
             retryUrl.searchParams.set(RETRY_PARAM, '1');
-            location.replace(retryUrl.toString());
+            // A module that took boot over during the eviction needs no retry.
+            evictBundlesThen(function () { if (!handedOver) location.replace(retryUrl.toString()); });
             return;
           }
           var splash = document.querySelector('.boot-splash');
@@ -918,7 +946,7 @@
             splash.setAttribute('aria-hidden', 'false');
             splash.addEventListener('click', function () {
               try { sessionStorage.removeItem(wsKey(RETRY_KEY)); } catch (e) {}
-              location.reload();
+              evictBundlesThen(function () { location.reload(); });
             }, { once: true });
           }
         }
@@ -953,6 +981,7 @@
 
         window.__lucidosBootLoaded = function () {
           recovered = true;
+          handedOver = true;
           window.clearTimeout(timer);
           // Boot is the module's now. A later module-script failure is the
           // application's to handle, and must never reload the page under it.

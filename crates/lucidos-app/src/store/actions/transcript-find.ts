@@ -14,7 +14,7 @@
 import { signal } from '@preact/signals';
 import {
   MAX_FIND_MATCHES, collectPageText, matchSpans, queryPattern, revealRange, spanToRange, stepIndex,
-  type FindPainter, type FindResult,
+  type ClearBand, type FindPainter, type FindResult,
 } from '@lucidos/find';
 import type { FindTarget } from './find-bar';
 import {
@@ -27,7 +27,8 @@ import type { ThreadState } from '../thread-events/thread-meta';
 import { getCollapsedVisibleEvents, headClampApplies, isMeaningfulText } from '../event-rendering';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { ensureWholeThreadLoaded } from './thread-loading';
-import { isElementVisible, stopFollowingBottom } from '../../components/chat/scrollState';
+import { markRevealScroll, stopFollowingBottom } from '../../components/chat/scrollState';
+import { isElementVisible } from '../../utils/elementVisibility';
 
 /** A turn the transcript is asked to draw, by `exchangeKey`. ThreadView
  *  answers it by moving its render window down to that turn. */
@@ -161,8 +162,16 @@ async function waitForRoots(threadId: string, passage: TranscriptPassage): Promi
   }
 }
 
-/** Let an unfolding roll finish, so the match is measured where it rests. */
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+/** Let an unfolding roll finish, so the match is measured where it rests. The
+ *  step's own unfold renders and starts its roll a frame later, so the wait
+ *  begins there. Otherwise a roll not yet started reads as none. */
 async function rollsSettled(el: Element | null): Promise<void> {
+  await nextFrame();
+  await nextFrame();
   if (!el || typeof el.getAnimations !== 'function') return;
   const rolls = el.getAnimations({ subtree: true }).map((a) => a.finished.then(() => {}, () => {}));
   await Promise.race([Promise.all(rolls), sleep(1000)]);
@@ -200,9 +209,24 @@ async function reveal(
   if (!stillWanted()) return null;
   const ranges = rangesIn(roots, pattern);
   const range = ranges[Math.min(k, ranges.length - 1)] ?? null;
-  if (range) revealRange(range);
+  const scroller = roots[0].closest<HTMLElement>('.thread-content');
+  if (range) revealRange(range, scroller ? clearBand(scroller) : undefined);
   else roots[0].scrollIntoView({ block: 'center' });
+  // Marked as ours. Unmarked, the transcript reads the step as the reader
+  // scrolling, or as the keyboard moving the page, and undoes it.
+  markRevealScroll(scroller);
   return range;
+}
+
+/** The part of the transcript nothing floats over. On the phone the find bar
+ *  covers its top, under the header, and the prompt covers its bottom. */
+export function clearBand(scroller: HTMLElement): ClearBand {
+  let { top, bottom } = scroller.getBoundingClientRect();
+  const bar = scroller.closest('.thread-view')?.querySelector(':scope > .find-bar-slot');
+  if (bar) top = Math.max(top, bar.getBoundingClientRect().bottom);
+  const prompt = scroller.closest('.thread-view-clip')?.parentElement?.querySelector(':scope > .prompt-area');
+  if (prompt) bottom = Math.min(bottom, prompt.getBoundingClientRect().top);
+  return { top, bottom };
 }
 
 /** The current match's range when it is drawn, without moving anything. */
@@ -219,7 +243,8 @@ let session: {
   threadId: string;
   query: string;
   current: number;
-  historyAsked: boolean;
+  /** The fetch of the thread's older history, once asked for. */
+  history: Promise<boolean> | null;
   texts: Map<string, string>;
 } | null = null;
 
@@ -262,16 +287,19 @@ export function transcriptTarget(threadId: string, painter: FindPainter): FindTa
       return NONE;
     }
     if (session?.threadId !== threadId) {
-      session = { threadId, query: '', current: -1, historyAsked: false, texts: new Map() };
+      session = { threadId, query: '', current: -1, history: null, texts: new Map() };
     }
     const own = session;
     // A close or a newer query ends this run: it must not paint or scroll.
     const stillWanted = () => session === own && own.query === query;
     // The count is the whole thread's, so history not loaded yet is fetched
-    // once. The transcript holds the reader in place while it folds in.
-    if (!own.historyAsked && threadMap.value.get(threadId)?.hasOlderEvents) {
-      own.historyAsked = true;
-      await ensureWholeThreadLoaded(threadId);
+    // once. The transcript holds the reader in place while it folds in, so
+    // every run waits for it: a step scrolled during the fold is put back.
+    if (!own.history && threadMap.value.get(threadId)?.hasOlderEvents) {
+      own.history = ensureWholeThreadLoaded(threadId);
+    }
+    if (own.history) {
+      await own.history;
       if (session !== own) return null;
     }
     const thread = threadMap.value.get(threadId);

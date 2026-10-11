@@ -9,13 +9,12 @@ import {
   clearThreadModelOverride,
   getThreadModelOverride,
   lastThreadModel,
-  lastThreadReasoningEffort,
   patchThreadModelOverride,
   resolveActiveThreadModel,
   resolveActiveThreadProvider,
   resolveActiveThreadReasoningEffort,
 } from './threadModelSelections';
-import { currentModel, reasoningEffort, threadMap } from './store';
+import { currentModel, preferences, threadMap } from './store';
 import type { StoredEvent } from './thread-events';
 import type { ThreadState } from './thread-events';
 
@@ -27,11 +26,20 @@ function seedThread(id: string, events: Array<[number, Partial<StoredEvent>]>): 
   threadMap.value = next;
 }
 
+/** The account's stored tier for `account-model`. */
+const ACCOUNT_EFFORTS = 'account-model=high';
+
+function resetAccount(): void {
+  currentModel.value = 'account-model';
+  preferences.value = { status: 'loaded', data: { chat_reasoning_efforts: ACCOUNT_EFFORTS } };
+}
+
+resetAccount();
+
 afterEach(() => {
   _resetThreadModelSelectionsForTesting();
   threadMap.value = new Map();
-  currentModel.value = 'account-model';
-  reasoningEffort.value = 'account-effort';
+  resetAccount();
 });
 
 describe('resolveActiveThreadModel: pending ?? last message ?? account default', () => {
@@ -67,14 +75,12 @@ describe('resolveActiveThreadModel: pending ?? last message ?? account default',
     // reading only MessageReceived would show the account model here however
     // the trigger was pinned. Mirrors the backend's
     // `IN ('MessageReceived', 'TriggerStarted')`.
-    currentModel.value = 'account-model';
-    reasoningEffort.value = 'account-effort';
     seedThread('t-trigger', [
-      [1, { type: 'TriggerStarted', model: 'gemini-3.5-flash', reasoning_effort: 'low' }],
+      [1, { type: 'TriggerStarted', model: 'gemini-3.8-flash', reasoning_effort: 'low' }],
       [2, { type: 'ResponseGenerated' }],
     ]);
-    expect(resolveActiveThreadModel('t-trigger')).toBe('gemini-3.5-flash');
-    expect(resolveActiveThreadReasoningEffort('t-trigger')).toBe('low');
+    expect(resolveActiveThreadModel('t-trigger')).toBe('gemini-3.8-flash');
+    expect(resolveActiveThreadReasoningEffort('t-trigger', 'gemini-3.8-flash')).toBe('low');
   });
 
   it('a legacy TriggerStarted without a model still falls back to the account default', () => {
@@ -91,34 +97,50 @@ describe('resolveActiveThreadModel: pending ?? last message ?? account default',
   });
 });
 
-describe('resolveActiveThreadReasoningEffort mirrors the model chain', () => {
-  it('last message effort ?? account default; pending pick wins', () => {
-    reasoningEffort.value = 'account-effort';
-    expect(resolveActiveThreadReasoningEffort('t-1')).toBe('account-effort');
-    seedThread('t-1', [[1, { type: 'MessageReceived', reasoning_effort: 'last-effort' }]]);
-    expect(resolveActiveThreadReasoningEffort('t-1')).toBe('last-effort');
-    patchThreadModelOverride('t-1', { reasoningEffort: 'picked-effort' });
-    expect(resolveActiveThreadReasoningEffort('t-1')).toBe('picked-effort');
+describe('resolveActiveThreadReasoningEffort: pending ?? memory for the model ?? account', () => {
+  it('last tier on the same model ?? account tier; pending pick wins', () => {
+    expect(resolveActiveThreadReasoningEffort('t-1', 'account-model')).toBe('high');
+    seedThread('t-1', [[1, { type: 'MessageReceived', model: 'account-model', reasoning_effort: 'low' }]]);
+    expect(resolveActiveThreadReasoningEffort('t-1', 'account-model')).toBe('low');
+    patchThreadModelOverride('t-1', { reasoningEffort: 'max' });
+    expect(resolveActiveThreadReasoningEffort('t-1', 'account-model')).toBe('max');
   });
 
-  it('lastThreadModel / lastThreadReasoningEffort return undefined for an unknown thread', () => {
+  it('a thread that stamped no model keeps its tier on the model it runs on', () => {
+    seedThread('t-1', [[1, { type: 'TriggerStarted', reasoning_effort: 'max' }]]);
+    expect(resolveActiveThreadReasoningEffort('t-1', 'account-model')).toBe('max');
+    expect(resolveActiveThreadReasoningEffort('t-1', 'other-model')).toBeNull();
+  });
+
+  it('a model-less thread tier stops once the account names a chat model', () => {
+    seedThread('t-1', [[1, { type: 'TriggerStarted', reasoning_effort: 'max' }]]);
+    preferences.value = {
+      status: 'loaded',
+      data: { chat_model: 'account-model', chat_reasoning_efforts: ACCOUNT_EFFORTS },
+    };
+    expect(resolveActiveThreadReasoningEffort('t-1', 'account-model')).toBe('high');
+  });
+
+  it('a remembered tier never follows the thread to another model', () => {
+    seedThread('t-1', [[1, { type: 'MessageReceived', model: 'account-model', reasoning_effort: 'low' }]]);
+    expect(resolveActiveThreadReasoningEffort('t-1', 'other-model')).toBeNull();
+  });
+
+  it('lastThreadModel returns undefined for an unknown thread', () => {
     expect(lastThreadModel('nope')).toBeUndefined();
-    expect(lastThreadReasoningEffort('nope')).toBeUndefined();
     expect(lastThreadModel(null)).toBeUndefined();
   });
 });
 
 describe('a pick is per-thread and never writes the account preference', () => {
   it('picking on thread A leaves thread B and the account default untouched', () => {
-    currentModel.value = 'account-model';
-    reasoningEffort.value = 'account-effort';
-    patchThreadModelOverride('A', { model: 'A-model', reasoningEffort: 'A-effort' });
+    patchThreadModelOverride('A', { model: 'A-model', reasoningEffort: 'low' });
     // Thread B (no override, no messages) still resolves the account default.
     expect(resolveActiveThreadModel('B')).toBe('account-model');
-    expect(resolveActiveThreadReasoningEffort('B')).toBe('account-effort');
-    // The account preference signals are untouched.
+    expect(resolveActiveThreadReasoningEffort('B', 'account-model')).toBe('high');
+    // The account preference is untouched.
     expect(currentModel.value).toBe('account-model');
-    expect(reasoningEffort.value).toBe('account-effort');
+    expect(preferences.value).toEqual({ status: 'loaded', data: { chat_reasoning_efforts: ACCOUNT_EFFORTS } });
   });
 
   it('a later patch preserves earlier fields', () => {

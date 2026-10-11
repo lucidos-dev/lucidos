@@ -3,15 +3,17 @@
 #
 #   ./scripts/e2e-github.sh <all|api|browser|wasm|embedder> [the suite's own flags]
 #
-# The e2e scripts hand over here when they see --github, so call it as
-# `./scripts/e2e.sh --github` and friends. Flags mean what they mean locally:
+# The e2e scripts hand over here unless the run must stay local (ADR 0386),
+# so call it as `./scripts/e2e.sh` and friends. Flags mean what they mean locally:
 #   all      --no-webkit
 #   api      -f <filter>, and anything else is passed to cargo test
 #   browser  -f <spec>, --webkit, --no-webkit, -- <playwright args>
+#            (a *.spec.ts among the Playwright args narrows both legs to it)
 #
-# Specs that need a logged-in Claude Code run here, as the local leg, in
-# parallel with the remote run. Everything else runs on GitHub. The report and
-# exit code match a local run; 76 means the run produced no verdict.
+# Specs with a test tagged @real-claude-code run here, as the local leg, in
+# parallel with the remote run. Everything else runs on GitHub, where the
+# browser shards answer Claude Code with the fake. The report and exit code
+# match a local run; 76 means the run produced no verdict.
 
 set -uo pipefail
 
@@ -47,9 +49,14 @@ skip_webkit=""
 pw_args=()
 
 refuse() {
-    echo "e2e-github.sh: $1 is not available in GitHub mode." >&2
+    echo "e2e-github.sh: $1 is not available in GitHub mode. Run with --local instead." >&2
     exit 1
 }
+
+for arg in "$@"; do
+    [ "$arg" != -- ] || break
+    [[ " ${E2E_GITHUB_LOCAL_ONLY_FLAGS[*]} " != *" $arg "* ]] || refuse "$arg"
+done
 
 case "$suite" in
     all)
@@ -57,7 +64,6 @@ case "$suite" in
         while [ $# -gt 0 ]; do
             case "$1" in
                 --no-webkit) skip_webkit=1 ;;
-                --packaged) refuse "--packaged (it boots the macOS .app on this host)" ;;
                 *) echo "e2e-github.sh: unknown flag for e2e.sh: $1" >&2; exit 1 ;;
             esac
             shift
@@ -67,7 +73,6 @@ case "$suite" in
         suites=(api)
         while [ $# -gt 0 ]; do
             case "$1" in
-                --no-reset) ;;
                 --) shift; api_args+=("$@"); break ;;
                 *) api_args+=("$1") ;;
             esac
@@ -81,9 +86,6 @@ case "$suite" in
                 -f) browser_file="${2:-}"; shift ;;
                 --webkit) use_webkit=1 ;;
                 --no-webkit) skip_webkit=1 ;;
-                --no-reset) ;;
-                -h | --headed) refuse "--headed" ;;
-                --ios | --device | --screenshot | --pwa) refuse "$1 (it drives the iOS Simulator)" ;;
                 --) shift; pw_args+=("$@"); break ;;
                 *) pw_args+=("$1") ;;
             esac
@@ -92,9 +94,27 @@ case "$suite" in
         ;;
     wasm | embedder)
         suites=("$suite")
-        [ $# -eq 0 ] || { echo "e2e-github.sh: $suite takes no flags" >&2; exit 1; }
+        [ $# -eq 0 ] || refuse "an argument to $suite"
         ;;
 esac
+
+spec_args=()
+if [ "${#pw_args[@]}" -gt 0 ]; then
+    rest=()
+    prev=""
+    for arg in "${pw_args[@]}"; do
+        if e2e_github_is_spec_arg "$prev" "$arg"; then
+            [[ " ${spec_args[*]-} " == *" $(basename "$arg") "* ]] || spec_args+=("$(basename "$arg")")
+        else
+            rest+=("$arg")
+        fi
+        prev="$arg"
+    done
+    pw_args=(${rest[@]+"${rest[@]}"})
+fi
+if [ -n "$browser_file" ] && [[ " ${spec_args[*]-} " != *" $(basename "$browser_file") "* ]]; then
+    spec_args+=("$(basename "$browser_file")")
+fi
 
 if [ -n "$use_webkit" ] && [ -n "$skip_webkit" ]; then
     echo "e2e-github.sh: --webkit and --no-webkit contradict each other" >&2
@@ -102,7 +122,7 @@ if [ -n "$use_webkit" ] && [ -n "$skip_webkit" ]; then
 fi
 for arg in ${pw_args[@]+"${pw_args[@]}"}; do
     case "$arg" in
-        --project | --project=*) echo "e2e-github.sh: use --webkit or --no-webkit, not --project, in GitHub mode" >&2; exit 1 ;;
+        --project | --project=*) refuse "--project (use --webkit or --no-webkit)" ;;
     esac
 done
 
@@ -121,14 +141,17 @@ $(e2e_browser_projects ${skip_webkit:+--no-webkit})
 EOF
     fi
     spec_dir="$PROJECT_DIR/crates/lucidos-app/e2e"
-    if [ -n "$browser_file" ]; then
-        candidates=("$spec_dir/$(basename "$browser_file")")
-        [ -f "${candidates[0]}" ] || { echo "e2e-github.sh: no spec named $browser_file" >&2; exit 1; }
+    if [ "${#spec_args[@]}" -gt 0 ]; then
+        candidates=()
+        for s in "${spec_args[@]}"; do
+            [ -f "$spec_dir/$s" ] || { echo "e2e-github.sh: no spec named $s" >&2; exit 1; }
+            candidates+=("$spec_dir/$s")
+        done
     else
         candidates=("$spec_dir"/*.spec.ts)
     fi
     for f in "${candidates[@]}"; do
-        if e2e_spec_needs_claude_code "$f"; then
+        if e2e_spec_needs_real_claude_code "$f"; then
             local_specs+=("$(basename "$f")")
         else
             remote_specs+=("$(basename "$f")")
@@ -200,6 +223,7 @@ local_log="$out_dir/local-claude-code.log"
 run_local_leg() {
     local waited=0 limit="${E2E_GITHUB_LOCK_WAIT_SECS:-3600}" holder child rc
     trap '[ -z "${child:-}" ] || kill -TERM "$child" 2>/dev/null; exit 143' TERM
+    export LUCIDOS_E2E_LOCAL=1
     while :; do
         holder="$(e2e_github_e2e_lock_holder)"
         if [ -n "$holder" ]; then
@@ -231,7 +255,7 @@ if [ "${#local_specs[@]}" -gt 0 ]; then
     # A single spec goes through -f, so projects that ignore it are skipped
     # exactly as in a local run.
     local_selection=()
-    if [ -n "$browser_file" ]; then
+    if [ -n "$browser_file" ] && [ "${#spec_args[@]}" -eq 1 ]; then
         local_selection=(-f "$(basename "$browser_file")" --)
     else
         local_selection=(--)

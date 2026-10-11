@@ -51,7 +51,7 @@ pub(super) async fn submit_mcp_consent(
         .unwrap()
         .thread_of(&body.request_id);
     if let Err(e) = super::thread_reach::refuse_permission_answer(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         card_thread,
         body.allowed,
@@ -97,6 +97,9 @@ pub(super) async fn set_mcp_auto_approve(
     headers: HeaderMap,
     Json(body): Json<McpAutoApproveRequest>,
 ) -> impl IntoResponse {
+    if let Err(refusal) = super::thread_reach::refuse_agent_permission_grant(&headers) {
+        return refusal.into_response();
+    }
     let actor = super::actor::user_actor(&headers, None);
     match state
         .engine
@@ -107,22 +110,6 @@ pub(super) async fn set_mcp_auto_approve(
         Ok(msg) => Json(serde_json::json!({ "success": true, "message": msg })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed: {}", e)).into_response(),
     }
-}
-
-/// The model a new Lucidos Agent thread would run with: the account's
-/// `chat_model` preference, else the provider default.
-///
-/// Mirrors the chat path's own order, so the page states the window the request
-/// packer will size against. `LlmProvider::default_model()` alone is NOT that
-/// window. It is `LUCIDOS_MODEL` or the `prefs::CHAT_MODEL` default, fixed
-/// at boot, so it drops the `[1m]` marker a saved preference carries. The page
-/// reported a 1M model's tools as a share of 200k.
-async fn resolved_chat_model(pool: &PgPool, provider_default: &str) -> String {
-    crate::core::PreferenceStore::user_chat_settings(pool)
-        .await
-        .0
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| provider_default.to_string())
 }
 
 /// GET /api/v1/mcp/servers: list MCP servers with status and context cost.
@@ -148,9 +135,7 @@ pub(super) async fn list_mcp_servers(
 
     // The window the resolved model actually has, so the page can state the
     // share of it these tools occupy.
-    let model =
-        resolved_chat_model(&state.pool, state.engine.current_provider().default_model()).await;
-    let context_window = state.engine.context_window_for(&model, None);
+    let (model, context_window) = state.engine.chat_model_and_window().await;
     let budget = state.engine.mcp_manager.budget(context_window).await;
 
     Ok(Json(serde_json::json!({
@@ -474,7 +459,7 @@ mod tests {
 
         // Unset: the provider default is all there is to report.
         assert_eq!(
-            resolved_chat_model(&pool, "claude-opus-5").await,
+            crate::core::PreferenceStore::resolved_chat_model(&pool, "claude-opus-5").await,
             "claude-opus-5"
         );
 
@@ -489,7 +474,7 @@ mod tests {
         .expect("save the chat model preference");
 
         assert_eq!(
-            resolved_chat_model(&pool, "claude-opus-5").await,
+            crate::core::PreferenceStore::resolved_chat_model(&pool, "claude-opus-5").await,
             "claude-opus-5[1m]"
         );
 
@@ -500,7 +485,7 @@ mod tests {
             .await
             .expect("blank the chat model preference");
         assert_eq!(
-            resolved_chat_model(&pool, "claude-opus-5").await,
+            crate::core::PreferenceStore::resolved_chat_model(&pool, "claude-opus-5").await,
             "claude-opus-5"
         );
 

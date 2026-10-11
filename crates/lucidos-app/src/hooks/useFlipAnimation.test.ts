@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
     blockExtent, contiguousRuns, crossesViewport, ghostOf, mountDepartureLayer, mountDisclosureMask,
-    rollDistance, rowEndScale, startTogetherOnNextFrame, tuckTarget,
+    rollDistance, rowEndScale, startTogetherOnNextFrame,
 } from './useFlipAnimation';
 
 describe('contiguousRuns', () => {
@@ -158,21 +158,6 @@ describe('startTogetherOnNextFrame', () => {
         frames[0](0);
         expect(anim.play).not.toHaveBeenCalled();
         expect(anim.startTime).toBeNull();
-    });
-});
-
-describe('tuckTarget', () => {
-    const sections = [
-        { name: 'current', ids: ['__section_current', 'a'] },
-        { name: 'archive', ids: ['__section_archive'], tucked: ['b', 'c'] },
-    ];
-
-    it('folds a thread hidden in a collapsed section into that section\'s header', () => {
-        expect(tuckTarget('b', sections)).toBe('__section_archive');
-    });
-
-    it('has no target for a thread that left every section', () => {
-        expect(tuckTarget('gone', sections)).toBeNull();
     });
 });
 

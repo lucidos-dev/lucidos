@@ -1,5 +1,6 @@
 import { signal } from '@preact/signals';
 import { pushOverlay, removeOverlay } from './overlayStack';
+import { drawerGrouping } from './store';
 
 /** Escape registry id. The panel is NOT an `<Overlay>` (it is a view inside a
  *  pane, not something floating over other UI, so it neither dismisses on an
@@ -11,10 +12,10 @@ import { pushOverlay, removeOverlay } from './overlayStack';
 const OVERLAY_ID = 'thread-filter-panel';
 
 /** Showing the filters is a state OF THE DRAWER, so it survives a reload the
- *  same way the drawer's other states do (`lucidos-alt-view`, the channel
- *  selection, the drawer's own open/closed, its width). Cleared rather than
- *  written `false` for the default, so a pristine state restores pristine
- *  (`setDrawerView`'s convention). */
+ *  same way the drawer's other states do (its grouping, the channel selection,
+ *  the drawer's own open/closed, its width). Cleared rather than written
+ *  `false` for the default, so a pristine state restores pristine
+ *  (`setDrawerGrouping`'s convention). */
 const PANEL_OPEN_KEY = 'lucidos-thread-filter-panel-open';
 
 /** Whether the thread filter panel is showing. The panel renders INSIDE the
@@ -61,8 +62,15 @@ function syncEscapeRegistration(): void {
 // off and on again. No-op on the ordinary closed boot.
 syncEscapeRegistration();
 
+/** The filter shapes the Folders grouping only, so the panel never shows
+ *  under Ongoing. An open does nothing there, and a switch to Ongoing closes it
+ *  (store/effects.ts). */
+function canOpen(): boolean {
+  return drawerGrouping.value === 'folders';
+}
+
 export function openThreadFilterPanel(): void {
-  setPanelOpen(true);
+  if (canOpen()) setPanelOpen(true);
 }
 
 export function closeThreadFilterPanel(): void {
@@ -70,5 +78,5 @@ export function closeThreadFilterPanel(): void {
 }
 
 export function toggleThreadFilterPanel(): void {
-  setPanelOpen(!threadFilterPanelOpen.value);
+  setPanelOpen(!threadFilterPanelOpen.value && canOpen());
 }

@@ -22,10 +22,23 @@ fn row(f: impl FnOnce(&mut TriageFacts)) -> TriageRow {
     };
     f(&mut facts);
     TriageRow {
+        family_root: facts.thread_id,
+        family_pinned: false,
         facts,
         title: "A thread".into(),
         section: "inbox".into(),
+        inbox_sub_threads: 0,
+        pinned_sub_threads: 0,
     }
+}
+
+/// A family of `open` inbox sub-threads, `pinned` of them pinned.
+fn family(open: usize, pinned: usize, f: impl FnOnce(&mut TriageFacts)) -> TriageRow {
+    let mut row = row(f);
+    row.facts.sub_thread_count = open as i64;
+    row.inbox_sub_threads = open;
+    row.pinned_sub_threads = pinned;
+    row
 }
 
 /// The confirm archives the safe rows, counts the rest once each by their
@@ -47,14 +60,100 @@ fn the_preflight_counts_what_stays_and_skips_pinned_rows() {
     ];
     let p = preflight(&rows);
     assert_eq!(p.safe.len(), 2, "idle and empty threads are both safe");
-    assert_eq!(p.kept_count, 5);
+    assert_eq!(p.safe_thread_count, 2);
+    assert_eq!(p.kept_thread_count, 5);
     assert_eq!(p.kept.get("question"), Some(&2));
     assert_eq!(p.kept.get("pending_change"), Some(&1));
     assert_eq!(p.kept.get("draft"), Some(&1));
     assert_eq!(p.kept.get("busy"), Some(&1));
-    assert_eq!(p.kept.values().sum::<usize>(), p.kept_count);
+    assert_eq!(p.kept.values().sum::<usize>(), p.kept_thread_count);
     let pinned = rows[7].facts.thread_id;
     assert!(p.safe.iter().all(|s| s.thread_id != pinned));
+}
+
+/// The confirm counts inbox threads as the Current badge does, so what goes and
+/// what stays add up to it. A kept family counts once under its reason and
+/// its other threads beside it. A pinned sub-thread stays open.
+#[test]
+fn the_preflight_counts_every_inbox_thread_in_a_family() {
+    let rows = vec![
+        family(3, 0, |_| {}),
+        family(2, 1, |_| {}),
+        family(4, 0, |f| f.status = ThreadStatus::Running),
+        family(1, 0, |f| f.sub_thread_needs = vec![NeedFact::Question]),
+        family(5, 0, |f| f.is_pinned = true),
+    ];
+    let p = preflight(&rows);
+    assert_eq!(p.safe.len(), 2, "the press sends family roots");
+    assert_eq!(
+        p.safe_thread_count,
+        4 + 2,
+        "each root and its unpinned subs"
+    );
+    assert_eq!(p.kept.get("busy"), Some(&1));
+    assert_eq!(p.kept.get("question"), Some(&1));
+    assert_eq!(p.kept.get(SAME_FAMILY), Some(&(4 + 1)));
+    assert_eq!(p.kept.get(PINNED_SUB_THREAD), Some(&1));
+    assert_eq!(p.kept_thread_count, 8);
+    let current_badge = 4 + 3 + 5 + 2;
+    assert_eq!(p.safe_thread_count + p.kept_thread_count, current_badge);
+}
+
+/// Archive all follows the drawer's families. A root under a pinned family is
+/// in Pinned, so it is neither archived nor counted. A pinned root in a family
+/// Current shows renders in Current and stays open, so it counts as kept.
+#[test]
+fn the_preflight_follows_the_drawers_families() {
+    let top = Uuid::new_v4();
+    let in_family = |f: fn(&mut TriageFacts), pinned_family: bool| {
+        let mut row = family(1, 0, f);
+        row.family_root = top;
+        row.family_pinned = pinned_family;
+        row.facts.is_pinned |= pinned_family;
+        row
+    };
+    let under_pinned = in_family(|_| {}, true);
+    let p = preflight(std::slice::from_ref(&under_pinned));
+    assert!(
+        p.safe.is_empty(),
+        "a pinned family's threads stay in Pinned"
+    );
+    assert_eq!(p.kept_thread_count, 0);
+
+    let pinned = in_family(|f| f.is_pinned = true, false);
+    let plain = in_family(|_| {}, false);
+    let p = preflight(&[pinned.clone(), plain]);
+    assert_eq!(p.safe_thread_count, 2);
+    assert_eq!(p.kept.get(PINNED_SUB_THREAD), Some(&1));
+    assert_eq!(
+        p.kept.get(SAME_FAMILY),
+        Some(&1),
+        "the pinned root's own sub"
+    );
+    assert_eq!(p.kept_thread_count, 2);
+
+    let p = preflight(std::slice::from_ref(&pinned));
+    assert_eq!(p.kept_thread_count, 0, "alone, its family sits in Pinned");
+}
+
+/// A kept entry carries how many inbox threads stayed with it, so the result
+/// toast counts threads like the confirm did.
+#[test]
+fn a_kept_entry_counts_the_threads_that_stayed() {
+    let asking = family(2, 0, |f| f.has_pending_question = true);
+    let gone = Uuid::new_v4();
+    let (_, kept) = still_safe(
+        std::slice::from_ref(&asking),
+        &[asking.facts.thread_id, gone],
+    );
+    let count = |id| {
+        kept.iter()
+            .find(|k| k.thread_id == id)
+            .unwrap()
+            .thread_count
+    };
+    assert_eq!(count(asking.facts.thread_id), 3);
+    assert_eq!(count(gone), 1);
 }
 
 /// The confirm is the ceiling: an id is archived only if the user confirmed

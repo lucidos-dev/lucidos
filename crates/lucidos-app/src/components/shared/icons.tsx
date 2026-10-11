@@ -474,9 +474,9 @@ export function ForwardIcon() {
   );
 }
 
-export function SearchIcon({ className }: { className?: string } = {}) {
+export function SearchIcon({ className, size }: { className?: string; size?: string } = {}) {
   return (
-    <svg class={className} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <svg class={className} {...(size ? { width: size, height: size } : {})} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
       <circle cx="7" cy="7" r="4.5" />
       <path d="M10.5 10.5L14 14" />
     </svg>
@@ -503,7 +503,7 @@ export function DraftsIcon({ size }: { size?: string } = {}) {
   );
 }
 
-export function AttentionIcon({ size }: { size?: string } = {}) {
+export function BlockedIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <circle cx="12" cy="12" r="10" />
@@ -560,9 +560,8 @@ export function MenuIcon() {
 // read as the way back.
 const FUNNEL_PATH = 'M2 2.5h12L9.5 8.25V14l-3-1.5V8.25z';
 
-// Unified thread-drawer Filter control. One button toggles the merged Status +
-// Thread type panel (see ThreadFilterPanel); also the "All statuses" row icon
-// inside that panel.
+// The thread drawer's Filter control, which toggles the thread-type panel
+// (see ThreadFilterPanel).
 export function FilterIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -577,8 +576,8 @@ export function FilterIcon() {
 const FUNNEL_SILHOUETTE_PATH =
   'M1.409 2.962A.75.75 0 0 1 2 1.75H14a.75.75 0 0 1 .591 1.212L10.25 8.509V14a.75.75 0 0 1-1.085.671l-3-1.5A.75.75 0 0 1 5.75 12.5V8.509z';
 
-// The Filter button and the panel's "All statuses" row while a thread-type
-// selection narrows the `all` view: the same funnel, filled. Outline for off and filled for on is the iOS convention.
+// The Filter button while a thread-type selection narrows the list: the same
+// funnel, filled. Outline for off and filled for on is the iOS convention.
 export function FilteredIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="currentColor" stroke="none">
@@ -676,7 +675,7 @@ export function CodexIcon() {
   );
 }
 
-// A crosshair: "find this in the list", for Show in thread list.
+// A crosshair: "find this in the list", for Show in Folders.
 export function LocateIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -764,35 +763,46 @@ export function EyeOffIcon() {
 }
 
 // Drawer "Review" view — an open eye (changes ready to look over / apply).
-export function ReviewIcon() {
+export function ReviewIcon({ size }: { size?: string } = {}) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
       <circle cx="12" cy="12" r="3" />
     </svg>
   );
 }
 
-// Drawer "In flight" indicator: a STATIC ring spinner, the same visual family as
-// the animated `.mini-spinner` on running thread rows (modal-overlay.css), so the
-// app shows one spinner shape. It stays static everywhere it labels the view
-// (the threads-header Filter button, the panel's In flight row, the IN FLIGHT
-// section header). Only the per-thread spinners animate, so motion appears only
-// where a turn is running.
+// Drawer "In flight" view: a jet cruising level, nose right, seen slightly from
+// above so the far wing is shorter than the near one. It labels the view (the
+// threads-header Filter button, the panel's In flight row, the IN FLIGHT section
+// header) and never animates. The per-thread `.mini-spinner` marks running work.
 export function InFlightIcon({ size }: { size?: string } = {}) {
   return (
-    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
-      <circle cx="12" cy="12" r="9" pathLength="100" stroke-dasharray="75 25" transform="rotate(-90 12 12)" />
+    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M8 19.3h2l5-6.8h5.5c.83 0 1.5-1.5 1.5-1.5s-.67-1.5-1.5-1.5H15l-4.6-4.8h-2l2.1 4.8H5L3.6 8.3H2.1L3 11l-1 3.2h1.5L5 12.5h5.5z" />
     </svg>
   );
 }
 
-// Drawer "Current" section — an inbox tray (the live working set).
+// The Ongoing grouping: an inbox tray, on the threads-header grouping button.
 export function InboxIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M22 12h-6l-2 3h-4l-2-3H2" />
       <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+    </svg>
+  );
+}
+
+// The Current section, the live working set: three stacked layers. Worn by its
+// drawer header and by every "Move to Current" action. Never the inbox tray,
+// which belongs to the Ongoing grouping shown in the same header.
+export function CurrentIcon({ size }: { size?: string } = {}) {
+  return (
+    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M12 2 2 7l10 5 10-5-10-5z" />
+      <path d="m2 12 10 5 10-5" />
+      <path d="m2 17 10 5 10-5" />
     </svg>
   );
 }
@@ -815,27 +825,6 @@ export function ArchiveIcon({ size }: { size?: string } = {}) {
       <rect x="3" y="4" width="18" height="4" rx="1" />
       <path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8" />
       <line x1="10" y1="12" x2="14" y2="12" />
-    </svg>
-  );
-}
-
-// Filter panel "Status" heading: a dot in a ring, like a status light.
-export function StatusIcon({ size }: { size?: string } = {}) {
-  return (
-    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <circle cx="12" cy="12" r="9" />
-      <circle cx="12" cy="12" r="3" fill="currentColor" />
-    </svg>
-  );
-}
-
-// Filter panel "By thread types" heading: stacked layers, one per type.
-export function ThreadTypesIcon({ size }: { size?: string } = {}) {
-  return (
-    <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <polygon points="12 2 2 7 12 12 22 7 12 2" />
-      <polyline points="2 17 12 22 22 17" />
-      <polyline points="2 12 12 17 22 12" />
     </svg>
   );
 }
@@ -1058,6 +1047,71 @@ export function LucidosMarkIcon() {
         <rect x="54" y="54" width="29" height="29" rx="7" />
         <path d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z" />
       </g>
+    </svg>
+  );
+}
+
+/** A *widget*: a panel with a header bar, the small answer on a thread's
+ *  shelf (ADR 0402). Its chip on the widget shelf and its bar both draw it. */
+export function WidgetIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 9h18M9 9v11" />
+    </svg>
+  );
+}
+
+/** Open in Canvas: the pane beside the thread, full size. */
+export function OpenInCanvasIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M12 4v16" />
+    </svg>
+  );
+}
+
+/* The three widget window modes share one frame, 17 by 15 at the same corner,
+   so they read as one family beside ⋯ and ✕. */
+
+/** A widget window's window mode: a card with a bar. */
+export function WidgetWindowModeIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
+      <path d="M3.5 9h17" />
+    </svg>
+  );
+}
+
+/** A widget window's minimal mode: the widget alone, only its corners. */
+export function WidgetMinimalModeIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3.5 9V7a2.5 2.5 0 0 1 2.5-2.5h2.5M15.5 4.5H18A2.5 2.5 0 0 1 20.5 7v2M20.5 15v2a2.5 2.5 0 0 1-2.5 2.5h-2.5M8.5 19.5H6A2.5 2.5 0 0 1 3.5 17v-2" />
+    </svg>
+  );
+}
+
+/** A widget window docked under the thread's title. */
+export function WidgetDockedModeIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3.5 4.5h17" />
+      <rect x="3.5" y="8.5" width="17" height="11" rx="2.5" />
+    </svg>
+  );
+}
+
+/** Make reusable: two arrows going round, offered again in other threads. */
+export function ReuseIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M17 2l4 4-4 4" />
+      <path d="M3 11V9a3 3 0 0 1 3-3h15" />
+      <path d="M7 22l-4-4 4-4" />
+      <path d="M21 13v2a3 3 0 0 1-3 3H3" />
     </svg>
   );
 }

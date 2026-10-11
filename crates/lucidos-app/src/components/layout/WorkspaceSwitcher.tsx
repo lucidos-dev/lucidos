@@ -70,7 +70,6 @@ import {
   recallWorkspaceSwitcherExpanded,
 } from '../../utils/lastWorkspace';
 import { workspaceState, workspaceStateLabel } from '../../utils/workspaceState';
-import { GlyphBadge } from '../shared/GlyphBadge';
 
 /** Skeleton rows when this device has never recorded a workspace count. Two,
  *  not the picker's three: an unfolded list pushes the rows below it down, so
@@ -287,13 +286,9 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
       aria-label={stateLabel}
     />
   );
+  // No unread badge: the notifications group above this list already counts
+  // each workspace, so a second count here repeats it.
   const name = <span class="brand-menu-ws-name">{w.name}</span>;
-  const unread = w.unread_count ?? 0;
-  const badge = unread > 0 && (
-    <GlyphBadge class="brand-menu-ws-badge" aria-label={`${unread} unread notifications`}>
-      {unread > 99 ? '99+' : unread}
-    </GlyphBadge>
-  );
 
   // Claim the right-click for the action row below. Without `preventDefault`
   // the browser's own menu covers the panel, which is what a right-click on a
@@ -326,7 +321,6 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
       >
         {dot}
         {name}
-        {badge}
         <CheckIcon className="brand-menu-ws-check" />
       </div>
     );
@@ -378,7 +372,6 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
     >
       {dot}
       {name}
-      {badge}
     </button>
   );
 }

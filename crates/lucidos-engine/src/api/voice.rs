@@ -152,16 +152,7 @@ async fn admit(
     }
 
     // Voice sessions live in the home thread alone (ADR 0362). The control is
-    // drawn there and nowhere else, so this is the floor under it. With the
-    // home thread switched off, no thread takes a call.
-    let home_switch = crate::core::prefs::HOME_THREAD_ENABLED.try_read(pool).await;
-    if matches!(home_switch, Ok(false)) {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "A call runs on the home thread, which is off. Turn it on in Settings, \
-             under Experimental.",
-        ));
-    }
+    // drawn there and nowhere else, so this is the floor under it.
     match crate::engine::home_thread::is_home_thread(pool, thread_id).await {
         Ok(true) => {}
         Ok(false) => {
@@ -254,7 +245,9 @@ mod tests {
     /// The workspace's home thread, the one thread a call runs on.
     async fn the_home_thread(pool: &sqlx::PgPool) -> Uuid {
         let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-        crate::engine::home_thread::enabled_home_thread(&bus, pool).await
+        crate::engine::home_thread::ensure_home_thread(&bus, pool)
+            .await
+            .expect("create the home thread")
     }
 
     /// A thread a coding agent holds.
@@ -285,7 +278,8 @@ mod tests {
     }
 
     /// Voice ships off. A workspace that never opted in has no call to place,
-    /// and the refusal lands before the thread is even looked up.
+    /// and the refusal lands before the thread is even looked up. Every
+    /// workspace has Home, so the voice switch is the only one it names.
     #[tokio::test]
     async fn a_call_is_refused_while_voice_is_off() {
         let (pool, db_name) = setup_test_db().await;
@@ -297,6 +291,7 @@ mod tests {
             .err()
             .expect("should refuse");
         assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert!(error.message.contains("under Voice"), "{}", error.message);
         assert_eq!(sessions.count(), 0, "a refusal must claim no slot");
 
         // And it is the switch that decides, not the thread.
@@ -368,35 +363,6 @@ mod tests {
         admit(&pool, &sessions, home)
             .await
             .expect("a call on the home thread");
-
-        teardown_test_db(&db_name).await;
-    }
-
-    /// Voice needs the home thread. With its switch off no thread takes a
-    /// call, the hidden home thread included, and the refusal names the switch.
-    #[tokio::test]
-    async fn a_call_is_refused_while_the_home_thread_is_off() {
-        let (pool, db_name) = setup_test_db().await;
-        let sessions = LiveVoiceSessions::new();
-        voice_is_on(&pool).await;
-        let home = the_home_thread(&pool).await;
-        crate::core::PreferenceStore::set_row_for_test(
-            &pool,
-            crate::core::prefs::HOME_THREAD_ENABLED.key(),
-            "false",
-        )
-        .await
-        .expect("turn the home thread off");
-
-        for thread_id in [home, a_chat_thread(&pool).await] {
-            let error = admit(&pool, &sessions, thread_id)
-                .await
-                .err()
-                .expect("should refuse while the home thread is off");
-            assert_eq!(error.status, StatusCode::FORBIDDEN);
-            assert!(error.message.contains("Experimental"), "{}", error.message);
-        }
-        assert_eq!(sessions.count(), 0, "a refusal must claim no slot");
 
         teardown_test_db(&db_name).await;
     }

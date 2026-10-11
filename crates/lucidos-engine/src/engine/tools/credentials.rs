@@ -221,7 +221,7 @@ fn name_taken_by(existing: &Credential, requested: AuthType) -> String {
 ///
 /// **A `secret` is never widened.** Its EMPTY scope is the answer rather than a
 /// gap, because the value is signed with and never sent.
-/// `CredentialStore::infer_scope_if_empty` skips one for the same reason:
+/// `CredentialStore::infer_undeclared_scopes` skips one for the same reason:
 /// giving it a host grants exactly the reach the type exists to refuse.
 fn hosts_outside_scope(existing: &Credential, requested: &[String]) -> Vec<String> {
     if existing.auth_type == AuthType::Secret {
@@ -1300,7 +1300,7 @@ mod tests {
             "update",
             "delete",
             "set_base_urls",
-            "infer_scope_if_empty",
+            "infer_undeclared_scopes",
         ] {
             assert!(
                 !production.contains(&format!("CredentialStore::{mutator}")),

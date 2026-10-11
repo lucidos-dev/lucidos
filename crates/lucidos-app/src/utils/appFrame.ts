@@ -10,8 +10,12 @@ import { API_BASE } from '../api/client/_core';
  *  from any other frame, so it cannot drive host-shell behavior. */
 export function appFrameFor(source: MessageEventSource | null): HTMLIFrameElement | null {
   if (!source) return null;
-  const frames = document.querySelectorAll<HTMLIFrameElement>('iframe[data-role="app-ui-frame"]');
-  return Array.from(frames).find((f) => f.contentWindow === source) ?? null;
+  return mountedAppFrames().find((f) => f.contentWindow === source) ?? null;
+}
+
+/** Every mounted app iframe: the Canvas pane's and each widget's. */
+export function mountedAppFrames(): HTMLIFrameElement[] {
+  return Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe[data-role="app-ui-frame"]'));
 }
 
 /** Which app a mounted frame is running, read from the `src` the host set.
@@ -35,9 +39,19 @@ export function appIdForFrame(frame: HTMLIFrameElement | null): string | null {
   }
 }
 
-/** True when `source` is the content window of a currently mounted app iframe.
- *  Shared by the SDK confirm bridge (`app-frame-messages.ts`), the app-frame keyboard
- *  shortcut forwarder (`useKeyboardShortcuts.ts`) and the app bridge. */
+/** The Canvas pane's app frame. A widget's frame lives in the thread pane
+ *  under the same `data-role` (ADR 0402), so a helper meaning "the open app"
+ *  asks for this one. */
+export const CANVAS_APP_FRAME_SELECTOR = '[data-role="app-ui-panel"] iframe[data-role="app-ui-frame"]';
+
+/** True for the Canvas pane's frame, false for a widget's on the shelf. */
+export function isCanvasAppFrame(frame: HTMLIFrameElement | null): boolean {
+  return frame?.closest('[data-role="app-ui-panel"]') != null;
+}
+
+/** True when `source` is the content window of a currently mounted app iframe,
+ *  a widget's included. Used by the host chrome bridges (`app-frame-messages.ts`)
+ *  and the pane swipe bridge. */
 export function isKnownAppFrame(source: MessageEventSource | null): boolean {
   return appFrameFor(source) !== null;
 }

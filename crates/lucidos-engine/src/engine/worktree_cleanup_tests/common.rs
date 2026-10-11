@@ -418,6 +418,7 @@ pub(crate) fn make_worker_with_active(
         // rely on backdated events (the Some-arm stranded path).
         stranded_grace: super::STRANDED_GRACE,
         temp_worktree_grace: super::TEMP_WORKTREE_GRACE,
+        size_walk: super::walk_directory_size_bytes,
         free_disk: super::os_free_disk_probe(workspace.clone()),
         changes,
         active_threads,

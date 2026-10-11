@@ -335,9 +335,9 @@ function ccScenes(changeId: string): Scene[] {
     {
       slug: 'cc-auto-prompt',
       title: 'An engine auto-prompt',
-      trigger: 'UserPromptInjected (engine)',
+      trigger: 'PromptInjected (engine)',
       events: [
-        ['UserPromptInjected', { text: 'Run /harden before finishing.', mode: 'engine', origin: ENGINE({ kind: 'harden_retrigger' }) }],
+        ['PromptInjected', { text: 'Run /harden before finishing.', mode: 'engine', origin: ENGINE({ kind: 'harden_retrigger' }) }],
         ...ccReply('Done.'),
       ],
     },
@@ -394,8 +394,8 @@ function seedThread(opts: { title: string; source: 'chat' | 'claude_code'; scene
   const now = new Date(start + tick * 1000).toISOString();
   const isCc = opts.source === 'claude_code';
   psql([
-    'INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ' +
-      `VALUES ('${threadId}', '${quote(opts.title)}', '${opts.source}', '${now}', ${scenes.length}, false, true, 'idle', 'inbox', 'active', ${isCc}, 0, false, false, false)`,
+    'INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) ' +
+      `VALUES ('${threadId}', '${quote(opts.title)}', '${opts.source}', '${now}', ${scenes.length}, false, true, 'idle', 'inbox', 'active', ${isCc}, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n${rows.join(',\n')}`,
   ].join(';\n'));
   return { threadId, title: opts.title, scenes };

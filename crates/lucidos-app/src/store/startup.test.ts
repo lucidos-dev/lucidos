@@ -228,6 +228,7 @@ describe('startShell runs when the shell chunk resolves', () => {
   const app = stripComments(readFileSync(resolve(dirname(SOURCE), '../App.tsx'), 'utf8'));
   const shell = stripComments(readFileSync(resolve(dirname(SOURCE), '../shellStartup.ts'), 'utf8'));
   const client = stripComments(readFileSync(SOURCE, 'utf8'));
+  const effects = stripComments(readFileSync(resolve(dirname(SOURCE), 'effects.ts'), 'utf8'));
 
   it('is called in the shell loader, before it hands <App/> back', () => {
     const loader = main.slice(main.indexOf("import('./App')"));
@@ -241,21 +242,36 @@ describe('startShell runs when the shell chunk resolves', () => {
     expect(main).not.toMatch(/import [^;]*from '\.\/shellStartup'/);
   });
 
-  // Each of these once sat in the entry chunk through client startup or
-  // main.tsx. Moving one back costs its whole subtree on first paint.
+  // The store's scroll calls queued during boot replay on provide. They must
+  // land before any other install can read or move the transcript's state.
+  it('provides scrollState to the handle before anything else it installs', () => {
+    const body = handlerBody(shell, 'export function startShell');
+    expect(body.trimStart().startsWith('provideScrollState(scrollState);')).toBe(true);
+  });
+
+  // Each of these once sat in the entry chunk through client startup, the
+  // store's effects or main.tsx. Moving one back costs its whole subtree on
+  // first paint.
   const SHELL_INSTALLS = [
     'installDeadPressProbe()',
     'installDeadKeystrokeProbe()',
     'installToastPressProbe()',
     'installAppKeybindingsSync()',
+    'installAppFocusedThreadSync()',
     'installAppFrameMessages()',
     'installPendingUploadRestore()',
     'installUnsentMessageRestore()',
+    'installScaleWheel()',
+    'installSeenTargetWatch()',
+    'startPageHealthLog()',
+    'provideScrollState(scrollState)',
+    'watchTranscriptLiveness(',
   ];
   for (const install of SHELL_INSTALLS) {
     it(`installs ${install} there, and nowhere on the entry path`, () => {
       expect(shell).toContain(install);
       expect(client).not.toContain(install);
+      expect(effects).not.toContain(install);
       expect(main).not.toContain(install);
     });
   }

@@ -285,11 +285,11 @@ pub fn is_local_url(url: &str) -> bool {
 
 /// `url` with any inline HTTP credential replaced by `***@`.
 ///
-/// An HTTPS URL may carry a token in its authority. This module writes the URL
-/// to the log and into a failure the Plugins panel shows, and neither is a
-/// place for a secret. An SSH URL keeps its username, which names an account
-/// rather than proving one.
-fn redacted(url: &str) -> String {
+/// An HTTPS URL may carry a token in its authority. The URL reaches the log, a
+/// failure the Plugins panel shows, and `git_clone`'s commit message and event,
+/// and none is a place for a secret. An SSH URL keeps its username, which names
+/// an account rather than proving one.
+pub(crate) fn redacted(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://").filter(|_| is_http_url(url)) else {
         return url.to_string();
     };

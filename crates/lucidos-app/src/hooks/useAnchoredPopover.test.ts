@@ -378,6 +378,14 @@ describe('computeAnchorPosition', () => {
     );
     expect(pos.left).toBe(300); // 200 + (600 - 400) / 2
   });
+
+  it("align 'center' centres the panel under its anchor, and still clamps", () => {
+    setViewport(393, 852);
+    const middle = fakeAnchor({ top: 50, bottom: 80, left: 150, right: 190 });
+    expect(computeAnchorPosition(middle, 100, 200, null, 'center').left).toBe(70); // 170 - 200 / 2
+    const nearEdge = fakeAnchor({ top: 50, bottom: 80, left: 10, right: 40 });
+    expect(computeAnchorPosition(nearEdge, 100, 200, null, 'center').left).toBe(8);
+  });
 });
 
 describe('pointAnchor', () => {

@@ -6,7 +6,7 @@ use super::VertexProvider;
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolCall, ToolDefinition,
 };
-use crate::llm::ModelSelection;
+use crate::llm::{ModelNotServed, ModelSelection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -103,6 +103,7 @@ impl VertexProvider {
             contents,
             tools: vertex_tools,
             generation_config,
+            tool_config: selection.forced_tool.map(VertexToolConfig::forced),
         };
 
         let access_token = self.get_access_token().await?;
@@ -123,13 +124,16 @@ impl VertexProvider {
 
         if !status.is_success() {
             log!("[Vertex] Gemini API error ({}): {}", status, body);
-            let message = super::explain_publisher_model_404(status.as_u16(), &body, model, &url)
-                .unwrap_or_else(|| format!("Gemini API error ({}): {}", status, body));
-            return Err(message.into());
+            if let Some(advice) =
+                super::explain_publisher_model_404(status.as_u16(), &body, model, &url)
+            {
+                return Err(Box::new(ModelNotServed::new(advice)));
+            }
+            return Err(format!("Gemini API error ({}): {}", status, body).into());
         }
 
-        let parsed: VertexResponse = match serde_json::from_str(&body) {
-            Ok(p) => p,
+        let response = match parse_gemini_reply(&body) {
+            Ok(response) => response,
             Err(e) => {
                 log!(
                     "[Vertex] Failed to parse Gemini response: {}\nBody: {}",
@@ -139,8 +143,6 @@ impl VertexProvider {
                 return Err(format!("Failed to parse Gemini response: {}", e).into());
             }
         };
-
-        let response = build_gemini_llm_response(parsed);
 
         // Gemini uses non-streaming requests, so emit the full final text at
         // once. `build_gemini_llm_response` suppresses text attached to
@@ -233,11 +235,9 @@ fn gemini_generation_config(
     if !model.starts_with("gemini-3") {
         return None;
     }
-    let effort =
-        reasoning_effort.unwrap_or(crate::core::prefs::CHAT_REASONING_EFFORT.default_text());
     Some(VertexGenerationConfig {
         thinking_config: VertexThinkingConfig {
-            thinking_level: gemini_thinking_level(model, effort),
+            thinking_level: reasoning_effort.map(|effort| gemini_thinking_level(model, effort)),
             include_thoughts: true,
         },
     })
@@ -274,6 +274,17 @@ fn gemini_thinking_level(model: &str, effort: &str) -> &'static str {
         // high / xhigh / max / unknown — cap at the model default.
         _ => "high",
     }
+}
+
+/// A Gemini reply body as the cross-provider `LlmResponse`, naming the model
+/// that served it.
+fn parse_gemini_reply(body: &str) -> Result<LlmResponse, serde_json::Error> {
+    let reply: serde_json::Value = serde_json::from_str(body)?;
+    let served_model = crate::llm::served_model::served_model_of(&reply);
+    Ok(LlmResponse {
+        served_model,
+        ..build_gemini_llm_response(serde_json::from_value(reply)?)
+    })
 }
 
 /// Translate a parsed `VertexResponse` (Gemini non-streaming reply) into
@@ -367,6 +378,8 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         // until the cost UI explicitly grows a Gemini-cached lane.
         cache_creation_tokens: None,
         cache_read_tokens: None,
+        // The reply's own field, which `parse_gemini_reply` reads.
+        served_model: None,
         thinking_chars: (thinking_chars > 0).then_some(thinking_chars),
         // Proof the model thought, which keeps a billed but textless thinking
         // turn out of the dropped-output branch of `classify_empty_completion`.
@@ -376,7 +389,7 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         // is `Some` only on a tool-call turn, which is exactly when `content`
         // is `None`.
         model_only_text: narration,
-        content_is_progress_notes: false,
+        progress_notes: Vec::new(),
     }
 }
 
@@ -390,6 +403,34 @@ struct VertexRequest {
     tools: Option<Vec<VertexTool>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
     generation_config: Option<VertexGenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
+    tool_config: Option<VertexToolConfig>,
+}
+
+/// Set only for a forced call: `ANY` mode with the one tool allowed, which
+/// makes the model call it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VertexToolConfig {
+    function_calling_config: VertexFunctionCallingConfig,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VertexFunctionCallingConfig {
+    mode: &'static str,
+    allowed_function_names: Vec<String>,
+}
+
+impl VertexToolConfig {
+    fn forced(tool: &str) -> Self {
+        Self {
+            function_calling_config: VertexFunctionCallingConfig {
+                mode: "ANY",
+                allowed_function_names: vec![tool.to_string()],
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -405,8 +446,10 @@ struct VertexThinkingConfig {
     /// valid depends on the model, see `gemini_thinking_level`). Replaces the
     /// deprecated `thinkingBudget` for 3.x entirely: sending a budget to a
     /// Gemini 3 model can 400 and degrades quality, and Gemini 3 thinking can't
-    /// be fully disabled (`minimal`, Flash-only, is the floor).
-    thinking_level: &'static str,
+    /// be fully disabled (`minimal`, Flash-only, is the floor). `None` leaves
+    /// it out, so the model thinks at its own default level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<&'static str>,
     /// When true, Gemini returns its deliberation as `thought:true` parts that
     /// `build_gemini_llm_response` strips — otherwise Flash narrates its
     /// reasoning in the ordinary answer text.
@@ -653,6 +696,32 @@ mod tests {
     use super::*;
     use crate::llm::provider::{ContentBlock, Message, MessageContent};
 
+    /// Gemini forces a call with `ANY` mode and the one function allowed. An
+    /// ordinary request sends no tool config.
+    #[test]
+    fn a_forced_call_allows_only_its_function() {
+        let request = |tool_config| VertexRequest {
+            system_instruction: None,
+            contents: Vec::new(),
+            tools: None,
+            generation_config: None,
+            tool_config,
+        };
+        let forced =
+            serde_json::to_value(request(Some(VertexToolConfig::forced("request_read")))).unwrap();
+        assert_eq!(
+            forced["toolConfig"],
+            serde_json::json!({
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": ["request_read"]
+                }
+            })
+        );
+        let plain = serde_json::to_value(request(None)).unwrap();
+        assert!(plain.get("toolConfig").is_none());
+    }
+
     #[test]
     fn message_content_to_parts_text_only() {
         let content = MessageContent::Text("hello".to_string());
@@ -879,6 +948,20 @@ mod tests {
             Some("Ax9z-encrypted-sig"),
             "Gemini 3's signature on the functionCall part must be captured"
         );
+    }
+
+    #[test]
+    fn a_gemini_reply_names_the_model_that_served_it() {
+        let body = r#"{
+            "candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+            "modelVersion": "gemini-3.6-flash"
+        }"#;
+        let resp = parse_gemini_reply(body).unwrap();
+        assert_eq!(resp.served_model.as_deref(), Some("gemini-3.6-flash"));
+        assert_eq!(resp.content.as_deref(), Some("hi"));
+
+        let unnamed = parse_gemini_reply(r#"{"candidates": []}"#).unwrap();
+        assert_eq!(unnamed.served_model, None);
     }
 
     #[test]
@@ -1207,6 +1290,11 @@ mod tests {
     fn gemini_thinking_level_clamps_to_model_supported_levels() {
         // Flash supports the full set: minimal/low/medium/high.
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "none"), "minimal");
+        // The command judge's default runs at `none` (ADR 0406).
+        assert_eq!(
+            gemini_thinking_level("gemini-3-flash-preview", "none"),
+            "minimal"
+        );
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "low"), "low");
         assert_eq!(
             gemini_thinking_level("gemini-3.5-flash", "medium"),
@@ -1327,10 +1415,16 @@ mod tests {
         }
     }
 
+    /// No effort leaves the level to the model, and still routes its thoughts
+    /// out of the visible answer.
     #[test]
-    fn gemini_generation_config_defaults_to_high_when_effort_absent() {
+    fn gemini_generation_config_sends_no_level_when_effort_absent() {
         let cfg = gemini_generation_config("gemini-3.5-flash", None).unwrap();
         let json = serde_json::to_value(&cfg).unwrap();
-        assert_eq!(json["thinkingConfig"]["thinkingLevel"], "high");
+        assert!(
+            json["thinkingConfig"].get("thinkingLevel").is_none(),
+            "{json}"
+        );
+        assert_eq!(json["thinkingConfig"]["includeThoughts"], true);
     }
 }

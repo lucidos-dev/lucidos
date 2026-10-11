@@ -1180,6 +1180,7 @@ async fn a_wake_never_overwrites_a_parent_parked_on_a_question() {
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta::NONE,
     })

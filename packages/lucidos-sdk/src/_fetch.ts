@@ -254,6 +254,15 @@ export async function requestText(
   return res.text();
 }
 
+export async function requestBlob(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = 10000,
+): Promise<Blob> {
+  const res = await rawFetch(path, init, timeoutMs);
+  return res.blob();
+}
+
 export async function requestVoid(
   path: string,
   init?: RequestInit,

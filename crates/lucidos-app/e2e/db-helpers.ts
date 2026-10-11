@@ -54,16 +54,16 @@ export function clearAllThreads(): void {
   ].join(';\n'));
 }
 
-/** Turn the experimental home thread switch on and return its id (ADR 0362).
- *  The switch ships off, and `clearAllThreads` truncates the row, so this puts
- *  both back. The drawer and the composer read only the switch and the row,
- *  so no event is needed. */
+/** The home thread's id, or null when a spec truncated it (ADR 0411). */
+export function homeThreadIdInDb(): string | null {
+  return psql('SELECT thread_id FROM thread_summaries WHERE is_home') || null;
+}
+
+/** The home thread's id, recreating its row if `clearAllThreads` truncated it.
+ *  Boot made it, so a fresh workspace already has one. The drawer and the
+ *  composer read only the row, so no event is needed. */
 export function ensureHomeThread(): string {
-  psql(
-    "INSERT INTO preferences (key, value) VALUES ('home_thread_enabled', 'true') " +
-    "ON CONFLICT (key, COALESCE(device_id, '')) DO UPDATE SET value = 'true'",
-  );
-  const existing = psql('SELECT thread_id FROM thread_summaries WHERE is_home');
+  const existing = homeThreadIdInDb();
   if (existing) return existing;
   return psql(
     "INSERT INTO thread_summaries (thread_id, title, initiator, source, created_at, last_activity, " +
@@ -122,7 +122,7 @@ export function psql(sql: string): string {
  *  `claude_code` row here would deny being one.
  *
  *  A `failed` thread in the Current section (`archiveState: 'inbox'`) is the
- *  simplest row that needs attention, which is what raises the Filter badge. */
+ *  simplest blocked row, which is what raises the Filter badge. */
 export function seedThreadRow({
   id, title, parentId, totalChildren = 0, now, source = 'chat', status = 'idle', archiveState = 'archived',
 }: {
@@ -138,14 +138,14 @@ export function seedThreadRow({
   const cols = ['thread_id', 'title', 'source', 'created_at', 'last_activity', 'message_count',
     'is_saved', 'has_response', 'status', 'archive_state', 'state',
     'is_coding_agent', 'active_children_count', 'total_children_count',
-    'coding_agent_proposed', 'coding_agent_requires_restart',
+    'coding_agent_change_state',
     'coding_agent_is_external_repo',
     ...(parentId ? ['parent_thread_id'] : []),
   ].join(', ');
   const vals = [`'${id}'`, `'${title}'`, `'${source}'`, `'${now}'`, `'${now}'`, '1',
     'false', 'true', `'${status}'`, `'${archiveState}'`, `'active'`,
     'false', '0', String(totalChildren),
-    'false', 'false', 'false',
+    `'none'`, 'false',
     ...(parentId ? [`'${parentId}'`] : []),
   ].join(', ');
   return `INSERT INTO thread_summaries (${cols}) VALUES (${vals})`;
@@ -186,8 +186,8 @@ export function seedStepHeavyThread({ turns, stepsPerTurn, title }: {
   }
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-      `VALUES ('${threadId}', '${title}', 'claude_code', '${now}', ${turns}, false, true, 'idle', 'archived', 'active', true, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', '${title}', 'claude_code', '${now}', ${turns}, false, true, 'idle', 'archived', 'active', true, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
   ].join(';\n'));
   return { threadId, messageIds };
@@ -219,8 +219,8 @@ export function seedChatThread({ turns, needles, title }: {
     );
   }
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) `
-      + `VALUES ('${threadId}', '${title}', 'chat', '${new Date().toISOString()}', ${turns}, false, true, 'idle', 'archived', 'active', false, 0, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_change_state, coding_agent_is_external_repo) `
+      + `VALUES ('${threadId}', '${title}', 'chat', '${new Date().toISOString()}', ${turns}, false, true, 'idle', 'archived', 'active', false, 0, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n${rows.join(',\n')}`,
   ].join(';\n'));
   return threadId;
@@ -258,8 +258,8 @@ export function seedThreadOfCounters({ turns, stepsPerTurn, title }: {
   }
 
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-      `VALUES ('${threadId}', '${title}', 'chat', '${new Date(base).toISOString()}', ${turns}, false, true, 'idle', 'archived', 'active', false, 0, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_change_state, coding_agent_is_external_repo) ` +
+      `VALUES ('${threadId}', '${title}', 'chat', '${new Date(base).toISOString()}', ${turns}, false, true, 'idle', 'archived', 'active', false, 0, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n` + rows.join(',\n'),
   ].join(';\n'));
   return threadId;
@@ -289,12 +289,11 @@ export function createCCThreadWithChange(titlePrefix: string, suffix: string, op
   const idleEventId = randomUUID();
   const requestId = randomUUID();
   psql([
-    // coding_agent_has_diff=true: the helper commits a real change on `branch`
-    // (above), so the branch genuinely has a diff. The WaitingBanner Diff button
-    // gates on this column (see WaitingBanner.getWaitingState `showDiff`); the
-    // direct projection insert bypasses EventBus, so the CodingAgentIdled
-    // {has_changes:true} event below never updates it — set it explicitly.
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo, coding_agent_has_diff) VALUES ('${threadId}', '${titlePrefix} ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, true, ${requiresRestart}, false, true)`,
+    // coding_agent_change_state='proposed': the helper commits a real change
+    // on `branch` (above) and seeds its pending `changes` row (below). The
+    // WaitingBanner's Apply and Diff gate on this column. The direct projection
+    // insert bypasses EventBus, so set it explicitly.
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', '${titlePrefix} ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, 'proposed', ${requiresRestart}, false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${msgEventId}', 'MessageReceived', '{"text":"test","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respEventId}', 'ResponseGenerated', '{"text":"Done.","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${idleEventId}', 'CodingAgentIdled', '{"has_changes":true,"is_external_repo":false,"requires_restart":${requiresRestart}}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
@@ -403,7 +402,7 @@ export function createAppCCThreadWithChange(opts: {
   const idleEventId = randomUUID();
   const requestId = randomUUID();
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo, coding_agent_has_diff, coding_agent_kind, coding_agent_folder) VALUES ('${threadId}', '${titlePrefix} ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, true, false, false, true, 'app', '${folder}')`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo, coding_agent_kind, coding_agent_folder) VALUES ('${threadId}', '${titlePrefix} ${suffix}', 'claude_code', '${now}', 1, false, true, 'waiting', 'inbox', true, 0, 'proposed', false, 'app', '${folder}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${msgEventId}', 'MessageReceived', '{"text":"test","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respEventId}', 'SessionStarted', '{"session_id":"e2e-${suffix}","branch":"${branch}","coding_agent_kind":"app","coding_agent_folder":"${folder}","app_id":"${appId}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${idleEventId}', 'CodingAgentIdled', '{"has_changes":true,"is_external_repo":false,"requires_restart":false}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,

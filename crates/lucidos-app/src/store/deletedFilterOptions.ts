@@ -12,21 +12,6 @@ export type DeletableOption = {
   lastActivity?: string;
 };
 
-/** True when the CURRENT "Include deleted" setting is actually holding an option
- *  back: a deleted entity that exists and the user has not selected. Selected
- *  ones always stay visible so the filter remains clearable, so they are never
- *  "hidden" however the switch is set.
- *
- *  This is the difference between the setting being narrow and it NARROWING
- *  anything: on a workspace that has never deleted a trigger, repo or app,
- *  leaving the switch off excludes nothing, and the filter panel must not claim
- *  the list is filtered. `deletedOptionsHidden` (threadFilterActive.ts) is the
- *  reactive union of this across the three lists. */
-export function hasHiddenDeleted(all: readonly DeletableOption[], selected: Set<string>): boolean {
-  if (includeDeletedFilterOptions.value) return false;
-  return all.some(o => o.deleted && !selected.has(o.id));
-}
-
 /** The options to SHOW: deleted entries are dropped unless the user opts in,
  *  except a selected one, which always stays so its filter can be cleared.
  *

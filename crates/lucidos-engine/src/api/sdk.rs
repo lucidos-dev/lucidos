@@ -44,6 +44,10 @@ const SURFACE_CSS: &str = include_str!("../../../lucidos-app/src/styles/global/s
 /// source. See docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md.
 const TEXT_INPUT_CSS: &str = include_str!("../../../lucidos-app/src/styles/global/text-input.css");
 
+/// The widget shapes (`.ring`, `.bar-run`, `.choice-row`): what an agent-built
+/// widget draws instead of a table. Iframe-only, since the host draws none.
+const SHAPES_CSS: &str = include_str!("sdk_iframe_shapes.css");
+
 /// The theme part rules for app frames, generated from the part catalog: the
 /// `@property` rules for the frame colour tokens, the protected reset, the
 /// `theme-effects` reduce rule and the app opt-out (ADR 0307).
@@ -59,14 +63,14 @@ const THEME_PARTS_CSS: &str =
 const CONTROL_THEME_PARTS_CSS: &str = include_str!("sdk_iframe_control_theme_parts.css");
 
 /// The served `/api/v1/sdk-iframe.css` body: iframe tokens and defaults, the
-/// shared component layers, then the theme part rules. Concatenated once and
-/// cached. `CONTROL_THEME_PARTS_CSS` must stay last — see its own comment.
+/// shared component layers, the widget shapes, then the theme part rules.
+/// Concatenated once and cached. `CONTROL_THEME_PARTS_CSS` must stay last — see its own comment.
 fn sdk_iframe_css() -> &'static str {
     static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CSS.get_or_init(|| {
         format!(
             "{SDK_IFRAME_BASE_CSS}\n{SHARED_COMPONENTS_CSS}\n{SURFACE_CSS}\n{TEXT_INPUT_CSS}\n\
-             {THEME_PARTS_CSS}\n{CONTROL_THEME_PARTS_CSS}"
+             {SHAPES_CSS}\n{THEME_PARTS_CSS}\n{CONTROL_THEME_PARTS_CSS}"
         )
     })
 }
@@ -379,6 +383,25 @@ mod tests {
                 pos < theme_part_pos,
                 "{needle} must come BEFORE the control theme-part rule, or its \
                  border shorthand undoes the theme's tint"
+            );
+        }
+    }
+
+    /// Every shape class the chat agent's widget guidance names is served, so
+    /// the agent never writes a class that styles nothing.
+    #[test]
+    fn the_widget_guidance_names_only_served_shapes() {
+        use crate::engine::widget_guidance::{widgets_rules, WidgetAudience};
+        let guidance = widgets_rules(WidgetAudience::Chat { automatic: true });
+        let css = sdk_iframe_css();
+        for class in ["ring", "bar-run", "choice-row"] {
+            assert!(
+                guidance.contains(&format!(".{class}")),
+                "guidance lacks .{class}"
+            );
+            assert!(
+                css.contains(&format!("\n.{class} {{")),
+                "the guidance names .{class}, which the served stylesheet lacks"
             );
         }
     }

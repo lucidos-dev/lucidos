@@ -21,6 +21,8 @@ function makeChange(over: Partial<Change> = {}): Change {
     files: ['a.rs'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-01-01T00:00:00Z',
     resolved_at: null,
@@ -57,7 +59,7 @@ describe('applyBlockedReason — the UI mirror of the server-side Apply gates', 
   });
 
   it('blocks Apply while the coding agent is still working', () => {
-    expect(applyBlockedReason(makeChange({ thread_unsettled: true }))).toBe(THREAD_UNSETTLED_TIP);
+    expect(applyBlockedReason(makeChange({ thread_unsettled: true, apply_ready: false }))).toBe(THREAD_UNSETTLED_TIP);
   });
 
   it('blocks Apply on a change reconciled to zero files, steering to Discard', () => {
@@ -71,7 +73,7 @@ describe('applyBlockedReason — the UI mirror of the server-side Apply gates', 
   it('reports the live thread first when a change is both empty and mid-turn', () => {
     // Wait-for-the-agent is the actionable instruction; the file count may
     // still change before it idles.
-    const reason = applyBlockedReason(makeChange({ file_count: 0, thread_unsettled: true }));
+    const reason = applyBlockedReason(makeChange({ file_count: 0, thread_unsettled: true, apply_ready: false }));
     expect(reason).toBe(THREAD_UNSETTLED_TIP);
   });
 });
@@ -79,7 +81,7 @@ describe('applyBlockedReason — the UI mirror of the server-side Apply gates', 
 describe('changeRowActions: never a disabled change action', () => {
   it('offers the standing apply, and only that, while the thread is settling', () => {
     const actions = changeRowActions(
-      makeChange({ thread_unsettled: true, thread_settling: true }),
+      makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: true }),
       false,
     );
     expect(actions.map((a) => a.kind)).toEqual(['standing']);
@@ -88,7 +90,7 @@ describe('changeRowActions: never a disabled change action', () => {
 
   it('flips the standing face to a cancel once armed', () => {
     const [action] = changeRowActions(
-      makeChange({ thread_unsettled: true, thread_settling: true }),
+      makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: true }),
       true,
     );
     expect(action).toMatchObject({ kind: 'standing', label: '✓ Applying on settle' });
@@ -97,14 +99,14 @@ describe('changeRowActions: never a disabled change action', () => {
   // A question card never settles by itself, so an arm on it drops the moment
   // it is pressed. Offering one is the same broken control in a new coat.
   it('offers nothing on a change whose thread is parked on a question', () => {
-    const parked = makeChange({ thread_unsettled: true, thread_settling: false });
+    const parked = makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: false });
     expect(changeRowActions(parked, false)).toEqual([]);
   });
 
   // The thread is working only to finish an apply that hit a conflict, and the
   // resolver lands the change itself. That apply is already in flight.
   it('offers nothing on a change whose apply is resolving merge conflicts', () => {
-    const resolving = makeChange({ thread_unsettled: true, thread_settling: true, resolving_conflict: true });
+    const resolving = makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: true, resolving_conflict: true });
     expect(changeRowActions(resolving, false)).toEqual([]);
   });
 
@@ -125,7 +127,7 @@ describe('changeRowActions: never a disabled change action', () => {
   });
 
   it('offers no Set aside where Discard is withheld, as the engine gate does', () => {
-    const working = makeChange({ thread_unsettled: true, thread_settling: true });
+    const working = makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: true });
     expect(changeRowActions(working, false).map((a) => a.kind)).not.toContain('set-aside');
     const emptied = makeChange({ file_count: 0 });
     expect(changeRowActions(emptied, false).map((a) => a.kind)).toEqual(['discard']);
@@ -149,17 +151,17 @@ describe('rowActionLayout', () => {
   it('keeps plain buttons where there is no Apply', () => {
     const emptied = rowActionLayout(changeRowActions(makeChange({ file_count: 0 }), false));
     expect(emptied).toEqual({ kind: 'flat', buttons: [{ kind: 'discard' }] });
-    const working = makeChange({ thread_unsettled: true, thread_settling: true });
+    const working = makeChange({ thread_unsettled: true, apply_ready: false, thread_settling: true });
     expect(rowActionLayout(changeRowActions(working, false)).kind).toBe('flat');
   });
 });
 
 describe('pendingSections: Ready, then Not finished', () => {
   const settled = makeChange({ id: 'a', thread_id: 't-a' });
-  const settling = makeChange({ id: 'b', thread_id: 't-b', thread_unsettled: true, thread_settling: true });
-  const parked = makeChange({ id: 'c', thread_id: 't-c', thread_unsettled: true, thread_settling: false });
+  const settling = makeChange({ id: 'b', thread_id: 't-b', thread_unsettled: true, apply_ready: false, thread_settling: true });
+  const parked = makeChange({ id: 'c', thread_id: 't-c', thread_unsettled: true, apply_ready: false, thread_settling: false });
   const resolving = makeChange({
-    id: 'd', thread_id: 't-d', thread_unsettled: true, thread_settling: true, resolving_conflict: true,
+    id: 'd', thread_id: 't-d', thread_unsettled: true, apply_ready: false, thread_settling: true, resolving_conflict: true,
   });
   const none = new Set<string>();
 
@@ -169,25 +171,18 @@ describe('pendingSections: Ready, then Not finished', () => {
     expect(s.notFinished.map((c) => c.id)).toEqual(['b', 'c', 'd']);
   });
 
+  // Ready offers Apply, so it lists only what Apply merges as it stands. The
+  // engine's `apply_ready` decides it, never a rule of the panel's own.
+  it('keeps a finished change that still needs hardening out of Ready', () => {
+    const unhardened = makeChange({ id: 'e', thread_id: 't-e', needs_hardening: true, apply_ready: false });
+    const s = pendingSections([settled, unhardened], none);
+    expect(s.ready.map((c) => c.id)).toEqual(['a']);
+    expect(s.notFinished.map((c) => c.id)).toEqual(['e']);
+  });
+
   // A question card never settles by itself, so the change is not ready either.
   it('never counts a parked thread as ready', () => {
     expect(pendingSections([parked], none).ready).toEqual([]);
-  });
-
-  it('never counts incomplete work as appliable in bulk', () => {
-    const stopped = makeChange({ id: 'e', incomplete: true });
-    expect(pendingSections([stopped], none).canApplyNow).toBe(false);
-    expect(pendingSections([stopped, settled], none).canApplyNow).toBe(true);
-  });
-
-  // Its turn did not finish, though its thread is idle (ADR 0346).
-  it('lists incomplete work under Not finished, never Ready', () => {
-    const stopped = makeChange({ id: 'e', thread_id: 't-e', incomplete: true });
-    const s = pendingSections([settled, stopped], none);
-    expect(s.ready.map((c) => c.id)).toEqual(['a']);
-    expect(s.notFinished.map((c) => c.id)).toEqual(['e']);
-    // An idle stopped thread has nothing to settle, so there is nothing to arm.
-    expect(s.armable).toEqual([]);
   });
 
   it('keeps Discard All to Ready, and to more than one change there', () => {
@@ -196,12 +191,11 @@ describe('pendingSections: Ready, then Not finished', () => {
     expect(pendingSections([settled, other, settling], none).showDiscardAll).toBe(true);
   });
 
-  // Incomplete work alone offers nothing to apply in bulk, until a batch runs.
+  // Nothing ready offers nothing to apply in bulk, until a batch runs.
   it('offers Apply All while something is ready, or a batch still runs', () => {
-    const stopped = makeChange({ id: 'h', incomplete: true });
     expect(pendingSections([settled], none).showApplyAll).toBe(true);
-    expect(pendingSections([stopped], none).showApplyAll).toBe(false);
-    expect(pendingSections([stopped], none, true).showApplyAll).toBe(true);
+    expect(pendingSections([parked], none).showApplyAll).toBe(false);
+    expect(pendingSections([parked], none, true).showApplyAll).toBe(true);
   });
 
   // A parked arm drops at once, and a conflict being resolved already applies.
@@ -210,7 +204,7 @@ describe('pendingSections: Ready, then Not finished', () => {
   });
 
   it('wears the cancel face only once every armable change is armed', () => {
-    const other = makeChange({ id: 'g', thread_id: 't-g', thread_unsettled: true, thread_settling: true });
+    const other = makeChange({ id: 'g', thread_id: 't-g', thread_unsettled: true, apply_ready: false, thread_settling: true });
     expect(pendingSections([settling, other], new Set(['t-b'])).armed).toBe(false);
     expect(pendingSections([settling, other], new Set(['t-b', 't-g'])).armed).toBe(true);
   });

@@ -57,10 +57,14 @@ impl LucidosEngine {
             )
             .await;
 
-        let configured = self.current_provider().configured_providers();
+        let router = self.current_provider();
+        let configured = router.configured_providers();
         let resolved = super::run::resolve_route_overrides(
             &self.pool,
-            &self.model_registry,
+            crate::core::ModelDefaults {
+                registry: &self.model_registry,
+                fallback_model: router.default_model(),
+            },
             |kind| configured.as_ref().is_none_or(|set| set.contains(&kind)),
             None,
             Some(thread_id),

@@ -264,7 +264,7 @@ pub(crate) fn require_input_to_create(
     Err(ApiError::bad_request(NOTHING_TO_START_THE_THREAD_WITH))
 }
 
-/// Announce every orphan in `batch` as `UserPromptInjected`, anchored on the
+/// Announce every orphan in `batch` as `PromptInjected`, anchored on the
 /// batch's first message (the turn the re-process runs under).
 ///
 /// The batch is announced WHOLE, not `[1..]`, and two things ride on that.
@@ -272,13 +272,13 @@ pub(crate) fn require_input_to_create(
 /// **The projection.** An orphan's `MessageReceived` was persisted before the
 /// terminator that ended the previous turn, so the re-process passes
 /// `PreEmittedOrigin::EngineReentry` and emits no starter event. That leaves
-/// `UserPromptInjected` as the only event in the turn whose lifecycle rule is
+/// `PromptInjected` as the only event in the turn whose lifecycle rule is
 /// `StatusRule::Set(ThreadStatus::Running)`. Skip the first orphan and a
 /// working thread projects idle for the whole turn.
 ///
-/// **The timeline.** The client absorbs a UPI into the `MessageReceived` it
+/// **The timeline.** The client absorbs a PromptInjected into the `MessageReceived` it
 /// names via `injected_message_id` and re-anchors that exchange to the
-/// ingestion point. Without the first orphan's UPI, a follow-up that arrived
+/// ingestion point. Without the first orphan's PromptInjected, a follow-up that arrived
 /// before a `ResponseCanceled` stays above the cancel boundary. It then renders
 /// as done while it is the turn being worked on.
 ///
@@ -296,7 +296,7 @@ async fn announce_orphan_batch(
         ..EventMeta::NONE
     };
     for orphan in batch {
-        crate::engine::emit_user_prompt_injected_event(bus, thread_id, &base_meta, orphan).await;
+        crate::engine::emit_prompt_injected_event(bus, thread_id, &base_meta, orphan).await;
     }
 }
 
@@ -305,7 +305,10 @@ async fn announce_orphan_batch(
 /// `process_message_with_steps` for a re-processed orphan can itself produce
 /// orphans: a follow-up `MessageReceived` that landed on `injection_rx` after
 /// the loop's final `try_recv()`. Iterating here keeps the chain bounded by the
-/// available orphans, and serializes per thread. A fire-and-forget spawn per
+/// available orphans, and serializes it per thread. One exception: a batch
+/// whose turn fails re-submits its own orphans in a chain of their own, which
+/// runs beside this one. Admission and injection still route each message
+/// into exactly one turn. A fire-and-forget spawn per
 /// orphan would drop the inner `orphaned_injections`, leaving an
 /// orphan-of-orphan unanswered and stamping the next reply with the wrong
 /// `request_event_id`.
@@ -380,6 +383,7 @@ pub(crate) async fn process_orphan_chain(
                 .await
             {
                 Ok(res) => res.orphaned_injections,
+                // A failed turn has already re-submitted its own orphans.
                 Err(e) => {
                     log!(
                         "[Chat] Failed to re-process {} orphaned injection(s) for thread {}: {}",
@@ -656,7 +660,7 @@ async fn queued_message_already_injected(
               FROM events
              WHERE aggregate = 'thread'
                AND aggregate_id = $1
-               AND event_type = 'UserPromptInjected'
+               AND event_type = 'PromptInjected'
                AND payload->>'injected_message_id' = $2
         )",
     )
@@ -909,7 +913,7 @@ pub(super) async fn chat_submit(
     // is unaffected and keeps vouching for its own human.
     if !thread_exists && parent_thread_id.is_none() {
         crate::api::thread_reach::refuse_without_authority(
-            &state.pool,
+            &state.engine.event_bus,
             &headers,
             None,
             crate::api::thread_reach::ThreadReachVerb::CreateTopThread,
@@ -1603,7 +1607,7 @@ pub(super) async fn cancel_chat(
     // as "cancel yourself": the unscoped form stops the whole workspace, so it
     // takes the owner's standing instruction like any other root-wide act.
     crate::api::thread_reach::refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         thread_id,
         crate::api::thread_reach::ThreadReachVerb::Cancel,

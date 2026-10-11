@@ -1,13 +1,14 @@
 import { API } from '../../api/client';
+import { forgetThreadWidgets, onWidgetEvent } from './widgets';
 import type { ApplyEstimates, Change } from '../../api/client';
 import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@lucidos/event-stream';
 import { getEventStream, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
-import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
-import { findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, recommendedCleanupProgress, diskUsageVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey, UNREAD_HOLD_EVENT_TYPES } from '../store';
+import { backgroundModelsVersion, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { describeRecommendedCleanupOutcome } from '../../utils/recommendedCleanup';
-import { isFormRequest } from '../thread-events/thread-event-types';
-import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
+import { isFormRequest, isWidgetEvent } from '../thread-events/thread-event-types';
+import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, NO_CHANGE, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { settleDeliveredUnsentMessage } from './sendSettlement';
 import { noteImageLanded } from '../landedImages';
@@ -28,7 +29,7 @@ import {
   handleNativePushDismiss,
   type NativePushDismissRequestedPayload,
 } from './native-push';
-import { addRestartGroup, applyChangeSummarized, STANDING_APPLY_CANCELED } from './chat-changes';
+import { addRestartGroup, applyChangeSummarized, refreshChangesState, STANDING_APPLY_CANCELED } from './chat-changes';
 import {
   handleFrontendUpdateDeferred,
   handleFrontendUpdateStranded,
@@ -54,13 +55,14 @@ import { closeResolvedFormRequest, openFormRequest, syncPendingFormRequests } fr
 import { setDevicePushEnabled } from './push';
 import { getDeviceId } from './devices';
 import { focusThread } from './threads';
+import { homeThreadId } from './homeThread';
 import { refreshRepoView } from './repositories';
 import {
   processSSEForReferences,
   refreshLlmConfigured,
   PROVIDER_PREFERENCE_KEYS,
 } from './entityReferences';
-import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale, loadAllThreads } from './thread-loading';
+import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
 import { applyRemoteCompose, pendingComposePuts, hasUnsentLocalDraft, clearSupersededDraft, noteComposeEpoch } from './compose';
 import type { ComposeSelectionOverride } from '../composeSelections';
@@ -69,10 +71,16 @@ import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { formatBytes } from '../../utils/formatBytes';
 import { errorDetail } from '../../utils/errorDetail';
-import { routeThreadNavigation, type NavigationActor } from './navigation-request';
+import { routeThreadNavigation } from './navigation-request';
+import { isForThisDevice, type DeviceScopeActor } from './device-scope';
 import { openBackupSettings } from './menu';
 import { applyEmbeddingModelStatus } from './backgroundActivity';
-import { applyTreeBackfillFrame, readyAfterCompleted, treeBackfillOfProgress } from './treeBackfill';
+import {
+  applyTreeBackfillFrame,
+  applyTreeBackfillProgress,
+  forgetTreeBackfillOrder,
+  readyAfterCompleted,
+} from './treeBackfill';
 import type { BackfillProgress, EmbeddingModelStatus } from '../../api/types';
 
 /** Keyed so a second failure replaces the first instead of stacking, and so the
@@ -160,7 +168,7 @@ function cancelApplySessionEndedTimer(threadId: string): void {
 // ---------------------------------------------------------------------------
 // Batched threadMap updates — coalesce rapid SSE events into one signal write
 // per animation frame. Without this, every SSE event triggers O(N*M)
-// recomputation in computed signals (attentionThreadCount iterates ALL threads
+// recomputation in computed signals (blockedThreadCount iterates ALL threads
 // and ALL events). WKWebView's tighter CPU/memory limits can crash under load.
 // ---------------------------------------------------------------------------
 /** Generation counter to prevent stale EventSource handlers from interfering
@@ -297,9 +305,12 @@ export function connectThreadEvents(): void {
         // Disk Usage page re-reads the running flag from its summary.
         recommendedCleanupProgress.value = null;
         diskUsageVersion.value++;
+        // App opens and changes during the gap move the footprint report.
+        promptFootprintVersion.value++;
         // `resyncLoadedThreads` coalesces and surfaces its own failures, so
         // `void` here only acknowledges that the promise is not needed back.
         void resyncLoadedThreads();
+        resyncChangesAndQueue();
         // `ServedFrontendAdvanced` is transient too. A swap during the gap
         // announced a newer client to nobody, so re-run the build-id check.
         void syncClientUpdateFromBuild();
@@ -316,6 +327,9 @@ export function connectThreadEvents(): void {
       // Mark for resync. Events emitted during the gap never reach this tab, so
       // the next successful connect must refetch persisted state.
       needsResyncOnOpen = true;
+      // The engine may restart in the gap, and its backfill frames then count
+      // from one again. A snapshot read meanwhile sets the new order.
+      forgetTreeBackfillOrder();
       markEventStreamStatus('disconnected');
       fanOutEventStreamStatus('error');
 
@@ -368,7 +382,7 @@ export function resyncLoadedThreads(): Promise<void> {
       // SSE gap. `refreshThreadList` never rejects, and owns the single keyed
       // card this shares with the resume sync.
       await refreshThreadList();
-      // One request, for the thread on screen. The metadata read above is what
+      // One events request, for the thread on screen. The metadata read above is what
       // repairs the drawer, and `refreshStaleThreadEvents` consumes the rest of
       // the marks on focus.
       //
@@ -376,14 +390,31 @@ export function resyncLoadedThreads(): Promise<void> {
       // authoritative state. Coalesced against a concurrent wake resync, and
       // `refreshThreadEvents` surfaces its own failures.
       const focused = focusedThreadId.value;
-      if (focused && threadMap.value.get(focused)?.eventsLoaded) {
+      const refreshFocused = !!focused && !!threadMap.value.get(focused)?.eventsLoaded;
+      if (refreshFocused) {
         await refreshThreadEvents(focused, { coalesce: true });
+        // A widget event missed in the gap changed the thread's widgets too.
+        onWidgetEvent(focused);
       }
+      // Home's widgets feed its long-press menu and the widget windows from
+      // any thread, so a pin missed in the gap matters there too.
+      const home = homeThreadId.value;
+      if (home && !(refreshFocused && home === focused)) onWidgetEvent(home);
     } finally {
       resyncInFlight = null;
     }
   })();
   return resyncInFlight;
+}
+
+/** Re-read the Changes and Thread Queue state after a stream gap: a reconnect
+ *  or a `Lagged`. Neither `ChangesUpdated`, `ApplyAllBatchCompleted` nor a queue
+ *  event is replayed. Without this, a batch that finished in the gap reads "in
+ *  progress" until the next wake or reload. A wake runs `runResumeSync`, which
+ *  re-reads both itself. Both reads report their own failures and never reject. */
+function resyncChangesAndQueue(): void {
+  void refreshChangesState();
+  void loadThreadQueue();
 }
 
 export function disconnectThreadEvents(): void {
@@ -394,6 +425,8 @@ export function disconnectThreadEvents(): void {
   // recovery. Do not let the next onopen also resync, or every real reconnect
   // doubles the per-thread refreshThreadEvents fan-out.
   needsResyncOnOpen = false;
+  // A resume sync disconnects here, often across an engine restart.
+  forgetTreeBackfillOrder();
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -420,6 +453,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     ? (data.aggregate as ThreadAggregate)
     : undefined;
   if (!threadId || !event || typeof event !== 'object' || !('type' in event)) return;
+  if (isWidgetEvent(event)) onWidgetEvent(threadId);
   // Live persisted events MUST carry an aggregate — its absence here (vs.
   // historical-replay where applyEventRows applies one snapshot at the end)
   // means the backend missed populating EmittedEvent.aggregate.
@@ -433,7 +467,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // `threadMap` signal flush at the bottom. Per-thread event arrivals bump
   // `threadEventsBump` unconditionally. The wide flush fires only when a meta
   // field consumers care about actually changed. Without the gate, every CC
-  // streaming token would re-execute attentionThreadCount and every visible
+  // streaming token would re-execute blockedThreadCount and every visible
   // ChatExchange. See `store/threadActivity.ts`.
   let metaChanged = false;
 
@@ -475,7 +509,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       } : {}),
     }));
     // New thread row inserted into the map — every subscriber needs to learn
-    // about it (drawer rows, attentionThreadCount, focused-thread router).
+    // about it (drawer rows, blockedThreadCount, focused-thread router).
     metaChanged = true;
     if (isThreadStarted) {
       // Seed the draft entry with the user's mode pick from ThreadStarted's
@@ -490,14 +524,6 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
 
   // Thread is guaranteed to exist after the skeleton block above.
   const thread = map.get(threadId)!;
-
-  // The event itself names the home thread, and the aggregate carries no such
-  // flag. Without this, an SSE-born Home would sit in a section as an
-  // ordinary thread until the next list read.
-  if (event.type === 'HomeThreadCreated' && !thread.meta.home) {
-    thread.meta.home = true;
-    metaChanged = true;
-  }
 
   // Update thread meta from lifecycle events
   if ((event.type === 'ThreadTitleGenerated' || event.type === 'ThreadTitleRenamed') && 'title' in event) {
@@ -552,6 +578,8 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       removingQueuedMessageIds.value = next;
     }
   }
+  // The Not ready strip and the Blocked badge read the hold from events.
+  if (UNREAD_HOLD_EVENT_TYPES.has(event.type)) metaChanged = true;
 
   // Archive race guard. Every persisted SSE event carries the projection
   // snapshot AT EVENT EMIT TIME. A cascade archive emits CodingAgentIdled for
@@ -563,9 +591,9 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // handleArchiveThread for every cascade member. It clears in that function's
   // finally, so post-archive SSE events apply their aggregate normally.
   if (aggregate && archivingThreadIds.value.has(threadId)) {
-    if (thread.meta.section !== 'archived' || thread.meta.codingAgentProposed) {
+    if (thread.meta.section !== 'archived' || thread.meta.codingAgentChangeState.kind !== 'none') {
       thread.meta.section = 'archived';
-      thread.meta.codingAgentProposed = false;
+      thread.meta.codingAgentChangeState = NO_CHANGE;
       metaChanged = true;
     }
   }
@@ -784,7 +812,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   bumpThreadEvents(threadId);
 
   // Global `threadMap` flush ONLY when meta-shape actually changed. Skipping it
-  // for streaming-only arrivals is the whole point. attentionThreadCount,
+  // for streaming-only arrivals is the whole point. blockedThreadCount,
   // ThreadDrawer.ThreadList, every visible ChatExchange and every PromptInput
   // effect read `threadMap.value` in their subscribe path, so they would
   // otherwise re-execute per CC token.
@@ -838,6 +866,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // holding them is now wrong about what exists.
       const ids = Array.isArray(data.thread_ids) ? (data.thread_ids as string[]) : [];
       dropDeletedThreads(ids);
+      forgetThreadWidgets(ids);
       // Idempotent on the device that made the delete, which already dropped
       // them, and it is what corrects every other one.
       //
@@ -890,6 +919,9 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
 
     case 'PreferencesChanged':
+      // The report carries the three footprint preferences in force, and the
+      // response style it measures is a preference too.
+      promptFootprintVersion.value++;
       // A peer device may have just dismissed the client-refresh toast globally
       // via the `client_refresh_dismissed_build` preference. So reload
       // preferences and THEN re-derive the client-update surface, to hide the
@@ -931,11 +963,6 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       if (String(data.key ?? '') === 'response_styles') {
         responseStylesVersion.value++;
       }
-      // This switch brings Home back or hides it. So the list re-reads now,
-      // and the Home entries find the thread without waiting for a change.
-      if (String(data.key ?? '') === 'home_thread_enabled') {
-        void loadAllThreads();
-      }
       break;
     // The `set_language` and `set_timezone` chat-agent tools write the
     // preference and emit LanguageSet or TimezoneSet, but NOT
@@ -957,10 +984,9 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     case 'AppUiRefreshRequested':
       // Transient system event aggregated on `app`. The engine emits it after
       // every app coding-agent apply touching an iframe-bundled file. The SDK
-      // iframe of `app_id` reloads to pick up the merged content. The matching
-      // handler in `handleTransientSideEffects` runs only for ThreadEvent
-      // envelopes. This branch is the one that fires for the live SystemEvent
-      // SSE frame.
+      // iframe of `app_id` reloads to pick up the merged content. The
+      // thread-scoped variant, from `refresh_app` and the end of a chat turn,
+      // is handled in `handleTransientSideEffects`.
       void refreshAppUI(data.app_id as string | undefined);
       // The running iframe is not the only surface reading those files. An
       // open app source editor is too, and it must re-read rather than save
@@ -1031,7 +1057,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     }
 
     case 'TreeBackfillProgressed':
-      applyTreeBackfillFrame(treeBackfillOfProgress(data.progress as BackfillProgress));
+      applyTreeBackfillProgress(data.progress as BackfillProgress);
       break;
 
     case 'TreeBackfillCompleted':
@@ -1230,6 +1256,12 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       diskUsageVersion.value++;
       break;
 
+    case 'ModelNotServedObserved':
+      // A default moved past the model, or a stored pick now fails. Either
+      // way the background rows say something different.
+      backgroundModelsVersion.value++;
+      break;
+
     case 'ProxyConfigRejected': {
       // The engine booted with entries in `apis.json` it will not serve, so
       // those proxies 502 when an app or a thread reaches for one.
@@ -1289,6 +1321,7 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // on transient wake noise), so `void` just acknowledges that we don't
       // need the promise back.
       void resyncLoadedThreads();
+      resyncChangesAndQueue();
       // A dropped frame may have been a form request, which the thread resync
       // does not reopen. It reports its own failures.
       void syncPendingFormRequests();
@@ -1457,13 +1490,24 @@ function handleTransientSideEffects(
       void loadArtifacts();
       break;
 
-    case 'AppUiCaptureRequested': {
-      const e = event as { app_id: string; request_id: string };
-      // captureAppUI owns its own console.warn telemetry + best-effort
-      // postAppCapture surfaces (see apps.ts) — `void` here.
-      void captureAppUI(e.app_id, e.request_id);
+    // `refresh_app` and the end-of-turn refresh. The tool's reload names the
+    // turn's last used device; the end-of-turn one names none, so it reloads
+    // the app wherever it is open.
+    case 'AppUiRefreshRequested':
+      if (isForThisDevice(event.actor)) void refreshAppUI(event.app_id);
+      // The app's files changed whichever device reloads, so an open source
+      // editor re-reads either way. See `appSourceEpoch`.
+      appSourceEpoch.value++;
       break;
-    }
+
+    // A capture names the turn's last used device, and only that page answers.
+    // Every page gets the event, so an unscoped answer from a page with no app
+    // frame would race the real one (engine/tools/app_capture.rs).
+    case 'AppUiCaptureRequested':
+      // captureAppUI owns its own console.warn telemetry + best-effort
+      // postAppCapture surfaces (see apps.ts), so `void` here.
+      if (isForThisDevice(event.actor)) void captureAppUI(event.app_id, event.request_id, event.save_format);
+      break;
 
     case 'NavigationRequested': {
       let nav;
@@ -1474,7 +1518,7 @@ function handleTransientSideEffects(
         showToast('Failed to handle navigation request from engine', 'error');
         break;
       }
-      routeThreadNavigation(nav, (event as { actor?: NavigationActor }).actor, sourceThreadId);
+      routeThreadNavigation(nav, (event as { actor?: DeviceScopeActor }).actor, sourceThreadId);
       break;
     }
 

@@ -377,12 +377,7 @@ fn open_decision_block(decision: &OpenDecision) -> String {
 /// stays open.
 fn workspace_shape(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFuture<'_> {
     Box::pin(async move {
-        let mut apps: Vec<String> = engine
-            .app_manager()
-            .list_apps()
-            .map(|apps| apps.into_iter().map(|a| a.name).collect())
-            .unwrap_or_default();
-        apps.sort();
+        let apps = app_names(engine.app_manager());
 
         let mut triggers: Vec<String> = {
             let registry = engine
@@ -487,7 +482,7 @@ async fn running_thread_names(
             sources: None,
             parent: None,
             has_draft: None,
-            has_diff: None,
+            change_state: None,
             limit: SHAPE_ITEMS as i64,
         })
         .await?;
@@ -507,6 +502,16 @@ async fn running_thread_names(
             }
         })
         .collect())
+}
+
+/// The apps line's names, sorted. Widgets are not apps here (ADR 0402).
+fn app_names(app_manager: &crate::core::AppManager) -> Vec<String> {
+    let mut names: Vec<String> = app_manager
+        .list_apps()
+        .map(|apps| apps.into_iter().map(|a| a.name).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 /// One `Label: a, b, c` line, capped, saying plainly when there are none.
@@ -535,6 +540,15 @@ mod tests {
     use super::*;
     use crate::engine::thread_events::QuestionOption;
     use crate::test_support::{setup_test_db, teardown_test_db};
+
+    #[tokio::test]
+    async fn the_apps_line_names_no_widget() {
+        let bus = crate::test_support::offline_event_bus();
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = crate::core::AppManager::new(tmp.path()).unwrap();
+        crate::core::apps::tests::app_and_widget(&manager, &bus).await;
+        assert_eq!(app_names(&manager), vec!["Habit Tracker".to_string()]);
+    }
 
     #[test]
     fn an_empty_list_says_none_rather_than_saying_nothing() {
@@ -754,15 +768,18 @@ mod tests {
                     label: "Run the tail now".to_string(),
                     description: Some("Chunks 25-33, on the current main".to_string()),
                     preview: None,
+                    widget: None,
                 },
                 QuestionOption {
                     id: "opt-1".to_string(),
                     label: "Leave it for tonight".to_string(),
                     description: None,
                     preview: None,
+                    widget: None,
                 },
             ],
             multi_select,
+            false,
         )
     }
 
@@ -840,6 +857,7 @@ mod tests {
             "toolu_q1",
             "What should I call it?",
             &[],
+            false,
             false,
         ));
         assert!(block.contains("What should I call it?"), "{}", block);

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, focusedThreadId, toasts } from '../store';
+import { panelOverlay, focusedThreadId, toasts, appSourceEpoch } from '../store';
 import type { App } from '../types';
 
 // Mock all side-effect imports that handleNavigationRequest calls
@@ -10,11 +10,13 @@ vi.mock('./menu', () => ({ switchMenuItem, openSettingsSubview, setActiveMenu, o
 
 const openAppById = vi.fn();
 const exitAppFullscreen = vi.fn(() => false);
+const refreshAppUI = vi.fn();
+const captureAppUI = vi.fn();
 vi.mock('./apps', () => ({
   openAppById,
   exitAppFullscreen,
-  refreshAppUI: vi.fn(),
-  captureAppUI: vi.fn(),
+  refreshAppUI,
+  captureAppUI,
   openCredentialRequest: vi.fn(),
 }));
 
@@ -79,7 +81,6 @@ vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
 // initialized yet when the hoisted factory runs.
 const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-device') }));
 vi.mock('./devices', () => ({ getDeviceId }));
-vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 // Mirrors the real predicate: a repo-encoded path is handled here, anything
 // else declines so the 'file' branch falls back to openFilePreview.
 const openEncodedRepoFilePreview = vi.fn((path: string) => path.startsWith('repo:'));
@@ -365,5 +366,74 @@ describe('NavigationRequested scoping', () => {
     // No device actor → device scope doesn't apply → existing offer behavior.
     expect(toasts.value).toHaveLength(1);
     expect(toasts.value[0].key).toBe('nav-offer-thread-B');
+  });
+});
+
+// The capture and the `refresh_app` reload name the turn's last used device.
+// Every page gets the event, whether or not it shows the thread. A page that
+// answered another device's capture raced the real one, and won with "No app
+// UI is currently open" (engine/tools/app_capture.rs).
+describe('app capture and refresh scoping', () => {
+  const OTHER = { kind: 'device', device_id: 'other-device' };
+  const HERE = { kind: 'device', device_id: 'this-device' };
+
+  function capture(actor?: object, save_format?: string) {
+    return {
+      thread_id: 'thread-A',
+      event: { type: 'AppUiCaptureRequested', app_id: 'habit-tracker', request_id: 'req-1', actor, save_format },
+    };
+  }
+
+  function refresh(actor?: object) {
+    return {
+      thread_id: 'thread-A',
+      event: { type: 'AppUiRefreshRequested', app_id: 'habit-tracker', actor },
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getDeviceId.mockReturnValue('this-device');
+  });
+
+  it('captures when the request names this device', () => {
+    handleThreadEvent(capture(HERE));
+    expect(captureAppUI).toHaveBeenCalledWith('habit-tracker', 'req-1', undefined);
+  });
+
+  it('passes the save format on, so the frame renders a sharp file', () => {
+    handleThreadEvent(capture(HERE, 'png'));
+    expect(captureAppUI).toHaveBeenCalledWith('habit-tracker', 'req-1', 'png');
+  });
+
+  it('stays silent on a capture for another device, so it cannot answer first', () => {
+    handleThreadEvent(capture(OTHER));
+    expect(captureAppUI).not.toHaveBeenCalled();
+  });
+
+  it('captures an unscoped request, from a turn with no last used device', () => {
+    handleThreadEvent(capture());
+    expect(captureAppUI).toHaveBeenCalledWith('habit-tracker', 'req-1', undefined);
+  });
+
+  it('reloads the app for a refresh naming this device', () => {
+    handleThreadEvent(refresh(HERE));
+    expect(refreshAppUI).toHaveBeenCalledWith('habit-tracker');
+  });
+
+  it('leaves the app alone for a refresh naming another device', () => {
+    handleThreadEvent(refresh(OTHER));
+    expect(refreshAppUI).not.toHaveBeenCalled();
+  });
+
+  it('has an open source editor re-read on any refresh, since the files changed', () => {
+    const before = appSourceEpoch.value;
+    handleThreadEvent(refresh(OTHER));
+    expect(appSourceEpoch.value).toBe(before + 1);
+  });
+
+  it('reloads the app for the unscoped end-of-turn refresh', () => {
+    handleThreadEvent(refresh());
+    expect(refreshAppUI).toHaveBeenCalledWith('habit-tracker');
   });
 });

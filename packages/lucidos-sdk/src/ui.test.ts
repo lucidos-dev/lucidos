@@ -4,7 +4,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // shared appearance contract when the four hand-copied versions of it were
 // collapsed into one.
 import { ui, webFontUrl, webFontUrls } from './ui';
-import { EMPTY_THEME, FONT_CATALOG, FOLLOW_THEME, parseResolvedTheme, resolveFontKey } from './appearance';
+import {
+  EMPTY_THEME, FONT_CATALOG, FOLLOW_THEME, SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS,
+  parseResolvedTheme, resolveFontKey,
+} from './appearance';
 
 describe('webFontUrl', () => {
   it('serves every vendored font from the local engine, never from Google', () => {
@@ -164,6 +167,11 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     (document as { visibilityState: string }).visibilityState = state;
   }
 
+  /** Run past both reads, the settle read and the one confirming it. */
+  function settle(): void {
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS + SYSTEM_THEME_MODE_CONFIRM_MS);
+  }
+
   /** Bring the frame up on `system`, painted to whatever the OS says now. */
   async function watchingOnSystem() {
     const { ui: freshUi } = await import('./ui');
@@ -254,7 +262,7 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
 
     mqLight = true;
     mqChangeListeners[0]();
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(getMock).toHaveBeenCalled();
   });
@@ -265,7 +273,7 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     setVisibility('hidden');
     mqLight = true;
     mqChangeListeners[0]();
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(getMock).not.toHaveBeenCalled();
   });
@@ -276,14 +284,42 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     setVisibility('hidden');
     mqLight = true;
     mqChangeListeners[0]();
-    vi.advanceTimersByTime(500);
+    settle();
     expect(getMock).not.toHaveBeenCalled();
 
     setVisibility('visible');
     document.dispatchEvent(new Event('visibilitychange'));
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(getMock).toHaveBeenCalled();
+  });
+
+  it('repaints nothing a brief wake reads, when the frame hides before the flip holds', async () => {
+    // The shell's case, in the frame: a sub-second iOS wake still reads the
+    // snapshot pass's light after the settle delay.
+    await watchingOnSystem();
+
+    mqLight = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS);
+    setVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    mqLight = false;
+    settle();
+
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  it('repaints nothing when the confirming read no longer sees the flip', async () => {
+    await watchingOnSystem();
+
+    mqLight = true;
+    mqChangeListeners[0]();
+    vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS);
+    mqLight = false;
+    settle();
+
+    expect(getMock).not.toHaveBeenCalled();
   });
 
   it('costs no preferences fetch on a wake that changed nothing', async () => {
@@ -292,7 +328,7 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     document.dispatchEvent(new Event('visibilitychange'));
     window.dispatchEvent(new Event('focus'));
     window.dispatchEvent(new Event('pageshow'));
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(getMock).not.toHaveBeenCalled();
   });
@@ -308,7 +344,7 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
 
     mqLight = true;
     mqChangeListeners[0]();
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(getMock).toHaveBeenCalled();
     localStorage.removeItem('lucidos-theme-mode');
@@ -321,7 +357,7 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     mqLight = true;
     mqChangeListeners[0]();
     document.dispatchEvent(new Event('visibilitychange'));
-    vi.advanceTimersByTime(500);
+    settle();
 
     expect(getMock).not.toHaveBeenCalled();
   });
@@ -387,12 +423,14 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     const THEME = JSON.stringify({ light: { '--accent': '#123456' }, dark: { '--accent': '#654321' } });
 
     const shell = { postMessage: () => {} };
+    const SHELL_ORIGIN = 'https://localhost:5251';
     let origParent: unknown;
 
-    /** The shell's push, as `_bridge.ts` receives it: from the parent window. */
+    /** The shell's push, as `_bridge.ts` receives it: from the parent window,
+     *  on the frame's own origin. */
     function pushAppearance(data: unknown, source: unknown = shell): void {
       const push = new Event('message');
-      Object.assign(push, { source, data: { type: 'lucidos:bridge:push', channel: 'appearance', data } });
+      Object.assign(push, { source, origin: SHELL_ORIGIN, data: { type: 'lucidos:bridge:push', channel: 'appearance', data } });
       window.dispatchEvent(push);
     }
 
@@ -403,9 +441,11 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
       inline.removeProperty = (name: string) => { delete props[name]; };
       origParent = (window as unknown as { parent: unknown }).parent;
       (window as unknown as { parent: unknown }).parent = shell;
+      vi.stubGlobal('location', { origin: SHELL_ORIGIN });
     });
 
     afterEach(() => {
+      vi.unstubAllGlobals();
       (window as unknown as { parent: unknown }).parent = origParent;
       const inline = document.documentElement.style as unknown as Record<string, unknown>;
       delete inline.setProperty;
@@ -490,7 +530,7 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
 
       mqLight = true;
       mqChangeListeners[0]();
-      vi.advanceTimersByTime(500);
+      settle();
 
       expect(attrs['data-theme-mode']).toBe('light');
       expect(style().getPropertyValue('--accent')).toBe('#123456');

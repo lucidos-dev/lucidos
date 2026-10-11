@@ -556,7 +556,7 @@ rather than as a link it can shrug off. Four arms:
 - a backtick-quoted repo path that does not exist
 - a sibling knowhow file or id that does not resolve
 - an event name in the audit or learning recipe that no engine enum has
-- a severity word in `workspace-audit.md` outside its own legend
+- a severity word in `workspace-audit.md` or one of its audit sections outside the root's legend
 
 Unconditional because the usual author of this drift is the OTHER side of the
 diff. A module becomes a directory, an event gets renamed, and a knowhow file

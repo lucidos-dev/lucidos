@@ -28,12 +28,12 @@ pub struct ThreadEventsQuery {
     /// bug-report dumps stay complete.
     #[serde(default)]
     pub include_context: bool,
-    /// Serve only the newest `limit` events. Absent means the whole history,
-    /// which is what every caller got before paging existed and what the
-    /// export path still asks for.
+    /// Serve only the newest `limit` drawable events: a page skips auxiliary
+    /// captures, which the transcript never draws. Absent means the whole
+    /// history, auxiliary captures included, which the export path asks for.
     ///
-    /// A thread shorter than one page is unaffected: it fits, so the response
-    /// is what it always was, with `has_more` false.
+    /// A thread shorter than one page fits, with `has_more` false. It reads as
+    /// the unpaged response does, less its auxiliary captures.
     pub limit: Option<i64>,
     /// Page backwards from here, as `created` plus `sequence`. Both halves are
     /// required together, because rows are ordered by the pair.
@@ -54,7 +54,7 @@ pub struct ThreadEventsSnapshot {
     pub events: Vec<ThreadEventRow>,
     #[serde(rename = "currentAggregate")]
     pub current_aggregate: Option<crate::core::store::ThreadAggregate>,
-    /// Whether older events remain behind `events[0]`. Always false for an
+    /// Whether older drawable events remain behind `events[0]`. Always false for an
     /// unpaged read, which by definition carries them all.
     #[serde(
         rename = "hasMore",

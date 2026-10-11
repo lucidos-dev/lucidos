@@ -287,7 +287,7 @@ impl<'a> Judge<'a> {
 /// `ProviderKind::parse` falls back to Vertex on an unknown string, so a typo
 /// would quietly route somewhere nobody asked for. The round-trip through
 /// `as_str` is what turns that into an error.
-fn provider_override(raw: Option<&str>) -> Fallible<Option<ProviderKind>> {
+pub(crate) fn provider_override(raw: Option<&str>) -> Fallible<Option<ProviderKind>> {
     let name = raw.unwrap_or_default().trim();
     if name.is_empty() {
         return Ok(None);
@@ -316,7 +316,11 @@ fn judge_registry(model: &str, pinned: Option<ProviderKind>) -> Fallible<ModelRe
 
 /// Point one model id at one provider. The registry handle is shared with the
 /// built router, so a row written after the build still routes.
-fn route_to(registry: &ModelRegistry, model: &str, provider: ProviderKind) -> Fallible<()> {
+pub(crate) fn route_to(
+    registry: &ModelRegistry,
+    model: &str,
+    provider: ProviderKind,
+) -> Fallible<()> {
     registry
         .write()
         .map_err(|_| "the judge's model registry lock is poisoned")?
@@ -325,7 +329,7 @@ fn route_to(registry: &ModelRegistry, model: &str, provider: ProviderKind) -> Fa
 }
 
 /// Everything the engine's provider build needs, with no database and no mock.
-fn judge_context(model: &str, registry: &ModelRegistry) -> ProviderBuildContext {
+pub(crate) fn judge_context(model: &str, registry: &ModelRegistry) -> ProviderBuildContext {
     // The engine falls back to a `gcloud` subprocess last. The eval does not
     // need it: `project_from_files` reads the same two files directly.
     let project_id = std::env::var("VERTEX_PROJECT_ID")
@@ -348,7 +352,7 @@ fn judge_context(model: &str, registry: &ModelRegistry) -> ProviderBuildContext 
 }
 
 /// Which provider actually serves the judge, or an error naming what is missing.
-fn resolve_provider(
+pub(crate) fn resolve_provider(
     registry: &ModelRegistry,
     model: &str,
     pinned: Option<ProviderKind>,

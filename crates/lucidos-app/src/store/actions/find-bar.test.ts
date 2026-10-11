@@ -4,15 +4,22 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 vi.mock('./app-bridge', () => ({ askFrame: vi.fn(), tellFrame: vi.fn() }));
 vi.mock('./apps', () => ({ getVisibleAppFrame: vi.fn() }));
 // jsdom lays nothing out, so every element would read as hidden.
-vi.mock('../../components/chat/scrollState', () => ({ isElementVisible: () => true }));
+vi.mock('../../utils/elementVisibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/elementVisibility')>()),
+  isElementVisible: () => true,
+}));
 
 import { askFrame, tellFrame } from './app-bridge';
 import { getVisibleAppFrame } from './apps';
 import {
-  FIND_TIMEOUT_MS, closeFind, contentFindKind, findQuery, findResult, findStatusText, findSurface,
-  focusedFindSurface, openFind, parseFindReply, rerunFindOn, resetFind, setFindQuery, stepFind,
+  FIND_TIMEOUT_MS, closeFind, contentFindKind, findFocusRequest, findQuery, findResult, findStatusText,
+  findSurface, focusedFindSurface, openFind, parseFindReply, rerunFindOn, resetFind, setFindQuery, stepFind,
+  takeFindRequest, toggleFocusedFind,
 } from './find-bar';
-import { filePreviewEditing, filePreviewSource, focusedPane, panelOverlay } from '../store';
+import { MIN_FIND_QUERY_CHARS, fileFindScope, requestFind } from './find-request';
+import {
+  filePreviewEditing, filePreviewSource, findRequest, focusedPane, lineScrollTarget, panelOverlay,
+} from '../store';
 
 const frame = { contentWindow: {} } as unknown as HTMLIFrameElement;
 const APP = { type: 'app-ui', app: { id: 'habit-tracker' } } as unknown as typeof panelOverlay.value;
@@ -141,8 +148,8 @@ describe('the find bar over an app', () => {
       .mockReturnValueOnce(new Promise((r) => { answerFirst = r; }))
       .mockResolvedValueOnce({ total: 1, current: 1, capped: false });
     openFind('content');
-    await typeQuery('a');
     await typeQuery('ab');
+    await typeQuery('abc');
     answerFirst({ total: 9, current: 1, capped: false });
     await vi.runAllTimersAsync();
     expect(findResult.value).toEqual({ status: 'found', total: 1, current: 1, capped: false });
@@ -170,6 +177,26 @@ describe('the find bar over an app', () => {
     answer({ total: 1, current: 1, capped: false });
     await rerun;
     expect(findResult.value).toEqual({ status: 'found', total: 1, current: 1, capped: false });
+  });
+
+  it('waits for a second character, and says so', async () => {
+    vi.mocked(askFrame).mockResolvedValue({ total: 4, current: 1, capped: false });
+    openFind('content');
+    await typeQuery('a');
+    expect(askFrame).not.toHaveBeenCalled();
+    expect(findResult.value).toEqual({ status: 'too-short' });
+    expect(findStatusText(findResult.value)).toBe(`Type ${MIN_FIND_QUERY_CHARS}+ characters`);
+    await stepFind(1);
+    expect(askFrame, 'Enter on one character searches nothing either').not.toHaveBeenCalled();
+  });
+
+  it('takes the highlights away when the query shrinks below two characters', async () => {
+    vi.mocked(askFrame).mockResolvedValue({ total: 4, current: 1, capped: false });
+    openFind('content');
+    await typeQuery('ap');
+    await typeQuery('a');
+    expect(tellFrame).toHaveBeenCalledWith(frame, 'find', { clear: true });
+    expect(findResult.value).toEqual({ status: 'too-short' });
   });
 
   it('does nothing on a reload while the bar is shut', async () => {
@@ -201,6 +228,19 @@ describe('the find bar over a text preview', () => {
     expect(findResult.value).toMatchObject({ total: 1 });
   });
 
+  it('scrolls a match out from under the open bar', async () => {
+    showPreview('<p>apple</p>');
+    document.body.insertAdjacentHTML('afterbegin', '<div class="file-preview-frame"><div class="find-bar-slot"></div></div>');
+    const bar = document.querySelector<HTMLElement>('.find-bar-slot')!;
+    bar.getBoundingClientRect = () => new DOMRect(0, 0, 10, 100);
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => {});
+    openFind('content');
+    await typeQuery('apple');
+    // The match's box is at the top of the viewport, under the bar's 100px.
+    expect(scrollBy).toHaveBeenCalledWith(0, 0 - 100 - (window.innerHeight - 100 - 10) / 2);
+    scrollBy.mockRestore();
+  });
+
   it('never changes the preview\'s markup', async () => {
     showPreview('<p>one <b>two</b> one</p>');
     const before = document.body.innerHTML;
@@ -209,6 +249,109 @@ describe('the find bar over a text preview', () => {
     await stepFind(1);
     closeFind();
     expect(document.body.innerHTML).toBe(before);
+  });
+});
+
+describe('a find a navigation asked for', () => {
+  const PATH = 'artifacts/notes.md';
+  const SCOPE = fileFindScope(PATH);
+
+  /** The source view of a file, one `.code-line` per line, as `LineNumberedCode` draws it. */
+  function showSource(lines: string[]) {
+    panelOverlay.value = file(PATH);
+    filePreviewSource.value = true;
+    document.body.innerHTML = `<div class="file-preview-frame-body"><pre>${lines
+      .map((text, i) => `<div class="code-line" data-line="${i + 1}"><span class="line-content">${text}</span></div>`)
+      .join('')}</pre></div>`;
+  }
+
+  beforeEach(() => {
+    findRequest.value = null;
+    lineScrollTarget.value = null;
+  });
+
+  it('opens on the file it was made for, with the query, from the cited line', async () => {
+    showSource(['apple', 'pear', 'apple', 'apple']);
+    lineScrollTarget.value = { path: PATH, line: 3 };
+    requestFind(SCOPE, 'apple', 3);
+
+    takeFindRequest('content', fileFindScope('artifacts/other.md'));
+    expect(findSurface.value, 'another file\'s bar leaves it alone').toBeNull();
+
+    takeFindRequest('content', SCOPE);
+    expect(findSurface.value).toBe('content');
+    expect(findQuery.value).toBe('apple');
+    expect(findRequest.value, 'taken once').toBeNull();
+    await vi.runAllTimersAsync();
+    expect(findResult.value, 'nothing runs before the line lands').toEqual({ status: 'idle' });
+
+    lineScrollTarget.value = null;
+    await vi.runAllTimersAsync();
+    expect(findResult.value).toEqual({ status: 'found', total: 3, current: 2, capped: false });
+    await stepFind(1);
+    expect(findResult.value).toMatchObject({ current: 3 });
+  });
+
+  it('ignores a step before the line lands, so the search still starts at the line', async () => {
+    showSource(['apple', 'pear', 'apple', 'apple']);
+    lineScrollTarget.value = { path: PATH, line: 3 };
+    requestFind(SCOPE, 'apple', 3);
+    takeFindRequest('content', SCOPE);
+
+    await stepFind(1);
+    expect(findResult.value, 'an early Enter searches nothing').toEqual({ status: 'idle' });
+
+    lineScrollTarget.value = null;
+    await vi.runAllTimersAsync();
+    expect(findResult.value).toEqual({ status: 'found', total: 3, current: 2, capped: false });
+    await stepFind(1);
+    expect(findResult.value).toMatchObject({ current: 3 });
+  });
+
+  it('runs at once when the line has already landed', async () => {
+    showSource(['apple', 'apple']);
+    requestFind(SCOPE, 'apple', 2);
+    takeFindRequest('content', SCOPE);
+    await vi.runAllTimersAsync();
+    expect(findResult.value).toMatchObject({ total: 2, current: 2 });
+  });
+
+  it('takes focus with a fine pointer, so Enter steps through the matches', () => {
+    showSource(['apple']);
+    const focusRequest = findFocusRequest.value;
+    requestFind(SCOPE, 'apple', 1);
+    takeFindRequest('content', SCOPE);
+    expect(findFocusRequest.value).toBe(focusRequest + 1);
+  });
+
+  it('takes no focus with a finger, so a phone keeps its keyboard down', () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({ matches: query === '(pointer: coarse)' }));
+    try {
+      showSource(['apple']);
+      const focusRequest = findFocusRequest.value;
+      requestFind(SCOPE, 'apple', 1);
+      takeFindRequest('content', SCOPE);
+      expect(findFocusRequest.value).toBe(focusRequest);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('asks for nothing with a query too short to search', () => {
+    requestFind(SCOPE, 'a'.repeat(MIN_FIND_QUERY_CHARS - 1), 1);
+    expect(findRequest.value).toBeNull();
+  });
+
+  it('never runs on a bar closed before the line landed', async () => {
+    showSource(['apple']);
+    lineScrollTarget.value = { path: PATH, line: 1 };
+    requestFind(SCOPE, 'apple', 1);
+    takeFindRequest('content', SCOPE);
+    closeFind();
+    lineScrollTarget.value = null;
+    await vi.runAllTimersAsync();
+    expect(findSurface.value).toBeNull();
+    expect(findResult.value).toEqual({ status: 'idle' });
   });
 });
 
@@ -221,6 +364,24 @@ describe('one session at a time', () => {
     expect(tellFrame).toHaveBeenCalledWith(frame, 'find', { clear: true });
     expect(findSurface.value).toBe('thread');
     expect(findQuery.value).toBe('');
+  });
+});
+
+describe('the Mod+F action', () => {
+  it('opens the bar on the focused pane, and closes an open bar like Escape', async () => {
+    vi.mocked(askFrame).mockResolvedValue({ total: 1, current: 1, capped: false });
+    toggleFocusedFind();
+    expect(findSurface.value).toBe('content');
+    await typeQuery('apple');
+    toggleFocusedFind();
+    expect(findSurface.value).toBeNull();
+    expect(tellFrame, 'the highlights go with it').toHaveBeenCalledWith(frame, 'find', { clear: true });
+  });
+
+  it('closes a bar open on the other pane', () => {
+    openFind('thread');
+    toggleFocusedFind();
+    expect(findSurface.value).toBeNull();
   });
 });
 

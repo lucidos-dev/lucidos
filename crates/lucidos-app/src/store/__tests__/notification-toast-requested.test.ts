@@ -35,6 +35,8 @@ vi.mock('../../api/client', () => ({ API_BASE: 'http://test', API: 'http://test/
 vi.mock('../actions/devices', () => ({ getDeviceId: () => 'dev-test' }));
 
 import type { Tap } from '@lucidos/sdk';
+import * as scrollState from '../../components/chat/scrollState';
+import { provideScrollState } from '../../components/chat/scrollStateHandle';
 import { handleGlobalEvent } from '../actions/thread-sync';
 import { focusThreadOrBootstrap } from '../actions/threads';
 import { viewNotification, handleNotificationSSE } from '../actions/notifications';
@@ -42,6 +44,9 @@ import {
   handleNotificationToastRequested,
   TOAST_REQUEST_STALE_AFTER_MS,
 } from '../actions/in-app-notification-toast';
+
+// The store reaches scrollState through the handle, which the shell fills.
+provideScrollState(scrollState);
 
 /** Fire a NotificationToastRequested the way the SSE channel would. This is
  *  the §4 in-app surface trigger — the engine emits it only after it decides

@@ -1,3 +1,4 @@
+use crate::engine::change_ops::{PlanHold, ProposalHold};
 use crate::engine::thread_lifecycle::ThreadStatus;
 use serde::{Deserialize, Serialize};
 
@@ -157,11 +158,11 @@ impl AbortCause {
     /// can say.
     ///
     /// **A pending change does not change the answer.** Both verdict arms used
-    /// to open `CASE WHEN coding_agent_proposed THEN 'waiting'`, on the
+    /// to open with a pending-change check writing `'waiting'`, on the
     /// reasoning that a change to review outranks the interruption. That
     /// ordering is right and it survives, but it belongs to the *reader*: the
     /// frontend's `resolveVisualStatus` already returns `failed` and `paused`
-    /// ahead of `changes`, and `coding_agent_proposed` is what carries the
+    /// ahead of `changes`, and the change state is what carries the
     /// change. Saying it a second time here cost the verdict outright, because
     /// `'waiting'` is not a `PRESERVED_STATUS_VERDICTS` value: the dying
     /// subprocess's drain landed milliseconds later and wrote `'running'` over
@@ -233,4 +234,67 @@ pub enum EventWaitCancelCause {
     /// fresh.
     #[serde(other)]
     Unknown,
+}
+
+impl EventWaitCancelCause {
+    /// The cancel ended one subscription and left the thread open. Nothing
+    /// re-opens it, so whatever the wait held back falls due now: a child's
+    /// card for its parent, and a held idle proposal (ADR 0395). An archive or
+    /// a discard ended the thread itself, and its own paths settle both.
+    pub fn leaves_thread_open(self) -> bool {
+        matches!(self, Self::UserStop | Self::AgentStandDown)
+    }
+}
+
+/// Why a turn end left work on its branch unproposed (ADR 0400). The hold
+/// variants are [`ProposalHold`]'s, mapped by the exhaustive `From` below, so a
+/// new hold cannot compile without a wire name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnproposedReason {
+    /// The branch has no implementation-plan marker.
+    PlanMissing,
+    /// A plan is recorded but the user has not approved it.
+    PlanAwaitingApproval,
+    /// A bounded security fix reaches past the files it named.
+    OutsideBound,
+    /// The work never ran `/harden`, so Apply would harden it first.
+    HardeningMissing,
+    /// The turn did not finish: a Stop, a failure, an abort or a cut-off.
+    TurnIncomplete,
+}
+
+impl UnproposedReason {
+    pub const ALL: [Self; 5] = [
+        Self::PlanMissing,
+        Self::PlanAwaitingApproval,
+        Self::OutsideBound,
+        Self::HardeningMissing,
+        Self::TurnIncomplete,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlanMissing => "plan_missing",
+            Self::PlanAwaitingApproval => "plan_awaiting_approval",
+            Self::OutsideBound => "outside_bound",
+            Self::HardeningMissing => "hardening_missing",
+            Self::TurnIncomplete => "turn_incomplete",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == value)
+    }
+}
+
+impl From<ProposalHold> for UnproposedReason {
+    fn from(hold: ProposalHold) -> Self {
+        match hold {
+            ProposalHold::Plan(PlanHold::Missing) => Self::PlanMissing,
+            ProposalHold::Plan(PlanHold::AwaitingApproval) => Self::PlanAwaitingApproval,
+            ProposalHold::Plan(PlanHold::OutsideBound) => Self::OutsideBound,
+            ProposalHold::HardeningMissing => Self::HardeningMissing,
+        }
+    }
 }

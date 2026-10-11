@@ -42,8 +42,6 @@ const MEMBER_THREAD_UNSETTLED: &str = "Its thread was working again when its tur
      came. Apply it once the thread settles.";
 const MEMBER_SETTLE_UNKNOWN: &str = "Lucidos could not check whether its thread had settled, so \
      it was not applied. Apply it again.";
-const MEMBER_INCOMPLETE: &str = "It became unfinished work from a stopped turn. Apply it from \
-     its own Apply, which asks first.";
 const MEMBER_EMPTY: &str = "It has no file changes left.";
 
 /// Why the driver must not apply a pending `change` when its turn comes, or
@@ -60,8 +58,6 @@ fn batch_member_skip_reason(
         None
     } else if thread_unsettled {
         Some(MEMBER_THREAD_UNSETTLED)
-    } else if change.incomplete {
-        Some(MEMBER_INCOMPLETE)
     } else if crate::core::changes::is_empty_pending_change(change) {
         Some(MEMBER_EMPTY)
     } else {
@@ -87,9 +83,13 @@ fn classify_recovered_member(status: Option<ChangeStatus>) -> RecoveredMember {
     match status {
         Some(ChangeStatus::Applied) => RecoveredMember::Applied,
         Some(ChangeStatus::Pending) => RecoveredMember::Pending,
-        Some(ChangeStatus::SetAside | ChangeStatus::Discarded | ChangeStatus::Reverted) | None => {
-            RecoveredMember::Terminal
-        }
+        Some(
+            ChangeStatus::SetAside
+            | ChangeStatus::Discarded
+            | ChangeStatus::Reverted
+            | ChangeStatus::Withdrawn,
+        )
+        | None => RecoveredMember::Terminal,
     }
 }
 
@@ -214,24 +214,22 @@ impl LucidosEngine {
     ) -> Result<ApplyAllOutcome, sqlx::Error> {
         let all_pending = self.changes().list_pending().await?;
         let total_pending = all_pending.len();
-        // Exclude changes whose thread has not settled: mid-turn, or parked and
-        // due to wake (ADR 0106). This path calls `apply_change` directly, which
-        // bypasses the per-change `guard_change_action` gate. Without it we
-        // would merge a branch the coding agent is still committing on, racing
-        // the session's next proposal (real thread 76b4ee76).
+        // Keep only the *apply-ready* changes, the Changes panel's Ready
+        // section. A thread still settling, mid-turn or parked and due to wake
+        // (ADR 0106), would race this merge: this path calls `apply_change`
+        // directly, past the per-change `guard_change_action` gate (real
+        // thread 76b4ee76). A change that needs hardening would start a
+        // hardening nobody pressed.
         //
-        // The sweep answers those dropped changes: not applied now, applied
-        // when their thread lands.
-        let live_filtered =
-            crate::core::changes::drop_unsettled_thread_changes(self.pool(), all_pending).await?;
-        let unsettled = total_pending - live_filtered.len();
+        // The sweep answers the settling ones: not applied now, applied when
+        // their thread lands.
+        let ready =
+            crate::core::changes::keep_apply_ready_changes(self.pool(), all_pending).await?;
+        let not_ready = total_pending - ready.len();
         // Also drop changes with no files left. The per-change endpoint 409s
         // those, and this path would otherwise do what the button refuses:
         // merge no-op commits, possibly spending a harden run on an empty diff.
-        // Incomplete work goes too: only its own Apply, which confirms, lands it.
-        let pending = crate::core::changes::drop_incomplete_changes(
-            crate::core::changes::drop_empty_changes(live_filtered),
-        );
+        let pending = crate::core::changes::drop_empty_changes(ready);
         let change_ids: Vec<Uuid> = pending.iter().map(|c| c.id).collect();
 
         // Arm BEFORE the first apply. That apply is awaited here and can spend
@@ -247,7 +245,7 @@ impl LucidosEngine {
         let Some(first) = pending.first() else {
             return Ok(ApplyAllOutcome::NothingToApply {
                 total_pending,
-                unsettled,
+                not_ready,
                 armed,
             });
         };
@@ -745,7 +743,7 @@ pub(crate) enum ApplyAllOutcome {
     /// caller name the real reason rather than one blanket refusal.
     NothingToApply {
         total_pending: usize,
-        unsettled: usize,
+        not_ready: usize,
         armed: usize,
     },
 }
@@ -917,7 +915,7 @@ mod tests {
     }
 
     fn pending_member() -> crate::core::changes::Change {
-        use crate::core::changes::{Change, ChangeState};
+        use crate::core::changes::{Change, ChangeStatusData};
         Change {
             id: Uuid::new_v4(),
             request_id: Uuid::new_v4(),
@@ -928,7 +926,7 @@ mod tests {
             file_count: 1,
             files: vec!["a.rs".into()],
             requires_restart: false,
-            state: ChangeState::Pending {
+            state: ChangeStatusData::Pending {
                 merge: None,
                 thread: Default::default(),
                 apply: Default::default(),
@@ -954,14 +952,6 @@ mod tests {
             batch_member_skip_reason(&clean, true),
             Some(MEMBER_THREAD_UNSETTLED)
         );
-        let incomplete = crate::core::changes::Change {
-            incomplete: true,
-            ..pending_member()
-        };
-        assert_eq!(
-            batch_member_skip_reason(&incomplete, false),
-            Some(MEMBER_INCOMPLETE)
-        );
         let empty = crate::core::changes::Change {
             file_count: 0,
             ..pending_member()
@@ -974,8 +964,7 @@ mod tests {
     #[test]
     fn a_resolved_member_is_left_to_apply_change() {
         let applied = crate::core::changes::Change {
-            state: crate::core::changes::ChangeState::Applied(Default::default()),
-            incomplete: true,
+            state: crate::core::changes::ChangeStatusData::Applied(Default::default()),
             ..pending_member()
         };
         assert_eq!(batch_member_skip_reason(&applied, true), None);

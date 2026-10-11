@@ -143,6 +143,32 @@ pub(crate) async fn realign(
     tx.commit().await
 }
 
+/// Replace the text of nodes no model wrote, in one transaction. A
+/// model-written node is never touched.
+pub(crate) async fn rewrite_verbatim(
+    pool: &PgPool,
+    scope: SummaryScope,
+    nodes: &[(NodeAddr, String)],
+) -> StoreResult<()> {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (addr, text) in nodes {
+        sqlx::query(
+            "UPDATE summary_tree_nodes SET text = $4 \
+             WHERE scope = $1 AND span = $2 AND start = $3 AND model IS NULL",
+        )
+        .bind(scope.as_db())
+        .bind(addr.span as i64)
+        .bind(addr.start as i64)
+        .bind(text)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
 /// Record that `scope` is complete for every event up to `through`.
 pub(crate) async fn reflect(pool: &PgPool, scope: SummaryScope, through: i64) -> StoreResult<()> {
     sqlx::query(

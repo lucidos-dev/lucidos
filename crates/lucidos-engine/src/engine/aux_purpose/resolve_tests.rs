@@ -16,6 +16,8 @@ use crate::test_support::{aux_captures, setup_test_db, teardown_test_db};
 struct StubRouter {
     configured: Vec<ProviderKind>,
     default_model: &'static str,
+    /// Models it answers not-found for, as a retired model's provider does.
+    refusing: Vec<&'static str>,
     seen: Mutex<Vec<(Option<String>, Option<Duration>)>>,
 }
 
@@ -29,6 +31,17 @@ impl StubRouter {
         Arc::new(Self {
             configured: configured.to_vec(),
             default_model: model,
+            refusing: Vec::new(),
+            seen: Mutex::default(),
+        })
+    }
+
+    /// A router holding `configured` whose provider no longer serves `models`.
+    fn refusing(configured: &[ProviderKind], models: &[&'static str]) -> Arc<Self> {
+        Arc::new(Self {
+            configured: configured.to_vec(),
+            default_model: "claude-opus-5-5",
+            refusing: models.to_vec(),
             seen: Mutex::default(),
         })
     }
@@ -49,6 +62,11 @@ impl LlmProvider for StubRouter {
             selection.model.map(str::to_string),
             selection.attempt_timeout,
         ));
+        if let Some(model) = selection.model.filter(|m| self.refusing.contains(m)) {
+            return Err(Box::new(crate::llm::ModelNotServed::new(format!(
+                "Vertex has no `{model}`"
+            ))));
+        }
         Ok(LlmResponse {
             content: Some("A summary.".to_string()),
             input_tokens: Some(120),
@@ -103,6 +121,91 @@ async fn an_install_without_vertex_runs_and_records_the_model_it_ran() {
     assert_eq!(captures.len(), 1);
     assert_eq!(captures[0]["model"], "claude-sonnet-5-5");
 
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Vertex retiring the judge's default: the call that hits the 404 retries on
+/// the next model and records it, and the next call starts there (I4, I6).
+#[tokio::test]
+async fn a_retired_default_moves_on_and_the_next_call_starts_there() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    let (gemini, haiku) = ("gemini-3-flash-preview", "claude-haiku-4-5");
+    let router = StubRouter::refusing(&[ProviderKind::Vertex], &[gemini]);
+    let purpose = ContextPurpose::CommandJudge;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let call = AuxCall::resolve(&pool, &registry, router.clone(), purpose)
+        .await
+        .reporting_to(&bus, &pool, &registry, purpose);
+    assert_eq!(call.model(), gemini);
+    assert_eq!(call.selection().fallback.as_deref(), Some(haiku));
+
+    let thread_id = uuid::Uuid::new_v4();
+    let capture = crate::engine::AuxCapture::new(&bus, thread_id, purpose);
+    crate::memory::summarize_conversation(call.provider().as_ref(), "turns", None, &capture)
+        .await
+        .expect("the fallback answers");
+    let seen: Vec<_> = router
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.0.clone())
+        .collect();
+    assert_eq!(seen, [Some(gemini.to_string()), Some(haiku.to_string())]);
+    let captures = aux_captures(&pool, thread_id, "command_judge").await;
+    assert_eq!(
+        captures[0]["model"], haiku,
+        "the cost names the model that ran"
+    );
+    let moved: Option<String> = sqlx::query_scalar(
+        "SELECT payload->'data'->>'moved_to' FROM events \
+         WHERE event_type = 'ModelNotServedObserved'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the observation");
+    assert_eq!(moved.as_deref(), Some(haiku));
+
+    let next = AuxCall::resolve(&pool, &registry, router.clone(), purpose).await;
+    assert_eq!(next.model(), haiku);
+    assert_eq!(next.selection().source, ModelSource::Default);
+    assert_eq!(next.selection().not_served, [gemini]);
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A stored pick its provider refuses fails, and nothing moves it (I2).
+#[tokio::test]
+async fn a_retired_stored_pick_fails_without_moving() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    let haiku = "claude-haiku-4-5";
+    crate::core::PreferenceStore::set_row_for_test(&pool, prefs::MODEL_COMMAND_JUDGE.key(), haiku)
+        .await
+        .unwrap();
+    let router = StubRouter::refusing(&[ProviderKind::Vertex], &[haiku]);
+    let purpose = ContextPurpose::CommandJudge;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let call = AuxCall::resolve(&pool, &registry, router.clone(), purpose)
+        .await
+        .reporting_to(&bus, &pool, &registry, purpose);
+    assert_eq!(call.selection().fallback, None);
+
+    let capture = crate::engine::AuxCapture::new(&bus, uuid::Uuid::new_v4(), purpose);
+    let err = crate::memory::summarize_conversation(call.provider().as_ref(), "t", None, &capture)
+        .await
+        .expect_err("a stored pick is refused, not substituted");
+    assert!(err.is::<crate::llm::ModelNotServed>(), "{err}");
+    assert_eq!(router.seen.lock().unwrap().len(), 1);
+    let notified: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'NotificationCreated'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(notified, 1);
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -277,7 +380,7 @@ async fn a_stored_memory_pair_binds_extraction_alone() {
     let (pool, db_name) = setup_test_db().await;
     let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
     for (key, value) in [
-        (prefs::MODEL_MEMORY.key(), "gemini-3.5-flash"),
+        (prefs::MODEL_MEMORY.key(), "gemini-3.8-flash"),
         (prefs::REASONING_MEMORY.key(), "high"),
     ] {
         crate::core::PreferenceStore::set_row_for_test(&pool, key, value)
@@ -292,7 +395,7 @@ async fn a_stored_memory_pair_binds_extraction_alone() {
     };
 
     let extraction = resolve(ContextPurpose::Memory).await;
-    assert_eq!(extraction.model, "gemini-3.5-flash");
+    assert_eq!(extraction.model, "gemini-3.8-flash");
     assert_eq!(extraction.source, ModelSource::Preference);
     assert_eq!(extraction.reasoning.as_deref(), Some("high"));
 
@@ -307,7 +410,7 @@ async fn a_stored_memory_pair_binds_extraction_alone() {
             selection.model,
             recommended(purpose, &registry)
                 .into_iter()
-                .find(|m| is_reachable(m, &registry, |k| k == ProviderKind::Vertex))
+                .find(|m| Reach::configured(&[ProviderKind::Vertex]).serves(&registry, m))
                 .expect("Vertex serves a recommended model"),
             "{purpose:?}"
         );
@@ -318,6 +421,44 @@ async fn a_stored_memory_pair_binds_extraction_alone() {
             "{purpose:?}"
         );
     }
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A task's own tier binds its recommended models. Any other model, picked
+/// with no tier, runs at its default effort, or sends none without one.
+#[tokio::test]
+async fn a_task_tier_binds_only_its_recommended_models() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    let router = StubRouter::holding(&ProviderKind::ALL);
+    let title = || resolve_selection(&pool, &registry, router.as_ref(), ContextPurpose::Title);
+
+    let on_its_own = title().await;
+    assert!(recommended(ContextPurpose::Title, &registry).contains(&on_its_own.model));
+    assert_eq!(on_its_own.reasoning.as_deref(), Some("none"));
+
+    let set_model = |model: &'static str| {
+        let pool = pool.clone();
+        async move {
+            crate::core::PreferenceStore::set_row_for_test(&pool, prefs::MODEL_TITLE.key(), model)
+                .await
+                .unwrap();
+        }
+    };
+    set_model("claude-opus-5-5").await;
+    assert_eq!(title().await.reasoning.as_deref(), Some("medium"));
+    set_model("my-local-model").await;
+    assert_eq!(title().await.reasoning, None);
+
+    crate::core::PreferenceStore::set_row_for_test(&pool, prefs::REASONING_TITLE.key(), "high")
+        .await
+        .unwrap();
+    assert_eq!(
+        title().await.reasoning.as_deref(),
+        Some("high"),
+        "stored wins"
+    );
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

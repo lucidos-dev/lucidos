@@ -332,6 +332,8 @@ Conditions are pure payload filters, so never use one for logic that depends on 
 
 **One field is always available on a thread event: `thread_id`.** It is not in any event's payload: the engine supplies it from the thread the event belongs to. It scopes a subscription to a single thread, so `{ "event_type": "CodingAgentIdled", "condition": { "thread_id": "<uuid>" } }` fires only when THAT coding-agent session reaches a turn boundary. A **domain event** (one your workspace emits with `emit_event`) belongs to no thread. It has no such field, so a `thread_id` condition on one matches nothing. Everything else a condition names is a **field path** into that event's own payload.
 
+That payload includes the merged metadata fields `channel`, `actor` and `request_event_id` (`thread-events.md` § Wire format and metadata). So `{ "event_type": "ResponseGenerated", "condition": { "channel": "claude_code" } }` fires only when a coding-agent turn ends.
+
 A persisted **system event** is the same case. `BackupFailed` belongs to no thread, so a `thread_id` condition never matches it. Condition on the variant's own fields instead, such as `filename` on `BackupCompleted`. The stored row wraps the event in a `type` / `data` envelope, and the matcher unwraps it for you, so never name those two keys.
 
 **`ChangeProposed` also records parked work.** It fires for a new or updated change, including one the engine files straight into set-aside (`set_aside: true`). That covers work found on an archived thread's branch, and the first boot on a new version can file many at once. A trigger for "a change is ready to apply" therefore carries `{ "set_aside": { "$ne": true } }`. A pending proposal omits the field, so a bare `false` matches nothing.
@@ -427,6 +429,10 @@ body = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
 
 Call `send_notification` only when there is something the user wants to hear about. A morning summary that finds nothing new sends no notification: silent success is the norm.
 
+When a run found something worth reading, call `request_read` with `read: true`. The thread then waits under Review until the user has read its reply. A run that found nothing just finishes and sends no notification. Every run still records a read decision: Lucidos decides one the run left open.
+
+A trigger that orchestrates *sub-threads* or waits on events wakes many times in one run. Each wake that only reports progress is `read: false`, so only the ending lands in Review. Say `read: true` on a step only for something the user should read before the run finishes, such as a failure.
+
 The scheduler auto-creates an error notification when a trigger fails, so don't double-notify on errors from inside the run.
 
 ## Where the thread lands: `go_to_review`
@@ -434,6 +440,8 @@ The scheduler auto-creates an error notification when a trigger fails, so don't 
 By default, trigger runs are unattended: their threads go straight to Archive when they finish. They surface in the Current section only if the user follows up with a message. That suits most cron triggers (silent imports, periodic syncs, idle nudges).
 
 A run that stops to ask the user a question, or to ask permission, always surfaces in Current, whatever `go_to_review` says. It stays there until the user answers or stops it.
+
+A run that says `request_read` with `read: true` also lands in Current, listed under Review until the user has read its reply. So a trigger that only sometimes finds something can leave `go_to_review` off and ask on the runs that matter.
 
 Set `go_to_review: true` when the trigger's *output is the point*: a daily summary the user means to read, an alert that needs acknowledgement, a scheduled report. The thread then surfaces in Current on completion instead of getting lost in Archive.
 
@@ -468,7 +476,9 @@ below are ignored there, and the form hides them.
 | nothing about models | omit both, so the trigger follows the account default |
 
 Pin a model only when the user asked for one. A pinned trigger stops following
-the account default, so a workspace-wide model change no longer reaches it.
+the account default, so a workspace-wide model change no longer reaches it. A
+model pin with no `reasoning_effort` runs that model at the account's tier for
+it, else its default effort.
 
 Like the `chat_model` preference, the model id is **not checked against the
 registry at save**, since a model can be disabled or deleted later. A wrong id

@@ -1,6 +1,7 @@
 import type { App } from '../../store/types';
 import { openImagePopupFromGroup, showToast } from '../../store/store';
-import { openFilePreview, openLocalFileOnConfirm } from '../../store/actions/artifacts';
+import { openLocalFileOnConfirm } from '../../store/actions/artifacts';
+import { openFilePreviewModal } from '../../store/actions/filePreviewModal';
 import { openApp, openAppById } from '../../store/actions/apps';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
@@ -16,6 +17,9 @@ import {
   hasUrlScheme,
   browserHandlesHref,
   extractSettingsViewFromHref,
+  hrefLineRef,
+  labelLineRef,
+  type LineRef,
 } from '../../utils/linkifyPaths';
 
 /** Toast key for the terminal dead-link guard, so tapping the same dead link
@@ -32,10 +36,32 @@ function deadLinkMessage(href: string): string {
   return `Link "${href}" points nowhere in this workspace`;
 }
 
+/** The lines a file link cites: its href's own, else a citation ending its
+ *  visible label (`main.rs:510-520`). The label is what the reader clicked. */
+function citedLines(anchor: HTMLElement, fromHref: LineRef | null): LineRef | null {
+  return fromHref ?? labelLineRef(anchor.textContent ?? '');
+}
+
+/** The line `rewriteArtifactAnchor` moved off the href, or null. */
+function artifactAnchorLines(anchor: HTMLElement): LineRef | null {
+  const { line, lineEnd } = anchor.dataset;
+  if (line === undefined) return null;
+  return { line: Number(line), lineEnd: lineEnd === undefined ? undefined : Number(lineEnd) };
+}
+
+/** Show a workspace data file in the file preview modal, at its cited lines. */
+function previewDataFile(path: string, lines: LineRef | null) {
+  openFilePreviewModal({ file_path: path, line: lines?.line, line_end: lines?.lineEnd });
+}
+
 /** Route a click inside rendered agent markdown (`linkifyPaths(renderMarkdown(…))`)
  *  to the host surface it names. Every surface that renders that HTML attaches
  *  this one handler, so a link that opens in the transcript opens everywhere.
- *  `source` names the surface in a not-found toast, e.g. "a notification". */
+ *  `source` names the surface in a not-found toast, e.g. "a notification".
+ *
+ *  A file link opens the file preview modal rather than navigating, so the
+ *  reader keeps their place in the prose. The modal's "Open in Files" is the
+ *  way on to the Files panel. */
 export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: string) {
   const imgTarget = (e.target as HTMLElement).closest('.image-thumbnail') as HTMLImageElement | null;
   if (imgTarget) {
@@ -49,7 +75,7 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
   if (artifactTarget) {
     e.preventDefault();
     const path = artifactTarget.dataset.path;
-    if (path) openFilePreview(path);
+    if (path) previewDataFile(path, citedLines(artifactTarget, artifactAnchorLines(artifactTarget)));
     return;
   }
 
@@ -118,7 +144,13 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
     const repoFile = extractRepoFileTargetFromHref(rawHref);
     if (repoFile) {
       e.preventDefault();
-      void openRepoFileLink(repoFile, source);
+      const fromHref = repoFile.line === undefined ? null : { line: repoFile.line, lineEnd: repoFile.lineEnd };
+      const lines = citedLines(anchorTarget, fromHref);
+      void openRepoFileLink(
+        { locator: repoFile.locator, line: lines?.line, lineEnd: lines?.lineEnd },
+        source,
+        openFilePreviewModal,
+      );
       return;
     }
     // A Settings page, such as the one a backup notification names. The
@@ -160,7 +192,7 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
     const dataPath = extractDataPathTarget(rawHref);
     if (dataPath) {
       e.preventDefault();
-      openFilePreview(dataPath);
+      previewDataFile(dataPath, citedLines(anchorTarget, hrefLineRef(rawHref)));
       return;
     }
     // A `file://` URL or an absolute filesystem path, such as a staged

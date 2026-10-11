@@ -175,7 +175,7 @@ fn change(
         file_count: 1,
         files: vec!["a.rs".to_string()],
         requires_restart: false,
-        state: crate::core::changes::ChangeState::Discarded,
+        state: crate::core::changes::ChangeStatusData::Discarded,
         created_at: chrono::Utc::now(),
         resolved_at: None,
         hardened: false,

@@ -1,4 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+use crate::engine::thread_events::UnproposedReason;
 
 // ── Core Types ──────────────────────────────────────────────────────
 
@@ -90,7 +92,7 @@ pub enum ThreadStatus {
     /// CLI's status filter, and in the generated TS union.
     ///
     /// `AbortCause::status_sql()` was the last writer. Its verdict arms opened
-    /// `CASE WHEN coding_agent_proposed THEN 'waiting'`, so an abort landing on
+    /// with a pending-change check that wrote `'waiting'`, so an abort landing on
     /// a CC thread with a pending change settled here instead of at `Paused` /
     /// `Failed`. That ordering (a change to review outranks the interruption)
     /// is kept, and now lives only in the frontend's `resolveVisualStatus`. See
@@ -99,7 +101,7 @@ pub enum ThreadStatus {
     ///
     /// Every settle path writes `STATUS_FROM_PROPOSED_CHANGE`, the literal
     /// `'idle'`: a proposed change is an artifact for the user to review, not a
-    /// parked loop, so it surfaces via `coding_agent_proposed` (and
+    /// parked loop, so it surfaces via the `proposed` change state (and
     /// `is_blocking` clause 3) instead. For "loop is parked waiting for human
     /// input" see `WaitingForUserAnswer`.
     Waiting,
@@ -125,7 +127,7 @@ pub enum ThreadStatus {
     /// simply on its way back.
     ///
     /// **Written whether or not the thread has a pending change.** The change
-    /// rides `coding_agent_proposed`, and the frontend's `resolveVisualStatus`
+    /// rides the change state, and the frontend's `resolveVisualStatus`
     /// ranks the two. This arm used to defer to a pending change and write
     /// `Waiting`, which is how the verdict got lost; see that variant.
     ///
@@ -288,6 +290,11 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "ThreadUnarchived" => EventClass::Metadata,
         // A proposal records what the agent offered; the reply moves things.
         "ThreadTriageProposed" => EventClass::Metadata,
+        // A read decision and a sighting mark the reply, not the thread's
+        // work, so none bumps recency (ADR 0409).
+        "ThreadReadRequested" | "ThreadReadNotRequested" | "ThreadReplySeen" => {
+            EventClass::Metadata
+        }
         // Queued-message removal is a pure marker over a prior MessageReceived.
         // It must not bump recency, status, section, or message count.
         "QueuedMessageRemoved" => EventClass::Metadata,
@@ -306,7 +313,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "ImageUploaded" => EventClass::Metadata,
         // Start
         "MessageReceived" | "TriggerStarted" => EventClass::Start,
-        "CodingAgentUserMessageSent" | "UserPromptInjected" => EventClass::Start,
+        "CodingAgentUserMessageSent" | "PromptInjected" => EventClass::Start,
         // Session lifecycle — invisible to user (no status change, no activity bump)
         "SessionStarted" | "ContinuationStarted" | "CodingAgentSettingsChanged" => {
             EventClass::Metadata
@@ -352,9 +359,15 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // ToolResult already covers that for the started case, and
         // completion happens outside any LLM turn).
         "BackgroundBashStarted" | "BackgroundBashCompleted" => EventClass::Metadata,
+        // An owner approval asked for and spent (ADR 0387). The card and the
+        // act each move the thread on their own, so both are Metadata.
+        "OwnerApprovalRequested" | "OwnerApprovalSpent" => EventClass::Metadata,
         // Command-guard checkpoint lifecycle: a pure card / audit projection,
         // so neither bumps status or activity (ADR 0002, Phase 4).
         "CommandCheckpointed" | "CommandCheckpointReverted" => EventClass::Metadata,
+        // A widget card or chip is a card projection (ADR 0402): it moves no
+        // status, and the turn that showed it already counts as activity.
+        "WidgetShown" | "WidgetPinned" | "WidgetUnpinned" => EventClass::Metadata,
         "CodingAgentTextStreamed"
         | "CodingAgentThoughtStreamed"
         | "CodingAgentToolCalled"
@@ -407,6 +420,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         | "ChangeSummarized"
         | "ChangeSetAside"
         | "ChangeBroughtBack"
+        | "ChangeWithdrawn"
+        | "ProposalWithheld"
         | "MergeResolutionStarted"
         | "MergeResolutionCleared" => EventClass::Metadata,
         // Phase 4 fan-in: parent's resume path renders this as the rich
@@ -445,7 +460,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // never read as needing the user. The three resolutions are Activity for
         // the same reason `UserQuestionAnswered` is: none of them opens a fresh
         // round of work. A delivery and an expiry resume the turn that parked,
-        // and the delivery's own `UserPromptInjected` is the Start event that
+        // and the delivery's own `PromptInjected` is the Start event that
         // opens the woken turn; a cancel resumes nothing at all.
         //
         // Not the same axis as how the transcript GROUPS them. This class drives
@@ -499,6 +514,9 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ThreadArchived",
         "ThreadArchiveRequested",
         "ThreadUnarchived",
+        "ThreadReadRequested",
+        "ThreadReadNotRequested",
+        "ThreadReplySeen",
         "ThreadTriageProposed",
         "ThreadStarted",
         "ThreadDiscarded",
@@ -512,13 +530,15 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ChangeReverted",
         "ChangeSetAside",
         "ChangeBroughtBack",
+        "ChangeWithdrawn",
+        "ProposalWithheld",
         "ChangeApplyFailed",
         "ChangeHardened",
         "ChangeSummarized",
         "MergeConflictDetected",
         "MergeResolutionStarted",
         "MergeResolutionCleared",
-        "UserPromptInjected",
+        "PromptInjected",
         "CredentialRequested",
         "PluginInstallRequested",
         "PluginUninstallRequested",
@@ -545,6 +565,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         // Background-bash lifecycle (run_bash_background trio).
         "BackgroundBashStarted",
         "BackgroundBashCompleted",
+        "OwnerApprovalRequested",
+        "OwnerApprovalSpent",
         // Engine-internal Flash enrichment for MessageReceived images.
         "ImageDescribed",
         // The cached older-turn summary. Persisted because the event IS the
@@ -578,6 +600,11 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "SideQuestionAnswered",
         "SideQuestionFailed",
         "SideQuestionDismissed",
+        // Widgets. Persisted so the shelf and the thread's widget cards survive
+        // a reload and show on every device (ADRs 0402, 0407).
+        "WidgetShown",
+        "WidgetPinned",
+        "WidgetUnpinned",
     ]
 }
 
@@ -712,6 +739,17 @@ pub fn resolve_transition(
             ThreadType::CodingAgent => to_inbox,
             ThreadType::Chat => violation("ChangeBroughtBack is coding-agent-only"),
         },
+        // A withdrawn change hands its work back to the thread, so the thread
+        // surfaces where its Continue lives (ADR 0400).
+        "ChangeWithdrawn" => match thread_type {
+            ThreadType::CodingAgent => to_inbox,
+            ThreadType::Chat => violation("ChangeWithdrawn is coding-agent-only"),
+        },
+        // Withheld work rides the turn end, whose own events place the thread.
+        "ProposalWithheld" => match thread_type {
+            ThreadType::CodingAgent => no_change,
+            ThreadType::Chat => violation("ProposalWithheld is coding-agent-only"),
+        },
         // UserQuestionAsked surfaces the thread in REVIEW so the user sees the
         // question card and the action buttons. Raised by CC's
         // `AskUserQuestion` tool AND by the chat agent's `ask_user_question`
@@ -789,6 +827,9 @@ pub fn resolve_transition(
         | "ThreadTitleRenamed"
         | "ThreadUnsaved"
         | "ThreadArchiveRequested"
+        | "ThreadReadRequested"
+        | "ThreadReadNotRequested"
+        | "ThreadReplySeen"
         | "ThreadTriageProposed"
         | "TriggerStarted"
         | "TriggerCompleted"
@@ -800,7 +841,7 @@ pub fn resolve_transition(
         | "MergeConflictDetected"
         | "MergeResolutionStarted"
         | "MergeResolutionCleared"
-        | "UserPromptInjected"
+        | "PromptInjected"
         | "CredentialRequested"
         | "PluginInstallRequested"
         | "PluginUninstallRequested"
@@ -858,6 +899,11 @@ pub fn resolve_transition(
         // thread for no user-visible reason.
         | "BackgroundBashStarted"
         | "BackgroundBashCompleted"
+        // An owner approval's request and spend (ADR 0387). Legal on both
+        // thread types, since the gate is shared. No section change: the
+        // card and the act each make their own.
+        | "OwnerApprovalRequested"
+        | "OwnerApprovalSpent"
         // Engine-internal Flash enrichment of a prior MessageReceived's
         // attached images. Emitted one or more iterations after the
         // originating MessageReceived (which already moved the section);
@@ -916,7 +962,11 @@ pub fn resolve_transition(
         | "SideQuestionAsked"
         | "SideQuestionAnswered"
         | "SideQuestionFailed"
-        | "SideQuestionDismissed" => no_change,
+        | "SideQuestionDismissed"
+        // A widget card or chip is display bookkeeping (ADRs 0402, 0407).
+        | "WidgetShown"
+        | "WidgetPinned"
+        | "WidgetUnpinned" => no_change,
         _ => violation("Unknown event type"),
     }?;
 
@@ -1052,14 +1102,148 @@ pub fn is_blocking(
     has_pending_changes: bool,
     is_external_repo: bool,
 ) -> bool {
+    // A held idle proposal is not counted here, so no ancestor count carries
+    // it. The family gate still refuses its cascade (ADR 0395).
     own_blocker(
         thread_type,
         status,
         archive_state,
-        has_pending_changes,
+        if has_pending_changes {
+            ChangeWork::Proposed
+        } else {
+            ChangeWork::None
+        },
         is_external_repo,
     )
     .is_some()
+}
+
+/// The coarse half of [`CodingAgentChangeState`]: the value stored in
+/// `thread_summaries.coding_agent_change_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeStateKind {
+    None,
+    Unproposed,
+    Proposed,
+}
+
+impl ChangeStateKind {
+    pub const ALL: [Self; 3] = [Self::None, Self::Unproposed, Self::Proposed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unproposed => "unproposed",
+            Self::Proposed => "proposed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == value)
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for ChangeStateKind {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <&str as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <&str as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for ChangeStateKind {
+    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        let raw = <&str as sqlx::Decode<sqlx::Postgres>>::decode(value)?;
+        Self::parse(raw).ok_or_else(|| format!("unknown change state {raw:?}").into())
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Postgres> for ChangeStateKind {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <&str as sqlx::Encode<sqlx::Postgres>>::encode_by_ref(&self.as_str(), buf)
+    }
+}
+
+/// What a coding-agent thread's branch holds toward a change (ADR 0400).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodingAgentChangeState {
+    /// No work on the branch.
+    None,
+    /// Work on the branch that no change carries. `reason` says why the last
+    /// turn end withheld it, and is absent when no turn end did.
+    Unproposed { reason: Option<UnproposedReason> },
+    /// A pending change carries the work.
+    Proposed { requires_restart: bool },
+}
+
+impl CodingAgentChangeState {
+    pub fn kind(self) -> ChangeStateKind {
+        match self {
+            Self::None => ChangeStateKind::None,
+            Self::Unproposed { .. } => ChangeStateKind::Unproposed,
+            Self::Proposed { .. } => ChangeStateKind::Proposed,
+        }
+    }
+
+    pub fn is_proposed(self) -> bool {
+        self.kind() == ChangeStateKind::Proposed
+    }
+
+    /// From the three `thread_summaries` columns. Their `CHECK` constraints
+    /// admit only legal rows, so an unreadable kind reads as unproposed work:
+    /// the direction that never hides a branch's commits.
+    pub fn from_columns(kind: &str, reason: Option<&str>, requires_restart: bool) -> Self {
+        match ChangeStateKind::parse(kind) {
+            Some(ChangeStateKind::None) => Self::None,
+            Some(ChangeStateKind::Proposed) => Self::Proposed { requires_restart },
+            Some(ChangeStateKind::Unproposed) => Self::Unproposed {
+                reason: reason.and_then(UnproposedReason::parse),
+            },
+            None => {
+                crate::log!("[ThreadLifecycle] Unknown coding_agent_change_state {kind:?}");
+                Self::Unproposed { reason: None }
+            }
+        }
+    }
+}
+
+/// What a thread holds toward a change, for [`own_blocker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeWork {
+    None,
+    /// A change carries its branch work.
+    Proposed,
+    /// Its idle held the proposal while it waits on an event (ADR 0395): a
+    /// branch diff that no change carries yet.
+    Held,
+}
+
+impl ChangeWork {
+    pub const ALL: [Self; 3] = [Self::None, Self::Proposed, Self::Held];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Proposed => "proposed",
+            Self::Held => "held",
+        }
+    }
+
+    /// From the projection's change state and `live_event_wait_count > 0`.
+    pub fn of(change: ChangeStateKind, holds_live_wait: bool) -> Self {
+        match change {
+            ChangeStateKind::Proposed => Self::Proposed,
+            ChangeStateKind::Unproposed if holds_live_wait => Self::Held,
+            _ => Self::None,
+        }
+    }
 }
 
 /// Which of `is_blocking`'s clauses holds for one thread. Declaration order is
@@ -1069,16 +1253,25 @@ pub enum OwnBlocker {
     Running,
     Question,
     PendingChange,
+    /// The agent parked mid-work with an unproposed diff (ADR 0395). Stop
+    /// waiting proposes it.
+    HeldProposal,
 }
 
 impl OwnBlocker {
-    pub const ALL: [Self; 3] = [Self::Running, Self::Question, Self::PendingChange];
+    pub const ALL: [Self; 4] = [
+        Self::Running,
+        Self::Question,
+        Self::PendingChange,
+        Self::HeldProposal,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Question => "question",
             Self::PendingChange => "pending_change",
+            Self::HeldProposal => "held_proposal",
         }
     }
 }
@@ -1089,7 +1282,7 @@ pub fn own_blocker(
     thread_type: ThreadType,
     status: ThreadStatus,
     archive_state: ArchiveState,
-    has_pending_changes: bool,
+    change: ChangeWork,
     is_external_repo: bool,
 ) -> Option<OwnBlocker> {
     match status {
@@ -1097,11 +1290,17 @@ pub fn own_blocker(
         ThreadStatus::WaitingForUserAnswer => return Some(OwnBlocker::Question),
         _ => {}
     }
-    if archive_state == ArchiveState::Archived {
+    if archive_state == ArchiveState::Archived
+        || thread_type != ThreadType::CodingAgent
+        || is_external_repo
+    {
         return None;
     }
-    (has_pending_changes && thread_type == ThreadType::CodingAgent && !is_external_repo)
-        .then_some(OwnBlocker::PendingChange)
+    match change {
+        ChangeWork::None => None,
+        ChangeWork::Proposed => Some(OwnBlocker::PendingChange),
+        ChangeWork::Held => Some(OwnBlocker::HeldProposal),
+    }
 }
 
 /// Why Archive or Delete cannot run on a thread: the one reason the menu shows
@@ -1114,21 +1313,25 @@ pub enum Blocker {
     Running,
     Question,
     PendingChange,
+    HeldProposal,
     DescendantRunning,
     DescendantQuestion,
     DescendantPendingChange,
+    DescendantHeldProposal,
 }
 
 impl Blocker {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::None,
         Self::Home,
         Self::Running,
         Self::Question,
         Self::PendingChange,
+        Self::HeldProposal,
         Self::DescendantRunning,
         Self::DescendantQuestion,
         Self::DescendantPendingChange,
+        Self::DescendantHeldProposal,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -1138,9 +1341,11 @@ impl Blocker {
             Self::Running => "running",
             Self::Question => "question",
             Self::PendingChange => "pending_change",
+            Self::HeldProposal => "held_proposal",
             Self::DescendantRunning => "descendant_running",
             Self::DescendantQuestion => "descendant_question",
             Self::DescendantPendingChange => "descendant_pending_change",
+            Self::DescendantHeldProposal => "descendant_held_proposal",
         }
     }
 }
@@ -1171,9 +1376,11 @@ pub fn action_blocker(
         (Some(OwnBlocker::Running), _) => Blocker::Running,
         (Some(OwnBlocker::Question), _) => Blocker::Question,
         (Some(OwnBlocker::PendingChange), _) => Blocker::PendingChange,
+        (Some(OwnBlocker::HeldProposal), _) => Blocker::HeldProposal,
         (None, Some(OwnBlocker::Running)) => Blocker::DescendantRunning,
         (None, Some(OwnBlocker::Question)) => Blocker::DescendantQuestion,
         (None, Some(OwnBlocker::PendingChange)) => Blocker::DescendantPendingChange,
+        (None, Some(OwnBlocker::HeldProposal)) => Blocker::DescendantHeldProposal,
         (None, None) => Blocker::None,
     }
 }
@@ -1302,7 +1509,7 @@ pub fn is_attention_needing(
 ///
 /// Inputs and their seam:
 /// - `has_pending_changes` / `descendants_block_archive` — projection facts
-///   (`coding_agent_proposed`, `blocking_descendant_count > 0`).
+///   (`coding_agent_change_state = 'proposed'`, `blocking_descendant_count > 0`).
 /// - `has_unsent_draft` — `thread_summaries.compose_text`/`compose_images`
 ///   non-empty. DB-derivable, but the frontend feeds the live value from the
 ///   `composeDrafts` signal so the cascade doesn't lag the 250 ms compose
@@ -1417,7 +1624,7 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     "ChangeApplied",
     "ChangeDiscarded",
     "CodingAgentUserMessageSent",
-    "UserPromptInjected",
+    "PromptInjected",
     "TriggerCompleted",
     "UserQuestionAsked",
     "UserQuestionAnswered",
@@ -1460,7 +1667,7 @@ pub const MESSAGE_COUNT_EVENTS: &[&str] = &[
     "MessageReceived",
     "TriggerStarted",
     "CodingAgentUserMessageSent",
-    "UserPromptInjected",
+    "PromptInjected",
 ];
 
 /// Event types that park a thread on the user: each sets status
@@ -1485,10 +1692,10 @@ pub enum StatusRule {
 /// How an event changes CC flags in thread_summaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CcFlagRule {
-    /// Clear coding_agent_is_external_repo and coding_agent_has_diff. The
-    /// proposal flags follow the `changes` row the event resolves.
+    /// Clear coding_agent_is_external_repo and the branch work. A pending change
+    /// keeps the change state `proposed` until its `changes` row resolves.
     ClearAll,
-    /// Write a pending `changes` row, which sets coding_agent_proposed.
+    /// Write a pending `changes` row, which makes the change state `proposed`.
     SetChanges,
     /// Read CC flags from event payload (CodingAgentIdled).
     FromPayload,
@@ -1532,7 +1739,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // under an open question waits for the answer. The coarse rule model
         // cannot express that, as with `preserving_verdict`.
         (
-            "UserPromptInjected",
+            "PromptInjected",
             StatusTransition {
                 status: StatusRule::Set(ThreadStatus::Running),
                 cc_flags: CcFlagRule::None,
@@ -1566,8 +1773,8 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
-        // Response completed → idle. A pending change shows through
-        // `coding_agent_proposed`, never through the status.
+        // Response completed → idle. A pending change shows through the change
+        // state, never through the status.
         (
             "ResponseGenerated",
             StatusTransition {
@@ -1603,7 +1810,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // cause enum, on `AbortCause::promises_auto_resume()`.
         //
         // A pending change does not enter into it. The change surfaces through
-        // `coding_agent_proposed`, and the frontend ranks it against the verdict.
+        // the change state, and the frontend ranks it against the verdict.
         (
             "ResponseAborted",
             StatusTransition {
@@ -1743,7 +1950,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // registration happens mid-turn and the turn's own terminator decides
         // the status, while a resolution lands on a thread that is idle,
         // running something unrelated, or parked on a question. The delivery's
-        // wake sets Running through its own `UserPromptInjected`, which is
+        // wake sets Running through its own `PromptInjected`, which is
         // where that transition belongs, and it leaves a parked question alone.
         // A cancel leaves the thread exactly as it found it.
         //

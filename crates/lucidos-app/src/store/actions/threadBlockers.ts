@@ -7,7 +7,7 @@
  */
 
 import { actionBlocker, ownBlocker, OWN_BLOCKER_PRIORITY, type ArchiveState, type Blocker, type OwnBlocker } from '../../generated/thread-lifecycle';
-import type { ThreadState } from '../thread-events';
+import { threadChangeWork, type ThreadState } from '../thread-events';
 import { effectiveThreadStatus, getThreadDisplaySection, threadMap } from '../store';
 import { BLOCKER_REASON, blockedBySubThreads } from './blockerCopy';
 import { collectThreadFamily } from './threadFamily';
@@ -32,7 +32,7 @@ function threadOwnBlocker(thread: ThreadState, archiveState: ArchiveState): OwnB
     codingAgent ? 'claude_code' : 'chat',
     effectiveThreadStatus(thread),
     archiveState,
-    meta.codingAgentProposed ?? false,
+    threadChangeWork(meta),
     codingAgent && (meta.codingAgentKind === 'external' || meta.codingAgentIsExternalRepo),
   );
 }

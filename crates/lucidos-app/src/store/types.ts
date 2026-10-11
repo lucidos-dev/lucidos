@@ -358,6 +358,19 @@ type ResponseEventKind =
       removes: number;
     }
   | {
+      /** A widget shown at this point (`WidgetShown`, ADR 0407). Draws its
+       *  card: the bar over the widget's frame. Unpinning it from the shelf
+       *  leaves the card as it is. */
+      type: 'widget';
+      app_id: string;
+      /** The instance's *widget params* (ADR 0415). Absent means none. */
+      params?: Record<string, unknown>;
+      /** The instance's label. Absent means the widget's name. */
+      label?: string;
+      /** The `WidgetShown` event's id, where "Show in thread" lands. */
+      event_id?: string;
+    }
+  | {
       /** The thread subscribed to an *event wait* (`await_event`, ADR 0047).
        *  Rendered as an **event row** (`components/chat/EventRow.tsx`), the
        *  marker shared with an event wake, a child-thread callback and a
@@ -772,12 +785,38 @@ export interface KnownOAuthProviders {
  *  `reveal`. `on-ready` waits for the app's `lucidos.ui.ready()`. */
 export type AppReveal = 'on-load' | 'on-ready';
 
+/** What an app folder is (`engine::core::AppKind`). */
+export type AppKind = 'app' | 'widget';
+
 export interface App {
   id: string;
   name: string;
   description: string;
+  /** The app icon: a path inside the app folder, sent only when it names a
+   *  usable image. Draw it through `AppIcon`. */
   icon?: string;
   reveal: AppReveal;
+  /** `widget` for a small answer on a thread's widget shelf (ADR 0402). The
+   *  apps list never holds one. */
+  kind: AppKind;
+  /** The thread a widget was made in. Absent for an app, and for a widget a
+   *  plugin ships. */
+  origin_thread_id?: string;
+  /** The plugin that ships a widget, instead of a thread (ADR 0414). */
+  origin_plugin_id?: string;
+  /** A reusable widget may be shown in any thread. False for an app. */
+  reusable: boolean;
+  /** The names a widget takes in its *widget params* (ADR 0415). Absent when
+   *  the manifest declares none. */
+  params?: Record<string, AppParam>;
+  /** A *built-in widget*: shipped with Lucidos and read-only (ADR 0415). */
+  built_in?: boolean;
+}
+
+/** One name a widget takes in its params (`engine::core::AppParam`). */
+export interface AppParam {
+  description: string;
+  required?: boolean;
 }
 
 // A pinned app entry
@@ -807,6 +846,25 @@ export interface InstalledPlugin {
   /** The installed version's `engine` requirement as authored. Absent when its
    *  manifest declares none. */
   engine_requirement?: string;
+  /** The installed copy of its *plugin media*, which outlives the marketplace. */
+  media: PluginMedia;
+}
+
+/** One media entry the engine dropped, and the limit or rule it broke. */
+export interface MediaProblem {
+  path: string;
+  reason: string;
+}
+
+/** A plugin's *plugin media* as URLs on the media route (ADR 0414). The engine
+ *  owns every limit; the client draws what it is given. */
+export interface PluginMedia {
+  /** The plugin icon, or its single app's icon. Absent: the monogram tile. */
+  icon_url?: string;
+  screenshots: string[];
+  videos: string[];
+  readme_url?: string;
+  problems: MediaProblem[];
 }
 
 
@@ -1062,6 +1120,8 @@ export interface MarketplacePlugin {
   /** The engine's own words for why ("Needs Lucidos 0.46.1 or later"). Set
    *  only when `engine_compatible` is false. */
   engine_incompatible_reason?: string;
+  /** This version's *plugin media*, from the scan's cache. */
+  media: PluginMedia;
 }
 
 export interface MarketplaceScanError {

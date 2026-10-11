@@ -23,10 +23,10 @@ and applies to any choice of client technology, protocol or format.
 Both halves are usually claimable, so the headline is shorthand for one
 distinction: **ramps in, never rooms.**
 
-A **ramp** reaches out to where the user already is and leads back in: a
-notification rendered by the OS, a share sheet, a widget showing what a trigger
-found, a link in an email, a data source pulled from somebody's cloud, an app
-downloaded from a store. It holds no state and its whole payload is a way in.
+A **ramp** reaches out to where the user already is and leads back in: an OS
+notification, a share sheet, a home-screen widget showing what a trigger
+found, an email link, a cloud data source, a store app. It holds no state and
+its whole payload is a way in.
 Ramps are good and we want more of them.
 
 A **room** is somewhere the user works *instead* of coming here: the transcript
@@ -65,7 +65,7 @@ first: chat-platform bridges as *the interface*, and hosting one of our agents
 agent protocol.
 
 Not ruled out, for contrast: notifications that link back in, presence surfaces
-in somebody else's shell (a widget, a share-sheet entry) that show state and
+in somebody else's shell (a home-screen widget, a share-sheet entry) that show state and
 hand off in, more clients reaching the same workspace, consuming third-party
 capability (MCP servers, provider APIs), and a `lucidos://` scheme (it points at
 our own client, so the test does not decide it either way; as *the* deep-link

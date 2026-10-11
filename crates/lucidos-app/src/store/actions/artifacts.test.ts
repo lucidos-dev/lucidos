@@ -163,7 +163,7 @@ describe('openFilePreview clears the previous file line state', () => {
     const { selectedLines, lineScrollTarget } = await import('../store');
     const { openFilePreview } = await import('./artifacts');
     selectedLines.value = { start: 5, end: 10 };
-    lineScrollTarget.value = 5;
+    lineScrollTarget.value = { path: 'artifacts/notes.md', line: 5 };
 
     openFilePreview('artifacts/other.md');
 
@@ -171,11 +171,21 @@ describe('openFilePreview clears the previous file line state', () => {
     expect(lineScrollTarget.value).toBeNull();
   });
 
+  it('drops a find request no bar took, so it cannot open on a later visit', async () => {
+    const { findRequest } = await import('../store');
+    const { openFilePreview } = await import('./artifacts');
+    findRequest.value = { scope: 'file:artifacts/notes.md', query: 'apple', line: 3 };
+
+    openFilePreview('artifacts/other.md');
+
+    expect(findRequest.value).toBeNull();
+  });
+
   it('drops them on the reload restore path too', async () => {
     const { selectedLines, lineScrollTarget } = await import('../store');
     const { openFilePreview } = await import('./artifacts');
     selectedLines.value = { start: 5, end: 10 };
-    lineScrollTarget.value = 5;
+    lineScrollTarget.value = { path: 'artifacts/notes.md', line: 5 };
 
     openFilePreview('artifacts/other.md', { preserveSource: true });
 

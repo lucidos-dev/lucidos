@@ -1,4 +1,4 @@
-/* GENERATED from packages/lucidos-sdk/src/previewFind/ by previewFind.build.mjs.
+/* GENERATED from packages/lucidos-sdk/src/previewFind/previewFind.ts by previewBundles.build.mjs.
    Do not edit: run `npm run build` in packages/lucidos-sdk. */
 "use strict";
 var __lucidosPreviewFind = (() => {
@@ -29,7 +29,7 @@ var __lucidosPreviewFind = (() => {
   // src/find.ts
   var ALL_HIGHLIGHT = "lucidos-find";
   var CURRENT_HIGHLIGHT = "lucidos-find-current";
-  var MAX_FIND_MATCHES = 2e3;
+  var MAX_FIND_MATCHES = 500;
   var SKIPPED_TAGS = /* @__PURE__ */ new Set([
     "SCRIPT",
     "STYLE",
@@ -175,10 +175,15 @@ var __lucidosPreviewFind = (() => {
   function highlightApiPresent() {
     return typeof CSS !== "undefined" && "highlights" in CSS && typeof Highlight === "function";
   }
-  function firstInView(ranges, root) {
-    const top = Math.max(0, root.getBoundingClientRect().top);
+  function firstInView(ranges, root, band) {
+    const top = Math.max(0, root.getBoundingClientRect().top, band?.top ?? 0);
     const index = ranges.findIndex((r) => r.getBoundingClientRect().bottom >= top);
     return index === -1 ? 0 : index;
+  }
+  function firstFrom(ranges, from) {
+    const at = from.ownerDocument.createRange();
+    at.setStartBefore(from);
+    return ranges.findIndex((r) => r.compareBoundaryPoints(Range.START_TO_START, at) >= 0);
   }
   function scrolls(el) {
     const style = getComputedStyle(el);
@@ -189,16 +194,24 @@ var __lucidosPreviewFind = (() => {
     const visible = spanStart >= boxStart && spanStart + spanSize <= boxStart + boxSize;
     return visible ? 0 : spanStart - boxStart - (boxSize - spanSize) / 2;
   }
-  function revealRange(range) {
+  function clipToBand(start, end, band) {
+    if (!band) return [start, end];
+    const top = Math.max(start, band.top);
+    const bottom = Math.min(end, band.bottom);
+    return bottom > top ? [top, bottom] : [start, end];
+  }
+  function revealRange(range, band) {
     for (let el = range.startContainer.parentElement; el && el !== document.documentElement; el = el.parentElement) {
       if (!scrolls(el)) continue;
       const box = el.getBoundingClientRect();
       const r2 = range.getBoundingClientRect();
-      el.scrollTop += centring(r2.top, r2.height, box.top, box.height);
+      const [top2, bottom2] = clipToBand(box.top, box.bottom, band);
+      el.scrollTop += centring(r2.top, r2.height, top2, bottom2 - top2);
       el.scrollLeft += centring(r2.left, r2.width, box.left, box.width);
     }
     const r = range.getBoundingClientRect();
-    const dy = centring(r.top, r.height, 0, window.innerHeight);
+    const [top, bottom] = clipToBand(0, window.innerHeight, band);
+    const dy = centring(r.top, r.height, top, bottom - top);
     const dx = centring(r.left, r.width, 0, window.innerWidth);
     if (dx || dy) window.scrollBy(dx, dy);
   }
@@ -235,7 +248,7 @@ var __lucidosPreviewFind = (() => {
       }
     };
   }
-  function createFinder(root, painter) {
+  function createFinder(root, painter, band) {
     let session = null;
     const none = { total: 0, current: 0, capped: false };
     const clear = () => {
@@ -244,7 +257,7 @@ var __lucidosPreviewFind = (() => {
     };
     return {
       clear,
-      find(query, step) {
+      find(query, step, from) {
         const pattern = queryPattern(query);
         const el = root();
         if (!pattern || !el) {
@@ -256,13 +269,16 @@ var __lucidosPreviewFind = (() => {
         const capped = spans.length > MAX_FIND_MATCHES;
         const ranges = spans.slice(0, MAX_FIND_MATCHES).map((s) => spanToRange(page, s));
         const total = ranges.length;
+        const uncovered = band?.();
         let current;
-        if (session?.query !== query) current = firstInView(ranges, el);
+        const start = from ? firstFrom(ranges, from) : -1;
+        if (start !== -1) current = start;
+        else if (from || session?.query !== query) current = firstInView(ranges, el, uncovered);
         else if (step) current = stepIndex(session.current, step, total);
         else current = Math.min(session.current, Math.max(total - 1, 0));
         session = { query, current };
         painter.paint(ranges, total > 0 ? current : -1);
-        if (total > 0) revealRange(ranges[current]);
+        if (total > 0) revealRange(ranges[current], uncovered);
         return { total, current: total > 0 ? current + 1 : 0, capped };
       }
     };

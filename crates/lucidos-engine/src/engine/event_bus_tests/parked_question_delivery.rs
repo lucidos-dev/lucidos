@@ -15,6 +15,7 @@ async fn emit_question(bus: &EventBus, thread_id: Uuid) {
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),
@@ -29,7 +30,7 @@ async fn emit_question(bus: &EventBus, thread_id: Uuid) {
 async fn emit_delivery_anchor(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::UserPromptInjected {
+        event: ThreadEvent::PromptInjected {
             text: "An event you subscribed to has arrived".into(),
             mode: ActorMode::Agent,
             origin: None,

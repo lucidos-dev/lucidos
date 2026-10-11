@@ -73,7 +73,7 @@ test.describe('Chat - send and receive messages', () => {
    * msg2 to land mid-turn. Detection of "mid-tool-call" polls the events
    * API for CodingAgentToolCalled — deterministic, not a fixed timer.
    */
-  test('mid-turn user message reaches CC during active tool calls', async ({ page }) => {
+  test('mid-turn user message reaches CC during active tool calls', { tag: '@real-claude-code' }, async ({ page }) => {
     test.setTimeout(180_000);
 
     await navigateToApp(page);

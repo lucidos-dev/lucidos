@@ -18,7 +18,7 @@ pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 echo "test: --check validates the resource contract and exits 0"
 out="$("$BUILD_HEADLESS" --check 2>&1)"; rc=$?
 if [ $rc -eq 0 ]; then pass "--check exits 0"; else fail "--check exited $rc: $out"; fi
-for name in lucidos-engine lucidos-gateway frontend postgres sdk system-knowhow; do
+for name in lucidos-engine lucidos-gateway frontend postgres sdk system-knowhow system-widgets; do
     if echo "$out" | grep -q "$name"; then pass "mentions $name"; else fail "missing $name from --check: $out"; fi
 done
 # The `lucidos` CLI is a distinct bundled resource — assert the space-delimited

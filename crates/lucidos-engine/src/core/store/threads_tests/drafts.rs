@@ -5,6 +5,7 @@
 use super::super::*;
 use super::test_helpers::*;
 use crate::core::store::EventStore;
+use crate::engine::thread_lifecycle::ChangeStateKind;
 
 const WS: &str = "myws";
 
@@ -42,13 +43,16 @@ fn no_images() -> serde_json::Value {
     serde_json::json!([])
 }
 
-fn filters(has_draft: Option<bool>, has_diff: Option<bool>) -> ThreadSummaryFilters<'static> {
+fn filters(
+    has_draft: Option<bool>,
+    change_state: Option<ChangeStateKind>,
+) -> ThreadSummaryFilters<'static> {
     ThreadSummaryFilters {
         status: StatusFilter::Any,
         sources: None,
         parent: None,
         has_draft,
-        has_diff,
+        change_state,
         limit: 1000,
     }
 }
@@ -239,29 +243,49 @@ async fn list_rows_carry_the_draft_and_the_filter_selects_on_it() {
     teardown_test_db(&db).await;
 }
 
+/// Each change state selects exactly its own thread, and the count agrees.
 #[tokio::test]
-async fn the_diff_filter_selects_on_the_git_fact() {
+async fn the_change_state_filter_selects_on_the_projected_state() {
+    use crate::engine::thread_lifecycle::CodingAgentChangeState;
+    use crate::test_support::seed_change_state;
+
     let (pool, db) = setup_test_db().await;
     let store = EventStore::new(pool.clone());
-    let with_diff = insert_draft_thread(&pool, "Diff", "", no_images(), None).await;
-    let _without = insert_draft_thread(&pool, "Clean", "", no_images(), None).await;
-    sqlx::query("UPDATE thread_summaries SET coding_agent_has_diff = TRUE WHERE thread_id = $1")
-        .bind(with_diff)
-        .execute(&pool)
-        .await
-        .expect("mark diff");
+    let none = insert_draft_thread(&pool, "Clean", "", no_images(), None).await;
+    let unproposed = insert_draft_thread(&pool, "Work", "", no_images(), None).await;
+    let proposed = insert_draft_thread(&pool, "Change", "", no_images(), None).await;
+    seed_change_state(
+        &pool,
+        unproposed,
+        CodingAgentChangeState::Unproposed { reason: None },
+    )
+    .await;
+    seed_change_state(
+        &pool,
+        proposed,
+        CodingAgentChangeState::Proposed {
+            requires_restart: false,
+        },
+    )
+    .await;
 
-    let rows = store
-        .list_thread_summaries(filters(None, Some(true)))
-        .await
-        .expect("list");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].thread_id, with_diff.to_string());
-    let rest = store
-        .count_thread_summaries(filters(None, Some(false)))
-        .await
-        .expect("count");
-    assert_eq!(rest, 1);
+    for (kind, expected) in [
+        (ChangeStateKind::None, none),
+        (ChangeStateKind::Unproposed, unproposed),
+        (ChangeStateKind::Proposed, proposed),
+    ] {
+        let rows = store
+            .list_thread_summaries(filters(None, Some(kind)))
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1, "{kind:?}");
+        assert_eq!(rows[0].thread_id, expected.to_string(), "{kind:?}");
+        let count = store
+            .count_thread_summaries(filters(None, Some(kind)))
+            .await
+            .expect("count");
+        assert_eq!(count, 1, "{kind:?}: the count must agree with the rows");
+    }
 
     pool.close().await;
     teardown_test_db(&db).await;

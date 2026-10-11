@@ -1,5 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'preact/hooks';
-import { filePreviewRevision, filePreviewSource, filePreviewWrap, filePreviewEditing, handshakeScriptsVersion, showToast, removeToast } from '../../store/store';
+import { filePreviewRevision, filePreviewWrap, handshakeScriptsVersion, showToast, removeToast } from '../../store/store';
+import { usePreviewViewState } from './previewViewState';
 import { lucidos } from '@lucidos/sdk';
 import { MarkdownDocument } from './MarkdownDocument';
 import { highlightFileLines } from '../../utils/syntaxHighlight';
@@ -187,7 +188,7 @@ interface Props {
   /** Skip mounting in the inactive dual-rendered layout — otherwise both
    *  SplitLayout and MobileSwipeContainer copies fetch and decode the file. */
   layout: 'desktop' | 'mobile';
-  /** Rendered in the app-facing preview modal rather than the content pane.
+  /** Rendered in the file preview modal rather than the content pane.
    *  The modal has no header Refresh, so it takes no part in the pane's. */
   modal?: boolean;
 }
@@ -197,9 +198,10 @@ export function FilePreviewInline({ path, layout, modal = false }: Props) {
   const stamp = filePreviewRevision.value;
   const url = previewUrl(lucidos.data.url(path), path, stamp);
   const revision = stamp && stamp.path === path ? stamp.rev : 0;
+  const view = usePreviewViewState();
   const body = dataPreviewBody(path, {
-    sourceToggle: filePreviewSource.value,
-    editing: filePreviewEditing.value,
+    sourceToggle: view.source.value,
+    editing: view.editing.value,
   });
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   // Nothing to refresh under the editor: a re-read would fight the draft.
@@ -342,7 +344,7 @@ export function EditorToolbar({ dirty, saving, showSaving, onClose, onCancel, on
 
 /** Inline editor for a text data file. Fetches the current raw content, lets
  *  the user edit it in a textarea, and writes it back via PUT /api/v1/data.
- *  Mounted by FilePreviewInline only while `filePreviewEditing` is on for an
+ *  Mounted by FilePreviewInline only while the preview's `editing` is on for an
  *  editable path. Save/Cancel/Close live here (not in the header) so the
  *  draft state stays local to the editor.
  *
@@ -413,7 +415,8 @@ function FileEditor({ path, url }: { path: string; url: string }) {
     }
   };
 
-  const leaveEditMode = () => { filePreviewEditing.value = false; };
+  const { editing } = usePreviewViewState();
+  const leaveEditMode = () => { editing.value = false; };
 
   return (
     <LoadingFade class="file-preview-fade" showSkeleton={showLoading} skeleton={<FileSourceSkeleton wideLines="wrap" />}>
@@ -593,8 +596,9 @@ function HtmlPreviewFrame({ content, url, path, withCapability, modal }: {
   // Keyed on the base, not the URL: the URL's revision stamp changes on every
   // refresh, and an unchanged document must not reload and lose its scroll.
   const baseHref = previewBaseHref(url);
+  const paneSwipe = viewportIsMobile.value && !modal;
   const { srcDoc, nonce } = useMemo(() => {
-    const bridge = previewBridgeConfig(bindings);
+    const bridge = previewBridgeConfig(bindings, paneSwipe);
     // The latest pass, peeked: a renewal must not rebuild the document. It
     // reaches the live one over the bridge instead.
     const base = withPreviewCapability(baseHref, withCapability ? peekArtifactPreviewCapability() : null);
@@ -602,7 +606,7 @@ function HtmlPreviewFrame({ content, url, path, withCapability, modal }: {
       nonce: bridge.nonce,
       srcDoc: withPreviewBridge(withPreviewBase(withPreviewSizing(content, scale), base), bridge),
     };
-  }, [content, baseHref, withCapability, scale, bindingsKey]);
+  }, [content, baseHref, withCapability, scale, bindingsKey, paneSwipe]);
 
   const frameRef = useRef<HTMLIFrameElement>(null);
   // A layout effect, so the listener is in place in the commit's own task,

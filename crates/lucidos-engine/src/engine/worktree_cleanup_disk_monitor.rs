@@ -258,6 +258,6 @@ fn worktree_footprint_bytes(workspace_root: &Path) -> u64 {
                 .and_then(parse_thread_short)
                 .is_some()
         })
-        .map(|entry| directory_size_bytes(&entry.path()))
+        .map(|entry| walk_directory_size_bytes(&entry.path()))
         .fold(0, u64::saturating_add)
 }

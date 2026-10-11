@@ -1,7 +1,7 @@
 /**
  * The memory module is chosen on Settings → System → Memory (ADR 0362).
  *
- * Tree costs money, so the first time its button opens a confirm panel with a
+ * Tree costs money, so the first time its button opens a confirm modal with a
  * cost estimate and the compactor model; only Start writes `memory_module`.
  * Once Tree is on, a progress bar follows the backfill to Ready over SSE, and
  * the Classic inspector steps aside. Coming back to Tree later needs no second
@@ -54,9 +54,14 @@ async function resetToClassic(page: Page): Promise<void> {
 
 const BACKFILL_READ = '**/api/v1/memory/tree-backfill';
 
+// Once `sw.js` controls the page, it sends the backfill read itself, and
+// `page.route` never sees it. The stub below then misses, and a workspace that
+// built trees skips the confirm modal.
+test.use({ serviceWorkers: 'block' });
+
 /** Read the backfill as never started: the state a workspace meets Tree in
- *  the first time. The three browser projects share one workspace, and an
- *  earlier project's backfill would otherwise skip the confirm panel. */
+ *  the first time. The start test builds trees in this workspace, so later
+ *  tests would otherwise skip the confirm modal. */
 async function readAsNeverStarted(page: Page): Promise<void> {
   await page.route(BACKFILL_READ, (route) => route.fulfill({ json: { state: 'off', started: false } }));
 }
@@ -200,7 +205,7 @@ test.describe('the memory module setting', () => {
     await expect(page.locator(COMPACTION_ROW)).toBeInViewport({ timeout: 10_000 });
   });
 
-  test('picking Sonnet 5.5 in the confirm panel prices it', async ({ page }) => {
+  test('picking Sonnet 5.5 in the confirm modal prices it', async ({ page }) => {
     await readAsNeverStarted(page);
     await openMemoryPage(page);
     await moduleButton(page, 'Tree').click();

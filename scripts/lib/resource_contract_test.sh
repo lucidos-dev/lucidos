@@ -47,7 +47,7 @@ scratch_check() {
 echo "test: the contract holds for the tree as committed"
 out="$(resource_contract_check "$DESKTOP_RS" 2>&1)"; rc=$?
 if [ $rc -eq 0 ]; then pass "check exits 0"; else fail "check exited $rc: $out"; fi
-for name in lucidos-engine lucidos-gateway frontend postgres sdk system-knowhow; do
+for name in lucidos-engine lucidos-gateway frontend postgres sdk system-knowhow system-widgets; do
     if echo "$out" | grep -q "$name"; then pass "names $name"; else fail "missing $name from: $out"; fi
 done
 # The `lucidos` CLI is a distinct resource, and a substring match cannot assert
@@ -56,10 +56,10 @@ done
 if echo "$out" | grep -qE '(^| )lucidos( |$)'; then pass "names the lucidos CLI"; else fail "missing the lucidos CLI from: $out"; fi
 
 echo ""
-echo "test: the three sources agree, and each names all seven"
-if [ "$(resource_contract_names | wc -l | tr -d ' ')" = "7" ]; then pass "seven staged resources"; else fail "expected seven staged resources"; fi
-if [ "$(resource_contract_runtime_required | wc -l | tr -d ' ')" = "7" ]; then pass "the headless launcher reaches seven"; else fail "headless launcher set is not seven: $(resource_contract_runtime_required | tr '\n' ' ')"; fi
-if [ "$(resource_contract_desktop_names "$DESKTOP_RS" | wc -l | tr -d ' ')" = "7" ]; then pass "the packaged launcher reaches seven"; else fail "desktop.rs set is not seven: $(resource_contract_desktop_names "$DESKTOP_RS" | tr '\n' ' ')"; fi
+echo "test: the three sources agree, and each names all eight"
+if [ "$(resource_contract_names | wc -l | tr -d ' ')" = "8" ]; then pass "eight staged resources"; else fail "expected eight staged resources"; fi
+if [ "$(resource_contract_runtime_required | wc -l | tr -d ' ')" = "8" ]; then pass "the headless launcher reaches eight"; else fail "headless launcher set is not eight: $(resource_contract_runtime_required | tr '\n' ' ')"; fi
+if [ "$(resource_contract_desktop_names "$DESKTOP_RS" | wc -l | tr -d ' ')" = "8" ]; then pass "the packaged launcher reaches eight"; else fail "desktop.rs set is not eight: $(resource_contract_desktop_names "$DESKTOP_RS" | tr '\n' ' ')"; fi
 
 echo ""
 echo "test: the Tauri resource map is derived, not restated"
@@ -70,8 +70,8 @@ for name in $(resource_contract_names); do
         *) fail "map is missing $name: $map" ;;
     esac
 done
-# One member per name, so the map cannot silently carry an eighth entry.
-if [ "$(printf '%s\n' "$map" | tr ',' '\n' | wc -l | tr -d ' ')" = "7" ]; then pass "map has exactly seven members"; else fail "map member count is wrong: $map"; fi
+# One member per name, so the map cannot silently carry a ninth entry.
+if [ "$(printf '%s\n' "$map" | tr ',' '\n' | wc -l | tr -d ' ')" = "8" ]; then pass "map has exactly eight members"; else fail "map member count is wrong: $map"; fi
 
 echo ""
 echo "test: every bundled executable is a staged resource"

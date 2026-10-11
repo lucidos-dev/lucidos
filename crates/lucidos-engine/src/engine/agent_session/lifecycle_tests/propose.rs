@@ -212,7 +212,14 @@ fn conflict_session_never_proposes_change_at_idle() {
     // Not external, not shutdown, conflict session: must refuse — even on a
     // Generated terminal, because the merge result is the original change.
     assert!(
-        idle_change_write(false, false, true, &Some(TerminalKind::Generated)).is_none(),
+        idle_change_write(
+            IdleSession {
+                is_conflict_session: true,
+                ..IdleSession::default()
+            },
+            &Some(TerminalKind::Generated)
+        )
+        .is_none(),
         "conflict-resolution sessions must NOT propose a phantom change at idle"
     );
 }
@@ -222,27 +229,50 @@ fn conflict_session_never_proposes_change_at_idle() {
 #[test]
 fn normal_generated_session_may_touch_change_state() {
     assert!(
-        idle_change_write(false, false, false, &Some(TerminalKind::Generated))
+        idle_change_write(IdleSession::default(), &Some(TerminalKind::Generated))
             == Some(IdleChangeWrite::Complete),
         "normal Generated session must reach the propose/reconcile branch"
     );
 }
 
-/// A `Generated` idle proposes immediately even though a background bash task
-/// may still be running. This is the deliberate reversal of the old bg-bash
-/// propose-gate: the 5-minute wait that gate imposed was worse than the rare
-/// wasted re-harden it prevented. Correctness is covered by harden-at-apply
-/// (un-hardened changes re-run `/harden` before they can merge); app/external
-/// changes skip `/harden` and accept the risk. The gate no longer takes a
-/// bg-bash parameter at all — this anchors that the decision is blind to
-/// background bash.
+/// A clean idle on a thread still holding an event wait proposes no new change.
+/// The agent parked mid-work, and the wait re-opens the thread for the idle
+/// that proposes. An open change still follows the branch, so a standing apply
+/// never fires on a stale row (ADR 0395).
 #[test]
-fn generated_proposes_regardless_of_background_bash() {
+fn a_live_event_wait_holds_the_clean_idle_to_a_resync() {
+    let waiting = IdleSession {
+        holds_live_wait: true,
+        ..IdleSession::default()
+    };
+    let write = idle_change_write(waiting, &Some(TerminalKind::Generated));
+    assert_eq!(write, Some(IdleChangeWrite::Resync));
     assert!(
-        idle_change_write(false, false, false, &Some(TerminalKind::Generated))
-            == Some(IdleChangeWrite::Complete),
-        "Generated idle with changes must propose immediately — background \
-         bash no longer gates the proposal (harden-at-apply is the net)"
+        !write.unwrap().may_create(),
+        "a held idle creates no change"
+    );
+    assert!(
+        idle_change_write(IdleSession::default(), &Some(TerminalKind::Generated))
+            .unwrap()
+            .may_create()
+    );
+}
+
+/// The hold covers finished-looking work only. A user Stop with a wait live is
+/// still unfinished, so its work is withheld and announced (ADR 0400).
+#[test]
+fn a_live_event_wait_does_not_hold_a_user_stop() {
+    use crate::engine::thread_events::CancelCause;
+    let waiting = IdleSession {
+        holds_live_wait: true,
+        ..IdleSession::default()
+    };
+    assert_eq!(
+        idle_change_write(
+            waiting,
+            &Some(TerminalKind::Canceled(CancelCause::UserStop))
+        ),
+        Some(IdleChangeWrite::Unfinished)
     );
 }
 
@@ -256,7 +286,7 @@ fn generated_proposes_regardless_of_background_bash() {
 /// existing pending row to zero when empty.
 #[test]
 fn gate_is_blind_to_whether_the_branch_has_a_diff() {
-    let clean_idle = idle_change_write(false, false, false, &Some(TerminalKind::Generated))
+    let clean_idle = idle_change_write(IdleSession::default(), &Some(TerminalKind::Generated))
         == Some(IdleChangeWrite::Complete);
     assert!(
         clean_idle,
@@ -267,7 +297,14 @@ fn gate_is_blind_to_whether_the_branch_has_a_diff() {
 #[test]
 fn external_repo_does_not_propose() {
     assert!(
-        idle_change_write(true, false, false, &Some(TerminalKind::Generated)).is_none(),
+        idle_change_write(
+            IdleSession {
+                is_external_repo: true,
+                ..IdleSession::default()
+            },
+            &Some(TerminalKind::Generated)
+        )
+        .is_none(),
         "external repos manage their own push/PR — no Lucidos change row"
     );
 }
@@ -275,69 +312,84 @@ fn external_repo_does_not_propose() {
 #[test]
 fn shutdown_does_not_propose() {
     assert!(
-        idle_change_write(false, true, false, &Some(TerminalKind::Generated)).is_none(),
+        idle_change_write(
+            IdleSession {
+                is_shutdown: true,
+                ..IdleSession::default()
+            },
+            &Some(TerminalKind::Generated)
+        )
+        .is_none(),
         "shutdown is mid-work, not a genuine idle — would create a spurious panel on resume"
     );
 }
 
-/// A failed terminal (CC error, empty Result, mid-stream API drop) does not
-/// propose. The user never ended that turn, so it is not surfaced for Apply.
-/// The work stays on the branch, and the user resumes or discards it.
+/// A failed terminal (CC error, empty Result, mid-stream API drop) is an
+/// unfinished turn. Its work stays on the branch, withheld and announced, and
+/// the user resumes or discards it (ADR 0400).
 #[test]
-fn failed_terminal_does_not_propose_at_idle() {
-    assert!(
-        idle_change_write(
-            false,
-            false,
-            false,
-            &Some(TerminalKind::Failed {
-                error: "stream interrupted".into(),
-            })
-        )
-        .is_none(),
-        "Failed terminal must NOT auto-propose"
+fn failed_terminal_withholds_at_idle() {
+    let write = idle_change_write(
+        IdleSession::default(),
+        &Some(TerminalKind::Failed {
+            error: "stream interrupted".into(),
+        }),
     );
+    assert_eq!(write, Some(IdleChangeWrite::Unfinished));
+    assert!(!write.unwrap().finished(), "a failed turn never proposes");
 }
 
-/// A user Stop proposes what the turn left, marked incomplete, so the work
-/// keeps an Apply and never drops off with an archive (ADR 0328). The other
-/// cancels propose nothing: a redirect's follow-up continues the branch, and
-/// an Apply or Discard stop owns the change itself.
+/// A user Stop withholds what the turn left: an unfinished turn never proposes
+/// (ADR 0400). The other cancels write nothing: a redirect's follow-up
+/// continues the branch, and an Apply or Discard stop owns the change itself.
 #[test]
-fn only_a_user_stop_proposes_a_cancelled_turn_and_as_incomplete() {
+fn only_a_user_stop_withholds_a_cancelled_turn() {
     use crate::engine::thread_events::CancelCause;
     let write =
-        |cause| idle_change_write(false, false, false, &Some(TerminalKind::Canceled(cause)));
+        |cause| idle_change_write(IdleSession::default(), &Some(TerminalKind::Canceled(cause)));
     assert_eq!(
         write(CancelCause::UserStop),
-        Some(IdleChangeWrite::Incomplete)
+        Some(IdleChangeWrite::Unfinished)
     );
     for cause in [
         CancelCause::SupersededByFollowup,
         CancelCause::UserAction,
         CancelCause::Unknown,
     ] {
-        assert_eq!(write(cause), None, "{cause:?} must not propose");
+        assert_eq!(write(cause), None, "{cause:?} must write nothing");
     }
 }
 
-/// Aborted terminal (engine shutdown) MUST NOT propose. The is_shutdown
-/// gate would already refuse, but pin the terminal-kind gate independently
-/// so the rule reads from one place instead of relying on two parallel
-/// checks staying in sync.
+/// An aborted terminal is unfinished, so its work is withheld. At engine
+/// shutdown the `is_shutdown` gate refuses first, and boot settles the turn.
 #[test]
-fn aborted_terminal_does_not_propose_at_idle() {
+fn aborted_terminal_withholds_unless_the_engine_is_shutting_down() {
     use crate::engine::thread_events::AbortCause;
-    assert!(
-        idle_change_write(
-            false,
-            false,
-            false,
-            &Some(TerminalKind::Aborted(AbortCause::EngineShutdown))
-        )
-        .is_none(),
-        "Aborted terminal must NOT auto-propose — engine-side, work preserved for recovery"
+    let aborted = Some(TerminalKind::Aborted(AbortCause::EngineShutdown));
+    assert_eq!(
+        idle_change_write(IdleSession::default(), &aborted),
+        Some(IdleChangeWrite::Unfinished)
     );
+    assert_eq!(
+        idle_change_write(
+            IdleSession {
+                is_shutdown: true,
+                ..IdleSession::default()
+            },
+            &aborted
+        ),
+        None,
+        "shutdown leaves the turn to boot recovery"
+    );
+}
+
+/// Only a finished turn proposes. A resync keeps an open change in step, and
+/// an unfinished turn proposes nothing at all.
+#[test]
+fn only_a_finished_write_proposes() {
+    assert!(IdleChangeWrite::Complete.finished());
+    assert!(IdleChangeWrite::Resync.finished());
+    assert!(!IdleChangeWrite::Unfinished.finished());
 }
 
 /// Safety-net abort sets terminal_kind = None (no terminal was emitted
@@ -351,7 +403,7 @@ fn aborted_terminal_does_not_propose_at_idle() {
 #[test]
 fn no_terminal_kind_does_not_propose_at_idle() {
     assert!(
-        idle_change_write(false, false, false, &None).is_none(),
+        idle_change_write(IdleSession::default(), &None).is_none(),
         "None terminal (safety-net abort) must NOT auto-propose"
     );
 }

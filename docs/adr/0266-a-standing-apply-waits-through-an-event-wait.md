@@ -47,7 +47,7 @@ an armed thread. So it would see the resolution event inside the gap every
 time, and merge the branch as the agent resumes.
 
 **The skip closes the gap without state.** `emit_resolution` writes the
-resolution, then at once a `UserPromptInjected` anchor. That anchor sets the
+resolution, then at once a `PromptInjected` anchor. That anchor sets the
 status to `running`, before any Thread Queue wait. So the next event the
 resolver sees after a skipped resolution already reads the true state. A cancel
 re-enters nothing, so it is not skipped, and the arm resolves on it.

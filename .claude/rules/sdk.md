@@ -31,4 +31,4 @@ paths:
 
 ## Tests
 
-`*.test.ts` next to source, run by Vitest from the workspace root. Pure functions only — no DOM-dependent SDK logic has tests today (see `scroll.test.ts` for the established style).
+`*.test.ts` next to source, run by Vitest from the workspace root. Test pure functions directly (`scroll.test.ts`). Test event-driven logic with fake events on an `EventTarget` (`paneSwipe.test.ts`).

@@ -7,9 +7,10 @@
 //! descendants because the archive cascade walks the whole family.
 //!
 //! **On whose behalf does it act?** Anything wider is the *workspace owner*'s
-//! button, and a thread may press one only while carrying their standing
-//! instruction (clauses 4 and 5). `api::standing_instruction` owns that answer,
-//! and this module refuses when neither half covers the act.
+//! button. A thread may press one while carrying their standing instruction
+//! (clauses 4 and 5, `api::standing_instruction`). It may also spend their
+//! *owner approval* for that one act (ADR 0387, `api::owner_approval`). This
+//! module refuses when none of the three covers the act.
 //!
 //! The gate is per VERB, never per route. Three verbs arrive by more than one
 //! path, and gating the first path of each is how the ungated set grew.
@@ -17,7 +18,7 @@
 //! **Messaging is reach, not authority.** A follow-up addresses a thread's own
 //! direct children, and the *home thread* may address any thread (ADR 0362).
 //! [`follow_up_reach`] answers that. It widens no clause-4 verb: the home
-//! thread still presses an owner button only on a standing instruction.
+//! thread presses an owner button only as any other thread does.
 //!
 //! **One thing here is still open, and it is recorded rather than left to be
 //! rediscovered** in `docs/plans/2026-08-30-a-thread-acts-in-its-own-subtree.md`.
@@ -35,7 +36,9 @@ use axum::http::{HeaderMap, StatusCode};
 use uuid::Uuid;
 
 use crate::api::actor::SubprocessOrigin;
+use crate::api::owner_approval::spend_owner_approval;
 use crate::api::standing_instruction::carries_standing_instruction;
+use crate::engine::event_bus::EventBus;
 
 /// Which clause-4 verb was attempted. Carried so the refusal and the log line
 /// name the verb instead of saying "this action": an agent reading "you cannot
@@ -44,8 +47,12 @@ use crate::api::standing_instruction::carries_standing_instruction;
 /// One variant per VERB, never per route. `Apply` covers the single change, the
 /// batch and a coding-agent thread's own apply alike. The authority question is
 /// the same one, and the caller reads the same sentence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThreadReachVerb {
+///
+/// It is also the wire name of the act an *owner approval card* proposes
+/// (ADR 0387), so a variant's kebab-case spelling is stored in events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThreadReachVerb {
     Archive,
     Cancel,
     /// Driving a live coding-agent session: interrupt it, or change its model or
@@ -103,7 +110,7 @@ impl ThreadReachVerb {
     ///
     /// [`Self::word`] needs a target to follow it, and two refusals have none:
     /// a verb aimed at the workspace root, and a caller with no subtree at all.
-    fn act(self) -> &'static str {
+    pub(crate) fn act(self) -> &'static str {
         match self {
             Self::Archive => "archiving a thread",
             Self::Cancel => "cancelling a turn",
@@ -120,6 +127,23 @@ impl ThreadReachVerb {
             Self::Continue => "restarting a turn",
             Self::CreateTopThread => "creating a top-thread",
         }
+    }
+
+    /// May an owner approval card propose this verb (ADR 0387)?
+    ///
+    /// Answering a question card and resolving a permission card are already
+    /// the owner's own answer, on screen. A card that authorized either would
+    /// put their voice on a card they never read.
+    pub(crate) fn proposable(self) -> bool {
+        !matches!(self, Self::AnswerQuestion | Self::ResolvePermission)
+    }
+
+    /// Does this verb aim at the workspace root rather than at a thread?
+    ///
+    /// Only creating a top-thread does. Every other verb an approval names
+    /// takes a target, so an unscoped cancel can never be approved.
+    pub(crate) fn aims_at_root(self) -> bool {
+        self == Self::CreateTopThread
     }
 }
 
@@ -159,9 +183,10 @@ pub(crate) enum ThreadReachError {
 /// workspace have none, so the old sentence sent the majority of callers to
 /// something with no row (ADR 0168 clause 1).
 const OWNERS_TO_PRESS: &str = "Anything wider than your own subtree is the workspace owner's \
-     to press, and a thread may press it only while carrying their standing \
-     instruction: a turn they opened, or a trigger firing they authorized. \
-     Report what you found and let the owner decide.";
+     to press. A thread may press it while carrying their standing instruction (a turn \
+     they opened, or a trigger firing they authorized), or with their owner approval for \
+     that one act. A coding agent asks for one with `lucidos ask-owner-approval <verb>`. \
+     Otherwise report what you found and let the owner decide.";
 
 impl ThreadReachError {
     /// HTTP status, beside the taxonomy so neither handler's mapping can drift
@@ -359,6 +384,30 @@ fn refuse_agent_always_allow(
     Ok(())
 }
 
+/// Refuse an agent changing a permission grant through Settings: a grant
+/// file, or an MCP server's auto-approve flag.
+///
+/// The same reasoning as [`refuse_agent_always_allow`]. These routes write the
+/// very grants that button writes, so an agent refused on the card must not
+/// reach them here (ADR 0362).
+pub(in crate::api) fn refuse_agent_permission_grant(
+    headers: &HeaderMap,
+) -> Result<(), super::error::ApiError> {
+    if matches!(
+        crate::api::actor::subprocess_origin(headers),
+        SubprocessOrigin::Subprocess { .. }
+    ) {
+        crate::log!("[ThreadReach] Refused: an agent wrote a permission grant");
+        return Err(super::error::ApiError::new(
+            StatusCode::FORBIDDEN,
+            "An agent cannot change a permission grant. It decides what every future \
+             session may do without asking, so only the workspace owner changes it, in \
+             Settings.",
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse an agent answering a permission card it has no authority for.
 ///
 /// Two checks, the widest grants first. No agent presses Always allow; a
@@ -370,7 +419,7 @@ fn refuse_agent_always_allow(
 /// `card_thread` is `None` for a card nothing is waiting on, and the route
 /// then answers its own 404.
 pub(in crate::api) async fn refuse_permission_answer(
-    pool: &sqlx::PgPool,
+    bus: &EventBus,
     headers: &HeaderMap,
     card_thread: Option<Uuid>,
     allowed: bool,
@@ -383,7 +432,7 @@ pub(in crate::api) async fn refuse_permission_answer(
         return Ok(());
     };
     refuse_without_authority(
-        pool,
+        bus,
         headers,
         Some(thread),
         ThreadReachVerb::ResolvePermission,
@@ -421,7 +470,7 @@ pub(in crate::api) async fn refuse_permission_answer(
 /// caller holding one of the other three credentials. Each names a device or
 /// the machine rather than a thread, so none has a reach to weigh.
 pub(in crate::api) async fn refuse_without_authority(
-    pool: &sqlx::PgPool,
+    bus: &EventBus,
     headers: &HeaderMap,
     target: Option<Uuid>,
     verb: ThreadReachVerb,
@@ -435,7 +484,7 @@ pub(in crate::api) async fn refuse_without_authority(
         return Ok(());
     };
     weigh_authority(
-        pool,
+        bus,
         source_thread_id,
         emitting_trigger_id.as_deref(),
         target,
@@ -455,40 +504,83 @@ pub(in crate::api) async fn refuse_without_authority(
 /// of its own. A tool call always has one, and a trigger thread's own turn
 /// carries the firing already.
 pub(crate) async fn refuse_thread_without_authority(
-    pool: &sqlx::PgPool,
+    bus: &EventBus,
     caller_thread_id: Uuid,
     target: Option<Uuid>,
     verb: ThreadReachVerb,
 ) -> Result<(), ThreadReachError> {
-    weigh_authority(pool, Some(caller_thread_id), None, target, verb).await
+    weigh_authority(bus, Some(caller_thread_id), None, target, verb).await
 }
 
-/// The rule itself, over the two authenticated facts about the caller.
-async fn weigh_authority(
+/// Which authority of its own a caller holds for an act, before any *owner
+/// approval* is weighed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldAuthority {
+    /// The target is the caller or one of its descendants (clause 3).
+    OwnSubtree,
+    /// The caller carries the owner's standing instruction (clause 5).
+    StandingInstruction,
+}
+
+/// Clauses 3 and 5, over the two authenticated facts about the caller.
+///
+/// Shared by the gate and by the owner approval request route. That route
+/// refuses to ask the owner for an act the caller can already do.
+pub(crate) async fn authority_held(
     pool: &sqlx::PgPool,
+    source_thread_id: Option<Uuid>,
+    emitting_trigger_id: Option<&str>,
+    target: Option<Uuid>,
+) -> Result<Option<HeldAuthority>, ThreadReachError> {
+    // A threadless caller has no subtree, so it skips straight to the owner's
+    // question below.
+    if let (Some(caller), Some(target)) = (source_thread_id, target) {
+        if authorize_thread_reach(pool, caller, target).await? {
+            return Ok(Some(HeldAuthority::OwnSubtree));
+        }
+    }
+    if carries_standing_instruction(pool, source_thread_id, emitting_trigger_id).await {
+        return Ok(Some(HeldAuthority::StandingInstruction));
+    }
+    Ok(None)
+}
+
+/// The rule itself: the caller's own authority first, then an owner approval
+/// for exactly this act, which the check spends (ADR 0387).
+async fn weigh_authority(
+    bus: &EventBus,
     source_thread_id: Option<Uuid>,
     emitting_trigger_id: Option<&str>,
     target: Option<Uuid>,
     verb: ThreadReachVerb,
 ) -> Result<(), ThreadReachError> {
-    // Clause 3. A threadless caller has no subtree, so it skips straight to the
-    // owner's question below.
-    if let (Some(caller), Some(target)) = (source_thread_id, target) {
-        if authorize_thread_reach(pool, caller, target).await? {
+    match authority_held(bus.pool(), source_thread_id, emitting_trigger_id, target).await? {
+        Some(HeldAuthority::OwnSubtree) => return Ok(()),
+        Some(HeldAuthority::StandingInstruction) => {
+            crate::log!(
+                "[ThreadReach] Allowed on the owner's standing instruction: caller {:?} may {} {:?}",
+                source_thread_id,
+                verb.word(),
+                target
+            );
             return Ok(());
         }
+        None => {}
     }
 
-    // Clause 5. The act is wider than the caller's own authority, so the only
-    // thing that can carry it is the owner's standing instruction.
-    if carries_standing_instruction(pool, source_thread_id, emitting_trigger_id).await {
-        crate::log!(
-            "[ThreadReach] Allowed on the owner's standing instruction: caller {:?} may {} {:?}",
-            source_thread_id,
-            verb.word(),
-            target
-        );
-        return Ok(());
+    // An approval names one thread's act, so a threadless caller holds none.
+    // A proposable verb with no target is only ever one aimed at the root, so
+    // an unscoped cancel cannot match a card.
+    if let Some(caller) = source_thread_id {
+        if spend_owner_approval(bus, caller, verb, target).await {
+            crate::log!(
+                "[ThreadReach] Allowed on an owner approval: caller {} may {} {:?}",
+                caller,
+                verb.word(),
+                target
+            );
+            return Ok(());
+        }
     }
 
     crate::log!(

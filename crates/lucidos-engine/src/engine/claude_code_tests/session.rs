@@ -490,6 +490,64 @@ async fn stop_on_an_entry_no_loop_listens_to_takes_the_no_session_fallback() {
     );
 }
 
+/// Claude Code refuses `set_reasoning_effort`, so an effort change to a live
+/// Claude Code session is recorded for the next spawn and never sent. Codex
+/// takes it on its control channel. Either way a turn in flight runs on.
+#[test]
+fn an_effort_change_reaches_claude_code_at_its_next_spawn_and_codex_on_its_channel() {
+    use super::control::deliver_control_request;
+    use crate::runtime::{CodingAgent, ControlRequest, TakesEffect};
+
+    let effort = || ControlRequest::SetReasoningEffort {
+        effort: "low".into(),
+    };
+    for (agent, in_flight, sent, takes_effect) in [
+        (CodingAgent::ClaudeCode, true, false, TakesEffect::NextTurn),
+        (CodingAgent::ClaudeCode, false, false, TakesEffect::Now),
+        (CodingAgent::Codex, true, true, TakesEffect::NextTurn),
+        (CodingAgent::Codex, false, true, TakesEffect::Now),
+    ] {
+        let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = make_test_session(msg_tx, !in_flight);
+        session.coding_agent = agent;
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+        session.control_tx = control_tx;
+
+        let outcome = deliver_control_request(&mut session, effort());
+
+        let case = format!("{agent:?}, in flight: {in_flight}");
+        assert_eq!(outcome, Ok(takes_effect), "{case}");
+        assert_eq!(control_rx.try_recv().is_ok(), sent, "{case}");
+        assert_eq!(
+            session.current_reasoning_effort.as_deref(),
+            Some("low"),
+            "{case}: the next spawn reads the recorded effort"
+        );
+    }
+}
+
+/// Claude Code takes a model switch live, so it still goes down the channel.
+#[test]
+fn a_model_change_reaches_a_running_claude_code_turn() {
+    use super::control::deliver_control_request;
+    use crate::runtime::{ControlRequest, TakesEffect};
+
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session = make_test_session(msg_tx, false);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    session.control_tx = control_tx;
+
+    let request = ControlRequest::SetModel {
+        model: "haiku".into(),
+    };
+    assert_eq!(
+        deliver_control_request(&mut session, request),
+        Ok(TakesEffect::Now)
+    );
+    assert!(control_rx.try_recv().is_ok());
+    assert_eq!(session.current_model.as_deref(), Some("haiku"));
+}
+
 /// A stop request with no thread id reaches every session. One that a change
 /// claim holds must be refused like a single-thread stop, or a Discard deletes the
 /// branch that apply is merging. The others still stop.

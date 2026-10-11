@@ -3,14 +3,12 @@ use super::*;
 use crate::core::changes::ChangeStatus;
 use crate::engine::thread_lifecycle::ThreadStatus;
 
-/// Locks in the boolean-cluster split: `CodingAgentIdled` no longer sets
-/// `coding_agent_proposed`, even when its `has_changes` payload is true.
-/// `coding_agent_proposed` is set EXCLUSIVELY by `ChangeProposed`. The two
-/// events still ship together in the production CC lifecycle (idle, then
-/// the engine emits ChangeProposed), but the projection treats them as
-/// independent writes — which lets `coding_agent_has_diff` and
-/// `coding_agent_proposed` evolve along separate axes (mid-session commits
-/// vs. formal review-ready proposal).
+/// Locks in the split: `CodingAgentIdled` never makes a thread `proposed`,
+/// even when its `has_changes` payload is true. It records `unproposed` work;
+/// only a pending change, which `ChangeProposed` writes, makes it `proposed`.
+/// The production CC lifecycle ships the two together: the idle, then the
+/// engine's ChangeProposed. The projection treats them as independent writes:
+/// mid-session commits against a formal review-ready proposal.
 ///
 /// Without this, drift returns: an idle payload could imply "ready for
 /// review" without the engine actually emitting the formal proposal event,
@@ -43,63 +41,52 @@ async fn coding_agent_idled_does_not_set_proposed_until_change_proposed() {
     .await
     .unwrap();
 
-    // Asserts the SPLIT: CodingAgentIdled alone leaves `coding_agent_proposed`
-    // false (so Apply / Discard buttons don't appear), and the row stays at
+    // Asserts the SPLIT: CodingAgentIdled alone records unproposed work (so
+    // Apply / Discard buttons don't appear), and the row stays at
     // 'idle'. The is_external flag DOES flow through (it's a property of the
     // session binding, not a proposal-lifecycle signal).
-    let (status, proposed, requires_restart, is_external): (String, bool, bool, bool) =
-        sqlx::query_as(
-            "SELECT status, coding_agent_proposed, coding_agent_requires_restart, \
-             coding_agent_is_external_repo FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let (status, is_external): (String, bool) = sqlx::query_as(
+        "SELECT status, coding_agent_is_external_repo FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         status, "idle",
         "CodingAgentIdled alone must NOT promote to 'waiting'"
     );
-    assert!(
-        !proposed,
-        "CodingAgentIdled must NOT set coding_agent_proposed"
-    );
-    assert!(
-        !requires_restart,
-        "coding_agent_requires_restart must NOT come from CodingAgentIdled"
+    assert_eq!(
+        read_change_state(&pool, thread_id).await,
+        CodingAgentChangeState::Unproposed { reason: None },
+        "CodingAgentIdled records work, never a proposal or its restart flag"
     );
     assert!(!is_external, "is_external_repo=false in payload");
 
     // Step 2: ChangeProposed fires — the formal "ready for review" event.
     emit_change_proposed(&bus, thread_id, "claude-code/split", true).await;
 
-    // Now `coding_agent_proposed` is true; status stays 'idle' — a proposed
-    // change is an artifact for review, not a parked loop, so the row does
-    // not enter a special "waiting" state. The pending-review affordance
-    // surfaces via `coding_agent_proposed` (and `is_blocking` clause 3),
-    // not via status. `coding_agent_requires_restart` comes from THIS
-    // event's payload, not the prior CodingAgentIdled.
-    let (status, proposed, requires_restart, has_diff): (String, bool, bool, bool) =
-        sqlx::query_as(
-            "SELECT status, coding_agent_proposed, coding_agent_requires_restart, \
-             coding_agent_has_diff FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    // Now the thread is proposed; status stays 'idle': a proposed change is
+    // an artifact for review, not a parked loop. The pending-review
+    // affordance surfaces via the change state (and `is_blocking` clause 3),
+    // not via status. The restart flag comes from THIS event's payload, not
+    // the prior CodingAgentIdled.
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         status, "idle",
         "ChangeProposed keeps status='idle' (review is an artifact, not a parked loop)"
     );
-    assert!(proposed, "ChangeProposed sets coding_agent_proposed");
-    assert!(
-        requires_restart,
-        "coding_agent_requires_restart comes from the ChangeProposed payload"
-    );
-    assert!(
-        has_diff,
-        "ChangeProposed also seeds the git-truth has_diff signal"
+    assert_eq!(
+        read_change_state(&pool, thread_id).await,
+        CodingAgentChangeState::Proposed {
+            requires_restart: true
+        },
+        "the restart flag comes from the ChangeProposed payload"
     );
 
     pool.close().await;
@@ -168,7 +155,7 @@ async fn sse_thread_event_carries_aggregate() {
 
 /// CodingAgentIdled with has_changes=true (followed by the synthetic
 /// ChangeProposed emitted by `emit_cc_idle`) must set
-/// `coding_agent_proposed=true` and leave status at 'idle' — a proposed
+/// the proposed change state and leave status at 'idle' — a proposed
 /// change is an artifact for review, not a parked loop (Option B).
 #[tokio::test]
 async fn claude_code_idled_with_changes_sets_proposed_keeps_idle() {
@@ -180,7 +167,7 @@ async fn claude_code_idled_with_changes_sets_proposed_keeps_idle() {
     emit_cc_idle(&bus, thread_id, true, None).await;
 
     let (status, has_changes): (String, bool) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT status, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
@@ -227,12 +214,12 @@ async fn external_repo_idle_with_changes_never_shows_apply_discard() {
     .unwrap();
 
     // External-repo threads stay 'idle' under the split model — the runtime
-    // never emits ChangeProposed for external repos, and `coding_agent_proposed`
+    // never emits ChangeProposed for external repos, and the change state
     // is now ChangeProposed-driven. The is_external flag still flows from the
     // CodingAgentIdled payload. The "no Apply/Discard buttons" guarantee comes
     // from the absent ChangeProposed event (asserted below).
     let (status, has_changes, is_external): (String, bool, bool) = sqlx::query_as(
-            "SELECT status, coding_agent_proposed, coding_agent_is_external_repo FROM thread_summaries WHERE thread_id = $1"
+            "SELECT status, coding_agent_change_state = 'proposed', coding_agent_is_external_repo FROM thread_summaries WHERE thread_id = $1"
         ).bind(thread_id).fetch_one(&pool).await.unwrap();
     assert_eq!(
         status, "idle",
@@ -240,7 +227,7 @@ async fn external_repo_idle_with_changes_never_shows_apply_discard() {
     );
     assert!(
         !has_changes,
-        "no ChangeProposed → coding_agent_proposed stays false"
+        "no ChangeProposed → the thread stays unproposed"
     );
     assert!(
         is_external,
@@ -366,7 +353,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
 
     let (status, has_changes, requires_restart, is_external): (String, bool, bool, bool) =
         sqlx::query_as(
-            "SELECT status, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo \
+            "SELECT status, coding_agent_change_state = 'proposed', coding_agent_requires_restart, coding_agent_is_external_repo \
              FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -377,10 +364,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
         status, "idle",
         "After full apply cycle, thread must be idle"
     );
-    assert!(
-        !has_changes,
-        "coding_agent_proposed must be false after apply"
-    );
+    assert!(!has_changes, "the thread must not be proposed after apply");
     assert!(!requires_restart);
     assert!(!is_external);
 
@@ -742,7 +726,7 @@ async fn slow_path_change_applied_carries_stashed_apply_actor() {
 /// locks the two guarantees:
 ///   1. Only branch B's change is left pending — the orphan is gone, so the
 ///      frontend's `hasPendingChanges` no longer suppresses Archive.
-///   2. `coding_agent_proposed` is TRUE afterwards, because branch B's change
+///   2. the thread is proposed afterwards, because branch B's change
 ///      is still pending and the flag follows the pending rows.
 ///
 /// This is the exact stuck state from thread `a4d52fd0` — two pending change
@@ -828,9 +812,9 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
         "the stale branch-A change must be discarded"
     );
 
-    // Invariant 2: coding_agent_proposed reflects the NEW change (discard-before-propose).
+    // Invariant 2: the proposed state reflects the NEW change (discard-before-propose).
     let proposed: bool = sqlx::query_scalar(
-        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
@@ -838,7 +822,7 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
     .unwrap();
     assert!(
         proposed,
-        "coding_agent_proposed must be TRUE after a cross-branch propose: the new \
+        "the thread must be proposed after a cross-branch propose: the new \
          change is still pending"
     );
 
@@ -852,8 +836,8 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
 /// in the crate builds one outside `main.rs`), so — as with the merge-helper
 /// signature test — we pin the load-bearing property structurally: the sibling
 /// reconcile call must appear BEFORE the `ChangeProposed` emit. If a refactor
-/// reorders them, `ChangeDiscarded`'s `ClearAll` would wipe the
-/// `coding_agent_has_diff` flag the proposal just set, and the Diff button with it.
+/// reorders them, `ChangeDiscarded`'s `ClearAll` would wipe the change state
+/// the proposal just set, and the Diff button with it.
 #[test]
 fn propose_change_reconciles_stale_branches_before_change_proposed_emit() {
     let src = include_str!("../change_ops/propose.rs");
@@ -866,7 +850,7 @@ fn propose_change_reconciles_stale_branches_before_change_proposed_emit() {
     assert!(
         discard_pos < proposed_pos,
         "the sibling reconcile must run BEFORE the ChangeProposed emit: otherwise \
-         ChangeDiscarded's ClearAll wipes the coding_agent_has_diff flag this proposal sets. \
+         ChangeDiscarded's ClearAll wipes the change state this proposal sets. \
          See docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md"
     );
 }
@@ -925,15 +909,9 @@ fn apply_time_reconcile_lives_in_apply_change_gated_not_in_handler_or_emitter() 
 /// rebuild started, no building spinner, and a "Switch to new version" offering
 /// a binary older than the merge.
 ///
-/// A SECOND trigger site is not merely redundant, it re-breaks the feature:
-/// `trigger_background_rebuild` coalesces by aborting the in-flight build, so a
-/// duplicate throws away a compile that was already most of the way to the
-/// Switch and starts it over. It used to be worse. Until 2026-08-05 the
-/// replacement probed the checkout-shared build lock before the aborted task had
-/// dropped its guard, read `SkippedLocked`, fell back to `BuildState::Idle`, and
-/// left no build running at all. `trigger_background_rebuild` now awaits the
-/// superseded task first, so a duplicate site costs a rebuild instead of losing
-/// one entirely.
+/// One site keeps one decision. A second rebuild site only joins the build in
+/// flight (ADR 0412). A second re-snapshot site still supersedes the refresh
+/// in flight, and waits out the build-watch again.
 #[test]
 fn apply_time_dev_refresh_lives_only_on_the_shared_change_applied_emit() {
     let emitters = include_str!("../change_ops_emitters.rs");
@@ -958,11 +936,11 @@ fn apply_time_dev_refresh_lives_only_on_the_shared_change_applied_emit() {
         ("api/changes.rs", include_str!("../../api/changes.rs")),
     ] {
         assert!(
-            !src.contains("trigger_background_rebuild()")
+            !src.contains("join_or_start_background_rebuild()")
+                && !src.contains("restart_background_rebuild()")
                 && !src.contains("refresh_served_frontend_after_rebuild()"),
             "{label} must NOT trigger the rebuild / frontend re-snapshot directly. \
-             emit_change_applied owns it: a second trigger site aborts the in-flight \
-             build and starts the whole compile over."
+             emit_change_applied owns it, as the one emit every merge path performs."
         );
     }
 }
@@ -975,10 +953,8 @@ fn apply_time_dev_refresh_lives_only_on_the_shared_change_applied_emit() {
 /// pathology: the ~0.6s double-fire race, Apply-All retries, the
 /// conflict-recovery cleanup, and post-restart re-emits all hit it. `emit_or_log`
 /// throws that verdict away, so emitting through it and then refreshing
-/// unconditionally would let the DUPLICATE coalesce (abort) the rebuild the
-/// ACCEPTED emit just started — and the replacement can read `SkippedLocked` and
-/// fall back to `BuildState::Idle`, leaving no build running. That is the very
-/// symptom this funnel was added to fix, re-entered through another door.
+/// unconditionally would let the DUPLICATE supersede the frontend refresh the
+/// ACCEPTED emit just started, and join its rebuild for nothing.
 #[test]
 fn post_apply_refresh_runs_only_for_the_accepted_change_applied() {
     let emitters = include_str!("../change_ops_emitters.rs");

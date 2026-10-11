@@ -33,6 +33,11 @@ source "$WORKSPACE_LIB_DIR/docker.sh"
 # functions. What it buys is that a caller of workspace.sh alone still has it.
 # shellcheck source=scripts/lib/ports.sh
 source "$WORKSPACE_LIB_DIR/ports.sh"
+
+# The agent run marker (ADR 0391). A coding agent's turn-end sweep reaps every
+# process carrying its marker, so a daemon meant to outlive the launch is
+# exec'd without it. The engine pins this name to its own constant in a test.
+AGENT_RUN_ENV="LUCIDOS_AGENT_RUN"
 # For `proc_env_value`, which `engine_gateway_port` reads a running engine's own
 # environment with. Pure parsing, no host call, so sourcing it costs nothing.
 # shellcheck source=scripts/lib/proc_env.sh
@@ -40,6 +45,9 @@ source "$WORKSPACE_LIB_DIR/proc_env.sh"
 # The ports, names and paths this file shares with the Rust crates.
 # shellcheck source=scripts/lib/workspace_constants.sh
 source "$WORKSPACE_LIB_DIR/workspace_constants.sh"
+# For `prune_stale_debug_objects`, which every engine build runs (ADR 0408).
+# shellcheck source=scripts/lib/stale_objects.sh
+source "$WORKSPACE_LIB_DIR/stale_objects.sh"
 
 # ── path_is_in_cc_worktree ──────────────────────────────────────────────
 # True (exit 0) when $1 lies inside a coding-agent worktree — one of the
@@ -96,8 +104,9 @@ path_is_in_cc_worktree() {
 # 2026-07-26 incident, and no opt-in should be able to buy it.
 #
 # The e2e harness is unaffected: `scripts/lib/e2e.sh` calls `start_engine`
-# directly (legacy direct-engine model, ADR 0014) and never starts a gateway, so
-# it only ever hits the `stack` scope, where the opt-out applies.
+# directly (direct-engine model, ADR 0014), so it only ever hits the `stack`
+# scope, where the opt-out applies. Its own session gateway (ADR 0385) is
+# refused from a worktree before it starts.
 assert_stack_not_worktree_pinned() {
     local project_dir="$1"
     local scope="${2:-stack}"
@@ -1760,8 +1769,8 @@ publish_launch_binary() {
 # Delete publish temps left behind by a build that was KILLED mid-publish.
 #
 # `publish_launch_binary` removes its own temp on every failure it can observe,
-# but the engine SIGKILLs the whole build process group when a second Apply
-# supersedes a build (`engine_version::BuildProcessGroupGuard`), and no trap
+# but the engine SIGKILLs the whole build process group when an explicit Rebuild
+# restarts a build (`engine_version::BuildProcessGroupGuard`), and no trap
 # catches SIGKILL. A kill landing inside the copy/sign window therefore strands
 # a `*.tmp.<pid>` that nothing ever collects, and a debug engine binary is
 # ~250 MB of it. Nothing launches from a temp, so this is disk hygiene rather
@@ -1947,6 +1956,7 @@ build_or_find_engine() {
     # A caller in an `||` or `if` runs with errexit off, so a failed compile
     # must fail here, or the uplift fallback below serves a stale binary.
     run_engine_cargo_build || return 1
+    prune_stale_debug_objects "$uplift_dir/deps"
     publish_launch_binaries "$uplift_dir" "$launch_dir" || true
 
     # Did this build actually produce a binary for the source on disk now? If
@@ -1962,6 +1972,7 @@ build_or_find_engine() {
         echo "Built engine is not the source now on disk (HEAD moved during the build,"
         echo "or another build clobbered the shared uplift path) — rebuilding once..."
         run_engine_cargo_build || return 1
+        prune_stale_debug_objects "$uplift_dir/deps"
         publish_launch_binaries "$uplift_dir" "$launch_dir" || true
         state="$(published_build_state "$launch_dir/lucidos-engine")"
     fi
@@ -2697,7 +2708,7 @@ start_gateway() {
     # on the daemon, and ENGINE_SUPERVISOR_PID is left EMPTY in gateway mode (the
     # gateway, not start_engine, owns the engines) so web-dev.sh's non-tty wait
     # falls back to the pidfile poll instead of blocking on the daemon.
-    ( run_gateway_supervised "$gw_pidfile" "$gw_log" "$GATEWAY_BIN" ) &
+    ( unset "$AGENT_RUN_ENV"; run_gateway_supervised "$gw_pidfile" "$gw_log" "$GATEWAY_BIN" ) &
     GATEWAY_SUPERVISOR_PID=$!
     disown "$GATEWAY_SUPERVISOR_PID" 2>/dev/null || true
     ENGINE_SUPERVISOR_PID=""
@@ -3268,7 +3279,7 @@ start_frontend_built() {
         # `spawn_gateway` uses. LUCIDOS_WORKSPACE is already exported by
         # `resolve_workspace`, and the CLI needs both.
         local cli_bin="${ENGINE_BIN:+${ENGINE_BIN%/*}/lucidos}"
-        (cd "$FRONTEND_DIR" && LUCIDOS_CLI_BIN="$cli_bin" exec node dev-build-watch.mjs) > "$bw_log" 2>&1 &
+        (cd "$FRONTEND_DIR" && unset "$AGENT_RUN_ENV" && LUCIDOS_CLI_BIN="$cli_bin" exec node dev-build-watch.mjs) > "$bw_log" 2>&1 &
         BUILD_WATCH_PID=$!
         echo "$BUILD_WATCH_PID" > "$bw_pidfile"
 

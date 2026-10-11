@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+use crate::api::thread_reach::ThreadReachVerb;
+
 /// One option offered by CC's AskUserQuestion tool. Persisted inside
 /// `UserQuestionAsked` and looked up when the user picks one to send the
 /// matching `tool_result` back to CC.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct QuestionOption {
     pub id: String,
     pub label: String,
@@ -13,6 +15,23 @@ pub struct QuestionOption {
     /// sample. Claude Code's native tool names it `preview`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// The widget the option draws under its label row, lifted out of a
+    /// *widget embed* in its description or preview (ADR 0415).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget: Option<WidgetEmbed>,
+}
+
+/// A *widget embed*, `![label](app:<id>?params={...})`, as the engine reads
+/// it: the widget, its params, and the alt text as its label.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WidgetEmbed {
+    pub app_id: String,
+    /// The instance's *widget params*. Absent means none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// The embed's alt text. Absent means the widget's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// How the user answered a `UserQuestionAsked`. Tagged so the JSON payload
@@ -55,6 +74,20 @@ pub enum AnswerKind {
     /// nothing is coming. Here the user did reply, just not to this question,
     /// and the reply drives the very next turn.
     Superseded,
+}
+
+/// The one clause-4 act an *owner approval card* proposes (ADR 0387).
+///
+/// Set on a `UserQuestionAsked` only by the internal ask route, when the agent
+/// asks with an `OwnerApprovalRequested` id. The engine then writes the card's
+/// question and options. Its presence is what makes the card's Allow spendable.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerApproval {
+    pub verb: ThreadReachVerb,
+    /// The thread the act aims at. `None` only for a verb that aims at the
+    /// workspace root (`ThreadReachVerb::aims_at_root`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_thread_id: Option<uuid::Uuid>,
 }
 
 impl AnswerKind {

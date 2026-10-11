@@ -17,13 +17,15 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
-use crate::engine::thread_lifecycle::{self, ArchiveState, ThreadStatus, ThreadType};
+use crate::engine::thread_lifecycle::{
+    self, ArchiveState, ChangeStateKind, ThreadStatus, ThreadType,
+};
 use crate::scheduler::user_tasks::{current_event_trigger_depth, current_trigger_id};
 
 /// CC session-end status — always `'idle'`. A proposed change is a review
 /// artifact, not a parked loop, so it does not block the parent's "is my
-/// child still working?" rollup. Pending review surfaces via the
-/// `coding_agent_proposed` column (and `is_blocking` clause 3) instead.
+/// child still working?" rollup. Pending review surfaces via the `proposed`
+/// change state (and `is_blocking` clause 3) instead.
 pub(super) const STATUS_FROM_PROPOSED_CHANGE: &str = ThreadStatus::Idle.sql_literal();
 
 /// The `status` values that are a **verdict about how the turn ended**, rather
@@ -60,7 +62,7 @@ pub(super) static PRESERVED_STATUS_VERDICTS_SQL: std::sync::LazyLock<String> =
 ///
 /// A verdict (see [`PRESERVED_STATUS_VERDICTS`]) is a statement about how the
 /// turn ended: it failed, or an engine restart interrupted it. Only a real start
-/// event (`MessageReceived`, `CodingAgentUserMessageSent`, `UserPromptInjected`,
+/// event (`MessageReceived`, `CodingAgentUserMessageSent`, `PromptInjected`,
 /// `CodingAgentPromptSent`, `ContinuationRequested`, …) may clear one, because
 /// only those mean new work was actually requested. Every event that merely
 /// *closes out* the ended turn has to leave the verdict alone, or the status dot
@@ -88,12 +90,35 @@ pub(super) fn preserving_verdict(target: &str) -> String {
     )
 }
 
+/// SET fragment for a fact about the branch: the SQL boolean `has_work` says
+/// whether it differs from main. A pending change keeps the change state
+/// `proposed`, and work that stays `unproposed` keeps its reason (ADR 0400).
+/// Postgres evaluates every SET against the old row, so both arms read the
+/// state from before this write.
+pub(crate) fn branch_work_sql(has_work: &str) -> String {
+    let proposed = ChangeStateKind::Proposed.as_str();
+    let unproposed = ChangeStateKind::Unproposed.as_str();
+    let none = ChangeStateKind::None.as_str();
+    format!(
+        "coding_agent_change_state = CASE WHEN coding_agent_change_state = '{proposed}' \
+            THEN '{proposed}' WHEN {has_work} THEN '{unproposed}' ELSE '{none}' END, \
+         coding_agent_unproposed_reason = CASE \
+            WHEN coding_agent_change_state = '{unproposed}' AND {has_work} \
+            THEN coding_agent_unproposed_reason END"
+    )
+}
+
 /// SET fragment that clears the CC-state columns on `thread_summaries` that
 /// events own, used identically by `ChangeApplied`, `ChangeDiscarded`, and
-/// `ThreadArchived`. The proposal flags are not here: they follow the
+/// `ThreadArchived`. A pending change stays `proposed` here: it follows the
 /// `changes` table (`ChangesProjection::sync_thread_proposal`).
-pub(super) const CLEAR_CODING_AGENT_FLAGS: &str =
-    "coding_agent_is_external_repo = FALSE, coding_agent_has_diff = FALSE";
+pub(super) static CLEAR_CODING_AGENT_FLAGS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            "coding_agent_is_external_repo = FALSE, {}",
+            branch_work_sql("FALSE")
+        )
+    });
 
 // ---------------------------------------------------------------------------
 // Types
@@ -533,25 +558,27 @@ impl EventBus {
         });
     }
 
-    /// Reconcile the live git-diff flag and broadcast the updated aggregate if
-    /// the flag changed.
+    /// Reconcile the change state with the branch's live diff, and broadcast
+    /// the updated aggregate if the state changed.
     ///
-    /// Used by the coding-agent worktree's post-commit hook. This intentionally
-    /// updates only `coding_agent_has_diff`: the formal proposal lifecycle
-    /// (`coding_agent_proposed`, `changes` row, Apply button) remains owned by
-    /// `ChangeProposed` at coding-agent idle.
-    pub async fn set_coding_agent_has_diff_and_broadcast(
+    /// Used by the coding-agent worktree's post-commit hook. This moves only
+    /// between `none` and `unproposed`: a proposal (the `changes` row, the
+    /// Apply button) stays owned by `ChangeProposed` at coding-agent idle.
+    pub async fn refresh_branch_work_and_broadcast(
         &self,
         thread_id: Uuid,
         has_diff: bool,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE thread_summaries \
-             SET coding_agent_has_diff = $2 \
+        let result = sqlx::query(&format!(
+            "UPDATE thread_summaries SET {} \
              WHERE thread_id = $1 \
-               AND coding_agent_has_diff IS DISTINCT FROM $2",
-        )
+               AND coding_agent_change_state <> '{}' \
+               AND (coding_agent_change_state = '{}') IS DISTINCT FROM $2",
+            branch_work_sql("$2"),
+            ChangeStateKind::Proposed.as_str(),
+            ChangeStateKind::Unproposed.as_str(),
+        ))
         .bind(thread_id)
         .bind(has_diff)
         .execute(&mut *tx)
@@ -883,6 +910,29 @@ impl EventBus {
                                 "[EventBus] ChangeApplied suppressed for {} — already applied \
                                  (duplicate apply path)",
                                 change_id
+                            );
+                            return Ok(None);
+                        }
+                    }
+
+                    // A sighting counts only for the request the client saw
+                    // (ADR 0409). The thread append lock above orders it against
+                    // a new `ThreadReadRequested`. So this read drops a duplicate,
+                    // and a sighting older than a newer request.
+                    if let ThreadEvent::ThreadReplySeen { seen_version } = te {
+                        let row: Option<(bool, i64)> = sqlx::query_as(
+                            "SELECT read_requested, summary_version FROM thread_summaries \
+                             WHERE thread_id = $1",
+                        )
+                        .bind(thread_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        if row != Some((true, *seen_version)) {
+                            tx.rollback().await?;
+                            crate::log!(
+                                "[EventBus] ThreadReplySeen dropped for {}: the request it \
+                                 saw is gone or newer",
+                                thread_id
                             );
                             return Ok(None);
                         }

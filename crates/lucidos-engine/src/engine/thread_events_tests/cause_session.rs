@@ -160,7 +160,7 @@ fn session_ended_reason_serialization() {
 /// resume.
 ///
 /// The verdicts are bare literals, and the assertion at the end is what keeps
-/// them that way. A `coding_agent_proposed` branch here would produce a status
+/// them that way. A proposed-state branch here would produce a status
 /// nothing preserves, so the dying turn's trailing drain overwrites it. See
 /// `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
 #[test]

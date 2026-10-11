@@ -1,6 +1,7 @@
 import type { App, MarketplacePlugin } from '../../store/types';
 import { isAppPinned, togglePinApp } from '../../store/actions/pinnedApps';
 import { PinIcon } from '../shared/icons';
+import { AppIcon } from '../shared/AppIcon';
 import { useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 
 /** Marketplace provenance for an installed app, resolved from the plugin
@@ -42,24 +43,29 @@ export function AppRow({ app, onOpen, onEdit, onDelete, pluginInfo, onUpdate }: 
   const pinLabel = pinned ? 'Unpin from the menu' : 'Pin to the menu';
   return (
     <div class={`list-row app-row${sk ? '' : ' clickable'}`} onClick={sk ? undefined : onOpen}>
-      <div class="list-row-info">
-        <div class="app-row-title-line">
-          <SkText class="title list-row-name" w="9rem">{app?.name}</SkText>
-          {pluginInfo && (
-            <span class="label label-neutral" data-tooltip={`Installed from ${pluginInfo.marketplaceName}`}>
-              {pluginInfo.marketplaceName}
-            </span>
-          )}
-          {pluginInfo?.updateAvailable && (
-            <span class="label">Update available</span>
-          )}
-          {pluginInfo?.updateBlockedReason && (
-            <span class="label label-warning">{pluginInfo.updateBlockedReason}</span>
+      <div class="app-row-lead">
+        <SkBlock w="var(--app-icon-size)" h="var(--app-icon-size)">
+          {app && <AppIcon appId={app.id} name={app.name} icon={app.icon} />}
+        </SkBlock>
+        <div class="list-row-info">
+          <div class="app-row-title-line">
+            <SkText class="title list-row-name" w="9rem">{app?.name}</SkText>
+            {pluginInfo && (
+              <span class="label label-neutral" data-tooltip={`Installed from ${pluginInfo.marketplaceName}`}>
+                {pluginInfo.marketplaceName}
+              </span>
+            )}
+            {pluginInfo?.updateAvailable && (
+              <span class="label">Update available</span>
+            )}
+            {pluginInfo?.updateBlockedReason && (
+              <span class="label label-warning">{pluginInfo.updateBlockedReason}</span>
+            )}
+          </div>
+          {(sk || app?.description) && (
+            <SkText class="list-row-details" as="div" w="16rem">{app?.description}</SkText>
           )}
         </div>
-        {(sk || app?.description) && (
-          <SkText class="list-row-details" as="div" w="16rem">{app?.description}</SkText>
-        )}
       </div>
       <div class="list-row-actions">
         {pluginInfo?.updateAvailable && onUpdate && (

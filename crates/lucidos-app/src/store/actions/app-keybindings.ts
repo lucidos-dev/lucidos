@@ -1,5 +1,6 @@
 import { effect } from '@preact/signals';
 import { postToAppFrame } from './app-bridge';
+import { mountedAppFrames } from '../../utils/appFrame';
 import { forwardableBindings } from './keybindings';
 // The SDK module that listens on the channel. Relative, because the barrel
 // does not export it; it has no import-time side effects.
@@ -19,7 +20,7 @@ export function pushKeybindingsToFrame(frame: HTMLIFrameElement): void {
 export function installAppKeybindingsSync(): () => void {
   return effect(() => {
     const bindings = forwardableBindings();
-    for (const frame of document.querySelectorAll<HTMLIFrameElement>('iframe[data-role="app-ui-frame"]')) {
+    for (const frame of mountedAppFrames()) {
       postToAppFrame(frame, KEYBINDINGS_CHANNEL, { bindings });
     }
   });

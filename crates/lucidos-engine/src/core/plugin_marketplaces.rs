@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::core::git_auth::GitCredentials;
+use crate::core::plugin_media::{self, MediaProblem, MediaSource, PluginMedia};
 use crate::core::plugins::{self, compare_versions, validate_tree, UpdateDecision};
 use crate::core::DATA_DIR;
 
@@ -68,6 +69,9 @@ pub struct InstalledPluginSummary {
     /// its manifest declares none, which the Plugins panel shows as a chip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_requirement: Option<String>,
+    /// The installed copy of its *plugin media*. Empty for a plugin installed
+    /// before media existed, until its next update.
+    pub media: PluginMedia,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +145,9 @@ pub struct MarketplacePlugin {
     /// only when `engine_compatible` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_incompatible_reason: Option<String>,
+    /// The scan's cached copy of this version's *plugin media*.
+    #[serde(default)]
+    pub media: PluginMedia,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +299,25 @@ pub fn scan_catalog(
     }
 }
 
+/// Drop the catalog media this catalog no longer needs. Call it only when the
+/// catalog is published: a scan that lost its slot would prune the media of
+/// the scan that replaced it. A marketplace with no rows failed its scan, so
+/// it keeps what it had.
+pub fn prune_media_for(workspace_path: &Path, catalog: &MarketplaceCatalog) {
+    let registered = catalog.marketplaces.iter().map(|m| m.id.clone()).collect();
+    let scanned = catalog
+        .plugins
+        .iter()
+        .map(|p| p.marketplace_id.clone())
+        .collect();
+    let keep = catalog
+        .plugins
+        .iter()
+        .map(|p| (p.marketplace_id.clone(), p.id.clone(), p.version.clone()))
+        .collect();
+    plugin_media::prune_cache(workspace_path, &registered, &scanned, &keep);
+}
+
 /// Stamp one catalog row with what is installed on this workspace right now.
 ///
 /// Every install-derived field is set here and nowhere else. So a scan and a
@@ -402,6 +428,9 @@ fn scan_one_marketplace(
     // Per-plugin non-blocking warnings (e.g. unknown categories): the plugin
     // still lists, the warning surfaces in the catalog's `errors`.
     let mut warnings: Vec<MarketplaceScanError> = Vec::new();
+    // Why each invalid plugin was skipped. With no valid plugin at all, the
+    // warnings are dropped, so the marketplace error carries these instead.
+    let mut invalid: Vec<String> = Vec::new();
 
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -421,6 +450,16 @@ fn scan_one_marketplace(
                     rel,
                     e
                 );
+                // Named in the catalog's errors too, so an author sees why
+                // their plugin does not list.
+                let reason = format!("plugin at '{}' is not valid: {}", display_root(&rel), e);
+                warnings.push(MarketplaceScanError {
+                    marketplace_id: marketplace.id.clone(),
+                    marketplace_name: marketplace.name.clone(),
+                    source: marketplace.source.clone(),
+                    error: reason.clone(),
+                });
+                invalid.push(reason);
                 continue;
             }
         };
@@ -484,7 +523,9 @@ fn scan_one_marketplace(
             engine_requirement: None,
             engine_compatible: false,
             engine_incompatible_reason: None,
+            media: PluginMedia::default(),
         };
+        plugin.media = cache_media(workspace_path, &plugin, &plugin_root, &manifest.media);
         let installed = installed_by_id.get(&plugin.id).cloned();
         apply_installed_state(&mut plugin, installed.as_ref());
         out.push(plugin);
@@ -492,11 +533,80 @@ fn scan_one_marketplace(
 
     if out.is_empty() {
         drop(scratch);
-        return Err("no valid plugins found".to_string());
+        return Err(match invalid.is_empty() {
+            true => "no valid plugins found".to_string(),
+            false => format!("no valid plugins found: {}", invalid.join("; ")),
+        });
     }
 
     drop(scratch);
     Ok((out, warnings))
+}
+
+/// A plugin root for a message: the repo root reads as `.`.
+fn display_root(rel: &str) -> &str {
+    if rel.is_empty() {
+        "."
+    } else {
+        rel
+    }
+}
+
+/// Keep one scanned plugin version's media in the catalog cache, and answer
+/// the URLs a row draws. A copy that cannot be written leaves the row without
+/// media, and says why in its problems.
+fn cache_media(
+    workspace_path: &Path,
+    plugin: &MarketplacePlugin,
+    plugin_root: &Path,
+    declared: &plugin_media::MediaDeclaration,
+) -> PluginMedia {
+    let resolved = plugin_media::resolve(plugin_root, declared);
+    let folders = [&plugin.marketplace_id, &plugin.id, &plugin.version];
+    if !folders.iter().all(|f| plugin_media::is_folder_name(f)) {
+        let mut problems = resolved.index.problems;
+        problems.push(MediaProblem {
+            path: plugin_media::MEDIA_DIR.to_string(),
+            reason: format!(
+                "could not be kept: marketplace '{}' has an id no folder can take",
+                plugin.marketplace_id
+            ),
+        });
+        return PluginMedia {
+            problems,
+            ..PluginMedia::default()
+        };
+    }
+    let copy = plugin_media::cache_dir(
+        workspace_path,
+        &plugin.marketplace_id,
+        &plugin.id,
+        &plugin.version,
+    );
+    match plugin_media::write_copy(&resolved, &copy) {
+        Ok(()) => MediaSource::Catalog {
+            marketplace_id: &plugin.marketplace_id,
+            plugin_id: &plugin.id,
+            version: &plugin.version,
+        }
+        .media(&resolved.index),
+        Err(e) => {
+            log!(
+                "[PluginMarketplaces] could not cache media for '{}': {}",
+                plugin.id,
+                e
+            );
+            let mut problems = resolved.index.problems;
+            problems.push(MediaProblem {
+                path: plugin_media::MEDIA_DIR.to_string(),
+                reason: format!("could not be kept: {e}"),
+            });
+            PluginMedia {
+                problems,
+                ..PluginMedia::default()
+            }
+        }
+    }
 }
 
 fn parse_marketplace_source(source: &str) -> Result<MarketplaceSource, String> {

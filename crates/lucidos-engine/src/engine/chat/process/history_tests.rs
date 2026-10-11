@@ -308,7 +308,7 @@ fn summary_event(summary: &str, covers: &str, at_secs: u32) -> EventRow {
             "summary": summary,
             "covers_through_event_id": covers,
             "covered_count": 4,
-            "model": "gemini-3.5-flash",
+            "model": "gemini-3.8-flash",
         }),
         created: Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, at_secs).unwrap(),
         thread_id: None,

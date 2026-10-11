@@ -38,7 +38,7 @@ test.describe('The home thread from the desktop header', () => {
     await expect(menu).toBeVisible();
     const items = (await menu.locator('[role="menuitem"]').allTextContents()).map((i) => i.trim());
     expect(items.length).toBeGreaterThan(0);
-    for (const forbidden of ['Pin thread', 'Unpin thread', 'Show in thread list']) {
+    for (const forbidden of ['Pin thread', 'Unpin thread', 'Show in Folders']) {
       expect(items).not.toContain(forbidden);
     }
     // Archive and Delete show blocked with the reason, never hidden (ADR 0378).

@@ -557,7 +557,7 @@ fn cc_inbox_no_changes_shows_archive() {
 
 #[test]
 fn external_repo_cc_no_pending_change_shows_archive() {
-    // External repo threads: coding_agent_proposed=true in thread_summaries but no
+    // External repo threads: a proposed change state in thread_summaries but no
     // pending row in the changes table (runtime skips propose_change).
     // has_pending_changes=false → Archive, not Apply/Discard.
     let actions = available_thread_actions(

@@ -54,7 +54,7 @@ impl AnthropicProvider {
         let reasoning_effort = selection.reasoning_effort;
         let messages_url = format!("{}/messages", crate::llm::ANTHROPIC_API_BASE_URL);
 
-        let (request, request_betas) = build_claude_request(
+        let (mut request, request_betas) = build_claude_request(
             messages,
             tools,
             model,
@@ -63,6 +63,9 @@ impl AnthropicProvider {
             WireTarget::Direct { url: &messages_url },
             "Anthropic",
         );
+        if let Some(tool) = selection.forced_tool {
+            request.force_tool(tool, model)?;
+        }
 
         let (auth_name, auth_value) = auth_header(&self.auth);
         let beta = anthropic_beta_header(&self.auth, &request_betas);
@@ -122,11 +125,14 @@ impl AnthropicProvider {
                     continue;
                 }
 
-                return Err(crate::llm::with_retry_context(
-                    format!("Anthropic API error ({}): {}", status, error_body),
-                    attempt,
-                )
-                .into());
+                return Err(crate::llm::not_served::failure(
+                    status.as_u16(),
+                    &error_body,
+                    crate::llm::with_retry_context(
+                        format!("Anthropic API error ({}): {}", status, error_body),
+                        attempt,
+                    ),
+                ));
             }
 
             match parse_claude_stream(resp, &on_token, display, "Anthropic").await {

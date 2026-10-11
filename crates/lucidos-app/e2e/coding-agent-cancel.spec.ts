@@ -21,7 +21,7 @@ test.describe('Claude Code cancel and stop', () => {
     await assertHealthy(page);
   });
 
-  test('cancel a CC response via Cancel button', async ({ page }) => {
+  test('cancel a CC response via Cancel button', { tag: '@real-claude-code' }, async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
     await pickComposeDestination(page);
@@ -39,7 +39,7 @@ test.describe('Claude Code cancel and stop', () => {
     expect(responseCount).toBeGreaterThanOrEqual(1);
   });
 
-  test('can send CC follow-up after canceling', async ({ page }) => {
+  test('can send CC follow-up after canceling', { tag: '@real-claude-code' }, async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
     await pickComposeDestination(page);
@@ -67,7 +67,7 @@ test.describe('Claude Code cancel and stop', () => {
     }, msg2, { timeout: 120_000 });
   });
 
-  test('cancel resumes the same CC session, does not respawn a fresh one', async ({ page }) => {
+  test('cancel resumes the same CC session, does not respawn a fresh one', { tag: '@real-claude-code' }, async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
     await pickComposeDestination(page);

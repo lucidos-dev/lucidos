@@ -53,6 +53,9 @@ pub struct PluginManifest {
     /// scan time (`scan_catalog`), not rejected at parse, so one bad tag never
     /// blocks install. Lowercased + trimmed + de-duplicated on parse.
     pub categories: Vec<String>,
+    /// The *plugin media* the manifest names. A bad entry never fails the
+    /// parse: `plugin_media::resolve` drops it and says why.
+    pub media: super::plugin_media::MediaDeclaration,
     /// Full manifest as JSON, so future additive fields land in the event.
     pub raw: serde_json::Value,
 }
@@ -120,6 +123,8 @@ pub enum ValidationError {
     /// An item directory (`apps/<id>`, `triggers/<slug>`, `fonts/<slug>`)
     /// named in [`VENDORED_DIR_NAMES`], which [`plan_files`] would skip.
     ItemNamedLikeBuildOutput(String),
+    /// A widget folder a plugin may not ship: `(apps/<id>, reason)`.
+    InvalidWidget(String, String),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -146,14 +151,18 @@ impl std::fmt::Display for ValidationError {
             ),
             Self::UnexpectedTopLevelEntry(e) => write!(
                 f,
-                "unexpected top-level entry '{}' (only manifest.toml + {} allowed)",
+                "unexpected top-level entry '{}' (only manifest.toml, {}/ + {} allowed)",
                 e,
+                super::plugin_media::MEDIA_DIR,
                 CONTENT_DIRS.join("/")
             ),
             Self::UnsafePath(p) => write!(f, "unsafe path in archive: {}", p),
             Self::InvalidTheme(path, reason) => write!(f, "{path} is not a valid theme: {reason}"),
             Self::InvalidFont(path, reason) => {
                 write!(f, "{path} is not a valid workspace font: {reason}")
+            }
+            Self::InvalidWidget(path, reason) => {
+                write!(f, "{path}/ is not a widget a plugin can ship: {reason}")
             }
             Self::ItemNamedLikeBuildOutput(path) => write!(
                 f,
@@ -239,6 +248,8 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         }
     }
 
+    let media = super::plugin_media::MediaDeclaration::from_manifest(table);
+
     let raw = serde_json::to_value(&value)
         .map_err(|e| ValidationError::ManifestParseError(e.to_string()))?;
 
@@ -250,6 +261,7 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         source,
         setup,
         categories,
+        media,
         raw,
     })
 }
@@ -287,13 +299,17 @@ pub fn validate_tree(root: &Path) -> Result<(PluginManifest, Vec<PlannedFile>), 
         }
         // No-follow: a symlink named as a content dir would pass `is_dir()` and
         // let the walk below escape the plugin tree. Reject any top-level entry
-        // that is not a real directory named in CONTENT_DIRS.
+        // that is not a real directory named in CONTENT_DIRS, or `media/`,
+        // which holds presentation files and is never installed as content.
         let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if !CONTENT_DIRS.contains(&name_str.as_ref()) || !is_real_dir {
+        let allowed =
+            CONTENT_DIRS.contains(&name_str.as_ref()) || name_str == super::plugin_media::MEDIA_DIR;
+        if !allowed || !is_real_dir {
             return Err(ValidationError::UnexpectedTopLevelEntry(name_str.into()));
         }
     }
     reject_items_named_like_build_output(root)?;
+    validate_widgets(&manifest.id, root)?;
 
     let planned = plan_files(root);
     if planned.is_empty() {
@@ -328,6 +344,50 @@ fn reject_items_named_like_build_output(root: &Path) -> Result<(), ValidationErr
                     "{dir}/{name_str}"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+/// A plugin ships a widget only as a reusable one that names this plugin as
+/// its origin (ADR 0414). A thread-owned widget belongs to a thread in the
+/// author's workspace, which no other workspace has.
+fn validate_widgets(plugin_id: &str, root: &Path) -> Result<(), ValidationError> {
+    use super::apps::{AppKind, AppManifest};
+    let Ok(entries) = std::fs::read_dir(root.join("apps")) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path().join("manifest.json")) else {
+            continue;
+        };
+        let Ok(app) = serde_json::from_str::<AppManifest>(&text) else {
+            continue;
+        };
+        if AppKind::from_manifest(&name, app.kind.as_deref()) != AppKind::Widget {
+            continue;
+        }
+        let invalid =
+            |reason: String| ValidationError::InvalidWidget(format!("apps/{name}"), reason);
+        if app.origin_thread_id.is_some() {
+            return Err(invalid(
+                "it names an origin_thread_id, and a shipped widget names its plugin instead"
+                    .into(),
+            ));
+        }
+        if app.origin_plugin_id.as_deref() != Some(plugin_id) {
+            return Err(invalid(format!(
+                "its manifest.json must set \"origin_plugin_id\": \"{plugin_id}\""
+            )));
+        }
+        if !app.reusable {
+            return Err(invalid(
+                "its manifest.json must set \"reusable\": true".into(),
+            ));
         }
     }
     Ok(())

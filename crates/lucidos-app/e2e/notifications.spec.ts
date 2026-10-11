@@ -79,7 +79,7 @@ function seedTallChatThread(exchanges: number): { threadId: string; firstEventId
     );
   }
   stmts.unshift(
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Deep-link target thread', 'chat', '${lastCreated}', ${exchanges}, false, true, 'idle', 'inbox', 'active', false, 0, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Deep-link target thread', 'chat', '${lastCreated}', ${exchanges}, false, true, 'idle', 'inbox', 'active', false, 0, 0, 'none', false)`,
   );
   psql(stmts.join(';\n'));
   return { threadId, firstEventId, lastEventId };
@@ -396,7 +396,7 @@ function seedShortChatThread(): { threadId: string; eventId: string } {
   const msgPayload = JSON.stringify({ text: 'Short seeded message.', channel: 'chat' });
   const respPayload = JSON.stringify({ text: 'Response.', images: [] });
   psql([
-    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Seen target thread', 'chat', '${respCreated}', 1, false, true, 'idle', 'inbox', 'active', false, 0, 0, false, false, false)`,
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_change_state, coding_agent_is_external_repo) VALUES ('${threadId}', 'Seen target thread', 'chat', '${respCreated}', 1, false, true, 'idle', 'inbox', 'active', false, 0, 0, 'none', false)`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${eventId}', 'MessageReceived', '${msgPayload}'::jsonb, '${msgCreated}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respId}', 'ResponseGenerated', '${respPayload}'::jsonb, '${respCreated}', 'thread', '${threadId}', '${threadId}')`,
   ].join(';\n'));

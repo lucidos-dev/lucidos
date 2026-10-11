@@ -70,8 +70,8 @@ pub struct TriggerInfo {
     /// account `chat_model` preference (the "Default" option in the form).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Reasoning effort for this trigger's intent fires. Absent = the account
-    /// `chat_reasoning_effort` preference.
+    /// Reasoning effort for this trigger's intent fires. Absent = the account's
+    /// tier for the model it runs on, else that model's default effort.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// The backend the pinned model runs on. Absent = the model's own
@@ -185,8 +185,8 @@ pub struct CreateTriggerCronRequest {
     #[serde(default)]
     pub model: Option<String>,
     /// Reasoning effort for this trigger's intent fires. Omitted, null, or blank
-    /// = the account `chat_reasoning_effort` preference. Must be one of
-    /// `none|low|medium|high|xhigh|max`; anything else is a 400.
+    /// = the account's tier for the model, else its default effort. Must be
+    /// one of `none|low|medium|high|xhigh|max`; anything else is a 400.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// The backend the pinned model runs on, when it has more than one route.

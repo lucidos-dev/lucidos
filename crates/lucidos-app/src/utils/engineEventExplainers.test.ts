@@ -70,6 +70,10 @@ describe('describeEngineReason', () => {
     expect(describeEngineReason({ kind: 'missing_hardening' }))
       .toMatch(/harden/i);
   });
+  it('returns explainer for missing_plan', () => {
+    expect(describeEngineReason({ kind: 'missing_plan' }))
+      .toMatch(/implementation plan/i);
+  });
   it('returns explainer for plugin_auto_update', () => {
     expect(describeEngineReason({
       kind: 'plugin_auto_update',
@@ -133,7 +137,8 @@ describe('every explainer is plain', () => {
       ...ABORT_CAUSES.map(describeAbortCause),
       ...CANCEL_CAUSES.map(describeCancelCause),
       ...(['continuation_started', 'session_recovered', 'orphan_recovery', 'harden_retrigger',
-        'stale_session', 'archived_branch_work', 'merge_conflict', 'missing_hardening'] as const)
+        'stale_session', 'archived_branch_work', 'merge_conflict', 'missing_hardening',
+        'missing_plan'] as const)
         .map(kind => describeEngineReason({ kind })),
     ];
     for (const text of texts) expect(text).not.toMatch(ENGINE_INTERNALS);

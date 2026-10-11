@@ -570,6 +570,7 @@ mod tests {
             ("claude-opus-5@default", "eu"),
             ("claude-sonnet-5", "eu"),
             ("claude-sonnet-5-5", "eu"),
+            ("claude-haiku-5-5", "eu"),
             ("gemini-2.5-flash", "eu"),
             ("gemini-3-flash-preview", "global"),
         ] {
@@ -681,9 +682,10 @@ mod tests {
             "claude-opus-5@default",
             "claude-sonnet-5",
             "claude-sonnet-5-5",
+            "claude-haiku-5-5",
             "gemini-2.5-flash",
             "gemini-3-flash-preview",
-            "gemini-3.5-flash",
+            "gemini-3.8-flash",
         ] {
             let went_global = location_from_endpoint(&provider.endpoint_for_model(model))
                 .as_deref()
@@ -912,11 +914,11 @@ mod tests {
     #[test]
     fn gemini_3_models_use_the_global_endpoint_builder() {
         let provider =
-            VertexProvider::new("my-project".into(), "eu".into(), "gemini-3.5-flash".into())
+            VertexProvider::new("my-project".into(), "eu".into(), "gemini-3.8-flash".into())
                 .unwrap();
         assert_eq!(
-            provider.endpoint_for_model("gemini-3.5-flash"),
-            provider.global_gemini_endpoint("gemini-3.5-flash"),
+            provider.endpoint_for_model("gemini-3.8-flash"),
+            provider.global_gemini_endpoint("gemini-3.8-flash"),
         );
     }
 

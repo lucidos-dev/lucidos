@@ -113,4 +113,19 @@ test.describe('Desktop UI-scale wheel zoom', () => {
     // The release keeps what the gesture asked for rather than reverting it.
     expect(await appliedScale(page)).toBe('112.5%');
   });
+
+  test('a modifier wheel opens the panel from closed, as Cmd +/- does', async ({ page }) => {
+    await navigateToApp(page);
+    await waitForEventStream(page);
+    await expect(page.locator('.scale-modal')).toBeHidden();
+
+    await page.mouse.move(400, 400);
+    await page.keyboard.down('Control');
+    await page.mouse.wheel(0, -100);
+    await expect(page.locator('.scale-modal-label')).toHaveText('112.5%');
+
+    await page.keyboard.up('Control');
+    await expect(page.locator('.scale-modal')).toBeHidden();
+    expect(await appliedScale(page)).toBe('112.5%');
+  });
 });

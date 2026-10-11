@@ -18,6 +18,7 @@ function plugin(overrides: Partial<MarketplacePlugin>): MarketplacePlugin {
     engine_compatible: true,
     status: 'installed',
     app_id: 'p',
+    media: { screenshots: [], videos: [], problems: [] },
     ...overrides,
   };
 }

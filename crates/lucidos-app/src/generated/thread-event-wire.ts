@@ -103,7 +103,7 @@ export interface ApiUsage {
   output_tokens: number;
   /** Set by both providers. */
   cache_read_tokens: number;
-  /** Anthropic-only. OpenAI charges nothing for a cache write. */
+  /** Anthropic, and OpenAI from GPT-5.6 on. Both bill a write above input. */
   cache_creation_tokens: number;
   /** How the four counts above split across text, audio and image. Only a
    *  realtime voice call reports one, so it is absent everywhere else and
@@ -122,6 +122,13 @@ export type CancelCause =
   | 'user_action'
   | 'superseded_by_followup'
   | 'unknown';
+
+/** The file format a saved app capture is encoded in. The save path's
+ *  extension picks it, and the app frame encodes the picture to match. */
+export type CaptureFormat =
+  | 'png'
+  | 'jpeg'
+  | 'webp';
 
 /** Outcome of a child thread that just completed, surfaced to the parent via
  *  `ThreadEvent::ChildThreadCompleted`. Replaces the prose discriminator
@@ -178,7 +185,8 @@ export type ContextPurpose =
   | 'summary_compaction'
   | 'memory_find'
   | 'web_search'
-  | 'proxy';
+  | 'proxy'
+  | 'read_decision';
 
 /** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
  *  in the LLM API call: the system prompt, prior messages (verbatim resume
@@ -245,8 +253,12 @@ export type EngineReason =
   | { kind: 'archived_branch_work' }
   /** Engine detected a merge conflict pulling main into a CC branch. */
   | { kind: 'merge_conflict' }
-  /** Engine detected the harden marker is missing or stale before apply. */
+  /** Engine detected the harden marker is missing: before an apply, or at a
+   *  turn end whose proposal it held and told the agent to harden. */
   | { kind: 'missing_hardening' }
+  /** Engine held a turn-end proposal because the branch's plan marker does
+   *  not satisfy the gate, and told the agent how to set one. */
+  | { kind: 'missing_plan' }
   /** Historical: the engine used to silently apply marketplace plugin updates
    *  in the background and stamped the resulting `PluginInstalled` event with
    *  this reason. That behavior was retired: the engine now checks for
@@ -453,6 +465,15 @@ export interface ModalityUsage {
   output_audio_tokens: number;
 }
 
+/** The one clause-4 act an *owner approval card* proposes (ADR 0387).
+ *  Full reasoning is on the Rust variant. */
+export interface OwnerApproval {
+  verb: ThreadReachVerb;
+  /** The thread the act aims at. `None` only for a verb that aims at the
+   *  workspace root (`ThreadReachVerb::aims_at_root`). */
+  target_thread_id?: string;
+}
+
 /** Why a plugin setup thread runs: a first install, or an update that changed
  *  the setup instructions.
  *  Full reasoning is on the Rust variant. */
@@ -475,6 +496,9 @@ export interface QuestionOption {
   /** Markdown the card shows under the option: a picture, or a short text
    *  sample. Claude Code's native tool names it `preview`. */
   preview?: string;
+  /** The widget the option draws under its label row, lifted out of a
+   *  *widget embed* in its description or preview (ADR 0415). */
+  widget?: WidgetEmbed;
 }
 
 /** One long-term memory the pre-turn recall injected into the turn's context,
@@ -508,6 +532,26 @@ export interface SubThreadPendingChange {
 export type ThreadDirection =
   | 'parent'
   | 'child';
+
+/** Which clause-4 verb was attempted. Carried so the refusal and the log line
+ *  name the verb instead of saying "this action": an agent reading "you cannot
+ *  cancel that thread" knows what it just tried.
+ *  Full reasoning is on the Rust variant. */
+export type ThreadReachVerb =
+  | 'archive'
+  | 'cancel'
+  | 'control'
+  | 'ask-side-question'
+  | 'dismiss-side-question'
+  | 'apply'
+  | 'discard'
+  | 'set-aside'
+  | 'bring-back'
+  | 'revert'
+  | 'answer-question'
+  | 'resolve-permission'
+  | 'continue'
+  | 'create-top-thread';
 
 /** One row of a *Todo list*. `content` is the imperative form ("Run tests");
  *  `active_form` is the present-continuous form ("Running tests") shown only
@@ -558,6 +602,16 @@ export type TriggerInvocation =
       thread_id?: string;
     };
 
+/** Why a turn end left work on its branch unproposed (ADR 0400). The hold
+ *  variants are [`ProposalHold`]'s, mapped by the exhaustive `From` below, so a
+ *  new hold cannot compile without a wire name. */
+export type UnproposedReason =
+  | 'plan_missing'
+  | 'plan_awaiting_approval'
+  | 'outside_bound'
+  | 'hardening_missing'
+  | 'turn_incomplete';
+
 /** Why a voice session ended.
  *  Full reasoning is on the Rust variant. */
 export type VoiceSessionEndReason =
@@ -566,6 +620,16 @@ export type VoiceSessionEndReason =
   | 'disconnected'
   | 'provider_failed'
   | 'engine_shutdown';
+
+/** A *widget embed*, `![label](app:<id>?params={...})`, as the engine reads
+ *  it: the widget, its params, and the alt text as its label. */
+export interface WidgetEmbed {
+  app_id: string;
+  /** The instance's *widget params*. Absent means none. */
+  params?: Record<string, unknown>;
+  /** The embed's alt text. Absent means the widget's name. */
+  label?: string;
+}
 
 export type ThreadEvent =
   | {
@@ -736,8 +800,15 @@ export type ThreadEvent =
       reasoning_effort?: string;
       /** How long the call took, wall clock, where the caller timed it.
        *  Absent for every purpose but the compactor today. The Tree
-       *  backfill estimate reads it as a model's seconds per call. */
+       *  backfill estimate reads it as a model's seconds per call at a tier. */
       duration_ms?: number;
+      /** The *served model*: the model id the provider's reply named,
+       *  verbatim. `model` is the one Lucidos asked for. Absent when the
+       *  reply named none, and on every row written before the field
+       *  existed. One that is neither `model` nor a dated snapshot of it
+       *  means another model answered: a provider reroute, or the router
+       *  sending a retired model's successor (ADR 0418). */
+      served_model?: string;
       /** Server dropped `sections` and `tools` here. The modal lazy-fetches them. */
       sections_stripped?: boolean;
       /** Links this event back to the request that opened the turn. */
@@ -1017,6 +1088,9 @@ export type ThreadEvent =
       /** The `Agent` call whose sub-agent wrote this text. Such text is the
        *  sub-agent's narration, never the session's reply. Absent otherwise. */
       parent_tool_use_id?: string;
+      /** The text is a *progress note*: the provider's summary of what the
+       *  agent wrote before a tool call. The agent itself read it in full. */
+      progress_note?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1190,9 +1264,9 @@ export type ThreadEvent =
       /** True iff the agent went idle while the chat-agent's
        *  `run_bash_background` tool still had a task running for this thread.
        *  **Recorded history only.** As of the bg-bash-gate removal this no
-       *  longer drives any projection or UI. The change proposes at idle
-       *  regardless of background bash (correctness is covered by
-       *  harden-at-apply), and the chat-agent bash auto-resumes CC via
+       *  longer drives any projection or UI. A live event wait, not a
+       *  background task, holds the idle proposal (ADR 0395), and the
+       *  chat-agent bash auto-resumes CC via
        *  `spawn_bash_completion_watcher`. Kept on the event so the timeline
        *  still records that an idle overlapped a background task. */
       bg_bash_pending?: boolean;
@@ -1287,6 +1361,48 @@ export type ThreadEvent =
    *  (ADR 0349). Moves it to the inbox and bumps nothing else. */
   | {
       type: 'ThreadUnarchived';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The thread's own agent asked the user to read its latest reply (ADR
+   *  0409). Sets `read_requested`, which lists the thread in the drawer's
+   *  Review group once its turn ends, unless its change already lists it
+   *  (ADR 0421). The actor names the agent thread, and is absent when the
+   *  turn-end gate forced the decision. */
+  | {
+      type: 'ThreadReadRequested';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The thread's agent decided its reply needs no reading: the no half of
+   *  the turn's *read decision*. Projects nothing, so it never clears an
+   *  unseen request (ADR 0409). The actor names the agent thread, and is
+   *  absent when the turn-end gate forced the decision. */
+  | {
+      type: 'ThreadReadNotRequested';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The user saw the reply a read request pointed at: its end stayed on
+   *  screen for the seen dwell. Clears `read_requested`. Recorded only while
+   *  the thread's summary still reads `seen_version`, so a duplicate or a
+   *  sighting older than a newer request records nothing. */
+  | {
+      type: 'ThreadReplySeen';
+      /** The thread's `summary_version` when the client saw the reply. */
+      seen_version: number;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1452,10 +1568,9 @@ export type ThreadEvent =
        *  Stamped from `is_harden_marker_present` at end-of-turn aggregate
        *  emit; engine-internal recovery emits resolve it the same way. */
       hardened?: boolean;
-      /** `true` when the work did not come from a finished turn: a user Stop
-       *  cut it short, or recovery found it after a turn was killed. The
-       *  frontend confirms before Apply, and Apply All passes it over. A
-       *  later clean turn re-emits with `false`. */
+      /** `true` when nobody saw the work finish: the archive net's
+       *  set-aside proposals. A pending change is never incomplete
+       *  (ADR 0400), and older rows marked so are withdrawn at boot. */
       incomplete?: boolean;
       /** `true` when the engine proposes the change straight into set-aside:
        *  work found on an archived thread's branch (ADR 0328). It leaves
@@ -1526,6 +1641,33 @@ export type ThreadEvent =
   | {
       type: 'ChangeBroughtBack';
       change_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A pending or set-aside change went back to unproposed work, and its
+   *  branch kept every commit (ADR 0400). A turn that stopped committed past
+   *  it, or Bring back met work that never finished. */
+  | {
+      type: 'ChangeWithdrawn';
+      change_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A turn end left work on the branch and proposed none of it (ADR 0400).
+   *  `files` is what a proposal would have carried. */
+  | {
+      type: 'ProposalWithheld';
+      branch_name: string;
+      files: string[];
+      reason: UnproposedReason;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1660,7 +1802,7 @@ export type ThreadEvent =
       actor?: MessageOrigin;
     }
   | {
-      type: 'UserPromptInjected';
+      type: 'PromptInjected';
       text: string;
       mode?: ActorMode;
       origin?: MessageOrigin;
@@ -1778,6 +1920,9 @@ export type ThreadEvent =
       options?: QuestionOption[];
       worktree_path?: string;
       multi_select?: boolean;
+      /** Set only on an *owner approval card* (ADR 0387): the act its
+       *  Allow once authorizes. The engine wrote this card's text. */
+      owner_approval?: OwnerApproval;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1789,6 +1934,38 @@ export type ThreadEvent =
       type: 'UserQuestionAnswered';
       tool_use_id: string;
       answer: AnswerKind;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A thread asked for an *owner approval* (ADR 0387), through `POST
+   *  /api/v1/owner-approvals`. `question` is the card the engine wrote. It
+   *  is shown when the thread asks `AskUserQuestion` with `request_id` as
+   *  its question. A request grants nothing until the owner allows the card. */
+  | {
+      type: 'OwnerApprovalRequested';
+      request_id: string;
+      approval: OwnerApproval;
+      question: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A thread spent an *owner approval* on the clause-4 act it names
+   *  (ADR 0387). Emitted only by `api::owner_approval`, before the act's
+   *  handler writes anything. `tool_use_id` names the approval card, and a
+   *  unique index on it refuses a second spend. */
+  | {
+      type: 'OwnerApprovalSpent';
+      tool_use_id: string;
+      verb: ThreadReachVerb;
+      target_thread_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2334,6 +2511,52 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** A widget instance was shown at this point in the thread (ADRs 0402,
+   *  0407, 0415). Draws its inline card here and adds no chip to the
+   *  thread's widget shelf. The widget's files stay in its app folder. */
+  | {
+      type: 'WidgetShown';
+      app_id: string;
+      /** The instance's *widget params*. Absent means none. */
+      params?: Record<string, unknown>;
+      /** The instance's chip label. Absent means the widget's name. */
+      label?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The user or the agent pinned a widget instance: its chip is now on this
+   *  thread's widget shelf. A pin alone adds the instance, as from an
+   *  embed. No file changes. */
+  | {
+      type: 'WidgetPinned';
+      app_id: string;
+      params?: Record<string, unknown>;
+      label?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A widget instance was unpinned: its chip left this thread's widget
+   *  shelf. The thread's card stays, and no file changes. */
+  | {
+      type: 'WidgetUnpinned';
+      app_id: string;
+      params?: Record<string, unknown>;
+      label?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** Retired. The pre-`ContextCaptured` token measurement. */
   | {
       type: 'ContextTokensMeasured';
@@ -2364,6 +2587,28 @@ export type ThreadEvent =
       type: 'MemorySearched';
       results?: number;
       queries?: string[];
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The pre-rename name for `WidgetPinned`. The snapshot endpoint serves the raw `event_type` column, so the Rust serde alias never reaches us. */
+  | {
+      type: 'WidgetRestored';
+      app_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The pre-rename name for `WidgetUnpinned`. The snapshot endpoint serves the raw `event_type` column, so the Rust serde alias never reaches us. */
+  | {
+      type: 'WidgetHidden';
+      app_id: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2425,6 +2670,9 @@ export type TransientEvent =
       type: 'AppUiCaptureRequested';
       app_id: string;
       request_id: string;
+      /** Set when the agent saves the capture as a file. The frame then
+       *  renders at the device pixel ratio, in this format. */
+      save_format?: CaptureFormat;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2517,6 +2765,9 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ThreadArchived: true,
   ThreadArchiveRequested: true,
   ThreadUnarchived: true,
+  ThreadReadRequested: true,
+  ThreadReadNotRequested: true,
+  ThreadReplySeen: true,
   ThreadTriageProposed: true,
   ThreadStarted: true,
   ThreadDiscarded: true,
@@ -2529,6 +2780,8 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ChangeDiscarded: true,
   ChangeSetAside: true,
   ChangeBroughtBack: true,
+  ChangeWithdrawn: true,
+  ProposalWithheld: true,
   ChangeReverted: true,
   ChangeApplyFailed: true,
   MergeConflictDetected: true,
@@ -2537,7 +2790,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ChangeHardened: true,
   ChangeSummarized: true,
   CodingAgentSettingsChanged: true,
-  UserPromptInjected: true,
+  PromptInjected: true,
   CredentialRequested: true,
   PluginInstallRequested: true,
   PluginUninstallRequested: true,
@@ -2547,6 +2800,8 @@ const THREAD_EVENT_TYPE_FLAGS = {
   McpConsentRequested: true,
   UserQuestionAsked: true,
   UserQuestionAnswered: true,
+  OwnerApprovalRequested: true,
+  OwnerApprovalSpent: true,
   CodingAgentPermissionRequest: true,
   CodingAgentPermissionResolved: true,
   CommandPermissionRequested: true,
@@ -2577,9 +2832,14 @@ const THREAD_EVENT_TYPE_FLAGS = {
   SideQuestionAnswered: true,
   SideQuestionFailed: true,
   SideQuestionDismissed: true,
+  WidgetShown: true,
+  WidgetPinned: true,
+  WidgetUnpinned: true,
   ContextTokensMeasured: true,
   ContextAssembled: true,
   MemorySearched: true,
+  WidgetRestored: true,
+  WidgetHidden: true,
 } satisfies Record<ThreadEvent['type'], true>;
 
 /** Runtime-enumerable view of the union. TypeScript types are erased, so the

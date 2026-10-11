@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.48.0 — 2026-10-11
+
+### Added
+- Widgets: small interactive answers that show inline in a thread as cards. A card never scrolls inside. Past one phone screen it clips, and Expand opens the widget full size in Canvas. Pin a widget to the shelf under the thread title to come back to it.
+- A widget can show in a question option or in a reply. Options can carry a playable sample, a chart or a picker.
+- Reusable widgets show in any thread and are listed in a Widgets group on the Apps panel. One widget can take different params in each place it shows.
+- Lucidos ships built-in widgets, starting with a Sound player. Only one sound plays at a time across apps, widgets and the shell.
+- Hold, hover or tap the Home icon to list the widgets pinned in Home. A pick opens a floating widget window over any screen. Drag it from any part that is not a control, resize it from any corner, and switch it between minimal, window and docked modes.
+- Every app and widget has an icon, on the apps panel, the menu drawer, the widget shelf and Search Everywhere. An app with no icon gets a letter tile.
+- Plugins can ship pictures: an icon, screenshots, videos and a README in a `media/` folder. Each Plugins panel row leads with its icon. A tap opens the plugin detail page: every screenshot and video in one strip, and the README.
+- Plugins can ship reusable widgets. Such a widget belongs to its plugin: it shows in any thread, and it leaves when the plugin is uninstalled.
+- Apps and widgets can read the thread you have open with `lucidos.ui.focusedThread()`, and follow it with `lucidos.ui.onFocusedThreadChange()`. A widget window floating over a thread sees that thread.
+- Every agent reply says whether it is worth reading. One that is waits under Review, marked with a dot, until you have seen its end. Coding agents answer with `lucidos request-read yes|no`. A trigger run that says yes lands in Current rather than Archive.
+- The threads drawer has a grouping button: Folders, Status or Ongoing. Ongoing shows four tiles, Blocked, Review, Drafts and In flight. Review splits into changes and unread, and In flight into running and waiting.
+- An amber strip above the prompt box says why a thread's work is not ready to apply, with a Harden button when hardening is what it waits on.
+- A plan approval can offer to implement the plan in a new thread.
+- Cmd or Ctrl plus the scroll wheel zooms the UI scale.
+- A file link in an agent reply opens the preview at the cited lines.
+- Lucidos remembers a reasoning effort per model, and a new model starts at its own default. Model pickers show each model's tier.
+- Claude Haiku 5.5 is in the model list.
+- Settings shows the workspace prompt footprint: what every turn loads, and its size.
+- Settings names a background model its provider no longer serves, and a default that is no longer served moves to the next model.
+- The agent can save a sharp screenshot of an open app as a file.
+- When the Lucidos Agent writes an app or widget file, it is told about three mistakes in the same turn: a hover that sticks on a phone, a sort or filter drawn as a blue button, and a button variant missing its base class. The file is still saved. The workspace audit finds the same mistakes in existing apps.
+
+### Changed
+- Every workspace has a home thread, and the Experimental switch for it is gone. A new install opens Home first, with the welcome in it, and the setup interview runs there. A device that has opened a thread before still opens that thread.
+- The Tree memory estimate and Start open in a modal. The estimate prices each reasoning tier and marks the recommended one.
+- A coding agent's work is proposed only once its turn has finished. Work held back for an event wait blocks Archive and Delete until the wait ends.
+- Opening a thread from Review lands on the change or on the reply to read.
+- On a phone, tapping an Ongoing tile with exactly one thread opens that thread.
+- A ready change shows a diff mark on its row.
+- Applying a change joins an engine build that is already running.
+- Archive all leaves a pinned thread's family alone.
+- Picking a Text hit in Search Everywhere also opens Find in file with your search.
+- Find in file searches only the code in a source preview, never its line numbers.
+- Gemini 3.5 Flash settings move to Gemini 3.8 Flash.
+- The Canvas title grows with a wide pane, up to 36rem.
+
+### Fixed
+- A cron trigger no longer fires twice in the hour that repeats when the clocks go back.
+- Six paths where an agent command could get past the command guard or lose git data are closed.
+- A token inside a clone URL stays out of git history and events.
+- A failed OAuth refresh refuses the call instead of sending the expired token.
+- Claude Code threads load the plugin MCP servers you have enabled.
+- Messages you sent while a turn was failing are sent again.
+- Find on a phone waits for two characters and stops at 500 matches, so a long thread no longer freezes it.
+- Code on a fence's opening line renders as code.
+- The iOS edit menu opens in the prompt box again.
+- A reload after a failed download no longer serves a half-cached frontend.
+- Panning a long file sideways with line wrap off is smooth on an iPhone.
+- On a phone, a button in an app no longer stays grey after a tap.
 ## v0.47.1 — 2026-10-07
 
 ### Fixed

@@ -3,7 +3,7 @@ import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, isAgentReplyText, modeToInitiator } from './exchange';
 import { isOneUtterance, joinSpoken } from './spokenMerge';
-import { SIDE_QUESTION_TYPES, isFormRequest, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
+import { SIDE_QUESTION_TYPES, WIDGET_SHELF_CHANGE_TYPES, isFormRequest, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange, TypedAnswer } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
@@ -532,7 +532,7 @@ export const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'ResponseAborted',
   'ResponseCanceled',
   'ContinuationStarted',
-  'UserPromptInjected',
+  'PromptInjected',
   'MissingHardeningDetected',
   'MergeConflictDetected',
   'ChangeApplied',
@@ -593,7 +593,7 @@ export type ContinuationHandoff = 'takes' | 'takes-unless-parked' | 'leaves' | '
  *  decided by its cause (`isExchangeStartEvent`). */
 export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHandoff> = new Map<string, ContinuationHandoff>([
   // A queued message. The loop has not picked it up, so the running turn
-  // keeps writing above it until a `UserPromptInjected` absorbs it.
+  // keeps writing above it until a `PromptInjected` absorbs it.
   ['MessageReceived', 'leaves'],
   // Opens the thread's own first turn, so there is none to take.
   ['TriggerStarted', 'leaves'],
@@ -605,7 +605,7 @@ export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHand
   ['ContinuationStarted', 'takes-unless-parked'],
   // A wake from a detached wait, injected as a ReentryFromWait, which holds no
   // turn of its own (ADR 0049).
-  ['UserPromptInjected', 'takes-unless-parked'],
+  ['PromptInjected', 'takes-unless-parked'],
   // A sub-thread finishing mid response. The engine injects the summary as a
   // ReentryFromEngine, minting no id, so only the redirect can find the card.
   ['ChildThreadCompleted', 'takes-unless-parked'],
@@ -723,6 +723,9 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // A side question is a card beside the thread (`store/sideQuestions.ts`),
   // never a step of a turn (ADR 0320).
   ...SIDE_QUESTION_TYPES,
+  // A pin or an unpin is shelf bookkeeping (ADR 0407). The widget card its
+  // `WidgetShown` drew stays as it is.
+  ...WIDGET_SHELF_CHANGE_TYPES,
 ]);
 
 /** True for a `ContextCaptured` recording an *auxiliary model call* rather
@@ -759,16 +762,16 @@ export function hasContentEvents(events: Map<number, StoredEvent>): boolean {
 /** Find an existing exchange to absorb `event` into instead of starting a new one.
  *
  *  Two convergent paths:
- *  1. Engine resume note. A UPI emitted by chat/rerun.rs right after
+ *  1. Engine resume note. A PromptInjected emitted by chat/rerun.rs right after
  *     ContinuationStarted belongs as a step under the resume initiator. A
- *     Human-mode UPI in the same position is a real correction and stays its
+ *     Human-mode PromptInjected in the same position is a real correction and stays its
  *     own exchange.
  *  2. Mid-flight injection. The chat fast path emits MessageReceived first with
  *     the client UUID, then sends the injection. The agentic loop later emits a
- *     UPI carrying that UUID in `injected_message_id`.
+ *     PromptInjected carrying that UUID in `injected_message_id`.
  *
  *  Returns null when the event is not absorbable, or when an injection's partner
- *  is missing. The caller then starts a new exchange, so the UPI still renders
+ *  is missing. The caller then starts a new exchange, so the PromptInjected still renders
  *  rather than vanishing. */
 function findAbsorbTarget(
   state: GroupFoldState,
@@ -776,7 +779,7 @@ function findAbsorbTarget(
   exchanges: Exchange[],
   event: StoredEvent,
 ): Exchange | null {
-  if (event.type !== 'UserPromptInjected') return null;
+  if (event.type !== 'PromptInjected') return null;
   if (event.mode === 'engine'
       && current
       && current.userEvent.type === 'ContinuationStarted') {
@@ -1328,8 +1331,8 @@ interface GroupFoldState {
    *  delivers one at a time, recording each copy right after its release, so
    *  one slot is enough. See `pairHeldDelivery`. */
   pendingRelease: { holder: Exchange; held: Extract<StoredEvent, { type: 'MessageHeld' }> } | null;
-  // request_event_id to redirect target exchange. Set when a UPI is absorbed
-  // mid-flight. The loop emits the UPI when it ingests the queued follow-up, so
+  // request_event_id to redirect target exchange. Set when a PromptInjected is absorbed
+  // mid-flight. The loop emits the PromptInjected when it ingests the queued follow-up, so
   // every event after that answers the absorbed prompt rather than the original
   // request. Without the redirect, the post-injection tools and the final
   // ResponseGenerated stay in the original exchange, and the follow-up panel
@@ -1485,7 +1488,7 @@ export const UNANCHORABLE_ASYNC_EVENTS: ReadonlySet<string> = new Set([
  *  arrived, the loop did not put it there.
  *
  *  An optimistic one carries `_displayCreated` and no `created`, a persisted
- *  queued one carries `created`. Both wait until a `UserPromptInjected` lands
+ *  queued one carries `created`. Both wait until a `PromptInjected` lands
  *  and is absorbed. */
 export function isUningestedMessage(exchange: Exchange): boolean {
   if (exchange.userEvent.type !== 'MessageReceived') return false;
@@ -1779,7 +1782,7 @@ function foldSorted(sorted: SequencedEvent[], paged: boolean): GroupFoldState {
  *  The end of the timeline when nothing was said after it, which is the common
  *  case for both callers. Otherwise just above the first utterance that
  *  followed. Used by the two paths where an exchange was created earlier than
- *  it was engaged with: the mid-flight `UserPromptInjected` absorb and
+ *  it was engaged with: the mid-flight `PromptInjected` absorb and
  *  `reanchorResolvedDivider`. No-op when it is already there.
  *
  *  All-or-nothing was wrong both ways. Moving to the end regardless prints the
@@ -2231,7 +2234,7 @@ function foldEvent(
     }
     const absorbTarget = findAbsorbTarget(state, current, exchanges, event);
     if (absorbTarget) {
-      // A queued mid-flight message is ingested here, the UPI being the moment
+      // A queued mid-flight message is ingested here, the PromptInjected being the moment
       // the loop picked it up. Boundaries created while it sat in the queue
       // leave the optimistic MR panel positioned ABOVE them. The agent only
       // engages with the message now, so its panel and reply belong BELOW those
@@ -2259,7 +2262,7 @@ function foldEvent(
       const ownId = absorbTarget.userEvent._eventId;
       if (ownId) reqIdRedirect.set(ownId, absorbTarget);
       current = absorbTarget;
-      if (event.type === 'UserPromptInjected') {
+      if (event.type === 'PromptInjected') {
         const absorbedReqId = requestEventIdOf(event);
         if (absorbedReqId) reqIdRedirect.set(absorbedReqId, absorbTarget);
       }
@@ -2733,7 +2736,7 @@ export function handleEvent(
     }
     // A real MessageReceived from the backend removes the matching optimistic
     // pending message by event_id.
-    if ((event.type === 'MessageReceived' || event.type === 'UserPromptInjected') && thread.pendingUserMessages.length > 0) {
+    if ((event.type === 'MessageReceived' || event.type === 'PromptInjected') && thread.pendingUserMessages.length > 0) {
       if (eventId) {
         const idx = thread.pendingUserMessages.findIndex(p => p.eventId === eventId);
         if (idx !== -1) {

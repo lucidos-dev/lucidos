@@ -44,9 +44,11 @@ mod http;
 mod knowhow;
 mod mcp_permission_server;
 mod notify;
+mod owner_approval;
 mod pair;
 mod planned;
 mod proxy;
+mod request_read;
 mod spawn_thread;
 mod threads;
 mod workspace;
@@ -114,7 +116,7 @@ enum Command {
     /// thread when it finishes, so you END YOUR TURN instead of waiting.
     ///
     /// A command you start yourself in the background dies when your turn
-    /// ends, because the engine stops your whole process group. Anything that
+    /// ends, because the engine stops every process you started. Anything that
     /// surely fits in 10 minutes is simpler as a foreground call.
     ///
     /// All three verbs act on `$LUCIDOS_THREAD_ID`, so none can reach another
@@ -123,6 +125,31 @@ enum Command {
     BackgroundTask {
         #[command(subcommand)]
         action: BackgroundTaskCmd,
+    },
+    /// Ask the workspace owner to let this thread do one act outside its own
+    /// subtree, once (an owner approval).
+    ///
+    /// Lucidos records the request and prints its id. Then ask AskUserQuestion
+    /// with that id as the only question: Lucidos shows its own card, naming
+    /// the act, and quotes your reason as yours. If the owner answers Allow
+    /// once, the first matching call spends the approval. It expires when the
+    /// thread's next turn starts.
+    ///
+    /// The verbs: create-top-thread (no --thread), and archive, cancel,
+    /// continue, apply, discard, set-aside, bring-back, revert, control,
+    /// ask-side-question, dismiss-side-question (each with --thread). A card
+    /// never asks to answer another card.
+    #[command(name = "ask-owner-approval")]
+    AskOwnerApproval {
+        /// The act, in kebab-case: create-top-thread, apply, archive, ...
+        verb: String,
+        /// The thread the act aims at. Omit it for create-top-thread.
+        #[arg(long)]
+        thread: Option<String>,
+        /// Why you need it, in a sentence or two. The owner reads it on the
+        /// card, quoted as yours.
+        #[arg(long)]
+        reason: String,
     },
     /// Mint a one-time code that pairs a device with this machine's gateway.
     ///
@@ -178,6 +205,20 @@ enum Command {
         #[command(subcommand)]
         action: EventWaitsCmd,
     },
+    /// Decide whether the user should read this thread's latest reply.
+    ///
+    /// Every turn ends with this read decision, run before your final message.
+    /// `yes` when the reply holds what they asked for (a report, findings, an
+    /// analysis, a researched answer) or they said they would read it later:
+    /// once your turn ends, the thread is listed under Review until they have
+    /// seen it. `no` for an acknowledgement, a plain "done", or a change ready
+    /// to apply, which Review lists already. It does not notify. Acts on
+    /// `$LUCIDOS_THREAD_ID` and takes no thread argument.
+    #[command(name = "request-read")]
+    RequestRead {
+        /// `yes` or `no`. Required: there is no default.
+        answer: request_read::ReadAnswer,
+    },
     /// Record/query hardening state. Invoked by `/harden` Phase 5.
     Hardened {
         #[command(subcommand)]
@@ -224,8 +265,8 @@ enum Command {
     #[command(name = "ask-user-question-hook", hide = true)]
     AskUserQuestionHook,
     /// Stop hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
-    /// when CC tries to idle. If the branch has commits but no harden marker,
-    /// prints a permissive reminder JSON so CC nudges the model to run /harden.
+    /// when CC tries to idle. If the turn ended on a plaintext question, prints
+    /// a block JSON once so CC re-asks it through AskUserQuestion.
     /// Hidden; not for direct invocation.
     #[command(name = "cc-stop-reminder", hide = true)]
     CcStopReminder,
@@ -258,8 +299,8 @@ enum Command {
     #[command(name = "cc-plan-gate", hide = true)]
     CcPlanGate,
     /// Git post-commit hook subcommand installed in coding-agent worktrees.
-    /// Refreshes the parent engine's `coding_agent_has_diff` projection so the
-    /// Diff button appears as soon as committed work exists. Hidden; not for
+    /// Refreshes the parent engine's change state so the Diff button appears
+    /// as soon as committed work exists. Hidden; not for
     /// direct invocation.
     #[command(name = "coding-agent-diff-hook", hide = true)]
     CodingAgentDiffHook,
@@ -426,6 +467,14 @@ enum Command {
         #[command(subcommand)]
         action: generated::EnvVarsCmd,
     },
+    /// A thread's widgets, the shelf in its title row, and reusable widgets:
+    /// `list`, `thread`, `show`, `pin`, `unpin`, `make-reusable` and
+    /// `stop-reusing`. A verb's `--thread-id` defaults to
+    /// `$LUCIDOS_THREAD_ID`, the session's own thread.
+    Widgets {
+        #[command(subcommand)]
+        action: generated::WidgetsCmd,
+    },
     /// Manage the chat-model registry (Settings → Models) — `list`, `add --id
     /// <id> --provider <p> [--label L] [--sort-order N]`, `update --id <id> …`,
     /// or `delete --id <id>`. Generated from the capability parity manifest;
@@ -471,6 +520,17 @@ enum Command {
     Webhooks {
         #[command(subcommand)]
         action: generated::WebhooksCmd,
+    },
+    /// `show` prints the *workspace prompt footprint* as JSON: each
+    /// workspace-grown prompt section's chars against its ceiling, its items,
+    /// clipped descriptions and items unused for the window, plus the system
+    /// prompt footprint. The workspace audit's prompt-footprint section reads
+    /// it. Generated from the capability parity manifest; no LLM tool, since
+    /// a schema would bill every turn to measure the prompt (ADR 0413).
+    #[command(name = "workspace-prompt-footprint")]
+    WorkspacePromptFootprint {
+        #[command(subcommand)]
+        action: generated::WorkspacePromptFootprintCmd,
     },
 }
 
@@ -558,10 +618,10 @@ enum ThreadsCmd {
         /// `--has-draft false` the rest.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         has_draft: Option<bool>,
-        /// Keep coding-agent threads whose branch differs from main
-        /// (`--has-diff`), or with `--has-diff false` the rest.
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-        has_diff: Option<bool>,
+        /// Keep coding-agent threads in this change state: `none`,
+        /// `unproposed` (branch work no change carries) or `proposed`.
+        #[arg(long)]
+        change_state: Option<String>,
     },
     /// Count thread summaries matching the same filters as `list`.
     /// Outputs `{ "count": N }`.
@@ -589,10 +649,10 @@ enum ThreadsCmd {
         /// Count threads holding an unsent draft, or with `false` the rest.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         has_draft: Option<bool>,
-        /// Count coding-agent threads whose branch differs from main, or with
-        /// `false` the rest.
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-        has_diff: Option<bool>,
+        /// Count coding-agent threads in this change state: `none`,
+        /// `unproposed` or `proposed`.
+        #[arg(long)]
+        change_state: Option<String>,
     },
     /// List every thread holding an unsent draft as JSON, newest edit first:
     /// thread_id, title, preview, length, last_edited, link. With `--thread`,
@@ -1508,6 +1568,15 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             label: args.label,
             command: args.command,
         }),
+        Command::AskOwnerApproval {
+            verb,
+            thread,
+            reason,
+        } => {
+            let ws = resolve_from_env()?;
+            owner_approval::cmd_ask(&ws, &verb, thread.as_deref(), &reason)?;
+            Ok(0)
+        }
         Command::BackgroundTask { action } => {
             let ws = resolve_from_env()?;
             match action {
@@ -1521,6 +1590,11 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 }
                 BackgroundTaskCmd::Stop { task_id } => background_task::cmd_stop(&ws, &task_id)?,
             }
+            Ok(0)
+        }
+        Command::RequestRead { answer } => {
+            let ws = resolve_from_env()?;
+            request_read::cmd_request_read(&ws, answer)?;
             Ok(0)
         }
         Command::EventWaits { action } => {
@@ -1563,7 +1637,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     parent,
                     my_children,
                     has_draft,
-                    has_diff,
+                    change_state,
                 } => threads::cmd_list(
                     &ws,
                     threads::ListFilters {
@@ -1577,7 +1651,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                             threads::source_thread_id_from_env(),
                         )?,
                         has_draft,
-                        has_diff,
+                        change_state,
                     },
                 )?,
                 ThreadsCmd::Count {
@@ -1587,7 +1661,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     parent,
                     my_children,
                     has_draft,
-                    has_diff,
+                    change_state,
                 } => threads::cmd_count(
                     &ws,
                     threads::ListFilters {
@@ -1603,7 +1677,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                             threads::source_thread_id_from_env(),
                         )?,
                         has_draft,
-                        has_diff,
+                        change_state,
                     },
                 )?,
                 ThreadsCmd::Drafts { thread, limit } => {
@@ -1707,6 +1781,20 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             generated::dispatch_recall(&ws, action)?;
             Ok(0)
         }
+        Command::Widgets { mut action } => {
+            let ws = resolve_from_env()?;
+            if let generated::WidgetsCmd::Thread { thread_id, .. }
+            | generated::WidgetsCmd::Show { thread_id, .. }
+            | generated::WidgetsCmd::Pin { thread_id, .. }
+            | generated::WidgetsCmd::Unpin { thread_id, .. } = &mut action
+            {
+                if thread_id.is_none() {
+                    *thread_id = threads::source_thread_id_from_env();
+                }
+            }
+            generated::dispatch_widgets(&ws, action)?;
+            Ok(0)
+        }
         Command::EnvVars { action } => {
             let ws = resolve_from_env()?;
             generated::dispatch_env_vars(&ws, action)?;
@@ -1730,6 +1818,11 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Webhooks { action } => {
             let ws = resolve_from_env()?;
             generated::dispatch_webhooks(&ws, action)?;
+            Ok(0)
+        }
+        Command::WorkspacePromptFootprint { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_workspace_prompt_footprint(&ws, action)?;
             Ok(0)
         }
     }

@@ -28,7 +28,6 @@ import type { SwitcherListProps } from '../WorkspaceSwitcher';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
 import type { WorkspaceStatus } from '../../../api/client/control';
 import type { Loadable } from '../../../store/types';
-vi.mock('../../shared/GlyphBadge', () => import('../../shared/__tests__/glyphBadgeStub'));
 
 const MANAGE = '/~/?pick';
 const NOOP = () => {};
@@ -79,7 +78,7 @@ function rowNode(node: unknown, id: string): VNode<Record<string, unknown>> {
 
 /** The whole flattened row that names `name`: from its own opening tag to the
  *  next row's. Rows are flat siblings in one container, so slicing between two
- *  openings is what isolates one of them, badge and check included. */
+ *  openings is what isolates one of them, check included. */
 function rowFor(text: string, name: string): string {
   const at = text.indexOf(`>${name}<`);
   expect(at, `no row named "${name}"`).toBeGreaterThanOrEqual(0);
@@ -245,14 +244,12 @@ describe('the workspace list', () => {
     expect(text).not.toContain('Manage workspaces');
   });
 
-  it('badges a workspace with unread notifications, and caps the count', () => {
+  it('draws no unread count, since the notifications group above already does', () => {
     const text = list({
       status: 'loaded',
-      data: [ws({ id: 'quiet', unread_count: 0 }), ws({ id: 'busy', unread_count: 3 }), ws({ id: 'loud', unread_count: 250 })],
+      data: [ws({ id: 'dev', unread_count: 4 }), ws({ id: 'busy', unread_count: 3 })],
     });
-    expect(rowFor(text, 'quiet')).not.toContain('brand-menu-ws-badge');
-    expect(rowFor(text, 'busy')).toContain('>3<');
-    expect(rowFor(text, 'loud')).toContain('>99+<');
+    expect(text).not.toContain('brand-menu-ws-badge');
   });
 
   it('keeps the gateway listing order, so the menu and the picker agree', () => {

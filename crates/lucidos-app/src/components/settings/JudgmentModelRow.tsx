@@ -5,7 +5,7 @@ import {
   saveModelSelection,
   storedBackgroundSelection,
 } from '../../store/actions/preferences';
-import { LUCIDOS_TIER_VOCABULARY } from '../../store/actions/models';
+import { LUCIDOS_TIER_VOCABULARY, PROVIDER_DEFAULT_EFFORT_LABEL } from '../../store/actions/models';
 import type { ModelSelectionPatch } from '../../hooks/useModelSelection';
 import { ModelSelectionRow } from './ModelSelectionRow';
 import { backgroundModelChoices, backgroundRowCaveat } from './backgroundModels';
@@ -103,6 +103,7 @@ export function JudgmentModelRow(props: {
       vocabulary={LUCIDOS_TIER_VOCABULARY}
       model={judgmentSelectedModel(picked, chatModel)}
       effort={judgmentSelectedEffort(picked, stored.effort ?? resolved?.effort ?? null)}
+      unsetEffortLabel={PROVIDER_DEFAULT_EFFORT_LABEL}
       disabled={props.disabled}
       onChange={(patch) => void apply(patch)}
     />

@@ -22,11 +22,15 @@ pub(crate) fn complete_addresses(len: u64) -> Vec<NodeAddr> {
     out
 }
 
+/// How many unbuilt leaves of a thread may build at once (OptChat §4).
+pub(crate) const LEAF_WINDOW: usize = 8;
+
 /// Whether a tree's leaves wait on the leaves before them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeafOrder {
-    /// A thread leaf reads the summaries before it as context.
-    InOrder,
+    /// A thread leaf reads the summaries before it as context, so it starts
+    /// once fewer than [`LEAF_WINDOW`] leaves before it are unbuilt.
+    Windowed,
     /// A workspace leaf reads nothing of its own tree.
     Any,
 }
@@ -85,14 +89,27 @@ impl Pending {
         self.leaves.first().copied().unwrap_or(self.len)
     }
 
-    /// Up to `room` nodes the compactor may start now (OptChat §4.1).
+    /// [`super::fold::built_prefix_end`] without a scan: the prefix ends just
+    /// before the first end an unbuilt node has.
+    pub(crate) fn built_prefix_end(&self) -> u64 {
+        let leaf_end = self.leaves.first().map(|&i| i + 1);
+        let merge_end = self.merges.first().map(|&(end, _)| end);
+        leaf_end
+            .into_iter()
+            .chain(merge_end)
+            .min()
+            .map_or(self.len, |end| end - 1)
+    }
+
+    /// Up to `room` nodes the compactor may start now (OptChat §4).
     ///
-    /// In a tree whose leaves read the lines before them, leaves build one at
-    /// a time, in order: only the first unbuilt one is eligible, so every line
-    /// before it is already a summary. Leaves that read no line of their own
-    /// tree may all build at once. A merge needs both children built and every
-    /// leaf up to its end built, so it never waits on a line that could still
-    /// change.
+    /// In a tree whose leaves read the lines before them, only the first
+    /// [`LEAF_WINDOW`] unbuilt leaves are eligible. A leaf's context stops at
+    /// the first unbuilt one, so it misses at most the few lines still
+    /// building. Leaves that read no line of their own tree may all build at
+    /// once. A merge needs both children built and every leaf up to its end
+    /// built, so it never waits on a line that could still change. Merges go
+    /// first: each one moves the built prefix, which every view folds.
     pub(crate) fn buildable<V>(
         &self,
         built: &HashMap<NodeAddr, V>,
@@ -101,18 +118,10 @@ impl Pending {
         room: usize,
     ) -> Vec<NodeAddr> {
         let first = self.first_unbuilt_leaf();
-        let leaves = match order {
-            LeafOrder::InOrder => self.leaves.range(first..=first),
-            LeafOrder::Any => self.leaves.range(first..),
-        };
-        let mut out: Vec<NodeAddr> = leaves
-            .map(|&i| NodeAddr::leaf(i))
-            .filter(|a| !busy.contains(a))
-            .take(room)
-            .collect();
+        let mut out = Vec::new();
         for &(end, span) in self.merges.range(..=(first, u64::MAX)) {
             if out.len() >= room {
-                break;
+                return out;
             }
             let addr = NodeAddr {
                 start: end - span,
@@ -126,6 +135,19 @@ impl Pending {
                 out.push(addr);
             }
         }
+        let window = match order {
+            LeafOrder::Windowed => LEAF_WINDOW,
+            LeafOrder::Any => usize::MAX,
+        };
+        let room = room - out.len();
+        out.extend(
+            self.leaves
+                .iter()
+                .take(window)
+                .map(|&i| NodeAddr::leaf(i))
+                .filter(|a| !busy.contains(a))
+                .take(room),
+        );
         out
     }
 }

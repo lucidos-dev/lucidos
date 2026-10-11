@@ -69,9 +69,11 @@ async fn seed_question_canceled_after_agent_died(bus: &EventBus, thread_id: Uuid
                 label: "A".into(),
                 description: None,
                 preview: None,
+                widget: None,
             }],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: cc_meta(),
     })

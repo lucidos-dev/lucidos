@@ -1,10 +1,11 @@
 import { ThreadStatusIcon } from '../shared/ThreadStatusIcon';
+import { ThreadIcon } from '../shared/ThreadIcon';
 import type { VisualStatus } from '../shared/threadVisualStatus';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { threadIsPinnable } from '../../store/actions/threadActions';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
-import { revealThreadInList } from '../drawer/ThreadDrawer';
-import { isElementVisible } from './scrollState';
+import { revealThreadInFolders } from '../drawer/ThreadDrawer';
+import { isElementVisible } from '../../utils/elementVisibility';
 import { openFind } from '../../store/actions/find-bar';
 import type { ThreadState } from '../../store/thread-events';
 
@@ -35,11 +36,11 @@ export function ThreadTitleMenu({ thread, title, status }: {
   const listed = state !== 'composing' && !home;
   return (
     <ThreadOverflowMenu threadId={id} title={title}
-      onShowInThreadList={listed ? () => revealThreadInList(id) : undefined}
+      onShowInFolders={listed ? () => revealThreadInFolders(id) : undefined}
       onFindInThread={state !== 'composing' ? () => openFind('thread') : undefined}
       face={{
         class: 'thread-title thread-title-menu',
-        children: <span class="thread-title-text"><ThreadStatusIcon status={status} />{title}</span>,
+        children: <span class="thread-title-text"><ThreadStatusIcon status={status} /><ThreadIcon home={home === true} />{title}</span>,
       }} />
   );
 }

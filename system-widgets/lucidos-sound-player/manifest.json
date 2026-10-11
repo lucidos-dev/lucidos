@@ -1,0 +1,12 @@
+{
+  "name": "Sound player",
+  "description": "Plays one sound clip: play and pause, a scrubber and the time, one row high.",
+  "kind": "widget",
+  "reusable": true,
+  "params": {
+    "clip": {
+      "description": "The clip to play: a workspace path such as artifacts/voices/marin.mp3, or an https URL",
+      "required": true
+    }
+  }
+}

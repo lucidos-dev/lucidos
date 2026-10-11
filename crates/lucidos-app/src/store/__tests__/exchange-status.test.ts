@@ -178,7 +178,7 @@ describe('exchangeStatus — full branch coverage', () => {
   it('returns "interrupted" for non-last non-CC exchange with steps (user moved on with follow-up)', () => {
     // A non-last chat exchange with steps but no completion is one the user
     // moved past — the response continues in the panel below (mid-flight
-    // injection redirects post-UPI events to the follow-up). Render as
+    // injection redirects post-injection events to the follow-up). Render as
     // 'interrupted' ("Done ↳") so only the last panel shows
     // "Working" — same treatment as CC follow-ups. Holds whether the engine
     // has gone idle or is still processing.
@@ -357,11 +357,11 @@ describe('exchangeStatus — full branch coverage', () => {
 
   it('returns "done" for follow-up exchange whose content was injected into prior request', () => {
     // When the user posts a follow-up while the agentic loop is still working
-    // on a prior message, the engine emits UserPromptInjected (with
+    // on a prior message, the engine emits PromptInjected (with
     // injected_message_id matching the new MessageReceived) — the new text is
     // folded into the running prompt. The agent's response carries the ORIGINAL
     // request_event_id, so it routes back to the prior exchange. The follow-up
-    // exchange ends up with only the absorbed UPI as its sole step.
+    // exchange ends up with only the absorbed PromptInjected as its sole step.
     //
     // Without this special case, the threadIdle fallback at the bottom of
     // exchangeStatus reads "isLast + hasSteps + !isComplete + threadIdle" as a
@@ -369,7 +369,7 @@ describe('exchangeStatus — full branch coverage', () => {
     // "Aborted ⚠" panel even though the user's request was answered (above).
     const exchange = makeExchange(msg('men kan ikke ha dette hele tiden'), [
       step(1, {
-        type: 'UserPromptInjected',
+        type: 'PromptInjected',
         text: 'men kan ikke ha dette hele tiden',
         injected_message_id: 'msg-followup',
       } as StoredEvent),

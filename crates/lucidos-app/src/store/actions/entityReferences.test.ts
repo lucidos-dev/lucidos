@@ -4,6 +4,7 @@ import type { App, PluginInstallRequest, PluginInstallReceipt } from '../types';
 
 // Mock loader functions to prevent API calls
 vi.mock('./apps', () => ({ loadApps: vi.fn() }));
+vi.mock('./thread-loading', () => ({ reloadFilterFacetsIfLoaded: vi.fn() }));
 vi.mock('./triggers', () => ({ loadTriggers: vi.fn(), loadHistoricalTriggers: vi.fn() }));
 vi.mock('./artifacts', () => ({ loadArtifacts: vi.fn(), refreshArtifacts: vi.fn(), invalidateFilePreview: vi.fn() }));
 vi.mock('./credentials', () => ({ loadCredentials: vi.fn() }));
@@ -36,6 +37,7 @@ vi.mock('./pinnedApps', async (importOriginal) => ({
 
 import { processSSEForReferences } from './entityReferences';
 import { loadApps } from './apps';
+import { reloadFilterFacetsIfLoaded } from './thread-loading';
 import { loadTriggers, loadHistoricalTriggers } from './triggers';
 import { loadArtifacts, refreshArtifacts, invalidateFilePreview } from './artifacts';
 import { loadCredentials } from './credentials';
@@ -67,7 +69,7 @@ function getNavStack(): { stack: Array<Record<string, unknown>>; cursor: number 
   return raw ? JSON.parse(raw) : null;
 }
 
-const testApp: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load' };
+const testApp: App = { id: 'habit-tracker', name: 'Habit Tracker', description: '', reveal: 'on-load', kind: 'app', reusable: false };
 
 describe('processSSEForReferences', () => {
   beforeEach(() => {
@@ -91,6 +93,14 @@ describe('processSSEForReferences', () => {
   });
 
   // ── Deleted app ──────────────────────────────────────────────────────────
+
+  describe('an App event re-reads the filter facets, which carry app labels', () => {
+    it.each(['AppCreated', 'AppUpdated', 'AppDeleted'])('%s', (type) => {
+      vi.mocked(reloadFilterFacetsIfLoaded).mockClear();
+      processSSEForReferences(type, { app_id: 'habit-tracker' });
+      expect(reloadFilterFacetsIfLoaded).toHaveBeenCalledTimes(1);
+    });
+  });
 
   describe('AppDeleted', () => {
     it('prunes app from recents localStorage', () => {

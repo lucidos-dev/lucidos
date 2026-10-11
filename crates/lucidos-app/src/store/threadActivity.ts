@@ -4,7 +4,7 @@
  *
  *  Purpose. `threadMap` itself is reserved for **meta-shape** changes
  *  (title, status, section, codingAgent* flags, child counts, etc.) so
- *  the many components that subscribe to it for meta — `attentionThreadCount`,
+ *  the many components that subscribe to it for meta — `blockedThreadCount`,
  *  `ThreadDrawer.ThreadList`, `PromptInput`, every visible `ChatExchange` —
  *  stop re-rendering on every token of a streaming CC subprocess. Components
  *  that need live data for the focused thread subscribe to the bump signal

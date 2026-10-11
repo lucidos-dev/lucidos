@@ -112,20 +112,20 @@ describe('the Apply shortcut', () => {
 
 describe('the Diff shortcut', () => {
   it("opens the focused thread's diff when the branch has one", () => {
-    focus({ codingAgentHasDiff: true });
+    focus({ codingAgentChangeState: { kind: 'unproposed', reason: null }});
     showFocusedThreadDiff();
     expect(viewThreadCcDiff).toHaveBeenCalledWith(ID);
   });
 
   it('does nothing while a discard is in flight, where the banner shows only its spinner', () => {
-    focus({ status: 'idle', codingAgentHasDiff: true });
+    focus({ status: 'idle', codingAgentChangeState: { kind: 'unproposed', reason: null }});
     discardingCCThreadIds.value = new Set([ID]);
     showFocusedThreadDiff();
     expect(viewThreadCcDiff).not.toHaveBeenCalled();
   });
 
   it('still opens it with a draft in the composer, where the standalone Diff shows', () => {
-    focus({ status: 'idle', codingAgentHasDiff: true });
+    focus({ status: 'idle', codingAgentChangeState: { kind: 'unproposed', reason: null }});
     discardingCCThreadIds.value = new Set([ID]);
     setDraft(ID, { text: 'a follow-up', image_hashes: [], mode: null });
     showFocusedThreadDiff();
@@ -133,7 +133,7 @@ describe('the Diff shortcut', () => {
   });
 
   it('does nothing when there is no diff, where no Diff button shows', () => {
-    focus({ codingAgentHasDiff: false });
+    focus({ codingAgentChangeState: { kind: 'none' }});
     showFocusedThreadDiff();
     expect(viewThreadCcDiff).not.toHaveBeenCalled();
   });

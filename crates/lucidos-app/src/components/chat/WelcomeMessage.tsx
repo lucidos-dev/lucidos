@@ -1,7 +1,7 @@
 import { dismissWelcomeSuggestions } from '../../store/actions/preferences';
 import { openFreeProviderSettings, openProviderSettings } from '../../store/actions/menu';
 import { startSetupInterview } from '../../store/actions/compose';
-import { composeHandlers } from './promptFocus';
+import { composeHandlers } from './composeHandlers';
 import { llmConfigured } from '../../store/store';
 import { viewportIsMobile } from '../../utils/viewport';
 
@@ -27,7 +27,7 @@ function WelcomeDisclaimer() {
  *  (`llmConfigured === false`). The agent can't answer until a provider exists,
  *  so this replaces the setup-interview entry point with calls to action that
  *  deep-link into Settings → Models → Providers. One dismissal hides both it
- *  and the starter prompts (`showWelcomeSurface`).
+ *  and the starter prompts (`welcomePlacement`).
  *
  *  TWO actions, because the first one is unreachable for the very user this
  *  screen exists for. Every credential provider wants a key, and a key wants a

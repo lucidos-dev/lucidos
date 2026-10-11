@@ -502,6 +502,7 @@ async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
             text: "still working...".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             parent_tool_use_id: None,
+            progress_note: false,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -524,7 +525,7 @@ async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
 }
 
 /// `events_pkey` is the structural reason the agentic loop's old inject
-/// path silently dropped `UserPromptInjected` events: a row already
+/// path silently dropped `PromptInjected` events: a row already
 /// existed with the same id (the optimistic `MessageReceived`). Locking
 /// this in here so a future schema change that relaxes the constraint
 /// doesn't quietly resurrect that bug.
@@ -563,7 +564,7 @@ async fn emit_with_existing_event_id_fails_with_pkey_violation() {
     let result = bus
         .emit(BusEvent::Thread {
             thread_id,
-            event: ThreadEvent::UserPromptInjected {
+            event: ThreadEvent::PromptInjected {
                 text: "second".into(),
                 mode: ActorMode::Human,
                 origin: None,

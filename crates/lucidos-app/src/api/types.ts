@@ -217,6 +217,12 @@ export interface ModelInfo {
   /** The *vision flag*: whether this model reads images. Image description
    *  offers and runs only such models. */
   vision: boolean;
+  /** The *default effort*: the tier this model runs at when nothing stored
+   *  names one. `null` means the engine sends no effort. */
+  default_effort: string | null;
+  /** The model this one was retired to, or null for a current model. The
+   *  engine sends the successor whenever a call names this one. */
+  successor: string | null;
   sort_order: number;
   source: string;
   enabled: boolean;
@@ -401,6 +407,9 @@ export interface BackfillProgress {
   /** The ready flag is set: turns read the trees while older threads still
    *  fill in. */
   ready: boolean;
+  /** The order of the frame that announced this count. A snapshot carries the
+   *  last frame's order, so a frame no newer than it was already counted. */
+  seq: number;
 }
 
 /** `GET /api/v1/memory/tree-backfill`. Mirrors the Rust `TreeBackfill`. */
@@ -461,11 +470,15 @@ export interface Bounds {
   high: number;
 }
 
-/** One reasoning tier's cost. `backfill_usd`/`daily_usd` are the range;
- *  `*_central` is the one figure the panel leads with, from measured (or
- *  fallback) per-call tokens rather than the range's own guesses. */
+/** One reasoning tier's cost and time. `backfill_usd`/`daily_usd` are the
+ *  range; `*_central` is the one figure the panel leads with, from measured
+ *  (or seeded) per-call tokens rather than the range's own guesses. */
 export interface EffortCost {
   effort: string;
+  /** Until turns read the trees, at this tier's seconds per call. */
+  usable_secs: Bounds;
+  /** Until every tree is built, at this tier's seconds per call. */
+  complete_secs: Bounds;
   backfill_usd: Bounds;
   backfill_usd_central: number;
   daily_usd: Bounds;
@@ -477,15 +490,15 @@ export interface EffortCost {
  *  range, because entry sizes are approximated. */
 export interface TreeBackfillEstimate {
   calls: Bounds;
-  /** Until turns read the trees, at the default seconds per call. */
+  /** Until turns read the trees, at the default seconds per call: what a
+   *  model the estimate does not price shows. */
   usable_secs: Bounds;
   /** Until every tree is built, at the default seconds per call. */
   complete_secs: Bounds;
   daily_calls: Bounds;
   /** One per compactor model, each carrying a row per reasoning tier. A
-   *  tier the model cannot run is priced as the tier routing snaps it to.
-   *  Its times use the model's measured seconds per call where it has any. */
-  costs: { model: string; usable_secs: Bounds; complete_secs: Bounds; by_effort: EffortCost[] }[];
+   *  tier the model cannot run is priced as the tier routing snaps it to. */
+  costs: { model: string; by_effort: EffortCost[] }[];
 }
 
 /** One row of `GET /api/v1/models/background`. Mirrors the Rust
@@ -495,16 +508,28 @@ export interface BackgroundModel {
   model: string;
   effort: string | null;
   source: 'preference' | 'default' | 'chat-model';
-  /** Whether a configured provider serves `model`. Only a stored pick can be
+  /** Whether a configured provider serves `model` and has not answered
+   *  not-found for it. Only a stored pick or the chat model can be
    *  unreachable, and its calls then fail. */
   reachable: boolean;
+  /** The models this row would run on ahead of `model`, plus `model`, whose
+   *  provider answered not-found in the last six hours (ADR 0403). */
+  not_served: string[];
   /** Whether this task sends images, so its model must read them. */
   needs_vision: boolean;
   /** Whether `model` reads images. With `needs_vision`, `false` means the
    *  engine refuses the task rather than calling the model. */
   vision: boolean;
   /** The models the picker lists first, best first. */
-  recommended: string[];
+  recommended: RecommendedSelection[];
+}
+
+/** One recommended model, and the tier its picker badges as recommended.
+ *  Mirrors the Rust `RecommendedSelection`. `effort` is set only where
+ *  measurement backs the tier: the compactor's row. */
+export interface RecommendedSelection {
+  model: string;
+  effort: string | null;
 }
 
 /** `GET /api/v1/models/background`, keyed by each row's model preference. */

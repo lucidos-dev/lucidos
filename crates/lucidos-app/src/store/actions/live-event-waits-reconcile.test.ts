@@ -79,10 +79,7 @@ function summary(overrides: Partial<ThreadSummary>): ThreadSummary {
     live_event_waits: [],
     status: 'idle',
     summary_version: 0,
-    coding_agent_has_diff: false,
-    coding_agent_proposed: false,
-    coding_agent_requires_restart: false,
-    coding_agent_incomplete: false,
+    coding_agent_change_state: { kind: 'none' },
     coding_agent_is_external_repo: false,
     last_revived_at: null,
     state: 'active',
@@ -186,6 +183,7 @@ describe('handleEvent repairs the list from the per-event aggregate', () => {
     liveEventWaitCount: waits.length,
     liveEventWaits: waits,
     lastActivity: RESOLVED_AT,
+    codingAgentChangeState: { kind: 'none' },
   } as unknown as ThreadAggregate);
 
   const unrelated: ThreadEvent = { type: 'ResponseGenerated', text: 'done' } as ThreadEvent;

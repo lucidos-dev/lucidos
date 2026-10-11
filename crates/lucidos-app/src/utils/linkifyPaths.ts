@@ -84,6 +84,7 @@ function applyMatches(text: string, matches: Match[]): string {
 const HREF_ATTR = /\shref\s*=\s*(?:"([^"]*)"|'([^']*)')/i;
 const CLASS_ATTR = /\sclass\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_PATH_ATTR = /\sdata-path\s*=\s*(?:"[^"]*"|'[^']*')/i;
+const DATA_LINE_ATTRS = /\sdata-line(?:-end)?\s*=\s*(?:"[^"]*"|'[^']*')/gi;
 
 /** If the opening anchor tag points at a workspace data file, return a
  *  replacement opening tag using `class="artifact-link" data-path="..."`, so
@@ -103,7 +104,9 @@ const DATA_PATH_ATTR = /\sdata-path\s*=\s*(?:"[^"]*"|'[^']*')/i;
  *  extension.
  *
  *  `href="#"` is forced rather than dropped: iOS Safari treats an `<a>` with
- *  no href as non-interactive, so taps never become `click` events. */
+ *  no href as non-interactive, so taps never become `click` events. A `#L`
+ *  line reference moves to `data-line` / `data-line-end`, since the forced
+ *  href can no longer carry it. */
 function rewriteArtifactAnchor(
   tag: string,
   pathLookup: Map<string, string> | undefined,
@@ -112,17 +115,22 @@ function rewriteArtifactAnchor(
   if (!m) return null;
   const href = m[1] ?? m[2];
   if (!href) return null;
-  let candidate = href;
+  let candidate = href.replace(LINE_FRAGMENT_RE, '');
   if (candidate.startsWith('/data/')) candidate = candidate.slice('/data/'.length);
   else if (candidate.startsWith('data/')) candidate = candidate.slice('data/'.length);
   const fullPath = pathLookup?.get(candidate) ?? extractDataPathTarget(href);
   if (!fullPath) return null;
   const escapedPath = fullPath.replace(/"/g, '&quot;');
+  const lines = hrefLineRef(href);
+  const lineAttrs = lines === null
+    ? ''
+    : ` data-line="${lines.line}"${lines.lineEnd === undefined ? '' : ` data-line-end="${lines.lineEnd}"`}`;
   const stripped = tag
     .replace(HREF_ATTR, '')
     .replace(CLASS_ATTR, '')
-    .replace(DATA_PATH_ATTR, '');
-  return stripped.replace(/^<a/i, `<a href="#" class="artifact-link" data-path="${escapedPath}"`);
+    .replace(DATA_PATH_ATTR, '')
+    .replace(DATA_LINE_ATTRS, '');
+  return stripped.replace(/^<a/i, `<a href="#" class="artifact-link" data-path="${escapedPath}"${lineAttrs}`);
 }
 
 const DATA_APP_ID_ATTR = /\sdata-app-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
@@ -577,15 +585,40 @@ export function extractTriggerIdFromHref(href: string): string | null {
 /** A file in a registered repository clone, named by a `repo:` href. The
  *  locator's `repoId` is whatever the link wrote, an id or a repository name,
  *  so a caller resolves it against the registry before opening. */
-export interface RepoFileHrefTarget {
-  locator: RepoLocator;
-  line?: number;
-  lineEnd?: number;
-}
+export type RepoFileHrefTarget = { locator: RepoLocator } & Partial<LineRef>;
 
 /** A GitHub-style line reference: `#L510`, `#L510-L520` or `#L510-520`. The
  *  only channel an href has for a line. */
 const LINE_FRAGMENT_RE = /#L(\d+)(?:-L?(\d+))?$/;
+
+/** A line citation the way prose writes one, ending a link's label:
+ *  `main.rs:510`, `main.rs:510-520`, or with an en dash. */
+const LABEL_LINES_RE = /:(\d+)(?:\s*[-\u2013]\s*(\d+))?$/;
+
+/** The line, and optionally the last line, a link cites. */
+export interface LineRef {
+  line: number;
+  lineEnd?: number;
+}
+
+function lineRefFrom(match: RegExpExecArray | null): LineRef | null {
+  if (!match) return null;
+  return match[2] === undefined
+    ? { line: Number(match[1]) }
+    : { line: Number(match[1]), lineEnd: Number(match[2]) };
+}
+
+/** The line reference ending an href, or null. */
+export function hrefLineRef(href: string): LineRef | null {
+  return lineRefFrom(LINE_FRAGMENT_RE.exec(href));
+}
+
+/** The line citation ending a link's visible label, or null. The label is
+ *  what the reader clicked, so a link that names lines only there still
+ *  lands on them. */
+export function labelLineRef(label: string): LineRef | null {
+  return lineRefFrom(LABEL_LINES_RE.exec(label.trim()));
+}
 
 /** Extract a `repo:<repo>:file:<path>` href (or `file#<ref>`, or `diff`),
  *  with an optional trailing line reference split off.
@@ -601,12 +634,9 @@ export function extractRepoFileTargetFromHref(href: string): RepoFileHrefTarget 
   const lineMatch = LINE_FRAGMENT_RE.exec(decoded);
   const locator = parseRepoPath(lineMatch ? decoded.slice(0, lineMatch.index) : decoded);
   if (!locator) return null;
-  if (!lineMatch) return { locator };
-  return {
-    locator,
-    line: Number(lineMatch[1]),
-    lineEnd: lineMatch[2] === undefined ? undefined : Number(lineMatch[2]),
-  };
+  const lines = lineRefFrom(lineMatch);
+  if (!lines) return { locator };
+  return { locator, line: lines.line, lineEnd: lines.lineEnd };
 }
 
 /** Extract a BARE app reference from an href: a single path segment with no

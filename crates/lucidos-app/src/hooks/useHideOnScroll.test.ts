@@ -101,7 +101,7 @@ describe('titleBarOffsetPx (dynamic bars)', () => {
   const headerHeight = 110;
   const titleBarHeight = 40;
   const chrome = headerHeight + titleBarHeight;
-  const elsewhere = { onThreadPane: false, headerHeight, titleBarHeight };
+  const elsewhere = { onOwnPane: false, headerHeight, titleBarHeight };
   const hookSource = readFileSync(
     resolve(dirname(fileURLToPath(import.meta.url)), 'useHideOnScroll.ts'),
     'utf8',
@@ -109,7 +109,7 @@ describe('titleBarOffsetPx (dynamic bars)', () => {
 
   it('takes the chrome offset on its own pane', () => {
     for (const chromeOffset of [0, -chrome]) {
-      expect(titleBarOffsetPx({ ...elsewhere, onThreadPane: true, chromeOffset, threadScrollTop: 0 })).toBe(chromeOffset);
+      expect(titleBarOffsetPx({ ...elsewhere, onOwnPane: true, chromeOffset, paneScrollTop: 0 })).toBe(chromeOffset);
     }
   });
 
@@ -119,20 +119,20 @@ describe('titleBarOffsetPx (dynamic bars)', () => {
   it('goes off screen with the header on another pane, over a scrolled transcript', () => {
     // There the chrome is the header alone, so the offset is its height. The
     // title bar must still clear the screen by its own height too.
-    const offset = titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, threadScrollTop: 500 });
+    const offset = titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, paneScrollTop: 500 });
     expect(headerHeight + offset + titleBarHeight).toBeLessThanOrEqual(0);
   });
 
   it('stays shown until the transcript can reach the band above it', () => {
     // The transcript rises into that band once it scrolls past the bar's own
     // height. Short of that the band is empty, and a hidden bar leaves one too.
-    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, threadScrollTop: 0 })).toBe(0);
-    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, threadScrollTop: titleBarHeight })).toBe(0);
-    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, threadScrollTop: titleBarHeight + 1 })).toBe(-chrome);
+    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, paneScrollTop: 0 })).toBe(0);
+    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, paneScrollTop: titleBarHeight })).toBe(0);
+    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: -headerHeight, paneScrollTop: titleBarHeight + 1 })).toBe(-chrome);
   });
 
   it('stays shown whenever the header is shown', () => {
-    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: 0, threadScrollTop: 500 })).toBe(0);
+    expect(titleBarOffsetPx({ ...elsewhere, chromeOffset: 0, paneScrollTop: 500 })).toBe(0);
   });
 
   it('is bound from the thread pane, not from the current pane', () => {
@@ -268,12 +268,11 @@ describe('--mobile-header-offset stays off the document root', () => {
   });
 
   it('writes the offset on every consumer element', () => {
-    // The sticky title bar, the scroll-to-top chevron and the transcript's find
-    // bar all read it (styles/mobile.css). Dropping one leaves that element at
-    // its resting position while the header scrolls away.
+    // The sticky title bar and the scroll-to-top chevron both read it
+    // (styles/mobile.css). Dropping one leaves that element at its resting
+    // position while the header scrolls away.
     expect(hookSource).toMatch(/titleBarEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
     expect(hookSource).toMatch(/chevronEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
-    expect(hookSource).toMatch(/findBarEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
   });
 
   const mobileCss = readFileSync(
@@ -322,7 +321,8 @@ describe('--mobile-header-offset stays off the document root', () => {
     // reads as the reader scrolling and cancels the landing, so the reader never
     // saw the message they just sent (scroll-follow-the-live-edge.test.ts).
     expect(hookSource).not.toMatch(/\.scrollTop\s*[+-]?=(?!=)/);
-    expect(hookSource.match(/holdAcrossRelayout\(currentContainer/g) ?? []).toHaveLength(2);
+    // Focusin, focusout, and a pin that ends the keyboard state.
+    expect(hookSource.match(/holdAcrossRelayout\(currentContainer/g) ?? []).toHaveLength(3);
   });
 
   it('re-takes its baseline at every write of ours, not on the scroll event', () => {
@@ -346,15 +346,15 @@ describe('--mobile-header-offset stays off the document root', () => {
   });
 
   it('keeps the offset off `top`, which would reinstate the forced layout', () => {
-    // All three consumers (the title bar, the up chevron and the transcript's
-    // find bar) take the offset on `translate` (composited) so the write
-    // cannot dirty layout. A `top` that reads it means the next scroll event's
+    // Every consumer takes the offset on `translate` (composited), so the
+    // write cannot dirty layout: the thread title bar and the up chevron. A
+    // `top` that reads it means the next scroll event's
     // scrollTop read forces a style+layout flush of the whole transcript again.
     const offsetOnTop = mobileCss.match(/top:[^;]*--mobile-header-offset/g) ?? [];
     expect(offsetOnTop).toHaveLength(0);
     const offsetOnTransform = mobileCss.match(/transform:[^;]*--mobile-header-offset/g) ?? [];
     expect(offsetOnTransform).toHaveLength(0);
-    expect(mobileCss.match(/translate:[^;]*--mobile-header-offset/g) ?? []).toHaveLength(3);
+    expect(mobileCss.match(/translate:[^;]*--mobile-header-offset/g) ?? []).toHaveLength(2);
   });
 });
 
@@ -365,12 +365,20 @@ describe('the dynamic bars glide on a compositor transition', () => {
   const inputCss = read('../styles/chat/input-messages.css');
   const GLIDE = /translate var\(--bars-glide-duration, 0s\) ease/;
 
-  /** The `property` value of the first rule whose selector ends in `selector`. */
+  /** The `property` value from the rules whose selector list names
+   *  `selector`, the last declaration winning as in the cascade. */
   function declarationOf(css: string, selector: string, property: string): string {
-    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const rule = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(css);
-    expect(rule, `no rule for ${selector}`).not.toBeNull();
-    return new RegExp(`(?:^|[;\\s])${property}:([^;]*);`).exec(rule![1])?.[1] ?? '';
+    const normalize = (sel: string) => sel.replace(/\s+/g, ' ').trim();
+    const uncommented = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    const rules = [...uncommented.matchAll(/([^{}]+)\{([^}]*)\}/g)]
+      .filter(m => m[1].split(',').map(normalize).includes(normalize(selector)));
+    expect(rules.length, `no rule for ${selector}`).toBeGreaterThan(0);
+    let value = '';
+    for (const rule of rules) {
+      const found = new RegExp(`(?:^|[;\\s])${property}:([^;]*);`).exec(rule[2]);
+      if (found) value = found[1];
+    }
+    return value;
   }
   const transitionOf = (css: string, selector: string) => declarationOf(css, selector, 'transition');
 
@@ -390,7 +398,8 @@ describe('the dynamic bars glide on a compositor transition', () => {
     expect(transitionOf(mobileCss, '.mobile-swipe-pane .mobile-thread-title-row')).toMatch(GLIDE);
     expect(transitionOf(mobileCss, ':root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area')).toMatch(GLIDE);
     // Both chevrons, from their shared base rule.
-    expect(transitionOf(inputCss, '.scroll-to-top,\n.scroll-to-bottom')).toMatch(GLIDE);
+    expect(transitionOf(inputCss, '.scroll-to-top')).toMatch(GLIDE);
+    expect(transitionOf(inputCss, '.scroll-to-bottom')).toMatch(GLIDE);
   });
 
   it('runs the glide only while the bars are dynamic', () => {
@@ -1399,32 +1408,40 @@ describe('shouldKeepHeaderVisible', () => {
   // on threads/chat panes the iframe is off-screen, so its scroll events
   // can't reach the parent and the header should hide normally.
   it('app-ui overlay forces visible on the content pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', dynamicBars: true })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', dynamicBars: true, findOpen: false })).toBe(true);
   });
 
   it('app-ui overlay does NOT force visible on the threads pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: 'app-ui', dynamicBars: true })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: 'app-ui', dynamicBars: true, findOpen: false })).toBe(false);
   });
 
   it('app-ui overlay does NOT force visible on the chat pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: 'app-ui', dynamicBars: true })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: 'app-ui', dynamicBars: true, findOpen: false })).toBe(false);
   });
 
   it('non-app-ui overlay on content pane does NOT force visible', () => {
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', dynamicBars: true })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', dynamicBars: true, findOpen: false })).toBe(false);
   });
 
   it('no overlay on any pane does NOT force visible', () => {
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: true })).toBe(false);
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: true })).toBe(false);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: null, dynamicBars: true })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: true, findOpen: false })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: true, findOpen: false })).toBe(false);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: null, dynamicBars: true, findOpen: false })).toBe(false);
   });
 
   it('pinned bars (dynamic bars off) force visible regardless of pane or overlay', () => {
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: false })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: false })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', dynamicBars: false })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', dynamicBars: false })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: false, findOpen: false })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: false, findOpen: false })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', dynamicBars: false, findOpen: false })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', dynamicBars: false, findOpen: false })).toBe(true);
+  });
+
+  // The find bar docks under the header, and each step scrolls. A header that
+  // slides with those scrolls drags the bar along.
+  it('an open find bar forces visible on every pane', () => {
+    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: true, findOpen: true })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'file-preview', dynamicBars: true, findOpen: true })).toBe(true);
+    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: true, findOpen: true })).toBe(true);
   });
 });
 

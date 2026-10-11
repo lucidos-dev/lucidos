@@ -206,10 +206,10 @@ async fn a_subscribed_thread_wakes_when_its_event_arrives() {
     let delivered = await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
     assert_eq!(delivered["event_type"], event_type.as_str());
 
-    // The delivery arrives as a new turn, anchored on a `UserPromptInjected`
+    // The delivery arrives as a new turn, anchored on a `PromptInjected`
     // carrying the event as prose. That the provider accepted the rebuilt
     // message array is the point.
-    let anchor = await_event_row(&pool, thread_id, "UserPromptInjected", 25).await;
+    let anchor = await_event_row(&pool, thread_id, "PromptInjected", 25).await;
     assert!(
         anchor["text"]
             .as_str()
@@ -240,7 +240,7 @@ async fn a_second_matching_event_delivers_only_once() {
 
     emit_domain_event(&event_type, "first").await;
     await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
-    await_event_row(&pool, thread_id, "UserPromptInjected", 25).await;
+    await_event_row(&pool, thread_id, "PromptInjected", 25).await;
 
     emit_domain_event(&event_type, "second, after the wait was consumed").await;
     // Long enough that a second delivery would have landed: the first one took
@@ -253,7 +253,7 @@ async fn a_second_matching_event_delivers_only_once() {
         "the wait was consumed by the first match"
     );
     assert_eq!(
-        count_events(&pool, thread_id, "UserPromptInjected").await,
+        count_events(&pool, thread_id, "PromptInjected").await,
         1,
         "one subscription, one delivery"
     );
@@ -281,7 +281,7 @@ async fn an_unrelated_event_leaves_a_subscribed_thread_subscribed() {
         0,
     );
     assert_eq!(
-        count_events(&pool, thread_id, "UserPromptInjected").await,
+        count_events(&pool, thread_id, "PromptInjected").await,
         0,
         "still watching for its own event, and nothing delivered to it"
     );
@@ -506,7 +506,7 @@ async fn a_wait_can_be_registered_over_http() {
 
     emit_domain_event(&event_type, "delivering to the HTTP-registered wait").await;
     await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
-    await_event_row(&pool, thread_id, "UserPromptInjected", 25).await;
+    await_event_row(&pool, thread_id, "PromptInjected", 25).await;
 }
 
 /// The **arming lookback** over the real route: the event lands BEFORE the

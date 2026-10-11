@@ -212,9 +212,9 @@ pub(crate) async fn resolve_main_worktree(path: &Path) -> PathBuf {
 /// 3. `git sparse-checkout set data/apps/<app_id>`.
 /// 4. `git checkout <branch>`.
 ///
-/// When a step after the add fails, the worktree this call added is removed so
-/// the caller can retry. A failed add removes nothing: whatever occupies
-/// `wt_path` then is not this attempt's to delete.
+/// When a step after the add fails or cannot run, this call removes the
+/// worktree it added, so the caller can retry. A failed add removes nothing:
+/// whatever occupies `wt_path` then is not this attempt's to delete.
 pub(crate) async fn create_sparse_app_worktree(
     workspace_root: &Path,
     app_id: &str,
@@ -224,12 +224,6 @@ pub(crate) async fn create_sparse_app_worktree(
     let wt_str = wt_path
         .to_str()
         .ok_or_else(|| format!("non-utf8 worktree path: {}", wt_path.display()))?;
-
-    // Runs only after step 1 succeeded, so it removes a worktree this call
-    // created. Best-effort: the next attempt's add reports anything left over.
-    let cleanup = || async {
-        let _ = git_cmd(&["worktree", "remove", "--force", wt_str], workspace_root).await;
-    };
 
     // Step 1: create the worktree without checking anything out. Without
     // --no-checkout, git would materialise every tracked file first and
@@ -272,36 +266,11 @@ pub(crate) async fn create_sparse_app_worktree(
         return Err(format!("git worktree add failed: {stderr}"));
     }
 
-    // Step 2: enable cone-mode sparse-checkout in the new worktree. Cone
-    // mode is the recommended mode — it works at the directory level (not
-    // pathspec level) which is exactly what we need to narrow to one
-    // `data/apps/<id>/` folder.
-    let init = git_cmd(&["sparse-checkout", "init", "--cone"], wt_path).await?;
-    if !init.status.success() {
-        let stderr = String::from_utf8_lossy(&init.stderr).trim().to_string();
-        cleanup().await;
-        return Err(format!("git sparse-checkout init failed: {stderr}"));
-    }
-
-    // Step 3: narrow to the app folder. Cone mode also always materialises
-    // top-level files (workspace `.gitignore`, our marker) — so the worktree
-    // root stays usable for `git status` / engine markers even though most
-    // of `data/` is pruned.
-    let app_path = format!("data/apps/{}", app_id);
-    let set = git_cmd(&["sparse-checkout", "set", &app_path], wt_path).await?;
-    if !set.status.success() {
-        let stderr = String::from_utf8_lossy(&set.stderr).trim().to_string();
-        cleanup().await;
-        return Err(format!("git sparse-checkout set failed: {stderr}"));
-    }
-
-    // Step 4: now materialise the sparse cone on the branch. Without this,
-    // the worktree HEAD is set but the working tree is empty.
-    let checkout = git_cmd(&["checkout", branch_name], wt_path).await?;
-    if !checkout.status.success() {
-        let stderr = String::from_utf8_lossy(&checkout.stderr).trim().to_string();
-        cleanup().await;
-        return Err(format!("git checkout {branch_name} failed: {stderr}"));
+    // Step 1 succeeded, so this removes a worktree this call created.
+    // Best-effort: the next attempt's add reports anything left over.
+    if let Err(e) = check_out_app_cone(wt_path, app_id, branch_name).await {
+        let _ = git_cmd(&["worktree", "remove", "--force", wt_str], workspace_root).await;
+        return Err(e);
     }
 
     if let Err(e) = link_git_crypt_dir(wt_path).await {
@@ -313,6 +282,45 @@ pub(crate) async fn create_sparse_app_worktree(
     }
 
     Ok(!branch_exists)
+}
+
+/// Steps 2 to 4 of [`create_sparse_app_worktree`]. `Err` covers a step that
+/// exited non-zero and one that could not run at all.
+async fn check_out_app_cone(wt_path: &Path, app_id: &str, branch_name: &str) -> Result<(), String> {
+    // Step 2: enable cone-mode sparse-checkout in the new worktree. Cone
+    // mode is the recommended mode — it works at the directory level (not
+    // pathspec level) which is exactly what we need to narrow to one
+    // `data/apps/<id>/` folder. A timeout here leaves steps 2 and 3 running:
+    // init can write the repo's shared `.git/config`, and killing that write
+    // strands its lock for every later spawn.
+    let init = git_cmd(&["sparse-checkout", "init", "--cone"], wt_path).await;
+    step_outcome(init, "git sparse-checkout init")?;
+
+    // Step 3: narrow to the app folder. Cone mode also always materialises
+    // top-level files (workspace `.gitignore`, our marker) — so the worktree
+    // root stays usable for `git status` / engine markers even though most
+    // of `data/` is pruned.
+    let app_path = format!("data/apps/{app_id}");
+    let set = git_cmd(&["sparse-checkout", "set", &app_path], wt_path).await;
+    step_outcome(set, "git sparse-checkout set")?;
+
+    // Step 4: now materialise the sparse cone on the branch. Without this,
+    // the worktree HEAD is set but the working tree is empty. A timeout kills
+    // this step, so no checkout keeps writing into the tree the failure path
+    // removes.
+    let checkout = git_cmd_kill_on_timeout(&["checkout", branch_name], wt_path).await;
+    step_outcome(checkout, &format!("git checkout {branch_name}"))
+}
+
+/// A step that could not run keeps its own error. One that ran and exited
+/// non-zero reports `step` with git's stderr.
+fn step_outcome(out: Result<std::process::Output, String>, step: &str) -> Result<(), String> {
+    let out = out?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("{step} failed: {stderr}"));
+    }
+    Ok(())
 }
 
 /// Add a git worktree, bridging git-crypt's per-worktree key lookup to the

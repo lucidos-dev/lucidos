@@ -7,8 +7,17 @@
 /** `CLIENT_LOG_MAX_BATCH` in `api/internal.rs`. */
 export const CLIENT_LOG_MAX_BATCH = 100;
 
+/** `WIDGET_PARAMS_MAX_BYTES` in `engine/widgets.rs`. */
+export const WIDGET_PARAMS_MAX_BYTES = 2048;
+
 /** `MAX_IDS` in `api/threads/archive_all.rs`. */
 export const ARCHIVE_ALL_MAX_IDS = 2000;
+
+/** `SAME_FAMILY` in `engine/thread_triage/archive_all.rs`. */
+export const ARCHIVE_ALL_SAME_FAMILY = "same_family";
+
+/** `PINNED_SUB_THREAD` in `engine/thread_triage/archive_all.rs`. */
+export const ARCHIVE_ALL_PINNED_SUB_THREAD = "pinned_sub_thread";
 
 /** `SIDE_QUESTION_TIMEOUT` in `engine/agent_session/side_question.rs`. */
 export const SIDE_QUESTION_TIMEOUT_MS = 120000;
@@ -18,6 +27,9 @@ export const PROXY_CLIENT_WAIT_SECS = 660;
 
 /** `HEADER_DEVICE_ID` in `api/actor.rs`. */
 export const HEADER_DEVICE_ID = "x-lucidos-device-id";
+
+/** `SOURCE_COMMIT_FILE` in `api/frontend_snapshot.rs`. */
+export const SOURCE_COMMIT_FILE = "source-commit";
 
 /** `BROAD_ALLOW_INEFFECTIVE` in `engine/claude_code/mod.rs`. */
 export const BROAD_ALLOW_INEFFECTIVE = ["Edit", "ExitPlanMode", "NotebookEdit", "Write"] as const;
@@ -46,6 +58,9 @@ export const AUTO_RESUME_AFTER_API_ERROR_REASON = "auto_resume_after_api_error";
 /** `ENGINE_RESTART_INTERRUPT_REASON` in `engine/agent_recovery/helpers.rs`. */
 export const ENGINE_RESTART_INTERRUPT_REASON = "engine_restart_interrupt";
 
+/** `HARDEN_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const HARDEN_REQUESTED_REASON = "harden_requested";
+
 /** `TYPESAFE_API_KEY_ENV` in `llm/judgment/endpoint.rs`. */
 export const TYPESAFE_API_KEY_ENV = "TYPESAFE_API_KEY";
 
@@ -63,6 +78,9 @@ export const CLOUDFLARE_ACCOUNTS_PREFIX = "https://api.cloudflare.com/client/v4/
 
 /** `SystemOneEndpoint::id` in `llm/judgment/endpoint.rs`. */
 export const SYSTEM_ONE_ENDPOINT_IDS = ["jev", "clef", "clef-flash", "custom"] as const;
+
+/** `TakesEffect` in `runtime/agent_runtime.rs`. */
+export const TAKES_EFFECT_VALUES = ["now", "next-turn"] as const;
 
 /** `SECTIONS` in `voice/sections.rs`. */
 export const VOICE_RESIDENT_SECTIONS = [

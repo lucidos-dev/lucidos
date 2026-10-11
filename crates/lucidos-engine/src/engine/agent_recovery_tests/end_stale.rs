@@ -494,3 +494,91 @@ mod a_refused_branch_delete_is_reported {
         );
     }
 }
+
+mod a_stale_recovery_keeps_withheld_work_visible {
+    //! I9: stale-session recovery ends its turn with `CodingAgentIdled`. Its
+    //! `has_changes` must report the branch's work whether a change carries it
+    //! or the turn end withheld it. Reporting "proposed or not" erased
+    //! withheld work to `none`. `end_stale_waiting_session` needs a
+    //! `LucidosEngine`, so the call site is pinned by source and the projection
+    //! half is replayed through the bus.
+
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent, UnproposedReason};
+    use crate::engine::thread_lifecycle::CodingAgentChangeState;
+    use crate::test_support::{
+        read_change_state, setup_test_db, start_cc_session, teardown_test_db,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn the_stale_idle_reports_branch_work_not_the_proposal() {
+        const RECOVERY_SRC: &str = include_str!("../agent_recovery/recovery.rs");
+        let body = &RECOVERY_SRC[RECOVERY_SRC
+            .find("pub(crate) async fn end_stale_waiting_session(")
+            .unwrap()..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let work = body
+            .find("branch_has_work = true;")
+            .expect("the branch's work is recorded");
+        let settle = body
+            .find("self.propose_stale_branch(")
+            .expect("before it is proposed or withheld");
+        assert!(work < settle);
+        assert!(
+            body.contains("has_changes: branch_has_work,"),
+            "the idle reports the branch's work"
+        );
+    }
+
+    /// The stale path's events for withheld work: the withholding, then the
+    /// idle with work. The work ends unproposed with its reason, never `none`.
+    #[tokio::test]
+    async fn withheld_work_survives_the_stale_idle() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let branch = "claude-code/stale-withheld";
+        start_cc_session(&bus, thread_id, branch, None).await;
+        let meta = || EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        };
+        for event in [
+            ThreadEvent::ProposalWithheld {
+                branch_name: branch.into(),
+                files: vec!["a.txt".into()],
+                reason: UnproposedReason::TurnIncomplete,
+            },
+            ThreadEvent::CodingAgentIdled {
+                has_changes: true,
+                is_external_repo: false,
+                requires_restart: false,
+                cc_session_id: None,
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                reason: None,
+                worktree_path: None,
+                worktree_head_sha: None,
+                bg_bash_pending: false,
+            },
+        ] {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta: meta(),
+            })
+            .await
+            .expect("emit");
+        }
+
+        assert_eq!(
+            read_change_state(&pool, thread_id).await,
+            CodingAgentChangeState::Unproposed {
+                reason: Some(UnproposedReason::TurnIncomplete)
+            }
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+}

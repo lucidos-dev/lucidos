@@ -1,10 +1,13 @@
 /**
  * What the host asks this frame to do, now that it cannot reach in.
  *
- * Three things the shell used to drive through `contentWindow`: read
+ * The shell used to drive these through `contentWindow`: read
  * `lucidos._capture` to screenshot an app for the agent, and `location.replace`
- * to switch apps and to deliver an app fragment. An opaque origin denies all
- * three, so the frame does them for itself.
+ * to deliver an app fragment. An opaque origin denies both, so the frame does
+ * them for itself. Switching apps remounts the frame and asks nothing of it.
+ *
+ * No op takes a whole URL. Any page that frames the app could otherwise send
+ * it anywhere, a `javascript:` URL included.
  *
  * `location.replace` and not `location.hash`, for the reason
  * `components/apps/iframeNav.ts` gives on the host side: a plain hash assignment
@@ -17,14 +20,7 @@ import { capture } from './capture';
 import { serveFind } from './find';
 
 export function installHostOps(): void {
-  serveHost('capture', () => capture());
-
-  serveHost('navigate', (args) => {
-    const url = (args as { url?: string })?.url;
-    if (typeof url !== 'string' || !url) throw new Error('navigate needs a url');
-    location.replace(url);
-    return true;
-  });
+  serveHost('capture', (args) => capture((args as { format?: string } | null)?.format));
 
   serveHost('hash', (args) => {
     const fragment = (args as { fragment?: string })?.fragment ?? '';

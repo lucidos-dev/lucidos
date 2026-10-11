@@ -23,6 +23,23 @@
 
 set -uo pipefail
 
+# ShellCheck runs in sequential batches to bound memory. `make lint` runs this
+# outside the build slot, so the slot's memory gate never sees it, and several
+# sessions can run it at once.
+#
+# .shellcheckrc makes ShellCheck parse each file's whole `source` tree, once per
+# checked file. So the heaviest single file sets the peak, and batching cannot
+# lower it much. What batching buys is that each process exits after its batch
+# and gives its memory back.
+#
+# Measured over 186 files: one process peaked at 1.3 GB and held over 1 GB for
+# about 48 s of an 82 s run. Batches of 20 peak at 1.26 GB, hold over 1 GB for
+# about 6 s, and average 540 MB against 1,070 MB. Wall time stayed within host
+# noise. Findings do not change, since each file's result depends only on its
+# own `source` tree. Only the "For more information:" footer differs: each
+# failing batch prints its own.
+SHELLCHECK_BATCH_SIZE=20
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR" || exit 1
@@ -79,7 +96,14 @@ fi
 
 echo "Linting $COUNT shell scripts with $(shellcheck --version | awk '/^version:/ { print "shellcheck " $2 }')..."
 
-if shellcheck "${FILES[@]}"; then
+STATUS=0
+i=0
+while [ "$i" -lt "$COUNT" ]; do
+    shellcheck "${FILES[@]:i:SHELLCHECK_BATCH_SIZE}" || STATUS=1
+    i=$((i + SHELLCHECK_BATCH_SIZE))
+done
+
+if [ "$STATUS" -eq 0 ]; then
     printf '%s✓%s shellcheck: %d files, no findings\n' "$C_GREEN" "$C_RESET" "$COUNT"
     exit 0
 fi

@@ -263,6 +263,49 @@ describe('settings search: the In-app toasts row', () => {
   );
 });
 
+describe('settings search: the Voice section', () => {
+  it('puts Models → Voice first for "voice"', () => {
+    const top = getSettingsSearchResults('voice', 20)[0];
+    expect(top?.id).toBe('models:voice');
+    expect(top?.subtitle).toBe('Settings → Models');
+  });
+
+  it.each(['talker', 'transcriber', 'spoken voice', 'resident context', 'speech'])(
+    'finds a Voice row by "%s"',
+    (term) => {
+      const hits = getSettingsSearchResults(term, 20).map((r) => r.id);
+      expect(hits.some((id) => id.startsWith('models:voice'))).toBe(true);
+    },
+  );
+
+  // The rows under the switch render only while voice is on. Landing on one
+  // while it is off would scroll to nothing.
+  it.each(['models:voice-talker', 'models:voice-transcriber', 'models:voice-talker-voice', 'models:voice-resident-sections'])(
+    'lands %s on the switch row, which always renders',
+    (id) => {
+      expect(findSettingsEntry(id)?.anchor).toBe('models:voice-enabled');
+    },
+  );
+});
+
+describe('settings search: rows gated on state', () => {
+  const found = (query: string, id: string) =>
+    getSettingsSearchResults(query, 50).some((r) => r.id === id);
+
+  it('offers Summary compaction only under the Tree memory module, where it renders', () => {
+    preferences.value = { status: 'loaded', data: { memory_module: 'classic' } };
+    expect(found('summary compaction', 'models:summary-compaction')).toBe(false);
+    preferences.value = { status: 'loaded', data: { memory_module: 'tree' } };
+    expect(found('summary compaction', 'models:summary-compaction')).toBe(true);
+  });
+
+  it('offers Style overrides only while the style remote has tuned something', () => {
+    expect(found('style overrides', 'appearance:style-overrides')).toBe(false);
+    preferences.value = { status: 'loaded', data: { style_overrides: JSON.stringify({ '--accent': 'red' }) } };
+    expect(found('style overrides', 'appearance:style-overrides')).toBe(true);
+  });
+});
+
 describe('settings search: ranked before the cut', () => {
   it('puts a label hit first, even one the index lists last', () => {
     // The shortcut entries are appended after the whole static index.

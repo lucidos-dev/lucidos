@@ -1,6 +1,6 @@
 import {
   repoSource, repoFiles, repoDiff, repoPending,
-  repoViewMode, repoExpandedFolders, expandedFolders, revealedFolder, selectedLines,
+  repoViewMode, repoExpandedFolders, expandedFolders, revealedFolder, selectedLines, lineScrollTarget, findRequest,
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   repositories, showToast,
   panelOverlay, parseRepoPath, encodeRepoPath, SELECTED_CHANGE_KEY,
@@ -430,6 +430,8 @@ export function openRepoFilePreview(path: string, mode: 'file' | 'diff'): void {
     ? { repoId, mode, changeId: repoSelectedChangeId.value ?? undefined, path }
     : { repoId, mode, path };
   selectedLines.value = null;
+  lineScrollTarget.value = null;
+  findRequest.value = null;
   panelOverlay.value = { type: 'file-preview', path: encodeRepoPath(locator) };
   revealContentPane();
   if (replaceInPlace) replaceNavState();

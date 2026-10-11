@@ -413,7 +413,7 @@ pub(super) fn build_trigger_knowhow_section(triggers_dir: &std::path::Path, slug
             kh.name,
             slug,
             kh.id,
-            super::process::workspace_payload::routing_description(&kh.description)
+            super::process::workspace_prompt_footprint::routing_description(&kh.description)
         ));
     }
     section

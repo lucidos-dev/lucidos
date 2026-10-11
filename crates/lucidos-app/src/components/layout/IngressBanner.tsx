@@ -4,7 +4,7 @@ import type { WebhookIngressOutage } from '../../api/client';
 import { currentIngressOutage } from '../../store/actions/webhookIngress';
 import { discussWebhookIngress } from '../../store/actions/webhook-ingress-discuss';
 import { openWebhookSettings } from '../../store/actions/menu';
-import { composeHandlers } from '../chat/promptFocus';
+import { composeHandlers } from '../chat/composeHandlers';
 import { useCoarseClock } from '../../hooks/useCoarseClock';
 import { webhookIngressNotice } from '../../utils/webhookIngressNotice';
 import { viewportIsMobile } from '../../utils/viewport';

@@ -37,6 +37,7 @@ async fn emit_question(bus: &EventBus, thread_id: Uuid) {
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),

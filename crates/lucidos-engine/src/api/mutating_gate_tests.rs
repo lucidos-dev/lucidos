@@ -24,6 +24,7 @@ const GATED_ROUTES: &[&str] = &[
     "/app",
     "/app-capture",
     "/app/:app_id/source",
+    "/app/opened",
     "/backup",
     "/backup/key",
     "/backup/key/reveal-token",
@@ -73,6 +74,7 @@ const GATED_ROUTES: &[&str] = &[
     "/internal/mark-hardened",
     "/internal/mark-planned",
     "/internal/permission-prompt",
+    "/internal/request-app-capture-for-test",
     "/internal/restart-intent",
     "/internal/seed-change-for-test",
     "/themes/resolve",
@@ -92,6 +94,7 @@ const GATED_ROUTES: &[&str] = &[
     "/oauth/accounts",
     "/oauth/complete",
     "/oauth/reauthorize",
+    "/owner-approvals",
     "/pinned-apps",
     "/plugins/catalog/rescan",
     "/plugins/install-request",
@@ -132,6 +135,9 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/:thread_id/event-waits",
     "/threads/:thread_id/event-waits/:wait_id/cancel",
     "/threads/:thread_id/event-waits/cancel",
+    "/threads/:thread_id/harden",
+    "/threads/:thread_id/read-request",
+    "/threads/:thread_id/read-request/seen",
     "/threads/archive",
     "/threads/archive-all",
     // Gated twice over. This layer refuses a caller with no credential at all.
@@ -150,6 +156,11 @@ const GATED_ROUTES: &[&str] = &[
     "/ui/navigate",
     "/webhooks",
     "/webhooks/:id",
+    "/widgets/make-reusable",
+    "/widgets/pin",
+    "/widgets/show",
+    "/widgets/stop-reusing",
+    "/widgets/unpin",
 ];
 
 /// Methods that write. Mirrors [`method_mutates`], which takes a `Method`.

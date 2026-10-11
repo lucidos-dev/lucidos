@@ -35,8 +35,8 @@ function seedThreadWithCheckpoint(counts: { restores: number; removes: number } 
   psql(
     [
       // Chat thread row — idle, in the inbox, has a response.
-      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) ` +
-        `VALUES ('${threadId}', 'E2E command checkpoint', 'chat', '${now}', 1, false, true, 'idle', 'inbox', false, 0, false, false, false)`,
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) ` +
+        `VALUES ('${threadId}', 'E2E command checkpoint', 'chat', '${now}', 1, false, true, 'idle', 'inbox', false, 0, 'none', false)`,
       // The user prompt — anchors the exchange the card renders inside.
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) ` +
         `VALUES ('${messageId}', 'MessageReceived', '{"text":"clean up the stale artifacts","mode":"human","channel":"chat"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,

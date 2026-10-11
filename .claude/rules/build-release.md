@@ -1,7 +1,7 @@
 ---
 paths:
   - "scripts/build*.sh"
-  - "scripts/check-staged-knowhow.sh"
+  - "scripts/check-staged-copies.sh"
   - "scripts/release*.sh"
   - "scripts/lib/build_*.sh"
   - "scripts/lib/stage_runtime*.sh"
@@ -73,12 +73,12 @@ Dev: native engine + Docker PostgreSQL. Production: the `.app` and the headless 
 ### GitHub Actions never gates a change: release checks plus on-demand e2e
 
 Every workflow in `.github/workflows/` verifies a **release or delivery
-artifact**, or runs the e2e suites **when someone asks** (ADR 0382). That is the
+artifact**, or runs the e2e suites **when someone asks** (ADRs 0382, 0386). That is the
 complete list of what belongs there:
 
 | workflow | fires on | verifies |
 |---|---|---|
-| `e2e.yml` | push to `e2e/**` by `./scripts/e2e*.sh --github`, plus a push to mirror `main` that only seeds the dependency cache | the selected e2e suites, sharded: Linux for API, WASM, embedder, `chromium` and `mobile`; macOS arm64 for `mobile-webkit`. No secrets, `contents: read`, and `e2e/*` branches never save a cache |
+| `e2e.yml` | push to `e2e/**` by `./scripts/e2e*.sh` (GitHub is their default; `--local` stays here), plus a push to mirror `main` that only seeds the dependency cache | the selected e2e suites, sharded: Linux for API, WASM, embedder, `chromium` and `mobile`; macOS arm64 for `mobile-webkit`. No secrets, `contents: read`, and `e2e/*` branches never save a cache |
 | `install-smoke.yml` | push to `rc/**`, a `dmg_tag` dispatch (the RC draft gate, ADR 0036), `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, **route parity between the two front doors**, and that both front doors still parse under macOS `/bin/sh` |
 | `release-tarballs.yml` | `rc/**` push, `v*` tag push, manual | the per-triple headless tarball build, and attaching it to that tag's release (still a DRAFT at the time) |
 
@@ -238,7 +238,14 @@ Why it matters beyond wasted minutes: a redundant `npm ci` saturates disk I/O an
 
 ### Shared staging (`scripts/lib/stage_runtime.sh`)
 
-The self-contained runtime tree — the 7 `RESOURCE_NAMES`: `lucidos-engine`, `lucidos-gateway`, `lucidos` (the CLI), `frontend`, relocatable **PostgreSQL 18 + pgvector** `postgres`, `sdk`, `system-knowhow` (engine-shipped reference docs, resolved by engines via `LUCIDOS_SYSTEM_KNOWHOW_DIR`) — is staged by ONE shared library that both build paths source:
+ONE shared library stages the self-contained runtime tree, and both build paths source it. The tree is the `RESOURCE_NAMES` in `scripts/lib/resource_contract.sh`:
+
+- `lucidos-engine`, `lucidos-gateway` and `lucidos` (the CLI).
+- `frontend`, `sdk`, and relocatable **PostgreSQL 18 + pgvector** `postgres`.
+- `system-knowhow`: engine-shipped reference docs, found via `LUCIDOS_SYSTEM_KNOWHOW_DIR`.
+- `system-widgets`: the built-in widgets, found via `LUCIDOS_SYSTEM_WIDGETS_DIR`.
+
+The library's functions:
 
 - `stage_runtime_triple` — target-triple resolution from `uname`.
 - `stage_runtime_fetch_postgres` — the theseus-rs PG18 + pgvector fetch/compile recipe; the same code resolves the macOS `*-apple-darwin` and Linux `*-unknown-linux-gnu` relocatable Postgres asset by triple. The `PG_SYSROOT` override applies only on a Darwin host; Linux uses system gcc.
@@ -260,7 +267,11 @@ That shape is the whole fix. `build-dmg.sh`'s old `check_resource_contract` comp
 
 **The stage outlives the build, so it is guarded at the point of consumption.** `stage_runtime_assemble` `rm -rf`s its target before copying, so every sanctioned build path is correct by construction. What is not correct by construction is `build-dmg.sh`'s stage *between* runs: `crates/lucidos-app/bundle-resources/` is gitignored and survives, and a `cargo tauri build --config '<resource map>'` typed by hand skips step 4 and hands Tauri whatever that leftover holds. Found on 2026-08-07 carrying 12,732 characters of stale `system-knowhow` descriptions against 6,584 live, including a doc that had since been rewritten, with nothing anywhere saying so.
 
-`stage_runtime_staged_knowhow_fresh` byte-diffs the staged copy against the live tree, and `scripts/check-staged-knowhow.sh` runs it from `tauri.conf.json`'s `beforeBuildCommand`, the one hook inside **every** `cargo tauri build` regardless of caller. Ordering is safe: `build-dmg.sh` stages at step 4 and builds at step 5, so the guard always sees a stage it just wrote. **Absent is clean, and must stay so**: a developer who has never run `build-dmg.sh` has no `bundle-resources/` at all and their build must not go red. Only `system-knowhow/` is checked, because it is the one staged resource that is a git-tracked SOURCE tree with an exact live counterpart; the binaries, `postgres/`, `frontend/` and `sdk/` are build outputs where "fresh" is undefined without rebuilding, and a timestamp heuristic there would fail open. A new staged resource of the source-tree kind should join the check.
+`stage_runtime_staged_copy_fresh` byte-diffs a staged copy against its live tree. `scripts/check-staged-copies.sh` runs it for each staged source tree. It runs from `tauri.conf.json`'s `beforeBuildCommand`, the one hook inside **every** `cargo tauri build` regardless of caller.
+
+Ordering is safe: `build-dmg.sh` stages at step 4 and builds at step 5, so the guard always sees a stage it just wrote.
+
+**Absent is clean, and must stay so**: a developer who has never run `build-dmg.sh` has no `bundle-resources/` at all and their build must not go red. Only `system-knowhow/` and `system-widgets/` are checked: they are git-tracked SOURCE trees with an exact live counterpart. The binaries, `postgres/`, `frontend/` and `sdk/` are build outputs, where "fresh" is undefined without rebuilding. A timestamp heuristic there would fail open. A new staged resource of the source-tree kind should join the check.
 
 Pure helpers are offline-tested by `scripts/lib/stage_runtime_test.sh`. The `lucidos` CLI is **load-bearing**, not a convenience: the engine resolves it as a sibling of `lucidos-engine` (`find_lucidos_cli_dir`), or by absolute path via `LUCIDOS_CLI_BIN` when the launcher stamps it (`desktop.rs::spawn_gateway` / `service_runtime_env_pairs`), to launch the Claude Code permission-prompt MCP server (`lucidos mcp-permission-server`). A bundle omitting it breaks every coding-agent thread on its first tool call — the engine now fails the CC spawn fast with a descriptive error rather than starting a doomed session (`resolve_lucidos_binary` in `crates/lucidos-engine/src/runtime/claude_code.rs`).
 

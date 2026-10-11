@@ -37,9 +37,9 @@ pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 VERSION="0.14.0"
 TRIPLE="$(stage_runtime_host_triple)"   # the host triple — the artifact the download path resolves
 STEM="lucidos-$VERSION-$TRIPLE"
-NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow)
+NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow system-widgets)
 
-# A fake runtime tree shaped like the staged 7-resource bundle (three "binaries",
+# A fake runtime tree shaped like the staged 8-resource bundle (three "binaries",
 # three static dirs, a relocatable-PG-like nested tree) — same shape as
 # headless_tarball_test.sh / stage_runtime_test.sh.
 new_resources() {
@@ -55,6 +55,7 @@ new_resources() {
     mkdir -p "$dir/frontend" && printf '<html>\n' > "$dir/frontend/index.html"
     mkdir -p "$dir/sdk"      && printf 'sdk\n'     > "$dir/sdk/sdk.js"
     mkdir -p "$dir/system-knowhow" && printf '# glossary\n' > "$dir/system-knowhow/glossary.md"
+    mkdir -p "$dir/system-widgets/lucidos-sound-player" && printf '{}\n' > "$dir/system-widgets/lucidos-sound-player/manifest.json"
     mkdir -p "$dir/postgres/bin" "$dir/postgres/lib"
     printf 'postgres\n' > "$dir/postgres/bin/postgres"; chmod +x "$dir/postgres/bin/postgres"
     printf 'libpq\n'    > "$dir/postgres/lib/libpq.5"

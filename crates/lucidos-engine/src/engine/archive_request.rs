@@ -27,7 +27,7 @@ use crate::engine::standing_apply::{
     read_turn_settle, thread_to_resolve, AgentSessions, TurnSettle,
 };
 use crate::engine::thread_events::ThreadEvent;
-use crate::engine::thread_lifecycle::ThreadStatus;
+use crate::engine::thread_lifecycle::{ChangeStateKind, ThreadStatus};
 use crate::engine::LucidosEngine;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -58,6 +58,11 @@ pub(crate) struct RequestFacts {
     /// A pending change the Archive button's gate refuses. An external-repo
     /// change does not count: the cascade clears it, as the gate lets it.
     pub pending_change: bool,
+    /// A branch diff no change carries yet and no turn end withheld. After a
+    /// canceled wait the branch-work net proposes it, so the request waits for
+    /// that, as the standing apply does (ADR 0395). Withheld work waits on the
+    /// owner instead, and Archive sets it aside (ADR 0400).
+    pub unproposed_work: bool,
     pub blocking_descendants: bool,
     /// The user pinned the thread after its agent asked. An agent never
     /// archives a pinned thread (ADR 0312), so the request waits for an unpin.
@@ -88,7 +93,12 @@ pub(crate) fn request_verdict(facts: &RequestFacts) -> RequestVerdict {
         && !facts.parked_on_question
         && !facts.live_event_waits
         && facts.turn_settle == TurnSettle::Settled;
-    if settled && !facts.pending_change && !facts.blocking_descendants && !facts.pinned {
+    if settled
+        && !facts.pending_change
+        && !facts.unproposed_work
+        && !facts.blocking_descendants
+        && !facts.pinned
+    {
         RequestVerdict::Archive
     } else {
         RequestVerdict::Wait
@@ -125,7 +135,17 @@ async fn threads_with_open_requests(pool: &sqlx::PgPool) -> Result<HashSet<Uuid>
 }
 
 /// The summary columns the verdict reads.
-type SummaryRow = (String, String, i32, bool, bool, i32, bool, bool);
+type SummaryRow = (
+    String,
+    String,
+    i32,
+    ChangeStateKind,
+    Option<String>,
+    bool,
+    i32,
+    bool,
+    bool,
+);
 
 /// Read the facts. `Ok(None)` = the thread is gone. A probe that could not run
 /// is an `Err`, and the request keeps its place.
@@ -138,9 +158,10 @@ pub(crate) async fn read_request_facts(
     thread_id: Uuid,
 ) -> Result<Option<RequestFacts>, BoxError> {
     let row: Option<SummaryRow> = sqlx::query_as(
-        "SELECT status, archive_state, live_event_wait_count, coding_agent_proposed, \
-                coding_agent_is_external_repo, blocking_descendant_count, is_coding_agent, \
-                is_saved \
+        "SELECT status, archive_state, live_event_wait_count, coding_agent_change_state, \
+                coding_agent_unproposed_reason, coding_agent_is_external_repo, \
+                blocking_descendant_count, \
+                is_coding_agent, is_saved \
            FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -150,7 +171,8 @@ pub(crate) async fn read_request_facts(
         status,
         archive_state,
         live_waits,
-        proposed,
+        change_state,
+        withheld_reason,
         external,
         blocking,
         is_coding_agent,
@@ -184,7 +206,10 @@ pub(crate) async fn read_request_facts(
         parked_on_question,
         live_event_waits: live_waits > 0,
         turn_settle,
-        pending_change: proposed && !external,
+        pending_change: change_state == ChangeStateKind::Proposed && !external,
+        unproposed_work: change_state == ChangeStateKind::Unproposed
+            && withheld_reason.is_none()
+            && !external,
         blocking_descendants: blocking > 0,
         pinned: is_saved,
     }))

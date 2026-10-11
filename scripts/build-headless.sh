@@ -15,6 +15,7 @@
 #   • postgres              (relocatable PostgreSQL 18 + compiled pgvector)
 #   • sdk                   (packages/lucidos-sdk/dist)
 #   • system-knowhow        (system-knowhow/)
+#   • system-widgets        (system-widgets/, the built-in widgets)
 # Staging runs through the shared scripts/lib/stage_runtime.sh, then reuses
 # scripts/lib/headless_tarball.sh to emit lucidos-<version>-<triple>.tar.gz plus a
 # `shasum -a 256 -c`-compatible .sha256 sidecar. No Tauri, no .app, no DMG.
@@ -103,7 +104,7 @@ Env knobs (all optional, shared with build-dmg.sh):
   PGVECTOR_VERSION  pgvector tag to compile          (default 0.8.2)
 
 build-headless.sh emits the Tauri-free lucidos-<version>-<triple>.tar.gz (engine +
-gateway + frontend + relocatable PostgreSQL 18 + pgvector + sdk + system-knowhow)
+gateway + frontend + relocatable PostgreSQL 18 + pgvector + sdk + system-knowhow + system-widgets)
 + a .sha256 sidecar.
 On Linux it is the release build path (see .github/workflows/release-tarballs.yml);
 on macOS it produces an UNSIGNED tarball (ship the signed one via
@@ -195,7 +196,8 @@ stage_runtime_assemble "$STAGE" \
     "frontend=$APP_DIR/dist" \
     "postgres=$PG_PREFIX" \
     "sdk=$REPO_ROOT/packages/lucidos-sdk/dist" \
-    "system-knowhow=$REPO_ROOT/system-knowhow" >/dev/null \
+    "system-knowhow=$REPO_ROOT/system-knowhow" \
+    "system-widgets=$REPO_ROOT/system-widgets" >/dev/null \
     || die "failed to stage the runtime tree into $STAGE"
 # The tarball is built from this tree, so assert it against the contract before
 # it is sealed. An omitted resource is invisible in a .tar.gz nobody unpacks.

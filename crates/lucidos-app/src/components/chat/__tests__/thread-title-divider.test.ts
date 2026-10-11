@@ -26,7 +26,7 @@ describe('Thread title band, desktop and mobile alike', () => {
 
   it('mobile: page colour at rest, --bg-secondary once scrolled', () => {
     expect(mobileCss).toMatch(/\.mobile-swipe-pane \.mobile-thread-title-row \{[^}]*background:\s*var\(--bg-primary\)/);
-    expect(mobileCss).toMatch(/\.mobile-thread-title-row\.scrolled \{[^}]*background:\s*var\(--bg-secondary\)/);
+    expect(mobileCss).toMatch(/\.mobile-swipe-pane \.mobile-thread-title-row\.scrolled \{[^}]*background:\s*var\(--bg-secondary\)/);
   });
 
   it('draws no hairline under either row', () => {

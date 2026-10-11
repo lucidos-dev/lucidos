@@ -370,3 +370,186 @@ A correction on Tree is therefore OptChat's: nothing is rewritten, and the
 latest ruling holds. Extraction into `memory_entries` keeps running, so a
 workspace switched back to Classic finds its store current. The `lucidos memory`
 commands stay, as reads of that store.
+
+## Amendment, 2026-10-08: the view follows OptChat revision 3c190e06
+
+Plan: `docs/plans/2026-10-08-tree-view-due-rule-sawtooth-and-block-marks.md`.
+
+Taelin rewrote the gist as revision 3c190e06, read 2026-10-08, and said the
+original "had a bug that trashed the cache". Section numbers in this
+amendment refer to that revision. The ones above still refer to f51fe5c9.
+
+### What changed
+
+1. **The due rule** (§3.2). A pair is ranked by `(T - last) / 2^l`, how long
+   ago its last entry was in its own line size. The 2026-10-05 amendment
+   measured from the pair's first entry, which rewrites old lines near ties.
+   With every node built, the new rule makes exactly the merges of Taelin's
+   rollback push at all 20,001 steps tried. The old rule matched at 481.
+2. **Merges come in batches** (§3.2). A view only appends until it passes its
+   budget. Then one batch merges it down to half the budget. The merges and
+   their order are unchanged; only their timing moves.
+3. **The view goes out in 4-line blocks** (§3.3). Each block is its own
+   content block. The thread view marks its last whole block and the one 20
+   blocks before it. The snapshot marks its last whole block.
+
+### Why
+
+Between batches each view is a prefix of the next. Anthropic looks back 20
+blocks from a marker for an entry an earlier request wrote. So a rung finds
+the last turn's rung whenever the turn added fewer than about 160 lines.
+
+The fixed marks at 50/128 and 80/128 left everything past the second mark at
+full price on every turn. Measured by
+`consecutive_turns_read_most_of_the_view_from_cache` on a synthetic, fully
+built log of 10,000 entries:
+
+| Turn size | Before (uncached) | Now (uncached) |
+|---|---|---|
+| 1 | 42% | 2.1% |
+| 4 | 51% | 6.1% |
+| 10 | 64% | 12.6% |
+| 30 | 77% | 34.2% |
+
+"Before" comes from the plan's simulation of the old fold and marks, which no
+longer exist in the tree.
+
+### Kept
+
+- **The budget is the ceiling** (I6). A view now averages about three
+  quarters of its budget rather than all of it. That is the price of the
+  reads above.
+- **We replay, never persist.** §3.2 says to save the view, because a
+  rebuilt one differs from the live one. Ours replays only the built prefix,
+  which is deterministic, and a batch's state is a function of the log.
+  `a_replay_from_zero_equals_the_live_view` still pins it.
+- **A turn never waits for the compactor** (I7).
+- **Two thread rungs, not one.** §3.3 uses one mark. A Lucidos turn with 40
+  tool calls adds 80 entries, past one lookback, so the second rung covers it.
+
+### Not adopted yet
+
+The same revision changes the compactor too:
+
+- a stable 16-32 KB compaction view, which compactions read from each
+  other's cache;
+- a ruler instead of a sample line;
+- leaves built up to 8 ahead.
+
+They touch summary quality and the pipelining this ADR rejected, so they need
+a plan of their own.
+
+## Amendment, 2026-10-08: the compactor follows OptChat revision 3c190e06
+
+Plan: `docs/plans/2026-10-08-tree-compactor-follows-optchat-revision-3c190e06.md`.
+This adopts what the amendment above listed as not adopted yet. Section
+numbers refer to revision 3c190e06.
+
+### What changed
+
+1. **A compaction view** (§4). A compactor call reads a fold of its tree's
+   built lines, on a sawtooth from 32 KB down to 16 KB. Built leaves past the
+   built prefix follow in an 8 KB tail. A drain keeps it live, so consecutive
+   calls share all of it but its end. It replaces the context tiling, which
+   was rebuilt per node and shared almost no prefix.
+2. **Marks at fixed rungs.** The view goes out in 4-line blocks marked at its
+   last three block ends. GPT reads an entry only at a mark in the very place
+   an earlier request wrote it, unlike Claude's 20-block lookback. A marked
+   view block is a cache mark on the GPT wire too, for turns as well as
+   compactions, from GPT-5.6 on. GPT-5.5 and older refuse the field with a
+   400, so they get the joined text as before. GPT-5.6 on reports its cache writes, which are now recorded.
+3. **A ruler** of 512 dashes replaces the sample line, which models copied.
+   The steps take the gist's wording with `<input>`, and so does the "too
+   long" follow-up.
+4. **The leaf window.** A thread leaf starts once fewer than 8 leaves before
+   it are unbuilt. Ready merges launch before leaves.
+5. **Entry kinds name a role, and a prompt names its sender**: `prompt`,
+   `response`, `call`, `result`, `report`, in place of `user`, `talk`,
+   `tool`, `echo`, `work`. A prompt carries the *ActorMode* its event
+   recorded, rendered `prompt (human)`, `prompt (agent)` or `prompt (engine)`.
+   So an agent's message is no longer credited to the user, and the
+   compactor's first rule, the user's own words, reads `prompt (human)` only.
+   A fired trigger and an image description are engine prompts, and a turn
+   that failed before any reply is a response. An existing tree's nodes that
+   no model wrote are re-derived from the log on the next drain, which keeps
+   I1. One that outgrows a node needs a model call. An agent's or the
+   engine's prompt is then rebuilt with every line above it, so no line
+   credits those words to the user. Other lines a model wrote keep their
+   wording, old tags included.
+
+### Measured
+
+A probe against GPT-6.1 Sol, the default compactor model, found a problem.
+Every compactor call wrote its whole input to the cache at 1.25x, and none
+read it back. Gemini 3.8 Flash on Vertex showed no cache hits at all.
+
+`consecutive_compactions_read_most_of_their_view_from_cache` simulates a
+backfill of a 10,000-entry thread with 8 calls in flight:
+
+| Context | View bytes per call | At full price |
+|---|---|---|
+| Context tiling, unmarked (before) | 15,369 | 15,369 |
+| Compaction view, leaves in order | 24,961 | 797 (3.2%) |
+| Compaction view, leaf window of 8 | 27,632 | 2,335 (8.4%) |
+
+A blind paired comparison of 48 real items, judged by Opus 5.5 and Gemini
+3.1 Pro on GPT-6.1 Sol's lines, found no loss of quality:
+
+| Comparison | Δ coverage [95%] | Δ unfaithful claims per line [95%] |
+|---|---|---|
+| New prompt and view vs before | +0.002 [−0.014, +0.016] | −0.156 [−0.292, −0.021] |
+| Leaf window vs none | +0.015 [−0.004, +0.037] | −0.047 [−0.188, +0.094] |
+
+### The rejected pipelining, revisited
+
+The 2026-10-06 amendment rejected pipelining a thread's leaves: it changes
+what every leaf reads, and shortens only the time to complete. The window is
+narrower. A leaf misses at most the 7 lines just before it, and only while
+they build, and the comparison measured no cost. It also helps live work: a
+turn of 40 tool calls no longer builds its 80 leaves one after another. A
+turn still never waits for the compactor (I7).
+
+### Departures from the gist, kept
+
+- **Bare lines.** The gist's view shows `id+n|` heads. Ours stays bare,
+  because the model copied addresses into its lines.
+- **Its own system prompt.** The gist runs compactions with the turns' system
+  prompt and tools, to read the turns' cache entry (§7, item 6). Ours runs on
+  a different, cheaper model, and a prompt cache belongs to one model. Our
+  turn prefix would only add uncached input.
+- **No wait for a concurrent writer.** Claude makes an entry readable once
+  its writer's response starts. The build loop does not hold calls back; the
+  simulation above already counts that.
+
+## Amendment, 2026-10-10: every workspace has Home
+
+[ADR 0411](0411-every-workspace-has-home.md) graduates the home thread. The
+`home_thread_enabled` switch named in Consequences above is removed: every
+workspace has Home, and the welcome lives in it. The 2026-10-06 amendment's
+Home entries show whenever the thread list carries Home.
+
+## Amendment, 2026-10-10: Home beside the mark on the phone
+
+The maintainer's decision. The phone's thread pane header pairs a Home icon
+with the Lucidos mark, and the two centre together between the nav chevrons.
+The menu that mark opens drops its Home row. The thread drawer's header has no
+Home icon, so the menu its mark opens keeps Home as the first row.
+
+Making the mark itself open Home, with the menu on a long press, was weighed
+and rejected: a long press cannot be found on a phone, and the mark's badges
+advertise the menu.
+
+## Amendment, 2026-10-10: a long press on Home lists its widgets
+
+The maintainer's decision. A hold (touch) or a right-click (desktop) on the
+Home icon, or on the Lucidos menu's Home row, lists the widgets pinned to
+Home. A pick floats that widget in a window over the app, and the user stays
+where they are ([ADR 0419](0419-widget-windows-stay-open.md)). A tap still
+opens Home. In Home a tap on the Home icon has nowhere to go, so it lists
+the widgets too.
+
+This does not contradict the rejected long-press mark above. There the hold
+would have hidden the menu, the mark's only way in. Here every widget still
+has its card in Home's transcript. Home draws no shelf, so the hold is how a
+pinned widget opens from anywhere ([ADR 0419](0419-widget-windows-stay-open.md)
+§ Amendment). The desktop tooltip names the right-click.

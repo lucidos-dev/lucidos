@@ -59,10 +59,9 @@ const mainTsx: string = readFileSync(resolve(stylesDir, '..', 'main.tsx'), 'utf-
  *  absent: it has no text, and the trim would be a no-op on it. */
 const GLYPH_BADGES = [
   'badge',                          // header counts, the "!" state badge, the unread count
-  'drawer-view-count',              // the thread filter's per-view counts
   'section-count-badge',            // a drawer section's thread count
   'drawer-badge',                   // the menu drawer's changes count
-  'brand-menu-ws-badge',            // unread per workspace, in the menu and the switcher
+  'brand-menu-ws-badge',            // unread per workspace, in the menu's notifications group
   'ws-picker-badge',                // unread per workspace, in the gateway picker
   'thread-status-question-badge',   // the "?" on a thread waiting for an answer
   'app-store-status',               // a plugin's "Installed v1.2.3" / version pill
@@ -188,11 +187,9 @@ describe('the pill and the baseline sit on whole pixels', () => {
   });
 
   it('has every badge with a pill state the height it was designed at', () => {
-    // The plain per-view count draws no pill, so it has no height to round.
-    // Its blue sibling is a `.badge` and inherits one.
     const missing: string[] = [];
     const sheets: string[] = styleSheetPaths(stylesDir).map(p => readFileSync(p, 'utf-8'));
-    for (const cls of GLYPH_BADGES.filter(c => c !== 'drawer-view-count')) {
+    for (const cls of GLYPH_BADGES) {
       const declared = sheets.some(css =>
         rulesTargeting(css, cls).some(r => r.props.has('--badge-height')));
       if (!declared) missing.push(cls);
@@ -214,17 +211,6 @@ describe('the pill and the baseline sit on whole pixels', () => {
         .filter((w): w is string => w !== undefined);
       expect(widths, `.${cls} width`).toContain('var(--badge-box, var(--badge-height))');
     }
-  });
-
-  it('keeps the drawer attention count round and on the plain counts\' column', () => {
-    // The plain count's cell width outranks the base `.badge` width, so the
-    // blue circle restates the box. Half the difference goes on its trailing
-    // edge, which keeps its middle where a plain number's middle is.
-    const drawerCss: string = readFileSync(resolve(stylesDir, 'drawer.css'), 'utf-8');
-    const attention = cssRules(drawerCss).find(r => r.selector === '.badge.drawer-view-count');
-    expect(attention?.props.get('min-width')).toBe('var(--badge-box, var(--badge-height))');
-    expect(attention?.props.get('margin-right'))
-      .toBe('calc((var(--badge-height) - var(--badge-box, var(--badge-height))) / 2)');
   });
 
   it('lets the dots keep the size their own rules give them', () => {

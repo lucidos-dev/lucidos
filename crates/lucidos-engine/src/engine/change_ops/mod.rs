@@ -3,17 +3,29 @@ use super::event_bus::SystemEvent;
 use super::git_ops::{
     any_iframe_bundled_file_changed, git_cmd, git_ran_ok, harden_marker_state, HardenMarkerState,
 };
-use super::thread_events::MessageOrigin;
+use super::thread_events::{MessageOrigin, UnproposedReason};
 use super::LucidosEngine;
-use crate::core::changes::{ChangeState, ChangeStatus};
+use crate::core::changes::{ChangeStatus, ChangeStatusData};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
 mod apply;
 mod discard;
+mod proposal_hold;
 mod propose;
 mod set_aside;
+pub(crate) use proposal_hold::{
+    apply_must_harden, read_proposal_hold, PlanFloor, PlanHold, ProposalHold,
+};
+#[cfg(test)]
+pub(crate) use propose::{
+    branch_moved_since_last_idle, withhold_unfinished_work, withhold_unready, HoldOutcome,
+    OpenChangeAfterHold,
+};
+pub(crate) use propose::{emit_change_withdrawn, emit_proposal_withheld, ProposeOutcome};
+#[cfg(test)]
+pub(crate) use set_aside::withdraw_for_redecision;
 pub(crate) use set_aside::SET_ASIDE_APPLY_REFUSAL;
 
 #[path = "../change_ops_emitters.rs"]
@@ -55,11 +67,6 @@ pub(crate) struct ProposeChangeInput<'a> {
     pub channel: crate::engine::thread_events::EventChannel,
     pub hardened: bool,
     pub origin: Option<MessageOrigin>,
-    /// `true` when the proposing CC turn ended in `ResponseFailed` — the
-    /// worktree contents reflect partial work, not a deliberate completion.
-    /// Flows onto `ChangeProposed.incomplete` and the `changes.incomplete`
-    /// projection column so the apply UI can confirm before landing.
-    pub incomplete: bool,
 }
 
 /// Trait for coding agents that can interact with change management.
@@ -114,10 +121,10 @@ impl ApplyKindContext {
     }
 
     /// True for Lucidos-source changes (not app, not external). The
-    /// implementation-plan floor applies only here: app threads don't plan,
-    /// and external repos have no `docs/plans/` convention or `lucidos planned`
-    /// marker. Legacy NULL `coding_agent_kind` parses to `Lucidos`, so old
-    /// rows are gated — correct, since they ARE Lucidos-source.
+    /// implementation-plan floor ([`PlanFloor`]) applies only here: app threads
+    /// don't plan, and external repos have no `docs/plans/` convention or
+    /// `lucidos planned` marker. Legacy NULL `coding_agent_kind` parses to
+    /// `Lucidos`, so old rows are gated, which is right: they ARE Lucidos source.
     pub fn is_lucidos_source(&self) -> bool {
         matches!(self.kind, CodingAgentKind::Lucidos)
     }
@@ -653,3 +660,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../change_ops_engine_origin_stamping_tests.rs"]
 mod engine_origin_stamping;
+
+#[cfg(test)]
+#[path = "../change_ops_withheld_work_tests.rs"]
+mod withheld_work_tests;

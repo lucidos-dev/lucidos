@@ -90,7 +90,7 @@ fn roundtrips_a_trigger_pinned_to_a_model_and_effort() {
             intent: "Summarize today".to_string(),
         },
     );
-    c.model = Some("gemini-3.5-flash".to_string());
+    c.model = Some("gemini-3.8-flash".to_string());
     c.reasoning_effort = Some("low".to_string());
     c.on = vec![EventSubscription {
         event_type: "DayEnded".to_string(),
@@ -101,7 +101,7 @@ fn roundtrips_a_trigger_pinned_to_a_model_and_effort() {
     let toml = def.to_toml().expect("serialize a model-pinned trigger");
     let parsed = TriggerDefinition::from_toml(&toml).expect("parse a model-pinned trigger");
     assert_eq!(parsed, def);
-    assert_eq!(parsed.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(parsed.model.as_deref(), Some("gemini-3.8-flash"));
     assert_eq!(parsed.reasoning_effort.as_deref(), Some("low"));
 }
 

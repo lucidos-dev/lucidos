@@ -29,11 +29,8 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
       updatedAt: '2026-04-12T00:00:00Z',
       status: 'idle',
       summaryVersion: 0,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
       lastRevivedAt: '',
       messageCount: 1,
       section: 'archived',
@@ -148,11 +145,11 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('running', false, false, false)).toBe('running');
   });
 
-  it('no active children + waiting + codingAgentProposed → changes (static dot)', () => {
+  it('no active children + waiting + a proposal → changes (static dot)', () => {
     expect(resolveVisualStatus('waiting', false, true, false)).toBe('changes');
   });
 
-  it('no active children + waiting without codingAgentProposed → idle (no dot)', () => {
+  it('no active children + waiting without a proposal → idle (no dot)', () => {
     // Defensive: backend shouldn't park threads in 'waiting' without changes,
     // but historical chat threads (pre-fix ResponseAborted/Failed) might.
     expect(resolveVisualStatus('waiting', false, false, false)).toBe('idle');
@@ -164,7 +161,7 @@ describe('visual status resolution', () => {
 
   // Changes outrank active children: the child writes its own worktree, so
   // the parent's change is whole and Apply is offered to match (ADR 0249).
-  it('waiting + active children + codingAgentProposed → changes (resolvable)', () => {
+  it('waiting + active children + a proposal → changes (resolvable)', () => {
     expect(resolveVisualStatus('waiting', true, true, false)).toBe('changes');
   });
 
@@ -184,7 +181,7 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('waiting_for_user_answer', true, false, false)).toBe('question');
   });
 
-  it('idle + active children + codingAgentProposed → changes (resolvable)', () => {
+  it('idle + active children + a proposal → changes (resolvable)', () => {
     expect(resolveVisualStatus('idle', true, true, false)).toBe('changes');
   });
 });

@@ -56,6 +56,8 @@ function makeChange(): Change {
     files: ['a.rs'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-01-01T00:00:00Z',
     resolved_at: null,
@@ -87,11 +89,8 @@ function makeThread(): ThreadState {
       totalChildrenCount: 0,
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
-      codingAgentProposed: true,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'proposed', requires_restart: false },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: true,
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
@@ -212,7 +211,7 @@ describe('the prompt row draws no flag where Lucidos never applies', () => {
   // The regression: this thread is running, which is exactly when the flag is
   // drawn and exactly when `getCodingAgentWaitingInfo` answers null.
   it('draws nothing before the thread has proposed anything', () => {
-    markExternal({ codingAgentKind: 'external', codingAgentProposed: false });
+    markExternal({ codingAgentKind: 'external', codingAgentChangeState: { kind: 'none' }});
     expect(standingApply()).toBeNull();
   });
 });

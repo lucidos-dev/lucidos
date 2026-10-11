@@ -53,7 +53,7 @@ describe('workspace file preview', () => {
     show(<FilePreviewInline path="scripts/tool.py" layout="desktop" />);
     expect(host.querySelector('.sk-bar')).toBeNull();
     passGate();
-    expect(skeleton('.code-line .line-number')?.textContent).toBe('1');
+    expect(skeleton('.code-line .line-number')?.getAttribute('data-line-number')).toBe('1');
     expect(skeleton('.code-line .line-content .sk-bar')).not.toBeNull();
     expect(host.querySelector('.loading-spinner')).toBeNull();
   });

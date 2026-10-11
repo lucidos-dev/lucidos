@@ -32,6 +32,7 @@ pub mod oauth_registry;
 pub mod pinned_apps;
 pub mod plugin_catalog_cache;
 pub mod plugin_marketplaces;
+pub mod plugin_media;
 pub mod plugins;
 pub mod preference_catalog;
 pub use preference_catalog as prefs;
@@ -39,9 +40,11 @@ pub mod preferences;
 pub mod repositories;
 pub mod response_style;
 pub mod shell;
+pub mod shipped_dir;
 pub mod slug;
 pub mod store;
 pub mod system_knowhow;
+pub mod system_widgets;
 pub mod technical_literacy;
 pub mod themes;
 pub mod user_dir;
@@ -314,7 +317,7 @@ pub fn write_json_atomic(
     Ok(())
 }
 
-pub use apps::{App, AppManager, AppReveal};
+pub use apps::{App, AppFiles, AppKind, AppManager, AppReveal, NewAppKind};
 pub use artifacts::{
     is_build_output_file, is_build_output_path, is_vendored_path, list_searchable_data_files,
     list_user_data_files, ArtifactManager, WriteAnnouncement, VENDORED_DIR_NAMES,
@@ -337,6 +340,7 @@ pub use oauth_registry::OAuthProviderRow;
 pub use pinned_apps::{PinnedAppStore, PinnedAppUi};
 pub use shell::{command_shell, TaskOutcome};
 pub use system_knowhow::{is_system_knowhow_path, resolve_system_knowhow_dir, SystemKnowhowStore};
+pub use system_widgets::{resolve_system_widgets_dir, BUILT_IN_WIDGET_PREFIX};
 
 /// Migrate legacy `prompts/` directories to `intents/` across the workspace.
 ///
@@ -444,8 +448,14 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
 /// the file is removed (see `environment_variables::migrate_env_file_to_db`).
 /// The gitignore entry stays as a safety backstop so any stray `.env` a user
 /// drops can never land in the workspace's git-tracked artifacts repo.
-const WORKSPACE_GITIGNORE_ENTRIES: &[&str] =
-    &[".lucidos/", "data/postgres/", "data/blobs/", "data/.env"];
+const WORKSPACE_GITIGNORE_ENTRIES: &[&str] = &[
+    ".lucidos/",
+    "data/postgres/",
+    "data/blobs/",
+    "data/.env",
+    // Installed *plugin media* (`plugin_media::INSTALLED_DIR`, ADR 0414).
+    "data/plugin-media/",
+];
 
 /// Ensure the workspace `.gitignore` exists and contains every
 /// engine-managed entry from `WORKSPACE_GITIGNORE_ENTRIES`. Idempotent:
@@ -503,7 +513,7 @@ pub use device_presence::DevicePresenceStore;
 pub use events::EventRow;
 pub use mcp_servers::{McpServer, McpServerStore};
 pub use models::{validate_routes, Model, ModelFields, ModelStore, Route};
-pub use preferences::{PreferenceStore, ResolvedModelSelection};
+pub use preferences::{ModelDefaults, PreferenceStore, ResolvedModelSelection};
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, SessionMessage, Step, ThreadEventRow,
     ThreadSummary,
@@ -511,19 +521,33 @@ pub use store::{
 pub use webhook_deliveries::{Claim, DeliveryLedger};
 pub use webhooks::{Webhook, WebhookStore};
 
+/// The commit whose tree an index was built from, and so the only parent a
+/// commit of that index may take. `None` is an unborn HEAD.
+///
+/// [`commit_index`] takes it rather than re-reading HEAD. A HEAD that moved
+/// after the index was built would otherwise become the parent of a tree that
+/// lacks the mover's changes, silently reverting them.
+#[must_use = "pass it to `commit_index` so a moved HEAD is refused"]
+#[derive(Clone, Copy, Debug)]
+pub struct IndexBase(Option<git2::Oid>);
+
 /// Reset the index to match HEAD's tree before staging. Drops entries a
-/// previous `commit_*` staged without committing. No-op on a fresh repo with
-/// no HEAD yet.
+/// previous `commit_*` staged without committing. Leaves the index alone on a
+/// fresh repo with no HEAD yet.
+///
+/// Returns the commit it read, which the commit of this index must sit on.
+/// This is the only way to obtain an [`IndexBase`], so every commit stages on
+/// a known tree.
 pub fn reset_index_to_head(
     repo: &git2::Repository,
     index: &mut git2::Index,
-) -> Result<(), git2::Error> {
-    if let Ok(head) = repo.head() {
-        if let Ok(tree) = head.peel_to_tree() {
-            index.read_tree(&tree)?;
-        }
+) -> Result<IndexBase, git2::Error> {
+    let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let base = IndexBase(head.map(|c| c.id()));
+    if let Some(id) = base.0 {
+        index.read_tree(&repo.find_commit(id)?.tree()?)?;
     }
-    Ok(())
+    Ok(base)
 }
 
 /// Did this git2 error mean "another writer of the same repo got there first",
@@ -545,21 +569,25 @@ pub fn reset_index_to_head(
 /// {"error":"failed to lock file '<ws>/.git/refs/heads/main.lock' for writing: ; class=Os (2); code=Locked (-14)"}
 /// ```
 ///
-/// **`Reference` / `Modified`, lost the HEAD compare-and-swap.** `commit_index`
-/// reads the parent with `repo.head()`, then asks libgit2 to move HEAD off
-/// exactly that parent. A commit landing on HEAD in between fails the swap. The
-/// competitor can be another git2 handle in THIS process or an out-of-process
-/// `git` CLI writer. It shows up as an intermittent 500 on an ordinary write:
+/// **`Modified`, HEAD moved under the commit.** `commit_index` names the
+/// [`IndexBase`] as the parent and asks libgit2 to move HEAD off exactly that
+/// commit. The competitor can be another git2 handle in THIS process or an
+/// out-of-process `git` CLI writer. libgit2 notices in one of two places:
+///
+/// - `Object`: HEAD had already moved when the commit started.
+/// - `Reference`: HEAD moved during the commit, and the swap failed.
 ///
 /// ```text
+/// {"error":"failed to create commit: current tip is not the first parent; class=Object (3); code=Modified (-15)"}
 /// {"error":"old reference value does not match; class=Reference (4); code=Modified (-15)"}
 /// ```
 pub fn is_transient_repo_contention(e: &git2::Error) -> bool {
-    e.code() == git2::ErrorCode::Locked
-        || matches!(
-            (e.class(), e.code()),
-            (git2::ErrorClass::Reference, git2::ErrorCode::Modified)
-        )
+    use git2::{ErrorClass, ErrorCode};
+    match e.code() {
+        ErrorCode::Locked => true,
+        ErrorCode::Modified => matches!(e.class(), ErrorClass::Object | ErrorClass::Reference),
+        _ => false,
+    }
 }
 
 /// Run a git2 repository write, retrying briefly while another writer of the
@@ -573,7 +601,8 @@ pub fn is_transient_repo_contention(e: &git2::Error) -> bool {
 ///   Stage INSIDE it, never before: every `commit_*` routed through this opens
 ///   with `reset_index_to_head`, which makes a repeat safe. That reset also
 ///   makes the retry CORRECT for the HEAD race. It re-reads the tree from the
-///   NEW head, so the attempt lands on top of the commit that beat it. A caller
+///   NEW head and returns the [`IndexBase`] the commit is pinned to. So the
+///   attempt lands on top of the commit that beat it. A caller
 ///   that deletes first must remove OUTSIDE the closure, stage tolerantly, and
 ///   finish through [`commit_index_unless_unchanged`].
 /// - **It sleeps the calling thread.** Prefer a blocking context. A caller
@@ -641,9 +670,10 @@ fn commit_new_lucidos_toml(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let repo = git2::Repository::open(workspace)?;
     let mut index = repo.index()?;
+    let base = reset_index_to_head(&repo, &mut index)?;
     index.add_path(std::path::Path::new("lucidos.toml"))?;
     index.write()?;
-    commit_index(&repo, "chore: pin workspace vite port")?;
+    commit_index(&repo, "chore: pin workspace vite port", base)?;
     Ok(())
 }
 
@@ -702,7 +732,7 @@ pub fn commit_data_paths_with_overrides(
     let repo = git2::Repository::open(workspace_path)?;
     retry_while_repo_contended(|| {
         let mut index = repo.index()?;
-        reset_index_to_head(&repo, &mut index)?;
+        let base = reset_index_to_head(&repo, &mut index)?;
         for p in data_relative_paths {
             let repo_relative = format!("data/{}", p);
             match overrides.iter().find(|(path, _, _)| path == p) {
@@ -714,7 +744,7 @@ pub fn commit_data_paths_with_overrides(
             }
         }
         index.write()?;
-        commit_index(&repo, message)
+        commit_index(&repo, message, base)
     })
 }
 
@@ -757,7 +787,7 @@ pub fn commit_data_paths_removed(
     let repo = git2::Repository::open(workspace_path)?;
     retry_while_repo_contended(|| {
         let mut index = repo.index()?;
-        reset_index_to_head(&repo, &mut index)?;
+        let base = reset_index_to_head(&repo, &mut index)?;
         let mut staged_any = false;
         for p in data_relative_paths {
             if is_path_traversal(p) {
@@ -776,26 +806,30 @@ pub fn commit_data_paths_removed(
             return Ok(None);
         }
         index.write()?;
-        commit_index(&repo, message).map(Some)
+        commit_index(&repo, message, base).map(Some)
     })
 }
 
-/// Create a commit from the current index state.
+/// Create a commit from the current index state, on top of `base`.
 ///
-/// The parent is re-read from HEAD on every call, and the HEAD update libgit2
-/// performs is compare-and-swap against exactly that parent. So this races any
-/// other writer of the repo, and a loser fails with `Reference` / `Modified`.
-/// Call it inside [`retry_while_repo_contended`], which turns that loss into a
-/// re-run onto the winner's head; see [`is_transient_repo_contention`].
-pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, git2::Error> {
+/// libgit2 refuses the commit unless HEAD is still `base`, and its HEAD update
+/// is a compare-and-swap against it. So this races any other writer of the
+/// repo, and a loser fails with `Modified`. Call it inside
+/// [`retry_while_repo_contended`], which turns that loss into a re-run onto the
+/// winner's head; see [`is_transient_repo_contention`].
+pub fn commit_index(
+    repo: &git2::Repository,
+    message: &str,
+    base: IndexBase,
+) -> Result<String, git2::Error> {
     let mut index = repo.index()?;
     let tree_id = index.write_tree()?;
     let tree = repo.find_tree(tree_id)?;
 
     let sig = git2::Signature::now("Lucidos", "lucidos@local")?;
 
-    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
-    let parents: Vec<&git2::Commit> = parent.as_ref().map(|p| vec![p]).unwrap_or_default();
+    let parent = base.0.map(|id| repo.find_commit(id)).transpose()?;
+    let parents: Vec<&git2::Commit> = parent.iter().collect();
 
     let commit_id = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)?;
 
@@ -819,6 +853,7 @@ pub fn commit_index(repo: &git2::Repository, message: &str) -> Result<String, gi
 pub fn commit_index_unless_unchanged(
     repo: &git2::Repository,
     message: &str,
+    base: IndexBase,
 ) -> Result<String, git2::Error> {
     let mut index = repo.index()?;
     let tree_id = index.write_tree()?;
@@ -831,7 +866,7 @@ pub fn commit_index_unless_unchanged(
             }
         }
     }
-    commit_index(repo, message)
+    commit_index(repo, message, base)
 }
 
 /// Reject paths that would escape the directory they get joined onto: any `..`
@@ -1150,7 +1185,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Truncate `s` to roughly `max` bytes, joining the head and tail with `…`
 /// so that meaningful suffixes (filenames, file extensions, query tails)
 /// survive. Returns `s` unchanged when it already fits. UTF-8-safe.
-fn middle_truncate(s: &str, max: usize) -> String {
+pub(crate) fn middle_truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
@@ -1574,7 +1609,12 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             args["provider"].as_str().unwrap_or("OAuth")
         ),
         "create_app" => format!(
-            "Creating app '{}'...",
+            "Creating {} '{}'...",
+            if args["kind"] == "widget" {
+                "widget"
+            } else {
+                "app"
+            },
             args["name"].as_str().unwrap_or("app")
         ),
         "list_apps" => "Listing apps...".to_string(),
@@ -1788,6 +1828,10 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "list_held_messages" => "Listing held messages...".to_string(),
         "detach_child_thread" => "Moving a child thread to top level...".to_string(),
         "archive_thread" => "Archiving a thread...".to_string(),
+        "request_read" => match args[crate::llm::tools::READ_ARG].as_bool() {
+            Some(false) => "No read needed".to_string(),
+            _ => "Asking you to read this reply...".to_string(),
+        },
         "triage_threads" => "Triaging threads...".to_string(),
         "apply_thread_triage" => "Applying the approved triage...".to_string(),
         "list_changes" => "Listing changes...".to_string(),
@@ -1862,6 +1906,18 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             ),
             _ => "Listing environment variables...".to_string(),
         },
+        "widgets" => {
+            let widget = args["app_id"].as_str().unwrap_or("widget");
+            match args["action"].as_str() {
+                Some("thread") => "Reading this thread's widgets...".to_string(),
+                Some("show") => format!("Showing widget '{}'...", widget),
+                Some("pin") => format!("Pinning widget '{}' to the shelf...", widget),
+                Some("unpin") => format!("Unpinning widget '{}' from the shelf...", widget),
+                Some("make_reusable") => format!("Making widget '{}' reusable...", widget),
+                Some("stop_reusing") => format!("Stopping reuse of widget '{}'...", widget),
+                _ => "Listing reusable widgets...".to_string(),
+            }
+        }
         "manage_repositories" => match args["action"].as_str() {
             Some("add") => format!(
                 "Adding repository '{}'...",

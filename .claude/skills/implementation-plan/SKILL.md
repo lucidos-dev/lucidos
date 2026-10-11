@@ -124,7 +124,8 @@ Use exactly one question. `Approve` is always the first option. What goes in the
 |---|---|---|
 | `Approve` | Start implementing the plan as written. | Always, first. |
 | A fork of the plan (`Frontend only`, `Skip the migration`, …) | Approve a named variant. | Whenever the plan has a genuine fork: a narrower scope, one layer instead of two, a different approach. |
-| `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork. Never alongside one. |
+| `Implement in a new thread` | Approve as written, and build in a fresh child thread. | When this thread is already heavy (a long grill, many pictures) **and** the plan spans several phases or layers. May sit beside a fork. |
+| `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork and no new-thread option. Never alongside either. |
 
 **The plan as written is the thorough, long-term fix.** The maintainer always prefers it to a narrower patch. So write the thorough variant as the plan, and offer the narrower one as the fork, never the reverse. An unattended run still stops at the decision, as a plan or under `Decisions:`: the preference picks which variant to recommend, not whether to ask.
 
@@ -136,9 +137,16 @@ The user can type a nuanced answer straight into the prompt and it arrives as th
 
 This is a **DECISION** question, not a post-work confirmation, so the "never ask about work you've already done" rule in the system prompt does not apply to it. The distinction is concrete: source edits are *blocked* until it is answered, and a plan is a proposal about work that has NOT been done, so there is nothing to hand off yet.
 
-**Prose is not a lighter-touch version of the tool, it is silence.** The tool call is the only thing that parks the thread in `WaitingForUserAnswer`, and that state is the sole input to `thread_lifecycle::is_attention_needing`: it lights the needs-attention badge, keeps the thread in the Current section, bubbles up the ancestor chain, and is a fire condition for the "When agent needs me" trigger that notifies the user. A question typed into your final message ends the turn instead, so the thread is indistinguishable from a finished one and nobody is told you are waiting.
+**Prose is not a lighter-touch version of the tool, it is silence.** The tool call is the only thing that parks the thread in `WaitingForUserAnswer`, the sole input to `thread_lifecycle::is_attention_needing`. That state does four things:
 
-When the user approves, run `lucidos planned approve`. This flips the marker to gate-satisfying and unblocks source edits and Apply. **A fork answer is an approval too**: revise the plan file to the chosen variant, re-commit, then run `lucidos planned approve`. If the user requests changes instead, revise the plan file, re-commit, and ask again (the marker stays `proposed` until approved). When an invariant changes mid-implementation, update the file (per Workflow step 5).
+- it lights the Blocked badge;
+- it keeps the thread in the Current section;
+- it bubbles up the ancestor chain;
+- it fires the "When agent needs me" trigger that notifies the user.
+
+A question typed into your final message ends the turn instead. The thread then looks finished, and nobody is told you are waiting.
+
+When the user approves, run `lucidos planned approve`. This flips the marker to gate-satisfying and unblocks source edits and Apply. It also rewrites the plan's `- **Status**: Proposed` line to `Approved` and commits that, so keep the line exactly as the template writes it. **A fork answer is an approval too**: revise the plan file to the chosen variant, re-commit, then run `lucidos planned approve`. If the user requests changes instead, revise the plan file, re-commit, and ask again (the marker stays `proposed` until approved). When an invariant changes mid-implementation, update the file (per Workflow step 5).
 
 **The message carries the plan; the card only asks.** The card renders right under your message, so the user reads both. Put the summary in the message. Keep the card's question to one short line, such as "Approve the plan above?". When the second option is a fork, name that trade-off in a few words. Never restate the summary in the card.
 
@@ -146,6 +154,8 @@ When the user approves, run `lucidos planned approve`. This flips the marker to 
 
 ```md
 ## Implementation Plan
+
+- **Status**: Proposed
 
 ### Context
 <brief summary of what is being implemented and the inputs used>
@@ -170,3 +180,32 @@ When the user approves, run `lucidos planned approve`. This flips the marker to 
 ```
 
 If `Open Questions` contains a load-bearing unresolved decision, stop and ask the user instead of editing.
+
+### Implement in a new thread
+
+A planning thread that ran a long grill carries every question, picture and
+draft into each later turn. The plan file already holds what a builder needs, so
+a fresh thread can start from it alone. Offer the option only when both hold:
+this thread is heavy, and the plan spans several phases or layers.
+
+Picking it is an approval, asked once:
+
+1. Run `lucidos planned approve` in this thread.
+2. Spawn the builder as a child, with your own coding-agent backend:
+   `lucidos spawn-thread --to "$LUCIDOS_WORKSPACE" --relation child --coding-agent <backend>`.
+   A child stays in this thread's subtree and reports back when it finishes.
+3. End your turn. This branch carries the plan only.
+
+The builder's worktree starts from `main`, where the plan does not exist yet.
+So the spawn message must be self-contained and say:
+
+```text
+Implement docs/plans/<date>-<slug>.md. The user approved it in the planning
+thread. First run `git merge <planning branch>` to get the plan commit. Then run
+`lucidos planned mark --plan docs/plans/<date>-<slug>.md` and
+`lucidos planned approve` without asking again, and build it phase by phase.
+```
+
+Both branches then carry the same plan commit, so either Apply merges cleanly.
+The same text reaches the agent through `lucidos planned mark` and the edit
+gate, from `NEW_THREAD_HANDOFF` in `crates/lucidos-cli/src/planned.rs`.

@@ -32,7 +32,7 @@ const SUMMARY_COMPACTION_ANCHOR = 'models:summary-compaction';
 /** Heads Settings → System → Memory: how a turn gets its past (ADR 0362).
  *
  *  Classic is written at once. Tree costs money, so the first time its button
- *  only opens the confirm panel: the estimate and the compactor model, and the
+ *  only opens the confirm modal: the estimate and the compactor model, and the
  *  Start button that writes `memory_module`. Once a backfill has started,
  *  Tree is written at once too, and the compactor resumes it. */
 export function MemoryModuleSection() {
@@ -41,6 +41,7 @@ export function MemoryModuleSection() {
   const loaded = preferences.value.status === 'loaded';
   const chosen = loaded ? currentMemoryModule() : null;
   const [confirming, setConfirming] = useState(false);
+  const [treeButton, setTreeButton] = useState<HTMLButtonElement | null>(null);
   const background = useBackgroundModels();
   const compactor = storedBackgroundSelection('model_summary_compaction', 'reasoning_summary_compaction').model
     ?? background.row('model_summary_compaction')?.model
@@ -82,9 +83,10 @@ export function MemoryModuleSection() {
           {MEMORY_MODULE_OPTIONS.map((m) => (
             <button
               key={m.value}
+              ref={m.value === 'tree' ? setTreeButton : undefined}
               type="button"
               aria-pressed={chosen === m.value}
-              aria-expanded={m.value === 'tree' && chosen !== 'tree' ? confirming : undefined}
+              aria-haspopup={m.value === 'tree' && chosen !== 'tree' ? 'dialog' : undefined}
               class={`segmented-btn ${chosen === m.value ? 'active' : ''}`}
               onClick={() => choose(m.value)}
             >
@@ -100,11 +102,14 @@ export function MemoryModuleSection() {
         after a one-time background summary of the workspace. Until then, turns
         stay on Classic. Switching back to Classic keeps what Tree built.
       </div>
-      <Disclosure open={confirming && chosen !== 'tree'}>
-        {confirming && (
-          <TreeBackfillConfirm background={background} onStart={startTree} onCancel={() => setConfirming(false)} />
-        )}
-      </Disclosure>
+      {confirming && chosen !== 'tree' && (
+        <TreeBackfillConfirm
+          background={background}
+          anchor={treeButton}
+          onStart={startTree}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
       <Disclosure open={chosen === 'tree'}>
         {chosen === 'tree' && <TreeBackfillStatus onPickModel={openCompactionModel} />}
         <div class="settings-row-note" data-role="memory-compaction-link">

@@ -110,6 +110,7 @@ async fn agent_text_after_the_question_ends_the_park() {
             text: "\n\n".into(),
             coding_agent: CodingAgent::ClaudeCode,
             parent_tool_use_id: None,
+            progress_note: false,
         }))
         .await,
         "the agent kept talking past the question, so the card is dead"
@@ -298,6 +299,7 @@ mod preserve_at_shutdown {
                 text: "moving on".into(),
                 coding_agent: CodingAgent::ClaudeCode,
                 parent_tool_use_id: None,
+                progress_note: false,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

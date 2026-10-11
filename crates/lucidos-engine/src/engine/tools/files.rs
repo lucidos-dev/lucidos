@@ -1,5 +1,7 @@
 use super::super::context::sanitize_file_content_for_llm;
 use super::super::LucidosEngine;
+use super::app_lint::{app_lint_note, app_lint_note_on_disk};
+use crate::core::AppKind;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use base64::Engine as _;
 use std::path::Path;
@@ -34,9 +36,12 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
 /// letting a write through would either commit nothing (a silent lie to the
 /// caller) or need a second, commitless result shape. `run_python` already
 /// covers the case.
-fn read_only_reason(data_path: &str) -> Option<&'static str> {
+fn read_only_reason(data_path: &str, apps: &crate::core::AppManager) -> Option<&'static str> {
     if crate::core::is_system_knowhow_path(data_path) {
         return Some("system knowhow is read-only (shipped with the engine)");
+    }
+    if let Some(reason) = apps.app_path_write_refusal(data_path) {
+        return Some(reason);
     }
     if crate::core::is_tmp_path(data_path) {
         return Some(
@@ -262,24 +267,35 @@ fn app_lifecycle_event(
     name: impl FnOnce() -> Option<String>,
     exists_now: bool,
     existed_before: bool,
-    is_delete: bool,
+    op: ManifestOp,
 ) -> Option<SystemEvent> {
-    match (exists_now, is_delete, existed_before) {
+    match (exists_now, op, existed_before) {
         // Manifest just appeared → the app was born.
-        (true, false, false) => Some(SystemEvent::AppCreated {
+        (true, ManifestOp::Write, false) => Some(SystemEvent::AppCreated {
             app_id: app_id.to_string(),
             name: name(),
             actor: None,
         }),
         // Manifest removed (and it was there before) → the app is gone.
-        (false, true, true) => Some(SystemEvent::AppDeleted {
+        (false, ManifestOp::Delete { kind_before }, true) => Some(SystemEvent::AppDeleted {
             app_id: app_id.to_string(),
+            kind: kind_before,
             actor: None,
         }),
         // Edit of an existing manifest, or anything else → handled at end of
         // turn (AppUpdated) or not list-relevant.
         _ => None,
     }
+}
+
+/// What a file tool did to a path that may be an app's manifest.
+#[derive(Clone, Copy)]
+enum ManifestOp {
+    Write,
+    /// `kind_before` is read before the delete, for `AppDeleted` (ADR 0404).
+    Delete {
+        kind_before: Option<AppKind>,
+    },
 }
 
 /// What a file tool did to one `data/` path.
@@ -341,14 +357,14 @@ impl LucidosEngine {
     /// (`system-knowhow/building-an-app.md`).
     ///
     /// `existed_before` = whether the manifest was present before this op,
-    /// snapshotted by the caller BEFORE touching disk. `is_delete` flips the
-    /// post-op reading: a delete that removed the manifest is `AppDeleted`.
+    /// snapshotted by the caller BEFORE touching disk, as is a delete's kind.
+    /// A delete that removed the manifest is `AppDeleted`.
     /// `actor: None` matches the artifact emits (agent-driven file ops).
     async fn emit_app_event_for_data_path(
         &self,
         data_path: &str,
         existed_before: bool,
-        is_delete: bool,
+        op: ManifestOp,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Some(app_id) = data_path_app_manifest_id(data_path) else {
             return Ok(());
@@ -359,7 +375,7 @@ impl LucidosEngine {
             || self.app_manager.app_name(app_id),
             exists_now,
             existed_before,
-            is_delete,
+            op,
         ) else {
             return Ok(());
         };
@@ -764,7 +780,7 @@ impl LucidosEngine {
             Some(repo_arg) => self.resolve_repo_path(repo_arg, raw_path).await?,
             None => {
                 let (data_path, full_path) = self.resolve_data_path(raw_path)?;
-                if let Some(reason) = read_only_reason(&data_path) {
+                if let Some(reason) = read_only_reason(&data_path, &self.app_manager) {
                     return Err(format!("Cannot edit '{}': {}", data_path, reason));
                 }
                 // A theme or a font file is validated whole, which a partial
@@ -879,7 +895,7 @@ impl LucidosEngine {
         self.record_script_authorship(authorship, &full_path, new_content.as_bytes())
             .await;
 
-        self.emit_app_event_for_data_path(path, app_existed_before, false)
+        self.emit_app_event_for_data_path(path, app_existed_before, ManifestOp::Write)
             .await
             .map_err(|e| format!("Failed to emit app event: {}", e))?;
 
@@ -1297,7 +1313,7 @@ impl LucidosEngine {
                     };
                 let path = data_path.as_str();
 
-                if let Some(reason) = read_only_reason(path) {
+                if let Some(reason) = read_only_reason(path, &self.app_manager) {
                     return Ok(format!("Error: Cannot write '{}': {}", path, reason));
                 }
 
@@ -1388,7 +1404,7 @@ impl LucidosEngine {
                 )
                 .await;
 
-                self.emit_app_event_for_data_path(path, app_existed_before, false)
+                self.emit_app_event_for_data_path(path, app_existed_before, ManifestOp::Write)
                     .await?;
                 self.announce_data_file_change(
                     path,
@@ -1401,8 +1417,11 @@ impl LucidosEngine {
                 let result_action = if file_exists { "UPDATED" } else { "CREATED" };
                 let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
                 Ok(format!(
-                    "[ACTION COMPLETED] {}: {} (commit: {})",
-                    result_action, path, sha_short
+                    "[ACTION COMPLETED] {}: {} (commit: {}){}",
+                    result_action,
+                    path,
+                    sha_short,
+                    app_lint_note(path, content).unwrap_or_default()
                 ))
             }
             "edit_file" => {
@@ -1429,11 +1448,16 @@ impl LucidosEngine {
                     // calls that too, and emits its own `DataFileEdited`. A repo
                     // edit writes nothing under `data/`, so it announces nothing.
                     Ok(r) => {
+                        let mut message = r.tool_message();
                         if matches!(r.target, EditTarget::Workspace { .. }) {
                             self.announce_data_file_change(&r.path, DataFileChange::Edited)
                                 .await?;
+                            let data_dir = self.workspace_path().join(crate::core::DATA_DIR);
+                            message.push_str(
+                                &app_lint_note_on_disk(&data_dir, &r.path).unwrap_or_default(),
+                            );
                         }
-                        Ok(r.tool_message())
+                        Ok(message)
                     }
                     Err(e) if e.contains("old_string not found") => {
                         // Show file content so the LLM can retry with the correct old_string
@@ -1582,7 +1606,7 @@ impl LucidosEngine {
                         Err(e) => return Ok(format!("Error: {}", e)),
                     };
 
-                if let Some(reason) = read_only_reason(&dst_data_path) {
+                if let Some(reason) = read_only_reason(&dst_data_path, &self.app_manager) {
                     return Ok(format!(
                         "Error: Cannot copy to '{}': {}",
                         dst_data_path, reason
@@ -1691,8 +1715,12 @@ impl LucidosEngine {
                     ),
                 }
 
-                self.emit_app_event_for_data_path(&dst_data_path, app_existed_before, false)
-                    .await?;
+                self.emit_app_event_for_data_path(
+                    &dst_data_path,
+                    app_existed_before,
+                    ManifestOp::Write,
+                )
+                .await?;
                 self.announce_data_file_change(
                     &dst_data_path,
                     DataFileChange::Written {
@@ -1716,7 +1744,7 @@ impl LucidosEngine {
                     };
                 let path = data_path.as_str();
 
-                if let Some(reason) = read_only_reason(path) {
+                if let Some(reason) = read_only_reason(path, &self.app_manager) {
                     return Ok(format!("Error: Cannot delete '{}': {}", path, reason));
                 }
 
@@ -1750,6 +1778,8 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                 let app_existed_before = data_path_app_id(path)
                     .map(|id| self.app_manager.app_exists(id))
                     .unwrap_or(false);
+                let kind_before =
+                    data_path_app_id(path).and_then(|id| self.app_manager.app_kind(id));
 
                 let _repo_guard = self.lock_workspace_repo().await;
 
@@ -1773,8 +1803,12 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                 // which can fail with the delete already committed.
                 self.forget_script_authorship(&full_path).await;
 
-                self.emit_app_event_for_data_path(path, app_existed_before, true)
-                    .await?;
+                self.emit_app_event_for_data_path(
+                    path,
+                    app_existed_before,
+                    ManifestOp::Delete { kind_before },
+                )
+                .await?;
                 self.announce_data_file_change(
                     path,
                     DataFileChange::Deleted {

@@ -201,12 +201,14 @@ async fn spawn_json_upstream(body: serde_json::Value) -> String {
 /// A model call through the proxy records what it cost (ADR 0242). The
 /// builtin `local` proxy reaches a loopback upstream that answers in OpenAI's
 /// shape. No origin token rides on the request, so the row lands on the home
-/// thread, and the caller still gets the reply unchanged.
+/// thread, and the caller still gets the reply unchanged. The row names the
+/// model the request asked for, and the *served model* the reply named.
 #[tokio::test]
 async fn a_model_call_through_the_proxy_records_its_cost() {
     let model = format!("e2e-proxied-{}", uuid::Uuid::new_v4());
+    let served_model = format!("{model}-served");
     let reply = json!({
-        "model": model,
+        "model": served_model,
         "choices": [{"message": {"role": "assistant", "content": "hi"}}],
         "usage": {"prompt_tokens": 321, "completion_tokens": 12},
     });
@@ -218,7 +220,7 @@ async fn a_model_call_through_the_proxy_records_its_cost() {
             "{}/api/v1/proxy/local/chat/completions",
             base_url()
         ))
-        .json(&json!({"model": "local-model", "messages": []}))
+        .json(&json!({"model": model, "messages": []}))
         .send()
         .await
         .expect("proxy request failed");
@@ -257,6 +259,7 @@ async fn a_model_call_through_the_proxy_records_its_cost() {
     assert_eq!(body, reply, "the caller gets the reply unchanged");
     let row = row.expect("the proxied call recorded a row");
     assert_eq!(row["payload"]["purpose"], "proxy");
+    assert_eq!(row["payload"]["served_model"], json!(served_model));
     assert_eq!(row["payload"]["usage"]["input_tokens"], 321);
     assert_eq!(row["payload"]["usage"]["output_tokens"], 12);
 }

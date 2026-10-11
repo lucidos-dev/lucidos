@@ -96,8 +96,8 @@ pub(crate) fn parse_coding_agent(
 }
 
 /// Resolve the model and reasoning effort a `run_thread` child runs on: a
-/// caller-supplied pin wins, otherwise the account chat preference. The two
-/// resolve independently, so pinning one leaves the other inherited.
+/// caller-supplied pin wins. Unpinned, the model is the account's `chat_model`
+/// and the effort stays `None`, for the caller to resolve for that model.
 ///
 /// Validation follows the trigger route pins, the other place a chat model and
 /// effort are pinned per spawn. The model id passes through unchecked
@@ -108,11 +108,9 @@ pub(crate) fn parse_coding_agent(
 pub(crate) fn resolve_sub_thread_model_and_effort(
     args: &serde_json::Value,
     pref_model: Option<String>,
-    pref_effort: Option<String>,
 ) -> Result<(Option<String>, Option<String>), String> {
     let model = normalize_route_setting(optional_string_arg(args, "model")?).or(pref_model);
-    let effort = validate_trigger_reasoning_effort(optional_string_arg(args, "reasoning_effort")?)?
-        .or(pref_effort);
+    let effort = validate_trigger_reasoning_effort(optional_string_arg(args, "reasoning_effort")?)?;
     Ok((model, effort))
 }
 
@@ -339,76 +337,21 @@ impl LucidosEngine {
             );
         }
         if tool_name == tn::CAPTURE_APP || tool_name == tn::REFRESH_APP {
-            let app_id = tool_args
-                .get("app_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            if tool_name == tn::REFRESH_APP {
-                self.event_bus
-                    .emit_or_log(
-                        BusEvent::Thread {
-                            thread_id,
-                            event: ThreadEvent::AppUiRefreshRequested {
-                                app_id: app_id.clone(),
-                            },
-                            meta: EventMeta::NONE,
-                        },
-                        "[AgenticLoop] AppUiRefreshRequested (refresh_app tool)",
-                    )
-                    .await;
-            }
-
-            let skip_capture = tool_args
-                .get("skip_capture")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            if skip_capture {
-                Some("App UI refreshed.".to_string())
-            } else {
-                if tool_name == tn::REFRESH_APP {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-
-                let request_id = Uuid::new_v4().to_string();
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                {
-                    let mut captures = self.pending_captures.lock().unwrap();
-                    captures.insert(request_id.clone(), tx);
-                }
-
-                self.event_bus
-                    .emit_or_log(
-                        BusEvent::Thread {
-                            thread_id,
-                            event: ThreadEvent::AppUiCaptureRequested {
-                                app_id: app_id.clone(),
-                                request_id: request_id.clone(),
-                            },
-                            meta: EventMeta::NONE,
-                        },
-                        "[AgenticLoop] AppUiCaptureRequested",
-                    )
-                    .await;
-
-                Some(
-                    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
-                        Ok(Ok(capture)) => {
-                            super::format_capture_result(&capture.screenshot, &capture.dom)
-                        }
-                        Ok(Err(_)) => {
-                            "Error: Capture failed — the frontend channel was dropped.".to_string()
-                        }
-                        Err(_) => {
-                            let mut captures = self.pending_captures.lock().unwrap();
-                            captures.remove(&request_id);
-                            "Error: Capture timed out (10s) — the frontend could not open or capture the app UI.".to_string()
-                        }
-                    },
+            let last_used = self.last_used_device(thread_id, device_id).await;
+            Some(
+                crate::engine::tools::app_capture::app_ui_tool_impl(
+                    &self.event_bus,
+                    &self.pool,
+                    &self.pending_captures,
+                    &self.artifact_manager,
+                    tool_args,
+                    thread_id,
+                    tool_name == tn::REFRESH_APP,
+                    last_used.as_deref(),
+                    crate::engine::tools::app_capture::CAPTURE_TIMEOUT,
                 )
-            }
+                .await,
+            )
         } else if tool_name == tn::RUN_CODING_AGENT || tool_name == tn::RUN_CLAUDE_LEGACY {
             let prompt = tool_args["prompt"].as_str().unwrap_or("");
             if prompt.is_empty() {
@@ -713,17 +656,35 @@ impl LucidosEngine {
                             let child_thread_id = uuid::Uuid::new_v4();
                             // Without this the spawned loop defaults to LUCIDOS_MODEL
                             // instead of the user's chat-mode preference.
-                            let (chat_model, chat_effort) =
-                                crate::core::PreferenceStore::user_chat_settings(&self.pool).await;
+                            let chat_model =
+                                crate::core::PreferenceStore::user_chat_model(&self.pool).await;
                             let (model, reasoning_effort) =
-                                match resolve_sub_thread_model_and_effort(
-                                    tool_args,
-                                    chat_model,
-                                    Some(chat_effort),
-                                ) {
+                                match resolve_sub_thread_model_and_effort(tool_args, chat_model) {
                                     Ok(pins) => pins,
                                     Err(e) => return Some(format!("Error: {}", e)),
                                 };
+                            // An unpinned tier resolves for the child's model now,
+                            // so its eager MessageReceived stamps the tier it runs at.
+                            let reasoning_effort = match reasoning_effort {
+                                Some(effort) => Some(effort),
+                                None => {
+                                    crate::core::PreferenceStore::resolve_chat_overrides_for_thread(
+                                        &self.pool,
+                                        crate::core::ModelDefaults {
+                                            registry: self.model_registry(),
+                                            fallback_model: self.current_provider().default_model(),
+                                        },
+                                        None,
+                                        None,
+                                        crate::core::ResolvedModelSelection {
+                                            model: model.clone(),
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await
+                                    .reasoning_effort
+                                }
+                            };
                             let caller_title = tool_args["title"].as_str();
                             // The eager MessageReceived (a Child relation child's
                             // active_children_count must increment before the parent
@@ -961,8 +922,11 @@ impl LucidosEngine {
                 tool_use_id,
                 &questions,
                 message,
-                String::new(),
-                EventChannel::Chat,
+                crate::engine::agent_question::QuestionAsker {
+                    cc_session_id: String::new(),
+                    channel: EventChannel::Chat,
+                    owner_approval: None,
+                },
             )
             .await;
         let answer_kinds = match outcome {
@@ -1456,36 +1420,29 @@ mod tests {
 
     // --- run_thread route pins ----------------------------------------------
 
-    /// The account preferences, as `user_chat_settings` hands them over.
+    /// The account's chat model, as `user_chat_model` hands it over.
     fn chat_prefs() -> (Option<String>, Option<String>) {
-        (Some("claude-opus-5".to_string()), Some("xhigh".to_string()))
+        (Some("claude-opus-5".to_string()), None)
     }
 
     fn resolved(args: serde_json::Value) -> (Option<String>, Option<String>) {
-        let (model, effort) = chat_prefs();
-        resolve_sub_thread_model_and_effort(&args, model, effort).expect("valid pins")
+        resolve_sub_thread_model_and_effort(&args, chat_prefs().0).expect("valid pins")
     }
 
-    /// The pre-existing behavior: a spawn that pins nothing runs on the
-    /// account's chat model and effort.
+    /// A spawn that pins nothing runs on the account's chat model, and leaves
+    /// the tier to be resolved for that model.
     #[test]
-    fn run_thread_without_pins_inherits_both_chat_preferences() {
-        assert_eq!(
-            resolved(json!({"prompt": "summarize this"})),
-            (Some("claude-opus-5".to_string()), Some("xhigh".to_string()))
-        );
+    fn run_thread_without_pins_inherits_the_chat_model_alone() {
+        assert_eq!(resolved(json!({"prompt": "summarize this"})), chat_prefs());
     }
 
-    /// The two pins resolve independently. Naming the model must not drag the
-    /// effort down to a provider default, and vice versa.
+    /// Naming the model leaves the tier unpinned, so the child runs that
+    /// model at its own tier rather than the account model's.
     #[test]
-    fn run_thread_model_pin_leaves_the_preference_effort_inherited() {
+    fn run_thread_model_pin_leaves_the_effort_to_the_model() {
         assert_eq!(
             resolved(json!({"prompt": "p", "model": "claude-sonnet-5"})),
-            (
-                Some("claude-sonnet-5".to_string()),
-                Some("xhigh".to_string())
-            )
+            (Some("claude-sonnet-5".to_string()), None)
         );
     }
 
@@ -1519,7 +1476,6 @@ mod tests {
     fn run_thread_rejects_an_unknown_reasoning_effort_and_names_it() {
         let err = resolve_sub_thread_model_and_effort(
             &json!({"prompt": "p", "reasoning_effort": "cheap"}),
-            None,
             None,
         )
         .unwrap_err();
@@ -1568,7 +1524,7 @@ mod tests {
             json!({"prompt": "p", "model": 5}),
             json!({"prompt": "p", "reasoning_effort": ["low"]}),
         ] {
-            let err = resolve_sub_thread_model_and_effort(&args, None, None)
+            let err = resolve_sub_thread_model_and_effort(&args, None)
                 .expect_err("a non-string pin must be refused");
             assert!(
                 err.contains("must be a string"),

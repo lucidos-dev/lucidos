@@ -1,28 +1,31 @@
-// -- startup sweep tests for coding_agent_has_diff ---------------------------------
+// -- startup sweep tests for the branch-work half of the change state --------
 
-mod startup_sweep_coding_agent_has_diff {
-    //! Tests for `reconcile_thread_coding_agent_has_diff` — the per-thread helper the
+mod startup_sweep_branch_work {
+    //! Tests for `reconcile_thread_branch_work` — the per-thread helper the
     //! engine-startup sweep dispatches into. Each test builds a real git repo +
     //! worktree, seeds an active CC thread row in `thread_summaries` (via the
     //! same `SessionStarted` projection path the engine uses at runtime), then
-    //! drives the helper and asserts the column reflects on-disk reality.
+    //! drives the helper and asserts the change state reflects on-disk reality.
     //!
-    //! The bigger sweep entry point (`refresh_coding_agent_has_diff_for_active_cc_threads`)
+    //! The bigger sweep entry point (`refresh_branch_work_for_active_cc_threads`)
     //! just enumerates active CC threads from the DB and calls this helper for
-    //! each — same shape `seed_coding_agent_has_diff` takes vs its per-session
+    //! each — same shape `seed_branch_work` takes vs its per-session
     //! bootstrap caller.
-    use crate::engine::agent_recovery::reconcile_thread_coding_agent_has_diff;
+    use crate::engine::agent_recovery::reconcile_thread_branch_work;
     use crate::engine::event_bus::{BusEvent, EventBus};
     use crate::engine::git_ops::git_cmd;
     use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
+    use crate::engine::thread_lifecycle::{ChangeStateKind, CodingAgentChangeState};
     use crate::test_support::{
-        make_repo_and_worktree, read_coding_agent_has_diff, setup_test_db, start_cc_session,
-        teardown_test_db,
+        make_repo_and_worktree, read_change_state_kind, seed_change_state, setup_test_db,
+        start_cc_session, teardown_test_db,
     };
+
+    const UNPROPOSED: CodingAgentChangeState = CodingAgentChangeState::Unproposed { reason: None };
     use uuid::Uuid;
 
     #[tokio::test]
-    async fn startup_sweep_refreshes_coding_agent_has_diff_for_active_cc_threads() {
+    async fn startup_sweep_refreshes_branch_work_for_active_cc_threads() {
         let branch = "claude-code/sweep-true";
         let (_tmp, repo_root, wt) = make_repo_and_worktree(branch).await;
 
@@ -40,18 +43,20 @@ mod startup_sweep_coding_agent_has_diff {
         let thread_id = Uuid::new_v4();
         start_cc_session(&bus, thread_id, branch, None).await;
 
-        // Precondition: deliberately stale FALSE — simulates the
-        // post-commit hook firing while the engine was down.
-        assert!(
-            !read_coding_agent_has_diff(&pool, thread_id).await,
-            "precondition: SessionStarted upsert must leave coding_agent_has_diff at the column default (false)"
+        // Precondition: deliberately stale `none`, as if the post-commit hook
+        // fired while the engine was down.
+        assert_eq!(
+            read_change_state_kind(&pool, thread_id).await,
+            ChangeStateKind::None,
+            "precondition: the SessionStarted upsert leaves the column default"
         );
 
-        reconcile_thread_coding_agent_has_diff(&pool, thread_id, &repo_root, branch, &wt).await;
+        reconcile_thread_branch_work(&pool, thread_id, &repo_root, branch, &wt).await;
 
-        assert!(
-            read_coding_agent_has_diff(&pool, thread_id).await,
-            "sweep must flip coding_agent_has_diff=true when the branch has commits beyond main on disk"
+        assert_eq!(
+            read_change_state_kind(&pool, thread_id).await,
+            ChangeStateKind::Unproposed,
+            "sweep must read commits beyond main on disk as unproposed work"
         );
 
         pool.close().await;
@@ -59,7 +64,7 @@ mod startup_sweep_coding_agent_has_diff {
     }
 
     #[tokio::test]
-    async fn startup_sweep_leaves_coding_agent_has_diff_false_when_branch_is_actually_fresh() {
+    async fn startup_sweep_leaves_change_state_none_when_branch_is_actually_fresh() {
         let branch = "claude-code/sweep-fresh";
         let (_tmp, repo_root, wt) = make_repo_and_worktree(branch).await;
 
@@ -70,11 +75,12 @@ mod startup_sweep_coding_agent_has_diff {
         let thread_id = Uuid::new_v4();
         start_cc_session(&bus, thread_id, branch, None).await;
 
-        reconcile_thread_coding_agent_has_diff(&pool, thread_id, &repo_root, branch, &wt).await;
+        reconcile_thread_branch_work(&pool, thread_id, &repo_root, branch, &wt).await;
 
-        assert!(
-            !read_coding_agent_has_diff(&pool, thread_id).await,
-            "sweep must leave coding_agent_has_diff=false when the branch has no commits beyond main"
+        assert_eq!(
+            read_change_state_kind(&pool, thread_id).await,
+            ChangeStateKind::None,
+            "sweep must leave the state none when the branch has no commits beyond main"
         );
 
         pool.close().await;
@@ -84,13 +90,13 @@ mod startup_sweep_coding_agent_has_diff {
     #[tokio::test]
     async fn startup_sweep_skips_terminated_cc_threads() {
         // Even if the branch on disk has commits, an archived thread must NOT
-        // get its coding_agent_has_diff flipped to TRUE — the WaitingBanner Diff
+        // read as unproposed work: the WaitingBanner Diff
         // button has nothing to act on for a thread the user already closed.
         // The bigger sweep enforces this by filtering on
         // `state='active' AND archive_state!='archived'` in the SQL
         // enumeration; the per-thread helper itself is unconditional, so we
         // test the filter contract by simulating: don't call the helper for
-        // archived threads, and verify the row stays at FALSE.
+        // archived threads, and verify the row stays `none`.
         let branch = "claude-code/sweep-archived";
         let (_tmp, _repo_root, _wt) = make_repo_and_worktree(branch).await;
 
@@ -101,7 +107,7 @@ mod startup_sweep_coding_agent_has_diff {
 
         // Archive the thread — `ThreadArchived` writes
         // archive_state='archived' (via the contract layer) and clears
-        // coding_agent_has_diff (via the projection). The sweep's
+        // the change state (via the projection). The sweep's
         // enumeration gate
         // (`WHERE is_coding_agent AND state='active' AND archive_state != 'archived'`)
         // skips it.
@@ -115,21 +121,22 @@ mod startup_sweep_coding_agent_has_diff {
 
         // Run the sweep entry point and assert no archived thread was
         // visited. We can verify this directly by calling
-        // refresh_coding_agent_has_diff_for_active_cc_threads with a repo whose
-        // branch has commits — if the gate didn't filter, the column would
-        // flip to TRUE.
+        // refresh_branch_work_for_active_cc_threads with a repo whose
+        // branch has commits: if the gate didn't filter, the state would
+        // become unproposed.
         let workspace_path =
             std::env::temp_dir().join(format!("lucidos-sweep-test-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&workspace_path).unwrap();
-        crate::engine::agent_recovery::refresh_coding_agent_has_diff_for_active_cc_threads(
+        crate::engine::agent_recovery::refresh_branch_work_for_active_cc_threads(
             &pool,
             &workspace_path,
             &workspace_path, // lucidos_repo_root unused for archived-only data set
         )
         .await;
 
-        let (archive_state, has_diff): (String, bool) = sqlx::query_as(
-            "SELECT archive_state, coding_agent_has_diff FROM thread_summaries WHERE thread_id = $1",
+        let (archive_state, change_state): (String, String) = sqlx::query_as(
+            "SELECT archive_state, coding_agent_change_state FROM thread_summaries \
+             WHERE thread_id = $1",
         )
         .bind(thread_id)
         .fetch_one(&pool)
@@ -139,10 +146,9 @@ mod startup_sweep_coding_agent_has_diff {
             archive_state, "archived",
             "precondition: ThreadArchived sets archive_state='archived'"
         );
-        assert!(
-            !has_diff,
-            "sweep must not flip coding_agent_has_diff for an archived thread (archive_state={})",
-            archive_state
+        assert_eq!(
+            change_state, "none",
+            "sweep must not mark an archived thread's branch as work (archive_state={archive_state})"
         );
 
         let _ = std::fs::remove_dir_all(&workspace_path);
@@ -154,14 +160,14 @@ mod startup_sweep_coding_agent_has_diff {
     async fn startup_sweep_writes_false_when_worktree_is_missing() {
         // Defensive contract: an active CC thread whose worktree directory was
         // removed from disk (cleanup, manual rm -rf, restart-after-crash) must
-        // have coding_agent_has_diff reset to FALSE. The git lookup against the main
-        // repo could still succeed and return TRUE (the branch ref survives
+        // have its change state reset to none. The git lookup against the main
+        // repo could still find work (the branch ref survives
         // worktree removal), which would leave the Diff button enabled for a
         // thread the user can no longer act on.
         let branch = "claude-code/sweep-missing-wt";
         let (_tmp, repo_root, wt) = make_repo_and_worktree(branch).await;
 
-        // Branch has commits — so seed_coding_agent_has_diff would say TRUE.
+        // Branch has commits, so seed_branch_work would say unproposed.
         std::fs::write(wt.join("a.txt"), "hello").unwrap();
         git_cmd(&["add", "a.txt"], &wt).await.unwrap();
         git_cmd(&["commit", "-m", "feat: add a"], &wt)
@@ -185,21 +191,16 @@ mod startup_sweep_coding_agent_has_diff {
         let thread_id = Uuid::new_v4();
         start_cc_session(&bus, thread_id, branch, None).await;
 
-        // Pre-seed the column to TRUE so we can assert the sweep actively
-        // resets it (not just leaves it at the default).
-        sqlx::query(
-            "UPDATE thread_summaries SET coding_agent_has_diff = TRUE WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Pre-seed unproposed so we can assert the sweep actively resets it
+        // (not just leaves it at the default).
+        seed_change_state(&pool, thread_id, UNPROPOSED).await;
 
-        reconcile_thread_coding_agent_has_diff(&pool, thread_id, &repo_root, branch, &wt).await;
+        reconcile_thread_branch_work(&pool, thread_id, &repo_root, branch, &wt).await;
 
-        assert!(
-            !read_coding_agent_has_diff(&pool, thread_id).await,
-            "sweep must reset coding_agent_has_diff=false when the worktree dir is missing on disk"
+        assert_eq!(
+            read_change_state_kind(&pool, thread_id).await,
+            ChangeStateKind::None,
+            "sweep must reset the state to none when the worktree dir is missing on disk"
         );
 
         pool.close().await;
@@ -209,20 +210,20 @@ mod startup_sweep_coding_agent_has_diff {
     #[tokio::test]
     async fn startup_sweep_resolves_legacy_non_deterministic_worktree_path() {
         // Pins worktree-path resolution in
-        // `refresh_coding_agent_has_diff_for_active_cc_threads` to flow through
+        // `refresh_branch_work_for_active_cc_threads` to flow through
         // `resolve_worktree_path`, which consults (1) the recorded
         // `CodingAgentIdled.worktree_path`, (2) `git worktree list` branch
         // matching, and (3) the deterministic path in that order. Resolving
         // via `deterministic_worktree_path` directly would skip (1)+(2) and
         // silently miss legacy `<workspace>/.lucidos/worktrees/cc-<random>`
         // paths — those threads would hit the worktree-missing branch in
-        // `reconcile_thread_coding_agent_has_diff` and have `coding_agent_has_diff`
-        // incorrectly wiped to FALSE.
+        // `reconcile_thread_branch_work` and have their change state
+        // incorrectly wiped to none.
         //
         // This test seeds a `CodingAgentIdled.worktree_path` pointing at a
         // non-deterministic path and asserts the sweep picks it up and writes
-        // TRUE based on the on-disk diff.
-        use crate::engine::agent_recovery::refresh_coding_agent_has_diff_for_active_cc_threads;
+        // unproposed based on the on-disk diff.
+        use crate::engine::agent_recovery::refresh_branch_work_for_active_cc_threads;
 
         let branch = "claude-code/sweep-legacy-path";
 
@@ -298,22 +299,16 @@ mod startup_sweep_coding_agent_has_diff {
         .await
         .unwrap();
 
-        // Pre-seed FALSE — if the sweep used `deterministic_worktree_path`
-        // (the bug), `worktree_path.exists()` would be false (no `thread-<short>`
-        // dir on disk) and the helper would write FALSE, leaving the column
-        // at FALSE and our assertion would fail.
-        sqlx::query(
-            "UPDATE thread_summaries SET coding_agent_has_diff = FALSE WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Pre-seed none: if the sweep used `deterministic_worktree_path` (the
+        // bug), no `thread-<short>` dir exists on disk, so the helper would
+        // write none and our assertion would fail.
+        seed_change_state(&pool, thread_id, CodingAgentChangeState::None).await;
 
-        refresh_coding_agent_has_diff_for_active_cc_threads(&pool, &workspace, &repo).await;
+        refresh_branch_work_for_active_cc_threads(&pool, &workspace, &repo).await;
 
-        assert!(
-            read_coding_agent_has_diff(&pool, thread_id).await,
+        assert_eq!(
+            read_change_state_kind(&pool, thread_id).await,
+            ChangeStateKind::Unproposed,
             "sweep must resolve the legacy worktree path via CodingAgentIdled \
              (not deterministic_worktree_path) and detect the on-disk diff"
         );
@@ -331,15 +326,15 @@ mod startup_sweep_coding_agent_has_diff {
         // external repo's branches).
         //
         // Bug shape this guards against: if the cc_repo_id branch in
-        // `refresh_coding_agent_has_diff_for_active_cc_threads` regresses (lookup
+        // `refresh_branch_work_for_active_cc_threads` regresses (lookup
         // omitted, falls through to `lucidos_repo_root`), `git worktree list`
         // against the wrong repo can't find the external worktree → resolve
         // falls back to the deterministic path under `<workspace>/.lucidos/`,
-        // which doesn't exist on disk → `reconcile_thread_coding_agent_has_diff`
-        // hits the missing-worktree branch and writes FALSE. Pre-seeded TRUE
-        // proves the sweep actively flips on the external-repo path.
+        // which doesn't exist on disk → `reconcile_thread_branch_work`
+        // hits the missing-worktree branch and writes none. Pre-seeded
+        // unproposed proves the sweep keeps it on the external-repo path.
         use crate::core::repositories::RepositoryStore;
-        use crate::engine::agent_recovery::refresh_coding_agent_has_diff_for_active_cc_threads;
+        use crate::engine::agent_recovery::refresh_branch_work_for_active_cc_threads;
 
         let branch = "claude-code/sweep-external-repo";
 
@@ -366,7 +361,7 @@ mod startup_sweep_coding_agent_has_diff {
         // If the sweep mistakenly falls back to this repo, `git worktree
         // list` finds nothing for `branch`, the resolver hits the
         // deterministic path under `<workspace>/.lucidos/worktrees/` (which
-        // doesn't exist), and the helper writes FALSE.
+        // doesn't exist), and the helper writes none.
         let lucidos_tmp = tempfile::tempdir().unwrap();
         let lucidos_repo = lucidos_tmp.path().to_path_buf();
         git_cmd(&["init", "-b", "main"], &lucidos_repo)
@@ -406,26 +401,19 @@ mod startup_sweep_coding_agent_has_diff {
         let thread_id = Uuid::new_v4();
         start_cc_session(&bus, thread_id, branch, Some(repo.id.to_string())).await;
 
-        // Pre-seed TRUE so a no-op sweep would leave it TRUE and fail to
-        // distinguish from the success case. The missing-worktree branch in
-        // `reconcile_thread_coding_agent_has_diff` writes FALSE; if the sweep
-        // mistakenly resolves against the wrong repo, the column flips to
-        // FALSE and the assertion below fails loudly.
-        sqlx::query(
-            "UPDATE thread_summaries SET coding_agent_has_diff = TRUE WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Pre-seed unproposed. The missing-worktree branch in
+        // `reconcile_thread_branch_work` writes none, so if the sweep resolves
+        // against the wrong repo, the assertion below fails loudly.
+        seed_change_state(&pool, thread_id, UNPROPOSED).await;
 
-        refresh_coding_agent_has_diff_for_active_cc_threads(&pool, &workspace, &lucidos_repo).await;
+        refresh_branch_work_for_active_cc_threads(&pool, &workspace, &lucidos_repo).await;
 
-        assert!(
-            read_coding_agent_has_diff(&pool, thread_id).await,
+        assert_eq!(
+            read_change_state_kind(&pool, thread_id).await,
+            ChangeStateKind::Unproposed,
             "sweep must resolve external-repo root via cc_repo_id lookup, \
-             find the worktree, detect the on-disk diff, and leave \
-             coding_agent_has_diff=true (not fall back to lucidos_repo_root)"
+             find the worktree, detect the on-disk diff, and leave the state \
+             unproposed (not fall back to lucidos_repo_root)"
         );
 
         pool.close().await;
@@ -443,12 +431,12 @@ mod startup_sweep_coding_agent_has_diff {
         // Bug shape this guards against: routing on `cc_repo_id` alone (NULL →
         // `lucidos_repo_root`) sends app threads to the Lucidos main repo, where
         // the `claude-code/app/...` branch does not exist. `proposal_files_for_branch`
-        // then returns None → the sweep wipes `coding_agent_has_diff` to FALSE on
+        // then returns None → the sweep wipes the change state to none on
         // every engine restart, hiding the WaitingBanner Diff button and the
         // standalone WIP diff button for an app thread that genuinely has a diff.
-        // Pre-seeded FALSE proves the fix actively flips it to TRUE via the
+        // Pre-seeded none proves the fix actively writes unproposed via the
         // workspace route.
-        use crate::engine::agent_recovery::refresh_coding_agent_has_diff_for_active_cc_threads;
+        use crate::engine::agent_recovery::refresh_branch_work_for_active_cc_threads;
         use crate::engine::agent_session::CodingAgentKind;
 
         let branch = "claude-code/app/habit-tracker/sweep";
@@ -492,7 +480,7 @@ mod startup_sweep_coding_agent_has_diff {
 
         // Separate empty Lucidos repo with NO `branch` ref. If the sweep
         // mis-routes app threads here, `proposal_files_for_branch` returns None
-        // and the column is wiped to FALSE.
+        // and the state is wiped to none.
         let lucidos_tmp = tempfile::tempdir().unwrap();
         let lucidos_repo = lucidos_tmp.path().to_path_buf();
         git_cmd(&["init", "-b", "main"], &lucidos_repo)
@@ -539,7 +527,7 @@ mod startup_sweep_coding_agent_has_diff {
 
         // Record the worktree path (source #1 in `resolve_worktree_path`) so the
         // worktree is found regardless of repo_root — isolating the bug to the
-        // repo_root routing that `seed_coding_agent_has_diff` diffs against.
+        // repo_root routing that `seed_branch_work` diffs against.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::CodingAgentIdled {
@@ -561,22 +549,17 @@ mod startup_sweep_coding_agent_has_diff {
         .await
         .unwrap();
 
-        // Pre-seed FALSE so the assertion proves the sweep actively flips it to
-        // TRUE via the workspace_path route (the bug leaves it FALSE).
-        sqlx::query(
-            "UPDATE thread_summaries SET coding_agent_has_diff = FALSE WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        // Pre-seed none so the assertion proves the sweep actively writes
+        // unproposed via the workspace_path route (the bug leaves it none).
+        seed_change_state(&pool, thread_id, CodingAgentChangeState::None).await;
 
-        refresh_coding_agent_has_diff_for_active_cc_threads(&pool, &workspace, &lucidos_repo).await;
+        refresh_branch_work_for_active_cc_threads(&pool, &workspace, &lucidos_repo).await;
 
-        assert!(
-            read_coding_agent_has_diff(&pool, thread_id).await,
+        assert_eq!(
+            read_change_state_kind(&pool, thread_id).await,
+            ChangeStateKind::Unproposed,
             "sweep must route app-kind threads to workspace_path, find the \
-             branch diff, and leave coding_agent_has_diff=true (not fall back \
+             branch diff, and leave the state unproposed (not fall back \
              to lucidos_repo_root, where the app branch does not exist)"
         );
 
@@ -1324,6 +1307,41 @@ mod restart_boundary_reads {
         assert!(
             !switch_was_user_initiated(&pool, thread_id).await,
             "a device abort older than the latest start has been consumed by a prior resume → no re-resume"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Regression: `settle_unresumed_switch_threads` withdraws an unkept resume
+    /// with a newer `RecoveryAfterRestart` abort carrying the same device actor.
+    /// It is no start event, so only the newest-abort clause retires the switch
+    /// abort. Without it, the next boot, a crash included, auto-resumes.
+    #[tokio::test]
+    async fn a_switch_abort_withdrawn_by_the_floor_is_not_a_switch() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+
+        seed_cc_start(&bus, thread_id).await;
+        tick().await;
+        abort_with(&bus, thread_id, Some(device_actor())).await;
+        assert!(
+            switch_was_user_initiated(&pool, thread_id).await,
+            "precondition: the switch abort alone reads as a user switch"
+        );
+        tick().await;
+        abort_with_cause(
+            &bus,
+            thread_id,
+            Some(device_actor()),
+            AbortCause::RecoveryAfterRestart,
+        )
+        .await;
+
+        assert!(
+            !switch_was_user_initiated(&pool, thread_id).await,
+            "the floor withdrew this resume promise, so no later boot may auto-resume it"
         );
 
         pool.close().await;

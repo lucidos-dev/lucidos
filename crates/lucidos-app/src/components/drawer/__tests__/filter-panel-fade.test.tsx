@@ -30,7 +30,7 @@ describe('the filter panel swaps under a navigation cover, and the signal leads'
   const navCover = () => host.querySelector('.nav-cover');
   const onStack = () => overlayStack.value.some(e => e.id === 'thread-filter-panel');
   const pressed = () => filterButtonState({
-    view: 'all', panelOpen: threadFilterPanelOpen.value, channelFilterActive: false, attentionCount: 0,
+    panelOpen: threadFilterPanelOpen.value, channelFilterActive: false,
   }).pressed;
 
   beforeEach(() => {

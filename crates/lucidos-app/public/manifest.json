@@ -1,7 +1,7 @@
 {
   "name": "Lucidos",
   "short_name": "Lucidos",
-  "description": "Builds and runs the apps and automations you describe, on your own machine",
+  "description": "Builds and runs the apps and automations you describe, together with the assistant, in one workspace on your own machine",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",

@@ -55,7 +55,7 @@ const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOv
 const fakeApp: App = {
   id: 'trip-planner',
   name: 'Trip Planner 2026',
-  description: 'Trip planner', reveal: 'on-load',
+  description: 'Trip planner', reveal: 'on-load', kind: 'app', reusable: false,
 };
 
 describe('switchMenuItem', () => {

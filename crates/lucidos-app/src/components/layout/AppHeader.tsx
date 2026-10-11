@@ -27,7 +27,7 @@ import { getContentTitle, getContentTitleShort, getDiffDescription } from './hea
 import { headerDblClickRegion, resolveHeaderDblClick } from './headerDblClick';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import { useThreadSearch } from '../../hooks/useThreadSearch';
-import { ThreadFilterButton, ThreadsPaneTitle } from './ThreadFilterButton';
+import { ThreadFilterButton, ThreadGroupingButton, ThreadsPaneTitle } from './ThreadsHeaderControls';
 import { isMobile } from '../../utils/viewport';
 import { isTextInput } from '../../utils/dom';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
@@ -61,21 +61,16 @@ function ThreadsHeader() {
           </svg>
         </button>
       </div>
-      {/* The pane's title says what the pane is showing: the list, or the filter
-          panel that has taken it over (ThreadFilterPanel, which carries no title
-          row of its own so this one is not repeated two rows down). Just
-          "Filters": the pane is already the Threads pane, and the drawer is the
-          only thing on screen the filter could be filtering. */}
+      {/* Leads the row, just past the drawer toggle resting over its leading
+          end (.thread-toggle-slot), so each end holds two controls. The button
+          only toggles: the panel renders down in the drawer pane (see
+          ThreadDrawer). It is also the panel's visible way out, which is why it
+          reads as held down while the panel is up (see filterButtonState). */}
+      <ThreadFilterButton class="threads-header-btn" tooltip={tooltipWithShortcut('Filter threads', 'toggleThreadFilter')} />
+      {/* Names the grouping, or the filter panel that has taken the list over
+          (ThreadFilterPanel carries no title row of its own). */}
       <ThreadsPaneTitle class="threads-header-title" />
-      {/* Beside Search at the trailing end, since the row's leading end belongs
-          to the drawer toggle resting over it (.thread-toggle-slot).
-          The button only toggles: the panel itself renders down in the drawer
-          pane (see ThreadDrawer), so it is not `aria-haspopup` chrome anymore.
-          It is also the panel's visible way out, which is why it reads as held
-          down while the panel is up (see filterButtonState). */}
-      <div class="view-selector-slot">
-        <ThreadFilterButton class="threads-header-btn" tooltip={tooltipWithShortcut('Filter threads', 'toggleThreadFilter')} />
-      </div>
+      <ThreadGroupingButton class="threads-header-btn" />
       <button
         class="icon-btn header-icon threads-header-btn"
         {...openSearchHandlers}

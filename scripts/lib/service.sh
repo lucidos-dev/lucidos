@@ -253,6 +253,7 @@ service_runtime_env_pairs() {
     printf 'LUCIDOS_STATIC_DIR=%s/frontend\n' "$root"
     printf 'LUCIDOS_SDK_DIR=%s/sdk\n' "$root"
     printf 'LUCIDOS_SYSTEM_KNOWHOW_DIR=%s/system-knowhow\n' "$root"
+    printf 'LUCIDOS_SYSTEM_WIDGETS_DIR=%s/system-widgets\n' "$root"
     printf 'FASTEMBED_CACHE_DIR=%s/fastembed\n' "$data"
     printf 'LUCIDOS_BOOT_WITHOUT_PROVIDER=1\n'
     printf 'LUCIDOS_PACKAGED=1\n'

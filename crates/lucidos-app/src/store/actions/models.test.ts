@@ -31,6 +31,8 @@ function model(
     routes: [{ provider, id, reasoning_efforts: reasoning_efforts ?? [] }],
     preferred_provider: null,
     vision: false,
+    default_effort: null,
+    successor: null,
     sort_order: 0,
     source: 'user',
     enabled,

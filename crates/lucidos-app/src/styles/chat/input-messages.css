@@ -98,6 +98,55 @@
     position: relative;
 }
 
+/* Above the prompt box, edge to edge with it: why the focused thread's work
+   is not ready, where Apply would otherwise be (ADR 0400). */
+.not-ready-strip {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.375rem;
+    padding: 0.375rem 0.5rem 0.375rem 0.75rem;
+    border: 1px solid var(--accent-orange);
+    border-radius: calc(var(--radius-control) * 0.75);
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+}
+
+.not-ready-strip-reason {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0;
+    border: none;
+    background: none;
+    text-align: left;
+    color: var(--accent-orange);
+    cursor: pointer;
+}
+
+.not-ready-strip-icon {
+    width: 0.875rem;
+    height: 0.875rem;
+    flex-shrink: 0;
+}
+
+.not-ready-strip-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.not-ready-strip-label {
+    font-weight: 500;
+}
+
+.not-ready-strip-hint {
+    color: var(--text-secondary);
+}
+
 .url-context-pill {
     padding: 0.25rem 0.625rem;
     margin-bottom: 0.375rem;
@@ -860,7 +909,7 @@
     min-width: 12rem;
     height: min(20rem, calc(var(--app-height, 100dvh) - 8rem));
     overflow-y: auto;
-    z-index: calc(var(--z-control-panel) + 1);
+    z-index: calc(var(--z-popover) + 1);
 }
 
 /* The Lucidos Agent picker (LucidosControlMenu) reuses the coding-agent
@@ -1447,8 +1496,23 @@
     animation: progress-pulse 2s ease-in-out infinite;
 }
 
-.progress-dot-changes {
+/* A read request (ADR 0409): the filled dot that reads as "unread". */
+.progress-dot-read-request {
     background: var(--text-secondary);
+}
+
+/* A ready change names itself with the diff glyph, at the question badge's
+   size, so it never reads as the unread dot. */
+.thread-status-changes-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-secondary);
+}
+
+.thread-status-changes-icon svg {
+    width: 0.7rem;
+    height: 0.7rem;
+    stroke-width: 2.5;
 }
 
 /* The "?" font lives HERE, not on the `::after` that draws it. `badges.css`
@@ -1529,13 +1593,6 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
 :root[data-motion="reduce"] .progress-dot-waiting,
 :root[data-motion="reduce"] .progress-dot-loading {
     animation: none;
-}
-
-/* Used by the System page's engine-death indicator (settings/system.css).
-   Keyframes are global. */
-@keyframes progress-blink-red {
-    0%, 100% { background: var(--accent-red); }
-    50% { background: transparent; }
 }
 
 /* --- Initiator turn — flat, card-less (Twitter-style feed). A human message

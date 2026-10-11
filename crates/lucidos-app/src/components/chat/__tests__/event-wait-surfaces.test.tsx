@@ -658,7 +658,7 @@ describe('eventDeliveryBody', () => {
     // The re-entry anchor's own card, tooltip and folded story included.
     for (const outcome of ['delivered', 'expired'] as const) {
       const anchor = {
-        type: 'UserPromptInjected', text: 'x', mode: 'agent',
+        type: 'PromptInjected', text: 'x', mode: 'agent',
         origin: { kind: 'engine', reason: { kind: 'event_wait', outcome, watched: ['ChangeProposed'], wait_reason: 'r' } },
       } as StoredEvent;
       expect(JSON.stringify(boundaryCard(anchor, '', { turn: 'done', carried: 'x' }))).not.toMatch(/wok|wake/i);

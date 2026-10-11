@@ -1356,9 +1356,16 @@ impl Call<'_> {
                 question,
                 options,
                 multi_select,
+                owner_approval,
                 ..
             } => {
-                let open = OpenDecision::question(tool_use_id, question, options, *multi_select);
+                let open = OpenDecision::question(
+                    tool_use_id,
+                    question,
+                    options,
+                    *multi_select,
+                    owner_approval.is_some(),
+                );
                 self.ask(session, open).await;
             }
             ThreadEvent::CommandPermissionRequested {

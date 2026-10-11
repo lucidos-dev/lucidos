@@ -13,8 +13,8 @@
  *    carve-out (Apply can't merge into a foreign repo → Archive instead).
  */
 
-import { threadMap, focusedThreadId, changes, showConfirm, effectiveThreadStatus, applyingNowThreadIds, applyingChangeThreadIds, discardingCCThreadIds, archivingThreadIds, standingApplyThreadIds, armingStandingApplyThreadIds } from '../store';
-import { getCodingAgentWaitingInfo, type ThreadMeta } from '../thread-events';
+import { threadMap, focusedThreadId, pendingChangeForThread, showConfirm, effectiveThreadStatus, applyingNowThreadIds, applyingChangeThreadIds, discardingCCThreadIds, archivingThreadIds, standingApplyThreadIds, armingStandingApplyThreadIds } from '../store';
+import { getCodingAgentWaitingInfo, threadChangeWork, type ThreadMeta } from '../thread-events';
 import { availableThreadActions, type Action } from '../../generated/thread-lifecycle';
 import { getDraft, draftIsEmpty } from '../composeDrafts';
 import { handleArchiveThread, handleSaveThread, handleUnsaveThread } from './threads';
@@ -28,7 +28,7 @@ export interface TaggedAction {
   kind: Action;
   category: ActionCategory;
   label: string;
-  /** Optional hover tooltip (e.g. the Apply restart / partial-work hint). */
+  /** Optional hover tooltip (e.g. the Apply restart hint). */
   tooltip?: string;
   /** Run the action. May open a confirm dialog first; returns its promise so
    *  callers can await completion (the cascade gates re-evaluation on it). */
@@ -39,8 +39,6 @@ export interface TaggedAction {
  *  destructive (typed text is lost), so it confirms. */
 const DISCARD_DRAFT_CONFIRM = 'Discard this unsent draft?';
 const DISCARD_CHANGE_CONFIRM = 'Discard all changes from this session? This cannot be undone.';
-export const APPLY_INCOMPLETE_CONFIRM =
-  'This change comes from a turn that did not finish: it was stopped, or it was cut short. The work may be partial. Apply anyway?';
 const SET_ASIDE_TOOLTIP =
   'Keep this change for later. It leaves Review and Apply All, and the thread can be archived. Bring it back from the Changes panel.';
 
@@ -66,22 +64,11 @@ export async function discardDraft(threadId: string): Promise<boolean> {
   return true;
 }
 
-/** The thread's pending change from the changes list, once the list names it. */
+/** The thread's pending change from the changes list, once the list names it
+ *  with at least one file. */
 function findPendingChange(threadId: string) {
-  const changesLoadable = changes.value;
-  if (changesLoadable.status !== 'loaded') return null;
-  return changesLoadable.data.find(
-    (c) => c.thread_id === threadId && c.status === 'pending' && c.file_count > 0,
-  ) ?? null;
-}
-
-/** Whether the thread's pending change is incomplete: its turn did not finish
- *  (ADR 0346). Like the restart flag, it unions the change row with the
- *  thread's projection flag, so it holds while either update is in flight.
- *  Its Apply confirms, and the banner leads with Continue. */
-export function threadHasIncompleteChange(threadId: string): boolean {
-  return (findPendingChange(threadId)?.incomplete ?? false)
-    || (threadMap.value.get(threadId)?.meta.codingAgentIncomplete ?? false);
+  const change = pendingChangeForThread(threadId);
+  return change && change.file_count > 0 ? change : null;
 }
 
 /**
@@ -103,8 +90,20 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   const status = effectiveThreadStatus(thread);
   const ccInfo = threadType === 'claude_code' ? getCodingAgentWaitingInfo(thread.meta) : null;
 
+  // The external-repo flag is read off `meta`, never off `ccInfo`. That helper
+  // answers null while the thread runs AND whenever nothing is proposed, and an
+  // external-repo thread never proposes at all (`idle_change_write` refuses).
+  // `codingAgentKind` is the fact that survives: written at `SessionStarted`
+  // and locked, so it is there from the thread's first moment. The legacy bool
+  // is read with it, because an old row carries it with no kind.
+  const isExternalRepo =
+    threadType === 'claude_code' &&
+    (thread.meta.codingAgentKind === 'external' || thread.meta.codingAgentIsExternalRepo);
   const pendingChange = findPendingChange(threadId);
-  const hasPendingChanges = !!pendingChange || (ccInfo?.proposed ?? false);
+  // Held work outranks Archive the way a proposed change does (ADR 0395). An
+  // external repo never proposes, so its diff holds nothing back.
+  const heldWork = !isExternalRepo && threadChangeWork(thread.meta) === 'held';
+  const hasPendingChanges = !!pendingChange || (ccInfo?.proposed ?? false) || heldWork;
   const descendantsBlockArchive = thread.meta.blockingDescendantCount > 0;
   const hasUnsentDraft = !draftIsEmpty(getDraft(threadId));
   const isSaved = thread.meta.saved;
@@ -125,18 +124,6 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   // before ThreadArchived). Mirror `is_blocking`'s carve-out: replace the
   // change layer (discard + apply) with a single Archive. Draft + save toggle
   // are untouched.
-  //
-  // Read off `meta`, never off `ccInfo`. That helper answers null while the
-  // thread runs AND whenever nothing is proposed, and an external-repo thread
-  // never proposes at all (`idle_change_write` refuses). So it is
-  // null in every state such a thread can reach, and this whole carve-out sat
-  // dead. `codingAgentKind` is the fact that survives: written at
-  // `SessionStarted` and locked, so it is there from the thread's first moment,
-  // which is the only time the standing apply is offered. The legacy bool is
-  // read with it, because an old row carries it with no kind.
-  const isExternalRepo =
-    threadType === 'claude_code' &&
-    (thread.meta.codingAgentKind === 'external' || thread.meta.codingAgentIsExternalRepo);
   let kinds: Action[] = raw;
   if (isExternalRepo && (raw.includes('apply') || raw.includes('discard'))) {
     kinds = raw.flatMap((a): Action[] => {
@@ -171,7 +158,6 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
     threadType === 'claude_code' &&
     kinds.includes('apply') &&
     (pendingChange?.requires_restart || ccInfo?.requiresRestart || false);
-  const incomplete = threadHasIncompleteChange(threadId);
 
   // The standing apply is armed against the thread's CURRENT change where it
   // has one, so it cannot reach a change proposed after the owner pressed.
@@ -180,7 +166,6 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   return kinds.map((kind) =>
     tagAction(kind, threadId, {
       requiresRestart,
-      incomplete,
       armed,
       pendingChangeId: pendingChange?.id,
     }),
@@ -217,7 +202,6 @@ function tagAction(
   threadId: string,
   opts: {
     requiresRestart: boolean;
-    incomplete: boolean;
     armed: boolean;
     pendingChangeId?: string;
   },
@@ -254,17 +238,8 @@ function tagAction(
         // background-build/switch semantics); the former "Apply & Restart" dual
         // label — which implied the restart happens on click — stays retired.
         label: opts.requiresRestart ? 'Apply*' : 'Apply',
-        // Tooltip prefers the partial-work warning (more critical) over the
-        // new-version hint when both apply.
-        tooltip: opts.incomplete
-          ? 'This change comes from a turn that did not finish. The work may be partial, so you will be asked to confirm.'
-          : opts.requiresRestart
-            ? APPLY_NEW_VERSION_TOOLTIP
-            : undefined,
-        invoke: async () => {
-          if (opts.incomplete && !(await showConfirm(APPLY_INCOMPLETE_CONFIRM, 'Apply', { variant: 'default' }))) return;
-          void endClaudeCodeAndApply(threadId);
-        },
+        tooltip: opts.requiresRestart ? APPLY_NEW_VERSION_TOOLTIP : undefined,
+        invoke: () => void endClaudeCodeAndApply(threadId),
       };
     case 'set_aside':
       return {
@@ -369,8 +344,7 @@ export async function runCloseCascade(): Promise<void> {
     case 'change': {
       // The change layer is a choice, and the dialog is its confirmation.
       // Discard calls its raw handler, whose own confirm would repeat this
-      // one. Apply calls its action, whose only extra confirm is for
-      // incomplete work.
+      // one. Apply calls its action, which asks nothing more.
       const apply = actions.find((a) => a.kind === 'apply');
       const ok = await showConfirm(
         'This thread has a pending change. Apply it now, or discard it?',
@@ -383,7 +357,6 @@ export async function runCloseCascade(): Promise<void> {
             : undefined,
         },
       );
-      // The action's own invoke, so incomplete work still asks first.
       if (ok && apply) await apply.invoke();
       return;
     }

@@ -17,8 +17,8 @@ vi.mock('../../../api/client', async (importActual) => ({
   listModels: () => listModelsMock(),
 }));
 
-import { reasoningEffort, currentModel, preferences, chatModels } from '../../../store/store';
-import { setChatModelSelection, setReasoningEffort, loadPreferences } from '../../../store/actions/preferences';
+import { currentModel, preferences, chatModels } from '../../../store/store';
+import { accountChatEffort, setChatModelSelection, loadPreferences } from '../../../store/actions/preferences';
 import { loadChatModels } from '../../../store/actions/models';
 import { DEFAULT_CHAT_MODEL } from '../../../store/models';
 import type { ModelInfo } from '../../../api/types';
@@ -39,13 +39,25 @@ const LOCAL_MODEL: ModelInfo = {
   ],
   preferred_provider: null,
   vision: false,
+  default_effort: null,
+  successor: null,
   sort_order: 1000,
   source: 'user',
   enabled: true,
   created_at: '2026-01-01T00:00:00Z',
 };
 
-describe('Chat model and reasoning effort persist across restarts', () => {
+/** A registry row whose provider documents a default effort. */
+const OPUS_55: ModelInfo = {
+  ...LOCAL_MODEL,
+  id: 'claude-opus-5-5',
+  label: 'Opus 5.5',
+  routes: [{ provider: 'vertex', id: 'claude-opus-5-5', reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] }],
+  default_effort: 'medium',
+  source: 'builtin',
+};
+
+describe('Chat model and its tier persist across restarts', () => {
   beforeEach(() => {
     setPreferenceMock.mockClear();
     getPreferencesMock.mockClear();
@@ -53,7 +65,6 @@ describe('Chat model and reasoning effort persist across restarts', () => {
     preferences.value = { status: 'loaded', data: {} };
     chatModels.value = { status: 'not-loaded' };
     currentModel.value = DEFAULT_CHAT_MODEL;
-    reasoningEffort.value = 'high';
   });
 
   it('setChatModelSelection writes the model preference to the API', async () => {
@@ -62,141 +73,127 @@ describe('Chat model and reasoning effort persist across restarts', () => {
     expect(setPreferenceMock).toHaveBeenCalledWith('chat_model', 'claude-sonnet-4-6', undefined);
   });
 
-  it('setReasoningEffort writes the effort preference to the API', async () => {
-    await setReasoningEffort('low');
-    expect(reasoningEffort.value).toBe('low');
-    expect(setPreferenceMock).toHaveBeenCalledWith('chat_reasoning_effort', 'low', undefined);
-  });
-
-  it('loadPreferences restores saved model and effort (simulated restart)', async () => {
+  it('loadPreferences restores the saved model and its own tier (simulated restart)', async () => {
     getPreferencesMock.mockResolvedValueOnce({
-      preferences: { chat_model: 'gemini-3.1-pro-preview', chat_reasoning_effort: 'medium' },
+      preferences: {
+        chat_model: 'gemini-3.1-pro-preview',
+        chat_reasoning_efforts: 'gemini-3.1-pro-preview=medium, claude-sonnet-5=max',
+      },
     });
-    // Simulate fresh app: signals at defaults, preferences not loaded yet.
-    currentModel.value = DEFAULT_CHAT_MODEL;
-    reasoningEffort.value = 'high';
     preferences.value = { status: 'not-loaded' };
 
     await loadPreferences();
 
     expect(currentModel.value).toBe('gemini-3.1-pro-preview');
-    expect(reasoningEffort.value).toBe('medium');
-  });
-
-  it('loadPreferences leaves defaults when no preference saved', async () => {
-    getPreferencesMock.mockResolvedValueOnce({ preferences: {} });
-    currentModel.value = DEFAULT_CHAT_MODEL;
-    reasoningEffort.value = 'high';
-    preferences.value = { status: 'not-loaded' };
-
-    await loadPreferences();
-
-    expect(currentModel.value).toBe(DEFAULT_CHAT_MODEL);
-    expect(reasoningEffort.value).toBe('high');
+    expect(accountChatEffort('gemini-3.1-pro-preview')).toBe('medium');
+    expect(accountChatEffort('claude-sonnet-5')).toBe('max');
   });
 
   it('loadPreferences honors any stored model value (registry is user-extensible)', async () => {
-    // The model set is now the DB-backed registry (users add their own), so the
-    // frontend no longer validates `chat_model` against a fixed allow-list — it
-    // honors the stored value and RoutingProvider resolves it (with a prefix
-    // fallback). An unknown reasoning effort still falls back to 'high'.
-    getPreferencesMock.mockResolvedValueOnce({
-      preferences: { chat_model: 'my-custom-model', chat_reasoning_effort: 'fake-effort' },
-    });
-    currentModel.value = DEFAULT_CHAT_MODEL;
-    reasoningEffort.value = 'high';
+    getPreferencesMock.mockResolvedValueOnce({ preferences: { chat_model: 'my-custom-model' } });
     preferences.value = { status: 'not-loaded' };
 
     await loadPreferences();
 
     expect(currentModel.value).toBe('my-custom-model');
-    expect(reasoningEffort.value).toBe('high');
   });
 
   it('loadPreferences falls back to the default model when none is stored', async () => {
-    getPreferencesMock.mockResolvedValueOnce({ preferences: { chat_reasoning_effort: 'medium' } });
+    getPreferencesMock.mockResolvedValueOnce({ preferences: {} });
     currentModel.value = 'something-else';
-    reasoningEffort.value = 'high';
     preferences.value = { status: 'not-loaded' };
 
     await loadPreferences();
 
     expect(currentModel.value).toBe(DEFAULT_CHAT_MODEL);
-    expect(reasoningEffort.value).toBe('medium');
   });
 });
 
-// One pick sets the pair, so the effort is the user's own choice rather than a
-// clamp of the previous one. What still clamps is a STORED pair the registry
-// later contradicts, which is the fault reported here: switching to a local
-// model with the account effort at xhigh sent a tier the local server had never
-// heard of, and the turn 400'd.
+describe('A model with no stored tier runs at its default effort', () => {
+  beforeEach(() => {
+    preferences.value = { status: 'loaded', data: {} };
+    chatModels.value = { status: 'loaded', data: [OPUS_55, LOCAL_MODEL] };
+  });
+
+  it('reads the default effort from the registry row', () => {
+    expect(accountChatEffort('claude-opus-5-5')).toBe('medium');
+  });
+
+  it('a stored tier wins, for that model only', () => {
+    preferences.value = { status: 'loaded', data: { chat_reasoning_efforts: 'claude-opus-5-5=xhigh' } };
+    expect(accountChatEffort('claude-opus-5-5')).toBe('xhigh');
+    expect(accountChatEffort('muse-glimmer:30b-mlx')).toBeNull();
+  });
+
+  it('a model with no default effort has no tier, so the engine sends none', () => {
+    expect(accountChatEffort('muse-glimmer:30b-mlx')).toBeNull();
+  });
+
+  it('a stored tier the route cannot run shows as the tier it snaps to', () => {
+    preferences.value = { status: 'loaded', data: { chat_reasoning_efforts: 'muse-glimmer:30b-mlx=max' } };
+    expect(accountChatEffort('muse-glimmer:30b-mlx')).toBe('high');
+  });
+});
+
 describe('The chat model selection is written whole', () => {
   beforeEach(() => {
     setPreferenceMock.mockClear();
-    getPreferencesMock.mockClear();
-    listModelsMock.mockClear();
-    preferences.value = { status: 'loaded', data: {} };
-    chatModels.value = { status: 'not-loaded' };
+    preferences.value = { status: 'loaded', data: { chat_reasoning_efforts: 'claude-opus-5-5=low' } };
+    chatModels.value = { status: 'loaded', data: [OPUS_55, LOCAL_MODEL] };
     currentModel.value = DEFAULT_CHAT_MODEL;
-    reasoningEffort.value = 'high';
   });
 
-  it('persists both halves of a pick', async () => {
-    chatModels.value = { status: 'loaded', data: [LOCAL_MODEL] };
-    reasoningEffort.value = 'xhigh';
-
+  it('stores the tier for the picked model, keeping every other', async () => {
     await setChatModelSelection({ model: 'muse-glimmer:30b-mlx', reasoningEffort: 'high' });
 
     expect(currentModel.value).toBe('muse-glimmer:30b-mlx');
-    expect(reasoningEffort.value).toBe('high');
-    expect(setPreferenceMock).toHaveBeenCalledWith('chat_reasoning_effort', 'high', undefined);
+    expect(setPreferenceMock).toHaveBeenCalledWith(
+      'chat_reasoning_efforts', 'claude-opus-5-5=low, muse-glimmer:30b-mlx=high', undefined,
+    );
+    expect(accountChatEffort('claude-opus-5-5')).toBe('low');
   });
 
-  it('leaves the stored effort alone for a model with no tiers', async () => {
-    // An image model reports `null`. `RoutingProvider::effort_for_model` drops
-    // what the model cannot take, so there is nothing to write.
-    reasoningEffort.value = 'medium';
+  it('refuses to write the list before preferences load, keeping the stored tiers', async () => {
+    preferences.value = { status: 'not-loaded' };
 
-    await setChatModelSelection({ model: 'imagen-4', reasoningEffort: null });
+    await setChatModelSelection({ model: 'muse-glimmer:30b-mlx', reasoningEffort: 'high' });
 
-    expect(reasoningEffort.value).toBe('medium');
     expect(setPreferenceMock).not.toHaveBeenCalledWith(
-      'chat_reasoning_effort', expect.anything(), expect.anything(),
+      'chat_reasoning_efforts', expect.anything(), expect.anything(),
     );
   });
 
-  // Ordering: preferences land before the registry, so the first clamp runs on
-  // the id-shape heuristic, which has no rule for a local id and lets `max`
-  // through. The registry's arrival has to correct it, or the picker keeps
-  // displaying a tier the engine would silently snap on the way to the wire.
-  it('the registry arriving re-clamps an effort the heuristic let through', async () => {
-    getPreferencesMock.mockResolvedValueOnce({
-      preferences: { chat_model: 'muse-glimmer:30b-mlx', chat_reasoning_effort: 'max' },
-    });
-    preferences.value = { status: 'not-loaded' };
-    await loadPreferences();
-    expect(reasoningEffort.value).toBe('max');
+  it('the Default row removes that model\'s stored tier alone', async () => {
+    preferences.value = {
+      status: 'loaded',
+      data: { chat_reasoning_efforts: 'claude-opus-5-5=low, muse-glimmer:30b-mlx=high' },
+    };
 
-    listModelsMock.mockResolvedValueOnce({ models: [LOCAL_MODEL] });
-    await loadChatModels();
+    await setChatModelSelection({ model: 'claude-opus-5-5', reasoningEffort: null });
 
-    expect(reasoningEffort.value).toBe('high');
-    // Display only: the stored preference is not rewritten, since the model
-    // this was clamped against may itself change again.
-    expect(setPreferenceMock).not.toHaveBeenCalled();
+    expect(setPreferenceMock).toHaveBeenCalledWith(
+      'chat_reasoning_efforts', 'muse-glimmer:30b-mlx=high', undefined,
+    );
+    expect(accountChatEffort('claude-opus-5-5')).toBe('medium');
   });
 
-  // A reload follows a `Model*` event, and every provider pick writes one. It
-  // must not narrow the account default that every draft falls back to.
-  it('a registry reload leaves the account effort alone', async () => {
-    reasoningEffort.value = 'max';
-    currentModel.value = 'muse-glimmer:30b-mlx';
-    chatModels.value = { status: 'loaded', data: [LOCAL_MODEL] };
+  it('stores nothing for a model with no tiers', async () => {
+    await setChatModelSelection({ model: 'imagen-4', reasoningEffort: null });
 
-    listModelsMock.mockResolvedValueOnce({ models: [LOCAL_MODEL] });
+    expect(setPreferenceMock).not.toHaveBeenCalledWith(
+      'chat_reasoning_efforts', expect.anything(), expect.anything(),
+    );
+  });
+
+  it('the registry arriving supplies the default effort', async () => {
+    chatModels.value = { status: 'not-loaded' };
+    preferences.value = { status: 'loaded', data: {} };
+    expect(accountChatEffort('claude-opus-5-5')).toBeNull();
+
+    listModelsMock.mockResolvedValueOnce({ models: [OPUS_55] });
     await loadChatModels();
 
-    expect(reasoningEffort.value).toBe('max');
+    expect(accountChatEffort('claude-opus-5-5')).toBe('medium');
+    expect(setPreferenceMock).not.toHaveBeenCalled();
   });
 });

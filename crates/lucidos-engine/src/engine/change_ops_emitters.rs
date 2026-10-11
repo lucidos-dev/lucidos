@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 
 use uuid::Uuid;
 
+use crate::core::AppKind;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::git_ops::{consume_harden_marker, consume_plan_marker, git_cmd};
 use crate::engine::thread_events::{
@@ -251,10 +252,8 @@ impl LucidosEngine {
         // guard for `ChangeApplied` (`FOR UPDATE` on the change row) and returns
         // `Ok(None)` for a recognized duplicate — the double-fire race, an
         // Apply-All retry, the conflict-recovery cleanup, a post-restart re-emit.
-        // Firing the refresh on the DUPLICATE would coalesce (abort) the rebuild
-        // the ACCEPTED emit just started, and the replacement build can then read
-        // `SkippedLocked` and fall back to `Idle` — no build running at all,
-        // which is the exact failure this funnel exists to prevent.
+        // Firing the refresh on the DUPLICATE would supersede the frontend
+        // refresh the ACCEPTED emit just started, and join its rebuild for nothing.
         let accepted = match self
             .event_bus
             .emit(BusEvent::Thread {
@@ -379,7 +378,7 @@ impl LucidosEngine {
             client_update
         );
         match decision {
-            PostApplyRefresh::RebuildEngine => engine.trigger_background_rebuild(),
+            PostApplyRefresh::RebuildEngine => engine.join_or_start_background_rebuild(),
             PostApplyRefresh::ReSnapshotFrontend => engine.refresh_served_frontend_after_rebuild(),
             PostApplyRefresh::Nothing => {}
         }
@@ -632,6 +631,10 @@ pub(crate) async fn compute_entity_events_for_change_apply(
                 actor: actor.clone(),
             }),
             (false, true) => Some(SystemEvent::AppDeleted {
+                kind: match pre_merge_sha {
+                    Some(sha) => app_kind_at(workspace_path, sha, &app_id).await,
+                    None => None,
+                },
                 app_id: app_id.clone(),
                 actor: actor.clone(),
             }),
@@ -706,6 +709,33 @@ async fn git_path_exists_at(repo_root: &std::path::Path, sha: &str, path: &str) 
             false
         }
     }
+}
+
+/// The kind an app's manifest declared at `sha`, for `AppDeleted` (ADR 0404).
+/// `None` when that manifest cannot be read there.
+async fn app_kind_at(repo_root: &std::path::Path, sha: &str, app_id: &str) -> Option<AppKind> {
+    let spec = format!("{}:data/apps/{}/manifest.json", sha, app_id);
+    let out = match git_cmd(&["show", &spec], repo_root).await {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            log!(
+                "[Changes] git show {} exited {:?}: {}",
+                spec,
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return None;
+        }
+        Err(e) => {
+            log!("[Changes] git show {} failed: {}", spec, e);
+            return None;
+        }
+    };
+    let manifest: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(AppKind::from_manifest(
+        app_id,
+        manifest.get("kind").and_then(|k| k.as_str()),
+    ))
 }
 
 /// Read the app's display name from `data/apps/<id>/manifest.json` for the
@@ -1105,9 +1135,55 @@ mod tests {
         // One app touched → one event (not two: dedup on app_id).
         assert_eq!(events.len(), 1, "got {:?}", events);
         assert!(
-            matches!(&events[0], SystemEvent::AppDeleted { app_id, .. } if app_id == "going-away"),
+            matches!(
+                &events[0],
+                SystemEvent::AppDeleted { app_id, kind: Some(AppKind::App), .. }
+                    if app_id == "going-away"
+            ),
             "got {:?}",
             events[0]
+        );
+    }
+
+    /// The manifest is gone after the merge, so the kind is read at the
+    /// pre-merge commit (ADR 0404).
+    #[tokio::test]
+    async fn cc_apply_removing_a_widget_records_its_kind() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        let pre_sha = init_repo(ws).await;
+        let dir = ws.join("data/apps/fare-grid");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"name": "Fare grid", "kind": "widget"}"#,
+        )
+        .unwrap();
+        let with_widget = commit_all(ws, "Add fare-grid").await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        let post_sha = commit_all(ws, "Delete fare-grid").await;
+        assert_ne!(pre_sha, with_widget);
+
+        let events = compute_entity_events_for_change_apply(
+            ws,
+            Some(&with_widget),
+            Some(&post_sha),
+            &["data/apps/fare-grid/manifest.json".to_string()],
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &events[..],
+                [SystemEvent::AppDeleted {
+                    kind: Some(AppKind::Widget),
+                    ..
+                }]
+            ),
+            "got {:?}",
+            events
         );
     }
 

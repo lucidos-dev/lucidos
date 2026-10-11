@@ -145,9 +145,11 @@ async fn teardown_skips_abort_for_question_parked_chat_thread() {
                 label: "Approve".into(),
                 description: None,
                 preview: None,
+                widget: None,
             }],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta::NONE,
     })

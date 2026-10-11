@@ -1,5 +1,5 @@
 import { computed, signal, type ReadonlySignal } from '@preact/signals';
-import { transcriptScrolls } from './threadWindow';
+import { transcriptScrolls } from './transcriptScrolls';
 import { isReducedMotion } from '../../utils/motion';
 // The LEAF breadcrumb module, not `utils/liveness`, which re-exports it behind
 // a `store` import this module deliberately avoids (see `parseNavigatedTurn`).
@@ -9,6 +9,7 @@ import { USER_SCROLL_WINDOW_MS, nowMs } from '../../utils/scrollActivity';
 import { isMobile } from '../../utils/viewport';
 import { isImageRetryPending } from '../../utils/markdownImageRetry';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
+import { isElementVisible, unmeasurableBox } from '../../utils/elementVisibility';
 
 /** Shared scroll-position signals for the chat area.
  *
@@ -55,44 +56,6 @@ let _activeScrollElement: HTMLElement | null = null;
 
 export function setActiveScrollElement(el: HTMLElement | null) {
   _activeScrollElement = el;
-}
-
-/** True if the element is actually visible: not `display: none`, and not
- *  clipped by a zero-height `overflow: hidden` ancestor. That second case is
- *  why the walk below exists, since such an ancestor keeps its
- *  `position: fixed` children rendering and leaves the element measuring
- *  full size. */
-export function isElementVisible(el: HTMLElement): boolean {
-  return unmeasurableBox(el) === null;
-}
-
-/** WHICH box makes `el` unmeasurable: `el` itself, or the nearest ancestor
- *  clipping it to nothing. `null` when `el` is measurable, which is what
- *  `isElementVisible` reports above.
- *
- *  Naming the box rather than answering yes or no is what lets a caller WAIT
- *  for it. A box is the only thing a `ResizeObserver` can watch, and the two
- *  answers point at DIFFERENT elements. A collapsed pane zeroes the target's
- *  own rect. An ancestor clipped to nothing leaves the target measuring full
- *  size while showing none of it. See `watchForABox` in the deep link. */
-function unmeasurableBox(el: HTMLElement): HTMLElement | null {
-  const r = el.getBoundingClientRect();
-  if (r.width <= 0 || r.height <= 0) return el;
-  // An element inside a zero-height overflow:hidden container reports non-zero
-  // dimensions from layout, so the clipping ancestor has to be found by walking.
-  let ancestor = el.parentElement;
-  while (ancestor && ancestor !== document.documentElement) {
-    // display:contents removes the element's own box, so it measures 0x0 while
-    // its children are fully visible. Skip these ancestors.
-    if (getComputedStyle(ancestor).display === 'contents') {
-      ancestor = ancestor.parentElement;
-      continue;
-    }
-    const ar = ancestor.getBoundingClientRect();
-    if (ar.height <= 0 || ar.width <= 0) return ancestor;
-    ancestor = ancestor.parentElement;
-  }
-  return null;
 }
 
 /** Fallback for when `_activeScrollElement` has not been set yet. */
@@ -830,10 +793,10 @@ function isAtLiveEdge(el: HTMLElement): boolean {
  *  transcript with a hair of overflow, from a border or a rounded line height,
  *  then answers the same for both. That is what the slack absorbs.
  *
- *  The PREDICATE comes from `threadWindow`, whose `fillAction` grows the render
- *  window until it is true. A second body here, however faithful, would let the
- *  fill stop short of a transcript the chevron still calls unscrollable. This
- *  is the chevron's name for the same question.
+ *  The PREDICATE is shared with `threadWindow`, whose `fillAction` grows the
+ *  render window until it is true. A second body here, however faithful, would
+ *  let the fill stop short of a transcript the chevron still calls
+ *  unscrollable. This is the chevron's name for the same question.
  *
  *  The DOWN chevron deliberately asks something else, `isAtLiveEdge`'s 2px. It
  *  describes where the reader IS, not whether the thread can move at all. */
@@ -1190,8 +1153,9 @@ function carryHeldScroll(el: HTMLElement): void {
 }
 
 /** Write `top` to hold the reader on the same content while the layout moved
- *  under them. Two callers: `restoreAfterReflow` for a pane resize, and the
- *  mobile header's keyboard compensation (`useHideOnScroll`). An anchor write,
+ *  under them. Three callers: `restoreAfterReflow` for a pane resize, the
+ *  mobile header's keyboard compensation (`useHideOnScroll`), and a widget
+ *  frame resizing above the reader (`WidgetFrame`). An anchor write,
  *  so the mobile bars stay put, and it carries the held stamp, so a send's
  *  landing survives it. */
 export function holdAcrossRelayout(el: HTMLElement, top: number): void {
@@ -3676,6 +3640,25 @@ export function isEventInViewport(eventId: string): boolean {
   return false;
 }
 
+/** True when the end of `threadId`'s newest turn is on screen: the bottom
+ *  edge of its last `.chat-exchange` sits inside the visible band. What a *read
+ *  request* waits on before it counts as read (ADR 0409). */
+export function isReplyEndInViewport(threadId: string): boolean {
+  const last = lastExchangeOf(threadId);
+  if (!last || !isElementVisible(last)) return false;
+  const bounds = visibleBand();
+  const r = last.getBoundingClientRect();
+  return r.bottom > bounds.top && r.bottom <= bounds.bottom
+    && r.right > bounds.left && r.left < bounds.right;
+}
+
+/** `threadId`'s newest rendered turn, or null. */
+export function lastExchangeOf(threadId: string): HTMLElement | null {
+  if (!threadId || typeof document === 'undefined' || !document.querySelectorAll) return null;
+  const all = document.querySelectorAll<HTMLElement>(`.chat-exchange[data-thread-id="${CSS.escape(threadId)}"]`);
+  return all.length > 0 ? all[all.length - 1] : null;
+}
+
 /** True when `el` is actually on screen, not merely laid out. Two distinct
  *  checks, and both are load-bearing. `isElementVisible` rejects an element with
  *  no box and anything inside a collapsed container. The rect test rejects an
@@ -3695,8 +3678,17 @@ export function isEventInViewport(eventId: string): boolean {
  *  see, and on a permission card an unseen grant. */
 export function isElementOnScreen(el: HTMLElement): boolean {
   if (!isElementVisible(el)) return false;
+  const bounds = visibleBand();
+  const r = el.getBoundingClientRect();
+  return r.bottom > bounds.top && r.top < bounds.bottom
+    && r.right > bounds.left && r.left < bounds.right;
+}
+
+/** The band an element must sit in to count as on screen: the active scroll
+ *  element's box, else the window. See `isElementOnScreen` for why. */
+function visibleBand(): { top: number; bottom: number; left: number; right: number } {
   const scroller = getActiveScrollElement();
-  const bounds = scroller && isElementVisible(scroller)
+  return scroller && isElementVisible(scroller)
     ? scroller.getBoundingClientRect()
     : {
         top: 0,
@@ -3704,9 +3696,6 @@ export function isElementOnScreen(el: HTMLElement): boolean {
         left: 0,
         right: window.innerWidth || document.documentElement.clientWidth,
       };
-  const r = el.getBoundingClientRect();
-  return r.bottom > bounds.top && r.top < bounds.bottom
-    && r.right > bounds.left && r.left < bounds.right;
 }
 
 /** Build the scroll- and resize-event handlers for a single `.thread-content`

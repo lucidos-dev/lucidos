@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 
-import { cssRules, rulesTargeting, type CssRule } from './css-rule-helpers';
+import { cssRules, rulesTargeting, selectorList, styleSheetPaths, type CssRule } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const CONTENT: string = readFileSync(resolve(here, '../panels/content.css'), 'utf8');
@@ -59,36 +59,63 @@ describe('soft wrap, the mode a preview opens on', () => {
   });
 });
 
-describe('pan, where the code slides under a pinned gutter', () => {
-  it('pins the gutter to the left edge of the scroll container', () => {
-    const gutter = ruleWith(CONTENT, 'line-number', 'line-numbered-pan');
-    expect(gutter.props.get('position')).toBe('sticky');
-    expect(gutter.props.get('left')).toBe('0');
-    // A sticky cell paints over whatever passes beneath it, and `inherit` is
-    // what makes it wear the row's own background. So the selected line's tint
-    // stays unbroken across the gutter instead of showing a plain band.
-    expect(gutter.props.get('background')).toBe('inherit');
+/** A sticky box per line made a phone pan stutter: WebKit repositions every
+ *  sticky box on each scroll frame, so the cost grew with the file. Measured in
+ *  WebKit mobile emulation, a 2,574-line file panned at 48 ms a frame and an
+ *  8,000-line one at 177 ms. With one pinned column both run at 16.7 ms.
+ *  Full numbers: docs/plans/2026-10-07-line-numbered-pan-single-gutter.md. */
+describe('pan pins ONE gutter column, never a box per line', () => {
+  const PER_LINE = /\.(code-line|line-number|line-content|line-selected)\b/;
+  const stylesRoot: string = resolve(here, '..');
+
+  it('makes no per-line element sticky in any stylesheet', () => {
+    const offenders: string[] = [];
+    for (const path of styleSheetPaths(stylesRoot)) {
+      for (const rule of cssRules(readFileSync(path, 'utf8'))) {
+        if (rule.props.get('position') !== 'sticky') continue;
+        // The subject of the selector is its last compound.
+        for (const sel of selectorList(rule.selector)) {
+          const subject = sel.trim().split(/\s+|>|\+|~/).filter(Boolean).pop() ?? '';
+          if (PER_LINE.test(subject)) offenders.push(`${path.split('/styles/')[1]}: ${sel}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 
-  it('sizes every row to the widest, so a highlight spans the scroll width', () => {
+  it('pins the gutter column to the left edge of the scroll container', () => {
+    const gutter = cssRules(CONTENT).filter(r => r.selector === '.line-numbered-gutter');
+    expect(gutter).toHaveLength(1);
+    expect(gutter[0].props.get('position')).toBe('sticky');
+    expect(gutter[0].props.get('left')).toBe('0');
+    // Opaque, since the code pans beneath it.
+    expect(gutter[0].props.get('background')).toBe('var(--code-surface)');
+  });
+
+  it('lays the two columns side by side, sized to the widest row', () => {
     const pre = rulesTargeting(CONTENT, 'line-numbered-pan')
       .filter(r => r.selector === '.line-numbered-pan');
     expect(pre).toHaveLength(1);
+    expect(pre[0].props.get('display')).toBe('flex');
     expect(pre[0].props.get('width')).toBe('max-content');
     expect(pre[0].props.get('min-width')).toBe('100%');
   });
 
-  it('gives the row an opaque surface for the gutter to inherit', () => {
-    const row = ruleWith(CONTENT, 'code-line', 'line-numbered-pan');
-    expect(row.props.get('background')).toBe('var(--code-surface)');
+  // Cell N and row N stay level only because both are one line of the same
+  // height. One declaration for both, so the two cannot drift apart.
+  it('gives a gutter cell the same line height as a code row', () => {
+    const shared = cssRules(CONTENT).filter(r => r.props.has('line-height')
+      && selectorList(r.selector).includes('.code-line')
+      && selectorList(r.selector).includes('.line-numbered-gutter .line-number'));
+    expect(shared).toHaveLength(1);
   });
 
-  // The base tint mixes the accent over `transparent`, which a sticky gutter
-  // cannot paint with. This mode restates it over the surface instead.
-  it('restates the selection tint opaquely', () => {
-    const selected = ruleWith(CONTENT, 'line-selected', 'line-numbered-pan');
-    expect(selected.props.get('background')).toContain('var(--code-surface)');
-    expect(selected.props.get('background')).not.toContain('transparent');
+  // No pan rule repaints a row: with nothing pinned over the code, the base
+  // translucent `.line-selected` tint is the right one.
+  it('leaves the code rows and their tint to the base rules', () => {
+    const repaints = cssRules(CONTENT)
+      .filter(r => r.selector.includes('line-numbered-pan') && r.props.has('background'));
+    expect(repaints.map(r => r.selector)).toEqual([]);
   });
 
   // A scroll container's inline padding is inside its scrollport, so panned
@@ -96,11 +123,22 @@ describe('pan, where the code slides under a pinned gutter', () => {
   // gutter is pinned and code still passes beside it.
   it('paints over the scroll container padding the code pans through', () => {
     const bleed = cssRules(CONTENT)
-      .filter(r => r.selector === '.line-numbered-pan .line-number::before');
+      .filter(r => r.selector === '.line-numbered-gutter::before');
     expect(bleed, 'the gutter needs a ::before bleeding over the container inset').toHaveLength(1);
     expect(bleed[0].props.get('width')).toBe('var(--code-gutter-inset, 0px)');
     expect(bleed[0].props.get('right')).toBe('100%');
     expect(bleed[0].props.get('background')).toBe('inherit');
+  });
+});
+
+/** Find in file walks text nodes, so a number held as text would match a
+ *  numeric search. The markup carries it as an attribute and this rule draws
+ *  it (`line-numbered-pan-layout.test.tsx` pins the markup half). */
+describe('the line number is drawn, not written', () => {
+  it('generates the number from its attribute', () => {
+    const drawn = cssRules(CONTENT).filter(r => r.selector === '.line-number::before');
+    expect(drawn).toHaveLength(1);
+    expect(drawn[0].props.get('content')).toBe('attr(data-line-number)');
   });
 });
 
@@ -127,9 +165,8 @@ describe('every file-preview scroll container names its inset', () => {
   });
 });
 
-/** The third mode carries no class at all, which is what keeps `pan`'s opaque
- *  row surface off a side-by-side diff column. That surface is two classes
- *  deep and would outrank every one of the column's own single-class tints. */
+/** The third mode carries no class at all. So no rule of either mode reaches a
+ *  side-by-side diff column, whose rows carry their own single-class tints. */
 describe('a caller-owned block is reached by neither mode', () => {
   const MODE = /\.line-numbered-(wrap|pan)\b/;
 

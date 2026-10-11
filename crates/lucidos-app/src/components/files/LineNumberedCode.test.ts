@@ -18,9 +18,9 @@ describe('fileRows', () => {
 });
 
 /** Each wide-line mode has its own class, and one mode's CSS must never reach a
- *  `<pre>` another owns. `pan` paints an opaque row surface, which outranks a
- *  caller's own single-class tint. Keeping that off a side-by-side diff column
- *  is exactly what `caller` is for. */
+ *  `<pre>` another owns. `pan` lays the rows out in two columns, which a
+ *  side-by-side diff column must not get: its tints cover the number in each
+ *  row. Keeping that off a diff column is exactly what `caller` is for. */
 describe('codeBlockClass', () => {
   const MODE_CLASSES = ['line-numbered-wrap', 'line-numbered-pan'];
   const modesIn = (cls: string) => cls.split(' ').filter(c => MODE_CLASSES.includes(c));
@@ -119,7 +119,7 @@ describe('renderRows: a filler row', () => {
   });
 });
 
-/** The third gate lives in a `useSignalEffect` and is DOM-bound, so it cannot be
+/** The third gate lives in a signal `effect` and is DOM-bound, so it cannot be
  *  driven from here. It matters as much as the other two: a column that consumed
  *  a pending `lineScrollTarget` would swallow a navigate meant for a file view
  *  and, finding no such row, null the selection out from under it. */
@@ -127,7 +127,7 @@ describe('the scroll target is consumed only by a participating view', () => {
   const source = readFileSync(new URL('./LineNumberedCode.tsx', import.meta.url), 'utf8');
 
   it('gates the consume on the same selectable flag as the click', () => {
-    const effect = source.split('useSignalEffect(')[1];
+    const effect = source.split('effect(() => {')[1];
     expect(effect).toBeDefined();
     const beforeConsume = effect.split('consumeLineScrollTarget')[0];
     expect(beforeConsume).toContain('selectable');

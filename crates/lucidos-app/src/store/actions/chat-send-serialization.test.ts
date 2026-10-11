@@ -65,10 +65,6 @@ vi.mock('./thread-navigation', () => ({
   removeThreadNavEntries: vi.fn(),
 }));
 
-vi.mock('../../components/chat/scrollState', () => ({
-  followSentMessage: vi.fn(),
-  stopFollowingBottom: vi.fn(),
-}));
 
 vi.mock('./thread-loading', () => ({
   refreshThreadEvents: vi.fn().mockResolvedValue(true),

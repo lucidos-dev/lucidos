@@ -66,7 +66,7 @@ test.describe('App coding-agent thread — Apply', () => {
       expect(srcBefore).toBeTruthy();
 
       // Click Apply — the action panel surfaces "Apply" / "Discard" once
-      // the coding_agent_proposed projection flag is true (seeded).
+      // the projection's coding_agent_change_state is 'proposed' (seeded).
       const panel = await waitForActionPanel(page, 'Apply', 15_000);
       await panel.locator('button', { hasText: /^Apply/ }).first().click();
 
@@ -78,7 +78,7 @@ test.describe('App coding-agent thread — Apply', () => {
       }, srcBefore, { timeout: 15_000 });
 
       // The WIP preview button must NOT be visible after Apply — the
-      // change is gone, codingAgentHasDiff cleared, the wipPreview effect
+      // change is gone, the change state falls to 'none', the wipPreview effect
       // clears wipPreviewThreadId. (The button is gated on
       // codingAgentKind === 'app' + the app being open — kind stays, but
       // pressing it would now show 404 content; better UX is to hide it

@@ -267,6 +267,7 @@ async fn scan_into_cache(
 fn record_scan_if_live(workspace: &Path, guard: &UpdateCheckGuard, catalog: &MarketplaceCatalog) {
     if guard.still_held() {
         plugin_catalog_cache::record_scan(workspace, catalog, Utc::now());
+        crate::core::plugin_marketplaces::prune_media_for(workspace, catalog);
     } else {
         log!("[PluginUpdateCheck] Discarding a scan whose slot was taken over");
     }

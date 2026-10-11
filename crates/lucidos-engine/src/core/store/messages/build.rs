@@ -187,6 +187,7 @@ fn moved_on_since(statuses: &ChangeStatuses, change_id: Uuid) -> Option<&'static
         Some(ChangeStatus::Applied) => Some("now applied"),
         Some(ChangeStatus::Discarded) => Some("now discarded"),
         Some(ChangeStatus::Reverted) => Some("now reverted"),
+        Some(ChangeStatus::Withdrawn) => Some("now withdrawn"),
         None => Some("now deleted"),
     }
 }
@@ -1108,9 +1109,7 @@ pub(crate) fn build_session_messages_with(
             "ChildThreadCompleted" => {
                 // Render the typed event as a user-channel block so the parent's
                 // resume LLM sees a clearly-attributed structured callback in
-                // its conversation history. Replaces the pre-Phase-4 prose
-                // `[Child thread completed]` UserPromptInjected which used to
-                // arrive on the parent thread carrying the same info.
+                // its conversation history.
                 let content = format_child_thread_completed_block(event, statuses);
 
                 messages.push(SessionMessage {

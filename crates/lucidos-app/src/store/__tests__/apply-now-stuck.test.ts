@@ -11,10 +11,6 @@ vi.mock('../../api/client', async (importOriginal) => {
   };
 });
 
-vi.mock('../../components/chat/scrollState', () => ({
-  followSentMessage: vi.fn(),
-  stopFollowingBottom: vi.fn(),
-}));
 
 import { endClaudeCodeAndApply } from '../actions/chat-claude-code';
 import { applyNow, applyChange, fetchChanges, ApiError, type Change, type ChangesState } from '../../api/client';

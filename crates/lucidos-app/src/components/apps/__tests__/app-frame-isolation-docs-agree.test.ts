@@ -33,7 +33,7 @@ const CLAIMS: Array<{ path: string; claim: RegExp; what: string }> = [
     what: 'the app-author contract, which says a direct fetch is refused',
   },
   {
-    path: 'system-knowhow/workspace-audit.md',
+    path: 'system-knowhow/workspace-audit/apps.md',
     claim: /What an isolated app frame can no longer do/,
     what: 'the audit check that hunts for storage and host-realm reads',
   },

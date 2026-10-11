@@ -13,18 +13,21 @@
  * `docs/plans/2026-10-07-find-in-previews-and-transcript.md`.
  */
 
-import { signal } from '@preact/signals';
-import { createFinder, createPainter, highlightApiPresent, type FindResult } from '@lucidos/find';
+import { effect, signal } from '@preact/signals';
+import { createFinder, createPainter, highlightApiPresent, type ClearBand, type FindResult } from '@lucidos/find';
 import { askFrame, tellFrame } from './app-bridge';
 import { getVisibleAppFrame } from './apps';
 import {
-  filePreviewEditing, filePreviewSource, focusedPane, focusedThreadId, mobileView, panelOverlay,
+  filePreviewEditing, filePreviewSource, findRequest, focusedPane, focusedThreadId, lineScrollTarget, mobileView,
+  panelOverlay,
 } from '../store';
+import { MIN_FIND_QUERY_CHARS, findQueryChars } from './find-request';
 import { transcriptSearchable, transcriptTarget } from './transcript-find';
 import { parseRepoPath } from '../repoPath';
 import { dataPreviewBody, repoPreviewBody } from '../../components/files/previewBody';
-import { isElementVisible } from '../../components/chat/scrollState';
-import { isMobile } from '../../utils/viewport';
+import { isElementVisible } from '../../utils/elementVisibility';
+import { holdSoftwareKeyboard } from '../../utils/softwareKeyboard';
+import { hasCoarsePointer, isMobile } from '../../utils/viewport';
 import { PREVIEW_FRAME_ROLE, askPreviewFind, postToPreviewFrame } from '../../utils/previewFrameProtocol';
 
 /** Where a find bar lives, and what it searches. */
@@ -32,6 +35,8 @@ export type FindSurface = 'content' | 'thread';
 
 export type FindBarResult =
   | { status: 'idle' }
+  /** Fewer than `MIN_FIND_QUERY_CHARS`: nothing is searched yet. */
+  | { status: 'too-short' }
   | { status: 'found'; total: number; current: number; capped: boolean }
   /** The target did not answer: an app with no SDK, or one that is wedged. */
   | { status: 'unsearchable'; message: string };
@@ -39,7 +44,7 @@ export type FindBarResult =
 export const findSurface = signal<FindSurface | null>(null);
 export const findQuery = signal('');
 export const findResult = signal<FindBarResult>({ status: 'idle' });
-/** Bumped on every open, so Mod+F on an open bar puts the caret back in it. */
+/** Bumped on every open that takes focus. The bar answers by focusing its field. */
 export const findFocusRequest = signal(0);
 
 /** How long an app frame gets to answer. An app with no SDK never does. */
@@ -47,9 +52,10 @@ export const FIND_TIMEOUT_MS = 2000;
 const TYPING_DEBOUNCE_MS = 120;
 
 /** Something the bar can search. `run` resolves to null when the text could
- *  not be reached, and the bar then shows `unsearchable`. */
+ *  not be reached, and the bar then shows `unsearchable`. `fromLine` starts
+ *  the query at that line, where the target shows numbered lines. */
 export interface FindTarget {
-  run(query: string, step?: 1 | -1): Promise<FindResult | null>;
+  run(query: string, step?: 1 | -1, fromLine?: number): Promise<FindResult | null>;
   clear(): void;
   unsearchable: string;
 }
@@ -109,10 +115,23 @@ function pageRoot(): Element | null {
   return body?.querySelector('.repo-preview-split-main') ?? body;
 }
 
-const pageFinder = createFinder(pageRoot, hostPainter);
+/** What the open bar leaves of the screen. On a phone it sticks over the top
+ *  of the file, so a match under it is out of view. */
+function pageBand(): ClearBand | undefined {
+  const bar = visibleElement('.file-preview-frame > .find-bar-slot');
+  return bar ? { top: bar.getBoundingClientRect().bottom, bottom: window.innerHeight } : undefined;
+}
+
+const pageFinder = createFinder(pageRoot, hostPainter, pageBand);
+
+/** The source view's row for `line`, which a requested find starts from. */
+function lineRow(line: number | undefined): Element | undefined {
+  if (line === undefined) return undefined;
+  return pageRoot()?.querySelector(`[data-line="${line}"]`) ?? undefined;
+}
 
 const pageTarget: FindTarget = {
-  run: (query, step) => Promise.resolve(pageFinder.find(query, step)),
+  run: (query, step, fromLine) => Promise.resolve(pageFinder.find(query, step, lineRow(fromLine))),
   clear: () => pageFinder.clear(),
   unsearchable: FILE_UNSEARCHABLE,
 };
@@ -180,21 +199,26 @@ let typingTimer: ReturnType<typeof setTimeout> | null = null;
 let latestTicket = 0;
 /** The target the open session last searched, which `closeFind` clears. */
 let activeTarget: FindTarget | null = null;
+/** Ends the wait for the line landing a requested find runs after. */
+let stopLandingWait = (): void => {};
+/** The landing wait's ticket. It is still the latest while the wait pends. */
+let landingTicket: number | null = null;
 
 function cancelTyping(): void {
   if (typingTimer !== null) clearTimeout(typingTimer);
   typingTimer = null;
 }
 
-function run(step?: 1 | -1): Promise<void> {
+function run(step?: 1 | -1, fromLine?: number): Promise<void> {
   cancelTyping();
   const ticket = ++latestTicket;
   const query = findQuery.value;
   const surface = findSurface.value;
   const target = surface ? targetFor(surface) : null;
-  if (!query.trim()) {
+  const chars = findQueryChars(query);
+  if (chars < MIN_FIND_QUERY_CHARS) {
     activeTarget?.clear();
-    findResult.value = { status: 'idle' };
+    findResult.value = chars === 0 ? { status: 'idle' } : { status: 'too-short' };
     return Promise.resolve();
   }
   if (!target) {
@@ -204,7 +228,7 @@ function run(step?: 1 | -1): Promise<void> {
   activeTarget = target;
   const unsearchable: FindBarResult = { status: 'unsearchable', message: target.unsearchable };
   return Promise.resolve()
-    .then(() => target.run(query, step))
+    .then(() => target.run(query, step, fromLine))
     .then(
       (count) => {
         if (ticket === latestTicket) findResult.value = count ? { status: 'found', ...count } : unsearchable;
@@ -216,15 +240,55 @@ function run(step?: 1 | -1): Promise<void> {
 }
 
 /** Open the bar on `surface`. A session open elsewhere closes first: the
- *  highlight registry is one per document. */
-export function openFind(surface: FindSurface): void {
+ *  highlight registry is one per document. Call it synchronously from the tap:
+ *  the bar's field focuses a render later, outside the gesture, so this holds
+ *  the keyboard for it now. Without `focus`, the caret stays where it is. */
+export function openFind(surface: FindSurface, { focus = true }: { focus?: boolean } = {}): void {
+  if (focus) holdSoftwareKeyboard();
   if (findSurface.value && findSurface.value !== surface) closeFind();
   findSurface.value = surface;
-  findFocusRequest.value++;
+  if (focus) findFocusRequest.value++;
 }
 
-/** The Mod+F action: open the bar on the focused pane, when it has a target. */
-export function openFocusedFind(): void {
+/** The bar on `surface` now shows `scope`, and its scope change has ended the
+ *  previous file's session. Open the request made for it, if any. The bar
+ *  takes focus, so Enter steps through the matches. A finger gets no focus,
+ *  since its keyboard would cover the file. */
+export function takeFindRequest(surface: FindSurface, scope: string): void {
+  const request = findRequest.peek();
+  if (request?.scope !== scope) return;
+  findRequest.value = null;
+  openFind(surface, { focus: !hasCoarsePointer() });
+  cancelTyping();
+  findQuery.value = request.query;
+  runAfterLineLanding(request.line);
+}
+
+/** Search from `line` once the router's line landing is done. `LineNumberedCode`
+ *  consumes `lineScrollTarget` as it scrolls the row into view. By then the
+ *  file's text has rendered, and the find's reveal cannot fight the landing. */
+function runAfterLineLanding(line: number): void {
+  stopLandingWait();
+  const ticket = ++latestTicket;
+  landingTicket = ticket;
+  const stop = effect(() => {
+    if (lineScrollTarget.value !== null) return;
+    // A microtask, so the effect is disposed outside its own run.
+    queueMicrotask(() => {
+      stop();
+      if (ticket === latestTicket) void run(undefined, line);
+    });
+  });
+  stopLandingWait = stop;
+}
+
+/** The Mod+F action. It closes an open bar, as Escape does, and otherwise
+ *  opens the bar on the focused pane, when that pane has a target. */
+export function toggleFocusedFind(): void {
+  if (findSurface.value) {
+    closeFind();
+    return;
+  }
   const surface = focusedFindSurface();
   if (surface) openFind(surface);
 }
@@ -245,6 +309,7 @@ export function closeFind(): void {
  *  and takes its text with it. */
 export function resetFind(): void {
   cancelTyping();
+  stopLandingWait();
   latestTicket++;
   activeTarget = null;
   findSurface.value = null;
@@ -259,8 +324,11 @@ export function setFindQuery(query: string): void {
   typingTimer = setTimeout(() => void run(), TYPING_DEBOUNCE_MS);
 }
 
-/** Move to the next or previous match, wrapping at the ends. */
+/** Move to the next or previous match, wrapping at the ends. A step while a
+ *  requested find waits for its line does nothing: running it would cancel
+ *  the search from that line. */
 export function stepFind(step: 1 | -1): Promise<void> {
+  if (landingTicket === latestTicket) return Promise.resolve();
   return run(step);
 }
 
@@ -276,6 +344,7 @@ export function rerunFindOn(surface: FindSurface): Promise<void> {
 export function findStatusText(result: FindBarResult): string {
   switch (result.status) {
     case 'idle': return '';
+    case 'too-short': return `Type ${MIN_FIND_QUERY_CHARS}+ characters`;
     case 'unsearchable': return result.message;
     case 'found': {
       if (result.total === 0) return 'No matches';

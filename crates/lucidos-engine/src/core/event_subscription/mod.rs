@@ -194,16 +194,18 @@ fn unwrap_adjacent_tag(event_type: &str, payload: Value) -> Value {
 ///
 /// They call this rather than composing the two steps themselves, so the view
 /// they match against is the same object by construction rather than by two
-/// call sites happening to agree. `EventMeta::NONE` because the meta a
-/// particular emit stamped is not part of it: the live paths never see the meta
-/// at all ([`crate::engine::event_bus::EmittedEvent`] does not carry it), so a
-/// meta field would be conditionable on replay only.
-pub fn matchable_thread_payload(event: &ThreadEvent, thread_id: Uuid) -> Value {
-    matchable_payload(
-        event.event_type(),
-        event.to_payload(&crate::engine::thread_events::EventMeta::NONE),
-        Some(thread_id),
-    )
+/// call sites happening to agree.
+///
+/// `meta` is the carrier's own, the value the bus persists the row with. Pass
+/// it, never `EventMeta::NONE`: the stored payload holds `channel`, `actor` and
+/// `request_event_id`, so dropping them here makes a condition on any of them
+/// match on replay and never live.
+pub fn matchable_thread_payload(
+    event: &ThreadEvent,
+    meta: &crate::engine::thread_events::EventMeta,
+    thread_id: Uuid,
+) -> Value {
+    matchable_payload(event.event_type(), event.to_payload(meta), Some(thread_id))
 }
 
 /// [`matchable_payload`] for a live `BusEvent::System`, the other half of the

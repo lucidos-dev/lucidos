@@ -11,7 +11,8 @@
 //!   ended its turn with Phase A still running, and sat idle for five hours
 //!   after Phase A finished with nobody subscribed.
 //! * **The coding-agent `background-tasks` route**, right after it spawns. A
-//!   coding agent ends its turn to wait, and its process group goes with it.
+//!   coding agent ends its turn to wait, and every process it started goes
+//!   with it.
 //!   The wait is the only thing left to wake it.
 //!
 //! # Why a subscription rather than a direct push

@@ -214,7 +214,7 @@ pub(super) async fn cleanup_worktree(
     // Discard gate before the disk is read. Tier 1 strips only regenerable output.
     if matches!(req.tier, 2 | 3) {
         super::thread_reach::refuse_without_authority(
-            &state.pool,
+            &state.engine.event_bus,
             &headers,
             Some(thread_uuid),
             super::thread_reach::ThreadReachVerb::Discard,
@@ -273,9 +273,10 @@ pub(super) async fn cleanup_worktree(
             // the UI reaches here via tier 3 (force).
             if worktree_git_admin_missing(&worktree) {
                 let dir = worktrees_dir(state.engine.workspace_path());
-                let pre_size = directory_size_bytes(&worktree);
-                let freed =
-                    remove_stranded_worktree(&dir, &worktree, pre_size).ok_or_else(|| {
+                let pre_size = directory_size_bytes(&worktree).await;
+                let freed = remove_stranded_worktree(&dir, &worktree, pre_size)
+                    .await
+                    .ok_or_else(|| {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Failed to remove stranded worktree".to_string(),
@@ -355,17 +356,7 @@ pub(super) async fn summary(
     let total_bytes = fs2::total_space(&dir)
         .ok()
         .or_else(|| fs2::total_space(workspace).ok());
-    // The walk can hit a multi-GB postgres data dir with many files — keep it
-    // off the tokio worker thread so other requests aren't stalled.
-    let data_dir = workspace.join(crate::core::DATA_DIR);
-    let workspace_data_bytes =
-        match tokio::task::spawn_blocking(move || directory_size_bytes(&data_dir)).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                crate::log!("[DiskUsage] data dir walk task failed: {}", e);
-                0
-            }
-        };
+    let workspace_data_bytes = directory_size_bytes(&workspace.join(crate::core::DATA_DIR)).await;
 
     Ok(Json(serde_json::json!({
         "free_bytes": free_bytes,

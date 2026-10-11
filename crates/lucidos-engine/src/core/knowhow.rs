@@ -129,16 +129,14 @@ fn derive_description(name: &str, body: &str) -> String {
 /// it. Resolution ignores the cap, so a reference still loads by its full id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KnowhowListDepth {
-    /// `<name>.md` only, for `data/apps/<id>/knowhow/` and
-    /// `data/triggers/<slug>/knowhow/`. The app or the trigger is already the
-    /// group, so a folder inside those roots holds references.
+    /// `<name>.md` only, for `data/apps/<id>/knowhow/`,
+    /// `data/triggers/<slug>/knowhow/` and the engine-shipped
+    /// `system-knowhow/`. The app, the trigger or the doc above it is already
+    /// the group, so a folder inside those roots holds references.
     FilesOnly,
     /// `<name>.md` and `<group>/<name>.md`, for `data/knowhow/` and the shared
     /// `~/.lucidos/knowhow/`. One group folder deep is still a doc.
     FilesAndGroups,
-    /// Every `.md` at any depth. Engine-shipped `system-knowhow/` only, where
-    /// the whole tree is the catalog.
-    Unbounded,
 }
 
 impl KnowhowListDepth {
@@ -148,7 +146,6 @@ impl KnowhowListDepth {
         match self {
             Self::FilesOnly => 1,
             Self::FilesAndGroups => 2,
-            Self::Unbounded => usize::MAX,
         }
     }
 }
@@ -399,7 +396,7 @@ fn is_safe_id(id: &str) -> bool {
 /// Resolve `<app_id>/<rest>` to `<apps>/<app_id>/knowhow/<rest>.md`. Returns
 /// `None` for ids that aren't app-scoped (no `/`), have empty segments, or
 /// fail [`is_safe_id`]. Existence is NOT checked — callers do that.
-fn app_scoped_knowhow_path(apps_dir: &Path, id: &str) -> Option<PathBuf> {
+pub(crate) fn app_scoped_knowhow_path(apps_dir: &Path, id: &str) -> Option<PathBuf> {
     if !is_safe_id(id) {
         return None;
     }

@@ -10,7 +10,7 @@ use crate::llm::anthropic_wire::{
     build_claude_request, parse_claude_stream, parse_context_suffix, WireTarget,
 };
 use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
-use crate::llm::ModelSelection;
+use crate::llm::{ModelNotServed, ModelSelection};
 
 impl VertexProvider {
     pub(super) async fn chat_claude(
@@ -28,7 +28,7 @@ impl VertexProvider {
         let (base_model, _) = parse_context_suffix(model);
         let url = self.endpoint_for_model(base_model);
 
-        let (request, header_betas) = build_claude_request(
+        let (mut request, header_betas) = build_claude_request(
             messages,
             tools,
             model,
@@ -37,6 +37,9 @@ impl VertexProvider {
             WireTarget::Vertex { url: &url },
             "Vertex",
         );
+        if let Some(tool) = selection.forced_tool {
+            request.force_tool(tool, model)?;
+        }
         let beta_header = (!header_betas.is_empty()).then(|| header_betas.join(","));
         let display = request.thinking_display();
 
@@ -100,12 +103,14 @@ impl VertexProvider {
                 // `model` carries the `[1m]` suffix the URL drops, and naming
                 // it is deliberate: that is the value the user picks in
                 // Settings, so that is what they would change.
-                let message =
+                if let Some(advice) =
                     super::explain_publisher_model_404(status.as_u16(), &error_body, model, &url)
-                        .unwrap_or_else(|| {
-                            format!("Claude API error ({}): {}", status, error_body)
-                        });
-
+                {
+                    return Err(Box::new(ModelNotServed::new(
+                        crate::llm::with_retry_context(advice, attempt),
+                    )));
+                }
+                let message = format!("Claude API error ({}): {}", status, error_body);
                 return Err(crate::llm::with_retry_context(message, attempt).into());
             }
 

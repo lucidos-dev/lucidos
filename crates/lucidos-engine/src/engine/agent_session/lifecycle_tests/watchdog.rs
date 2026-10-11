@@ -781,7 +781,7 @@ fn the_idle_arm_proposes_before_it_idles() {
         .find("self.emit_coding_agent_idled(")
         .expect("the Result arm must still emit this turn's CodingAgentIdled");
     for write in [
-        "self.propose_change(",
+        "self.propose_turn_work(",
         "self.reconcile_emptied_pending_change(",
     ] {
         let at = arm
@@ -793,6 +793,66 @@ fn the_idle_arm_proposes_before_it_idles() {
              so a change written afterwards never reaches it",
         );
     }
+}
+
+/// The turn-end gate brackets the idle (ADR 0417). The forced read decision
+/// runs before `CodingAgentIdled`, so the turn's decision is recorded before
+/// its end. The re-entries run after it, so each opens its own exchange.
+#[test]
+fn the_idle_arm_decides_before_it_idles_and_re_enters_after() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+
+    let classify = RUN_SRC
+        .find("let (terminal_kind, emit_idle) = classify_result(")
+        .expect("run.rs must still classify the Result before acting on it");
+    let arm = &RUN_SRC[classify..];
+    let idle_emit = arm
+        .find("self.emit_coding_agent_idled(")
+        .expect("the Result arm must still emit this turn's CodingAgentIdled");
+    let decide = arm
+        .find("self.gate_coding_agent_read_decision(thread_id)")
+        .expect("the Result arm must force a missing read decision");
+    let reenter = arm
+        .find("reentry_ledger.take_due(&gate)")
+        .expect("the Result arm must send the turn-end re-entries");
+    assert!(
+        decide < idle_emit,
+        "the read decision is recorded before the idle"
+    );
+    assert!(
+        idle_emit < reenter,
+        "a re-entry opens its own exchange after the idle"
+    );
+}
+
+/// The Result arm feeds the change gate the thread's live event waits (ADR
+/// 0395). Source-text like its sibling above: a hardcoded `false` would compile
+/// and silently restore a proposal at every parked idle.
+#[test]
+fn the_idle_arm_gates_its_proposal_on_live_event_waits() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+
+    let read_at = RUN_SRC
+        .find("let holds_live_wait = !self.live_waits.for_thread(thread_id).await.is_empty();")
+        .expect("the Result arm must read the thread's live event waits");
+    let from_read = &RUN_SRC[read_at..];
+    let gate_at = from_read
+        .find("idle_change_write(")
+        .expect("the live-wait read must precede the change gate");
+    let gate_end = gate_at
+        + from_read[gate_at..]
+            .find("&last_terminal_kind")
+            .expect("the change gate must still take the terminal kind");
+    assert!(
+        from_read[gate_at..gate_end].contains("holds_live_wait,"),
+        "the change gate must receive the live-wait answer"
+    );
+    assert!(
+        from_read.contains(
+            "Some(_) if !write.may_create() && !self.branch_has_open_change(&branch_name).await =>"
+        ),
+        "a held idle must create no change, and only re-sync an open one"
+    );
 }
 
 /// The resume helper must not re-derive the decision it is handed. Two copies of

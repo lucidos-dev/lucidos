@@ -439,13 +439,13 @@ mod tests {
     }
 
     #[test]
-    fn json_registers_stop_hook_for_harden_reminder() {
+    fn json_registers_stop_hook_for_the_question_redirect() {
         let json = build_cc_settings_json(&[]);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let entries = &parsed["hooks"]["Stop"];
         assert!(
             entries.is_array(),
-            "Stop must be an array — needed so CC checks for harden state when it tries to idle"
+            "Stop must be an array, so CC asks the hook about a plaintext question at idle"
         );
         let hook = &entries[0]["hooks"][0];
         assert_eq!(hook["type"], "command");

@@ -4,8 +4,9 @@
  *  to the account default on every new message. The DURABLE record of that is the
  *  model/reasoning_effort the backend stamps on each `MessageReceived` event — so
  *  resolution is `this thread's pending pick ?? the thread's last message ?? the
- *  account default` (`currentModel` / `reasoningEffort`, backed by the
- *  `chat_model` / `chat_reasoning_effort` preferences, editable in Settings).
+ *  account default` (`currentModel` and `accountChatEffort`, backed by the
+ *  `chat_model` / `chat_reasoning_efforts` preferences, editable in Settings).
+ *  A tier is remembered with its model, so switching model never carries one.
  *
  *  This map holds ONLY a not-yet-sent pick made from the in-thread control menu.
  *  It is IN-MEMORY / ephemeral (unlike `composeSelections`, which is DB-backed):
@@ -19,7 +20,8 @@
  *  an override only when the user made an explicit pick this turn. */
 
 import { signal } from '@preact/signals';
-import { threadMap, currentModel, reasoningEffort } from './store';
+import { threadMap, currentModel } from './store';
+import { accountChatEffort, storedChatModel } from './actions/preferences';
 import type { StoredEvent } from './thread-events';
 
 export interface ThreadModelOverride {
@@ -100,8 +102,14 @@ export function lastThreadModel(threadId: string | null | undefined): string | u
   return newestStarterValue(threadId, (event) => event.model);
 }
 
-export function lastThreadReasoningEffort(threadId: string | null | undefined): string | undefined {
-  return newestStarterValue(threadId, (event) => event.reasoning_effort);
+/** The tier this thread last ran `model` at. Mirrors the backend's
+ *  `last_thread_chat_settings`: a tier is remembered WITH its model, and
+ *  `undefined` matches starters that stamped no model. */
+function lastThreadReasoningEffort(
+  threadId: string | null | undefined,
+  model: string | undefined,
+): string | undefined {
+  return newestStarterValue(threadId, (event) => ((event.model || undefined) === model ? event.reasoning_effort : undefined));
 }
 
 /** The backend this thread last pinned for `model`. Mirrors the backend's
@@ -131,12 +139,25 @@ export function resolveActiveThreadProvider(
   return lastThreadProvider(threadId, model) ?? null;
 }
 
-export function resolveActiveThreadReasoningEffort(threadId: string | null | undefined): string {
-  return (
-    getThreadModelOverride(threadId).reasoningEffort ??
-    lastThreadReasoningEffort(threadId) ??
-    reasoningEffort.value
-  );
+/** The tier the next send on this thread runs at, for `model`: this thread's
+ *  pending pick, then its memory for `model`, then the account's tier for it.
+ *  `null` sends no effort. */
+export function resolveActiveThreadReasoningEffort(
+  threadId: string | null | undefined,
+  model: string,
+): string | null {
+  const pending = getThreadModelOverride(threadId);
+  if (pending.reasoningEffort && (pending.model ?? model) === model) return pending.reasoningEffort;
+  // The model the thread names, which is unset when it never stamped one.
+  const named = model === resolveActiveThreadModel(threadId)
+    ? pending.model ?? lastThreadModel(threadId)
+    : model;
+  // A thread that named no model ran on the router's, so its tier never
+  // carries onto a `chat_model` set since.
+  const remembered = named === undefined && storedChatModel() !== null
+    ? undefined
+    : lastThreadReasoningEffort(threadId, named);
+  return remembered ?? accountChatEffort(model);
 }
 
 export function _resetThreadModelSelectionsForTesting(): void {

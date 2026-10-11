@@ -8,9 +8,11 @@
 //! cached prefix.
 //!
 //! The thread view is a fold over the thread's own tree, with each unbuilt
-//! leaf read from its event. A turn never waits on the compactor (I7). Its
-//! cache marks sit at fixed offsets, so consecutive turns read its stable
-//! start from the prompt cache.
+//! leaf read from its event. A turn never waits on the compactor (I7).
+//!
+//! Both views go out in blocks of a few lines. Between batches a view only
+//! grows at its end, so the last turn's marked block starts this turn's view.
+//! A mark a few blocks on then reads it from the prompt cache (OptChat §3.3).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +24,7 @@ use super::fold::{built_prefix_end, fold};
 use super::log::{EntryKind, ThreadKind};
 use super::store::{self, StoredNode};
 use super::{NodeAddr, SummaryScope};
+use crate::llm::provider::ContentBlock;
 
 type StoreResult<T> = Result<T, sqlx::Error>;
 
@@ -30,10 +33,23 @@ type StoreResult<T> = Result<T, sqlx::Error>;
 /// entries its built prefix does not reach yet.
 pub(crate) const RECENT_BYTES: usize = 8 * 1024;
 
-/// Where a thread view's cache marks fall, as fractions of its prefix budget:
-/// the last line end at or before each. OptChat's marks at 50k and 80k of
-/// 128k. The prefix budget is what a caught-up view fills.
-const THREAD_MARKS: [(usize, usize); 2] = [(50, 128), (80, 128)];
+/// Lines per view block. The next turn can read the cache up to any block end.
+/// So an unchanged view re-sends fewer lines than this.
+pub(crate) const BLOCK_LINES: usize = 4;
+
+/// How many content blocks back Anthropic looks from a cache mark for an entry
+/// an earlier request wrote.
+pub(crate) const LOOKBACK_BLOCKS: usize = 20;
+
+/// The recent block's cap in lines. A rollover with no batch appends the
+/// recent lines to the snapshot. Fewer than a lookback of blocks keeps the new
+/// snapshot's rung within reach of the old one.
+pub(crate) const RECENT_LINES: usize = (LOOKBACK_BLOCKS - 1) * BLOCK_LINES;
+
+/// Cache marks per view. The snapshot is frozen per epoch and needs one. A
+/// thread view takes two, so one turn may add twice the lookback.
+const SNAPSHOT_RUNGS: usize = 1;
+pub(crate) const THREAD_RUNGS: usize = 2;
 
 pub(crate) const WORKSPACE_VIEW_OPEN: &str = "[WORKSPACE MEMORY VIEW]\n\
 Summary lines over every thread turn and artifact write in this workspace, oldest first. \
@@ -118,11 +134,102 @@ fn indented_len(text: &str) -> usize {
     text.len() + 2 * text.matches('\n').count()
 }
 
+/// A framed view, cut into blocks of [`BLOCK_LINES`] lines.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ViewBlocks {
+    pub(crate) text: String,
+    /// Byte offsets into `text` where each whole block ends, ascending.
+    pub(crate) ends: Vec<usize>,
+    /// The ends that take a cache mark, ascending: see [`rungs`].
+    pub(crate) marks: Vec<usize>,
+}
+
+impl ViewBlocks {
+    /// `lines` framed by `open` and `close`, or empty when there are none.
+    /// `rungs` names the marked prefixes from the count of whole blocks.
+    pub(crate) fn render(
+        open: &str,
+        lines: impl IntoIterator<Item = String>,
+        close: &str,
+        rungs: impl Fn(usize) -> Vec<usize>,
+    ) -> Self {
+        let mut view = Self {
+            text: open.to_string(),
+            ..Self::default()
+        };
+        for (i, line) in lines.into_iter().enumerate() {
+            view.text.push_str(&line);
+            if (i + 1) % BLOCK_LINES == 0 {
+                view.ends.push(view.text.len());
+            }
+        }
+        if view.text.len() == open.len() {
+            return Self::default();
+        }
+        view.text.push_str(close);
+        view.marks = rungs(view.ends.len())
+            .into_iter()
+            .map(|blocks| view.ends[blocks - 1])
+            .collect();
+        view
+    }
+
+    /// The text cut at every block end, each piece with whether it is marked,
+    /// then the rest.
+    pub(crate) fn pieces(&self) -> Vec<(&str, bool)> {
+        let mut pieces = Vec::with_capacity(self.ends.len() + 1);
+        let mut from = 0;
+        for &end in &self.ends {
+            pieces.push((&self.text[from..end], self.marks.contains(&end)));
+            from = end;
+        }
+        pieces.push((&self.text[from..], false));
+        pieces
+    }
+
+    /// One content block per piece: a marked piece is a memory view block,
+    /// which every wire marks for its cache, and the rest plain text.
+    pub(crate) fn blocks(&self) -> impl Iterator<Item = ContentBlock> + '_ {
+        self.pieces()
+            .into_iter()
+            .filter(|(text, _)| !text.is_empty())
+            .map(|(text, marked)| {
+                let text = text.to_string();
+                if marked {
+                    ContentBlock::MemoryView { text }
+                } else {
+                    ContentBlock::Text { text }
+                }
+            })
+    }
+}
+
+/// Which prefixes of a view's `blocks` whole blocks take a cache mark,
+/// ascending, as block counts: the last block, then every
+/// [`LOOKBACK_BLOCKS`]th before it, `count` at most. The last turn's mark sits
+/// a few blocks back, where some rung's lookback finds it.
+pub(crate) fn rungs(blocks: usize, count: usize) -> Vec<usize> {
+    let mut rungs: Vec<usize> = (0..count)
+        .map_while(|i| blocks.checked_sub(i * LOOKBACK_BLOCKS))
+        .filter(|&b| b > 0)
+        .collect();
+    rungs.reverse();
+    rungs
+}
+
+/// Which prefixes take a cache mark where a read needs a mark at the very
+/// same place: the last `count` block ends, ascending. A request that grew
+/// the view by fewer blocks still marks an earlier request's last end. So it
+/// reads what that request wrote there.
+pub(crate) fn trailing_rungs(blocks: usize, count: usize) -> Vec<usize> {
+    (blocks.saturating_sub(count) + 1..=blocks).collect()
+}
+
 /// One turn's workspace view.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceView {
     /// The snapshot, framed. Shared byte for byte within its epoch.
-    pub(crate) snapshot: String,
+    pub(crate) snapshot: ViewBlocks,
     /// Leaves newer than the snapshot, framed, or empty.
     pub(crate) recent: String,
 }
@@ -134,7 +241,7 @@ struct Snapshot {
     /// Leaf `end - 1`'s event. A delete before `end` moves it, which retires
     /// the snapshot.
     last_event: Option<Uuid>,
-    text: String,
+    text: ViewBlocks,
 }
 
 /// The live view snapshots, one per workspace view budget.
@@ -164,8 +271,9 @@ impl ViewSnapshots {
 
         if let Some(snapshot) = snapshots.get(&budget) {
             if self.still_holds(pool, snapshot).await? {
-                let recent = frame_recent(&recent_lines(pool, snapshot.end).await?);
-                if recent.len() <= recent_cap {
+                let lines = recent_lines(pool, snapshot.end).await?;
+                let recent = frame_recent(&lines.concat());
+                if recent.len() <= recent_cap && lines.len() <= RECENT_LINES {
                     return Ok(WorkspaceView {
                         snapshot: snapshot.text.clone(),
                         recent,
@@ -179,7 +287,7 @@ impl ViewSnapshots {
             "[SummaryTree] Workspace view snapshot epoch {} at {} leaves, {} bytes (budget {})",
             snapshot.epoch,
             snapshot.end,
-            snapshot.text.len(),
+            snapshot.text.text.len(),
             budget
         );
         let view = WorkspaceView {
@@ -216,16 +324,14 @@ impl ViewSnapshots {
             0,
         );
         let nodes = store::nodes_at(pool, SummaryScope::Workspace, &tiles).await?;
-        let mut text = String::new();
-        if !tiles.is_empty() {
-            text.push_str(WORKSPACE_VIEW_OPEN);
-            for tile in &tiles {
-                if let Some(node) = nodes.get(tile) {
-                    text.push_str(&render_line(&id(*tile), &node.text));
-                }
-            }
-            text.push_str(WORKSPACE_VIEW_CLOSE);
-        }
+        let text = ViewBlocks::render(
+            WORKSPACE_VIEW_OPEN,
+            tiles
+                .iter()
+                .filter_map(|tile| Some(render_line(&id(*tile), &nodes.get(tile)?.text))),
+            WORKSPACE_VIEW_CLOSE,
+            |blocks| rungs(blocks, SNAPSHOT_RUNGS),
+        );
         let last_event = end
             .checked_sub(1)
             .and_then(|i| shapes.get(&NodeAddr::leaf(i)))
@@ -239,15 +345,15 @@ impl ViewSnapshots {
     }
 }
 
-/// The built workspace leaves from `from` on, contiguous, rendered.
-async fn recent_lines(pool: &PgPool, from: u64) -> StoreResult<String> {
-    let mut out = String::new();
+/// The built workspace leaves from `from` on, contiguous, each rendered.
+async fn recent_lines(pool: &PgPool, from: u64) -> StoreResult<Vec<String>> {
+    let mut out = Vec::new();
     let mut expect = from;
     for (addr, node) in store::leaves_from(pool, SummaryScope::Workspace, from).await? {
         if addr.start != expect {
             break;
         }
-        out.push_str(&render_line(&format!("w/{addr}"), &node.text));
+        out.push(render_line(&format!("w/{addr}"), &node.text));
         expect += 1;
     }
     Ok(out)
@@ -256,11 +362,11 @@ async fn recent_lines(pool: &PgPool, from: u64) -> StoreResult<String> {
 /// A coding agent's view section: the workspace view, then how to open it
 /// through the `lucidos` CLI. Empty when the view is.
 pub(crate) fn coding_agent_section(view: &WorkspaceView) -> String {
-    if view.snapshot.is_empty() && view.recent.is_empty() {
+    if view.snapshot.text.is_empty() && view.recent.is_empty() {
         return String::new();
     }
     let mut out = String::from("\n\n");
-    out.push_str(&view.snapshot);
+    out.push_str(&view.snapshot.text);
     if !view.recent.is_empty() {
         out.push_str(&view.recent);
         out.push('\n');
@@ -281,29 +387,6 @@ fn frame_recent(lines: &str) -> String {
     format!("{RECENT_OPEN}{lines}{RECENT_CLOSE}")
 }
 
-/// A thread memory view and where its cache marks fall.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ThreadView {
-    /// The view, framed, or empty.
-    pub(crate) text: String,
-    /// Byte offsets into `text`, ascending, each just past a line's newline.
-    pub(crate) marks: Vec<usize>,
-}
-
-impl ThreadView {
-    /// The text cut at its marks: one piece ending at each mark, then the rest.
-    pub(crate) fn pieces(&self) -> Vec<&str> {
-        let mut pieces = Vec::with_capacity(self.marks.len() + 1);
-        let mut from = 0;
-        for &mark in &self.marks {
-            pieces.push(&self.text[from..mark]);
-            from = mark;
-        }
-        pieces.push(&self.text[from..]);
-        pieces
-    }
-}
-
 /// A Lucidos Agent thread's memory view at `budget` bytes, or empty for a
 /// thread with no past. `current_message` is the turn's own message, already
 /// in the log, which the view leaves to the request line.
@@ -312,9 +395,9 @@ pub(crate) async fn thread_view(
     thread_id: Uuid,
     budget: usize,
     current_message: &str,
-) -> StoreResult<ThreadView> {
+) -> StoreResult<ViewBlocks> {
     if budget == 0 {
-        return Ok(ThreadView::default());
+        return Ok(ViewBlocks::default());
     }
     let mut log = store::load_thread_log_now(pool, thread_id, ThreadKind::LucidosAgent).await?;
     // The turn's own message, with its image count, or a trigger's `[name
@@ -324,7 +407,7 @@ pub(crate) async fn thread_view(
     if !current.is_empty()
         && log.entries.last().is_some_and(|e| {
             let text = e.text.trim();
-            e.kind == EntryKind::User
+            matches!(e.kind, EntryKind::Prompt(_))
                 && (text == current
                     || text.starts_with(&format!("{current} ["))
                     || text.ends_with(&format!("] {current}")))
@@ -341,7 +424,7 @@ pub(crate) fn render_thread_view(
     entries: &[super::log::LogEntry],
     nodes: &HashMap<NodeAddr, StoredNode>,
     budget: usize,
-) -> ThreadView {
+) -> ViewBlocks {
     let lines = thread_lines(entries, nodes);
     let trusted = trusted_end(entries, nodes);
     let len = entries.len() as u64;
@@ -357,45 +440,20 @@ pub(crate) fn render_thread_view(
         fold_budget,
         reserve,
     );
-    if tiles.is_empty() {
-        return ThreadView::default();
-    }
-    let mut text = String::from(THREAD_VIEW_OPEN);
-    let mut line_ends = Vec::with_capacity(tiles.len());
-    for tile in &tiles {
-        text.push_str(&render_line(&tile.to_string(), &lines[tile]));
-        line_ends.push(text.len());
-    }
-    text.push_str(THREAD_VIEW_CLOSE);
-    let mut marks: Vec<usize> = thread_mark_offsets(budget)
-        .into_iter()
-        .filter(|&at| at < text.len())
-        .filter_map(|at| {
-            line_ends
-                .iter()
-                .take_while(|&&end| end <= at)
-                .last()
-                .copied()
-        })
-        .collect();
-    marks.dedup();
-    ThreadView { text, marks }
+    ViewBlocks::render(
+        THREAD_VIEW_OPEN,
+        tiles
+            .iter()
+            .map(|tile| render_line(&tile.to_string(), &lines[tile])),
+        THREAD_VIEW_CLOSE,
+        |blocks| rungs(blocks, THREAD_RUNGS),
+    )
 }
 
 /// A thread view's fold budget and the reserve it keeps for entries past the built prefix.
 fn thread_budgets(budget: usize) -> (usize, usize) {
     let fold_budget = budget.saturating_sub(THREAD_VIEW_OPEN.len() + THREAD_VIEW_CLOSE.len());
     (fold_budget, RECENT_BYTES.min(fold_budget / 2))
-}
-
-/// The offsets a thread view of `budget` bytes puts its cache marks at or
-/// before, ascending.
-pub(crate) fn thread_mark_offsets(budget: usize) -> Vec<usize> {
-    let (fold_budget, reserve) = thread_budgets(budget);
-    THREAD_MARKS
-        .iter()
-        .map(|(part, whole)| (fold_budget - reserve) * part / whole)
-        .collect()
 }
 
 /// The lines a thread view may show: each built node whose leaves still

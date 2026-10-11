@@ -79,6 +79,8 @@ An HTML file under `artifacts/` is untrusted content: it may come from an upload
 | `<a href="results.csv" download>` in a browser, a Copy button, a video's fullscreen button | `localStorage`, `sessionStorage`, `IndexedDB`, cookies. An opaque origin has none. |
 | `mailto:` and `tel:` links | Reading or changing the Lucidos window around it (`parent.…`) |
 
+On a phone, a sideways drag anywhere in the preview swipes between Lucidos panes, as it does over an app. A page wider than the screen keeps its sideways drag, so it pans instead. A carousel or a canvas keeps its own drag by claiming it, the same way an app does (`system-knowhow/js-sdk.md` § Pane swipe).
+
 A document that needs live workspace data, or must remember state between opens, is an **app**, not an artifact. An app reads the workspace through `lucidos.*` (`system-knowhow/js-sdk.md`), and remembers per-device state in `lucidos.storage`. If a snapshot is enough, write the data into the report, as a JSON `<script>` block or inline in the markup.
 
 Relative assets load from `artifacts/` only. An HTML file elsewhere (`knowhow/`, an app folder) still renders, but behind the gateway its relative images and stylesheets do not load. Keep a report and its assets together under `artifacts/`.
@@ -90,7 +92,7 @@ Each app: `apps/{id}/`
 | File/Dir | Purpose |
 |----------|---------|
 | `index.html` | App UI |
-| `manifest.json` | Name, description, icon, and `reveal` (when the loading cover lifts; see `js-sdk.md` § Showing the app once its content is ready). User-facing, not loaded into the LLM |
+| `manifest.json` | Name, description, `icon` (a path to an image in the app folder; see `building-an-app.md` § App icon), and `reveal` (when the loading cover lifts; see `js-sdk.md` § Showing the app once its content is ready). User-facing, not loaded into the LLM |
 | `knowhow/` | App-specific reference docs |
 | `intents/` | App-specific user intents |
 | `scripts/` | App-specific helper scripts |

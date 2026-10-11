@@ -83,11 +83,12 @@ mod reply_text_tests {
             input_tokens: None,
             cache_creation_tokens: None,
             cache_read_tokens: None,
+            served_model: None,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,
             model_only_text: model_only.map(str::to_string),
-            content_is_progress_notes: false,
+            progress_notes: Vec::new(),
         }
     }
 

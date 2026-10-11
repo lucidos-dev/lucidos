@@ -364,7 +364,7 @@ pub(crate) async fn try_adopt_renegade_branch(
 /// single-turn session that renamed its own branch computed its end-of-turn
 /// diff against a ref that no longer existed, git exited 128, and the Diff
 /// button stayed dark forever. Idle is the boundary whose answer is durable
-/// (`CodingAgentIdled.has_changes` feeds `thread_summaries.coding_agent_has_diff`),
+/// (`CodingAgentIdled.has_changes` feeds the thread's change state),
 /// which is why it, of all the branch-reading sites, must not trust the cache.
 ///
 /// Adoption needs BOTH gates to pass:

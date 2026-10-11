@@ -1,4 +1,5 @@
 import type { ComponentType } from 'preact';
+import { WidgetShelf } from '../widgets/WidgetShelf';
 import { scrolledFromTop } from '../chat/scrollState';
 import { SearchIcon } from '../shared/icons';
 import { SearchField } from '../shared/SearchField';
@@ -8,11 +9,12 @@ import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { BrandMenuButton } from './HeaderMark';
+import { ThreadHeaderHomeButton } from './ThreadHeaderActions';
 import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
 import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, type MobileView } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
 import { useThreadSearch } from '../../hooks/useThreadSearch';
-import { ThreadFilterButton, ThreadsPaneTitle } from './ThreadFilterButton';
+import { ThreadFilterButton, ThreadGroupingButton, ThreadsPaneTitle } from './ThreadsHeaderControls';
 import { ThreadTitleMenu } from '../chat/ThreadTitle';
 import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { threadDisplayTitle } from '../../utils/threadTitle';
@@ -37,10 +39,10 @@ export const MOBILE_PANE_CONFIGS: Record<MobileView, MobilePaneConfig> = {
   content: { Header: MobileContentHeader, Pane: () => <ContentPane layout="mobile" /> },
 };
 
-/** Mobile threads header — search and filter for the threads pane */
+/** Mobile threads header: filter, grouping and search for the threads pane. */
 function MobileThreadsHeader() {
-  // The Filter button and the title are the desktop row's own components, so
-  // the two rows cannot drift.
+  // The Filter and Grouping buttons and the title are the desktop row's own
+  // components, so the two rows cannot drift.
   const { searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadSearch();
 
   return (
@@ -61,21 +63,19 @@ function MobileThreadsHeader() {
             </svg>
           </button>
         </div>
-        {/* Single unified Filter control: it toggles the merged Status +
-            Thread type panel, which renders down in the threads pane itself
-            (see ThreadFilterPanel / ThreadDrawer). Packed left in the same slot
-            the channel filter + view selector used to share. It is also the
-            panel's visible way out, which is why it reads as held down while the
-            panel is up (see filterButtonState). */}
-        <div class="view-selector-slot">
-          <ThreadFilterButton />
-        </div>
+        {/* Grouping leads the row, so the one control shown in both groupings
+            holds the corner. The Filter control after it toggles the thread
+            filter panel, which renders down in the threads pane itself (see
+            ThreadFilterPanel / ThreadDrawer). It is also the panel's visible
+            way out, which is why it reads as held down while the panel is up
+            (see filterButtonState). It shows under Folders only, fading in a
+            box it keeps, so the title beside it never moves. */}
+        <ThreadGroupingButton />
+        <ThreadFilterButton />
         {/* Title is absolutely centered on the row middle (see
             .mobile-header-title); the spacer pins the trailing icons right. It
-            says what the pane is showing: the list, or the filter panel that has
-            taken it over (ThreadFilterPanel carries no title row of its own).
-            Just "Filters", matching the desktop row: the pane is already the
-            Threads pane. */}
+            names the grouping, or the filter panel that has taken the list over
+            (ThreadFilterPanel carries no title row of its own). */}
         <ThreadsPaneTitle class="pane-header-title mobile-header-title" />
         <div class="pane-header-spacer" />
         {/* No SetupInterviewButton on either mobile header, deliberately: the
@@ -111,8 +111,8 @@ function MobileThreadsHeader() {
 }
 
 /** Mobile thread header. The row is built around a CENTRED cluster of back
- *  chevron, Lucidos mark, forward chevron, with one drawer affordance at each
- *  edge.
+ *  chevron, Home and the Lucidos mark, forward chevron, with one drawer
+ *  affordance at each edge.
  *
  *  The mark is three controls in one: the brand, the connection light, and the
  *  menu carrying New thread, Search everywhere and Workspaces. Those three used
@@ -121,7 +121,7 @@ function MobileThreadsHeader() {
  *  mark where a thumb reaches them.
  *
  *  Both edges keep their drawer: the thread drawer toggle leads (so the
- *  needs-attention badge riding it stays visible from the conversation, per
+ *  Blocked badge riding it stays visible from the conversation, per
  *  `threadToggleBadgeCount`) and the hamburger trails, mirroring it across the
  *  row so the menu drawer slides out from under it on the right (drawerSideFor
  *  in Drawer.tsx). Pane navigation is otherwise swipe-only; the dot indicator
@@ -140,7 +140,13 @@ function MobileThreadHeader() {
             e2e/mobile-threads-title-alignment.spec.ts. */}
         <div class="header-nav-cluster">
           <ThreadBackButton />
-          <BrandMenuButton />
+          {/* Home and the mark centre as one pair between the chevrons. So
+              this mark's menu drops its Home row, which the threads row's
+              mark keeps. */}
+          <span class="header-mark-pair">
+            <ThreadHeaderHomeButton />
+            <BrandMenuButton />
+          </span>
           <ThreadForwardButton />
         </div>
         <HamburgerButton />
@@ -238,6 +244,7 @@ export function MobileThreadTitleBar() {
       data-scroller-pinned
     >
       <ThreadTitleMenu thread={eventThread} title={threadTitle} status={threadVisualStatus(eventThread)} />
+      <WidgetShelf threadId={threadId} />
     </div>
   );
 }

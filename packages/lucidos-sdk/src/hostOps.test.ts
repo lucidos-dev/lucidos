@@ -12,16 +12,18 @@ import { installHostOps } from './hostOps';
 import { _resetHostServingForTesting } from './_bridge';
 
 const APP_DOC = 'https://host.example/ws/app/pr-understanding/';
+const HOST_ORIGIN = new URL(APP_DOC).origin;
 
 const saved: Record<string, unknown> = {};
 let listener: ((event: MessageEvent) => void) | null = null;
-let loc: { href: string; replace: ReturnType<typeof vi.fn>; hash?: string };
+let loc: { href: string; origin: string; replace: ReturnType<typeof vi.fn>; hash?: string };
 
 /** Install a frame whose live URL can drift, the way a real app moves itself
  *  with `history.replaceState`, and capture the SDK's message listener. */
 function setFrame(hash = '', query = '') {
   loc = {
     href: `${APP_DOC}${query}${hash}`,
+    origin: HOST_ORIGIN,
     replace: vi.fn((url: string) => { loc.href = url; }),
   };
   const parent = { postMessage: vi.fn() };
@@ -46,6 +48,7 @@ async function hostSays(op: string, args: unknown, id?: string) {
   const event = {
     data: { type: 'lucidos:bridge:host', id, op, args },
     source: (globalThis as any).window.parent,
+    origin: HOST_ORIGIN,
   };
   listener?.(event as unknown as MessageEvent);
   await Promise.resolve();
@@ -71,10 +74,17 @@ afterEach(() => {
 });
 
 describe('navigate', () => {
-  it('uses location.replace, never a pushed entry', async () => {
-    setFrame();
-    await hostSays('navigate', { url: '/app/notes-app/' });
-    expect(loc.replace).toHaveBeenCalledWith('/app/notes-app/');
+  it('is not an op, so even the host cannot send the frame to a URL', async () => {
+    // Whatever window frames the app is its parent. An op taking a whole URL
+    // would let a foreign page run a `javascript:` URL in the app's origin.
+    const parent = setFrame();
+    await hostSays('navigate', { url: '/app/notes-app/' }, 'host-1');
+
+    expect(loc.replace).not.toHaveBeenCalled();
+    expect(parent.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'host-1', ok: false }),
+      expect.anything(),
+    );
   });
 });
 
@@ -149,7 +159,7 @@ describe('answering', () => {
 
   it('stays silent when it did not, which is what a navigation sends', async () => {
     const parent = setFrame();
-    await hostSays('navigate', { url: '/app/x/' });
+    await hostSays('hash', { fragment: 'pr-1645' });
 
     expect(parent.postMessage).not.toHaveBeenCalled();
   });
@@ -157,8 +167,9 @@ describe('answering', () => {
   it('refuses a message from anywhere but the host', async () => {
     setFrame();
     const event = {
-      data: { type: 'lucidos:bridge:host', op: 'navigate', args: { url: '/evil' } },
+      data: { type: 'lucidos:bridge:host', op: 'hash', args: { fragment: 'elsewhere' } },
       source: { postMessage: vi.fn() },
+      origin: HOST_ORIGIN,
     };
     listener?.(event as unknown as MessageEvent);
 

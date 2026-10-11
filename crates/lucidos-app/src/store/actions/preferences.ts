@@ -1,5 +1,5 @@
 import { effect, signal, untracked } from '@preact/signals';
-import { preferences, showToast, removeToast, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, currentModel, reasoningEffort, selectedCodingAgent, clampThreadDrawerWidth, llmConfigured, type NotificationsFilter } from '../store';
+import { preferences, showToast, removeToast, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, currentModel, selectedCodingAgent, clampThreadDrawerWidth, llmConfigured, welcomeDismissed, type NotificationsFilter } from '../store';
 import type { CodingAgent } from '../../api/types';
 import type { ThreadState } from '../thread-events';
 import { failedIfFresh } from '../types';
@@ -8,7 +8,8 @@ import { resolvedHexColor } from '../../utils/cssColor';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
-import { clampEffortFor } from './models';
+import { clampEffortFor, modelDefaultEffort } from './models';
+import { parseChatEfforts, withChatEffort } from '../chatEfforts';
 import { isIOSPwa, isTauri } from '../../utils/platform';
 import { setProseAutocorrect } from '../../utils/noAutofill';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
@@ -22,10 +23,10 @@ import {
 import {
   EMPTY_THEME, FONT_PREFERENCES, THEME_EFFECTS_STORAGE_KEY,
   THEME_KEY, THEME_STORAGE_KEY,
-  MOTION_STORAGE_KEY, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_ATTRIBUTE, THEME_MODE_BG,
+  MOTION_STORAGE_KEY, THEME_MODE_ATTRIBUTE, THEME_MODE_BG,
   THEME_MODE_KEY, THEME_MODE_STORAGE_KEY, UI_SCALE_STORAGE_KEY,
   FONT_BOLD_ATTRIBUTE, FONT_FAMILY_STORAGE_KEY, WORKSPACE_FONT_STORAGE_KEY,
-  clampUiScale, fontBoldMark, isWorkspaceFontId, themeBackground, themeTokenNames, parseResolvedTheme,
+  clampUiScale, followSystemThemeMode, fontBoldMark, isWorkspaceFontId, themeBackground, themeTokenNames, parseResolvedTheme,
   parseUiScale, parseWorkspaceFont, replaceInlineTokens, resolveFont, resolveThemeMode,
   sanitizeResolvedTheme,
   type FontPreference, type ThemeEffectsPref, type MotionPref, type ResolvedTheme,
@@ -76,7 +77,6 @@ export type ImageModel = PreferenceValues<'image_model'>;
 // style-remote overrides afterwards.
 
 let systemThemeModeQuery: MediaQueryList | null = null;
-let systemThemeModeSettleTimer: number | null = null;
 // Seeded so loadPreferences can skip a no-op applyThemeMode when unchanged. The
 // matching module-init install of the OS listener sits beside
 // `syncSystemThemeModeListener`, which cannot run before its own constants exist.
@@ -689,23 +689,37 @@ export function setTheme(id: string, known?: ResolvedTheme): Promise<void> {
 
 // --- Following the OS under a `system` preference ---
 //
-// Two things go wrong if `system` is resolved only from the media query's
-// `change` event, and the guards below answer one each.
+// Three things go wrong if `system` is resolved only from the media query's
+// `change` event. `followSystemThemeMode` (`@lucidos/appearance`) holds the
+// guards, shared with every app iframe.
 //
 // Backgrounding an iOS app makes UIKit flip its trait collection to the
 // opposite appearance and straight back, to render both app-switcher snapshots
 // (rdar://7213631). WKWebView passes each flip into the page as a real media
 // query change. Acting on one paints an appearance that existed for the
 // snapshot alone. That is the light flash telemetry caught 24+ times in one
-// session, and it is why this listener was once skipped on iOS entirely.
+// session, and it is why this listener was once skipped on iOS entirely. The
+// visibility guard drops a flip that arrives while the app is backgrounded.
 //
 // The event can also simply never arrive. An installed iOS PWA is resumed
 // rather than reloaded. A frozen desktop tab runs no JavaScript, and a sleeping
-// machine wakes into an appearance nobody announced.
+// machine wakes into an appearance nobody announced. The resume events cover it.
+//
+// And a resume can read the snapshot's appearance while the page is visible.
+// An iOS wake can last under a second, and the media query lags it. The
+// confirming read keeps that wake from painting, and from being snapshotted.
+
+/** Re-resolves `system` when the OS appearance may have moved. */
+const systemThemeModeFollower = followSystemThemeMode({
+  visible: () => document.visibilityState === 'visible',
+  moved: () => currentThemeMode() === 'system'
+    && document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) !== resolveThemeMode('system', osPrefersLight()),
+  apply: () => applyThemeMode('system'),
+});
 
 /** The three events one iOS wake delivers together, per
  *  `docs/plans/2026-08-03-ios-pwa-resume-storm-and-durable-compose-drafts.md`.
- *  Each schedules the same settle timer, so a wake costs one read.
+ *  Each schedules the same follower, so a wake costs one read.
  *
  *  Deliberately NOT `onPageWake` (`utils/pageVisit.ts`), which fires only when
  *  a hide preceded. A window that merely lost focus never went hidden, so a Mac
@@ -717,54 +731,23 @@ const SYSTEM_THEME_MODE_RESUME_EVENTS: ReadonlyArray<readonly [EventTarget, stri
   [window, 'pageshow'],
 ];
 
-/** Re-resolve `system` and apply it, if all three guards pass: the preference
- *  still follows the OS, the user is actually looking at the page, and the
- *  resolved value is not the one already painted.
- *
- *  The visibility guard is what makes the media-query listener safe on iOS: a
- *  snapshot-pass flip arrives while the app is backgrounded, so it is dropped
- *  rather than painted. */
-function refreshSystemThemeMode(): void {
-  if (currentThemeMode() !== 'system') return;
-  if (document.visibilityState !== 'visible') return;
-  const resolved = resolveThemeMode('system', osPrefersLight());
-  if (document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) === resolved) return;
-  applyThemeMode('system');
-}
-
-/** Arm one shared settle timer, which re-READS the OS when it fires. Nothing
- *  ever applies the value an event carried: a flip that raced the visibility
- *  guard has been corrected by the time this samples.
- *
- *  An already-armed timer is left alone rather than pushed back. A burst then
- *  resolves one settle delay after its first event, not after its last. */
-function scheduleSystemThemeModeRefresh(): void {
-  if (systemThemeModeSettleTimer !== null) return;
-  systemThemeModeSettleTimer = window.setTimeout(() => {
-    systemThemeModeSettleTimer = null;
-    refreshSystemThemeMode();
-  }, SYSTEM_THEME_MODE_SETTLE_MS);
-}
-
 /** Subscribe to the OS appearance while the preference is `system`, and to
  *  nothing at all otherwise. Called from every `applyThemeMode`, so it tears the
  *  previous registration down first and is safe to run repeatedly. */
 function syncSystemThemeModeListener(mode: ThemeMode): void {
-  systemThemeModeQuery?.removeEventListener('change', scheduleSystemThemeModeRefresh);
+  const { schedule } = systemThemeModeFollower;
+  systemThemeModeQuery?.removeEventListener('change', schedule);
   systemThemeModeQuery = null;
   for (const [target, type] of SYSTEM_THEME_MODE_RESUME_EVENTS) {
-    target.removeEventListener(type, scheduleSystemThemeModeRefresh);
+    target.removeEventListener(type, schedule);
   }
-  if (systemThemeModeSettleTimer !== null) {
-    clearTimeout(systemThemeModeSettleTimer);
-    systemThemeModeSettleTimer = null;
-  }
+  systemThemeModeFollower.cancel();
   if (mode !== 'system') return;
 
   systemThemeModeQuery = window.matchMedia('(prefers-color-scheme: light)');
-  systemThemeModeQuery.addEventListener('change', scheduleSystemThemeModeRefresh);
+  systemThemeModeQuery.addEventListener('change', schedule);
   for (const [target, type] of SYSTEM_THEME_MODE_RESUME_EVENTS) {
-    target.addEventListener(type, scheduleSystemThemeModeRefresh);
+    target.addEventListener(type, schedule);
   }
 }
 
@@ -1085,27 +1068,47 @@ export function currentChatModel(): string {
   return currentPreference('chat_model');
 }
 
-export function currentChatReasoningEffort(): string {
-  return currentPreference('chat_reasoning_effort');
+/** The stored `chat_model`, or null while unset and the router's own runs. */
+export function storedChatModel(): string | null {
+  if (preferences.value.status !== 'loaded') return null;
+  return acceptedValue('chat_model', preferences.value.data.chat_model);
+}
+
+/** The stored `chat_reasoning_efforts` list, or null while unset. */
+function storedChatEfforts(): string | null {
+  if (preferences.value.status !== 'loaded') return null;
+  return acceptedValue('chat_reasoning_efforts', preferences.value.data.chat_reasoning_efforts);
+}
+
+/** The tier a new chat on `modelId` runs at: the account's tier for it, else
+ *  its *default effort*, snapped onto what the model offers. `null` means the
+ *  engine sends no effort and the model runs at its provider's default.
+ *  Mirrors `PreferenceStore::resolve_chat_overrides_for_thread`. */
+export function accountChatEffort(modelId: string): string | null {
+  const stored = parseChatEfforts(storedChatEfforts()).get(modelId);
+  return stored === undefined ? modelDefaultEffort(modelId) : clampEffortFor(stored, modelId);
 }
 
 /** Persist the chat *model selection*, both halves.
  *
- *  One pick sets the pair, so the effort is the user's own choice rather than a
- *  clamp of the previous one. A model with no tiers reports `null` and leaves
- *  the stored effort alone, which nothing acts on: the picker clamps for
- *  display and `RoutingProvider::effort_for_model` clamps the request. */
+ *  One pick sets the pair, and the tier is stored for that model alone, so
+ *  every other model keeps its own. `null` is the Default row, which removes
+ *  the model's stored tier so it runs at its default effort. */
 export async function setChatModelSelection(
   patch: { model: string; reasoningEffort: string | null },
 ): Promise<void> {
   await savePreference('chat_model', patch.model, () => { currentModel.value = patch.model; });
-  if (patch.reasoningEffort !== null) await setReasoningEffort(patch.reasoningEffort);
-}
-
-export function setReasoningEffort(effort: string): Promise<void> {
-  return savePreference('chat_reasoning_effort', effort, () => {
-    reasoningEffort.value = effort;
-  });
+  // The list is written whole, so writing it unread would drop every other
+  // model's tier.
+  if (preferences.value.status !== 'loaded') {
+    if (patch.reasoningEffort !== null) {
+      showToast('Preferences have not loaded, so the reasoning effort was not saved', 'error');
+    }
+    return;
+  }
+  const stored = storedChatEfforts();
+  const next = withChatEffort(stored, patch.model, patch.reasoningEffort);
+  if (next !== (stored ?? '')) await savePreference('chat_reasoning_efforts', next);
 }
 
 // --- Response style ---
@@ -1289,7 +1292,6 @@ async function loadPreferencesAs(mySeq: number): Promise<void> {
     applyFontFamily(currentFontFamily());
     if (workspaceFontList.value.status === 'not-loaded') void loadWorkspaceFonts();
     currentModel.value = currentChatModel();
-    reasoningEffort.value = clampEffortFor(currentChatReasoningEffort(), currentModel.value);
     notificationsFilter.value = currentNotificationsFilter();
     cacheServedValue('notification_toasts', NOTIFICATION_TOASTS_KEY);
     // The cache first: a stale mirror would otherwise answer for an unset key.
@@ -1522,7 +1524,8 @@ export type BackgroundModelKey =
   | 'model_conversation_summary'
   | 'model_query_classification'
   | 'model_summary_compaction'
-  | 'model_command_judge';
+  | 'model_command_judge'
+  | 'model_read_decision';
 
 /** The reasoning half of each background *model selection*. */
 export type BackgroundReasoningKey =
@@ -1533,7 +1536,8 @@ export type BackgroundReasoningKey =
   | 'reasoning_conversation_summary'
   | 'reasoning_query_classification'
   | 'reasoning_summary_compaction'
-  | 'reasoning_command_judge';
+  | 'reasoning_command_judge'
+  | 'reasoning_read_decision';
 
 /** A background row's stored *model selection*, each half `null` while unset.
  *  The engine resolves an unset half, inheritance and the configured providers
@@ -1607,14 +1611,10 @@ export function setCodingAgentPermissionMode(mode: CcPermissionMode): Promise<vo
 
 // --- New-workspace welcome + starter suggestions ---
 
-/** Whether the new-workspace welcome + starter suggestions have been retired
- *  via "Don't show this again". Treats not-yet-loaded (and failed) preferences
- *  as dismissed so a returning user who already retired it never sees a flash
- *  during the preferences fetch — an onboarding surface fails closed. A genuinely
- *  new workspace gets it back once the preference loads and reads unset. */
+/** Whether the new-workspace welcome has been retired. The rule lives in the
+ *  store's `welcomeDismissed`, which the compose layout also reads. */
 export function welcomeSuggestionsDismissed(): boolean {
-  if (preferences.value.status !== 'loaded') return true;
-  return preferences.value.data['welcome_suggestions_dismissed'] === 'true';
+  return welcomeDismissed.value;
 }
 
 /** One-way retire: the user clicked "Don't show this again" on the
@@ -1635,15 +1635,15 @@ export const WELCOME_RETIRES_AFTER_THREADS = 3;
 /** Retires the welcome once the user has started enough threads to know the
  *  composer, so nobody carries it for months. Runs after each send and saves
  *  the same preference as "Don't show this again". It counts top-level threads
- *  the user sent: drafts, trigger runs and sub-threads are not use of the
- *  composer. Desktop keeps the header's ? button as the way back into the
+ *  the user sent: drafts, trigger runs, sub-threads and the home thread, which
+ *  boot made, are not use of the composer. Desktop keeps the header's ? button as the way back into the
  *  setup interview. With no provider the welcome is the provider-setup call to
  *  action, which the same preference hides, so it never retires then. */
 export function retireWelcomeAfterUse(threads: Iterable<ThreadState>): Promise<void> {
   if (!llmConfigured.value || welcomeSuggestionsDismissed()) return Promise.resolve();
   let started = 0;
   for (const { meta } of threads) {
-    if (meta.initiator === 'user' && meta.state === 'active' && !meta.parentThreadId) started++;
+    if (meta.initiator === 'user' && meta.state === 'active' && !meta.parentThreadId && !meta.home) started++;
   }
   return started >= WELCOME_RETIRES_AFTER_THREADS ? dismissWelcomeSuggestions() : Promise.resolve();
 }
@@ -1782,22 +1782,6 @@ export function voiceEnabled(): boolean {
 
 export function setVoiceEnabled(enabled: boolean): Promise<void> {
   return savePreference('voice_enabled', enabled ? 'true' : 'false');
-}
-
-// --- Home thread ---
-
-/**
- * Whether this workspace has the experimental home thread switched on.
- *
- * An unloaded preference set reads the catalog default, which is off, so Home
- * never flashes into the header before the answer arrives.
- */
-export function homeThreadEnabled(): boolean {
-  return currentPreference('home_thread_enabled') === 'true';
-}
-
-export function setHomeThreadEnabled(enabled: boolean): Promise<void> {
-  return savePreference('home_thread_enabled', enabled ? 'true' : 'false');
 }
 
 /** The speech-to-speech model a *voice session* speaks through. Deliberately

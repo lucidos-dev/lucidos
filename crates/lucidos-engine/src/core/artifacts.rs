@@ -47,7 +47,7 @@ pub const VENDORED_DIR_NAMES: &[&str] = &[
 /// the `list_files`, `glob_files` and `grep_files` tools, where filtering would
 /// remove the agent's only way to reach a vendored file on purpose. It is for
 /// code that SHAPES a payload, where a listing is a sample rather than an
-/// answer: see `engine::chat::process::workspace_payload`.
+/// answer: see `engine::chat::process::workspace_prompt_footprint`.
 pub fn is_vendored_path(data_relative: &str) -> bool {
     let Some((dirs, _file)) = data_relative.rsplit_once('/') else {
         return false;
@@ -232,18 +232,20 @@ impl ArtifactManager {
         // the file is newly created or modified, also commit it to the
         // artifacts repo so the workspace's git history records the change.
         //
-        // Deliberately NOT routed through `retry_while_repo_contended`: this is
-        // the constructor, so it runs at startup before this manager is shared
-        // and before any timer or agent session exists to move HEAD under it.
-        // It also stages outside any closure, and it logs-and-continues rather
-        // than failing a request, so losing a race here costs a .gitignore
-        // update that the next boot redoes rather than a 500.
+        // Request handlers construct managers too, so this commit races other
+        // writers like any other and retries. The next construction finds the
+        // entries present and never commits, so a lost race would leave the
+        // edit uncommitted for good.
         match super::ensure_workspace_gitignore_entries(&workspace_path) {
             Ok(true) => {
-                let mut index = repo.index()?;
-                index.add_path(Path::new(".gitignore"))?;
-                index.write()?;
-                if let Err(e) = super::commit_index(&repo, "chore: update .gitignore") {
+                let committed = super::retry_while_repo_contended(|| {
+                    let mut index = repo.index()?;
+                    let base = super::reset_index_to_head(&repo, &mut index)?;
+                    index.add_path(Path::new(".gitignore"))?;
+                    index.write()?;
+                    super::commit_index(&repo, "chore: update .gitignore", base)
+                });
+                if let Err(e) = committed {
                     log!("[Artifacts] Failed to commit .gitignore: {}", e);
                 }
             }
@@ -370,7 +372,7 @@ impl ArtifactManager {
             super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
-                super::reset_index_to_head(&repo, &mut index)?;
+                let base = super::reset_index_to_head(&repo, &mut index)?;
 
                 for artifact_path in &paths {
                     let repo_path = format!("{}/{}", ARTIFACTS_DIR, artifact_path);
@@ -378,7 +380,7 @@ impl ArtifactManager {
                 }
                 index.write()?;
 
-                super::commit_index(&repo, &message)
+                super::commit_index(&repo, &message, base)
             })
         })
         .await
@@ -414,7 +416,7 @@ impl ArtifactManager {
             super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
-                super::reset_index_to_head(&repo, &mut index)?;
+                let base = super::reset_index_to_head(&repo, &mut index)?;
 
                 for data_path in &paths {
                     let repo_path = format!("data/{}", data_path);
@@ -422,7 +424,7 @@ impl ArtifactManager {
                 }
                 index.write()?;
 
-                super::commit_index(&repo, &message)
+                super::commit_index(&repo, &message, base)
             })
         })
         .await
@@ -456,12 +458,12 @@ impl ArtifactManager {
             super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
-                super::reset_index_to_head(&repo, &mut index)?;
+                let base = super::reset_index_to_head(&repo, &mut index)?;
 
                 let _ = index.remove_path(std::path::Path::new(&repo_path));
                 index.write()?;
 
-                super::commit_index_unless_unchanged(&repo, &message)
+                super::commit_index_unless_unchanged(&repo, &message, base)
             })
         })
         .await
@@ -493,12 +495,12 @@ impl ArtifactManager {
             super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
-                super::reset_index_to_head(&repo, &mut index)?;
+                let base = super::reset_index_to_head(&repo, &mut index)?;
 
                 super::add_path_unless_ignored(&repo, &mut index, &repo_path)?;
                 index.write()?;
 
-                super::commit_index(&repo, &message)
+                super::commit_index(&repo, &message, base)
             })
         })
         .await
@@ -539,7 +541,7 @@ impl ArtifactManager {
             super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
-                super::reset_index_to_head(&repo, &mut index)?;
+                let base = super::reset_index_to_head(&repo, &mut index)?;
 
                 // Add all changes under data/ (artifacts, apps, and any other data subdirs)
                 index.add_all([super::DATA_DIR], git2::IndexAddOption::DEFAULT, None)?;
@@ -555,7 +557,7 @@ impl ArtifactManager {
                     }
                 }
 
-                super::commit_index(&repo, &message).map(Some)
+                super::commit_index(&repo, &message, base).map(Some)
             })
         })
         .await

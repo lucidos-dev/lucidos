@@ -10,25 +10,57 @@ import { installDeadPressProbe } from './components/chat/deadPressProbe';
 import { installDeadKeystrokeProbe } from './components/chat/deadKeystrokeProbe';
 import { installToastPressProbe } from './components/shared/toastPressProbe';
 import { installAppKeybindingsSync } from './store/actions/app-keybindings';
+import { installAppFocusedThreadSync } from './store/actions/app-focused-thread';
 import { installAppFrameMessages } from './store/actions/app-frame-messages';
 import { installPendingUploadRestore } from './store/actions/pendingUploadRestore';
 import { installUnsentMessageRestore } from './store/actions/unsentMessageRestore';
+import { installScaleWheel } from './components/shared/scaleWheelListener';
+import { installSeenTargetWatch } from './store/actions/seen-target';
+import { startPageHealthLog } from './utils/pageHealthLog.report';
+import * as scrollState from './components/chat/scrollState';
+import { provideScrollState } from './components/chat/scrollStateHandle';
+import { watchTranscriptLiveness } from './store/transcriptLiveness';
+import { focusedThreadId, threadMap, isThreadStreaming } from './store/store';
+import { voiceCall } from './store/voiceCall';
+import { isOnCall } from './voice/callState';
 
 /** Install the shell's document-level listeners. Returns the teardown. */
 export function startShell(): () => void {
+  // FIRST, so the store's scroll calls queued during boot replay before
+  // anything else here runs. See components/chat/scrollStateHandle.ts.
+  provideScrollState(scrollState);
   // Three diagnostics, not features: the composer's buttons, its textarea and
   // the toasts' buttons. See their headers and docs/temporary-measures.md.
   installDeadPressProbe();
   installDeadKeystrokeProbe();
   installToastPressProbe();
+  // The *seen target* rule: a notification clears once the reader has looked
+  // at what its tap points at. Nothing is on screen to look at before this.
+  // See actions/seen-target.ts and system-knowhow/notifications.md §4.
+  installSeenTargetWatch();
   const stops = [
     installAppKeybindingsSync(),
+    installAppFocusedThreadSync(),
     installAppFrameMessages(),
     // Images a previous page load was still uploading come back as chips.
     installPendingUploadRestore(),
     // Sends a previous page load never learned the outcome of come back as
     // unsent messages, with Retry.
     installUnsentMessageRestore(),
+    // Cmd/Ctrl + wheel steps the UI scale, as Cmd +/- does.
+    installScaleWheel(),
+    // A diagnostic, not a feature: docs/temporary-measures.md § Page health log.
+    startPageHealthLog(),
+    // The transcript's follow parks on a scroll unless the thread on screen is
+    // live streaming: the agent running, or a call up on it. A call writes no
+    // turn, so the projection alone reads it as quiet. See transcriptLiveness.ts.
+    watchTranscriptLiveness({
+      focused: focusedThreadId,
+      threads: threadMap,
+      isLive: (thread) => isThreadStreaming(thread)
+        || (isOnCall(voiceCall.value.phase) && voiceCall.value.threadId === thread.meta.id),
+      setLive: scrollState.setTranscriptLive,
+    }),
   ];
   return () => {
     for (const stop of stops) stop();

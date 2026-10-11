@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::core::webhook_ingress::{AddressProbe, Family, FamilyVerdict};
 use crate::core::webhook_refusal::{RefusalCause, Resolution};
-use crate::core::AuthType;
+use crate::core::{AppKind, AuthType};
 use crate::engine::thread_events::MessageOrigin;
 use crate::scheduler::notifications::Tap;
 
@@ -171,6 +171,23 @@ pub enum SystemEvent {
     ProxyConfigRejected {
         rejected: Vec<crate::api::RejectedProvider>,
     },
+    /// A provider answered that it does not serve the model an auxiliary call
+    /// ran on: retired, never enabled, or misspelled. PERSISTED, at most once
+    /// per provider, model and purpose within the window.
+    ///
+    /// Default selection reads these rows to pass over the model. A retired
+    /// default moves on by itself, and a stored pick fails visibly (ADR 0403).
+    ModelNotServedObserved {
+        model: String,
+        /// The provider that answered, spelled as `ProviderKind::as_str`.
+        provider: String,
+        purpose: crate::engine::ContextPurpose,
+        /// The provider's failure, rewritten into advice where we have one.
+        message: String,
+        /// The model the call retried on, or `None` when it failed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        moved_to: Option<String>,
+    },
     /// The owner deleted a thread and its whole family. PERSISTED, and the only
     /// trace left of them (ADR 0192).
     ///
@@ -192,6 +209,10 @@ pub enum SystemEvent {
         /// Coding-agent worktrees removed after the commit. Best effort, so it
         /// can be lower than the number of coding-agent members.
         worktrees_removed: usize,
+        /// The deleted threads' own widgets removed from `data/apps/` (ADR
+        /// 0402). Best effort, like the worktrees.
+        #[serde(default)]
+        widgets_removed: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -320,10 +341,10 @@ pub enum SystemEvent {
         #[serde(skip_serializing)]
         actor: Option<MessageOrigin>,
     },
-    /// App list-refresh hints. Broadcast-only (`is_persisted` = false), like
-    /// `AppUiRefreshRequested`: the `appsList` is a disk-scan projection and
-    /// these SSE signals keep it live; the durable record of an app change is
-    /// the git commit (and `ChangeApplied` for coding-agent applies).
+    /// App list-refresh hints. `AppCreated` and `AppUpdated` are
+    /// broadcast-only, like `AppUiRefreshRequested`: the `appsList` is a
+    /// disk-scan projection and these SSE signals keep it live. The durable
+    /// record of an app change is the git commit.
     AppCreated {
         app_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -338,8 +359,30 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// Persisted, unlike its two siblings (ADR 0404): the `app_kinds`
+    /// projection keeps `kind`, so a removed widget still lists as a widget.
+    /// `kind` is read from the manifest before it goes; `None` means unread.
     AppDeleted {
         app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<AppKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The user opened an app's UI (ADR 0413). Persisted: it is the only
+    /// evidence of use, which the workspace prompt footprint judges an app
+    /// unused by. A reload restore, a history step and a widget card do not
+    /// emit it.
+    AppOpened {
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A knowhow doc was read through `GET /api/v1/knowhow/read`, which is
+    /// what `lucidos knowhow read` calls (ADR 0413). Persisted as use evidence
+    /// for the workspace prompt footprint, at most one per doc per day.
+    KnowhowRead {
+        knowhow_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -448,9 +491,9 @@ pub enum SystemEvent {
         sent_at_ms: i64,
     },
     /// The engine's dev background-rebuild `build_state` transitioned
-    /// (`idle`|`building`|`ready`|`failed`) — emitted from `trigger_background_rebuild`
+    /// (`idle`|`building`|`ready`|`failed`), emitted by `engine::background_build`
     /// at build start (`building`) and completion (`ready`/`failed`, latest
-    /// generation only). A pure UI POKE so the connected client learns of a build
+    /// generation only). A follow-up build after a join emits nothing new. A pure UI POKE so the connected client learns of a build
     /// over the live SSE stream instead of waiting on the throttled 4s
     /// version-status poll (which iOS suspends on a backgrounded PWA, so the
     /// transient `building` window was never seen — the spinner badge never
@@ -458,7 +501,7 @@ pub enum SystemEvent {
     /// GET rather than trusting `state` directly, so a stale/duplicate poke can
     /// only trigger a harmless re-check, never a false spin. Transient (never
     /// persisted — like `ServedFrontendAdvanced`) and dev-only by construction
-    /// (`trigger_background_rebuild` no-ops packaged). `sent_at_ms` is
+    /// (both rebuild entry points no-op packaged). `sent_at_ms` is
     /// informational — the handler is idempotent, so no page-side freshness gate.
     EngineBuildStateChanged {
         state: String,
@@ -1513,6 +1556,9 @@ impl SystemEvent {
         "ArtifactCreated",
         "ArtifactUpdated",
         "ArtifactDeleted",
+        "AppDeleted",
+        "AppOpened",
+        "KnowhowRead",
         "RepositoryImported",
         "TriggerCreated",
         "TriggerUpdated",
@@ -1592,6 +1638,7 @@ impl SystemEvent {
         "BackupFailed",
         "BackupKeyRevealed",
         "ProxyConfigRejected",
+        "ModelNotServedObserved",
         "ThreadsDeleted",
         "MemoryCorrected",
         "RecommendedCleanupStarted",
@@ -1640,6 +1687,7 @@ impl SystemEvent {
             Self::BackupFailed { .. } => "BackupFailed",
             Self::BackupKeyRevealed { .. } => "BackupKeyRevealed",
             Self::ProxyConfigRejected { .. } => "ProxyConfigRejected",
+            Self::ModelNotServedObserved { .. } => "ModelNotServedObserved",
             Self::ThreadsDeleted { .. } => "ThreadsDeleted",
             Self::RecoveryProgress { .. } => "RecoveryProgress",
             Self::MemoryCorrected { .. } => "MemoryCorrected",
@@ -1658,6 +1706,8 @@ impl SystemEvent {
             Self::AppCreated { .. } => "AppCreated",
             Self::AppUpdated { .. } => "AppUpdated",
             Self::AppDeleted { .. } => "AppDeleted",
+            Self::AppOpened { .. } => "AppOpened",
+            Self::KnowhowRead { .. } => "KnowhowRead",
             Self::AppUiRefreshRequested { .. } => "AppUiRefreshRequested",
             Self::FrontendUpdateDeferred { .. } => "FrontendUpdateDeferred",
             Self::FrontendUpdateStranded { .. } => "FrontendUpdateStranded",
@@ -1791,6 +1841,7 @@ impl SystemEvent {
         "BackupFailed",
         "BackupKeyRevealed",
         "ProxyConfigRejected",
+        "ModelNotServedObserved",
         "ThreadsDeleted",
         "RecoveryProgress",
         "MemoryCorrected",
@@ -1809,6 +1860,8 @@ impl SystemEvent {
         "AppCreated",
         "AppUpdated",
         "AppDeleted",
+        "AppOpened",
+        "KnowhowRead",
         "AppUiRefreshRequested",
         "FrontendUpdateDeferred",
         "FrontendUpdateStranded",
@@ -1927,6 +1980,7 @@ impl SystemEvent {
             | Self::BackupFailed { .. }
             | Self::BackupKeyRevealed { .. }
             | Self::ProxyConfigRejected { .. }
+            | Self::ModelNotServedObserved { .. }
             | Self::ThreadsDeleted { .. }
             | Self::RecoveryProgress { .. }
             | Self::RecommendedCleanupStarted { .. }
@@ -1953,7 +2007,9 @@ impl SystemEvent {
             Self::AppCreated { .. }
             | Self::AppUpdated { .. }
             | Self::AppDeleted { .. }
+            | Self::AppOpened { .. }
             | Self::AppUiRefreshRequested { .. } => "app",
+            Self::KnowhowRead { .. } => "knowhow",
             Self::DomainEvent { .. } => "domain",
             Self::DeviceVisible { .. } | Self::DeviceHidden { .. } => "device_presence",
             Self::PresenceCheck { .. } => "presence",
@@ -2066,7 +2122,9 @@ impl SystemEvent {
             Self::AppCreated { app_id, .. }
             | Self::AppUpdated { app_id, .. }
             | Self::AppDeleted { app_id, .. }
+            | Self::AppOpened { app_id, .. }
             | Self::AppUiRefreshRequested { app_id, .. } => app_id.clone(),
+            Self::KnowhowRead { knowhow_id, .. } => knowhow_id.clone(),
             Self::DomainEvent { event_type, .. } => event_type.clone(),
             Self::ChangeDiscarded { change_id } => change_id.clone(),
             Self::DeviceVisible { device_id } | Self::DeviceHidden { device_id } => {

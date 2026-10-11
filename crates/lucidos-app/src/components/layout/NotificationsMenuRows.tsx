@@ -192,10 +192,9 @@ function notifyRow(row: NotifyRow, props: NotificationsGroupProps) {
       key={`notif:${row.id ?? ''}`}
     >
       <BellIcon />
-      {/* The switcher list's own name and count classes, not copies of them.
-          These rows carry the same two things (a workspace name that must
-          ellipsise, and its unread count as a pill), so a second pair would be
-          two rules to keep in step for one appearance. */}
+      {/* The switcher list's own name class, not a copy: both rows carry a
+          workspace name that must ellipsise. The count lives only here, since
+          the switcher list leaves it to this group. */}
       <span class="brand-menu-ws-name">{row.name}</span>
       <GlyphBadge class="brand-menu-ws-badge" aria-hidden="true">{countLabel(row.count)}</GlyphBadge>
     </button>

@@ -456,3 +456,68 @@ describe('an option preview', () => {
     })));
   });
 });
+
+// ADR 0415: an option's widget sits in one box with the option's button, as a
+// sibling, never a descendant. Only the button picks, and a settled card keeps
+// every widget.
+describe('an option with a widget', () => {
+  const player = {
+    id: 'lucidos-sound-player', name: 'Sound player', description: '', reveal: 'on-load' as const,
+    kind: 'widget' as const, reusable: true, built_in: true, params: { clip: { description: 'What to play', required: true } },
+  };
+  const options = [
+    { id: 'opt-0', label: 'Marin', description: 'Warm, unhurried', widget: { app_id: player.id, params: { clip: 'marin.mp3' }, label: 'Marin' } },
+    { id: 'opt-1', label: 'Ash' },
+  ];
+
+  async function withPlayerKnown(run: (host: HTMLElement) => void): Promise<void> {
+    const { appsById: widgetApps } = await import('../../../store/appsById');
+    widgetApps.value = new Map([[player.id, { status: 'loaded', data: player }]]);
+    const host = document.createElement('div');
+    document.body.append(host);
+    try {
+      run(host);
+    } finally {
+      render(null, host);
+      host.remove();
+      widgetApps.value = new Map();
+    }
+  }
+
+  it('draws the frame beside the button, and only buttons are choices', async () => {
+    await withPlayerKnown((host) => {
+      render(<QuestionBody threadId="t" toolUseId="tu-widget" question="Which voice?" options={options} multiSelect />, host);
+      const box = host.querySelector('.question-option-boxed')!;
+      const button = box.querySelector(':scope > button.question-option')!;
+      const frame = box.querySelector(':scope > .widget-embed')!;
+      expect(button && frame).toBeTruthy();
+      expect(button.contains(frame), 'the frame is never inside the button').toBe(false);
+      expect(button.compareDocumentPosition(frame) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(host.querySelectorAll('[data-role="card-choices"] button')).toHaveLength(2);
+      expect(button.querySelector('.question-option-desc')!.textContent).toBe('Warm, unhurried');
+
+      (frame as HTMLElement).click();
+      expect(getMultiSelectedIds('tu-widget'), 'a tap on the widget picks nothing').toEqual([]);
+      button.querySelector<HTMLElement>('.question-option-label')!.click();
+      expect(getMultiSelectedIds('tu-widget')).toEqual(['opt-0']);
+      setMultiSelectedIds('tu-widget', []);
+    });
+  });
+
+  it('keeps every widget on an answered card and a terminated one', async () => {
+    await withPlayerKnown((host) => {
+      render(
+        <AnsweredBody toolUseId="tu-a" question="Which voice?" options={options} multiSelect={false}
+          resolved={{ kind: 'Selected', option_id: 'opt-1' }} />,
+        host,
+      );
+      const box = host.querySelector('.question-option-boxed')!;
+      expect(box.querySelector('.widget-embed')).toBeTruthy();
+      expect(box.classList.contains('question-option-dimmed'), 'the box dims, not the row twice').toBe(true);
+      expect(box.querySelector('.question-option-static.question-option-dimmed')).toBeNull();
+
+      render(<TerminatedQuestionBody question="Which voice?" options={options} multiSelect={false} />, host);
+      expect(host.querySelector('.question-option-boxed .widget-embed')).toBeTruthy();
+    });
+  });
+});

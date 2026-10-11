@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, getExchangesWithPending, getLabel, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { applySummaryVersion, exchangeStatus, exchangeTimestamp, exchangeUserMessage, getCodingAgentWaitingInfo, groupIntoExchanges } from '../thread-events';
+import { applySummaryVersion, changeReadyToReview, exchangeStatus, exchangeTimestamp, exchangeUserMessage, getCodingAgentWaitingInfo, groupIntoExchanges } from '../thread-events';
 import { displaySection } from '../../generated/thread-lifecycle';
 import { effectiveThreadStatus } from '../store';
 
@@ -37,7 +37,7 @@ describe('Bug: applying a change keeps thread in Review until CC actually runs',
     thread.meta.channel = 'claude_code';
     applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'waiting');
     thread.meta.section = 'inbox';
-    thread.meta.codingAgentProposed = true;
+    thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
 
     expect(effectiveThreadStatus(thread)).toBe('waiting');
 
@@ -51,7 +51,7 @@ describe('Bug: applying a change keeps thread in Review until CC actually runs',
       const section = displaySection(
         thread.meta.section, effectiveThreadStatus(thread),
         thread.meta.saved, thread.meta.activeChildrenCount > 0,
-        thread.meta.codingAgentProposed,
+        changeReadyToReview(thread.meta),
         thread.meta.attentionDescendantCount > 0,
       );
       expect(section).toBe('current');
@@ -470,7 +470,7 @@ describe('Flow: MissingHardeningDetected', () => {
       { type: 'MissingHardeningDetected', created: t(-4000) } as any,
     ]);
 
-    // ResponseCanceled set idle (no codingAgentProposed). MissingHardeningDetected doesn't change status.
+    // ResponseCanceled set idle (nothing proposed). MissingHardeningDetected doesn't change status.
     // The hardening session (SessionStarted) will set it back to 'running' when it starts.
     expect(map.get(id)!.meta.status).toBe('idle');
   });
@@ -556,7 +556,7 @@ describe('SSE event-based status transitions via handleEvent()', () => {
 
     const thread = map.get(id)!;
 
-    // SessionEnded checks codingAgentProposed (false) → idle
+    // SessionEnded with nothing proposed → idle
     expect(thread.meta.status).toBe('idle');
   });
 
@@ -574,9 +574,9 @@ describe('SSE event-based status transitions via handleEvent()', () => {
 
     const thread = map.get(id)!;
 
-    // SessionEnded sets idle whatever codingAgentProposed says
+    // SessionEnded sets idle whatever the change state says
     expect(thread.meta.status).toBe('idle');
-    expect(thread.meta.codingAgentProposed).toBe(true);
+    expect(thread.meta.codingAgentChangeState.kind).toBe('proposed');
   });
 
   it('CodingAgentIdled sets status=idle', () => {
@@ -612,7 +612,7 @@ describe('SSE event-based status transitions via handleEvent()', () => {
       { type: 'ResponseGenerated', created: '2026-01-01T00:00:01Z' },
     ]);
 
-    // ResponseGenerated checks codingAgentProposed (false) → idle
+    // ResponseGenerated with nothing proposed → idle
     expect(map.get(id)!.meta.status).toBe('idle');
   });
 
@@ -632,8 +632,7 @@ describe('SSE event-based status transitions via handleEvent()', () => {
 
     // ChangeApplied sets status='idle' and clears all CC flags
     expect(map.get(id)!.meta.status).toBe('idle');
-    expect(map.get(id)!.meta.codingAgentProposed).toBe(false);
-    expect(map.get(id)!.meta.codingAgentRequiresRestart).toBe(false);
+    expect(map.get(id)!.meta.codingAgentChangeState).toEqual({ kind: 'none' });
   });
 
   it('ChangeDiscarded clears CC flags and sets status=idle', () => {
@@ -652,7 +651,7 @@ describe('SSE event-based status transitions via handleEvent()', () => {
 
     // ChangeDiscarded sets status='idle' and clears all CC flags
     expect(map.get(id)!.meta.status).toBe('idle');
-    expect(map.get(id)!.meta.codingAgentProposed).toBe(false);
+    expect(map.get(id)!.meta.codingAgentChangeState.kind).not.toBe('proposed');
   });
 });
 
@@ -671,7 +670,7 @@ describe('ResponseGenerated sets status=idle (when no pending changes)', () => {
       { type: 'ResponseGenerated', created: '2026-03-20T21:19:59Z' },
     ]);
 
-    // ResponseGenerated checks codingAgentProposed (false) → idle
+    // ResponseGenerated with nothing proposed → idle
     expect(map.get(id)!.meta.status).toBe('idle');
   });
 

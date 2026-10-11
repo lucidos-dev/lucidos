@@ -8,7 +8,9 @@
 @import './settings/backup.css';
 @import './settings/directory-picker.css';
 @import './settings/response-style-editor.css';
+@import './settings/settings-overview.css';
 @import './settings/disk-usage.css';
+@import './settings/prompt-footprint.css';
 @import './settings/keyboard-shortcuts.css';
 @import './settings/system.css';
 @import './settings/whats-new.css';

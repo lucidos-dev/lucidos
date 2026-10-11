@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { appUrl, fetchEventTypes } from './apps';
+import { appUrl, fetchEventTypes, pinAppApi, unpinAppApi } from './apps';
+import { parseWidgetParams } from '../../../../../packages/lucidos-sdk/src/params';
 import { engineRestarting } from '../../store/store';
 
 // The trigger event-type picker caches whatever verdict this read produces. So
@@ -67,6 +68,25 @@ describe('appUrl', () => {
       const url = appUrl('pr-understanding', 'thread-7');
       expect(url).toContain('thread_id=thread-7');
       expect(url).toContain('device=cfdb4cbfe6044f8b');
+    });
+
+    // ADR 0415: params ride one SDK-owned key, so the host keys survive and
+    // `lucidos.params()` reads back exactly what the host wrote.
+    it('carries widget params beside the host keys, and the SDK reads both back', () => {
+      const params = { clip: 'artifacts/voices/marin.mp3', thread_id: 'not-a-host-key' };
+      const url = new URL(appUrl('lucidos-sound-player', 'thread-7', undefined, params), 'http://h');
+      expect(url.searchParams.get('thread_id')).toBe('thread-7');
+      expect(url.searchParams.get('device')).toBe('cfdb4cbfe6044f8b');
+      expect(parseWidgetParams(url.search)).toEqual(params);
+    });
+
+    it('writes one URL for one instance, whatever the key order', () => {
+      expect(appUrl('w', undefined, undefined, { b: 1, a: { d: 2, c: 3 } }))
+        .toBe(appUrl('w', undefined, undefined, { a: { c: 3, d: 2 }, b: 1 }));
+    });
+
+    it('adds no params key for empty params', () => {
+      expect(appUrl('w', undefined, undefined, {})).not.toContain('params=');
     });
 
     it('still puts the fragment last', () => {
@@ -138,5 +158,42 @@ describe('fetchEventTypes', () => {
 
     await expect(fetchEventTypes()).rejects.toThrow('Load failed');
     expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+// The engine answers a failed pin with `200 {success: false}`. `pinApp` pins
+// optimistically and reverts only on a rejection. A resolved refusal therefore
+// left the tile pinned on screen and in the offline cache.
+describe('pinAppApi and unpinAppApi', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockFetch = vi.fn();
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    engineRestarting.value = false;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('resolves when the engine reports success', async () => {
+    mockFetch.mockImplementation(() => Promise.resolve(okJson({ success: true })));
+
+    await expect(pinAppApi('habit-tracker', 'device-1')).resolves.toEqual({ success: true });
+    await expect(unpinAppApi('habit-tracker', 'device-1')).resolves.toEqual({ success: true });
+  });
+
+  it('rejects a pin the engine refused, with its reason', async () => {
+    mockFetch.mockResolvedValue(okJson({ success: false, error: 'Failed to pin app: pool timed out' }));
+
+    await expect(pinAppApi('habit-tracker', 'device-1')).rejects.toThrow('Failed to pin app: pool timed out');
+  });
+
+  it('rejects an unpin the engine refused, naming the app when no reason came', async () => {
+    mockFetch.mockResolvedValue(okJson({ success: false }));
+
+    await expect(unpinAppApi('habit-tracker', 'device-1')).rejects.toThrow('habit-tracker');
   });
 });

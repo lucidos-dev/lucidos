@@ -1,6 +1,9 @@
-//! Stop hook subcommand: when CC tries to idle, nudge it to run `/harden` if
-//! it has committed work that hasn't been reviewed yet. Soft reminder — the
-//! model can ignore it and continue, or run `/harden` and stop again.
+//! Stop hook subcommand: when Claude Code ends its turn on a plaintext
+//! question, send it back once to re-ask through AskUserQuestion. A soft block:
+//! the model re-asks, or keeps its open-ended question and stops again.
+//!
+//! Asking for `/harden` belongs to the engine's turn-end gate, which reaches
+//! both backends (ADR 0417).
 //!
 //! Wired into `<workspace>/.lucidos/cc-settings.json` via the engine's
 //! `cc_settings.rs`.
@@ -10,8 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::hardened::{self, HardenedState};
-use crate::workspace::{resolve_from_env, BoxError};
+use crate::workspace::BoxError;
 
 /// Env var the engine sets when spawning a CC session that's interactive
 /// (chat / recovery / external-repo). Absent for unattended sessions
@@ -127,102 +129,6 @@ pub(crate) fn detect_plaintext_question(
     Ok(Some(uuid.to_string()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StopDecision {
-    Allow,
-    Remind,
-}
-
-/// Outcome of the Stop hook orchestration. Three states because the hook now
-/// covers two unrelated concerns: harden enforcement and AskUserQuestion
-/// redirect. `run()` maps each variant to one stdout JSON.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StopAction {
-    Allow,
-    RemindHarden,
-    RedirectQuestion { message_uuid: String },
-}
-
-/// Pure decision: should this Stop attempt trigger a `/harden` reminder?
-/// Sentinel handling lives in `run()` — the pre-filter is the sole enforcement
-/// so this signature stays tight.
-pub(crate) fn decide(commits_ahead: u32, state: HardenedState) -> StopDecision {
-    if commits_ahead == 0 {
-        return StopDecision::Allow;
-    }
-    match state {
-        // Fresh/Stale = trusted per CLAUDE.md (follow-up commits don't re-trigger).
-        HardenedState::Fresh | HardenedState::Stale => StopDecision::Allow,
-        HardenedState::Missing => StopDecision::Remind,
-    }
-}
-
-/// Orchestrates the Stop-hook priority: a detected plaintext question wins
-/// over the harden reminder (the user must answer first; harden makes no
-/// sense until the question is resolved). Each sentinel-present flag means
-/// "we already nudged for this key" — guards against infinite redirect loops
-/// (question) and re-nagging on the same commit (harden). Pure function —
-/// `run()` does the IO and feeds it the inputs.
-pub(crate) fn decide_stop_action(
-    question_uuid: Option<String>,
-    question_sentinel_present: bool,
-    commits_ahead: u32,
-    state: HardenedState,
-    harden_sentinel_present: bool,
-) -> StopAction {
-    if let Some(uuid) = question_uuid {
-        if !question_sentinel_present {
-            return StopAction::RedirectQuestion { message_uuid: uuid };
-        }
-    }
-    if harden_sentinel_present {
-        return StopAction::Allow;
-    }
-    match decide(commits_ahead, state) {
-        StopDecision::Allow => StopAction::Allow,
-        StopDecision::Remind => StopAction::RemindHarden,
-    }
-}
-
-/// What an unreadable commit count stands in for: one commit, which reminds
-/// when no marker is present.
-const UNKNOWN_COMMITS_AHEAD: u32 = 1;
-
-/// How many commits this branch carries that `main` does not, as the reminder
-/// reads it.
-///
-/// A probe that could not run is UNKNOWN, never zero. Zero is the one answer
-/// that lets unhardened work through, and `git rev-list` fails for reasons
-/// that say nothing about the branch: a spawn failure, a busy index, a
-/// repository with no `main`. The engine probe in [`run`] resolves its own
-/// unknown toward the reminder, and this one now matches it.
-pub(crate) fn commits_ahead_or_unknown(probe: Result<String, BoxError>) -> u32 {
-    probe
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .unwrap_or(UNKNOWN_COMMITS_AHEAD)
-}
-
-/// `cc-settings.json` is workspace-scoped, so this hook fires for
-/// external-repo CC sessions too. `/harden` is only defined in the Lucidos
-/// repo at `.claude/commands/harden.md` — the per-session filesystem check
-/// keeps the reminder from pointing CC at a command that isn't there.
-pub(crate) fn harden_command_available(cwd: &Path) -> bool {
-    cwd.join(".claude/commands/harden.md").is_file()
-}
-
-pub(crate) const REMINDER_REASON: &str =
-    "If you're done implementing, run /harden now. If you have more work to do, \
-     ignore this and continue.";
-
-pub(crate) fn build_reminder_json() -> String {
-    serde_json::json!({
-        "decision": "block",
-        "reason": REMINDER_REASON,
-    })
-    .to_string()
-}
-
 pub(crate) const QUESTION_REDIRECT_REASON: &str =
     "You ended your turn with a plaintext question. Re-issue it via the \
      AskUserQuestion tool so the user can click options instead of typing. \
@@ -246,87 +152,32 @@ pub(crate) fn run() -> Result<(), BoxError> {
     let mut stdin_buf = String::new();
     let _ = std::io::stdin().lock().read_to_string(&mut stdin_buf);
 
-    let cwd = std::env::current_dir().map_err(|e| format!("cc-stop-reminder cwd: {}", e))?;
-
-    // External-repo CC sessions reach this hook too (cc-settings.json is
-    // workspace-scoped). Skip silently when /harden isn't available.
-    if !harden_command_available(&cwd) {
+    // Only an interactive session can redirect: an unattended one
+    // (conflict resolution) would hang waiting for an answer that never comes.
+    // The engine sets the variable in `runtime/claude_code.rs::build_command`
+    // from `SpawnArgs.interactive`.
+    if std::env::var(SESSION_KIND_ENV).as_deref() != Ok(SESSION_KIND_INTERACTIVE) {
         return Ok(());
     }
-
-    // AskUserQuestion redirect only fires for interactive sessions —
-    // unattended ones (conflict-resolution) would hang waiting for an answer
-    // that's not coming. Env var is set by the engine in
-    // `runtime/claude_code.rs::build_command` from `SpawnArgs.interactive`.
-    let question_uuid =
-        if std::env::var(SESSION_KIND_ENV).as_deref() == Ok(SESSION_KIND_INTERACTIVE) {
-            parse_stop_hook_payload(&stdin_buf).ok().and_then(|p| {
-                detect_plaintext_question(Path::new(&p.transcript_path))
-                    .ok()
-                    .flatten()
-            })
-        } else {
-            None
-        };
-
-    let commits_ahead = commits_ahead_or_unknown(hardened::run_git(
-        &cwd,
-        &["rev-list", "--count", "main..HEAD"],
-    ));
-
-    if question_uuid.is_none() && commits_ahead == 0 {
+    let question_uuid = parse_stop_hook_payload(&stdin_buf).ok().and_then(|p| {
+        detect_plaintext_question(Path::new(&p.transcript_path))
+            .ok()
+            .flatten()
+    });
+    let Some(message_uuid) = question_uuid else {
         return Ok(());
-    }
-
-    let head_sha = hardened::run_git(&cwd, &["rev-parse", "HEAD"]).unwrap_or_default();
-    let harden_sentinel_present = !head_sha.is_empty() && sentinel_path(&head_sha).exists();
-
-    let state = if commits_ahead == 0 || harden_sentinel_present {
-        HardenedState::Fresh
-    } else {
-        let Ok(ws) = resolve_from_env() else {
-            return Ok(());
-        };
-        // Engine unreachable / transport error => Missing, which still reminds.
-        // Better to nag than let unhardened code through unnoticed.
-        hardened::query_state(&ws).unwrap_or(HardenedState::Missing)
     };
-
-    let question_sentinel_present = question_uuid
-        .as_ref()
-        .map(|u| question_sentinel_path(u).exists())
-        .unwrap_or(false);
-
-    match decide_stop_action(
-        question_uuid,
-        question_sentinel_present,
-        commits_ahead,
-        state,
-        harden_sentinel_present,
-    ) {
-        StopAction::Allow => Ok(()),
-        StopAction::RemindHarden => {
-            if !head_sha.is_empty() {
-                write_sentinel(&sentinel_path(&head_sha));
-            }
-            println!("{}", build_reminder_json());
-            Ok(())
-        }
-        StopAction::RedirectQuestion { message_uuid } => {
-            write_sentinel(&question_sentinel_path(&message_uuid));
-            println!("{}", build_question_redirect_json());
-            Ok(())
-        }
+    // The sentinel means this message was already sent back once.
+    let sentinel = question_sentinel_path(&message_uuid);
+    if !sentinel.exists() {
+        write_sentinel(&sentinel);
+        println!("{}", build_question_redirect_json());
     }
+    Ok(())
 }
 
-fn sentinel_path(head_sha: &str) -> PathBuf {
-    cc_sentinel_path("stop-reminder", head_sha)
-}
-
-/// Writing the sentinel is the loop guard for both the harden reminder and
-/// the question redirect — if it silently fails we'd re-nag every Stop or
-/// infinite-loop the redirect. Surface the failure on stderr (CC's hook
+/// Writing the sentinel is the redirect's loop guard. If it silently failed,
+/// the hook would redirect the same question on every Stop. Surface the failure on stderr (CC's hook
 /// stderr is preserved) instead of `let _ = `.
 fn write_sentinel(path: &Path) {
     if let Err(e) = std::fs::write(path, b"") {
@@ -543,155 +394,10 @@ mod tests {
         assert!(b.to_string_lossy().contains("bbbb"));
     }
 
+    /// The hook acts on a plaintext question and nothing else. Asking for
+    /// `/harden` has one definition, the engine's turn-end gate (ADR 0417).
     #[test]
-    fn stop_action_redirects_question_when_detected_and_sentinel_absent() {
-        let action = decide_stop_action(
-            Some("uuid-1".to_string()),
-            false, // question sentinel absent
-            5,     // commits_ahead — irrelevant when question wins
-            HardenedState::Missing,
-            false, // harden sentinel absent
-        );
-        assert_eq!(
-            action,
-            StopAction::RedirectQuestion {
-                message_uuid: "uuid-1".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn stop_action_falls_through_to_harden_when_question_sentinel_present() {
-        let action = decide_stop_action(
-            Some("uuid-1".to_string()),
-            true, // question sentinel present — already redirected once
-            5,
-            HardenedState::Missing,
-            false,
-        );
-        assert_eq!(action, StopAction::RemindHarden);
-    }
-
-    #[test]
-    fn stop_action_falls_through_to_harden_when_no_question() {
-        let action = decide_stop_action(None, false, 5, HardenedState::Missing, false);
-        assert_eq!(action, StopAction::RemindHarden);
-    }
-
-    #[test]
-    fn stop_action_allows_when_no_question_and_no_commits() {
-        let action = decide_stop_action(None, false, 0, HardenedState::Missing, false);
-        assert_eq!(action, StopAction::Allow);
-    }
-
-    #[test]
-    fn stop_action_allows_when_no_question_and_already_hardened() {
-        let action = decide_stop_action(None, false, 5, HardenedState::Fresh, false);
-        assert_eq!(action, StopAction::Allow);
-    }
-
-    #[test]
-    fn stop_action_allows_when_harden_sentinel_present_even_if_state_missing() {
-        // Sentinel encodes "we already nudged for this commit" — second Stop
-        // attempt for the same HEAD must allow even if the engine still
-        // reports Missing (e.g. user hasn't run /harden yet, but we already
-        // reminded them once).
-        let action = decide_stop_action(None, false, 5, HardenedState::Missing, true);
-        assert_eq!(action, StopAction::Allow);
-    }
-
-    /// A `git rev-list` that could not run says nothing about the branch being
-    /// clean. Read as zero it silenced the reminder on a session with
-    /// unhardened commits, which is the one direction that loses work.
-    #[test]
-    fn an_unreadable_commit_count_reminds_instead_of_allowing() {
-        let spawn_failed = commits_ahead_or_unknown(Err("git rev-list: no such file".into()));
-        assert_eq!(
-            decide(spawn_failed, HardenedState::Missing),
-            StopDecision::Remind,
-        );
-        // Output that will not parse is the same unknown: empty on a killed
-        // git, or a line from a repository that answered something else.
-        let unparseable = commits_ahead_or_unknown(Ok(String::new()));
-        assert_eq!(
-            decide(unparseable, HardenedState::Missing),
-            StopDecision::Remind,
-        );
-    }
-
-    #[test]
-    fn a_readable_commit_count_is_used_as_it_stands() {
-        assert_eq!(commits_ahead_or_unknown(Ok("0".to_string())), 0);
-        assert_eq!(commits_ahead_or_unknown(Ok("7\n".to_string())), 7);
-    }
-
-    #[test]
-    fn allow_when_no_commits_ahead() {
-        assert_eq!(
-            decide(0, HardenedState::Missing),
-            StopDecision::Allow,
-            "read-only sessions must not get a spurious harden reminder",
-        );
-    }
-
-    #[test]
-    fn allow_when_already_fresh() {
-        assert_eq!(decide(5, HardenedState::Fresh), StopDecision::Allow);
-    }
-
-    #[test]
-    fn allow_when_stale_marker_present() {
-        // CLAUDE.md policy: once hardened, follow-up tweaks don't re-trigger.
-        assert_eq!(decide(7, HardenedState::Stale), StopDecision::Allow);
-    }
-
-    #[test]
-    fn remind_when_commits_exist_and_no_marker() {
-        assert_eq!(decide(1, HardenedState::Missing), StopDecision::Remind);
-    }
-
-    #[test]
-    fn harden_command_available_true_when_file_present() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".claude/commands")).unwrap();
-        std::fs::write(dir.path().join(".claude/commands/harden.md"), b"# /harden").unwrap();
-        assert!(
-            harden_command_available(dir.path()),
-            "Lucidos worktree ships .claude/commands/harden.md — must detect it",
-        );
-    }
-
-    #[test]
-    fn harden_command_available_false_when_file_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(
-            !harden_command_available(dir.path()),
-            "external repos don't ship /harden — hook must not nudge for it",
-        );
-    }
-
-    #[test]
-    fn harden_command_available_false_when_path_is_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".claude/commands/harden.md")).unwrap();
-        assert!(
-            !harden_command_available(dir.path()),
-            "must require a regular file, not a directory of that name",
-        );
-    }
-
-    #[test]
-    fn reminder_json_uses_block_decision_with_permissive_reason() {
-        let parsed: serde_json::Value = serde_json::from_str(&build_reminder_json()).unwrap();
-        assert_eq!(parsed["decision"], "block");
-        let reason = parsed["reason"].as_str().expect("reason must be a string");
-        assert!(
-            reason.contains("/harden"),
-            "reason must name the skill so CC knows what to invoke",
-        );
-        assert!(
-            reason.to_lowercase().contains("ignore"),
-            "wording must be permissive — CC can ignore if not done",
-        );
+    fn the_hook_never_asks_for_harden() {
+        assert!(!build_question_redirect_json().contains("/harden"));
     }
 }

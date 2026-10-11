@@ -218,18 +218,19 @@ fn shutdown_wins_over_empty_text() {
 }
 
 /// Empty-text Result on an otherwise-clean turn classifies as `Failed`
-/// (the OOM-killed Bash / SIGTERM'd subprocess scenario). The propose
-/// gate refuses Failed, so this turn does NOT surface as a pending
-/// change — the user gets a red-dot terminal in the UI and the partial
-/// worktree state stays uncommitted on the branch for resume. Without
-/// this branch the empty Result would render as a green "completed"
-/// turn AND auto-propose the partial work as Apply-ready.
+/// (the OOM-killed Bash / SIGTERM'd subprocess scenario). A failed turn is
+/// unfinished, so its work is withheld and never surfaces as a pending
+/// change (ADR 0400). The user gets a red-dot terminal, and the partial work
+/// stays on the branch for resume. Without this branch the empty Result
+/// would render as a green "completed" turn AND propose the partial work.
 #[test]
 fn empty_text_failed_does_not_propose() {
     let (terminal, _) = classify_result(false, false, false, None, true);
-    assert!(
-        idle_change_write(false, false, false, &Some(terminal)).is_none(),
-        "empty-text Failed (OOM / SIGTERM) must NOT auto-propose — half-assed"
+    let write = idle_change_write(IdleSession::default(), &Some(terminal));
+    assert_eq!(
+        write,
+        Some(IdleChangeWrite::Unfinished),
+        "empty-text Failed (OOM / SIGTERM) is withheld, never proposed"
     );
 }
 
@@ -908,21 +909,18 @@ fn run_direct_agent_refuses_empty_input_before_anything_else() {
 ///     deletes (the thread-9e37697e data-loss fix); only the explicit
 ///     Discard / conflict paths `git branch -D`.
 ///   - A cancel keeps the branch so the session stays resumable, even with no
-///     commits. A Stop with net work proposes it as incomplete, so stopped work
-///     keeps an Apply (ADR 0328). A redirect never proposes: its follow-up
-///     continues the branch. Both rank below the external and crash arms.
+///     commits. A Stop or a failure with net work withholds it: an unfinished
+///     turn never proposes (ADR 0400). A redirect never proposes: its follow-up
+///     continues the branch. All rank below the external and crash arms.
 #[test]
 fn classify_session_end_action_table() {
     use SessionEndAction::*;
-    use TurnCancel::{None as NotCanceled, Redirected, Stopped};
+    use TurnCancel::{Failed, None as NotCanceled, Redirected, Stopped};
     let cases = [
         // (has_commits, files_empty, is_external, safety_net_fired, cancel) → action
         //
         // Healthy turn (no safety net, not cancelled):
-        (
-            (true, false, false, false, NotCanceled),
-            Propose { incomplete: false },
-        ),
+        ((true, false, false, false, NotCanceled), Propose),
         ((true, true, false, false, NotCanceled), KeepEmptyBranch), // phantom-Change regression
         ((true, false, true, false, NotCanceled), KeepExternalBranch),
         ((true, true, true, false, NotCanceled), KeepExternalBranch),
@@ -949,15 +947,19 @@ fn classify_session_end_action_table() {
         //
         // A Stop keeps the branch so the session stays resumable. The
         // grilling-cancel bug is the no-commits row: it MUST be
-        // KeepCanceledBranch, not KeepEmptyBranch. Net work proposes as
-        // incomplete, so stopped work never loses its Apply.
+        // KeepCanceledBranch, not KeepEmptyBranch. Net work is withheld,
+        // never proposed: the turn did not finish.
         ((false, true, false, false, Stopped), KeepCanceledBranch), // grilling cancel (the bug)
         ((false, false, false, false, Stopped), KeepCanceledBranch),
-        (
-            (true, false, false, false, Stopped),
-            Propose { incomplete: true },
-        ),
+        ((true, false, false, false, Stopped), WithholdUnfinished),
         ((true, true, false, false, Stopped), KeepCanceledBranch),
+        // A failure is unfinished too. With no net work it keeps the branch
+        // like any session end.
+        ((true, false, false, false, Failed), WithholdUnfinished),
+        ((true, true, false, false, Failed), KeepEmptyBranch),
+        ((false, true, false, false, Failed), KeepEmptyBranch),
+        ((true, false, true, false, Failed), KeepExternalBranch),
+        ((true, false, false, true, Failed), CrashedKeepBranch),
         // A redirect never proposes: its follow-up continues on the branch.
         ((true, false, false, false, Redirected), KeepCanceledBranch),
         ((false, true, false, false, Redirected), KeepCanceledBranch),

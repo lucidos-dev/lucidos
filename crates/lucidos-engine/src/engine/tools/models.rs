@@ -67,11 +67,12 @@ impl LucidosEngine {
                 .collect::<Vec<_>>()
                 .join("; ");
             out.push_str(&format!(
-                "- {}: \"{}\" | routes: {} | {} | {} | {}\n",
+                "- {}: \"{}\" | routes: {} | {} | default effort: {} | {} | {}\n",
                 m.id,
                 m.label,
                 routes,
                 vision_label(m.vision),
+                m.default_effort.as_deref().unwrap_or("provider default"),
                 if m.enabled { "enabled" } else { "disabled" },
                 if m.is_builtin() { "builtin" } else { "user" },
             ));

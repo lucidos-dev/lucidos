@@ -1,32 +1,72 @@
 /**
- * There is exactly ONE apps glyph.
+ * An app or widget picture has one renderer, and the apps glyph one drawing.
  *
- * Three surfaces mark an app: Search Everywhere's result rows and the
- * content-pane back/forward history menu (both through `CategoryIcon`'s `apps`
- * case), and the message route panel's fallback for an app whose manifest
- * declares no icon of its own. Before 2026-08-13 the first two drew a 2x2
- * rounded tile grid inline while the third rendered a 📦, so the same concept
- * wore two marks and neither knew about the other.
+ * Every surface naming an app or widget draws its app icon through `AppIcon`
+ * (ADR 0414, invariant I3). The manifest's `icon` is a path, so a surface
+ * rendering it as text, or drawing a generic glyph instead, is the bug. The
+ * surface half is a source scan: a rendered check sees only the surfaces it
+ * mounts, and a new reader of `icon` would slip past it.
  *
- * They are one `AppsIcon` now, and this pins it from both ends: `CategoryIcon`
- * must delegate rather than re-inline, and `resolveAppInfo`'s fallback must be
- * that same component. Without the first half the grid can quietly come back
- * next to a package; without the second the route panel drifts on its own.
- *
- * The `CategoryIcon` half is a source scan because the point is that the file
- * contains no second drawing, which a rendered comparison cannot express: two
- * hand-written copies of one path render identically and pass.
+ * The apps glyph (`AppsIcon`) still marks the apps CATEGORY: the menu drawer's
+ * Apps row and a search hit for the Apps page. `CategoryIcon` must delegate
+ * to it rather than re-inline a second drawing, which a rendered comparison
+ * cannot express: two hand-written copies of one path render identically.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 import type { VNode } from 'preact';
 import { CategoryIcon } from '../CategoryIcon';
+import { AppIcon } from '../AppIcon';
 import { AppsIcon } from '../icons';
 import { resolveAppInfo } from '../../chat/MessageRoutePanel';
 import { appsList } from '../../../store/store';
 
-const CATEGORY_ICON_SRC = readFileSync(new URL('../CategoryIcon.tsx', import.meta.url), 'utf8');
+const source = (rel: string): string => readFileSync(new URL(rel, import.meta.url), 'utf8');
+
+/** Every surface that names an app or widget (ADR 0414 § Decision). */
+const APP_SURFACES = [
+  '../../apps/AppCard.tsx',
+  '../../apps/ReusableWidgetsSection.tsx',
+  '../../layout/Drawer.tsx',
+  '../../widgets/WidgetShelf.tsx',
+  '../../widgets/WidgetCard.tsx',
+  '../../search/SearchEverywhere.tsx',
+  '../../layout/ContentNav.tsx',
+  '../../chat/MessageRoutePanel.tsx',
+];
+
+/** How an `icon` field may appear on a surface: handed to `AppIcon`, or
+ *  carried to the line that does. `appInfo.icon` is the `AppIcon` node
+ *  `resolveAppInfo` built, not the raw field. */
+const ALLOWED_ICON_READS = [
+  /icon=\{[\w$?.]+\.icon\}/,
+  /appIcon: [\w$?.]+\.icon\b/,
+  /\{appInfo\.icon\}/,
+];
+
+describe('every app surface draws its picture through AppIcon (I3)', () => {
+  for (const rel of APP_SURFACES) {
+    const src = source(rel);
+    it(`${rel} renders AppIcon`, () => {
+      expect(src).toMatch(/<(AppIcon|ListedAppIcon)\b/);
+    });
+
+    it(`${rel} draws no generic glyph for an app or widget`, () => {
+      expect(src).not.toMatch(/<(WidgetIcon|AppsIcon)\b/);
+    });
+
+    it(`${rel} reads an icon field only to hand it to AppIcon`, () => {
+      const reads = src.split('\n').filter((line) => /\.icon\b(?!-)/.test(line));
+      const stray = reads.filter((line) => !ALLOWED_ICON_READS.some((ok) => ok.test(line)));
+      expect(stray).toEqual([]);
+    });
+  }
+
+  it('only AppIcon builds an app file URL for a picture', () => {
+    for (const rel of APP_SURFACES) expect(source(rel)).not.toContain('appFileUrl(');
+  });
+});
 
 describe('the apps glyph has one definition', () => {
   it('CategoryIcon delegates its apps case to AppsIcon', () => {
@@ -36,53 +76,47 @@ describe('the apps glyph has one definition', () => {
   it('CategoryIcon draws no apps shape of its own', () => {
     // The arm runs from `case 'apps':` to the next `case`, and must contain no
     // geometry: a `<rect>`/`<path>`/`<circle>` here is a second copy of the mark.
-    const arm = CATEGORY_ICON_SRC.split("case 'apps':")[1]?.split('case ')[0] ?? '';
+    const arm = source('../CategoryIcon.tsx').split("case 'apps':")[1]?.split('case ')[0] ?? '';
     expect(arm, "expected a `case 'apps':` arm").not.toBe('');
     expect(arm).not.toMatch(/<(rect|path|circle|polyline|polygon|line)\b/);
     expect(arm).toContain('AppsIcon');
   });
 
-  it('the route panel fallback is the same component', () => {
-    appsList.value = { status: 'loaded', data: [] };
-    const info = resolveAppInfo('data/apps/habit-tracker');
-    expect(info?.name).toBe('habit-tracker');
-    expect((info?.icon as VNode).type).toBe(AppsIcon);
-  });
-
   it('AppsIcon sizes itself, because one of its slots has no CSS to size it', () => {
     // `.search-everywhere-result-icon` carries no rule anywhere in styles/.
-    // That surface has always sized its glyphs from the `width`/`height`
-    // attributes `CategoryIcon`'s props spread puts on each <svg>. Delegating
-    // the apps case to a component that omitted them painted an app hit at the
-    // default replaced-element box (~300px) instead of 1rem. The other two
-    // consumers do size their slot in CSS and so never showed it.
+    // That surface sizes its glyphs from the `width`/`height` attributes.
     const svg = AppsIcon() as VNode<Record<string, unknown>>;
     expect(svg.props.width).toBe('1rem');
     expect(svg.props.height).toBe('1rem');
-    // A caller with its own CSS still wins: a rule beats a presentation
-    // attribute, which is what keeps the route panel at --icon-size-md.
     const sized = AppsIcon({ size: '2rem' }) as VNode<Record<string, unknown>>;
     expect(sized.props.width).toBe('2rem');
   });
 });
 
-describe("an app's own manifest icon is user content and passes through", () => {
-  it('a declared icon is rendered verbatim, never replaced by the fallback', () => {
+describe('the coding-agent App row', () => {
+  const iconProps = (folder: string) =>
+    (resolveAppInfo(folder)?.icon as VNode<Record<string, unknown>>);
+
+  it('hands the listed icon to AppIcon', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', icon: '\u{1F331}' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', icon: 'assets/icon.svg' }],
     } as typeof appsList.value;
     const info = resolveAppInfo('data/apps/habit-tracker');
-    expect(info?.icon).toBe('\u{1F331}');
     expect(info?.name).toBe('Habit Tracker');
+    const node = iconProps('data/apps/habit-tracker');
+    expect(node.type).toBe(AppIcon);
+    expect(node.props).toMatchObject({ appId: 'habit-tracker', name: 'Habit Tracker', icon: 'assets/icon.svg' });
   });
 
-  it('a loaded app with an empty icon falls back', () => {
+  it('shows the monogram tile for an app with no icon', () => {
     appsList.value = {
       status: 'loaded',
-      data: [{ id: 'habit-tracker', name: 'Habit Tracker', icon: '' }],
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker' }],
     } as typeof appsList.value;
-    expect((resolveAppInfo('data/apps/habit-tracker')?.icon as VNode).type).toBe(AppsIcon);
+    const node = iconProps('data/apps/habit-tracker');
+    expect(node.type).toBe(AppIcon);
+    expect(node.props.icon).toBeUndefined();
   });
 
   it('a failed appsList fetch says so in the name and still marks the row', () => {
@@ -90,7 +124,7 @@ describe("an app's own manifest icon is user content and passes through", () => 
     const info = resolveAppInfo('data/apps/habit-tracker');
     expect(info?.failed).toBe(true);
     expect(info?.name).toContain('apps failed to load');
-    expect((info?.icon as VNode).type).toBe(AppsIcon);
+    expect(iconProps('data/apps/habit-tracker').type).toBe(AppIcon);
   });
 
   it('a still-loading appsList marks the row without claiming failure', () => {
@@ -98,6 +132,6 @@ describe("an app's own manifest icon is user content and passes through", () => 
     const info = resolveAppInfo('data/apps/habit-tracker');
     expect(info?.failed).toBeUndefined();
     expect(info?.name).toBe('habit-tracker');
-    expect((info?.icon as VNode).type).toBe(AppsIcon);
+    expect(iconProps('data/apps/habit-tracker').type).toBe(AppIcon);
   });
 });

@@ -63,7 +63,7 @@ pub struct TriggerDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Reasoning effort for this trigger's intent fires. Omitted (None) = the
-    /// account `chat_reasoning_effort` preference.
+    /// account's tier for the model it runs on, else that model's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// The backend the pinned model runs on. Omitted (None) = the model's own

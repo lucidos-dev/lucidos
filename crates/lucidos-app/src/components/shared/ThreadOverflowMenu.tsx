@@ -1,6 +1,6 @@
 import { OverflowMenu, type HostOpener, type TriggerFace } from './OverflowMenu';
 import type { ComponentChildren } from 'preact';
-import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, InboxIcon, LocateIcon, MoveToTopIcon, PinIcon, SearchIcon, SetAsideIcon, SparkleIcon, StandingApplyIcon, TrashIcon } from './icons';
+import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, CurrentIcon, LocateIcon, MoveToTopIcon, PinIcon, SearchIcon, SetAsideIcon, SparkleIcon, StandingApplyIcon, TrashIcon } from './icons';
 import { canRenameThread, canSuggestThreadName, promptRenameThread, suggestThreadName } from '../../store/actions/threadRename';
 import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
 import { exportThread } from '../../utils/exportThread';
@@ -24,7 +24,7 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
   discard: () => <TrashIcon />,
 };
 
-/** Per-thread overflow (⋯) menu for a STARTED thread: Show in thread list and a
+/** Per-thread overflow (⋯) menu for a STARTED thread: Show in Folders and a
  *  Pin/Unpin toggle first, then Copy thread reference / Copy thread title / Download thread, then the
  *  conditional change, Archive and Delete actions.
  *  Built on the shared <OverflowMenu> shell (trigger + anchored menu popover +
@@ -58,9 +58,10 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
  *  sits with the mutating actions. It confirms, because it cannot be undone,
  *  but it is not red: nothing is stopped or lost.
  *
- *  **Show in thread list leads the menu, in the thread titles only**: they
- *  pass `onShowInThreadList`. On a drawer row it would point at the row
- *  just opened. **Find in thread** joins it there, for the same reason
+ *  **Show in Folders leads the menu** wherever the host passes
+ *  `onShowInFolders`: the thread titles, and a drawer row under Ongoing. A
+ *  row under Folders leaves it out, since it would point at itself.
+ *  **Find in thread** joins it in the thread titles only
  *  (`onFindInThread`): it searches the open transcript.
  *
  *  **Rename… and Suggest name follow, on a sent thread.** This menu is the only
@@ -71,10 +72,10 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
  *  **Pin/Unpin shows on every open.** The mobile title row draws no pin, and a
  *  drawer row's pin is mouse-only (`tabindex=-1`), so the menu must carry it.
  *  Beside an inline pin it repeats that button, which costs nothing. */
-export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, onFindInThread, stopPropagation, extraClass, tabIndex, hostOpener, face }: {
+export function ThreadOverflowMenu({ threadId, title, onShowInFolders, onFindInThread, stopPropagation, extraClass, tabIndex, hostOpener, face }: {
   threadId: string;
   title: string;
-  onShowInThreadList?: () => void;
+  onShowInFolders?: () => void;
   onFindInThread?: () => void;
   stopPropagation?: boolean;
   extraClass?: string;
@@ -106,12 +107,12 @@ export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, onFind
         const exits = exitItems(threadId);
         return (
           <>
-            {(onShowInThreadList || onFindInThread) && (
+            {(onShowInFolders || onFindInThread) && (
               <>
-                {onShowInThreadList && (
-                  <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(onShowInThreadList)}>
+                {onShowInFolders && (
+                  <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(onShowInFolders)}>
                     <LocateIcon />
-                    Show in thread list
+                    Show in Folders
                   </button>
                 )}
                 {onFindInThread && (
@@ -195,7 +196,7 @@ export function ThreadOverflowMenu({ threadId, title, onShowInThreadList, onFind
             {exits.archive === 'blocked' && <BlockedExit icon={<ArchiveIcon />} label="Archive" reason={exits.reason} />}
             {exits.unarchive && (
               <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void handleUnarchiveThread(threadId); })}>
-                <InboxIcon />
+                <CurrentIcon />
                 Move to Current
               </button>
             )}

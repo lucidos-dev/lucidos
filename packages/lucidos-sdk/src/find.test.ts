@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  clearFind, collectPageText, find, matchSpans, MAX_FIND_MATCHES, queryPattern, serveFind, spanToRange, stepIndex,
+  clearFind, collectPageText, createFinder, createPainter, find, matchSpans, MAX_FIND_MATCHES, queryPattern, revealRange, serveFind, spanToRange,
+  stepIndex,
 } from './find';
 
 // jsdom has no layout. Every range sits at the top of the viewport, which is
@@ -124,6 +125,42 @@ describe('find over a document', () => {
     scrollBy.mockRestore();
   });
 
+  it('treats a match under a floating bar as out of view, and centres it in the clear band', () => {
+    const rect = vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 10, 10, 20));
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => {});
+    document.body.innerHTML = '<p>a</p>';
+    const range = document.createRange();
+    range.selectNodeContents(document.body.firstChild!);
+    revealRange(range, { top: 100, bottom: 300 });
+    expect(scrollBy).toHaveBeenCalledWith(0, 10 - 100 - (200 - 20) / 2);
+    rect.mockRestore();
+    scrollBy.mockRestore();
+  });
+
+  it('keeps a finder\'s matches clear of the band it is given', () => {
+    const rect = vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 10, 10, 20));
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => {});
+    document.body.innerHTML = '<p>a</p>';
+    const finder = createFinder(() => document.body, createPainter(() => false), () => ({ top: 100, bottom: 300 }));
+    finder.find('a');
+    expect(scrollBy).toHaveBeenCalledWith(0, 10 - 100 - (200 - 20) / 2);
+    finder.clear();
+    rect.mockRestore();
+    scrollBy.mockRestore();
+  });
+
+  it('leaves a match alone when it shows inside the clear band', () => {
+    const rect = vi.spyOn(Range.prototype, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 150, 10, 20));
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => {});
+    document.body.innerHTML = '<p>a</p>';
+    const range = document.createRange();
+    range.selectNodeContents(document.body.firstChild!);
+    revealRange(range, { top: 100, bottom: 300 });
+    expect(scrollBy).not.toHaveBeenCalled();
+    rect.mockRestore();
+    scrollBy.mockRestore();
+  });
+
   it('keeps its place when the same query runs again, as on a frame reload', () => {
     document.body.innerHTML = '<p>a</p><p>a</p><p>a</p>';
     find('a');
@@ -136,6 +173,29 @@ describe('find over a document', () => {
     find('a');
     find('a', 1);
     expect(find('ab').current).toBe(1);
+  });
+
+  it('starts at the first match at or after a given node, then steps from there', () => {
+    document.body.innerHTML = '<p>a</p><p id="from">b a</p><p>a</p>';
+    const finder = createFinder(() => document.body, createPainter(() => false));
+    expect(finder.find('a', undefined, document.getElementById('from')!).current).toBe(2);
+    expect(finder.find('a', 1).current).toBe(3);
+    finder.clear();
+  });
+
+  it('starts over at the node even when the query is the same', () => {
+    document.body.innerHTML = '<p>a</p><p>a</p><p id="from">a</p>';
+    const finder = createFinder(() => document.body, createPainter(() => false));
+    finder.find('a');
+    expect(finder.find('a', undefined, document.getElementById('from')!).current).toBe(3);
+    finder.clear();
+  });
+
+  it('falls back to the first match in view when none comes after the node', () => {
+    document.body.innerHTML = '<p>a</p><p>a</p><p id="from">b</p>';
+    const finder = createFinder(() => document.body, createPainter(() => false));
+    expect(finder.find('a', undefined, document.getElementById('from')!).current).toBe(1);
+    finder.clear();
   });
 
   it('reports no match as zero of zero', () => {

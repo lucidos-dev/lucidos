@@ -20,7 +20,7 @@ use crate::core::plugins::{
     check_engine_requirement, check_font_room, compare_versions, detect_conflicts,
     engine_requirement_of, validate_tree, PlannedFile, UpdateDecision, AUTH_MODULES_DIR,
 };
-use crate::core::DATA_DIR;
+use crate::core::{plugin_media, DATA_DIR};
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
 use crate::engine::release_notices::running_release;
 use crate::engine::thread_events::{EngineReason, MessageOrigin, PluginSetupOccasion};
@@ -797,6 +797,19 @@ pub(crate) async fn uninstall_with_bus(
         .map_err(|e| format!("commit uninstalled plugin files: {}", e))?;
     }
 
+    // Media is never in the file list, so it goes by the plugin id.
+    let media = plugin_media::installed_dir(workspace_path, &pending.plugin_id);
+    // The id comes from the install record. Never delete through one that
+    // names more than one folder.
+    let removal = match plugin_media::is_folder_name(&pending.plugin_id) {
+        true => plugin_media::remove_copy(&media),
+        false => Ok(()),
+    };
+    let media_note = removal.err().map(|e| {
+        log!("[Plugins] could not delete {}: {}", media.display(), e);
+        format!(" Its pictures could not be deleted: {e}.")
+    });
+
     let mut all_files = pending.files_present.clone();
     for f in &pending.files_missing {
         if !all_files.contains(f) {
@@ -826,6 +839,7 @@ pub(crate) async fn uninstall_with_bus(
         (d, 0) => summary.push_str(&format!(" ({d} files removed).")),
         (d, n) => summary.push_str(&format!(" ({d} files removed, {n} already gone).")),
     }
+    summary.push_str(&media_note.unwrap_or_default());
 
     Ok(ConfirmedUninstall {
         summary,
@@ -1861,6 +1875,8 @@ pub(crate) async fn install_from_unpacked_with_bus(
         )
     };
 
+    let media_note = keep_installed_media(workspace_path, plugin_root, &manifest);
+
     let installed_at = chrono::Utc::now().to_rfc3339();
     let from = manifest
         .source
@@ -1900,16 +1916,36 @@ pub(crate) async fn install_from_unpacked_with_bus(
     // twice. No LLM reads it either: `install_plugin` returns the staging
     // sentinel, and the confirm reaching here arrives over HTTP.
     let result = format!(
-        "Installed {} v{} ({} files).",
+        "Installed {} v{} ({} files).{}",
         manifest.name,
         manifest.version,
-        installed_files.len()
+        installed_files.len(),
+        media_note.unwrap_or_default()
     );
     Ok(InstallWrite {
         summary: result,
         installed_files,
         local_changes_commit,
     })
+}
+
+/// Copy the plugin's media to its installed media copy, replacing whatever an
+/// older version left there. Never fails the install (ADR 0414). A copy that
+/// cannot be written answers a sentence for the receipt instead.
+fn keep_installed_media(
+    workspace_path: &Path,
+    plugin_root: &Path,
+    manifest: &crate::core::plugins::PluginManifest,
+) -> Option<String> {
+    let resolved = plugin_media::resolve(plugin_root, &manifest.media);
+    let copy = plugin_media::installed_dir(workspace_path, &manifest.id);
+    let error = plugin_media::write_copy(&resolved, &copy).err()?;
+    log!(
+        "[Plugins] could not keep the media of '{}': {}",
+        manifest.id,
+        error
+    );
+    Some(format!(" Its pictures could not be kept: {error}."))
 }
 
 fn short_source(source: &str) -> String {
@@ -1945,3 +1981,11 @@ mod query_tests;
 #[cfg(test)]
 #[path = "../plugins_tests/triggers.rs"]
 mod triggers_tests;
+
+#[cfg(test)]
+#[path = "../plugins_tests/media.rs"]
+mod media_tests;
+
+#[cfg(test)]
+#[path = "../plugins_tests/widgets.rs"]
+mod widgets_tests;

@@ -53,21 +53,32 @@ describe('normalizeLineRange', () => {
 });
 
 describe('consumeLineScrollTarget', () => {
+  const PATH = 'artifacts/notes.md';
+
   beforeEach(() => {
     lineScrollTarget.value = null;
   });
 
   it('returns nothing when no scroll was requested', () => {
-    expect(consumeLineScrollTarget()).toBeNull();
+    expect(consumeLineScrollTarget(lineScrollTarget, PATH)).toBeNull();
     expect(lineScrollTarget.value).toBeNull();
   });
 
   // One-shot: a re-render must not re-scroll a user who has since scrolled away.
   it('hands the target over once and clears it', () => {
-    lineScrollTarget.value = 510;
+    lineScrollTarget.value = { path: PATH, line: 510 };
 
-    expect(consumeLineScrollTarget()).toBe(510);
+    expect(consumeLineScrollTarget(lineScrollTarget, PATH)).toBe(510);
     expect(lineScrollTarget.value).toBeNull();
-    expect(consumeLineScrollTarget()).toBeNull();
+    expect(consumeLineScrollTarget(lineScrollTarget, PATH)).toBeNull();
+  });
+
+  it('keeps a target that names another file', () => {
+    const target = { path: 'artifacts/log.txt', line: 3 };
+    lineScrollTarget.value = target;
+
+    expect(consumeLineScrollTarget(lineScrollTarget, PATH)).toBeNull();
+    expect(consumeLineScrollTarget(lineScrollTarget, null)).toBeNull();
+    expect(lineScrollTarget.value).toBe(target);
   });
 });

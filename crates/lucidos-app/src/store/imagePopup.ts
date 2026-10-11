@@ -12,6 +12,11 @@ export function openImagePopup(src: string): void {
   popupImage.value = { images: [src], index: 0 };
 }
 
+/** Open the popup on `images[index]`, with prev/next across all of them. */
+export function openImageGallery(images: string[], index: number): void {
+  popupImage.value = { images, index };
+}
+
 /** The image the markdown renderers produce from `![alt](src)`, inside the
  *  scroll wrapper that sizes it. One selector reaches every markdown surface:
  *  a chat turn, a rendered `.md` preview, a notification body, and a question

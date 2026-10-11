@@ -30,21 +30,8 @@ import postcss from 'postcss';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
-import { fileURLToPath } from 'node:url';
-// @ts-expect-error: same
-import { dirname, resolve } from 'node:path';
-
-const here = dirname(fileURLToPath(import.meta.url));
-/** Repo root, from `crates/lucidos-app/src/styles/__tests__/`. */
-const REPO_ROOT = resolve(here, '../../../../..');
-
-/** Stylesheets the engine embeds and serves, relative to the repo root. Add a
- *  new one here in the same change that adds the `include_str!`. */
-const ENGINE_SERVED_CSS = [
-  'crates/lucidos-engine/src/api/sdk_iframe.css',
-  'crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css',
-  'crates/lucidos-app/src/styles/generated/theme-parts-frame.css',
-] as const;
+import { resolve } from 'node:path';
+import { ENGINE_SERVED_CSS, REPO_ROOT } from './css-rule-helpers';
 
 describe('engine-served stylesheets', () => {
   for (const relPath of ENGINE_SERVED_CSS) {

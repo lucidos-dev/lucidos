@@ -5,13 +5,14 @@ import { resolveFileTarget } from './fileTarget';
 import { openOAuthAuthorizationUrl } from './oauth';
 import { navigateToTrigger } from './triggers';
 import { focusThread, focusThreadOrBootstrap, unfocusThread } from './threads';
-import { getDeviceId } from './devices';
+import { isForThisDevice, type DeviceScopeActor } from './device-scope';
 import { formatThreadLabel } from './thread-label';
 import { pushNavState } from './navigation';
 import { holdFocusedPaneWhileTyping, releaseTypingHold, revealContentPane } from './pane';
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { openEncodedRepoFilePreview } from './repositories';
 import { openRepoFileLink } from './repoFileLink';
+import { fileFindScope, requestFind } from './find-request';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { isMobile } from '../../utils/viewport';
 import { showToast, dismissToast, repositories, focusedThreadId, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_SUBVIEW_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
@@ -146,7 +147,12 @@ export function handleNavigationRequest(nav: {
   id?: string;
   event_id?: string;
   prompt?: string;
-}, opts?: { source?: string }): Promise<unknown> | void {
+}, opts?: {
+  source?: string;
+  /** A query to open Find in file on, from the cited line. Frontend-only:
+   *  Search Everywhere passes it for a text hit, and no engine event does. */
+  find?: string;
+}): Promise<unknown> | void {
   const navAppId = nav.app_id;
   switch (nav.target) {
     case 'files':
@@ -239,7 +245,7 @@ export function handleNavigationRequest(nav: {
         break;
       }
       // One resolver for the locator and its line rules, shared with the
-      // app-facing preview modal so the two surfaces address exactly the same
+      // file preview modal so the two surfaces address exactly the same
       // set of files (see `resolveFileTarget`).
       const { path: filePath, range } = resolveFileTarget(nav.file_path, nav.line, nav.line_end);
       // The engine sends a repository's id, but a navigate stored before it
@@ -268,7 +274,8 @@ export function handleNavigationRequest(nav: {
       if (range) {
         filePreviewSource.value = true;
         selectedLines.value = range;
-        lineScrollTarget.value = range.start;
+        lineScrollTarget.value = { path: filePath, line: range.start };
+        if (opts?.find) requestFind(fileFindScope(filePath), opts.find, range.start);
       }
       break;
     }
@@ -401,19 +408,6 @@ export function handleNavigationRequest(nav: {
  *  user-initiated and bound to no thread. */
 export const NIL_THREAD_ID = '00000000-0000-0000-0000-000000000000';
 
-/** The `actor` a navigation carries, in the shape the device test reads. */
-export interface NavigationActor {
-  kind?: string;
-  device_id?: string;
-}
-
-/** Whether a navigation scoped to `actor` is this device's to act on. An agent
- *  navigate names one device (engine/tools/navigate.rs); one with no device
- *  actor (a trigger turn, an app iframe) belongs to every device. */
-export function navigationIsForThisDevice(actor: NavigationActor | null | undefined): boolean {
-  return actor?.kind !== 'device' || actor.device_id === getDeviceId();
-}
-
 /** Route an engine-asked navigation from `sourceThreadId`: a `NavigationRequested`,
  *  or the OAuth authorization page a form request carries.
  *
@@ -424,10 +418,10 @@ export function navigationIsForThisDevice(actor: NavigationActor | null | undefi
  *  navigates refresh one offer instead of stacking. */
 export function routeThreadNavigation(
   nav: Parameters<typeof handleNavigationRequest>[0],
-  actor: NavigationActor | null | undefined,
+  actor: DeviceScopeActor | null | undefined,
   sourceThreadId: string,
 ): void {
-  if (!navigationIsForThisDevice(actor)) return;
+  if (!isForThisDevice(actor)) return;
   const fromApp = sourceThreadId === NIL_THREAD_ID;
   if (fromApp || sourceThreadId === focusedThreadId.value) {
     // Named in any "couldn't open" toast downstream, so the error says where

@@ -304,7 +304,12 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
 
     // The user-visible surface: the repos filter facet now labels the deleted
     // repo with its recovered name instead of the UUID.
-    let facets = store.get_filter_facets().await.expect("get_filter_facets");
+    let ws = tempfile::tempdir().unwrap();
+    let apps = crate::core::AppManager::new(ws.path()).unwrap();
+    let facets = store
+        .get_filter_facets(&apps)
+        .await
+        .expect("get_filter_facets");
     let deleted_facet = facets
         .repos
         .iter()

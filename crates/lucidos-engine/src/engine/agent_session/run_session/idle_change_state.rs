@@ -2,7 +2,7 @@
 //!
 //! The idle boundary is the only branch-reading site whose answer is
 //! **durable**: `has_changes` rides `CodingAgentIdled` into
-//! `thread_summaries.coding_agent_has_diff`, which is the Diff button's gate.
+//! the thread's change state, which is the Diff button's gate.
 //! Spawn (`spawn_context`), the worktree's post-commit hook
 //! (`api::internal::coding_agent_diff_refresh`) and the session-end path
 //! (`completion`) all re-read the branch from the worktree; the idle used to

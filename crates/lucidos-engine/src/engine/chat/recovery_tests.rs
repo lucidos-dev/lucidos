@@ -37,9 +37,11 @@ async fn emit_unanswered_question(bus: &EventBus, thread_id: Uuid, tool_use_id: 
                 label: "A".into(),
                 description: None,
                 preview: None,
+                widget: None,
             }],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta::NONE,
     })
@@ -561,6 +563,47 @@ mod switch_resume {
         teardown_test_db(&db_name).await;
     }
 
+    /// Regression: the boot floor withdraws an unkept resume promise with a newer
+    /// `RecoveryAfterRestart` abort that inherits the device actor. That abort is
+    /// no start event. A later boot of any cause, a crash included, must not
+    /// re-run the turn the user was handed back to Continue for.
+    #[tokio::test]
+    async fn a_withdrawn_switch_resume_is_not_a_candidate_on_a_later_boot() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let thread_id = Uuid::new_v4();
+        seed_turn(&bus, thread_id, None).await;
+        tick().await;
+        emit_abort(
+            &bus,
+            thread_id,
+            Some(device_actor()),
+            AbortCause::EngineShutdown,
+        )
+        .await;
+        assert!(
+            candidates_contain(&pool, thread_id).await,
+            "precondition: the switch abort alone makes the thread a candidate"
+        );
+        tick().await;
+        emit_abort(
+            &bus,
+            thread_id,
+            Some(device_actor()),
+            AbortCause::RecoveryAfterRestart,
+        )
+        .await;
+
+        assert!(
+            !candidates_contain(&pool, thread_id).await,
+            "the floor withdrew this resume promise, so no later boot may auto-resume it"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
     /// Crash-safety: only the device-attributed `EngineShutdown` teardown counts.
     /// A crash emits nothing (or a `System` abort from the recovery sweep), and a
     /// `StaleSettle` abort carries a device actor from a user Stop/Archive button
@@ -707,7 +750,7 @@ mod switch_resume {
     ///   so it took the `shutdown_active_threads` fallback, which hardcoded a
     ///   system actor. That is what `teardown_actor()` fixes.
     /// * The loop-breaker has to leave the abort unsuperseded. A wake turn is
-    ///   anchored on a `UserPromptInjected`, which is deliberately NOT in
+    ///   anchored on a `PromptInjected`, which is deliberately NOT in
     ///   `THREAD_START_EVENTS_SQL`, so "newer than the latest start" is measured
     ///   against the ORIGINAL `MessageReceived`, several turns back. It holds,
     ///   and it is worth pinning: the completed turn in between is exactly the
@@ -740,7 +783,7 @@ mod switch_resume {
         tick().await;
         bus.emit(BusEvent::Thread {
             thread_id,
-            event: ThreadEvent::UserPromptInjected {
+            event: ThreadEvent::PromptInjected {
                 text: "An event you subscribed to has arrived.".into(),
                 mode: ActorMode::Agent,
                 origin: None,

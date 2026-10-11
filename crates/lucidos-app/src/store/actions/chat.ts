@@ -25,10 +25,9 @@ import { getDeviceId } from './devices';
 import { endUnsentMessage, recordUnsentMessage, takeUnsentMessage, unsentMessages, type SendSettlement } from '../unsentMessages';
 import { forgetUnsentMessageRecord, markUnsentMessageRecordUnsent, persistSendingMessage, type UnsentMessageRecord } from '../unsentMessageRecords';
 import { restoreRefusedSend, settleAcceptedSend } from './sendSettlement';
-import { unsentPicks } from '../pendingDecisions';
+import { questionTheSendAnswers, unsentPicks } from '../pendingDecisions';
 import { generateUuid } from '../../utils/uuid';
 import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, retireUnsentExchange, type PendingUserMessage, type StoredEvent, type QueuedMessage } from '../thread-events';
-import { questionTheSendAnswers } from '../../components/chat/prompt-input-helpers';
 import { getDraft } from '../composeDrafts';
 import { reopenEmptyDraft, updateCompose } from './compose';
 import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
@@ -39,7 +38,7 @@ import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation'
 import { formatThreadLabel } from './thread-label';
 import { revealThreadPane } from './pane';
 import { retireWelcomeAfterUse } from './preferences';
-import { followSentMessage } from '../../components/chat/scrollState';
+import { followSentMessage } from '../../components/chat/scrollStateHandle';
 import { setCanceledQuestion, setCanceledWhileAwaiting } from '../canceledQuestions';
 import { refreshThreadEvents, forgetThreadEventsFailures } from './thread-loading';
 import { markThreadRerenderStart } from '../../utils/threadOpenMarks';
@@ -242,7 +241,7 @@ export function schedulePendingCleanup(threadId: string, eventId: string, attemp
       // Marked rather than merely kept, because a bare pending row makes
       // `effectiveThreadStatus` report 'running'. Left counted, the thread would
       // sit mid-turn for the life of the page: out of Review even once it
-      // proposes a change, inside `inFlightThreadCount`, and showing a Stop with
+      // proposes a change, inside the In flight group, and showing a Stop with
       // nothing to stop.
       markPendingUnconfirmed(threadId, eventId);
       console.warn(`[Chat] pending message ${eventId} unconfirmed after ${attempt} refetches that never landed; keeping the row`);

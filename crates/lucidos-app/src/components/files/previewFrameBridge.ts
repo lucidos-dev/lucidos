@@ -7,9 +7,9 @@
 //
 // The host cannot reach into an opaque frame's `contentDocument`. So a small
 // script is stamped into the document, ahead of the artifact's own. It carries
-// link clicks, downloads, shell shortcuts and fragment scrolls. It cancels what
-// the browser must not do, and posts the rest up. Every routing DECISION stays
-// on the host.
+// link clicks, downloads, shell shortcuts, fragment scrolls and pane swipes. It
+// cancels what the browser must not do, and posts the rest up. Every routing
+// DECISION stays on the host.
 //
 // The UI-scale zoom needs no bridge: `withPreviewSizing` stamps it into the
 // document text. The zoom SHORTCUTS ride the chord bridge like every other.
@@ -27,6 +27,8 @@ import {
   settlePreviewFind,
 } from '../../utils/previewFrameProtocol';
 import PREVIEW_FIND_SOURCE from '../../../../../packages/lucidos-sdk/src/generated/preview-find.js?raw';
+import PREVIEW_SWIPE_SOURCE from '../../../../../packages/lucidos-sdk/src/generated/preview-swipe.js?raw';
+import { forwardPreviewSwipe } from '../../store/actions/frame-swipe-bridge';
 import {
   PREVIEW_HOST_SCHEMES,
   type PreviewLinkAction,
@@ -95,11 +97,14 @@ export interface PreviewBridgeConfig {
   nonce: string;
   bindings: readonly Binding[];
   hostSchemes: readonly string[];
+  /** Whether sideways drags swipe the phone's panes. Off away from the phone, which
+   *  has no pane swipe, and in the modal, which floats over the panes. */
+  paneSwipe: boolean;
 }
 
 /**
  * The script that runs inside the preview frame, as source. Plain ES5 over its
- * three arguments, with no outer name, so a test can run it against a fake window.
+ * arguments, with no outer name, so a test can run it against a fake window.
  *
  * What it cancels, it decides synchronously, from two stamped lists: the schemes
  * the host routes, and the current shortcut bindings. The click rule mirrors
@@ -114,7 +119,7 @@ export interface PreviewBridgeConfig {
  *  - each message is an object literal, which no prototype setter intercepts;
  *  - it posts only for a trusted event, never for a scripted `click()`.
  */
-export const PREVIEW_BRIDGE_SOURCE = String.raw`function (cfg, win, doc, finder) {
+export const PREVIEW_BRIDGE_SOURCE = String.raw`function (cfg, win, doc, finder, swiper) {
   var self = doc.currentScript;
   if (self && self.parentNode) self.parentNode.removeChild(self);
   var host = win.parent;
@@ -218,13 +223,24 @@ export const PREVIEW_BRIDGE_SOURCE = String.raw`function (cfg, win, doc, finder)
         capped: reply ? reply.capped : null });
     }
   });
+  if (cfg.paneSwipe && swiper) {
+    swiper.installFramePaneSwipe(win, {
+      onDrag: function (dx) {
+        post({ type: frameType, nonce: nonce, kind: 'swipe', dx: dx });
+      },
+      onRelease: function (paneDelta) {
+        post({ type: frameType, nonce: nonce, kind: 'swipe-end', paneDelta: paneDelta });
+      }
+    }, { yieldToWidePage: true });
+  }
 }`;
 
-/** The name the preview finder bundle gives its result
- *  (`PREVIEW_FIND_GLOBAL` in `packages/lucidos-sdk/previewFind.build.mjs`).
- *  The bundle runs inside the bridge's own function, so this is a local there,
- *  never a window global. Pinned against the bundle text in the bridge tests. */
+/** The names the preview bundles give their results (`PREVIEW_BUNDLES` in
+ *  `packages/lucidos-sdk/previewBundles.build.mjs`). The bundles run inside the
+ *  bridge's own function, so these are locals there, never window globals.
+ *  Pinned against the bundle text in the bridge tests. */
 export const PREVIEW_FIND_LOCAL = '__lucidosPreviewFind';
+export const PREVIEW_SWIPE_LOCAL = '__lucidosPreviewSwipe';
 
 /** The `<script>` tag that installs the bridge. JSON cannot close a script
  *  element once every `<` is escaped, so no artifact byte is needed. */
@@ -234,10 +250,12 @@ export function previewBridgeScript(cfg: PreviewBridgeConfig): string {
     bindings: cfg.bindings,
     mac: isMac,
     schemes: cfg.hostSchemes,
+    paneSwipe: cfg.paneSwipe,
     frameType: PREVIEW_FRAME_MESSAGE,
     hostType: PREVIEW_HOST_MESSAGE,
   }).replace(/</g, '\\u003c');
-  return `<script>(function(){${PREVIEW_FIND_SOURCE}\n;(${PREVIEW_BRIDGE_SOURCE})(${json}, window, document, ${PREVIEW_FIND_LOCAL});})();</script>`;
+  return `<script>(function(){${PREVIEW_FIND_SOURCE}\n;${PREVIEW_SWIPE_SOURCE}\n;`
+    + `(${PREVIEW_BRIDGE_SOURCE})(${json}, window, document, ${PREVIEW_FIND_LOCAL}, ${PREVIEW_SWIPE_LOCAL});})();</script>`;
 }
 
 /** Stamp the bridge in as the very first thing the document parses, after a
@@ -252,8 +270,8 @@ export function withPreviewBridge(html: string, cfg: PreviewBridgeConfig): strin
 }
 
 /** The bridge config for one render: a fresh nonce and today's lists. */
-export function previewBridgeConfig(bindings: readonly Binding[]): PreviewBridgeConfig {
-  return { nonce: newBridgeNonce(), bindings, hostSchemes: PREVIEW_HOST_SCHEMES };
+export function previewBridgeConfig(bindings: readonly Binding[], paneSwipe: boolean): PreviewBridgeConfig {
+  return { nonce: newBridgeNonce(), bindings, hostSchemes: PREVIEW_HOST_SCHEMES, paneSwipe };
 }
 
 /** A message from a preview frame, once it has passed every check. */
@@ -265,6 +283,8 @@ export type PreviewFrameMessage =
     chord: { key: string; metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean };
   }
   | { kind: 'fragment-missing'; id: string }
+  | { kind: 'swipe'; dx: number }
+  | { kind: 'swipe-end'; paneDelta: -1 | 0 | 1 }
   /** The frame's raw count, or null when its finder failed. Unchecked here:
    *  the find bar validates a count from any frame the same way. */
   | { kind: 'find-result'; id: string; reply: unknown };
@@ -329,6 +349,12 @@ export function readPreviewFrameMessage(
     case 'fragment-missing':
       if (!boundedString(data.id)) return null;
       return { kind: 'fragment-missing', id: data.id };
+    case 'swipe':
+      if (typeof data.dx !== 'number' || !Number.isFinite(data.dx)) return null;
+      return { kind: 'swipe', dx: data.dx };
+    case 'swipe-end':
+      // Any other delta still ends the drag, as a snap back.
+      return { kind: 'swipe-end', paneDelta: data.paneDelta === 1 || data.paneDelta === -1 ? data.paneDelta : 0 };
     case 'find-result':
       if (!boundedString(data.id)) return null;
       return {
@@ -409,6 +435,12 @@ export function routePreviewFrameMessage(msg: PreviewFrameMessage, ctx: PreviewF
       return;
     case 'fragment-missing':
       showToast(`No "${msg.id}" section in ${ctx.artifactPath}`, 'error');
+      return;
+    case 'swipe':
+      forwardPreviewSwipe(ctx.frameWindow, { kind: 'drag', dx: msg.dx });
+      return;
+    case 'swipe-end':
+      forwardPreviewSwipe(ctx.frameWindow, { kind: 'release', paneDelta: msg.paneDelta });
       return;
     case 'find-result':
       settlePreviewFind(msg.id, msg.reply);

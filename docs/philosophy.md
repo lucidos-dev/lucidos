@@ -170,9 +170,9 @@ says a person's work accumulates in one place that is theirs. Nearly everything
 else follows from taking that literally.
 
 A **ramp** reaches out to where the user already is and leads back in. A
-notification rendered by Apple, a share sheet, a link in an email, a widget
-showing what a trigger found, a calendar pulled out of Google's cloud, an app
-downloaded from a store. These are good and we want more of them. None of them
+notification rendered by Apple is one, and so is a share sheet or a link in an
+email. So is a home-screen widget showing what a trigger found, a calendar
+pulled out of Google's cloud, or an app downloaded from a store. These are good and we want more of them. None of them
 holds any state, and each one's entire payload is a way in.
 
 A **room** is somewhere the user works *instead* of coming here. The transcript
@@ -385,8 +385,9 @@ What this does **not** rule out, and the distinction is the whole point:
 
 - Notifications that reach the user wherever they are, because their payload is
   a way back in.
-- Presence surfaces inside somebody else's shell: a widget, a share-sheet entry,
-  a lock-screen glance. Showing state and handing off into Lucidos is a ramp.
+- Presence surfaces inside somebody else's shell: a home-screen widget, a
+  share-sheet entry, a lock-screen glance. Showing state and handing off into
+  Lucidos is a ramp.
   Working *in* it would be a room.
 - More clients (PWA, desktop app, mobile) that reach the same workspace, because
   they bring the user in rather than pushing the agent out.

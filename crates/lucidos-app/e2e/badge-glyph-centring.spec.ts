@@ -27,7 +27,6 @@ const BADGES: Record<string, string> = {
     '<span class="brand-mark-slot">'
     + '<span style="display:inline-block;width:2.1rem;height:2.1rem"></span>'
     + '<span class="badge brand-unread-badge">0</span></span>',
-  'drawer attention count': '<span class="badge drawer-view-count">0</span>',
   'section count': '<span class="section-count-badge">0</span>',
   'menu drawer count': '<span class="drawer-badge">0</span>',
   'workspace menu count':

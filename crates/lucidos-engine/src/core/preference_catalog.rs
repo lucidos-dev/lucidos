@@ -49,9 +49,6 @@ pub enum PrefSideEffect {
     /// the tool layer drive the `[PUSH_NOTIFICATION_REQUEST]` permission
     /// handshake.
     Push,
-    /// `home_thread_enabled`: turning it on creates the home thread unless one
-    /// is already marked, so off and on again brings the same thread back.
-    HomeThread,
 }
 
 /// The allowed values for a preference — drives both validation and the
@@ -73,6 +70,8 @@ pub enum PrefValue {
     ThemeId,
     /// Comma-separated `model=bytes` pairs, each a model id and a byte count.
     ModelBytes,
+    /// Comma-separated `model=tier` pairs, each a model id and a reasoning tier.
+    ModelEfforts,
     /// `theme`, a font catalog id, or a well-formed workspace font id. Whether
     /// the workspace font exists is asked where it is used, which falls back
     /// when it does not (ADR 0308).
@@ -347,6 +346,14 @@ macro_rules! aux_fallback_note {
     };
 }
 
+/// Which models a background task's default tier binds, appended to each
+/// task's reasoning description (`aux_purpose::task_effort`).
+macro_rules! task_tier_note {
+    () => {
+        " While unset, this default applies to the task's recommended models; any other model runs at its own default effort."
+    };
+}
+
 // ---- Agent-settable ----
 
 // ---- Locale (global, side-effecting) ----
@@ -384,14 +391,14 @@ pub const CHAT_MODEL: Pref<Text> = Pref::text(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
-pub const CHAT_REASONING_EFFORT: Pref<Text> = Pref::text(PrefSpec {
-    key: "chat_reasoning_effort",
-    label: "Reasoning effort",
+pub const CHAT_REASONING_EFFORTS: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "chat_reasoning_efforts",
+    label: "Reasoning effort per model",
     access: PrefAccess::Agent,
     scope: PrefScope::Global,
-    value: PrefValue::Enum(REASONING_EFFORTS),
-    default: PrefDefault::Value("high"),
-    description: "Default thinking budget for NEW Lucidos Agent threads. A thread that's already running reuses its own last-used effort, so changing this does NOT change the current/running thread on its next turn (use the thread's in-thread picker for that). Not every model supports every tier; the engine clamps per model.",
+    value: PrefValue::ModelEfforts,
+    default: PrefDefault::Unset("each model's default effort"),
+    description: "Thinking budget for NEW Lucidos Agent threads, per chat model, as 'model=tier' pairs separated by commas, for example 'claude-opus-5-5=high'. A model not listed runs at its default effort, which manage_models(action='list') shows. Write the whole list: the value replaces it. A thread that's already running reuses its own last-used effort while it stays on the same model. Not every model supports every tier; the engine clamps per model.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -460,7 +467,10 @@ pub const REASONING_TITLE: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
     default: PrefDefault::Value("none"),
-    description: "Thinking budget for thread-title generation. Naming a thread needs none of it; raise this only if titles are poor.",
+    description: concat!(
+        "Thinking budget for thread-title generation. Naming a thread needs none of it; raise this only if titles are poor.",
+        task_tier_note!()
+    ),
     side_effect: PrefSideEffect::None,
 });
 
@@ -485,7 +495,10 @@ pub const REASONING_IMAGE_DESCRIPTION: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
     default: PrefDefault::Value("none"),
-    description: "Thinking budget for describing an uploaded image. Captioning is a perception task, so the default spends nothing on deliberation.",
+    description: concat!(
+        "Thinking budget for describing an uploaded image. Captioning is a perception task, so the default spends nothing on deliberation.",
+        task_tier_note!()
+    ),
     side_effect: PrefSideEffect::None,
 });
 
@@ -507,7 +520,10 @@ pub const REASONING_CHANGE_SUMMARY: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
     default: PrefDefault::Inherits(&REASONING_TITLE.spec),
-    description: "Thinking budget for the change summary. It condenses a list of commit subjects into one line, so the default spends nothing. Inherits reasoning_title until you set this one.",
+    description: concat!(
+        "Thinking budget for the change summary. It condenses a list of commit subjects into one line, so the default spends nothing. Inherits reasoning_title until you set this one.",
+        task_tier_note!()
+    ),
     side_effect: PrefSideEffect::None,
 });
 
@@ -528,8 +544,8 @@ pub const REASONING_SUMMARY_COMPACTION: Pref<Optional> = Pref::optional(PrefSpec
     access: PrefAccess::Agent,
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
-    default: PrefDefault::Unset("the tier the compactor's model runs at by default: low"),
-    description: "Thinking budget for the compactor. A summary line has to fit 512 bytes and keep the user's words, which a little thinking helps with. While unset, the compactor runs its model at the tier its default names, which is low for every default model.",
+    default: PrefDefault::Unset("low on the compactor's default models, else the model's default effort"),
+    description: "Thinking budget for the compactor. A summary line has to fit 512 bytes and keep the user's words, which a little thinking helps with. While unset, the compactor runs each of its default models at low, the tier their comparison measured, and any other model at its own default effort.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -554,7 +570,38 @@ pub const REASONING_MEMORY_FIND: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
     default: PrefDefault::Value("none"),
-    description: "Thinking budget for find. It answers short yes/no questions, so the default spends nothing.",
+    description: concat!(
+        "Thinking budget for find. It answers short yes/no questions, so the default spends nothing.",
+        task_tier_note!()
+    ),
+    side_effect: PrefSideEffect::None,
+});
+
+pub const MODEL_READ_DECISION: Pref<Text> = Pref::text(PrefSpec {
+    key: "model_read_decision",
+    label: "Read-decision model",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Value(BACKGROUND_MODEL),
+    description: concat!(
+        "Background model that decides whether a reply is worth reading, when a turn ended without deciding. It sees the turn's message and its reply, and must call request_read. A Claude model that always thinks cannot be made to, so the reply then waits under Review. It follows no other key.",
+        aux_fallback_note!()
+    ),
+    side_effect: PrefSideEffect::None,
+});
+
+pub const REASONING_READ_DECISION: Pref<Text> = Pref::text(PrefSpec {
+    key: "reasoning_read_decision",
+    label: "Read-decision reasoning",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(REASONING_EFFORTS),
+    default: PrefDefault::Value("none"),
+    description: concat!(
+        "Thinking budget for the read decision, one yes or no. A forced call on Claude runs without thinking whatever this says.",
+        task_tier_note!()
+    ),
     side_effect: PrefSideEffect::None,
 });
 
@@ -579,7 +626,10 @@ pub const REASONING_MEMORY: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
     default: PrefDefault::Value("low"),
-    description: "Thinking budget for fact extraction. GPT-5.6 Luna and GPT-5.4 mini lost coverage at none, and Gemini 3 Flash measured the same at low as at none.",
+    description: concat!(
+        "Thinking budget for fact extraction. GPT-5.6 Luna and GPT-5.4 mini lost coverage at none, and Gemini 3 Flash measured the same at low as at none.",
+        task_tier_note!()
+    ),
     side_effect: PrefSideEffect::None,
 });
 
@@ -604,7 +654,10 @@ pub const REASONING_QUERY_CLASSIFICATION: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
     default: PrefDefault::Value("none"),
-    description: "Thinking budget for query classification. It answers three yes/no questions in front of every turn, so the default spends nothing.",
+    description: concat!(
+        "Thinking budget for query classification. It answers three yes/no questions in front of every turn, so the default spends nothing.",
+        task_tier_note!()
+    ),
     side_effect: PrefSideEffect::None,
 });
 
@@ -629,19 +682,8 @@ pub const VOICE_ENABLED: Pref<Flag> = Pref::flag(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Bool,
     default: PrefDefault::Value("false"),
-    description: "Off by default. When 'true', the home thread can be called and spoken to: its composer grows a call control and /api/v1/voice accepts a socket. A call runs on the home thread alone, so it also needs home_thread_enabled. Experimental. It rents a speech-to-speech talker from OpenAI and needs that provider configured, and every spoken utterance starts an ordinary agent turn, so a short call can cost several turns. With this off nothing voice-shaped is reachable and the other voice keys do nothing.",
+    description: "Off by default. When 'true', the home thread can be called and spoken to: its composer grows a call control and /api/v1/voice accepts a socket. A call runs on the home thread alone. Experimental. It rents a speech-to-speech talker from OpenAI and needs that provider configured, and every spoken utterance starts an ordinary agent turn, so a short call can cost several turns. With this off nothing voice-shaped is reachable and the other voice keys do nothing.",
     side_effect: PrefSideEffect::None,
-});
-
-pub const HOME_THREAD_ENABLED: Pref<Flag> = Pref::flag(PrefSpec {
-    key: "home_thread_enabled",
-    label: "Home thread (experimental)",
-    access: PrefAccess::Agent,
-    scope: PrefScope::Global,
-    value: PrefValue::Bool,
-    default: PrefDefault::Value("false"),
-    description: "Off by default. When 'true', the workspace has a home thread: one chat thread that never ends, opened from a Home entry in the header or the Lucidos menu rather than from the thread drawer. It can follow up any thread, and it presses an owner button only when the user's words in that turn ask for it. Voice calls run there alone. Turning it on creates the home thread if none exists. Turning it off hides it and turns those powers off; the thread and its history stay, and come back when it is turned on again.",
-    side_effect: PrefSideEffect::HomeThread,
 });
 
 pub const MODEL_VOICE_TALKER: Pref<Text> = Pref::text(PrefSpec {
@@ -695,7 +737,10 @@ pub const REASONING_CONVERSATION_SUMMARY: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
     default: PrefDefault::Value("low"),
-    description: "Thinking budget for the conversation summary. Measured output length does not track this setting, so raising it is unlikely to help; the summariser's failures are calls that never complete.",
+    description: concat!(
+        "Thinking budget for the conversation summary. Measured output length does not track this setting, so raising it is unlikely to help; the summariser's failures are calls that never complete.",
+        task_tier_note!()
+    ),
     side_effect: PrefSideEffect::None,
 });
 
@@ -770,6 +815,17 @@ pub const MOBILE_DYNAMIC_BARS: Pref<Flag> = Pref::flag(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const AUTOMATIC_WIDGETS: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "automatic_widgets",
+    label: "Automatic widgets",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Bool,
+    default: PrefDefault::Value("true"),
+    description: "Whether the agent may choose on its own to answer with a widget, a small interactive answer shown inline in the thread. 'false' stops only that choice: a widget the user asks for is still made.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const EXTERNAL_LINK_TARGET: Pref<Text> = Pref::text(PrefSpec {
     key: "external_link_target",
     label: "External links open in",
@@ -825,6 +881,40 @@ pub const SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS: Pref<Number> = Pref::number(P
     value: PrefValue::Number { min: 1.0, max: 1000.0 },
     default: PrefDefault::Value("10"),
     description: "How often the sweep runs, in rounds. Only read when `self_curated_context_mode` is 'true'. Removing a pair from the middle of the request invalidates every cached byte after it, so the pass is scheduled rather than run every round: nine rounds in ten are pure appends and keep the cache discount. Setting it to 1 restores a per-round drop and pays that cost on every round.",
+    side_effect: PrefSideEffect::None,
+});
+
+// ---- Workspace prompt footprint (global, ADR 0413) ----
+pub const WORKSPACE_PROMPT_FOOTPRINT_SECTION_CEILING: Pref<Number> = Pref::number(PrefSpec {
+    key: "workspace_prompt_footprint_section_ceiling",
+    label: "Prompt footprint section ceiling (chars)",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Number { min: 100.0, max: 1_000_000.0 },
+    default: PrefDefault::Value("6000"),
+    description: "Chars one section of the workspace prompt footprint may take before the workspace audit flags it. The prompt still carries the whole section: nothing is cut. Change it only when the user asks, never to clear an audit finding.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const WORKSPACE_PROMPT_FOOTPRINT_TOTAL_CEILING: Pref<Number> = Pref::number(PrefSpec {
+    key: "workspace_prompt_footprint_total_ceiling",
+    label: "Prompt footprint total ceiling (chars)",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Number { min: 100.0, max: 1_000_000.0 },
+    default: PrefDefault::Value("20000"),
+    description: "Chars the whole workspace prompt footprint may take before the workspace audit flags it. The prompt still carries everything: nothing is cut. Change it only when the user asks, never to clear an audit finding.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const WORKSPACE_PROMPT_FOOTPRINT_UNUSED_DAYS: Pref<Number> = Pref::number(PrefSpec {
+    key: "workspace_prompt_footprint_unused_days",
+    label: "Unused after (days)",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Number { min: 1.0, max: 3650.0 },
+    default: PrefDefault::Value("60"),
+    description: "Days without use after which the workspace prompt footprint calls an app or reusable widget unused, and a knowhow doc not loaded by name. An item younger than this is not judged. Change it only when the user asks.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1128,7 +1218,7 @@ pub const MODEL_COMMAND_JUDGE: Pref<Text> = Pref::text(PrefSpec {
     },
     scope: PrefScope::Global,
     value: PrefValue::Text,
-    default: PrefDefault::Value("claude-haiku-4-5"),
+    default: PrefDefault::Value(BACKGROUND_MODEL),
     description: concat!(
         "The model the command-guard judge runs on.",
         aux_fallback_note!()
@@ -1145,7 +1235,10 @@ pub const REASONING_COMMAND_JUDGE: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(REASONING_EFFORTS),
     default: PrefDefault::Value("none"),
-    description: "The effort the command-guard judge runs at. It answers with a short JSON verdict in front of every ambiguous command, so the default spends nothing.",
+    description: concat!(
+        "The effort the command-guard judge runs at. It answers with a short JSON verdict in front of every ambiguous command, so the default spends nothing.",
+        task_tier_note!()
+    ),
     side_effect: PrefSideEffect::None,
 });
 
@@ -1534,7 +1627,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &LANGUAGE.spec,
     &TIMEZONE.spec,
     &CHAT_MODEL.spec,
-    &CHAT_REASONING_EFFORT.spec,
+    &CHAT_REASONING_EFFORTS.spec,
     &RESPONSE_STYLE.spec,
     &RESPONSE_STYLES.spec,
     &TECHNICAL_LITERACY.spec,
@@ -1549,13 +1642,14 @@ pub const CATALOG: &[&PrefSpec] = &[
     &REASONING_SUMMARY_COMPACTION.spec,
     &MODEL_MEMORY_FIND.spec,
     &REASONING_MEMORY_FIND.spec,
+    &MODEL_READ_DECISION.spec,
+    &REASONING_READ_DECISION.spec,
     &MODEL_MEMORY.spec,
     &REASONING_MEMORY.spec,
     &MODEL_QUERY_CLASSIFICATION.spec,
     &REASONING_QUERY_CLASSIFICATION.spec,
     &MODEL_CONVERSATION_SUMMARY.spec,
     &VOICE_ENABLED.spec,
-    &HOME_THREAD_ENABLED.spec,
     &MODEL_VOICE_TALKER.spec,
     &MODEL_VOICE_TRANSCRIBER.spec,
     &VOICE_TALKER_VOICE.spec,
@@ -1567,11 +1661,15 @@ pub const CATALOG: &[&PrefSpec] = &[
     &NOTIFICATIONS_FILTER.spec,
     &NOTIFICATION_TOASTS.spec,
     &MOBILE_DYNAMIC_BARS.spec,
+    &AUTOMATIC_WIDGETS.spec,
     &EXTERNAL_LINK_TARGET.spec,
     &WELCOME_SUGGESTIONS_DISMISSED.spec,
     &SELF_CURATED_CONTEXT_MODE.spec,
     &SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS.spec,
     &SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS.spec,
+    &WORKSPACE_PROMPT_FOOTPRINT_SECTION_CEILING.spec,
+    &WORKSPACE_PROMPT_FOOTPRINT_TOTAL_CEILING.spec,
+    &WORKSPACE_PROMPT_FOOTPRINT_UNUSED_DAYS.spec,
     &MEMORY_MODULE.spec,
     &WORKSPACE_VIEW_BYTES_HOME.spec,
     &WORKSPACE_VIEW_BYTES_CHAT.spec,
@@ -1633,6 +1731,22 @@ pub const CATALOG: &[&PrefSpec] = &[
 /// The spec for any catalogued key, whoever may write it.
 pub fn spec(key: &str) -> Option<&'static PrefSpec> {
     CATALOG.iter().copied().find(|s| s.key == key)
+}
+
+/// Keys that no longer mean anything, each with what a writer is told. A
+/// write of one is refused on every path, so a stale client or agent cannot
+/// bring back a row nothing reads.
+pub const RETIRED_KEYS: &[(&str, &str)] = &[(
+    "home_thread_enabled",
+    "home_thread_enabled was removed: every workspace has a home thread now (ADR 0411).",
+)];
+
+/// What a writer of a retired key is told, or `None` for any other key.
+pub fn retired_key_reason(key: &str) -> Option<&'static str> {
+    RETIRED_KEYS
+        .iter()
+        .find(|(retired, _)| *retired == key)
+        .map(|(_, reason)| *reason)
 }
 
 /// Find the catalog spec for an agent-settable key.
@@ -1727,6 +1841,9 @@ pub fn validate(spec: &PrefSpec, value: &str) -> Result<(), String> {
         PrefValue::ModelBytes => crate::engine::summary_tree::module::parse_model_caps(value)
             .map(|_| ())
             .map_err(|e| format!("'{}': {}", spec.key, e)),
+        PrefValue::ModelEfforts => parse_model_efforts(value)
+            .map(|_| ())
+            .map_err(|e| format!("'{}': {}", spec.key, e)),
         PrefValue::FontFamily => {
             if crate::core::fonts::FONT_PREFERENCE_VALUES.contains(&value)
                 || crate::core::workspace_fonts::is_workspace_id(value)
@@ -1744,6 +1861,39 @@ pub fn validate(spec: &PrefSpec, value: &str) -> Result<(), String> {
     }
 }
 
+/// Parse comma-separated `model=value` pairs, the shape of the per-model
+/// preferences. `unit` names the value in errors, and `parse` reads one value.
+pub(crate) fn parse_model_pairs<'a, T>(
+    value: &'a str,
+    unit: &str,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> Result<Vec<(&'a str, T)>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            let (id, raw) = item
+                .split_once('=')
+                .ok_or_else(|| format!("'{item}' is not model={unit}"))?;
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(format!("'{item}' names no model"));
+            }
+            let parsed = parse(raw.trim()).map_err(|why| format!("'{item}' {why}"))?;
+            Ok((id, parsed))
+        })
+        .collect()
+}
+
+/// Parse `model=tier` pairs, each tier on the ladder.
+pub(crate) fn parse_model_efforts(value: &str) -> Result<Vec<(&str, &'static str)>, String> {
+    parse_model_pairs(value, "tier", |raw| {
+        crate::llm::reasoning::tier(raw)
+            .ok_or_else(|| format!("has no tier; use one of {}", REASONING_EFFORTS.join(", ")))
+    })
+}
+
 /// Human-readable summary of a spec's allowed values, used in the agent-facing
 /// description for both `set_preference`'s error path and `get_preferences`.
 pub fn allowed_values_hint(spec: &PrefSpec) -> String {
@@ -1755,6 +1905,10 @@ pub fn allowed_values_hint(spec: &PrefSpec) -> String {
         PrefValue::Text => "text".to_string(),
         PrefValue::ThemeId => "a theme id".to_string(),
         PrefValue::ModelBytes => "model=bytes, model=bytes".to_string(),
+        PrefValue::ModelEfforts => format!(
+            "model=tier, model=tier (tier: {})",
+            REASONING_EFFORTS.join(" | ")
+        ),
         PrefValue::FontFamily => format!(
             "{} | ws-<slug> (a workspace font)",
             crate::core::fonts::FONT_PREFERENCE_VALUES.join(" | ")
@@ -1771,6 +1925,18 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for spec in CATALOG {
             assert!(seen.insert(spec.key), "duplicate catalog key: {}", spec.key);
+        }
+    }
+
+    /// A retired key is refused on write, so a live spec under the same name
+    /// could never be set.
+    #[test]
+    fn no_live_preference_carries_a_retired_key() {
+        for (key, _) in RETIRED_KEYS {
+            assert!(
+                spec(key).is_none(),
+                "{key} is retired but still in the catalog"
+            );
         }
     }
 

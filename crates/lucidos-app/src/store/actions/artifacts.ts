@@ -7,6 +7,7 @@ import {
   filePreviewSource,
   selectedLines,
   lineScrollTarget,
+  findRequest,
   showToast,
   showConfirm,
   dismissToast,
@@ -187,11 +188,13 @@ export function openFilePreview(path: string, opts?: { preserveSource?: boolean 
   // file would highlight whatever rows happen to sit at those numbers in the
   // next one, and a scroll request that never found its file (a load error, a
   // format with no source view) would fire on an unrelated file later.
-  // `openRepoFilePreview` clears the same pair on its own path, which sets
+  // A find request that no bar took is dropped for the same reason.
+  // `openRepoFilePreview` clears the same state on its own path, which sets
   // panelOverlay directly for its push-vs-replace logic. The navigate-to-a-line
-  // router deliberately sets its range AFTER calling in here.
+  // router deliberately sets its range and find AFTER calling in here.
   selectedLines.value = null;
   lineScrollTarget.value = null;
+  findRequest.value = null;
   panelOverlay.value = { type: 'file-preview', path };
   localStorage.setItem('file-preview-open', path);
   revealContentPane();

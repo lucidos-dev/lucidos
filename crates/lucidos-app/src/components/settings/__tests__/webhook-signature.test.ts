@@ -63,8 +63,8 @@ describe('the scheme presets', () => {
     expect(stripe.template).toBe('{timestamp}.{body}');
   });
 
-  /** A `{timestamp}` template with no tolerance skips the replay check, and
-   *  that check is the only reason either scheme signs a timestamp. */
+  /** A signed timestamp exists only to bound replay, so every timestamped
+   *  preset names its window rather than leaving it to the engine default. */
   it('gives every timestamped scheme a replay window', () => {
     for (const preset of SCHEME_PRESETS) {
       if (!preset.hmac?.template.includes('{timestamp}')) continue;

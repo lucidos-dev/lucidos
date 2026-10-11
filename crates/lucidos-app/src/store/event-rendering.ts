@@ -78,6 +78,7 @@ export function drawsResponseRow(event: ResponseEvent, showSteps: boolean): bool
     case 'text': return isMeaningfulText(event);
     case 'image':
     case 'checkpoint':
+    case 'widget':
     case 'event_wait':
     case 'held_message':
     case 'form_request':
@@ -234,6 +235,7 @@ export function responseBody(
         break;
       case 'image':
       case 'checkpoint':
+      case 'widget':
       case 'event_wait':
       case 'held_message':
       case 'form_request':

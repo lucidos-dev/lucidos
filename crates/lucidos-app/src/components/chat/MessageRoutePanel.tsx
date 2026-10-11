@@ -1,7 +1,7 @@
 import { useRef } from 'preact/hooks';
 import { UNTITLED_THREAD } from '../../utils/threadTitle';
 import type { ComponentChildren } from 'preact';
-import { AppsIcon } from '../shared/icons';
+import { AppIcon } from '../shared/AppIcon';
 import { messageRoutePanel, closeMessageRoutePanel, contextViewer, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
 import { loadApps } from '../../store/actions/apps';
 import { turnDeviceName } from '../../store/actions/devices';
@@ -26,23 +26,11 @@ import {
   exchangeReasoningEffort,
   displayModelName,
   displayReasoningEffort,
-  findCommandPermissionResolution,
-  findMcpPermissionResolution,
-  findPermissionResolution,
-  findQuestionAnswer,
-  questionDividerResolution,
-  isChangeLifecycleEvent,
-  legacyOrigin,
   modeToInitiator,
   PENDING_TITLE_PLACEHOLDER,
   plainEventName,
   sortEventsChronologically,
-  starterEngineReason,
   SYSTEM_LABEL,
-  type AnsweredQuestion,
-  type ResolvedCommandPermission,
-  type ResolvedMcpPermission,
-  type ResolvedPermission,
   type Exchange,
   type EngineReason,
   type MessageOrigin,
@@ -59,82 +47,7 @@ import {
   engineReasonHeadline,
   UNRECORDED_ENGINE_SEED_EXPLAINER,
 } from '../../utils/engineEventExplainers';
-
-/** A bare `ContinuationStarted` is engine-raised by *current* design on the
- *  chat and trigger channels: `emit_resume_anchor` (`chat/rerun.rs`) writes
- *  `origin: None` on every resume, carrying its attribution on `EventMeta.actor`
- *  instead. So it lands here for the *actor-less* case only: a user-clicked
- *  Continue stamps the clicking device on `actor`, and `resolveOrigin` prefers
- *  that. Its explainer comes from the event's own `reason` field where one was
- *  recorded, not from this coarser `continuation_started`.
- *
- *  Every other engine-only starter resolves through `starterEngineReason`. */
-const CONTINUATION_ENGINE_REASON: EngineReason = { kind: 'continuation_started' };
-
-/** Takes the full Exchange so the divider-starter cases (UserQuestionAsked,
- *  CodingAgentPermissionRequest) can walk the exchange's steps for the matching
- *  resolution event and read the device actor from there. */
-export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
-  const userEvent = exchange.userEvent;
-  if (userEvent.type === 'MessageReceived') return legacyOrigin(userEvent);
-  if (isChangeLifecycleEvent(userEvent)) return userEvent.actor;
-  // A question or permission card: the chip names the agent that asked, so the
-  // Origin is whoever answered it.
-  const settlement = dividerSettlement(exchange);
-  if (settlement !== null) return settlement?.actor;
-  // Engine-emitted events (ContinuationStarted, CodingAgentPromptSent, TriggerStarted, ChangeProposed)
-  // carry origin directly — surface it so the popover can render the Engine variant.
-  if ('origin' in userEvent && userEvent.origin) {
-    return userEvent.origin as MessageOrigin;
-  }
-  // ContinuationStarted triggered by the user clicking Continue stamps the device
-  // on `EventMeta.actor` (the chip reads it for the "You" label) but leaves
-  // `origin` empty — fall back so the popover matches the chip.
-  if ('actor' in userEvent && userEvent.actor) {
-    return userEvent.actor as MessageOrigin;
-  }
-  // Nothing persisted: for a starter only the engine can write, that is an
-  // older row rather than an unknown actor, and its shape says why.
-  const implied = starterEngineReason(userEvent)
-    ?? (userEvent.type === 'ContinuationStarted' ? CONTINUATION_ENGINE_REASON : undefined);
-  if (implied) return { kind: 'engine', reason: implied };
-  return undefined;
-}
-
-type DividerSettlement =
-  | AnsweredQuestion
-  | ResolvedPermission
-  | ResolvedCommandPermission
-  | ResolvedMcpPermission;
-
-/** The step that settled a question or permission card: the user's answer or
- *  verdict. `undefined` while the card waits, and `null` for any other turn.
- *  A canceled or superseded question was never answered, so it stays waiting,
- *  as on the card's own status. An MCP consent records no answer at all. */
-function dividerSettlement(exchange: Exchange): DividerSettlement | undefined | null {
-  const userEvent = exchange.userEvent;
-  switch (userEvent.type) {
-    case 'UserQuestionAsked':
-      return questionDividerResolution(exchange) ? undefined : findQuestionAnswer(exchange, userEvent.tool_use_id);
-    case 'CodingAgentPermissionRequest':
-      return findPermissionResolution(exchange, userEvent.request_id);
-    case 'CommandPermissionRequested':
-      return findCommandPermissionResolution(exchange, userEvent.request_id);
-    case 'McpPermissionRequested':
-      return findMcpPermissionResolution(exchange, userEvent.request_id);
-    case 'McpConsentRequested':
-      return undefined;
-    default:
-      return null;
-  }
-}
-
-/** Whether the Origin popover says anything the chip does not. A question or
- *  permission card's chip already names the asker, so its popover waits until
- *  someone answered. */
-export function originPopoverHasContent(exchange: Exchange): boolean {
-  return dividerSettlement(exchange) === null || resolveOrigin(exchange) !== undefined;
-}
+import { dividerSettlement, resolveOrigin, type DividerSettlement } from './messageOrigin';
 
 /** Live lookup wins over `cachedLinkedTitle` because SSE handlers
  *  (`CodingAgentThreadSpawned`, the skeleton path in `handleThreadEvent`)
@@ -413,7 +326,7 @@ function deviceRowLabel(userEvent: StoredEvent): string {
   if (verb) return `${verb} on`;
   switch (userEvent.type) {
     case 'MessageReceived':
-    case 'UserPromptInjected':           return 'Sent from';
+    case 'PromptInjected':               return 'Sent from';
     case 'ResponseAborted':
     case 'ResponseCanceled':
     case 'EventWaitCanceled':            return 'Stopped from';
@@ -513,7 +426,7 @@ function renderFoldedPause(pause: StoredEvent): preact.JSX.Element {
 function isUnrecordedEngineSeed(userEvent: StoredEvent): boolean {
   switch (userEvent.type) {
     case 'MessageReceived':
-    case 'UserPromptInjected':
+    case 'PromptInjected':
       return modeToInitiator(userEvent.mode) === 'system';
     case 'CodingAgentPromptSent':
       return true;
@@ -848,14 +761,8 @@ function contextLink(tokens: number, snapshot: ContextCapture | undefined): prea
 /** App icon + name for the App row on app coding-agent threads (rendered above
  *  the Branch row). Distinguishes the four `Loadable` states so a failed
  *  appsList fetch doesn't render identically to a loading one (per frontend.md).
- *
- *  `icon` is `ComponentChildren` rather than `string` because the slot holds two
- *  different KINDS of thing. An app's own `manifest.json` icon is user-authored
- *  content, almost always an emoji, and passes through verbatim: it is not ours
- *  to restyle. The fallback for an app that declares none is ours, and it is
- *  `<AppsIcon/>`, the single apps mark that also labels a Search Everywhere app
- *  hit and an app entry in the content-pane history menu. Exported for the unit
- *  test that pins exactly that split. */
+ *  The icon is always an `AppIcon`: the monogram tile until the list names a
+ *  usable image. Exported for its unit test. */
 export function resolveAppInfo(
   folder: string | undefined,
 ): { icon: ComponentChildren; name: string; failed?: boolean } | undefined {
@@ -867,18 +774,16 @@ export function resolveAppInfo(
   // `loading` synchronously (setLoadingIfFresh), so the next render no longer
   // sees `not-loaded` and won't re-fetch — exactly one fetch fires.
   if (apps.status === 'not-loaded') void loadApps();
-  const fallbackIcon = <AppsIcon />;
+  const monogram = <AppIcon appId={appId} name={appId} />;
   if (apps.status === 'failed') {
-    return { icon: fallbackIcon, name: `${appId} (apps failed to load)`, failed: true };
+    return { icon: monogram, name: `${appId} (apps failed to load)`, failed: true };
   }
   if (apps.status !== 'loaded') {
-    return { icon: fallbackIcon, name: appId };
+    return { icon: monogram, name: appId };
   }
   const match = apps.data.find(a => a.id === appId);
-  return {
-    icon: match?.icon || fallbackIcon,
-    name: match?.name || appId,
-  };
+  const name = match?.name || appId;
+  return { icon: <AppIcon appId={appId} name={name} icon={match?.icon} />, name };
 }
 
 /** CC repo label. Returns undefined for legacy events from before the engine

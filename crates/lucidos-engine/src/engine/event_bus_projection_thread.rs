@@ -11,7 +11,8 @@
 use uuid::Uuid;
 
 use super::super::{
-    preserving_verdict, BusEvent, EventBus, CLEAR_CODING_AGENT_FLAGS, STATUS_FROM_PROPOSED_CHANGE,
+    branch_work_sql, preserving_verdict, BusEvent, EventBus, CLEAR_CODING_AGENT_FLAGS,
+    STATUS_FROM_PROPOSED_CHANGE,
 };
 use super::propagation::{
     detach_child_from_parent, hold_parent_recount_lock, load_blocking_sample,
@@ -24,7 +25,9 @@ use crate::core::store::{EventWaitSummary, LegacyInitiator};
 use crate::engine::thread_events::{
     ActorMode, AnswerKind, CancelCause, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
-use crate::engine::thread_lifecycle::{resolve_transition, ArchiveState, ThreadStatus};
+use crate::engine::thread_lifecycle::{
+    resolve_transition, ArchiveState, ChangeStateKind, ThreadStatus,
+};
 
 /// Whitespace `btrim` must strip when matching a submitted answer against the
 /// stored draft, so the comparison agrees with the client's `String.prototype
@@ -318,6 +321,9 @@ impl EventBus {
                            -- agent/engine follow-up bumps last_agent_action.
                            last_user_action = CASE WHEN $8 THEN NOW() ELSE thread_summaries.last_user_action END,
                            last_agent_action = CASE WHEN $8 THEN thread_summaries.last_agent_action ELSE NOW() END,
+                           -- The user wrote again, so the reply they were
+                           -- asked to read is behind them (ADR 0409).
+                           read_requested = CASE WHEN $8 THEN FALSE ELSE thread_summaries.read_requested END,
                            message_count = thread_summaries.message_count + 1,
                            status = {RUNNING},
                            last_revived_at = NOW(),
@@ -561,7 +567,7 @@ impl EventBus {
             ThreadEvent::ResponseGenerated { .. } => {
                 // Normal completion: go idle. A pending coding-agent proposal
                 // does not change that; see STATUS_FROM_PROPOSED_CHANGE for why
-                // review surfaces through `coding_agent_proposed` instead.
+                // review surfaces through the `proposed` change state instead.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
                      has_response = TRUE, \
@@ -622,21 +628,16 @@ impl EventBus {
                 has_changes,
                 ..
             } => {
-                // Authoritative for `is_external_repo` and `coding_agent_has_diff`
-                // (git-truth signal — reflects whether the branch has any
-                // committed diff against main, not the proposal lifecycle).
-                // `requires_restart` stays the aggregate `ChangeProposed`'s job
-                // — same reason `coding_agent_proposed` does. `has_response =
-                // TRUE` is the CC equivalent of `ResponseGenerated` for
-                // surfacing the thread in `get_recent_threads`.
-                //
-                // `coding_agent_has_diff = has_changes` is what fixes the
-                // "Diff button says 'No changes on this branch' when the
-                // branch has commits" bug — `has_changes` is `wt_has_changes`
-                // computed from `branch_changed_files`, which is the same
-                // git-truth the seed/refresh paths consult. Setting it here
-                // means the Diff button is enabled the moment CC idles with
-                // a diff, regardless of whether `ChangeProposed` has fired.
+                // Authoritative for `is_external_repo` and for whether the branch
+                // holds work (git truth, `wt_has_changes` from
+                // `branch_changed_files`, as the seed and refresh paths read
+                // it). A pending change keeps the state `proposed`; the
+                // proposal itself stays the aggregate `ChangeProposed`'s job.
+                // Work that stays unproposed keeps the reason a
+                // `ProposalWithheld` gave it, which may land before this idle.
+                // `has_response = TRUE` is the CC equivalent of
+                // `ResponseGenerated` for surfacing the thread in
+                // `get_recent_threads`.
                 //
                 // `preserving_verdict` keeps the turn's verdict. A CC turn that
                 // ends in failure emits `ResponseFailed` (→ status='failed')
@@ -660,9 +661,10 @@ impl EventBus {
                     "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
                      has_response = TRUE, \
                      coding_agent_is_external_repo = $2, \
-                     coding_agent_has_diff = $3, \
+                     {}, \
                      status = {} \
                      WHERE thread_id = $1",
+                    branch_work_sql("$3"),
                     preserving_verdict(STATUS_FROM_PROPOSED_CHANGE)
                 ))
                 .bind(thread_id)
@@ -690,9 +692,10 @@ impl EventBus {
             } => {
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
-                     {CLEAR_CODING_AGENT_FLAGS}, \
+                     {clear}, \
                      status = {IDLE} \
                      WHERE thread_id = $1",
+                    clear = *CLEAR_CODING_AGENT_FLAGS,
                 ))
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -716,9 +719,10 @@ impl EventBus {
             ThreadEvent::ChangeDiscarded { change_id, .. } => {
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
-                     {CLEAR_CODING_AGENT_FLAGS}, \
+                     {clear}, \
                      status = {IDLE} \
                      WHERE thread_id = $1",
+                    clear = *CLEAR_CODING_AGENT_FLAGS,
                 ))
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -735,19 +739,36 @@ impl EventBus {
 
             // Message count increment + activity (CC user messages and mid-flight injections)
             ThreadEvent::CodingAgentUserMessageSent { .. }
-            | ThreadEvent::UserPromptInjected { .. } => {
+            | ThreadEvent::PromptInjected { .. } => {
                 // An injection that lands under an open question waits for
                 // the answer (ADR 0255), so the question keeps the thread.
-                // Overwriting it puts out the needs-attention badge on a
+                // Overwriting it puts out the Blocked badge on a
                 // question nobody has answered. The turn's first activity
                 // event sets 'running' once the agent really resumes.
-                let status = if matches!(event, ThreadEvent::UserPromptInjected { .. }) {
-                    format!("CASE WHEN status = {WAITING_FOR_USER_ANSWER} THEN status ELSE {RUNNING} END")
+                //
+                // Only a human's prompt is a user action. An agent's follow-up
+                // or an engine note (a wait delivery, a resume note) is agent
+                // activity, or it reshuffles the drawer under the reader.
+                //
+                // A new turn starts, so the last turn end's reason for
+                // withholding the work no longer stands (ADR 0400).
+                //
+                // A human prompt also puts a read request behind the user,
+                // as a chat message does (ADR 0409).
+                let (status, human) = match event {
+                    ThreadEvent::PromptInjected { mode, .. } => (
+                        format!("CASE WHEN status = {WAITING_FOR_USER_ANSWER} THEN status ELSE {RUNNING} END"),
+                        *mode == ActorMode::Human,
+                    ),
+                    _ => (RUNNING.to_string(), true),
+                };
+                let (action_column, read_requested) = if human {
+                    ("last_user_action", "FALSE")
                 } else {
-                    RUNNING.to_string()
+                    ("last_agent_action", "read_requested")
                 };
                 sqlx::query(&format!(
-                    "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), message_count = message_count + 1, status = {status}, last_revived_at = NOW() WHERE thread_id = $1",
+                    "UPDATE thread_summaries SET last_activity = NOW(), {action_column} = NOW(), message_count = message_count + 1, status = {status}, last_revived_at = NOW(), coding_agent_unproposed_reason = NULL, read_requested = {read_requested} WHERE thread_id = $1",
                 ))
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -785,8 +806,21 @@ impl EventBus {
             // itself projects nothing (ADR 0310).
             ThreadEvent::ThreadArchiveRequested => Vec::new(),
 
-            // `resolve_transition` moves the thread; neither projects more.
-            ThreadEvent::ThreadUnarchived | ThreadEvent::ThreadTriageProposed { .. } => Vec::new(),
+            ThreadEvent::ThreadReadRequested | ThreadEvent::ThreadReplySeen { .. } => {
+                let requested = matches!(event, ThreadEvent::ThreadReadRequested);
+                sqlx::query("UPDATE thread_summaries SET read_requested = $2 WHERE thread_id = $1")
+                    .bind(thread_id)
+                    .bind(requested)
+                    .execute(&mut **tx)
+                    .await?;
+                Vec::new()
+            }
+
+            // `resolve_transition` moves the thread; neither projects more. A
+            // no never clears an unseen request, so it writes nothing.
+            ThreadEvent::ThreadUnarchived
+            | ThreadEvent::ThreadTriageProposed { .. }
+            | ThreadEvent::ThreadReadNotRequested => Vec::new(),
 
             // Save/unsave
             ThreadEvent::ThreadSaved => {
@@ -832,11 +866,13 @@ impl EventBus {
                 // `is_stopped_child` clears too. A cascade from the parent
                 // archives the parent as well, so the child owes it nothing. A
                 // direct archive settles through the marker, which stays.
+                // An archive also dismisses a read request (ADR 0409).
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET status = {IDLE}, \
-                     is_saved = FALSE, is_stopped_child = FALSE, \
-                     {CLEAR_CODING_AGENT_FLAGS} \
+                     is_saved = FALSE, is_stopped_child = FALSE, read_requested = FALSE, \
+                     {clear} \
                      WHERE thread_id = $1",
+                    clear = *CLEAR_CODING_AGENT_FLAGS,
                 ))
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -1042,7 +1078,7 @@ impl EventBus {
                 set_aside,
                 ..
             } => {
-                // `coding_agent_proposed` and `coding_agent_requires_restart`
+                // The `proposed` change state and `coding_agent_requires_restart`
                 // follow the `changes` row this writes: see
                 // `ChangesProjection::sync_thread_proposal`. Legacy per-commit
                 // events (empty change_id, commit_sha set) survive only in
@@ -1057,7 +1093,7 @@ impl EventBus {
                     // the emit doesn't yank the thread back to 'idle' while
                     // CC is still mid-stream. Else 'idle' — a proposed change
                     // is an artifact for review, not a parked loop. The
-                    // pending-review state is carried by coding_agent_proposed.
+                    // pending-review state is carried by the change state.
                     //
                     // `preserving_verdict` because a proposal is also one of the
                     // dying turn's trailing events: an interrupted coding-agent
@@ -1068,17 +1104,16 @@ impl EventBus {
                     // against, and the second half of
                     // `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
                     //
-                    // `coding_agent_has_diff` is derived from the file list the
-                    // event actually carries, not hardcoded TRUE: every ordinary
-                    // proposal carries a non-empty list (unchanged), while
+                    // The branch work comes from the file list the event carries.
                     // `reconcile_emptied_pending_change` re-emits with an empty
-                    // one to record that the branch's diff cancelled out — and
-                    // that must NOT light the thread's Diff button on a branch
-                    // whose live `git diff` is empty.
+                    // one when the diff cancelled out, and a set-aside proposal
+                    // leaves its work unproposed. `write_proposed_aggregate`
+                    // then moves a pending row to `proposed`.
                     sqlx::query(&format!(
-                        "UPDATE thread_summaries SET coding_agent_has_diff = $2, \
+                        "UPDATE thread_summaries SET {}, \
                          status = {} \
                          WHERE thread_id = $1",
+                        branch_work_sql("$2"),
                         &*STATUS_AFTER_PROPOSAL_SQL
                     ))
                     .bind(thread_id)
@@ -1176,10 +1211,12 @@ impl EventBus {
                 // back to running so the thread surfaces in the recents list as
                 // soon as the dispatcher emits the spawn. The contract's
                 // status_transitions table sets Running too; we emit the SQL
-                // here so the timestamp moves alongside it.
+                // here so the timestamp moves alongside it. The resumed turn
+                // ends with its own verdict, so the last one's reason clears.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), \
-                     status = {RUNNING}, last_revived_at = NOW() WHERE thread_id = $1",
+                     status = {RUNNING}, last_revived_at = NOW(), \
+                     coding_agent_unproposed_reason = NULL WHERE thread_id = $1",
                 ))
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -1374,14 +1411,13 @@ impl EventBus {
             }
             // **No resolution moves the status.** A subscription never held the
             // turn, so its resolution says nothing about one. An idle thread
-            // is woken by its own `UserPromptInjected`, a running one would be
+            // is woken by its own `PromptInjected`, a running one would be
             // misreported as revived, and a question keeps a parked one.
             //
-            // None of the three is a user action for `last_agent_action`
-            // either: the wake's first event bumps it, and stamping it here
-            // would credit the agent for an event the engine delivered. A
-            // cancel IS a user action, because every cancel cause is a person
-            // pressing something.
+            // A delivery or an expiry leaves `last_agent_action` to the
+            // re-entry anchor written right after it, a non-human
+            // `PromptInjected`. A cancel IS a user action, because every cancel
+            // cause is a person pressing something.
             //
             // All three DROP the wait from `live_event_waits`, by `wait_id`,
             // and the count follows from the array's new length. The wait is
@@ -1542,6 +1578,36 @@ impl EventBus {
                     change_id,
                     crate::core::changes::ChangeStatus::Pending,
                 )
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::ChangeWithdrawn { change_id } => {
+                crate::core::changes_projection::ChangesProjection::write_status(
+                    tx,
+                    change_id,
+                    crate::core::changes::ChangeStatus::Withdrawn,
+                )
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::ProposalWithheld { reason, .. } => {
+                // A pending change keeps the row `proposed` (ADR 0397's edge of
+                // a plan recorded under one); otherwise the work is unproposed
+                // for this reason.
+                let proposed = ChangeStateKind::Proposed.as_str();
+                sqlx::query(&format!(
+                    "UPDATE thread_summaries SET \
+                     coding_agent_unproposed_reason = CASE \
+                        WHEN coding_agent_change_state = '{proposed}' THEN NULL ELSE $2 END, \
+                     coding_agent_change_state = CASE \
+                        WHEN coding_agent_change_state = '{proposed}' THEN '{proposed}' \
+                        ELSE '{unproposed}' END \
+                     WHERE thread_id = $1",
+                    unproposed = ChangeStateKind::Unproposed.as_str(),
+                ))
+                .bind(thread_id)
+                .bind(reason.as_str())
+                .execute(&mut **tx)
                 .await?;
                 Vec::new()
             }
@@ -1758,6 +1824,11 @@ impl EventBus {
             // the event-store fallback in `bash_output`.
             | ThreadEvent::BackgroundBashStarted { .. }
             | ThreadEvent::BackgroundBashCompleted { .. }
+            // An owner approval asked for, then spent. The request is the
+            // card's wording, the spend is the single-use key, and the card
+            // and the act project on their own.
+            | ThreadEvent::OwnerApprovalRequested { .. }
+            | ThreadEvent::OwnerApprovalSpent { .. }
             // Engine-internal Flash enrichment of a prior MessageReceived's
             // attached images. Persisted for history projection / title
             // generation lookup by source_event_id; doesn't bump activity or
@@ -1785,6 +1856,11 @@ impl EventBus {
             // resurface the thread. Both are pure card/audit projection.
             | ThreadEvent::CommandCheckpointed { .. }
             | ThreadEvent::CommandCheckpointReverted { .. }
+            // A thread's widgets derive from these events on read (ADR 0402),
+            // so no column holds them.
+            | ThreadEvent::WidgetShown { .. }
+            | ThreadEvent::WidgetPinned { .. }
+            | ThreadEvent::WidgetUnpinned { .. }
             // The end of a call says nothing a column holds. Persisted so a
             // session is countable and a trigger can subscribe.
             //
@@ -1802,21 +1878,27 @@ impl EventBus {
         // This runs after metadata updates so upsert events have created the row.
         let thread_type = Self::get_thread_type(tx, &thread_id).await?;
         let current = Self::get_current_section(tx, &thread_id).await?;
-        let (source, trigger_go_to_review, is_saved): (Option<String>, bool, bool) =
-            sqlx::query_as(
-                "SELECT source, COALESCE(trigger_go_to_review, FALSE), is_saved \
+        let (source, trigger_go_to_review, is_saved, read_requested): (
+            Option<String>,
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT source, COALESCE(trigger_go_to_review, FALSE), is_saved, read_requested \
                  FROM thread_summaries WHERE thread_id = $1",
-            )
-            .bind(thread_id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .unwrap_or((None, false, false));
+        )
+        .bind(thread_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or((None, false, false, false));
         // A trigger execution runs unattended, so its terminal event must not
-        // surface it in REVIEW. Three things make one attended again.
+        // surface it in REVIEW. Four things make one attended again.
         // `trigger_go_to_review` ("Send directly to Archive" turned off) covers
-        // reports the user is meant to read. A pin says the user is watching,
-        // and a pinned thread is never archived (ADR 0312). A user follow-up
-        // covers the rest: the latest start is a human `MessageReceived`.
+        // reports the user is meant to read, and a read request covers one
+        // report the run itself judged worth reading (ADR 0409). A pin says the
+        // user is watching, and a pinned thread is never archived (ADR 0312). A
+        // user follow-up covers the rest: the latest start is a human
+        // `MessageReceived`.
         //
         // The pin is read AFTER step 1, so a `ThreadSaved` sees its own write.
         //
@@ -1829,24 +1911,27 @@ impl EventBus {
         // Human to mirror `default_mode_human` on `ThreadEvent::MessageReceived`,
         // so legacy rows persisted before the field existed still read as
         // user messages.
-        let is_unattended =
-            if source.as_deref() != Some("trigger") || trigger_go_to_review || is_saved {
-                false
-            } else {
-                let human = ActorMode::Human.as_str();
-                let latest_start: Option<String> = sqlx::query_scalar(
-                    "SELECT event_type FROM events WHERE aggregate_id = $1::text \
+        let is_unattended = if source.as_deref() != Some("trigger")
+            || trigger_go_to_review
+            || is_saved
+            || read_requested
+        {
+            false
+        } else {
+            let human = ActorMode::Human.as_str();
+            let latest_start: Option<String> = sqlx::query_scalar(
+                "SELECT event_type FROM events WHERE aggregate_id = $1::text \
                  AND (event_type = 'TriggerStarted' \
                       OR (event_type = 'MessageReceived' \
                           AND COALESCE(payload->>'mode', $2) = $2)) \
                  ORDER BY sequence DESC LIMIT 1",
-                )
-                .bind(thread_id)
-                .bind(human)
-                .fetch_optional(&mut **tx)
-                .await?;
-                latest_start.as_deref() != Some("MessageReceived")
-            };
+            )
+            .bind(thread_id)
+            .bind(human)
+            .fetch_optional(&mut **tx)
+            .await?;
+            latest_start.as_deref() != Some("MessageReceived")
+        };
         match resolve_transition(event.event_type(), thread_type, current, is_unattended) {
             Ok(mut transition) => {
                 // CodingAgentIdled(has_changes=false) after apply/discard is a housekeeping

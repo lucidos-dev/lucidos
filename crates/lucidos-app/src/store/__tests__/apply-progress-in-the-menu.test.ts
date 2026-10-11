@@ -50,6 +50,8 @@ function pendingChange(id: string, threadId: string, overrides: Partial<Change> 
     files: ['a.ts'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-05-04T00:00:00Z',
     resolved_at: null,

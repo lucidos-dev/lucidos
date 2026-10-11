@@ -30,6 +30,8 @@ function change(id: string, threadId: string | null, overrides: Partial<Change> 
     files: ['a.ts'],
     requires_restart: false,
     hardened: true,
+    needs_hardening: false,
+    apply_ready: true,
     status: 'pending',
     created_at: '2026-05-04T00:00:00Z',
     resolved_at: null,
@@ -68,7 +70,7 @@ describe('applyPhaseOf', () => {
   it('prefers the phase event this page saw', () => {
     const seen = { phase: 'resolving-conflict' as const, eventId: 'e-1', startedAt: TEN_MIN_AGO };
     const phases = new Map([['t-2', seen]]);
-    expect(applyPhaseOf('t-2', change('c', 't-2', { hardened: false }), phases)).toEqual(seen);
+    expect(applyPhaseOf('t-2', change('c', 't-2', { needs_hardening: true }), phases)).toEqual(seen);
   });
 
   it('falls back to the row after a reload, start time included', () => {
@@ -76,7 +78,7 @@ describe('applyPhaseOf', () => {
       resolving_conflict: true,
       apply_phase_started_at: TEN_MIN_AGO,
     }), NO_PHASES)).toEqual({ phase: 'resolving-conflict', eventId: null, startedAt: TEN_MIN_AGO });
-    expect(applyPhaseOf('t-2', change('c', 't-2', { hardened: false }), NO_PHASES)?.phase).toBe('hardening');
+    expect(applyPhaseOf('t-2', change('c', 't-2', { needs_hardening: true }), NO_PHASES)?.phase).toBe('hardening');
     expect(applyPhaseOf('t-2', change('c', 't-2'), NO_PHASES)).toEqual({ phase: 'merging', eventId: null, startedAt: null });
   });
 
@@ -119,7 +121,7 @@ describe('batchSecondsLeft', () => {
   it('adds up hardening, and ends each conflict at its own time beside the queue', () => {
     const pending = [
       change('c-1', 't-1', { resolving_conflict: true, apply_phase_started_at: TEN_MIN_AGO }),
-      change('c-2', 't-x', { hardened: false }),
+      change('c-2', 't-x', { needs_hardening: true }),
       change('c-3', 't-y', { predicted_conflict: 'conflict' }),
     ];
     // c-1 ends in 8 min. c-2 hardens 20 min, then c-3's 18 min conflict ends at 38.
@@ -132,8 +134,8 @@ describe('batchSecondsLeft', () => {
     const parked = { ...batch, applyingChangeIds: ['c-2'], resolvingChangeIds: ['c-1'] };
     const pending = [
       change('c-1', 't-1', { resolving_conflict: true, apply_phase_started_at: TEN_MIN_AGO }),
-      change('c-2', 't-x', { hardened: false }),
-      change('c-3', 't-y', { hardened: false }),
+      change('c-2', 't-x', { needs_hardening: true }),
+      change('c-3', 't-y', { needs_hardening: true }),
     ];
     // c-1 ends in 8 min, while c-2 and c-3 harden for 40 min in turn.
     expect(batchSecondsLeft(parked, pending, NO_PHASES, ESTIMATES, NOW)).toBe(40 * MIN);
@@ -151,7 +153,7 @@ describe('batchSecondsLeft', () => {
     const pending = [
       change('c-1', 't-1', { predicted_conflict: 'clean' }),
       change('c-2', 't-x', { predicted_conflict: 'clean' }),
-      change('c-3', 't-y', { hardened: false }),
+      change('c-3', 't-y', { needs_hardening: true }),
     ];
     const resolved = { ...batch, resolvedChangeIds: ['c-3'], applyingChangeIds: [], resolvingChangeIds: [] };
     expect(batchSecondsLeft(resolved, pending, NO_PHASES, ESTIMATES, NOW)).toBe(0);
@@ -168,7 +170,7 @@ describe('batchSecondsLeft', () => {
 
   // A sum missing one of its terms would claim less time than the batch needs.
   it('gives no total when a needed estimate is missing', () => {
-    const pending = [change('c-1', 't-1'), change('c-2', 't-x', { hardened: false }), change('c-3', 't-y')];
+    const pending = [change('c-1', 't-1'), change('c-2', 't-x', { needs_hardening: true }), change('c-3', 't-y')];
     expect(batchSecondsLeft(batch, pending, NO_PHASES, { ...ESTIMATES, hardening: null }, NOW)).toBeNull();
     expect(batchSecondsLeft(batch, null, NO_PHASES, ESTIMATES, NOW)).toBeNull();
   });

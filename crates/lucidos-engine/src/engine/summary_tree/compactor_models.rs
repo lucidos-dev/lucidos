@@ -1,6 +1,6 @@
 //! The compactor's model catalog: one source for its price table, its
-//! per-model token seeds and its default. A second copy of any of them falls
-//! silently out of sync; see
+//! per-tier token and time seeds and its default. A second copy of any of them
+//! falls silently out of sync; see
 //! `docs/plans/2026-10-06-tree-compactor-provider-aware-default.md`.
 //!
 //! [`super::estimate`] reads [`COMPACTOR_MODELS`] for its price table, and
@@ -9,28 +9,69 @@
 
 use serde::Serialize;
 
-use crate::engine::aux_purpose::{recommended, select_model, ModelSource};
+use crate::engine::aux_purpose::{recommended, select_model, ModelSource, Reach};
 use crate::engine::ContextPurpose;
-use crate::llm::model_registry::{resolve_route, ModelRegistry, ProviderKind, Unconfigured};
+use crate::llm::model_registry::{
+    default_effort, resolve_route, ModelRegistry, ProviderKind, Unconfigured,
+};
+use crate::llm::reasoning::clamp_effort;
 
 /// One measured compactor model.
 pub(crate) struct CompactorModel {
     pub(crate) id: &'static str,
     /// List price in USD per million (input, output) tokens.
     pub(crate) price: (f64, f64),
-    /// Tokens one compactor call spends, measured in the comparison the plan
-    /// above records. The estimate prices a model with too little history of
-    /// its own on these.
-    pub(crate) seed: MeasuredUsage,
+    /// What a cached input token costs, as a share of the input price.
+    pub(crate) cache: CacheRates,
+    /// One compactor call at each tier the comparison measured, in ladder
+    /// order. The estimate prices a tier with too little history of its own on
+    /// these. Figures and their derivations:
+    /// `docs/plans/2026-10-08-tree-estimate-prices-each-tier.md`.
+    pub(crate) seeds: &'static [TierSeed],
+}
+
+/// One measured tier of a compactor model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TierSeed {
+    pub(crate) effort: &'static str,
+    pub(crate) usage: MeasuredUsage,
+    /// Seconds one call took, wall clock. `None` where the comparison timed
+    /// no run at this tier.
+    pub(crate) secs_per_call: Option<f64>,
 }
 
 /// Average tokens of one compactor call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MeasuredUsage {
+    /// Every input token, cached or not.
     pub(crate) avg_input: u64,
-    /// The average at the `low` tier: the baseline the estimate scales other
-    /// tiers from.
-    pub(crate) avg_output_low: u64,
+    /// The part of `avg_input` read from the prompt cache.
+    pub(crate) avg_cache_read: u64,
+    /// The part of `avg_input` written to the prompt cache.
+    pub(crate) avg_cache_write: u64,
+    /// Every output token, thinking included.
+    pub(crate) avg_output: u64,
+}
+
+/// A seed with no cached input: the comparison sent none.
+const fn uncached(effort: &'static str, input: u64, output: u64, secs: Option<f64>) -> TierSeed {
+    TierSeed {
+        effort,
+        usage: MeasuredUsage {
+            avg_input: input,
+            avg_cache_read: 0,
+            avg_cache_write: 0,
+            avg_output: output,
+        },
+        secs_per_call: secs,
+    }
+}
+
+/// A cached input token's price, as a share of the plain input price.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CacheRates {
+    pub(crate) read: f64,
+    pub(crate) write: f64,
 }
 
 pub(crate) const COMPACTOR_MODELS: &[CompactorModel] = &[
@@ -38,10 +79,12 @@ pub(crate) const COMPACTOR_MODELS: &[CompactorModel] = &[
         id: "gpt-6.1-sol",
         // https://developers.openai.com/api/docs/models/gpt-6.1-sol
         price: (2.0, 10.0),
-        seed: MeasuredUsage {
-            avg_input: 2_909,
-            avg_output_low: 109,
+        // https://developers.openai.com/api/docs/guides/prompt-caching
+        cache: CacheRates {
+            read: 0.05,
+            write: 1.25,
         },
+        seeds: &[uncached("low", 2_909, 109, Some(6.1))],
     },
     CompactorModel {
         id: "gemini-3.8-flash",
@@ -49,20 +92,35 @@ pub(crate) const COMPACTOR_MODELS: &[CompactorModel] = &[
         // (docs/temporary-measures.md, "Gemini 3.8 Flash's introductory
         // compactor price").
         price: (0.75, 3.75),
-        seed: MeasuredUsage {
-            avg_input: 3_229,
-            avg_output_low: 93,
+        // https://ai.google.dev/gemini-api/docs/pricing, "Context caching
+        // price". Implicit caching writes at no premium.
+        cache: CacheRates {
+            read: 0.1,
+            write: 1.0,
         },
+        // Medium's output assumes low's calls per node and input: the
+        // comparison reports only its dollars per node.
+        seeds: &[
+            uncached("low", 3_229, 93, Some(2.6)),
+            uncached("medium", 3_229, 495, Some(8.0)),
+        ],
     },
     CompactorModel {
         id: "claude-sonnet-5-5",
         // https://platform.claude.com/docs/en/about-claude/pricing, "Model
         // pricing" table, "Claude Sonnet 5.5" row.
         price: (2.0, 10.0),
-        seed: MeasuredUsage {
-            avg_input: 4_383,
-            avg_output_low: 181,
+        // https://platform.claude.com/docs/en/build-with-claude/prompt-caching,
+        // 5-minute entries.
+        cache: CacheRates {
+            read: 0.05,
+            write: 1.25,
         },
+        // The comparison timed no medium run.
+        seeds: &[
+            uncached("low", 4_383, 181, Some(2.2)),
+            uncached("medium", 4_422, 182, None),
+        ],
     },
 ];
 
@@ -94,23 +152,27 @@ pub(crate) const COMPACTOR_DEFAULTS: &[CompactorDefault] = &[
     },
 ];
 
-/// The tier a default entry runs `model` at, for a model picked with no tier.
-fn default_effort_for(model: &str) -> Option<&'static str> {
+/// The tier a default entry runs `model` at: its measured tier, if any.
+pub(crate) fn default_effort_for(model: &str) -> Option<&'static str> {
     COMPACTOR_DEFAULTS
         .iter()
         .find(|entry| entry.model == model)
         .map(|entry| entry.effort)
 }
 
-/// The tier for a model no default entry names, picked with no tier.
-pub(crate) const FALLBACK_EFFORT: &str = "low";
+/// The tier `model` runs at when no tier is stored: its measured tier, else
+/// its *default effort*.
+fn unset_effort(model: &str, registry: &ModelRegistry) -> Option<&'static str> {
+    default_effort_for(model).or_else(|| default_effort(registry, model))
+}
 
 /// The model and tier the compactor runs on, and where the model came from.
 /// `GET /api/v1/models/background` serves it, through `AuxCall`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CompactorSelection {
     pub model: String,
-    pub effort: String,
+    /// `None` sends no effort, for a model with no default effort.
+    pub effort: Option<String>,
     pub source: ModelSource,
 }
 
@@ -120,20 +182,16 @@ fn select(
     stored_effort: Option<String>,
     chat_model: &str,
     registry: &ModelRegistry,
-    is_configured: impl Fn(ProviderKind) -> bool,
+    reach: &Reach,
 ) -> CompactorSelection {
     let (model, source) = select_model(
         stored_model,
         &recommended(ContextPurpose::SummaryCompaction, registry),
         chat_model,
         registry,
-        is_configured,
+        reach,
     );
-    let effort = stored_effort.unwrap_or_else(|| {
-        default_effort_for(&model)
-            .unwrap_or(FALLBACK_EFFORT)
-            .to_string()
-    });
+    let effort = stored_effort.or_else(|| unset_effort(&model, registry).map(str::to_string));
     CompactorSelection {
         model,
         effort,
@@ -141,13 +199,12 @@ fn select(
     }
 }
 
-/// The compactor's selection on this workspace, against the providers the
-/// router has configured. `chat_model` is the model turns run on, the last
-/// resort.
+/// The compactor's selection on this workspace, against what `reach` says the
+/// providers serve. `chat_model` is the model turns run on, the last resort.
 pub(crate) async fn compactor_selection(
     pool: &sqlx::PgPool,
     registry: &ModelRegistry,
-    configured: &[ProviderKind],
+    reach: &Reach,
     chat_model: &str,
 ) -> CompactorSelection {
     let pair = crate::engine::aux_purpose::SUMMARY_COMPACTION_PREFS;
@@ -156,35 +213,51 @@ pub(crate) async fn compactor_selection(
         pair.reasoning.read(pool).await,
         chat_model,
         registry,
-        |kind| configured.contains(&kind),
+        reach,
     )
 }
 
-/// The lane `model`'s calls run in: its route, as `provider/wire id`. When no
-/// configured provider serves it, what to configure instead. The compactor
-/// reports that as waiting for a model, rather than failing every node
-/// against a backend that is not there.
-pub(crate) fn compactor_lane(
+/// Where the compactor's calls go, resolved once per node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompactorRoute {
+    /// The route, as `provider/wire id`: the lane the calls share.
+    pub(crate) lane: String,
+    /// The tier the route runs, snapped as routing snaps it. The capture
+    /// records this, so the estimate finds history under the tier that ran.
+    pub(crate) effort: Option<String>,
+}
+
+/// The route `model`'s calls take at `effort`. When no configured provider
+/// serves it, what to configure instead. The compactor reports that as waiting
+/// for a model, rather than failing every node against a backend that is not
+/// there.
+pub(crate) fn compactor_route(
     model: &str,
+    effort: Option<&str>,
     registry: &ModelRegistry,
     configured: &[ProviderKind],
-) -> Result<String, String> {
-    resolve_route(registry, model, None, |kind| configured.contains(&kind))
-        .map(|route| format!("{}/{}", route.provider.as_str(), route.wire_id))
-        .map_err(|Unconfigured(kind)| {
+) -> Result<CompactorRoute, String> {
+    let route = resolve_route(registry, model, None, |kind| configured.contains(&kind)).map_err(
+        |Unconfigured(kind)| {
             format!(
                 "no configured provider serves {model}; configure {} or pick another model",
                 kind.as_str()
             )
-        })
+        },
+    )?;
+    Ok(CompactorRoute {
+        lane: format!("{}/{}", route.provider.as_str(), route.wire_id),
+        effort: effort
+            .and_then(|e| clamp_effort(e, route.provider, &route.wire_id))
+            .map(str::to_string),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::prefs;
-    use crate::llm::model_registry::load_from_db;
-    use crate::llm::reasoning::clamp_effort;
+    use crate::llm::model_registry::{load_from_db, ModelRouting};
     use crate::test_support::{setup_test_db, teardown_test_db};
     use std::sync::{Arc, RwLock};
 
@@ -224,6 +297,31 @@ mod tests {
         }
     }
 
+    /// The estimate reads a default's tier exactly, so every default tier is
+    /// seeded. Seeds run up the ladder, each tier once.
+    #[test]
+    fn every_default_tier_is_seeded_and_seeds_climb_the_ladder() {
+        for entry in COMPACTOR_DEFAULTS {
+            let model = COMPACTOR_MODELS.iter().find(|m| m.id == entry.model);
+            assert!(
+                model.is_some_and(|m| m.seeds.iter().any(|s| s.effort == entry.effort)),
+                "{} has no {} seed",
+                entry.model,
+                entry.effort
+            );
+        }
+        let rung = |effort: &str| crate::llm::EFFORT_LADDER.iter().position(|t| *t == effort);
+        for model in COMPACTOR_MODELS {
+            let rungs: Vec<_> = model.seeds.iter().map(|s| rung(s.effort)).collect();
+            assert!(rungs.iter().all(Option::is_some), "{}: {rungs:?}", model.id);
+            assert!(
+                rungs.windows(2).all(|w| w[0] < w[1]),
+                "{}: {rungs:?}",
+                model.id
+            );
+        }
+    }
+
     fn selected(
         stored_model: Option<&str>,
         stored_effort: Option<&str>,
@@ -234,44 +332,64 @@ mod tests {
             stored_effort.map(str::to_string),
             "my-chat-model",
             &crate::llm::model_registry::empty(),
-            only(kinds),
+            &Reach::configured(kinds),
         )
     }
 
     #[test]
     fn a_stored_model_and_tier_win_over_the_default() {
-        let s = selected(Some("gemini-3.5-flash"), Some("high"), &ProviderKind::ALL);
-        assert_eq!(s.model, "gemini-3.5-flash");
-        assert_eq!(s.effort, "high");
+        let s = selected(Some("gemini-3.8-flash"), Some("high"), &ProviderKind::ALL);
+        assert_eq!(s.model, "gemini-3.8-flash");
+        assert_eq!(s.effort.as_deref(), Some("high"));
         assert_eq!(s.source, ModelSource::Preference);
     }
 
+    /// A measured model keeps its measured tier. Any other runs at its default
+    /// effort, and one with none sends no effort.
     #[test]
-    fn a_model_picked_without_a_tier_runs_at_its_default_tier() {
-        assert_eq!(selected(Some("gpt-6.1-sol"), None, &[]).effort, "low");
-        assert_eq!(
-            selected(Some("gemini-3.5-flash"), None, &[]).effort,
-            FALLBACK_EFFORT
-        );
+    fn a_model_picked_without_a_tier_runs_at_its_measured_or_default_tier() {
+        let registry = crate::llm::model_registry::empty();
+        let mut opus = ModelRouting::single(ProviderKind::Vertex, "claude-opus-5-5");
+        opus.default_effort = Some("medium");
+        let mut sol = ModelRouting::single(ProviderKind::OpenAi, "gpt-6.1-sol");
+        sol.default_effort = Some("medium");
+        registry.write().unwrap().extend([
+            ("claude-opus-5-5".to_string(), opus),
+            ("gpt-6.1-sol".to_string(), sol),
+        ]);
+        let effort = |model: &str| {
+            select(
+                Some(model.to_string()),
+                None,
+                "my-chat-model",
+                &registry,
+                &Reach::configured(&[]),
+            )
+            .effort
+        };
+        assert_eq!(effort("gpt-6.1-sol").as_deref(), Some("low"), "measured");
+        assert_eq!(effort("claude-opus-5-5").as_deref(), Some("medium"));
+        assert_eq!(effort("my-local-model"), None);
     }
 
     #[test]
     fn a_stored_tier_applies_to_the_default_model() {
         let s = selected(None, Some("medium"), &[ProviderKind::OpenAi]);
         assert_eq!(
-            (s.model.as_str(), s.effort.as_str()),
-            ("gpt-6.1-sol", "medium")
+            (s.model.as_str(), s.effort.as_deref()),
+            ("gpt-6.1-sol", Some("medium"))
         );
         assert_eq!(s.source, ModelSource::Default);
     }
 
     /// Nothing on the list is reachable on a local-only install, so the
-    /// compactor runs on whatever the workspace chats with.
+    /// compactor runs on whatever the workspace chats with, at that model's
+    /// default effort.
     #[test]
     fn with_no_default_reachable_the_chat_model_compacts() {
         let s = selected(None, None, &[ProviderKind::Local]);
         assert_eq!(s.model, "my-chat-model");
-        assert_eq!(s.effort, FALLBACK_EFFORT);
+        assert_eq!(s.effort, None, "the chat model has no row here");
         assert_eq!(s.source, ModelSource::ChatModel);
     }
 
@@ -281,15 +399,42 @@ mod tests {
     #[test]
     fn an_unreachable_model_names_what_to_configure() {
         let registry = crate::llm::model_registry::empty();
-        let reason = compactor_lane("gpt-6.1-sol", &registry, &[ProviderKind::Vertex])
+        let reason = compactor_route("gpt-6.1-sol", None, &registry, &[ProviderKind::Vertex])
             .expect_err("OpenAI is not configured");
         assert!(
             reason.contains("gpt-6.1-sol") && reason.contains("openai"),
             "{reason}"
         );
         assert_eq!(
-            compactor_lane("gpt-6.1-sol", &registry, &[ProviderKind::OpenAi]),
+            compactor_route("gpt-6.1-sol", None, &registry, &[ProviderKind::OpenAi])
+                .map(|r| r.lane),
             Ok("openai/gpt-6.1-sol".to_string())
+        );
+    }
+
+    /// The route carries the tier it runs, so the capture records that tier
+    /// and the estimate's per-tier history finds it. A stored tier the route
+    /// cannot run snaps as routing snaps it.
+    #[test]
+    fn the_route_carries_the_tier_it_runs() {
+        let registry = crate::llm::model_registry::empty();
+        let effort = |model: &str, stored: &str, kind: ProviderKind| {
+            compactor_route(model, Some(stored), &registry, &[kind])
+                .expect("served")
+                .effort
+        };
+        assert_eq!(
+            effort("gpt-6.1-sol", "none", ProviderKind::OpenAi).as_deref(),
+            clamp_effort("none", ProviderKind::OpenAi, "gpt-6.1-sol")
+        );
+        assert_eq!(
+            effort("gpt-6.1-sol", "medium", ProviderKind::OpenAi).as_deref(),
+            Some("medium")
+        );
+        assert_ne!(
+            effort("gpt-6.1-sol", "none", ProviderKind::OpenAi).as_deref(),
+            Some("none"),
+            "Sol has no none tier"
         );
     }
 
@@ -350,8 +495,8 @@ mod tests {
     async fn the_selection_reads_the_stored_keys() {
         let (pool, db_name) = setup_test_db().await;
         let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
-        let unset =
-            compactor_selection(&pool, &registry, &[ProviderKind::Vertex], "my-chat-model").await;
+        let vertex = Reach::configured(&[ProviderKind::Vertex]);
+        let unset = compactor_selection(&pool, &registry, &vertex, "my-chat-model").await;
         assert_eq!(unset.model, "gemini-3.8-flash");
         assert_eq!(unset.source, ModelSource::Default);
 
@@ -362,8 +507,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let memory_only =
-            compactor_selection(&pool, &registry, &[ProviderKind::Vertex], "my-chat-model").await;
+        let memory_only = compactor_selection(&pool, &registry, &vertex, "my-chat-model").await;
         assert_eq!(memory_only.model, "gemini-3.8-flash", "no inheritance");
 
         for (key, value) in [
@@ -374,10 +518,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let stored =
-            compactor_selection(&pool, &registry, &[ProviderKind::Vertex], "my-chat-model").await;
+        let stored = compactor_selection(&pool, &registry, &vertex, "my-chat-model").await;
         assert_eq!(stored.model, "claude-sonnet-5-5");
-        assert_eq!(stored.effort, "high");
+        assert_eq!(stored.effort.as_deref(), Some("high"));
         assert_eq!(stored.source, ModelSource::Preference);
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -396,7 +539,7 @@ mod tests {
             &recommended(ContextPurpose::SummaryCompaction, registry),
             "",
             registry,
-            only(kinds),
+            &Reach::configured(kinds),
         );
         if source != ModelSource::Default {
             return None;

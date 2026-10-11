@@ -155,34 +155,49 @@ pub(super) fn terminate_decision(
 /// whole block. Its pending row then keeps advertising a file the live Diff
 /// does not show.
 ///
-/// A clean `Generated` terminal writes complete work. A user Stop writes its
-/// branch work as incomplete, so stopped work always keeps an Apply and never
-/// drops off with an archive (ADR 0328). Every other terminal writes nothing:
-/// a failed turn, a redirect the next turn continues, and an Apply or Discard
-/// stop, which owns the change itself.
+/// A clean `Generated` terminal proposes its work, and `propose_change` can
+/// still hold it on the plan floor (ADR 0397). A user Stop, a failure or an
+/// abort did not finish, so its work is withheld, never proposed (ADR 0400).
+/// Every other terminal writes nothing: a redirect the next turn continues,
+/// and an Apply or Discard stop, which owns the change itself.
 ///
 /// External repos never produce Lucidos changes, and a shutdown is mid-work
 /// rather than idle. A conflict-resolution session runs in a `merge-tmp`
 /// worktree where the merge IS the change being applied. Proposing there
-/// creates a phantom second change row nothing resolves. Background bash
-/// deliberately does NOT gate this: harden-at-apply re-runs the tests before
-/// an un-hardened change can merge.
+/// creates a phantom second change row nothing resolves.
+///
+/// A live event wait holds a clean idle's proposal (ADR 0395): the agent parked
+/// mid-work, and the wait re-opens the thread. That idle only keeps an existing
+/// change in step with the branch. A wait that ends without re-opening the
+/// thread hands the proposal to `propose_work_a_canceled_wait_held`.
 pub(super) fn idle_change_write(
-    is_external_repo: bool,
-    is_shutdown: bool,
-    is_conflict_session: bool,
+    session: IdleSession,
     terminal_kind: &Option<TerminalKind>,
 ) -> Option<IdleChangeWrite> {
-    if is_external_repo || is_shutdown || is_conflict_session {
+    if session.is_external_repo || session.is_shutdown || session.is_conflict_session {
         return None;
     }
     match terminal_kind {
+        Some(TerminalKind::Generated) if session.holds_live_wait => Some(IdleChangeWrite::Resync),
         Some(TerminalKind::Generated) => Some(IdleChangeWrite::Complete),
-        Some(TerminalKind::Canceled(crate::engine::thread_events::CancelCause::UserStop)) => {
-            Some(IdleChangeWrite::Incomplete)
-        }
+        Some(
+            TerminalKind::Canceled(crate::engine::thread_events::CancelCause::UserStop)
+            | TerminalKind::Failed { .. }
+            | TerminalKind::Aborted(_),
+        ) => Some(IdleChangeWrite::Unfinished),
         _ => None,
     }
+}
+
+/// What an idle knows about its session, for [`idle_change_write`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct IdleSession {
+    pub(super) is_external_repo: bool,
+    pub(super) is_shutdown: bool,
+    pub(super) is_conflict_session: bool,
+    /// The thread holds an event wait that has not been delivered, expired or
+    /// canceled.
+    pub(super) holds_live_wait: bool,
 }
 
 /// How an idle may write change state, from [`idle_change_write`].
@@ -190,14 +205,21 @@ pub(super) fn idle_change_write(
 pub(super) enum IdleChangeWrite {
     /// The turn finished: its branch work is a change ready to review.
     Complete,
-    /// The user stopped the turn: its branch work is proposed as incomplete,
-    /// so Apply confirms first and Apply All passes it over.
-    Incomplete,
+    /// The turn did not finish: a Stop, a failure or an abort. Its branch work
+    /// stays unproposed, announced as withheld (ADR 0400).
+    Unfinished,
+    /// The turn ended holding a live event wait: an open change follows the
+    /// branch, and no new one is proposed.
+    Resync,
 }
 
 impl IdleChangeWrite {
-    pub(super) fn incomplete(self) -> bool {
-        self == Self::Incomplete
+    pub(super) fn finished(self) -> bool {
+        self != Self::Unfinished
+    }
+
+    pub(super) fn may_create(self) -> bool {
+        self != Self::Resync
     }
 }
 
@@ -215,8 +237,8 @@ impl IdleChangeWrite {
 /// forward there is the phantom-Apply regression named in
 /// [`idle_change_write`].
 ///
-/// `prior` is the thread's last known state: `has_changes` from
-/// `thread_summaries.coding_agent_has_diff`, which the post-commit hook corrects
+/// `prior` is the thread's last known state: `has_changes` from the change
+/// state holding work, which the post-commit hook corrects
 /// mid-turn, and `requires_restart` from the most recent turn-closer payload.
 pub(super) fn idle_change_flags(
     changed_files: Option<&[String]>,
@@ -356,10 +378,9 @@ pub(super) fn terminal_clears_user_hit_stop(terminal: &TerminalKind) -> bool {
 /// Auto-commit the worktree on session cleanup ONLY when the last turn
 /// finished cleanly (Generated) AND the user didn't ask to discard.
 ///
-/// Anything else leaves the worktree's contents uncommitted on the branch. The
-/// post-commit hook fires per commit and emits a per-commit `ChangeProposed`.
-/// Without this gate a half-finished session publishes a spurious Apply card
-/// even though [`idle_change_write`] already refused.
+/// Anything else leaves the worktree's contents uncommitted on the branch. So
+/// a half-finished session never commits partial work that a later proposal
+/// would carry.
 ///
 /// Recovery is unaffected: `recover_orphaned_worktrees` re-spawns the agent in
 /// the same worktree, and it sees uncommitted dirt the same as committed state.
@@ -649,11 +670,11 @@ pub(super) fn stop_terminal_kind(
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SessionEndAction {
-    /// Propose the branch's net work. `incomplete` marks work a user Stop cut
-    /// short, so it keeps an Apply that confirms first (ADR 0328).
-    Propose {
-        incomplete: bool,
-    },
+    /// Propose the branch's net work.
+    Propose,
+    /// The turn did not finish (a Stop or a failure), so its net work stays
+    /// unproposed and is announced as withheld (ADR 0400).
+    WithholdUnfinished,
     KeepExternalBranch,
     /// Safety net fired (CC EOF without a Result event) and commits exist on the
     /// branch. Keep the commits on disk so the user can resume, but do NOT emit
@@ -684,10 +705,10 @@ pub(super) enum SessionEndAction {
 /// Any commits on the branch then reflect partial work: they stay on disk via
 /// `CrashedKeepBranch` and are never proposed as a change.
 ///
-/// `cancel` says how the last terminal cancelled the turn, if it did. Both
-/// cancels keep the branch so the session stays resumable. A Stop with net work
-/// proposes it as incomplete; a redirect never proposes, because the follow-up
-/// continues on the branch. Cancels rank below the external and crash arms,
+/// `cancel` says how the last terminal ended the turn short, if it did. A
+/// cancel keeps the branch so the session stays resumable. A Stop or a failure
+/// with net work withholds it; a redirect never proposes, because the follow-up
+/// continues on the branch. These rank below the external and crash arms,
 /// which carry more specific semantics. A cancel cannot co-occur with
 /// `safety_net_fired`, because a cancel emits a terminal.
 pub(super) fn classify_session_end_action(
@@ -701,13 +722,13 @@ pub(super) fn classify_session_end_action(
     match (has_commits, is_external_repo, safety_net_fired, cancel) {
         (true, true, _, _) => SessionEndAction::KeepExternalBranch,
         (true, false, true, _) => SessionEndAction::CrashedKeepBranch,
-        (_, _, _, TurnCancel::Stopped) if proposable => {
-            SessionEndAction::Propose { incomplete: true }
+        (_, _, _, TurnCancel::Stopped | TurnCancel::Failed) if proposable => {
+            SessionEndAction::WithholdUnfinished
         }
         (_, _, _, TurnCancel::Stopped | TurnCancel::Redirected) => {
             SessionEndAction::KeepCanceledBranch
         }
-        _ if proposable => SessionEndAction::Propose { incomplete: false },
+        _ if proposable => SessionEndAction::Propose,
         _ => SessionEndAction::KeepEmptyBranch,
     }
 }
@@ -722,6 +743,8 @@ pub(super) enum TurnCancel {
     Stopped,
     /// A follow-up interrupted the turn and continues it.
     Redirected,
+    /// The turn ended in failure, so it did not finish.
+    Failed,
 }
 
 impl TurnCancel {
@@ -730,6 +753,7 @@ impl TurnCancel {
         match terminal {
             Some(TerminalKind::Canceled(CancelCause::UserStop)) => Self::Stopped,
             Some(TerminalKind::Canceled(CancelCause::SupersededByFollowup)) => Self::Redirected,
+            Some(TerminalKind::Failed { .. }) => Self::Failed,
             _ => Self::None,
         }
     }

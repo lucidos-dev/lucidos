@@ -50,6 +50,8 @@ mod themes;
 /// `MatchedPath`, which reports the FULL path a nest resolved to. Two copies
 /// would let a prefix change refuse every exempt route instead.
 pub(crate) const API_V1_PREFIX: &str = "/api/v1";
+pub(crate) mod owner_approval;
+mod plugin_media;
 mod plugins;
 mod presence;
 pub mod presence_pong;
@@ -64,6 +66,7 @@ pub(crate) mod proxy_pipeline_builder;
 pub(crate) mod proxy_pipeline_config;
 pub(crate) mod proxy_script_layer;
 pub(crate) mod proxy_script_runner;
+pub(crate) mod proxy_speech;
 pub(crate) mod proxy_static_layers;
 pub(crate) mod proxy_timeout;
 pub(crate) mod proxy_token_cache;
@@ -87,14 +90,15 @@ mod trigger_groups;
 mod triggers;
 mod voice;
 mod webhooks;
+mod widgets;
 mod workspace_label;
+mod workspace_prompt_footprint;
 mod ws_echo;
 
 /// The `apis.json` read, re-exported because the engine binary reads it at
 /// startup and `SystemEvent::ProxyConfigRejected` carries the refusals. The
 /// rest of `proxy` stays crate-internal.
 pub use proxy::{load_proxy_config, InsecureTransport, ProxyConfigLoad, RejectedProvider};
-pub use proxy_builtin::local_upstream_base_url;
 /// The model write rules, re-exported so `manage_models` applies the same ones.
 pub(crate) use settings::{apply_model_update, routes_for_create};
 
@@ -596,7 +600,11 @@ impl ChatImage {
 #[derive(Debug, Deserialize)]
 pub struct AppCaptureRequest {
     pub request_id: String,
-    pub screenshot: String, // base64-encoded image (JPEG from html2canvas; format sniffed downstream)
+    /// The answering page's device, as a chat send names it. It wins over the
+    /// header, so the check compares the id the turn recorded.
+    #[serde(default)]
+    pub device_id: Option<String>,
+    pub screenshot: String, // base64-encoded image (JPEG from the SDK capture; format sniffed downstream)
     pub dom: String,
 }
 
@@ -920,6 +928,10 @@ pub struct ModelInfo {
     pub routes: Vec<RouteInfo>,
     pub preferred_provider: Option<String>,
     pub vision: bool,
+    /// The *default effort*; `None` means the engine sends no effort.
+    pub default_effort: Option<String>,
+    /// The model this one was retired to; `None` for a current model.
+    pub successor: Option<String>,
     pub sort_order: i32,
     pub source: String,
     pub enabled: bool,
@@ -1448,9 +1460,8 @@ pub fn create_router(
     // than at listen time. See `api::local_auth`.
     bind_choice: &crate::net_config::BindChoice,
 ) -> Router {
-    // Initialize AppManager
-    let app_manager =
-        Arc::new(AppManager::new(&workspace_path).expect("Failed to initialize AppManager"));
+    // The engine's own, so the routes see the built-in widgets it resolved.
+    let app_manager = engine.shared_app_manager();
 
     // Resolve + pin the served frontend (dev) BEFORE `engine` is moved into
     // `AppState`. The served dir lives behind a swappable handle so a
@@ -1515,6 +1526,7 @@ pub fn create_router(
         .merge(chat::router())
         .merge(claude_code::router())
         .merge(side_questions::router())
+        .merge(owner_approval::router())
         .merge(threads::router())
         .merge(changes::router())
         .merge(notifications::router())
@@ -1531,6 +1543,7 @@ pub fn create_router(
         .merge(memory::router())
         .merge(recall::router())
         .merge(apps::router())
+        .merge(widgets::router())
         .merge(command_permission::router())
         .merge(command_checkpoint::router())
         .merge(mcp::router())
@@ -1552,8 +1565,10 @@ pub fn create_router(
         .merge(blobs::router())
         .merge(themes::router())
         .merge(plugins::router())
+        .merge(plugin_media::router())
         .merge(webhooks::router())
         .merge(workspace_label::router())
+        .merge(workspace_prompt_footprint::router())
         .merge(handshake_scripts::router())
         .merge(proxy::router())
         .fallback(|| async { axum::http::StatusCode::NOT_FOUND })

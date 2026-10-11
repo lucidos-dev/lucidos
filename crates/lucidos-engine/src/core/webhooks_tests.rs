@@ -364,6 +364,58 @@ fn a_replayed_delivery_is_refused_once_it_is_stale() {
 }
 
 #[test]
+fn a_signed_timestamp_with_no_tolerance_still_gets_the_default_window() {
+    let cfg = HmacConfig {
+        tolerance_secs: None,
+        ..slack_config()
+    };
+    assert_eq!(
+        cfg.replay_tolerance_secs(),
+        Some(DEFAULT_REPLAY_TOLERANCE_SECS)
+    );
+    let secret = "slack-signing-secret";
+    let body = "token=x";
+    let signed_at = 1_700_000_000;
+    let expected = sign(&cfg, secret, &format!("v0:{signed_at}:{body}"));
+    let hook = hook_with(None, Some(cfg));
+    let header = format!("v0={expected}");
+    let delivered_at = |now_unix| PresentedDelivery {
+        authorization: None,
+        signature_header: Some(&header),
+        timestamp_header: Some("1700000000"),
+        body,
+        now_unix,
+    };
+    assert_eq!(
+        verify(&hook, &delivered_at(signed_at), Some(secret)),
+        Ok(())
+    );
+    assert_eq!(
+        verify(
+            &hook,
+            &delivered_at(signed_at + DEFAULT_REPLAY_TOLERANCE_SECS + 1),
+            Some(secret)
+        ),
+        Err(DeliveryRefusal::TimestampOutsideTolerance),
+        "a captured delivery must not verify forever"
+    );
+}
+
+#[test]
+fn a_scheme_that_signs_no_timestamp_keeps_no_window() {
+    assert_eq!(github_config().replay_tolerance_secs(), None);
+}
+
+#[test]
+fn an_explicit_tolerance_wins_over_the_default() {
+    let explicit = HmacConfig {
+        tolerance_secs: Some(900),
+        ..slack_config()
+    };
+    assert_eq!(explicit.replay_tolerance_secs(), Some(900));
+}
+
+#[test]
 fn a_tolerance_with_no_timestamp_refuses_rather_than_skipping_the_check() {
     assert!(timestamp_within_tolerance(None, None, 0));
     assert!(timestamp_within_tolerance(Some(300), Some("100"), 200));

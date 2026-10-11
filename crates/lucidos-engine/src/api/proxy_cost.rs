@@ -6,6 +6,9 @@
 //! records only what the provider reported: a reply with no usage block, such
 //! as a quota read, records nothing.
 //!
+//! OpenAI speech reports usage only on a stream, or not at all for `tts-1`.
+//! `api::proxy_speech` rewrites, records or refuses those requests.
+//!
 //! The record runs on its own task. The caller gets its response unchanged and
 //! no later than the proxy would have returned it.
 
@@ -16,7 +19,9 @@ use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::engine::model_call::CallDetail;
 use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
+use crate::llm::served_model::served_model_of;
 use crate::llm::usage_wire::{self, ProviderUsage};
 
 /// The Gemini API's host. Vertex hosts are recognised by `llm::vertex`.
@@ -109,36 +114,58 @@ pub(crate) async fn record_model_call(
                 .into_response();
         }
     };
-    let streamed = parts
-        .headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("text/event-stream"));
-    if let Some((usage, model)) = reported(&bytes, streamed, request_body, path) {
-        let capture =
-            AuxCapture::for_thread_or_home(&engine.event_bus, cost_thread, ContextPurpose::Proxy);
-        let request_chars = String::from_utf8_lossy(request_body).chars().count();
-        tokio::spawn(async move {
-            capture
-                .record_usage(
-                    &model,
-                    request_chars,
-                    Some(crate::engine::model_call::usage_from_provider(usage)),
-                )
-                .await;
-        });
+    let streamed = is_event_stream(&parts.headers);
+    if let Some(call) = reported(&bytes, streamed, request_body, path) {
+        record(engine, cost_thread, call, request_body);
     }
     Response::from_parts(parts, Body::from(bytes))
 }
 
-/// The usage a reply reported and the model that served it, or `None` when
-/// the reply names no prompt tokens.
-fn reported(
-    reply: &[u8],
-    streamed: bool,
+/// Record one proxied call's cost, on a task of its own.
+pub(crate) fn record(
+    engine: &Arc<LucidosEngine>,
+    cost_thread: Option<Uuid>,
+    call: ReportedCall,
     request_body: &[u8],
-    path: &str,
-) -> Option<(ProviderUsage, String)> {
+) {
+    let capture =
+        AuxCapture::for_thread_or_home(&engine.event_bus, cost_thread, ContextPurpose::Proxy);
+    let request_chars = String::from_utf8_lossy(request_body).chars().count();
+    tokio::spawn(async move {
+        capture
+            .record_usage_detailed(
+                &call.model,
+                request_chars,
+                Some(crate::engine::model_call::usage_from_provider(call.usage)),
+                CallDetail {
+                    served_model: call.served_model,
+                    ..CallDetail::default()
+                },
+            )
+            .await;
+    });
+}
+
+/// Whether a reply is a server-sent event stream.
+pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"))
+}
+
+/// What one forwarded call reported.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReportedCall {
+    pub(crate) usage: ProviderUsage,
+    /// The model the request asked for, else the one the reply named.
+    pub(crate) model: String,
+    /// The model the reply named. A streamed reply is not read for it.
+    pub(crate) served_model: Option<String>,
+}
+
+/// What a reply reported, or `None` when it names no prompt tokens.
+fn reported(reply: &[u8], streamed: bool, request_body: &[u8], path: &str) -> Option<ReportedCall> {
     let reply_json = (!streamed)
         .then(|| serde_json::from_slice::<serde_json::Value>(reply).ok())
         .flatten();
@@ -147,37 +174,33 @@ fn reported(
         Some(json) => usage_wire::from_json(json),
         None => usage_wire::from_event_stream(&String::from_utf8_lossy(reply)),
     }?;
-    Some((usage, model_of(reply_json.as_ref(), request_body, path)))
+    let served_model = match &reply_json {
+        Some(serde_json::Value::Array(chunks)) => chunks.last(),
+        other => other.as_ref(),
+    }
+    .and_then(served_model_of);
+    let model = requested_model_of(request_body, path)
+        .or_else(|| served_model.clone())
+        .unwrap_or_default();
+    Some(ReportedCall {
+        usage,
+        model,
+        served_model,
+    })
 }
 
-/// The model a reply names, else the one the request asked for, else the one
-/// a Gemini path carries (`models/<model>:<method>`).
-fn model_of(reply: Option<&serde_json::Value>, request_body: &[u8], path: &str) -> String {
-    let named = |json: &serde_json::Value| {
-        ["model", "modelVersion"]
-            .iter()
-            .find_map(|key| json.get(*key).and_then(|m| m.as_str()))
-            .filter(|m| !m.is_empty())
-            .map(str::to_string)
-    };
-    let reply = match reply {
-        Some(serde_json::Value::Array(chunks)) => chunks.last(),
-        other => other,
-    };
-    reply
-        .and_then(named)
-        .or_else(|| {
-            serde_json::from_slice::<serde_json::Value>(request_body)
-                .ok()
-                .as_ref()
-                .and_then(named)
-        })
+/// The model the request asked for: the body's, else the one a Gemini path
+/// carries (`models/<model>:<method>`).
+fn requested_model_of(request_body: &[u8], path: &str) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(request_body)
+        .ok()
+        .and_then(|body| Some(body.get("model")?.as_str()?.to_string()))
+        .filter(|model| !model.is_empty())
         .or_else(|| {
             let after = path.rsplit_once("models/")?.1;
             let model = after.split([':', '/']).next()?;
             (!model.is_empty()).then(|| model.to_string())
         })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

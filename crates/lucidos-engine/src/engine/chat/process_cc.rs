@@ -214,15 +214,7 @@ impl LucidosEngine {
                 let mut orphans = crate::engine::agent_session::queued_to_orphans(residual);
                 match result {
                     Ok(ref mut pr) => pr.orphaned_injections.append(&mut orphans),
-                    // A failed turn carries no result to hang them on, so they
-                    // do go. Said out loud rather than silently, which is what
-                    // this block exists to prevent.
-                    Err(ref e) => log!(
-                        "[Chat] Dropped {} coalesced follow-up(s) on thread {}: the CC turn failed ({})",
-                        orphans.len(),
-                        thread_id,
-                        e
-                    ),
+                    Err(_) => self.resubmit_orphans_of_failed_turn(thread_id, orphans),
                 }
             }
         }

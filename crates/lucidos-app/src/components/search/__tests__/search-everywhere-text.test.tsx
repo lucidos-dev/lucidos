@@ -27,11 +27,18 @@ vi.mock('../../../api/client', async (importOriginal) => ({
   },
 }));
 
-const navigation = vi.hoisted(() => ({ requests: [] as unknown[] }));
+const navigation = vi.hoisted(() => ({ requests: [] as unknown[][] }));
 
 vi.mock('../../../store/actions/navigation-request', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/navigation-request')>()),
-  handleNavigationRequest: (nav: unknown) => { navigation.requests.push(nav); },
+  handleNavigationRequest: (...args: unknown[]) => { navigation.requests.push(args); },
+}));
+
+const paneFocus = vi.hoisted(() => ({ focused: [] as unknown[] }));
+
+vi.mock('../../layout/paneFocus', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../layout/paneFocus')>()),
+  focusPaneMainControl: (pane: unknown) => { paneFocus.focused.push(pane); },
 }));
 
 import { SERVER_DEBOUNCE_MS, SearchEverywhere, TEXT_TAB_WINDOW } from '../SearchEverywhere';
@@ -96,6 +103,7 @@ beforeEach(() => {
   engine.text = {};
   engine.textAsked = [];
   navigation.requests = [];
+  paneFocus.focused = [];
   localStorage.removeItem(RECENTS_KEY);
   preferences.value = { status: 'not-loaded' };
   searchEverywhereOpen.value = true;
@@ -131,15 +139,18 @@ describe('the All tab', () => {
     expect(row.querySelector('.search-everywhere-result-subtitle')!.textContent).toBe('knowhow/notes.md:4');
   });
 
-  it('opens the file at the line on Enter, and remembers the file', async () => {
+  it('opens the file at the line on Enter, finding the query there, and remembers the file', async () => {
     engine.text.preview = found([line('knowhow/notes.md', 4)]);
     type(QUERY);
     await settle();
     press('Enter');
-    expect(navigation.requests).toEqual([{ target: 'file', file_path: 'knowhow/notes.md', line: 4 }]);
+    expect(navigation.requests).toEqual([
+      [{ target: 'file', file_path: 'knowhow/notes.md', line: 4 }, { find: QUERY }],
+    ]);
     expect(searchEverywhereOpen.value).toBe(false);
     const recents = JSON.parse(localStorage.getItem(RECENTS_KEY) ?? '[]');
     expect(recents[0]).toMatchObject({ category: 'files', id: 'knowhow/notes.md', title: 'notes.md' });
+    expect(paneFocus.focused, 'the find bar takes the focus, not the pane').toEqual([]);
   });
 
   it('names a failed Text search instead of hiding it', async () => {

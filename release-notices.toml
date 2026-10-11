@@ -149,3 +149,19 @@ such call and says what to change.
 """
 action_label = "Audit my workspace"
 action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "every-workspace-has-home"
+since = "0.47.2"
+title = "Every workspace now has Home"
+body = """
+Home is one conversation that never ends. Open it from the Home icon in the \
+thread header: at its start on desktop, beside the Lucidos mark on a phone. From Home, Lucidos can follow up any of your threads, and it \
+presses your buttons only when you ask it to in that message.
+
+It used to sit behind a switch under Experimental. The switch is gone, so \
+Home shows even if you had it off. Its history is still there.
+
+Home costs nothing while you leave it alone: it works only when you write in \
+it.
+"""

@@ -31,7 +31,7 @@ async fn refuse_change_verb(
     let Some(thread_id) = row else {
         return Ok(());
     };
-    Ok(refuse_without_authority(&state.pool, headers, thread_id, verb).await?)
+    Ok(refuse_without_authority(&state.engine.event_bus, headers, thread_id, verb).await?)
 }
 
 /// The same gate for a batch, whose target is every change it will touch.
@@ -49,7 +49,7 @@ async fn refuse_batch_change_verb(
     verb: ThreadReachVerb,
 ) -> Result<(), ApiError> {
     for change in batch {
-        refuse_without_authority(&state.pool, headers, change.thread_id, verb).await?;
+        refuse_without_authority(&state.engine.event_bus, headers, change.thread_id, verb).await?;
     }
     Ok(())
 }
@@ -448,7 +448,7 @@ pub(super) async fn arm_standing_apply(
     // the gate the immediate apply takes. The `apply_when_settled` LLM tool is
     // the other way to this same act, and asks the same rule.
     refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         Some(body.thread_id),
         ThreadReachVerb::Apply,
@@ -506,7 +506,7 @@ pub(super) async fn disarm_standing_apply(
     // Taking an apply back acts on the same thread's apply, so it asks the gate
     // the arm asks. A caller that could not have armed here may not cancel here.
     refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         Some(thread_id),
         ThreadReachVerb::Apply,
@@ -546,7 +546,13 @@ pub(super) async fn disarm_all_standing_applies(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
     // Workspace scope, so no subtree contains it. Same reasoning as Apply All.
-    refuse_without_authority(&state.pool, &headers, None, ThreadReachVerb::Apply).await?;
+    refuse_without_authority(
+        &state.engine.event_bus,
+        &headers,
+        None,
+        ThreadReachVerb::Apply,
+    )
+    .await?;
     let disarmed = state
         .engine
         .drop_standing_applies(DisarmScope::All, DISARMED_BY_OWNER, actor)
@@ -568,15 +574,14 @@ pub(super) struct ApplyAllQuery {
 /// What Apply All says when nothing could be applied now and the sweep was not
 /// asked for. Pure, so each refusal names the real reason rather than one blanket
 /// message.
-pub(super) fn empty_apply_all_refusal(total_pending: usize, unsettled: usize) -> &'static str {
+pub(super) fn empty_apply_all_refusal(total_pending: usize, not_ready: usize) -> &'static str {
     if total_pending == 0 {
         "No pending changes"
-    } else if unsettled == total_pending {
-        "All pending changes belong to threads that are still working or waiting for something. \
-         Use \"Apply all on settle\", or wait for them to finish."
+    } else if not_ready == total_pending {
+        "No pending change is ready: each thread is still working or waiting for something, \
+         or its work is not hardened. Use \"Apply all on settle\", or wait for them to finish."
     } else {
-        "None of the settled changes can be applied together: each has no file changes left, \
-         or is incomplete work that needs its own Apply."
+        "None of the ready changes can be applied: each has no file changes left."
     }
 }
 
@@ -608,7 +613,13 @@ pub(super) async fn apply_all_changes(
     // contains that, so clause 3 cannot cover it and a thread caller needs the
     // owner's standing instruction. Before the batch record and the first
     // merge, so a refusal leaves neither.
-    refuse_without_authority(&state.pool, &headers, None, ThreadReachVerb::Apply).await?;
+    refuse_without_authority(
+        &state.engine.event_bus,
+        &headers,
+        None,
+        ThreadReachVerb::Apply,
+    )
+    .await?;
     // The rule lives on the engine, so the agent's `apply_as_they_settle` runs
     // the same press this button does.
     let outcome = state
@@ -617,12 +628,12 @@ pub(super) async fn apply_all_changes(
         .await
         .map_err(ApiError::db)?;
 
-    let (total_pending, unsettled, armed) = match &outcome {
+    let (total_pending, not_ready, armed) = match &outcome {
         ApplyAllOutcome::NothingToApply {
             total_pending,
-            unsettled,
+            not_ready,
             armed,
-        } => (*total_pending, *unsettled, *armed),
+        } => (*total_pending, *not_ready, *armed),
         ApplyAllOutcome::Started { .. } => (0, 0, 0),
     };
     if let ApplyAllOutcome::NothingToApply { .. } = outcome {
@@ -630,7 +641,7 @@ pub(super) async fn apply_all_changes(
         if !query.keep_going {
             return Err(ApiError::bad_request(empty_apply_all_refusal(
                 total_pending,
-                unsettled,
+                not_ready,
             )));
         }
         state.engine.broadcast_changes_updated().await;
@@ -794,15 +805,16 @@ pub(super) async fn discard_all_changes(
     if all_pending.is_empty() {
         return Err(ApiError::bad_request("No pending changes"));
     }
-    // Skip changes whose thread has not settled, mid-turn or parked. Discarding
-    // would delete the branch and worktree out from under a session that is
-    // still going. Mirrors the Apply All filter and `guard_change_action`.
-    let pending = crate::core::changes::drop_unsettled_thread_changes(&state.pool, all_pending)
+    // Discard All sits on the Ready section, so it acts on the apply-ready
+    // changes only. Discarding an unsettled one would delete the branch and
+    // worktree out from under a session that is still going. Mirrors the
+    // Apply All filter and `guard_change_action`.
+    let pending = crate::core::changes::keep_apply_ready_changes(&state.pool, all_pending)
         .await
         .map_err(ApiError::db)?;
     if pending.is_empty() {
         return Err(ApiError::bad_request(
-            "All pending changes belong to threads that are still working or waiting for something. Wait for them to finish, then discard.",
+            "No pending change is ready: each thread is still working or waiting for something, or its work is not hardened.",
         ));
     }
     // Before the first discard, so a refusal deletes no branch and no worktree.
@@ -879,7 +891,7 @@ mod tests {
 
     /// The refusal names the control the Changes panel draws.
     #[test]
-    fn all_unsettled_refusal_points_at_apply_all_on_settle() {
+    fn a_refusal_with_nothing_ready_points_at_apply_all_on_settle() {
         let msg = empty_apply_all_refusal(2, 2);
         assert!(msg.contains("\"Apply all on settle\""), "{msg}");
         assert!(!msg.contains("Keep going"), "{msg}");
@@ -947,9 +959,9 @@ mod tests {
     ) {
         sqlx::query(
             "INSERT INTO thread_summaries
-                (thread_id, is_coding_agent, status, coding_agent_proposed,
+                (thread_id, is_coding_agent, status, coding_agent_change_state,
                  live_event_wait_count, active_children_count)
-             VALUES ($1, true, $2, true, $3, $4)",
+             VALUES ($1, true, $2, 'proposed', $3, $4)",
         )
         .bind(thread_id)
         .bind(status)
@@ -1039,12 +1051,15 @@ mod tests {
         use crate::engine::standing_apply::{
             standing_verdict, ArmedChange, SettleFacts, StandingVerdict, TurnSettle,
         };
+        use crate::engine::thread_lifecycle::CodingAgentChangeState;
 
         let facts = |status: &str, waits: bool| SettleFacts {
             status: status.to_string(),
             parked_on_question: false,
             live_event_waits: waits,
-            has_diff: true,
+            change_state: CodingAgentChangeState::Proposed {
+                requires_restart: false,
+            },
             armed_change: ArmedChange::Ready(Uuid::new_v4()),
             turn_settle: TurnSettle::Settled,
         };

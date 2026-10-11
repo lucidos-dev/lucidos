@@ -10,6 +10,7 @@ use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::parse_thread_id;
 use crate::api::AppState;
 use crate::engine::agent_session::background_task::BackgroundTaskStart;
 
@@ -45,10 +46,6 @@ pub(super) fn require_own_thread_agent(
                 .to_string(),
         )),
     }
-}
-
-fn parse_thread_id(raw: &str) -> Result<Uuid, (StatusCode, String)> {
-    Uuid::parse_str(raw).map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))
 }
 
 #[derive(Deserialize)]

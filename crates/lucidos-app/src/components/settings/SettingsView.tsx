@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
-import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
+import { currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileDynamicBars, setMobileDynamicBars, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, homeThreadEnabled, setHomeThreadEnabled, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileDynamicBars, setMobileDynamicBars, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
 import { DEFAULT_THEME_MODE, THEME_EFFECTS_PREFS, THEME_MODES, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
 import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import { openScaleModal } from '../shared/scaleModalState';
@@ -29,7 +29,8 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { SETTINGS_SECTION_REFRESH } from './settingsSectionRefresh';
 import {
-  lucidosModelChoices, LUCIDOS_TIER_VOCABULARY, rememberProvider,
+  lucidosModelChoices, LUCIDOS_TIER_VOCABULARY, PROVIDER_DEFAULT_EFFORT_LABEL, rememberProvider,
+  defaultTierLabel, modelDefaultEffort,
 } from '../../store/actions/models';
 import { type ModelChoice } from '../../store/modelSelection';
 import { ModelSelectionRow } from './ModelSelectionRow';
@@ -1159,7 +1160,10 @@ export function SettingsView() {
             models={lucidosModelChoices(currentModel.value)}
             vocabulary={LUCIDOS_TIER_VOCABULARY}
             model={currentModel.value}
-            effort={reasoningEffort.value}
+            effort={accountChatEffort(currentModel.value)}
+            effortFor={accountChatEffort}
+            unsetEffortLabel={PROVIDER_DEFAULT_EFFORT_LABEL}
+            defaultEffortLabel={(m) => defaultTierLabel(modelDefaultEffort(m))}
             onChange={(p) => {
               void setChatModelSelection(p);
               if (p.provider) void rememberProvider(p.model, p.provider);
@@ -1263,6 +1267,13 @@ export function SettingsView() {
             anchor="models:conversation-summary"
             modelKey="model_conversation_summary"
             reasoningKey="reasoning_conversation_summary"
+            background={background}
+          />
+          <BackgroundModelRow
+            label="Read decision"
+            anchor="models:read-decision"
+            modelKey="model_read_decision"
+            reasoningKey="reasoning_read_decision"
             background={background}
           />
           {/* The compactor runs only under Tree, so the row shows only then. */}
@@ -1481,7 +1492,6 @@ export function SettingsView() {
         )}
         {notificationsSection()}
         {linksSection()}
-        {experimentalSection()}
       </>
     );
   }
@@ -1668,38 +1678,6 @@ export function SettingsView() {
     );
   }
 
-  /** Experimental: features that ship off while they prove themselves. Each
-   *  row is a switch the engine reads too, so it holds on every device. */
-  function experimentalSection() {
-    const loaded = preferences.value.status === 'loaded';
-    return (
-      <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="appearance:experimental">Experimental</div>
-        <div class="settings-row" data-search-anchor="appearance:home-thread">
-          <span class="settings-row-label">
-            Home thread
-            <Explainer title="Home thread">
-              <p>
-                One conversation that never ends, at the top of your threads. It
-                can follow up any of your other threads, and it presses your
-                buttons only when you ask it to in that message.
-              </p>
-              <p>
-                Voice calls happen there, so voice needs it on. Turning it off
-                hides Home, and turning it on again brings the same thread back.
-              </p>
-            </Explainer>
-          </span>
-          <LoadableToggle
-            loaded={loaded}
-            checked={homeThreadEnabled()}
-            onChange={(c) => void setHomeThreadEnabled(c)}
-          />
-        </div>
-      </div>
-    );
-  }
-
   function renderSubview() {
     switch (settingsSubview.value) {
       case 'system': return <SystemSubmenu />;
@@ -1722,6 +1700,7 @@ export function SettingsView() {
       case 'webhooks': return <WebhooksPage />;
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
+      case 'prompt-footprint': return <SystemPage panel="prompt-footprint" />;
       case 'environment-variables': return <SystemPage panel="environment-variables" />;
       case 'debugging': return <SystemPage panel="debugging" />;
       case 'communication-surfaces': return <SystemPage panel="communication-surfaces" />;

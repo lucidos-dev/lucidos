@@ -136,9 +136,22 @@ Settings.
 
 **Amended by the `secret` type**, which is signed with rather than sent and so
 names no host by design. An empty scope is that type's answer, not a gap, so the
-inference skips it: see `CredentialStore::infer_scope_if_empty`. The sentence
+inference skips it: see `CredentialStore::infer_undeclared_scopes`. The sentence
 above once read that `request_credential` had always required a `base_url`.
 It no longer does, for exactly that type.
+
+**Amended so "once" holds.** The pass first ran on every start, keyed on an
+empty scope alone. So an empty scope a user chose was refilled from whatever
+`apis.json` said, and an app can write that file (ADR 0156). Now a
+`scope_declared` column marks a row someone decided, and every write path sets
+it, an empty set included. The migration also declares every existing row
+that was edited or created after this ADR. Only an undeclared row is
+inferred, and the first pass then declares every row.
+
+The pass infers only types sent as a header, so an `oauth_client` is skipped
+too. It no longer reads the `local_base_url` preference for the `local` key.
+Settings saves that key with its scope, so a scope comes only from a write
+that names it, never from a preference.
 
 **The handshake runner is the only place the engine executes a file from
 workspace data.** Every other `Command::new` in the engine spawns a fixed

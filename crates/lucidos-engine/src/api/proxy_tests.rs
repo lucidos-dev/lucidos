@@ -2061,11 +2061,40 @@ fn a_legitimate_encoded_slash_inside_a_segment_still_forwards() {
 fn decoded_readings_peels_one_layer_per_round_and_terminates() {
     assert_eq!(
         decoded_readings("%2e%2e%252fadmin"),
-        vec!["%2e%2e%2fadmin", "%2e%2e/admin"]
+        Some(vec![
+            "%2e%2e%2fadmin".to_string(),
+            "%2e%2e/admin".to_string()
+        ])
     );
-    assert_eq!(decoded_readings("..%5cadmin"), vec!["../admin"]);
+    assert_eq!(
+        decoded_readings("..%5cadmin"),
+        Some(vec!["../admin".to_string()])
+    );
     // Nothing to decode means no extra probe to run.
-    assert!(decoded_readings("items/42").is_empty());
+    assert_eq!(decoded_readings("items/42"), Some(Vec::new()));
+}
+
+/// Regression: one round peels a single `%25`, so `%` followed by `25` k
+/// times took k rounds and kept every reading. A path near the URI limit held
+/// about a gigabyte of strings, and a few such requests could OOM the engine.
+#[test]
+fn a_deeply_nested_path_is_refused_without_peeling_every_layer() {
+    // Each `25` after the `%` is one more layer, and the final `%2f` takes one
+    // more round to become `/`.
+    let at_cap = format!("%{}2fadmin", "25".repeat(MAX_DECODE_ROUNDS - 1));
+    assert_eq!(
+        decoded_readings(&at_cap).map(|r| r.len()),
+        Some(MAX_DECODE_ROUNDS),
+        "a path exactly at the cap is still probed layer by layer"
+    );
+
+    let past_cap = format!("%{}2fadmin", "25".repeat(MAX_DECODE_ROUNDS));
+    assert_eq!(decoded_readings(&past_cap), None);
+
+    let hostile = format!("%{}", "25".repeat(30_000));
+    assert_eq!(decoded_readings(&hostile), None);
+    let result = build_contained_target_url(PREFIXED_BASE, &hostile, None);
+    assert!(result.is_err(), "a hostile nesting must be refused");
 }
 
 #[test]
@@ -2429,10 +2458,42 @@ fn credential_scopes_collect_every_naming_entry() {
     );
 }
 
-/// The inference is once. A row that already carries a scope is never
-/// rewritten, so a user's own correction survives every later start.
+/// Make a seeded credential look like one stored before the migration that
+/// added `scope_declared`, which is the only row the inference may touch.
+async fn mark_undeclared(pool: &sqlx::PgPool, service_name: &str) {
+    sqlx::query("UPDATE credentials SET scope_declared = false WHERE service_name = $1")
+        .bind(service_name)
+        .execute(pool)
+        .await
+        .expect("mark the credential undeclared");
+}
+
+fn configured(
+    entries: &[(&str, &[&str])],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    entries
+        .iter()
+        .map(|(name, urls)| {
+            (
+                name.to_string(),
+                urls.iter().map(|u| u.to_string()).collect(),
+            )
+        })
+        .collect()
+}
+
+async fn stored_scope(pool: &sqlx::PgPool, service_name: &str) -> Vec<String> {
+    CredentialStore::get(pool, service_name)
+        .await
+        .unwrap()
+        .expect("the row exists")
+        .base_urls
+}
+
+/// The inference is once. A legacy row takes its entry's scope at the first
+/// start, and no later start re-scopes it, whatever `apis.json` says by then.
 #[tokio::test]
-async fn inferring_a_scope_leaves_an_existing_one_alone() {
+async fn inferring_a_scope_runs_once() {
     use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
     let (pool, db) = setup_test_db().await;
     let bus = crate::test_support::offline_event_bus();
@@ -2444,22 +2505,34 @@ async fn inferring_a_scope_leaves_an_existing_one_alone() {
         "sk-legacy",
     )
     .await;
+    mark_undeclared(&pool, "legacy-key").await;
 
-    assert!(
-        CredentialStore::infer_scope_if_empty(&pool, &bus, "legacy-key", "https://api.first.test")
-            .await
-            .unwrap(),
-        "an unscoped credential takes the inferred scope"
-    );
-    assert!(
-        !CredentialStore::infer_scope_if_empty(&pool, &bus, "legacy-key", "https://api.other.test")
-            .await
-            .unwrap(),
-        "a scoped credential is never re-scoped"
-    );
-    let stored = CredentialStore::get(&pool, "legacy-key").await.unwrap();
+    let scoped = CredentialStore::infer_undeclared_scopes(
+        &pool,
+        &bus,
+        &configured(&[("legacy-key", &["https://api.first.test"])]),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        stored.unwrap().base_urls,
+        scoped,
+        vec![(
+            "legacy-key".to_string(),
+            "https://api.first.test".to_string()
+        )],
+        "an undeclared, unscoped credential takes the inferred scope"
+    );
+
+    let rescoped = CredentialStore::infer_undeclared_scopes(
+        &pool,
+        &bus,
+        &configured(&[("legacy-key", &["https://api.other.test"])]),
+    )
+    .await
+    .unwrap();
+    assert!(rescoped.is_empty(), "a second start infers nothing");
+    assert_eq!(
+        stored_scope(&pool, "legacy-key").await,
         vec!["https://api.first.test".to_string()],
         "the inference fills the set once, and never appends to it"
     );
@@ -2468,44 +2541,99 @@ async fn inferring_a_scope_leaves_an_existing_one_alone() {
     teardown_test_db(&db).await;
 }
 
-/// A `secret` keeps its empty scope through the inference. For that type the
-/// empty set is the answer, not a legacy gap: the value is signed with and
-/// never sent, and `apis.json` is writable over the API. So an entry naming a
-/// webhook signing secret must not be able to hand it to a host.
+/// The regression behind the `scope_declared` column. A user narrowed a key to
+/// "send nowhere", and an app then wrote an `apis.json` entry naming it at the
+/// app's own host. The next start must leave the empty scope alone, so the
+/// gate still refuses the key everywhere.
 #[tokio::test]
-async fn inferring_a_scope_never_reaches_a_secret() {
+async fn inferring_a_scope_never_fills_a_scope_the_user_emptied() {
     use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
     let (pool, db) = setup_test_db().await;
     let bus = crate::test_support::offline_event_bus();
     seed_credential(
         &pool,
-        "deploys-github",
-        "",
-        crate::core::AuthType::Secret,
-        "whsec_shared",
+        "narrowed-key",
+        "https://api.example.test",
+        crate::core::AuthType::Bearer,
+        "sk-live-secret",
     )
     .await;
-
-    assert!(
-        !CredentialStore::infer_scope_if_empty(
-            &pool,
-            &bus,
-            "deploys-github",
-            "https://attacker.test"
-        )
+    let id = CredentialStore::get(&pool, "narrowed-key")
         .await
-        .unwrap(),
-        "a secret is skipped, so nothing is inferred and nothing is announced"
-    );
+        .unwrap()
+        .expect("the row exists")
+        .id;
+    CredentialStore::set_base_urls(&pool, &bus, id, &[], None)
+        .await
+        .unwrap()
+        .expect("the row exists");
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("data/config")).unwrap();
+    std::fs::write(
+        tmp.path().join("data/config/apis.json"),
+        r#"{"app-entry": {"base_url": "https://attacker.test", "auth": {"pipeline": [
+            {"type": "static_credential", "kind": "bearer", "credential": "narrowed-key"}
+        ]}}}"#,
+    )
+    .unwrap();
+    let scopes = load_proxy_config(tmp.path()).credential_scopes();
+
+    let scoped = CredentialStore::infer_undeclared_scopes(&pool, &bus, &scopes)
+        .await
+        .unwrap();
+    assert!(scoped.is_empty(), "nothing is inferred: {scoped:?}");
     assert!(
-        CredentialStore::get(&pool, "deploys-github")
-            .await
-            .unwrap()
-            .expect("the row exists")
-            .base_urls
-            .is_empty(),
-        "the scope stays empty, so the gate still refuses it everywhere"
+        stored_scope(&pool, "narrowed-key").await.is_empty(),
+        "the empty scope the user chose survives the start"
     );
+    let err = check_credential_scope(&pool, "narrowed-key", "https://attacker.test")
+        .await
+        .expect_err("an unscoped credential is refused");
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A `secret` and an `oauth_client` keep their empty scope even as legacy rows.
+/// A secret is signed with and an OAuth client blob is read by the OAuth flow,
+/// so neither is sent to an `apis.json` host. Inferring one would hand the
+/// value to whatever host an app wrote there.
+#[tokio::test]
+async fn inferring_a_scope_never_reaches_a_type_that_is_not_sent() {
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let bus = crate::test_support::offline_event_bus();
+    for (name, auth_type) in [
+        ("deploys-github", crate::core::AuthType::Secret),
+        ("dropbox", crate::core::AuthType::OauthClient),
+    ] {
+        seed_credential(&pool, name, "", auth_type, "value").await;
+        mark_undeclared(&pool, name).await;
+    }
+
+    let scoped = CredentialStore::infer_undeclared_scopes(
+        &pool,
+        &bus,
+        &configured(&[
+            ("deploys-github", &["https://attacker.test"]),
+            ("dropbox", &["https://attacker.test"]),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert!(scoped.is_empty(), "nothing is inferred: {scoped:?}");
+    for name in ["deploys-github", "dropbox"] {
+        let row = sqlx::query_scalar::<_, Vec<String>>(
+            "SELECT base_urls FROM credentials WHERE service_name = $1",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(row.is_empty(), "{name} stays unscoped");
+    }
 
     pool.close().await;
     teardown_test_db(&db).await;

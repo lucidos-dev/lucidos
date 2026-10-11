@@ -253,7 +253,7 @@ impl LucidosEngine {
             ChangeStatus::Pending | ChangeStatus::SetAside => {}
             // Idempotent: already discarded, return success
             ChangeStatus::Discarded => return Ok(()),
-            status @ (ChangeStatus::Applied | ChangeStatus::Reverted) => {
+            status @ (ChangeStatus::Applied | ChangeStatus::Reverted | ChangeStatus::Withdrawn) => {
                 return Err(format!("Change is already {status}").into());
             }
         }
@@ -345,9 +345,12 @@ impl LucidosEngine {
             .await?
             .ok_or("Change not found")?;
         let shas = match &change.state {
-            ChangeState::Applied(shas) => shas,
-            ChangeState::Reverted(_) => return Ok("Change already reverted.".to_string()),
-            ChangeState::Pending { .. } | ChangeState::SetAside | ChangeState::Discarded => {
+            ChangeStatusData::Applied(shas) => shas,
+            ChangeStatusData::Reverted(_) => return Ok("Change already reverted.".to_string()),
+            ChangeStatusData::Pending { .. }
+            | ChangeStatusData::SetAside
+            | ChangeStatusData::Discarded
+            | ChangeStatusData::Withdrawn => {
                 return Err(format!(
                     "Change is '{}', only applied changes can be reverted",
                     change.status()

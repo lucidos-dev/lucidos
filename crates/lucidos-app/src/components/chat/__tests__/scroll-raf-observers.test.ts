@@ -18,7 +18,7 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
 }
 
 import { mockScrollEl } from './scroll-test-helpers';
-import { composeHandlers } from '../promptFocus';
+import { composeHandlers } from '../composeHandlers';
 import { awayFromBottom, makeScrollObservers, notAtTop, scrollToBottom, setActiveScrollElement, stopFollowingBottom } from '../scrollState';
 
 describe('scrollToBottom is one write, not a tail', () => {

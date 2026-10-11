@@ -45,6 +45,12 @@ describe('status mark sizes', () => {
     );
   });
 
+  it('draws the change glyph at the question badge size', () => {
+    const glyph = block(css, '.thread-status-changes-icon svg {');
+    expect(decl(glyph, 'width')).toBe(badge);
+    expect(decl(glyph, 'height')).toBe(badge);
+  });
+
   it('draws the pause glyph as tall as the dot', () => {
     expect(decl(block(css, '.thread-status-paused-icon svg {'), 'height')).toBe(dot);
   });

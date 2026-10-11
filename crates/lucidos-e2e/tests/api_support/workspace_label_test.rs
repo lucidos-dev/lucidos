@@ -1,56 +1,106 @@
 //! `GET /api/v1/workspace-label`: the display name a direct-port page asks for.
 //!
-//! The e2e engine is launched directly by `scripts/lib/e2e.sh`, not spawned by
-//! the gateway, so it is exactly the shape that has no registry row of its own
-//! to consult. That makes this suite the right place to pin the DEGRADATION,
-//! which is the half a unit test cannot reach: the route must answer 200 with a
-//! null label, not 404 and not a 500. A frontend that got either would log a
-//! warning on every boot, and an engine that erred here would put an unreachable
-//! gateway on the app's startup path.
+//! The harness gives the e2e engine a gateway identity only when a live gateway
+//! lists this workspace at the engine's port. Otherwise the engine has none
+//! (ADR 0385, `scripts/lib/e2e_gateway.sh`). A local run usually finds the dev
+//! gateway; a GitHub API shard has none. So the expected label is read from the identity
+//! the engine actually holds, never assumed.
 //!
-//! **Both roads to that null are real here, which is why the assertion holds
-//! however the suite was started.** From a clean shell the gateway identity vars
-//! are simply unset. From inside a coding-agent session they are NOT: a
-//! directly-launched engine inherits its launcher's whole environment, and this
-//! suite genuinely picked up `LUCIDOS_WORKSPACE_ID=dev` that way and answered
-//! with the `dev` workspace's label until the handler started checking the slug
-//! against the port it actually serves on. That check is what keeps this test
-//! honest rather than accidentally passing.
+//! The engine stamps that identity into the shell it serves, as the
+//! `lucidos-gateway-port` and `lucidos-workspace-id` metas. With both, the label
+//! must be the name the gateway lists for our own slug at our own port. With
+//! neither, it must be null: 200 with a null label, not 404 and not a 500.
 //!
-//! The populated case lives in the Rust unit tests beside the handler
-//! (`api/workspace_label.rs`), which drive the projection off a real listing
-//! without needing a gateway in the harness.
+//! The projection's edge cases (another workspace's row, a slug at the wrong
+//! port) live in the Rust unit tests beside the handler, `api/workspace_label.rs`.
 
-use crate::support::{base_url, http_client};
+use crate::support::{base_url, http_client, local_process_client};
+
+/// The `content` of `<meta name="{name}" content="…">` in `html`, or `None`.
+fn meta_content(html: &str, name: &str) -> Option<String> {
+    let start = html.find(&format!("<meta name=\"{name}\" content=\""))?;
+    let rest = &html[start..];
+    let value = rest.split_once("content=\"")?.1.split_once('"')?.0;
+    Some(value.to_string())
+}
+
+/// The name the gateway on `gateway_port` lists for `workspace_id`. Panics if
+/// the gateway does not list it at `engine_port`, since the harness attaches an
+/// identity only when it does.
+async fn listed_name(gateway_port: &str, workspace_id: &str, engine_port: u16) -> String {
+    let client = local_process_client();
+    for scheme in ["https", "http"] {
+        let url = format!("{scheme}://127.0.0.1:{gateway_port}/~/api/v1/control/workspaces");
+        let Ok(resp) = client.get(&url).send().await else {
+            continue;
+        };
+        let listing: serde_json::Value = resp.json().await.expect("listing is JSON");
+        let row = listing["workspaces"]
+            .as_array()
+            .expect("listing carries a workspaces array")
+            .iter()
+            .find(|w| w["id"] == workspace_id)
+            .unwrap_or_else(|| panic!("gateway does not list '{workspace_id}': {listing}"));
+        assert_eq!(
+            row["port"], engine_port,
+            "the harness attached this gateway, so it lists us at our port: {row}"
+        );
+        return row["name"]
+            .as_str()
+            .expect("row carries a name")
+            .to_string();
+    }
+    panic!("gateway on :{gateway_port} unreachable on either scheme");
+}
 
 #[tokio::test]
-async fn workspace_label_is_null_for_an_engine_with_no_registry_row_of_its_own() {
+async fn workspace_label_is_the_name_the_engines_own_gateway_lists() {
     let client = http_client();
-    let url = format!("{}/api/v1/workspace-label", base_url());
+    let base = base_url();
+    let engine_port = reqwest::Url::parse(&base)
+        .expect("base url parses")
+        .port()
+        .expect("base url carries the engine port");
+
+    let shell = client
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .expect("Shell request failed");
+    // A shell with no metas reads as "no gateway", so a missing one must fail.
+    assert_eq!(shell.status(), 200, "the engine serves its shell");
+    let shell = shell.text().await.expect("Shell body");
+    let expected = match (
+        meta_content(&shell, "lucidos-gateway-port"),
+        meta_content(&shell, "lucidos-workspace-id"),
+    ) {
+        (Some(gateway_port), Some(id)) => Some(listed_name(&gateway_port, &id, engine_port).await),
+        _ => None,
+    };
 
     let resp = client
-        .get(&url)
+        .get(format!("{base}/api/v1/workspace-label"))
         .send()
         .await
         .expect("Workspace label request failed");
     assert_eq!(
         resp.status(),
         200,
-        "the label route answers even with no gateway"
+        "the label route answers with or without a gateway"
     );
 
     let body: serde_json::Value = resp.json().await.expect("Invalid JSON");
-    // The key must be PRESENT and null, not absent: the client reads
-    // `body.label`, and an engine that answered `{}` would look identical to one
-    // that answered a label of `undefined`.
+    // The key must be PRESENT, even when null: the client reads `body.label`,
+    // and an engine that answered `{}` would look identical to one that
+    // answered a label of `undefined`.
     assert!(
         body.get("label").is_some(),
         "response carries a `label` key: {body}"
     );
-    assert!(
-        body["label"].is_null(),
-        "this engine holds no registry row, so it has no name to report, got {}",
-        body["label"]
+    assert_eq!(
+        body["label"].as_str(),
+        expected.as_deref(),
+        "the label is our own gateway's name for us, or null with no gateway: {body}"
     );
 }
 

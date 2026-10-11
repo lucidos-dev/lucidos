@@ -40,7 +40,9 @@ pub(crate) use external_edits::git_head_sha as external_edits_for_recovery_head_
 // Engine construction passes the hung-tool ceiling to the external watchdog;
 // `lifecycle` is private, so re-export it here.
 pub(crate) use lifecycle::WATCHDOG_HUNG_TOOL_CEILING_MS;
-pub(crate) use parsing::{parse_ask_user_question_inputs, question_text};
+pub(crate) use parsing::{
+    option_embed_problem, parse_ask_user_question_inputs, question_text, ParsedQuestion,
+};
 pub(crate) use prompts::build_merge_prompt;
 pub(crate) use reconstruct::prepend_reconstruction;
 pub(crate) use resume::{

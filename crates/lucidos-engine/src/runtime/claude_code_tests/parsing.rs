@@ -1184,22 +1184,30 @@ fn assistant_thinking(model: &str, thinking: &str) -> String {
     .to_string()
 }
 
+/// What reaches the transcript: prose and progress notes alike.
 fn messages(events: &[AgentEvent]) -> Vec<&str> {
     events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::Message { text, .. } => Some(text.as_str()),
+            AgentEvent::Message { text, .. } | AgentEvent::ProgressNote { text } => {
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect()
 }
 
+/// A note is its own event, never `Message` prose: the card gate must tell
+/// the summary the user read from text they read in full.
 #[test]
-fn a_relayed_note_from_an_always_thinking_model_is_a_message() {
+fn a_relayed_note_from_an_always_thinking_model_is_a_progress_note() {
     for model in ["claude-opus-5-5", "claude-fable-5-1"] {
         let mut state = CcStreamState::with_notes_relayed(true);
         let events = parse_line(&mut state, &assistant_thinking(model, "  Found it.  "));
-        assert_eq!(messages(&events), ["Found it.\n\n"], "{model}");
+        assert!(
+            matches!(&events[..], [AgentEvent::ProgressNote { text }] if text == "Found it."),
+            "{model}: {events:?}"
+        );
     }
 }
 

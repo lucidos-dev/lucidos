@@ -32,6 +32,8 @@ window). On boot it:
    `lucidos …` calls), `LUCIDOS_STATIC_DIR`, `LUCIDOS_SDK_DIR`,
    `LUCIDOS_SYSTEM_KNOWHOW_DIR` (the staged `system-knowhow/` reference docs —
    packaged builds have no source checkout for the repo-root fallback),
+   `LUCIDOS_SYSTEM_WIDGETS_DIR` (the staged `system-widgets/`, the built-in
+   widgets, for the same reason),
    `FASTEMBED_CACHE_DIR`, and `LUCIDOS_BOOT_WITHOUT_PROVIDER=1`,
 3. the gateway creates/loads the workspace registry (first run finds it empty and
    creates no workspace — the smart root then serves the picker so the user names
@@ -152,8 +154,8 @@ PostgreSQL 18 and compiles pgvector against it (the proven
 `scripts/prototype/desktop-pg-pgvector-spike.sh` recipe), stages everything into
 `crates/lucidos-app/bundle-resources/`, and runs `cargo tauri build --bundles
 app,dmg`. The staging directory is gitignored and survives between runs, so
-`cargo tauri build` verifies the staged `system-knowhow/` copy against the live
-tree before it packages anything (`scripts/check-staged-knowhow.sh`, wired into
+`cargo tauri build` verifies the staged `system-knowhow/` and `system-widgets/`
+copies against their live trees before it packages anything (`scripts/check-staged-copies.sh`, wired into
 `beforeBuildCommand`). A build driven by hand rather than through this script
 therefore cannot silently ship a months-old copy; it stops and prints the diff.
 The result is an **unsigned** `.dmg` under `target/release/bundle/dmg/`

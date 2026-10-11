@@ -1,7 +1,7 @@
 import { test, expect, Page, Locator } from './fixtures';
 import {
   addTriggerCard, apiRequest, assertHealthy, navigateToApp, openTriggersPanel,
-  pickDropdownOption,
+  pickDropdownOption, waitForModalExitFade,
 } from './helpers';
 
 /** Trigger group lifecycle through the real panel UI (TriggersView +
@@ -35,11 +35,13 @@ function groupSection(page: Page, name: string): Locator {
   });
 }
 
-/** Accept whatever confirm dialog is currently open (group/trigger deletes are
- *  both guarded by `showConfirm`, whose OK button carries `data-role="confirm-ok"`). */
+/** Accept whatever confirm dialog is currently open. `showConfirm` guards both
+ *  group and trigger deletes, and its OK button carries `data-role="confirm-ok"`.
+ *  Returns once its exit fade is over, so the next confirm is the only one. */
 async function confirmDialog(page: Page): Promise<void> {
   await page.locator('.confirm-dialog').waitFor({ state: 'visible', timeout: 10_000 });
   await page.locator('.confirm-dialog [data-role="confirm-ok"]:visible').first().click();
+  await waitForModalExitFade(page);
 }
 
 /** Clear any open toasts. On mobile the toast container overlays the panel and

@@ -22,7 +22,7 @@ import { assertHealthy, navigateToApp, openThreadDrawer, stampOverlayBuild } fro
 
 test.use({ viewport: { width: 1280, height: 800 } });
 
-/** Well clear of the drawer's floor (312px at this project's 16px root), so
+/** Well clear of the drawer's floor (320px at this project's 16px root), so
  *  the row's controls have real distance to travel into the corner. */
 const OPEN_DRAWER_WIDTH = 420;
 

@@ -11,8 +11,9 @@
  * runtime, which forces two self-contained programs. Both are built from
  * `boot/appearanceBoot.ts`, which reads this file like everyone else.
  *
- * **This module is pure**: no DOM, no storage, no network, so every rule is
- * unit-testable without a browser. Anything touching `document` belongs in
+ * **This module touches no DOM, storage or network**, so every rule is
+ * unit-testable without a browser. Its one side effect is the timers that
+ * `followSystemThemeMode` arms. Anything touching `document` belongs in
  * `boot/`. It is deliberately NOT re-exported from `index.ts`: nothing here
  * belongs on `window.lucidos`. That also keeps the whole SDK out of the host
  * store's module graph, which initialises a theme listener at import time.
@@ -239,6 +240,57 @@ export function resolveThemeMode(mode: ThemeMode, prefersLight: boolean): Resolv
  * so this is here for the single definition rather than for agreement.
  */
 export const SYSTEM_THEME_MODE_SETTLE_MS = 300;
+
+/**
+ * How long a moved OS appearance must still hold, after the settle read first
+ * saw it, before it paints.
+ *
+ * An iOS wake can be brief: the app shows for under a second, then hides. For
+ * that moment the media query can still report the snapshot pass's appearance,
+ * past the settle delay. Painting it leaves the page in that appearance, and
+ * iOS snapshots it, so the next return opens on it and then snaps back. A real
+ * flip pays this much extra latency (ADR 0092).
+ */
+export const SYSTEM_THEME_MODE_CONFIRM_MS = 1000;
+
+/** What a page tells `followSystemThemeMode` about itself. */
+export interface SystemThemeModePage {
+  /** Whether the user can see the page now. */
+  visible(): boolean;
+  /** Whether the preference is `system` and the OS asks for a mode other
+   *  than the painted one. */
+  moved(): boolean;
+  /** Repaint for the OS appearance. */
+  apply(): void;
+}
+
+/**
+ * The OS-appearance follower the shell and every app iframe share.
+ *
+ * `schedule` runs on every media-query change and every resume event. A burst
+ * arms one settle read. A read that sees a move arms a confirming read, and
+ * only a move that is still there then paints. Each read asks `moved()` afresh,
+ * so no event's value ever paints. A hide cancels whatever is pending, and the
+ * next wake starts over.
+ */
+export function followSystemThemeMode(page: SystemThemeModePage): { schedule(): void; cancel(): void } {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const cancel = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  const read = (confirming: boolean) => {
+    timer = null;
+    if (!page.visible() || !page.moved()) return;
+    if (confirming) page.apply();
+    else timer = setTimeout(() => read(true), SYSTEM_THEME_MODE_CONFIRM_MS);
+  };
+  const schedule = () => {
+    if (!page.visible()) cancel();
+    else if (timer === null) timer = setTimeout(() => read(false), SYSTEM_THEME_MODE_SETTLE_MS);
+  };
+  return { schedule, cancel };
+}
 
 // --- Motion ---
 

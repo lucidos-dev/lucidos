@@ -91,8 +91,9 @@ self.addEventListener('activate', (event) => {
 // to work around an iOS Safari bug where the implicit "don't call respondWith"
 // fallback returns empty/corrupted responses after the SW is killed and restarted
 // under memory pressure (manifests as blank thread views). Workspace images under
-// /data/ are fetched explicitly too, and read whole (see fetchWholeImage). Built /assets/*
-// bundles are also served Cache-first (see SHELL_CACHE) to speed up reloads.
+// /data/ are fetched explicitly too, and read whole (see fetchWhole). Built /assets/*
+// bundles are also served Cache-first (see SHELL_CACHE) to speed up reloads, and
+// a miss is read whole before it is cached.
 //
 // We DO NOT intercept non-GET methods (POST/PUT/PATCH/DELETE). iOS WebKit's body
 // stream cloning is unreliable when respondWith re-issues a request with a body —
@@ -190,20 +191,22 @@ self.addEventListener('fetch', (event) => {
 
   // A workspace image (a markdown `![](artifacts/x.png)` in a reply). On iOS its
   // body can end early and still count as a success, so the picture draws part
-  // of its height above an empty box. See fetchWholeImage. Images only: a
-  // video's range requests stay native.
+  // of its height above an empty box. See fetchWhole. Images only: a video's
+  // range requests stay native.
   if (rel.startsWith('/data/') && event.request.destination === 'image') {
-    event.respondWith(fetchWholeImage(event.request));
+    event.respondWith(fetchWhole(event.request));
     return;
   }
 
   // Content-hashed app bundles — no-op in dev (Vite never serves /assets/*).
+  // A miss is read whole (fetchWhole): a short body cached under an immutable
+  // hash fails that chunk on every later load, and no reload replaces it.
   // Refuse to cache an HTML response here (see isHtmlResponse): a bundle deleted
   // by a later build resolves through the server's SPA fallback to index.html,
   // and caching that under the bundle URL poisons the entry permanently.
   if (rel.startsWith('/assets/')) {
     event.respondWith(
-      cacheFirst(event.request, SHELL_CACHE, (r) => !!r && r.ok && !isHtmlResponse(r)),
+      cacheFirst(event.request, SHELL_CACHE, (r) => !!r && r.ok && !isHtmlResponse(r), fetchWhole),
     );
     return;
   }
@@ -232,21 +235,21 @@ async function fetchWithRetry(request) {
   }
 }
 
-const IMAGE_ATTEMPTS = 3;
-// How long an image body may go without a byte before the attempt is dropped.
-// Idle time, not total time, so a big picture on a slow link still finishes.
-const IMAGE_STALL_MS = 10_000;
+const WHOLE_BODY_ATTEMPTS = 3;
+// How long a body may go without a byte before the attempt is dropped. Idle
+// time, not total time, so a big file on a slow link still finishes.
+const WHOLE_BODY_STALL_MS = 10_000;
 
-// An image body that ends early can still read as a success, even through an
+// A body that ends early can still read as a success on iOS, even through an
 // explicit fetch. So read it whole here and count the bytes against
-// Content-Length. A short, stalled or failed body is fetched again. The page
-// gets one complete in-memory body, or a network error, which is what lets
-// `markdownImageRetry.ts` try again later.
-async function fetchWholeImage(request) {
-  for (let attempt = 1; attempt <= IMAGE_ATTEMPTS; attempt++) {
+// Content-Length. A short, stalled or failed body is fetched again. The caller
+// gets one complete in-memory body, or a network error. For an image that lets
+// `markdownImageRetry.ts` try again later; for a bundle it keeps the cache clean.
+async function fetchWhole(request) {
+  for (let attempt = 1; attempt <= WHOLE_BODY_ATTEMPTS; attempt++) {
     try {
       // A retry skips the HTTP cache, which may hold the broken copy.
-      return await readWholeImage(request, attempt === 1 ? {} : { cache: 'reload' });
+      return await readWhole(request, attempt === 1 ? {} : { cache: 'reload' });
     } catch {
       /* short, stalled or failed: the next attempt starts fresh */
     }
@@ -254,12 +257,12 @@ async function fetchWholeImage(request) {
   return Response.error();
 }
 
-async function readWholeImage(request, init) {
+async function readWhole(request, init) {
   const controller = new AbortController();
   let stallTimer = null;
   const armStallTimer = () => {
     clearTimeout(stallTimer);
-    stallTimer = setTimeout(() => controller.abort(), IMAGE_STALL_MS);
+    stallTimer = setTimeout(() => controller.abort(), WHOLE_BODY_STALL_MS);
   };
   armStallTimer();
   try {
@@ -276,10 +279,10 @@ async function readWholeImage(request, init) {
       received += value.byteLength;
     }
     // A decoded body no longer matches the wire length, so only an unencoded
-    // one can be counted. Images are served unencoded.
+    // one can be counted. Images and bundles are served unencoded.
     const declared = Number(response.headers.get('content-length'));
     if (!response.headers.has('content-encoding') && declared > 0 && received !== declared) {
-      throw new Error(`image body ended at ${received} of ${declared} bytes`);
+      throw new Error(`body ended at ${received} of ${declared} bytes`);
     }
     // The body is decoded now, so the wire framing no longer describes it.
     const headers = new Headers(response.headers);
@@ -317,15 +320,16 @@ function isPairingShell(response) {
 
 // Cache-first for immutable content (content-addressed blobs, content-hashed app
 // bundles): serve from the Cache API on a hit with no network, otherwise fetch
-// (with the iOS SW-restart retry) and populate the cache off the response path.
+// and populate the cache off the response path. `fetchMiss` defaults to the iOS
+// SW-restart retry; the asset branch passes `fetchWhole`.
 // `isCacheable(response)` decides what's worth storing — defaults to "any 2xx"
 // so a transient 404/5xx during a deploy swap is never pinned; the asset branch
 // passes a stricter predicate that also rejects an HTML SPA-fallback body.
-async function cacheFirst(request, cacheName, isCacheable) {
+async function cacheFirst(request, cacheName, isCacheable, fetchMiss = fetchWithRetry) {
   const cache = await caches.open(cacheName);
   const cached = await cache.match(request);
   if (cached) return cached;
-  const response = await fetchWithRetry(request);
+  const response = await fetchMiss(request);
   const cacheable = isCacheable ? isCacheable(response) : (response && response.ok);
   if (cacheable) {
     // Clone off the response path so delivery isn't blocked on the cache write.

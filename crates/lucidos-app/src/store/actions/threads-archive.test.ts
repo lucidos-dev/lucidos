@@ -34,7 +34,7 @@ import { putComposeOnThread } from '../../api/client';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { _resetComposeDraftsForTesting, draftPresentThreadIds, getDraft } from '../composeDrafts';
-import { ALL_CHANNELS, archivingThreadIds, confirmState, setDrawerView, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
+import { ALL_CHANNELS, archivingThreadIds, confirmState, setDrawerGrouping, setSelectedOngoingGroup, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
 import { ARCHIVE_PINNED_CONFIRM, focusThread, handleArchiveThread, subscriptionsStoppedByArchive } from './threads';
@@ -54,7 +54,6 @@ vi.mock('../../api/threads', () => ({
 vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../components/chat/promptFocus')>()),
   focusPromptNow: vi.fn(),
-  composeHandlers: vi.fn(),
 }));
 
 vi.mock('../../api/client', async (importOriginal) => ({
@@ -94,7 +93,8 @@ beforeEach(() => {
   selectedAppIds.value = new Set();
   // Reset the drawer view + search so the post-archive focus picker defaults to
   // the full Current list unless a test opts into an alternate view.
-  setDrawerView('all');
+  setDrawerGrouping('folders');
+  setSelectedOngoingGroup('blocked');
   threadSearchQuery.value = '';
   threadSearchResults.value = { status: 'not-loaded' };
   localStorage.removeItem('lucidos-focused-thread');
@@ -105,10 +105,10 @@ describe('handleArchiveThread', () => {
     // Set up: t1 (focused, waiting/inbox = review), t2 (also waiting/inbox = review)
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
@@ -127,7 +127,7 @@ describe('handleArchiveThread', () => {
     (globalThis as any).innerWidth = 375;
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
@@ -146,10 +146,10 @@ describe('handleArchiveThread', () => {
     (globalThis as any).innerWidth = 375;
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
@@ -167,10 +167,10 @@ describe('handleArchiveThread', () => {
     (globalThis as any).innerWidth = 375;
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
@@ -189,7 +189,7 @@ describe('handleArchiveThread', () => {
     // prompt unfocused and the header visible.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Last review', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Last review', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
@@ -206,13 +206,13 @@ describe('handleArchiveThread', () => {
     // Dismissing t2 should focus t3 (below), not t1 (top)
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t3', makeThreadState('t3', {
-      meta: { id: 't3', title: 'Thread t3', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't3', title: 'Thread t3', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t2');
@@ -229,13 +229,13 @@ describe('handleArchiveThread', () => {
     // the chat thread t2 (filtered out) and land on the next claude_code thread.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'CC t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'CC t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Chat t2', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'failed', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Chat t2', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'failed', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t3', makeThreadState('t3', {
-      meta: { id: 't3', title: 'CC t3', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't3', title: 'CC t3', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     threadChannelFilter.value = new Set(['claude_code']);
@@ -249,16 +249,16 @@ describe('handleArchiveThread', () => {
 
   it('navigates to next review thread after apply+archive (regression: Apply used to skip Archive)', async () => {
     // Simulates the fixed flow: after Apply, thread stays in review (section=inbox,
-    // codingAgentProposed=false), Archive button appears, clicking Archive navigates to next thread.
+    // nothing proposed), Archive button appears, clicking Archive navigates to next thread.
     // Previously Apply moved the thread to ARCHIVE immediately, skipping Archive button.
     const map = new Map<string, ThreadState>();
     // t1: just applied — still in review with Archive button (inbox, no changes, idle)
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Applied thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Applied thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     // t2: another review thread waiting for attention
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Pending thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Pending thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
@@ -276,7 +276,7 @@ describe('handleArchiveThread', () => {
     // so the user can pick another thread from the compose view.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Last review', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Last review', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t1');
@@ -292,10 +292,10 @@ describe('handleArchiveThread', () => {
     // 2 review threads: t1 (top), t2 (bottom). Dismissing t2 should focus t1.
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
-      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('t2', makeThreadState('t2', {
-      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t2');
@@ -310,17 +310,17 @@ describe('handleArchiveThread', () => {
     // the cascade locally by walking parentThreadId so it can drop descendants
     // out of review immediately, without waiting for the API response.
     //
-    // Review order (tier 1 — all have codingAgentProposed=true, sorted by
+    // Review order (tier 1 — all hold a proposal, sorted by
     // recency desc): parent, child, sibling.
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('child', makeThreadState('child', {
-      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
+      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
     }));
     map.set('sibling', makeThreadState('sibling', {
-      meta: { id: 'sibling', title: 'Sibling', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'sibling', title: 'Sibling', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -346,13 +346,13 @@ describe('handleArchiveThread', () => {
     // jumps to cB. The drawer's family order is [pA, pB, cB] → next row is pB.
     const map = new Map<string, ThreadState>();
     map.set('pA', makeThreadState('pA', {
-      meta: { id: 'pA', title: 'Family A parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:03Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'pA', title: 'Family A parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:03Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('pB', makeThreadState('pB', {
-      meta: { id: 'pB', title: 'Family B parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'running', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 1 },
+      meta: { id: 'pB', title: 'Family B parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'running', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 1 },
     }));
     map.set('cB', makeThreadState('cB', {
-      meta: { id: 'cB', title: 'Family B sub-thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'pB' },
+      meta: { id: 'cB', title: 'Family B sub-thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'pB' },
     }));
     threadMap.value = map;
     focusThread('pA');
@@ -385,13 +385,13 @@ describe('handleArchiveThread', () => {
   it('skips composing drafts when picking the next focus', async () => {
     const map = new Map<string, ThreadState>();
     map.set('focused', makeThreadState('focused', {
-      meta: { updatedAt: '2026-01-01T00:00:03Z', channel: 'claude_code', status: 'waiting', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+      meta: { updatedAt: '2026-01-01T00:00:03Z', channel: 'claude_code', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     map.set('draft', makeThreadState('draft', {
       meta: { updatedAt: '2026-01-01T00:00:02Z', channel: 'claude_code', section: 'inbox', state: 'composing' },
     }));
     map.set('sibling', makeThreadState('sibling', {
-      meta: { updatedAt: '2026-01-01T00:00:01Z', channel: 'claude_code', status: 'waiting', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+      meta: { updatedAt: '2026-01-01T00:00:01Z', channel: 'claude_code', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
     focusThread('focused');
@@ -404,16 +404,16 @@ describe('handleArchiveThread', () => {
   it('cascading archive still lands on a real review sibling, not a discarded orphan', async () => {
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { updatedAt: '2026-01-01T00:00:04Z', channel: 'claude_code', status: 'waiting', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+      meta: { updatedAt: '2026-01-01T00:00:04Z', channel: 'claude_code', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     map.set('child', makeThreadState('child', {
-      meta: { updatedAt: '2026-01-01T00:00:03Z', channel: 'claude_code', status: 'waiting', codingAgentProposed: true, messageCount: 1, section: 'inbox', parentThreadId: 'parent' },
+      meta: { updatedAt: '2026-01-01T00:00:03Z', channel: 'claude_code', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox', parentThreadId: 'parent' },
     }));
     map.set('orphan', makeThreadState('orphan', {
       meta: { updatedAt: '2026-01-01T00:00:02Z', channel: 'claude_code', section: 'inbox', state: 'discarded' },
     }));
     map.set('sibling', makeThreadState('sibling', {
-      meta: { updatedAt: '2026-01-01T00:00:01Z', channel: 'claude_code', status: 'waiting', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+      meta: { updatedAt: '2026-01-01T00:00:01Z', channel: 'claude_code', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -441,16 +441,17 @@ describe('handleArchiveThread', () => {
 });
 
 // ---------------------------------------------------------------------------
-// handleArchiveThread — respects the active drawer view
+// handleArchiveThread — walks the list on screen
 // ---------------------------------------------------------------------------
-// The post-archive focus walks the view the user is *currently looking at*, not
-// always the Current section. Archiving from "Needs attention" lands on the next
-// attention row; from "Review" the next review row; from search the next result.
-// A thread that's in Current but NOT in the active view must be skipped.
+// The post-archive focus walks the list the user is *currently looking at*,
+// not always the Current section. Under Ongoing it walks the selected group: from
+// Blocked the next blocked row, from Review the next review row.
+// From search it takes the next result. A thread in Current but NOT in the
+// selected group must be skipped.
 // ---------------------------------------------------------------------------
 
-describe('handleArchiveThread — active drawer view', () => {
-  it('lands on the next Needs-attention thread, skipping a Current-only thread', async () => {
+describe('handleArchiveThread — the list on screen', () => {
+  it('lands on the next Blocked thread, skipping a Current-only thread', async () => {
     // a1 (focused) and a3 both need attention (waiting_for_user_answer). c2 is a
     // plain Current thread (idle, no CTA) that is NOT in the attention view but
     // sorts between them in the Current list — so the OLD Current-only picker
@@ -467,7 +468,8 @@ describe('handleArchiveThread — active drawer view', () => {
       meta: { id: 'a3', title: 'Attention 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    setDrawerView('attention');
+    setDrawerGrouping('ongoing');
+    setSelectedOngoingGroup('blocked');
     focusThread('a1');
 
     await handleArchiveThread('a1');
@@ -476,21 +478,22 @@ describe('handleArchiveThread — active drawer view', () => {
   });
 
   it('lands on the next Review thread when the review view is active', async () => {
-    // r1 (focused) and r3 are review threads (codingAgentProposed, idle). a2 needs
+    // r1 (focused) and r3 are review threads (a proposal, idle). a2 needs
     // attention but is NOT in review. In the review view, archiving r1 must skip
     // a2 and land on r3.
     const map = new Map<string, ThreadState>();
     map.set('r1', makeThreadState('r1', {
-      meta: { id: 'r1', title: 'Review 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'idle', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+      meta: { id: 'r1', title: 'Review 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     map.set('a2', makeThreadState('a2', {
       meta: { id: 'a2', title: 'Attention 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
     }));
     map.set('r3', makeThreadState('r3', {
-      meta: { id: 'r3', title: 'Review 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+      meta: { id: 'r3', title: 'Review 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    setDrawerView('review');
+    setDrawerGrouping('ongoing');
+    setSelectedOngoingGroup('review');
     focusThread('r1');
 
     await handleArchiveThread('r1');
@@ -504,16 +507,17 @@ describe('handleArchiveThread — active drawer view', () => {
     // The next focus must still come from the review view, not the compose view.
     const map = new Map<string, ThreadState>();
     map.set('r1', makeThreadState('r1', {
-      meta: { id: 'r1', title: 'Applied', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'idle', codingAgentProposed: false, messageCount: 1, section: 'inbox' },
+      meta: { id: 'r1', title: 'Applied', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, messageCount: 1, section: 'inbox' },
     }));
     map.set('a2', makeThreadState('a2', {
       meta: { id: 'a2', title: 'Attention 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
     }));
     map.set('r3', makeThreadState('r3', {
-      meta: { id: 'r3', title: 'Review 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+      meta: { id: 'r3', title: 'Review 3', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    setDrawerView('review');
+    setDrawerGrouping('ongoing');
+    setSelectedOngoingGroup('review');
     focusThread('r1');
 
     await handleArchiveThread('r1');
@@ -536,7 +540,8 @@ describe('handleArchiveThread — active drawer view', () => {
       meta: { id: 'x', title: 'Running', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'running', messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    setDrawerView('in-flight');
+    setDrawerGrouping('ongoing');
+    setSelectedOngoingGroup('in-flight');
     focusThread('x');
 
     await handleArchiveThread('x');
@@ -555,7 +560,8 @@ describe('handleArchiveThread — active drawer view', () => {
       meta: { id: 'a2', title: 'Attention 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    setDrawerView('attention');
+    setDrawerGrouping('ongoing');
+    setSelectedOngoingGroup('blocked');
     focusThread('a2');
 
     await handleArchiveThread('a2');
@@ -565,7 +571,7 @@ describe('handleArchiveThread — active drawer view', () => {
 
   it('lands on the row below when the archived thread was stopped out of the attention view first', async () => {
     // A thread waiting on a question offers Archive only once it is stopped,
-    // and stopping it idles it out of Needs attention. Its place in the list
+    // and stopping it idles it out of Blocked. Its place in the list
     // when it was opened still decides where the focus goes.
     const waiting = (id: string, at: string) => makeThreadState(id, {
       meta: { id, title: id, channel: 'claude_code', updatedAt: at, status: 'waiting_for_user_answer', messageCount: 1, section: 'inbox' },
@@ -575,7 +581,8 @@ describe('handleArchiveThread — active drawer view', () => {
       ['a2', waiting('a2', '2026-01-01T00:00:02Z')],
       ['a3', waiting('a3', '2026-01-01T00:00:01Z')],
     ]);
-    setDrawerView('attention');
+    setDrawerGrouping('ongoing');
+    setSelectedOngoingGroup('blocked');
     focusThread('a2');
 
     const stopped = new Map(threadMap.value);
@@ -597,7 +604,8 @@ describe('handleArchiveThread — active drawer view', () => {
       meta: { id: 'c2', title: 'Current only', channel: 'claude_code', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    setDrawerView('attention');
+    setDrawerGrouping('ongoing');
+    setSelectedOngoingGroup('blocked');
     focusThread('a1');
 
     await handleArchiveThread('a1');
@@ -608,15 +616,15 @@ describe('handleArchiveThread — active drawer view', () => {
   it('walks the search results when a search query is active (overriding the view)', async () => {
     const map = new Map<string, ThreadState>();
     map.set('s1', makeThreadState('s1', {
-      meta: { id: 's1', title: 'Search 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'waiting', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+      meta: { id: 's1', title: 'Search 1', channel: 'claude_code', updatedAt: '2026-01-01T00:00:03Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     map.set('s2', makeThreadState('s2', {
-      meta: { id: 's2', title: 'Search 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, messageCount: 1, section: 'inbox' },
+      meta: { id: 's2', title: 'Search 2', channel: 'claude_code', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, messageCount: 1, section: 'inbox' },
     }));
     threadMap.value = map;
-    // A search query overrides drawerView (mirrors ThreadDrawer's activeView):
-    // the next focus follows the result order, not the Current section.
-    setDrawerView('all');
+    // A search query overrides the grouping (mirrors ThreadDrawer's
+    // activeView): the next focus follows the result order, not Current.
+    setDrawerGrouping('folders');
     threadSearchQuery.value = 'foo';
     threadSearchResults.value = {
       status: 'loaded',
@@ -658,10 +666,10 @@ describe('handleArchiveThread — optimistic UI', () => {
 
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('sibling', makeThreadState('sibling', {
-      meta: { id: 'sibling', title: 'Sibling', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'sibling', title: 'Sibling', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -684,13 +692,13 @@ describe('handleArchiveThread — optimistic UI', () => {
 
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('child', makeThreadState('child', {
-      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
+      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
     }));
     map.set('grandchild', makeThreadState('grandchild', {
-      meta: { id: 'grandchild', title: 'Grandchild', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'child' },
+      meta: { id: 'grandchild', title: 'Grandchild', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'child' },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -718,13 +726,13 @@ describe('handleArchiveThread — optimistic UI', () => {
 
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('sibling', makeThreadState('sibling', {
-      meta: { id: 'sibling', title: 'Sibling', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'sibling', title: 'Sibling', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('elsewhere', makeThreadState('elsewhere', {
-      meta: { id: 'elsewhere', title: 'Elsewhere', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
+      meta: { id: 'elsewhere', title: 'Elsewhere', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -743,15 +751,15 @@ describe('handleArchiveThread — optimistic UI', () => {
     expect(focusedThreadId.value).toBe('elsewhere');
   });
 
-  it('restores section + codingAgentProposed and shows a toast when the API rejects', async () => {
+  it('restores section + change state and shows a toast when the API rejects', async () => {
     (archiveThread as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('boom'));
 
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('child', makeThreadState('child', {
-      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
+      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -761,8 +769,8 @@ describe('handleArchiveThread — optimistic UI', () => {
 
     expect(threadMap.value.get('parent')?.meta.section).toBe('inbox');
     expect(threadMap.value.get('child')?.meta.section).toBe('inbox');
-    expect(threadMap.value.get('parent')?.meta.codingAgentProposed).toBe(true);
-    expect(threadMap.value.get('child')?.meta.codingAgentProposed).toBe(true);
+    expect(threadMap.value.get('parent')?.meta.codingAgentChangeState.kind).toBe('proposed');
+    expect(threadMap.value.get('child')?.meta.codingAgentChangeState.kind).toBe('proposed');
     expect(archivingThreadIds.value.has('parent')).toBe(false);
     expect(toasts.value.some(t => t.type === 'error')).toBe(true);
   });
@@ -865,7 +873,7 @@ describe('handleArchiveThread: a pinned thread', () => {
 // the row flickers back into Review until the SSE ThreadArchived event
 // finally confirms the move. The fix mirrors the composeEditedAt staleness
 // guard: a request that started before the local flip is by definition stale
-// wrt section + codingAgentProposed.
+// wrt section + change state.
 // ---------------------------------------------------------------------------
 
 describe('handleArchiveThread — stale loadAllThreads response', () => {
@@ -877,10 +885,10 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
 
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('sibling', makeThreadState('sibling', {
-      meta: { id: 'sibling', title: 'Sibling', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'sibling', title: 'Sibling', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -894,7 +902,7 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
     // User clicks Archive — optimistic flip to 'archived'.
     const pending = handleArchiveThread('parent');
     expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
-    expect(threadMap.value.get('parent')?.meta.codingAgentProposed).toBe(false);
+    expect(threadMap.value.get('parent')?.meta.codingAgentChangeState.kind).toBe('none');
 
     // The stale GET response lands now, carrying the pre-archive snapshot.
     upsertThread(threadMap.value, {
@@ -906,12 +914,12 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
       message_count: 1,
       section: 'inbox',              // stale
       status: 'waiting',
-      coding_agent_proposed: true,   // stale
+      coding_agent_change_state: { kind: 'proposed', requires_restart: false },   // stale
     } as any, false, requestStartedAt);
 
     // Optimistic flip must survive — no flicker back to Review.
     expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
-    expect(threadMap.value.get('parent')?.meta.codingAgentProposed).toBe(false);
+    expect(threadMap.value.get('parent')?.meta.codingAgentChangeState.kind).toBe('none');
 
     resolveApi({ archived: ['parent'] });
     await pending;
@@ -925,10 +933,10 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
 
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('child', makeThreadState('child', {
-      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
+      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -948,12 +956,12 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
       message_count: 1,
       section: 'inbox',
       status: 'waiting',
-      coding_agent_proposed: true,
+      coding_agent_change_state: { kind: 'proposed', requires_restart: false },
       parent_thread_id: 'parent',
     } as any, false, requestStartedAt);
 
     expect(threadMap.value.get('child')?.meta.section).toBe('archived');
-    expect(threadMap.value.get('child')?.meta.codingAgentProposed).toBe(false);
+    expect(threadMap.value.get('child')?.meta.codingAgentChangeState.kind).toBe('none');
 
     resolveApi({ archived: ['parent', 'child'] });
     await pending;
@@ -970,7 +978,7 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
 
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -992,7 +1000,7 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
       message_count: 1,
       section: 'archived',
       status: 'idle',
-      coding_agent_proposed: false,
+      coding_agent_change_state: { kind: 'none' },
     } as any, false, freshRequestStartedAt);
 
     expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
@@ -1024,7 +1032,7 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
 
     const map = new Map<string, ThreadState>();
     map.set('t', makeThreadState('t', {
-      meta: { id: 't', title: 'CC thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't', title: 'CC thread', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t');
@@ -1035,7 +1043,7 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
 
     // Backend's stop_agent emits CodingAgentIdled BEFORE the ThreadArchived
     // emit. Its aggregate is the PRE-archive snapshot (section='inbox',
-    // coding_agent_proposed=false). Without the SSE archive-race guard,
+    // nothing proposed). Without the SSE archive-race guard,
     // applyAggregateToMeta would overwrite section back to 'inbox' and the
     // row would briefly fly back to Review.
     handleThreadEvent({
@@ -1056,11 +1064,8 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
         activeChildrenCount: 0,
         totalChildrenCount: 0,
         blockingDescendantCount: 0, attentionDescendantCount: 0,
-        codingAgentProposed: false,
-        codingAgentRequiresRestart: false,
-        codingAgentIncomplete: false,
+        codingAgentChangeState: { kind: 'none' },
         codingAgentIsExternalRepo: false,
-        codingAgentHasDiff: false,
         isSaved: false,
         hasResponse: true,
         lastRevivedAt: null,
@@ -1071,7 +1076,7 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
     });
 
     expect(threadMap.value.get('t')?.meta.section).toBe('archived');
-    expect(threadMap.value.get('t')?.meta.codingAgentProposed).toBe(false);
+    expect(threadMap.value.get('t')?.meta.codingAgentChangeState.kind).toBe('none');
 
     resolveApi({ archived: ['t'] });
     await pending;
@@ -1085,10 +1090,10 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
 
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'idle', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:02Z', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('child', makeThreadState('child', {
-      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
+      meta: { id: 'child', title: 'Child', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -1117,11 +1122,8 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
         activeChildrenCount: 0,
         totalChildrenCount: 0,
         blockingDescendantCount: 0, attentionDescendantCount: 0,
-        codingAgentProposed: true,
-        codingAgentRequiresRestart: false,
-        codingAgentIncomplete: false,
+        codingAgentChangeState: { kind: 'proposed', requires_restart: false },
         codingAgentIsExternalRepo: false,
-        codingAgentHasDiff: false,
         isSaved: false,
         hasResponse: true,
         lastRevivedAt: null,
@@ -1132,7 +1134,7 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
     });
 
     expect(threadMap.value.get('child')?.meta.section).toBe('archived');
-    expect(threadMap.value.get('child')?.meta.codingAgentProposed).toBe(false);
+    expect(threadMap.value.get('child')?.meta.codingAgentChangeState.kind).toBe('none');
 
     resolveApi({ archived: ['parent', 'child'] });
     await pending;
@@ -1146,7 +1148,7 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
 
     const map = new Map<string, ThreadState>();
     map.set('t', makeThreadState('t', {
-      meta: { id: 't', title: 'Thread', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 't', title: 'Thread', channel: 'chat', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('t');
@@ -1174,11 +1176,8 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
         activeChildrenCount: 0,
         totalChildrenCount: 0,
         blockingDescendantCount: 0, attentionDescendantCount: 0,
-        codingAgentProposed: false,
-        codingAgentRequiresRestart: false,
-        codingAgentIncomplete: false,
+        codingAgentChangeState: { kind: 'none' },
         codingAgentIsExternalRepo: false,
-        codingAgentHasDiff: false,
         isSaved: false,
         hasResponse: false,
         lastRevivedAt: null,
@@ -1211,7 +1210,7 @@ describe('handleArchiveThread — 409 error toasts', () => {
   function seedReviewThread(): void {
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -1283,10 +1282,10 @@ describe('handleArchiveThread — 409 error toasts', () => {
   it('names every member the archive skipped, puts it back, and says to retry', async () => {
     const map = new Map<string, ThreadState>();
     map.set('parent', makeThreadState('parent', {
-      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+      meta: { id: 'parent', title: 'Parent', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     map.set('child', makeThreadState('child', {
-      meta: { id: 'child', title: 'Fix the login page', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
+      meta: { id: 'child', title: 'Fix the login page', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0, parentThreadId: 'parent' },
     }));
     threadMap.value = map;
     focusThread('parent');
@@ -1310,7 +1309,7 @@ describe('handleArchiveThread — 409 error toasts', () => {
     const map = new Map<string, ThreadState>();
     for (const [id, updatedAt] of [['parent', '2026-01-01T00:00:02Z'], ['other', '2026-01-01T00:00:01Z']]) {
       map.set(id, makeThreadState(id, {
-        meta: { id, title: id, channel: 'claude_code', saved: false, createdAt: '', updatedAt, status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+        meta: { id, title: id, channel: 'claude_code', saved: false, createdAt: '', updatedAt, status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }, codingAgentIsExternalRepo: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
       }));
     }
     threadMap.value = map;

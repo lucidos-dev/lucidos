@@ -24,7 +24,7 @@ describe('settings navigation', () => {
     // first. The badge and the notice modal both send the reader to Release
     // Notices, and the Lucidos menu's version row opens What's New. Both sit
     // closest to Overview's subject.
-    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['system-overview', 'release-notices', 'whats-new', 'thread-queue', 'backup', 'memory', 'disk-usage', 'environment-variables', 'debugging', 'communication-surfaces']);
+    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['system-overview', 'release-notices', 'whats-new', 'thread-queue', 'backup', 'memory', 'disk-usage', 'prompt-footprint', 'environment-variables', 'debugging', 'communication-surfaces']);
     expect(settingsSubviewLabel('system-overview')).toBe('Overview');
     expect(settingsSubviewLabel('release-notices')).toBe('Release Notices');
     expect(settingsSubviewShortLabel('release-notices')).toBe('Notices');

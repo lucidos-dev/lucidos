@@ -328,7 +328,7 @@ mod tool_result_split_tests {
     /// empty` from the provider.
     #[test]
     fn failed_screenshot_capture_produces_no_image_block() {
-        let raw = super::super::format_capture_result("", "html2canvas failed on oklab()");
+        let raw = super::super::format_capture_result("", "", "rasterize failed: image decode");
         let split = split_tool_result(&raw);
         let blocks = build_tool_result_blocks(&[out("call_1", split.llm_text)], "Results.");
 
@@ -339,7 +339,7 @@ mod tool_result_split_tests {
         );
         assert!(blocks.iter().any(|b| matches!(
             b,
-            ContentBlock::ToolResult { content, .. } if content.contains("html2canvas failed")
+            ContentBlock::ToolResult { content, .. } if content.contains("rasterize failed")
         )));
     }
 

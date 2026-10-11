@@ -5,6 +5,7 @@ import {
   NO_BACKFILL_PROGRESS,
   backfillDetail,
   backfillPercent,
+  forgetTreeBackfillOrder,
   loadTreeBackfill,
   treeBackfill,
   treeBackfillStarted,
@@ -28,6 +29,7 @@ const RUNNING: TreeBackfill = {
 describe('the Tree backfill store', () => {
   beforeEach(() => {
     treeBackfill.value = { status: 'not-loaded' };
+    forgetTreeBackfillOrder();
     mockGet.mockReset();
   });
 
@@ -77,6 +79,48 @@ describe('the Tree backfill store', () => {
     resolve(RUNNING);
     await inFlight;
     expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'ready' } });
+  });
+
+  /** The read after Start can overtake frames still in flight on SSE. A
+   *  frame its snapshot already counted must not step the bar back. */
+  it('drops a frame the snapshot already counted', async () => {
+    const at = (seq: number, done: number) => ({ ...ZERO, done, total: 2, done_milli: done * 1_000, seq });
+    mockGet.mockResolvedValue({ state: 'running', progress: at(2, 1) });
+    await loadTreeBackfill();
+
+    handleGlobalEvent('TreeBackfillProgressed', { progress: at(1, 0) });
+    handleGlobalEvent('TreeBackfillProgressed', { progress: at(2, 1) });
+    expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'running', progress: at(2, 1) } });
+
+    handleGlobalEvent('TreeBackfillProgressed', { progress: at(3, 2) });
+    expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'running', progress: at(3, 2) } });
+  });
+
+  /** A read that started before the reset can carry a restarted engine's old
+   *  order. It still shows, but it sets no order. */
+  it('takes no order from a snapshot read that started before the reset', async () => {
+    let resolve: (v: TreeBackfill) => void = () => {};
+    mockGet.mockReturnValue(new Promise<TreeBackfill>((r) => { resolve = r; }));
+    const inFlight = loadTreeBackfill();
+    forgetTreeBackfillOrder();
+    resolve({ state: 'running', progress: { ...RUNNING.progress, seq: 40 } });
+    await inFlight;
+
+    const fresh = { ...RUNNING.progress, done: 4, seq: 1 };
+    handleGlobalEvent('TreeBackfillProgressed', { progress: fresh });
+    expect(treeBackfill.value).toEqual({ status: 'loaded', data: { state: 'running', progress: fresh } });
+  });
+
+  /** A reconnect can follow an engine restart, whose frames count from one
+   *  again. */
+  it('takes a low order again once the order is forgotten', () => {
+    handleGlobalEvent('TreeBackfillProgressed', { progress: { ...RUNNING.progress, seq: 40 } });
+    forgetTreeBackfillOrder();
+    handleGlobalEvent('TreeBackfillProgressed', { progress: { ...RUNNING.progress, done: 4, seq: 1 } });
+    expect(treeBackfill.value).toEqual({
+      status: 'loaded',
+      data: { state: 'running', progress: { ...RUNNING.progress, done: 4, seq: 1 } },
+    });
   });
 
   it('shows a failed first read, but keeps a live state over a failed refresh', async () => {

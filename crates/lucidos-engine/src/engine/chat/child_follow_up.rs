@@ -777,7 +777,7 @@ impl crate::engine::LucidosEngine {
     ///
     /// `PreEmittedOrigin::Message`, never `EngineReentry`: a redirect from the
     /// parent is a real message the child should acknowledge with its own
-    /// `CodingAgentPromptSent` / `UserPromptInjected`, not a silent engine
+    /// `CodingAgentPromptSent` / `PromptInjected`, not a silent engine
     /// re-entry like a child's completion re-opening its parent.
     async fn pre_emit_follow_up(
         self: &std::sync::Arc<Self>,

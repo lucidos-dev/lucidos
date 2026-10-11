@@ -16,7 +16,7 @@ import type { Exchange } from '../../../store/thread-events';
 
 const PROSE_DELIVERY: Exchange = {
   userEvent: {
-    type: 'UserPromptInjected',
+    type: 'PromptInjected',
     text: 'An event you subscribed to has arrived',
     mode: 'agent',
     created: '2026-01-01T12:00:00Z',

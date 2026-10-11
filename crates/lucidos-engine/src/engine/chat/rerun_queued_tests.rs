@@ -3,7 +3,7 @@
 //! Reported case, from the dev workspace event store: a `MessageReceived` at
 //! 08:57:40, an `engine_shutdown` abort five seconds later, then a resume that
 //! carried only the engine note. The message was named by no
-//! `UserPromptInjected`, no `QueuedMessageRemoved` and no response, so it sat
+//! `PromptInjected`, no `QueuedMessageRemoved` and no response, so it sat
 //! as a "Queued" bubble nobody could clear but the user.
 //!
 //! These drive the two functions the resume is made of, against a bare
@@ -127,7 +127,7 @@ async fn resume_in(
     (anchor_event_id, recovered)
 }
 
-/// Every `UserPromptInjected` on the thread, oldest first, as
+/// Every `PromptInjected` on the thread, oldest first, as
 /// `(injected_message_id, request_event_id, channel)`.
 async fn injections(
     pool: &sqlx::PgPool,
@@ -138,7 +138,7 @@ async fn injections(
                 NULLIF(payload->>'request_event_id','')::uuid, \
                 payload->>'channel' \
            FROM events \
-          WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected' \
+          WHERE aggregate_id = $1 AND event_type = 'PromptInjected' \
           ORDER BY sequence ASC",
     )
     .bind(thread_id.to_string())
@@ -304,7 +304,7 @@ async fn a_message_ingested_before_the_abort_is_not_recovered() {
     emit(
         &bus,
         thread_id,
-        ThreadEvent::UserPromptInjected {
+        ThreadEvent::PromptInjected {
             text: "only the open ones".into(),
             mode: ActorMode::Human,
             origin: None,

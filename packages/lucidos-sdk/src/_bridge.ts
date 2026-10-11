@@ -28,7 +28,12 @@ export type BridgeOp =
   | 'storage.prime'
   | 'storage.set'
   | 'storage.remove'
-  | 'storage.clear';
+  | 'storage.clear'
+  | 'ui.focused-thread';
+
+/** Host to app, on every change: the thread the user has open, as
+ *  `{ threadId: string | null }`. The host imports this name. */
+export const FOCUSED_THREAD_CHANNEL = 'focused-thread';
 
 export interface BridgeRequest {
   type: typeof BRIDGE_TYPE;
@@ -95,11 +100,13 @@ export function _setBridgedForTesting(value: boolean | null): void {
   bridged = value;
 }
 
-/** Where a reply may come from. Only the window we posted to may answer, the
- *  same rule the confirm bridge in `ui.ts` follows. A nested frame an app embeds
- *  can post to the app, and must not be able to resolve our calls. */
+/** Where a reply or a host request may come from: the parent window, on the
+ *  origin we post to. A nested frame an app embeds can post to the app, and
+ *  must not resolve our calls. A foreign page that frames the app IS its
+ *  parent, so the source alone admits it and the origin is what refuses it.
+ *  No event carries the `'*'` fallback as its origin, so that fails closed. */
 function fromHost(event: MessageEvent): boolean {
-  return event.source === window.parent;
+  return event.source === window.parent && event.origin === hostOrigin();
 }
 
 /** The host's origin, so a message cannot be aimed at some other document.
@@ -187,10 +194,10 @@ let serving = false;
  *
  * The host used to reach through `contentWindow` for these: it read
  * `lucidos._capture` to screenshot an app, and drove `location.replace` to
- * switch apps and to deliver a fragment. An opaque origin denies all three, so
- * the frame does them and reports back.
+ * deliver a fragment. An opaque origin denies both, so the frame does them and
+ * reports back.
  *
- * Only `window.parent` is answered, the same rule replies follow.
+ * Only `window.parent` on the host origin is answered, the rule replies follow.
  */
 export function serveHost(op: string, handler: (args: unknown) => unknown): void {
   hostHandlers.set(op, handler);

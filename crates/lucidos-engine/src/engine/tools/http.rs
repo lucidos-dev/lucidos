@@ -1,9 +1,10 @@
 use super::super::LucidosEngine;
 use super::bulk_limits::{bulk_threshold_error, BulkContext, MAX_BULK_BYTES};
-use crate::core::oauth::{self, provider_for_url};
+use crate::core::oauth::{self, provider_for_url, AccountLookupError};
 use crate::core::WriteAnnouncement;
 use crate::core::{AuthType, CredentialStore, OAuthStore};
 use bytes::Bytes;
+use sqlx::PgPool;
 use std::time::Duration;
 
 /// Per-request timeout for the `http_request` LLM tool. A server that accepts
@@ -72,6 +73,29 @@ pub(crate) fn build_http_tool_client(timeout: Duration) -> reqwest::Result<reqwe
 /// persisted paths want `&[u8]`, and a download may run to `MAX_BULK_BYTES`.
 pub(crate) async fn read_response_body(response: reqwest::Response) -> reqwest::Result<Bytes> {
     response.bytes().await
+}
+
+/// The OAuth access token `http_request` sends to `provider`, refreshed first.
+///
+/// `Ok(None)` sends the request without one: no account is connected, or the
+/// lookup failed, which is logged. `Err` is the reconnect message for a token
+/// the engine knows is dead, and the request must not go out.
+async fn oauth_token_for_request(pool: &PgPool, provider: &str) -> Result<Option<String>, String> {
+    match oauth::get_account_with_fresh_token(pool, provider).await {
+        Ok(account) => Ok(Some(account.access_token)),
+        Err(AccountLookupError::NotConnected) => {
+            log!(
+                "[OAuth] No {} account found, skipping token injection",
+                provider
+            );
+            Ok(None)
+        }
+        Err(AccountLookupError::DbError(e)) => {
+            log!("[OAuth] Failed to look up {} account: {}", provider, e);
+            Ok(None)
+        }
+        Err(AccountLookupError::RefreshFailed(msg)) => Err(msg),
+    }
 }
 
 impl LucidosEngine {
@@ -149,47 +173,26 @@ impl LucidosEngine {
         // OAuth token injection (overrides static credentials for OAuth providers)
         let oauth_provider = provider_for_url(url);
         if let Some(oauth_provider) = oauth_provider {
-            match OAuthStore::get_by_provider(&self.pool, oauth_provider).await {
-                Ok(Some(mut account)) => {
-                    // Refresh if expired or expiring within 60s
-                    match oauth::refresh_oauth_if_needed(&self.pool, &mut account).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            log!("[OAuth] Token refresh failed for {}: {}", oauth_provider, e)
-                        }
+            let access_token = match oauth_token_for_request(&self.pool, oauth_provider).await {
+                Ok(token) => token,
+                Err(refusal) => return Ok(format!("Error: {refusal}")),
+            };
+            if let Some(access_token) = access_token {
+                // Same shape as the 401-retry arm below. An unrenderable
+                // token never becomes an empty `Authorization`, which would
+                // overwrite the stored credential injected above.
+                match reqwest::header::HeaderValue::from_str(&format!("Bearer {access_token}")) {
+                    Ok(val) => {
+                        headers.insert(reqwest::header::AUTHORIZATION, val);
+                        log!("[OAuth] Injected {} token for {}", oauth_provider, url);
                     }
-
-                    // Same shape as the 401-retry arm below. An unrenderable
-                    // token used to fall back to an EMPTY `Authorization`.
-                    // That also overwrote the stored credential injected
-                    // above, so the request went out unauthenticated and the
-                    // agent read the 401 as a bad key.
-                    match reqwest::header::HeaderValue::from_str(&format!(
-                        "Bearer {}",
-                        account.access_token
-                    )) {
-                        Ok(val) => {
-                            headers.insert(reqwest::header::AUTHORIZATION, val);
-                            log!("[OAuth] Injected {} token for {}", oauth_provider, url);
-                        }
-                        Err(e) => log!(
-                            "[OAuth] {} token is not a valid header value ({}); leaving the request's existing auth in place for {}",
-                            oauth_provider,
-                            e,
-                            url
-                        ),
-                    }
+                    Err(e) => log!(
+                        "[OAuth] {} token is not a valid header value ({}); leaving the request's existing auth in place for {}",
+                        oauth_provider,
+                        e,
+                        url
+                    ),
                 }
-                Ok(None) => log!(
-                    "[OAuth] No {} account found, skipping token injection for {}",
-                    oauth_provider,
-                    url
-                ),
-                Err(e) => log!(
-                    "[OAuth] Failed to look up {} account: {}",
-                    oauth_provider,
-                    e
-                ),
             }
         }
 
@@ -743,5 +746,49 @@ mod tests {
              a lossy UTF-8 decode and the body is persisted verbatim, so use \
              read_response_body instead."
         );
+    }
+
+    /// An expired token with no refresh token cannot be renewed. The tool
+    /// refuses, names the account and the fix, and sends nothing.
+    #[tokio::test]
+    async fn a_token_that_cannot_be_refreshed_refuses_the_request() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        crate::test_support::seed_oauth_account(
+            &pool,
+            "spotify",
+            Some("user@example.com"),
+            None,
+            "stale-token",
+            None,
+            Some(chrono::Utc::now() - chrono::Duration::seconds(120)),
+            "user-read-playback-state",
+        )
+        .await
+        .unwrap();
+
+        let refusal = oauth_token_for_request(&pool, "spotify")
+            .await
+            .expect_err("a token known to be dead is never sent");
+        assert!(
+            refusal.contains("spotify")
+                && refusal.contains("user@example.com")
+                && refusal.contains("reconnect"),
+            "the refusal has to name the provider, the account and the fix: {refusal}"
+        );
+        assert!(
+            !refusal.contains("stale-token"),
+            "a refusal never carries token material: {refusal}"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A provider with no connected account is not a refusal. The request goes
+    /// out on whatever auth it already carries.
+    #[tokio::test]
+    async fn an_unconnected_provider_sends_without_a_token() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        assert_eq!(oauth_token_for_request(&pool, "spotify").await, Ok(None));
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 }

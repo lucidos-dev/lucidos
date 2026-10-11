@@ -169,7 +169,7 @@ describe('what the group renders', () => {
     })));
     expect(text).toContain('dev');
     expect(text).toContain('demo');
-    // The name and count wear the switcher list's classes rather than copies.
+    // The name wears the switcher list's class rather than a copy.
     expect(text).toContain('class="brand-menu-ws-name"');
     expect(text).toContain('class="brand-menu-ws-badge"');
   });

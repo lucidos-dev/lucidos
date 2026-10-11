@@ -21,7 +21,7 @@ export interface TranscriptLivenessDeps {
  * status, which is a second copy that drifts. A call writes no turn, so it is
  * asked for separately.
  *
- * Wired in `store/effects.ts`: the stores are the producers and the transcript
+ * Wired in `shellStartup.ts`: the stores are the producers and the transcript
  * the consumer, and a producer must not import a consumer. A factory, so a
  * test drives its own focus and threads. Returns the dispose.
  */

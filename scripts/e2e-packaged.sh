@@ -332,5 +332,14 @@ printf '%s' "$KNOWHOW" | grep -q 'system-knowhow/' \
     || fail "GET /api/v1/knowhow lists no system-knowhow/ id — LUCIDOS_SYSTEM_KNOWHOW_DIR unresolved in the packaged engine"
 log "PASS: system-knowhow staged + resolved (Resources/system-knowhow + /api/v1/knowhow)"
 
+# 8f. The built-in widgets are staged AND resolved (LUCIDOS_SYSTEM_WIDGETS_DIR),
+# the same pair of checks for the same reason (ADR 0415).
+[ -f "$APP/Contents/Resources/system-widgets/lucidos-sound-player/manifest.json" ] \
+    || fail "Resources/system-widgets/lucidos-sound-player missing: system-widgets not staged into the bundle"
+PLAYER="$(curl -s "$BASE/$SLUG/api/v1/app?id=lucidos-sound-player")"
+printf '%s' "$PLAYER" | grep -q '"built_in":true' \
+    || fail "GET /api/v1/app?id=lucidos-sound-player is not the built-in: LUCIDOS_SYSTEM_WIDGETS_DIR unresolved in the packaged engine ($PLAYER)"
+log "PASS: system-widgets staged + resolved (Resources/system-widgets + /api/v1/app)"
+
 PASSED=1
 # cleanup (EXIT trap) stops the service, verifies a clean shutdown, and reports.

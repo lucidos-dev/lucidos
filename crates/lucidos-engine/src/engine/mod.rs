@@ -8,6 +8,7 @@ pub(crate) mod apply_all_driver;
 pub(crate) mod apply_estimate;
 mod archive_request;
 pub(crate) mod aux_purpose;
+mod background_build;
 pub mod cc_permission;
 pub mod cc_question_wait;
 pub(crate) mod cc_settings;
@@ -18,6 +19,7 @@ pub(in crate::engine) mod chat;
 pub(crate) mod claude_code;
 pub(crate) mod command_guard;
 pub(crate) mod command_judge;
+pub use command_judge::{classify_for_eval as classify_command_for_eval, EvalVerdict};
 pub(crate) mod command_judge_questions;
 pub mod command_permission;
 /// `pub(crate)` for the cost helpers: `tool_definitions_chars`,
@@ -52,8 +54,11 @@ pub(crate) mod memory;
 pub mod memory_consumer;
 pub mod model_call;
 mod pending_apply_actors;
+pub mod pending_change_watch;
 pub(crate) mod preferences;
+pub(crate) mod prompt_footprint;
 pub(crate) mod question_card_gate;
+pub(crate) mod read_request;
 pub mod release_notices;
 pub(crate) mod repo_directory_grants;
 mod session_seed;
@@ -74,13 +79,17 @@ pub(crate) mod tool_arg_entity_repair;
 pub(crate) mod tools;
 pub(crate) mod trigger_group_writes;
 pub(crate) mod trigger_writes;
+pub(crate) mod turn_end;
 pub mod types;
 pub(crate) mod user_profile;
+pub mod widget_embed;
+pub mod widget_guidance;
+pub mod widgets;
 pub mod worktree_cleanup;
 
 pub(crate) use agentic_loop::{
-    coalesced_images_for_reprocess, coalesced_user_text_for_reprocess,
-    emit_user_prompt_injected_event, filter_removed_queued_prompts, strip_app_capture_marker,
+    coalesced_images_for_reprocess, coalesced_user_text_for_reprocess, emit_prompt_injected_event,
+    filter_removed_queued_prompts, strip_app_capture_marker,
 };
 #[cfg(test)]
 pub(crate) use change_ops::bind_in_place_conflict_resolution;
@@ -148,10 +157,10 @@ pub struct InjectedPrompt {
     pub text: String,
     /// Client-provided UUID for the injecting message. Carried through the
     /// channel for callers that need correlation, but NOT reused as the
-    /// persisted `UserPromptInjected.id` — the chat fast-path emits a
+    /// persisted `PromptInjected.id` — the chat fast-path emits a
     /// `MessageReceived` row with this UUID first, so reusing it would
     /// collide on `events_pkey`. Frontend reconciles pending messages via
-    /// `MessageReceived.id`; the UPI link back to the request is carried
+    /// `MessageReceived.id`; the PromptInjected link back to the request is carried
     /// by `EventMeta::request_event_id`.
     pub event_id: Option<Uuid>,
     /// Semantic mode of the actor that generated this injection — Human (user
@@ -162,7 +171,7 @@ pub struct InjectedPrompt {
     /// Optional images attached to the injected message.
     pub images: Option<Vec<crate::api::ChatImage>>,
     /// Structured origin describing the actor (e.g. ThreadLink::Child for a
-    /// child→parent callback). Stamped onto the persisted UserPromptInjected
+    /// child→parent callback). Stamped onto the persisted PromptInjected
     /// event so the chip can render the right initiator label.
     pub origin: Option<thread_events::MessageOrigin>,
     pub kind: InjectedPromptKind,
@@ -170,21 +179,21 @@ pub struct InjectedPrompt {
 
 #[derive(Clone, Debug)]
 pub enum InjectedPromptKind {
-    /// Synthesised user message — emits `UserPromptInjected` and pushes the
+    /// Synthesised user message — emits `PromptInjected` and pushes the
     /// framed text into the next agentic-loop turn.
     UserText,
     /// Engine re-entry on an existing thread, the child-completion case being
     /// the headline one. The parent's `ChildThreadCompleted` event is
     /// already the exchange-starter on the wire (caller passed its id as
     /// `prompt.spawning_event_id`); the loop projects `prompt.text` inline
-    /// as the next user-channel block WITHOUT emitting `UserPromptInjected`
+    /// as the next user-channel block WITHOUT emitting `PromptInjected`
     /// — otherwise the response would split into a duplicate exchange and
     /// strand the rich child-completion card.
     ReentryFromEngine,
     /// Event-wait delivery or expiry (see `engine::event_wait`). Same
     /// projection rule as `ReentryFromEngine` and for the same reason:
     /// `emit_delivery` has already put the re-entry's exchange-starter on the
-    /// wire (a `UserPromptInjected` carrying the matched event), so the loop
+    /// wire (a `PromptInjected` carrying the matched event), so the loop
     /// must project the text inline rather than emit a second one.
     ///
     /// **Named for the resolved WAIT, not for a sleeping thread.** Reaching
@@ -202,7 +211,7 @@ pub enum InjectedPromptKind {
     /// Same projection rule again, and here the reason is that the exchange
     /// starter is somebody ELSE's. A spoken reply is `Metadata` and starts no
     /// turn (ADR 0149): it lands beside the one already running. Emitting a
-    /// `UserPromptInjected` for it would claim the talker interrupted the
+    /// `PromptInjected` for it would claim the talker interrupted the
     /// user, and `SpokenReplyGenerated` is already the record.
     ///
     /// **It never wakes an idle thread.** With no live handle there is nothing
@@ -494,14 +503,9 @@ pub struct LucidosEngine {
     /// spin builds forever (bounded per HEAD; reset when HEAD moves). Dev-only.
     /// See `engine_version::self_heal_engine_version_if_needed`.
     self_heal_state: std::sync::Mutex<engine_version::SelfHealState>,
-    /// Handle to the in-flight Apply-triggered background rebuild task (dev), so a
-    /// later Apply can coalesce — abort the running build and start over. The
-    /// build child is `kill_on_drop`, so aborting the task kills the cargo process.
-    /// See `engine_version::trigger_background_rebuild`.
-    build_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Monotonic generation so only the latest background rebuild updates
-    /// `build_state` — a superseded build's completion is ignored.
-    build_generation: std::sync::atomic::AtomicU64,
+    /// The in-flight background rebuild task (dev): a later Apply joins it, an
+    /// explicit Rebuild restarts it. See `background_build`.
+    background_build: background_build::BackgroundBuild,
     /// Process group of THIS engine's in-flight rebuild, or 0 when none runs.
     /// Published only while the build's `BuildProcessGroupGuard` is armed, so
     /// it never names a group whose leader has been reaped.
@@ -517,19 +521,12 @@ pub struct LucidosEngine {
     /// The source dir (`LUCIDOS_STATIC_DIR` = live `dist/`) that served-frontend
     /// snapshots are taken from. Set alongside `served_frontend`.
     served_frontend_source: std::sync::OnceLock<PathBuf>,
-    /// The trunk HEAD the served snapshot was taken at, or `None` when unknown
-    /// or when an engine change sits between it and the running commit. `None`
-    /// at boot, and written on each successful swap. `engine_version::pending_commits_since` reads
-    /// it to leave out what that client already carries. In memory like the
-    /// snapshot itself: a restart re-pins and records again.
-    served_frontend_commit: std::sync::Mutex<Option<String>>,
     /// Monotonic generation for served-frontend re-snapshots: coalesces rapid
     /// frontend-only Applies (only the latest generation swaps) AND names the
     /// snapshot subdir. Boot pins generation 0; the first refresh is generation 1.
-    /// Mirrors `build_generation`.
     frontend_refresh_generation: std::sync::atomic::AtomicU64,
     /// Handle to the in-flight served-frontend refresh task, so a later Apply can
-    /// abort + supersede it. Mirrors `build_task`.
+    /// abort + supersede it. A snapshot is cheap to redo, unlike an engine build.
     frontend_refresh_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The generation and start time of the last applying frontend refresh.
     /// It counts as in flight only while that generation is still current, so
@@ -647,13 +644,9 @@ pub struct LucidosEngine {
     /// cross-engine instantiation), so we hold it on the engine and hand
     /// it out via `wasm_engine()`.
     wasm_engine: Arc<wasmtime::Engine>,
-    /// Pending App UI capture requests. Key: request_id, Value: oneshot sender.
-    /// Tool handlers insert a sender, the /api/v1/app-capture endpoint resolves it.
-    pub pending_captures: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, tokio::sync::oneshot::Sender<CaptureResult>>,
-        >,
-    >,
+    /// App UI captures waiting for an answer. `capture_app` / `refresh_app`
+    /// insert one; `POST /api/v1/app-capture` resolves it.
+    pub(crate) pending_captures: Arc<tools::app_capture::PendingCaptures>,
     /// Plugin installs awaiting user confirmation in the install panel.
     /// Key: install_id (UUID). Value: staged plugin tree + manifest. Inserted
     /// when `install_plugin` returns the `[PLUGIN_INSTALL_REQUEST]` sentinel;

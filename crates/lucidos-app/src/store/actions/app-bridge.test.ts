@@ -28,6 +28,8 @@ import {
   resolveBridgePath,
   _resetAppBridgeForTesting,
 } from './app-bridge';
+import { setFocusedThread } from '../store';
+import { BRIDGE_REPLY_TYPE, BRIDGE_TYPE } from '../../../../../packages/lucidos-sdk/src/_bridge';
 
 describe('pathIsAllowed', () => {
   it('admits what the engine classified as app-reachable', () => {
@@ -147,13 +149,10 @@ describe('the engine table covers the SDK', () => {
     return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   }
 
-  /** A path the SDK turns into a `src` / `href` rather than a fetch. A
-   *  subresource loads fine from an opaque origin and never reaches the
-   *  bridge, and the engine classifies those as `Asset`. `/api/v1` is the base
-   *  the bridge prepends, not a suffix. `/events` is the stream, which the host
-   *  holds and relays rather than fetching for an app. `/app/` is an app's own
-   *  asset URL, served outside `/api/v1` entirely. */
-  const NOT_BRIDGED = ['/static/', '/fonts/', '/api/v1', '/app/'];
+  /** A path the SDK names that is not a bridged suffix. `/api/v1` is the base
+   *  the bridge prepends. `/app/` is an app's own asset URL, served outside
+   *  `/api/v1` entirely. */
+  const NOT_BRIDGED = ['/api/v1', '/app/'];
 
   /** The one path the SDK names that no bridged call may take: the stream the
    *  host holds and relays. Matched exactly, because `/events/query` and
@@ -315,6 +314,25 @@ describe('the installed router', () => {
     expect(posted).toEqual([]);
 
     document.body.appendChild(frame);
+  });
+
+  it('answers the focused thread from the shell, null included', async () => {
+    const posted: unknown[] = [];
+    const win = frame.contentWindow as Window;
+    vi.spyOn(win, 'postMessage').mockImplementation((m: unknown) => { posted.push(m); });
+    const ask = (id: string) => deliver(win, { type: BRIDGE_TYPE, id, op: 'ui.focused-thread', args: null });
+
+    setFocusedThread('thread-a');
+    ask('1');
+    await vi.waitFor(() => expect(posted).toContainEqual(
+      { type: BRIDGE_REPLY_TYPE, id: '1', ok: true, value: 'thread-a' },
+    ));
+
+    setFocusedThread(null);
+    ask('2');
+    await vi.waitFor(() => expect(posted).toContainEqual(
+      { type: BRIDGE_REPLY_TYPE, id: '2', ok: true, value: null },
+    ));
   });
 
   it('answers a preference read scoped to "this device" with the real id', async () => {

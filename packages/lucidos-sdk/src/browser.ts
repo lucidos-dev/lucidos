@@ -11,7 +11,9 @@ import { installNoKeyCodeText } from './noKeyCodeText';
 import { isBridged } from './_bridge';
 import { primeBridgedStorage } from './_storage';
 import { installHostOps } from './hostOps';
-import { installCapabilityRenewal } from './frameCapability';
+import { installCapabilityRenewal, installDocumentRelativeUrls } from './frameCapability';
+import { installWidgetFrame } from './widgetFrame';
+import { installOneSound } from './oneSound';
 
 export * from './index';
 
@@ -33,6 +35,15 @@ if (typeof document !== 'undefined') {
   // attribute write. Nothing reloads, and an already-loaded resource is
   // untouched. A document with no pass ignores every push.
   installCapabilityRenewal();
+  // That base names another path, so a bare `#tab` would resolve off this
+  // document. History calls and in-page links resolve against its own URL.
+  installDocumentRelativeUrls();
+  // Report the content size once the host marks this frame a widget, so the
+  // widget's frame fits what it draws (ADRs 0402, 0407).
+  installWidgetFrame();
+  // A sound starting here pauses every other frame's, and the host's. The
+  // frames cannot reach each other, so the host relays.
+  installOneSound();
   // Scroll memory reads storage, and an isolated frame's own storage throws, so
   // the host holds it. That read is async and the restore is not, so the values
   // are fetched first. `primeBridgedStorage` is a no-op in a frame that can read

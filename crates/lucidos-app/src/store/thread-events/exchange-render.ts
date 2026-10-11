@@ -9,6 +9,7 @@ import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, RecalledMemory, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
 import type { ThreadState } from './thread-meta';
+import type { OngoingGroup } from '../store';
 import type { ActorMode, EventSubscription, EventWaitCancelCause, MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
 
 /** The two projections' step shapes, as far as the resolvers care. */
@@ -1047,6 +1048,11 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         });
         break;
       }
+      case 'WidgetShown': {
+        const e = event as { app_id: string; params?: Record<string, unknown>; label?: string; _eventId?: string };
+        events.push({ type: 'widget', app_id: e.app_id, params: e.params, label: e.label, event_id: e._eventId });
+        break;
+      }
       case 'MessageHeld': {
         if (event._eventId && exchange.deliveredHeldIds?.has(event._eventId)) break;
         events.push({
@@ -1478,26 +1484,34 @@ export function exchangeError(exchange: Exchange): ExchangeError | null {
 /** Every event id this exchange puts into the DOM as `data-event-id`: the
  *  complete set a deep-link can resolve against inside this turn.
  *
- *  Exactly two, both in `ChatExchange`. The root carries the turn's STARTER,
- *  and the failure card carries its own `ResponseFailed` (see
- *  `ExchangeError.eventId` above). Every other step is deliberately unstamped,
- *  inline steps most of all: the "Show steps" toggle can hide them, and an id
- *  there would resolve only sometimes.
+ *  Three kinds:
+ *  - the turn root, in `ChatExchange`, carries the turn's STARTER;
+ *  - the failure card, in `ChatExchange`, carries its own `ResponseFailed`
+ *    (see `ExchangeError.eventId` above);
+ *  - each widget card (`WidgetCard`) carries its own `WidgetShown`, so "Show
+ *    in thread" lands on the card and not on the turn's start.
+ *
+ *  Every other step is deliberately unstamped, inline steps most of all: the
+ *  "Show steps" toggle can hide them, and an id there would resolve only
+ *  sometimes. A widget card is a marker, drawn whatever the toggle says.
  *
  *  Declared here rather than inferred at the deep-link site, so the stamping
  *  rule has ONE definition. `deepLinkAnchorForEvent` reads it to decide
  *  whether an event addresses itself. A source-scan tripwire in
  *  `__tests__/deep-link-anchor.test.ts` asserts the `data-event-id`
- *  expressions in `ChatExchange.tsx` are exactly the two below. Add a third
- *  stamp to the component and that tripwire fails until it is declared here. */
+ *  expressions in both components are exactly these. Add another stamp and
+ *  that tripwire fails until it is declared here. */
 export function stampedEventIds(exchange: Exchange): string[] {
   const ids: string[] = [];
-  // Both stamps are conditional in the component, since Preact drops an
+  // Every stamp is conditional in its component, since Preact drops an
   // `undefined` attribute. An id the DOM will not carry is not listed here.
   const starter = exchangeStarterId(exchange);
   if (starter) ids.push(starter);
   const failure = exchangeError(exchange)?.eventId;
   if (failure) ids.push(failure);
+  for (const { event } of exchange.steps) {
+    if (event.type === 'WidgetShown' && event._eventId) ids.push(event._eventId);
+  }
   return ids;
 }
 
@@ -1516,27 +1530,41 @@ export function exchangeStarterId(exchange: Exchange): string | undefined {
   return exchange.userEvent._eventId;
 }
 
-/** Where opening a thread from Needs attention lands.
+/** The Ongoing groups whose rows open on what needs the user rather than on
+ *  the saved reading position (ADR 0409). */
+export type LandingGroup = Extract<OngoingGroup, 'blocked' | 'review'>;
+
+/** Where opening a thread from Blocked or Review lands.
  *
  *  - `card`: the thing waiting on the user, as a `data-event-id`.
  *  - `card-not-loaded`: the status names a card, and the loaded exchanges do
  *    not hold it. It may be older than the loaded page.
- *  - `turn`: no card applies, so the newest turn. A stopped child lands on the
+ *  - `turn`: no card applies, so a turn's start. A stopped child lands on the
  *    turn that stopped, and an open form sits inside that turn. */
-export type AttentionTarget =
+export type LandingTarget =
   | { kind: 'card'; eventId: string }
   | { kind: 'card-not-loaded'; newestTurnId: string | null }
   | { kind: 'turn'; eventId: string | null };
 
-/** Pick the {@link AttentionTarget}. Newest first, so the live request wins.
+/** Pick the {@link LandingTarget} for a thread opened from `group`. Newest
+ *  first, so the live request wins. `changeReady` says the thread holds a
+ *  ready change, which only Review reads.
  *
+ *  From Blocked:
  *  - Waiting on the user: the open question or permission card.
  *  - Failed: the failure card.
  *
  *  Each card is gated on its own status, because an older canceled question
- *  or a failure the user moved past stays in the history. */
-export function attentionTarget(exchanges: Exchange[], status: ThreadStatus): AttentionTarget {
+ *  or a failure the user moved past stays in the history.
+ *
+ *  From Review: the turn that proposed the ready change, else the newest turn,
+ *  whose reply a read request points at. A change applied or discarded
+ *  earlier still sits in its turn, so only a ready one counts. */
+export function landingTarget(exchanges: Exchange[], status: ThreadStatus, group: LandingGroup, changeReady = false): LandingTarget {
   const newestTurnId = newestStarterId(exchanges);
+  if (group === 'review') {
+    return { kind: 'turn', eventId: (changeReady ? newestProposalTurnId(exchanges) : null) ?? newestTurnId };
+  }
   const awaitsUser = status === 'waiting_for_user_answer';
   const failed = status === 'failed';
   if (!awaitsUser && !failed) return { kind: 'turn', eventId: newestTurnId };
@@ -1548,6 +1576,18 @@ export function attentionTarget(exchanges: Exchange[], status: ThreadStatus): At
     if (card) return { kind: 'card', eventId: card };
   }
   return { kind: 'card-not-loaded', newestTurnId };
+}
+
+/** The start of the newest turn that proposed a change, or null. A per-commit
+ *  `ChangeProposed` carries no `change_id`, so only the turn's aggregate
+ *  proposal counts. */
+function newestProposalTurnId(exchanges: Exchange[]): string | null {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const proposed = exchanges[i].steps.some(({ event }) => event.type === 'ChangeProposed' && !!event.change_id);
+    const starter = proposed ? exchangeStarterId(exchanges[i]) : undefined;
+    if (starter) return starter;
+  }
+  return null;
 }
 
 function newestStarterId(exchanges: Exchange[]): string | null {
@@ -1815,13 +1855,13 @@ function isRecoveryInterruptMarker(event: ThreadEvent): boolean {
 }
 
 
-/** Read the engine note (UserPromptInjected step) from a ContinuationStarted
+/** Read the engine note (PromptInjected step) from a ContinuationStarted
  *  exchange. Returns the full text and a coarse count of bullet entries for
  *  the subline ("Reminded the model about N prior tool calls"), or null when
  *  there is no engine note. */
 export function resumeEngineNote(exchange: Exchange): { text: string; toolCount: number } | null {
   for (const { event } of exchange.steps) {
-    if (event.type === 'UserPromptInjected' && (event as { mode?: ActorMode }).mode === 'engine') {
+    if (event.type === 'PromptInjected' && (event as { mode?: ActorMode }).mode === 'engine') {
       const text = (event as { text: string }).text || '';
       // The engine note format from
       // chat/rerun.rs::build_side_effect_summary: "- name(args) → result".
@@ -1919,7 +1959,7 @@ function canQueueBehind(exchange: Exchange): boolean {
     // carrying an `injected_message_id` into the message it names, whose
     // `MessageReceived` answers this above. A rerun pairs its anchor with a
     // `ContinuationStarted`, which starts the exchange and answers above too.
-    case 'UserPromptInjected':
+    case 'PromptInjected':
     case 'UserQuestionAsked':
     case 'CodingAgentPermissionRequest':
     case 'CommandPermissionRequested':
@@ -2332,14 +2372,14 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   if (threadIsCC) isCC = true;
 
   const hasSteps = exchange.steps.length > 0;
-  // Absorbed-UPI placeholder: the engine emitted a UPI carrying this
+  // Absorbed-injection placeholder: the engine emitted a PromptInjected carrying this
   // exchange's MR via injected_message_id, so the response lives in the PRIOR
   // exchange, routed there by request id. The placeholder reads as 'done' and
   // is excluded from the 'interrupted' carve-out below, whose "↳" arrow points
   // the wrong way.
   //
   // "Lives in the prior exchange" is the whole claim, and one shape makes it
-  // false: the UPI's own `request_event_id` naming THIS exchange's
+  // false: the PromptInjected's own `request_event_id` naming THIS exchange's
   // MessageReceived. The turn is then anchored right here and its steps are on
   // their way in. That is the orphan re-entry (`announce_orphan_batch` in
   // `api/chat.rs`), where a follow-up queued behind a cancelled turn is
@@ -2349,10 +2389,10 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   // neither, and two `undefined`s comparing equal would revoke the placeholder
   // from exactly the case it was written for.
   const onlyStep = exchange.steps.length === 1 ? exchange.steps[0].event : undefined;
-  const upiRequestId = (onlyStep as { request_event_id?: string } | undefined)?.request_event_id;
+  const injectionRequestId = (onlyStep as { request_event_id?: string } | undefined)?.request_event_id;
   const anchorId = exchange.userEvent._eventId;
-  const announcesThisExchange = !!upiRequestId && !!anchorId && upiRequestId === anchorId;
-  const isAbsorbedUpiPlaceholder = onlyStep?.type === 'UserPromptInjected'
+  const announcesThisExchange = !!injectionRequestId && !!anchorId && injectionRequestId === anchorId;
+  const isAbsorbedInjectionPlaceholder = onlyStep?.type === 'PromptInjected'
     && !!onlyStep.injected_message_id
     && !announcesThisExchange;
 
@@ -2398,7 +2438,7 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   // question or permission card has its continuation and terminal in flight,
   // so render it as working.
   //
-  // The absorbed-UPI placeholder is excluded because its lone UPI step means
+  // The absorbed-injection placeholder is excluded because its lone PromptInjected step means
   // the real response lives in the PRIOR exchange.
   //
   // An engine-down boundary supplies the quiescence itself, so it need not
@@ -2408,7 +2448,7 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   const isStale =
     (threadIdle || isEngineDownBoundary) && !threadAwaitingAnswer
     && isLast && !isComplete && hasSteps
-    && !isAbsorbedUpiPlaceholder;
+    && !isAbsorbedInjectionPlaceholder;
 
   if (isFailed) return verdict('error');
   // An abort or shutdown AFTER the exchange completed does not undo the user's
@@ -2518,11 +2558,11 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   if (threadAwaitingAnswer && threadIdle && (isLast || behindOpenQuestion) && !hasSteps
     && !isChangeLifecycleEvent(exchange.userEvent)) return verdict('held');
   // Non-last with steps but no terminator: the user moved past this exchange.
-  // The chat fast path injects the follow-up via UPI under the parent's
+  // The chat fast path injects the follow-up via a PromptInjected under the parent's
   // request_event_id and redirects later events to the new exchange. A coding
   // agent shares one session across exchanges. 'interrupted' keeps "Working"
   // on the last panel only.
-  if (!isLast && !isComplete && hasSteps && !isAbsorbedUpiPlaceholder) return verdict('interrupted');
+  if (!isLast && !isComplete && hasSteps && !isAbsorbedInjectionPlaceholder) return verdict('interrupted');
   if (isComplete) return verdict('done');
   // A non-last coding-agent exchange without a terminator was skipped by the
   // msg_tx queue, so it is safely 'done'.
@@ -2564,10 +2604,10 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   // arriving right now, whatever the projection last said.
   if (streamingBuffer) return verdict('streaming');
 
-  // The absorbed-UPI placeholder, for the isLast case that the `!isLast`
+  // The absorbed-injection placeholder, for the isLast case that the `!isLast`
   // branch above bypasses. It must not read as a crash, which is why `isStale`
   // excludes it outright rather than relying on this line's position.
-  if (isAbsorbedUpiPlaceholder) return verdict('done');
+  if (isAbsorbedInjectionPlaceholder) return verdict('done');
 
   if (isStale) return boundaryAbort ? aborted(boundaryAbort) : verdict('done');
 

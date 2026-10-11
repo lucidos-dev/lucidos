@@ -12,7 +12,7 @@ async function archiveAndRecord(page: import('@playwright/test').Page, id: strin
     await expect(item).toBeVisible();
     await item.evaluate(el => { (window as unknown as { __archiveItem: HTMLElement }).__archiveItem = el; });
     return page.evaluate(async () => {
-        const selector = '.flip-departure-layer > *, .flip-portal > *';
+        const selector = '.flip-departure-layer > *';
         (window as unknown as { __archiveItem: HTMLElement }).__archiveItem.click();
         const frames: Frame[] = [];
         const start = performance.now();
@@ -38,7 +38,7 @@ test.describe('Drawer archive departure', () => {
     });
 
     for (const archiveCollapsed of [false, true]) {
-        test(`an archived row visibly leaves (Archive ${archiveCollapsed ? 'collapsed' : 'open'})`, async ({ page, context }) => {
+        test(`an archived row visibly leaves in place (Archive ${archiveCollapsed ? 'collapsed' : 'open'})`, async ({ page, context }) => {
             await context.addInitScript((collapsed) => {
                 localStorage.setItem('lucidos-drawer-collapsed', JSON.stringify(collapsed ? ['archive'] : []));
             }, archiveCollapsed);
@@ -69,6 +69,10 @@ test.describe('Drawer archive departure', () => {
             const height = page.viewportSize()!.height;
             const visible = frames.filter(f => f.copies.some(c => c.opacity > 0.05 && c.bottom > 0 && c.top < height));
             expect(visible[visible.length - 1].t - visible[0].t, trace).toBeGreaterThanOrEqual(150);
+            // It folds where it stood. It never flies to the Archive section,
+            // open or collapsed, so its top edge holds still.
+            const tops = frames.flatMap(f => f.copies.map(c => c.top));
+            expect(Math.max(...tops) - Math.min(...tops), trace).toBeLessThan(1);
         });
     }
 });

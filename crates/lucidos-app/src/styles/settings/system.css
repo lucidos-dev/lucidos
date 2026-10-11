@@ -36,8 +36,15 @@
     height: var(--system-status-dot);
 }
 
+/* The dot is already red, so the blink fades opacity, which the compositor
+   animates without a repaint. */
+@keyframes status-dot-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}
+
 .system-status-row .status-dot.disconnected {
-    animation: progress-blink-red 0.6s ease-in-out infinite;
+    animation: status-dot-blink 0.6s ease-in-out infinite;
 }
 
 /* Reduced motion: a steady red dot. The word beside it carries the state. */

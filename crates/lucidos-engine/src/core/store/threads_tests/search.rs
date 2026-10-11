@@ -222,6 +222,34 @@ async fn search_threads_by_text_matches_via_entities() {
     teardown_test_db(&db).await;
 }
 
+/// A workspace whose pgvector extension will not load boots with no
+/// `memory_entries` table. Text search must still find titles and messages
+/// there; only the entity arm has nothing to read.
+#[tokio::test]
+async fn text_search_works_without_a_memory_entries_table() {
+    let (pool, db) = setup_test_db().await;
+    sqlx::query("DROP TABLE IF EXISTS memory_entries")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = EventStore::new(pool.clone());
+
+    let titled = Uuid::new_v4();
+    insert_thread(&pool, titled, "foo").await;
+    let body_only = Uuid::new_v4();
+    insert_thread(&pool, body_only, "Release").await;
+    insert_message(&pool, body_only, "MessageReceived", "the foo report").await;
+
+    let hits = store
+        .search_threads_by_text("foo", 20)
+        .await
+        .expect("text search must not need memory_entries");
+    let ids: Vec<String> = hits.into_iter().map(|h| h.info.thread_id).collect();
+    assert_eq!(ids, vec![titled.to_string(), body_only.to_string()]);
+
+    teardown_test_db(&db).await;
+}
+
 /// A short token is checked only inside threads a long token matched. It must
 /// still be found in a different message from the long one.
 #[tokio::test]
@@ -315,7 +343,7 @@ async fn text_search_reaches_events_through_its_indexes() {
 
     let explain = format!(
         "EXPLAIN (GENERIC_PLAN) {}",
-        super::search::text_search_sql()
+        super::search::text_search_sql(true)
     );
     // The simple protocol, because a generic plan leaves `$n` unbound.
     let plan = sqlx::raw_sql(&explain)

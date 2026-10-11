@@ -962,7 +962,7 @@ async fn a_change_reads_unsettled_whenever_its_thread_works_again() {
     emit(
         &bus,
         thread,
-        ThreadEvent::UserPromptInjected {
+        ThreadEvent::PromptInjected {
             text: "the background task finished".into(),
             mode: crate::engine::thread_events::ActorMode::Agent,
             origin: None,
@@ -1133,7 +1133,7 @@ async fn the_sub_thread_count_and_the_filter_agree_on_one_tree() {
             sources: None,
             parent: None,
             has_draft: None,
-            has_diff: None,
+            change_state: None,
             limit: 100,
         })
         .await

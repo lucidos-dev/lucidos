@@ -49,11 +49,8 @@ function makeCCThread(id: string, overrides: Partial<ThreadState['meta']> = {}):
       activeChildrenCount: 0,
       totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0,
-      codingAgentProposed: false,
-      codingAgentRequiresRestart: false,
-      codingAgentIncomplete: false,
+      codingAgentChangeState: { kind: 'none' },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
@@ -260,27 +257,6 @@ describe('getBannerActions', () => {
     expect(buttonLabels(rows(members))).toEqual(['Discard...']);
   });
 
-  // A stopped turn's change is not ready to review (ADR 0346).
-  it('leads an incomplete change with Continue, and moves Apply into the caret', () => {
-    const members = getBannerActions({
-      type: 'actions',
-      actions: DISCARD_APPLY,
-      threadId: 'tid',
-      isArchiving: false,
-      showDiff: false,
-      incomplete: true,
-    });
-    expect(members.map((m) => m.key)).toEqual(['change-actions']);
-    const props = splitProps(rowOf(members[0]));
-    expect(props.primary.key).toBe('continue');
-    expect(props.primary.label).toBe('Continue');
-    expect(props.primary.className).toBe('action-btn');
-    expect(props.menuActions.map((a) => a.kind)).toEqual(['apply', 'discard']);
-
-    const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
-    expect(buttonLabels(members[0].menuRows!(ctx))).toEqual(['Continue', 'Apply', 'Discard']);
-  });
-
   /** The caret's actions would go with the fold, so the composite contributes
    *  one menu row per action rather than one for the face. */
   it('folds the split button into a row per action', () => {
@@ -297,17 +273,13 @@ describe('getBannerActions', () => {
   });
 });
 
-describe('showDiff is driven by codingAgentHasDiff alone', () => {
-  it('Diff is shown when codingAgentHasDiff is true and no pending change exists', () => {
-    // Single-signal rule: branch-has-diff is the sole driver. The previous
-    // three-signal union (pendingChange OR codingAgentProposed OR codingAgentIsExternalRepo)
-    // is gone — codingAgentHasDiff is the git-truth replacement.
+describe('showDiff follows the change state', () => {
+  it('Diff is shown for unproposed work with no pending change', () => {
     const thread = makeCCThread('t1', {
       status: 'idle',
       section: 'inbox',
-      codingAgentProposed: false,
+      codingAgentChangeState: { kind: 'unproposed', reason: null },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: true,
     });
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -320,19 +292,21 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
     }
   });
 
-  it('Diff is hidden when codingAgentHasDiff is false even if coding_agent_proposed=true', () => {
-    // Proves the new rule replaces the union: under the old union,
-    // codingAgentProposed=true alone would have shown Diff. The new rule
-    // requires the branch to actually have a diff against its diff base.
+  // The engine can empty a pending change (the branch no longer differs from
+  // main) and the thread still reads proposed. Its file list hides Diff.
+  it('Diff is hidden for a proposal whose pending change lists no files', () => {
     const thread = makeCCThread('t1', {
       status: 'waiting',
       section: 'inbox',
-      codingAgentProposed: true,
+      codingAgentChangeState: { kind: 'proposed', requires_restart: false },
       codingAgentIsExternalRepo: false,
-      codingAgentHasDiff: false,
     });
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
+    changes.value = {
+      status: 'loaded',
+      data: [{ id: 'c1', thread_id: 't1', status: 'pending', file_count: 0, files: [] } as never],
+    };
 
     const state = getWaitingState();
     expect(state).not.toBeNull();
@@ -342,20 +316,31 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
     }
   });
 
-  it('marks the state incomplete from the thread flag, before the changes list names the change', () => {
+  it('Diff is shown for a proposal whose pending change lists files', () => {
     const thread = makeCCThread('t1', {
-      status: 'idle',
+      status: 'waiting',
       section: 'inbox',
-      codingAgentProposed: true,
-      codingAgentIncomplete: true,
-      codingAgentHasDiff: true,
+      codingAgentChangeState: { kind: 'proposed', requires_restart: false },
     });
+    threadMap.value = new Map([['t1', thread]]);
+    focusedThreadId.value = 't1';
+    changes.value = {
+      status: 'loaded',
+      data: [{ id: 'c1', thread_id: 't1', status: 'pending', file_count: 1, files: ['a.rs'] } as never],
+    };
+
+    const state = getWaitingState();
+    expect(state?.type === 'actions' && state.showDiff).toBe(true);
+  });
+
+  it('Diff is hidden when the branch holds no work', () => {
+    const thread = makeCCThread('t1', { status: 'idle', section: 'inbox' });
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
     const state = getWaitingState();
     expect(state?.type).toBe('actions');
-    if (state?.type === 'actions') expect(state.incomplete).toBe(true);
+    expect(state?.type === 'actions' && state.showDiff).toBe(false);
   });
 
   it('shows disabled "applying" for a QUEUED Apply All member (change applying, thread idle/waiting)', () => {
@@ -363,7 +348,7 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
     // applyingChangeIds → reverse-mapped by applyingChangeThreadIds). A member
     // still waiting its turn has no live session (status 'waiting', not mid-turn)
     // — nothing to interrupt — so it shows the disabled "Apply...".
-    const thread = makeCCThread('t1', { status: 'waiting', codingAgentHasDiff: true });
+    const thread = makeCCThread('t1', { status: 'waiting', codingAgentChangeState: { kind: 'unproposed', reason: null }});
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
     changes.value = { status: 'loaded', data: [{ id: 'c1', thread_id: 't1' } as never] };
@@ -439,12 +424,12 @@ describe('getStandaloneActions', () => {
   // mid-turn (waitingState='canceling'), where the banner is suppressed but
   // the branch already has commits to diff. "Branch has commits → Diff
   // visible" is the user-facing rule; the data layer already exposes that
-  // truth via meta.codingAgentHasDiff, this helper just surfaces it.
+  // truth via meta.codingAgentChangeState, this helper just surfaces it.
 
-  it('renders Diff button for focused CC thread with codingAgentHasDiff=true', () => {
+  it('renders Diff button for a focused CC thread holding unproposed work', () => {
     const thread = makeCCThread('t1', {
       status: 'running',
-      codingAgentHasDiff: true,
+      codingAgentChangeState: { kind: 'unproposed', reason: null },
     });
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -454,10 +439,10 @@ describe('getStandaloneActions', () => {
     expect(diffNodes(rows(members)).map((v) => v.props.threadId)).toEqual(['t1']);
   });
 
-  it('returns null when codingAgentHasDiff=false', () => {
+  it('returns null when the branch holds no work', () => {
     const thread = makeCCThread('t1', {
       status: 'running',
-      codingAgentHasDiff: false,
+      codingAgentChangeState: { kind: 'none' },
     });
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -470,7 +455,7 @@ describe('getStandaloneActions', () => {
     const thread = makeCCThread('t1', {
       channel: 'chat',
       status: 'idle',
-      codingAgentHasDiff: true,
+      codingAgentChangeState: { kind: 'unproposed', reason: null },
     });
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
@@ -488,7 +473,7 @@ describe('getStandaloneActions', () => {
     // handed one. Both must reach the same face with the same id.
     const thread = makeCCThread('tid', {
       status: 'running',
-      codingAgentHasDiff: true,
+      codingAgentChangeState: { kind: 'unproposed', reason: null },
     });
     threadMap.value = new Map([['tid', thread]]);
     focusedThreadId.value = 'tid';

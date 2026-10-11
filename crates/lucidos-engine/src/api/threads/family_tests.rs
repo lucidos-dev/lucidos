@@ -22,6 +22,7 @@ use super::{
 };
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
+use crate::engine::thread_lifecycle::ChangeStateKind;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use axum::http::StatusCode;
 use sqlx::PgPool;
@@ -34,7 +35,7 @@ fn row(
     is_coding_agent: bool,
     status: &str,
     archive_state: &str,
-    coding_agent_proposed: bool,
+    proposed: bool,
     coding_agent_is_external_repo: bool,
 ) -> FamilyRow {
     FamilyRow {
@@ -42,10 +43,25 @@ fn row(
         is_coding_agent,
         status: status.to_string(),
         archive_state: archive_state.to_string(),
-        coding_agent_proposed,
+        coding_agent_change_state: if proposed {
+            ChangeStateKind::Proposed
+        } else {
+            ChangeStateKind::None
+        },
         coding_agent_is_external_repo,
+        holds_live_wait: false,
         is_saved: false,
         is_home: false,
+    }
+}
+
+/// A coding agent parked on an event wait with an unproposed diff: its idle
+/// held the proposal (ADR 0395).
+fn cc_holding_work(id: Uuid) -> FamilyRow {
+    FamilyRow {
+        coding_agent_change_state: ChangeStateKind::Unproposed,
+        holds_live_wait: true,
+        ..row(id, true, "idle", "inbox", false, false)
     }
 }
 
@@ -242,7 +258,7 @@ async fn spawn_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid, bring_to_id
 
 /// Spawn a CC child of `parent_id`, bring its session to Idle. Drop a
 /// `ChangeProposed` if `with_pending_changes` so the row exits Idle into
-/// Waiting + coding_agent_proposed=true.
+/// Waiting + a proposed change.
 async fn spawn_cc_child(
     bus: &EventBus,
     pool: &PgPool,
@@ -854,9 +870,11 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
                 label: "A".into(),
                 description: None,
                 preview: None,
+                widget: None,
             }],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -1018,7 +1036,7 @@ async fn external_repo_cc_with_pending_changes_does_not_block() {
     let ext_cc = Uuid::new_v4();
     let mut ext_row = idle_cc(ext_cc);
     ext_row.coding_agent_is_external_repo = true;
-    ext_row.coding_agent_proposed = true;
+    ext_row.coding_agent_change_state = ChangeStateKind::Proposed;
     ext_row.status = "waiting".into();
     let family = vec![idle_chat(target), ext_row];
 
@@ -1269,6 +1287,18 @@ fn every_refusal_carries_the_blocker_the_menu_shows() {
             "pending child",
             vec![idle_chat(target), cc_with_pending(child)],
             Blocker::DescendantPendingChange,
+            "descendants_blocking",
+        ),
+        (
+            "parent parked with held work",
+            vec![cc_holding_work(target)],
+            Blocker::HeldProposal,
+            "parent_holds_held_proposal",
+        ),
+        (
+            "child parked with held work",
+            vec![idle_chat(target), cc_holding_work(child)],
+            Blocker::DescendantHeldProposal,
             "descendants_blocking",
         ),
     ];

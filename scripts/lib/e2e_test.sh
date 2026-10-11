@@ -673,15 +673,16 @@ test_ensure_workspace_running_builds_the_frontend_before_the_engine() {
         setup_postgres() { :; }
         build_e2e_engine_once() { :; }
         ensure_frontend_built() { echo "frontend"; }
+        attach_e2e_gateway() { echo "gateway"; }
         start_engine() { echo "engine"; }
         curl() { if [[ "$*" == *health* ]]; then return 1; fi; echo "<!DOCTYPE html>"; }
-        ensure_workspace_running 2>/dev/null | grep -E '^(frontend|engine)$' | tr '\n' ' '
+        ensure_workspace_running 2>/dev/null | grep -E '^(frontend|gateway|engine)$' | tr '\n' ' '
     )"
 
-    if [ "$order" = "frontend engine " ]; then
-        pass "the build lands before the boot that pins it"
+    if [ "$order" = "frontend gateway engine " ]; then
+        pass "the build and the gateway identity land before the boot"
     else
-        fail "order was '$order': the engine pins a stale dist/ and serves it all run"
+        fail "order was '$order': the engine boots on a stale dist/ or an inherited gateway"
     fi
 }
 
@@ -713,7 +714,9 @@ test_source_pins_the_engine_version_for_the_engine_it_starts() {
     # what a child process would inherit, so a bare assignment fails too.
     got=$(
         unset LUCIDOS_PIN_ENGINE_VERSION
-        # shellcheck source=e2e.sh
+        # The top of this file already sources e2e.sh for ShellCheck. A second
+        # parse costs about 700 MB of ShellCheck memory and finds nothing new.
+        # shellcheck source=/dev/null
         source "$SCRIPT_DIR/e2e.sh" >/dev/null 2>&1
         env | sed -n 's/^LUCIDOS_PIN_ENGINE_VERSION=//p'
     )

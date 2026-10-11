@@ -4,14 +4,14 @@
 //! per-turn iteration cap (no terminator → UI stuck on "running"),
 //! and every follow-up the user typed collided with the original
 //! `MessageReceived` row on `events_pkey` because the optimistic
-//! client UUID was reused as the persisted `UserPromptInjected` id.
+//! client UUID was reused as the persisted `PromptInjected` id.
 
 use super::super::event_bus::{BusEvent, EventBus};
 use super::super::thread_events::{ActorMode, EventMeta, ThreadEvent};
 use super::super::{InjectedPrompt, InjectedPromptKind};
 use super::{
     append_injected_prompts_to_messages, emit_iteration_cap_response_generated,
-    emit_user_prompt_injected_event, ensure_failure_terminator_emitted, ensure_terminator_emitted,
+    emit_prompt_injected_event, ensure_failure_terminator_emitted, ensure_terminator_emitted,
     filter_removed_queued_prompts, round_backstop_message, tool_call_cap_message,
 };
 use crate::llm::{Message, MessageContent};
@@ -185,7 +185,7 @@ fn the_two_engine_limit_messages_say_different_things() {
 }
 
 // ---------------------------------------------------------------------------
-// UserPromptInjected event_id collision
+// PromptInjected event_id collision
 // ---------------------------------------------------------------------------
 
 /// Regression: the inject path used to write `inject_meta.event_id =
@@ -193,11 +193,11 @@ fn the_two_engine_limit_messages_say_different_things() {
 /// `chat::process` had already persisted as `MessageReceived.id`. The
 /// emit silently failed under `emit_or_log`, the loop kept going, the UI
 /// never got the SSE — and worse, the event was lost forever. This test
-/// drives the inject helper directly and asserts the persisted UPI row
+/// drives the inject helper directly and asserts the persisted PromptInjected row
 /// gets a fresh id (different from the prompt's optimistic id) and the
 /// emit succeeds.
 #[tokio::test]
-async fn user_prompt_injected_does_not_collide_with_optimistic_id() {
+async fn prompt_injected_does_not_collide_with_optimistic_id() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
 
@@ -217,32 +217,32 @@ async fn user_prompt_injected_does_not_collide_with_optimistic_id() {
         kind: crate::engine::InjectedPromptKind::UserText,
     };
 
-    emit_user_prompt_injected_event(&bus, thread_id, &base_meta, &prompt).await;
+    emit_prompt_injected_event(&bus, thread_id, &base_meta, &prompt).await;
 
-    let upi_id: Uuid = sqlx::query_scalar(
+    let prompt_injected_id: Uuid = sqlx::query_scalar(
         "SELECT id FROM events \
-         WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected'",
+         WHERE aggregate_id = $1 AND event_type = 'PromptInjected'",
     )
     .bind(thread_id.to_string())
     .fetch_one(&pool)
     .await
-    .expect("UserPromptInjected must persist (no duplicate-key error)");
+    .expect("PromptInjected must persist (no duplicate-key error)");
 
     assert_ne!(
-        upi_id, client_event_id,
-        "UserPromptInjected must get a fresh id, not the optimistic MessageReceived id"
+        prompt_injected_id, client_event_id,
+        "PromptInjected must get a fresh id, not the optimistic MessageReceived id"
     );
 
     let request_link: Option<String> =
         sqlx::query_scalar("SELECT payload->>'request_event_id' FROM events WHERE id = $1")
-            .bind(upi_id)
+            .bind(prompt_injected_id)
             .fetch_one(&pool)
             .await
             .expect("query");
     assert_eq!(
         request_link.as_deref(),
         Some(client_event_id.to_string().as_str()),
-        "request_event_id must still link UPI back to the originating request"
+        "request_event_id must still link PromptInjected back to the originating request"
     );
 
     // injected_message_id carries the MessageReceived id forward so the
@@ -250,7 +250,7 @@ async fn user_prompt_injected_does_not_collide_with_optimistic_id() {
     // existing user message.
     let injected_link: Option<String> =
         sqlx::query_scalar("SELECT payload->>'injected_message_id' FROM events WHERE id = $1")
-            .bind(upi_id)
+            .bind(prompt_injected_id)
             .fetch_one(&pool)
             .await
             .expect("query");
@@ -320,13 +320,13 @@ async fn append_injected_prompts_coalesces_messages_but_emits_each_audit_row() {
 
     let injected_links: Vec<String> = sqlx::query_scalar(
         "SELECT payload->>'injected_message_id' FROM events \
-         WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected' \
+         WHERE aggregate_id = $1 AND event_type = 'PromptInjected' \
          ORDER BY created",
     )
     .bind(thread_id.to_string())
     .fetch_all(&pool)
     .await
-    .expect("UserPromptInjected rows must persist");
+    .expect("PromptInjected rows must persist");
     assert_eq!(
         injected_links,
         vec![

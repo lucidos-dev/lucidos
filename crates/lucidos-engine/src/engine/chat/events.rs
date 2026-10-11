@@ -240,6 +240,10 @@ impl crate::engine::LucidosEngine {
         // re-resolves with this event excluded, landing on the same answer.
         let resolved = crate::core::PreferenceStore::resolve_chat_overrides_for_thread(
             self.pool(),
+            crate::core::ModelDefaults {
+                registry: self.model_registry(),
+                fallback_model: self.current_provider().default_model(),
+            },
             Some(thread_id),
             None,
             crate::core::ResolvedModelSelection {

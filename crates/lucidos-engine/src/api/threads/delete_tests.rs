@@ -338,6 +338,7 @@ async fn the_audit_record_carries_no_content() {
         event_count: counts.events,
         memory_count: counts.memory,
         worktrees_removed: 0,
+        widgets_removed: 0,
         actor: None,
     }))
     .await
@@ -382,6 +383,7 @@ async fn a_later_delete_cannot_reach_an_earlier_record() {
         event_count: 2,
         memory_count: 0,
         worktrees_removed: 0,
+        widgets_removed: 0,
         actor: None,
     }))
     .await
@@ -766,6 +768,7 @@ fn the_audit_frame_is_the_last_thing_the_handler_does() {
     for earlier in [
         "drop_live_subscriptions(&state, &ids)",
         "reclaim_worktrees(&state, &coding_agents)",
+        "remove_owned_widgets(&state, &ids, &actor)",
         "repair_ancestor_counts(&state)",
     ] {
         let at = SRC

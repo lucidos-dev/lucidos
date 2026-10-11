@@ -129,7 +129,7 @@ const PLAIN_EVENT_NAMES: Record<string, string> = {
   MessageHeld: 'message held',
   MissingHardeningDetected: 'hardening needed',
   MergeConflictDetected: 'merge conflict',
-  UserPromptInjected: 'message to the agent',
+  PromptInjected: 'message to the agent',
   CodingAgentPromptSent: 'instructions to the agent',
   ResponseAborted: 'response interrupted',
   ResponseCanceled: 'response canceled',
@@ -174,7 +174,7 @@ const PLAIN_EVENT_MEANINGS: Record<string, string> = {
   MessageHeld: 'A message waited for your reply before the agent read it.',
   MissingHardeningDetected: 'The change had not passed hardening, its automatic review and test run, yet.',
   MergeConflictDetected: 'The change conflicts with newer changes in the project: a merge conflict.',
-  UserPromptInjected: 'Words handed to the agent while it works, from you, another thread or Lucidos.',
+  PromptInjected: 'Words handed to the agent while it works, from you, another thread or Lucidos.',
   CodingAgentPromptSent: 'Words Lucidos handed to the coding agent.',
   ResponseAborted: 'Lucidos stopped a reply before it finished.',
   ResponseCanceled: 'You stopped a reply before it finished.',
@@ -201,14 +201,14 @@ export const LEGACY_REENTRY_OPENINGS: [string, EventWaitReason['outcome']][] = [
   ['An event you subscribed to has arrived', 'delivered'],
 ];
 
-/** Why a `UserPromptInjected` exists, when it is an *event wait* re-entry.
+/** Why a `PromptInjected` exists, when it is an *event wait* re-entry.
  *
  *  The engine's origin says so on every row written now. An older row recorded
  *  no origin, so its shape is read instead: a delivery link, or one of the two
  *  opening sentences. Such a row knows only the outcome, so `watched` and
  *  `wait_reason` come back empty and every reader drops those clauses. */
 export function waitReentryReason(event: StoredEvent): EventWaitReason | undefined {
-  if (event.type !== 'UserPromptInjected') return undefined;
+  if (event.type !== 'PromptInjected') return undefined;
   if (event.origin?.kind === 'engine') {
     return event.origin.reason.kind === 'event_wait' ? event.origin.reason : undefined;
   }

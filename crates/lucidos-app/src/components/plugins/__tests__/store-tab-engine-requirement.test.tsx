@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect } from 'vitest';
 import { render } from 'preact';
-import { cardPrimaryAction, pluginRowsInScope, PluginStoreRow } from '../StoreTab';
+import { pluginRowsInScope, PluginStoreRow } from '../StoreTab';
+import { cardPrimaryAction } from '../pluginCard';
 import type { InstalledPlugin, MarketplacePlugin } from '../../../store/types';
 
 function row(over: Partial<MarketplacePlugin>): MarketplacePlugin {
@@ -19,6 +20,7 @@ function row(over: Partial<MarketplacePlugin>): MarketplacePlugin {
     files_count: 1,
     engine_compatible: true,
     status: 'available',
+    media: { screenshots: [], videos: [], problems: [] },
     ...over,
   };
 }
@@ -126,6 +128,7 @@ describe('a plugin that declares no engine requirement', () => {
       content: ['apps'],
       files: ['apps/trigger-timeline/index.html'],
       engine_requirement,
+      media: { screenshots: [], videos: [], problems: [] },
     });
     const orphan = (p: InstalledPlugin) =>
       pluginRowsInScope({ status: 'loaded', data: { plugins: [] } }, { status: 'loaded', data: [p] }, true)[0];

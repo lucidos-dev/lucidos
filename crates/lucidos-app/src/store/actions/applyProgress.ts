@@ -69,7 +69,8 @@ export function phaseLabel(
 
 /** What the apply of `change` on `threadId` is doing, or `null` when nothing
  *  says. A phase event this page saw wins. Otherwise the row answers, which is
- *  all a reloaded page has: an unhardened change hardens before it merges. */
+ *  all a reloaded page has: a change that needs hardening hardens before it
+ *  merges. */
 export function applyPhaseOf(
   threadId: string | null,
   change: Change | undefined,
@@ -80,7 +81,7 @@ export function applyPhaseOf(
   if (!change) return null;
   const startedAt = change.apply_phase_started_at ?? null;
   if (change.resolving_conflict) return { phase: 'resolving-conflict', eventId: null, startedAt };
-  if (!change.hardened) return { phase: 'hardening', eventId: null, startedAt };
+  if (change.needs_hardening) return { phase: 'hardening', eventId: null, startedAt };
   return { phase: 'merging', eventId: null, startedAt: null };
 }
 

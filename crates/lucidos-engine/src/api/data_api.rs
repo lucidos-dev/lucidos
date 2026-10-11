@@ -63,6 +63,13 @@ fn validate_data_path_mutate(path: &str) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
+/// A built-in widget is read-only from the data API too, and no new app may
+/// take its reserved prefix (ADR 0415).
+fn built_in_widget_refusal(state: &AppState, path: &str) -> Option<Response> {
+    let reason = state.app_manager.app_path_write_refusal(path)?;
+    Some(ApiError::with_code(403, format!("Cannot change '{path}': {reason}")).into_response())
+}
+
 /// The workspace-relative file this `/data` mount request names, or `None` when
 /// the mount must not serve it.
 ///
@@ -337,6 +344,9 @@ pub(super) async fn write_data(
     if let Err((code, msg)) = validate_data_path_mutate(&path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
+    if let Some(resp) = built_in_widget_refusal(&state, &path) {
+        return resp;
+    }
     let data_dir = state.workspace_path.join(crate::core::DATA_DIR);
     if let Err(msg) = crate::core::data_prefixes::validate_data_write(&data_dir, &path, &body) {
         return ApiError::with_code(422, msg).into_response();
@@ -450,6 +460,9 @@ pub(super) async fn delete_data(
     if let Err((code, msg)) = validate_data_path_mutate(&path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
+    if let Some(resp) = built_in_widget_refusal(&state, &path) {
+        return resp;
+    }
 
     // Before the delete, for the reason `write_data` gives above.
     let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
@@ -549,6 +562,9 @@ pub(super) async fn edit_data(
 ) -> Response {
     if let Err((code, msg)) = validate_data_path_mutate(&body.path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
+    if let Some(resp) = built_in_widget_refusal(&state, &body.path) {
+        return resp;
     }
     // A theme is validated whole, which an operation-by-operation edit cannot
     // honour, so a theme is saved with `PUT` instead.

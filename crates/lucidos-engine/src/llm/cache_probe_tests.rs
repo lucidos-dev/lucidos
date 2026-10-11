@@ -47,6 +47,7 @@ fn request(tools: Vec<ClaudeTool>, messages: Vec<ClaudeMessage>) -> ClaudeReques
         thinking: None,
         output_config: None,
         anthropic_beta: None,
+        tool_choice: None,
     }
 }
 
@@ -353,8 +354,8 @@ fn host_of_survives_shapes_that_are_not_urls() {
 }
 
 /// A Tree turn's first message, built by the real request builder: the view
-/// snapshot, two thread view pieces ending at marks, the view's rest, then the
-/// message.
+/// snapshot's marked block, the thread view's two rungs, the view's rest, then
+/// the message.
 fn tree_request(rounds: usize, thread_view: &str) -> ClaudeRequest {
     use crate::llm::provider::{ContentBlock, Message, MessageContent, ToolDefinition};
     let mut messages = vec![Message {
@@ -405,8 +406,8 @@ fn tree_request(rounds: usize, thread_view: &str) -> ClaudeRequest {
 }
 
 /// I5: a Tree turn's first round marks the view snapshot, so other threads read
-/// the prefix through it, and both thread view marks, so the next turn reads
-/// the view's stable start. Tools and system give way to them.
+/// the prefix through it, and both thread view rungs, so the next turn reads
+/// nearly the whole view. Tools and system give way to them.
 #[test]
 fn a_tree_first_round_marks_the_view_snapshot() {
     let line = line(&tree_request(1, "[THREAD MEMORY VIEW]"));

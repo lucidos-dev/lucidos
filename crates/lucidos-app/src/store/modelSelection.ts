@@ -41,6 +41,9 @@ export interface ModelChoice {
   section?: string;
   /** The backend the model resolves to when nothing here picks one. */
   defaultProvider?: string;
+  /** The tier this surface recommends for the model, which its tier step
+   *  badges. Absent where nothing measured backs one. */
+  recommendedEffort?: string;
 }
 
 /** One reasoning tier as a surface displays it.
@@ -52,6 +55,8 @@ export interface TierChoice {
   value: string;
   label: string;
   description?: string;
+  /** This surface recommends the tier for the model the step belongs to. */
+  recommended?: boolean;
 }
 
 /** The unified ladder, ascending. Mirrors `llm::reasoning::EFFORT_LADDER`, and
@@ -67,6 +72,11 @@ export function tierOptions(
   vocabulary: readonly TierChoice[],
 ): TierChoice[] {
   return vocabulary.filter((tier) => offered.includes(tier.value));
+}
+
+/** `tiers` with `recommended` marked on the one `effort` names. */
+function markRecommended(tiers: TierChoice[], effort: string | undefined): TierChoice[] {
+  return tiers.map((tier) => (tier.value === effort ? { ...tier, recommended: true } : tier));
 }
 
 /** One row of the picker's PROVIDER step, carrying the tiers it accepts. */
@@ -171,7 +181,10 @@ export function modelRows(
       value: model.value,
       label: model.label,
       description: [model.description, onProvider?.label].filter(Boolean).join(' · ') || undefined,
-      tiers: tierOptions(onProvider?.reasoningEfforts ?? model.reasoningEfforts, vocabulary),
+      tiers: markRecommended(
+        tierOptions(onProvider?.reasoningEfforts ?? model.reasoningEfforts, vocabulary),
+        model.recommendedEffort,
+      ),
       provider,
       providerLabel: onProvider?.label ?? null,
       providers: showsProviderStep(model, provider)
@@ -179,7 +192,7 @@ export function modelRows(
             value: p.value,
             label: p.label,
             configured: p.configured,
-            tiers: tierOptions(p.reasoningEfforts, vocabulary),
+            tiers: markRecommended(tierOptions(p.reasoningEfforts, vocabulary), model.recommendedEffort),
           }))
         : [],
       section: model.section,

@@ -11,7 +11,12 @@ import '../actions/wipPreview';
 // Mock API client
 const mockPostAppCapture = vi.fn().mockResolvedValue(undefined);
 const mockListAppsApi = vi.fn().mockResolvedValue([]);
-vi.mock('../../api/client', () => ({
+const mockGetAppApi = vi.fn();
+const mockRecordAppOpenedApi = vi.fn().mockResolvedValue(undefined);
+vi.mock('../../api/client', async () => ({
+  recordAppOpenedApi: (...args: unknown[]) => mockRecordAppOpenedApi(...args),
+  ApiError: (await vi.importActual<typeof import('../../api/client/_core')>('../../api/client/_core')).ApiError,
+  getAppApi: (...args: unknown[]) => mockGetAppApi(...args),
   postAppCapture: (...args: unknown[]) => mockPostAppCapture(...args),
   listAppsApi: (...args: unknown[]) => mockListAppsApi(...args),
   retryTransientRead: <T>(read: () => Promise<T>) => read(),
@@ -29,13 +34,13 @@ vi.mock('./navigation', () => ({
 const notesApp: App = {
   id: 'notes-app',
   name: 'Notes App',
-  description: 'Daily notes', reveal: 'on-load',
+  description: 'Daily notes', reveal: 'on-load', kind: 'app', reusable: false,
 };
 
 const tripPlanner: App = {
   id: 'trip-planner-2026',
   name: 'Trip Planner 2026',
-  description: 'Vacation planner', reveal: 'on-load',
+  description: 'Vacation planner', reveal: 'on-load', kind: 'app', reusable: false,
 };
 
 describe('captureAppUI', () => {
@@ -97,6 +102,19 @@ describe('captureAppUI', () => {
       '',
       expect.stringContaining('Error'),
     );
+  });
+
+  // A hidden tab shares its device id with the visible one, which may have the
+  // app open. Its quick "no app" answer would win the race, so it stays silent.
+  it('stays silent in a hidden tab with no app open', async () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    try {
+      const { captureAppUI } = await import('./apps');
+      await captureAppUI('notes-app', 'test-request-id');
+      expect(mockPostAppCapture).not.toHaveBeenCalled();
+    } finally {
+      visibility.mockRestore();
+    }
   });
 });
 
@@ -349,6 +367,8 @@ describe('openAppById', () => {
   it('toasts when the app id is unknown — stale link should not silently no-op', async () => {
     appsList.value = { status: 'loaded', data: [notesApp] };
     mockListAppsApi.mockResolvedValue([notesApp]);
+    const { ApiError } = await import('../../api/client/_core');
+    mockGetAppApi.mockRejectedValue(new ApiError(404, 'App not found: trip-planner-2026'));
 
     const { openAppById } = await import('./apps');
     await openAppById('trip-planner-2026');
@@ -359,6 +379,18 @@ describe('openAppById', () => {
     // After the disk re-scan still misses, the toast names the id + that it's gone.
     expect(errors[0].message).toMatch(/trip-planner-2026/);
     expect(errors[0].message).toMatch(/no longer exists/i);
+  });
+
+  it('opens a widget by id, since the apps list never holds one (ADR 0402)', async () => {
+    appsList.value = { status: 'loaded', data: [notesApp] };
+    mockListAppsApi.mockResolvedValue([notesApp]);
+    const widget: App = { ...notesApp, id: 'fare-grid', name: 'Fare grid', kind: 'widget', origin_thread_id: 't1' };
+    mockGetAppApi.mockResolvedValue(widget);
+
+    const { openAppById } = await import('./apps');
+    await openAppById('fare-grid');
+
+    expect(panelOverlay.value).toMatchObject({ type: 'app-ui', app: { id: 'fare-grid', kind: 'widget' } });
   });
 
   it('never calls an app gone when the re-scan failed, and keeps the cached list', async () => {
@@ -535,6 +567,46 @@ describe('openApp carries an app fragment', () => {
   });
 });
 
+describe('openApp records one AppOpened per real open', () => {
+  beforeEach(() => {
+    panelOverlay.value = null;
+    inputMode.value = { type: 'do' };
+    mockRecordAppOpenedApi.mockClear();
+  });
+
+  it('posts once on a fresh open', async () => {
+    const { openApp } = await import('./apps');
+    openApp(notesApp);
+
+    expect(mockRecordAppOpenedApi).toHaveBeenCalledTimes(1);
+    expect(mockRecordAppOpenedApi).toHaveBeenCalledWith('notes-app');
+  });
+
+  it('posts nothing for a move inside an app already open', async () => {
+    const { openApp } = await import('./apps');
+    openApp(notesApp);
+    openApp(notesApp, 'pr-1645');
+    openApp(notesApp);
+
+    expect(mockRecordAppOpenedApi).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts again when the user opens a different app', async () => {
+    const { openApp } = await import('./apps');
+    openApp(notesApp);
+    openApp(tripPlanner);
+
+    expect(mockRecordAppOpenedApi.mock.calls).toEqual([['notes-app'], ['trip-planner-2026']]);
+  });
+
+  it('posts nothing for a widget opened in Canvas', async () => {
+    const { openApp } = await import('./apps');
+    openApp({ ...notesApp, id: 'fare-grid', kind: 'widget' });
+
+    expect(mockRecordAppOpenedApi).not.toHaveBeenCalled();
+  });
+});
+
 describe('openApp expands the content pane on desktop', () => {
   beforeEach(() => {
     panelOverlay.value = null;
@@ -614,5 +686,24 @@ describe('exitAppFullscreen', () => {
     const { exitAppFullscreen } = await import('./apps');
     expect(exitAppFullscreen()).toBe(true);
     expect(exit).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Last in the file: it resets the module graph, which later tests holding the
+// top-level store imports would not survive.
+describe('a reload restore of the open app', () => {
+  it('posts nothing when a reload restores the open app', async () => {
+    // A fresh module, so the one-shot restore has not run yet.
+    vi.resetModules();
+    mockRecordAppOpenedApi.mockClear();
+    localStorage.setItem('app-window-open', notesApp.id);
+    mockListAppsApi.mockResolvedValueOnce([notesApp]);
+    const store = await import('../store');
+    const { loadApps } = await import('./apps');
+    await loadApps();
+
+    expect(store.panelOverlay.value).toEqual({ type: 'app-ui', app: notesApp });
+    expect(mockRecordAppOpenedApi).not.toHaveBeenCalled();
+    localStorage.removeItem('app-window-open');
   });
 });

@@ -215,8 +215,27 @@ fn tool_definitions(tools: ToolSet) -> Vec<Value> {
                     },
                     "options": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "2-4 short answer labels; omit for free-text. \
+                        "items": {
+                            "anyOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string" },
+                                        "description": {
+                                            "type": "string",
+                                            "description": "Markdown under the label. A \
+                                                picture or a widget embed draws here: \
+                                                ![label](app:<id>?params={...})"
+                                        },
+                                        "preview": { "type": "string" }
+                                    },
+                                    "required": ["label"]
+                                }
+                            ]
+                        },
+                        "description": "2-4 answers: a short label, or {label, description} \
+                            to draw a picture or a widget in the option. Omit for free-text. \
                             NEVER include an \"Other\" / \"Something else\" / \"Let me type \
                             it\" label: there is no text-entry option, so tapping one just \
                             sends you that label back as the answer. The user can always \
@@ -489,6 +508,15 @@ mod tests {
         // and Codex silently loses its question path.
         assert_eq!(tools[1]["name"], "ask_user_question");
         assert_eq!(tools[1]["inputSchema"]["required"][0], "question");
+        // Codex writes a widget embed in an object option's description
+        // (ADR 0415), so the schema must offer the object form.
+        let kinds = &tools[1]["inputSchema"]["properties"]["options"]["items"]["anyOf"];
+        assert_eq!(kinds[0]["type"], "string");
+        assert_eq!(kinds[1]["type"], "object");
+        assert!(kinds[1]["properties"]["description"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("app:<id>"));
     }
 
     /// Claude Code has its own `AskUserQuestion` tool, hooked to the same

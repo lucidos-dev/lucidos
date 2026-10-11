@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::engine::summary_tree::shape::{complete_addresses, LeafOrder, Pending};
+use crate::engine::summary_tree::shape::{complete_addresses, LeafOrder, Pending, LEAF_WINDOW};
 use crate::engine::summary_tree::NodeAddr;
 
 fn addr(start: u64, span: u64) -> NodeAddr {
@@ -19,7 +19,7 @@ fn buildable(
     built: &HashMap<NodeAddr, String>,
     busy: &HashSet<NodeAddr>,
 ) -> Vec<NodeAddr> {
-    Pending::new(len, built).buildable(built, busy, LeafOrder::InOrder, usize::MAX)
+    Pending::new(len, built).buildable(built, busy, LeafOrder::Windowed, usize::MAX)
 }
 
 #[test]
@@ -40,26 +40,42 @@ fn a_complete_tree_holds_every_aligned_power_of_two() {
     assert_eq!(all, expected);
 }
 
-/// Leaves build one at a time: only the first unbuilt leaf is eligible.
+/// A thread leaf starts once fewer than the window's leaves before it are
+/// unbuilt. One still building counts as unbuilt.
 #[test]
-fn only_the_first_unbuilt_leaf_may_start() {
+fn a_thread_leaf_starts_while_few_leaves_before_it_are_unbuilt() {
+    let window = LEAF_WINDOW as u64;
     let none = built(&[]);
-    assert_eq!(buildable(4, &none, &HashSet::new()), vec![addr(0, 1)]);
+    let first: Vec<_> = (0..window).map(|i| addr(i, 1)).collect();
+    assert_eq!(buildable(2 * window, &none, &HashSet::new()), first);
     let busy: HashSet<_> = [addr(0, 1)].into_iter().collect();
-    assert!(buildable(4, &none, &busy).is_empty());
+    assert_eq!(buildable(2 * window, &none, &busy), first[1..]);
 }
 
-/// A merge starts only once both children are built, and runs beside the next
-/// leaf.
+/// A merge starts only once both children are built, and goes ahead of the
+/// leaves beside it.
 #[test]
 fn a_merge_waits_for_both_children() {
     let two = built(&[addr(0, 1), addr(1, 1)]);
-    let mut next = buildable(4, &two, &HashSet::new());
-    next.sort();
-    assert_eq!(next, vec![addr(0, 2), addr(2, 1)]);
+    let next = buildable(4, &two, &HashSet::new());
+    assert_eq!(next, vec![addr(0, 2), addr(2, 1), addr(3, 1)]);
 
     let one = built(&[addr(0, 1)]);
-    assert_eq!(buildable(4, &one, &HashSet::new()), vec![addr(1, 1)]);
+    assert_eq!(
+        buildable(4, &one, &HashSet::new()),
+        vec![addr(1, 1), addr(2, 1), addr(3, 1)]
+    );
+}
+
+/// Leaves never take the room a ready merge needs.
+#[test]
+fn a_ready_merge_goes_before_the_leaves() {
+    let two = built(&[addr(0, 1), addr(1, 1)]);
+    let pending = Pending::new(16, &two);
+    assert_eq!(
+        pending.buildable(&two, &HashSet::new(), LeafOrder::Windowed, 1),
+        vec![addr(0, 2)]
+    );
 }
 
 /// A merge never starts over a leaf that is not built, even when its own
@@ -82,8 +98,8 @@ fn a_built_node_leaves_the_pending_set() {
     }
     assert_eq!(pending.first_unbuilt_leaf(), 2);
     assert_eq!(
-        pending.buildable(&nodes, &HashSet::new(), LeafOrder::InOrder, usize::MAX),
-        vec![addr(2, 1), addr(0, 2)]
+        pending.buildable(&nodes, &HashSet::new(), LeafOrder::Windowed, usize::MAX),
+        vec![addr(0, 2), addr(2, 1), addr(3, 1)]
     );
 }
 

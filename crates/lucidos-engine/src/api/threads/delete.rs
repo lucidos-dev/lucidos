@@ -29,6 +29,7 @@ use crate::api::error::ApiError;
 use crate::api::AppState;
 use crate::engine::thread_lifecycle::Blocker;
 use crate::engine::worktree_cleanup::BranchDisposal;
+use crate::memory::pgvector::PgVectorIndex;
 
 use super::extract_thread_uuid;
 use super::family::{
@@ -94,9 +95,9 @@ pub(in crate::api) struct DeletePreflight {
     /// Model-written *summary tree* lines the delete sends back to the
     /// compactor, each one background model call to rebuild.
     summary_rebuild_count: i64,
-    /// Any coding-agent member with a diff on disk, or a recorded branch some
-    /// repo still holds. Both halves are needed: `ThreadArchived` clears
-    /// `coding_agent_has_diff`, so the column alone reads false for exactly the
+    /// Any coding-agent member whose change state holds work, or a recorded
+    /// branch some repo still holds. Both halves are needed: `ThreadArchived`
+    /// clears the branch work, so the state alone reads `none` for exactly the
     /// archived thread whose branch the delete is about to take.
     has_unapplied_branch_work: bool,
     /// Any `changes` row for the family already at `applied`.
@@ -163,9 +164,9 @@ pub(in crate::api) async fn delete_preflight(
         .await
         .map_err(internal)?
         .is_some();
-    // `coding_agent_has_diff` alone under-reports, and it under-reports on the
-    // case this feature exists for. `ThreadArchived` clears the column, so an
-    // archived coding-agent thread always reads false while its branch may
+    // The change state alone under-reports, and it under-reports on the case
+    // this feature exists for. `ThreadArchived` clears the branch work, so an
+    // archived coding-agent thread always reads `none` while its branch may
     // still hold commits nothing merged. Ask git as well.
     let mut has_unapplied_branch_work = facts.has_unapplied_branch_work;
     if !has_unapplied_branch_work {
@@ -268,6 +269,7 @@ pub(in crate::api) async fn delete_thread_family(
     // the dead through the projection's upsert.
     drop_live_subscriptions(&state, &ids).await;
     let worktrees_removed = reclaim_worktrees(&state, &coding_agents).await;
+    let widgets_removed = remove_owned_widgets(&state, &ids, &actor).await;
     // Before the emit. The frame is what makes every client re-read the list,
     // and a re-read that lands first reads the stale counts.
     if surviving_parent.is_some() {
@@ -287,6 +289,7 @@ pub(in crate::api) async fn delete_thread_family(
                     event_count: counts.events,
                     memory_count: counts.memory,
                     worktrees_removed,
+                    widgets_removed,
                     actor: Some(actor),
                 },
             ),
@@ -301,7 +304,53 @@ pub(in crate::api) async fn delete_thread_family(
         "event_count": counts.events,
         "memory_count": counts.memory,
         "worktrees_removed": worktrees_removed,
+        "widgets_removed": widgets_removed,
     })))
+}
+
+/// Remove the widgets these threads own: made in one of them and not reusable
+/// (ADR 0402). Reusable widgets, apps made from a widget, and other threads'
+/// widgets stay. One commit for all of them. Best effort like the worktrees,
+/// so a failure is logged and reported as a lower count.
+async fn remove_owned_widgets(
+    state: &AppState,
+    ids: &[Uuid],
+    actor: &crate::engine::thread_events::MessageOrigin,
+) -> usize {
+    let owned = match state.app_manager.widgets_owned_by(ids) {
+        Ok(owned) => owned,
+        Err(e) => {
+            log!(
+                "[Delete] Could not read the deleted threads' widgets: {}",
+                e
+            );
+            return 0;
+        }
+    };
+    if owned.is_empty() {
+        return 0;
+    }
+    let _repo_guard = state.engine.lock_workspace_repo().await;
+    match state
+        .app_manager
+        .delete_widgets(&state.engine.event_bus, &owned, Some(actor.clone()))
+        .await
+    {
+        Ok(removed) => removed.len(),
+        Err(e) => {
+            // The ones removed before the failure are committed and announced,
+            // so the count reads back from disk rather than from the error.
+            log!(
+                "[Delete] Could not remove every widget of {:?}: {}",
+                owned,
+                e
+            );
+            owned
+                .iter()
+                .filter(|id| !state.app_manager.app_exists(id))
+                .count()
+        }
+    }
 }
 
 /// How much the one transaction removed, for the audit record.
@@ -333,7 +382,7 @@ async fn delete_family_rows(
     // 1. Memory, first, and by the text form of the id: that is what
     //    `memory_entries_source_event_id_idx` is an expression index on
     //    (created at runtime in memory/pgvector.rs, since the table is).
-    let memory = if memory_table_exists(tx).await? {
+    let memory = if PgVectorIndex::table_exists(&mut **tx).await? {
         sqlx::query(
             "DELETE FROM memory_entries \
              WHERE source->>'type' = 'event' AND source->>'id' = ANY($1)",
@@ -419,27 +468,11 @@ async fn family_event_ids(
     .await
 }
 
-/// Does this workspace have a `memory_entries` table at all?
-///
-/// It is created at runtime by `PgVectorIndex::new` rather than by a migration,
-/// and that call is allowed to fail. A workspace whose pgvector extension will
-/// not load boots with memory search disabled and no table. Asking first
-/// matters, because a missing relation inside a transaction aborts every
-/// statement after it. The whole cascade would then fail on exactly the
-/// workspaces that have no memory to delete.
-async fn memory_table_exists(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT to_regclass('public.memory_entries') IS NOT NULL")
-        .fetch_one(&mut **tx)
-        .await
-}
-
 async fn count_memory_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     event_ids: &[Uuid],
 ) -> Result<i64, sqlx::Error> {
-    if !memory_table_exists(tx).await? {
+    if !PgVectorIndex::table_exists(&mut **tx).await? {
         return Ok(0);
     }
     let texts: Vec<String> = event_ids.iter().map(|id| id.to_string()).collect();
@@ -467,10 +500,11 @@ async fn load_preflight_facts(
     target: Uuid,
 ) -> Result<PreflightFacts, sqlx::Error> {
     let rows: Vec<(Uuid, Option<String>, bool)> = sqlx::query_as(
-        "SELECT thread_id, title, coding_agent_has_diff \
+        "SELECT thread_id, title, coding_agent_change_state <> $2 \
          FROM thread_summaries WHERE thread_id = ANY($1)",
     )
     .bind(ids)
+    .bind(crate::engine::thread_lifecycle::ChangeStateKind::None)
     .fetch_all(&mut **tx)
     .await?;
 
@@ -488,10 +522,10 @@ async fn load_preflight_facts(
     };
     // Family order, so the dialog's list reads parent-first like the drawer.
     for id in ids {
-        let Some((_, title, has_diff)) = rows.iter().find(|(tid, _, _)| tid == id) else {
+        let Some((_, title, has_work)) = rows.iter().find(|(tid, _, _)| tid == id) else {
             continue;
         };
-        facts.has_unapplied_branch_work |= *has_diff;
+        facts.has_unapplied_branch_work |= *has_work;
         let title = title.clone().unwrap_or_default();
         if *id != target {
             facts.sub_thread_titles.push(title.clone());
@@ -548,6 +582,7 @@ async fn blocking_members(
                 OwnBlocker::Running => "running",
                 OwnBlocker::Question => "waiting_for_user_answer",
                 OwnBlocker::PendingChange => "pending_change",
+                OwnBlocker::HeldProposal => "held_proposal",
             })
         } else if state.engine.is_agent_running_for(row.thread_id).await {
             Some("agent_session_live")

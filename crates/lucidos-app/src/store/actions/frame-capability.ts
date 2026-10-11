@@ -23,7 +23,7 @@
 import { signal } from '@preact/signals';
 import { API } from '../../api/client';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
-import { appIdForFrame } from '../../utils/appFrame';
+import { appIdForFrame, mountedAppFrames } from '../../utils/appFrame';
 import { PREVIEW_FRAME_ROLE, postToPreviewFrame } from '../../utils/previewFrameProtocol';
 import { postToAppFrame } from './app-bridge';
 
@@ -84,7 +84,7 @@ async function tick(): Promise<void> {
  * behind a gateway.
  */
 export async function renewEveryOpenFrame(): Promise<number> {
-  const frames = document.querySelectorAll<HTMLIFrameElement>('iframe[data-role="app-ui-frame"]');
+  const frames = mountedAppFrames();
   let nextDelayMs = DEFAULT_RENEW_AFTER_MS;
   let failed = false;
   for (const frame of frames) {

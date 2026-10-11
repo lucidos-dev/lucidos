@@ -663,8 +663,8 @@ test_gateway_scope_ignores_the_optin() {
 test_stack_scope_still_honours_the_optin() {
     echo "test: stack scope (direct engine, what e2e uses) still honours the opt-in"
 
-    # scripts/lib/e2e.sh calls start_engine directly and never starts a gateway,
-    # so it only ever reaches this scope. Regressing it breaks e2e's frontend.
+    # scripts/lib/e2e.sh calls start_engine directly, so it only ever reaches
+    # this scope. Regressing it breaks e2e's frontend.
     local wt="$SANDBOX/ws4/.lucidos/worktrees/thread-e2e"
     mkdir -p "$wt"
     if LUCIDOS_ALLOW_WORKTREE_STACK=1 assert_stack_not_worktree_pinned "$wt" >/dev/null 2>&1; then
@@ -1594,7 +1594,7 @@ test_publish_failure_preserves_the_previous_binary() {
 test_publish_prunes_only_dead_publish_temps() {
     echo "test: a SIGKILLed publish's temp is collected, a live one's is not"
 
-    # A coalescing Apply SIGKILLs the whole build process group
+    # An explicit Rebuild SIGKILLs the whole build process group
     # (engine_version::BuildProcessGroupGuard), which no trap catches, so a kill
     # inside the copy/sign window strands a ~250 MB temp that nothing collects.
     # The next publish sweeps it, but ONLY when its pid is dead: a human

@@ -197,9 +197,6 @@ pub async fn write_data_fixture(
     Err(format!("PUT /api/v1/data/{rel} returned {status}: {body}"))
 }
 
-/// How long `remove_data_fixtures` keeps watching its path after the deletes.
-const FIXTURE_CLEANUP_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
-
 /// Delete committed fixtures under `data/<dir>/` and leave that path clean in
 /// git. `files` are `data/`-relative. Best-effort: a failed cleanup must not
 /// fail the assertion its test exists for.
@@ -210,59 +207,21 @@ const FIXTURE_CLEANUP_SETTLE: std::time::Duration = std::time::Duration::from_se
 /// that never appeared, such as output of a script that never ran, fails its
 /// delete harmlessly.
 ///
-/// **A committed delete is not yet a terminal state.** The engine's
-/// auto-commit (`commit_all_dirty`) stages ALL of `data/`, and every script run
-/// in this parallel suite fires one. One that staged a fixture BEFORE the delete
-/// and commits AFTER it writes the path back into HEAD while it is gone from
-/// disk. So this watches the path for the whole window and commits any dirt
-/// under the exclusive guard. The window is a ceiling, not a sleep. The watch
-/// goes once the engine race is fixed (`docs/temporary-measures.md`, "The e2e
-/// fixture cleanup watches for a deleted path coming back").
+/// A committed delete is terminal. An auto-commit that staged the fixture
+/// earlier is pinned to the HEAD it staged from. libgit2 refuses it, and the
+/// retry re-stages without the file.
 pub async fn remove_data_fixtures(client: &reqwest::Client, dir: &str, files: &[String]) {
-    {
-        // The files disappear from the tree; see `workspace_tree_lock`. Scoped
-        // to the deletes, because holding a guard across the watch below would
-        // queue every other tree writer behind it to protect nothing.
-        let _tree = workspace_tree_lock().read().await;
-        for rel in files {
-            let _ = client
-                .delete(format!("{}/api/v1/data/{}", base_url(), rel))
-                .send()
-                .await;
-        }
-        // Git tracks no directories, so dropping the emptied ones changes no
-        // tracked state. A directory that still holds a file stays.
-        remove_empty_dirs(&workspace_path().join("data").join(dir));
+    // The files disappear from the tree; see `workspace_tree_lock`.
+    let _tree = workspace_tree_lock().read().await;
+    for rel in files {
+        let _ = client
+            .delete(format!("{}/api/v1/data/{}", base_url(), rel))
+            .send()
+            .await;
     }
-    let pathspec = format!("data/{dir}");
-    let deadline = std::time::Instant::now() + FIXTURE_CLEANUP_SETTLE;
-    while std::time::Instant::now() < deadline {
-        let dirty = std::process::Command::new("git")
-            .current_dir(workspace_path())
-            .args(["status", "--porcelain", "--", &pathspec])
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            // A `git status` that would not run says nothing about the tree, so
-            // treat it as dirty and keep trying rather than declaring victory.
-            .unwrap_or(true);
-        if dirty {
-            // The exit code cannot tell a lost `index.lock` from "nothing to
-            // commit", so the next poll is what settles it.
-            let _tree = workspace_tree_lock().write().await;
-            let _ = std::process::Command::new("git")
-                .current_dir(workspace_path())
-                .args([
-                    "commit",
-                    "-q",
-                    "-m",
-                    &format!("e2e: remove fixtures under {pathspec}"),
-                    "--",
-                    &pathspec,
-                ])
-                .output();
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
+    // Git tracks no directories, so dropping the emptied ones changes no
+    // tracked state. A directory that still holds a file stays.
+    remove_empty_dirs(&workspace_path().join("data").join(dir));
 }
 
 /// Remove `dir` and every directory under it that holds no file.
@@ -724,7 +683,9 @@ pub fn commit_on_new_branch(branch: &str, file: &str, contents: &str) {
         branch,
         "main",
     ]);
-    std::fs::write(wt_dir.join(file), contents).unwrap();
+    let path = wt_dir.join(file);
+    std::fs::create_dir_all(path.parent().expect("a file has a parent")).unwrap();
+    std::fs::write(path, contents).unwrap();
     git_in(&wt_dir, &["add", file]);
     git_in(&wt_dir, &["commit", "-m", &format!("e2e: {file}")]);
     git(&["worktree", "remove", "--force", wt_dir.to_str().unwrap()]);

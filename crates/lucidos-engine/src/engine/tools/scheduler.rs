@@ -1332,9 +1332,29 @@ pub(crate) fn next_occurrences_multi(
     tz: chrono_tz::Tz,
     n: usize,
 ) -> Vec<chrono::DateTime<chrono_tz::Tz>> {
+    next_occurrences_after(schedules, tz, chrono::Utc::now(), n)
+}
+
+/// [`next_occurrences_multi`] with the clock as an argument.
+///
+/// Only instants strictly after `now` in UTC count. In the hour a fall-back
+/// repeats, `cron` resolves an ambiguous wall time to its EARLIER instant,
+/// which has already passed. A loop taking that as its next fire reads it as
+/// due, and fires again after every run until the hour is over.
+pub(crate) fn next_occurrences_after(
+    schedules: &[cron::Schedule],
+    tz: chrono_tz::Tz,
+    now: chrono::DateTime<chrono::Utc>,
+    n: usize,
+) -> Vec<chrono::DateTime<chrono_tz::Tz>> {
+    let local_now = now.with_timezone(&tz);
     let mut merged: Vec<chrono::DateTime<chrono_tz::Tz>> = schedules
         .iter()
-        .flat_map(|s| s.upcoming(tz).take(n))
+        .flat_map(|s| {
+            s.after(&local_now)
+                .filter(|t| t.with_timezone(&chrono::Utc) > now)
+                .take(n)
+        })
         .collect();
     merged.sort_unstable();
     merged.dedup();

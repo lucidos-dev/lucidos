@@ -259,22 +259,22 @@ pub fn cc_command_definitions() -> serde_json::Value {
 }
 
 /// Serialize a `ControlRequest` to the JSON line that CC expects on stdin.
-pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) -> String {
+/// `None` for a request CC refuses: see [`crate::runtime::CodingAgent::control_reach`].
+pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) -> Option<String> {
     let body = match request {
         ControlRequest::Interrupt => serde_json::json!({ "subtype": "interrupt" }),
         ControlRequest::SetModel { model } => {
             serde_json::json!({ "subtype": "set_model", "model": model })
         }
-        ControlRequest::SetReasoningEffort { effort } => {
-            serde_json::json!({ "subtype": "set_reasoning_effort", "effort": effort })
-        }
+        ControlRequest::SetReasoningEffort { .. } => return None,
     };
-    serde_json::to_string(&serde_json::json!({
+    let line = serde_json::to_string(&serde_json::json!({
         "type": "control_request",
         "request_id": request_id,
         "request": body,
     }))
-    .expect("ControlRequest serialization cannot fail")
+    .expect("ControlRequest serialization cannot fail");
+    Some(line)
 }
 
 /// The one stream-json line a side question writes: the instructions and the
@@ -860,6 +860,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         let CcCommand {
             mut cmd,
             system_prompt_file,
+            run_marker,
         } = build_command(&args, cli_dir)?;
         let stream_state = CcStreamState::with_notes_relayed(relays_vertex_calls(&cmd));
         let mut child = super::spawn_env::spawn_below_engine(&mut cmd)?;
@@ -889,6 +890,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             )
             .await;
             drop(system_prompt_file);
+            super::agent_run_marker::reap_marked_groups(run_marker, GROUP_TEARDOWN_GRACE).await;
         });
 
         Ok(RunningAgent {
@@ -1010,6 +1012,7 @@ const CC_BYTE_STREAM_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 struct CcCommand {
     cmd: tokio::process::Command,
     system_prompt_file: Option<tempfile::TempPath>,
+    run_marker: super::agent_run_marker::AgentRunMarker,
 }
 
 /// Where the system prompt files live. Inside the workspace rather than the
@@ -1100,9 +1103,11 @@ fn build_command_with_settings(
         .arg(permission_mode.flag())
         .arg("--permission-prompt-tool")
         .arg(CC_PERMISSION_PROMPT_TOOL)
+        // Added to Claude Code's own MCP sources, never in place of them, so
+        // enabled plugin servers start too. A same-named server cannot replace
+        // it. No `--strict-mcp-config`: see ADR 0398.
         .arg("--mcp-config")
         .arg(permission_mcp_config_json(cli_dir))
-        .arg("--strict-mcp-config")
         .arg("--settings")
         .arg(settings);
     for dir in args.additional_directories {
@@ -1150,7 +1155,7 @@ fn build_command_with_settings(
     // Agent-independent Lucidos env contract (workspace, host protection,
     // PG*, subprocess origin, spawn metadata, compile env, PATH), shared
     // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.
-    apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
+    let run_marker = apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
     // Push CC's own byte-idle streaming deadline out past the engine's
     // inactivity watchdog, so a provider stall auto-resumes instead of killing
     // the turn. See `CC_BYTE_STREAM_IDLE_TIMEOUT_MS` for the full reasoning.
@@ -1220,6 +1225,7 @@ fn build_command_with_settings(
     Ok(CcCommand {
         cmd,
         system_prompt_file,
+        run_marker,
     })
 }
 
@@ -1624,7 +1630,10 @@ async fn driver_task(
             req = control_rx.recv() => {
                 let Some(req) = req else { break };
                 let request_id = uuid::Uuid::new_v4().to_string();
-                let mut line = cc_control_request_to_json(&req, &request_id);
+                let Some(mut line) = cc_control_request_to_json(&req, &request_id) else {
+                    log!("[ClaudeCode] Dropped a control request Claude Code refuses: {:?}", req);
+                    continue;
+                };
                 line.push('\n');
                 if !write_stdin_line(&mut stdin, &line, "control_request").await {
                     break;
@@ -1747,7 +1756,8 @@ async fn driver_task(
     // Tear down the whole process group, so no descendant is left orphaned
     // holding the stdout pipe. Graceful-first: SIGTERM the group, wait out
     // `GROUP_TEARDOWN_GRACE`, then SIGKILL. Only while the child is unreaped,
-    // see `signal_child_process_group`'s pid-recycle caveat.
+    // see `signal_child_process_group`'s pid-recycle caveat. Bash calls run in
+    // groups of their own; the launcher reaps those by agent run marker.
     #[cfg(unix)]
     if !child_reaped {
         if let Some(pid) = child_pid {

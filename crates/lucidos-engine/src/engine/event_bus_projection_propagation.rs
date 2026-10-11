@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use super::super::EventBus;
 use crate::engine::thread_lifecycle::{
-    is_attention_needing, is_blocking, ArchiveState, ThreadStatus, ThreadType,
+    is_attention_needing, is_blocking, ArchiveState, ChangeStateKind, ThreadStatus, ThreadType,
 };
 
 /// Sample of the `thread_summaries` columns that feed `is_blocking` and
@@ -65,11 +65,12 @@ pub(crate) async fn load_blocking_sample(
     thread_id: Uuid,
 ) -> Result<Option<BlockingSample>, sqlx::Error> {
     let row: Option<(bool, String, String, bool, bool, bool)> = sqlx::query_as(
-        "SELECT is_coding_agent, status, archive_state, coding_agent_proposed, \
+        "SELECT is_coding_agent, status, archive_state, coding_agent_change_state = $2, \
                 coding_agent_is_external_repo, is_stopped_child \
          FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
+    .bind(ChangeStateKind::Proposed)
     .fetch_optional(&mut **tx)
     .await?;
     Ok(row.map(
@@ -77,7 +78,7 @@ pub(crate) async fn load_blocking_sample(
             is_coding_agent,
             status_str,
             archive_state_str,
-            coding_agent_proposed,
+            is_proposed,
             coding_agent_is_external_repo,
             is_stopped_child,
         )| {
@@ -89,7 +90,7 @@ pub(crate) async fn load_blocking_sample(
                 },
                 status: ThreadStatus::parse(&status_str),
                 archive_state: ArchiveState::parse(&archive_state_str),
-                has_pending_changes: coding_agent_proposed,
+                has_pending_changes: is_proposed,
                 is_external_repo: coding_agent_is_external_repo,
                 is_stopped_child,
             }
@@ -275,7 +276,7 @@ pub(crate) async fn reconcile_proposal_lifecycle_end(
 
 /// Arm the child's `parent_callback_pending` marker because a **start event**
 /// arrived: `MessageReceived`, `CodingAgentUserMessageSent`,
-/// `UserPromptInjected`, a non-empty `CodingAgentPromptSent`, or
+/// `PromptInjected`, a non-empty `CodingAgentPromptSent`, or
 /// `ContinuationRequested`. That is the set `preserving_verdict`
 /// (`event_bus/mod.rs`) already names as "new work was actually requested".
 ///
@@ -469,7 +470,7 @@ static BLOCKING_DESCENDANT_FILTER: std::sync::LazyLock<String> = std::sync::Lazy
     format!(
         "d.status IN ({running},{waiting_for_user_answer}) \
          OR (d.archive_state <> 'archived' \
-             AND d.coding_agent_proposed AND d.is_coding_agent \
+             AND d.is_proposed AND d.is_coding_agent \
              AND NOT d.coding_agent_is_external_repo)",
         running = ThreadStatus::Running.sql_literal(),
         waiting_for_user_answer = ThreadStatus::WaitingForUserAnswer.sql_literal(),
@@ -481,7 +482,7 @@ static ATTENTION_DESCENDANT_FILTER: std::sync::LazyLock<String> = std::sync::Laz
     format!(
         "d.status = {waiting_for_user_answer} \
          OR (d.archive_state <> 'archived' \
-             AND ((d.coding_agent_proposed AND d.is_coding_agent \
+             AND ((d.is_proposed AND d.is_coding_agent \
                    AND NOT d.coding_agent_is_external_repo) \
                   OR d.is_stopped_child))",
         waiting_for_user_answer = ThreadStatus::WaitingForUserAnswer.sql_literal(),
@@ -506,13 +507,13 @@ async fn reconcile_descendant_counts(
          ), \
          descendants AS ( \
             SELECT a.thread_id AS root_id, c.thread_id, c.status, c.archive_state, \
-                   c.coding_agent_proposed, c.is_coding_agent, c.coding_agent_is_external_repo, \
+                   c.coding_agent_change_state = '{proposed}' AS is_proposed, c.is_coding_agent, c.coding_agent_is_external_repo, \
                    c.is_stopped_child \
             FROM ancestors a \
             JOIN thread_summaries c ON c.parent_thread_id = a.thread_id \
             UNION \
             SELECT d.root_id, c.thread_id, c.status, c.archive_state, \
-                   c.coding_agent_proposed, c.is_coding_agent, c.coding_agent_is_external_repo, \
+                   c.coding_agent_change_state = '{proposed}' AS is_proposed, c.is_coding_agent, c.coding_agent_is_external_repo, \
                    c.is_stopped_child \
             FROM descendants d \
             JOIN thread_summaries c ON c.parent_thread_id = d.thread_id \
@@ -537,6 +538,7 @@ async fn reconcile_descendant_counts(
          RETURNING u.thread_id",
         blocking = &*BLOCKING_DESCENDANT_FILTER,
         attention = &*ATTENTION_DESCENDANT_FILTER,
+        proposed = ChangeStateKind::Proposed.as_str(),
     ))
     .bind(anchor)
     .fetch_all(&mut **tx)
@@ -785,14 +787,14 @@ impl EventBus {
             "WITH RECURSIVE descendants AS ( \
                 SELECT t.thread_id AS root_id, \
                        c.thread_id, c.status, c.archive_state, \
-                       c.coding_agent_proposed, c.is_coding_agent, \
+                       c.coding_agent_change_state = '{proposed}' AS is_proposed, c.is_coding_agent, \
                        c.coding_agent_is_external_repo, c.is_stopped_child \
                 FROM thread_summaries t \
                 JOIN thread_summaries c ON c.parent_thread_id = t.thread_id \
                 UNION \
                 SELECT d.root_id, \
                        c.thread_id, c.status, c.archive_state, \
-                       c.coding_agent_proposed, c.is_coding_agent, \
+                       c.coding_agent_change_state = '{proposed}' AS is_proposed, c.is_coding_agent, \
                        c.coding_agent_is_external_repo, c.is_stopped_child \
                 FROM descendants d \
                 JOIN thread_summaries c ON c.parent_thread_id = d.thread_id \
@@ -810,6 +812,7 @@ impl EventBus {
              WHERE u.thread_id = sub.root_id",
             blocking = &*BLOCKING_DESCENDANT_FILTER,
             attention = &*ATTENTION_DESCENDANT_FILTER,
+            proposed = ChangeStateKind::Proposed.as_str(),
         ))
         .execute(pool)
         .await?;

@@ -189,7 +189,7 @@ async fn the_thread_list_skips_a_trigger_run_nobody_talked_to() {
         SummaryScope::Thread(newer),
         NodeAddr::leaf(0),
         &StoredNode {
-            text: "user: hello".to_string(),
+            text: "prompt (human): hello".to_string(),
             model: None,
             source_event_id: Some(Uuid::new_v4()),
             source_thread_id: None,

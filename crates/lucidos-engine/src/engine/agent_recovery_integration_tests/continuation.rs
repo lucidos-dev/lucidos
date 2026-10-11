@@ -160,6 +160,7 @@ async fn continuation_retry_input_recaps_the_thread_before_the_continue_message(
             text: "Traced it to the debounced compose PUT.".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             parent_tool_use_id: None,
+            progress_note: false,
         },
         meta: cc_meta,
     })
@@ -271,16 +272,19 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
                     label: "Approve".into(),
                     description: None,
                     preview: None,
+                    widget: None,
                 },
                 QuestionOption {
                     id: "opt-1".into(),
                     label: "Derive the deadline instead".into(),
                     description: None,
                     preview: None,
+                    widget: None,
                 },
             ],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -472,6 +476,28 @@ async fn the_stale_resume_retry_also_carries_the_answer() {
     assert!(
         input.contains("the user declined nothing"),
         "and the framing that goes with it: {input}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Harden resumes the held thread to run `/harden`, never with the bare
+/// continue message. Its turn end then proposes through the normal floor.
+#[tokio::test]
+async fn a_harden_request_resumes_with_the_harden_message() {
+    use crate::engine::agent_recovery::{continue_input_for_reason, HARDEN_REQUESTED_REASON};
+
+    let (pool, db_name) = setup_test_db().await;
+    assert_eq!(
+        continue_input_for_reason(
+            &pool,
+            std::path::Path::new("/nonexistent"),
+            Uuid::new_v4(),
+            Some(HARDEN_REQUESTED_REASON)
+        )
+        .await,
+        crate::engine::claude_code::AUTO_HARDEN_MESSAGE,
     );
 
     pool.close().await;

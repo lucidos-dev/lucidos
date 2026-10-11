@@ -5,6 +5,7 @@ pub mod types;
 
 use crate::core::EventRow;
 use crate::engine::thread_events::ThreadEvent;
+use crate::engine::AUXILIARY_CAPTURE_SQL;
 use chrono::{DateTime, Utc};
 pub(crate) use messages::{
     build_resume_tool_blocks_with_skip_ids, collect_tool_pairs_chronological,
@@ -501,10 +502,15 @@ impl EventStore {
         .await
     }
 
-    /// The NEWEST `limit` events of a thread, older than `before`.
+    /// The NEWEST `limit` drawable events of a thread, older than `before`.
     ///
     /// Rows come back oldest-first, the order every reader already expects, so
     /// a page is prepended to what the client holds rather than reversed there.
+    ///
+    /// **A page holds drawable history.** It skips auxiliary captures
+    /// ([`AUXILIARY_CAPTURE_SQL`]), in its rows and in `has_more`. The
+    /// transcript drops them, so a page of them draws nothing, and the home
+    /// thread records hundreds. The unpaged and delta reads keep them.
     ///
     /// **The cursor is the pair, never the sequence alone.** Rows are ordered by
     /// `(created, sequence)` because a sequence is allocated globally and can
@@ -512,10 +518,10 @@ impl EventStore {
     /// would therefore skip or repeat rows at a page edge.
     ///
     /// **One statement, so the page and the watermark share a snapshot.** Read
-    /// separately, an event landing between the two queries would put a
-    /// sequence in `max_sequence` that no returned row carries. The client
-    /// advances its forward mark to it, and that event is then skipped by every
-    /// later delta.
+    /// separately, a drawable event landing between the two queries would put
+    /// a sequence in `max_sequence` that the page should carry and does not.
+    /// The client advances its forward mark to it, and that event is then
+    /// skipped by every later delta.
     pub async fn get_thread_events_page(
         &self,
         thread_id: Uuid,
@@ -528,38 +534,45 @@ impl EventStore {
         };
         // One row beyond the page answers `has_more` without a second query,
         // and without a count that could disagree with the page it describes.
-        let mut rows = sqlx::query_as::<_, PagedEventRow>(
+        // The watermark joins the page rather than riding on its rows, so a
+        // page that skipped every row still carries it.
+        let sql = format!(
             r#"WITH page AS (
                  SELECT sequence, event_type, payload, created, id
                  FROM events
                  WHERE thread_id = $1
                    AND ($2::timestamptz IS NULL OR (created, sequence) < ($2, $3))
+                   AND NOT {AUXILIARY_CAPTURE_SQL}
                  ORDER BY created DESC, sequence DESC
                  LIMIT $4
+               ),
+               watermark AS (
+                 SELECT max(sequence) AS max_sequence FROM events WHERE thread_id = $1
                )
-               SELECT sequence, event_type, payload, created, id as event_id,
-                      (SELECT max(sequence) FROM events WHERE thread_id = $1) as max_sequence
-               FROM page
-               ORDER BY created ASC, sequence ASC"#,
-        )
-        .bind(thread_id)
-        .bind(before_created)
-        .bind(before_seq)
-        .bind(limit.saturating_add(1))
-        .fetch_all(&self.pool)
-        .await?;
+               SELECT page.sequence, page.event_type, page.payload, page.created,
+                      page.id as event_id, watermark.max_sequence
+               FROM watermark LEFT JOIN page ON true
+               ORDER BY page.created ASC, page.sequence ASC"#
+        );
+        let rows = sqlx::query_as::<_, PagedEventRow>(&sql)
+            .bind(thread_id)
+            .bind(before_created)
+            .bind(before_seq)
+            .bind(limit.saturating_add(1))
+            .fetch_all(&self.pool)
+            .await?;
 
-        let has_more = rows.len() as i64 > limit;
+        // The join yields exactly one row with no event when the page is empty.
+        let max_sequence = rows.first().and_then(|r| r.max_sequence);
+        let mut events: Vec<ThreadEventRow> =
+            rows.into_iter().filter_map(PagedEventRow::event).collect();
+        let has_more = events.len() as i64 > limit;
         if has_more {
             // The extra row is the OLDEST, because the page is ascending.
-            rows.remove(0);
+            events.remove(0);
         }
-        // Every row carries the same value, and an empty page carries none.
-        // The client only reads it on a cold open, where an empty page means an
-        // empty thread and no watermark to advance.
-        let max_sequence = rows.first().and_then(|r| r.max_sequence);
         Ok(ThreadEventPage {
-            events: rows.into_iter().map(ThreadEventRow::from).collect(),
+            events,
             has_more,
             max_sequence,
         })
@@ -567,26 +580,28 @@ impl EventStore {
 }
 
 /// A paged row, which carries the thread's watermark alongside itself so the
-/// two come from one statement. See `get_thread_events_page`.
+/// two come from one statement. See `get_thread_events_page`. Every event
+/// column is absent on the one row an empty page returns.
 #[derive(sqlx::FromRow)]
 struct PagedEventRow {
-    sequence: i64,
-    event_type: String,
-    payload: serde_json::Value,
-    created: DateTime<Utc>,
-    event_id: Uuid,
+    sequence: Option<i64>,
+    event_type: Option<String>,
+    payload: Option<serde_json::Value>,
+    created: Option<DateTime<Utc>>,
+    event_id: Option<Uuid>,
     max_sequence: Option<i64>,
 }
 
-impl From<PagedEventRow> for ThreadEventRow {
-    fn from(r: PagedEventRow) -> Self {
-        ThreadEventRow {
-            sequence: r.sequence,
-            event_type: r.event_type,
-            payload: r.payload,
-            created: r.created,
-            event_id: r.event_id,
-        }
+impl PagedEventRow {
+    /// The event this row carries, or `None` for an empty page's row.
+    fn event(self) -> Option<ThreadEventRow> {
+        Some(ThreadEventRow {
+            sequence: self.sequence?,
+            event_type: self.event_type?,
+            payload: self.payload?,
+            created: self.created?,
+            event_id: self.event_id?,
+        })
     }
 }
 
@@ -594,7 +609,7 @@ impl From<PagedEventRow> for ThreadEventRow {
 pub struct ThreadEventPage {
     /// Oldest-first, as every other read path returns them.
     pub events: Vec<ThreadEventRow>,
-    /// True when the thread holds events older than `events[0]`.
+    /// True when the thread holds drawable events older than `events[0]`.
     pub has_more: bool,
     /// The highest `sequence` the whole thread holds, or `None` when it holds
     /// nothing. NOT derivable from the page: see `get_thread_events_page`.

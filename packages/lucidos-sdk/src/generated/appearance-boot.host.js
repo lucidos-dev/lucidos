@@ -1439,8 +1439,8 @@
   function registeredFaces() {
     var _a;
     const holder = globalThis;
-    (_a = holder.__lucidosWorkspaceFaces) != null ? _a : holder.__lucidosWorkspaceFaces = /* @__PURE__ */ new Set();
-    return holder.__lucidosWorkspaceFaces;
+    (_a = holder.__lucidosWorkspaceFaceRegistry) != null ? _a : holder.__lucidosWorkspaceFaceRegistry = /* @__PURE__ */ new Map();
+    return holder.__lucidosWorkspaceFaceRegistry;
   }
   function registerWorkspaceFont(font, urlFor) {
     if (typeof FontFace === "undefined" || typeof document === "undefined" || !document.fonts) return;
@@ -1449,9 +1449,10 @@
       const key = `${font.family}
 ${face.path}`;
       if (registered.has(key)) continue;
-      registered.add(key);
+      const weight = registeredFaceWeight(font, face);
+      registered.set(key, { family: font.family, path: face.path, weight, style: face.style });
       const fontFace = new FontFace(font.family, `url("${urlFor(face.path)}")`, {
-        weight: registeredFaceWeight(font, face),
+        weight,
         style: face.style,
         display: "swap"
       });

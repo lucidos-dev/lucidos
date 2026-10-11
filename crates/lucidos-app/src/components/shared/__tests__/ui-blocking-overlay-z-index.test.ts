@@ -12,10 +12,9 @@ const styles = (rel: string): string =>
   readFileSync(resolve(here, '../../../styles', rel), 'utf-8');
 
 // :root design tokens live in the base partial; the overlays themselves are
-// defined in modal-overlay.css and drawer.css.
+// defined in modal-overlay.css.
 const baseCss = styles('global/base.css');
 const modalCss = styles('global/modal-overlay.css');
-const drawerCss = styles('drawer.css');
 
 const TOKENS: Record<string, number> = {};
 for (const m of baseCss.matchAll(/--(z-[\w-]+):\s*(\d+)\s*;/g)) {
@@ -52,30 +51,14 @@ function blockZ(css: string, selector: string): number {
 /**
  * Regression: the UI-blocking overlay blocks the whole UI while the client
  * refreshes (SW swap + reload). Nothing may render above it EXCEPT toasts (so
- * the "Refreshing…" toast stays visible). Previous bug: drawer thread rows whose
- * status changed flew above the dim blocker because the FLIP animation portal sat
- * at z-index 9999. (Engine restart no longer mounts this overlay — see
- * UiBlockingOverlay.tsx — but the z-index ordering it relies on is unchanged.)
+ * the "Refreshing…" toast stays visible). The drawer's leaving-row copies paint
+ * inside the drawer list's stacking context, so they stay under the blocker
+ * (`drawer-rows-under-scroll-indicator.test.ts` pins it). Engine restart does
+ * not mount this overlay (UiBlockingOverlay.tsx), but it relies on the same
+ * z-index ordering.
  */
 describe('ui-blocking overlay z-index (only toasts above the blocker)', () => {
   const overlayZ = blockZ(modalCss, '.ui-blocking-overlay');
-  const flipPortalZ = blockZ(drawerCss, '.flip-portal');
-
-  it('a flying drawer thread (.flip-portal) stays below the blocking overlay', () => {
-    expect(flipPortalZ).toBeLessThan(overlayZ);
-  });
-
-  it('the flying thread still renders above app chrome so it is never clipped', () => {
-    expect(flipPortalZ).toBeGreaterThan(TOKENS['z-control-panel']);
-  });
-
-  // A fullscreen app owns the screen. Before --z-app-fullscreen existed the
-  // panel sat at --z-tooltip and was above the portal by a mile; at 2250 the
-  // ordering has to be stated, or a drawer thread whose status changes flies
-  // across an app the reader put in fullscreen.
-  it('a flying drawer thread stays below a fullscreen app panel', () => {
-    expect(flipPortalZ).toBeLessThan(TOKENS['z-app-fullscreen']);
-  });
 
   it('only the toast layer sits above the blocking overlay', () => {
     expect(TOKENS['z-toast']).toBeGreaterThan(overlayZ);

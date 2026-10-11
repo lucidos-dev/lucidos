@@ -11,16 +11,23 @@ import {
   type WheelBank,
 } from '../scaleWheel';
 
+/** How a gesture reached the page: a wheel turned with Cmd or Ctrl held, or a
+ *  trackpad pinch, which Chrome flags as ctrl-wheel with no key down. */
+const KEYED_WHEEL = true;
+const PINCH = false;
+
 /** Feed a stream of events and count the steps they buy, draining greedily.
  *  The per-frame cap lives in the component; here every banked step is taken,
  *  which is what says how many the gesture ASKED for. */
-function stepsFor(deltas: number[], deltaMode = 0, gapMs = 8): number {
+function stepsFor(
+  deltas: number[], { deltaMode = 0, gapMs = 8, keyHeld = KEYED_WHEEL } = {},
+): number {
   let bank: WheelBank = emptyWheelBank();
   let at = 1000;
   let steps = 0;
   for (const d of deltas) {
     at += gapMs;
-    bank = foldWheelEvent(bank, wheelZoomDistance(d, deltaMode), at);
+    bank = foldWheelEvent(bank, wheelZoomDistance(d, deltaMode), at, keyHeld);
     for (;;) {
       const taken = takeWheelStep(bank);
       bank = taken.bank;
@@ -55,45 +62,70 @@ describe('a mouse notch is still exactly one step', () => {
   });
 
   it('in line mode', () => {
-    expect(stepsFor([-3], 1)).toBe(1);
+    expect(stepsFor([-3], { deltaMode: 1 })).toBe(1);
   });
 
   it('three notches are three steps', () => {
     expect(stepsFor([-100, -100, -100])).toBe(3);
   });
+
+  it('a slow notch smaller than 100px still steps, every time', () => {
+    // macOS Chrome reports a slow mouse tick as a few pixels. Each tick lands
+    // after the gesture gap, so nothing can bank across them.
+    const slow = { gapMs: WHEEL_GESTURE_GAP_MS + 50 };
+    expect(stepsFor([-4, -4, -4], slow)).toBe(3);
+    expect(stepsFor([40, 40], slow)).toBe(-2);
+  });
 });
 
 describe('a pinch spends distance, not events', () => {
-  it('twenty small-delta events are not twenty steps', () => {
+  it('twenty small-delta events are no step, not twenty', () => {
     // A macOS trackpad pinch, roughly. Twenty events carrying 4px each are 80px
-    // of travel, which is less than one notch.
-    expect(stepsFor(Array(20).fill(-4))).toBe(0);
+    // of travel, short of one notch.
+    expect(stepsFor(Array(20).fill(-4), { keyHeld: PINCH })).toBe(0);
   });
 
   it('the steps track the distance travelled', () => {
     // 50 events of 8px is 400px, which is four notches.
-    expect(stepsFor(Array(50).fill(-8))).toBe(4);
+    expect(stepsFor(Array(50).fill(-8), { keyHeld: PINCH })).toBe(4);
+    // 40 events of 8px is 320px: three notches, and the remainder buys nothing.
+    expect(stepsFor(Array(40).fill(-8), { keyHeld: PINCH })).toBe(3);
+  });
+
+  it('its first event is not floored to a notch', () => {
+    // The floor belongs to a slow mouse tick. A pinch's first event is one
+    // sliver of the gesture, and flooring it bought a step nobody asked for.
+    const bank = foldWheelEvent(emptyWheelBank(), 4, 1000, PINCH);
+    expect(bank.distance).toBe(4);
+    expect(takeWheelStep(bank).step).toBe(0);
   });
 });
 
 describe('the bank belongs to one gesture', () => {
   it('an idle gap drops what the previous gesture banked', () => {
-    let bank = foldWheelEvent(emptyWheelBank(), 90, 1000);
-    bank = foldWheelEvent(bank, 90, 1000 + WHEEL_GESTURE_GAP_MS + 1);
-    // Without the reset the two 90s would total 180 and buy a step.
-    expect(takeWheelStep(bank).step).toBe(0);
-    expect(bank.distance).toBe(90);
+    let bank = foldWheelEvent(emptyWheelBank(), 90, 1000, KEYED_WHEEL);
+    bank = takeWheelStep(bank).bank;
+    bank = foldWheelEvent(bank, 10, 1008, KEYED_WHEEL);
+    bank = foldWheelEvent(bank, 90, 1008 + WHEEL_GESTURE_GAP_MS + 1, KEYED_WHEEL);
+    // The new gesture opens with exactly one notch, not one plus the 10 left over.
+    expect(bank.distance).toBe(100);
+  });
+
+  it('a zero-distance event leaves the gesture unopened', () => {
+    let bank = foldWheelEvent(emptyWheelBank(), 0, 1000, KEYED_WHEEL);
+    bank = foldWheelEvent(bank, 4, 1008, KEYED_WHEEL);
+    expect(takeWheelStep(bank).step).toBe(1);
   });
 
   it('a continuous gesture keeps banking', () => {
-    let bank = foldWheelEvent(emptyWheelBank(), 90, 1000);
-    bank = foldWheelEvent(bank, 90, 1008);
+    let bank = foldWheelEvent(emptyWheelBank(), 90, 1000, KEYED_WHEEL);
+    bank = foldWheelEvent(bank, 90, 1008, KEYED_WHEEL);
     expect(takeWheelStep(bank).step).toBe(1);
   });
 
   it('reversing direction answers at once instead of paying off the old bank', () => {
-    let bank = foldWheelEvent(emptyWheelBank(), 90, 1000);
-    bank = foldWheelEvent(bank, -100, 1008);
+    let bank = foldWheelEvent(emptyWheelBank(), 90, 1000, KEYED_WHEEL);
+    bank = foldWheelEvent(bank, -100, 1008, KEYED_WHEEL);
     const taken = takeWheelStep(bank);
     expect(taken.step).toBe(-1);
     expect(taken.bank.distance).toBe(0);
@@ -102,7 +134,7 @@ describe('the bank belongs to one gesture', () => {
 
 describe('takeWheelStep leaves the remainder banked', () => {
   it('spends exactly one notch per call', () => {
-    const bank = foldWheelEvent(emptyWheelBank(), 250, 1000);
+    const bank = foldWheelEvent(emptyWheelBank(), 250, 1000, KEYED_WHEEL);
     const first = takeWheelStep(bank);
     expect(first.step).toBe(1);
     expect(first.bank.distance).toBe(150);
@@ -145,7 +177,7 @@ describe('createWheelZoom spends one step per frame', () => {
     const zoom = createWheelZoom(d => steps.push(d));
     // Ten full notches, all before the renderer gets a turn. Each one used to
     // apply straight away, and the layout it forced is what wedged the tab.
-    for (let i = 0; i < 10; i++) zoom.push(-100, 0, 1000 + i);
+    for (let i = 0; i < 10; i++) zoom.push(-100, 0, 1000 + i, KEYED_WHEEL);
     expect(steps).toEqual([]);
     flushFrame();
     expect(steps).toEqual([1]);
@@ -154,7 +186,7 @@ describe('createWheelZoom spends one step per frame', () => {
   it('the rest drains over the following frames', () => {
     const steps: number[] = [];
     const zoom = createWheelZoom(d => steps.push(d));
-    for (let i = 0; i < 3; i++) zoom.push(-100, 0, 1000 + i);
+    for (let i = 0; i < 3; i++) zoom.push(-100, 0, 1000 + i, KEYED_WHEEL);
     flushFrame();
     flushFrame();
     flushFrame();
@@ -164,28 +196,38 @@ describe('createWheelZoom spends one step per frame', () => {
   it('settles instead of scheduling for ever', () => {
     const steps: number[] = [];
     const zoom = createWheelZoom(d => steps.push(d));
-    zoom.push(-100, 0, 1000);
+    zoom.push(-100, 0, 1000, KEYED_WHEEL);
     for (let i = 0; i < 5; i++) flushFrame();
     expect(steps).toEqual([1]);
     expect(frames).toEqual([]);
   });
 
-  it('a sub-notch pinch asks for no step at all', () => {
+  it('a sub-notch pinch leaves the scale alone', () => {
     const steps: number[] = [];
     const zoom = createWheelZoom(d => steps.push(d));
-    for (let i = 0; i < 20; i++) zoom.push(-4, 0, 1000 + i * 8);
+    for (let i = 0; i < 20; i++) zoom.push(-4, 0, 1000 + i * 8, PINCH);
+    flushFrame();
     flushFrame();
     expect(steps).toEqual([]);
+  });
+
+  it('a slow tick of a keyed wheel still steps once', () => {
+    const steps: number[] = [];
+    const zoom = createWheelZoom(d => steps.push(d));
+    zoom.push(-4, 0, 1000, KEYED_WHEEL);
+    flushFrame();
+    flushFrame();
+    expect(steps).toEqual([1]);
   });
 });
 
 /** The case above is exactly the one the panel can time out under, and only the
- *  component wires the two together. A source scan, because mounting the panel
- *  drags in the whole overlay stack to assert one call. */
+ *  listener wires the two together. A source scan, because a frame-accurate
+ *  pinch against the real linger timer asserts one call through three clocks. */
 describe('the wheel handler keeps the panel alive', () => {
   it('renews the linger on every event, not only on a step', () => {
     const source = readFileSync(
-      new URL('../ScaleModal.tsx', import.meta.url), 'utf8',
+      new URL('../scaleWheelListener.ts', import.meta.url), 'utf8',
     );
     const handler = source.slice(
       source.indexOf('function handleWheel'),

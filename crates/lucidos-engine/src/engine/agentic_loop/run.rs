@@ -266,6 +266,9 @@ impl LucidosEngine {
         // `MAX_TODO_WAKE_NUDGE`, so a model that answers and still walks away
         // finalizes normally.
         let mut todo_wake_nudges_forced = 0usize;
+        // Whether this turn made its *read decision*. The turn-end gate forces
+        // one before `ResponseGenerated` when it did not (ADR 0417).
+        let mut read_decided = false;
         let mut cached_list_files: Option<String> = None;
         let mut modified_app_uis: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -363,6 +366,8 @@ impl LucidosEngine {
                 None
             };
             if let Some(cap_message) = cap_message {
+                self.gate_chat_turn_end(thread_id, origin_id, read_decided, &cap_message)
+                    .await;
                 let msg = emit_iteration_cap_response_generated(
                     &self.event_bus,
                     thread_id,
@@ -1058,7 +1063,7 @@ impl LucidosEngine {
                     .await;
             }
             turn_capture
-                .finish(meta.clone(), |usage| {
+                .finish(meta.clone(), |usage, served_model| {
                     crate::engine::thread_events::ThreadEvent::ContextCaptured {
                         producer: crate::engine::ContextProducer::MainLlm,
                         model: capture_seed.model.to_string(),
@@ -1075,6 +1080,7 @@ impl LucidosEngine {
                         api_call_id: None,
                         reasoning_effort: None,
                         duration_ms: None,
+                        served_model,
                     }
                 })
                 .await;
@@ -1194,12 +1200,12 @@ impl LucidosEngine {
                 response.content = (!cleaned.is_empty()).then_some(cleaned);
             }
 
-            // The round after a prose nudge came back without a tool call, so
-            // the model kept its question. Its reply only says why, and the
-            // turn ends on the draft the user already has.
-            let kept_draft = prose_nudge_draft
-                .take()
-                .filter(|_| response.tool_calls.is_empty());
+            // The round after a prose nudge came back with no tool call but its
+            // read decision, so the model kept its question. Its reply only
+            // says why, and the turn ends on the draft the user already has.
+            let kept_draft = prose_nudge_draft.take().filter(|_| {
+                response.tool_calls.is_empty() || calls_only_the_read_decision(&response.tool_calls)
+            });
             if let Some(draft) = &kept_draft {
                 log!(
                     "[AgenticLoop] thread={} kept its prose question after the nudge: {}",
@@ -1593,6 +1599,8 @@ impl LucidosEngine {
                     .filter(|c| !c.is_empty());
 
                 if let Some(clean_response) = cleaned {
+                    self.gate_chat_turn_end(thread_id, origin_id, read_decided, &clean_response)
+                        .await;
                     self.event_bus
                         .emit_or_log(
                             crate::engine::event_bus::BusEvent::Thread {
@@ -1689,6 +1697,8 @@ impl LucidosEngine {
                         thread_id,
                         diagnostic
                     );
+                    self.gate_chat_turn_end(thread_id, origin_id, read_decided, "")
+                        .await;
                     self.event_bus
                         .emit_or_log(
                             crate::engine::event_bus::BusEvent::Thread {
@@ -1819,6 +1829,8 @@ impl LucidosEngine {
                                 consecutive_same_call
                             );
                             let msg = "I listed the available files but wasn't able to complete the task. Could you give me more specific instructions?";
+                            self.gate_chat_turn_end(thread_id, origin_id, read_decided, msg)
+                                .await;
                             self.event_bus.emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
@@ -1869,6 +1881,8 @@ impl LucidosEngine {
                             consecutive_same_call
                         );
                         let msg = format!("I read the file `{}` but wasn't able to complete the task with it. Could you give me more specific instructions?", path_for_msg);
+                        self.gate_chat_turn_end(thread_id, origin_id, read_decided, &msg)
+                            .await;
                         self.event_bus
                             .emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
@@ -1933,6 +1947,8 @@ impl LucidosEngine {
                             target
                         );
                         let msg = format!("I tried to process `{}` but it failed repeatedly. The error may need to be resolved before retrying.", target);
+                        self.gate_chat_turn_end(thread_id, origin_id, read_decided, &msg)
+                            .await;
                         self.event_bus
                             .emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
@@ -2056,13 +2072,7 @@ impl LucidosEngine {
                     .await;
 
                 let card_refusal = if tool_call.name == tn::ASK_USER_QUESTION && human_can_answer {
-                    use crate::engine::question_card_gate::{refuse_card, RoundText};
-                    let round = if response.content_is_progress_notes {
-                        RoundText::Notes(&round_text)
-                    } else {
-                        RoundText::Reply(&round_text)
-                    };
-                    refuse_card(
+                    crate::engine::question_card_gate::refuse_card(
                         &self.pool,
                         thread_id,
                         &tool_call.id,
@@ -2071,7 +2081,10 @@ impl LucidosEngine {
                             .get("questions")
                             .unwrap_or(&serde_json::Value::Null),
                         crate::engine::agent_question::card_message(&tool_call.arguments),
-                        Some(round),
+                        Some(crate::engine::question_card_gate::ChatRound {
+                            text: &round_text,
+                            progress_notes: &response.progress_notes,
+                        }),
                     )
                     .await
                 } else {
@@ -2407,6 +2420,9 @@ impl LucidosEngine {
                 if tool_call.name == tn::ASK_USER_QUESTION && is_error {
                     this_iter_question_ask_failed = true;
                 }
+                if tool_call.name == tn::REQUEST_READ && !is_error {
+                    read_decided = true;
+                }
 
                 // Track app UI modifications for deferred refresh before final response
                 // Path format: apps/{app_id}/{file}
@@ -2576,6 +2592,58 @@ impl LucidosEngine {
                 return Err(reason.into());
             }
 
+            // A reply whose only call was its read decision has already said
+            // everything: the turn ends on its text, with no round to spend
+            // (ADR 0417). Whatever the final-answer branch would still send
+            // back takes the ordinary path instead.
+            if let Some(answer) = self
+                .final_answer_beside_decision(FinalAnswerBesideDecision {
+                    response: &response,
+                    had_errors,
+                    thread_id,
+                    injections_pending: !injection_rx.is_empty(),
+                    cancelled: cancel_token.is_cancelled(),
+                    question: QuestionReaskInputs {
+                        ask_failed_last_iter: question_ask_failed_last_iter,
+                        leaked_as_text: question_leaked_as_text,
+                        ends_in_a_question: false,
+                        human_can_answer,
+                        reask_forced: question_reask_forced,
+                        prose_nudges_forced: question_prose_nudges_forced,
+                    },
+                    wake_nudges_forced: todo_wake_nudges_forced,
+                })
+                .await
+            {
+                self.refresh_apps_modified_this_turn(thread_id, &modified_app_uis)
+                    .await;
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+                                text: answer.clone(),
+                                images: images.clone(),
+                                model: effective_model.clone(),
+                                reasoning_effort: effective_effort.clone(),
+                            },
+                            meta: meta.authored_by(
+                                crate::engine::thread_events::AgentParticipant::LucidosAgent,
+                            ),
+                        },
+                        "[AgenticLoop] ResponseGenerated (beside the read decision)",
+                    )
+                    .await;
+                *terminator_settled = true;
+                return Ok(terminal_result(
+                    answer,
+                    images,
+                    request_id,
+                    thread_id,
+                    *proposed_change,
+                ));
+            }
+
             // 1. Add the assistant's tool_use response as a message
             let mut assistant_blocks = Vec::new();
             // The RAW reply, span included. Gemini's plan narration is barred
@@ -2639,7 +2707,15 @@ impl LucidosEngine {
                 TOOL_RESULTS_INSTRUCTION
             };
 
-            let result_blocks = build_tool_result_blocks(&tool_outputs, instruction);
+            let instruction = instruction_after_round(
+                instruction,
+                &response.progress_notes,
+                response
+                    .tool_calls
+                    .iter()
+                    .any(|tc| tc.name == tn::ASK_USER_QUESTION),
+            );
+            let result_blocks = build_tool_result_blocks(&tool_outputs, &instruction);
 
             // Pin before the move: an image the model explicitly asked to see
             // must stay in vision for the rest of the turn, not just until its

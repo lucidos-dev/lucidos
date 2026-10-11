@@ -94,6 +94,15 @@ describe('openRepoFileLink', () => {
     );
   });
 
+  // A link in agent prose opens the file preview modal instead. The registry
+  // match, and the id it resolves to, are the same either way.
+  it('hands the resolved file and lines to the opener it is given', async () => {
+    const open = vi.fn();
+    await openRepoFileLink(link('repo:lucidos:file:src/a.rs', 5, 9), 'a chat', open);
+    expect(open).toHaveBeenCalledWith({ file_path: `repo:${LUCIDOS.id}:file:src/a.rs`, line: 5, line_end: 9 });
+    expect(mocks.handleNavigationRequest).not.toHaveBeenCalled();
+  });
+
   it('keeps the ref and the cited lines of a `file#<ref>` link', async () => {
     await openRepoFileLink(link('repo:Lucidos:file#origin/main:src/a:b.rs', 10, 20));
     expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(

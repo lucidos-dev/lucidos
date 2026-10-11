@@ -120,3 +120,37 @@ async fn a_manual_rescan_returns_immediately() {
         "rescan waited for the scan it queued",
     );
 }
+
+/// The *plugin media* route is mounted and answers an unlisted path with a 404.
+/// That answer carries the sandbox headers too (ADR 0414, invariants I6 and
+/// I13). An app frame may not read the route at all (I17).
+#[tokio::test]
+async fn the_media_route_serves_nothing_unlisted_and_refuses_apps() {
+    let client = user_client().await;
+    let api = base_url();
+    for path in [
+        "/api/v1/plugins/media/installed/no-such-plugin/media/icon.svg",
+        "/api/v1/plugins/media/catalog/no-mkt/no-such-plugin/1.0.0/media/icon.svg",
+    ] {
+        let resp = client
+            .get(format!("{api}{path}"))
+            .send()
+            .await
+            .expect("media request failed");
+        assert_eq!(resp.status(), 404, "{path}");
+        let headers = resp.headers();
+        assert_eq!(headers["x-content-type-options"], "nosniff", "{path}");
+        assert_eq!(
+            headers["content-security-policy"], "sandbox; default-src 'none'",
+            "{path}"
+        );
+
+        let from_app = client
+            .get(format!("{api}{path}"))
+            .header("x-lucidos-app-id", "habit-tracker")
+            .send()
+            .await
+            .expect("media request failed");
+        assert_eq!(from_app.status(), 403, "an app frame reached {path}");
+    }
+}

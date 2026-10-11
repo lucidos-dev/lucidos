@@ -751,7 +751,7 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
 
     // 3. Engine restarts: the chat orphan-thread sweep emits ResponseAborted
     //    (EngineShutdown) with a SYSTEM actor. Nobody promised to resume this
-    //    one, so for a chat thread (coding_agent_proposed=false) it maps to
+    //    one, so for a chat thread (not proposed) it maps to
     //    status='failed'.
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -776,7 +776,7 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
     assert_eq!(
         after_abort, "failed",
         "a system-actor EngineShutdown abort is not the switch fingerprint, so a \
-         thread with coding_agent_proposed=false settles at failed"
+         thread with no proposed state settles at failed"
     );
 
     // 4. Tool-orphan sweep emits the synthetic ToolResult (system actor) to
@@ -994,6 +994,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
                 text: "\n\nCommitting, then running the suite.".into(),
                 coding_agent,
                 parent_tool_use_id: None,
+                progress_note: false,
             },
             meta: cc_meta(),
         })
@@ -1088,7 +1089,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
 /// `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
 ///
 /// `AbortCause::status_sql` used to answer `'waiting'` instead of the verdict
-/// whenever `coding_agent_proposed` was set, reasoning that a change to review
+/// whenever the thread was proposed, reasoning that a change to review
 /// outranks the interruption. But `'waiting'` is not a
 /// `PRESERVED_STATUS_VERDICTS` value, so the drain landing milliseconds later
 /// wrote `'running'` over it. Both such threads came back spinning, with
@@ -1210,7 +1211,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
             status_of(thread_id).await,
             verdict,
             "{case}: the abort records its verdict whether or not a change is \
-             pending. The change surfaces through coding_agent_proposed."
+             pending. The change surfaces through the proposed change state."
         );
 
         // The dying subprocess's drain, the step that used to erase it.
@@ -1233,6 +1234,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
                 text: "\n\nCommitting.".into(),
                 coding_agent,
                 parent_tool_use_id: None,
+                progress_note: false,
             },
             meta: cc_meta(),
         })
@@ -1309,7 +1311,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
         );
 
         let proposed: bool = sqlx::query_scalar(
-            "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+            "SELECT coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
         )
         .bind(thread_id)
         .fetch_one(&pool)
@@ -1419,6 +1421,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
     )
     .await;
@@ -1951,6 +1954,7 @@ async fn seed_thread_awaiting_answer(bus: &EventBus, pool: &PgPool, draft: &str)
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta::NONE,
     })

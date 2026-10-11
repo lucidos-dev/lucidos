@@ -1,18 +1,21 @@
 // @vitest-environment jsdom
 /**
  * Choosing Tree spends money, so the first time the Tree button only opens a
- * confirm panel with the estimate. `memory_module` is written by its Start
+ * confirm modal with the estimate. `memory_module` is written by its Start
  * button alone, and Start waits for the estimate. Cancel writes nothing. Once
  * a backfill has started, Tree is written at once.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { BackgroundModels, TreeBackfillEstimate } from '../../../api/types';
 
-const { getTreeBackfillEstimate, getTreeBackfill, getBackgroundModels, setMemoryModule } = vi.hoisted(() => ({
+const {
+  getTreeBackfillEstimate, getTreeBackfill, getBackgroundModels, setMemoryModule, saveModelSelection,
+} = vi.hoisted(() => ({
   getTreeBackfillEstimate: vi.fn<() => Promise<TreeBackfillEstimate>>(),
   getTreeBackfill: vi.fn(),
   getBackgroundModels: vi.fn<() => Promise<BackgroundModels>>(),
   setMemoryModule: vi.fn<(m: string) => Promise<void>>(),
+  saveModelSelection: vi.fn<(m: string, r: string, p: unknown) => Promise<void>>(),
 }));
 
 vi.mock('../../../api/client', async () => {
@@ -22,7 +25,7 @@ vi.mock('../../../api/client', async () => {
 
 vi.mock('../../../store/actions/preferences', async () => {
   const actual = await vi.importActual<Record<string, unknown>>('../../../store/actions/preferences');
-  return { ...actual, setMemoryModule };
+  return { ...actual, setMemoryModule, saveModelSelection };
 });
 
 import { stubIntentFieldObservers } from '../../triggers/__tests__/intentFieldStubs';
@@ -36,14 +39,22 @@ const ESTIMATE: TreeBackfillEstimate = {
   daily_calls: { low: 700, high: 900 },
   costs: [{
     model: 'gpt-6.1-sol',
-    usable_secs: { low: 30 * 60, high: 30 * 60 },
-    complete_secs: { low: 2 * 3600, high: 3 * 3600 },
     by_effort: [{
       effort: 'low',
+      usable_secs: { low: 30 * 60, high: 30 * 60 },
+      complete_secs: { low: 2 * 3600, high: 3 * 3600 },
       backfill_usd: { low: 1100, high: 2300 },
       backfill_usd_central: 1700,
       daily_usd: { low: 12, high: 30 },
       daily_usd_central: 20,
+    }, {
+      effort: 'medium',
+      usable_secs: { low: 30 * 60, high: 60 * 60 },
+      complete_secs: { low: 2 * 3600, high: 5 * 3600 },
+      backfill_usd: { low: 1200, high: 3100 },
+      backfill_usd_central: 2000,
+      daily_usd: { low: 13, high: 38 },
+      daily_usd_central: 24,
     }],
   }],
 };
@@ -86,12 +97,18 @@ describe('choosing Tree', () => {
         effort: 'low',
         source: 'default',
         reachable: true,
+        not_served: [],
         needs_vision: false,
         vision: true,
-        recommended: ['gpt-6.1-sol', 'gemini-3.8-flash', 'claude-sonnet-5-5'],
+        recommended: [
+          { model: 'gpt-6.1-sol', effort: 'low' },
+          { model: 'gemini-3.8-flash', effort: 'low' },
+          { model: 'claude-sonnet-5-5', effort: 'low' },
+        ],
       },
     });
     setMemoryModule.mockReset().mockResolvedValue(undefined);
+    saveModelSelection.mockReset().mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -115,7 +132,7 @@ describe('choosing Tree', () => {
     const estimate = host.querySelector('[data-role="tree-estimate"]')?.textContent ?? '';
     expect(estimate).toContain('210K–260K');
     expect(estimate).toContain('$1,100–$2,300');
-    // The chosen model's own times, from its measured call time.
+    // The chosen tier's own times, from its measured call time.
     expect(estimate).toContain('Usable in30 minutes');
     expect(estimate).toContain('Complete in2–3 hours');
     expect(button(host, 'Start Tree').disabled).toBe(false);
@@ -124,6 +141,32 @@ describe('choosing Tree', () => {
     button(host, 'Start Tree').click();
     await settle();
     expect(setMemoryModule).toHaveBeenCalledExactlyOnceWith('tree');
+  });
+
+  /** A panel in the page left the Classic memory list showing under it. */
+  it('opens as a modal dialog, and its X writes nothing', async () => {
+    getTreeBackfillEstimate.mockResolvedValue(ESTIMATE);
+    unmount = await mount(host);
+    expect(button(host, 'Tree').getAttribute('aria-haspopup')).toBe('dialog');
+
+    button(host, 'Tree').click();
+    await settle();
+    const dialog = host.querySelector('[data-role="tree-confirm"]');
+    expect(dialog?.getAttribute('role')).toBe('dialog');
+    expect(dialog?.getAttribute('aria-modal')).toBe('true');
+    expect(dialog?.closest('.modal-overlay')).not.toBeNull();
+
+    // In <body> the picker's menu would open behind the dialog.
+    dialog!.querySelector<HTMLButtonElement>('.model-selection-field .dropdown-trigger')!.click();
+    await settle();
+    expect(dialog!.querySelector('.dropdown-menu')).not.toBeNull();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await settle();
+
+    host.querySelector<HTMLButtonElement>('[data-role="surface-close"]')!.click();
+    await settle();
+    expect(host.querySelector('[data-role="tree-confirm"]')).toBeNull();
+    expect(setMemoryModule).not.toHaveBeenCalled();
   });
 
   it('writes nothing on Cancel', async () => {
@@ -191,10 +234,10 @@ describe('choosing Tree', () => {
         ...ESTIMATE.costs,
         {
           model: 'claude-sonnet-5-5',
-          usable_secs: ESTIMATE.usable_secs,
-          complete_secs: ESTIMATE.complete_secs,
           by_effort: [{
             effort: 'low',
+            usable_secs: ESTIMATE.usable_secs,
+            complete_secs: ESTIMATE.complete_secs,
             backfill_usd: { low: 2200, high: 4600 },
             backfill_usd_central: 3400,
             daily_usd: { low: 24, high: 60 },
@@ -214,6 +257,49 @@ describe('choosing Tree', () => {
     await settle();
     expect(host.querySelector('[data-role="tree-estimate"]')?.textContent)
       .toContain('$2,200–$4,600');
+  });
+
+  /** Each tier shows its own price and time. */
+  it('prices and times the stored tier, not the model', async () => {
+    getTreeBackfillEstimate.mockResolvedValue(ESTIMATE);
+    const store = await import('../../../store/store');
+    unmount = await mount(host);
+    store.preferences.value = {
+      status: 'loaded',
+      data: { memory_module: 'classic', reasoning_summary_compaction: 'medium' },
+    };
+
+    button(host, 'Tree').click();
+    await settle();
+    const estimate = host.querySelector('[data-role="tree-estimate"]')?.textContent ?? '';
+    expect(estimate).toContain('$1,200–$3,100');
+    expect(estimate).toContain('Complete in2–5 hours');
+  });
+
+  /** At the recommended tier there is nothing to say. Off it, one click
+   *  saves the tier the engine recommends for the model. */
+  it('offers the recommended tier only while another is picked', async () => {
+    getTreeBackfillEstimate.mockResolvedValue(ESTIMATE);
+    const store = await import('../../../store/store');
+    unmount = await mount(host);
+
+    button(host, 'Tree').click();
+    await settle();
+    expect(host.querySelector('[data-role="tree-recommended-tier"]')).toBeNull();
+
+    store.preferences.value = {
+      status: 'loaded',
+      data: { memory_module: 'classic', reasoning_summary_compaction: 'medium' },
+    };
+    await settle();
+    const note = host.querySelector('[data-role="tree-recommended-tier"]');
+    expect(note?.textContent).toContain('Low is recommended for');
+    button(host, 'Use Low').click();
+    expect(saveModelSelection).toHaveBeenCalledExactlyOnceWith(
+      'model_summary_compaction',
+      'reasoning_summary_compaction',
+      { model: 'gpt-6.1-sol', reasoningEffort: 'low' },
+    );
   });
 
   it('goes straight back to Tree once a backfill has started', async () => {

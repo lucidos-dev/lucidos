@@ -1,19 +1,18 @@
 //! The fold: which nodes of a summary tree a *memory view* shows (OptChat
-//! §5.2).
+//! §3.2).
 //!
-//! A view appends each entry's line at its end. While it is over budget, it
-//! merges the adjacent pair of sibling lines that is most due: the oldest for
-//! its size. A merged line never splits. A line over `2^l` entries therefore
-//! changes about once every `2^l` entries. A view changes near its end, which
-//! keeps its start readable from the prompt cache.
+//! A view appends each entry's line at its end, and nothing else changes.
+//! Once it passes its budget, one batch merges the most due pairs of sibling
+//! lines until the view is half its budget: a sawtooth. A merged line never
+//! splits. Between batches each view is a prefix of the next, so a turn reads
+//! the last turn's whole view from the prompt cache. Holding merges for a
+//! batch rewrites far fewer lines than merging at every entry.
 //!
 //! Every read replays the view from entry 0, so a restart loses nothing. The
 //! replay covers only the *built prefix*, where every node is built. Those
 //! nodes never change, so a longer built prefix replays to the shorter one's
 //! view plus appends and merges. Newer entries follow as leaves, in a reserve
-//! the prefix replay leaves free. Why: the ADR 0362 amendment.
-
-use std::collections::HashMap;
+//! the prefix replay leaves free. Why: the ADR 0362 amendments.
 
 use super::NodeAddr;
 
@@ -33,19 +32,12 @@ pub(crate) fn fold(
     reserve: usize,
 ) -> Vec<NodeAddr> {
     let mut view = Fold::default();
-    let prefix_budget = budget.saturating_sub(reserve);
-    while view.len < built_prefix {
-        view.push(&size, prefix_budget);
-    }
-    while view.len < len {
-        view.push(&size, budget);
-    }
-    let mut drop = 0;
-    while view.bytes > budget && drop < view.parts.len() {
-        view.bytes -= view.parts[drop].bytes;
-        drop += 1;
-    }
-    view.parts[drop..].iter().map(|p| p.addr).collect()
+    view.advance(
+        built_prefix,
+        &size,
+        Budget::sawtooth(budget.saturating_sub(reserve)),
+    );
+    view.into_tiles(len, &size, budget)
 }
 
 /// The longest prefix `[0, f)` of a log of `len` entries over which every node
@@ -66,13 +58,42 @@ pub(crate) fn built_prefix_end(len: u64, built: impl Fn(NodeAddr) -> bool) -> u6
     len
 }
 
+/// When a view merges: a batch starts once it passes `high` bytes, and merges
+/// until it is at most `low`.
+#[derive(Clone, Copy)]
+pub(crate) struct Budget {
+    high: usize,
+    low: usize,
+}
+
+impl Budget {
+    /// A view that grows to `high` bytes, then drops to half of it at once.
+    pub(crate) fn sawtooth(high: usize) -> Self {
+        Self {
+            high,
+            low: high / 2,
+        }
+    }
+
+    /// A view that merges at every entry to stay at `bytes`.
+    pub(crate) fn exact(bytes: usize) -> Self {
+        Self {
+            high: bytes,
+            low: bytes,
+        }
+    }
+}
+
 /// A view as it folds, one entry at a time.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Fold {
     parts: Vec<Part>,
     bytes: usize,
     /// Entries appended so far, the `T` of OptChat's age rule.
     len: u64,
+    /// A batch has started and not yet reached its low mark, because some
+    /// pair's parent was unbuilt. It goes on at the next entry.
+    batching: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -82,22 +103,59 @@ struct Part {
 }
 
 impl Fold {
-    /// Append the next entry's leaf, then merge the most due built pairs until
-    /// the view fits `budget`, or no pair has a built parent.
-    pub(crate) fn push(&mut self, size: &impl Fn(NodeAddr) -> Option<usize>, budget: usize) {
+    /// Append the next entry's leaf. Past `budget.high`, or in a batch not
+    /// yet done, merge the most due built pairs down to `budget.low`.
+    pub(crate) fn push(&mut self, size: &impl Fn(NodeAddr) -> Option<usize>, budget: Budget) {
         let leaf = NodeAddr::leaf(self.len);
         let bytes = size(leaf).unwrap_or(0);
         self.parts.push(Part { addr: leaf, bytes });
         self.bytes += bytes;
         self.len += 1;
-        while self.bytes > budget {
+        self.batching |= self.bytes > budget.high;
+        while self.batching && self.bytes > budget.low {
             let Some((at, parent)) = self.most_due(size) else {
-                break;
+                return;
             };
             self.bytes -= self.parts[at].bytes + self.parts[at + 1].bytes;
             self.bytes += parent.bytes;
             self.parts.splice(at..at + 2, [parent]);
         }
+        self.batching = false;
+    }
+
+    /// Push entries until `len` of them are in.
+    pub(crate) fn advance(
+        &mut self,
+        len: u64,
+        size: &impl Fn(NodeAddr) -> Option<usize>,
+        budget: Budget,
+    ) {
+        while self.len < len {
+            self.push(size, budget);
+        }
+    }
+
+    /// The view at `len` entries: the entries past this fold join it within
+    /// `budget`, merging at each one as needed. When no built pair is left to
+    /// merge, the oldest lines go, so no view exceeds its budget (I6).
+    pub(crate) fn into_tiles(
+        mut self,
+        len: u64,
+        size: &impl Fn(NodeAddr) -> Option<usize>,
+        budget: usize,
+    ) -> Vec<NodeAddr> {
+        self.advance(len, size, Budget::exact(budget));
+        let mut drop = 0;
+        while self.bytes > budget && drop < self.parts.len() {
+            self.bytes -= self.parts[drop].bytes;
+            drop += 1;
+        }
+        self.parts[drop..].iter().map(|p| p.addr).collect()
+    }
+
+    /// Entries appended so far.
+    pub(crate) fn entries(&self) -> u64 {
+        self.len
     }
 
     #[cfg(test)]
@@ -105,9 +163,14 @@ impl Fold {
         self.parts.iter().map(|p| p.addr).collect()
     }
 
-    /// Where the sibling pair with the largest `due = age / 2^(l+2)` and a
-    /// built parent starts, and that parent. Ties go to the oldest pair.
+    /// Where the sibling pair with the largest `due` and a built parent
+    /// starts, and that parent. Ties go to the oldest pair.
+    ///
+    /// `due = (T - last) / 2^l`: how long ago the pair's last entry was, in
+    /// the pair's own line size. Measured from the pair's first entry
+    /// instead, near ties it merges old pairs and rewrites old lines.
     fn most_due(&self, size: &impl Fn(NodeAddr) -> Option<usize>) -> Option<(usize, Part)> {
+        let due = |parent: NodeAddr| (self.len + 1 - parent.end(), parent.span / 2);
         let mut best: Option<(usize, Part)> = None;
         for (at, pair) in self.parts.windows(2).enumerate() {
             let (a, b) = (pair[0].addr, pair[1].addr);
@@ -120,8 +183,8 @@ impl Fold {
             };
             // Cross-multiplied, so no division rounds two dues together.
             let beats = best.is_none_or(|(_, held)| {
-                u128::from(self.len - parent.start) * u128::from(held.addr.span)
-                    > u128::from(self.len - held.addr.start) * u128::from(parent.span)
+                let ((age, line), (held_age, held_line)) = (due(parent), due(held.addr));
+                u128::from(age) * u128::from(held_line) > u128::from(held_age) * u128::from(line)
             });
             if !beats {
                 continue;
@@ -140,67 +203,12 @@ impl Fold {
     }
 }
 
-/// The compactor's context: the coarsest aligned cover of a prefix `[0, k)`,
-/// then every leaf from `k` on, for the smallest `k` that fits `budget`.
-///
-/// It rebuilds from scratch for each node, which OptChat §5.3 rules out for a
-/// turn's view, so no view uses it. `size` is as for [`fold`]. An unbuilt
-/// block reads as its built children. When even the finest built cover is over
-/// budget, the oldest lines go.
-pub(crate) fn context_tiling(
-    len: u64,
-    size: impl Fn(NodeAddr) -> Option<usize>,
-    budget: usize,
-) -> Vec<NodeAddr> {
-    let mut cover = Cover {
-        size: &size,
-        bytes: HashMap::new(),
-    };
-    // Leaf bytes from the newest back, only as far as the budget reaches. A
-    // `k` whose leaves alone overflow cannot fit, so the scan starts at `k0`.
-    let mut suffix = vec![0usize];
-    let mut k0 = len;
-    while k0 > 0 {
-        let grown = suffix[suffix.len() - 1] + size(NodeAddr::leaf(k0 - 1)).unwrap_or(0);
-        if grown > budget {
-            break;
-        }
-        suffix.push(grown);
-        k0 -= 1;
-    }
-    let leaves_from = |k: u64| suffix[(len - k) as usize];
-
-    let fits = (k0..=len).find(|&k| {
-        let prefix: usize = blocks(k).into_iter().map(|b| cover.bytes(b)).sum();
-        prefix + leaves_from(k) <= budget
-    });
-    let k = fits.unwrap_or(len);
-
-    let mut tiles = Vec::new();
-    for block in blocks(k) {
-        cover.push(block, &mut tiles);
-    }
-    tiles.extend((k..len).map(NodeAddr::leaf));
-
-    let mut total: usize = tiles.iter().map(|t| size(*t).unwrap_or(0)).sum();
-    let mut drop = 0;
-    while total > budget && drop < tiles.len() {
-        total -= size(tiles[drop]).unwrap_or(0);
-        drop += 1;
-    }
-    tiles.split_off(drop)
-}
-
 /// The coarsest built nodes covering `[0, end)`, oldest first: the aligned
 /// blocks of [`blocks`], each unbuilt one replaced by its children.
 pub(crate) fn built_cover(end: u64, size: impl Fn(NodeAddr) -> Option<usize>) -> Vec<NodeAddr> {
-    let cover = Cover {
-        size: &size,
-        bytes: HashMap::new(),
-    };
     let mut tiles = Vec::new();
     for block in blocks(end) {
-        cover.push(block, &mut tiles);
+        push_built(block, &size, &mut tiles);
     }
     tiles
 }
@@ -225,33 +233,12 @@ fn blocks(end: u64) -> Vec<NodeAddr> {
     out
 }
 
-/// A block's built cover and its bytes, memoised so a stalled compactor costs
-/// one pass over the tree rather than one per candidate `k`.
-struct Cover<'a, F: Fn(NodeAddr) -> Option<usize>> {
-    size: &'a F,
-    bytes: HashMap<NodeAddr, usize>,
-}
-
-impl<F: Fn(NodeAddr) -> Option<usize>> Cover<'_, F> {
-    fn bytes(&mut self, addr: NodeAddr) -> usize {
-        if let Some(&known) = self.bytes.get(&addr) {
-            return known;
-        }
-        let bytes = match ((self.size)(addr), addr.children()) {
-            (Some(own), _) => own,
-            (None, Some((a, b))) => self.bytes(a) + self.bytes(b),
-            (None, None) => 0,
-        };
-        self.bytes.insert(addr, bytes);
-        bytes
-    }
-
-    fn push(&self, addr: NodeAddr, out: &mut Vec<NodeAddr>) {
-        if (self.size)(addr).is_some() {
-            out.push(addr);
-        } else if let Some((a, b)) = addr.children() {
-            self.push(a, out);
-            self.push(b, out);
-        }
+/// `addr` if it is built, else its built children, oldest first.
+fn push_built(addr: NodeAddr, size: &impl Fn(NodeAddr) -> Option<usize>, out: &mut Vec<NodeAddr>) {
+    if size(addr).is_some() {
+        out.push(addr);
+    } else if let Some((a, b)) = addr.children() {
+        push_built(a, size, out);
+        push_built(b, size, out);
     }
 }

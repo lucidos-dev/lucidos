@@ -50,12 +50,30 @@ fn should_auto_allow(tool_name: &str) -> bool {
 /// only adds the CC-specific auto-allow gate and the HTTP wire shape.
 pub(super) async fn permission_prompt(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<PermissionPromptRequest>,
 ) -> impl IntoResponse {
     let thread_id = match Uuid::parse_str(&body.thread_id) {
         Ok(id) => id,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
     };
+    // An "Allow for this thread" here widens what that thread's agent may do,
+    // so another thread must not raise the card.
+    if asks_for_another_thread(&headers, thread_id) {
+        crate::log!(
+            "[PermissionPrompt] refused {thread_id}/{}: the caller's token names another thread",
+            body.tool_use_id
+        );
+        return Json(PermissionPromptResponse {
+            allowed: false,
+            reason: Some(
+                "A permission card lands on the thread that asks it, and this request named \
+                 another thread."
+                    .to_string(),
+            ),
+        })
+        .into_response();
+    }
 
     if should_auto_allow(&body.tool_name) {
         return Json(PermissionPromptResponse {
@@ -274,11 +292,11 @@ struct CodingAgentDiffRefreshResponse {
     changed: bool,
 }
 
-/// Whether `branch_name` carries un-applied work, for the durable
-/// `coding_agent_has_diff` flag.
+/// Whether `branch_name` carries un-applied work, for the durable change
+/// state.
 ///
 /// `Err` means git could not answer: a spawn failure, the 30s timeout, or a
-/// branch ref that no longer resolves. The caller must then leave the flag
+/// branch ref that no longer resolves. The caller must then leave the state
 /// alone. Writing the empty answer clears the Diff button for a thread that
 /// just committed. A probe that could not run is UNKNOWN, never a "no"
 /// (`.claude/rules/rust.md`).
@@ -301,8 +319,8 @@ async fn probe_branch_has_diff(
 /// coding-agent worktree's git post-commit hook via `lucidos
 /// coding-agent-diff-hook`.
 ///
-/// This is a live UI refresh only: it reconciles `coding_agent_has_diff` from
-/// git truth and broadcasts the updated aggregate when the flag changes. It
+/// This is a live UI refresh only: it reconciles the change state from git
+/// truth and broadcasts the updated aggregate when the state changes. It
 /// does NOT emit `ChangeProposed`, create a `changes` row, or mark the turn as
 /// ready for Apply. Formal proposal still happens when the coding-agent turn
 /// idles.
@@ -359,7 +377,7 @@ pub(super) async fn coding_agent_diff_refresh(
     match state
         .engine
         .event_bus
-        .set_coding_agent_has_diff_and_broadcast(thread_id, has_diff)
+        .refresh_branch_work_and_broadcast(thread_id, has_diff)
         .await
     {
         Ok(changed) => Json(CodingAgentDiffRefreshResponse { has_diff, changed }).into_response(),
@@ -668,6 +686,9 @@ struct ApprovePlanResponse {
     /// Whether a `proposed` row was flipped to `planned`. `false` means there
     /// was nothing to approve (no row, or it was already planned / simple).
     approved: bool,
+    /// The flipped plan's file, for the CLI to mark `Approved`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_path: Option<String>,
 }
 
 /// POST /api/v1/internal/approve-plan — invoked by `lucidos planned approve`
@@ -689,7 +710,11 @@ pub(super) async fn approve_plan(
         .approve_plan(&repo_root, &body.branch_name)
         .await
     {
-        Ok(approved) => Json(ApprovePlanResponse { approved }).into_response(),
+        Ok(approved) => Json(ApprovePlanResponse {
+            approved: approved.is_some(),
+            plan_path: approved.and_then(|a| a.plan_path),
+        })
+        .into_response(),
         Err(e) => {
             crate::log!(
                 "[Internal] approve_plan failed for {}: {}",
@@ -922,6 +947,23 @@ struct AskUserQuestionResponse {
     refusal: Option<String>,
 }
 
+/// Does a token-bearing caller name a thread other than its own?
+///
+/// A thread asks on its own card only. A token for another thread would park a
+/// thread it does not own, and later resume that thread's agent with a
+/// question it never asked. A caller presenting no origin token keeps today's
+/// reach, as `api::thread_reach` leaves it.
+pub(in crate::api) fn asks_for_another_thread(
+    headers: &axum::http::HeaderMap,
+    thread_id: Uuid,
+) -> bool {
+    matches!(
+        crate::api::actor::subprocess_origin(headers),
+        crate::api::actor::SubprocessOrigin::Subprocess { source_thread_id, .. }
+            if source_thread_id != Some(thread_id)
+    )
+}
+
 /// POST /api/v1/internal/ask-user-question — two callers, same contract:
 /// the lucidos-cli `ask-user-question-hook` subcommand (from inside a Claude
 /// Code subprocess when CC fires the `AskUserQuestion` PreToolUse hook) and
@@ -940,18 +982,57 @@ struct AskUserQuestionResponse {
 /// map goes back to CC as a single tool result — CC sees one tool call.
 pub(super) async fn ask_user_question(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<AskUserQuestionRequest>,
 ) -> impl IntoResponse {
     let thread_id = match Uuid::parse_str(&body.thread_id) {
         Ok(id) => id,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
     };
+    if asks_for_another_thread(&headers, thread_id) {
+        crate::log!(
+            "[AskUserQuestion] refused {thread_id}/{}: the caller's token names another thread",
+            body.tool_use_id
+        );
+        return Json(AskUserQuestionResponse {
+            questions: body.questions,
+            answers: serde_json::Value::Object(serde_json::Map::new()),
+            refusal: Some(
+                "A question card lands on the thread that asks it, and this request named \
+                 another thread. Ask from inside your own thread."
+                    .to_string(),
+            ),
+        })
+        .into_response();
+    }
+
+    // An ask naming an owner approval request shows the engine's card in its
+    // place (ADR 0387). Everything below then reads that card, exactly as it
+    // would read the agent's own question.
+    let (questions, owner_approval) =
+        match crate::api::owner_approval::approval_ask(&state.pool, thread_id, &body.questions)
+            .await
+        {
+            Ok(crate::api::owner_approval::ApprovalAsk::Ordinary) => (body.questions, None),
+            Ok(crate::api::owner_approval::ApprovalAsk::Approval {
+                approval,
+                questions,
+            }) => (questions, Some(approval)),
+            Err(refusal) => {
+                return Json(AskUserQuestionResponse {
+                    questions: body.questions,
+                    answers: serde_json::Value::Object(serde_json::Map::new()),
+                    refusal: Some(refusal),
+                })
+                .into_response();
+            }
+        };
 
     if let Some(refusal) = crate::engine::question_card_gate::refuse_coding_agent_card(
         &state.pool,
         thread_id,
         &body.tool_use_id,
-        &body.questions,
+        &questions,
     )
     .await
     {
@@ -960,7 +1041,7 @@ pub(super) async fn ask_user_question(
             body.tool_use_id
         );
         return Json(AskUserQuestionResponse {
-            questions: body.questions,
+            questions,
             answers: serde_json::Value::Object(serde_json::Map::new()),
             refusal: Some(refusal.text()),
         })
@@ -972,10 +1053,13 @@ pub(super) async fn ask_user_question(
         .walk_question_batch(
             thread_id,
             &body.tool_use_id,
-            &body.questions,
+            &questions,
             None,
-            body.session_id.clone(),
-            EventChannel::ClaudeCode,
+            crate::engine::agent_question::QuestionAsker {
+                cc_session_id: body.session_id.clone(),
+                channel: EventChannel::ClaudeCode,
+                owner_approval,
+            },
         )
         .await;
 
@@ -1002,7 +1086,7 @@ pub(super) async fn ask_user_question(
             body.tool_use_id
         );
         return Json(AskUserQuestionResponse {
-            questions: body.questions,
+            questions,
             answers: serde_json::Value::Object(serde_json::Map::new()),
             refusal: None,
         })
@@ -1011,15 +1095,70 @@ pub(super) async fn ask_user_question(
 
     let answers = crate::engine::agent_question::build_hook_answers(
         &answer_kinds,
-        &body.questions,
+        &questions,
         crate::engine::agent_question::AnswerImages::BlobPaths(state.engine.workspace_path()),
     );
     Json(AskUserQuestionResponse {
-        questions: body.questions,
+        questions,
         answers,
         refusal: None,
     })
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RequestAppCaptureForTest {
+    pub thread_id: String,
+    pub app_id: String,
+    /// The device the capture names, as a turn's last used device would.
+    /// Absent, the request names none, as in a background turn.
+    pub device_id: Option<String>,
+    /// The tool's `save_as_artifact`, so a spec can drive a saved capture.
+    pub save_as_artifact: Option<String>,
+}
+
+/// POST /api/v1/internal/request-app-capture-for-test: run a `capture_app`
+/// request against the pages connected right now, and return the tool result.
+///
+/// A browser spec cannot make the agent call `capture_app`, so this drives the
+/// same engine function with a named device instead. Everything past it is
+/// real: the event, each page's device test, the frame's own capture, and the
+/// answer through `/api/v1/app-capture`.
+///
+/// Gated like `seed_change_for_test`: a production build sets neither flag,
+/// so it answers 404.
+pub(super) async fn request_app_capture_for_test(
+    State(state): State<AppState>,
+    Json(body): Json<RequestAppCaptureForTest>,
+) -> impl IntoResponse {
+    use crate::engine::tools::app_capture::{app_ui_tool_impl, CAPTURE_TIMEOUT};
+    if !cfg!(any(debug_assertions, feature = "e2e-test-hooks")) {
+        return (StatusCode::NOT_FOUND, "test-only endpoint").into_response();
+    }
+    let Ok(thread_id) = Uuid::parse_str(&body.thread_id) else {
+        return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response();
+    };
+    let artifacts = match crate::core::ArtifactManager::new(state.workspace_path.clone()) {
+        Ok(artifacts) => artifacts,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let mut args = serde_json::json!({ "app_id": body.app_id });
+    if let Some(path) = body.save_as_artifact {
+        args["save_as_artifact"] = path.into();
+    }
+    let result = app_ui_tool_impl(
+        &state.engine.event_bus,
+        &state.pool,
+        &state.engine.pending_captures,
+        &artifacts,
+        &args,
+        thread_id,
+        false,
+        body.device_id.as_deref(),
+        CAPTURE_TIMEOUT,
+    )
+    .await;
+    Json(serde_json::json!({ "result": result })).into_response()
 }
 
 /// Routes for the `/internal/*` surface (engine-internal hooks used by CC
@@ -1041,6 +1180,10 @@ pub(super) fn router() -> Router<AppState> {
         .route("/internal/client-log", post(client_log))
         .route("/internal/client-logs", post(client_logs))
         .route("/internal/seed-change-for-test", post(seed_change_for_test))
+        .route(
+            "/internal/request-app-capture-for-test",
+            post(request_app_capture_for_test),
+        )
 }
 
 #[cfg(test)]

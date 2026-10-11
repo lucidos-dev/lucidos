@@ -2,8 +2,9 @@ import { useEffect, useRef } from 'preact/hooks';
 import type { RefObject } from 'preact';
 import {
   closeFind, findFocusRequest, findQuery, findResult, findStatusText, findSurface,
-  setFindQuery, stepFind, type FindSurface,
+  setFindQuery, stepFind, takeFindRequest, type FindSurface,
 } from '../../store/actions/find-bar';
+import { findRequest } from '../../store/store';
 import { pushOverlay, removeOverlay } from '../../store/overlayStack';
 import { ChevronDownIcon, ChevronUpIcon, CloseIcon } from './icons';
 import { Disclosure } from './Disclosure';
@@ -59,13 +60,15 @@ export function FindBar({ surface, scope, placeholder }: {
 }) {
   const open = findSurface.value === surface;
   const focusRequest = findFocusRequest.value;
+  const request = findRequest.value;
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // Keyed on the request alone: an open that asks for no focus leaves the caret.
   useEffect(() => {
     if (!open) return;
     inputRef.current?.focus({ preventScroll: true });
     inputRef.current?.select();
-  }, [open, focusRequest]);
+  }, [focusRequest]);
 
   // One entry per surface: a hand-off from one bar to the other removes the
   // closing bar's entry and must not take the opening one with it.
@@ -81,6 +84,11 @@ export function FindBar({ surface, scope, placeholder }: {
   useEffect(() => () => {
     if (findSurface.value === surface) closeFind();
   }, [surface, scope]);
+
+  // After the cleanup above, so a request opens on a session of its own.
+  useEffect(() => {
+    if (request) takeFindRequest(surface, scope);
+  }, [request, surface, scope]);
 
   return (
     <Disclosure open={open} class="find-bar-slot">

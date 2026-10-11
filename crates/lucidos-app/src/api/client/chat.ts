@@ -5,7 +5,7 @@ import type { DiffFile } from '../../store/store';
 import type { AnswerKind, AllowScope } from '../../store/thread-events';
 import type { Loadable } from '../../store/types';
 import type { ChatRequestBody, CodingAgent } from '../types';
-import { SIDE_QUESTION_TIMEOUT_MS } from '@lucidos/engine-constants';
+import { SIDE_QUESTION_TIMEOUT_MS, type TAKES_EFFECT_VALUES } from '@lucidos/engine-constants';
 
 // --- Health ---
 export interface HealthInfo {
@@ -142,6 +142,14 @@ export async function continueThread(threadId: string): Promise<void> {
   await throwIfNotOk(res);
 }
 
+/** **Harden** on the Not ready strip: start the hardening run for a resting
+ *  thread whose work was held as `hardening_missing`. Its turn end proposes
+ *  the change. 409s when nothing on the thread waits on hardening. */
+export async function hardenThread(threadId: string): Promise<void> {
+  const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/harden`, { method: 'POST' });
+  await throwIfNotOk(res);
+}
+
 /** **Stop waiting** on ONE of a thread's live event waits. The thread keeps any
  *  others (a thread-level Stop, which cancels them all, is
  *  `POST /api/v1/chat/cancel`).
@@ -155,8 +163,16 @@ export async function cancelThreadEventWait(threadId: string, waitId: string): P
   await throwIfNotOk(res);
 }
 
-export async function sendControlRequest(threadId: string, request: Record<string, string>): Promise<void> {
-  await json(`${API}/claude-code/control`, {
+/** When a control change takes effect: the engine's `TakesEffect`. */
+export type ControlTakesEffect = typeof TAKES_EFFECT_VALUES[number];
+
+export interface ControlResponse {
+  ok: true;
+  takes_effect: ControlTakesEffect;
+}
+
+export async function sendControlRequest(threadId: string, request: Record<string, string>): Promise<ControlResponse> {
+  return json<ControlResponse>(`${API}/claude-code/control`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ thread_id: threadId, request }),

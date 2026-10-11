@@ -13,7 +13,7 @@ use crate::engine::agent_recovery::ENGINE_RESTART_INTERRUPT_REASON;
 use crate::engine::thread_events::{
     CancelCause, ChildCompletionStatus, EventMeta, EventWaitCancelCause, ThreadEvent,
 };
-use crate::engine::thread_lifecycle::{ArchiveState, ThreadStatus};
+use crate::engine::thread_lifecycle::{ArchiveState, ChangeStateKind, ThreadStatus};
 
 /// What the fan-in reads about a child, in one self-joined query.
 ///
@@ -30,14 +30,23 @@ struct ChildRow {
     is_stopped_child: bool,
     holds_live_wait: bool,
     status: ThreadStatus,
-    coding_agent_proposed: bool,
+    coding_agent_change_state: ChangeStateKind,
     parent_is_coding_agent: Option<bool>,
+}
+
+impl ChildRow {
+    /// A coding-agent child whose idle held its proposal (ADR 0395): its branch
+    /// has a diff, and no change carries it yet.
+    fn holds_unproposed_work(&self) -> bool {
+        self.is_coding_agent && self.coding_agent_change_state == ChangeStateKind::Unproposed
+    }
 }
 
 const CHILD_ROW_SQL: &str = "SELECT c.parent_thread_id, c.is_coding_agent, c.title, \
             c.first_message, c.parent_callback_pending, c.is_stopped_child, \
             c.live_event_wait_count > 0 AS holds_live_wait, c.status, \
-            c.coding_agent_proposed, p.is_coding_agent AS parent_is_coding_agent \
+            c.coding_agent_change_state, \
+            p.is_coding_agent AS parent_is_coding_agent \
      FROM thread_summaries c \
      LEFT JOIN thread_summaries p ON p.thread_id = c.parent_thread_id \
      WHERE c.thread_id = $1";
@@ -595,22 +604,45 @@ impl EventBus {
     /// the parent would never hear. An archive or a discard of the thread is
     /// the settle's business: see `settle_child`.
     ///
-    /// Only an idle child still owed a card qualifies. A running child's own
-    /// terminal reports, and a stopped child waits for the user.
+    /// A child with held work defers to the branch-work net, which proposes
+    /// the work and then sends this card with the change listed (ADR 0395).
     async fn announce_when_last_wait_ends(
         &self,
         child_thread_id: Uuid,
         cause: EventWaitCancelCause,
     ) {
-        if !matches!(
-            cause,
-            EventWaitCancelCause::UserStop | EventWaitCancelCause::AgentStandDown
-        ) {
+        if cause.leaves_thread_open() {
+            self.send_held_card(child_thread_id, true).await;
+        }
+    }
+
+    /// Whether `child_thread_id`'s held card waits on the branch-work net to
+    /// propose its work first. Read it BEFORE proposing: the proposal is what
+    /// clears it.
+    pub(crate) async fn held_card_awaits_proposal(&self, child_thread_id: Uuid) -> bool {
+        self.load_child_row(child_thread_id)
+            .await
+            .is_some_and(|row| row.parent_callback_pending && row.holds_unproposed_work())
+    }
+
+    /// Send the held card the cancel deferred, once the branch-work net has
+    /// proposed the work it waited on.
+    pub(crate) async fn send_held_card_after_proposal(&self, child_thread_id: Uuid) {
+        self.send_held_card(child_thread_id, false).await;
+    }
+
+    /// Only an idle child still owed a card qualifies. A running child's own
+    /// terminal reports, and a stopped child waits for the user.
+    async fn send_held_card(&self, child_thread_id: Uuid, defer_unproposed_work: bool) {
+        let Some(row) = self.load_child_row(child_thread_id).await else {
+            return;
+        };
+        if defer_unproposed_work && row.holds_unproposed_work() {
             return;
         }
         // Idle only. A failed or paused child still owes its parent a card,
         // and the next resume or the settle carries it with the real status.
-        let Some(ChildRow {
+        let ChildRow {
             parent_thread_id: Some(parent_id),
             is_coding_agent,
             title,
@@ -619,9 +651,9 @@ impl EventBus {
             is_stopped_child: false,
             holds_live_wait: false,
             status,
-            coding_agent_proposed: proposed,
+            coding_agent_change_state,
             parent_is_coding_agent,
-        }) = self.load_child_row(child_thread_id).await
+        } = row
         else {
             return;
         };
@@ -643,7 +675,8 @@ impl EventBus {
             parent_id,
             parent_is_coding_agent,
             label: child_label(title, first_msg),
-            status: if is_coding_agent && !proposed {
+            // A diff the net could not propose is still work.
+            status: if is_coding_agent && coding_agent_change_state == ChangeStateKind::None {
                 ChildCompletionStatus::NoChanges
             } else {
                 ChildCompletionStatus::Success

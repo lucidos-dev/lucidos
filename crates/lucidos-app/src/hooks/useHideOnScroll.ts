@@ -16,17 +16,20 @@ import { viewportIsMobile } from '../utils/viewport';
 import { isRepaintNudging } from '../utils/webkitRepaint';
 import { isUserScrolling } from '../utils/scrollActivity';
 import { currentMobileDynamicBars } from '../store/actions/preferences';
+import { findSurface } from '../store/actions/find-bar';
 
 /** Pure rule for when hide-on-scroll should be inert and the header pinned visible.
- *  Pinned bars (dynamic bars off) win everywhere. Otherwise only the content
- *  pane with an open app-UI iframe pins, because its scroll events leak to the
- *  parent. Other panes don't have that problem and hide normally. */
+ *  Pinned bars (dynamic bars off) win everywhere. An open find bar pins them
+ *  too: it docks under the header, and each step scrolls. The content pane with
+ *  an open app-UI iframe pins, because its scroll events leak to the parent.
+ *  Other panes don't have that problem and hide normally. */
 export function shouldKeepHeaderVisible(opts: {
   view: MobileView;
   overlayType: NonNullable<PanelOverlay>['type'] | null | undefined;
   dynamicBars: boolean;
+  findOpen: boolean;
 }): boolean {
-  if (!opts.dynamicBars) return true;
+  if (!opts.dynamicBars || opts.findOpen) return true;
   return opts.view === 'content' && opts.overlayType === 'app-ui';
 }
 
@@ -133,22 +136,23 @@ export function chromeOffsetPx(opts: {
   return headerOffsetPx({ away: opts.away, scrollTop: opts.scrollTop, chromeHeight });
 }
 
-/** The thread title bar's offset, in px. On its own pane it is the chrome's.
- *  On any other pane it follows the header away. A swipe back then never
- *  shows the transcript in the band above a bar under an absent header.
+/** The thread pane's title bar offset, in px. On its own pane it is the
+ *  chrome's. On any other pane it follows the header away. A swipe back then
+ *  never shows the pane's content in the band above a bar under an absent
+ *  header.
  *
- *  The transcript reaches that band only once it has scrolled past the bar's
- *  own height. Up to there the band is the empty top of the pane, and the bar
+ *  The content reaches that band only once it has scrolled past the bar's own
+ *  height. Up to there the band is the empty top of the pane, and the bar
  *  stays shown: hidden, it would leave its own empty band where it rests. */
 export function titleBarOffsetPx(opts: {
-  onThreadPane: boolean;
+  onOwnPane: boolean;
   chromeOffset: number;
-  threadScrollTop: number;
+  paneScrollTop: number;
   headerHeight: number;
   titleBarHeight: number;
 }): number {
-  if (opts.onThreadPane) return opts.chromeOffset;
-  const away = opts.chromeOffset < 0 && opts.threadScrollTop > opts.titleBarHeight;
+  if (opts.onOwnPane) return opts.chromeOffset;
+  const away = opts.chromeOffset < 0 && opts.paneScrollTop > opts.titleBarHeight;
   return away ? -(opts.headerHeight + opts.titleBarHeight) : 0;
 }
 
@@ -232,12 +236,8 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let threadScroller: Element | null = null;
     // A freshly bound title bar has no position to glide from, so it lands.
     let titleBarFresh = false;
-    // The scroll-to-top chevron and the transcript's open find bar, the other
-    // two `--mobile-header-offset` consumers.
+    // The scroll-to-top chevron, the other `--mobile-header-offset` consumer.
     let chevronEl: HTMLElement | null = null;
-    let findBarEl: HTMLElement | null = null;
-    // Like the title bar, a freshly mounted find bar lands rather than glides.
-    let findBarFresh = false;
     let titleBarResizeObserver: ResizeObserver | null = null;
     let currentContainer: Element | null = null;
     let currentContainerPane: Element | null = null;
@@ -370,18 +370,12 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // The down chevron is the third consumer, of the PROMPT's offset: it sits
       // just above the prompt, so it has to slide with it on every pane.
       const nextDownChevron = (threadScroller?.parentElement?.querySelector(':scope > .scroll-to-bottom') ?? null) as HTMLElement | null;
-      // The find bar mounts only while open, above the transcript's wrap. Its
-      // mount and unmount reach the MutationObserver, which rebinds it here.
-      const nextFindBar = threadScroller?.closest('.thread-view')?.querySelector<HTMLElement>(':scope > .find-bar-slot') ?? null;
-      if (nextTitleBar === titleBarEl && nextChevron === chevronEl && nextDownChevron === downChevronEl
-        && nextFindBar === findBarEl) return false;
+      if (nextTitleBar === titleBarEl && nextChevron === chevronEl && nextDownChevron === downChevronEl) return false;
       // The outgoing up chevron keeps its last value. A pane swipe has already
       // revealed it (`attachListener`), so it glides in as it slides out.
       bindTitleBar(nextTitleBar);
       chevronEl = nextChevron;
       downChevronEl = nextDownChevron;
-      findBarFresh = nextFindBar !== null && nextFindBar !== findBarEl;
-      findBarEl = nextFindBar;
       // Force the next applyTransform to write. The freshly-bound elements carry
       // no value (or a stale one), and the change-detection guard below would
       // otherwise skip them because the OFFSET itself has not moved.
@@ -449,9 +443,9 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       }
       if (headerRef.current) {
         const titleOffsetRem = titleBarOffsetPx({
-          onThreadPane,
+          onOwnPane: onThreadPane,
           chromeOffset: offset,
-          threadScrollTop,
+          paneScrollTop: threadScrollTop,
           headerHeight: cachedHeight,
           titleBarHeight,
         }) / cachedRemSize;
@@ -465,9 +459,6 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         if (offsetRem !== lastOffsetRem) {
           lastOffsetRem = offsetRem;
           chevronEl?.style.setProperty('--mobile-header-offset', `${offsetRem}rem`);
-          findBarEl?.style.setProperty('--mobile-header-offset', `${offsetRem}rem`);
-          if (findBarEl && findBarFresh) landWithoutGlide(findBarEl);
-          findBarFresh = false;
         }
         if (titleOffsetRem !== lastTitleOffsetRem) {
           lastTitleOffsetRem = titleOffsetRem;
@@ -866,17 +857,25 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         view: mobileView.value,
         overlayType: panelOverlay.value?.type,
         dynamicBars,
+        findOpen: findSurface.value !== null,
       });
       if (next === disabled) return;
       disabled = next;
-      // Reset stale keyboard state when pinning the header. iOS Safari may
-      // miss focusout when opening app UI, leaving keyboardOpen true →
-      // spacer would collapse while header is forced visible.
+      // Pinning resets the keyboard state, since the pinned header never
+      // slides off for it. iOS Safari may also miss focusout on opening app
+      // UI, and the spacer would then collapse under a visible header.
       if (disabled && keyboardOpen) {
         keyboardOpen = false;
         updateHeaderVar();
+        // The spacer grew back, so the content keeps its place as on focusout.
+        if (currentContainer) {
+          holdAcrossRelayout(currentContainer as HTMLElement, currentContainer.scrollTop + cachedHeight - cachedSafeAreaTop);
+        }
       }
-      applyTransform();
+      // While pinned, no scroll reached the intent. Unpinned, the bars stay
+      // shown and the reader's next scroll counts from here.
+      if (!disabled) syncToScroll(currentContainer);
+      else applyTransform();
     }
     recomputeDisabled();
 
@@ -925,6 +924,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
 
     const unsubOverlay = panelOverlay.subscribe(recomputeDisabled);
     const unsubPrefs = preferences.subscribe(recomputeDisabled);
+    const unsubFind = findSurface.subscribe(recomputeDisabled);
     // Entering or leaving the compose-empty view: its prompt never slides, and
     // the thread a first send lands on starts with the prompt shown.
     const unsubCompose = composeViewActive.subscribe(() => {
@@ -952,6 +952,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       unsub();
       unsubOverlay();
       unsubPrefs();
+      unsubFind();
       unsubCompose();
       promptResizeObserver?.disconnect();
       if (promptEl) promptEl.style.translate = '';

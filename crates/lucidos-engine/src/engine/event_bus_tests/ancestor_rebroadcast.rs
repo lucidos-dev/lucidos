@@ -264,6 +264,7 @@ async fn no_blocking_flip_does_not_rebroadcast_ancestors() {
             text: "still working...".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             parent_tool_use_id: None,
+            progress_note: false,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -362,6 +363,7 @@ async fn per_token_streaming_does_not_sample_blocking() {
                 text: format!("chunk {i}"),
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 parent_tool_use_id: None,
+                progress_note: false,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

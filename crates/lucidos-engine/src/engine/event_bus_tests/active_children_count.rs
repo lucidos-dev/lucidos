@@ -593,7 +593,7 @@ async fn test_cc_child_proposed_change_does_not_block_parent_active() {
     emit_cc_idle(&bus, child_id, true, None).await;
 
     let (status, proposed): (String, bool) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT status, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(child_id)
     .fetch_one(&pool)
@@ -603,7 +603,7 @@ async fn test_cc_child_proposed_change_does_not_block_parent_active() {
         status, "idle",
         "child settles to 'idle' after CodingAgentIdled+ChangeProposed (Option B)"
     );
-    assert!(proposed, "ChangeProposed sets coding_agent_proposed");
+    assert!(proposed, "ChangeProposed makes the thread proposed");
 
     assert_active_children(
         &pool,
@@ -656,6 +656,7 @@ async fn emit_question_asked(bus: &EventBus, thread_id: Uuid) {
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1008,7 +1009,7 @@ async fn follow_up_to_a_coding_agent_child_holding_a_pending_change() {
     emit_cc_idle(&bus, child_id, true, None).await;
     assert_active_children(&pool, parent_id, 0, "the child's work is done").await;
     let proposed: bool = sqlx::query_scalar(
-        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(child_id)
     .fetch_one(&pool)

@@ -361,7 +361,7 @@ export function WebhookSignatureFields({ draft, credentials, onChange }: Props) 
             <input
               class="device-name-input"
               type="number"
-              placeholder="Seconds. Empty skips the check, which suits a scheme with no timestamp."
+              placeholder="Seconds. Empty uses the default window if the template signs {timestamp}."
               value={draft.custom.tolerance_secs}
               onInput={(e) =>
                 patchCustom({ tolerance_secs: (e.target as HTMLInputElement).value })}

@@ -238,6 +238,7 @@ export type BoundaryTurn = 'waiting' | 'working' | 'done' | 'stopped';
  *  event's own name. */
 const REASON_PILL: Partial<Record<EngineReason['kind'], string>> = {
   missing_hardening: 'hardening needed',
+  missing_plan: 'plan needed',
   harden_retrigger: 'hardening needed',
   merge_conflict: 'merge conflict',
   stale_session: 'stopped agent tidied up',
@@ -265,7 +266,7 @@ const WAIT_REENTRY: Record<EventWaitReason['outcome'], { pill: string; meaning: 
 const WORKING_STATE: Partial<Record<string, string>> = {
   MissingHardeningDetected: 'Running hardening',
   MergeConflictDetected: 'Resolving',
-  UserPromptInjected: 'Agent working',
+  PromptInjected: 'Agent working',
   CodingAgentPromptSent: 'Agent working',
 };
 
@@ -302,7 +303,7 @@ function boundaryCardParts(
       return { state: 'Requested', tone: 'live' as const, fact: ev.tool };
     case 'MissingHardeningDetected':
     case 'MergeConflictDetected':
-    case 'UserPromptInjected':
+    case 'PromptInjected':
     case 'CodingAgentPromptSent':
       return { ...workState(ev.type, turn), why };
     default:
@@ -353,11 +354,11 @@ export function boundaryCard(event: StoredEvent, summary: string, opts: {
 function waitReentryCard(reason: EventWaitReason, opts: { carried?: ComponentChildren; turn: BoundaryTurn }) {
   const { pill, meaning } = WAIT_REENTRY[reason.outcome];
   const waitedFor = describeWatchedEvents(reason.watched);
-  const { state, tone } = workState('UserPromptInjected', opts.turn);
+  const { state, tone } = workState('PromptInjected', opts.turn);
   return eventRowBody({
     kind: 'boundary',
     role: 'boundary-card',
-    subject: eventNameChip({ kind: 'chip', name: 'UserPromptInjected', label: pill, meaning, sentenceStart: true }),
+    subject: eventNameChip({ kind: 'chip', name: 'PromptInjected', label: pill, meaning, sentenceStart: true }),
     stateLabel: state,
     tone,
     facts: [waitedFor ? { kind: 'text', text: waitedFor } : null],
@@ -409,7 +410,7 @@ export function ResumeCard({ exchange }: { exchange: Exchange }) {
 /** The body of an event-delivery exchange: the event a *thread subscription*
  *  delivered, named, with its payload folded away (ADR 0047).
  *
- *  The anchor's `UserPromptInjected.text` spells the payload out as
+ *  The anchor's `PromptInjected.text` spells the payload out as
  *  pretty-printed JSON, because that text IS the prompt the model reads.
  *  Rendering it through `MarkdownBlock` puts a screen of raw JSON in the
  *  transcript. The engine links the anchor to its `EventWaitDelivered` so the

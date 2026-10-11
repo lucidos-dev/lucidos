@@ -78,7 +78,7 @@
    the same thing, the current state of the response and when it last updated.
    Same shape as `.initiator-meta` (input-messages.css); the two headers sit one
    above the other in a turn, so they wrap the same way or they read as two
-   different widgets.
+   different controls.
 
    It is the row's ELASTIC field, and that is what decides how the header
    degrades once it stops fitting. As a rigid content-width item it was bumped
@@ -746,6 +746,9 @@
         var(--bg-tertiary) 75%
     );
     background-size: 200% 100%;
+    /* The sweep repaints every frame, so the block owns its layer
+       (an-endless-repaint-owns-its-layer.test.ts). */
+    will-change: transform;
     animation: shimmer 1.5s infinite;
 }
 
@@ -1231,6 +1234,73 @@
         background: var(--bg-tertiary);
         border-color: var(--border-color);
     }
+}
+
+/* An option with a widget (ADR 0415): one box holds the label row, then the
+   widget. The box wears the option's surface and its state, and the row inside
+   goes clear, so the two read as one option. The frame is the row's sibling,
+   so a press on the widget never picks: hovering it tints nothing. */
+.question-option-boxed {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    padding-bottom: var(--space-md);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-control);
+    transition:
+        background-color var(--duration-normal),
+        border-color var(--duration-normal);
+}
+
+.question-option-boxed .question-option,
+.question-option-boxed .question-option-static {
+    padding-bottom: var(--space-xs);
+    background: transparent;
+    border-color: transparent;
+}
+
+.question-option-boxed > .widget-embed,
+.question-option-boxed > .widget-embed-unavailable {
+    margin: 0 calc(var(--turn-surface-inset) - 1px);
+}
+
+@media (hover: hover) {
+    .question-option-boxed:has(> .question-option:not(:disabled):hover),
+    .question-option-boxed:has(> .question-option-unsent > .question-option:hover) {
+        background: var(--picked-surface);
+        border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
+    }
+
+    .question-option-boxed .question-option:hover {
+        background: transparent;
+        border-color: transparent;
+    }
+}
+
+/* A terminated card dims the whole box, widget and all, once. */
+.question-body-terminated .question-option-boxed {
+    opacity: 0.55;
+}
+
+.question-body-terminated .question-option-boxed .question-option:disabled {
+    opacity: 1;
+}
+
+@media (hover: hover) {
+    .question-body-terminated .question-option-boxed .question-option:disabled:hover {
+        background: transparent;
+        border-color: transparent;
+    }
+}
+
+/* What an embed draws when its widget cannot: a quiet line in place. */
+.widget-embed-unavailable {
+    padding: var(--space-sm) var(--space-md);
+    border: 1px dashed var(--border-color);
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
 }
 
 /* FreeText resolution block. The answer is the one thing on the card the user

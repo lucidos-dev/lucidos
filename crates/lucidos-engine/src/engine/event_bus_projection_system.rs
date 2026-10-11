@@ -2,7 +2,7 @@
 //! `NotificationCreated` rows into the `notifications` table, the
 //! `ThreadQueue*` events into the `thread_queue` table, and `RepositoryAdded`
 //! into the durable `repo_names` table (so removed repos keep a resolvable
-//! name).
+//! name), and `AppDeleted` into `app_kinds` (so a removed widget stays one).
 
 use uuid::Uuid;
 
@@ -127,6 +127,23 @@ impl EventBus {
                     .execute(&mut **tx)
                     .await?;
                 }
+                Ok(())
+            }
+            SystemEvent::AppDeleted {
+                app_id,
+                kind: Some(kind),
+                ..
+            } => {
+                // Stored in the spelling serde writes, and read back through serde.
+                let kind = serde_json::to_value(kind)?;
+                sqlx::query(
+                    "INSERT INTO app_kinds (app_id, kind) VALUES ($1, $2) \
+                     ON CONFLICT (app_id) DO UPDATE SET kind = EXCLUDED.kind",
+                )
+                .bind(app_id)
+                .bind(kind.as_str())
+                .execute(&mut **tx)
+                .await?;
                 Ok(())
             }
             _ => Ok(()),

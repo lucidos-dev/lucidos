@@ -6,7 +6,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 /// External-repo CC threads idled before the May-2026 cleanup consolidation
-/// kept their branch + `coding_agent_proposed=true` after `agent_recovery` removed
+/// kept their branch and a proposed change state after `agent_recovery` removed
 /// the worktree dir. The handler used to 404 with "Worktree not found on disk"
 /// even though the diff was still recoverable from `SessionStarted.repo_id` +
 /// `branch`.

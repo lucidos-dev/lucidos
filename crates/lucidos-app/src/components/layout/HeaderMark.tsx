@@ -8,7 +8,7 @@ import { openWhatsNew } from '../../store/actions/menu';
 import { crossWorkspaceUnreadTotal, refreshOtherWorkspacesUnread } from '../../store/actions/app-badge';
 import { connectionNotice, connectionNoticeSentence, connectionPhrase } from '../../utils/connectionNotice';
 import { lucidosVersionLabel, lucidosVersionTooltip } from '../../utils/lucidosVersion';
-import { composeHandlers } from '../chat/promptFocus';
+import { composeHandlers } from '../chat/composeHandlers';
 import { focusSearchInput } from '../search/searchEverywhereActions';
 import { Overlay } from '../shared/Overlay';
 import { ComposeIcon, SearchIcon, HelpIcon, HomeIcon, LucidosMarkIcon } from '../shared/icons';
@@ -20,6 +20,7 @@ import { ActivityMenuGroup } from './ActivityMenuRows';
 import { WorkspaceRefreshRow, WorkspaceRestartRow } from './WorkspaceMenuRows';
 import { lazyComponent, whenLoaded, type PendingOpen } from '../../utils/lazyComponent';
 import { prefetchWhenIdle } from '../../utils/idlePrefetch';
+import { useHomeWidgetsPress } from '../widgets/HomeWidgetsMenu';
 
 /** The workspace switcher's chunk, fetched once the boot splash lifts (ADR 0288).
  *  The brand menu opens only once it is in memory, so the row never pops in. */
@@ -59,21 +60,40 @@ export function connectionNoticeRow(status: ConnectionStatus, workspace: string 
 
 /** The Lucidos menu's Home row, with its own separator, so it leaves nothing
  *  behind while the home thread is off. No thread list draws the home thread,
- *  so on a phone this row is the way to it. A plain click rather than
- *  `composeHandlers`: opening Home is for reading, so it raises no keyboard. */
-export function HomeMenuGroup({ onClose }: { onClose: () => void }) {
+ *  so this row is the way to it from the phone's thread drawer, whose header
+ *  has no Home icon. A plain click rather than
+ *  `composeHandlers`: opening Home is for reading, so it raises no keyboard.
+ *
+ *  A hold lists Home's widgets, as the Home icon's does. The row leaves with
+ *  the menu, so a picked widget opens under `near`, the menu's own anchor. */
+export function HomeMenuGroup({ onClose, near = null }: { onClose: () => void; near?: HTMLElement | null }) {
   if (!homeThreadId.value) return null;
+  return <HomeMenuRow onClose={onClose} near={near} />;
+}
+
+function HomeMenuRow({ onClose, near }: { onClose: () => void; near: HTMLElement | null }) {
+  const { press, menu } = useHomeWidgetsPress(
+    () => { onClose(); openHomeThread(); },
+    { near: () => near, onPick: onClose },
+  );
   return (
     <>
       <button
         type="button"
         class="brand-menu-item home-thread-btn"
         role="menuitem"
-        onClick={() => { onClose(); openHomeThread(); }}
+        onPointerDown={press.onPointerDown}
+        onPointerMove={press.onPointerMove}
+        onPointerUp={press.onPointerUp}
+        onPointerLeave={press.onPointerLeave}
+        onPointerCancel={press.onPointerCancel}
+        onContextMenu={(e) => { if (!e.altKey) press.onContextMenu(e); }}
+        onClick={press.onClick}
       >
         <HomeIcon />
         Home
       </button>
+      {menu}
       <div class="brand-menu-separator" role="separator" />
     </>
   );
@@ -98,17 +118,20 @@ export function HomeMenuGroup({ onClose }: { onClose: () => void }) {
  * immediately reopens it, so it never closes. See `.claude/rules/frontend.md`
  * § Modals & Popovers.
  */
-function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
+function LucidosMenu({ open, onClose, anchor, actionsInRow, homeInRow }: {
   open: boolean;
   onClose: () => void;
   anchor: HTMLElement | null;
-  /** The host's own header row already carries Home, New thread, Search
-   *  everywhere and Setup interview as icons, so the menu does not repeat them.
+  /** The host's own header row already carries New thread, Search everywhere
+   *  and Setup interview as icons, so the menu does not repeat them.
    *  True on desktop only: no mobile header has room for them, which is why
    *  they came into the menu in the first place. What is left is Workspaces and
    *  Refresh, the pair the retired workspace switcher owned and the only part of
    *  this menu desktop can reach nowhere else. */
   actionsInRow: boolean;
+  /** The host's row carries a Home icon, so the menu drops its Home row. True
+   *  on both thread pane rows; the thread drawer's row has no Home icon. */
+  homeInRow: boolean;
 }) {
   // The version of LUCIDOS the user is running: the umbrella release, plus a
   // `*` when the code has moved past it. One number, the same one on every
@@ -195,9 +218,9 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
             in under the user's eyes rather than waiting for the next open. */}
         {connectionNoticeRow(connectionStatus.value, visibleWorkspaceName.value)}
 
-        {/* The first row on a phone. Desktop has the Home icon in its
-            thread header instead (`threadHeaderActions`). */}
-        {!actionsInRow && <HomeMenuGroup onClose={onClose} />}
+        {/* The first row from the thread drawer's mark. Both thread pane rows
+            carry a Home icon instead (`ThreadHeaderHomeButton`). */}
+        {!homeInRow && <HomeMenuGroup onClose={onClose} near={anchor} />}
 
         {/* The work in flight, one row per job, which is what the spinning
             badge on the mark advertises. Above the notifications because it is
@@ -252,7 +275,7 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
         <div class="brand-menu-separator" role="separator" />
 
         {/* Three of the actions the desktop header carries as icons; Home,
-            the fourth, leads the menu above. Repeating
+            the fourth, has its own rule above. Repeating
             them there would make the menu a second copy of the row above it,
             so they render only where the row has no room for them, which is
             both mobile headers. The *setup interview* is one of the three: its
@@ -302,9 +325,8 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
  * connection light, and it opens the menu.
  *
  * `placement` names the header row the mark sits on. That decides how it is
- * DRESSED, and one thing about what it opens. A row that already carries Home,
- * New thread, Search everywhere and Setup interview as icons gets a menu
- * without them (see `LucidosMenu`'s `actionsInRow`).
+ * DRESSED, and what it opens. The menu drops any row whose action the host's
+ * row already carries as an icon (`actionsInRow`, `homeInRow`).
  *
  * - `cluster` (the mobile thread pane) is the centrepiece of a fixed-width nav
  *   cluster, at the larger tap target, and it is the connection light:
@@ -425,6 +447,7 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
         onClose={() => setOpen(false)}
         anchor={anchor}
         actionsInRow={onDesktop}
+        homeInRow={!inRow}
       />
     </>
   );

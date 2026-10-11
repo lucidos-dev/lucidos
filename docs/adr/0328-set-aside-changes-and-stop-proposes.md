@@ -1,6 +1,7 @@
 # 0328: A change can be set aside, and a Stop proposes the branch's work
 
-- **Status**: Accepted
+- **Status**: Accepted; "a Stop proposes the branch's work" is superseded by
+  [ADR 0400](0400-coding-agent-change-state.md). Set aside still holds.
 - **Date**: 2026-09-29
 
 ## Context

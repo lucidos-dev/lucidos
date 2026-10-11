@@ -243,9 +243,8 @@ describe("FieldLabel: the button never becomes the label's own control", () => {
   it('lets a checkbox row keep its explainer inline, where the input wins', () => {
     // The wrapping-label case is safe and deliberately untouched: the checkbox
     // is the FIRST labelable descendant, so it stays the label's control.
-    // The class is matched loosely because that row carries a conditional dim
-    // (`thread-filter-option-dimmed`) under a status view; what this pins is the
-    // ORDER inside the label, not the class string.
+    // The class is matched loosely: what this pins is the ORDER inside the
+    // label, not the class string.
     expect(filterPanel).toMatch(
       /<label class=[^>]*thread-filter-option[^>]*>[\s\S]*?<input[\s\S]*?<Explainer title="Include deleted">/,
     );

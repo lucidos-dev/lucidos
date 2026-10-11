@@ -15,9 +15,9 @@
  * Pure, so the decision is testable without a wheel.
  */
 
-/** Pixel-equivalent distance of one classic wheel notch. What Chrome and Safari
- *  report for one detent in `DOM_DELTA_PIXEL`, and therefore the natural size of
- *  one scale step. */
+/** Pixel-equivalent distance of one classic wheel notch, and therefore the
+ *  natural size of one scale step. Chrome reports it for one detent on Windows.
+ *  macOS reports a slow tick as far less, which `foldWheelEvent` covers. */
 const PX_PER_NOTCH = 100;
 
 /** Lines in one notch, for the engines that report `DOM_DELTA_LINE` (Firefox
@@ -64,15 +64,27 @@ export function wheelZoomDistance(deltaY: number, deltaMode: number): number {
  *
  *  Two things empty it first. An idle gap means the previous gesture ended, and
  *  a reversal means the user changed their mind. Carrying either would make the
- *  new direction wait out distance the old one banked. */
+ *  new direction wait out distance the old one banked.
+ *
+ *  A wheel turned with Cmd or Ctrl held opens its gesture with at least one
+ *  notch. macOS reports a slow mouse tick as a few pixels. Each tick also
+ *  arrives after the gap, so without the floor a slow wheel never steps. A pinch
+ *  gets no floor: Chrome sends it as ctrl-wheel with no key down, and its first
+ *  event is a sliver of the gesture, not a notch. A zero-distance event folds
+ *  nothing in, so it cannot open a gesture and spend the floor. */
 export function foldWheelEvent(
-  bank: WheelBank, distance: number, nowMs: number,
+  bank: WheelBank, distance: number, nowMs: number, modifierKeyHeld: boolean,
 ): WheelBank {
+  if (distance === 0) return bank;
   const stale = nowMs - bank.lastEventAt > WHEEL_GESTURE_GAP_MS;
-  const reversed = bank.distance !== 0 && distance !== 0
+  const reversed = bank.distance !== 0
     && Math.sign(distance) !== Math.sign(bank.distance);
-  const carried = stale || reversed ? 0 : bank.distance;
-  return { distance: carried + distance, lastEventAt: nowMs };
+  if (!(stale || reversed)) {
+    return { distance: bank.distance + distance, lastEventAt: nowMs };
+  }
+  const floor = modifierKeyHeld ? PX_PER_NOTCH : 0;
+  const opening = Math.sign(distance) * Math.max(Math.abs(distance), floor);
+  return { distance: opening, lastEventAt: nowMs };
 }
 
 /** Spend one step's worth of banked distance, or answer 0 when there is not
@@ -93,8 +105,8 @@ export function takeWheelStep(bank: WheelBank): { bank: WheelBank; step: number 
  *  No input device can ask for more scale changes than the renderer can paint,
  *  so a sustained gesture can only jank.
  *
- *  Here rather than in the component, so the whole policy is one testable unit
- *  and `ScaleModal` only decides which events are its own. */
+ *  Here rather than in the listener, so the whole policy is one testable unit
+ *  and `scaleWheelListener.ts` only decides which events are its own. */
 export function createWheelZoom(step: (direction: number) => void) {
   let bank = emptyWheelBank();
   let frame: number | null = null;
@@ -116,12 +128,14 @@ export function createWheelZoom(step: (direction: number) => void) {
 
   return {
     /** Fold one event in. The caller has already decided it is a zoom. */
-    push(deltaY: number, deltaMode: number, at: number): void {
-      bank = foldWheelEvent(bank, wheelZoomDistance(deltaY, deltaMode), at);
+    push(deltaY: number, deltaMode: number, at: number, modifierKeyHeld: boolean): void {
+      bank = foldWheelEvent(bank, wheelZoomDistance(deltaY, deltaMode), at, modifierKeyHeld);
       schedule();
     },
-    /** Drop a pending frame. For the caller's teardown. */
+    /** Drop the pending frame and whatever distance is still banked, so a
+     *  gesture the panel no longer serves cannot step after it closes. */
     stop(): void {
+      bank = emptyWheelBank();
       if (frame === null) return;
       cancelAnimationFrame(frame);
       frame = null;

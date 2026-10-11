@@ -46,7 +46,7 @@ export type Exchange = {
    *  therefore never be resolved by its own exchange, and rendering finalizes
    *  it instead of shimmering forever (see `exchangeSteps` /
    *  `exchangeResponseEvents`). Cleared if the exchange takes the continuation
-   *  back (a queued follow-up whose `UserPromptInjected` is absorbed, an
+   *  back (a queued follow-up whose `PromptInjected` is absorbed, an
    *  answered divider re-anchored to its resolution point). Only Thinking
    *  markers are stale — a pending TOOL step can still be resolved by a result
    *  that re-routes back by tool id. */
@@ -783,6 +783,8 @@ export function describeEngineTool(name: string, args: unknown): string {
     case 'create_app': return str('name') ? `Create app: ${str('name')}` : 'Create app';
     case 'create_trigger': return str('name') ? `Schedule: ${str('name')}` : 'Create trigger';
     case 'run_claude': return 'Run Claude Code';
+    // The read decision (ADR 0417): a no is quiet, a yes asks.
+    case 'request_read': return a?.read === false ? 'No read needed' : 'Asking you to read this reply';
     case 'correct_memory': return 'Correct memory';
     case 'set_language': return str('language') ? `Set language: ${str('language')}` : 'Set language';
     case 'set_timezone': return str('timezone') ? `Set timezone: ${str('timezone')}` : 'Set timezone';

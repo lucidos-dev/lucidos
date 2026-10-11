@@ -28,17 +28,39 @@ const LONG_LINE = 3;
 const TAIL = 'THE-TAIL-THE-CITATION-MEANT';
 const LONG = `const wide = ${Array.from({ length: 90 }, (_, i) => `segment_${i}`).join('_')}_${TAIL};`;
 
+/** A file long enough that a sticky box per line made a phone pan stutter. */
+const LONG_FILE_NAME = 'e2e-long-file-sample.json';
+const LONG_FILE = resolve(WORKSPACE, 'data/artifacts', LONG_FILE_NAME);
+const LONG_FILE_LINES = 3000;
+
+/** The gutter cell numbering `row`. In pan mode it lives in the gutter column
+ *  beside the code, at the row's own index; otherwise inside the row. Runs in
+ *  the page through `evaluateHandle`, so it must stay self-contained. */
+function gutterOf(row: Element): Element {
+  const inRow = row.querySelector('.line-number');
+  if (inRow) return inRow;
+  const index = Array.prototype.indexOf.call(row.parentElement!.children, row);
+  return row.closest('pre')!.querySelector('.line-numbered-gutter')!.children[index];
+}
+
+const backgroundOf = (el: Element) => getComputedStyle(el).backgroundColor;
+
 /** Geometry of one rendered row, read after panning its scroll container as far
  *  right as it goes. `tailInView` is the whole question: is the last character
  *  of the line inside the box the reader is looking at. */
 interface RowProbe {
   scrollWidth: number;
   clientWidth: number;
-  rowWidth: number;
-  /** The `<pre>`'s own width, which in pan mode is its widest row. Compared
-   *  against `rowWidth` rather than against `scrollWidth`, whose extra is the
-   *  scroll container's padding. */
+  /** From the gutter cell's left edge to the row's right edge: the band a
+   *  selected line's tint covers. In pan mode the cell sits in its own column,
+   *  so the row alone is narrower than the `<pre>` by the gutter. */
+  bandWidth: number;
+  /** The `<pre>`'s own width, which in pan mode is its widest row plus the
+   *  gutter. Compared against `bandWidth` rather than against `scrollWidth`,
+   *  whose extra is the scroll container's padding. */
   blockWidth: number;
+  /** Where the pan stood when the probe began, before it moved anything. */
+  landedScrollLeft: number;
   rowHeight: number;
   gutters: number;
   gutterShift: number;
@@ -47,10 +69,10 @@ interface RowProbe {
   scrolledBy: number;
 }
 
-function probeRow(row: Locator): Promise<RowProbe> {
-  return row.evaluate((el: HTMLElement) => {
+async function probeRow(row: Locator): Promise<RowProbe> {
+  const gutterCell = await row.evaluateHandle(gutterOf);
+  return row.evaluate((el: HTMLElement, gutter: Element) => {
     const scroller = el.closest('.file-preview-content, .repo-file-content') as HTMLElement;
-    const gutter = el.querySelector('.line-number') as HTMLElement;
     const content = el.querySelector('.line-content') as HTMLElement;
 
     // The last character's own box. A Range is the only thing that answers
@@ -69,6 +91,7 @@ function probeRow(row: Locator): Promise<RowProbe> {
       return r.right <= box.right + 1 && r.left >= box.left - 1;
     };
 
+    const landedScrollLeft = scroller.scrollLeft;
     scroller.scrollLeft = 0;
     const tailInViewUnscrolled = within(tailRect());
     const rect = el.getBoundingClientRect();
@@ -83,7 +106,8 @@ function probeRow(row: Locator): Promise<RowProbe> {
     return {
       scrollWidth: scroller.scrollWidth,
       clientWidth: scroller.clientWidth,
-      rowWidth: rect.width,
+      bandWidth: rect.right - gutter.getBoundingClientRect().left,
+      landedScrollLeft,
       blockWidth: (el.closest('.file-preview-code') as HTMLElement).getBoundingClientRect().width,
       rowHeight: rect.height,
       gutters: el.querySelectorAll('.line-number').length,
@@ -92,7 +116,7 @@ function probeRow(row: Locator): Promise<RowProbe> {
       tailInViewScrolled,
       scrolledBy,
     };
-  });
+  }, gutterCell);
 }
 
 /** Nothing outside the code region absorbed the long line: no page-level
@@ -130,11 +154,16 @@ test.describe('a source line wider than the file preview', () => {
     const lines = Array.from({ length: 12 }, (_, i) =>
       i + 1 === LONG_LINE ? LONG : `short line ${i + 1}`);
     writeFileSync(SAMPLE_FILE, `${lines.join('\n')}\n`);
+    const longFile = Array.from({ length: LONG_FILE_LINES }, (_, i) =>
+      `  "row_${i + 1}": "${'a value too wide for any screen '.repeat(9)}${i + 1}",`);
+    // No trailing newline: the preview would show it as one more, empty line.
+    writeFileSync(LONG_FILE, longFile.join('\n'));
   });
 
   test.afterAll(() => {
     rmSync(APP_DIR, { recursive: true, force: true });
     rmSync(SAMPLE_FILE, { force: true });
+    rmSync(LONG_FILE, { force: true });
   });
 
   /** Seed the remembered mode before the app boots, so a test names the mode it
@@ -202,9 +231,14 @@ test.describe('a source line wider than the file preview', () => {
     expect(cited.scrolledBy).toBeGreaterThan(0);
     expect(cited.tailInViewScrolled).toBe(true);
 
+    // The citation opened the line at its start: scrolling a row wider than
+    // the view to itself would have panned its first characters under the
+    // gutter.
+    expect(cited.landedScrollLeft).toBeLessThanOrEqual(1);
+
     // The gutter does not go with it, and the highlight runs the whole width.
     expect(cited.gutterShift).toBeLessThanOrEqual(1);
-    expect(cited.rowWidth).toBeCloseTo(cited.blockWidth, 0);
+    expect(cited.bandWidth).toBeCloseTo(cited.blockWidth, 0);
     expect(cited.blockWidth).toBeGreaterThan(cited.clientWidth);
 
     // A long line must not widen the modal, in this mode least of all.
@@ -231,14 +265,14 @@ test.describe('a source line wider than the file preview', () => {
 
   // ── The same renderer, behind the Files panel ──
 
-  async function openInFilesPanel(page: Page, wrap: boolean) {
+  async function openInFilesPanel(page: Page, wrap: boolean, name = SAMPLE_NAME) {
     await bootWithWrap(page, wrap);
     await gotoWithRetry(page, '/');
     await ensureOnThreadPane(page);
     await waitForVisibleInput(page);
     await openFilesPanel(page);
     await waitForVisibleElement(page, '.file-item', 15_000);
-    expect(await clickVisibleElement(page, '.file-item', SAMPLE_NAME)).toBe(true);
+    expect(await clickVisibleElement(page, '.file-item', name)).toBe(true);
     await expect(row(page, LONG_LINE)).toBeVisible({ timeout: 10_000 });
   }
 
@@ -266,29 +300,83 @@ test.describe('a source line wider than the file preview', () => {
     expect(await pageDoesNotPan(page)).toBe(true);
   });
 
+  // ── A long file, where a sticky box per line made a phone pan stutter ──
+
+  test('pans a long file under one pinned gutter, every row level with its number', async ({ page }) => {
+    await openInFilesPanel(page, false, LONG_FILE_NAME);
+    const pre = page.locator('.line-numbered-pan:visible').first();
+    await expect(pre.locator(`.code-line[data-line="${LONG_FILE_LINES}"]`)).toHaveCount(1);
+
+    const probe = await pre.evaluate((el: HTMLElement, last: number) => {
+      const scroller = el.closest('.file-preview-content') as HTMLElement;
+      const gutter = el.querySelector('.line-numbered-gutter') as HTMLElement;
+      const cells = gutter.children;
+      const rowOf = (n: number) => el.querySelector(`.code-line[data-line="${n}"]`) as HTMLElement;
+      const skew = (n: number) => Math.abs(
+        cells[n - 1].getBoundingClientRect().top - rowOf(n).getBoundingClientRect().top);
+      let sticky = 0;
+      for (const node of el.querySelectorAll('*')) if (getComputedStyle(node).position === 'sticky') sticky++;
+
+      scroller.scrollLeft = 0;
+      const before = gutter.getBoundingClientRect().left;
+      scroller.scrollLeft = scroller.scrollWidth;
+      const scrolledBy = scroller.scrollLeft;
+      const shift = Math.abs(gutter.getBoundingClientRect().left - before);
+      // The pinned column paints above the code passing beneath it. Read the
+      // whole stack at mid-screen: phone chrome such as the edge-swipe strip
+      // lies over both, so the topmost element alone says nothing.
+      const box = gutter.getBoundingClientRect();
+      const stack = document.elementsFromPoint(box.left + box.width / 2, innerHeight / 2);
+      const gutterAt = stack.findIndex(n => n.closest('.line-numbered-gutter'));
+      const codeAt = stack.findIndex(n => n.closest('.line-numbered-code'));
+      const onTop = gutterAt >= 0 && (codeAt < 0 || gutterAt < codeAt);
+      scroller.scrollLeft = 0;
+      return {
+        sticky, cellCount: cells.length, scrolledBy, shift, onTop,
+        firstSkew: skew(1), lastSkew: skew(last),
+        lastNumber: cells[last - 1].getAttribute('data-line-number'),
+      };
+    }, LONG_FILE_LINES);
+
+    // One pinned box for the whole file, never one per line.
+    expect(probe.sticky).toBe(1);
+    expect(probe.cellCount).toBe(LONG_FILE_LINES);
+    expect(probe.lastNumber).toBe(String(LONG_FILE_LINES));
+    // The pan moves the code and leaves the gutter where it was, on top.
+    expect(probe.scrolledBy).toBeGreaterThan(0);
+    expect(probe.shift).toBeLessThanOrEqual(1);
+    expect(probe.onTop).toBe(true);
+    // Rows and numbers are separate columns, so they must not drift apart.
+    expect(probe.firstSkew).toBeLessThanOrEqual(1);
+    expect(probe.lastSkew).toBeLessThanOrEqual(1);
+    expect(await pageDoesNotPan(page)).toBe(true);
+  });
+
   // ── The pinned gutter's colour, in both themes ──
 
   /** What the gutter and its row actually paint, and what they sit on.
    *
-   *  A sticky gutter paints over the code passing beneath it, so its colour is
-   *  load-bearing rather than decorative. It has to be the row's own, or the
-   *  cited line's tint breaks at the gutter. The row's has to be the
-   *  container's, or the strip reads as a band in the wrong grey. Neither is
-   *  visible to the other assertions here, and both change with the theme. */
-  function paintOf(scope: Locator, surface: string) {
-    return scope.evaluate((panel: HTMLElement, opts: { sel: string; line: number }) => {
-      const bg = (el: Element) => getComputedStyle(el).backgroundColor;
-      const of = (line: number) => {
-        const el = panel.querySelector(`.code-line[data-line="${line}"]`)!;
-        return { row: bg(el), gutter: bg(el.querySelector('.line-number')!) };
-      };
+   *  The pinned gutter column paints over the code passing beneath it, so its
+   *  colour is load-bearing rather than decorative. It has to be the
+   *  container's, or the strip reads as a band in the wrong grey. A cited
+   *  cell's tint has to be its row's, or the highlight breaks at the gutter.
+   *  Neither is visible to the other assertions here, and both change with
+   *  the theme. */
+  async function paintOf(scope: Locator, surface: string) {
+    const of = async (line: number) => {
+      const el = scope.locator(`.code-line[data-line="${line}"]`).first();
       return {
-        theme: document.documentElement.getAttribute('data-theme-mode'),
-        surface: bg(document.querySelector(opts.sel)!),
-        cited: of(opts.line),
-        plain: of(1),
+        row: await el.evaluate(backgroundOf),
+        gutter: await (await el.evaluateHandle(gutterOf)).evaluate(backgroundOf),
       };
-    }, { sel: surface, line: LONG_LINE });
+    };
+    return {
+      theme: await scope.page().evaluate(() => document.documentElement.getAttribute('data-theme-mode')),
+      surface: await scope.page().locator(surface).evaluate(backgroundOf),
+      column: await scope.locator('.line-numbered-gutter').evaluate(backgroundOf),
+      cited: await of(LONG_LINE),
+      plain: await of(1),
+    };
   }
 
   for (const theme of ['dark', 'light'] as const) {
@@ -298,12 +386,13 @@ test.describe('a source line wider than the file preview', () => {
       const paint = await paintOf(modal, '[data-role="file-preview-modal"]');
 
       expect(paint.theme, 'the emulated scheme did not reach the document').toBe(theme);
-      // An ordinary row is the panel's own surface, so the pinned strip reads
-      // as the page rather than as a band.
-      expect(paint.plain.row).toBe(paint.surface);
-      // And the gutter is whatever its row is wearing, tinted or not, so the
-      // cited line's highlight runs unbroken across it.
-      expect(paint.plain.gutter).toBe(paint.plain.row);
+      // The pinned column is the panel's own surface, so it reads as the page
+      // rather than as a band.
+      expect(paint.column).toBe(paint.surface);
+      // An ordinary row and cell paint nothing, so both show that surface.
+      expect(paint.plain.row).toBe(paint.plain.gutter);
+      // The cited cell wears its row's tint, so the highlight runs unbroken
+      // across the gutter.
       expect(paint.cited.gutter).toBe(paint.cited.row);
       expect(paint.cited.row).not.toBe(paint.plain.row);
     });

@@ -43,6 +43,13 @@ html {
     --z-sticky: 200;
     --z-drawer: 300;
     --z-control-panel: 2200;
+    /* The floor of the widget windows' band (ADR 0419). Each window adds its
+       stack rank. They float over the panes, the drawer and the header
+       chrome, and under popovers, menus, modals and toasts. */
+    --z-widget-window: 2210;
+    /* Popovers and menus, above the header chrome they open from and above
+       the widget windows, so a menu is never drawn behind a window. */
+    --z-popover: 2220;
     /* A pseudo-fullscreen app panel (.app-ui-fullscreen, the CSS fallback used
        where the Fullscreen API is unavailable) covers the header chrome (2200)
        and is covered by the modal layer (2300). Both halves are load-bearing:
@@ -566,7 +573,7 @@ html, html[data-theme-mode="dark"] {
        .pane-header, so a theme can retune it (panels/shell.css). */
     --header-fg: #ffffff;
     /* An alpha of its own, because the Filter glyph paints the muted tone as
-       an opaque shape under a group opacity (.filter-glyph in shell.css). */
+       an opaque shape under a group opacity (.crossfade-glyph in shell.css). */
     --header-fg-muted-alpha: 0.72;
     --header-fg-muted: color-mix(in srgb, var(--header-fg) calc(var(--header-fg-muted-alpha) * 100%), transparent);
     /* The veil steps a header control wears, as alphas of --header-fg: one step

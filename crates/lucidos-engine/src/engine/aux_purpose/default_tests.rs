@@ -1,7 +1,8 @@
 use std::sync::{Arc, RwLock};
 
 use super::*;
-use crate::llm::model_registry::{load_from_db, resolve_route};
+use crate::engine::aux_purpose::NotServed;
+use crate::llm::model_registry::{load_from_db, resolve_route, ProviderKind};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
 /// Every purpose that runs on a chat model through [`super::super::AuxCall`].
@@ -14,6 +15,7 @@ const CHAT_MODEL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::QueryClassification,
     ContextPurpose::MemoryFind,
     ContextPurpose::CommandJudge,
+    ContextPurpose::ReadDecision,
 ];
 
 const CHAT_MODEL: &str = "claude-opus-5-5";
@@ -36,7 +38,7 @@ fn resolved(
         &keep_capable(purpose, recommended_with(purpose, None), registry),
         CHAT_MODEL,
         registry,
-        only(kinds),
+        &Reach::configured(kinds),
     );
     let provider = resolve_route(registry, &model, None, only(kinds))
         .ok()
@@ -59,46 +61,37 @@ async fn the_default_follows_the_configured_providers() {
     let sol = "gpt-6.1-sol";
     let flash38 = "gemini-3.8-flash";
     let sonnet = "claude-sonnet-5-5";
-    // Per install: most purposes, the judge, extraction, the summary.
-    let rows: &[(&[ProviderKind], Served, Served, Served, Served)] = &[
+    // Per install: most purposes (the judge among them), extraction, the
+    // summary. The judge's measured default leads the shared fallbacks, so it
+    // resolves like the rest.
+    let rows: &[(&[ProviderKind], Served, Served, Served)] = &[
         (
             &[Vertex],
             (gemini, Vertex),
-            (haiku, Vertex),
             (gemini, Vertex),
             (flash38, Vertex),
         ),
         (
             &ProviderKind::ALL,
             (gemini, Vertex),
-            (haiku, Vertex),
             (luna, OpenAi),
             (sol, OpenAi),
         ),
         (
             &[Vertex, Anthropic],
             (gemini, Vertex),
-            (haiku, Vertex),
             (gemini, Vertex),
             (flash38, Vertex),
         ),
         (
             &[OpenRouter],
             (gemini, OpenRouter),
-            (haiku, OpenRouter),
             (luna, OpenRouter),
             (sol, OpenRouter),
         ),
-        (
-            &[OpenAi],
-            (mini, OpenAi),
-            (mini, OpenAi),
-            (luna, OpenAi),
-            (sol, OpenAi),
-        ),
+        (&[OpenAi], (mini, OpenAi), (luna, OpenAi), (sol, OpenAi)),
         (
             &[Anthropic],
-            (haiku, Anthropic),
             (haiku, Anthropic),
             (haiku, Anthropic),
             (sonnet, Anthropic),
@@ -106,15 +99,13 @@ async fn the_default_follows_the_configured_providers() {
         (
             &[OpenAi, Anthropic],
             (mini, OpenAi),
-            (haiku, Anthropic),
             (luna, OpenAi),
             (sol, OpenAi),
         ),
     ];
-    for (kinds, most, judge, extraction, summary) in rows {
+    for (kinds, most, extraction, summary) in rows {
         for purpose in CHAT_MODEL_PURPOSES {
             let expected = match purpose {
-                ContextPurpose::CommandJudge => judge,
                 ContextPurpose::Memory => extraction,
                 ContextPurpose::ConversationSummary => summary,
                 _ => most,
@@ -167,13 +158,74 @@ async fn a_stored_pick_is_never_substituted() {
         &recommended_with(ContextPurpose::Title, None),
         CHAT_MODEL,
         &registry,
-        only(&kinds),
+        &Reach::configured(&kinds),
     );
     assert_eq!(
         (model.as_str(), source),
         ("gemini-3-flash-preview", ModelSource::Preference)
     );
-    assert!(!is_reachable(&model, &registry, only(&kinds)));
+    assert!(!Reach::configured(&kinds).serves(&registry, &model));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// When Vertex stops serving the judge's default, the judge moves to the next
+/// model Vertex serves. The failing call retries on it (I4).
+#[tokio::test]
+async fn a_not_served_default_moves_to_the_next_reachable_model() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    let gemini = "gemini-3-flash-preview";
+    let haiku = "claude-haiku-4-5";
+    let purpose = ContextPurpose::CommandJudge;
+    let list = keep_capable(purpose, recommended_with(purpose, None), &registry);
+    let fresh = Reach::configured(&[ProviderKind::Vertex]);
+    let retired = Reach::new(
+        vec![ProviderKind::Vertex],
+        NotServed::of(&[(ProviderKind::Vertex, gemini)]),
+    );
+    assert_eq!(list[0], gemini);
+    // GPT-5.4 mini comes between them, but Vertex does not serve it.
+    assert_eq!(
+        next_reachable(gemini, &list, &registry, &fresh).as_deref(),
+        Some(haiku)
+    );
+    let (model, source) = select(None, &list, CHAT_MODEL, &registry, &retired);
+    assert_eq!((model.as_str(), source), (haiku, ModelSource::Default));
+    assert_eq!(
+        passed_over(&model, source, &list, &registry, &retired),
+        [gemini]
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A stored pick its provider refuses stays the pick and reads unreachable.
+/// Moving it would substitute a model the user never chose (I2).
+#[tokio::test]
+async fn a_not_served_stored_pick_stays_the_pick() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    let haiku = "claude-haiku-4-5";
+    let purpose = ContextPurpose::CommandJudge;
+    let list = recommended_with(purpose, None);
+    let retired = Reach::new(
+        vec![ProviderKind::Vertex],
+        NotServed::of(&[(ProviderKind::Vertex, haiku)]),
+    );
+    let (model, source) = select(
+        Some(haiku.to_string()),
+        &list,
+        CHAT_MODEL,
+        &registry,
+        &retired,
+    );
+    assert_eq!((model.as_str(), source), (haiku, ModelSource::Preference));
+    assert!(!retired.serves(&registry, &model));
+    assert_eq!(
+        passed_over(&model, source, &list, &registry, &retired),
+        [haiku]
+    );
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -236,7 +288,7 @@ async fn a_stored_text_only_pick_stays_the_pick() {
         &keep_capable(purpose, recommended_with(purpose, None), &registry),
         CHAT_MODEL,
         &registry,
-        only(&ProviderKind::ALL),
+        &Reach::configured(&ProviderKind::ALL),
     );
     assert_eq!(
         (model.as_str(), source),
@@ -250,18 +302,18 @@ async fn a_stored_text_only_pick_stays_the_pick() {
 /// read it. It goes ahead of a purpose's measured lead too.
 #[test]
 fn the_extraction_override_leads_all_but_the_judge() {
-    let with_env = |purpose| recommended_with(purpose, Some("gemini-3.5-flash"));
-    assert_eq!(with_env(ContextPurpose::Memory)[0], "gemini-3.5-flash");
+    let with_env = |purpose| recommended_with(purpose, Some("gemini-3.8-flash"));
+    assert_eq!(with_env(ContextPurpose::Memory)[0], "gemini-3.8-flash");
     assert!(with_env(ContextPurpose::Memory)[1..].starts_with(
         &purpose_lead(ContextPurpose::Memory)
             .iter()
             .map(|m| m.to_string())
             .collect::<Vec<_>>()
     ));
-    assert_eq!(with_env(ContextPurpose::Title)[0], "gemini-3.5-flash");
+    assert_eq!(with_env(ContextPurpose::Title)[0], "gemini-3.8-flash");
     assert_eq!(
         with_env(ContextPurpose::CommandJudge)[0],
-        "claude-haiku-4-5"
+        "gemini-3-flash-preview"
     );
 }
 

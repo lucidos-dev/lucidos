@@ -10,7 +10,7 @@
  * threads pane that the list toggle holds on the pane beside it.
  *
  * Invokes the component directly and walks the returned VNode tree, the same way
- * `thread-toggle-attention-badge.test.tsx` does: the button is hook-free at its
+ * `thread-toggle-blocked-badge.test.tsx` does: the button is hook-free at its
  * own level, and the walk never calls a nested component.
  */
 import { beforeEach, describe, expect, it } from 'vitest';

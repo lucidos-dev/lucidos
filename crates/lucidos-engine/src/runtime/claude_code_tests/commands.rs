@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn cc_control_request_interrupt_serializes() {
-    let json = cc_control_request_to_json(&ControlRequest::Interrupt, "test-id-123");
+    let json = cc_control_request_to_json(&ControlRequest::Interrupt, "test-id-123").unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["type"], "control_request");
     assert_eq!(parsed["request_id"], "test-id-123");
@@ -16,11 +16,22 @@ fn cc_control_request_set_model_serializes() {
             model: "claude-sonnet-4-6".to_string(),
         },
         "test-id-456",
-    );
+    )
+    .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["type"], "control_request");
     assert_eq!(parsed["request"]["subtype"], "set_model");
     assert_eq!(parsed["request"]["model"], "claude-sonnet-4-6");
+}
+
+/// Claude Code answers `set_reasoning_effort` with `Unsupported control
+/// request subtype`, so no line for it is ever written.
+#[test]
+fn cc_control_request_never_serializes_a_reasoning_effort() {
+    let request = ControlRequest::SetReasoningEffort {
+        effort: "low".to_string(),
+    };
+    assert_eq!(cc_control_request_to_json(&request, "test-id"), None);
 }
 
 /// The mode is chosen once, in Settings, and passed at spawn. A mid-session
@@ -194,26 +205,24 @@ fn the_model_rows_run_newest_version_first() {
 
 #[test]
 fn control_request_deserializes_all_variants() {
-    let cases = vec![
-        (r#"{"subtype":"interrupt"}"#, "interrupt"),
+    let cases = [
+        (r#"{"subtype":"interrupt"}"#, Some("interrupt")),
         (
             r#"{"subtype":"set_model","model":"claude-sonnet-4-6"}"#,
-            "set_model",
+            Some("set_model"),
         ),
         (
             r#"{"subtype":"set_reasoning_effort","effort":"high"}"#,
-            "set_reasoning_effort",
+            None,
         ),
     ];
     for (json, expected_subtype) in cases {
         let req: ControlRequest = serde_json::from_str(json).unwrap();
-        let serialized = cc_control_request_to_json(&req, "test-id");
-        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(
-            parsed["request"]["subtype"], expected_subtype,
-            "Failed for: {}",
-            json
-        );
+        let subtype = cc_control_request_to_json(&req, "test-id").map(|line| {
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+            parsed["request"]["subtype"].as_str().unwrap().to_string()
+        });
+        assert_eq!(subtype.as_deref(), expected_subtype, "Failed for: {json}");
     }
 }
 

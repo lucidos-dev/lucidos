@@ -41,6 +41,7 @@ async fn ask(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {
             options: vec![opt("opt-0", "A")],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
     )
     .await;
@@ -80,7 +81,7 @@ async fn wait_delivery(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
     emit(
         bus,
         thread_id,
-        ThreadEvent::UserPromptInjected {
+        ThreadEvent::PromptInjected {
             text: text.into(),
             mode: ActorMode::Agent,
             origin: None,
@@ -103,7 +104,7 @@ async fn wait_expiry(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
     emit(
         bus,
         thread_id,
-        ThreadEvent::UserPromptInjected {
+        ThreadEvent::PromptInjected {
             text: text.into(),
             mode: ActorMode::Agent,
             origin: None,
@@ -189,7 +190,7 @@ async fn only_a_delivery_is_held() {
     let resume_note = emit(
         &bus,
         thread_id,
-        ThreadEvent::UserPromptInjected {
+        ThreadEvent::PromptInjected {
             text: "resumed".into(),
             mode: ActorMode::Engine,
             origin: None,
@@ -346,7 +347,7 @@ async fn the_resume_finds_an_anchor_its_resolution_does_not_precede() {
         emit(
             &bus,
             thread_id,
-            ThreadEvent::UserPromptInjected {
+            ThreadEvent::PromptInjected {
                 text: text.into(),
                 mode: ActorMode::Agent,
                 origin: None,
@@ -359,7 +360,7 @@ async fn the_resume_finds_an_anchor_its_resolution_does_not_precede() {
     emit(
         &bus,
         thread_id,
-        ThreadEvent::UserPromptInjected {
+        ThreadEvent::PromptInjected {
             text: "an acknowledged message".into(),
             mode: ActorMode::Agent,
             origin: None,

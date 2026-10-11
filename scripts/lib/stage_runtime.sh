@@ -208,6 +208,8 @@ stage_runtime_fetch_postgres() {
 # read path). The engine finds it via LUCIDOS_SYSTEM_KNOWHOW_DIR (set by the
 # desktop/gateway launcher + install service to <resources>/system-knowhow);
 # omitting it silently degrades every packaged install to no reference docs.
+# `system-widgets/` holds the built-in widgets, found the same way through
+# LUCIDOS_SYSTEM_WIDGETS_DIR (ADR 0415).
 stage_runtime_assemble() {
     local stage="$1"; shift
     [ -n "$stage" ] || { echo "ERROR: stage_runtime_assemble needs a stage dir" >&2; return 1; }
@@ -258,11 +260,13 @@ stage_runtime_assemble() {
     printf '%s\n' "$stage"
 }
 
-# ── staged-knowhow freshness (the hand-run-build guard) ──────────────────────
+# ── staged source-tree freshness (the hand-run-build guard) ──────────────────
 
-# stage_runtime_staged_knowhow_fresh <stage-dir> <system-knowhow-dir>
-# Exit 0 when <stage-dir>/system-knowhow either does not exist or is byte-identical
-# to <system-knowhow-dir>; non-zero with the diff on stderr when it has drifted.
+# stage_runtime_staged_copy_fresh <stage-dir> <live-dir>
+# Exit 0 when <stage-dir>/<basename of live-dir> either does not exist or is
+# byte-identical to <live-dir>; non-zero with the diff on stderr when it has
+# drifted. Asked of every staged SOURCE tree: system-knowhow/ and
+# system-widgets/.
 #
 # WHY THIS EXISTS. stage_runtime_assemble above rm -rf's the stage and re-copies,
 # so every sanctioned build path is correct by construction. What is NOT correct
@@ -270,43 +274,42 @@ stage_runtime_assemble() {
 # crates/lucidos-app/bundle-resources/, it is gitignored, and it survives from one
 # run to the next. A `cargo tauri build --config '<resource map>'` typed by hand
 # skips step 4 and hands Tauri whatever that leftover holds, so a months-old copy
-# of system-knowhow/ gets packaged and nothing says a word. That is the hole: not
+# of a source tree gets packaged and nothing says a word. That is the hole: not
 # a wrong copy (the builds fix that), a stale one nobody is told about. Found
-# 2026-08-07 with 12,732 chars of stale descriptions staged against 6,584 live,
-# including a whole doc that had been rewritten.
+# with 12,732 chars of stale system-knowhow descriptions staged against 6,584
+# live, including a whole doc that had been rewritten.
 #
-# system-knowhow/ is the only staged resource this can be asked of: it is the one
-# that is a git-tracked SOURCE tree with an exact live counterpart, so the
-# comparison is a byte diff. The binaries, postgres/, frontend/ and sdk/ are build
-# outputs where "fresh" is undefined without rebuilding them, and a timestamp
-# heuristic there would fail open.
+# Only a git-tracked SOURCE tree with an exact live counterpart can be asked,
+# since the comparison is a byte diff. The binaries, postgres/, frontend/ and
+# sdk/ are build outputs where "fresh" is undefined without rebuilding them, and
+# a timestamp heuristic there would fail open.
 #
-# An absent stage, or a stage with no system-knowhow/ in it, is CLEAN. A developer
-# who has never run build-dmg.sh has no bundle-resources/ at all, and this must not
+# An absent stage, or a stage without this tree in it, is CLEAN. A developer who
+# has never run build-dmg.sh has no bundle-resources/ at all, and this must not
 # turn their `cargo tauri build` red. The fast path tests -e rather than -d so that
-# ABSENT is the only thing it waves through: a staged system-knowhow that is not a
+# ABSENT is the only thing it waves through: a staged copy that is not a
 # directory is something gone wrong, and `diff -r` reports the type mismatch as the
 # drift it is instead of the guard reading it as nothing to check.
-stage_runtime_staged_knowhow_fresh() {
-    local stage="$1" system_knowhow="$2" staged drift
-    staged="$stage/system-knowhow"
+stage_runtime_staged_copy_fresh() {
+    local stage="$1" live="$2" name staged drift
+    name="$(basename "$live")"
+    staged="$stage/$name"
     [ -e "$staged" ] || return 0
-    [ -d "$system_knowhow" ] || {
-        echo "ERROR: system-knowhow dir not found: $system_knowhow" >&2
+    [ -d "$live" ] || {
+        echo "ERROR: $name dir not found: $live" >&2
         return 1
     }
 
-    drift="$(diff -r "$system_knowhow" "$staged" 2>&1)" && return 0
+    drift="$(diff -r "$live" "$staged" 2>&1)" && return 0
 
     {
-        echo "ERROR: the staged system-knowhow copy has drifted from the live tree."
-        echo "  live:   $system_knowhow"
+        echo "ERROR: the staged $name copy has drifted from the live tree."
+        echo "  live:   $live"
         echo "  staged: $staged"
         echo ""
         echo "$drift"
         echo ""
-        echo "A packaged build would ship the STAGED text, so the workspace LLM would"
-        echo "route on descriptions that no longer match the docs. Restage it:"
+        echo "A packaged build would ship the STAGED copy, not the tree in git. Restage it:"
         echo "  ./scripts/build-dmg.sh          # restages from scratch, then builds"
         echo "or drop the leftover so the next build rebuilds it:"
         echo "  rm -rf '$stage'"

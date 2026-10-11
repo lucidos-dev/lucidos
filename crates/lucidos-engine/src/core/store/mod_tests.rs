@@ -780,6 +780,182 @@ async fn thread_events_page_reports_no_max_sequence_for_an_empty_thread() {
     teardown_test_db(&db).await;
 }
 
+/// Insert one thread row of `event_type` with `payload` at second `seq` and
+/// sequence `seq`, so clock order and sequence order agree.
+async fn insert_typed_thread_event(
+    pool: &PgPool,
+    thread_id: Uuid,
+    seq: i64,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, created, thread_id, sequence) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(event_type)
+    .bind(payload)
+    .bind(base + chrono::Duration::seconds(seq))
+    .bind(thread_id)
+    .bind(seq)
+    .execute(pool)
+    .await
+    .expect("insert typed thread event");
+}
+
+/// A message row.
+async fn insert_message(pool: &PgPool, thread_id: Uuid, seq: i64) {
+    let payload = json!({ "text": "hello", "channel": "chat" });
+    insert_typed_thread_event(pool, thread_id, seq, "MessageReceived", payload).await;
+}
+
+/// A `ContextCaptured` row as the engine serializes it for `purpose`. A
+/// `Turn` writes no `purpose` key.
+async fn insert_capture(
+    pool: &PgPool,
+    thread_id: Uuid,
+    seq: i64,
+    purpose: crate::engine::ContextPurpose,
+) {
+    let event = crate::engine::model_call::auxiliary_capture(purpose, "m", 1, None, false);
+    let payload = serde_json::to_value(&event).expect("serialize capture");
+    insert_typed_thread_event(pool, thread_id, seq, "ContextCaptured", payload).await;
+}
+
+/// A turn capture, which carries the inline context chip.
+async fn insert_turn_capture(pool: &PgPool, thread_id: Uuid, seq: i64) {
+    insert_capture(pool, thread_id, seq, crate::engine::ContextPurpose::Turn).await;
+}
+
+/// An auxiliary capture, which the transcript never draws.
+async fn insert_auxiliary_capture(pool: &PgPool, thread_id: Uuid, seq: i64) {
+    insert_capture(pool, thread_id, seq, crate::engine::ContextPurpose::Title).await;
+}
+
+/// A page serves drawable history: it skips auxiliary captures and keeps turn
+/// captures, which carry the inline context chip.
+#[tokio::test]
+async fn thread_events_page_skips_auxiliary_captures_and_keeps_turn_captures() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    insert_message(&pool, thread, 1).await;
+    insert_turn_capture(&pool, thread, 2).await;
+    insert_auxiliary_capture(&pool, thread, 3).await;
+    insert_message(&pool, thread, 4).await;
+    insert_auxiliary_capture(&pool, thread, 5).await;
+    insert_auxiliary_capture(&pool, thread, 6).await;
+
+    let page = store
+        .get_thread_events_page(thread, None, 2)
+        .await
+        .expect("page");
+    let seqs: Vec<i64> = page.events.iter().map(|e| e.sequence).collect();
+    assert_eq!(seqs, vec![2, 4], "the newest two drawable rows");
+    assert!(page.has_more, "the message at 1 remains");
+    assert_eq!(
+        page.max_sequence,
+        Some(6),
+        "the watermark counts the auxiliary captures the page skips"
+    );
+
+    let older = store
+        .get_thread_events_page(thread, Some((page.events[0].created, 2)), 2)
+        .await
+        .expect("older page");
+    let older_seqs: Vec<i64> = older.events.iter().map(|e| e.sequence).collect();
+    assert_eq!(older_seqs, vec![1]);
+    assert!(!older.has_more);
+
+    let unpaged = store
+        .get_thread_events_by_seq(thread, None)
+        .await
+        .expect("unpaged read");
+    assert_eq!(unpaged.len(), 6, "the unpaged read stays complete");
+
+    teardown_test_db(&db).await;
+}
+
+/// The SQL predicate agrees with the serializer for every purpose. Every
+/// auxiliary purpose is skipped, and a turn is served with or without its key.
+/// The explicit `"turn"` literal pins the client's reading of the wire: the
+/// engine never writes it, and `isAuxiliaryCapture` treats it as a turn.
+#[tokio::test]
+async fn thread_events_page_classifies_every_purpose_like_the_transcript() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    insert_turn_capture(&pool, thread, 1).await;
+    let explicit_turn = json!({ "producer": "main_llm", "purpose": "turn" });
+    insert_typed_thread_event(&pool, thread, 2, "ContextCaptured", explicit_turn).await;
+    let auxiliary = crate::engine::aux_purpose::ALL_PURPOSES
+        .iter()
+        .filter(|p| !p.is_turn());
+    for (i, purpose) in auxiliary.enumerate() {
+        insert_capture(&pool, thread, 10 + i as i64, *purpose).await;
+    }
+
+    let page = store
+        .get_thread_events_page(thread, None, 100)
+        .await
+        .expect("page");
+    let seqs: Vec<i64> = page.events.iter().map(|e| e.sequence).collect();
+    assert_eq!(seqs, vec![1, 2], "only the two turn captures are drawable");
+
+    teardown_test_db(&db).await;
+}
+
+/// Only auxiliary captures behind a page is nothing to fetch. Otherwise the
+/// client pages through rows it then throws away.
+#[tokio::test]
+async fn thread_events_page_has_no_more_when_only_auxiliary_captures_remain() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    insert_auxiliary_capture(&pool, thread, 1).await;
+    insert_auxiliary_capture(&pool, thread, 2).await;
+    insert_message(&pool, thread, 3).await;
+    insert_message(&pool, thread, 4).await;
+
+    let page = store
+        .get_thread_events_page(thread, None, 2)
+        .await
+        .expect("page");
+    let seqs: Vec<i64> = page.events.iter().map(|e| e.sequence).collect();
+    assert_eq!(seqs, vec![3, 4]);
+    assert!(!page.has_more, "only auxiliary captures lie behind");
+
+    teardown_test_db(&db).await;
+}
+
+/// A thread of only auxiliary captures serves an empty page that still carries
+/// the watermark. Without it the client's next delta would refetch every row.
+#[tokio::test]
+async fn an_empty_drawable_page_still_reports_the_threads_max_sequence() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    for seq in 1..=3 {
+        insert_auxiliary_capture(&pool, thread, seq).await;
+    }
+
+    let page = store
+        .get_thread_events_page(thread, None, 10)
+        .await
+        .expect("page");
+    assert!(page.events.is_empty());
+    assert!(!page.has_more);
+    assert_eq!(page.max_sequence, Some(3));
+
+    teardown_test_db(&db).await;
+}
+
 /// One thread holding a real event and all four side-question events. Returns
 /// the thread and the id of one side-question row.
 async fn a_thread_with_side_questions(pool: &PgPool) -> (Uuid, Uuid) {

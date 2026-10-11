@@ -35,7 +35,7 @@
  *
  * The two rules are deliberate copies, one per component file, and the headers
  * sit one above the other inside a turn: if they degrade differently they read
- * as two different widgets. Nothing but this test holds the copies together.
+ * as two different controls. Nothing but this test holds the copies together.
  *
  * The other half of the contract is WHERE the row's other fields sit once the
  * cluster is two lines, and it is pinned here because it is the same layout
@@ -247,7 +247,7 @@ describe('turn header meta stacking', () => {
       return [
         ...CONTRACT.map(([prop]) => `${prop}: ${effective(rules, prop)}`),
         // The first field's sizing joins the comparison for the same reason the
-        // wrap contract is in it: a turn's two headers are read as one widget,
+        // wrap contract is in it: a turn's two headers are read as one control,
         // so one of them aligning its status differently is the same class of
         // bug as one of them wrapping differently.
         `first-field: ${field?.props.get('display')} ${field?.props.get('align-items')} ${field?.props.get('min-height')}`,

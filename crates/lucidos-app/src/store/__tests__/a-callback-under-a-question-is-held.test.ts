@@ -31,7 +31,7 @@ const CHILD_RETURNED = {
 } as ThreadEvent;
 
 const DELIVERY_ANCHOR = {
-  type: 'UserPromptInjected', text: 'An event you subscribed to has arrived', mode: 'agent',
+  type: 'PromptInjected', text: 'An event you subscribed to has arrived', mode: 'agent',
 } as ThreadEvent;
 
 /** Status as the transcript renders it while the thread is parked on the
@@ -51,7 +51,7 @@ describe('a callback under an open question', () => {
   const last = exchanges.length - 1;
 
   it('is held, never "Requesting"', () => {
-    expect(exchanges[last].userEvent.type).toBe('UserPromptInjected');
+    expect(exchanges[last].userEvent.type).toBe('PromptInjected');
     expect(parkedStatus(exchanges, last)).toBe('held');
     expect(statusLabel('held', false).label).toBe('Not read yet');
   });

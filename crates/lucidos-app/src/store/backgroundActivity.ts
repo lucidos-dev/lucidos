@@ -33,7 +33,7 @@ import type { EmbeddingModelStatus } from '../api/types';
 import type { TailscaleServeProgress } from '../utils/tauri';
 import type { CommitGroup, CommitGroupKind, PendingCommits } from '../api/client';
 import { formatBytes } from '../utils/formatBytes';
-import { formatElapsed } from '../utils/formatTime';
+import { formatElapsed } from '../utils/elapsed';
 
 /** Last known embedding-model status, or `null` before the first read.
  *

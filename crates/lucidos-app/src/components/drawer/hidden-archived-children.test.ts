@@ -15,12 +15,14 @@ import {
     computeFamilyDecorations,
     computeHiddenArchivedThreads,
     filterHiddenArchived,
+    inboxThreadCount,
     visibleChildrenCount,
     orderedCurrentForReview,
     renderedFamilyRows,
 } from './ThreadDrawer';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
 import type { ArchiveState } from '../../generated/thread-lifecycle';
+import type { CodingAgentChangeState } from '../../api/threads';
 
 type ThreadOpts = {
     parentId?: string;
@@ -28,7 +30,7 @@ type ThreadOpts = {
     status?: ThreadStatus;
     saved?: boolean;
     totalChildrenCount?: number;
-    codingAgentProposed?: boolean;
+    codingAgentChangeState?: CodingAgentChangeState;
 };
 
 function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
@@ -47,10 +49,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         activeChildrenCount: 0,
         totalChildrenCount: opts.totalChildrenCount ?? 0,
         blockingDescendantCount: 0, attentionDescendantCount: 0,
-        codingAgentHasDiff: false,
-        codingAgentProposed: opts.codingAgentProposed ?? false,
-        codingAgentRequiresRestart: false,
-        codingAgentIncomplete: false,
+        codingAgentChangeState: opts.codingAgentChangeState ?? { kind: 'none' },
         codingAgentIsExternalRepo: false,
         lastRevivedAt: '',
         parentThreadId: opts.parentId,
@@ -274,5 +273,20 @@ describe('orderedCurrentForReview excludes default-hidden archived branches', ()
 
         const ordered = orderedCurrentForReview(threads, graph).map(t => t.meta.id);
         expect(ordered).toEqual(['parent']);
+    });
+});
+
+describe('inboxThreadCount, the section badge', () => {
+    it('counts inbox threads only, as Archive all counts them', () => {
+        // A lifted archived parent, a dimmed archived middle over a live
+        // grandchild, and a revealed archived branch all render in Current.
+        const lifted = inArchive('lifted', { totalChildrenCount: 2 });
+        const live = running('live', { parentId: 'lifted' });
+        const middle = inArchive('middle', { parentId: 'lifted', totalChildrenCount: 1 });
+        const grandchild = running('grandchild', { parentId: 'middle' });
+        const revealed = inArchive('revealed', { parentId: 'live' });
+        const idle = makeThread('idle');
+
+        expect(inboxThreadCount([lifted, live, middle, grandchild, revealed, idle])).toBe(3);
     });
 });

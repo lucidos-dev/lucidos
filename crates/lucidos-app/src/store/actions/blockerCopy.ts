@@ -18,15 +18,18 @@ export type HeldBlocker = Exclude<Blocker, 'none'>;
 const STILL_RUNNING = 'still running';
 export const WAITING_FOR_ANSWER = 'waiting for your answer';
 export const CHANGE_TO_RESOLVE = 'a change to apply or discard';
+const FINISHING_ITS_CHANGE = 'still waiting to finish its change';
 
 export const BLOCKER_REASON: Record<HeldBlocker, string> = {
   home: 'The home thread always stays open.',
   running: `This thread is ${STILL_RUNNING}. Stop it first.`,
   question: `This thread is ${WAITING_FOR_ANSWER}. Answer or stop it first.`,
   pending_change: 'Apply or discard the pending change first.',
+  held_proposal: `This thread is ${FINISHING_ITS_CHANGE}. Stop waiting first.`,
   descendant_running: `A sub-thread is ${STILL_RUNNING}.`,
   descendant_question: `A sub-thread is ${WAITING_FOR_ANSWER}.`,
   descendant_pending_change: `A sub-thread has ${CHANGE_TO_RESOLVE}.`,
+  descendant_held_proposal: `A sub-thread is ${FINISHING_ITS_CHANGE}.`,
 };
 
 /** A blocking sub-thread's state, short enough to sit beside its title in the
@@ -35,6 +38,7 @@ export const SUB_THREAD_STATE: Record<OwnBlocker, string> = {
   running: 'running',
   question: 'waiting for you',
   pending_change: 'change to apply',
+  held_proposal: 'finishing its change',
 };
 
 /** The note over the thread menu's list of blocking sub-threads. */
@@ -98,6 +102,7 @@ const MEMBER_REASON_BLOCKER: Record<string, OwnBlocker | 'home'> = {
   agent_session_live: 'running',
   waiting_for_user_answer: 'question',
   pending_change: 'pending_change',
+  held_proposal: 'held_proposal',
 };
 
 /** The blocker a delete preflight's `blocked_by` list amounts to, worded as

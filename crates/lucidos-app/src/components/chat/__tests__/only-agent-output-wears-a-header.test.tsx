@@ -116,12 +116,12 @@ describe('a turn the agent did not write', () => {
     expect(host.querySelector('.event-row[data-kind="boundary"] .event-row-state')?.textContent).toBe('Done');
   });
 
-  // The reported card: "Prompt to the agent", a raw `UserPromptInjected`
+  // The reported card: "Prompt to the agent", a raw `PromptInjected`
   // tooltip, and the model's instructions as the only explanation. It now
   // tells the story, and the model's words sit one fold deeper.
   it('tells a timed-out wait as a story, with the model\'s words folded deeper', () => {
     mount(starter({
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'A subscription you registered has timed out.\n\nTimed out. Report what you were waiting for.',
       mode: 'agent',
       origin: {
@@ -134,7 +134,7 @@ describe('a turn the agent did not write', () => {
     expect(pill?.textContent).toBe('Wait timed out');
     expect(pill?.getAttribute('data-tooltip')).toBe('Lucidos told the agent its wait ran out of time.');
     expect(card?.querySelector('.event-row-meta')?.textContent).toBe('bench slot released');
-    expect(card?.textContent).not.toContain('UserPromptInjected');
+    expect(card?.textContent).not.toContain('PromptInjected');
     expect(card?.textContent).not.toMatch(/prompt to the agent/i);
 
     act(() => { card!.querySelector<HTMLButtonElement>('.event-row-fold-toggle')!.click(); });
@@ -148,7 +148,7 @@ describe('a turn the agent did not write', () => {
 
   // An older row has no origin, so its frozen opening sentence names it.
   it('names an older timed-out wait by its shape', () => {
-    mount(starter({ type: 'UserPromptInjected', text: 'A subscription you registered has timed out.\n\nTimed out.', mode: 'agent' }));
+    mount(starter({ type: 'PromptInjected', text: 'A subscription you registered has timed out.\n\nTimed out.', mode: 'agent' }));
     const card = host.querySelector('.event-row[data-kind="boundary"]');
     expect(card?.querySelector('.event-row-subject')?.textContent).toBe('Wait timed out');
     expect(card?.querySelector('.event-row-meta')).toBeNull();
@@ -158,7 +158,7 @@ describe('a turn the agent did not write', () => {
   // structured card to draw, so it falls back to this one: still a story.
   it('names an older arrival whose matched event is not loaded', () => {
     mount(starter({
-      type: 'UserPromptInjected',
+      type: 'PromptInjected',
       text: 'An event you subscribed to has arrived (you were waiting because: x).\n\n{}',
       mode: 'agent',
       delivered_event_id: 'evt-gone',
@@ -170,7 +170,7 @@ describe('a turn the agent did not write', () => {
   });
 
   it('names an auto-prompt by what the engine asked for', () => {
-    mount(starter({ type: 'UserPromptInjected', text: 'Run /harden before finishing.', mode: 'engine', origin: ENGINE('harden_retrigger') }));
+    mount(starter({ type: 'PromptInjected', text: 'Run /harden before finishing.', mode: 'engine', origin: ENGINE('harden_retrigger') }));
     const card = host.querySelector('.event-row[data-kind="boundary"]');
     expect(card?.querySelector('.event-row-subject')?.textContent).toBe('Hardening needed');
   });

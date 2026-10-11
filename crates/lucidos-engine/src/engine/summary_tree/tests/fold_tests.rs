@@ -1,14 +1,16 @@
 //! The fold over synthetic logs: I4 (a stable fold), I6 (budgets hold), the
 //! fold's half of I7, and the spec fold's own promises from the ADR 0362
-//! amendment. A replay equals the view kept live, consecutive views share
-//! most of their bytes, and each level keeps about as many lines.
+//! amendments:
+//! - it makes the rollback push's merges, in batches;
+//! - a replay equals the view kept live;
+//! - consecutive turns read most of the view from cache;
+//! - each level keeps about as many lines.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::engine::summary_tree::fold::{
-    built_cover, built_prefix_end, context_tiling, fold, Fold,
-};
+use crate::engine::summary_tree::fold::{built_cover, built_prefix_end, fold, Budget, Fold};
 use crate::engine::summary_tree::shape::complete_addresses;
+use crate::engine::summary_tree::view::{rungs, BLOCK_LINES, LOOKBACK_BLOCKS, THREAD_RUNGS};
 use crate::engine::summary_tree::NodeAddr;
 
 fn addr(start: u64, span: u64) -> NodeAddr {
@@ -46,7 +48,7 @@ fn assert_tiles(tiles: &[NodeAddr], from: u64, len: u64) {
 /// A rendered line's bytes for a fully built synthetic tree, a pure function
 /// of the address. Leaves mix short verbatim messages with near-full
 /// summaries; merges are dense summaries. The `[id] ` prefix is counted.
-fn synthetic(a: NodeAddr) -> usize {
+pub(super) fn synthetic(a: NodeAddr) -> usize {
     let mut h = a.start.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ a.span.wrapping_mul(0xC2B2_AE3D);
     h ^= h >> 29;
     h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -73,15 +75,62 @@ fn a_roomy_budget_shows_every_entry_verbatim() {
     );
 }
 
-/// The most due pair goes first: the oldest for its size. Between pairs as
-/// due as each other, the older one goes.
+/// The most due pair goes first: the longest ago for its size. Between pairs
+/// as due as each other, the older one goes. So each level keeps about as
+/// many lines, rather than the oldest lines all folding into one. Driven at an
+/// exact budget, since the sawtooth changes when merges happen, not which.
 #[test]
 fn a_tight_budget_merges_the_most_due_pairs() {
     let sizes = complete(8, 10);
+    let mut live = Fold::default();
+    for _ in 0..8 {
+        live.push(&|a| sizes.get(&a).copied(), Budget::exact(50));
+    }
     assert_eq!(
-        view(8, &sizes, 50),
-        vec![addr(0, 4), addr(4, 1), addr(5, 1), addr(6, 1), addr(7, 1)]
+        live.addrs(),
+        vec![addr(0, 2), addr(2, 2), addr(4, 2), addr(6, 1), addr(7, 1)]
     );
+}
+
+/// Taelin's rollback push, quoted in OptChat §3.1, without `life`: under push
+/// alone it stays 0. `list` is newest first, each state with its keep bit. A
+/// 0 bit absorbs the pushed state, and a 1 bit carries the old one further.
+fn rollback_push(list: &mut Vec<(bool, u64)>, mut state: u64) {
+    for entry in list.iter_mut() {
+        if !entry.0 {
+            entry.0 = true;
+            return;
+        }
+        (state, entry.1) = (entry.1, state);
+        entry.0 = false;
+    }
+    list.push((false, state));
+}
+
+/// Push's list as view lines: each state runs to the next newer one, and the
+/// newest runs to `len`.
+fn rollback_lines(list: &[(bool, u64)], len: u64) -> Vec<NodeAddr> {
+    let starts: Vec<u64> = list.iter().rev().map(|e| e.1).collect();
+    let ends = starts.iter().skip(1).copied().chain([len]);
+    starts
+        .iter()
+        .zip(ends)
+        .map(|(&s, e)| addr(s, e - s))
+        .collect()
+}
+
+/// With push's list length as the budget, the fold makes exactly push's
+/// merges at every step (OptChat §3.2). Measuring a pair's age from its first
+/// entry instead matches at 481 of these steps.
+#[test]
+fn the_fold_makes_the_rollback_push_merges() {
+    let mut list = Vec::new();
+    let mut live = Fold::default();
+    for t in 0..=20_000u64 {
+        rollback_push(&mut list, t);
+        live.push(&|_| Some(1), Budget::exact(list.len()));
+        assert_eq!(live.addrs(), rollback_lines(&list, t + 1), "t = {t}");
+    }
 }
 
 /// I6: no view is over its budget, for every log length and budget tried.
@@ -134,6 +183,38 @@ fn the_fold_is_stable_as_the_log_grows() {
     }
 }
 
+/// The sawtooth: a view only appends until it passes its budget, then one
+/// batch merges it down to half. With every node built, a batch always gets
+/// there.
+#[test]
+fn the_view_appends_until_a_batch_halves_it() {
+    let budget = BUDGET - RESERVE;
+    let size = |a: NodeAddr| Some(synthetic(a));
+    let mut live = Fold::default();
+    let mut previous: Vec<NodeAddr> = Vec::new();
+    let mut batches = 0;
+    for len in 1..20_000u64 {
+        live.push(&size, Budget::sawtooth(budget));
+        let tiles = live.addrs();
+        let appended = tiles.len() == previous.len() + 1 && tiles.starts_with(&previous);
+        let grown = bytes(&previous, size) + synthetic(NodeAddr::leaf(len - 1));
+        if grown > budget {
+            batches += 1;
+            assert!(
+                bytes(&tiles, size) <= budget / 2,
+                "len {len}: a batch stopped short"
+            );
+        } else {
+            assert!(
+                appended,
+                "len {len}: merged with {grown} bytes under {budget}"
+            );
+        }
+        previous = tiles;
+    }
+    assert!(batches >= 5, "only {batches} batches");
+}
+
 /// A view kept live, one entry at a time, is byte for byte the view a replay
 /// from entry 0 gives. Checked with the compactor caught up, and with it a
 /// turn behind, where the unbuilt tail rides in the reserve.
@@ -141,7 +222,7 @@ fn the_fold_is_stable_as_the_log_grows() {
 fn a_replay_from_zero_equals_the_live_view() {
     let mut live = Fold::default();
     for len in 1..3_000u64 {
-        live.push(&|a| Some(synthetic(a)), BUDGET - RESERVE);
+        live.push(&|a| Some(synthetic(a)), Budget::sawtooth(BUDGET - RESERVE));
         let replay = fold(len, len, |a| Some(synthetic(a)), BUDGET, RESERVE);
         assert_eq!(live.addrs(), replay, "caught up, len {len}");
     }
@@ -161,7 +242,7 @@ fn a_replay_from_zero_equals_the_live_view() {
         let now = built_prefix_end(len, |a| a.end() <= first_unbuilt);
         assert_eq!(now, first_unbuilt);
         while replayed < now {
-            live.push(&|a| Some(synthetic(a)), BUDGET - RESERVE);
+            live.push(&|a| Some(synthetic(a)), Budget::sawtooth(BUDGET - RESERVE));
             replayed += 1;
         }
         let replay = fold(len, now, size, BUDGET, RESERVE);
@@ -171,79 +252,86 @@ fn a_replay_from_zero_equals_the_live_view() {
     }
 }
 
-/// The share of the newer view's bytes two consecutive views have in common
-/// from their start, averaged over `samples` turns of `turn` entries each.
-fn mean_share(
-    entries: u64,
-    turn: u64,
-    samples: u64,
-    view: &mut dyn FnMut(u64) -> Vec<NodeAddr>,
-) -> f64 {
+/// The share of a view's bytes a turn re-sends at full price, averaged over
+/// `samples` turns of `turn` entries each, from a log of `entries`.
+///
+/// It models Anthropic's cache. The last turn wrote an entry at each of its
+/// rungs. This turn reads the longest of those its view still starts with,
+/// if one of its own rungs lies at most a lookback after it.
+fn uncached_share(entries: u64, turn: u64, samples: u64) -> f64 {
+    let size = |a: NodeAddr| Some(synthetic(a));
+    let mut live = Fold::default();
+    let mut view = |len: u64| {
+        while live.entries() < len {
+            live.push(&size, Budget::sawtooth(BUDGET - RESERVE));
+        }
+        live.addrs()
+    };
+    let rungs_of = |tiles: &[NodeAddr]| rungs(tiles.len() / BLOCK_LINES, THREAD_RUNGS);
     let mut previous = view(entries);
-    let mut total = 0.0;
+    let (mut uncached, mut sent) = (0, 0);
     for step in 1..=samples {
         let current = view(entries + step * turn);
-        let shared: usize = previous
+        let same = previous
             .iter()
             .zip(&current)
             .take_while(|(a, b)| a == b)
-            .map(|(a, _)| synthetic(*a))
-            .sum();
-        total += shared as f64 / bytes(&current, |a| Some(synthetic(a))) as f64;
+            .count();
+        let ours = rungs_of(&current);
+        let read = rungs_of(&previous)
+            .into_iter()
+            .filter(|&r| r * BLOCK_LINES <= same)
+            .filter(|&r| ours.iter().any(|&n| n >= r && n - r <= LOOKBACK_BLOCKS))
+            .max()
+            .unwrap_or(0);
+        let total = bytes(&current, size);
+        uncached += total - bytes(&current[..read * BLOCK_LINES], size);
+        sent += total;
         previous = current;
     }
-    total / samples as f64
+    uncached as f64 / sent as f64
 }
 
-/// Consecutive turns share most of the view, where the old fold shared
-/// little. Measured at 1k, 10k and 100k entries with turns of 1, 4 and 10
-/// entries; the numbers are in the ADR 0362 amendment.
-///
-/// The spec fold is driven live, which the replay test above shows is the
-/// same view. A view's levels bound its share, so the majority is asserted
-/// from 10k entries for turns of up to four. The table reports the rest.
+/// Consecutive turns read most of the view from the prompt cache. Between
+/// batches a view only appends, and a rung a few blocks on finds the last
+/// turn's entry. A batch rewrites the view once. The table goes to the log;
+/// the plan for OptChat revision 3c190e06 holds the numbers it replaced.
 #[test]
-fn consecutive_turns_share_most_of_the_view() {
+fn consecutive_turns_read_most_of_the_view_from_cache() {
     let mut report = String::new();
-    let mut spec_shares = HashMap::new();
-    for entries in [1_000u64, 10_000, 100_000] {
-        for turn in [1u64, 4, 10] {
-            let mut live = Fold::default();
-            let mut pushed = 0;
-            let mut spec = |len: u64| {
-                while pushed < len {
-                    live.push(&|a| Some(synthetic(a)), BUDGET - RESERVE);
-                    pushed += 1;
-                }
-                live.addrs()
-            };
-            let new = mean_share(entries, turn, 40, &mut spec);
-            let mut old = |len: u64| context_tiling(len, |a| Some(synthetic(a)), BUDGET);
-            let old = mean_share(entries, turn, 40, &mut old);
+    let mut shares = HashMap::new();
+    for entries in [1_000u64, 10_000] {
+        for turn in [1u64, 4, 10, 30] {
+            let share = uncached_share(entries, turn, 300);
             report.push_str(&format!(
-                "{entries} entries, turns of {turn}: old {:.0}%, spec {:.0}%\n",
-                old * 100.0,
-                new * 100.0
+                "{entries} entries, turns of {turn}: {:.1}% uncached\n",
+                share * 100.0
             ));
-            spec_shares.insert((entries, turn), new);
+            shares.insert((entries, turn), share);
         }
     }
-    log!("[SummaryTree] Consecutive-view prefix share:\n{report}");
-    for entries in [10_000, 100_000] {
-        for turn in [1, 4] {
-            assert!(spec_shares[&(entries, turn)] > 0.5, "{report}");
-        }
-    }
-    assert!(spec_shares[&(1_000, 1)] > 0.5, "{report}");
+    log!("[SummaryTree] Uncached share of the thread view per turn:\n{report}");
+    assert!(shares[&(10_000, 4)] <= 0.10, "{report}");
+    assert!(shares[&(10_000, 30)] <= 0.40, "{report}");
 }
 
 /// No cliff: each level between the leaves and the coarsest holds within a
-/// factor of two of the median level's lines. Detail fades with age in steps. The leaves hold the newest pairs still filling in, so they get a
-/// factor of three.
+/// factor of two of the median level's lines, so detail fades with age in
+/// steps. Read as the last batch before 10k entries left the view: after it,
+/// every new entry is one more leaf. The leaves hold the newest pairs still
+/// filling in, so they get a factor of three.
 #[test]
 fn each_level_keeps_about_as_many_lines() {
-    let len = 10_000;
-    let tiles = fold(len, len, |a| Some(synthetic(a)), BUDGET, RESERVE);
+    let size = |a: NodeAddr| Some(synthetic(a));
+    let mut live = Fold::default();
+    let (mut tiles, mut len) = (Vec::new(), 0);
+    for pushed in 1..=10_000u64 {
+        let before = live.addrs().len();
+        live.push(&size, Budget::sawtooth(BUDGET - RESERVE));
+        if live.addrs().len() <= before {
+            (tiles, len) = (live.addrs(), pushed);
+        }
+    }
     assert_tiles(&tiles, 0, len);
     let mut per_span: HashMap<u64, usize> = HashMap::new();
     for t in &tiles {
@@ -300,22 +388,6 @@ fn a_stalled_compactor_drops_the_oldest_lines_to_keep_the_budget() {
     let sizes: HashMap<NodeAddr, usize> = (0..20).map(|i| (NodeAddr::leaf(i), 10)).collect();
     let tiles = view(20, &sizes, 55);
     assert_eq!(tiles, (15..20).map(NodeAddr::leaf).collect::<Vec<_>>());
-}
-
-/// The compactor's context keeps its own shape: the coarsest cover of an old
-/// prefix, then the recent entries verbatim.
-#[test]
-fn the_context_tiling_covers_an_old_prefix_then_recent_leaves() {
-    let sizes = complete(8, 10);
-    assert_eq!(
-        context_tiling(8, |a| sizes.get(&a).copied(), 50),
-        vec![addr(0, 4), addr(4, 1), addr(5, 1), addr(6, 1), addr(7, 1)]
-    );
-    let leaves: HashMap<NodeAddr, usize> = (0..20).map(|i| (NodeAddr::leaf(i), 10)).collect();
-    assert_eq!(
-        context_tiling(20, |a| leaves.get(&a).copied(), 55),
-        (15..20).map(NodeAddr::leaf).collect::<Vec<_>>()
-    );
 }
 
 #[test]

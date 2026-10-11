@@ -3,6 +3,10 @@ import type { ComponentType } from 'preact';
 
 const reloadForStaleChunk = vi.fn(() => true);
 vi.mock('../hooks/sw-update', () => ({ reloadForStaleChunk: () => reloadForStaleChunk() }));
+const postClientLog = vi.fn();
+vi.mock('./clientLog', () => ({
+  postClientLog: (...args: unknown[]) => postClientLog(...args),
+}));
 
 import { lazyComponent, whenLoaded } from './lazyComponent';
 
@@ -43,6 +47,20 @@ describe('lazyComponent.preload', () => {
     const Lazy = lazyComponent(() => Promise.reject(new Error('404')));
     await expect(Lazy.preload()).resolves.toBe(false);
     expect(reloadForStaleChunk).toHaveBeenCalledTimes(1);
+    error.mockRestore();
+  });
+
+  // console.error never reaches the server, and a phone stuck behind the boot
+  // splash has no other way to say which chunk failed or why.
+  it('posts the failure to the engine log', async () => {
+    postClientLog.mockClear();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const Lazy = lazyComponent(() => Promise.reject(new SyntaxError('Unexpected end of script')));
+    await Lazy.preload();
+    expect(postClientLog).toHaveBeenCalledTimes(1);
+    expect(postClientLog).toHaveBeenCalledWith('chunk', 'load_failed', {
+      message: 'SyntaxError: Unexpected end of script',
+    });
     error.mockRestore();
   });
 

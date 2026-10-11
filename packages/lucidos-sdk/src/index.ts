@@ -14,6 +14,7 @@ import { proxy } from './proxy';
 import { oauth } from './oauth';
 import { request } from './request';
 import { storage } from './storage';
+import { params } from './params';
 
 export const lucidos = {
   configure,
@@ -43,6 +44,8 @@ export const lucidos = {
   // Per-app, per-device storage. An isolated frame's own `localStorage`
   // throws, so this stands in for it.
   storage,
+  // A widget's params for the place it shows (ADR 0415).
+  params,
   _capture: capture,
 };
 
@@ -57,6 +60,10 @@ export type { StorageFailure } from './storage';
 export { appMayCall, appReachableMethods, normalizeSuffix, pathMatchesPattern } from './appReach';
 export { APP_REACHABLE_ROUTES } from './generated/app-reach';
 export { parseAppId } from './scroll';
+// The one query key widget params travel under. The host's `appUrl` writes
+// it, so the writer and `lucidos.params` read this one copy.
+export { WIDGET_PARAMS_QUERY, isWidgetParams } from './params';
+export type { WidgetParams } from './params';
 // App storage's key layout and limits. The host enforces the same limits the
 // SDK checks, so both read this one copy.
 export * from './appStorage';

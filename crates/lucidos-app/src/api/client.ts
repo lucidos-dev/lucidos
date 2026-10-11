@@ -21,3 +21,4 @@ export * from './client/mcp';
 export * from './client/pluginMarketplaces';
 export * from './client/releaseNotices';
 export * from './client/webhooks';
+export * from './client/widgets';

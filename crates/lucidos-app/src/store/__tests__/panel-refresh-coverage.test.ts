@@ -36,6 +36,7 @@ const OVERLAYS: Record<NonNullable<PanelOverlay>['type'], Coverage> = {
   'file-preview': { registers: ['files/FilePreviewInline.tsx', 'files/RepoFilePreview.tsx'] },
   'url-preview': { static: 'a web page, reloaded by its own header control' },
   'notification-detail': { static: 'rendered from the notification already in memory' },
+  'plugin-detail': { registers: ['plugins/PluginDetailPage.tsx'] },
   form: { static: 'an editor holding the user\'s draft' },
 };
 
@@ -56,6 +57,7 @@ const SETTINGS: Record<SettingsSubview, Coverage> = {
   locale: { static: 'preferences, which stay live over SSE' },
   marketplaces: { registers: ['settings/MarketplacesSection.tsx'] },
   'disk-usage': { registers: ['settings/DiskUsagePage.tsx'] },
+  'prompt-footprint': { registers: ['settings/PromptFootprintPage.tsx'] },
   permissions: { registers: ['settings/AllowlistEditor.tsx'] },
   mcp: { registers: ['settings/McpServersPage.tsx'] },
   'keyboard-shortcuts': { static: 'preferences, which stay live over SSE' },

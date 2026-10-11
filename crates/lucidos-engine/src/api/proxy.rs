@@ -776,7 +776,12 @@ pub(crate) fn build_contained_target_url(
     // reads `../admin` and leaves the prefix anyway, with our credentials on
     // the request. Checking the readings refuses that, while a blanket ban on
     // `%2f` would break a legitimate encoded slash inside a segment.
-    for reading in decoded_readings(path) {
+    let Some(readings) = decoded_readings(path) else {
+        return Err(format!(
+            "upstream path nests more than {MAX_DECODE_ROUNDS} layers of percent-encoding"
+        ));
+    };
+    for reading in readings {
         let probe = build_target_url(base_url, &reading, query);
         let Ok(probe) = reqwest::Url::parse(&probe) else {
             return Err("upstream URL does not parse with separators decoded".to_string());
@@ -838,17 +843,19 @@ fn redirect_path_within_base(base_url: &str, target_path: &str) -> Option<String
 ///
 /// A round rewrites the separator encodings into `/`, then unwraps one layer of
 /// escaping. So `%252f` becomes `%2f`, then `/`, and an upstream stack that
-/// decodes twice is covered as well as one that decodes once. Chasing a fixed
-/// depth would just move the bypass one `%25` deeper.
+/// decodes twice is covered as well as one that decodes once.
 ///
-/// Terminates because every rewrite maps three characters to one, so each round
-/// is strictly shorter than the last. A backslash maps to `/` because the URL
-/// standard treats it as a separator. That is also why
-/// [`request_path_has_traversal`] rejects a literal one.
-fn decoded_readings(path: &str) -> Vec<String> {
-    let mut readings = Vec::new();
-    let mut current = path.to_string();
+/// `None` means the path still changes after [`MAX_DECODE_ROUNDS`] rounds, and
+/// the caller refuses it. One round can peel a single `%25`, so an uncapped
+/// probe costs time and memory quadratic in the path length. Refusing past the
+/// cap, rather than accepting, keeps a deeper nesting from becoming a bypass.
+///
+/// A backslash maps to `/` because the URL standard treats it as a separator.
+/// That is also why [`request_path_has_traversal`] rejects a literal one.
+fn decoded_readings(path: &str) -> Option<Vec<String>> {
+    let mut readings: Vec<String> = Vec::new();
     loop {
+        let current = readings.last().map_or(path, String::as_str);
         let next = current
             .replace("%2f", "/")
             .replace("%2F", "/")
@@ -856,12 +863,18 @@ fn decoded_readings(path: &str) -> Vec<String> {
             .replace("%5C", "/")
             .replace("%25", "%");
         if next == current {
-            return readings;
+            return Some(readings);
         }
-        readings.push(next.clone());
-        current = next;
+        if readings.len() == MAX_DECODE_ROUNDS {
+            return None;
+        }
+        readings.push(next);
     }
 }
+
+/// How many decode layers the containment probe chases before it refuses.
+/// Real upstreams decode once or twice; the cap bounds what one request costs.
+const MAX_DECODE_ROUNDS: usize = 8;
 
 /// Append `key=urlencoded(value)` to a URL's query string. Preserves any
 /// existing query and chooses `?` vs `&` accordingly.
@@ -1669,7 +1682,8 @@ pub(crate) async fn resolve_named_proxy(
 /// anything reaches the network.
 ///
 /// A model provider's reply records what the call cost, on `cost_thread` or
-/// the home thread (`api::proxy_cost`).
+/// the home thread (`api::proxy_cost`). A speech call is rewritten, recorded
+/// or refused so its cost is never lost (`api::proxy_speech`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_resolved(
     engine: &Arc<crate::engine::LucidosEngine>,
@@ -1683,7 +1697,13 @@ pub(crate) async fn dispatch_resolved(
     cost_thread: Option<uuid::Uuid>,
 ) -> Result<Response, (StatusCode, String)> {
     use crate::api::proxy_cost::{prepare_request, record_model_call, Upstream};
-    match resolved {
+    use crate::api::proxy_speech::{ask_for_usage, finish};
+    let base_url = match &resolved {
+        ResolvedProxy::Config(config) => config.base_url.as_str(),
+        ResolvedProxy::Builtin { base_url, .. } => base_url.as_str(),
+    };
+    let (body, speech) = ask_for_usage(base_url, &path, body)?;
+    let response = match resolved {
         ResolvedProxy::Config(config) => {
             let upstream = Upstream::Configured {
                 base_url: &config.base_url,
@@ -1700,7 +1720,7 @@ pub(crate) async fn dispatch_resolved(
                 body.clone(),
             )
             .await?;
-            Ok(record_model_call(engine, cost_thread, upstream, &path, &body, response).await)
+            record_model_call(engine, cost_thread, upstream, &path, &body, response).await
         }
         // The builtin arm builds its own layers, so it binds its own pipeline.
         // Same gate, same type, no second way to reach the network.
@@ -1721,7 +1741,7 @@ pub(crate) async fn dispatch_resolved(
                 body.clone(),
             )
             .await?;
-            Ok(record_model_call(
+            record_model_call(
                 engine,
                 cost_thread,
                 Upstream::Builtin,
@@ -1729,9 +1749,10 @@ pub(crate) async fn dispatch_resolved(
                 &body,
                 response,
             )
-            .await)
+            .await
         }
-    }
+    };
+    Ok(finish(engine, cost_thread, speech, &body, response).await)
 }
 
 async fn proxy_handle_inner(

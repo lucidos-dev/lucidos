@@ -1,6 +1,7 @@
 import { signal, type ReadonlySignal } from '@preact/signals';
 import { useDelayedFlag } from '../hooks/useDelayedLoading';
-import type { AnswerKind } from './thread-events';
+import { effectiveThreadStatus } from './store';
+import { awaitedQuestionCard, computeExchanges, type AnswerKind, type ThreadState } from './thread-events';
 import type { SendFailure } from './actions/sendRetry';
 
 /** The optimistic picks of one kind of card, keyed by the card's own id.
@@ -50,6 +51,19 @@ export function usePickMark(confirmed: boolean, pending: boolean): PickMark {
  *  because a send reads it too: a typed message is no answer to a card whose
  *  pick is already on its way (`questionTheSendAnswers`). */
 export const pendingAnswers = pendingDecisions<AnswerKind>();
+
+/** The question card a message sent now would answer, by tool-use id. The
+ *  engine routes typed text to an open question as its `FreeText` answer.
+ *
+ *  Only the NEWEST card that awaits an answer counts. A permission card waits
+ *  under the same status, and walking past it would reach a question an abort
+ *  stranded. A send behind an answer already in flight answers nothing either,
+ *  typed or tapped: the engine takes the later text as an ordinary message. */
+export function questionTheSendAnswers(thread: ThreadState): string | undefined {
+  if (effectiveThreadStatus(thread) !== 'waiting_for_user_answer') return undefined;
+  const card = awaitedQuestionCard(computeExchanges(thread));
+  return card && !pendingAnswers.map.peek().has(card) ? card : undefined;
+}
 
 /** A question card's pick whose quiet retries all went unanswered. The card
  *  draws it as Not sent on the picked option, and Retry sends it again. */

@@ -16,7 +16,7 @@ import { test, expect, type Page } from './fixtures';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve } from 'path';
 import { WORKSPACE } from './db-helpers';
-import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, waitForEventStream, waitForModalExitFade } from './helpers';
 
 const SAMPLE_NAME = 'e2e-scaled-report.html';
 const SAMPLE_PATH = `artifacts/${SAMPLE_NAME}`;
@@ -100,6 +100,8 @@ async function setUiScale(page: Page, percent: number): Promise<void> {
   for (let at = 200; at > percent; at -= 12.5) await page.keyboard.press('ArrowLeft');
   await expect(page.locator('.scale-modal-label')).toHaveText(`${percent}%`);
   await page.keyboard.press('Escape');
+  // The next call opens the modal again, so its closing drawing must be gone.
+  await waitForModalExitFade(page);
 }
 
 test.describe('an HTML artifact preview', () => {

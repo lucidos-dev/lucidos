@@ -2,14 +2,13 @@
  * A queued follow-up the engine recovers after a restart stops rendering as
  * "Queued", with no frontend change.
  *
- * The reported bug was engine-side: a follow-up typed mid-turn was stranded
- * when a restart aborted that turn, because nothing read it back out of the
- * event store. The resume now announces it with a `UserPromptInjected` naming
- * it in `injected_message_id`.
+ * When a restart aborts a turn, the resume reads its queued follow-ups back
+ * out of the event store. It announces each one with a `PromptInjected`
+ * naming it in `injected_message_id`.
  *
  * This pins the client half of that contract. `findAbsorbTarget` folds such a
- * UPI into the message's own exchange, which gives that exchange a step and so
- * ends `isUningestedMessage`. Break the absorb and the bubble stays pinned to
+ * `PromptInjected` into the message's own exchange. That gives the exchange a
+ * step, which ends `isUningestedMessage`. Break the absorb and the bubble stays pinned to
  * the bottom of the transcript even though the engine answered it.
  *
  * Plan: docs/plans/2026-09-21-a-queued-follow-up-survives-the-restart.md
@@ -36,9 +35,9 @@ function transcript(upTo: number): Map<number, StoredEvent> {
     { type: 'MessageReceived', text: 'wtf r u up to?', _eventId: QUEUED, created: at(2) },
     { type: 'ResponseAborted', text: '', cause: 'engine_shutdown', request_event_id: TURN, created: at(3) },
     { type: 'ContinuationStarted', branch: '', _eventId: RESUME, created: at(4) },
-    { type: 'UserPromptInjected', text: NOTE, mode: 'engine', request_event_id: RESUME, created: at(5) },
+    { type: 'PromptInjected', text: NOTE, mode: 'engine', request_event_id: RESUME, created: at(5) },
     // The recovery: names the stranded message, anchored on the resume.
-    { type: 'UserPromptInjected', text: 'wtf r u up to?', mode: 'human', injected_message_id: QUEUED, request_event_id: RESUME, created: at(6) },
+    { type: 'PromptInjected', text: 'wtf r u up to?', mode: 'human', injected_message_id: QUEUED, request_event_id: RESUME, created: at(6) },
     { type: 'ResponseGenerated', text: 'Reading the tickets now.', request_event_id: RESUME, created: at(7) },
   ] as StoredEvent[];
   return new Map(rows.slice(0, upTo).map((event, i) => [i + 1, event]));
@@ -69,7 +68,7 @@ describe('a queued follow-up recovered after a restart', () => {
     const ingested = queuedExchange(6);
     expect(ingested).toBeDefined();
     expect(isWaitingTypedMessage(ingested!)).toBe(false);
-    expect(ingested!.steps.map(s => s.event.type)).toContain('UserPromptInjected');
+    expect(ingested!.steps.map(s => s.event.type)).toContain('PromptInjected');
   });
 
   it('gathers the resumed reply under the recovered message', () => {
@@ -82,7 +81,7 @@ describe('a queued follow-up recovered after a restart', () => {
 
   it('keeps a retracted message out, even after the resume', () => {
     // A retraction that landed while the engine was down wins: the engine
-    // emits no UPI for it, so the exchange is dropped as removed.
+    // emits no PromptInjected for it, so the exchange is dropped as removed.
     const rows = new Map(transcript(5));
     rows.set(6, { type: 'QueuedMessageRemoved', removed_message_id: QUEUED, created: at(6) } as StoredEvent);
     const ids = exchangesOf(rows).map(ex => ex.userEvent._eventId);

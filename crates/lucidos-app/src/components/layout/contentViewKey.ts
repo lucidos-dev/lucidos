@@ -98,6 +98,7 @@ export function contentViewKey(
     if (overlay.type === 'file-preview') return `file:${overlay.path}`;
     if (overlay.type === 'url-preview') return `url:${overlay.url}`;
     if (overlay.type === 'notification-detail') return `notification:${overlay.notification.id}`;
+    if (overlay.type === 'plugin-detail') return `plugin:${overlay.marketplaceId}:${overlay.pluginId}`;
     return overlay.type;
   }
   if (active === 'settings') return settingsViewKey(settingsSubview);

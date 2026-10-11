@@ -107,6 +107,13 @@ fn scan_catalog_reports_marketplace_with_only_invalid_manifests() {
     assert!(catalog.plugins.is_empty());
     assert_eq!(catalog.errors.len(), 1);
     assert!(catalog.errors[0].error.contains("no valid plugins"));
+    assert!(
+        catalog.errors[0]
+            .error
+            .contains("missing required field: version"),
+        "the author sees why: {}",
+        catalog.errors[0].error
+    );
 }
 
 #[test]
@@ -188,6 +195,7 @@ fn catalog_plugin(
         engine_requirement: None,
         engine_compatible: true,
         engine_incompatible_reason: None,
+        media: Default::default(),
     }
 }
 
@@ -396,6 +404,7 @@ mod installed_state_overlay {
             engine_requirement: None,
             engine_compatible: true,
             engine_incompatible_reason: None,
+            media: Default::default(),
         }
     }
 
@@ -412,6 +421,7 @@ mod installed_state_overlay {
             modified: true,
             modified_paths: vec!["apps/an-app/index.html".to_string()],
             engine_requirement: None,
+            media: Default::default(),
         }
     }
 
@@ -477,4 +487,58 @@ mod installed_state_overlay {
         assert!(!row.modified);
         assert!(row.modified_paths.is_empty());
     }
+}
+
+/// Invariant I19: catalog media is a cache. A scan fills it, and the next scan
+/// rebuilds it once `.lucidos/` is cleared.
+#[test]
+fn a_scan_caches_media_and_rebuilds_it_after_a_wipe() {
+    let workspace = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    write_plugin(repo_dir.path(), "pictured", "0.2.0", "Pictured");
+    let manifest = repo_dir.path().join("manifest.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        format!("{text}icon = \"media/icon.svg\"\nscreenshots = [\"media/a.png\"]\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo_dir.path().join("media")).unwrap();
+    std::fs::write(repo_dir.path().join("media/icon.svg"), "<svg/>").unwrap();
+    std::fs::write(repo_dir.path().join("media/a.png"), "png").unwrap();
+    commit_all(repo_dir.path());
+    let mut registry = PluginMarketplaceRegistry::default();
+    add_local_marketplace(&mut registry, repo_dir.path());
+
+    let scan = || scan_catalog(workspace.path(), &registry, &[], &GitCredentials::none());
+    let plugin = scan().plugins.remove(0);
+    let copy = plugin_media::cache_dir(
+        workspace.path(),
+        &plugin.marketplace_id,
+        "pictured",
+        "0.2.0",
+    );
+    let icon_url = plugin.media.icon_url.expect("an icon URL");
+    assert!(
+        icon_url.ends_with("/pictured/0.2.0/media/icon.svg"),
+        "{icon_url}"
+    );
+    assert_eq!(plugin.media.screenshots.len(), 1);
+    assert!(plugin_media::listed_file(&copy, "media/a.png").is_some());
+
+    std::fs::remove_dir_all(workspace.path().join(plugin_media::CACHE_DIR)).unwrap();
+    let catalog = scan();
+    assert!(plugin_media::listed_file(&copy, "media/a.png").is_some());
+
+    // Publishing a catalog without the marketplace drops its media.
+    prune_media_for(
+        workspace.path(),
+        &MarketplaceCatalog {
+            marketplaces: vec![],
+            plugins: vec![],
+            errors: vec![],
+        },
+    );
+    assert!(!copy.exists());
+    drop(catalog);
 }

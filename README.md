@@ -7,18 +7,18 @@
   </picture>
 </a>
 
-<sub>Described in chat, running seconds later in the same window, wired to your own data. [60-second demo](https://www.youtube.com/watch?v=hNN5bL1nq7k) &middot; [lucidos.dev](https://lucidos.dev) &middot; macOS DMG, or one line on macOS and Linux.</sub>
+<sub>Described in chat, running seconds later in the same window, wired to your own data. [60-second demo](https://www.youtube.com/watch?v=hNN5bL1nq7k) &middot; [lucidos.dev](https://lucidos.dev) &middot; macOS DMG, or one line on macOS and Linux. The public GitHub repo is a release mirror, so its commit count does not show how old the project is.</sub>
 
 <!--intro-start-->
-Lucidos builds and runs the apps and automations you describe. Describe one in chat and you are using it seconds later, in the same window, wired to your own data. Ask for a change and it changes while it keeps running. No build step, no deploy, no separate service to stand up.
+Lucidos builds and runs the apps and automations you describe. They run together with the assistant in one workspace, and share its data, memory and connected accounts. Describe an app in chat and you are using it seconds later, in the same window, wired to your own data. Ask for a change and it changes while it keeps running. No build step, no deploy, no separate service to stand up.
 
 > *If you can describe it, it exists*
 
-Everything you make lives in one workspace on your own machine: the apps, the automations, the files, the data, and the memory. They share all of it, so the twentieth thing you build costs less than the first, because it already knows what the others learned. Researching a topic, keeping the findings, building an app around them, and pulling in data from an outside API on a schedule is one flow, not four tools.
+Everything lives on your own machine: the apps, the automations, the files, the data, the memory, and the accounts you connect. You connect a service once, and the proxy adds the key to each call, so an app never sees it. Because everything shares one workspace, the twentieth thing you build costs less than the first: it already knows what the others learned. The assistant writes what it learns into knowhow, and it can split a big job across parallel threads. Researching a topic, keeping the findings, building an app on them and pulling outside data on a schedule is one flow, not four tools.
 
 Chat sits beside the work in a split view on desktop, and as a pane you swipe to on mobile. You never leave your work to talk to it. So the loop that makes an app better runs while you are using it: you spot the thing, you say it, the app changes under you and keeps running. That loop is the same on a phone. It asks for no editor, no build, no redeploy, and no permission to read code, though knowing what is going on underneath is still an advantage. The prompt is the main interface, and the models are configurable and swappable.
 
-You own the data. It lives in a local Postgres event store, or as git-versioned artifacts you can read without Lucidos. Nothing happens without your intent: you can automate anything, on a schedule or on an event, but Lucidos does not act on its own.
+You own the data. It lives in a local Postgres event store, or as git-versioned artifacts you can read without Lucidos. You decide what runs. Once you create a trigger, it runs unattended, on a schedule or when an event happens. It can run a script, start the assistant, or hand a job to a coding agent.
 <!--intro-end-->
 
 [![A half-marathon training app, described in chat and running live beside it, reading this morning's Oura readiness](docs/screenshots/readme-hero.png)](https://www.youtube.com/watch?v=hNN5bL1nq7k)

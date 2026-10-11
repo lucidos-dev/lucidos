@@ -47,69 +47,34 @@ fn spawn_consumer_continue_must_send_non_empty_user_message() {
 ///
 /// Contract: `select_unproposed_idle_cc_threads` picks the thread, and
 /// `propose_held_back_changes_on_startup_with_roots` emits exactly one
-/// `ChangeProposed` for it (branch name + real committed file), flipping
-/// `coding_agent_proposed` TRUE.
+/// `ChangeProposed` for it (branch name + real committed file), moving the
+/// thread to `proposed`.
 #[tokio::test]
 async fn startup_proposes_held_back_change_for_eligible_thread() {
     use super::{
         propose_held_back_changes_on_startup_with_roots, select_unproposed_idle_cc_threads,
     };
-    use crate::test_support::{make_repo_and_worktree, start_cc_session};
 
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let branch = "claude-code/held-back-propose-test";
-    let (_tmp, repo_root, wt) = make_repo_and_worktree(branch).await;
-
-    // Real committed work on the branch — without this,
-    // `proposal_files_for_branch` returns None and the propose path skips.
-    std::fs::write(wt.join("a.txt"), "held-back content").unwrap();
-    use crate::engine::git_ops::git_cmd;
-    git_cmd(&["add", "."], &wt).await.unwrap();
-    git_cmd(&["commit", "-m", "held-back commit"], &wt)
-        .await
-        .unwrap();
-
-    let thread_id = Uuid::new_v4();
-
-    // SessionStarted seeds `is_coding_agent=true, state='active'` and the
-    // branch lookup the held-back-propose helper needs.
-    start_cc_session(&bus, thread_id, branch, None).await;
-
-    // A clean Generated terminal: the thread FINISHED its turn (the per-idle
-    // propose was held back), which is what makes it eligible for re-proposal —
-    // `propose_one_held_back_change` only rescues threads whose last turn ended
-    // cleanly.
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::ResponseGenerated {
-            text: "Done.".into(),
-            images: Vec::new(),
-            model: Some("test-model".into()),
-            reasoning_effort: None,
-        },
-        meta: EventMeta {
-            channel: Some(EventChannel::ClaudeCode),
-            ..EventMeta::NONE
-        },
-    })
-    .await
-    .expect("emit succeeds")
-    .expect("event persisted");
-
-    // Stuck-after-restart shape: a real committed diff, never proposed.
-    sqlx::query(
-        "UPDATE thread_summaries \
-         SET coding_agent_has_diff = TRUE, \
-             coding_agent_proposed = FALSE, \
-             archive_state = 'inbox' \
-         WHERE thread_id = $1",
+    let (_tmp, repo_root, thread_id) = stuck_thread_with_held_back_work(&pool, &bus, branch).await;
+    crate::engine::git_ops::record_planned(
+        &pool,
+        &repo_root,
+        branch,
+        crate::engine::git_ops::PlanMarkerKind::AcknowledgedSimple,
+        None,
+        Some("test fixture"),
+        &[],
+        "abc",
     )
-    .bind(thread_id)
-    .execute(&pool)
     .await
-    .expect("stamp stuck shape");
+    .expect("record a satisfying plan marker");
+    crate::engine::git_ops::record_hardened(&pool, &repo_root, branch, "abc")
+        .await
+        .expect("record the harden marker");
 
     // Selection picks exactly this thread.
     let selected = select_unproposed_idle_cc_threads(&pool).await;
@@ -125,10 +90,10 @@ async fn startup_proposes_held_back_change_for_eligible_thread() {
     propose_held_back_changes_on_startup_with_roots(&pool, &bus, &repo_root, &repo_root, &selected)
         .await;
 
-    // The contract: coding_agent_proposed is TRUE — the ChangeProposed event
-    // landed and its projection arm ran.
+    // The contract: the thread is proposed, so the ChangeProposed event landed
+    // and its projection arm ran.
     let proposed_after: bool = sqlx::query_scalar(
-        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)
@@ -136,7 +101,7 @@ async fn startup_proposes_held_back_change_for_eligible_thread() {
     .unwrap();
     assert!(
         proposed_after,
-        "coding_agent_proposed must flip TRUE after the held-back propose runs — \
+        "the thread must be proposed after the held-back propose runs — \
          without this the user has a worktree with a real diff but no Apply button. \
          See threads c1cec485-… / 7f971704-… (2026-05-28/29)."
     );
@@ -173,6 +138,246 @@ async fn startup_proposes_held_back_change_for_eligible_thread() {
     teardown_test_db(&db_name).await;
 }
 
+/// An idle Lucidos-kind thread whose turn ended cleanly with committed work on
+/// `branch` that no change carries: the shape the held-back sweep rescues.
+async fn stuck_thread_with_held_back_work(
+    pool: &sqlx::PgPool,
+    bus: &EventBus,
+    branch: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, Uuid) {
+    use crate::test_support::{make_repo_and_worktree, start_cc_session};
+
+    let (_tmp, repo_root, wt) = make_repo_and_worktree(branch).await;
+
+    // Real committed work on the branch — without this,
+    // `proposal_files_for_branch` returns None and the propose path skips.
+    std::fs::write(wt.join("a.txt"), "held-back content").unwrap();
+    use crate::engine::git_ops::git_cmd;
+    git_cmd(&["add", "."], &wt).await.unwrap();
+    git_cmd(&["commit", "-m", "held-back commit"], &wt)
+        .await
+        .unwrap();
+
+    let thread_id = Uuid::new_v4();
+
+    // SessionStarted seeds `is_coding_agent=true, state='active'` and the
+    // branch lookup the held-back-propose helper needs.
+    start_cc_session(bus, thread_id, branch, None).await;
+
+    // A clean Generated terminal: the thread FINISHED its turn, and the
+    // per-idle propose was held back. `propose_one_held_back_change` rescues
+    // only threads whose last turn ended cleanly.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "Done.".into(),
+            images: Vec::new(),
+            model: Some("test-model".into()),
+            reasoning_effort: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    // Stuck-after-restart shape: a real committed diff, never proposed.
+    sqlx::query(
+        "UPDATE thread_summaries \
+         SET coding_agent_change_state = 'unproposed', \
+             coding_agent_unproposed_reason = NULL, \
+             archive_state = 'inbox' \
+         WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .expect("stamp stuck shape");
+    (_tmp, repo_root, thread_id)
+}
+
+/// The payloads of a thread's `ProposalWithheld` events, oldest first.
+async fn withheld_payloads(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT payload FROM events \
+         WHERE thread_id = $1 AND event_type = 'ProposalWithheld' ORDER BY sequence",
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// The sweep applies the same plan floor as `propose_change`. Work on a
+/// Lucidos-source branch with no marker stays unproposed, because Apply would
+/// refuse it. I3: the hold is announced once with branch, files and reason, and
+/// a second boot over the same branch announces nothing.
+#[tokio::test]
+async fn startup_holds_a_held_back_change_whose_branch_has_no_plan_marker() {
+    use super::propose_held_back_changes_on_startup_with_roots;
+    use crate::engine::thread_events::UnproposedReason;
+    use crate::engine::thread_lifecycle::CodingAgentChangeState;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let branch = "claude-code/held-back-no-plan";
+    let (_tmp, repo_root, thread_id) = stuck_thread_with_held_back_work(&pool, &bus, branch).await;
+
+    for _boot in 0..2 {
+        propose_held_back_changes_on_startup_with_roots(
+            &pool,
+            &bus,
+            &repo_root,
+            &repo_root,
+            &[thread_id],
+        )
+        .await;
+    }
+
+    let proposals: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = 'ChangeProposed'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(proposals, 0, "a marker-less branch must not be proposed");
+    let withheld = withheld_payloads(&pool, thread_id).await;
+    assert_eq!(
+        withheld.len(),
+        1,
+        "two boots, one announcement: {withheld:?}"
+    );
+    assert_eq!(withheld[0]["branch_name"], branch);
+    assert_eq!(withheld[0]["files"], serde_json::json!(["a.txt"]));
+    assert_eq!(withheld[0]["reason"], "plan_missing");
+    assert_eq!(
+        crate::test_support::read_change_state(&pool, thread_id).await,
+        CodingAgentChangeState::Unproposed {
+            reason: Some(UnproposedReason::PlanMissing)
+        }
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A thread still holding an event wait after a clean turn parked mid-work, so
+/// its idle held the proposal (ADR 0395). A restart must not undo that hold:
+/// the wait survives it, and its delivery, expiry or cancel proposes later. A
+/// user Stop never proposes, wait or no wait: its work is withheld (ADR 0400).
+#[tokio::test]
+async fn startup_propose_helper_holds_only_a_clean_turn_holding_an_event_wait() {
+    use super::propose_held_back_changes_on_startup_with_roots;
+    use crate::engine::thread_events::CancelCause;
+    use crate::test_support::{make_repo_and_worktree, start_cc_session};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+    let cases = [
+        (
+            "clean",
+            ThreadEvent::ResponseGenerated {
+                text: "Not done yet.".into(),
+                images: Vec::new(),
+                model: Some("test-model".into()),
+                reasoning_effort: None,
+            },
+            0,
+        ),
+        (
+            "stopped",
+            ThreadEvent::ResponseCanceled {
+                text: String::new(),
+                images: Vec::new(),
+                model: None,
+                reasoning_effort: None,
+                cause: CancelCause::UserStop,
+            },
+            1,
+        ),
+    ];
+    for (name, terminal, expected_withheld) in cases {
+        let branch = format!("claude-code/held-at-boot-{name}");
+        let (_tmp, repo_root, wt) = make_repo_and_worktree(&branch).await;
+        std::fs::write(wt.join("a.txt"), "waiting work").unwrap();
+        use crate::engine::git_ops::git_cmd;
+        git_cmd(&["add", "."], &wt).await.unwrap();
+        git_cmd(&["commit", "-m", "waiting work"], &wt)
+            .await
+            .unwrap();
+
+        // A satisfying plan marker, so the plan floor stays out of a test
+        // about the event-wait hold.
+        crate::engine::git_ops::record_planned(
+            &pool,
+            &repo_root,
+            &branch,
+            crate::engine::git_ops::PlanMarkerKind::AcknowledgedSimple,
+            None,
+            Some("test fixture"),
+            &[],
+            "abc",
+        )
+        .await
+        .expect("record a satisfying plan marker");
+
+        let thread_id = Uuid::new_v4();
+        start_cc_session(&bus, thread_id, &branch, None).await;
+        let wait_id = Uuid::new_v4();
+        for event in [crate::test_support::event_wait_started(wait_id), terminal] {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta: cc_meta.clone(),
+            })
+            .await
+            .expect("emit succeeds");
+        }
+        sqlx::query(
+            "UPDATE thread_summaries SET coding_agent_change_state = 'unproposed' \
+             WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .expect("stamp the held shape");
+
+        propose_held_back_changes_on_startup_with_roots(
+            &pool,
+            &bus,
+            &repo_root,
+            &repo_root,
+            &[thread_id],
+        )
+        .await;
+
+        let proposals: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'ChangeProposed'",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(proposals, 0, "{name} turn holding a live event wait");
+        assert_eq!(
+            withheld_payloads(&pool, thread_id).await.len(),
+            expected_withheld,
+            "{name}: only the unfinished turn is announced as withheld"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Companion: the held-back propose helper must skip threads that don't need
 /// rescuing. Three cases — already-proposed, no diff, external repo — must
 /// emit nothing. Without this, the recovery could double-emit `ChangeProposed`
@@ -199,8 +404,7 @@ async fn startup_propose_helper_skips_ineligible_threads() {
     let already_proposed = Uuid::new_v4();
     start_cc_session(&bus, already_proposed, branch, None).await;
     sqlx::query(
-        "UPDATE thread_summaries \
-         SET coding_agent_has_diff = TRUE, coding_agent_proposed = TRUE \
+        "UPDATE thread_summaries SET coding_agent_change_state = 'proposed' \
          WHERE thread_id = $1",
     )
     .bind(already_proposed)
@@ -214,8 +418,7 @@ async fn startup_propose_helper_skips_ineligible_threads() {
     let branch_b = "claude-code/no-diff-test";
     start_cc_session(&bus, no_diff, branch_b, None).await;
     sqlx::query(
-        "UPDATE thread_summaries \
-         SET coding_agent_has_diff = FALSE, coding_agent_proposed = FALSE \
+        "UPDATE thread_summaries SET coding_agent_change_state = 'none' \
          WHERE thread_id = $1",
     )
     .bind(no_diff)
@@ -230,7 +433,7 @@ async fn startup_propose_helper_skips_ineligible_threads() {
     start_cc_session(&bus, external, branch_c, Some("ext-repo".into())).await;
     sqlx::query(
         "UPDATE thread_summaries \
-         SET coding_agent_has_diff = TRUE, coding_agent_proposed = FALSE, \
+         SET coding_agent_change_state = 'unproposed', \
              coding_agent_is_external_repo = TRUE \
          WHERE thread_id = $1",
     )
@@ -242,8 +445,7 @@ async fn startup_propose_helper_skips_ineligible_threads() {
     // Case D: a real committed diff (reuses `branch`'s commit) but the last
     // turn ended NOT-clean (ResponseAborted — engine killed it mid-turn). The
     // sweep only re-proposes FINISHED threads; an interrupted thread recovers
-    // via Continue, so the helper must skip it even though it has a diff and
-    // no proposal.
+    // via Continue, so its work is withheld, never proposed (ADR 0400).
     let interrupted = Uuid::new_v4();
     start_cc_session(&bus, interrupted, branch, None).await;
     bus.emit(BusEvent::Thread {
@@ -264,8 +466,7 @@ async fn startup_propose_helper_skips_ineligible_threads() {
     .expect("emit succeeds")
     .expect("event persisted");
     sqlx::query(
-        "UPDATE thread_summaries \
-         SET coding_agent_has_diff = TRUE, coding_agent_proposed = FALSE \
+        "UPDATE thread_summaries SET coding_agent_change_state = 'unproposed' \
          WHERE thread_id = $1",
     )
     .bind(interrupted)
@@ -296,6 +497,18 @@ async fn startup_propose_helper_skips_ineligible_threads() {
             n, 0,
             "thread {} is ineligible (already-proposed / no-diff / external / interrupted-not-clean) — the helper must emit zero ChangeProposed",
             tid
+        );
+    }
+    for (tid, expected) in [
+        (already_proposed, 0),
+        (no_diff, 0),
+        (external, 0),
+        (interrupted, 1),
+    ] {
+        assert_eq!(
+            withheld_payloads(&pool, tid).await.len(),
+            expected,
+            "only the interrupted thread's work is announced as withheld"
         );
     }
 
@@ -374,8 +587,7 @@ async fn startup_proposes_held_back_change_for_app_kind_thread() {
     // defaults to Lucidos kind, so override it explicitly here.
     sqlx::query(
         "UPDATE thread_summaries \
-         SET coding_agent_has_diff = TRUE, \
-             coding_agent_proposed = FALSE, \
+         SET coding_agent_change_state = 'unproposed', \
              coding_agent_kind = 'app', \
              archive_state = 'inbox' \
          WHERE thread_id = $1",
@@ -402,7 +614,7 @@ async fn startup_proposes_held_back_change_for_app_kind_thread() {
     .await;
 
     let proposed_after: bool = sqlx::query_scalar(
-        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_one(&pool)

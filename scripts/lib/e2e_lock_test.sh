@@ -29,6 +29,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # detect — and SIGUSR1 — a real running e2e engine.
 TMPROOT="$(mktemp -d -t lucidos-e2e-lock-test.XXXXXX)"
 export E2E_LOCK_DIR_OVERRIDE="$TMPROOT/lock-dir"
+# Test 9 runs a real entry script, which would otherwise hand off to GitHub.
+export LUCIDOS_E2E_LOCAL=1
 mkdir -p "$E2E_LOCK_DIR_OVERRIDE"
 # Basename starts with `e2e-` so it satisfies
 # `assert_e2e_workspace_is_disposable` in scripts/lib/e2e.sh, which refuses

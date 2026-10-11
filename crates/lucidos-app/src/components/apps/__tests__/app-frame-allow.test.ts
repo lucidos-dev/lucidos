@@ -76,10 +76,10 @@ describe('what the app frame delegates', () => {
   it('is what the frame actually carries', () => {
     // The scan below catches a SECOND spelling. Nothing but this catches the
     // attribute being dropped, which denies every feature just as completely.
-    const src: string = readFileSync(resolve(APPS_DIR, 'AppUiInline.tsx'), 'utf8');
+    const src: string = readFileSync(resolve(APPS_DIR, 'AppFrame.tsx'), 'utf8');
     expect(
       src,
-      'AppUiInline.tsx no longer passes APP_FRAME_ALLOW to the app frame, so the '
+      'AppFrame.tsx no longer passes APP_FRAME_ALLOW to the app frame, so the '
       + 'constant above is not what ships and every feature in it is denied.',
     ).toContain('allow={APP_FRAME_ALLOW}');
   });

@@ -2,8 +2,9 @@
 //!
 //! The user reads only the agent's text and its cards, never a tool result or
 //! the agent's reasoning. So a card may not be the first thing they get after
-//! a reply they typed into a card, or after tool work nobody reported. Nor may
-//! it point "above" at words the user never read. One rule for the chat agent,
+//! tool work nobody reported. Nor may it point "above" at words the user never
+//! read. A typed answer counts as a message: it may answer the card, ask back
+//! or say something else. One rule for the chat agent,
 //! Claude Code and Codex, read from the thread's events so every agent sees
 //! the same facts.
 //!
@@ -13,6 +14,10 @@
 //! A card question longer than any note reports the tool work before it: the
 //! user reads it in full. So does the chat card's `message`, which the user
 //! reads as the agent's reply.
+//!
+//! Nor may a card follow a *progress note* without a `message`. The user read
+//! only the provider's summary of what the agent wrote, and the agent believes
+//! they read all of it. The stream marks a note, so this rule guesses nothing.
 //!
 //! A model-tolerance measure: `docs/temporary-measures.md` § "A question card
 //! with no answer before it". Plans:
@@ -45,17 +50,17 @@ macro_rules! card_message_hint {
 #[cfg(test)]
 const CARD_MESSAGE_HINT: &str = card_message_hint!();
 
-/// The tool result a card gets when the agent owes words, after the marker
+/// The tool result a card gets after unreported tool work, after the marker
 /// and the quoted input. Every agent's notes between tool calls arrive as
 /// text, so it asks for prose.
 const OWES_WORDS: &str = concat!(
-    "Since the user's last input you have written them nothing. They read only your text and \
-     your cards, never your tool results or your reasoning. If they asked something, answer it \
-     in plain prose now, or ",
+    "Since the user's last input you have not told them what your tools found. They read only \
+     your text and your cards, never your tool results or your reasoning. Say what you found in \
+     plain prose now, or ",
     card_message_hint!(),
-    ". If you ran tools, say what you found. Then ask your question again, and keep everything \
-     already on the card, pictures and links included. If there is truly nothing to say, send \
-     the same question again unchanged: it will not be refused twice."
+    ". If they asked something, answer it the same way. Then ask your question again, and keep \
+     everything already on the card, pictures and links included. If there is truly nothing to \
+     say, send the same question again unchanged: it will not be refused twice."
 );
 
 /// A refusal that quotes the user's input reads like news of a new message.
@@ -75,8 +80,8 @@ const NOTE_SIZED_CHARS: usize = 600;
 /// Why a card is refused. Each reason carries its own tool result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// A typed reply got no words back, or tool work went unreported.
-    /// `input` is the user's last input, quoted so it never reads as new.
+    /// Tool work went unreported. `input` is the user's last input, quoted so
+    /// it never reads as new.
     OwesWords { input: LastInput },
     /// The card points "above", and all the user read since their last input
     /// is `words`, too short to hold what it points at.
@@ -84,9 +89,9 @@ pub(crate) enum Refusal {
     /// The agent saved these artifacts since the user's last input, and
     /// neither its words nor the card show or link them.
     ArtifactNotShown { paths: Vec<String> },
-    /// The user typed `reply`, and all they got back is progress notes,
-    /// `words`. A note summarizes a draft and never carries it.
-    OnlyNotes { reply: String, words: String },
+    /// The last words before the card were a progress note: `note` is all the
+    /// user read of what the agent wrote there.
+    NoteShownAsSummary { note: String },
 }
 
 impl Refusal {
@@ -120,6 +125,21 @@ impl Refusal {
                     seen = seen
                 )
             }
+            Self::NoteShownAsSummary { note } => format!(
+                concat!(
+                    "{REFUSAL_MARKER} The text you wrote just before this card was longer than \
+                     a note, so the user saw only this summary of it: \"{note}\". Nothing else \
+                     of it reached them. Text written before any tool call reaches them only \
+                     as such a summary. Put what they need, such as the answer, steps, links or \
+                     pictures, ",
+                    card_message_hint!(),
+                    ", or else in the question. Then ask again. If the summary already gives \
+                     them everything, send the same question again unchanged: it will not be \
+                     refused twice."
+                ),
+                REFUSAL_MARKER = REFUSAL_MARKER,
+                note = quote(note)
+            ),
             Self::ArtifactNotShown { paths } => {
                 let paths = paths
                     .iter()
@@ -134,9 +154,9 @@ impl Refusal {
                          Put the line `lucidos data write` printed ON the card. A picture's \
                          `![...]` line goes ",
                         card_message_hint!(),
-                        ", in the question, or in an option's `preview` if your tool has one. \
-                         When the options look different, give each its own picture of only \
-                         that option. The `[...](...)` link to any other file goes ",
+                        ", or in the question. An option's picture goes in its `preview` or \
+                         description, whichever your tool has. When the options look different, \
+                         give each its own picture of only that option. The `[...](...)` link to any other file goes ",
                         card_message_hint!(),
                         " or in the question: an option shows a link as plain text. If they \
                          asked something, answer it in plain prose or ",
@@ -150,37 +170,8 @@ impl Refusal {
                     paths = paths
                 )
             }
-            Self::OnlyNotes { reply, words } => format!(
-                concat!(
-                    "{REFUSAL_MARKER} The user's last input is {}. You already received it and \
-                     acted on it. {NOTHING_NEW} Since that reply, all they have read from you \
-                     is this progress note: \"{}\". Before a tool call, your prose reaches them \
-                     only as a short note that summarizes it. So a message, steps or a draft \
-                     you wrote there reached nobody. Put what they must read on the card \
-                     itself, ",
-                    card_message_hint!(),
-                    ", or else in the question: the card shows it in full. Then send your card \
-                     again, with everything already on it. Never end your turn without it: \
-                     a reply that asks for something else still leaves your questions open. \
-                     If the note truly says it all, send the same question again unchanged: \
-                     it will not be refused twice."
-                ),
-                typed_reply(reply),
-                words.trim(),
-                REFUSAL_MARKER = REFUSAL_MARKER,
-                NOTHING_NEW = NOTHING_NEW
-            ),
         }
     }
-}
-
-/// What the chat round wrote before its card. Only the chat loop knows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RoundText<'a> {
-    /// Text the user reads in full.
-    Reply(&'a str),
-    /// Only progress notes, each a short summary of what the model drafted.
-    Notes(&'a str),
 }
 
 /// Everything the card renders, one field per line. `questions` is the
@@ -313,7 +304,7 @@ pub(crate) enum LastInput {
     Message(String),
     /// A card answer that only picked options.
     Picked,
-    /// A card answer carrying text the user typed.
+    /// Text the user typed into a card, with or without a pick.
     Typed(String),
 }
 
@@ -332,17 +323,16 @@ impl LastInput {
     /// The input named and quoted, for a refusal. `None` when it has no text.
     fn quoted(&self) -> Option<String> {
         match self {
-            Self::Typed(text) if !text.trim().is_empty() => Some(typed_reply(text)),
+            Self::Typed(text) if !text.trim().is_empty() => Some(format!(
+                "the text they typed into your card: \"{}\"",
+                quote(text)
+            )),
             Self::Message(text) if !text.trim().is_empty() => {
                 Some(format!("this message: \"{}\"", quote(text)))
             }
             _ => None,
         }
     }
-}
-
-fn typed_reply(text: &str) -> String {
-    format!("the reply they typed into your card: \"{}\"", quote(text))
 }
 
 /// `text` on one line, cut to [`QUOTED_INPUT_CHARS`].
@@ -358,7 +348,6 @@ fn quote(text: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SinceLastInput {
     pub(crate) last_input: LastInput,
-    pub(crate) spoke: bool,
     /// Tool calls after the agent's last words, or after the input if it said
     /// nothing. "Let me check the log" reports nothing the log said.
     pub(crate) unreported_tool_calls: i64,
@@ -370,24 +359,20 @@ pub(crate) struct SinceLastInput {
     pub(crate) words: String,
     /// Artifacts this thread saved through the data API since that input.
     pub(crate) saved_artifacts: Vec<String>,
-    /// The chat round before the card wrote only progress notes.
-    pub(crate) round_was_notes: bool,
     /// The card carries a `message`, which the user reads in full above it.
     pub(crate) card_has_message: bool,
+    /// The progress note the user read last, when it is the latest of the
+    /// agent's words since that input.
+    pub(crate) last_progress_note: Option<String>,
 }
 
 impl SinceLastInput {
     /// Fold in the chat round's own text, which may not be in the events yet.
     /// Words written after the tool work report it.
-    fn with_round_text(mut self, round: RoundText<'_>) -> Self {
-        let round_text = match round {
-            RoundText::Reply(text) | RoundText::Notes(text) => text,
-        };
+    fn with_round_text(mut self, round_text: &str) -> Self {
         if round_text.trim().is_empty() {
             return self;
         }
-        self.round_was_notes = matches!(round, RoundText::Notes(_));
-        self.spoke = true;
         self.unreported_tool_calls = 0;
         if self.words.contains(round_text) {
             return self;
@@ -405,6 +390,18 @@ impl SinceLastInput {
         self
     }
 
+    /// Fold in the chat round: its text, and its last progress note when the
+    /// text ends on it. Prose after the note is what the user read last.
+    fn with_round(self, round: ChatRound<'_>) -> Self {
+        let mut since = self.with_round_text(round.text);
+        since.last_progress_note = round
+            .progress_notes
+            .last()
+            .filter(|note| round.text.trim_end().ends_with(note.trim()))
+            .cloned();
+        since
+    }
+
     /// Fold in the card's `message`, which the user reads as a reply shown
     /// just above the card. So the card may also point "above" at it.
     fn with_card_message(self, message: &str) -> Self {
@@ -413,12 +410,12 @@ impl SinceLastInput {
         }
         Self {
             card_has_message: true,
-            ..self.with_round_text(RoundText::Reply(message))
+            ..self.with_round_text(message)
         }
     }
 
     /// A card `question` longer than any note reports the tool work before
-    /// it. It answers nothing the user typed: a re-sent card reads the same.
+    /// it.
     fn with_card_question(mut self, question: &str) -> Self {
         if question.trim().chars().count() >= NOTE_SIZED_CHARS {
             self.unreported_tool_calls = 0;
@@ -427,11 +424,10 @@ impl SinceLastInput {
     }
 }
 
-/// Refuse when a saved artifact shows nowhere. Or when a typed reply got no
-/// words back, or tool work went unreported. Or when a typed reply got only
-/// note-sized progress notes back. Or when the card points "above" at
-/// note-sized words. A card carrying a `message` passes all but the first.
-/// `card` is everything the card renders.
+/// Refuse when a saved artifact shows nowhere. Or when a progress note was
+/// the last thing the user read. Or when tool work went unreported. Or when
+/// the card points "above" at note-sized words. A card carrying a `message`
+/// passes all but the first. `card` is everything the card renders.
 ///
 /// One refusal per input, plus one artifact refusal. The artifact goes first:
 /// the work that made it is usually the unreported work. A retry after any
@@ -451,8 +447,14 @@ pub(crate) fn should_refuse(s: &SinceLastInput, card: &str) -> Option<Refusal> {
     if s.refused {
         return None;
     }
-    let unanswered = matches!(s.last_input, LastInput::Typed(_)) && !s.spoke;
-    if unanswered || s.unreported_tool_calls > 0 {
+    if let Some(note) = s
+        .last_progress_note
+        .as_ref()
+        .filter(|_| !s.card_has_message)
+    {
+        return Some(Refusal::NoteShownAsSummary { note: note.clone() });
+    }
+    if s.unreported_tool_calls > 0 {
         return Some(Refusal::OwesWords {
             input: s.last_input.clone(),
         });
@@ -460,12 +462,6 @@ pub(crate) fn should_refuse(s: &SinceLastInput, card: &str) -> Option<Refusal> {
     let words = s.words.trim();
     if s.card_has_message || words.chars().count() >= NOTE_SIZED_CHARS {
         return None;
-    }
-    if let (LastInput::Typed(reply), true) = (&s.last_input, s.round_was_notes) {
-        return Some(Refusal::OnlyNotes {
-            reply: reply.clone(),
-            words: words.to_string(),
-        });
     }
     says_above(card).then(|| Refusal::PointsAboveAtNothing {
         words: words.to_string(),
@@ -475,7 +471,7 @@ pub(crate) fn should_refuse(s: &SinceLastInput, card: &str) -> Option<Refusal> {
 /// The refusal for the card `tool_use_id` is about to raise on `thread_id`,
 /// or `None` to show it. `questions` is the tool's `questions` array,
 /// `message` the chat card's `message`, and `round` whatever the chat round
-/// wrote before the call.
+/// wrote before the call, with the progress notes among it.
 ///
 /// A card already shown always passes, so a crash-recovery re-POST is safe.
 /// A query error shows the card: blocking a question on a DB blip helps nobody.
@@ -485,12 +481,12 @@ pub(crate) async fn refuse_card(
     tool_use_id: &str,
     questions: &serde_json::Value,
     message: Option<&str>,
-    round: Option<RoundText<'_>>,
+    round: Option<ChatRound<'_>>,
 ) -> Option<Refusal> {
     match read_since_last_input(pool, thread_id, tool_use_id).await {
         Ok(Some(since)) => {
             let since = match round {
-                Some(round) => since.with_round_text(round),
+                Some(round) => since.with_round(round),
                 None => since,
             };
             let since = since
@@ -506,6 +502,14 @@ pub(crate) async fn refuse_card(
             None
         }
     }
+}
+
+/// What the chat round wrote before its card. The text may not be in the
+/// events yet, and the progress notes among it are never marked there.
+#[derive(Clone, Copy)]
+pub(crate) struct ChatRound<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) progress_notes: &'a [String],
 }
 
 /// How long a coding agent's refusal waits before its second look.
@@ -536,23 +540,22 @@ async fn read_since_last_input(
         Option<String>,
         Option<serde_json::Value>,
         Option<String>,
-        bool,
         i64,
         bool,
         bool,
         Option<String>,
         Vec<String>,
+        Option<String>,
     );
     // `DataFileWritten` has no thread_id: the saving thread is its actor. The
     // `created` bound only lets the index narrow the scan, with a minute of
     // slack for clock skew between transactions. `sequence` decides.
-    let row: Row =
-        sqlx::query_as(
-            "WITH last_input AS ( \
+    let row: Row = sqlx::query_as(
+        "WITH last_input AS ( \
                SELECT sequence, created, event_type, payload->'answer' AS answer, \
                  payload->>'text' AS text FROM events \
                WHERE thread_id = $1 \
-                 AND event_type IN ('MessageReceived', 'UserPromptInjected', 'UserQuestionAnswered') \
+                 AND event_type IN ('MessageReceived', 'PromptInjected', 'UserQuestionAnswered') \
                ORDER BY sequence DESC LIMIT 1 \
              ), since AS ( \
                SELECT sequence, event_type, payload FROM events \
@@ -572,7 +575,6 @@ async fn read_since_last_input(
                (SELECT event_type FROM last_input), \
                (SELECT answer FROM last_input), \
                (SELECT text FROM last_input), \
-               (SELECT sequence FROM last_words) IS NOT NULL, \
                (SELECT COUNT(*) FROM since \
                  WHERE event_type IN ('ToolCalled', 'CodingAgentToolCalled') \
                    AND NOT (payload->>'name' = ANY($3)) \
@@ -590,27 +592,33 @@ async fn read_since_last_input(
                    AND created >= COALESCE((SELECT created FROM last_input) - interval '1 minute', \
                      '-infinity'::timestamptz) \
                    AND sequence > COALESCE((SELECT sequence FROM last_input), 0) \
-                   AND payload->'data'->'actor'->>'source_thread_id' = $1::text)",
-        )
-        .bind(thread_id)
-        .bind(tool_use_id)
-        .bind(not_work())
-        .bind(REFUSAL_MARKER)
-        .bind(REFUSAL_WINDOW_CHARS)
-        .bind(format!("{REFUSAL_MARKER} {ARTIFACT_REFUSAL_LEAD}"))
-        .fetch_one(pool)
-        .await?;
+                   AND payload->'data'->'actor'->>'source_thread_id' = $1::text), \
+               (SELECT CASE WHEN COALESCE((payload->>'progress_note')::boolean, false) \
+                   THEN btrim(payload->>'text', E' \\t\\r\\n') END FROM since \
+                 WHERE event_type = 'CodingAgentTextStreamed' \
+                   AND payload->>'parent_tool_use_id' IS NULL \
+                   AND btrim(payload->>'text', E' \\t\\r\\n') <> '' \
+                 ORDER BY sequence DESC LIMIT 1)",
+    )
+    .bind(thread_id)
+    .bind(tool_use_id)
+    .bind(not_work())
+    .bind(REFUSAL_MARKER)
+    .bind(REFUSAL_WINDOW_CHARS)
+    .bind(format!("{REFUSAL_MARKER} {ARTIFACT_REFUSAL_LEAD}"))
+    .fetch_one(pool)
+    .await?;
     let (
         already_shown,
         input_type,
         answer,
         message,
-        spoke,
         unreported_tool_calls,
         refused,
         artifact_refused,
         words,
         saved,
+        last_progress_note,
     ) = row;
     if already_shown {
         return Ok(None);
@@ -622,14 +630,13 @@ async fn read_since_last_input(
     };
     Ok(Some(SinceLastInput {
         last_input,
-        spoke,
         unreported_tool_calls,
         refused,
         artifact_refused,
         words: words.unwrap_or_default(),
         saved_artifacts: saved.into_iter().filter(|p| is_shown_artifact(p)).collect(),
-        round_was_notes: false,
         card_has_message: false,
+        last_progress_note,
     }))
 }
 

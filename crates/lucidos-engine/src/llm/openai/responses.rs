@@ -22,8 +22,14 @@ impl OpenAiProvider {
     /// - `{"role": "user"|"assistant", "content": "..."}`
     /// - `{"type": "function_call", "id": "...", "call_id": "...", "name": "...", "arguments": "..."}`
     /// - `{"type": "function_call_output", "call_id": "...", "output": "..."}`
-    fn convert_messages_responses(messages: &[Message]) -> Vec<serde_json::Value> {
+    ///
+    /// `breakpoints` is [`super::takes_cache_breakpoints`] for the model.
+    fn convert_messages_responses(
+        messages: &[Message],
+        breakpoints: bool,
+    ) -> Vec<serde_json::Value> {
         let mut input: Vec<serde_json::Value> = Vec::new();
+        let mut marked = 0;
 
         for msg in messages {
             match &msg.content {
@@ -35,6 +41,18 @@ impl OpenAiProvider {
                 }
                 MessageContent::Blocks(blocks) => {
                     let mut text_parts: Vec<String> = Vec::new();
+                    let marked_text = breakpoints
+                        && msg.role == "user"
+                        && blocks
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::MemoryView { .. }));
+                    if marked_text {
+                        input.push(serde_json::json!({
+                            "role": msg.role,
+                            "content": marked_parts(blocks, &mut marked),
+                        }));
+                        continue;
+                    }
 
                     for block in blocks {
                         match block {
@@ -143,6 +161,11 @@ impl OpenAiProvider {
         )
     }
 
+    /// The Responses API `tool_choice` that makes the model call `tool`.
+    fn forced_tool_choice_responses(tool: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "function", "name": tool })
+    }
+
     fn build_responses_body(
         &self,
         model: &str,
@@ -151,7 +174,8 @@ impl OpenAiProvider {
         system_prompt: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> serde_json::Value {
-        let input = Self::convert_messages_responses(messages);
+        let input =
+            Self::convert_messages_responses(messages, super::takes_cache_breakpoints(model));
 
         let mut body = serde_json::json!({
             "model": model,
@@ -416,8 +440,11 @@ impl OpenAiProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let model = selection.model.unwrap_or(&self.model);
         let reasoning_effort = selection.reasoning_effort;
-        let body =
+        let mut body =
             self.build_responses_body(model, messages, tools, system_prompt, reasoning_effort);
+        if let Some(tool) = selection.forced_tool {
+            body["tool_choice"] = Self::forced_tool_choice_responses(tool);
+        }
 
         // Debug: log tool count and names
         if let Some(tools_arr) = body.get("tools").and_then(|t| t.as_array()) {
@@ -473,11 +500,14 @@ impl OpenAiProvider {
                     status,
                     &error_body[..error_body.floor_char_boundary(500)]
                 );
-                return Err(crate::llm::with_retry_context(
-                    format!("OpenAI Responses API error ({}): {}", status, error_body),
-                    attempt,
-                )
-                .into());
+                return Err(crate::llm::not_served::failure(
+                    status.as_u16(),
+                    &error_body,
+                    crate::llm::with_retry_context(
+                        format!("OpenAI Responses API error ({}): {}", status, error_body),
+                        attempt,
+                    ),
+                ));
             }
 
             match self.parse_responses_stream(resp, &on_token).await {
@@ -509,9 +539,133 @@ impl OpenAiProvider {
     }
 }
 
+/// Explicit breakpoints a request may carry. A request writes the cache at
+/// most four times, and the default mode spends one at the end of the latest
+/// message.
+pub(crate) const MAX_BREAKPOINTS: usize = 3;
+
+/// A user message holding memory view blocks, as typed text parts. Each
+/// memory view block takes a breakpoint, so a later request that marks the
+/// same place reads the cache up to there. A read needs a breakpoint in the
+/// very same place, which is why the view marks fixed places.
+///
+/// The parts read as the joined string would, with a newline between two
+/// parts only where the first does not already end in one. Only text
+/// travels, as images do not on this wire.
+fn marked_parts(blocks: &[ContentBlock], breakpoints: &mut usize) -> Vec<serde_json::Value> {
+    let texts: Vec<(&str, bool)> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::MemoryView { text } => Some((text.as_str(), true)),
+            ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
+                Some((text.as_str(), false))
+            }
+            _ => None,
+        })
+        .filter(|(text, _)| !text.is_empty())
+        .collect();
+    let last = texts.len().saturating_sub(1);
+    texts
+        .iter()
+        .enumerate()
+        .map(|(i, &(text, marked))| {
+            let mut text = text.to_string();
+            if i < last && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            let mut part = serde_json::json!({"type": "input_text", "text": text});
+            if marked && *breakpoints < MAX_BREAKPOINTS {
+                *breakpoints += 1;
+                part["prompt_cache_breakpoint"] = serde_json::json!({"mode": "explicit"});
+            }
+            part
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user(blocks: Vec<ContentBlock>) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: MessageContent::Blocks(blocks),
+        }
+    }
+
+    fn view(text: &str) -> ContentBlock {
+        ContentBlock::MemoryView {
+            text: text.to_string(),
+        }
+    }
+
+    fn text(text: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: text.to_string(),
+        }
+    }
+
+    /// A memory view block is a cache mark on this wire too: it travels as its
+    /// own part with a breakpoint, so a later request marking the same place
+    /// reads up to it.
+    #[test]
+    fn a_memory_view_block_takes_a_breakpoint() {
+        let input = OpenAiProvider::convert_messages_responses(
+            &[user(vec![
+                view("<chat>\na\nb\n"),
+                text("c\n</chat>\n"),
+                text("the task"),
+            ])],
+            true,
+        );
+        let parts = input[0]["content"].as_array().expect("typed parts");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["prompt_cache_breakpoint"]["mode"], "explicit");
+        assert!(parts[1].get("prompt_cache_breakpoint").is_none());
+        assert!(parts[2].get("prompt_cache_breakpoint").is_none());
+        let joined: String = parts.iter().map(|p| p["text"].as_str().unwrap()).collect();
+        assert_eq!(joined, "<chat>\na\nb\nc\n</chat>\nthe task");
+    }
+
+    /// A message with no memory view block, which is every Classic message,
+    /// keeps its one joined string.
+    #[test]
+    fn a_message_with_no_memory_view_block_stays_one_string() {
+        let input =
+            OpenAiProvider::convert_messages_responses(&[user(vec![text("a"), text("b")])], true);
+        assert_eq!(input[0]["content"], "a\nb");
+    }
+
+    /// A model before GPT-5.6 refuses a breakpoint with a 400, so a message
+    /// holding a memory view block goes to it as one joined string.
+    #[test]
+    fn a_model_without_breakpoints_gets_the_joined_string() {
+        assert!(!super::super::takes_cache_breakpoints("gpt-5.5"));
+        assert!(!super::super::takes_cache_breakpoints("gpt-5.3-codex"));
+        assert!(super::super::takes_cache_breakpoints("gpt-5.6-sol"));
+        assert!(super::super::takes_cache_breakpoints("gpt-6.1-sol"));
+        let input = OpenAiProvider::convert_messages_responses(
+            &[user(vec![view("<chat>\na\n"), text("the task")])],
+            false,
+        );
+        assert_eq!(input[0]["content"], "<chat>\na\n\nthe task");
+    }
+
+    /// Breakpoints stop at three, since the default mode writes at the end of
+    /// the latest message too and a request allows four writes.
+    #[test]
+    fn a_request_carries_at_most_three_breakpoints() {
+        let blocks = (0..5).map(|i| view(&format!("block {i}\n"))).collect();
+        let input = OpenAiProvider::convert_messages_responses(&[user(blocks)], true);
+        let marked = input[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p.get("prompt_cache_breakpoint").is_some())
+            .count();
+        assert_eq!(marked, MAX_BREAKPOINTS);
+    }
 
     /// The Responses API retains response objects for at least 30 days under
     /// its `store: true` default. We rebuild the full history as `input` on
@@ -528,6 +682,16 @@ mod tests {
         let body = provider.build_responses_body("gpt-5.5", &messages, &[], None, None);
 
         assert_eq!(body["store"], false);
+    }
+
+    /// The Responses API names the function at the top level, unlike Chat
+    /// Completions.
+    #[test]
+    fn a_forced_call_names_its_function() {
+        assert_eq!(
+            OpenAiProvider::forced_tool_choice_responses("request_read"),
+            serde_json::json!({ "type": "function", "name": "request_read" })
+        );
     }
 
     /// Sibling of `chat_body_sends_the_reasoning_effort_verbatim`: the two
@@ -573,7 +737,7 @@ mod tests {
         // Terminal event — `meta` populated from the embedded Response.
         let done = OpenAiProvider::process_responses_chunk(
             "response.completed",
-            r#"{"response":{"status":"completed","usage":{"input_tokens":11,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}}"#,
+            r#"{"response":{"status":"completed","model":"gpt-5.6-luna-2026-04-01","usage":{"input_tokens":11,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}}"#,
             &mut content,
             &mut tools,
             &mut item_id_map,
@@ -589,6 +753,10 @@ mod tests {
         assert_eq!(meta.output_tokens, Some(3));
         assert_eq!(meta.cache_read_tokens, Some(4));
         assert_eq!(meta.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(
+            meta.served_model.as_deref(),
+            Some("gpt-5.6-luna-2026-04-01")
+        );
     }
 
     /// The overlap, on its own, matching the Chat Completions case exactly.
@@ -611,6 +779,28 @@ mod tests {
         .unwrap();
         assert_eq!(meta.input_tokens, Some(42));
         assert_eq!(meta.cache_read_tokens, Some(12));
+    }
+
+    /// GPT-5.6 on reports what it wrote to the cache, also as a part of the
+    /// input total. It costs more than plain input, so it is recorded.
+    #[test]
+    fn a_cache_write_is_recorded_as_part_of_the_input_total() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut item_id_map = std::collections::HashMap::new();
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_responses_chunk(
+            "response.completed",
+            r#"{"response":{"status":"completed","usage":{"input_tokens":5476,"output_tokens":9,"input_tokens_details":{"cache_write_tokens":5435,"cached_tokens":0}}}}"#,
+            &mut content,
+            &mut tools,
+            &mut item_id_map,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(meta.input_tokens, Some(5476));
+        assert_eq!(meta.cache_write_tokens, Some(5435));
+        assert_eq!(meta.cache_read_tokens, None);
     }
 
     /// A response that read no cache leaves the count unset.

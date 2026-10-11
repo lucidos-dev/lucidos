@@ -85,13 +85,34 @@ async fn the_estimate_prices_a_backfill_before_anything_is_spent() {
     let central = low_row["backfill_usd_central"].as_f64().unwrap();
     assert!((low_usd..=high_usd).contains(&central), "{low_row}");
 
-    let high_row = by_effort
-        .iter()
-        .find(|e| e["effort"] == "high")
-        .expect("a high-tier row");
+    let row = |effort: &str| {
+        by_effort
+            .iter()
+            .find(|e| e["effort"] == effort)
+            .unwrap_or_else(|| panic!("a {effort}-tier row: {by_effort:?}"))
+    };
     assert!(
-        high_row["backfill_usd"]["high"].as_f64().unwrap() >= high_usd,
+        row("high")["backfill_usd"]["high"].as_f64().unwrap() >= high_usd,
         "a higher reasoning tier must not cost less: {by_effort:?}"
+    );
+    // Each tier carries its own time, and Gemini 3.8 Flash's seeded medium
+    // tier is slower and dearer than its low tier.
+    for effort in ["low", "medium", "high"] {
+        for field in ["usable_secs", "complete_secs"] {
+            let bounds = &row(effort)[field];
+            let (low, high) = (bounds["low"].as_u64(), bounds["high"].as_u64());
+            assert!(low <= high, "{effort} {field}: {bounds}");
+        }
+    }
+    let central = |effort: &str| row(effort)["backfill_usd_central"].as_f64().unwrap();
+    // A fresh workspace may have nothing left to build, which prices at zero.
+    if central("low") > 0.0 {
+        assert!(central("medium") > central("low"), "{by_effort:?}");
+    }
+    let complete_high = |effort: &str| row(effort)["complete_secs"]["high"].as_u64().unwrap();
+    assert!(
+        complete_high("medium") >= complete_high("low"),
+        "{by_effort:?}"
     );
 }
 

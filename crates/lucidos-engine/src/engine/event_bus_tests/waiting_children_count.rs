@@ -134,7 +134,7 @@ async fn the_wake_moves_the_child_back_to_active() {
 
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
-        event: ThreadEvent::UserPromptInjected {
+        event: ThreadEvent::PromptInjected {
             text: "An event you subscribed to has arrived".into(),
             mode: ActorMode::Engine,
             origin: None,

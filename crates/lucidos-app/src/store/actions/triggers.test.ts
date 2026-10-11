@@ -175,10 +175,10 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
 
   it('sends the pinned pair on create and omits it when Default', async () => {
     await submitTrigger({
-      ...base, run: intentRun, model: 'gemini-3.5-flash', reasoningEffort: 'low',
+      ...base, run: intentRun, model: 'gemini-3.8-flash', reasoningEffort: 'low',
     });
     expect(mockCreateTrigger.mock.calls[0][0]).toMatchObject({
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       reasoning_effort: 'low',
     });
 
@@ -227,7 +227,7 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
       triggerId: 't1',
       goToReview: true,
       sideEffectGrant: ['email'],
-      model: 'gemini-3.5-flash',
+      model: 'gemini-3.8-flash',
       reasoningEffort: 'low',
       provider: 'vertex',
     });

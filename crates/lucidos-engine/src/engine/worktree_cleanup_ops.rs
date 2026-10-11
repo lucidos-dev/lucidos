@@ -148,13 +148,36 @@ pub(crate) fn directory_age(path: &Path) -> Option<Duration> {
     mtime.elapsed().ok()
 }
 
-/// Sum file sizes under `path` recursively. Best-effort — silently skips
-/// entries we can't stat. Returns 0 if the path doesn't exist.
-pub(crate) fn directory_size_bytes(path: &Path) -> u64 {
+/// Sum file sizes under `path` recursively, on the blocking pool. A worktree
+/// can hold tens of GB, and a walk on an async worker stalls every task queued
+/// behind it. Returns 0 if the path doesn't exist or the walk task fails.
+pub(crate) async fn directory_size_bytes(path: &Path) -> u64 {
+    measure_on_blocking_pool(path, walk_directory_size_bytes).await
+}
+
+/// Run `walk` over `path` on the blocking pool. Tests pass a walk that blocks.
+pub(super) async fn measure_on_blocking_pool(path: &Path, walk: fn(&Path) -> u64) -> u64 {
+    let walk_path = path.to_path_buf();
+    match tokio::task::spawn_blocking(move || walk(&walk_path)).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log!(
+                "[WorktreeCleanup] size walk of {} failed: {}",
+                path.display(),
+                e
+            );
+            0
+        }
+    }
+}
+
+/// The blocking walk behind [`directory_size_bytes`]. Best-effort: silently
+/// skips entries it can't stat. Call it only from the blocking pool.
+pub(super) fn walk_directory_size_bytes(path: &Path) -> u64 {
     directory_size_bytes_skipping(path, &[])
 }
 
-/// [`directory_size_bytes`], leaving out the subtrees rooted at `skip`.
+/// [`walk_directory_size_bytes`], leaving out the subtrees rooted at `skip`.
 fn directory_size_bytes_skipping(path: &Path, skip: &[PathBuf]) -> u64 {
     let mut total: u64 = 0;
     let mut stack = vec![path.to_path_buf()];
@@ -192,7 +215,7 @@ pub(crate) fn worktree_size_breakdown(worktree: &Path, artifact_dirs: &[&str]) -
     let artifact_dirs: Vec<PathBuf> = artifact_dirs.iter().map(|sub| worktree.join(sub)).collect();
     let artifact_bytes: u64 = artifact_dirs
         .iter()
-        .map(|dir| directory_size_bytes(dir))
+        .map(|dir| walk_directory_size_bytes(dir))
         .sum();
     let rest = directory_size_bytes_skipping(worktree, &artifact_dirs);
     WorktreeSize {
@@ -391,7 +414,7 @@ pub(crate) fn worktree_git_admin_missing(worktree: &Path) -> bool {
 /// and is preserved; only never-committed edits in the detached working copy
 /// are lost. Returns bytes freed, or `None` if the guard rejected the path or
 /// the removal failed.
-pub(crate) fn remove_stranded_worktree(
+pub(crate) async fn remove_stranded_worktree(
     worktrees_dir: &Path,
     worktree: &Path,
     pre_size: u64,
@@ -403,7 +426,7 @@ pub(crate) fn remove_stranded_worktree(
         );
         return None;
     }
-    match std::fs::remove_dir_all(worktree) {
+    match tokio::fs::remove_dir_all(worktree).await {
         Ok(()) => Some(pre_size),
         Err(e) => {
             log!(
@@ -478,8 +501,8 @@ pub(crate) async fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
     let mut pruned: Vec<&'static str> = Vec::new();
     for sub in prunable_artifact_dirs(worktree).await {
         let target = worktree.join(sub);
-        let size = directory_size_bytes(&target);
-        match std::fs::remove_dir_all(&target) {
+        let size = directory_size_bytes(&target).await;
+        match tokio::fs::remove_dir_all(&target).await {
             Ok(()) => {
                 freed = freed.saturating_add(size);
                 pruned.push(sub);
@@ -580,7 +603,10 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
         }
     };
 
-    let total_size = pre_size.unwrap_or_else(|| directory_size_bytes(worktree));
+    let total_size = match pre_size {
+        Some(size) => size,
+        None => directory_size_bytes(worktree).await,
+    };
 
     // Use `git worktree remove --force` so git's bookkeeping (the
     // `worktrees/<name>` admin dir under `.git/`) is cleaned up too. If
@@ -611,7 +637,7 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
         }
     };
     if !removed_via_git && worktree.exists() {
-        if let Err(e) = std::fs::remove_dir_all(worktree) {
+        if let Err(e) = tokio::fs::remove_dir_all(worktree).await {
             log!(
                 "[WorktreeCleanup] remove_dir_all failed for {}: {}",
                 worktree.display(),
@@ -625,11 +651,28 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
     // `has_branch_commits` returns true on error, so a branch is kept whenever
     // git could not answer. `Always` is the owner's delete and takes the branch
     // without asking, which is the one place that inversion is correct.
+    //
+    // Cleanup never deletes the repo's default branch. An agent can check it
+    // out in its own worktree, and it always reads as merged into itself.
     let mut branch_deleted = false;
     if let Some(branch_name) = branch.as_deref() {
-        let keep_unmerged = disposal == BranchDisposal::WhenMerged
-            && has_branch_commits(&repo_root, branch_name).await;
-        if !keep_unmerged {
+        let kept_because =
+            if branch_name == crate::engine::git_ops::default_local_branch(&repo_root).await {
+                Some("it is the repo's default branch")
+            } else if disposal == BranchDisposal::WhenMerged
+                && has_branch_commits(&repo_root, branch_name).await
+            {
+                Some("it has unmerged commits")
+            } else {
+                None
+            };
+        if let Some(reason) = kept_because {
+            log!(
+                "[WorktreeCleanup] preserving branch {}: {}",
+                branch_name,
+                reason
+            );
+        } else {
             match git_cmd(&["branch", "-D", branch_name], &repo_root).await {
                 Ok(o) if o.status.success() => {
                     branch_deleted = true;
@@ -650,11 +693,6 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
                     e
                 ),
             }
-        } else {
-            log!(
-                "[WorktreeCleanup] preserving branch {}: it has unmerged commits",
-                branch_name
-            );
         }
     }
 

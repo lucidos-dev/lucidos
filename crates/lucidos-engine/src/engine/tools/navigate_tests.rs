@@ -86,9 +86,11 @@ async fn answer_from(bus: &EventBus, thread_id: Uuid, from: &str) {
                 label: "Patch".into(),
                 description: None,
                 preview: None,
+                widget: None,
             }],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: chat_meta(None),
     })

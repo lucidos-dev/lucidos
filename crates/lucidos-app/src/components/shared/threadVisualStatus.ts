@@ -8,11 +8,12 @@ import type { ThreadMeta, ThreadStatus, ThreadState } from '../../store/thread-e
 import { changeReadyToReview } from '../../store/thread-events';
 import { effectiveThreadStatus } from '../../store/store';
 
-/** 'changes' = static dot (CC has pending changes); 'question' = "?" badge
- *  (CC paused on AskUserQuestion). 'waiting' = pulsing dot. It shows only when
- *  the thread has no state of its own to surface: own state wins, even with
- *  active children or a live subscription. */
-export type VisualStatus = ThreadStatus | 'changes' | 'question';
+/** 'changes' = diff glyph (CC has pending changes). 'read-request' = static
+ *  dot (its agent asked the user to read the reply, ADR 0409). 'question' =
+ *  "?" badge (CC paused on AskUserQuestion). 'waiting' = pulsing dot. It shows
+ *  only when the thread has no state of its own to surface: own state wins,
+ *  even with active children or a live subscription. */
+export type VisualStatus = ThreadStatus | 'changes' | 'read-request' | 'question';
 
 /** `waiting` covers BOTH ways a thread can be finished-but-not-done: it is
  *  waiting on child threads it spawned, or on an *event wait* it registered.
@@ -39,6 +40,7 @@ export function resolveVisualStatus(
   waitsOnSubThreads: boolean,
   changeReady: boolean,
   hasLiveEventWaits: boolean,
+  readRequested = false,
 ): VisualStatus {
   if (status === 'failed') return 'failed';
   if (status === 'running') return 'running';
@@ -54,12 +56,14 @@ export function resolveVisualStatus(
   // an interrupted thread with a change came back reading Running. See
   // `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
   if (status === 'paused') return 'paused';
+  // The agent asked to be read once its turn ended, and Review lists it then,
+  // whatever it still waits on. It has no Apply for a wait to guard
+  // (ADR 0424). A change replaces a request, so the two never meet (ADR 0421).
+  if (readRequested && !changeReady) return 'read-request';
   // A live event wait outranks `changes`: the thread is not finished, so its
   // change is not final and cannot be resolved yet. Reading it as "Changes to
   // review" invited an Apply that would merge a branch still being worked on.
   if (hasLiveEventWaits) return 'waiting';
-  // An incomplete change is not ready, so it draws no `changes` dot and the
-  // thread reads by its turn alone (ADR 0346).
   if (changeReady) return 'changes';
   if (waitsOnSubThreads) return 'waiting';
   return 'idle';
@@ -68,7 +72,7 @@ export function resolveVisualStatus(
 /** The meta facts `visualStatusFor` reads. */
 type VisualStatusFacts = Pick<
   ThreadMeta,
-  'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentProposed' | 'codingAgentIncomplete' | 'liveEventWaitCount'
+  'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentChangeState' | 'liveEventWaitCount' | 'readRequested'
 >;
 
 /** `resolveVisualStatus` fed from a thread's meta, for a surface holding a
@@ -82,6 +86,7 @@ export function visualStatusFor(status: ThreadStatus, meta: VisualStatusFacts | 
     meta.activeChildrenCount + (meta.waitingChildrenCount ?? 0) > 0,
     changeReadyToReview(meta),
     meta.liveEventWaitCount > 0,
+    meta.readRequested === true,
   );
 }
 

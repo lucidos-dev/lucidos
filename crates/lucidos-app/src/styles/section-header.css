@@ -1,8 +1,9 @@
 /* ===== Section headers and row hairlines for the list panels =====
  *
  * One look for every list panel's sections: the thread drawer, Triggers,
- * Changes and Thread queue. The label is bold and uppercase with no band and
- * no caret, and the count turns into a pill when the section collapses.
+ * Changes and Thread queue. The label is bold and uppercase with no band. A
+ * header that collapses leads with a chevron, which turns as it opens, and its
+ * count turns into a pill when it collapses.
  * Markup: components/shared/SectionHeader.tsx.
  *
  * Host-only. Apps keep the `.list-section-title` base in
@@ -263,6 +264,30 @@ html[data-theme-mode="dark"] .section-count-badge {
     }
 }
 
+/* The collapse chevron, before the icon. It turns with the `aria-expanded` of
+   the element holding it: the drawer's header row, or a panel's toggle button.
+   A hair outside the content column, so the icon after it stays near the x a
+   row's text starts at. It holds its compositing layer in both states, as
+   `.family-disclosure svg` does, so WebKit lands the turn where it ended. */
+.section-chevron {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    margin-left: -0.125rem;
+    margin-right: 0.125rem;
+    color: var(--text-secondary);
+}
+
+.section-chevron svg {
+    transform: rotate(0deg);
+    will-change: transform;
+    transition: transform var(--duration-normal) cubic-bezier(0.22, 0, 0, 1);
+}
+
+[aria-expanded="true"] > .section-chevron svg {
+    transform: rotate(90deg);
+}
+
 /* Section header icon — sits left of the label, sharing the title's flex row.
    Sized to the label cap-height and slightly dimmed so the text stays primary. */
 .section-icon {
@@ -280,7 +305,7 @@ html[data-theme-mode="dark"] .section-count-badge {
 }
 
 @media (hover: hover) {
-    /* Flat headers carry no fill, so hover is a color-only cue — no band. */
+    /* Headers carry no fill, so hover is a color-only cue, with no band. */
     .list-section-title-collapsible:hover {
         color: var(--text-primary);
     }

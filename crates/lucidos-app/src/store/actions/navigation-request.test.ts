@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from '@lucidos/sdk';
-import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories } from '../store';
+import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories, findRequest } from '../store';
 
 // Spy on showToast but keep the rest of the store real — navigation-request.ts
 // reads the nav lists + settingsSubviewLabel at module load to build its
@@ -68,6 +68,7 @@ const { refreshRepositories } = vi.hoisted(() => ({ refreshRepositories: vi.fn(a
 vi.mock('./repositoriesLoader', () => ({ refreshRepositories }));
 
 const { handleNavigationRequest, describeNavTarget } = await import('./navigation-request');
+const { fileFindScope } = await import('./find-request');
 
 describe('handleNavigationRequest — settings sub-sections', () => {
   beforeEach(() => {
@@ -189,6 +190,23 @@ describe('handleNavigationRequest — file target', () => {
     expect(openFilePreview).toHaveBeenCalledWith('artifacts/notes.md');
   });
 
+  describe('with a find', () => {
+    beforeEach(() => {
+      findRequest.value = null;
+    });
+
+    it('asks Find in file to open on the opened file, from the cited line', () => {
+      handleNavigationRequest({ target: 'file', file_path: 'artifacts/notes.md', line: 4 }, { find: 'zqxv needle' });
+      expect(findRequest.value).toEqual({ scope: fileFindScope('artifacts/notes.md'), query: 'zqxv needle', line: 4 });
+      expect(lineScrollTarget.value, 'the line landing still happens').toEqual({ path: 'artifacts/notes.md', line: 4 });
+    });
+
+    it('asks for nothing where the file cannot show the line', () => {
+      handleNavigationRequest({ target: 'file', file_path: 'artifacts/photo.png', line: 4 }, { find: 'zqxv needle' });
+      expect(findRequest.value).toBeNull();
+    });
+  });
+
   it('routes a repo-encoded path to the repo preview, intact', () => {
     handleNavigationRequest({ target: 'file', file_path: ENCODED });
     // The encoded path is handed over verbatim — ContentPane parses it and
@@ -284,7 +302,7 @@ describe('handleNavigationRequest: file target at a line', () => {
 
     expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(ENCODED);
     expect(selectedLines.value).toEqual({ start: 510, end: 510 });
-    expect(lineScrollTarget.value).toBe(510);
+    expect(lineScrollTarget.value, 'named by the path the preview shows').toEqual({ path: ENCODED, line: 510 });
     expect(filePreviewSource.value).toBe(true);
   });
 
@@ -294,7 +312,7 @@ describe('handleNavigationRequest: file target at a line', () => {
     expect(openFilePreview).toHaveBeenCalledWith('artifacts/notes.md');
     expect(selectedLines.value).toEqual({ start: 10, end: 20 });
     // The scroll lands on the first line of the range, not the last.
-    expect(lineScrollTarget.value).toBe(10);
+    expect(lineScrollTarget.value).toEqual({ path: 'artifacts/notes.md', line: 10 });
     expect(filePreviewSource.value).toBe(true);
   });
 

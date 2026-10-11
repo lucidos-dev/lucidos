@@ -33,22 +33,31 @@ mod format_capture_result_tests {
 
     #[test]
     fn round_trips_screenshot_and_dom_when_capture_succeeds() {
-        let formatted = format_capture_result("abc123base64", "<html><body>hi</body></html>");
+        let formatted = format_capture_result("abc123base64", "", "<html><body>hi</body></html>");
         let (b64, dom) = parse_app_capture_marker(&formatted).expect("must round-trip");
         assert_eq!(b64, "abc123base64");
         assert_eq!(dom, "DOM snapshot:\n<html><body>hi</body></html>");
     }
 
     #[test]
+    fn a_lead_line_sits_after_the_marker_and_before_the_dom() {
+        let formatted = format_capture_result("abc", "Saved shot.png.", "<main/>");
+        let (b64, rest) = parse_app_capture_marker(&formatted).expect("must round-trip");
+        assert_eq!(b64, "abc");
+        assert_eq!(rest, "Saved shot.png.\nDOM snapshot:\n<main/>");
+    }
+
+    #[test]
     fn omits_marker_when_screenshot_is_empty() {
-        // SDK sets `screenshot = ""` when html2canvas fails (e.g. an
-        // `oklab(...)` CSS color it can't parse) and puts the failure in `dom`.
+        // SDK sets `screenshot = ""` when its rasterizer fails and puts the
+        // failure in `dom`.
         // Emitting `[APP_CAPTURE:]` (empty marker) would make the agentic loop
         // build an empty Image content block, which the Anthropic API rejects
         // with `400 "image cannot be empty"`. Drop the marker entirely so the
         // tool-result text falls through to the plain-text path and the LLM
         // still sees the failure reason.
         let formatted = format_capture_result(
+            "",
             "",
             "Error: Attempting to parse an unsupported color function \"oklab\"",
         );

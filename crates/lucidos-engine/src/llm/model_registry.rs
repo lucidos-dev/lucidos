@@ -124,6 +124,10 @@ pub struct ModelRouting {
     pub preferred: Option<ProviderKind>,
     /// The *vision flag*: whether this model reads images.
     pub vision: bool,
+    /// The *default effort*, a tier on the ladder, or `None` to send none.
+    pub default_effort: Option<&'static str>,
+    /// The model this one was retired to, or `None` for a current model.
+    pub successor: Option<String>,
 }
 
 impl ModelRouting {
@@ -133,6 +137,8 @@ impl ModelRouting {
             routes: vec![RouteEntry::new(provider, wire_id)],
             preferred: None,
             vision: false,
+            default_effort: None,
+            successor: None,
         }
     }
 
@@ -209,9 +215,23 @@ pub fn context_window_from_prefix(model: &str) -> usize {
 ///
 /// Each site keeps its own threshold, because they answer different questions.
 pub fn gpt_major_version(model: &str) -> Option<u32> {
+    gpt_version(model).map(|(major, _)| major)
+}
+
+/// A GPT id's `(major, minor)` version: `gpt-5.6-sol` is `(5, 6)`, and
+/// `gpt-6-astra` is `(6, 0)`. `None` for an id that is not `gpt-<number>`.
+pub fn gpt_version(model: &str) -> Option<(u32, u32)> {
     let rest = model.strip_prefix("gpt-")?;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    let number = |s: &str| -> String { s.chars().take_while(char::is_ascii_digit).collect() };
+    let major = number(rest);
+    let minor = rest[major.len()..]
+        .strip_prefix('.')
+        .map(number)
+        .filter(|m| !m.is_empty());
+    Some((
+        major.parse().ok()?,
+        minor.map_or(Some(0), |m| m.parse().ok())?,
+    ))
 }
 
 /// Normalize a stored `models.context_window` into a usable window.
@@ -249,6 +269,11 @@ pub async fn load_from_db(pool: &PgPool) -> HashMap<String, ModelRouting> {
                     routes,
                     preferred,
                     vision: m.vision,
+                    default_effort: m
+                        .default_effort
+                        .as_deref()
+                        .and_then(crate::llm::reasoning::tier),
+                    successor: m.successor,
                 };
                 (m.id, routing)
             })
@@ -278,6 +303,25 @@ pub async fn reload(registry: &ModelRegistry, pool: &PgPool) {
     }
 }
 
+/// The model a call naming `model` is sent as: `model` itself, or the end of
+/// its successor chain when it was retired (ADR 0418). A provider that retires
+/// a model may route its id elsewhere, and Lucidos never relies on that.
+///
+/// The walk stops at the first model it has already seen, so a hand-edited
+/// cycle sends the last new model rather than looping.
+pub fn current_model(registry: &ModelRegistry, model: &str) -> String {
+    let mut chain = vec![model.to_string()];
+    while let Some(next) = chain
+        .last()
+        .and_then(|current| routing_for(registry, current))
+        .and_then(|routing| routing.successor)
+        .filter(|next| !chain.contains(next))
+    {
+        chain.push(next);
+    }
+    chain.pop().unwrap_or_default()
+}
+
 /// Look up a model id in the registry, if the lock is readable.
 fn routing_for(registry: &ModelRegistry, model: &str) -> Option<ModelRouting> {
     registry.read().ok().and_then(|map| map.get(model).cloned())
@@ -290,6 +334,13 @@ fn routing_for(registry: &ModelRegistry, model: &str) -> Option<ModelRouting> {
 /// model that rejects them, which is the failure the flag exists to stop.
 pub fn reads_images(registry: &ModelRegistry, model: &str) -> bool {
     routing_for(registry, model).is_some_and(|routing| routing.vision)
+}
+
+/// The *default effort* of `model`: the tier it runs at when nothing stored
+/// names one. `None` for a model with no row or no documented default, and the
+/// caller then sends no effort.
+pub fn default_effort(registry: &ModelRegistry, model: &str) -> Option<&'static str> {
+    routing_for(registry, model).and_then(|routing| routing.default_effort)
 }
 
 /// The refusal for a provider name that names no backend.
@@ -455,6 +506,35 @@ mod tests {
                 .map(|(id, routing)| (id.to_string(), routing.clone()))
                 .collect(),
         ))
+    }
+
+    /// A row retired to `successor`.
+    fn retired_to(id: &str, successor: &str) -> ModelRouting {
+        ModelRouting {
+            successor: Some(successor.to_string()),
+            ..ModelRouting::single(ProviderKind::Vertex, id)
+        }
+    }
+
+    #[test]
+    fn a_retired_model_is_sent_as_the_end_of_its_successor_chain() {
+        let reg = registry_of(&[
+            ("old", retired_to("old", "middle")),
+            ("middle", retired_to("middle", "new")),
+            ("new", ModelRouting::single(ProviderKind::Vertex, "new")),
+        ]);
+        assert_eq!(current_model(&reg, "old"), "new");
+        assert_eq!(current_model(&reg, "middle"), "new");
+        assert_eq!(current_model(&reg, "new"), "new");
+        assert_eq!(current_model(&reg, "unknown"), "unknown");
+    }
+
+    /// A hand-edited table can form a cycle. The walk must still end.
+    #[test]
+    fn a_successor_cycle_ends_on_the_last_new_model() {
+        let reg = registry_of(&[("a", retired_to("a", "b")), ("b", retired_to("b", "a"))]);
+        assert_eq!(current_model(&reg, "a"), "b");
+        assert_eq!(current_model(&reg, "b"), "a");
     }
 
     fn registry_with_windows(pairs: &[(&str, Option<usize>)]) -> ModelRegistry {
@@ -718,7 +798,7 @@ mod tests {
             "z-ai/glm-5.2",
             "grok-4.20",
             "gemini-3.1-pro-preview",
-            "gemini-3.5-flash",
+            "gemini-3.8-flash",
         ] {
             assert_eq!(
                 context_window_from_prefix(id),
@@ -745,6 +825,20 @@ mod tests {
 
     /// The version parser both id-shape rules read. It answers the number, so a
     /// family after Astra needs no edit at either call site.
+    #[test]
+    fn gpt_version_reads_major_and_minor() {
+        for (id, expected) in [
+            ("gpt-5.6-sol", Some((5, 6))),
+            ("gpt-5.3-codex", Some((5, 3))),
+            ("gpt-6-astra", Some((6, 0))),
+            ("gpt-4o", Some((4, 0))),
+            ("gpt-", None),
+            ("claude-opus-5", None),
+        ] {
+            assert_eq!(gpt_version(id), expected, "{id}");
+        }
+    }
+
     #[test]
     fn gpt_major_version_reads_the_number_not_the_spelling() {
         for (id, expected) in [
@@ -811,6 +905,8 @@ mod tests {
             ],
             preferred: None,
             vision: false,
+            default_effort: None,
+            successor: None,
         }
     }
 
@@ -902,12 +998,12 @@ mod tests {
     /// user to configure something that still would not serve it.
     #[test]
     fn a_pick_the_row_cannot_serve_falls_through_rather_than_refusing() {
-        let mut routing = ModelRouting::single(ProviderKind::Vertex, "gemini-3.5-flash");
+        let mut routing = ModelRouting::single(ProviderKind::Vertex, "gemini-3.8-flash");
         routing.preferred = Some(ProviderKind::Anthropic);
-        let reg = registry_of(&[("gemini-3.5-flash", routing)]);
+        let reg = registry_of(&[("gemini-3.8-flash", routing)]);
         let route = resolve_route(
             &reg,
-            "gemini-3.5-flash",
+            "gemini-3.8-flash",
             None,
             only(&[ProviderKind::Vertex]),
         )
@@ -976,6 +1072,8 @@ mod tests {
                 ],
                 preferred: None,
                 vision: false,
+                default_effort: None,
+                successor: None,
             },
         )]);
         let id = "claude-opus-5-5[1m]";

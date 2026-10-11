@@ -83,6 +83,7 @@ pub const GET_BACKUP_STATUS: &str = "get_backup_status";
 // Grouped env-var tool (list/set/delete). `set_environment_variable` stays wired
 // as a back-compat alias to the `set` action.
 pub const ENV_VARS: &str = "env_vars";
+pub const WIDGETS: &str = "widgets";
 pub const SET_ENVIRONMENT_VARIABLE: &str = "set_environment_variable";
 
 // Credentials & OAuth
@@ -202,6 +203,10 @@ pub const LIST_EVENT_WAITS: &str = "list_event_waits";
 /// The revoke half of `await_event`: without it an agent told to stop watching
 /// had to admit the subscription would re-open it later regardless.
 pub const CANCEL_EVENT_WAIT: &str = "cancel_event_wait";
+/// Ask the user to read this thread's latest reply: once the turn ends, the
+/// drawer lists the thread under Review until they have seen it (ADR 0409).
+/// Scoped to the calling thread, like the event-wait tools.
+pub const REQUEST_READ: &str = "request_read";
 
 /// Ask a judgment provider a set of typed questions about one state.
 ///

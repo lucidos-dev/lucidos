@@ -55,9 +55,11 @@ describe('Apply Now: Scenario A3 — clean merge (happy path)', () => {
     handleEventWithAgg(map, 't1', 6, { type: 'ResponseGenerated' }, '2026-01-01T00:00:10Z');
     handleEventWithAgg(map, 't1', 7, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:11Z');
 
-    // Thread status: idle, with the change proposed
+    // Thread status: idle. The idle reports the branch's work; only the
+    // ChangeProposed below makes it a proposal.
     expect(thread.meta.status).toBe('idle');
-    expect(getCodingAgentWaitingInfo(thread.meta)).toEqual({ proposed: true, isExternalRepo: false, requiresRestart: false });
+    expect(thread.meta.codingAgentChangeState).toEqual({ kind: 'unproposed', reason: null });
+    expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
 
     // 3. Backend proposes change, merges, emits ChangeApplied → ChangeProposed + ChangeApplied + SessionEnded
     handleEventWithAgg(map, 't1', 8, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['lib.rs'] } as any, '2026-01-01T00:00:12Z');
@@ -104,7 +106,7 @@ describe('Apply Now: Scenario A1 — hardening not done', () => {
     // 4. Review finishes, CC idles again
     handleEventWithAgg(map, 't1', 9, { type: 'ResponseGenerated' }, '2026-01-01T00:00:10Z');
     handleEventWithAgg(map, 't1', 10, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:11Z');
-    expect(thread.meta.codingAgentProposed).toBe(true);
+    expect(thread.meta.codingAgentChangeState.kind).toBe('unproposed');
 
     // 5. Backend proposes change, merges, emits ChangeApplied + kills CC + SessionEnded
     handleEventWithAgg(map, 't1', 11, { type: 'ChangeProposed', change_id: 'c-1', description: 'Fix', files: ['a.rs'] } as any, '2026-01-01T00:00:12Z');
@@ -143,7 +145,7 @@ describe('Apply Now: Scenario A1 — hardening not done', () => {
 });
 
 describe('Apply Now: Scenario A4 — no commits to apply (branch already merged)', () => {
-  it('ChangeApplied without codingAgentProposed → idle', () => {
+  it('ChangeApplied without a proposal → idle', () => {
     const thread = makeThread({ eventsLoaded: true, meta: { ...makeThread().meta, channel: 'claude_code' } });
     const map = new Map([['t1', thread]]);
 
@@ -154,15 +156,14 @@ describe('Apply Now: Scenario A4 — no commits to apply (branch already merged)
     handleEventWithAgg(map, 't1', 4, { type: 'ResponseGenerated' }, '2026-01-01T00:00:05Z');
     handleEventWithAgg(map, 't1', 5, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:06Z');
 
-    expect(thread.meta.codingAgentProposed).toBe(true);
+    expect(thread.meta.codingAgentChangeState.kind).toBe('unproposed');
     expect(thread.meta.status).toBe('idle');
 
-    // 3. ChangeApplied clears CC flags and sets status to idle
+    // 3. ChangeApplied clears the change state and sets status to idle
     handleEventWithAgg(map, 't1', 6, { type: 'ChangeApplied', change_id: 'c-1' } as any, '2026-01-01T00:00:07Z');
 
-    // Status becomes idle, CC flags cleared
     expect(thread.meta.status).toBe('idle');
-    expect(thread.meta.codingAgentProposed).toBe(false);
+    expect(thread.meta.codingAgentChangeState).toEqual({ kind: 'none' });
     expect(getCodingAgentWaitingInfo(thread.meta)).toBeNull();
   });
 });
@@ -258,7 +259,7 @@ describe('Apply Now: edge cases', () => {
 
     // ChangeApplied clears all CC flags → idle
     expect(thread.meta.status).toBe('idle');
-    expect(thread.meta.codingAgentProposed).toBe(false);
+    expect(thread.meta.codingAgentChangeState.kind).not.toBe('proposed');
   });
 
   it('ChangeApplied with requires_restart=true is reflected in events', () => {
@@ -495,7 +496,7 @@ describe('Backend-authoritative liveness: meta.status from backend', () => {
 
     handleEventWithAgg(map, 't1', 3, { type: 'CodingAgentIdled', has_changes: true } as any, '2026-01-01T00:00:02Z');
     expect(thread.meta.status).toBe('idle');
-    expect(thread.meta.codingAgentProposed).toBe(true);
+    expect(thread.meta.codingAgentChangeState.kind).toBe('unproposed');
   });
 });
 

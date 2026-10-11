@@ -4,10 +4,10 @@ use super::idle_snapshot::CodingAgentIdleSnapshot;
 use super::spawn_context::SpawnWorktreeContext;
 use crate::engine::agent_session::text_buffer::CodingAgentTextBuffer;
 use crate::engine::agentic_loop::should_flush;
-use crate::engine::change_ops::now_epoch_millis;
+use crate::engine::change_ops::{now_epoch_millis, ProposeOutcome};
 use crate::engine::claude_code::STALE_RESUME_ERROR;
 use crate::engine::git_ops::{
-    auto_commit_preserving_marker, default_local_branch, describe_branch_changes,
+    auto_commit_preserving_marker, branch_head_sha, default_local_branch, describe_branch_changes,
     files_require_restart, is_external_repo_path, is_harden_marker_present, main_worktree,
 };
 use crate::engine::thread_events::{EventChannel, SessionEndReason};
@@ -25,9 +25,9 @@ use crate::engine::agent_session::lifecycle::{
     is_resume_settle_result, is_stale_resume_signal, require_agent_input, reset_per_turn_flags,
     result_auto_commits, should_auto_commit_on_cleanup, starts_turn_after_terminal,
     terminal_clears_user_hit_stop, terminate_decision, turn_has_terminal, watchdog_gate,
-    IdleAction, StaleResumeInputs, TerminalKind, TerminateDecision, TurnTerminal, WatchdogGate,
-    WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS,
-    WATCHDOG_TICK_INTERVAL_SECS,
+    IdleAction, IdleChangeWrite, IdleSession, StaleResumeInputs, TerminalKind, TerminateDecision,
+    TurnTerminal, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS,
+    WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
 };
 use crate::engine::agent_session::resume::{
     change_description_fallback, default_claude_config_dir, live_claude_config_dir,
@@ -276,6 +276,7 @@ impl LucidosEngine {
                         api_call_id: reported.api_call_id,
                         reasoning_effort: None,
                         duration_ms: None,
+                        served_model: None,
                     },
                     meta: meta.clone(),
                 },
@@ -1147,8 +1148,8 @@ impl LucidosEngine {
             );
         }
 
-        // Seed `coding_agent_has_diff` from the actual worktree state. The
-        // projection's per-event handlers keep this column live, but cannot fill
+        // Seed the branch work from the actual worktree state. The
+        // projection's per-event handlers keep it live, but cannot fill
         // the gap between session start and the first new commit. A thread
         // resumed after an engine restart would show no Diff button until its
         // next commit, even with commits already on the branch.
@@ -1159,7 +1160,7 @@ impl LucidosEngine {
         // same git truth the Diff button computes, so the button's visibility
         // and its rendered diff stay in lockstep. Both the initial start and the
         // resume path land here.
-        crate::engine::session_seed::seed_coding_agent_has_diff(
+        crate::engine::session_seed::seed_branch_work(
             self.pool(),
             thread_id,
             &repo_root,
@@ -1236,6 +1237,8 @@ impl LucidosEngine {
         const THOUGHT_FLUSH_THRESHOLD: usize = 240;
         let mut is_waiting = false;
         let mut proposed_change = false;
+        // The branch HEAD each turn-end re-entry last went out for.
+        let mut reentry_ledger = crate::engine::turn_end::ReentryLedger::default();
         let mut emitted_terminal_event = false; // Track whether ResponseGenerated/ResponseCanceled was emitted
                                                 // user_hit_stop: when true, the next Result emits ResponseCanceled (exchange:
                                                 // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
@@ -1339,10 +1342,9 @@ impl LucidosEngine {
                             // and return. The worktree and branch persist on
                             // disk, so a follow-up reuses them, and engine
                             // shutdown has no idle loop to cancel.
-                            // Partial work skips the auto-commit, so the
-                            // post-commit hook cannot fire a spurious
-                            // `ChangeProposed`. The gate stays purely about
-                            // terminal kind. A Discard recorded by now only
+                            // Partial work skips the auto-commit, so it never
+                            // becomes a commit a later proposal would carry. The
+                            // gate stays purely about terminal kind. A Discard recorded by now only
                             // commits what finalize then deletes with the branch.
                             // The commit runs BEFORE the reap, while the entry is
                             // still in the map. A Stop landing meanwhile is then
@@ -1553,17 +1555,6 @@ impl LucidosEngine {
                                 drop(permit);
                                 log!("[AgentSession] [TIMING] Startup semaphore released: {:?}", cc_start.elapsed());
                             }
-                            if let Some(ref effort) = cc_reasoning_effort {
-                                log!("[AgentSession] Setting initial reasoning effort: {}", effort);
-                                if agent_control_tx
-                                    .send(crate::runtime::ControlRequest::SetReasoningEffort {
-                                        effort: effort.clone(),
-                                    })
-                                    .is_err()
-                                {
-                                    log!("[AgentSession] Failed to forward reasoning effort: agent control channel closed");
-                                }
-                            }
                         }
                         // Straggler guard: the runtime sometimes delivers a
                         // trailing Message AFTER this turn's terminal event.
@@ -1571,7 +1562,9 @@ impl LucidosEngine {
                         // the projection to `running` and strand an already-idled
                         // thread there forever. Drop it. A real follow-up turn
                         // re-arms emission through `reset_per_turn_flags`.
-                        AgentEvent::Message { text, .. } if turn_ended => {
+                        AgentEvent::Message { text, .. } | AgentEvent::ProgressNote { text }
+                            if turn_ended =>
+                        {
                             log!(
                                 "[AgentSession] Dropping post-terminal straggler text ({} chars) for thread {} — would resurrect 'running' on an idled thread",
                                 text.len(),
@@ -1603,6 +1596,24 @@ impl LucidosEngine {
                                 claude_text_buf.flush(&self.event_bus, thread_id, coding_agent, &meta, "[AgentSession] CodingAgentTextStreamed (Message flush)").await;
                             }
                         }
+                        AgentEvent::ProgressNote { text } => {
+                            if is_waiting {
+                                is_waiting = false;
+                                let mut sessions = self.agent_sessions.lock().await;
+                                if let Some(s) = sessions.get_mut(&thread_id) { s.is_waiting = false; }
+                            }
+                            self.flush_coding_agent_thought(
+                                thread_id,
+                                &claude_thought_buf,
+                                &mut last_thought_persisted_len,
+                                coding_agent,
+                                &meta,
+                            )
+                            .await;
+                            claude_text_buf
+                                .flush_progress_note(&text, &self.event_bus, thread_id, coding_agent, &meta)
+                                .await;
+                        }
                         AgentEvent::SubAgentMessage { .. } if turn_ended => {}
                         // A sub-agent's prose is recorded whole, tagged with its
                         // `Agent` call, and kept out of the session's text buffer:
@@ -1616,6 +1627,7 @@ impl LucidosEngine {
                                         text: text.to_string(),
                                         coding_agent,
                                         parent_tool_use_id: Some(parent_tool_use_id),
+                                        progress_note: false,
                                     },
                                     meta: meta.clone(),
                                 }, "[AgentSession] CodingAgentTextStreamed (sub-agent)").await;
@@ -1852,7 +1864,7 @@ impl LucidosEngine {
                                             // so emit its text for the frontend.
                                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
-                                                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: text.trim().to_string(), coding_agent, parent_tool_use_id: None },
+                                                event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed { text: text.trim().to_string(), coding_agent, parent_tool_use_id: None, progress_note: false },
                                                 meta: meta.clone(),
                                             }, "[AgentSession] CodingAgentTextStreamed (slash command result)").await;
                                         }
@@ -2146,9 +2158,8 @@ impl LucidosEngine {
                                         // shows immediately (propose_change deduplicates). When
                                         // CC skipped /harden, hardened=false propagates to the
                                         // change record and Apply runs hardening at click time.
-                                        // Background bash deliberately does NOT gate
-                                        // this. See `idle_change_write`
-                                        // for that and for the other guards.
+                                        // A live event wait holds a clean idle's proposal. See
+                                        // `idle_change_write` for that and the other guards.
                                         //
                                         // Before the idle emit, never after it: the idle
                                         // builds the parent's completion card from the
@@ -2160,12 +2171,18 @@ impl LucidosEngine {
                                         // A branch whose diff cancelled out still has a
                                         // pending row to reconcile, which would otherwise
                                         // keep claiming files the branch no longer has.
-                                        if let Some(write) = idle_change_write(
-                                            is_external_repo,
-                                            is_shutdown,
-                                            conflict_change.is_some(),
+                                        let mut held_proposal = None;
+                                        let holds_live_wait = !self.live_waits.for_thread(thread_id).await.is_empty();
+                                        let idle_write = idle_change_write(
+                                            IdleSession {
+                                                is_external_repo,
+                                                is_shutdown,
+                                                is_conflict_session: conflict_change.is_some(),
+                                                holds_live_wait,
+                                            },
                                             &last_terminal_kind,
-                                        ) {
+                                        );
+                                        if let Some(write) = idle_write {
                                             // Reuses the single probe above rather than re-asking git.
                                             // `None` means the probe could not be answered, and an
                                             // unanswered probe must never touch durable change state:
@@ -2189,6 +2206,12 @@ impl LucidosEngine {
                                                     // longer carries.
                                                     self.reconcile_emptied_pending_change(thread_id, &repo_root, &branch_name).await;
                                                 }
+                                                Some(_) if !write.may_create() && !self.branch_has_open_change(&branch_name).await => {
+                                                    log!(
+                                                        "[AgentSession] Holding the idle proposal for thread {}: it holds a live event wait",
+                                                        thread_id
+                                                    );
+                                                }
                                                 Some(changed_files) => {
                                                     // Only the propose path needs the marker: the
                                                     // reconcile above re-reads it itself, and only if
@@ -2200,7 +2223,7 @@ impl LucidosEngine {
                                                     let log_range = format!("{}..{}", base, branch_name);
                                                     let description = describe_branch_changes(&repo_root, &log_range, &fallback, None).await;
                                                     let repo_root_str = repo_root.to_string_lossy().to_string();
-                                                    match self.propose_change(crate::engine::change_ops::ProposeChangeInput {
+                                                    match self.propose_turn_work(crate::engine::change_ops::ProposeChangeInput {
                                                         thread_id,
                                                         branch_name: &branch_name,
                                                         repo_root: &repo_root_str,
@@ -2215,17 +2238,18 @@ impl LucidosEngine {
                                                         // recovery paths stamp Engine origin
                                                         // via propose_branch_changes.
                                                         origin: None,
-                                                        // A user Stop proposes what the
-                                                        // turn left, marked incomplete.
-                                                        incomplete: write.incomplete(),
-                                                    }).await {
-                                                        Ok(_) => {
+                                                    }, write.finished()).await {
+                                                        Ok(ProposeOutcome::Proposed(_)) => {
                                                             // Track for the ProcessResult returned via the
                                                             // Exited arm. Every idle exits the subprocess,
                                                             // so the post-loop cleanup that used to set
                                                             // this is skipped now.
                                                             proposed_change = true;
                                                         }
+                                                        Ok(ProposeOutcome::Held(hold)) => {
+                                                            held_proposal = Some(hold);
+                                                        }
+                                                        Ok(ProposeOutcome::Unfinished) => {}
                                                         Err(e) => {
                                                             log!("[AgentSession] Failed to propose change at idle: {}", e);
                                                         }
@@ -2250,6 +2274,15 @@ impl LucidosEngine {
                                         // Shutdown: emitting idle would make recover_orphaned_worktrees
                                         // skip this session as "truly idle" and break recovery.
                                         if emit_idle {
+                                            // The turn-end gate's forced decisions, before
+                                            // the idle records the turn's end (ADR 0417). An
+                                            // engine-run merge resolution is not the user's
+                                            // turn, and an unfinished turn decides nothing.
+                                            if conflict_change.is_none()
+                                                && matches!(last_terminal_kind, Some(TerminalKind::Generated))
+                                            {
+                                                self.gate_coding_agent_read_decision(thread_id).await;
+                                            }
                                             self.emit_coding_agent_idled(
                                                 thread_id,
                                                 CodingAgentIdleSnapshot {
@@ -2276,6 +2309,25 @@ impl LucidosEngine {
                                         // carries the decision on from here.
                                         withheld_api_error =
                                             self.event_bus.auto_resume_holds().release(thread_id);
+
+                                        // After the idle, so a re-entry opens its own
+                                        // exchange. Before `terminate_decision`, which
+                                        // then sees it queued and keeps the subprocess.
+                                        if let Some(hold) = held_proposal {
+                                            let gate = crate::engine::turn_end::TurnEndState::at_session_idle(
+                                                true,
+                                                idle_write == Some(IdleChangeWrite::Complete),
+                                                crate::engine::turn_end::SessionFacts {
+                                                    head: branch_head_sha(&repo_root, &branch_name).await,
+                                                    held: Some(hold),
+                                                },
+                                            );
+                                            if let Some(hold) = reentry_ledger.take_due(&gate) {
+                                                if let Err(e) = self.nudge_held_proposal_in_session(thread_id, hold, &msg_tx).await {
+                                                    log!("[AgentSession] Proposal-hold re-entry for thread {} not sent: {}", thread_id, e);
+                                                }
+                                            }
+                                        }
 
                                         match idle_action(conflict_change.is_some(), is_shutdown) {
                                             IdleAction::EndSession => {

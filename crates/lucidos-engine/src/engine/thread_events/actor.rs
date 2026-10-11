@@ -55,8 +55,12 @@ pub enum EngineReason {
     ArchivedBranchWork,
     /// Engine detected a merge conflict pulling main into a CC branch.
     MergeConflict,
-    /// Engine detected the harden marker is missing or stale before apply.
+    /// Engine detected the harden marker is missing: before an apply, or at a
+    /// turn end whose proposal it held and told the agent to harden.
     MissingHardening,
+    /// Engine held a turn-end proposal because the branch's plan marker does
+    /// not satisfy the gate, and told the agent how to set one.
+    MissingPlan,
     /// Historical: the engine used to silently apply marketplace plugin updates
     /// in the background and stamped the resulting `PluginInstalled` event with
     /// this reason. That behavior was retired: the engine now checks for

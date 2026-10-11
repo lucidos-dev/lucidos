@@ -1,4 +1,4 @@
-import { LUCIDOS_TIER_VOCABULARY } from '../../store/actions/models';
+import { LUCIDOS_TIER_VOCABULARY, PROVIDER_DEFAULT_EFFORT_LABEL } from '../../store/actions/models';
 import {
   saveModelSelection,
   storedBackgroundSelection,
@@ -47,6 +47,7 @@ export function BackgroundModelRow({
       vocabulary={LUCIDOS_TIER_VOCABULARY}
       model={model}
       effort={stored.effort ?? resolved?.effort ?? null}
+      unsetEffortLabel={PROVIDER_DEFAULT_EFFORT_LABEL}
       onChange={(p) => void saveModelSelection(modelKey, reasoningKey, p)}
     />
   );

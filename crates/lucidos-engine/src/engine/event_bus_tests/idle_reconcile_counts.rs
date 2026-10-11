@@ -45,14 +45,14 @@ async fn test_change_applied_reconciles_parent_active_children_count() {
     .unwrap();
 
     let (status, proposed): (String, bool) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT status, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(child_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(status, "idle", "ChangeApplied keeps child at idle");
-    assert!(!proposed, "ChangeApplied clears coding_agent_proposed");
+    assert!(!proposed, "ChangeApplied takes the thread off proposed");
 
     assert_active_children(
         &pool,
@@ -105,14 +105,14 @@ async fn test_change_discarded_reconciles_parent_active_children_count() {
     .unwrap();
 
     let (status, proposed): (String, bool) = sqlx::query_as(
-        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        "SELECT status, coding_agent_change_state = 'proposed' FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(child_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(status, "idle", "ChangeDiscarded keeps child at idle");
-    assert!(!proposed, "ChangeDiscarded clears coding_agent_proposed");
+    assert!(!proposed, "ChangeDiscarded takes the thread off proposed");
 
     assert_active_children(
         &pool,

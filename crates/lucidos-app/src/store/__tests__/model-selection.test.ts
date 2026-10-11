@@ -308,6 +308,38 @@ describe('useModelSelection', () => {
     const { selection } = selectionFor(CODEX_MODELS, CODING_AGENT, 'gpt-9', null);
     expect(selection.label).toBe('gpt-9');
   });
+
+  /** A model with no default effort runs at its provider's default. A surface
+   *  that opts in names that, rather than showing a bare model name. */
+  it('names no tier in force with the surface label, only when tiers exist', () => {
+    const select = (model: string) => useModelSelection({
+      models: CODEX_MODELS,
+      vocabulary: CODING_AGENT,
+      model,
+      effort: null,
+      unsetEffortLabel: 'Provider default',
+      onChange: () => {},
+    });
+    expect(select('gpt-5.5').label).toBe('GPT-5.5 · Provider default');
+    expect(select('gpt-5.5').effort).toBeNull();
+    expect(selectionFor(CODEX_MODELS, CODING_AGENT, 'gpt-5.5', null).selection.label).toBe('GPT-5.5');
+  });
+
+  /** The tier step opens on another model's own tier, and on the tier in force
+   *  for the model already selected. */
+  it('opens each model on its own tier', () => {
+    const selection = useModelSelection({
+      models: CODEX_MODELS,
+      vocabulary: CODING_AGENT,
+      model: 'gpt-5.5',
+      effort: 'high',
+      effortFor: (model) => (model === 'gpt-5.6-sol' ? 'max' : null),
+      onChange: () => {},
+    });
+    expect(selection.effortFor('gpt-5.6-sol')).toBe('max');
+    expect(selection.effortFor('gpt-5.5')).toBe('high');
+    expect(selection.effortFor('default')).toBeNull();
+  });
 });
 
 /** A Claude row as the Lucidos Agent's adapter serves it: two backends. The

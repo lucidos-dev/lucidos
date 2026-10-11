@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-26
+- **Amended by**: [0391](0391-agent-teardown-reaps-by-agent-run-marker.md). The
+  turn's process group named below never held a Bash call. The teardown now
+  reaps the early run by agent run marker.
 
 ## Context
 

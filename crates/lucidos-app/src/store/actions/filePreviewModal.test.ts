@@ -89,7 +89,7 @@ describe('openFilePreviewModal: what it shows', () => {
 
   // The navigate router binds the Files panel to the repository it is opening
   // (`openEncodedRepoFilePreview` → `switchRepoSource`). The modal must NOT:
-  // rebinding the panel behind the app is the navigation this feature exists to
+  // rebinding the panel behind the modal is the navigation this feature exists to
   // avoid, and it would reset the panel's expanded folders and change list too.
   it('leaves the Files panel bound to its own repository', () => {
     openFilePreviewModal({ file_path: `repo:${REPO_ID}:file:src/main.rs`, line: 5 });
@@ -99,20 +99,23 @@ describe('openFilePreviewModal: what it shows', () => {
   });
 });
 
+/** The view state the open modal provides to its preview body. */
+const view = () => filePreviewModal.value!.view;
+
 describe('openFilePreviewModal: the cited line', () => {
   it('selects the line, scrolls to it, and shows source so there is something to highlight', () => {
     openFilePreviewModal({ file_path: 'artifacts/notes.md', line: 10, line_end: 20 });
-    expect(selectedLines.value).toEqual({ start: 10, end: 20 });
-    expect(lineScrollTarget.value).toBe(10);
-    expect(filePreviewSource.value).toBe(true);
+    expect(view().selectedLines.value).toEqual({ start: 10, end: 20 });
+    expect(view().lineScrollTarget.value).toEqual({ path: 'artifacts/notes.md', line: 10 });
+    expect(view().source.value).toBe(true);
     expect(filePreviewModal.value?.range).toEqual({ start: 10, end: 20 });
   });
 
   it('renders the document itself when no line is cited', () => {
     openFilePreviewModal({ file_path: 'artifacts/notes.md' });
-    expect(selectedLines.value).toBeNull();
-    expect(lineScrollTarget.value).toBeNull();
-    expect(filePreviewSource.value).toBe(false);
+    expect(view().selectedLines.value).toBeNull();
+    expect(view().lineScrollTarget.value).toBeNull();
+    expect(view().source.value).toBe(false);
   });
 
   // A citation's line number is the part that goes stale; it must never cost the
@@ -125,8 +128,8 @@ describe('openFilePreviewModal: the cited line', () => {
   ])('opens the file anyway with %s', (_label, file_path, line) => {
     openFilePreviewModal({ file_path, line });
     expect(filePreviewModal.value).not.toBeNull();
-    expect(selectedLines.value).toBeNull();
-    expect(filePreviewSource.value).toBe(false);
+    expect(view().selectedLines.value).toBeNull();
+    expect(view().source.value).toBe(false);
   });
 
   // The diff view needs the panel's global repo state, which the modal must not
@@ -134,100 +137,64 @@ describe('openFilePreviewModal: the cited line', () => {
   // citation is honoured.
   //
   // The locator reaches the state UNREWRITTEN, which is what keeps the change
-  // id: the modal renders the file at the change's end state, not at HEAD. An
-  // earlier version rewrote `diff#<changeId>` to a plain `file` locator to make
-  // the line honourable and dropped the id with it.
+  // id: the modal renders the file at the change's end state, not at HEAD.
   it('previews a diff locator as the file at its change, at its line', () => {
     const locator = `repo:${REPO_ID}:diff#change-7:src/main.rs`;
     openFilePreviewModal({ file_path: locator, line: 42 });
     expect(filePreviewModal.value?.path).toBe(locator);
-    expect(selectedLines.value).toEqual({ start: 42, end: 42 });
+    expect(view().selectedLines.value).toEqual({ start: 42, end: 42 });
   });
 });
 
 describe('the modal is read-only', () => {
-  it('drops an in-progress edit mode for its lifetime', () => {
+  it('opens out of edit mode even while the Files panel is editing', () => {
     filePreviewEditing.value = true;
     openFilePreviewModal({ file_path: 'artifacts/notes.md' });
-    expect(filePreviewEditing.value).toBe(false);
+    expect(view().editing.value).toBe(false);
   });
 });
 
-describe('closeFilePreviewModal hands the borrowed view state back', () => {
-  it('restores all four signals to the values it found', () => {
+// A file link in the transcript opens the modal over whatever the content pane
+// shows, a Files preview included. The two must never share a highlight, a
+// scroll target, the Source toggle or the editor.
+describe('the modal keeps its view state apart from the Files panel', () => {
+  const panelState = () => ({
+    source: filePreviewSource.value,
+    editing: filePreviewEditing.value,
+    selection: selectedLines.value,
+    scroll: lineScrollTarget.value,
+  });
+
+  beforeEach(() => {
     filePreviewSource.value = true;
     filePreviewEditing.value = true;
     selectedLines.value = { start: 3, end: 4 };
-    lineScrollTarget.value = 3;
-
-    openFilePreviewModal({ file_path: 'artifacts/other.md', line: 99 });
-    expect(selectedLines.value).toEqual({ start: 99, end: 99 });
-
-    closeFilePreviewModal();
-    expect(filePreviewModal.value).toBeNull();
-    expect(filePreviewSource.value).toBe(true);
-    expect(filePreviewEditing.value).toBe(true);
-    expect(selectedLines.value).toEqual({ start: 3, end: 4 });
-    expect(lineScrollTarget.value).toBe(3);
+    lineScrollTarget.value = { path: 'artifacts/notes.md', line: 3 };
   });
 
-  // A second previewFile replaces the first. Closing must then restore what was
-  // there before the FIRST one, not what the first one applied.
-  it('restores across a replacing preview', () => {
-    filePreviewSource.value = false;
-    selectedLines.value = { start: 1, end: 1 };
-
+  it('leaves the panel untouched across open, replace and close', () => {
+    const before = panelState();
     openFilePreviewModal({ file_path: 'artifacts/a.md', line: 10 });
+    expect(panelState()).toEqual(before);
     openFilePreviewModal({ file_path: 'artifacts/b.md', line: 20 });
+    expect(panelState()).toEqual(before);
     closeFilePreviewModal();
-
-    expect(filePreviewSource.value).toBe(false);
-    expect(selectedLines.value).toEqual({ start: 1, end: 1 });
+    expect(panelState()).toEqual(before);
   });
 
-  // A link inside the previewed document can navigate the shell, and the opener
-  // clears the selection / scroll / source toggle BEFORE it sets `panelOverlay`,
-  // which is what the modal's watcher closes on. Restoring on top of that would
-  // put the panel's pre-modal highlight onto the file just opened, which is the
-  // cross-file leak the openers clear it to prevent.
-  it('drops the borrow instead of restoring when the pane has navigated', () => {
-    filePreviewSource.value = true;
-    selectedLines.value = { start: 3, end: 4 };
+  it('gives each open its own state, so a replacing preview starts clean', () => {
+    openFilePreviewModal({ file_path: 'artifacts/a.md', line: 10 });
+    const first = view();
+    openFilePreviewModal({ file_path: 'artifacts/b.md' });
+    expect(view()).not.toBe(first);
+    expect(view().selectedLines.value).toBeNull();
+  });
 
-    openFilePreviewModal({ file_path: 'artifacts/report.md', line: 99 });
-
-    // What `openFilePreview` does on its way to setting panelOverlay.
-    filePreviewSource.value = false;
-    selectedLines.value = null;
-    lineScrollTarget.value = null;
-
-    closeFilePreviewModal({ navigated: true });
-
+  it('is a no-op when no modal is open', () => {
+    const before = panelState();
+    closeFilePreviewModal();
     expect(filePreviewModal.value).toBeNull();
-    expect(filePreviewSource.value).toBe(false);
-    expect(selectedLines.value).toBeNull();
-    expect(lineScrollTarget.value).toBeNull();
-  });
-
-  // The escalation is the other direction: it closes first, so the hand-back
-  // happens BEFORE the router configures the destination.
-  it('still restores for a plain dismissal after the same sequence', () => {
-    filePreviewSource.value = true;
-    selectedLines.value = { start: 3, end: 4 };
-
-    openFilePreviewModal({ file_path: 'artifacts/report.md', line: 99 });
-    closeFilePreviewModal();
-
-    expect(filePreviewSource.value).toBe(true);
-    expect(selectedLines.value).toEqual({ start: 3, end: 4 });
-  });
-
-  it('is a no-op when no modal is open, so it cannot clobber the panel', () => {
-    filePreviewSource.value = true;
-    selectedLines.value = { start: 7, end: 8 };
-    closeFilePreviewModal();
-    expect(filePreviewSource.value).toBe(true);
-    expect(selectedLines.value).toEqual({ start: 7, end: 8 });
+    expect(panelState()).toEqual(before);
   });
 });
 

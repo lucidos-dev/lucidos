@@ -1,6 +1,7 @@
 use super::lifecycle::foreign_worktree_reason;
 use crate::engine::change_ops::{
-    branch_is_hardened, now_epoch_millis, MergeOwnership, MERGE_OWNED_BY_RESOLVER_MESSAGE,
+    apply_must_harden, branch_is_hardened, now_epoch_millis, MergeOwnership, PlanFloor,
+    ProposalHold, ProposeOutcome, MERGE_OWNED_BY_RESOLVER_MESSAGE,
 };
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, auto_commit_safe_files_if_dirty, branch_changed_files,
@@ -175,30 +176,21 @@ pub(crate) fn apply_inactivity_timeout_minutes(
     }
 }
 
-/// Whether the in-session apply (`apply_now_inner`) must run the Lucidos-source
-/// `/harden` + test flow before merging.
-///
-/// App coding-agent threads own their own hardening and never run the
-/// Lucidos-source `/harden` (their worktree has no `cargo`/`tsc`/`scripts` and
-/// their session prompt explicitly opts out) — so they ALWAYS skip, regardless
-/// of marker state. This mirrors the `is_app()` harden-gate skip in
-/// `change_ops::apply_change`; without it, clicking Apply on an app thread with
-/// a live session wrongly injected "Run /harden now." + `make test` into the
-/// app session and then failed the apply with "Hardening did not complete".
-/// Non-app (Lucidos-source / external) threads gate on the harden marker as
-/// before.
-pub(super) fn should_run_in_session_hardening(is_app: bool, branch_hardened: bool) -> bool {
-    !is_app && !branch_hardened
-}
+/// What an Apply with nothing pending and no proposal hold answers (ADR 0400).
+pub(crate) const NOTHING_PROPOSED_REFUSAL: &str =
+    "Nothing is proposed on this thread, so there is nothing to apply. A turn that \
+     finishes proposes its work.";
 
 impl LucidosEngine {
     /// Apply Now: keep the existing Claude Code session alive and use it for review/conflict resolution.
-    /// Only kills CC after the merge succeeds. Falls back to stale session handling if no live session.
+    /// Only kills CC after the merge succeeds. With no live session it applies
+    /// the pending change directly. Either way it needs a proposal: with
+    /// nothing pending it refuses (ADR 0400).
     ///
     /// Runs as a background task (tokio::spawn). Steps:
     /// 1. Auto-commit in worktree
     /// 2. Review if needed (send follow-up to existing CC)
-    /// 3. Propose change
+    /// 3. Refresh the pending change to the branch head
     /// 4. Try merge (clean / trivial / CC-assisted conflict resolution)
     /// 5. On success: kill CC + clean up. On failure: CC stays alive for retry.
     pub async fn apply_now(
@@ -285,24 +277,11 @@ impl LucidosEngine {
                 _ => {
                     drop(guard);
 
-                    // Fast path: apply existing pending change directly when
-                    // there's no live agent session. Coding-agent sessions
-                    // cleanly exit at idle (Phase 5.3), so "no live session" is the
-                    // expected post-clean-idle state for any thread the user
-                    // returns to apply later — not a signal that the prior
-                    // turn died mid-edit. The fast path skips the
-                    // worktree-scan + describe + propose_change round-trip
-                    // that `end_stale_waiting_session` would otherwise
-                    // perform: when a clean pending row already exists, the
-                    // recovery sweep would just re-emit a duplicate
-                    // `ChangeProposed` with the same payload, producing a
-                    // noise event in the timeline. Skipping it keeps the
-                    // history clean. (`propose_branch_changes` now derives
-                    // `incomplete` from the prior terminal event via
-                    // `last_turn_ended_cleanly`, so the recovery path no
-                    // longer flips clean rows to incomplete=true — but the
-                    // fast path is still worth keeping for the no-op-emit
-                    // reason.) See the regression test
+                    // No live session: apply the pending change directly.
+                    // Coding-agent sessions exit at a clean idle, so this is
+                    // the usual state of a thread the user returns to apply.
+                    // A pending row needs no re-proposal, which would only
+                    // add a duplicate `ChangeProposed` to the timeline. See
                     // `apply_now_no_live_session_fast_path_preserves_clean_pending_change`.
                     let pending = self.changes().pending_for_thread(thread_id).await?;
                     if !pending.is_empty() {
@@ -329,50 +308,27 @@ impl LucidosEngine {
                         return Ok(());
                     }
 
-                    log!(
-                        "[ApplyNow] No live session and no pending change for thread {} — running stale-session recovery to propose then apply",
-                        thread_id
-                    );
-                    // Stale fallback: no pending change row exists — propose
-                    // any uncommitted/committed work on the branch, then
-                    // explicitly apply it. The apply is stamped with the
-                    // clicking user's actor, so the resulting ChangeApplied
-                    // chip reads "You" — not the engine.
-                    self.end_stale_waiting_session(thread_id, false, actor.clone())
-                        .await?;
-                    let pending = self.changes().pending_for_thread(thread_id).await?;
-                    // Guarantee a terminal event so the frontend's `applyingNow`
-                    // spinner always resolves. Without this, a stale fallback that
-                    // proposes nothing (branch had no real commits) would hang
-                    // the spinner indefinitely.
-                    if pending.is_empty() {
-                        self.event_bus
-                            .emit_or_log(
-                                crate::engine::event_bus::BusEvent::Thread {
-                                    thread_id,
-                                    event: crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
+                    // Nothing is pending, so nothing is Apply's to land
+                    // (ADR 0400). A stale session's work is proposed by its
+                    // own recovery, never by an Apply. The terminal event
+                    // resolves the frontend's `applyingNow` spinner.
+                    let error = self.nothing_proposed_refusal(thread_id).await;
+                    log!("[ApplyNow] Refused for thread {}: {}", thread_id, error);
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event:
+                                    crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
                                         change_id: String::new(),
-                                        error: "No changes to apply — branch is already merged or has no commits".to_string(),
+                                        error: error.to_string(),
                                         actor: actor.clone(),
                                     },
-                                    meta: crate::engine::thread_events::EventMeta::NONE,
-                                },
-                                "[ApplyNow] ChangeApplyFailed (stale fallback, no pending)",
-                            )
-                            .await;
-                        return Ok(());
-                    }
-                    for change in pending {
-                        log!(
-                            "[ApplyNow] Applying user-requested change {} on stale-session thread {}",
-                            change.id,
-                            thread_id
-                        );
-                        // Log only, for the same reason as the fast path above.
-                        if let Err(e) = self.apply_change(change.id, actor.clone()).await {
-                            log!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
-                        }
-                    }
+                                meta: crate::engine::thread_events::EventMeta::NONE,
+                            },
+                            "[ApplyNow] ChangeApplyFailed (no live session, nothing pending)",
+                        )
+                        .await;
                     return Ok(());
                 }
             }
@@ -528,6 +484,22 @@ impl LucidosEngine {
         use crate::engine::event_bus::BusEvent;
         use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
+        // Apply acts only on a proposal (ADR 0400). Work no change carries is
+        // never Apply's to propose. An unanswered read refuses too.
+        let pending = match self.changes().get_pending_by_branch(branch_name).await {
+            Ok(row) => row.is_some(),
+            Err(e) => {
+                log!("[ApplyNow] pending lookup for {}: {}", branch_name, e);
+                false
+            }
+        };
+        if !pending {
+            let error = self.nothing_proposed_refusal(thread_id).await;
+            self.refuse_apply_now(thread_id, worktree_path, error, actor)
+                .await;
+            return Ok(());
+        }
+
         // Step 1: Auto-commit in worktree (preserves harden marker if fresh)
         auto_commit_preserving_marker(
             &self.pool,
@@ -538,16 +510,31 @@ impl LucidosEngine {
         )
         .await;
 
-        // App threads skip the /harden + test gate entirely (apps own their
-        // hardening). Probe the marker only for non-app threads — mirrors the
-        // `is_app()` skip in `change_ops::apply_change`.
-        let is_app =
-            crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
-                .await
-                .is_app();
-        let branch_hardened =
-            !is_app && branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await;
-        if should_run_in_session_hardening(is_app, branch_hardened) {
+        let kind_ctx =
+            crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id)).await;
+        // Before hardening, so a held branch never spends a suite run on a
+        // change that cannot land. Both gates judge what will land.
+        let landing = self.landing_files(repo_root, branch_name).await;
+        let floor = self
+            .plan_floor(&kind_ctx, repo_root, branch_name)
+            .await
+            .with_landing(landing.as_deref().unwrap_or_default());
+        if let PlanFloor::Held(hold) = floor {
+            self.refuse_apply_now_for_hold(
+                thread_id,
+                worktree_path,
+                ProposalHold::Plan(hold),
+                actor,
+            )
+            .await;
+            return Ok(());
+        }
+
+        // The same hardening gate as `change_ops::apply_change`. Apps own
+        // their hardening, so their marker is never probed.
+        let mut hardened = !kind_ctx.is_app()
+            && branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await;
+        if apply_must_harden(&kind_ctx, hardened, landing.as_deref()) {
             self.request_hardening_in_session(thread_id, msg_tx).await?;
             self.wait_and_commit(
                 thread_id,
@@ -582,6 +569,7 @@ impl LucidosEngine {
                 self.mark_session_idle(thread_id, worktree_path).await;
                 return Ok(());
             }
+            hardened = true;
         }
 
         // Step 1 only logs a failed auto-commit. A tree still dirty here holds
@@ -731,7 +719,7 @@ impl LucidosEngine {
 
         // Hardened: we just ran hardening or it was already hardened.
         let repo_root_str = repo_root.to_string_lossy();
-        let change_id = self
+        let outcome = self
             .propose_change(crate::engine::change_ops::ProposeChangeInput {
                 thread_id,
                 branch_name,
@@ -740,15 +728,24 @@ impl LucidosEngine {
                 files: &changed_files,
                 requires_restart,
                 channel: EventChannel::ClaudeCode,
-                hardened: true, // apply_now ensures hardening before this point
+                hardened,
                 // Apply-now propose is part of a live agent flow — origin is
                 // carried by the surrounding MessageReceived.
                 origin: None,
-                // Apply-now reaches this point only when the user clicked
-                // Apply on a clean idle — never from a failed turn.
-                incomplete: false,
             })
             .await?;
+        let change_id = match outcome {
+            ProposeOutcome::Proposed(id) => id,
+            // The marker went away after the check above.
+            ProposeOutcome::Held(hold) => {
+                self.refuse_apply_now_for_hold(thread_id, worktree_path, hold, actor)
+                    .await;
+                return Ok(());
+            }
+            ProposeOutcome::Unfinished => {
+                return Err("propose_change never withholds a finished turn".into());
+            }
+        };
 
         // Step 5: Check main repo for uncommitted changes
         self.commit_dirty_logged("Coding agent changes", "apply_now auto-commit")
@@ -772,10 +769,7 @@ impl LucidosEngine {
         // Here rather than at the merge, for the same reason as in
         // `apply_change_inner`: this returns a clean refusal, while an `Err`
         // out of the merge helpers reads as "main diverged" and escalates.
-        //
-        // Only the bounded lane is gated. Whether this path should carry the
-        // whole plan floor is a separate question, and widening it would start
-        // refusing applies that work today.
+        // The rest of the plan floor already ran, before hardening.
         if let crate::engine::git_ops::PlanMarkerState::Present(kind) =
             self.plan_marker_state(repo_root, branch_name).await
         {
@@ -957,6 +951,16 @@ impl LucidosEngine {
         )
         .await
         .map_err(|e| format!("Could not commit the leftover merge edits: {e}"))?;
+
+        // The resolving session edited after the apply-time bound check, so
+        // this rechecks a bounded security fix, as Tiers 2 and 3 do. Both
+        // callers treat an `Err` as a failed apply, never as a cue to escalate.
+        if let Some(refusal) = self
+            .bounded_fix_refusal_for_resolution(repo_root, worktree_path, branch_name, branch_name)
+            .await
+        {
+            return Err(refusal.into());
+        }
 
         catchup_and_ff_to_main(repo_root, worktree_path, branch_name)
             .await
@@ -1241,6 +1245,58 @@ impl LucidosEngine {
         self.broadcast_changes_updated().await;
 
         commits
+    }
+
+    /// Refuse an Apply Now the proposal hold keeps. The branch keeps its work
+    /// and the session stays alive to clear the hold.
+    async fn refuse_apply_now_for_hold(
+        &self,
+        thread_id: Uuid,
+        worktree_path: &Path,
+        hold: ProposalHold,
+        actor: Option<MessageOrigin>,
+    ) {
+        self.refuse_apply_now(thread_id, worktree_path, hold.apply_refusal(), actor)
+            .await;
+    }
+
+    /// Refuse an Apply Now with `error`. The branch keeps its work and the
+    /// session stays alive.
+    async fn refuse_apply_now(
+        &self,
+        thread_id: Uuid,
+        worktree_path: &Path,
+        error: &str,
+        actor: Option<MessageOrigin>,
+    ) {
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::thread_events::{EventMeta, ThreadEvent};
+
+        log!("[ApplyNow] Refused for thread {}: {}", thread_id, error);
+        self.event_bus
+            .emit_or_log(
+                BusEvent::Thread {
+                    thread_id,
+                    event: ThreadEvent::ChangeApplyFailed {
+                        change_id: String::new(),
+                        error: error.to_string(),
+                        actor,
+                    },
+                    meta: EventMeta::NONE,
+                },
+                "[ApplyNow] ChangeApplyFailed",
+            )
+            .await;
+        self.mark_session_idle(thread_id, worktree_path).await;
+    }
+
+    /// What an Apply with nothing pending answers. The proposal hold names
+    /// itself; otherwise the work waits on a turn that finishes.
+    async fn nothing_proposed_refusal(&self, thread_id: Uuid) -> &'static str {
+        match self.branch_work_hold(thread_id).await {
+            Some(hold) => hold.apply_refusal(),
+            None => NOTHING_PROPOSED_REFUSAL,
+        }
     }
 
     /// Reset worktree to main and re-enter idle state.
@@ -1574,7 +1630,8 @@ mod tests {
     #[test]
     fn apply_now_refuses_a_parked_question_before_it_prompts_anything() {
         let src = include_str!("apply_now.rs");
-        let body = &src[src.find("pub async fn apply_now(").unwrap()..];
+        let production = &src[..src.find("\n#[cfg(test)]").unwrap()];
+        let body = &production[production.find("pub async fn apply_now(").unwrap()..];
         let at = |needle: &str| {
             body.find(needle)
                 .unwrap_or_else(|| panic!("apply_now no longer contains {needle:?}"))
@@ -1583,13 +1640,54 @@ mod tests {
             for later in [
                 "session.change_claim = Some(",
                 "pending_for_thread(thread_id)",
-                "end_stale_waiting_session(",
+                "self.nothing_proposed_refusal(thread_id)",
             ] {
                 assert!(
                     at(refusal) < at(later),
                     "{refusal} must be returned before {later:?}"
                 );
             }
+        }
+    }
+
+    /// Apply needs a proposal (ADR 0400). With no live session and nothing
+    /// pending, Apply refuses: it never recovers the stale session, which
+    /// would propose the branch. The live path checks for the pending change
+    /// before it commits, prompts or merges anything.
+    #[test]
+    fn apply_now_refuses_rather_than_proposes_when_nothing_is_pending() {
+        let src = include_str!("apply_now.rs");
+        let production = &src[..src.find("\n#[cfg(test)]").unwrap()];
+        let start = production.find("pub async fn apply_now(").unwrap();
+        let end = production
+            .find("pub(crate) async fn wait_for_idle(")
+            .unwrap();
+        let no_live = &production[start..end];
+        assert!(!no_live.contains("end_stale_waiting_session("));
+        assert!(!no_live.contains(".propose"), "an Apply never proposes");
+        let pending = no_live.find("pending_for_thread(thread_id)").unwrap();
+        let refusal = no_live
+            .find("self.nothing_proposed_refusal(thread_id)")
+            .expect("nothing pending is refused");
+        assert!(pending < refusal);
+
+        let inner = &production[production.find("async fn apply_now_inner(").unwrap()..];
+        let check = inner
+            .find("get_pending_by_branch(branch_name)")
+            .expect("the live path reads the pending change");
+        let refused = inner
+            .find("self.nothing_proposed_refusal(thread_id)")
+            .expect("and refuses without one");
+        for later in [
+            "auto_commit_preserving_marker(",
+            "request_hardening_in_session(",
+            ".propose_change(",
+        ] {
+            let at = inner.find(later).unwrap_or_else(|| panic!("{later:?}"));
+            assert!(
+                check < at && refused < at,
+                "{later:?} must follow the check"
+            );
         }
     }
 
@@ -1618,6 +1716,31 @@ mod tests {
         assert!(
             gate < at("self.reset_worktree_and_idle("),
             "the dirtiness gate must precede every reset in apply_now_inner"
+        );
+    }
+
+    /// Regression: the Tier 1 resolution session edits after the apply-time
+    /// bound check, and its work was fast-forwarded to main unchecked. Tiers
+    /// 2 and 3 recheck the bound there, so a bounded fix could widen only here.
+    #[test]
+    fn the_tier1_resolution_rechecks_the_bound_before_main_moves() {
+        let src = include_str!("apply_now.rs");
+        let start = src.find("async fn cc_assisted_merge_then_ff(").unwrap();
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let at = |needle: &str| {
+            body.find(needle).unwrap_or_else(|| {
+                panic!("cc_assisted_merge_then_ff no longer contains {needle:?}")
+            })
+        };
+        let check = at(".bounded_fix_refusal_for_resolution(");
+        assert!(
+            at("commit_worktree_or_err(") < check,
+            "the check must see the session's last edits"
+        );
+        assert!(
+            check < at("catchup_and_ff_to_main("),
+            "the check must come before main moves"
         );
     }
 
@@ -1743,34 +1866,6 @@ mod tests {
 
         let (free, _rx) = claim_test_session(false, Some("/wt"), None);
         assert_eq!(crate::engine::claude_code::stop_refusal(&free), None);
-    }
-
-    /// Regression: clicking Apply on an *app* coding-agent thread with a live
-    /// session must NOT run the Lucidos-source `/harden` + test flow, even when
-    /// the branch has no harden marker. Before the fix, `apply_now_inner`
-    /// injected "Run /harden now." + `make test` into the app
-    /// session and failed the apply with "Hardening did not complete" — exactly
-    /// the reported bug on the "Create App Demo Video" (`demo-director`) thread.
-    #[test]
-    fn app_thread_never_runs_in_session_hardening() {
-        // App thread, no marker — must still skip.
-        assert!(!should_run_in_session_hardening(true, false));
-        // App thread, marker present — skip.
-        assert!(!should_run_in_session_hardening(true, true));
-    }
-
-    /// Non-app (Lucidos-source / external) threads still gate on the marker: run
-    /// hardening iff the branch isn't already hardened.
-    #[test]
-    fn non_app_thread_gates_in_session_hardening_on_marker() {
-        assert!(
-            should_run_in_session_hardening(false, false),
-            "unhardened non-app branch must run /harden before merging"
-        );
-        assert!(
-            !should_run_in_session_hardening(false, true),
-            "already-hardened non-app branch skips the redundant /harden"
-        );
     }
 
     const TEN_MIN_MS: i64 = 600_000;

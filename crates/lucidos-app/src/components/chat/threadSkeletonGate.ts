@@ -6,13 +6,20 @@
  *  render. It was reverted the same day. Read ADR 0081 before bringing it back,
  *  which records what it cost and why the trade does not work. */
 
+/** Has the client loaded the thread's whole history? Every terminal verdict
+ *  needs it (docs/glossary.md § Whole history loaded). */
+export function wholeHistoryLoaded(eventsLoaded: boolean, hasOlderEvents: boolean): boolean {
+  return eventsLoaded && !hasOlderEvents;
+}
+
 /** The terms ThreadView already derives per render, named so the gate below can
  *  be read without it. */
 export interface ThreadLoadingState {
   hasExchanges: boolean;
   animating: boolean;
   eventsLoadFailed: boolean;
-  eventsLoaded: boolean;
+  /** `wholeHistoryLoaded`. */
+  historyLoaded: boolean;
   disconnected: boolean;
 }
 
@@ -23,7 +30,7 @@ export function threadIsLoadingNow(state: ThreadLoadingState): boolean {
   return !state.hasExchanges
     && !state.animating
     && !state.eventsLoadFailed
-    && !state.eventsLoaded
+    && !state.historyLoaded
     && !state.disconnected;
 }
 

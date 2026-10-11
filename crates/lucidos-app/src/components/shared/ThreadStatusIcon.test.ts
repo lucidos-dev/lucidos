@@ -7,7 +7,7 @@ describe('visualStatusFor', () => {
   const idle = {
     activeChildrenCount: 0,
     waitingChildrenCount: 0,
-    codingAgentProposed: false,
+    codingAgentChangeState: { kind: 'none' },
     liveEventWaitCount: 0,
   } as ThreadMeta;
 
@@ -25,23 +25,24 @@ describe('visualStatusFor', () => {
   // The child writes its own worktree, so the parent's change stays
   // applicable (ADR 0249), exactly as with a running child.
   it('lets the parent\'s own change outrank a waiting child', () => {
-    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 1, codingAgentProposed: true }))
+    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 1, codingAgentChangeState: { kind: 'proposed', requires_restart: false }}))
       .toBe('changes');
   });
 
-  // A Stop proposed what the turn left. It is not ready, so no changes dot,
-  // and the thread reads by its turn alone (ADR 0346).
-  it('draws no changes dot for an incomplete change', () => {
-    expect(visualStatusFor('idle', { ...idle, codingAgentProposed: true, codingAgentIncomplete: true }))
+  // Work a turn end withheld is not a proposal, so no changes dot, and the
+  // thread reads by its turn alone (ADR 0400).
+  it('draws no changes dot for unproposed work', () => {
+    const withheld = { kind: 'unproposed', reason: 'turn_incomplete' } as const;
+    expect(visualStatusFor('idle', { ...idle, codingAgentChangeState: withheld }))
       .toBe('idle');
-    expect(visualStatusFor('idle', { ...idle, activeChildrenCount: 1, codingAgentProposed: true, codingAgentIncomplete: true }))
+    expect(visualStatusFor('idle', { ...idle, activeChildrenCount: 1, codingAgentChangeState: withheld }))
       .toBe('waiting');
   });
 
   it('reads an absent count as zero', () => {
     const beforeTheField = {
       activeChildrenCount: 0,
-      codingAgentProposed: false,
+      codingAgentChangeState: { kind: 'none' },
       liveEventWaitCount: 0,
     } as ThreadMeta;
     expect(visualStatusFor('idle', beforeTheField)).toBe('idle');
@@ -93,7 +94,7 @@ describe('statusTooltip', () => {
 
 // An engine restart interrupted the turn. Nothing failed, and after a *Switch to
 // new version* the engine resumes it by itself, so painting the red error dot
-// (which also claimed a needs-attention slot) was wrong on both counts.
+// (which also claimed a Blocked slot) was wrong on both counts.
 describe('paused', () => {
   it('resolves to its own visual status, never failed', () => {
     expect(resolveVisualStatus('paused', false, false, false)).toBe('paused');
@@ -188,5 +189,31 @@ describe('live event waits', () => {
     expect(resolveVisualStatus('running', true, true, true)).toBe('running');
     expect(resolveVisualStatus('waiting_for_user_answer', true, true, true)).toBe('question');
     expect(resolveVisualStatus('paused', true, true, true)).toBe('paused');
+  });
+});
+
+// A read request (ADR 0409) takes the filled dot, which reads as "unread", and
+// a ready change names itself with the diff glyph instead.
+describe('read request and change marks', () => {
+  function classesOf(status: 'read-request' | 'changes'): string[] {
+    const vnode = ThreadStatusIcon({ status }) as unknown as { props: { children: unknown[] } };
+    return (vnode.props.children as ({ props?: { class?: string } } | false)[])
+      .filter((c): c is { props: { class: string } } => !!c && typeof c === 'object' && !!c.props?.class)
+      .map((c) => c.props.class);
+  }
+
+  it('ranks a read request below a change and above either way of waiting', () => {
+    expect(resolveVisualStatus('idle', false, false, false, true)).toBe('read-request');
+    expect(resolveVisualStatus('idle', false, true, false, true)).toBe('changes');
+    expect(resolveVisualStatus('idle', true, false, false, true)).toBe('read-request');
+    // A read request has no Apply for a live wait to guard (ADR 0424).
+    expect(resolveVisualStatus('idle', false, false, true, true)).toBe('read-request');
+    expect(resolveVisualStatus('idle', false, true, true, false)).toBe('waiting');
+    expect(resolveVisualStatus('running', false, false, false, true)).toBe('running');
+  });
+
+  it('draws the filled dot for a read request and the diff glyph for a change', () => {
+    expect(classesOf('read-request').join(' ')).toContain('progress-dot-read-request');
+    expect(classesOf('changes')).toEqual(['thread-status-changes-icon']);
   });
 });

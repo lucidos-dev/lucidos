@@ -175,6 +175,18 @@ function abandonHeightAnimation(el: HTMLTextAreaElement): void {
   pendingHeightAnim.get(el)?.();
 }
 
+/** Cancel a height transition the ease already started.
+ *
+ *  Clearing `transition` is not enough in WebKit. A transition that started in
+ *  the same frame keeps running, and the next measurement reads its height
+ *  instead of the content's. The box then keeps the height of the text just
+ *  sent. A typed answer followed at once by a new question does exactly this. */
+function stopHeightTransition(el: HTMLTextAreaElement): void {
+  for (const animation of el.getAnimations?.() ?? []) {
+    if ((animation as CSSTransition).transitionProperty === 'height') animation.cancel();
+  }
+}
+
 /** Smoothly animate a textarea's height from a previous inline height to the one
  *  it currently rests at. The caller must have ALREADY applied the final height
  *  (e.g. via {@link resizeTextarea}) before calling — we read `el.style.height`
@@ -220,6 +232,7 @@ export function animateTextareaHeightFrom(el: HTMLTextAreaElement, fromHeight: s
     el.removeEventListener('transitionend', finish);
     document.removeEventListener('visibilitychange', onHidden);
     el.style.transition = '';
+    stopHeightTransition(el);
     pendingHeightAnim.delete(el);
   };
   const finish = (e?: TransitionEvent) => {

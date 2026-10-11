@@ -91,6 +91,11 @@ deleted one, because dedup superseded the older row. There is no reconciler.
 events are gone nothing can resolve the directory back to a thread. ADR 0035
 carries the amendment.
 
+**Delete also removes the deleted threads' own widgets** (amended by ADR 0402).
+A widget is git-tracked under `data/apps/`, but it belongs to the thread that
+made it, so keeping it would keep part of the thread. Reusable widgets and apps
+made from a widget belong to no thread and stay.
+
 **Four things are deliberately left behind.**
 
 - A surviving parent's own events still name the deleted child in their payloads,

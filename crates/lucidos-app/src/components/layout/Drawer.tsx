@@ -15,6 +15,8 @@ import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 import { MENU_ITEM_LABELS, type MenuItem } from '../../store/types';
 import { drawerAnchor, drawerClosing, drawerOpen, drawerSide, forceCloseDrawer } from './drawerState';
 import { GlyphBadge } from '../shared/GlyphBadge';
+import { AppIcon } from '../shared/AppIcon';
+import { CategoryIcon } from '../shared/CategoryIcon';
 
 /** The rows this drawer lists in order. Not every menu item: Changes and
  *  Settings are rendered below with a badge of their own, and Notifications is
@@ -55,6 +57,7 @@ let closeGeneration = 0;
 interface PinnedUi {
   appId: string;
   appName: string;
+  appIcon?: string;
 }
 
 /** Render rows only when both Loadables are `loaded` — falling through to
@@ -68,9 +71,18 @@ function resolvedPinnedUis(): PinnedUi[] {
   const result: PinnedUi[] = [];
   for (const entry of pinned.data) {
     const app = loaded.data.find((s) => s.id === entry.app_id);
-    if (app) result.push({ appId: app.id, appName: app.name });
+    if (app) result.push({ appId: app.id, appName: app.name, appIcon: app.icon });
   }
   return result;
+}
+
+/** A fixed row's glyph, so a pinned app's icon never stands alone. */
+function DrawerGlyph({ category }: { category: string }) {
+  return (
+    <span class="drawer-item-glyph" aria-hidden="true">
+      <CategoryIcon category={category} />
+    </span>
+  );
 }
 
 export function Drawer() {
@@ -133,9 +145,11 @@ export function Drawer() {
               closeDrawer();
             }}
           >
+            <AppIcon appId={p.appId} name={p.appName} icon={p.appIcon} />
             {p.appName}
           </div>
         ))}
+        {pinned.length > 0 && <div class="drawer-menu-divider" aria-hidden="true" />}
 
         {/* Menu items */}
         {menuItems.map((item) => (
@@ -147,6 +161,7 @@ export function Drawer() {
               closeDrawer();
             }}
           >
+            <DrawerGlyph category={item} />
             {MENU_ITEM_LABELS[item]}
           </div>
         ))}
@@ -171,6 +186,7 @@ export function Drawer() {
               closeDrawer();
             }}
           >
+            <DrawerGlyph category="web" />
             Browser
           </div>
         )}
@@ -183,7 +199,8 @@ export function Drawer() {
               closeDrawer();
             }}
           >
-            {MENU_ITEM_LABELS.changes}
+            <DrawerGlyph category="changes" />
+            <span class="drawer-item-label">{MENU_ITEM_LABELS.changes}</span>
             {changeBadge !== null && changeBadge > 0 && (
               <GlyphBadge class="drawer-badge">{changeBadge > 99 ? '99+' : changeBadge}</GlyphBadge>
             )}
@@ -201,6 +218,7 @@ export function Drawer() {
             closeDrawer();
           }}
         >
+          <DrawerGlyph category="settings" />
           {MENU_ITEM_LABELS.settings}
           <SystemAttentionBadge placement="inline" label={systemAttentionBadge()} />
         </div>

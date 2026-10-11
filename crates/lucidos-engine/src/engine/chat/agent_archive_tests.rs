@@ -103,6 +103,7 @@ async fn a_waiting_caller_gets_the_archive_routes_refusal() {
             options: vec![],
             worktree_path: None,
             multi_select: false,
+            owner_approval: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),

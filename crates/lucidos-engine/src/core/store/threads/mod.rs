@@ -2,7 +2,9 @@ use super::types::SessionMessage;
 use super::EventStore;
 use crate::core::event_subscription::EventSubscription;
 use crate::core::EventRow;
-use crate::engine::thread_lifecycle::{ArchiveState, ThreadStatus};
+use crate::engine::thread_lifecycle::{
+    ArchiveState, ChangeStateKind, CodingAgentChangeState, ThreadStatus,
+};
 use crate::engine::thread_state::ThreadState;
 use serde::{Deserialize, Serialize};
 
@@ -169,6 +171,10 @@ pub struct ThreadSummary {
     /// and its parent is still owed the card that settles it (ADR 0252).
     /// Counts toward attention and never toward blocking.
     pub is_stopped_child: bool,
+    /// Whether the thread's agent asked the user to read its latest reply, and
+    /// the user has not seen it yet (ADR 0409). Lists the thread in the
+    /// drawer's Review group. Counts toward neither attention nor blocking.
+    pub read_requested: bool,
     /// Thread status, computed by the backend. Nothing writes `waiting` any
     /// more; it survives on historical rows.
     pub status: ThreadStatus,
@@ -176,26 +182,11 @@ pub struct ThreadSummary {
     /// the column, so two reads with the same version saw the same row. The
     /// client never applies a summary older than the one it holds.
     pub summary_version: i64,
-    /// Whether the coding-agent branch has any diff against main on disk — pure git
-    /// truth. Set by the projection on `ChangeProposed`, cleared on
-    /// `ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`, seeded at
-    /// session bootstrap, and reconciled by the startup sweep against on-disk
-    /// git state. Drives the WaitingBanner Diff button.
-    pub coding_agent_has_diff: bool,
-    /// The coding-agent thread holds a pending change, complete or incomplete.
-    /// Derived from the `changes` rows; cleared on Apply / Discard / Set aside.
-    /// Drives the Apply / Discard buttons and blocks Archive. Whether the
-    /// change is ready to review is `coding_agent_incomplete` (ADR 0346).
-    /// Distinct from `coding_agent_has_diff` (the git fact): a thread can have
-    /// a diff mid-session before the coding agent has formally proposed.
-    pub coding_agent_proposed: bool,
-    /// Whether the proposed change requires an engine restart. Only meaningful
-    /// when `coding_agent_proposed = true`; cleared together with it.
-    pub coding_agent_requires_restart: bool,
-    /// Whether the proposed change is incomplete: its turn did not finish, so
-    /// it is not ready to review (ADR 0346). Only meaningful when
-    /// `coding_agent_proposed = true`; cleared together with it.
-    pub coding_agent_incomplete: bool,
+    /// What the coding-agent branch holds toward a change (ADR 0400). `proposed`
+    /// follows the pending `changes` rows and drives Apply and the Archive
+    /// block. `unproposed` is branch work no change carries, with the reason
+    /// the last turn end withheld it.
+    pub coding_agent_change_state: CodingAgentChangeState,
     /// Whether the coding-agent thread is bound to an external repo. External repos
     /// can't be Applied via the engine merge flow — the WaitingBanner shows
     /// Done/Archive instead, and `archive_thread` marks pending changes as
@@ -348,8 +339,8 @@ fn channel_facet_filter_sql(alias: &str, s: usize, t: usize, r: usize, a: usize)
 ///
 /// `name` is the resolved label, populated for the repos facet (live registry →
 /// `repo_names` projection) so a removed repo lists under its historical name
-/// rather than its raw UUID. NULL for trigger / app facets, whose labels the
-/// frontend resolves from its own registries.
+/// rather than its raw UUID. NULL for trigger facets, whose labels the
+/// frontend resolves from its own registry.
 #[derive(Serialize, sqlx::FromRow)]
 pub struct FilterFacet {
     pub id: Option<String>,
@@ -357,13 +348,28 @@ pub struct FilterFacet {
     pub last_activity: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// One app folder a coding-agent thread worked in, labelled by the engine.
+/// The client cannot label it: the apps list never holds a widget (ADR 0402).
+///
+/// A live folder answers from its manifest. A removed one has no name, and its
+/// `kind` comes from the `app_kinds` projection when `AppDeleted` recorded it
+/// (ADR 0404). `kind` is also `None` for a live folder whose manifest is broken.
+#[derive(Serialize)]
+pub struct AppFilterFacet {
+    pub id: String,
+    pub name: Option<String>,
+    pub kind: Option<crate::core::AppKind>,
+    pub deleted: bool,
+    pub last_activity: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Complete set of selectable drawer filter facets — every trigger / repo / app
-/// that has stamped at least one thread. Labels are resolved client-side.
+/// that has stamped at least one thread.
 #[derive(Serialize)]
 pub struct FilterFacets {
     pub triggers: Vec<FilterFacet>,
     pub repos: Vec<FilterFacet>,
-    pub apps: Vec<FilterFacet>,
+    pub apps: Vec<AppFilterFacet>,
 }
 
 /// Row type for thread summary queries — all columns selected from thread_summaries.
@@ -387,20 +393,17 @@ struct ThreadRow {
     blocking_descendant_count: i64,
     attention_descendant_count: i64,
     is_stopped_child: bool,
+    read_requested: bool,
     live_event_wait_count: i64,
     /// `sqlx::types::Json` rather than a bare `Vec`, because that is what
     /// decodes a JSONB column into a typed value.
     live_event_waits: sqlx::types::Json<Vec<EventWaitSummary>>,
     status: String,
     summary_version: i64,
-    /// Pure git truth — `git diff main..branch` is non-empty.
-    coding_agent_has_diff: bool,
-    /// See `ThreadSummary::coding_agent_proposed`.
-    coding_agent_proposed: bool,
-    /// Only meaningful when `coding_agent_proposed = true`.
+    /// The three columns `CodingAgentChangeState::from_columns` reads.
+    coding_agent_change_state: String,
+    coding_agent_unproposed_reason: Option<String>,
     coding_agent_requires_restart: bool,
-    /// Only meaningful when `coding_agent_proposed = true`.
-    coding_agent_incomplete: bool,
     coding_agent_is_external_repo: bool,
     last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     is_saved: bool,
@@ -474,6 +477,10 @@ pub struct ThreadAggregate {
     /// aggregate so the stopped-child notice and the attention badge appear
     /// and clear live.
     pub is_stopped_child: bool,
+    /// See `ThreadSummary::read_requested`. Carried on the per-event SSE
+    /// aggregate so the Review group gains and loses the thread live, on every
+    /// device.
+    pub read_requested: bool,
     /// Count of *event waits* this thread holds unresolved. See
     /// `ThreadSummary::live_event_wait_count`. Carried on the per-event SSE
     /// aggregate so the Waiting dot lights the moment a wait is registered or
@@ -486,16 +493,14 @@ pub struct ThreadAggregate {
     /// `handleEvent`'s seq-dedup guard, so even a re-delivered event repairs a
     /// stranded list. That is the one path that could not repair it before.
     pub live_event_waits: Vec<EventWaitSummary>,
-    /// Pure git truth — drives the Diff button. See `ThreadSummary::coding_agent_has_diff`.
-    pub coding_agent_has_diff: bool,
-    /// See `ThreadSummary::coding_agent_proposed`.
-    pub coding_agent_proposed: bool,
-    /// Only meaningful when `coding_agent_proposed = true`.
-    pub coding_agent_requires_restart: bool,
-    /// See `ThreadSummary::coding_agent_incomplete`.
-    pub coding_agent_incomplete: bool,
+    /// See `ThreadSummary::coding_agent_change_state`.
+    pub coding_agent_change_state: CodingAgentChangeState,
     pub coding_agent_is_external_repo: bool,
     pub is_saved: bool,
+    /// See `ThreadSummary::home`. An SSE event can be the first a client hears
+    /// of the home thread, and it must not draw that thread in a section.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub home: bool,
     pub has_response: bool,
     pub last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     pub parent_thread_id: Option<String>,
@@ -567,14 +572,17 @@ fn row_to_thread_aggregate(
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
         is_stopped_child: r.is_stopped_child,
+        read_requested: r.read_requested,
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,
-        coding_agent_has_diff: r.coding_agent_has_diff,
-        coding_agent_proposed: r.coding_agent_proposed,
-        coding_agent_requires_restart: r.coding_agent_requires_restart,
-        coding_agent_incomplete: r.coding_agent_incomplete,
+        coding_agent_change_state: CodingAgentChangeState::from_columns(
+            &r.coding_agent_change_state,
+            r.coding_agent_unproposed_reason.as_deref(),
+            r.coding_agent_requires_restart,
+        ),
         coding_agent_is_external_repo: r.coding_agent_is_external_repo,
         is_saved: r.is_saved,
+        home: r.is_home,
         has_response: r.has_response,
         last_revived_at: r.last_revived_at,
         parent_thread_id: r.parent_thread_id,
@@ -611,9 +619,9 @@ fn thread_cols(alias: &str) -> String {
         "{a}.thread_id::text, {a}.title, {a}.first_message, {a}.source, {a}.initiator, {a}.created_at, {a}.last_activity, \
         {a}.last_user_action, {a}.last_agent_action, \
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.waiting_children_count::bigint, {a}.total_children_count::bigint, \
-        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, \
+        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, {a}.read_requested, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
-        {a}.status, {a}.summary_version, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, {a}.coding_agent_incomplete, \
+        {a}.status, {a}.summary_version, {a}.coding_agent_change_state, {a}.coding_agent_unproposed_reason, {a}.coding_agent_requires_restart, \
         {a}.coding_agent_is_external_repo, {a}.last_revived_at, \
         {a}.is_saved, {a}.is_home, {a}.has_response, \
         {a}.parent_thread_id::text AS parent_thread_id, \
@@ -701,14 +709,16 @@ fn row_to_thread_summary(
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
         is_stopped_child: r.is_stopped_child,
+        read_requested: r.read_requested,
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,
         status: ThreadStatus::parse(&r.status),
         summary_version: r.summary_version,
-        coding_agent_has_diff: r.coding_agent_has_diff,
-        coding_agent_proposed: r.coding_agent_proposed,
-        coding_agent_requires_restart: r.coding_agent_requires_restart,
-        coding_agent_incomplete: r.coding_agent_incomplete,
+        coding_agent_change_state: CodingAgentChangeState::from_columns(
+            &r.coding_agent_change_state,
+            r.coding_agent_unproposed_reason.as_deref(),
+            r.coding_agent_requires_restart,
+        ),
         coding_agent_is_external_repo: r.coding_agent_is_external_repo,
         last_revived_at: r.last_revived_at,
         parent_thread_id: r.parent_thread_id,
@@ -760,61 +770,23 @@ pub struct ThreadSummaryFilters<'a> {
     /// `Some(true)` keeps threads holding a draft, `Some(false)` keeps the
     /// rest, `None` is no filter. "Holding a draft" is [`HAS_DRAFT_SQL`].
     pub has_draft: Option<bool>,
-    /// The same three-way filter on `coding_agent_has_diff`, the git fact that
-    /// the branch differs from main.
-    pub has_diff: Option<bool>,
+    /// Keeps threads whose change state has this kind. `None` is no filter.
+    pub change_state: Option<ChangeStateKind>,
     pub limit: i64,
 }
 
 /// The `WHERE` fragment for every filter but status, shared by the list and
-/// count queries. `$3` sources, `$4` parent, `$5` has_draft, `$6` has_diff.
+/// count queries. `$3` sources, `$4` parent, `$5` has_draft, `$6` change state.
 /// The list query binds its limit as `$7`.
 static SUMMARY_FILTER_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "($3::text[] IS NULL OR t.source = ANY($3)) \
          AND ($4::uuid IS NULL OR t.parent_thread_id = $4) \
          AND ($5::bool IS NULL OR ({has_draft}) = $5) \
-         AND ($6::bool IS NULL OR t.coding_agent_has_diff = $6) \
-         AND {home_visible}",
+         AND ($6::text IS NULL OR t.coding_agent_change_state = $6)",
         has_draft = HAS_DRAFT_SQL,
-        home_visible = home_visible_sql("t"),
     )
 });
-
-/// Keeps a row unless it is the home thread with its switch off (ADR 0362).
-/// Every thread list a person or an agent reads carries it, so a hidden home
-/// thread appears in none of them.
-/// The switch reads exactly as `prefs::parse_flag` reads it, and an absent or
-/// unrecognised row takes the catalog default.
-pub(crate) fn home_visible_sql(alias: &str) -> String {
-    use crate::core::preference_catalog::{FLAG_OFF_VALUES, FLAG_ON_VALUES};
-    let switch = &crate::core::prefs::HOME_THREAD_ENABLED;
-    let default_on = switch.default_flag();
-    // A row that flips the default: on-spellings hide nothing when the default
-    // is off, so it is their presence that shows the thread, and vice versa.
-    let flipping = if default_on {
-        FLAG_OFF_VALUES
-    } else {
-        FLAG_ON_VALUES
-    };
-    let spellings = flipping
-        .iter()
-        .map(|v| format!("'{v}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let row = format!(
-        "EXISTS (SELECT 1 FROM preferences hp WHERE hp.key = '{key}' \
-         AND hp.device_id IS NULL \
-         AND lower(btrim(hp.value, E' \\t\\r\\n')) IN ({spellings}))",
-        key = switch.key(),
-    );
-    let shown = if default_on {
-        format!("NOT {row}")
-    } else {
-        row
-    };
-    format!("NOT ({alias}.is_home AND NOT {shown})")
-}
 
 /// How a `list` / `count` query narrows by thread status.
 ///

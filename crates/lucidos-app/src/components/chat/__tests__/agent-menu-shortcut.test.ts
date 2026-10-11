@@ -7,8 +7,8 @@
  *  Plan: `docs/plans/2026-10-01-shortcuts-for-every-toggle.md`. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-vi.mock('../scrollState', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../scrollState')>();
+vi.mock('../../../utils/elementVisibility', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../utils/elementVisibility')>();
   // jsdom lays nothing out, so visibility rides a test attribute.
   return { ...actual, isElementVisible: (el: HTMLElement) => el.dataset.visible === 'yes' };
 });

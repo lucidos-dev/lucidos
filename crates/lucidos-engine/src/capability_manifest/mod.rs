@@ -43,6 +43,10 @@
 //! (`crates/lucidos-cli/src/{await_event,event_waits}.rs`), which the manifest
 //! has no way to express.
 //!
+//! `request_read` (ADR 0409) is absent for the same reason. It acts on the
+//! calling thread and takes no argument, so its CLI verb, `lucidos
+//! request-read`, is hand-wired over `$LUCIDOS_THREAD_ID` too.
+//!
 //! No SDK either: an app iframe is not a thread and holds no subscriptions of
 //! its own. The capability an app or a script actually wants there is the
 //! `triggers` domain, which IS in the manifest: a standing rule that reacts to
@@ -1739,6 +1743,160 @@ const ENV_VARS_DOMAIN: Domain = Domain {
 };
 
 // ---------------------------------------------------------------------------
+// widgets: a thread's widgets, its shelf and reusable widgets (ADRs 0402, 0407,
+// 0415). Show, pin and unpin name a widget instance: the widget and its params.
+// Every widget action the UI offers has an action here, for the agent and the
+// CLI. Open in Canvas is navigate_ui to the widget's id. `thread_id` is
+// optional so the CLI can default it to the session's own thread; the HTTP
+// route requires it.
+// ---------------------------------------------------------------------------
+
+const WIDGET_APP_ID_ARG: Arg = Arg {
+    name: "app_id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Body,
+    description: "The widget's id.",
+};
+const WIDGET_THREAD_BODY_ARG: Arg = Arg {
+    name: "thread_id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Thread uuid. Default: yours.",
+};
+const WIDGET_PARAMS_ARG: Arg = Arg {
+    name: "params",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Widget params, a JSON object. One set is one instance.",
+};
+const WIDGET_LABEL_ARG: Arg = Arg {
+    name: "label",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Chip label. Default: the widget's name.",
+};
+/// What show, pin and unpin name: one widget instance in one thread.
+const WIDGET_INSTANCE_ARGS: &[Arg] = &[
+    WIDGET_APP_ID_ARG,
+    WIDGET_THREAD_BODY_ARG,
+    WIDGET_PARAMS_ARG,
+    WIDGET_LABEL_ARG,
+];
+const WIDGET_THREAD_QUERY_ARG: Arg = Arg {
+    name: "thread_id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Query,
+    description: "Thread uuid. Default: yours.",
+};
+
+const fn widget_op(
+    action: &'static str,
+    summary: &'static str,
+    method: Method,
+    path: &'static str,
+    args: &'static [Arg],
+    cli_name: &'static str,
+) -> Operation {
+    Operation {
+        action,
+        summary,
+        method,
+        path,
+        args,
+        cli_name,
+        sdk_name: action,
+        mutating: !matches!(method, Method::Get),
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    }
+}
+
+const WIDGETS_OPS: &[Operation] = &[
+    widget_op(
+        "list",
+        "The reusable widgets.",
+        Method::Get,
+        "/widgets",
+        &[],
+        "list",
+    ),
+    widget_op(
+        "thread",
+        "Every widget in a thread.",
+        Method::Get,
+        "/widgets/thread",
+        &[WIDGET_THREAD_QUERY_ARG],
+        "thread",
+    ),
+    widget_op(
+        "show",
+        "Show a widget in a thread. Another thread's must be reusable.",
+        Method::Post,
+        "/widgets/show",
+        WIDGET_INSTANCE_ARGS,
+        "show",
+    ),
+    widget_op(
+        "pin",
+        "Add its chip to the shelf.",
+        Method::Post,
+        "/widgets/pin",
+        WIDGET_INSTANCE_ARGS,
+        "pin",
+    ),
+    widget_op(
+        "unpin",
+        "Remove its chip. The card stays.",
+        Method::Post,
+        "/widgets/unpin",
+        WIDGET_INSTANCE_ARGS,
+        "unpin",
+    ),
+    widget_op(
+        "make_reusable",
+        "Offer it to every thread.",
+        Method::Post,
+        "/widgets/make-reusable",
+        &[WIDGET_APP_ID_ARG],
+        "make-reusable",
+    ),
+    widget_op(
+        "stop_reusing",
+        "Hand it back to its origin thread.",
+        Method::Post,
+        "/widgets/stop-reusing",
+        &[WIDGET_APP_ID_ARG],
+        "stop-reusing",
+    ),
+];
+
+const WIDGETS_DOMAIN: Domain = Domain {
+    name: "widgets",
+    tool_name: "widgets",
+    tool_summary:
+        "A thread's widgets, shelf and reusable widgets. Make one with create_app kind='widget'.",
+    llm: true,
+    cli: true,
+    sdk: false,
+    operations: WIDGETS_OPS,
+    llm_aliases: &[],
+    llm_gate: Gate::Ungated,
+};
+
+// ---------------------------------------------------------------------------
 // threads — thread-summary introspection. Groups the two flat read tools
 // (list_threads / count_threads) into one grouped LLM tool, delegating to the
 // existing handlers via the flat alias. The spawn tools (run_thread /
@@ -1757,7 +1915,7 @@ const THREADS_LIST_LLM_SCHEMA: &str = r#"{
   "source": {"type":"string","description":"Comma-separated 'chat', 'trigger', 'coding-agent' (legacy 'claude_code' accepted). Omit for all."},
   "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children, not grandchildren; resolved from the calling thread, so no id. How you recover a child's thread_id."},
   "has_draft": {"type":"boolean","description":"Holds an unsent draft; false inverts."},
-  "has_diff": {"type":"boolean","description":"Coding-agent branch differs from main; false inverts."},
+  "change_state": {"type":"string","enum":["none","unproposed","proposed"],"description":"Coding-agent branch work."},
   "limit": {"type":"integer","description":"1-1000, default 100."}
 }"#;
 const THREADS_COUNT_LLM_SCHEMA: &str = r#"{
@@ -2913,6 +3071,42 @@ const WEBHOOKS_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
 };
 
+// ---------------------------------------------------------------------------
+// workspace_prompt_footprint: what the workspace's own content adds to every
+// chat turn (ADR 0413). `llm: false` is the point: a tool schema would bill
+// every turn of every workspace to measure the prompt. The audit reaches it
+// through the CLI it already runs. No app needs it, so no SDK either.
+// ---------------------------------------------------------------------------
+
+const WORKSPACE_PROMPT_FOOTPRINT_OPS: &[Operation] = &[Operation {
+    action: "show",
+    summary: "Each workspace-grown prompt section's chars against its ceiling, with its items: clipped descriptions, unused apps and reusable widgets, and knowhow docs not loaded by name. Plus the system prompt footprint, for scale.",
+    method: Method::Get,
+    path: "/workspace-prompt-footprint",
+    args: &[],
+    cli_name: "show",
+    sdk_name: "show",
+    mutating: false,
+    llm_alias: None,
+    llm_schema: None,
+    llm: None,
+    cli: None,
+    sdk: None,
+}];
+
+const WORKSPACE_PROMPT_FOOTPRINT_DOMAIN: Domain = Domain {
+    name: "workspace_prompt_footprint",
+    tool_name: "workspace_prompt_footprint",
+    tool_summary:
+        "The workspace prompt footprint: what the workspace's own content adds to every chat turn.",
+    llm: false,
+    cli: true,
+    sdk: false,
+    operations: WORKSPACE_PROMPT_FOOTPRINT_OPS,
+    llm_aliases: &[],
+    llm_gate: Gate::Ungated,
+};
+
 const DOMAINS: &[Domain] = &[
     Domain {
         name: "notifications",
@@ -2942,6 +3136,8 @@ const DOMAINS: &[Domain] = &[
     MCP_DOMAIN,
     PLUGINS_DOMAIN,
     WEBHOOKS_DOMAIN,
+    WIDGETS_DOMAIN,
+    WORKSPACE_PROMPT_FOOTPRINT_DOMAIN,
 ];
 
 /// The full manifest.
@@ -3121,6 +3317,19 @@ mod tests {
                  ThreadStatus::ALL, expected to find {expected}"
             );
         }
+    }
+
+    #[test]
+    fn threads_change_state_enum_matches_the_change_state_kind() {
+        let values = crate::engine::thread_lifecycle::ChangeStateKind::ALL
+            .map(|k| format!("\"{}\"", k.as_str()))
+            .join(",");
+        let expected = format!("\"change_state\": {{\"type\":\"string\",\"enum\":[{values}]");
+        assert!(
+            THREADS_LIST_LLM_SCHEMA.contains(&expected),
+            "the threads 'list' change_state property must offer exactly \
+             ChangeStateKind::ALL, expected to find {expected}"
+        );
     }
 
     /// A caller reading only the tool schema has to be able to tell that

@@ -302,6 +302,7 @@ fn per_token_streaming_names_match_the_predicate() {
             text: String::new(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             parent_tool_use_id: None,
+            progress_note: false,
         },
         ThreadEvent::CodingAgentThoughtStreamed {
             text: String::new(),
@@ -563,10 +564,16 @@ fn a_retired_name_is_refused_and_names_its_replacement() {
     for (retired, replacement) in [
         ("ClaudeCodeIdled", "CodingAgentIdled"),
         ("MemorySearched", "MemoryRecalled"),
+        ("UserPromptInjected", "PromptInjected"),
     ] {
-        let err = awaitable(retired).unwrap_err();
-        assert!(err.contains("retired"), "{retired}: {err}");
-        assert!(err.contains(replacement), "{retired}: {err}");
+        for err in [awaitable(retired), triggerable(retired)].map(Result::unwrap_err) {
+            assert!(err.contains("retired"), "{retired}: {err}");
+            assert!(err.contains(replacement), "{retired}: {err}");
+        }
+        assert!(
+            validate_emittable_event_type(retired).is_err(),
+            "{retired} must not be emittable: its rows read back as {replacement}",
+        );
     }
 }
 

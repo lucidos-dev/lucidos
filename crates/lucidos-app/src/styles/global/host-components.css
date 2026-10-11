@@ -803,25 +803,21 @@ html[data-theme-mode="dark"] .split-button.open::before {
  * regardless of placement direction. Custom callers that use `.dropdown-menu`
  * directly (e.g. `ChangeSelector`) inherit the legacy absolute positioning.
  *
- * The z-index out-ranks the floating header chrome (--z-control-panel), which
- * otherwise paints its icons over a menu that reaches up into the header band.
+ * The z-index is the popover layer (--z-popover), above the floating header
+ * chrome, which otherwise paints its icons over a menu that reaches up into
+ * the header band.
  * That is an ordinary case for the composer's destination picker: it opens
  * upward and clamps to the top margin once the option list outgrows the space
  * above it. Being a <body> child is what makes the number reachable at all,
- * since inside a pane it is capped by that pane's stacking context. It ties
- * with `.thread-toggle-slot` and wins on DOM order (the portal appends
- * after `.app-shell`), the same footing as `.thread-overflow-menu`.
+ * since inside a pane it is capped by that pane's stacking context. It sits
+ * above `.thread-toggle-slot`, on the same footing as `.thread-overflow-menu`.
  *
  * Deliberately below --z-modal, so a modal (and the UI-blocking overlay, which
- * shares that level) still covers an open menu. The price is that a `Dropdown`
- * nested INSIDE a backdrop `<Overlay>` would be portaled out to a layer that
- * modal paints over, and its clicks would read as "outside" to that modal's
- * dismiss handler. No dropdown is nested that way today (`CredentialModal` and
- * `TriggerDetails` are content-pane views despite the names, see
- * `docs/code-review-priors.md` § Frontend), so this is a constraint rather
- * than a bug. Putting one in a modal means portaling the menu into that
- * modal's panel, NOT raising this number past --z-modal, which would float
- * every menu over the blocker.
+ * shares that level) still covers an open menu. So a menu opened INSIDE a
+ * backdrop `<Overlay>` portals into that modal's panel, not <body>
+ * (`PortalTarget` in `Overlay.tsx`). There it paints above the modal, and its
+ * taps read as inside it. Never raise this number past --z-modal instead:
+ * that would float every menu over the blocker.
  *
  * `max-width` caps a long option label so it clips (via the
  * `.dropdown-option-label` ellipsis) instead of growing a viewport-positioned
@@ -842,12 +838,12 @@ html[data-theme-mode="dark"] .split-button.open::before {
        covers a menu that publishes no room, such as the nav history. */
     max-height: min(18.75rem, var(--anchor-room, calc(var(--app-height, 100dvh) - 1rem)));
     overflow-y: auto;
-    z-index: calc(var(--z-control-panel) + 1);
+    z-index: calc(var(--z-popover) + 1);
 }
 
 /* A dropdown used as a form field sizes its option rows to the taller control
  * the trigger is (`.form-group .dropdown-trigger`), so the menu does not read
- * as a different, smaller widget hanging off it. `Dropdown` puts this class on
+ * as a different, smaller control hanging off it. `Dropdown` puts this class on
  * the panel itself (`dropdownMenuClass`) because the menu is portaled out of
  * the `.form-group` that used to scope the rule through the DOM. */
 .dropdown-menu-field .dropdown-option {
@@ -859,8 +855,8 @@ html[data-theme-mode="dark"] .split-button.open::before {
  * behind ThreadOverflowMenu + DraftOverflowMenu).
  * Portaled to <body> with `position: fixed` offsets from `useAnchoredPosition`
  * (set inline via panelStyle), so this rule owns only the box + rows, not
- * placement. Being a <body> child it must out-rank the header chrome
- * (--z-control-panel) to paint above it — same as `.nav-history-menu`. */
+ * placement. Being a <body> child it takes the popover layer (--z-popover) to
+ * paint above the header chrome, same as `.nav-history-menu`. */
 .thread-overflow-menu {
     /* Shrink-to-fit on the longest row, NOT the container width. The menu is
      * portaled to <body> and measured (offsetWidth) by useAnchoredPosition while
@@ -884,7 +880,7 @@ html[data-theme-mode="dark"] .split-button.open::before {
      * wraps instead (see `.thread-overflow-item`). */
     max-width: min(22rem, calc(100vw - 1rem));
     padding: 0.25rem;
-    z-index: calc(var(--z-control-panel) + 1);
+    z-index: calc(var(--z-popover) + 1);
 }
 
 .thread-overflow-item {
@@ -1190,7 +1186,7 @@ html[data-theme-mode="dark"] .split-button.open::before {
    `shared-components.css` now (see
    docs/plans/2026-10-03-sdk-dropdown-shares-host-css.md) — `lucidos.ui.Select`
    wears them too. The variants below (header, danger, nav-history, form-field
-   sizing) stay here: the SDK widget never applies these classes. */
+   sizing) stay here: the SDK control never applies these classes. */
 
 .dropdown-option.dropdown-option-header {
     color: var(--text-secondary);
@@ -1335,23 +1331,6 @@ html[data-theme-mode="dark"] .split-button.open::before {
         to bottom, transparent 0, #000 min(var(--disclosure-fade-reach), var(--disclosure-fade)));
     mask-image: linear-gradient(
         to bottom, transparent 0, #000 min(var(--disclosure-fade-reach), var(--disclosure-fade)));
-}
-
-/* "See all statuses" shortcut sitting under a status-filter view's empty-state
-   message (thread drawer). A small gap separates it from the message; the link
-   itself is .accent-link (shared). Host-chrome only. */
-.empty-state-action {
-    margin-top: 0.5rem;
-}
-
-/* The same shortcut closing out a status-filter view that DID have rows. Reads
-   as a footer rather than one more row: centered like its empty-state twin, at
-   the empty state's own font size, and set off from the last row by more space
-   above than below. Host-chrome only. */
-.filtered-view-footer {
-    padding: 1rem 1rem 0.75rem;
-    text-align: center;
-    font-size: var(--font-size-md);
 }
 
 /* ── Explainer: the info icon and the popover it opens ───────────────────────
@@ -1625,6 +1604,11 @@ html[data-theme-mode="dark"] .split-button.open::before {
 .control-option-desc {
     font-size: var(--font-size-xs);
     color: var(--text-secondary);
+}
+
+.control-option-badge {
+    margin-left: var(--space-sm);
+    vertical-align: middle;
 }
 
 /* ── The System attention badge ───────────────────────────────────────────
@@ -1990,4 +1974,45 @@ mark.search-match {
     color: inherit;
     border-radius: calc(var(--radius-control) * 0.5);
     padding: 0 0.0625rem;
+}
+
+/* ── App icon (ADR 0414) ─────────────────────────────────────────────────────
+   The one tile every app and widget picture sits on (`AppIcon`). A surface
+   sizes it through --app-icon-size, and a large one rounds it more through
+   --app-icon-radius. An image sits on a small neutral tile. The monogram
+   tile tints the theme hue `AppIcon` picks from the app id. */
+.app-icon {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    width: var(--app-icon-size, 1rem);
+    height: var(--app-icon-size, 1rem);
+    border-radius: var(--app-icon-radius, calc(var(--radius-control) * 0.5));
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+.app-icon-image {
+    padding: calc(var(--app-icon-size, 1rem) * 0.1);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+}
+
+.app-icon-image img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.app-icon-monogram {
+    background: color-mix(in srgb, var(--app-icon-hue) 22%, var(--bg-secondary));
+    color: var(--app-icon-hue);
+    font-family: var(--font-ui);
+    font-size: calc(var(--app-icon-size, 1rem) * 0.5);
+    font-weight: 700;
+    line-height: 1;
 }

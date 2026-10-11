@@ -373,14 +373,21 @@ pub async fn resolve(pool: &PgPool) -> String {
     section_for(&library(pool).await, &selected, literacy)
 }
 
-/// The widest section the ENGINE authors, for the always-loaded budget meter.
+/// The selected style when its text is the user's own, written or overridden.
+/// That text is *workspace prompt footprint*; a shipped style is engine text.
+pub async fn user_written_selection(pool: &PgPool) -> Option<Style> {
+    let selected = prefs::RESPONSE_STYLE.read(pool).await;
+    library(pool)
+        .await
+        .into_iter()
+        .find(|s| s.id == selected && s.source != StyleSource::Builtin)
+}
+
+/// The widest section the ENGINE authors, for the system prompt footprint.
 ///
 /// A user's own instruction is workspace content, like `user_profile.md`, so it
 /// is not on that meter. What is billed is the widest shipped style plus the
 /// widest literacy level, the wrapper and the floor.
-///
-/// Test-only, because the meter is: production reads a real selection.
-#[cfg(test)]
 pub fn widest_shipped_section() -> String {
     let widest_style = SHIPPED
         .iter()

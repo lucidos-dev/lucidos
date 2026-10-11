@@ -1534,6 +1534,7 @@ fn user_question_asked() -> crate::engine::thread_events::ThreadEvent {
         options: vec![],
         worktree_path: None,
         multi_select: false,
+        owner_approval: None,
     }
 }
 

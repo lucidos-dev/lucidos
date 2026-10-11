@@ -77,8 +77,8 @@ async fn a_short_thread_is_served_whole_with_nothing_older() {
     );
 }
 
-/// The unpaged read is byte-identical to the paged one that covers the thread.
-/// That is the promise to every existing caller, the export path included.
+/// The unpaged read is byte-identical to the paged one that covers a thread
+/// with no auxiliary captures, which only the unpaged read keeps.
 #[tokio::test]
 async fn a_short_thread_reads_the_same_paged_or_not() {
     let pool = pool().await;

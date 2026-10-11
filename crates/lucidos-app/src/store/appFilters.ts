@@ -13,58 +13,83 @@ import { visibleFilterOptions } from './deletedFilterOptions';
 export type AppFilterOption = {
   id: string;
   label: string;
-  /** True when the app no longer appears in the live `appsList` but threads
-   *  still reference it. Renders with a `(deleted)` suffix. Mirrors
+  /** True once the engine says the folder is gone, while threads still
+   *  reference it. Renders with a `(deleted)` suffix. Mirrors
    *  `RepoFilterOption.deleted`. */
   deleted: boolean;
+  /** True for a widget (ADR 0402), live or deleted. Lists under Widgets. */
+  widget: boolean;
   /** ISO timestamp of the most-recent thread bound to this app. Used to order
-   *  deleted entries — most-recent first. */
+   *  deleted entries, most-recent first. */
   lastActivity?: string;
 };
 
-/** Lists every app that has a coding-agent thread. Completeness comes
- *  from the backend `filterFacets` (all session-having apps, even those whose
- *  threads aren't in the loaded window); the loaded `threadMap` adds
- *  just-created threads immediately; `selectedAppIds` is always included so a
- *  filter restored from localStorage stays clearable. The `appsList` registry
- *  supplies live-vs-`(deleted)` labels. Returns [] until `appsList` loads —
- *  without it every app would mis-label as "(deleted)". */
-export const appFilterOptionsAll = computed<AppFilterOption[]>(() => {
-  if (appsList.value.status !== 'loaded') return [];
-  const liveById = new Map(appsList.value.data.map(a => [a.id, a]));
-  const result: AppFilterOption[] = [];
-  const seen = new Set<string>();
-
-  const push = (id: string, fallbackLabel?: string, lastActivity?: string) => {
-    if (seen.has(id)) return;
-    seen.add(id);
-    const live = liveById.get(id);
-    if (live) {
-      result.push({ id, label: live.name || live.id, deleted: false });
-      return;
-    }
-    result.push({ id, label: fallbackLabel ?? id, deleted: true, lastActivity });
-  };
-
-  for (const facet of loadedOr(filterFacets.value, undefined)?.apps ?? []) {
-    if (facet.id) push(facet.id, facet.id, facet.last_activity ?? undefined);
-  }
+/** App ids of the loaded coding-agent threads, with each one's newest time. */
+const threadAppIds = computed<ReadonlyMap<string, string | undefined>>(() => {
+  const ids = new Map<string, string | undefined>();
   for (const entry of threadMap.value.values()) {
     if (entry.meta.codingAgentKind !== 'app') continue;
     const id = appIdFromFolder(entry.meta.codingAgentFolder);
-    if (!id) continue;
-    push(id, id, entry.meta.updatedAt);
+    if (id && !ids.has(id)) ids.set(id, entry.meta.updatedAt);
   }
-  for (const id of selectedAppIds.value) push(id);
+  return ids;
+});
 
+/** Lists every app that has a coding-agent thread.
+ *
+ *  The engine labels each facet (ADR 0404), so a widget, which the apps list
+ *  never holds, still labels as itself. Completeness comes from the facets;
+ *  the loaded `threadMap` adds just-created threads, labelled from `appsList`
+ *  until the facets catch up (`appIdsMissingFromFacets`). An id nothing can
+ *  label is left out, never called deleted on a guess. A selected one stays,
+ *  under its id, so a filter restored from localStorage stays clearable. */
+export const appFilterOptionsAll = computed<AppFilterOption[]>(() => {
+  const facets = loadedOr(filterFacets.value, undefined)?.apps ?? [];
+  const listed = new Map(loadedOr(appsList.value, []).map(a => [a.id, a]));
+  const selected = selectedAppIds.value;
+  const result: AppFilterOption[] = [];
+  const seen = new Set<string>();
+
+  for (const facet of facets) {
+    seen.add(facet.id);
+    result.push({
+      id: facet.id,
+      label: facet.name || facet.id,
+      deleted: facet.deleted,
+      widget: facet.kind === 'widget',
+      lastActivity: facet.deleted ? facet.last_activity ?? undefined : undefined,
+    });
+  }
+  for (const id of [...threadAppIds.value.keys(), ...selected]) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const app = listed.get(id);
+    if (app) {
+      result.push({ id, label: app.name || id, deleted: false, widget: false });
+    } else if (selected.has(id)) {
+      result.push({ id, label: id, deleted: false, widget: false });
+    }
+  }
   return result;
 });
 
-/** The visible slice: unselected deleted entries dropped unless the user opts in
- *  (`visibleFilterOptions`), which is also what `deletedOptionsHidden` reports
- *  on. */
+/** Loaded threads' app ids the facets do not label yet: a widget a brand-new
+ *  thread works in, say. Empty until the facets load. */
+export const appIdsMissingFromFacets = computed<string[]>(() => {
+  const facets = filterFacets.value;
+  if (facets.status !== 'loaded') return [];
+  const labelled = new Set(facets.data.apps.map(f => f.id));
+  return [...threadAppIds.value.keys()].filter(id => !labelled.has(id));
+});
+
+/** The visible apps: unselected deleted entries dropped unless the user opts
+ *  in (`visibleFilterOptions`). */
 export const appFilterOptions = computed<AppFilterOption[]>(() =>
-  visibleFilterOptions(appFilterOptionsAll.value, selectedAppIds.value));
+  visibleFilterOptions(appFilterOptionsAll.value.filter(o => !o.widget), selectedAppIds.value));
+
+/** The visible widgets, sliced the same way. */
+export const widgetFilterOptions = computed<AppFilterOption[]>(() =>
+  visibleFilterOptions(appFilterOptionsAll.value.filter(o => o.widget), selectedAppIds.value));
 
 export function toggleAppId(id: string): void {
   const next = new Set(selectedAppIds.value);

@@ -13,7 +13,7 @@ use crate::api::thread_reach::{refuse_without_authority, ThreadReachVerb};
 use crate::api::AppState;
 use crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON;
 
-use super::extract_thread_uuid;
+use super::{extract_thread_uuid, parse_thread_id};
 
 /// Read `is_saved` for a thread. `None` = the thread isn't in the projection.
 /// Drives the idempotent save/unsave short-circuit below.
@@ -84,7 +84,7 @@ pub(in crate::api) async fn answer_thread_question(
     // lands outside the caller's subtree (ADR 0168 clause 4). Before the answer
     // is recorded, so a refusal leaves the card live and answerable.
     refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
         ThreadReachVerb::AnswerQuestion,
@@ -96,7 +96,14 @@ pub(in crate::api) async fn answer_thread_question(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
     })?;
-    let actor = crate::api::actor::user_actor(&headers, None);
+    let actor = crate::api::owner_approval::answering_actor(
+        &state.pool,
+        &headers,
+        thread_uuid,
+        &body.tool_use_id,
+    )
+    .await
+    .map_err(|e| (e.status, Json(serde_json::json!({ "error": e.message }))))?;
     use crate::engine::agent_question::{answer_pending_question, AnswerResult};
     match answer_pending_question(
         &state.engine,
@@ -269,7 +276,7 @@ pub(in crate::api) async fn suggest_title(
 
     // Refused before the model call, so a stale menu spends nothing.
     if let Some(id) = thread_uuid {
-        let home = crate::engine::home_thread::is_marked_home_thread(&state.pool, id)
+        let home = crate::engine::home_thread::is_home_thread(&state.pool, id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         if home {
@@ -355,7 +362,7 @@ pub(in crate::api) async fn suggest_title(
 /// first CC text arrives so the timeline reads "You restarted" → resume.
 ///
 /// **Chat / trigger threads.** Calls into `engine.continue_chat(...)` which
-/// emits `ContinuationStarted` + `UserPromptInjected` (engine note
+/// emits `ContinuationStarted` + `PromptInjected` (engine note
 /// summarizing completed tool pairs from the aborted run) and re-enters the
 /// agentic loop with a fresh `request_event_id`.
 ///
@@ -367,13 +374,12 @@ pub(in crate::api) async fn continue_thread(
     Path(thread_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let thread_uuid = Uuid::parse_str(&thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
+    let thread_uuid = parse_thread_id(&thread_id)?;
     // Restarting another thread's turn is nobody's answer to anything, which is
     // why ADR 0168 puts it on clause 4. Before the emit, so a refusal starts no
     // turn.
     refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
         ThreadReachVerb::Continue,
@@ -446,6 +452,51 @@ pub(in crate::api) async fn continue_thread(
     Ok(StatusCode::OK)
 }
 
+/// POST /api/v1/threads/:thread_id/harden, the Not ready strip's **Harden**.
+///
+/// Starts the hardening run for a resting coding-agent thread whose turn end
+/// withheld its work as `hardening_missing`. Its turn end then proposes the
+/// change through the normal floor. Any other thread is refused with a 409,
+/// so the button can never start a turn the strip did not offer.
+pub(in crate::api) async fn harden_thread(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let thread_uuid = parse_thread_id(&thread_id)?;
+    // Starting a turn on another thread is the same act as Continue.
+    refuse_without_authority(
+        &state.engine.event_bus,
+        &headers,
+        Some(thread_uuid),
+        ThreadReachVerb::Continue,
+    )
+    .await
+    .map_err(|e| (e.status_code(), e.to_string()))?;
+    let actor = crate::api::actor::user_actor(&headers, None);
+    if !state.engine.work_awaits_hardening(thread_uuid).await {
+        return Err((
+            StatusCode::CONFLICT,
+            "Nothing on this thread waits on hardening.".to_string(),
+        ));
+    }
+    state
+        .engine
+        .harden_held_work(thread_uuid, actor)
+        .await
+        .map_err(|e| {
+            log!("[API] harden failed for thread {}: {}", thread_uuid, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to start hardening: {}", e),
+            )
+        })?;
+    // Harden is the user's reply too, so held agent messages follow it into
+    // the resumed session, as they follow Continue (ADR 0256).
+    state.engine.spawn_held_message_release(thread_uuid);
+    Ok(StatusCode::OK)
+}
+
 /// POST /api/v1/threads/:thread_id/event-waits/:wait_id/cancel, the **Stop
 /// waiting** button on one subscription in the indicator.
 ///
@@ -468,14 +519,13 @@ pub(in crate::api) async fn cancel_thread_event_wait(
 ) -> Result<StatusCode, (StatusCode, String)> {
     // `wait_id` alone would find the wait; `thread_id` scopes it, so an id from
     // one thread's UI can never cancel another thread's subscription.
-    let thread_uuid = Uuid::parse_str(&thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
+    let thread_uuid = parse_thread_id(&thread_id)?;
     let wait_uuid = Uuid::parse_str(&wait_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid wait_id: {e}")))?;
     // The path names the thread, and the caller picks the path. So an agent
     // presenting its token is held to its own reach, as on every cancel route.
     refuse_without_authority(
-        &state.pool,
+        &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
         ThreadReachVerb::Cancel,
@@ -538,18 +588,32 @@ pub(super) fn refuse_event_waits_for_another_thread(
     headers: &HeaderMap,
     thread_id: Uuid,
 ) -> Result<(), (StatusCode, String)> {
+    refuse_an_agent_from_another_thread(
+        headers,
+        thread_id,
+        "A thread's event subscriptions are its own. This route acts on the \
+         calling thread, and the id in the path is not it. Drop the id: \
+         `lucidos event-waits list` / `cancel` and `lucidos await-event` \
+         already act on the thread you are running in.",
+    )
+}
+
+/// Refuse a subprocess whose origin token names a thread other than
+/// `thread_id`, with `refusal` as the 403 body. The check behind every route
+/// that acts on the calling thread only. See
+/// [`refuse_event_waits_for_another_thread`] for who is in scope and why.
+pub(super) fn refuse_an_agent_from_another_thread(
+    headers: &HeaderMap,
+    thread_id: Uuid,
+    refusal: &str,
+) -> Result<(), (StatusCode, String)> {
     use crate::api::actor::SubprocessOrigin;
     match crate::api::actor::subprocess_origin(headers) {
         SubprocessOrigin::Subprocess {
             source_thread_id, ..
-        } if source_thread_id != Some(thread_id) => Err((
-            StatusCode::FORBIDDEN,
-            "A thread's event subscriptions are its own. This route acts on the \
-                 calling thread, and the id in the path is not it. Drop the id: \
-                 `lucidos event-waits list` / `cancel` and `lucidos await-event` \
-                 already act on the thread you are running in."
-                .to_string(),
-        )),
+        } if source_thread_id != Some(thread_id) => {
+            Err((StatusCode::FORBIDDEN, refusal.to_string()))
+        }
         _ => Ok(()),
     }
 }
@@ -580,8 +644,7 @@ pub(in crate::api) async fn register_thread_event_wait(
     headers: HeaderMap,
     Json(args): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let thread_uuid = Uuid::parse_str(&thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
+    let thread_uuid = parse_thread_id(&thread_id)?;
     refuse_event_waits_for_another_thread(&headers, thread_uuid)?;
 
     // The thread has to exist, and this is the one caller that can get it
@@ -639,8 +702,7 @@ pub(in crate::api) async fn list_thread_event_waits(
     Path(thread_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let thread_uuid = Uuid::parse_str(&thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
+    let thread_uuid = parse_thread_id(&thread_id)?;
     refuse_event_waits_for_another_thread(&headers, thread_uuid)?;
     let waits = state.engine.list_event_waits_for_thread(thread_uuid).await;
     Ok(Json(serde_json::json!({
@@ -668,8 +730,7 @@ pub(in crate::api) async fn cancel_thread_event_waits_for_agent(
     headers: HeaderMap,
     Json(args): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let thread_uuid = Uuid::parse_str(&thread_id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
+    let thread_uuid = parse_thread_id(&thread_id)?;
     refuse_event_waits_for_another_thread(&headers, thread_uuid)?;
     let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
     // Trimmed and emptied by `resolve_cancel_target`, which is the one place

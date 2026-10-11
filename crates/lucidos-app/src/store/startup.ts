@@ -39,12 +39,13 @@ import {
 import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
 import { refreshChangesState, restoreRestartState } from './actions/chat-changes';
+import { openHomeOnColdStart } from './actions/coldStartHome';
 import { restoreRepoSelectionFromStorage } from './actions/repositories';
 import { openThreadAcrossWorkspaces } from './actions/cross-workspace';
 import { inlineMarkdownImage, openImagePopupFromGroup } from './imagePopup';
 import { installMarkdownImageRetry } from '../utils/markdownImageRetry';
 import { installMarkdownImageFallback } from '../utils/markdownImageFallback';
-import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
+import { CHECK_ICON, COPY_ICON } from '../utils/copyIcons';
 import { clipboardOrReport } from '../utils/clipboard';
 import { effect } from '@preact/signals';
 import { markBoot } from '../utils/bootTiming';
@@ -144,6 +145,9 @@ export function startClient(): () => void {
   if (savedThreadId) {
     setFocusedThread(savedThreadId);
   }
+  // A device with no stored focus starts in Home (ADR 0411). A returning user
+  // keeps their last thread, so this reads the key before anything writes it.
+  const stopColdStartHome = openHomeOnColdStart(savedThreadId !== null);
 
   // Restore the restart state from localStorage BEFORE the first
   // checkConnection: a reload mid-restart re-raises the progress dialog and
@@ -687,6 +691,7 @@ export function startClient(): () => void {
     swLiveness.stop();
     stopLiveness();
     stopBootMarks();
+    stopColdStartHome();
     stopAppBridge();
     stopFrameCapabilityRenewal();
     clearInterval(connectionInterval);

@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { activeInlineForm, triggers, triggerGroups, showToast, chatModels, currentModel, reasoningEffort } from '../../store/store';
+import { activeInlineForm, triggers, triggerGroups, showToast, chatModels, currentModel } from '../../store/store';
 import {
   closeTriggerForm,
   submitTrigger,
 } from '../../store/actions/triggers';
 import {
   chatModelOptions, loadChatModels, lucidosModelChoices, LUCIDOS_TIER_VOCABULARY,
+  PROVIDER_DEFAULT_EFFORT_LABEL,
 } from '../../store/actions/models';
+import { accountChatEffort } from '../../store/actions/preferences';
 import type { ModelChoice } from '../../store/modelSelection';
 import { ModelSelectionField } from '../shared/ModelSelectionField';
 import { REASONING_LEVELS } from '../../store/models';
@@ -423,15 +425,16 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   // tiers of its own, so picking it clears both halves. Its label names the
   // pair the run will actually use. For a legacy trigger that pinned an effort
   // and no model, that is the pinned tier.
-  const tierLabel = (value: string) =>
-    REASONING_LEVELS.find(l => l.value === value)?.label ?? value;
+  const tierLabel = (value: string | null) => (value === null
+    ? PROVIDER_DEFAULT_EFFORT_LABEL
+    : REASONING_LEVELS.find(l => l.value === value)?.label ?? value);
   const accountLabel =
     chatModelOptions().find(o => o.value === currentModel.value)?.label ?? currentModel.value;
-  // The account's tier, except on a legacy trigger that pinned an effort and no
-  // model. Once a model IS pinned the tier belongs to that pick, and naming it
-  // here would claim Default runs on it.
+  // The account's tier for its model, except on a legacy trigger that pinned an
+  // effort and no model. Once a model IS pinned the tier belongs to that pick,
+  // and naming it here would claim Default runs on it.
   const inheritedTier = tierLabel(
-    model === '' && triggerEffort ? triggerEffort : reasoningEffort.value,
+    model === '' && triggerEffort ? triggerEffort : accountChatEffort(currentModel.value),
   );
   const modelChoices: ModelChoice[] = [
     { value: '', label: `Default (${accountLabel} · ${inheritedTier})`, reasoningEfforts: [] },

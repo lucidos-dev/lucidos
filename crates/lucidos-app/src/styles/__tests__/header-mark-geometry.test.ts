@@ -597,6 +597,38 @@ describe('the nav chevrons are pinned to one shared span', () => {
   it('the chevrons and the mark cannot be squeezed by a long title', () => {
     const fixed = cssRules(markCss).find(r => r.selector.includes('.header-nav-cluster > .icon-btn'));
     expect(fixed?.props.get('flex')).toBe('0 0 auto');
+    expect(fixed?.selector).toContain('.header-nav-cluster > .header-mark-pair');
+  });
+
+  it('the floor is the thread row\'s narrowest width, Home included', () => {
+    // A floor that leaves out Home lets the pair overflow the cluster on the
+    // floor arm, which pushes a chevron into an edge control.
+    const floor = decl(block(markCss, ':root {'), '--header-nav-min-span') ?? '';
+    for (const term of ['--mobile-header-icon-box', '--header-mark-tap', '--header-nav-gap']) {
+      expect(floor, `the floor must count ${term}`).toContain(`var(${term})`);
+    }
+    // The pair gap is gone before the floor engages. Counting it would hold
+    // the chevrons apart for a gap that is not there.
+    expect(floor, 'the floor must not count the pair gap').not.toContain('--header-mark-pair-gap');
+  });
+
+  it('Home and the mark spread apart when there is room, and close up when there is not', () => {
+    // The pair asks for the max gap and is the one fixed-size member allowed to
+    // shrink, down to its children touching. Only with Home in it: the mark
+    // alone keeps the plain `0 0 auto`, so it stays on the axis.
+    const pair = cssRules(markCss)
+      .find(r => r.selector === '.header-nav-cluster > .header-mark-pair:has(> .home-thread-btn)');
+    expect(pair, 'the Home pair rule is gone').toBeDefined();
+    const flex = pair!.props.get('flex') ?? '';
+    expect(flex, 'it may shrink but never grow').toMatch(/^0 1 calc\(/);
+    for (const term of ['--mobile-header-icon-box', '--header-mark-tap', '--header-mark-pair-gap-max']) {
+      expect(flex, `the basis must count ${term}`).toContain(`var(${term})`);
+    }
+    expect(pair!.props.get('justify-content'), 'the free space goes between Home and the mark')
+      .toBe('space-between');
+    const fixedGaps = cssRules(markCss)
+      .filter(r => r.selector.includes('.header-mark-pair') && r.props.has('gap'));
+    expect(fixedGaps, 'a fixed gap cannot close up, and it would stack on the spread').toEqual([]);
   });
 });
 
@@ -632,7 +664,10 @@ describe('the nav chevrons reach past their button for a tap', () => {
     // A disabled chevron's opacity makes it a stacking context, so a z-index
     // on the reach would stay inside the button. The neighbours rise instead.
     expect(rule('.header-nav-cluster > .nav-chevron::before').get('z-index')).toBeUndefined();
-    const inside = rule('.header-nav-cluster > .brand-mark-slot, .header-title-cluster > .mobile-content-title');
+    const inside = rule(
+      '.header-nav-cluster > .brand-mark-slot, .header-nav-cluster > .header-mark-pair, '
+      + '.header-title-cluster > .mobile-content-title',
+    );
     expect(inside.get('position')).toBe('relative');
     expect(inside.get('z-index')).toBe('1');
     // The drawer toggle and the hamburger come before the transformed cluster

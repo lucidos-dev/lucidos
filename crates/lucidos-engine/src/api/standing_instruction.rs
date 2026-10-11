@@ -12,7 +12,9 @@
 //! Both inputs are prefix fields of the *thread-bound origin token*, under its
 //! MAC (`api::actor`), so neither is a claim a caller can edit. The turn-start
 //! set is `agent_recovery::THREAD_START_EVENTS_SQL`, shared with the recovery
-//! gates: "the owner opened this turn" must mean one thing.
+//! gates: "the owner opened this turn" must mean one thing. An *owner approval*
+//! (`api::owner_approval`) reads the same current turn, through
+//! [`opens_current_turn_sql`].
 //!
 //! **Nothing here can be self-granted.** An agent creates triggers freely, and
 //! an unchecked fire would promote its own thread to the owner's authority in
@@ -76,32 +78,42 @@ enum TurnStart {
     SomebodyElse,
 }
 
+/// SQL predicate over one `events` row: does it open the turn the standing
+/// instruction and an *owner approval* are weighed against?
+///
+/// It is the recovery gates' turn-start set, minus any resume the owner did
+/// not click. So a resume reads as the turn it continues (ADR 0282), and the
+/// owner's own Continue still opens one. Unqualified columns, so use it only
+/// inside a query whose sole `FROM` is `events`.
+///
+/// `origin` before `actor` because a turn-start event naming a person carries
+/// the structured origin: `MessageReceived` stamps it at the chat boundary.
+/// `actor` is the `EventMeta` slot, for a start event that records its
+/// initiator there instead. Both hold a `MessageOrigin`, so `kind` means the
+/// same in either.
+pub(super) fn opens_current_turn_sql() -> String {
+    format!(
+        "event_type IN ({starts}) \
+         AND NOT (event_type IN ('ContinuationStarted', 'OrphanRecoveryStarted') \
+              AND COALESCE(payload->'origin', payload->'actor')->>'kind' \
+                  IS DISTINCT FROM 'device')",
+        starts = crate::engine::agent_recovery::THREAD_START_EVENTS_SQL,
+    )
+}
+
 /// Read the thread's newest turn-start event. `None` when the thread has never
 /// started a turn, or the read failed.
 async fn newest_turn_start(pool: &PgPool, thread_id: Uuid) -> Option<TurnStart> {
-    // `origin` before `actor` because a turn-start event naming a person
-    // carries the structured origin: `MessageReceived` stamps it at the chat
-    // boundary. `actor` is the `EventMeta` slot, for a start event that records
-    // its initiator there instead. Both hold a `MessageOrigin`, so `kind` means
-    // the same in either.
-    //
     // `task_id` is `TriggerStarted`'s legacy spelling of `trigger_id`, aliased
     // on the enum and therefore still live in old rows.
-    //
-    // The query skips a resume the owner did not click, so it reads the turn
-    // start that resume continues. The owner's own Continue carries a device
-    // origin and counts as a turn they opened.
     let sql = format!(
         "SELECT event_type, \
                 COALESCE(payload->'origin', payload->'actor')->>'kind' = 'device', \
                 COALESCE(payload->>'trigger_id', payload->>'task_id') \
          FROM events \
-         WHERE aggregate_id = $1 AND event_type IN ({starts}) \
-           AND NOT (event_type IN ('ContinuationStarted', 'OrphanRecoveryStarted') \
-                AND COALESCE(payload->'origin', payload->'actor')->>'kind' \
-                    IS DISTINCT FROM 'device') \
+         WHERE aggregate_id = $1 AND {opens} \
          ORDER BY sequence DESC LIMIT 1",
-        starts = crate::engine::agent_recovery::THREAD_START_EVENTS_SQL,
+        opens = opens_current_turn_sql(),
     );
     let row: Option<(String, Option<bool>, Option<String>)> = sqlx::query_as(&sql)
         .bind(thread_id.to_string())
@@ -172,4 +184,4 @@ async fn owner_authorized_trigger(pool: &PgPool, trigger_id: &str) -> bool {
 
 #[cfg(test)]
 #[path = "standing_instruction_tests.rs"]
-mod tests;
+pub(crate) mod tests;

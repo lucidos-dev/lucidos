@@ -8,11 +8,8 @@ import { openPluginInstallRequest } from './plugin-install';
 import { openPluginUninstallRequest } from './plugin-uninstall';
 import { openEmailConfirmRequest } from './email-confirm';
 import { getDeviceId } from './devices';
-import {
-  handleNavigationRequest,
-  navigationIsForThisDevice,
-  routeThreadNavigation,
-} from './navigation-request';
+import { isForThisDevice } from './device-scope';
+import { handleNavigationRequest, routeThreadNavigation } from './navigation-request';
 import { formatThreadLabel } from './thread-label';
 
 /** *Form requests*: something the agent asked the user to act on, persisted
@@ -82,9 +79,9 @@ export function openFormRequest(
 /** Whether this device should open `event` unasked. An authorization page goes
  *  to the device its actor names, as a navigation does. A form goes to every
  *  device, and the first answer closes it on the others. */
-function isForThisDevice(event: FormRequestEvent): boolean {
+function requestIsForThisDevice(event: FormRequestEvent): boolean {
   if (event.type !== 'OAuthAuthorizationRequested') return true;
-  return navigationIsForThisDevice(event.actor);
+  return isForThisDevice(event.actor);
 }
 
 /** Read the open requests and offer the newest one this page has not offered.
@@ -105,7 +102,7 @@ export async function syncPendingFormRequests(): Promise<void> {
     return;
   }
   if (activeInlineForm.value) return;
-  const fresh = pending.filter((p) => !offered.has(p.request_id) && isForThisDevice(p.event));
+  const fresh = pending.filter((p) => !offered.has(p.request_id) && requestIsForThisDevice(p.event));
   const newest = fresh[fresh.length - 1];
   if (newest) openFormRequest(newest.thread_id, newest.event);
 }

@@ -16,7 +16,7 @@
  *  "per-draft value ?? account default" shape as `effectiveSendMode`. Editing a
  *  draft writes ONLY the override (and, for scope, the localStorage last-used
  *  seed below); it never writes the account-wide preference (`chat_model` /
- *  `chat_reasoning_effort` / `coding_agent_default`). `sendCompose` consumes the
+ *  `chat_reasoning_efforts` / `coding_agent_default`). `sendCompose` consumes the
  *  resolved values at send and then `clearComposeSelection`s the entry.
  *
  *  SCOPE'S LAST-USED SEED (localStorage). Scope has no account preference — its
@@ -45,8 +45,8 @@ import {
   selectedScope,
   selectedCodingAgent,
   currentModel,
-  reasoningEffort,
 } from './store';
+import { accountChatEffort } from './actions/preferences';
 import type { CodingAgent } from '../api/types';
 import type { CodingAgentModelValue, CodingAgentReasoningEffort } from '../api/client';
 
@@ -189,8 +189,10 @@ export function resolveModel(threadId: string | null | undefined): string {
   return getComposeSelectionOverride(threadId).model ?? currentModel.value;
 }
 
-export function resolveReasoningEffort(threadId: string | null | undefined): string {
-  return getComposeSelectionOverride(threadId).reasoningEffort ?? reasoningEffort.value;
+/** The draft's tier: its own pick, else the account's tier for the draft's
+ *  model. `null` sends no effort. */
+export function resolveReasoningEffort(threadId: string | null | undefined): string | null {
+  return getComposeSelectionOverride(threadId).reasoningEffort ?? accountChatEffort(resolveModel(threadId));
 }
 
 /** The backend this draft pinned, or `null` for the model's own default. No

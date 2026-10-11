@@ -55,7 +55,10 @@ vi.mock('./plugin-uninstall', () => ({
 vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));
 vi.mock('./pane', () => ({ revealContentPane: vi.fn() }));
 vi.mock('./wipPreview', () => ({ clearWipIfMatches: vi.fn() }));
-vi.mock('../../components/chat/scrollState', () => ({ isElementVisible: vi.fn(() => true) }));
+vi.mock('../../utils/elementVisibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/elementVisibility')>()),
+  isElementVisible: vi.fn(() => true),
+}));
 
 describe('confirmDeleteApp — plugin ownership', () => {
   beforeEach(() => {

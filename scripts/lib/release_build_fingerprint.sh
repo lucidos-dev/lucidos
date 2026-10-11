@@ -85,6 +85,7 @@ RELEASE_FINGERPRINT_PATHS=(
     package.json
     package-lock.json
     system-knowhow
+    system-widgets
 )
 
 # ── Tier 2: the build recipe — decides what gets bundled and how it is signed,

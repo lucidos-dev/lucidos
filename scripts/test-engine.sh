@@ -40,7 +40,10 @@
 #                                             #   -- -- mymod another_mod --test-threads=4
 #
 # Env:
-#   LUCIDOS_TEST_PG_PORT   host port for the test container (default 5510)
+#   LUCIDOS_TEST_PG_PORT         host port for the test container (default 5510)
+#   LUCIDOS_TEST_RUN_LIMIT_SECS  stop a run that outlives this, compile included
+#                                (default RUN_LIMIT_DEFAULT_SECS below). A hung
+#                                test then exits 124 and frees its build slot.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -184,16 +187,20 @@ cd "$PROJECT_DIR"
 # `lucidos` binary, and passes straight through when an outer wrapper (a `make
 # test` that already took one) marked the process tree as holding.
 SLOT="$PROJECT_DIR/scripts/with-build-slot.sh"
+# Inside the slot, so the time spent waiting for one never counts. The default
+# is about 3x the slowest full run seen on a busy host (ADR 0391).
+RUN_LIMIT_DEFAULT_SECS=2700
+LIMIT=("$PROJECT_DIR/scripts/with-run-limit.sh" "${LUCIDOS_TEST_RUN_LIMIT_SECS:-$RUN_LIMIT_DEFAULT_SECS}")
 
 # Safe array expansion: under `set -u`, "${arr[@]}" on an empty array is an
 # "unbound variable" error in bash 3.2 (macOS default). The +-form expands to
 # nothing when empty and to the quoted elements otherwise.
 if [ "$FULL" = "1" ]; then
     echo "[test] cargo test --locked -p lucidos-engine (full crate)"
-    "$SLOT" --label "engine tests (full)" -- \
+    "$SLOT" --label "engine tests (full)" -- "${LIMIT[@]}" "engine tests (full)" -- \
         cargo test --locked -p lucidos-engine ${PASSTHRU[@]+"${PASSTHRU[@]}"}
 else
     echo "[test] cargo test --locked -p lucidos-engine --lib"
-    "$SLOT" --label "engine tests" -- \
+    "$SLOT" --label "engine tests" -- "${LIMIT[@]}" "engine tests" -- \
         cargo test --locked -p lucidos-engine --lib ${PASSTHRU[@]+"${PASSTHRU[@]}"}
 fi

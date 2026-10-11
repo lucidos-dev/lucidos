@@ -1,9 +1,9 @@
 import { Component, createRef, type ComponentChildren, type RefObject } from 'preact';
 import type { Signal } from '@preact/signals';
-import type { DrawerView } from '../../store/store';
+import type { DrawerGrouping } from '../../store/store';
 import { navCoverFuseMs } from '../shared/NavigationCover';
 
-/** A drawing of the list as it looked when its status filter changed. Each dip
+/** A drawing of the list as it looked when its grouping changed. Each dip
  *  takes a new `id`, even when it carries the same `node` over. */
 export type LeavingDrawing = { id: number; node: HTMLElement; scrollTop: number };
 
@@ -33,23 +33,23 @@ export function drawLeavingList(list: HTMLElement | null): LeavingDrawing | null
   for (const el of [node, ...node.querySelectorAll('*')]) {
     for (const name of IDENTITY_ATTRIBUTES) el.removeAttribute(name);
   }
-  // A row in flight is drawn at rest. A clone carries no Web Animation, so its
-  // flying copy would sit frozen at the flight's start.
-  for (const portal of node.querySelectorAll('.flip-portal')) portal.replaceChildren();
+  // A leaving row is drawn gone. A clone carries no Web Animation, so its
+  // folding copy would sit frozen at the start of its exit.
+  for (const layer of node.querySelectorAll('.flip-departure-layer')) layer.remove();
   return { id: ++lastDrawingId, node, scrollTop: list.scrollTop };
 }
 
-/** Draws the list when its status filter changes. It wraps the list's content,
+/** Draws the list when its grouping changes. It wraps the list's content,
  *  because `getSnapshotBeforeUpdate` runs after render and before the content's
  *  DOM changes: the one moment the leaving view still exists. */
 export class LeavingViewSnapshot extends Component<{
-  view: DrawerView;
+  grouping: DrawerGrouping;
   list: RefObject<HTMLElement>;
   drawing: Signal<LeavingDrawing | null>;
   children?: ComponentChildren;
 }> {
-  getSnapshotBeforeUpdate(previous: Readonly<{ view: DrawerView }>): LeavingDrawing | null {
-    return previous.view === this.props.view ? null : drawLeavingList(this.props.list.current);
+  getSnapshotBeforeUpdate(previous: Readonly<{ grouping: DrawerGrouping }>): LeavingDrawing | null {
+    return previous.grouping === this.props.grouping ? null : drawLeavingList(this.props.list.current);
   }
 
   componentDidUpdate(_props: unknown, _state: unknown, drawn: LeavingDrawing | null): void {

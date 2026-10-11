@@ -14,6 +14,9 @@ vi.mock('../../components/chat/scrollState', async (importOriginal) => ({
   scrollToEventAndPulse,
 }));
 
+// The store reaches scrollState through the handle, which the shell fills.
+const { provideScrollState } = await import('../../components/chat/scrollStateHandle');
+provideScrollState(await import('../../components/chat/scrollState'));
 const { threadMap } = await import('../store');
 const { landOnEvent } = await import('./threads');
 

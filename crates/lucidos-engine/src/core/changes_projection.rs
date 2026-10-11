@@ -11,6 +11,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::core::changes::{Change, ChangeStatus, RestartGroup};
+use crate::engine::thread_lifecycle::ChangeStateKind;
 
 /// Column projection used by every `query_as::<_, Change>` call. The table has
 /// no `thread_title` column — it's enriched per-response from `thread_summaries`
@@ -97,39 +98,48 @@ impl ChangesProjection {
 
     // --- Write API (called from event_bus inside the event commit tx) ---
 
-    /// Recompute a thread's `coding_agent_proposed`,
-    /// `coding_agent_requires_restart` and `coding_agent_incomplete` from its
-    /// pending changes. The three columns are a cache of this table, and
-    /// nothing else writes them. Every write below calls this in its
-    /// transaction when it moves a change in or out of `pending`, or flips a
-    /// restart or incomplete flag.
+    /// Recompute a thread's change state and `coding_agent_requires_restart`
+    /// from its pending changes. `proposed` is a cache of this table, and
+    /// nothing else writes it. Every write below calls this in its transaction
+    /// when it moves a change in or out of `pending`, or flips a restart flag.
     ///
-    /// An incomplete change still sets `coding_agent_proposed`, because it
-    /// still blocks Archive. `coding_agent_incomplete` is what tells the
-    /// "ready to review" readers to pass it over (ADR 0346).
+    /// `leaving` is where a thread lands when its last pending change goes:
+    /// [`landing_after`] of the status that took it.
     pub(crate) async fn sync_thread_proposal<'e, E>(
         executor: E,
         thread_id: Uuid,
+        leaving: ChangeStateKind,
     ) -> sqlx::Result<()>
     where
         E: sqlx::Executor<'e, Database = Postgres>,
     {
-        sqlx::query(
-            "UPDATE thread_summaries t SET \
-                coding_agent_proposed = p.pending, \
-                coding_agent_requires_restart = p.requires_restart, \
-                coding_agent_incomplete = p.incomplete \
-             FROM (SELECT COUNT(*) > 0 AS pending, \
-                          COALESCE(bool_or(requires_restart), FALSE) AS requires_restart, \
-                          COALESCE(bool_or(incomplete), FALSE) AS incomplete \
-                   FROM changes WHERE thread_id = $1 AND status = $2) p \
+        sqlx::query(&format!(
+            "WITH p AS ( \
+                SELECT COUNT(*) > 0 AS pending, \
+                       COALESCE(bool_or(requires_restart), FALSE) AS requires_restart \
+                FROM changes WHERE thread_id = $1 AND status = $2), \
+             n AS ( \
+                SELECT CASE WHEN p.pending THEN '{proposed}' \
+                            WHEN t.coding_agent_change_state = '{proposed}' THEN $3 \
+                            ELSE t.coding_agent_change_state END AS state, \
+                       CASE WHEN p.pending OR t.coding_agent_change_state = '{proposed}' \
+                            THEN NULL ELSE t.coding_agent_unproposed_reason END AS reason, \
+                       p.pending AND p.requires_restart AS requires_restart \
+                FROM thread_summaries t, p WHERE t.thread_id = $1) \
+             UPDATE thread_summaries t SET \
+                coding_agent_change_state = n.state, \
+                coding_agent_unproposed_reason = n.reason, \
+                coding_agent_requires_restart = n.requires_restart \
+             FROM n \
              WHERE t.thread_id = $1 \
-               AND (t.coding_agent_proposed, t.coding_agent_requires_restart, \
-                    t.coding_agent_incomplete) \
-                   IS DISTINCT FROM (p.pending, p.requires_restart, p.incomplete)",
-        )
+               AND (t.coding_agent_change_state, t.coding_agent_unproposed_reason, \
+                    t.coding_agent_requires_restart) \
+                   IS DISTINCT FROM (n.state, n.reason, n.requires_restart)",
+            proposed = ChangeStateKind::Proposed.as_str(),
+        ))
         .bind(thread_id)
         .bind(ChangeStatus::Pending)
+        .bind(leaving.as_str())
         .execute(executor)
         .await?;
         Ok(())
@@ -191,7 +201,7 @@ impl ChangesProjection {
         .bind(status)
         .execute(&mut **tx)
         .await?;
-        Self::sync_thread_proposal(&mut **tx, thread_id).await
+        Self::sync_thread_proposal(&mut **tx, thread_id, landing_after(status)).await
     }
 
     /// Per-commit `ChangeProposed` (empty change_id, commit_sha set): bump
@@ -220,7 +230,7 @@ impl ChangesProjection {
         .fetch_all(&mut **tx)
         .await?;
         for thread_id in thread_ids.into_iter().flatten() {
-            Self::sync_thread_proposal(&mut **tx, thread_id).await?;
+            Self::sync_thread_proposal(&mut **tx, thread_id, ChangeStateKind::Unproposed).await?;
         }
         Ok(())
     }
@@ -257,7 +267,14 @@ impl ChangesProjection {
             None => {
                 crate::log!("[ChangesProjection] write_applied: no row for {}: missing aggregate ChangeProposed?", id);
             }
-            Some(Some(thread_id)) => Self::sync_thread_proposal(&mut **tx, thread_id).await?,
+            Some(Some(thread_id)) => {
+                Self::sync_thread_proposal(
+                    &mut **tx,
+                    thread_id,
+                    landing_after(ChangeStatus::Applied),
+                )
+                .await?
+            }
             Some(None) => {}
         }
         Ok(())
@@ -322,7 +339,9 @@ impl ChangesProjection {
             None => {
                 crate::log!("[ChangesProjection] write_status({}) for {}: no row, missing aggregate ChangeProposed?", status, id);
             }
-            Some(Some(thread_id)) => Self::sync_thread_proposal(&mut **tx, thread_id).await?,
+            Some(Some(thread_id)) => {
+                Self::sync_thread_proposal(&mut **tx, thread_id, landing_after(status)).await?
+            }
             Some(None) => {}
         }
         Ok(())
@@ -459,12 +478,16 @@ impl ChangesProjection {
         .await
     }
 
-    /// Whether any `changes` row, in any status, names this branch.
-    pub async fn any_for_branch(&self, branch_name: &str) -> sqlx::Result<bool> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM changes WHERE branch_name = $1)")
-            .bind(branch_name)
-            .fetch_one(&self.pool)
-            .await
+    /// Whether a `changes` row someone decided names this branch: any status
+    /// but `withdrawn`, which hands the work back undecided (ADR 0400).
+    pub async fn branch_has_decided_change(&self, branch_name: &str) -> sqlx::Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM changes WHERE branch_name = $1 AND status <> $2)",
+        )
+        .bind(branch_name)
+        .bind(ChangeStatus::Withdrawn)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// All pending changes for a specific thread.
@@ -737,7 +760,7 @@ impl ChangesProjection {
              WHERE event_type IN (
                  'ChangeProposed','ChangeApplied','ChangeDiscarded',
                  'ChangeReverted','ChangeHardened','ChangeSummarized',
-                 'ChangeSetAside','ChangeBroughtBack',
+                 'ChangeSetAside','ChangeBroughtBack','ChangeWithdrawn',
                  'MergeResolutionStarted','MergeResolutionCleared'
              )
                AND payload->>'change_id' IS NOT NULL
@@ -778,7 +801,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
            AND event_type IN (
                'ChangeProposed','ChangeApplied','ChangeDiscarded',
                'ChangeReverted','ChangeHardened','ChangeSummarized',
-               'ChangeSetAside','ChangeBroughtBack',
+               'ChangeSetAside','ChangeBroughtBack','ChangeWithdrawn',
                'MergeResolutionStarted','MergeResolutionCleared'
            )
          ORDER BY created",
@@ -868,6 +891,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
                         | "ChangeReverted"
                         | "ChangeSetAside"
                         | "ChangeBroughtBack"
+                        | "ChangeWithdrawn"
                 )
         })
         .filter(|r| r.0 != "ChangeBroughtBack");
@@ -903,6 +927,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
                 "ChangeApplied" => ChangeStatus::Applied,
                 "ChangeDiscarded" => ChangeStatus::Discarded,
                 "ChangeReverted" => ChangeStatus::Reverted,
+                "ChangeWithdrawn" => ChangeStatus::Withdrawn,
                 _ => unreachable!(),
             };
             if t.0 == "ChangeApplied" {
@@ -958,9 +983,23 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
         return Ok(false);
     }
     if let Some(thread_id) = first.2 {
-        ChangesProjection::sync_thread_proposal(pool, thread_id).await?;
+        ChangesProjection::sync_thread_proposal(pool, thread_id, landing_after(status)).await?;
     }
     Ok(true)
+}
+
+/// Where a thread lands when a change leaves `pending` for `status`. Apply,
+/// Discard and Revert leave no work on the branch to speak of, while Set aside
+/// and Withdraw keep it there unproposed (ADR 0400).
+pub(crate) fn landing_after(status: ChangeStatus) -> ChangeStateKind {
+    match status {
+        ChangeStatus::Applied | ChangeStatus::Discarded | ChangeStatus::Reverted => {
+            ChangeStateKind::None
+        }
+        ChangeStatus::Pending | ChangeStatus::SetAside | ChangeStatus::Withdrawn => {
+            ChangeStateKind::Unproposed
+        }
+    }
 }
 
 #[cfg(test)]
@@ -986,3 +1025,7 @@ mod set_aside_tests;
 #[cfg(test)]
 #[path = "changes_projection_tests/summary.rs"]
 mod summary_tests;
+
+#[cfg(test)]
+#[path = "changes_projection_tests/withdrawn.rs"]
+mod withdrawn_tests;

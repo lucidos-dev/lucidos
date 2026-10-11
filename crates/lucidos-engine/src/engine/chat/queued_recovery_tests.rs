@@ -61,7 +61,7 @@ async fn announce_injected(bus: &EventBus, thread_id: Uuid, message_id: Uuid) {
     emit(
         bus,
         thread_id,
-        ThreadEvent::UserPromptInjected {
+        ThreadEvent::PromptInjected {
             text: "whatever".into(),
             mode: ActorMode::Human,
             origin: None,
@@ -132,7 +132,7 @@ async fn the_interrupted_turn_does_not_recover_its_own_message() {
     teardown_test_db(&db_name).await;
 }
 
-/// A message the loop already took carries a `UserPromptInjected`. That marker
+/// A message the loop already took carries a `PromptInjected`. That marker
 /// is what makes a second pass a no-op, so this is the idempotency test at the
 /// predicate level.
 #[tokio::test]

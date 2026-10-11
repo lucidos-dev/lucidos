@@ -31,7 +31,7 @@ impl LucidosEngine {
         user_message: &str,
         user_images: Option<&[crate::api::ChatImage]>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if crate::engine::home_thread::is_marked_home_thread(&self.pool, thread_id).await? {
+        if crate::engine::home_thread::is_home_thread(&self.pool, thread_id).await? {
             return Ok(());
         }
         // Caller-provided title — emit immediately, skip async LLM title generation

@@ -18,7 +18,7 @@ pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 
 VERSION="0.14.0"
 TRIPLE="aarch64-apple-darwin"
-NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow)
+NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow system-widgets)
 
 # A fake resources dir shaped like the real .app Contents/Resources: three loose
 # "binaries", three static dirs, and a relocatable-PG-like nested tree with a
@@ -33,6 +33,7 @@ new_resources() {
     mkdir -p "$dir/frontend" && printf '<html>\n' > "$dir/frontend/index.html"
     mkdir -p "$dir/sdk"      && printf 'sdk\n'     > "$dir/sdk/sdk.js"
     mkdir -p "$dir/system-knowhow" && printf '# glossary\n' > "$dir/system-knowhow/glossary.md"
+    mkdir -p "$dir/system-widgets/lucidos-sound-player" && printf '{}\n' > "$dir/system-widgets/lucidos-sound-player/manifest.json"
     mkdir -p "$dir/postgres/bin" "$dir/postgres/lib"
     printf 'postgres\n' > "$dir/postgres/bin/postgres"
     chmod +x "$dir/postgres/bin/postgres"

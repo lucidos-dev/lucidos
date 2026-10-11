@@ -30,6 +30,7 @@ fn fixture_row() -> ThreadRow {
         blocking_descendant_count: 5,
         attention_descendant_count: 6,
         is_stopped_child: true,
+        read_requested: true,
         live_event_wait_count: 1,
         live_event_waits: sqlx::types::Json(vec![EventWaitSummary {
             wait_id: uuid::Uuid::from_u128(7),
@@ -39,10 +40,9 @@ fn fixture_row() -> ThreadRow {
         }]),
         status: "waiting_for_user_answer".into(),
         summary_version: 42,
-        coding_agent_has_diff: true,
-        coding_agent_proposed: true,
+        coding_agent_change_state: "proposed".into(),
+        coding_agent_unproposed_reason: None,
         coding_agent_requires_restart: true,
-        coding_agent_incomplete: true,
         coding_agent_is_external_repo: false,
         last_revived_at: Some(at("2026-01-02T03:04:09Z")),
         is_saved: true,
@@ -81,9 +81,9 @@ fn thread_summary_serializes_to_the_pinned_bytes() {
             r#""last_agent_action":"2026-01-02T03:04:08Z","message_count":3,"saved":true,"#,
             r#""section":"inbox","active_children_count":1,"waiting_children_count":2,"#,
             r#""total_children_count":4,"live_event_wait_count":1,"live_event_waits":{waits},"#,
-            r#""blocking_descendant_count":5,"attention_descendant_count":6,"is_stopped_child":true,"#,
-            r#""status":"waiting_for_user_answer","summary_version":42,"coding_agent_has_diff":true,"#,
-            r#""coding_agent_proposed":true,"coding_agent_requires_restart":true,"coding_agent_incomplete":true,"#,
+            r#""blocking_descendant_count":5,"attention_descendant_count":6,"is_stopped_child":true,"read_requested":true,"#,
+            r#""status":"waiting_for_user_answer","summary_version":42,"#,
+            r#""coding_agent_change_state":{{"kind":"proposed","requires_restart":true}},"#,
             r#""coding_agent_is_external_repo":false,"#,
             r#""last_revived_at":"2026-01-02T03:04:09Z","#,
             r#""parent_thread_id":"00000000-0000-0000-0000-000000000002","parent_thread_title":"Parent","#,
@@ -109,9 +109,8 @@ fn thread_aggregate_serializes_to_the_pinned_bytes() {
             r#""status":"waiting_for_user_answer","summaryVersion":42,"activeChildrenCount":1,"#,
             r#""waitingChildrenCount":2,"#,
             r#""totalChildrenCount":4,"blockingDescendantCount":5,"attentionDescendantCount":6,"#,
-            r#""isStoppedChild":true,"liveEventWaitCount":1,"liveEventWaits":{waits},"#,
-            r#""codingAgentHasDiff":true,"codingAgentProposed":true,"codingAgentRequiresRestart":true,"#,
-            r#""codingAgentIncomplete":true,"#,
+            r#""isStoppedChild":true,"readRequested":true,"liveEventWaitCount":1,"liveEventWaits":{waits},"#,
+            r#""codingAgentChangeState":{{"kind":"proposed","requires_restart":true}},"#,
             r#""codingAgentIsExternalRepo":false,"isSaved":true,"#,
             r#""hasResponse":true,"lastRevivedAt":"2026-01-02T03:04:09Z","#,
             r#""parentThreadId":"00000000-0000-0000-0000-000000000002","parentThreadTitle":"Parent","#,
@@ -145,6 +144,46 @@ fn every_status_and_state_value_keeps_its_wire_text() {
     }
 }
 
+/// Each change state is one tagged object, and each detail rides only on its
+/// own kind. These bytes are the wire contract the frontend's union reads.
+#[test]
+fn every_change_state_serializes_to_its_tagged_object() {
+    for (kind, reason, requires_restart, expected) in [
+        ("none", None, false, r#"{"kind":"none"}"#),
+        (
+            "unproposed",
+            None,
+            false,
+            r#"{"kind":"unproposed","reason":null}"#,
+        ),
+        (
+            "unproposed",
+            Some("plan_awaiting_approval"),
+            false,
+            r#"{"kind":"unproposed","reason":"plan_awaiting_approval"}"#,
+        ),
+        (
+            "proposed",
+            None,
+            false,
+            r#"{"kind":"proposed","requires_restart":false}"#,
+        ),
+    ] {
+        let row = ThreadRow {
+            coding_agent_change_state: kind.into(),
+            coding_agent_unproposed_reason: reason.map(String::from),
+            coding_agent_requires_restart: requires_restart,
+            ..fixture_row()
+        };
+        let aggregate = serde_json::to_value(row_to_thread_aggregate(row).unwrap()).unwrap();
+        assert_eq!(
+            aggregate["codingAgentChangeState"].to_string(),
+            expected,
+            "{kind} {reason:?}"
+        );
+    }
+}
+
 /// The home thread's summary carries `"home":true` beside `saved`. Every other
 /// summary omits the key, which is what keeps the bytes above unchanged.
 #[test]
@@ -158,6 +197,23 @@ fn only_the_home_threads_summary_carries_the_home_key() {
     let json = serde_json::to_string(&summary).unwrap();
     assert!(
         json.contains(r#""saved":true,"home":true,"section""#),
+        "{json}"
+    );
+}
+
+/// The per-event aggregate carries the same key. A client can meet the home
+/// thread first through an SSE event. Without the key, the client draws that
+/// thread in Current as an ordinary one.
+#[test]
+fn only_the_home_threads_aggregate_carries_the_home_key() {
+    let aggregate = row_to_thread_aggregate(ThreadRow {
+        is_home: true,
+        ..fixture_row()
+    })
+    .unwrap();
+    let json = serde_json::to_string(&aggregate).unwrap();
+    assert!(
+        json.contains(r#""isSaved":true,"home":true,"hasResponse""#),
         "{json}"
     );
 }

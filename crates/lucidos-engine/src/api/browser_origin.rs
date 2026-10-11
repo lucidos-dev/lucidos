@@ -176,7 +176,6 @@ fn is_public_app_asset(path: &str) -> bool {
         path,
         "/sdk.js" | "/sdk-prefs.js" | "/sdk-iframe.css" | "/sdk-iframe-audio.js"
     ) || path.starts_with("/fonts/")
-        || path.starts_with("/static/")
 }
 
 /// Refuse a browser request that came from another origin.
@@ -428,7 +427,6 @@ mod tests {
             "/sdk-iframe.css",
             "/sdk-iframe-audio.js",
             "/fonts/fira-code.css",
-            "/static/html2canvas.min.js",
         ] {
             assert!(is_public_app_asset(path), "{path}");
             assert!(

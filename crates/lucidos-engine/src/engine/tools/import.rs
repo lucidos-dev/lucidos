@@ -359,8 +359,10 @@ impl LucidosEngine {
                     return Ok("Error: url is required".to_string());
                 }
 
-                // Parse repo name from URL
-                let repo_name = url
+                // What every sink but the clone itself sees. The log, the tool
+                // result, the commit message and the event all outlive the call.
+                let shown_url = crate::core::git_auth::redacted(url);
+                let repo_name = shown_url
                     .trim_end_matches(".git")
                     .rsplit('/')
                     .next()
@@ -451,7 +453,7 @@ impl LucidosEngine {
                                 sub
                             ));
                         }
-                        log!(@git_clone, "Cloning {} to {:?} (.lucidos/tmp/)", url, target);
+                        log!(@git_clone, "Cloning {} to {:?} (.lucidos/tmp/)", shown_url, target);
                         if let Err(e) = crate::core::git_auth::shallow_clone_within(
                             url,
                             branch.as_deref(),
@@ -467,7 +469,7 @@ impl LucidosEngine {
                         return Ok(format!(
                             "[ACTION COMPLETED] CLONED TO TMP: {} → .lucidos/tmp/{}/ (ephemeral, gitignored, not indexed). \
                              Extract any files the app actually needs into data/artifacts/imported/<name>/ via copy_file or import_file.",
-                            url, sub
+                            shown_url, sub
                         ));
                     }
                     GitCloneRoute::Artifacts(sub) => sub,
@@ -475,7 +477,7 @@ impl LucidosEngine {
 
                 let temp_dir =
                     std::env::temp_dir().join(format!("lucidos_clone_{}", Uuid::new_v4()));
-                log!(@git_clone, "Cloning {} to {:?}", url, temp_dir);
+                log!(@git_clone, "Cloning {} to {:?}", shown_url, temp_dir);
 
                 if let Err(e) = crate::core::git_auth::shallow_clone_within(
                     url,
@@ -537,20 +539,20 @@ impl LucidosEngine {
                 if imported_count == 0 {
                     return Ok(format!(
                         "No files imported from {}. {} files skipped due to filters.",
-                        url, skipped_count
+                        shown_url, skipped_count
                     ));
                 }
 
                 if imported_count > MAX_BULK_FILE_COUNT || total_bytes > MAX_BULK_BYTES {
                     return Ok(bulk_threshold_error(
-                        BulkContext::Clone { url },
+                        BulkContext::Clone { url: &shown_url },
                         Some(imported_count),
                         total_bytes,
                     ));
                 }
 
                 // Write all files and commit in one operation
-                let commit_msg = format!("Import {} files from {}", imported_count, url);
+                let commit_msg = format!("Import {} files from {}", imported_count, shown_url);
                 let commit_sha = self
                     .artifact_manager
                     .write_batch_and_commit(&collected_files, &commit_msg)
@@ -559,7 +561,7 @@ impl LucidosEngine {
                 // Emit event for the batch import
                 self.event_bus
                     .emit(BusEvent::System(SystemEvent::RepositoryImported {
-                        url: url.to_string(),
+                        url: shown_url.clone(),
                         branch: branch.unwrap_or_default(),
                         destination: dest_base.clone(),
                         file_count: imported_count,
@@ -678,6 +680,38 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `git_clone` wrote the raw URL, `user:token@` included, to
+    /// the log, the tool result, the workspace commit message and the
+    /// `RepositoryImported` event. Only the clone itself may see it now.
+    #[test]
+    fn git_clone_hands_the_raw_url_only_to_the_clone() {
+        let src = include_str!("import.rs");
+        let start = src.find("let shown_url =").expect("the git_clone arm");
+        let arm = &src[start..src[start..].find("Unknown import tool").unwrap() + start];
+        let names_raw_url = |line: &str| {
+            line.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|token| token == "url")
+        };
+        let allowed = [
+            "GitCredentials::resolve_one(&self.pool, url)",
+            "git_auth::redacted(url)",
+            "url: shown_url",
+            "url: &shown_url",
+        ];
+        for line in arm.lines().filter(|l| names_raw_url(l)) {
+            let trimmed = line.trim();
+            assert!(
+                trimmed == "url," || allowed.iter().any(|a| trimmed.contains(a)),
+                "git_clone passes the raw URL somewhere other than the clone: {trimmed}"
+            );
+        }
+        assert_eq!(
+            arm.lines().filter(|l| l.trim() == "url,").count(),
+            2,
+            "the two shallow_clone_within calls are the only raw-URL arguments"
+        );
+    }
 
     /// `walk_dir` was a nested `fn` inside `git_clone`'s match arm, which is why
     /// the bug below shipped untested. It is lifted to module level (a pure move,

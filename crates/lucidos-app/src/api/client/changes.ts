@@ -4,8 +4,9 @@ import type { DiffFile, RepoDiff } from '../../store/store';
 
 // --- Changes ---
 
-/** Mirrors the engine's `ChangeStatus`, the five values `changes.status` holds. */
-export type ChangeStatus = 'pending' | 'set_aside' | 'applied' | 'discarded' | 'reverted';
+/** Mirrors the engine's `ChangeStatus`, the six values `changes.status` holds.
+ *  A `withdrawn` change went back to unproposed work, its branch untouched. */
+export type ChangeStatus = 'pending' | 'set_aside' | 'applied' | 'discarded' | 'reverted' | 'withdrawn';
 
 export interface Change {
   id: string;
@@ -29,9 +30,9 @@ export interface Change {
    *  commits. Null for a single commit and until it lands. Read it through
    *  `changeHeadline`, never on its own. */
   summary: string | null;
-  /** True when the work did not come from a finished turn: a user Stop cut it
-   *  short, or recovery found it after a turn was killed. Apply confirms
-   *  first, and Apply All passes it over. */
+  /** True on a set-aside change the archive net kept from a turn that may not
+   *  have finished. A pending change is never incomplete: an unfinished turn
+   *  never proposes (ADR 0400). */
   incomplete: boolean;
   /** True when the originating thread has not finished with this change: it is
    * mid-turn (Running or WaitingForUserAnswer) or holds a live event wait.
@@ -56,6 +57,14 @@ export interface Change {
    *  from `git merge-tree`. `unknown` when git could not answer. Null on
    *  non-pending changes. */
   predicted_conflict?: ConflictPrediction | null;
+  /** True when Apply would have to harden this change before it merges: it
+   *  never ran `/harden`, carries more than implementation plans, and its
+   *  thread is not an app thread. The engine decides it. */
+  needs_hardening: boolean;
+  /** *Apply-ready*: a pending change whose thread has finished and that needs
+   *  no hardening. Exactly the Changes panel's Ready section. The engine
+   *  decides it. */
+  apply_ready: boolean;
 }
 
 /** Mirrors the engine's `ConflictPrediction`. */
@@ -193,7 +202,7 @@ export interface ApplyAllResult {
   failed?: number;
 }
 
-/** Apply every pending change whose thread has settled. */
+/** Apply every *apply-ready* change: the Changes panel's Ready section. */
 export async function applyAllChanges(): Promise<ApplyAllResult> {
   return json(`${API}/changes/apply-all`, { method: 'POST' }, APPLY_TIMEOUT_MS);
 }

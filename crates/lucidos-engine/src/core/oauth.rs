@@ -645,13 +645,14 @@ pub fn provider_not_connected_msg(provider: &str) -> String {
 pub enum AccountLookupError {
     NotConnected,
     DbError(BoxError),
-    RefreshFailed(BoxError),
+    /// The user-facing message from [`refresh_or_reconnect`].
+    RefreshFailed(String),
 }
 
 /// One-shot "give me a valid access token for this provider": loads the
 /// account row and refreshes the token if it's expired or expiring soon.
-/// Used by `proxy_script_layer::DbOAuthLookup` and the
-/// `/api/v1/oauth/{provider}/access-token` endpoint.
+/// Used by the `http_request` tool, `proxy_script_layer::DbOAuthLookup`, the
+/// backup providers and the `/api/v1/oauth/{provider}/access-token` endpoint.
 pub async fn get_account_with_fresh_token(
     pool: &PgPool,
     provider: &str,
@@ -660,10 +661,72 @@ pub async fn get_account_with_fresh_token(
         .await
         .map_err(|e| AccountLookupError::DbError(Box::new(e)))?
         .ok_or(AccountLookupError::NotConnected)?;
-    refresh_oauth_if_needed(pool, &mut account)
+    refresh_or_reconnect(pool, &mut account)
         .await
         .map_err(AccountLookupError::RefreshFailed)?;
     Ok(account)
+}
+
+/// [`refresh_oauth_if_needed`], with a failure turned into a message that
+/// names the account and tells the user to reconnect it.
+///
+/// A caller that gets `Err` must not send `account.access_token`. The engine
+/// cannot vouch for that token, and the provider's bare 401 names no cause.
+pub async fn refresh_or_reconnect(pool: &PgPool, account: &mut OAuthAccount) -> Result<(), String> {
+    refresh_oauth_if_needed(pool, account).await.map_err(|e| {
+        crate::log!(
+            "[OAuth] Token refresh failed for {} ({}): {}",
+            account.provider,
+            account.id,
+            e
+        );
+        format!(
+            "The {} token for {} could not be refreshed: {e}. If this keeps happening, reconnect the account in Settings → Accounts.",
+            account.provider,
+            account_label(account)
+        )
+    })
+}
+
+/// How a refusal names an OAuth account to the user.
+fn account_label(account: &OAuthAccount) -> String {
+    match account.email.as_deref().or(account.display_name.as_deref()) {
+        Some(name) => format!("the account {name}"),
+        None => format!("the connected {} account", account.provider),
+    }
+}
+
+/// The OAuth access token an email account presents, refreshed first.
+///
+/// `Ok(None)` only for an account with no OAuth link, which uses its stored
+/// password. Every other failure refuses, so IMAP and SMTP never skip XOAUTH2
+/// silently.
+pub async fn linked_account_token(
+    pool: &PgPool,
+    oauth_account_id: Option<Uuid>,
+) -> Result<Option<String>, String> {
+    let Some(oauth_id) = oauth_account_id else {
+        return Ok(None);
+    };
+    let mut account = match OAuthStore::get_by_id(pool, oauth_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            return Err(format!(
+                "This email account is linked to OAuth account {oauth_id}, which no longer \
+                 exists. Reconnect it in Settings → Accounts."
+            ))
+        }
+        Err(e) => {
+            crate::log!(
+                "[OAuth] Linked account lookup failed for {}: {}",
+                oauth_id,
+                e
+            );
+            return Err(format!("Could not read the linked OAuth account: {e}"));
+        }
+    };
+    refresh_or_reconnect(pool, &mut account).await?;
+    Ok(Some(account.access_token))
 }
 
 /// Build `OAUTH_*` environment variables from connected OAuth accounts.
@@ -1910,6 +1973,10 @@ pub async fn prepare_oauth_flow(
 ) -> Result<PreparedOAuthFlow, BoxError> {
     use crate::core::CredentialStore;
 
+    // One name for the account lookup, the client credential and the stored
+    // row, so `oauth:Dropbox` and `dropbox` cannot connect two accounts.
+    let provider = client_provider_name(provider);
+
     // What this flow will ASK for: everything the account already holds, plus
     // everything it has ever been asked for, plus what this caller wants. Never
     // narrower than any of the three.
@@ -1917,7 +1984,7 @@ pub async fn prepare_oauth_flow(
     // The `desired` half is what lets *Reconnect* recover a refused scope.
     // Merging only against the GRANTED set computes `granted UNION granted`, so
     // an account a provider had narrowed would stay narrow forever.
-    let existing_account = OAuthStore::get_by_provider(pool, provider).await?;
+    let existing_account = OAuthStore::get_by_provider(pool, &provider).await?;
     let merged_scopes = match existing_account {
         Some(ref acct) => {
             let held = merge_scopes(&acct.scopes, acct.desired_scopes.as_deref().unwrap_or(""));
@@ -1926,10 +1993,9 @@ pub async fn prepare_oauth_flow(
         None => scopes.to_string(),
     };
 
-    let cred_service = client_provider_name(provider);
-    let client_cred = CredentialStore::get_oauth_client(pool, &cred_service)
+    let client_cred = CredentialStore::get_oauth_client(pool, &provider)
         .await?
-        .ok_or_else(|| format!("No OAuth client credentials found for {}", cred_service))?;
+        .ok_or_else(|| format!("No OAuth client credentials found for {}", provider))?;
 
     let client_config: serde_json::Value = serde_json::from_str(&client_cred.auth_value)
         .map_err(|e| format!("Invalid OAuth client credentials JSON: {}", e))?;
@@ -2015,7 +2081,6 @@ pub async fn prepare_oauth_flow(
     let request_id = uuid::Uuid::new_v4();
     let pool = pool.clone();
     let event_bus = event_bus.clone();
-    let provider = provider.to_string();
     let initiator = initiator.clone();
     let holds_port = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let task_holds_port = holds_port.clone();

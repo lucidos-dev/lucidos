@@ -10,7 +10,8 @@
  *  `preventDefault()` it. That is the only way to suppress WebKit's native
  *  back/forward gesture in the standalone iOS PWA, since no CSS opt-out exists.
  *  See `shouldSuppressEdgeNavigation`. A pane swipe over an app needs no strip:
- *  the SDK posts drags from inside the frame (`app-swipe-bridge.ts`).
+ *  the SDK posts drags from inside the frame (`frame-swipe-bridge.ts`), and the
+ *  HTML artifact preview's bridge does the same.
  *
  *  That is why they are also mounted inside a pseudo-fullscreen app overlay,
  *  which covers the panes' own strips. Being mounted does NOT imply a pane swipe

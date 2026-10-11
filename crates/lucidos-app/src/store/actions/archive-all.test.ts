@@ -1,32 +1,45 @@
 import { describe, it, expect } from 'vitest';
-import { archiveAllConfirmation, archiveAllResultMessage, idBatches, nothingToArchiveMessage, undoAction } from './archive-all';
+import { archiveAllConfirmation, archiveAllResultMessage, changedSinceConfirm, idBatches, nothingToArchiveMessage, undoAction } from './archive-all';
 import { BLOCKER_REASON } from './blockerCopy';
-import { ARCHIVE_ALL_MAX_IDS } from '@lucidos/engine-constants';
+import { ARCHIVE_ALL_MAX_IDS, ARCHIVE_ALL_PINNED_SUB_THREAD, ARCHIVE_ALL_SAME_FAMILY } from '@lucidos/engine-constants';
 import { toastTap } from '../../components/shared/toastTap';
 import type { ArchiveAllPreflight } from '../../api/threads';
 
-function preflight(safe: number, kept: Record<string, number>): ArchiveAllPreflight {
+/** `safe` family roots whose archives take `safeThreads` inbox threads. */
+function preflight(safe: number, kept: Record<string, number>, safeThreads = safe): ArchiveAllPreflight {
   return {
     safe: Array.from({ length: safe }, (_, i) => ({ thread_id: `t${i}`, title: `Thread ${i}` })),
+    safe_thread_count: safeThreads,
     kept,
-    kept_count: Object.values(kept).reduce((a, b) => a + b, 0),
+    kept_thread_count: Object.values(kept).reduce((a, b) => a + b, 0),
   };
 }
 
 describe('the Archive all confirm', () => {
-  it('names what stays in Current, counted by reason', () => {
+  it('names what stays open, counted by reason', () => {
     const c = archiveAllConfirmation(preflight(42, { question: 12, pending_change: 4, draft: 2 }));
     expect(c?.title).toBe('Archive 42 threads?');
     expect(c?.message).toBe(
-      '18 need you and stay in Current: 12 waiting for your answer, '
+      '18 stay open: 12 waiting for your answer, '
         + '4 with a change to apply or discard, 2 with unsent drafts. You can undo right after.',
+    );
+  });
+
+  it('counts sub-threads, so its totals add up to the Current badge', () => {
+    const c = archiveAllConfirmation(
+      preflight(138, { [ARCHIVE_ALL_SAME_FAMILY]: 2, busy: 4, [ARCHIVE_ALL_PINNED_SUB_THREAD]: 1, pending_change: 1 }, 211),
+    );
+    expect(c?.title).toBe('Archive 211 threads?');
+    expect(c?.message).toBe(
+      '8 stay open: 1 with a change to apply or discard, 4 still working, 1 pinned, '
+        + '2 more alongside them. You can undo right after.',
     );
   });
 
   it('uses the singular for one of each', () => {
     const c = archiveAllConfirmation(preflight(1, { failed_run: 1 }));
     expect(c?.title).toBe('Archive 1 thread?');
-    expect(c?.message).toBe('1 needs you and stays in Current: 1 whose last run failed. You can undo right after.');
+    expect(c?.message).toBe('1 stays open: 1 whose last run failed. You can undo right after.');
   });
 
   it('says everything goes when nothing needs the user', () => {
@@ -50,12 +63,12 @@ describe('the Archive all confirm', () => {
 });
 
 describe('the Archive all toast when nothing can go', () => {
-  it('says how many need the user, and why', () => {
-    expect(nothingToArchiveMessage(preflight(0, { question: 2, busy: 1 }))).toBe(
-      'Nothing to archive. 3 threads in Current need you: 2 waiting for your answer, 1 still working.',
+  it('says how many stay open, and why', () => {
+    expect(nothingToArchiveMessage(preflight(0, { question: 2, busy: 1, [ARCHIVE_ALL_SAME_FAMILY]: 3 }))).toBe(
+      'Nothing to archive. 6 threads stay open: 2 waiting for your answer, 1 still working, 3 more alongside them.',
     );
     expect(nothingToArchiveMessage(preflight(0, { draft: 1 }))).toBe(
-      'Nothing to archive. 1 thread in Current needs you: 1 with an unsent draft.',
+      'Nothing to archive. 1 thread stays open: 1 with an unsent draft.',
     );
   });
 
@@ -69,6 +82,18 @@ describe('the Archive all result', () => {
     expect(archiveAllResultMessage(5, {})).toBe('Archived 5 threads.');
     expect(archiveAllResultMessage(1, { question: 1, pinned: 1 })).toBe(
       'Archived 1 thread. 2 changed since you confirmed and stayed: 1 waiting for your answer, 1 now pinned.',
+    );
+  });
+
+  it('counts the threads that stayed with a changed family, as the confirm did', () => {
+    const changed = changedSinceConfirm([
+      { thread_id: 'a', reason: 'asked', slug: 'question', thread_count: 3 },
+      { thread_id: 'b', reason: 'gone', slug: 'gone', thread_count: 1 },
+    ]);
+    expect(changed).toEqual({ question: 1, gone: 1, [ARCHIVE_ALL_SAME_FAMILY]: 2 });
+    expect(archiveAllResultMessage(5, changed)).toBe(
+      'Archived 5 threads. 4 changed since you confirmed and stayed: '
+        + '1 waiting for your answer, 1 no longer there, 2 more alongside them.',
     );
   });
 

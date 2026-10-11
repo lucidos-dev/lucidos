@@ -123,7 +123,7 @@ pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
         return false;
     }
     // Auto-commit harmless dirty files that shouldn't block merging Lucidos changes
-    let auto_committable = dirty_files.iter().all(|f| f.starts_with("docs/plans/"));
+    let auto_committable = dirty_files.iter().all(|f| is_plan_file(f));
     if auto_committable {
         let mut add_args: Vec<&str> = vec!["add", "--"];
         add_args.extend(add_paths.iter());
@@ -392,7 +392,7 @@ pub(crate) async fn has_branch_commits(repo_root: &Path, branch_name: &str) -> b
 /// (three-dot merge-base diff). The base is `default_diff_base` — the SAME ref
 /// the Diff button diffs against (`origin/<default>` when the local default
 /// branch has diverged, otherwise the local default) — so the
-/// `coding_agent_has_diff` gate this feeds and the diff the button renders can
+/// branch-work gate this feeds and the diff the button renders can
 /// never disagree. Using the local default directly here was the
 /// `example-repo` migration bug: a branch whose commits already live on
 /// `origin/main` but not on a force-rewritten local `main` showed 53 changed
@@ -544,6 +544,17 @@ async fn git_failure_reason(args: &[&str], dir: &Path) -> Option<String> {
 /// would drop the paths that DID stage. One unreadable path in the worktree
 /// would then cost the user every other edit in it.
 async fn stage_and_commit_logged(worktree_path: &Path, message: &str) {
+    if let Ok(conflicted) = conflicted_paths(worktree_path).await {
+        if !conflicted.is_empty() {
+            log!(
+                "[Git] Auto-commit skipped in {}: {} path(s) still hold merge conflict markers ({})",
+                worktree_path.display(),
+                conflicted.len(),
+                conflicted.join(", ")
+            );
+            return;
+        }
+    }
     if let Some(reason) = git_failure_reason(&["add", "-A"], worktree_path).await {
         log!(
             "[Git] git add -A reported a failure in {}: {}. Committing whatever staged",
@@ -577,13 +588,23 @@ async fn stage_and_commit_logged(worktree_path: &Path, message: &str) {
 /// A dirty submodule's own content is not counted: the superproject cannot
 /// commit it, so counting it would refuse every Apply on that worktree.
 ///
-/// `Ok(false)` when the worktree was already clean.
+/// `Ok(false)` when the worktree was already clean. `Err` when an unfinished
+/// merge left a path holding conflict markers, which `git add -A` would commit.
 pub(crate) async fn commit_worktree_or_err(
     worktree_path: &Path,
     message: &str,
 ) -> Result<bool, String> {
-    if uncommitted_paths(worktree_path).await?.is_empty() {
+    let dirty = uncommitted_paths(worktree_path).await?;
+    if dirty.is_empty() {
         return Ok(false);
+    }
+    let conflicted = conflicted_paths(worktree_path).await?;
+    if !conflicted.is_empty() {
+        return Err(format!(
+            "{} path(s) still hold merge conflict markers ({}). Resolve or abort the merge first",
+            conflicted.len(),
+            conflicted.join(", ")
+        ));
     }
     let add = git_failure_reason(&["add", "-A"], worktree_path).await;
     let commit = git_failure_reason(&["commit", "-m", message], worktree_path).await;
@@ -622,6 +643,88 @@ async fn uncommitted_paths(worktree_path: &Path) -> Result<Vec<String>, String> 
         .filter(|l| !l.trim().is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// The paths an unfinished merge in `worktree_path` leaves holding conflict
+/// markers, or `Err` when git cannot say. `git add` marks a path resolved with
+/// whatever it holds, so a staged path counts during a merge, not only an
+/// unmerged one.
+///
+/// A path the agent already fixed in place is not listed, so committing it
+/// still finishes the merge. Neither is a directory (a submodule conflict).
+/// An unmerged binary file is listed: git writes no markers into one, so
+/// `git add -A` would commit one side as the resolution. A file that cannot
+/// be read is listed, because "could not look" must not publish markers.
+/// `-z` keeps a path with a space or a non-ASCII byte unquoted.
+async fn conflicted_paths(worktree_path: &Path) -> Result<Vec<String>, String> {
+    let unmerged = git_paths(
+        &["diff", "--name-only", "--diff-filter=U", "-z"],
+        worktree_path,
+    )
+    .await?;
+    let mut candidates = unmerged.clone();
+    let merging = git_cmd(
+        &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        worktree_path,
+    )
+    .await?
+    .status
+    .success();
+    if merging {
+        candidates.extend(
+            git_paths(
+                &["diff", "--cached", "--name-only", "--diff-filter=d", "-z"],
+                worktree_path,
+            )
+            .await?,
+        );
+        candidates.sort();
+        candidates.dedup();
+    }
+    Ok(candidates
+        .into_iter()
+        .filter(|path| {
+            let full = worktree_path.join(path);
+            match std::fs::read(&full) {
+                Ok(bytes) => {
+                    has_conflict_markers(&bytes) || (bytes.contains(&0) && unmerged.contains(path))
+                }
+                Err(_) if full.is_dir() => false,
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            }
+        })
+        .collect())
+}
+
+/// The NUL-separated paths a `git ... -z` listing prints, or `Err` when git
+/// cannot answer.
+async fn git_paths(args: &[&str], worktree_path: &Path) -> Result<Vec<String>, String> {
+    let out = git_cmd(args, worktree_path).await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// True when `bytes` hold a line opening or closing a git conflict hunk: a
+/// run of at least seven `<` or `>` and then a space or the line's end. The
+/// `conflict-marker-size` attribute lengthens the run past seven.
+fn has_conflict_markers(bytes: &[u8]) -> bool {
+    let is_marker = |line: &[u8], marker: u8| {
+        let run = line.iter().take_while(|b| **b == marker).count();
+        run >= 7 && matches!(line.get(run), None | Some(b' ' | b'\r'))
+    };
+    bytes
+        .split(|b| *b == b'\n')
+        .any(|line| is_marker(line, b'<') || is_marker(line, b'>'))
 }
 
 /// Repo-relative paths that are dirty in `worktree_path`, from

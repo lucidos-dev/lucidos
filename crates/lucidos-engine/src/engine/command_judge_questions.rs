@@ -87,6 +87,16 @@ const CATEGORY_INSTRUCTIONS: &str = "If `command` has an irreversible real-world
      which kind is it? Answer for the side-effect the command would have, even when you judge \
      the command harmless overall. Pick the single best fit.";
 
+/// The criterion name for `lane`. The judge never answers `Catastrophic`,
+/// which only the static fast path settles.
+pub(crate) fn lane_name(lane: RiskLane) -> &'static str {
+    match lane {
+        RiskLane::Safe => SAFE,
+        RiskLane::ReversibleDanger => REVERSIBLE,
+        RiskLane::IrreversibleDanger | RiskLane::Catastrophic => IRREVERSIBLE,
+    }
+}
+
 /// Both questions, asked together over one state.
 pub(crate) fn questions() -> Vec<(String, Question)> {
     vec![

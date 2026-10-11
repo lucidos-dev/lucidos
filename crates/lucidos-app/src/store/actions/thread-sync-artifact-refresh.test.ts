@@ -41,7 +41,6 @@ const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-devic
 vi.mock('./devices', () => ({
   getDeviceId,
 }));
-vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./repositories', () => ({
   refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false),
 }));
