@@ -8,7 +8,7 @@ use crate::runtime::CodingAgent;
 
 use super::{
     AbortCause, ActorMode, AnswerKind, ApplyNowOutcome, ArrangedTile, CancelCause, CaptureFormat,
-    ChildCompletionStatus, EventWaitCancelCause, FormRequestOutcome, LayoutClass,
+    ChildCompletionStatus, CodingAgentExit, EventWaitCancelCause, FormRequestOutcome, LayoutClass,
     McpEnablementSource, MessageOrigin, OwnerApproval, QuestionOption, RecalledMemory,
     SessionEndReason, TodoItem, TriggerInvocation, UnproposedReason, UnqueueReason,
     VoiceSessionEndReason, WakeMode,
@@ -420,6 +420,11 @@ pub enum ThreadEvent {
     },
     ResponseFailed {
         error: String,
+        /// Set when the coding agent's process ended on its own and took the
+        /// turn with it. Absent on every other failure, and on stored events
+        /// from before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_exit: Option<CodingAgentExit>,
     },
 
     // Resume-after-abort boundary. Opens a new exchange in the timeline whose

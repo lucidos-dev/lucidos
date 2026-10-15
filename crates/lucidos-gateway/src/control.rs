@@ -512,10 +512,10 @@ async fn request_update_relay(
     State(state): State<GatewayState>,
     device: Option<Extension<auth::AuthenticatedDevice>>,
 ) -> Result<Json<crate::update_relay::Ticket>, ApiError> {
-    let latest = state.release_check().latest_version();
     let ticket = state
         .update_relay()
-        .request(latest.as_deref(), std::time::Instant::now())
+        .request_refreshing(state.release_check(), std::time::Instant::now())
+        .await
         .map_err(|refusal| ApiError::conflict(refusal.message()))?;
     let by = device
         .as_deref()

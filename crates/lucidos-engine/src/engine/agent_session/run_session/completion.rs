@@ -4,8 +4,8 @@ use crate::engine::agent_session::lifecycle::{
     auto_resume_after_api_error, classify_session_end_action, conflict_abort_deletes_temp_state,
     conflict_resolution_cleanup_action, discarded_worktree_removal, held_completion_release,
     lane_thread_end, should_auto_commit_on_cleanup, transient_api_failure_error,
-    ConflictResolutionCleanupAction, HeldCompletionRelease, SafetyNetAction, SessionEndAction,
-    TerminalKind, TurnCancel, WorktreeRemoval, MAX_API_ERROR_AUTO_RESUMES,
+    ConflictResolutionCleanupAction, HeldCompletionRelease, SafetyNetAction, SafetyNetInput,
+    SessionEndAction, TerminalKind, TurnCancel, WorktreeRemoval, MAX_API_ERROR_AUTO_RESUMES,
 };
 use crate::engine::agent_session::resume::{
     api_error_auto_resumes_spent, change_description_fallback,
@@ -19,6 +19,7 @@ use crate::engine::git_ops::{
 };
 use crate::engine::thread_events::EventChannel;
 use crate::engine::{AgentSession, LucidosEngine, ProcessResult, StopReason};
+use crate::runtime::AgentExitFacts;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -413,7 +414,9 @@ impl LucidosEngine {
         agent_cancel: &tokio_util::sync::CancellationToken,
         emitted_terminal_event: bool,
         watchdog_fired: bool,
-        killed_by_signal: bool,
+        exit: AgentExitFacts,
+        // The agent's startup line arrived. An exit before it is a start failure.
+        init_seen: bool,
         last_emitted_idle: bool,
         is_external_repo: bool,
         mut proposed_change: bool,
@@ -444,6 +447,8 @@ impl LucidosEngine {
         // The decision tree is pinned by `safety_net_action` (lifecycle.rs):
         //   - watchdog_fired → ContinuationRequested (auto-recovery, user never knew)
         //   - stray signal-kill (no engine cancel) → ContinuationRequested (auto-resume)
+        //   - the agent exited on its own with a failed code or words on
+        //     stderr → ResponseFailed with its words (no retry)
         //   - else           → ResponseAborted(SafetyNet) (red dot, user notified)
         //   - external terminal already emitted → Skip (don't relabel)
         // The cleanup path below reads `safety_net_fired` and skips
@@ -458,11 +463,13 @@ impl LucidosEngine {
         let engine_cancelled = agent_cancel.is_cancelled();
         if safety_net_fired {
             log!(
-                "[AgentSession] safety net firing for thread {} — buffered_text_len={}, watchdog_fired={}, killed_by_signal={}, engine_cancelled={}",
+                "[AgentSession] safety net firing for thread {} — buffered_text_len={}, watchdog_fired={}, killed_by_signal={}, exit_code={:?}, init_seen={}, engine_cancelled={}",
                 thread_id,
                 claude_text_buf.len(),
                 watchdog_fired,
-                killed_by_signal,
+                exit.killed_by_signal,
+                exit.code,
+                init_seen,
                 engine_cancelled,
             );
         }
@@ -484,15 +491,40 @@ impl LucidosEngine {
                 "safety net",
             )
             .await;
-        let net_action = crate::engine::agent_session::lifecycle::safety_net_action(
-            safety_net_fired,
-            watchdog_fired,
-            external_already,
-            killed_by_signal,
-            engine_cancelled,
-        );
-        match net_action {
+        let net_action =
+            crate::engine::agent_session::lifecycle::safety_net_action(&SafetyNetInput {
+                safety_net_fired,
+                watchdog_fired,
+                external_terminal_already_emitted: external_already,
+                engine_cancelled,
+                init_seen,
+                exit: &exit,
+                coding_agent,
+            });
+        match &net_action {
             SafetyNetAction::Nothing | SafetyNetAction::Skip => {}
+            SafetyNetAction::EmitFailed { error, agent_exit } => {
+                log!(
+                    "[AgentSession] thread {}: {} exited on its own ({:?}, code {:?}); failing the turn with its words and not retrying",
+                    thread_id,
+                    coding_agent.display_name(),
+                    agent_exit.stage,
+                    agent_exit.code,
+                );
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                                error: error.clone(),
+                                agent_exit: Some(*agent_exit),
+                            },
+                            meta: meta.clone(),
+                        },
+                        "[AgentSession] safety-net ResponseFailed (the agent exited on its own)",
+                    )
+                    .await;
+            }
             SafetyNetAction::EmitContinuationRequested => {
                 // Before the emit: a continuation that re-attaches a merge
                 // duty may take this run's apply claim from here on.

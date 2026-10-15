@@ -1056,7 +1056,7 @@ fn process_sse_data(
 // ===== Claude/Anthropic prompt caching =====
 
 /// The API's limit on `cache_control` markers in one request.
-const MAX_CACHE_BREAKPOINTS: usize = 4;
+pub(crate) const MAX_CACHE_BREAKPOINTS: usize = 4;
 
 /// Anthropic ephemeral cache marker (5-minute TTL, the default). Writes cost
 /// ~1.25× input price; reads cost ~0.1×, so a single cache hit pays back the
@@ -1081,7 +1081,7 @@ const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// an automatic one alongside 4 explicit ones is a 400.
 /// `docs/investigations/2026-08-23-context-mode-cache-breakpoint-diagnosis.md`
 /// measures what each is worth.
-fn ephemeral_cache_marker() -> serde_json::Value {
+pub(crate) fn ephemeral_cache_marker() -> serde_json::Value {
     serde_json::json!({"type": "ephemeral"})
 }
 

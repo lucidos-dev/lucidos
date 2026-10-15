@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.49.1 — 2026-10-15
+
+### Added
+- A successor thread can run on a different implementer: backend, model and reasoning effort. `lucidos successor spawn` takes `--coding-agent`, `--coding-agent-model` and `--reasoning-effort`.
+- In a coding-agent thread on the Lucidos source, a plan's Implement in a new thread option names the implementer. The planning agent recommends one and says why, and you can take it or keep this thread's.
+
+### Changed
+- Claude models on OpenRouter use prompt caching, and cache writes are priced.
+- Coding-agent usage records the model that served each reply, so a sub-agent's calls can be priced.
+
+### Fixed
+- A coding agent that exits on its own, for example when Claude Code cannot reach its login gateway, fails the turn with a card that shows its own error message, masked for secrets. Try again sends the message it never read.
+- A phone with the desktop app open offers Update Desktop App as soon as a release is published, without waiting for the hourly release check.
+- Check for updates shows on a phone, and says so when the check fails.
+- With the theme on System, the app and its app frames keep the right light or dark mode after a slow start, a theme change or a hidden tab.
+- The Home rail toggle shows whenever Home exists, so an empty board still has Add.
+- The Home rail's divider runs up through the header, and its toggle matches the header icons.
 ## v0.49.0 — 2026-10-15
 
 ### Added

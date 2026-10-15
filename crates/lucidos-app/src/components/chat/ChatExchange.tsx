@@ -15,6 +15,7 @@ import { discardUnsentMessage, editQueuedMessage, removeQueuedMessage, retryUnse
 import { unsentMessages } from '../../store/unsentMessages';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
+import { agentExitCopy } from './agentExitCopy';
 import { originPopoverHasContent } from './messageOrigin';
 import { pendingAnswers, unsentPicks } from '../../store/pendingDecisions';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody, engineResolutionNote, pendingVerdicts } from './PermissionCard';
@@ -234,6 +235,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const events = exchangeResponseEvents(exchange, isLast, threadIdle);
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer, behindOpenQuestion);
   const error = exchangeError(exchange);
+  const agentExitCard = error?.agentExit && agentExitCopy(error.agentExit, threadCodingAgent);
   const unsentEventId = unsentMessageOf(exchange);
   // A live turn's output can land between the bubble and this card, so the
   // card names the message Retry would send.
@@ -789,21 +791,40 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         // `data-change-id`. Inline steps are NOT stamped, since the "Show
         // steps" toggle can hide them and an id there resolves only sometimes.
         <div class="exchange-error" data-event-id={error.eventId || undefined}>
-          <strong>{unsentEventId ? 'Not sent' : 'The reply failed'}</strong>
+          <strong>{unsentEventId ? 'Not sent' : agentExitCard?.heading ?? 'The reply failed'}</strong>
           {unsentText && <blockquote class="exchange-error-quote">{unsentText}</blockquote>}
-          <p>{error.message}</p>
           {unsentEventId
             ? (
-              <div class="exchange-error-actions">
-                <button type="button" class="action-btn action-btn-secondary exchange-error-discard" onClick={() => discardUnsentMessage(unsentEventId)}>
-                  Discard
-                </button>
-                <button type="button" class="action-btn exchange-error-retry" onClick={() => void retryUnsentMessage(unsentEventId)}>
-                  Retry
-                </button>
-              </div>
+              <>
+                <p>{error.message}</p>
+                <div class="exchange-error-actions">
+                  <button type="button" class="action-btn action-btn-secondary exchange-error-discard" onClick={() => discardUnsentMessage(unsentEventId)}>
+                    Discard
+                  </button>
+                  <button type="button" class="action-btn exchange-error-retry" onClick={() => void retryUnsentMessage(unsentEventId)}>
+                    Retry
+                  </button>
+                </div>
+              </>
             )
-            : <p>Send a message to try again.</p>}
+            : agentExitCard
+              ? (
+                <>
+                  <p class="exchange-error-output">{error.message}</p>
+                  <p class="exchange-error-reason">{agentExitCard.reason}</p>
+                  {isLast && (
+                    <div class="exchange-error-actions">
+                      <ContinueButton threadId={threadId} label="Try again" />
+                    </div>
+                  )}
+                </>
+              )
+              : (
+                <>
+                  <p>{error.message}</p>
+                  <p>Send a message to try again.</p>
+                </>
+              )}
         </div>
       )}
     </div>

@@ -39,12 +39,13 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
-    AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
+    AgentEvent, AgentExitFacts, AgentInput, AgentRuntime, CodingAgent, ControlRequest,
+    RunningAgent, SpawnArgs,
 };
 use super::claude_code::{format_exit_status, CcMenuOption, GROUP_TEARDOWN_GRACE};
 use super::codex_parse::{parse_codex_line, TurnTracker};
 use super::lucidos_cli::{ensure_workspace_bin_symlink, lucidos_cli_dir};
-use super::spawn_env::{apply_lucidos_env, drain_stderr};
+use super::spawn_env::{apply_lucidos_env, command_secret_values, StderrTail};
 
 #[derive(Debug, serde::Deserialize)]
 struct CodexMenuOptionsFile {
@@ -832,10 +833,10 @@ async fn driver_task(
     }
 
     // Codex (exec mode) spawns a fresh child per turn — there is no single
-    // long-lived process whose stray-signal death the safety net could resume.
-    // Auto-resume on signal-kill stays CC-only.
+    // long-lived process whose exit these facts could describe. Each turn's
+    // failure already rode its own `Result`.
     let _ = events_tx.send(AgentEvent::Exited {
-        killed_by_signal: false,
+        exit: AgentExitFacts::default(),
     });
     // events_tx drops here — channel closes, consumer sees None.
 }
@@ -923,6 +924,7 @@ async fn run_turn(
         resume_sid.as_deref(),
         &image_paths,
     );
+    let secrets = command_secret_values(&cmd);
     let mut child = match super::spawn_env::spawn_below_engine(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
@@ -939,9 +941,8 @@ async fn run_turn(
     send_prompt_on_stdin(child.stdin.take(), prompt);
     let child_pid = child.id();
     let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
+    let stderr = StderrTail::spawn(child.stderr.take().expect("piped stderr"), secrets);
     let mut stdout_reader = BufReader::new(stdout);
-    let mut stderr_reader = BufReader::new(stderr);
 
     // Bytes, read with the cancel-safe `read_until`. A mid-turn input or a
     // control request drops the read. The part of a line already read must
@@ -1055,9 +1056,9 @@ async fn run_turn(
         }
     };
 
-    let stderr_tail = drain_stderr(&mut stderr_reader).await;
+    let stderr_tail = stderr.finish().await;
     if !stderr_tail.is_empty() {
-        log!("[Codex] codex stderr: {}", stderr_tail.trim());
+        log!("[Codex] codex stderr: {}", stderr_tail);
     }
     log!(
         "[Codex] turn child exited (pid={} status={})",
@@ -1099,10 +1100,7 @@ async fn run_turn(
         let reason = tracker
             .last_error
             .clone()
-            .or_else(|| {
-                let t = stderr_tail.trim();
-                (!t.is_empty()).then(|| t.to_string())
-            })
+            .or_else(|| (!stderr_tail.is_empty()).then(|| stderr_tail.clone()))
             .unwrap_or_else(|| {
                 format!(
                     "codex exited unexpectedly ({})",

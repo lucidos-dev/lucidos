@@ -6,6 +6,7 @@
 //! the emit helpers are grouped by responsibility seam in the sibling modules.
 
 mod actor;
+mod agent_exit;
 mod apply_now;
 mod capture;
 mod cause;
@@ -27,6 +28,7 @@ pub use actor::{
     ActorMode, AgentParticipant, EngineReason, EventWaitOutcome, MessageOrigin,
     PluginSetupOccasion, ThreadDirection, CACHE_KEEP_ALIVE_REASON_KIND,
 };
+pub use agent_exit::{CodingAgentExit, CodingAgentExitStage};
 pub use apply_now::ApplyNowOutcome;
 pub use capture::CaptureFormat;
 pub use cause::{AbortCause, CancelCause, EventWaitCancelCause, UnproposedReason, UnqueueReason};

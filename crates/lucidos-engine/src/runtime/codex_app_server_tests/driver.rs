@@ -645,3 +645,85 @@ done
     assert!(named, "the rejected input is named before the Result");
     s.cancel.cancel();
 }
+
+/// The app-server dies before it answers `initialize`: no thread, no turn, so no
+/// `Result` follows. Its own words and exit code must still reach the engine on
+/// `Exited`, which is the only event it sends.
+#[tokio::test]
+async fn a_child_that_dies_before_its_handshake_reports_its_words_and_code() {
+    let mut s = stub_driver_scripted(
+        "#!/bin/sh\necho 'Not signed in to https://claude-gateway.example.com' >&2\nexit 7\n",
+        None,
+    );
+    let mut events = Vec::new();
+    loop {
+        let ev = next_event(&mut s.events_rx).await;
+        let done = matches!(ev, AgentEvent::Exited { .. });
+        events.push(ev);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Init { .. })),
+        "no handshake means no Init: {events:?}"
+    );
+    let Some(AgentEvent::Exited { exit }) = events.pop() else {
+        panic!("Exited is last");
+    };
+    assert_eq!(exit.code, Some(7));
+    assert_eq!(
+        exit.stderr_tail,
+        "Not signed in to https://claude-gateway.example.com"
+    );
+    assert!(!exit.killed_by_signal);
+}
+
+/// The stub's secrets stay out of the tail: a spawn's injected env is masked.
+#[tokio::test]
+async fn the_stderr_tail_masks_the_spawns_injected_secrets() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let script = tmp.path().join("codex-stub.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho \"bad token $LUCIDOS_AGENT_ORIGIN_TOKEN\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let config = CodexConfig {
+        codex_bin: script.into_os_string(),
+        worktree_path: tmp.path().to_path_buf(),
+        system_prompt: None,
+        model: None,
+        reasoning_effort: None,
+        sandbox_writable_roots: Vec::new(),
+        env_removed: Vec::new(),
+        env: vec![(
+            std::ffi::OsString::from(crate::api::actor::ENV_AGENT_ORIGIN_TOKEN),
+            std::ffi::OsString::from("origin-token-0123456789"),
+        )],
+    };
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (permission_tx, _permission_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(app_server_driver_task(
+        config,
+        None,
+        events_tx,
+        input_rx,
+        control_rx,
+        permission_tx,
+        CancellationToken::new(),
+    ));
+    loop {
+        if let AgentEvent::Exited { exit } = next_event(&mut events_rx).await {
+            assert_eq!(exit.stderr_tail, "bad token [REDACTED]");
+            break;
+        }
+    }
+}

@@ -641,7 +641,10 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
     let huge_error = "X".repeat(5000);
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
-        event: ThreadEvent::ResponseFailed { error: huge_error },
+        event: ThreadEvent::ResponseFailed {
+            error: huge_error,
+            agent_exit: None,
+        },
         meta: EventMeta::NONE,
     })
     .await

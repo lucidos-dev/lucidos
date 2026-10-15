@@ -4,6 +4,8 @@
 - **Date**: 2026-10-13
 - **Amended by**: [ADR 0468](0468-home-rail-toggle-holds-the-corner.md),
   decision 1. The toggle now holds the window corner in both states.
+  [ADR 0484](0484-home-rail-toggle-always-offered.md), decision 2. The toggle
+  is now offered whenever Home exists, an empty board included.
 
 Amends [ADR 0466](0466-home-board-is-a-desktop-rail.md) (the board button that
 hides and shows the rail).

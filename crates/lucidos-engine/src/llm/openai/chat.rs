@@ -2,11 +2,13 @@
 //! The struct, shared stream types, and dispatch live in the parent `openai`
 //! module.
 
+use crate::llm::anthropic_wire::{ephemeral_cache_marker, MAX_CACHE_BREAKPOINTS};
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
 };
 use crate::llm::ModelSelection;
 use futures::StreamExt;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use super::{
@@ -14,21 +16,215 @@ use super::{
     DEFAULT_MAX_COMPLETION_TOKENS, STREAM_LOG_TAG,
 };
 
+/// OpenRouter's namespace for Anthropic models. It is the one model family on
+/// this wire that caches only what carries a `cache_control` marker.
+const ANTHROPIC_NAMESPACE: &str = "anthropic/";
+
+/// What a text part is, for the cache marker's sake.
+#[derive(Clone, Copy, PartialEq)]
+enum PartKind {
+    Body,
+    /// Volatile engine notes, rewritten every round. Never a marker anchor.
+    Tail,
+    View,
+}
+
+struct TextPart {
+    text: String,
+    kind: PartKind,
+}
+
+impl TextPart {
+    fn new(text: &str, kind: PartKind) -> Self {
+        Self {
+            text: text.to_string(),
+            kind,
+        }
+    }
+}
+
+/// The text and image parts of one user or assistant wire message, kept apart
+/// so a cache marker can land on a single part. A `tool` message is never one:
+/// it takes a plain string.
+struct Parts {
+    texts: Vec<TextPart>,
+    images: Vec<serde_json::Value>,
+    /// Indexes into [`Parts::cacheable_texts`] that carry a marker.
+    marks: BTreeSet<usize>,
+}
+
+impl Parts {
+    fn new(texts: Vec<TextPart>, images: Vec<serde_json::Value>) -> Self {
+        Self {
+            texts,
+            images,
+            marks: BTreeSet::new(),
+        }
+    }
+
+    /// The text parts the API accepts: it rejects an empty one.
+    fn cacheable_texts(&self) -> Vec<&TextPart> {
+        self.texts.iter().filter(|t| !t.text.is_empty()).collect()
+    }
+
+    /// The part a message-level marker lands on: the last that is not a tail.
+    /// `None` for a message with nothing but tail text, such as the one left
+    /// when a round's tool results split off into `tool` messages. The marker
+    /// then goes to the message before it.
+    fn anchor(&self) -> Option<usize> {
+        self.cacheable_texts()
+            .iter()
+            .rposition(|t| t.kind != PartKind::Tail)
+    }
+
+    fn views(&self) -> Vec<usize> {
+        self.cacheable_texts()
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.kind == PartKind::View)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Mark one part. Returns whether a new marker landed, so a part marked
+    /// twice counts once against the cap.
+    fn mark(&mut self, at: usize) -> bool {
+        self.marks.insert(at)
+    }
+
+    /// The content every model but Anthropic gets: the text joined into one
+    /// string, or one text part beside the images.
+    fn joined_content(&self) -> Option<serde_json::Value> {
+        let joined = (!self.texts.is_empty()).then(|| {
+            self.texts
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        if self.images.is_empty() {
+            return joined.map(serde_json::Value::String);
+        }
+        let mut content: Vec<serde_json::Value> = joined
+            .map(|text| serde_json::json!({ "type": "text", "text": text }))
+            .into_iter()
+            .collect();
+        content.extend(self.images.iter().cloned());
+        Some(serde_json::Value::Array(content))
+    }
+
+    /// The content an Anthropic model gets: one part per text block, so a
+    /// marker lands on exactly one block. The blocks stay the same with or
+    /// without a marker, because a cache entry is keyed on them. One unmarked
+    /// text stays a plain string, which renders as the same single block.
+    fn split_content(&self) -> Option<serde_json::Value> {
+        let texts = self.cacheable_texts();
+        if texts.is_empty() && self.images.is_empty() {
+            return self.joined_content();
+        }
+        if texts.len() == 1 && self.images.is_empty() && self.marks.is_empty() {
+            return Some(serde_json::Value::String(texts[0].text.clone()));
+        }
+        let mut content: Vec<serde_json::Value> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let mut part = serde_json::json!({ "type": "text", "text": t.text });
+                if self.marks.contains(&i) {
+                    part["cache_control"] = ephemeral_cache_marker();
+                }
+                part
+            })
+            .collect();
+        content.extend(self.images.iter().cloned());
+        Some(serde_json::Value::Array(content))
+    }
+}
+
+/// One Chat Completions wire message. `value` holds everything but the
+/// content of a message that has [`Parts`].
+struct ChatMessage {
+    value: serde_json::Value,
+    parts: Option<Parts>,
+}
+
+impl ChatMessage {
+    fn plain(value: serde_json::Value) -> Self {
+        Self { value, parts: None }
+    }
+
+    fn with_parts(value: serde_json::Value, parts: Parts) -> Self {
+        Self {
+            value,
+            parts: Some(parts),
+        }
+    }
+
+    fn into_value(mut self, split_text: bool) -> serde_json::Value {
+        if let Some(parts) = &self.parts {
+            let content = if split_text {
+                parts.split_content()
+            } else {
+                parts.joined_content()
+            };
+            if let Some(content) = content {
+                self.value["content"] = content;
+            }
+        }
+        self.value
+    }
+}
+
+/// Place cache markers on an Anthropic request, in the order
+/// `anthropic_wire` uses: the last message that can hold one, the one before
+/// it, each memory view, then the system block. At most
+/// [`MAX_CACHE_BREAKPOINTS`]. Tool definitions and `tool` messages take none.
+/// Returns whether the system block took a marker.
+fn place_cache_markers(messages: &mut [ChatMessage], has_system: bool) -> bool {
+    let anchored: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.parts.as_ref().is_some_and(|p| p.anchor().is_some()))
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut breakpoints = 0;
+    for &i in anchored.iter().rev().take(2) {
+        if let Some(parts) = messages[i].parts.as_mut() {
+            if let Some(anchor) = parts.anchor() {
+                breakpoints += usize::from(parts.mark(anchor));
+            }
+        }
+    }
+    'views: for &i in &anchored {
+        let Some(parts) = messages[i].parts.as_mut() else {
+            continue;
+        };
+        for view in parts.views() {
+            if breakpoints == MAX_CACHE_BREAKPOINTS {
+                break 'views;
+            }
+            breakpoints += usize::from(parts.mark(view));
+        }
+    }
+    has_system && breakpoints < MAX_CACHE_BREAKPOINTS
+}
+
 impl OpenAiProvider {
     /// Convert internal messages to OpenAI Chat Completions format.
-    fn convert_messages_chat(messages: &[Message]) -> Vec<serde_json::Value> {
-        let mut openai_messages: Vec<serde_json::Value> = Vec::new();
+    fn convert_messages_chat(messages: &[Message]) -> Vec<ChatMessage> {
+        let mut openai_messages: Vec<ChatMessage> = Vec::new();
 
         for msg in messages {
             match &msg.content {
                 MessageContent::Text(text) => {
-                    openai_messages.push(serde_json::json!({
-                        "role": msg.role,
-                        "content": text,
-                    }));
+                    openai_messages.push(ChatMessage::with_parts(
+                        serde_json::json!({ "role": msg.role }),
+                        Parts::new(vec![TextPart::new(text, PartKind::Body)], Vec::new()),
+                    ));
                 }
                 MessageContent::Blocks(blocks) => {
-                    let mut text_parts: Vec<String> = Vec::new();
+                    let mut text_parts: Vec<TextPart> = Vec::new();
                     let mut image_parts: Vec<serde_json::Value> = Vec::new();
                     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
                     let mut tool_results: Vec<(String, String)> = Vec::new();
@@ -36,12 +232,15 @@ impl OpenAiProvider {
                     for block in blocks {
                         match block {
                             // A tail block is ordinary text here. Only the
-                            // engine and the Anthropic cache anchor care who
-                            // wrote it.
-                            ContentBlock::Text { text }
-                            | ContentBlock::EngineTail { text }
-                            | ContentBlock::MemoryView { text } => {
-                                text_parts.push(text.clone());
+                            // engine and the cache markers care who wrote it.
+                            ContentBlock::Text { text } => {
+                                text_parts.push(TextPart::new(text, PartKind::Body));
+                            }
+                            ContentBlock::EngineTail { text } => {
+                                text_parts.push(TextPart::new(text, PartKind::Tail));
+                            }
+                            ContentBlock::MemoryView { text } => {
+                                text_parts.push(TextPart::new(text, PartKind::View));
                             }
                             ContentBlock::Image {
                                 media_type, data, ..
@@ -83,15 +282,18 @@ impl OpenAiProvider {
                     // 1. Assistant `tool_calls` message first — it owns any text
                     //    as its `content` field.
                     if has_tool_calls {
-                        let mut assistant_msg = serde_json::json!({
+                        let assistant_msg = serde_json::json!({
                             "role": "assistant",
                             "tool_calls": tool_calls,
                         });
-                        if !text_parts.is_empty() {
-                            assistant_msg["content"] =
-                                serde_json::Value::String(text_parts.join("\n"));
-                        }
-                        openai_messages.push(assistant_msg);
+                        openai_messages.push(if text_parts.is_empty() {
+                            ChatMessage::plain(assistant_msg)
+                        } else {
+                            ChatMessage::with_parts(
+                                assistant_msg,
+                                Parts::new(std::mem::take(&mut text_parts), Vec::new()),
+                            )
+                        });
                     }
 
                     // 2. Tool-result `tool` messages MUST immediately follow the
@@ -106,37 +308,22 @@ impl OpenAiProvider {
                     //    assistant `tool_calls` and its responses (the observed
                     //    kimi-k3 failure — thread 85239abe).
                     for (tool_call_id, content) in tool_results {
-                        openai_messages.push(serde_json::json!({
+                        openai_messages.push(ChatMessage::plain(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
                             "content": content,
-                        }));
+                        })));
                     }
 
                     // 3. Remaining user text/image content, AFTER the tool
                     //    messages. Skipped when this block was an assistant
                     //    `tool_calls` message (step 1 already consumed its text).
-                    if !has_tool_calls {
-                        if !image_parts.is_empty() {
-                            // When images are present, use array-of-parts content format
-                            let mut content_parts: Vec<serde_json::Value> = Vec::new();
-                            if !text_parts.is_empty() {
-                                content_parts.push(serde_json::json!({
-                                    "type": "text",
-                                    "text": text_parts.join("\n"),
-                                }));
-                            }
-                            content_parts.extend(image_parts);
-                            openai_messages.push(serde_json::json!({
-                                "role": msg.role,
-                                "content": content_parts,
-                            }));
-                        } else if !text_parts.is_empty() {
-                            openai_messages.push(serde_json::json!({
-                                "role": msg.role,
-                                "content": text_parts.join("\n"),
-                            }));
-                        }
+                    let has_user_content = !text_parts.is_empty() || !image_parts.is_empty();
+                    if !has_tool_calls && has_user_content {
+                        openai_messages.push(ChatMessage::with_parts(
+                            serde_json::json!({ "role": msg.role }),
+                            Parts::new(text_parts, image_parts),
+                        ));
                     }
                 }
             }
@@ -180,16 +367,36 @@ impl OpenAiProvider {
         system_prompt: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> serde_json::Value {
-        let mut openai_messages = Vec::new();
+        // OpenRouter caches an Anthropic model's prompt only where a text part
+        // carries `cache_control`. Every other model keeps its body as it was,
+        // because a strict or local server can reject a key it does not know.
+        let explicit_cache = model.starts_with(ANTHROPIC_NAMESPACE);
+        let mut chat_messages = Self::convert_messages_chat(messages);
+        let has_system_text = system_prompt.is_some_and(|s| !s.is_empty());
+        let mark_system =
+            explicit_cache && place_cache_markers(&mut chat_messages, has_system_text);
 
+        let mut openai_messages = Vec::new();
         if let Some(system) = system_prompt {
+            let content = if mark_system {
+                serde_json::json!([{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": ephemeral_cache_marker(),
+                }])
+            } else {
+                serde_json::Value::String(system.to_string())
+            };
             openai_messages.push(serde_json::json!({
                 "role": "system",
-                "content": system,
+                "content": content,
             }));
         }
-
-        openai_messages.extend(Self::convert_messages_chat(messages));
+        openai_messages.extend(
+            chat_messages
+                .into_iter()
+                .map(|message| message.into_value(explicit_cache)),
+        );
 
         let mut body = serde_json::json!({
             "model": model,
@@ -665,6 +872,39 @@ mod tests {
         assert_eq!(meta.cache_read_tokens, Some(12));
     }
 
+    /// OpenRouter reports an Anthropic cache write beside the read, both
+    /// inside `prompt_tokens`. A zero write stays unset, like a zero read.
+    #[test]
+    fn a_cache_write_is_recorded_as_part_of_the_prompt_total() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":5476,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":5435}}}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(meta.input_tokens, Some(5476));
+        assert_eq!(meta.cache_read_tokens, None);
+        assert_eq!(meta.cache_write_tokens, Some(5435));
+
+        let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
+        assert_eq!(resp.cache_creation_tokens, Some(5435));
+    }
+
+    #[test]
+    fn a_zero_cache_write_stays_unset() {
+        let mut meta = StreamMeta::default();
+        meta.absorb_chat_usage(&serde_json::json!({
+            "prompt_tokens": 40,
+            "prompt_tokens_details": {"cached_tokens": 12, "cache_write_tokens": 0}
+        }));
+        assert_eq!(meta.cache_read_tokens, Some(12));
+        assert_eq!(meta.cache_write_tokens, None);
+    }
+
     /// A prompt that read no cache leaves the count unset, so "read nothing"
     /// stays distinct from "this server reports no cached count at all".
     #[test]
@@ -1100,7 +1340,10 @@ mod tests {
             },
         ];
 
-        let wire = OpenAiProvider::convert_messages_chat(&messages);
+        let wire: Vec<serde_json::Value> = OpenAiProvider::convert_messages_chat(&messages)
+            .into_iter()
+            .map(|message| message.into_value(false))
+            .collect();
 
         // Exactly three wire messages, in order:
         //   assistant(tool_calls) → tool(result) → user(text)
@@ -1145,6 +1388,316 @@ mod tests {
             .get("stream_options")
             .expect("stream_options must be sent");
         assert_eq!(opts["include_usage"], serde_json::Value::Bool(true));
+    }
+
+    fn msg(role: &str, blocks: Vec<ContentBlock>) -> Message {
+        Message {
+            role: role.to_string(),
+            content: MessageContent::Blocks(blocks),
+        }
+    }
+
+    fn text(text: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: text.to_string(),
+        }
+    }
+
+    fn view(text: &str) -> ContentBlock {
+        ContentBlock::MemoryView {
+            text: text.to_string(),
+        }
+    }
+
+    fn tail(text: &str) -> ContentBlock {
+        ContentBlock::EngineTail {
+            text: text.to_string(),
+        }
+    }
+
+    const CLAUDE: &str = "anthropic/claude-haiku-5.5";
+
+    fn body_for(model: &str, messages: &[Message], system: Option<&str>) -> serde_json::Value {
+        OpenAiProvider::new("k".to_string(), model.to_string())
+            .unwrap()
+            .build_chat_body(model, messages, &[], system, None)
+    }
+
+    fn marker_count(body: &serde_json::Value) -> usize {
+        body.to_string().matches("\"cache_control\"").count()
+    }
+
+    /// The wire indexes of the messages whose content carries a marker.
+    fn marked_messages(body: &serde_json::Value) -> Vec<usize> {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.to_string().contains("\"cache_control\""))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn history() -> Vec<Message> {
+        vec![
+            msg("user", vec![text("first question")]),
+            msg("assistant", vec![text("first answer")]),
+            msg("user", vec![view("memory view"), text("second question")]),
+        ]
+    }
+
+    /// Every other model on this wire gets the body it always got. A strict or
+    /// local server can reject a key it does not know.
+    #[test]
+    fn a_model_outside_the_anthropic_namespace_gets_no_cache_control() {
+        for model in [
+            "gpt-5.4",
+            "z-ai/glm-5.2",
+            "google/gemini-3.8-flash",
+            "muse-glimmer:30b-mlx",
+        ] {
+            let body = body_for(model, &history(), Some("system"));
+            assert_eq!(marker_count(&body), 0, "{model}: {body}");
+            assert_eq!(body["messages"][0]["content"], "system");
+            assert_eq!(body["messages"][1]["content"], "first question");
+            assert_eq!(
+                body["messages"][3]["content"], "memory view\nsecond question",
+                "{model} joined its text parts as before"
+            );
+        }
+    }
+
+    /// Priority mirrors `anthropic_wire`: the last message, the one before it,
+    /// each memory view, then the system block.
+    #[test]
+    fn an_anthropic_request_marks_last_messages_views_then_system() {
+        let body = body_for(CLAUDE, &history(), Some("system"));
+        let wire = &body["messages"];
+        let marker = serde_json::json!({"type": "ephemeral"});
+
+        assert_eq!(wire[0]["content"][0]["cache_control"], marker, "system");
+        assert!(wire[1]["content"].is_string(), "oldest message stays plain");
+        assert_eq!(
+            wire[2]["content"][0]["cache_control"], marker,
+            "penultimate"
+        );
+        // The last message is marked at its final non-tail part, and its view
+        // part holds a marker of its own.
+        assert_eq!(wire[3]["content"][1]["text"], "second question");
+        assert_eq!(wire[3]["content"][1]["cache_control"], marker, "last");
+        assert_eq!(wire[3]["content"][0]["cache_control"], marker, "view");
+        assert_eq!(marker_count(&body), 4);
+    }
+
+    /// A tail block carries the engine's volatile notes. It is rewritten every
+    /// round, so it never anchors a marker.
+    #[test]
+    fn an_engine_tail_never_anchors_a_marker() {
+        let messages = vec![msg("user", vec![text("question"), tail("volatile note")])];
+        let body = body_for(CLAUDE, &messages, None);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        assert!(content[1].get("cache_control").is_none(), "{content}");
+        assert_eq!(content[1]["text"], "volatile note");
+    }
+
+    /// Tool results split off into `tool` messages, which take no marker. The
+    /// tail then sits alone in a user message, and the marker goes to the
+    /// message before the tool round instead.
+    #[test]
+    fn a_message_of_only_tail_text_takes_no_marker() {
+        let messages = vec![
+            msg("user", vec![text("question")]),
+            msg(
+                "assistant",
+                vec![
+                    text("Checking."),
+                    ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "load_knowhow".to_string(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    },
+                ],
+            ),
+            msg(
+                "user",
+                vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: "result body".to_string(),
+                    },
+                    tail("volatile note"),
+                ],
+            ),
+        ];
+        let body = body_for(CLAUDE, &messages, None);
+        let wire = body["messages"].as_array().unwrap();
+        assert_eq!(wire.len(), 4, "{body}");
+        assert_eq!(wire[3]["role"], "user");
+        assert!(!wire[3].to_string().contains("cache_control"), "{body}");
+        assert_eq!(marked_messages(&body), vec![0, 1]);
+    }
+
+    #[test]
+    fn an_anthropic_request_never_exceeds_four_markers() {
+        let mut messages = Vec::new();
+        for i in 0..6 {
+            messages.push(msg(
+                "user",
+                vec![view(&format!("view {i}")), text(&format!("question {i}"))],
+            ));
+            messages.push(msg("assistant", vec![text(&format!("answer {i}"))]));
+        }
+        let body = body_for(CLAUDE, &messages, Some("system"));
+        assert_eq!(marker_count(&body), 4, "{body}");
+        // The two newest messages hold two of them. The system block is last in
+        // priority, and the views spent the rest.
+        let marked = marked_messages(&body);
+        assert!(marked.contains(&12) && marked.contains(&11), "{marked:?}");
+        assert!(
+            body["messages"][0]["content"].is_string(),
+            "system lost its slot to the views"
+        );
+    }
+
+    /// A tool round: the last wire message is a `tool` message, which takes
+    /// only a string. The marker walks back to the nearest message that can
+    /// hold one, and no part is empty.
+    #[test]
+    fn a_tool_round_marks_only_messages_that_take_a_part_array() {
+        let messages = vec![
+            msg("user", vec![text("look it up"), text("")]),
+            msg(
+                "assistant",
+                vec![
+                    text("Checking."),
+                    ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "load_knowhow".to_string(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    },
+                ],
+            ),
+            msg(
+                "user",
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "result body".to_string(),
+                }],
+            ),
+        ];
+        let body = body_for(CLAUDE, &messages, None);
+        let wire = body["messages"].as_array().unwrap();
+
+        assert_eq!(wire.len(), 3, "user, assistant, tool: {body}");
+        assert_eq!(wire[1]["role"], "assistant");
+        assert_eq!(wire[2]["role"], "tool");
+        assert_eq!(wire[2]["tool_call_id"], "call_1");
+        assert_eq!(wire[2]["content"], "result body");
+        assert_eq!(marked_messages(&body), vec![0, 1]);
+        assert!(!body.to_string().contains(r#""text":"""#), "{body}");
+    }
+
+    /// An assistant message holding only `tool_calls` has no text to mark.
+    #[test]
+    fn a_message_with_no_text_is_not_marked() {
+        let messages = vec![msg(
+            "assistant",
+            vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "load_knowhow".to_string(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }],
+        )];
+        let body = body_for(CLAUDE, &messages, None);
+        assert_eq!(marker_count(&body), 0, "{body}");
+    }
+
+    /// The tool result must still follow its assistant `tool_calls` message.
+    #[test]
+    fn an_anthropic_tool_round_keeps_the_result_adjacent() {
+        let messages = vec![
+            msg(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "load_knowhow".to_string(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                }],
+            ),
+            msg(
+                "user",
+                vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: "result body".to_string(),
+                    },
+                    text("Results above."),
+                ],
+            ),
+        ];
+        let body = body_for(CLAUDE, &messages, None);
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["assistant", "tool", "user"]);
+        assert_eq!(body["messages"][2]["content"][0]["text"], "Results above.");
+    }
+
+    /// A message keeps the same blocks with or without a marker. A cache entry
+    /// is keyed on them, so a message marked last round must not change shape
+    /// when it is plain this round.
+    #[test]
+    fn an_unmarked_message_renders_the_blocks_it_had_when_marked() {
+        let mut messages = vec![msg("user", vec![text("context"), tail("volatile note")])];
+        let marked = body_for(CLAUDE, &messages, None);
+        for _ in 0..3 {
+            messages.push(msg("assistant", vec![text("answer")]));
+            messages.push(msg("user", vec![text("next")]));
+        }
+        let unmarked = body_for(CLAUDE, &messages, None);
+
+        let strip = |content: &serde_json::Value| {
+            content
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| part["text"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            strip(&marked["messages"][0]["content"]),
+            strip(&unmarked["messages"][0]["content"])
+        );
+    }
+
+    /// Images ride beside the text parts, and a marker lands on text only.
+    #[test]
+    fn an_image_message_keeps_its_image_after_the_marked_text() {
+        let messages = vec![msg(
+            "user",
+            vec![
+                text("describe this"),
+                ContentBlock::Image {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "AAAA".to_string(),
+                },
+            ],
+        )];
+        let body = body_for(CLAUDE, &messages, None);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(marker_count(&body), 1);
     }
 
     /// Chat Completions forces a call by naming the function.

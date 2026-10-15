@@ -36,6 +36,8 @@ use crate::codegen::REGENERATE;
 const TYPE_SOURCES: &[(&str, &str)] = &[
     ("ActorMode", "engine/thread_events/actor.rs"),
     ("AgentParticipant", "engine/thread_events/actor.rs"),
+    ("CodingAgentExit", "engine/thread_events/agent_exit.rs"),
+    ("CodingAgentExitStage", "engine/thread_events/agent_exit.rs"),
     ("EngineReason", "engine/thread_events/actor.rs"),
     ("MessageOrigin", "engine/thread_events/actor.rs"),
     ("PluginSetupOccasion", "engine/thread_events/actor.rs"),

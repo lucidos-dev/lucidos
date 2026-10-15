@@ -227,6 +227,26 @@ export function resolveThemeMode(mode: ThemeMode, prefersLight: boolean): Resolv
 }
 
 /**
+ * What a repaint paints. Under a `system` preference that was already `system`,
+ * it keeps the mode on `<html>`: only `followSystemThemeMode`'s confirmed read
+ * moves it (ADR 0092). Any other repaint would read the OS with none of the
+ * follower's guards, and paint a hidden page.
+ *
+ * A change of preference into `system`, and a first paint with nothing usable on
+ * `<html>`, resolve against the OS. The OS is read only then.
+ */
+export function repaintThemeMode(
+  next: ThemeMode,
+  previous: ThemeMode,
+  painted: string | null,
+  osPrefersLight: () => boolean,
+): ResolvedThemeMode {
+  if (next !== 'system') return next;
+  if (previous === 'system' && (painted === 'light' || painted === 'dark')) return painted;
+  return resolveThemeMode(next, osPrefersLight());
+}
+
+/**
  * How long the shell and every app iframe wait before sampling the OS
  * appearance, once something suggests it moved.
  *
@@ -994,14 +1014,27 @@ const APPEARANCE_PUSH_SOURCES: ReadonlyArray<readonly [string, string]> = [
   [PREF_THEME_EFFECTS.key, THEME_EFFECTS_STORAGE_KEY],
 ];
 
-/** What the shell painted, read from its mirrors. Raw strings: the frame runs
- *  each through the parser it runs on the engine seed. */
-export function readAppearancePush(get: (key: string) => string | null): Record<string, string> {
+/** The push key for the mode the shell has on its `<html>`. A frame on
+ *  `system` paints it, since only the shell's guarded follower moved it. */
+export const PAINTED_THEME_MODE_PUSH_KEY = 'painted_theme_mode';
+
+const APPEARANCE_PUSH_KEYS: readonly string[] = [
+  ...APPEARANCE_PUSH_SOURCES.map(([key]) => key),
+  PAINTED_THEME_MODE_PUSH_KEY,
+];
+
+/** What the shell painted, read from its mirrors and its `<html>`. Raw
+ *  strings: the frame runs each through the parser it runs on the engine seed. */
+export function readAppearancePush(
+  get: (key: string) => string | null,
+  paintedThemeMode: string | null,
+): Record<string, string> {
   const push: Record<string, string> = {};
   for (const [key, storageKey] of APPEARANCE_PUSH_SOURCES) {
     const value = get(storageKey);
     if (value !== null) push[key] = value;
   }
+  if (paintedThemeMode !== null) push[PAINTED_THEME_MODE_PUSH_KEY] = paintedThemeMode;
   return push;
 }
 
@@ -1010,7 +1043,7 @@ export function sanitizeAppearancePush(value: unknown): Record<string, string> |
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const push: Record<string, string> = {};
-  for (const [key] of APPEARANCE_PUSH_SOURCES) {
+  for (const key of APPEARANCE_PUSH_KEYS) {
     const entry = raw[key];
     if (typeof entry === 'string') push[key] = entry;
   }

@@ -142,6 +142,7 @@ async fn a_failed_no_wake_child_still_wakes() {
         child_id,
         ThreadEvent::ResponseFailed {
             error: "boom".into(),
+            agent_exit: None,
         },
     )
     .await;

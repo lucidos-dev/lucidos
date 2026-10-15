@@ -489,3 +489,35 @@ fn change_proposed_new_format() {
              new event payloads byte-compatible with pre-field DB rows"
     );
 }
+
+/// A `ResponseFailed` stored before `agent_exit` existed reads unchanged, and a
+/// failure that is not an agent's own exit writes the same bytes as before.
+#[test]
+fn response_failed_reads_old_rows_and_round_trips_agent_exit() {
+    let old: ThreadEvent =
+        serde_json::from_value(json!({ "type": "ResponseFailed", "error": "boom" })).unwrap();
+    assert!(matches!(
+        old,
+        ThreadEvent::ResponseFailed {
+            agent_exit: None,
+            ..
+        }
+    ));
+    assert_eq!(
+        serde_json::to_value(&old).unwrap(),
+        json!({ "type": "ResponseFailed", "error": "boom" }),
+        "no agent_exit means no new key on the wire"
+    );
+
+    let exit = ThreadEvent::ResponseFailed {
+        error: "could not load settings".into(),
+        agent_exit: Some(CodingAgentExit {
+            stage: CodingAgentExitStage::Startup,
+            code: Some(1),
+        }),
+    };
+    let wire = serde_json::to_value(&exit).unwrap();
+    assert_eq!(wire["agent_exit"], json!({ "stage": "startup", "code": 1 }));
+    let read_back = serde_json::from_value::<ThreadEvent>(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&read_back).unwrap(), wire);
+}

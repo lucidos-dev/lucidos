@@ -4,19 +4,19 @@ use std::path::{Path, PathBuf};
 // renders the same names for the bash tools. See `format_exit_status`.
 use crate::core::shell::signal_name;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
-    AccountPin, AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, InputWithdrawal,
-    RunningAgent, SpawnArgs, WithdrawRequest,
+    AccountPin, AgentEvent, AgentExitFacts, AgentInput, AgentRuntime, CodingAgent, ControlRequest,
+    InputWithdrawal, RunningAgent, SpawnArgs, WithdrawRequest,
 };
 use super::lucidos_cli::{
     ensure_workspace_bin_symlink, lucidos_cli_dir, place_lucidos_cli_skill, LUCIDOS_BIN_NAME,
     LUCIDOS_CLI_SKILL,
 };
-use super::spawn_env::{apply_lucidos_env, drain_stderr};
+use super::spawn_env::{apply_lucidos_env, command_secret_values, StderrTail};
 
 /// One `/model` or `/effort` picker entry. Claude Code's model rows come from
 /// discovery (`cc_model_discovery`), with `cc_menu_options.json` as the
@@ -602,12 +602,12 @@ async fn ask_side_question_of(
         Ok(SideQuestionReply { answer: Err(e), .. }) => Some(e.clone()),
         Ok(_) => None,
     };
-    if let (Some(e), Some(mut stderr)) = (failure, child.stderr.take().map(BufReader::new)) {
-        let tail = drain_stderr(&mut stderr).await;
+    if let (Some(e), Some(stderr)) = (failure, child.stderr.take()) {
+        let tail = StderrTail::spawn(stderr, Vec::new()).finish().await;
         log!(
             "[ClaudeCode] side question failed: {} (stderr: {})",
             e,
-            tail.trim()
+            tail
         );
     }
     reply
@@ -720,13 +720,9 @@ async fn probe_models_of(
             .map_err(|e| e.unwrap_or_else(|| "Claude Code refused initialize".to_string()))
             .and_then(|body| super::cc_model_discovery::parse_initialize_models(&body)),
     };
-    if let (Err(e), Some(mut stderr)) = (&models, child.stderr.take().map(BufReader::new)) {
-        let tail = drain_stderr(&mut stderr).await;
-        log!(
-            "[ClaudeCode] model probe failed: {} (stderr: {})",
-            e,
-            tail.trim()
-        );
+    if let (Err(e), Some(stderr)) = (&models, child.stderr.take()) {
+        let tail = StderrTail::spawn(stderr, Vec::new()).finish().await;
+        log!("[ClaudeCode] model probe failed: {} (stderr: {})", e, tail);
     }
     Ok(models?)
 }
@@ -865,10 +861,14 @@ impl AgentRuntime for ClaudeCodeRuntime {
         } = build_command(&args, cli_dir)?;
         let agent_run = args.agent_run.clone();
         let stream_state = CcStreamState::with_notes_relayed(relays_vertex_calls(&cmd));
+        let secrets = command_secret_values(&cmd);
         let mut child = super::spawn_env::spawn_below_engine(&mut cmd)?;
         let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
-        let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+        let stderr = StderrTail::spawn(
+            child.stderr.take().ok_or("Failed to capture stderr")?,
+            secrets,
+        );
 
         let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
@@ -881,7 +881,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
                 child,
                 stdin,
                 BufReader::new(stdout),
-                BufReader::new(stderr),
+                stderr,
                 events_tx,
                 input_rx,
                 control_rx,
@@ -1543,7 +1543,8 @@ pub(crate) const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration
 /// How long a child whose stdout closed gets to exit on its own before the
 /// driver tears it down. A dying process closes its stdout before the OS can
 /// report it gone, so without this wait a stray kill reads as engine teardown.
-const EXIT_AFTER_STDOUT_EOF_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const EXIT_AFTER_STDOUT_EOF_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(1);
 
 /// Drive the CC process: forward stdout → events_tx, input/control → stdin,
 /// and react to cancellation. Always emits `AgentEvent::Exited` (best-effort)
@@ -1553,7 +1554,7 @@ async fn driver_task(
     mut child: Child,
     mut stdin: ChildStdin,
     mut stdout_reader: BufReader<ChildStdout>,
-    mut stderr_reader: BufReader<ChildStderr>,
+    stderr: StderrTail,
     events_tx: mpsc::UnboundedSender<AgentEvent>,
     mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
     mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
@@ -1794,8 +1795,8 @@ async fn driver_task(
         }
     }
 
-    // Make sure the child is gone before draining stderr — otherwise stderr
-    // could keep producing output and we'd block.
+    // Make sure the child is gone before the tail settles, so the last of its
+    // stderr is in.
     let _ = child.start_kill();
     if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
         .await
@@ -1804,20 +1805,26 @@ async fn driver_task(
         let _ = child.kill().await;
     }
 
-    let stderr_tail = drain_stderr(&mut stderr_reader).await;
+    let stderr_tail = stderr.finish().await;
     if stderr_tail.is_empty() {
         // Absence-of-evidence is itself evidence. Without this log we
         // can't distinguish "stderr was empty" (e.g. SIGKILL or clean
         // SIGTERM-handled exit) from "we forgot to log stderr".
         log!("[ClaudeCode] Claude Code stderr: <empty>");
     } else {
-        log!("[ClaudeCode] Claude Code stderr: {}", stderr_tail.trim());
+        log!("[ClaudeCode] Claude Code stderr: {}", stderr_tail);
     }
     let killed_by_signal = natural_exit_status
         .as_ref()
         .map(exit_indicates_signal_kill)
         .unwrap_or(false);
-    let _ = events_tx.send(AgentEvent::Exited { killed_by_signal });
+    let _ = events_tx.send(AgentEvent::Exited {
+        exit: AgentExitFacts {
+            killed_by_signal,
+            code: natural_exit_status.and_then(|status| status.code()),
+            stderr_tail,
+        },
+    });
     // events_tx drops here — channel closes, consumer sees None.
 }
 

@@ -3,6 +3,7 @@ import {
   RELAY_GIVE_UP_MS,
   loadRelayedUpdate,
   relayAvailable,
+  relayClientReady,
   saveRelayedUpdate,
   settleRelay,
 } from './updateRelay';
@@ -105,19 +106,40 @@ describe('relayAvailable', () => {
   });
 
   it('is available for an attached, unblocked client behind the newest release', () => {
-    expect(relayAvailable()).toBe(true);
+    expect(relayAvailable(false)).toBe(true);
   });
 
-  it('is not available without a client, with a blocker, or without a newer release', () => {
+  it('is not available without a client or with a blocker', () => {
     updateRelay.value = null;
-    expect(relayAvailable()).toBe(false);
+    expect(relayAvailable(true)).toBe(false);
     updateRelay.value = { client: { version: '1.2.0', blocker: 'needs a password' }, request: null };
-    expect(relayAvailable()).toBe(false);
+    expect(relayAvailable(true)).toBe(false);
+  });
+
+  // The gateway's answer, once it has one, outranks the caller's word.
+  it('is not available to a client already on the newest release the gateway knows', () => {
     updateRelay.value = { client: { version: '1.3.0', blocker: null }, request: null };
-    expect(relayAvailable()).toBe(false);
-    updateRelay.value = { client: { version: '1.2.0', blocker: null }, request: null };
+    expect(relayAvailable(false)).toBe(false);
+    expect(relayAvailable(true)).toBe(false);
+  });
+
+  // The hourly poll lags a fresh release, and the gateway refreshes its check
+  // before it refuses, so the caller's word is enough while the gateway has none.
+  it('takes the caller\'s word while the gateway knows no release', () => {
     releaseCheck.value = check('1.2.0', null);
-    expect(relayAvailable()).toBe(false);
+    expect(relayAvailable(false)).toBe(false);
+    expect(relayAvailable(true)).toBe(true);
+  });
+});
+
+describe('relayClientReady', () => {
+  it('needs an attached client with no blocker', () => {
+    updateRelay.value = null;
+    expect(relayClientReady()).toBe(false);
+    updateRelay.value = { client: { version: '1.2.0', blocker: 'needs a password' }, request: null };
+    expect(relayClientReady()).toBe(false);
+    updateRelay.value = { client: { version: '1.2.0', blocker: null }, request: null };
+    expect(relayClientReady()).toBe(true);
   });
 });
 

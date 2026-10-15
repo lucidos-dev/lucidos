@@ -273,6 +273,7 @@ mod tests {
         let small = crate::successor::ContextReading::Read {
             input_tokens: Some(40_000),
             offer: false,
+            implementer: None,
         };
         let out = build_awaiting_approval_json("/tmp/x.rs", &card_shape(small));
         let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
@@ -329,26 +330,48 @@ mod tests {
 
     /// I11: the number decides the shape, never the agent. A large thread
     /// leads with the successor; a small or unreadable one gets today's pair.
+    /// The implementer on a large card is the agent's pick, named beside this
+    /// thread's own, within the question tool's 4 options.
     #[test]
     fn the_card_shape_follows_the_measured_context() {
-        use crate::successor::ContextReading;
+        use crate::successor::{ContextReading, Implementer};
         let large = card_shape(ContextReading::Read {
             input_tokens: Some(240_000),
             offer: true,
+            implementer: Some(Implementer {
+                coding_agent: "claude-code".into(),
+                model: Some("claude-opus-5-5".into()),
+                reasoning_effort: Some("high".into()),
+            }),
         });
         for needle in [
             "240k tokens",
-            "`Implement in a new thread (Recommended)` first",
-            "`Approve here` second",
-            "Never offer `Request changes`",
-            "lucidos successor spawn --narrative",
+            "This thread runs on claude-code with model claude-opus-5-5 at high effort.",
+            "`Implement in a new thread: <implementer> (Recommended)`",
+            "only when it differs; `Approve here`",
+            "never more than 4 options, and never `Request changes`",
+            "by your judgement of the plan",
+            "lucidos successor spawn --narrative <file>`",
+            "Add only the flags that differ from this thread's implementer",
+            "`--coding-agent-model <model id>`",
+            "picking this thread's implementer adds none",
             "without asking again",
         ] {
             assert!(large.contains(needle), "missing {needle:?}: {large}");
         }
+        let unread = card_shape(ContextReading::Read {
+            input_tokens: Some(240_000),
+            offer: true,
+            implementer: None,
+        });
+        assert!(
+            unread.contains("could not read this thread's implementer"),
+            "{unread}"
+        );
         let small = card_shape(ContextReading::Read {
             input_tokens: Some(240_000),
             offer: false,
+            implementer: None,
         });
         assert!(small.contains("`Approve` / `Request changes`"));
         assert!(!small.contains("new thread"), "the engine said no: {small}");

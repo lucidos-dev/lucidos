@@ -638,6 +638,7 @@ async fn held_work_is_released_only_for_an_idle_open_thread_whose_turn_proposes(
         "claude-code/held-failed",
         ThreadEvent::ResponseFailed {
             error: "stream interrupted".into(),
+            agent_exit: None,
         },
     )
     .await;

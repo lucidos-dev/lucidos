@@ -46,6 +46,125 @@ fn a_successor_takes_its_old_threads_place() {
     assert_eq!(child.spawning_event_id, Some(spawned_by));
 }
 
+fn implementer(agent: CodingAgent, model: Option<&str>, effort: Option<&str>) -> Implementer {
+    Implementer {
+        coding_agent: agent,
+        model: model.map(str::to_string),
+        reasoning_effort: effort.map(str::to_string),
+    }
+}
+
+fn asking(
+    agent: Option<CodingAgent>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> ImplementerRequest {
+    ImplementerRequest {
+        coding_agent: agent,
+        coding_agent_model: model.map(str::to_string),
+        reasoning_effort: effort.map(str::to_string),
+    }
+}
+
+/// Invariant 1: a handoff that names no implementer carries the old one as
+/// is, unvalidated, exactly as before the request could name one.
+#[test]
+fn a_handoff_naming_no_implementer_carries_the_old_one() {
+    let old = implementer(
+        CodingAgent::ClaudeCode,
+        Some("claude-opus-5-5"),
+        Some("max"),
+    );
+    assert_eq!(
+        resolve_implementer(&old, &ImplementerRequest::default()),
+        Ok(old)
+    );
+}
+
+/// Invariant 2: what the handoff names is what the successor runs on.
+#[test]
+fn the_named_implementer_reaches_the_successor() {
+    let old = implementer(
+        CodingAgent::ClaudeCode,
+        Some("claude-opus-5-5"),
+        Some("high"),
+    );
+    assert_eq!(
+        resolve_implementer(&old, &asking(None, Some("sonnet"), Some("medium"))),
+        Ok(implementer(
+            CodingAgent::ClaudeCode,
+            Some("sonnet"),
+            Some("medium")
+        ))
+    );
+    assert_eq!(
+        resolve_implementer(
+            &old,
+            &asking(Some(CodingAgent::Codex), Some("gpt-5.6-sol"), Some("max"))
+        ),
+        Ok(implementer(
+            CodingAgent::Codex,
+            Some("gpt-5.6-sol"),
+            Some("max")
+        ))
+    );
+}
+
+/// A new backend starts from its own defaults: the old model and effort
+/// belong to the old backend.
+#[test]
+fn a_new_backend_carries_neither_model_nor_effort() {
+    let old = implementer(
+        CodingAgent::ClaudeCode,
+        Some("claude-opus-5-5"),
+        Some("high"),
+    );
+    assert_eq!(
+        resolve_implementer(&old, &asking(Some(CodingAgent::Codex), None, None)),
+        Ok(implementer(CodingAgent::Codex, None, None))
+    );
+}
+
+/// Invariant 3: an implementer the backend does not offer is refused, with
+/// the offered list, rather than swapped for a default.
+#[test]
+fn an_implementer_the_backend_lacks_is_refused() {
+    let old = implementer(CodingAgent::ClaudeCode, None, None);
+    for (request, needle) in [
+        (asking(None, Some("no-such-model"), None), "no-such-model"),
+        (
+            asking(Some(CodingAgent::Codex), Some("sonnet"), None),
+            "not offered by codex",
+        ),
+        (
+            asking(Some(CodingAgent::Codex), Some("gpt-5.4"), Some("max")),
+            "runs only on",
+        ),
+    ] {
+        let refusal = resolve_implementer(&old, &request).unwrap_err();
+        assert!(refusal.contains(needle), "{request:?}: {refusal}");
+    }
+}
+
+/// Invariant 4: a carried effort survives a model change only while the new
+/// model accepts it.
+#[test]
+fn a_carried_effort_never_outlives_its_model() {
+    let old = implementer(CodingAgent::Codex, Some("gpt-5.6-sol"), Some("max"));
+    assert_eq!(
+        resolve_implementer(&old, &asking(None, Some("gpt-5.4"), None)),
+        Ok(implementer(CodingAgent::Codex, Some("gpt-5.4"), None))
+    );
+    assert_eq!(
+        resolve_implementer(&old, &asking(None, Some("gpt-5.6-terra"), None)),
+        Ok(implementer(
+            CodingAgent::Codex,
+            Some("gpt-5.6-terra"),
+            Some("max")
+        ))
+    );
+}
+
 const FULL_NARRATIVE: &str = "\
 # Handoff
 

@@ -22,43 +22,80 @@ use crate::api::error::ApiError;
 use crate::api::thread_reach::{refuse_without_authority, ThreadReachError, ThreadReachVerb};
 use crate::api::AppState;
 use crate::core::store::thread_link;
-use crate::engine::successor::{missing_narrative_sections, record_handoff, ThreadContext};
+use crate::engine::successor::{
+    missing_narrative_sections, record_handoff, resolve_implementer, Implementer,
+    ImplementerRequest, ThreadContext,
+};
 use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
 
 fn parse_thread_id(raw: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(raw).map_err(|e| ApiError::bad_request(format!("Invalid thread id: {e}")))
 }
 
+/// The context reading, plus the implementer a coding-agent thread runs on,
+/// which a plan card names beside the one it recommends.
+#[derive(Debug, Serialize)]
+pub(in crate::api) struct ThreadContextResponse {
+    #[serde(flatten)]
+    context: ThreadContext,
+    implementer: Option<Implementer>,
+}
+
 pub(in crate::api) async fn thread_context(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
-) -> Result<Json<ThreadContext>, ApiError> {
+) -> Result<Json<ThreadContextResponse>, ApiError> {
     let thread_id = parse_thread_id(&thread_id)?;
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1)")
-            .bind(thread_id)
-            .fetch_one(&state.pool)
-            .await
-            .map_err(ApiError::db)?;
-    if !exists {
-        return Err(ApiError::not_found(format!(
-            "Thread {thread_id} does not exist"
-        )));
-    }
-    crate::engine::successor::thread_context(&state.pool, thread_id)
+    let (is_coding_agent, coding_agent): (bool, Option<String>) = sqlx::query_as(
+        "SELECT is_coding_agent, coding_agent FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::db)?
+    .ok_or_else(|| ApiError::not_found(format!("Thread {thread_id} does not exist")))?;
+    let context = crate::engine::successor::thread_context(&state.pool, thread_id)
         .await
-        .map(Json)
-        .map_err(ApiError::db)
+        .map_err(ApiError::db)?;
+    let implementer = if is_coding_agent {
+        Some(thread_implementer(&state, thread_id, coding_agent.as_deref()).await)
+    } else {
+        None
+    };
+    Ok(Json(ThreadContextResponse {
+        context,
+        implementer,
+    }))
+}
+
+/// The implementer a coding-agent thread runs on: its backend, and the model
+/// and effort its sessions last recorded. A successor carries these over.
+async fn thread_implementer(
+    state: &AppState,
+    thread_id: Uuid,
+    coding_agent: Option<&str>,
+) -> Implementer {
+    let (model, reasoning_effort) = state.engine.cc_thread_settings(thread_id).await;
+    Implementer {
+        coding_agent: coding_agent
+            .map(crate::runtime::CodingAgent::parse)
+            .unwrap_or(crate::runtime::CodingAgent::ClaudeCode),
+        model,
+        reasoning_effort,
+    }
 }
 
 /// Exactly one of the two. The agent's handoff carries a *handoff narrative*;
-/// the composer's carries the user's next message and no narrative.
+/// the composer's carries the user's next message and no narrative. Either
+/// may name the successor's implementer.
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct SuccessorRequest {
     #[serde(default)]
     narrative: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(flatten)]
+    implementer: ImplementerRequest,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +103,8 @@ pub(in crate::api) struct SuccessorResponse {
     successor_thread_id: Uuid,
     /// A markdown link to the successor, as `lucidos spawn-thread` prints one.
     link: String,
+    /// What the successor runs on, so the caller reports what it started.
+    implementer: Implementer,
 }
 
 /// The old thread, as the handoff reads it.
@@ -219,6 +258,11 @@ pub(in crate::api) async fn spawn_successor(
             ),
         ));
     }
+    let implementer = resolve_implementer(
+        &thread_implementer(&state, old_id, old.coding_agent.as_deref()).await,
+        &request.implementer,
+    )
+    .map_err(|e| refusal(StatusCode::BAD_REQUEST, "implementer-not-offered", e))?;
     let base_sha = carried_head(&state, old_id, &old_title).await?;
 
     // Last before any write: an owner approval this spends must not be
@@ -302,10 +346,9 @@ pub(in crate::api) async fn spawn_successor(
     .await
     .map_err(ApiError::db)?
     .flatten();
-    let (cc_model, reasoning_effort) = engine.cc_thread_settings(old_id).await;
     let successor_id = Uuid::new_v4();
     let successor_title = format!("{old_title} (continued)");
-    let request = crate::engine::thread_queue::ThreadQueueRequest::AgentChat {
+    let queued = crate::engine::thread_queue::ThreadQueueRequest::AgentChat {
         depth: 0,
         message,
         thread_id: successor_id,
@@ -313,7 +356,7 @@ pub(in crate::api) async fn spawn_successor(
         image_hashes: Vec::new(),
         device_id,
         model: None,
-        reasoning_effort,
+        reasoning_effort: implementer.reasoning_effort.clone(),
         provider: None,
         use_coding_agent: Some(true),
         repo_id: if app_id.is_some() {
@@ -321,11 +364,8 @@ pub(in crate::api) async fn spawn_successor(
         } else {
             old.cc_repo_id
         },
-        cc_model,
-        coding_agent: old
-            .coding_agent
-            .as_deref()
-            .map(crate::runtime::CodingAgent::parse),
+        cc_model: implementer.model.clone(),
+        coding_agent: Some(implementer.coding_agent),
         title: Some(successor_title.clone()),
         mode,
         origin: origin.clone(),
@@ -368,11 +408,12 @@ pub(in crate::api) async fn spawn_successor(
     .await
     .map_err(|e| ApiError::internal(format!("Could not record the handoff: {e}")))?;
     claim.commit().await.map_err(ApiError::db)?;
-    engine.thread_queue.submit(request, origin, None).await;
+    engine.thread_queue.submit(queued, origin, None).await;
 
     Ok(Json(SuccessorResponse {
         successor_thread_id: successor_id,
         link: link(&successor_title, successor_id),
+        implementer,
     }))
 }
 

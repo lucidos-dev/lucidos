@@ -14,10 +14,12 @@ mod has_diff;
 mod helpers;
 mod orphaned_branch_work;
 mod recovery;
+mod undelivered_input;
 
 pub use has_diff::*;
 pub use helpers::*;
 pub use orphaned_branch_work::spawn_branch_work_net;
+pub(crate) use undelivered_input::undelivered_input_after_start_failure;
 // `recovery`'s free predicates stay in that file next to the recovery pass
 // that documents them; re-export the ones the teardown emit + its tests share
 // (`engine_impl/shutdown.rs`), so both sides of the preserve/resume contract

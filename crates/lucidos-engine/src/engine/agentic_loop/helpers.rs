@@ -2219,6 +2219,29 @@ pub(crate) async fn ensure_failure_terminator_emitted(
     channel: Option<crate::engine::thread_events::EventChannel>,
     error: &str,
 ) {
+    ensure_agent_failure_terminator_emitted(
+        bus,
+        pool,
+        thread_id,
+        request_event_id,
+        channel,
+        error,
+        None,
+    )
+    .await;
+}
+
+/// [`ensure_failure_terminator_emitted`] for a failure that is a coding agent's
+/// own exit, which the card reads from `agent_exit`.
+pub(crate) async fn ensure_agent_failure_terminator_emitted(
+    bus: &crate::engine::event_bus::EventBus,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    request_event_id: Uuid,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+    error: &str,
+    agent_exit: Option<crate::engine::thread_events::CodingAgentExit>,
+) {
     if crate::engine::thread_events::has_terminator_for(pool, thread_id, request_event_id).await {
         return;
     }
@@ -2228,6 +2251,7 @@ pub(crate) async fn ensure_failure_terminator_emitted(
             thread_id,
             event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                 error: error.to_string(),
+                agent_exit,
             },
             meta: crate::engine::thread_events::EventMeta {
                 request_event_id: Some(request_event_id),

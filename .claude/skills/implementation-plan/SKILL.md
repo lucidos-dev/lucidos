@@ -118,13 +118,13 @@ Write the plan to a new file `docs/plans/YYYY-MM-DD-<slug>.md`, using the struct
 
 **Ask with your question tool, never in prose** (`AskUserQuestion` on Claude Code, `ask_user_question` on the `lucidos` MCP server on Codex). Prose is what fails: told only to "present the plan and wait", the agent writes a summary, ends the turn, and the thread sits idle until the user types "approve" by hand. In the Lucidos UI the tool renders as clickable buttons, so approval is one tap.
 
-Use exactly one question. Offer the options `lucidos planned mark` prints. `Approve` is the first option unless that output leads with `Implement in a new thread (Recommended)` (§ Implement in a new thread). What goes in the second slot is a **floor, not a fixed shape**:
+Use exactly one question. Offer the options `lucidos planned mark` prints. `Approve` is the first option unless that output leads with a new-thread option (§ Implement in a new thread). What goes in the second slot is a **floor, not a fixed shape**:
 
 | Option | Meaning | When |
 |---|---|---|
 | `Approve` | Start implementing the plan as written. | First, unless the new-thread option leads; then it reads `Approve here`, second. |
 | A fork of the plan (`Frontend only`, `Skip the migration`, …) | Approve a named variant. | Whenever the plan has a genuine fork: a narrower scope, one layer instead of two, a different approach. |
-| `Implement in a new thread (Recommended)` | Approve as written, and build in a *successor thread*. | **Only when `lucidos planned mark` says so**, from this thread's measured context. It then goes FIRST, with `Approve here` second. May sit beside a fork. |
+| `Implement in a new thread: <implementer> (Recommended)` | Approve as written, and build in a *successor thread* on that implementer. | **Only when `lucidos planned mark` says so**, from this thread's measured context. It then goes FIRST, optionally followed by one naming this thread's implementer, then `Approve here`. May sit beside a fork, within 4 options. |
 | `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork and no new-thread option. Never alongside either. |
 
 **The plan as written is the thorough, long-term fix.** The maintainer always prefers it to a narrower patch. So write the thorough variant as the plan, and offer the narrower one as the fork, never the reverse. An unattended run still stops at the decision, as a plan or under `Decisions:`: the preference picks which variant to recommend, not whether to ask.
@@ -187,19 +187,38 @@ A planning thread that ran a long grill carries every question, picture and
 draft into each later turn. The plan file already holds what a builder needs, so
 a fresh thread can start from it alone.
 
-**The number decides, never your judgement.** `lucidos planned mark --plan`
-reads this thread's context size from the engine and prints the card's options.
-Over the engine's threshold it prints `Implement in a new thread (Recommended)`
-first and `Approve here` second. Under it, or when the size is unknown, it
-prints the plain floor. Offer exactly what it prints.
+**The number decides whether, never your judgement.** `lucidos planned mark
+--plan` reads this thread's context size from the engine and prints the card's
+options. Under the engine's threshold, or when the size is unknown, it prints
+the plain floor. Offer exactly what it prints.
 
-Picking `Implement in a new thread` is an approval, asked once:
+Over the threshold, **your judgement picks the implementer** (ADR 0486): the
+successor's backend, model and reasoning effort. The output names this thread's
+implementer. A fully specified plan with settled decisions suits a cheaper
+model, such as Sonnet. A plan that leaves design judgement to the builder keeps
+this thread's model. Say why in one line of your message. The card reads, never
+more than 4 options and never `Request changes`:
+
+1. `Implement in a new thread: <implementer> (Recommended)`, for example
+   `Implement in a new thread: Sonnet 5.5, high (Recommended)`.
+2. `Implement in a new thread: <this thread's implementer>`, only when it
+   differs.
+3. `Approve here`.
+4. A real fork of the plan, if it has one.
+
+Name the backend only when it is not this thread's (`Codex GPT-5.6 Sol, high`).
+
+Picking a new-thread option is an approval, asked once. A typed reply naming
+another implementer counts the same:
 
 1. Run `lucidos planned approve` in this thread.
-2. Write a handoff narrative and run `lucidos successor spawn --narrative <file>`
-   (`lucidos successor --help` has the six sections). The narrative names the
-   plan path and says the user approved it here, so the builder builds it phase
-   by phase without asking again.
+2. Write a handoff narrative and run `lucidos successor spawn --narrative
+   <file>`. Add only the flags that differ from this thread's implementer:
+   `--coding-agent`, `--coding-agent-model`, `--reasoning-effort`. An omitted
+   flag keeps this thread's. Pass ids, not picker labels. `lucidos successor
+   --help` has the six sections. The narrative names the plan path
+   and says the user approved it here, so the builder builds it phase by phase
+   without asking again.
 3. End your turn with the link it prints.
 
 The successor's branch starts at this branch's last commit, so it already holds

@@ -330,14 +330,37 @@ impl LucidosEngine {
                             // iteration. Continue is fundamentally a Claude
                             // Code session resurrection, not a new user
                             // message.
-                            let continue_input =
-                                crate::engine::agent_recovery::continue_input_for_reason(
+                            //
+                            // Try again after a start failure delivers the
+                            // message the agent never read, with its images.
+                            // The agent saw nothing of it, so the bare
+                            // continue message would leave the request lost.
+                            let undelivered = if continue_reason.as_deref()
+                                == Some(crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON)
+                            {
+                                crate::engine::agent_recovery::undelivered_input_after_start_failure(
                                     engine.pool(),
-                                    engine.workspace_path(),
                                     thread_id,
-                                    continue_reason.as_deref(),
                                 )
-                                .await;
+                                .await
+                            } else {
+                                None
+                            };
+                            let continue_images = undelivered
+                                .as_ref()
+                                .and_then(|u| engine.resolve_queued_image_hashes(&u.image_hashes));
+                            let continue_input = match &undelivered {
+                                Some(u) => u.text.clone(),
+                                None => {
+                                    crate::engine::agent_recovery::continue_input_for_reason(
+                                        engine.pool(),
+                                        engine.workspace_path(),
+                                        thread_id,
+                                        continue_reason.as_deref(),
+                                    )
+                                    .await
+                                }
+                            };
                             let mut result = match claim.as_mut() {
                                 Err(e) => Err(e.to_string().into()),
                                 Ok(claim) => {
@@ -346,7 +369,7 @@ impl LucidosEngine {
                                             claim,
                                             request_id,
                                             &continue_input,
-                                            None,
+                                            continue_images.as_deref(),
                                             event_id,
                                             None,
                                             &cancel_token,
@@ -384,14 +407,25 @@ impl LucidosEngine {
                                     thread_id
                                 );
                                 retried = true;
-                                let retry_text =
-                                    crate::engine::agent_recovery::continue_retry_input(
-                                        engine.pool(),
-                                        engine.workspace_path(),
-                                        thread_id,
-                                        continue_reason.as_deref(),
-                                    )
-                                    .await;
+                                let retry_text = match &undelivered {
+                                    Some(u) => {
+                                        crate::engine::agent_session::prepend_reconstruction(
+                                            engine.pool(),
+                                            thread_id,
+                                            &u.text,
+                                        )
+                                        .await
+                                    }
+                                    None => {
+                                        crate::engine::agent_recovery::continue_retry_input(
+                                            engine.pool(),
+                                            engine.workspace_path(),
+                                            thread_id,
+                                            continue_reason.as_deref(),
+                                        )
+                                        .await
+                                    }
+                                };
                                 result = match claim.as_mut() {
                                     Err(e) => Err(e.to_string().into()),
                                     Ok(claim) => {
@@ -400,7 +434,7 @@ impl LucidosEngine {
                                                 claim,
                                                 request_id,
                                                 &retry_text,
-                                                None,
+                                                continue_images.as_deref(),
                                                 event_id,
                                                 None,
                                                 &cancel_token,
@@ -437,6 +471,28 @@ impl LucidosEngine {
                                     event_id,
                                     e
                                 );
+                                // A coding agent that exited before its session
+                                // began says why. Land that as the turn's failure,
+                                // so the settle below finds a terminal and the
+                                // card shows the CLI's words.
+                                if let Err(error) = &result {
+                                    if let Some(agent_exit) =
+                                        crate::engine::agent_session::start_failure::agent_exit_of(
+                                            error.as_ref(),
+                                        )
+                                    {
+                                        crate::engine::agentic_loop::ensure_agent_failure_terminator_emitted(
+                                            &engine.event_bus,
+                                            engine.pool(),
+                                            thread_id,
+                                            event_id,
+                                            Some(crate::engine::thread_events::EventChannel::ClaudeCode),
+                                            &error.to_string(),
+                                            Some(agent_exit),
+                                        )
+                                        .await;
+                                    }
+                                }
                                 // Fail-loud backstop for a re-attached duty:
                                 // the resumed session died before its
                                 // completion could settle the merge (spawn

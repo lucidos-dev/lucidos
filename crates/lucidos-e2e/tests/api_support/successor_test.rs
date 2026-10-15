@@ -151,14 +151,36 @@ impl Drop for WorktreeThread {
     }
 }
 
+/// Record the model and effort a coding-agent session runs on, as a session
+/// start does.
+async fn insert_settings(pool: &sqlx::PgPool, thread_id: Uuid, model: &str, effort: &str) {
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+         VALUES ($1, 'CodingAgentSettingsChanged', $2, $3, 'thread', $3::text)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(json!({"model": model, "reasoning_effort": effort, "coding_agent": "claude-code"}))
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .expect("insert CodingAgentSettingsChanged failed");
+}
+
 /// The context size is the latest capture of the thread's own turn. A
-/// sub-agent's capture never counts, however large or recent it is.
+/// sub-agent's capture never counts, however large or recent it is. The
+/// reading also names the implementer the thread runs on.
 #[tokio::test]
 async fn context_reports_the_latest_main_session_capture() {
     let client = user_client().await;
     let pool = connect().await;
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "idle").await;
+    insert_settings(&pool, thread_id, "claude-opus-5-5", "high").await;
+    let implementer = json!({
+        "coding_agent": "claude-code",
+        "model": "claude-opus-5-5",
+        "reasoning_effort": "high",
+    });
 
     let empty = get_context(&client, thread_id).await;
 
@@ -190,17 +212,17 @@ async fn context_reports_the_latest_main_session_capture() {
 
     assert_eq!(
         empty,
-        json!({"input_tokens": null, "offer": false, "nudge": false, "applied": false}),
+        json!({"input_tokens": null, "offer": false, "nudge": false, "applied": false, "implementer": implementer}),
         "a thread with no captures has no size"
     );
     assert_eq!(
         offered,
-        json!({"input_tokens": offer_size, "offer": true, "nudge": false, "applied": false}),
+        json!({"input_tokens": offer_size, "offer": true, "nudge": false, "applied": false, "implementer": implementer}),
         "the later sub-agent capture must not count"
     );
     assert_eq!(
         nudged,
-        json!({"input_tokens": nudge_size, "offer": true, "nudge": true, "applied": false}),
+        json!({"input_tokens": nudge_size, "offer": true, "nudge": true, "applied": false, "implementer": implementer}),
         "a newer main-session capture is the size"
     );
 }
@@ -312,6 +334,87 @@ async fn composer_successor_wakes_nothing_on_the_old_thread() {
         .send()
         .await
         .ok();
+}
+
+/// The implementer a handoff names is the one the successor's first session
+/// runs on, not the old thread's.
+#[tokio::test]
+async fn successor_runs_on_the_implementer_it_was_handed() {
+    let client = user_client().await;
+    let pool = connect().await;
+    let old = WorktreeThread::seed(&pool, "successor-implementer").await;
+    insert_settings(&pool, old.thread_id, "claude-opus-5-5", "high").await;
+
+    let (status, body) = post_successor(
+        &client,
+        old.thread_id,
+        json!({
+            "message": "Say exactly: \"successor-ok\"",
+            "coding_agent_model": "sonnet",
+            "reasoning_effort": "medium",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "the handoff must succeed: {body}");
+    assert_eq!(
+        body["implementer"],
+        json!({"coding_agent": "claude-code", "model": "sonnet", "reasoning_effort": "medium"}),
+        "the reply names what the successor runs on: {body}"
+    );
+    let successor_id = body["successor_thread_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("successor_thread_id must be a uuid: {body}"));
+
+    // The thread queue records the request it was handed. Its first session
+    // starts on exactly that request.
+    let queued: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload->'data'->'request' FROM events \
+         WHERE event_type = 'ThreadQueued' AND payload->'data'->>'thread_id' = $1 \
+         ORDER BY sequence LIMIT 1",
+    )
+    .bind(successor_id.to_string())
+    .fetch_optional(&pool)
+    .await
+    .expect("read the successor's queued request");
+    client
+        .post(format!("{}/api/v1/threads/archive", base_url()))
+        .json(&json!({ "thread_id": successor_id.to_string() }))
+        .send()
+        .await
+        .ok();
+    let queued = queued.expect("the handoff queues the successor before it replies");
+    assert_eq!(queued["coding_agent"], "claude-code", "{queued}");
+    assert_eq!(queued["cc_model"], "sonnet", "{queued}");
+    assert_eq!(queued["reasoning_effort"], "medium", "{queued}");
+}
+
+/// A model the backend does not offer refuses the handoff before anything is
+/// recorded, and names the models it does offer.
+#[tokio::test]
+async fn successor_refuses_an_implementer_the_backend_lacks() {
+    let client = user_client().await;
+    let pool = connect().await;
+    let old = WorktreeThread::seed(&pool, "successor-bad-implementer").await;
+
+    let (status, body) = post_successor(
+        &client,
+        old.thread_id,
+        json!({"message": "carry on", "coding_agent": "codex", "coding_agent_model": "sonnet"}),
+    )
+    .await;
+    let spawned = count_events_of_type(&pool, old.thread_id, "SuccessorThreadSpawned").await;
+    delete_thread_rows(&pool, old.thread_id).await;
+
+    assert_eq!(status, 400, "an unoffered model must refuse: {body}");
+    assert_eq!(body["reason"], "implementer-not-offered", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("gpt-5.6-sol")),
+        "the refusal lists the offered models: {body}"
+    );
+    assert_eq!(spawned, 0, "a refused handoff records no link");
 }
 
 /// Uncommitted work refuses the handoff, so the successor never starts

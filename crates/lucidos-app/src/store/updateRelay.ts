@@ -18,16 +18,27 @@ export const RELAY_GIVE_UP_MS = 15 * 60_000;
 const STORAGE_KEY = 'lucidos.relayed-update';
 
 /**
+ * Is a desktop app attached and able to install unattended? The gateway refuses
+ * a request while none is, or while the one attached reports a blocker.
+ */
+export function relayClientReady(): boolean {
+  const client = updateRelay.value?.client;
+  return !!client && client.blocker === null;
+}
+
+/**
  * Can the desktop app take the newest release for this session?
  *
- * All three: a client is attached, it reports no blocker, and the gateway knows
- * a release newer than the client. The gateway refuses any other request, so a
- * button offered outside this would be a button that errors.
+ * A client is attached and unblocked, and a release newer than it is known. The
+ * gateway's own check answers that once it has one. Until then the caller's word
+ * stands, because the hourly poll lags a fresh release and the gateway refreshes
+ * its check before it refuses a request (ADR 0338, as amended by ADR 0485).
  */
-export function relayAvailable(): boolean {
+export function relayAvailable(hasNewerRelease: boolean): boolean {
   const client = updateRelay.value?.client;
+  if (!client || client.blocker !== null) return false;
   const latest = releaseCheck.value?.latest?.version;
-  return !!client && client.blocker === null && !!latest && isNewerVersion(latest, client.version);
+  return latest ? isNewerVersion(latest, client.version) : hasNewerRelease;
 }
 
 /** Where a watched request stands after one look at the gateway. */

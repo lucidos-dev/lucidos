@@ -51,7 +51,6 @@ const CONSUMER_EXEMPT: Record<string, Exemption> = {
   'components/chat/LucidosControlMenu.tsx': { tag: 'structure-first', why: 'anchored menu; only kicks off the model list read' },
   'components/chat/MessageRoutePanel.tsx': { tag: 'no-visual', why: 'label lookup that falls back to the raw id' },
   'components/chat/MicrophonePicker.tsx': { tag: 'structure-first', why: 'anchored popover drawn from the first frame' },
-  'components/home/HomeRail.tsx': { tag: 'no-visual', why: 'whether the board has a tile only decides if a hidden rail offers its toggle' },
   'components/layout/Drawer.tsx': { tag: 'no-visual', why: 'derives the pinned set; draws nothing itself' },
   'components/picker/NetworkAccessPopover.tsx': { tag: 'structure-first', why: 'the canonical structure-first popover' },
   'components/plugins/CatalogScanFailure.tsx': { tag: 'single-value', why: 'a failure notice beside a list with its own skeleton' },

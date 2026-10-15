@@ -405,6 +405,7 @@ pub(super) async fn emit_routing_failure(
             thread_id,
             event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                 error: error.to_string(),
+                agent_exit: None,
             },
             meta: EventMeta::NONE,
         })
@@ -1072,7 +1073,7 @@ mod tests {
             } => {
                 assert_eq!(*thread_id, tid);
                 match event {
-                    ThreadEvent::ResponseFailed { error } => {
+                    ThreadEvent::ResponseFailed { error, .. } => {
                         assert_eq!(error, "session gone");
                     }
                     other => panic!("expected ResponseFailed, got {:?}", other),

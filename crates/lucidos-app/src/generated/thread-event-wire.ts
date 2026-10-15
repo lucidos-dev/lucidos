@@ -179,6 +179,19 @@ export type CodingAgent =
   | 'claude-code'
   | 'codex';
 
+/** How a coding agent's process ended, carried on `ResponseFailed` so the card
+ *  can say what happened. The CLI's own words travel in `error`. */
+export interface CodingAgentExit {
+  stage: CodingAgentExitStage;
+  /** The process exit code. `None` when a signal ended it. */
+  code?: number;
+}
+
+/** Where in its life a coding agent's process ended on its own. */
+export type CodingAgentExitStage =
+  | 'startup'
+  | 'mid_turn';
+
 /** The kind of coding-agent thread. Serialized on `SessionStarted` events and
  *  stored in `thread_summaries.coding_agent_kind`. */
 export type CodingAgentKind =
@@ -1103,6 +1116,10 @@ export type ThreadEvent =
   | {
       type: 'ResponseFailed';
       error: string;
+      /** Set when the coding agent's process ended on its own and took the
+       *  turn with it. Absent on every other failure, and on stored events
+       *  from before it existed. */
+      agent_exit?: CodingAgentExit;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */

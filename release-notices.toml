@@ -203,8 +203,8 @@ Home now has two faces: the Home board and the Home chat. Every widget you \
 pinned to Home is a tile on the board, live, at its default size.
 
 On a desktop, the board is a rail at the right edge of the window, beside \
-your threads. The button in the window's top-right corner hides the rail. \
-While the board has a tile, the same button shows it again. Drag the rail's \
+your threads. The button in the window's top-right corner hides the rail, \
+and the same button shows it again. Drag the rail's \
 edge to change its width. The Home icon opens the Home chat.
 
 On a phone, the Home icon opens Home on the board, with the prompt under it. \

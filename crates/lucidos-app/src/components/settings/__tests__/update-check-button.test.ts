@@ -44,10 +44,12 @@ describe('the update-check button', () => {
     expect(page).not.toContain("'guide'");
   });
 
-  // A phone can neither install nor usefully check (ADR 0190), so the gate
-  // stands the button down.
-  it('offers a phone no update button', () => {
+  // A phone can neither install nor usefully check on its own (ADR 0190), so
+  // the gate stands the button down. The relay and the check that leads to it
+  // are the two ways in (ADR 0485).
+  it('offers a phone an update button only through its desktop app', () => {
     expect(page).toContain('(canInstallHere || canCheckHere) && !thisDeviceIsMobile()');
+    expect(page).toContain("route === 'check' && thisDeviceIsMobile()");
   });
 
   // The subtraction must not reach `canCheckHere` itself. That value feeds

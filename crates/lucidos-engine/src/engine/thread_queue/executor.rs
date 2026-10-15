@@ -572,7 +572,10 @@ impl LucidosEngine {
     /// Resolve content-addressed image hashes back to inline `ChatImage`s.
     /// Missing blobs are dropped with a log line (same policy as
     /// `chat_submit`'s `image_hashes` resolution).
-    fn resolve_queued_image_hashes(&self, hashes: &[String]) -> Option<Vec<crate::api::ChatImage>> {
+    pub(crate) fn resolve_queued_image_hashes(
+        &self,
+        hashes: &[String],
+    ) -> Option<Vec<crate::api::ChatImage>> {
         if hashes.is_empty() {
             return None;
         }

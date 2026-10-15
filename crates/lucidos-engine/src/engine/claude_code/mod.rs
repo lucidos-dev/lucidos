@@ -506,6 +506,7 @@ pub(crate) async fn emit_background_task_failure(
                     thread_id,
                     event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                         error: error.to_string(),
+                        agent_exit: None,
                     },
                     meta: crate::engine::thread_events::EventMeta::NONE,
                 },

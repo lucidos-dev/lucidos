@@ -1912,7 +1912,7 @@ past its box.
 
 Under `system`, `watchPreferences()` watches the OS appearance two ways. The `prefers-color-scheme` media query covers a flip while the app is on screen. The frame's resume (`visibilitychange`, `focus`, `pageshow`) covers one announced while it was not, the normal case in an installed iOS PWA.
 
-Both sample a moment after the event. A moved theme repaints only if a second read, about a second later, still sees the move. So a brief iOS wake that still reports the app-switcher snapshot's appearance repaints nothing. Your app does none of this itself.
+Both sample a moment after the event. A moved theme repaints only if a second read, about a second later, still sees the move. So a brief iOS wake that still reports the app-switcher snapshot's appearance repaints nothing. Only that read, or a shell push carrying the shell's own mode, moves an app already on `system`. A fetch answer keeps the mode on screen. Your app does none of this itself.
 
 `navigate()` sends a navigation request to the Lucidos frontend via SSE. `target`
 and `params` (`NavigateParams` = `NavigateUi` minus `target`) are typed against

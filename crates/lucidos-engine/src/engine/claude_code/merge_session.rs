@@ -117,6 +117,7 @@ impl CodingAgentChangeOps for LucidosEngine {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                     error: format!("Failed to emit prompt: {}", e),
+                                    agent_exit: None,
                                 },
                                 meta: crate::engine::thread_events::EventMeta::NONE,
                             },

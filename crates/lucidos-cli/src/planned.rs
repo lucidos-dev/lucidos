@@ -14,17 +14,35 @@ use crate::hardened::{git_context, run_git};
 use crate::http::client as http_client;
 use crate::workspace::{BoxError, Workspace};
 
-/// What picking `Implement in a new thread` does. Printed only when this
-/// thread's measured context calls for the option ([`card_shape`]).
-pub(crate) const NEW_THREAD_HANDOFF: &str = "Picking `Implement in a new thread` approves the \
-    plan: run `lucidos planned approve` here, then hand the build to a successor thread with \
-    `lucidos successor spawn --narrative <file>` (`lucidos successor --help` has the format). \
-    The narrative names the plan path and says the user approved it here, so the builder builds \
-    it phase by phase without asking again. The successor's branch starts at this branch's last \
-    commit, so it already holds the plan, and the approved marker carries over. End your turn \
-    with the link it prints. If the handoff is refused for authority, run the \
-    `lucidos ask-owner-approval` it names, then retry. `Approve here` builds in this thread \
+/// What picking an `Implement in a new thread` option does. Printed only
+/// when this thread's measured context calls for the option ([`card_shape`]).
+pub(crate) const NEW_THREAD_HANDOFF: &str = "Picking an `Implement in a new thread` option \
+    approves the plan: run `lucidos planned approve` here, then hand the build to a successor \
+    thread with `lucidos successor spawn --narrative <file>`. Add only the flags that differ \
+    from this thread's implementer: `--coding-agent <backend>`, `--coding-agent-model <model id>`, \
+    `--reasoning-effort <level>`. An omitted flag keeps this thread's, so picking this thread's \
+    implementer adds none. Pass model ids, not picker labels (`claude-sonnet-5-5`, not `Sonnet 5.5`). A typed \
+    reply naming another implementer works the same way. Lucidos refuses a model or effort the \
+    backend does not offer, and lists the ones it does. `lucidos successor --help` has the \
+    narrative format. The narrative names the plan path and says the user approved it here, so \
+    the builder builds it phase by phase without asking again. The successor's branch starts at \
+    this branch's last commit, so it already holds the plan, and the approved marker carries \
+    over. End your turn with the link it prints. If the handoff is refused for authority, run \
+    the `lucidos ask-owner-approval` it names, then retry. `Approve here` builds in this thread \
     instead.";
+
+/// How the planning agent picks the successor's implementer. Whether to offer
+/// a new thread is the measured context's call; which implementer is the
+/// agent's, because only the agent has read the plan.
+const IMPLEMENTER_CHOICE: &str = "Recommend the successor's implementer too: backend, model and \
+    reasoning effort, by your judgement of the plan. A fully specified plan with settled \
+    decisions suits a cheaper model, such as Sonnet. A plan that leaves design judgement to the \
+    builder keeps this thread's model. Say why in one line of your message. Offer, in order: \
+    `Implement in a new thread: <implementer> (Recommended)`; `Implement in a new thread: \
+    <this thread's implementer>`, only when it differs; `Approve here`; then a real fork of the \
+    plan if it has one. That is never more than 4 options, and never `Request changes`. Name an \
+    implementer by the model's picker label and the effort, for example `Sonnet 5.5, high`. Name \
+    the backend only when it is not this thread's, for example `Codex GPT-5.6 Sol, high`.";
 
 /// The plan-approval card's options under the floor: today's shape.
 const FLOOR_SHAPE: &str = "Offer `Approve` / `Request changes`. The option pair is a floor: if \
@@ -40,15 +58,21 @@ pub(crate) fn card_shape(reading: crate::successor::ContextReading) -> String {
         ContextReading::Read {
             offer: true,
             input_tokens,
+            implementer,
         } => {
             let size = input_tokens
                 .map(|t| format!("{}k tokens", t / 1000))
                 .unwrap_or_else(|| "large".to_string());
+            let runs_on = implementer
+                .map(|i| format!("This thread runs on {}.", i.describe()))
+                .unwrap_or_else(|| {
+                    "Lucidos could not read this thread's implementer, so name the model you run \
+                     on."
+                    .to_string()
+                });
             format!(
                 "This thread's context is {size}, large enough that the build belongs in a \
-                 fresh thread. So offer `Implement in a new thread (Recommended)` first and \
-                 `Approve here` second, plus a real fork of the plan if it has one. Never offer \
-                 `Request changes` beside them. {NEW_THREAD_HANDOFF}"
+                 fresh thread. {runs_on} {IMPLEMENTER_CHOICE} {NEW_THREAD_HANDOFF}"
             )
         }
         ContextReading::Read { offer: false, .. } => FLOOR_SHAPE.to_string(),

@@ -10,6 +10,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { PREF_FONT_FAMILY } from './generated/preference-catalog';
 import {
+  PAINTED_THEME_MODE_PUSH_KEY,
   readAppearancePush,
   sanitizeAppearancePush,
   DEFAULT_MOTION,
@@ -43,6 +44,7 @@ import {
   resolveReducedMotion,
   resolveFont,
   resolveFontKey,
+  repaintThemeMode,
   resolveThemeMode,
   resolveThemeModePreference,
   type FontId,
@@ -99,6 +101,34 @@ describe('resolving a theme against the OS', () => {
   it('every resolved theme has a background to paint before any stylesheet', () => {
     expect(THEME_MODE_BG.light).toBe('#ffffff');
     expect(THEME_MODE_BG.dark).toBe('#07172e');
+  });
+});
+
+describe('what a repaint paints', () => {
+  const os = (light: boolean) => vi.fn(() => light);
+
+  it('keeps the painted mode under a system preference that was already system', () => {
+    const read = os(true);
+    expect(repaintThemeMode('system', 'system', 'dark', read)).toBe('dark');
+    expect(repaintThemeMode('system', 'system', 'light', os(false))).toBe('light');
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('resolves against the OS when the preference moves into system', () => {
+    expect(repaintThemeMode('system', 'dark', 'dark', os(true))).toBe('light');
+    expect(repaintThemeMode('system', 'light', 'light', os(false))).toBe('dark');
+  });
+
+  it('resolves against the OS when nothing usable is painted yet', () => {
+    expect(repaintThemeMode('system', 'system', null, os(true))).toBe('light');
+    expect(repaintThemeMode('system', 'system', 'bogus', os(false))).toBe('dark');
+  });
+
+  it('never consults the OS for an explicit mode', () => {
+    const read = os(true);
+    expect(repaintThemeMode('dark', 'system', 'light', read)).toBe('dark');
+    expect(repaintThemeMode('light', 'light', 'dark', read)).toBe('light');
+    expect(read).not.toHaveBeenCalled();
   });
 });
 
@@ -419,17 +449,21 @@ describe('the appearance push', () => {
       'lucidos-ui-scale': '125',
       'lucidos-style-overrides': '{"--accent":"red"}',
     };
-    expect(readAppearancePush(key => mirror[key] ?? null)).toEqual({
+    expect(readAppearancePush(key => mirror[key] ?? null, 'dark')).toEqual({
       'theme-mode': 'light',
       theme_resolved: '{"light":{},"dark":{}}',
       'ui-scale': '125',
       style_overrides: '{"--accent":"red"}',
+      [PAINTED_THEME_MODE_PUSH_KEY]: 'dark',
     });
+    expect(readAppearancePush(() => null, null)).toEqual({});
   });
 
   it('keeps only the known keys, and only strings', () => {
     expect(sanitizeAppearancePush({ 'ui-scale': '150', motion: 3, chat_model: 'x' }))
       .toEqual({ 'ui-scale': '150' });
+    expect(sanitizeAppearancePush({ [PAINTED_THEME_MODE_PUSH_KEY]: 'light' }))
+      .toEqual({ [PAINTED_THEME_MODE_PUSH_KEY]: 'light' });
     expect(sanitizeAppearancePush(null)).toBeNull();
     expect(sanitizeAppearancePush(['ui-scale'])).toBeNull();
   });

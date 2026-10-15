@@ -29,12 +29,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::agent_runtime::{AgentEvent, AgentInput, AgentPermissionRequest, ControlRequest};
-use super::claude_code::format_exit_status;
+use super::agent_runtime::{
+    AgentEvent, AgentExitFacts, AgentInput, AgentPermissionRequest, ControlRequest,
+};
+use super::claude_code::{format_exit_status, EXIT_AFTER_STDOUT_EOF_GRACE};
 use super::codex::{lucidos_mcp_server_config_json, write_image_files, CodexConfig};
 use super::codex_app_server_parse::{
     parse_app_server_line, parse_approval_request, AppServerLine, AppServerTracker,
 };
+use super::spawn_env::StderrTail;
 
 /// How long the handshake (initialize → thread established) may take before
 /// the driver gives up and synthesizes a failure. Generous — a cold codex
@@ -195,7 +198,11 @@ fn build_turn_start_params(
 }
 
 /// Spawn the persistent `codex app-server` child.
-fn spawn_app_server_child(config: &CodexConfig) -> std::io::Result<tokio::process::Child> {
+/// Returns the child and the secret values its env carries, which its stderr
+/// tail masks.
+fn spawn_app_server_child(
+    config: &CodexConfig,
+) -> std::io::Result<(tokio::process::Child, Vec<String>)> {
     let mut cmd = tokio::process::Command::new(&config.codex_bin);
     cmd.arg("app-server")
         .current_dir(&config.worktree_path)
@@ -208,7 +215,8 @@ fn spawn_app_server_child(config: &CodexConfig) -> std::io::Result<tokio::proces
     for (k, v) in &config.env {
         cmd.env(k, v);
     }
-    super::spawn_env::spawn_below_engine(&mut cmd)
+    let secrets = super::spawn_env::command_secret_values(&cmd);
+    Ok((super::spawn_env::spawn_below_engine(&mut cmd)?, secrets))
 }
 
 /// Drive one persistent app-server session. See module docs for the contract.
@@ -221,8 +229,8 @@ pub(super) async fn app_server_driver_task(
     permission_tx: mpsc::UnboundedSender<AgentPermissionRequest>,
     cancel: CancellationToken,
 ) {
-    let mut child = match spawn_app_server_child(&config) {
-        Ok(c) => c,
+    let (mut child, secrets) = match spawn_app_server_child(&config) {
+        Ok(spawned) => spawned,
         Err(e) => {
             log!("[CodexAppServer] failed to spawn codex app-server: {}", e);
             let _ = events_tx.send(AgentEvent::Result {
@@ -230,10 +238,8 @@ pub(super) async fn app_server_driver_task(
                 duration_ms: 0,
                 error: Some(format!("Failed to start Codex: {e}")),
             });
-            // Codex doesn't classify signal-kills — its app-server interrupt is
-            // graceful, so the stray-SIGTERM auto-resume path is CC-only.
             let _ = events_tx.send(AgentEvent::Exited {
-                killed_by_signal: false,
+                exit: AgentExitFacts::default(),
             });
             return;
         }
@@ -241,7 +247,9 @@ pub(super) async fn app_server_driver_task(
     let child_pid = child.id();
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
+    // Read while the child runs: a process that lives for a whole turn-set
+    // would block mid-write on an undrained 64 KB pipe, which reads as a hang.
+    let stderr = StderrTail::spawn(child.stderr.take().expect("piped stderr"), secrets);
 
     // Cancel-safe stdout: a dedicated reader task feeds whole lines into an
     // mpsc. `read_line` directly in a `select!` arm is NOT cancel-safe —
@@ -267,36 +275,6 @@ pub(super) async fn app_server_driver_task(
         }
         // lines_tx drops — the driver sees recv() = None as stdout EOF.
     });
-
-    // The persistent child's stderr must be drained CONTINUOUSLY — unlike
-    // the per-turn exec children, this process lives for a whole turn-set,
-    // and an undrained 64KB pipe would eventually block codex mid-write,
-    // silencing stdout and reading as a hang. Keep a bounded tail for the
-    // wind-down diagnostic log.
-    let stderr_tail: std::sync::Arc<std::sync::Mutex<VecDeque<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    {
-        let tail = stderr_tail.clone();
-        tokio::spawn(async move {
-            const TAIL_BUDGET: usize = 4096;
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let mut t = tail.lock().unwrap();
-                        t.push_back(line.clone());
-                        while t.iter().map(String::len).sum::<usize>() > TAIL_BUDGET && t.len() > 1
-                        {
-                            t.pop_front();
-                        }
-                    }
-                }
-            }
-        });
-    }
 
     // Driver action queue — approval-response tasks and the main loop share it
     // so stdin writes and approval-state updates stay ordered in one place.
@@ -334,6 +312,12 @@ pub(super) async fn app_server_driver_task(
     // teardown's process-group kill, so it names the reaping rather than the
     // logging it also drives.
     let mut child_reaped = false;
+    // The child's own exit status, kept only when the OS reported it gone
+    // before any teardown kill of ours.
+    let mut natural_exit_status: Option<std::process::ExitStatus> = None;
+    // True when the loop ended on stdout EOF, where the child is usually
+    // exiting.
+    let mut stdout_closed = false;
     let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
 
     // All stdin writes go through this macro: bounded so a wedged child
@@ -408,6 +392,7 @@ pub(super) async fn app_server_driver_task(
                     // after child.wait fired; everything buffered has been
                     // processed by this arm already).
                     log!("[CodexAppServer] stdout EOF — child gone");
+                    stdout_closed = true;
                     break 'session;
                 };
                 match parse_app_server_line(&line) {
@@ -667,6 +652,7 @@ pub(super) async fn app_server_driver_task(
                     "[CodexAppServer] app-server child died (status={}) — draining remaining stdout",
                     format_exit_status(&wait_result),
                 );
+                natural_exit_status = wait_result.ok();
                 child_reaped = true;
                 child_death_drain_deadline = Some(
                     tokio::time::Instant::now() + std::time::Duration::from_millis(500),
@@ -696,6 +682,18 @@ pub(super) async fn app_server_driver_task(
     // drops their respond_rx, which releases the engine-side waiters (see
     // the JoinSet comment above).
     drop(approval_tasks);
+
+    // A dying process closes its stdout before the OS can report it gone, so
+    // give it a moment to exit by itself. Its own status then classifies the
+    // death instead of our teardown kill.
+    if stdout_closed && !child_reaped {
+        if let Ok(Ok(status)) =
+            tokio::time::timeout(EXIT_AFTER_STDOUT_EOF_GRACE, child.wait()).await
+        {
+            natural_exit_status = Some(status);
+            child_reaped = true;
+        }
+    }
 
     // Reap the child. The persistent process has no clean-exit path of its
     // own, so the driver kills it on wind-down (a no-op if it already died).
@@ -733,12 +731,9 @@ pub(super) async fn app_server_driver_task(
             }
         };
 
-    let stderr_text: String = {
-        let tail = stderr_tail.lock().unwrap();
-        tail.iter().map(String::as_str).collect()
-    };
-    if !stderr_text.trim().is_empty() {
-        log!("[CodexAppServer] codex stderr: {}", stderr_text.trim());
+    let stderr_text = stderr.finish().await;
+    if !stderr_text.is_empty() {
+        log!("[CodexAppServer] codex stderr: {}", stderr_text);
     }
     if !child_reaped {
         log!(
@@ -761,10 +756,7 @@ pub(super) async fn app_server_driver_task(
         let reason = tracker
             .last_error
             .clone()
-            .or_else(|| {
-                let t = stderr_text.trim();
-                (!t.is_empty()).then(|| t.to_string())
-            })
+            .or_else(|| (!stderr_text.is_empty()).then(|| stderr_text.clone()))
             .unwrap_or_else(|| {
                 format!(
                     "codex app-server exited unexpectedly ({})",
@@ -779,9 +771,13 @@ pub(super) async fn app_server_driver_task(
     }
 
     // Codex's app-server interrupt is graceful, so the stray-SIGTERM
-    // auto-resume path stays CC-only — no signal classification here.
+    // auto-resume path stays CC-only: `killed_by_signal` is never set here.
     let _ = events_tx.send(AgentEvent::Exited {
-        killed_by_signal: false,
+        exit: AgentExitFacts {
+            killed_by_signal: false,
+            code: natural_exit_status.and_then(|status| status.code()),
+            stderr_tail: stderr_text,
+        },
     });
     // events_tx drops here — channel closes, consumer sees None.
 }

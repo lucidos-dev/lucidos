@@ -198,7 +198,10 @@ fn thread_event_type_name_extraction() {
             "ResponseAborted",
         ),
         (
-            ThreadEvent::ResponseFailed { error: "e".into() },
+            ThreadEvent::ResponseFailed {
+                error: "e".into(),
+                agent_exit: None,
+            },
             "ResponseFailed",
         ),
         (

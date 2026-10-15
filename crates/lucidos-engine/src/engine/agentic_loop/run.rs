@@ -814,6 +814,7 @@ impl LucidosEngine {
                                     thread_id,
                                     event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                         error: e.to_string(),
+                                        agent_exit: None,
                                     },
                                     meta: meta.clone(),
                                 },
@@ -1325,6 +1326,7 @@ impl LucidosEngine {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                     error: error.to_string(),
+                                    agent_exit: None,
                                 },
                                 meta: meta.clone(),
                             },
@@ -1698,6 +1700,7 @@ impl LucidosEngine {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                     error,
+                                    agent_exit: None,
                                 },
                                 meta: meta.clone(),
                             },
@@ -2625,6 +2628,7 @@ impl LucidosEngine {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                 error: reason.clone(),
+                                agent_exit: None,
                             },
                             meta: meta.clone(),
                         },

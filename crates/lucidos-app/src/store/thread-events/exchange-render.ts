@@ -11,7 +11,7 @@ import type { ContextAssembledData, ContextCapture, ContextSection, RecalledMemo
 import type { Exchange } from './exchange';
 import type { ThreadState } from './thread-meta';
 import type { OngoingGroup } from '../store';
-import type { ActorMode, EventSubscription, EventWaitCancelCause, MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
+import type { ActorMode, CodingAgentExit, EventSubscription, EventWaitCancelCause, MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
 
 /** The two projections' step shapes, as far as the resolvers care. */
 type StepLike = { outcome: StepOutcome; description?: string; tool_name?: string; call_event_id?: string };
@@ -1487,6 +1487,9 @@ export function changePanelHasContinuation(exchange: Exchange): boolean {
 export interface ExchangeError {
   /** `ResponseFailed.error`, the text rendered in the card. */
   message: string;
+  /** Set when the coding agent's process exited on its own, which swaps the
+   *  generic card for one that explains it and offers Try again. */
+  agentExit?: CodingAgentExit;
   /** The `ResponseFailed`'s OWN event id. `ChatExchange` stamps it on the card
    *  as `data-event-id`, which is what resolves a notification deep-link to a
    *  failure (`scrollToEventAndPulse`) and pulses the card itself.
@@ -1500,7 +1503,7 @@ export interface ExchangeError {
 /** The error a failed exchange carries, or null when it didn't fail. */
 export function exchangeError(exchange: Exchange): ExchangeError | null {
   for (const { event } of exchange.steps) {
-    if (event.type === 'ResponseFailed') return { message: event.error, eventId: event._eventId };
+    if (event.type === 'ResponseFailed') return { message: event.error, agentExit: event.agent_exit, eventId: event._eventId };
   }
   return null;
 }

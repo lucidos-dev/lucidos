@@ -212,6 +212,7 @@ async fn test_cc_child_response_failed_then_idled_decrements_parent() {
         thread_id: child_id,
         event: ThreadEvent::ResponseFailed {
             error: "agentic loop blew up".into(),
+            agent_exit: None,
         },
         meta: EventMeta::NONE,
     })

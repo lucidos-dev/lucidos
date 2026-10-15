@@ -147,13 +147,18 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
   const offeredVersion = packagedUpdateVersion();
   const canInstallHere = canInstallUpdateHere();
   const canCheckHere = canCheckForUpdatesHere();
-  // A phone can neither install nor usefully check (ADR 0190), so it gets no
-  // button, unless the desktop app can take the update for it (ADR 0338). The
-  // subtraction lands HERE, never on `canCheckHere`, which stays a capability.
-  // `updateGuidance` reads that to reason about the INSTALL. A phone answering
-  // "cannot check" makes it claim a desktop app on a machine that may have none.
-  const relay = updateRoute() === 'relay';
-  const offersUpdateControl = relay || ((canInstallHere || canCheckHere) && !thisDeviceIsMobile());
+  // A phone can neither install nor usefully check on its own (ADR 0190), so it
+  // gets no button, unless the desktop app can take the update for it (ADR 0338).
+  // Then it gets the relay, or the check that finds the release to relay
+  // (ADR 0485). The subtraction lands HERE, never on `canCheckHere`, which stays a
+  // capability. `updateGuidance` reads that to reason about the INSTALL. A phone
+  // answering "cannot check" makes it claim a desktop app on a machine that may
+  // have none.
+  const route = updateRoute();
+  const relay = route === 'relay';
+  const phoneChecksViaDesktop = route === 'check' && thisDeviceIsMobile();
+  const offersUpdateControl =
+    relay || phoneChecksViaDesktop || ((canInstallHere || canCheckHere) && !thisDeviceIsMobile());
   const pageRoute: UpdateRoute = relay ? 'relay' : canInstallHere ? 'install' : 'check';
   const tauriHasUpdate = !!offeredVersion;
   const check = releaseCheck.value;

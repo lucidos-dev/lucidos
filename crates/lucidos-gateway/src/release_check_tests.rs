@@ -274,18 +274,18 @@ fn writing_without_a_home_is_an_error_not_a_panic() {
 
 // ── Live requests against a throwaway origin ────────────────────────────────
 
-struct Origin {
-    url: String,
+pub(crate) struct Origin {
+    pub(crate) url: String,
     seen: Arc<Mutex<Vec<String>>>,
 }
 
 impl Origin {
-    fn requests(&self) -> usize {
+    pub(crate) fn requests(&self) -> usize {
         self.seen.lock().unwrap().len()
     }
 }
 
-fn http_ok(body: &str) -> String {
+pub(crate) fn http_ok(body: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
          content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -294,7 +294,7 @@ fn http_ok(body: &str) -> String {
 }
 
 /// A loopback origin that records each request and answers with `response`.
-async fn origin_serving(response: String, delay: Duration) -> Origin {
+pub(crate) async fn origin_serving(response: String, delay: Duration) -> Origin {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -325,7 +325,7 @@ async fn origin_serving(response: String, delay: Duration) -> Origin {
 }
 
 /// An installed deployment whose preference lives in `dir`.
-fn deployment_in(dir: &Path, enabled: bool) -> Deployment {
+pub(crate) fn deployment_in(dir: &Path, enabled: bool) -> Deployment {
     let config = dir.join("updates.toml");
     write_updates_toml(Some(&config), &UpdatesToml { enabled }).unwrap();
     Deployment {

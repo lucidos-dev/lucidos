@@ -620,6 +620,7 @@ async fn cc_idle_after_failed_turn_preserves_failed_status() {
         thread_id,
         event: ThreadEvent::ResponseFailed {
             error: "Unknown error".into(),
+            agent_exit: None,
         },
         meta: EventMeta::NONE,
     })

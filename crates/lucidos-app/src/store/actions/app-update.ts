@@ -4,7 +4,7 @@ import type { ToastAction } from '../types';
 // The READ lives a layer up, where a surface can ask "is there an update?"
 // without importing this module's toasts, IPC and menu navigation.
 import { packagedUpdateVersion } from '../packagedUpdate';
-import { relayAvailable } from '../updateRelay';
+import { relayAvailable, relayClientReady } from '../updateRelay';
 import { refreshUpdateRelay, resumeRelayedUpdate, watchRelayedUpdate, type RelayNews } from './update-relay';
 import { openWhatsNew, openSettingsSubview } from './menu';
 import { isTauri, thisDeviceIsMobile } from '../../utils/platform';
@@ -366,19 +366,24 @@ export function canCheckForUpdatesHere(): boolean {
  *  reader a release is newer must not then offer to go and find out.
  *
  *  **`relay` is decided first**, because it is the one route that lets a phone
- *  act. It needs a release the GATEWAY knows, not merely one `hasNewerRelease`
- *  asserts: the gateway refuses a request for anything else.
+ *  act. It takes a release from either source: the gateway's own check, or a
+ *  caller that knows better. The gateway refreshes its check before it refuses a
+ *  request, so a release it has not polled yet is still taken (ADR 0338).
  *
- *  **Otherwise a mobile client gets one answer, whatever the state.** None of
+ *  **Otherwise a mobile client gets one answer, with one exception.** None of
  *  the branches below can reach a different one: Lucidos ships no mobile client,
  *  so `isTauri()` is false and `install` is already out. What it takes away is
- *  `check`, whose only outcomes on a phone are "up to date" and this same
- *  sentence. And `guide`, which spends a page load to say it. */
+ *  `check`, whose only outcomes on a phone were "up to date" and this same
+ *  sentence (ADR 0190). And `guide`, which spends a page load to say it. The
+ *  exception is a phone whose desktop app can take an update: there a check that
+ *  finds a release turns into `relay`, so it leads somewhere. */
 export function updateRoute(
   hasNewerRelease: boolean = packagedUpdateVersion() !== null,
 ): UpdateRoute {
-  if (hasNewerRelease && !sessionCanInstall() && relayAvailable()) return 'relay';
-  if (thisDeviceIsMobile()) return 'desktop';
+  if (hasNewerRelease && !sessionCanInstall() && relayAvailable(hasNewerRelease)) return 'relay';
+  if (thisDeviceIsMobile()) {
+    return !hasNewerRelease && relayClientReady() && canCheckForUpdatesHere() ? 'check' : 'desktop';
+  }
   if (hasNewerRelease) return sessionCanInstall() ? 'install' : 'guide';
   return canCheckForUpdatesHere() ? 'check' : 'guide';
 }

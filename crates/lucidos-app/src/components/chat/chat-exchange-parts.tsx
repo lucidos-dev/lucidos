@@ -192,7 +192,7 @@ export function changeEventRowBody({ type, headline, headlinePending, stateLabel
  *  (`continuableAbortIndex`). Disables itself between click and response, and
  *  `continueStoppedThread` refuses a second press, so a double-click can't
  *  double-emit. Surfaces network failures via toast and re-enables. */
-export function ContinueButton({ threadId }: { threadId: string }) {
+export function ContinueButton({ threadId, label = 'Continue' }: { threadId: string; label?: string }) {
   const inFlight = useSignal(false);
   const onClick = async (e: MouseEvent) => {
     e.stopPropagation();
@@ -209,7 +209,7 @@ export function ContinueButton({ threadId }: { threadId: string }) {
   };
   return (
     <button class="action-btn" onClick={onClick} disabled={inFlight.value}>
-      {inFlight.value ? 'Continuing...' : 'Continue'}
+      {inFlight.value ? 'Continuing...' : label}
     </button>
   );
 }

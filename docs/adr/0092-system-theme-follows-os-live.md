@@ -97,6 +97,33 @@ before. One helper, `followSystemThemeMode` in
 `packages/lucidos-sdk/src/appearance.ts`, now carries the timers for the shell
 and every app iframe, so the two cannot drift apart.
 
+### Amendment: only the follower moves a page already on `system`
+
+The guards held only for the follower. Every other repaint re-resolved `system`
+against the live media query, with none of them. In the shell that is
+`applyTheme`, run by startup's first preference load, every theme fetch and
+every edit of the active theme's file. In an app frame it is `paint`, run by
+every shell push and every preference fetch.
+
+A mobile-webkit run of `system-theme-follows-os.spec.ts` caught it. The test
+hid the page and flipped the OS to light. Startup's preference load, slow on
+that runner, landed afterwards and painted the hidden page light. On an iPhone
+the same repaint can land inside the snapshot pass.
+
+So a repaint under a preference that was already `system` now keeps the mode
+on `<html>` (`repaintThemeMode` in `packages/lucidos-sdk/src/appearance.ts`).
+Only the follower's confirmed read takes a fresh OS read and moves it. A
+change of preference into `system` still resolves against the OS at once,
+since the user just chose it. A repaint also no longer cancels a pending
+follower read, which would otherwise lose a real flip.
+
+An app frame's shell push now carries the mode the shell painted
+(`PAINTED_THEME_MODE_PUSH_KEY`), and a frame on `system` paints it. Before, the
+push made the frame re-read the OS. That is how a frame followed a flip the
+shell caught on a window `focus` the frame never received. The shell's mode
+already passed the guards, so adopting it keeps that path without an unguarded
+read.
+
 ## Consequences
 
 - A theme flip is applied about 1.3 seconds after the OS announces it, on every
@@ -107,6 +134,9 @@ and every app iframe, so the two cannot drift apart.
 - The two guards are load-bearing rather than defensive. Dropping the visibility
   check re-opens the flash on iOS, so it is pinned by unit tests in both
   surfaces rather than left to review.
+- Under `system`, the follower is the only path from the OS appearance to the
+  page. A new repaint path inherits the guards by going through
+  `repaintThemeMode`, and must never sample the media query itself.
 - **iOS 17 is not fixed by this, and cannot be.** A home-screen PWA froze
   `prefers-color-scheme` at its launch value there, so no listener and no
   re-read can move it ([Apple Developer Forums thread](https://developer.apple.com/forums/thread/739154),

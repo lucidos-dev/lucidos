@@ -12,8 +12,9 @@ import { focusedThreadId, threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { threadHeaderActions, threadHeaderHomeAction } from '../ThreadHeaderActions';
 import { HomeMenuGroup } from '../BrandMenuRows';
-import { HomeRailToggle, homeRailToggleOffered } from '../../home/HomeRail';
+import { HomeRailToggle } from '../../home/HomeRail';
 import { act } from 'preact/test-utils';
+import { homeBoards } from '../../../store/homeBoard';
 import { homeRailShown, setHomeRailShown } from '../../../store/homeRail';
 
 function seedThreads(withHome: boolean): void {
@@ -79,16 +80,16 @@ describe('the Home rail toggle', () => {
     expect(button.getAttribute('aria-label')).toBe('Show Home board');
   });
 
-  it('is offered while the rail shows, and while hidden only for a board with tiles', () => {
-    const tiles = (n: number) => ({
-      status: 'loaded' as const,
-      data: { tiles: Array.from({ length: n }, () => ({}) as never) } as never,
-    });
-    expect(homeRailToggleOffered(true, { status: 'not-loaded' })).toBe(true);
-    expect(homeRailToggleOffered(true, tiles(0))).toBe(true);
-    expect(homeRailToggleOffered(false, { status: 'not-loaded' })).toBe(false);
-    expect(homeRailToggleOffered(false, tiles(0))).toBe(false);
-    expect(homeRailToggleOffered(false, tiles(1))).toBe(true);
+  it('is offered with the rail hidden and the board empty, so the rail can come back', () => {
+    seedThreads(true);
+    setHomeRailShown(false);
+    homeBoards.value = new Map([['desktop', { status: 'loaded', data: { tiles: [] } as never }]]);
+    render(<HomeRailToggle />, host);
+    const button = host.querySelector<HTMLButtonElement>('button.home-rail-toggle')!;
+    expect(button.getAttribute('aria-label')).toBe('Show Home board');
+    expect(document.documentElement.hasAttribute('data-home-rail-toggle')).toBe(true);
+    act(() => button.click());
+    expect(homeRailShown.value).toBe(true);
   });
 });
 

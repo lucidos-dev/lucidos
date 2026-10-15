@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // collapsed into one.
 import { ui, webFontUrl, webFontUrls } from './ui';
 import {
-  EMPTY_THEME, FONT_CATALOG, FOLLOW_THEME, SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS,
+  EMPTY_THEME, FONT_CATALOG, FOLLOW_THEME, PAINTED_THEME_MODE_PUSH_KEY, SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS,
   parseResolvedTheme, resolveFontKey,
 } from './appearance';
 
@@ -158,10 +158,12 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   let attrs: Record<string, string>;
   let originalGetAttribute: unknown;
   let originalSetAttribute: unknown;
-  /** `vi.resetModules()` leaves an earlier case's bridge listening on
-   *  `window`, so each case removes the message listeners it added. */
-  let messageListeners: EventListenerOrEventListenerObject[];
-  let origAddEventListener: typeof window.addEventListener;
+  /** `vi.resetModules()` leaves an earlier case's bridge and OS follower
+   *  listening on `window` and `document`, so each case removes the listeners
+   *  it added. A leftover follower would repaint this case's page. */
+  let moduleListeners: Array<[EventTarget, string, EventListenerOrEventListenerObject]>;
+  let origWindowAdd: typeof window.addEventListener;
+  let origDocumentAdd: typeof document.addEventListener;
 
   function setVisibility(state: 'visible' | 'hidden'): void {
     (document as { visibilityState: string }).visibilityState = state;
@@ -184,12 +186,17 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.useFakeTimers();
-    messageListeners = [];
-    origAddEventListener = window.addEventListener;
+    moduleListeners = [];
+    origWindowAdd = window.addEventListener;
+    origDocumentAdd = document.addEventListener;
     window.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
-      if (type === 'message') messageListeners.push(listener);
-      Reflect.apply(origAddEventListener, window, [type, listener, options]);
+      if (['message', 'focus', 'pageshow'].includes(type)) moduleListeners.push([window, type, listener]);
+      Reflect.apply(origWindowAdd, window, [type, listener, options]);
     }) as typeof window.addEventListener;
+    document.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
+      if (type === 'visibilitychange') moduleListeners.push([document, type, listener]);
+      Reflect.apply(origDocumentAdd, document, [type, listener, options]);
+    }) as typeof document.addEventListener;
     sseOn = vi.fn();
     sseConnect = vi.fn();
     getMock = vi.fn().mockResolvedValue({ 'theme-mode': 'system' });
@@ -231,8 +238,9 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
   });
 
   afterEach(() => {
-    window.addEventListener = origAddEventListener;
-    for (const listener of messageListeners) window.removeEventListener('message', listener);
+    window.addEventListener = origWindowAdd;
+    document.addEventListener = origDocumentAdd;
+    for (const [target, type, listener] of moduleListeners) target.removeEventListener(type, listener);
     vi.doUnmock('./sse');
     vi.doUnmock('./preferences');
     (globalThis as { matchMedia?: unknown }).matchMedia = origMatchMedia;
@@ -257,14 +265,16 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     expect(mqChangeListeners).toHaveLength(1);
   });
 
-  it('re-applies on an OS flip announced while the frame is visible', async () => {
+  it('repaints on an OS flip announced while the frame is visible, with no fetch', async () => {
     await watchingOnSystem();
+    expect(attrs['data-theme-mode']).toBe('dark');
 
     mqLight = true;
     mqChangeListeners[0]();
     settle();
 
-    expect(getMock).toHaveBeenCalled();
+    expect(attrs['data-theme-mode']).toBe('light');
+    expect(getMock).not.toHaveBeenCalled();
   });
 
   it('ignores a flip announced while the frame is hidden', async () => {
@@ -275,7 +285,7 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     mqChangeListeners[0]();
     settle();
 
-    expect(getMock).not.toHaveBeenCalled();
+    expect(attrs['data-theme-mode']).toBe('dark');
   });
 
   it('repairs on resume a flip that arrived while the frame was hidden', async () => {
@@ -285,13 +295,14 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     mqLight = true;
     mqChangeListeners[0]();
     settle();
-    expect(getMock).not.toHaveBeenCalled();
+    expect(attrs['data-theme-mode']).toBe('dark');
 
     setVisibility('visible');
     document.dispatchEvent(new Event('visibilitychange'));
     settle();
 
-    expect(getMock).toHaveBeenCalled();
+    expect(attrs['data-theme-mode']).toBe('light');
+    expect(getMock).not.toHaveBeenCalled();
   });
 
   it('repaints nothing a brief wake reads, when the frame hides before the flip holds', async () => {
@@ -307,7 +318,7 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     mqLight = false;
     settle();
 
-    expect(getMock).not.toHaveBeenCalled();
+    expect(attrs['data-theme-mode']).toBe('dark');
   });
 
   it('repaints nothing when the confirming read no longer sees the flip', async () => {
@@ -319,7 +330,7 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     mqLight = false;
     settle();
 
-    expect(getMock).not.toHaveBeenCalled();
+    expect(attrs['data-theme-mode']).toBe('dark');
   });
 
   it('costs no preferences fetch on a wake that changed nothing', async () => {
@@ -346,7 +357,8 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     mqChangeListeners[0]();
     settle();
 
-    expect(getMock).toHaveBeenCalled();
+    expect(attrs['data-theme-mode']).toBe('light');
+    expect(getMock).not.toHaveBeenCalled();
     localStorage.removeItem('lucidos-theme-mode');
   });
 
@@ -359,7 +371,79 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
     document.dispatchEvent(new Event('visibilitychange'));
     settle();
 
-    expect(getMock).not.toHaveBeenCalled();
+    expect(attrs['data-theme-mode']).toBe('dark');
+  });
+
+  describe('a repaint keeps the painted mode (ADR 0092)', () => {
+    // Only the follower reads the OS for a `system` frame. A fetch answer
+    // repaints for other reasons and must not. The push cases sit in the
+    // shell-push block below.
+    afterEach(() => {
+      localStorage.removeItem('lucidos-theme-mode');
+      delete (globalThis as { __lucidosPrefs?: unknown }).__lucidosPrefs;
+    });
+
+    it('an applyPreferences answer landing while hidden paints nothing the OS says', async () => {
+      const freshUi = await watchingOnSystem();
+      expect(attrs['data-theme-mode']).toBe('dark');
+
+      setVisibility('hidden');
+      mqLight = true;
+      await freshUi.applyPreferences();
+
+      expect(attrs['data-theme-mode']).toBe('dark');
+
+      setVisibility('visible');
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(SYSTEM_THEME_MODE_SETTLE_MS + SYSTEM_THEME_MODE_CONFIRM_MS);
+
+      expect(attrs['data-theme-mode']).toBe('light');
+    });
+
+    it('the first applyPreferences keeps what the boot script painted', async () => {
+      localStorage.setItem('lucidos-theme-mode', 'system');
+      attrs['data-theme-mode'] = 'dark';
+      const { ui: freshUi } = await import('./ui');
+
+      setVisibility('hidden');
+      mqLight = true;
+      await freshUi.applyPreferences();
+
+      expect(attrs['data-theme-mode']).toBe('dark');
+    });
+
+    it('the first applyPreferences keeps what the engine seed painted, with no stored mirror', async () => {
+      // An isolated app frame inherits no localStorage, so the seed is all the
+      // boot script had to go on.
+      (globalThis as { __lucidosPrefs?: unknown }).__lucidosPrefs = { 'theme-mode': 'system' };
+      attrs['data-theme-mode'] = 'dark';
+      const { ui: freshUi } = await import('./ui');
+
+      setVisibility('hidden');
+      mqLight = true;
+      await freshUi.applyPreferences();
+
+      expect(attrs['data-theme-mode']).toBe('dark');
+    });
+
+    it('a flip before the first paint repaints from the engine seed', async () => {
+      // `applyPreferences` may be unawaited, or its fetch may hang.
+      (globalThis as { __lucidosPrefs?: unknown }).__lucidosPrefs = { 'theme-mode': 'system' };
+      attrs['data-theme-mode'] = 'dark';
+      const { ui: freshUi } = await import('./ui');
+      freshUi.watchPreferences();
+
+      mqLight = true;
+      mqChangeListeners[0]();
+      settle();
+      expect(attrs['data-theme-mode']).toBe('light');
+
+      mqLight = false;
+      mqChangeListeners[0]();
+      settle();
+      expect(attrs['data-theme-mode']).toBe('dark');
+      expect(getMock).not.toHaveBeenCalled();
+    });
   });
 
   it('is idempotent: a second watchPreferences() does not double-subscribe', async () => {
@@ -535,6 +619,58 @@ describe('ui.watchPreferences: live theme reaction wiring', () => {
       expect(attrs['data-theme-mode']).toBe('light');
       expect(style().getPropertyValue('--accent')).toBe('#123456');
       expect(getMock).not.toHaveBeenCalled();
+    });
+
+    it('a push landing while hidden paints nothing the OS says (ADR 0092)', async () => {
+      await watchingOnSystem();
+      pushAppearance({ 'theme-mode': 'system', theme_resolved: THEME });
+      expect(attrs['data-theme-mode']).toBe('dark');
+
+      setVisibility('hidden');
+      mqLight = true;
+      pushAppearance({ 'theme-mode': 'system', theme_resolved: THEME, 'ui-scale': '150' });
+
+      expect(attrs['data-theme-mode']).toBe('dark');
+
+      setVisibility('visible');
+      document.dispatchEvent(new Event('visibilitychange'));
+      settle();
+
+      expect(attrs['data-theme-mode']).toBe('light');
+      expect(getMock).not.toHaveBeenCalled();
+    });
+
+    it('a push carrying the mode the shell painted moves a system frame with the shell', async () => {
+      // The shell can catch a flip on a window `focus` this frame never gets.
+      await watchingOnSystem();
+      pushAppearance({ 'theme-mode': 'system', theme_resolved: THEME, [PAINTED_THEME_MODE_PUSH_KEY]: 'dark' });
+      expect(attrs['data-theme-mode']).toBe('dark');
+
+      mqLight = true;
+      pushAppearance({ 'theme-mode': 'system', theme_resolved: THEME, [PAINTED_THEME_MODE_PUSH_KEY]: 'light' });
+
+      expect(attrs['data-theme-mode']).toBe('light');
+      expect(getMock).not.toHaveBeenCalled();
+    });
+
+    it('a push while hidden paints the shell mode, never what the OS says', async () => {
+      await watchingOnSystem();
+
+      setVisibility('hidden');
+      mqLight = true;
+      pushAppearance({ 'theme-mode': 'system', theme_resolved: THEME, [PAINTED_THEME_MODE_PUSH_KEY]: 'dark' });
+
+      expect(attrs['data-theme-mode']).toBe('dark');
+    });
+
+    it('a push changing the preference into system resolves against the OS at once', async () => {
+      await watchingOnSystem();
+      pushAppearance({ 'theme-mode': 'dark', theme_resolved: THEME });
+
+      mqLight = true;
+      pushAppearance({ 'theme-mode': 'system', theme_resolved: THEME });
+
+      expect(attrs['data-theme-mode']).toBe('light');
     });
   });
 });

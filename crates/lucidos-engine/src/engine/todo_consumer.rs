@@ -614,6 +614,7 @@ mod tests {
             thread_id,
             event: ThreadEvent::ResponseFailed {
                 error: "upstream 500".to_string(),
+                agent_exit: None,
             },
             meta: EventMeta::NONE,
         })

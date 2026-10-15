@@ -17,6 +17,7 @@ pub(crate) mod side_question;
 mod spawn;
 pub(crate) mod spawn_claim;
 pub(crate) mod spawn_dispatcher;
+pub(crate) mod start_failure;
 mod text_buffer;
 mod tool_output;
 mod turn_gap;

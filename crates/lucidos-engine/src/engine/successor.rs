@@ -5,9 +5,11 @@
 //!
 //! Plan: `docs/plans/2026-10-13-auto-compact-trial-and-successor-threads.md`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::runtime::{validate_coding_agent_effort, validate_coding_agent_model, CodingAgent};
 
 use super::event_bus::{BusEvent, EventBus};
 use super::thread_events::{EventMeta, MessageOrigin, ThreadEvent, UnproposedReason};
@@ -53,6 +55,63 @@ impl ThreadContext {
             applied: false,
         }
     }
+}
+
+/// The *implementer* a coding-agent thread runs on. An unset model or effort
+/// means the backend's own default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Implementer {
+    pub coding_agent: CodingAgent,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// The implementer a handoff asks for. An omitted field carries over, as
+/// [`resolve_implementer`] decides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ImplementerRequest {
+    #[serde(default)]
+    pub coding_agent: Option<CodingAgent>,
+    #[serde(default)]
+    pub coding_agent_model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+/// The successor's implementer: what the handoff asked for, the old thread's
+/// for the rest. Refuses a model or effort the backend does not offer.
+///
+/// A model carries over only on the same backend. An effort carries over as
+/// is while backend and model stay. On a new model it carries only if that
+/// model accepts it, so it never pins a tier the model drops.
+pub fn resolve_implementer(
+    old: &Implementer,
+    requested: &ImplementerRequest,
+) -> Result<Implementer, String> {
+    let coding_agent = requested.coding_agent.unwrap_or(old.coding_agent);
+    let same_backend = coding_agent == old.coding_agent;
+    let model = match requested.coding_agent_model.as_deref() {
+        Some(model) => validate_coding_agent_model(coding_agent, Some(model))?,
+        None if same_backend => old.model.clone(),
+        None => None,
+    };
+    let reasoning_effort = match requested.reasoning_effort.as_deref() {
+        Some(effort) => validate_coding_agent_effort(coding_agent, model.as_deref(), Some(effort))?,
+        None if same_backend && model == old.model => old.reasoning_effort.clone(),
+        None if same_backend => validate_coding_agent_effort(
+            coding_agent,
+            model.as_deref(),
+            old.reasoning_effort.as_deref(),
+        )
+        .ok()
+        .flatten(),
+        None => None,
+    };
+    Ok(Implementer {
+        coding_agent,
+        model,
+        reasoning_effort,
+    })
 }
 
 /// The one definition of a thread's context size: the latest `ContextCaptured`

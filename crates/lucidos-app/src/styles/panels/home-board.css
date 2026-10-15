@@ -65,9 +65,11 @@
     overscroll-behavior: contain;
 }
 
-/* Drawn like the pane dividers (.split-divider), and like them clear in the
-   header row unless a theme paints --header-divider (.app-header::after). The
-   ::before widens the grab zone to both sides of the band. */
+/* Drawn like the pane dividers (.split-divider), and it runs the whole window
+   height, the header row and the macOS title-bar band included. The rail's
+   head is a flat --bg-primary fill beside the blue bar, so the line is what
+   marks that edge. The ::before widens the grab zone to both sides of the
+   band. */
 .home-rail-divider {
     position: absolute;
     top: 0;
@@ -75,10 +77,7 @@
     left: 0;
     z-index: 4;
     width: var(--divider-width);
-    background: linear-gradient(
-        var(--header-divider) calc(var(--titlebar-inset, 0px) + var(--app-header-height)),
-        var(--border-color) 0
-    );
+    background: var(--border-color);
     cursor: col-resize;
     touch-action: none;
 }
@@ -127,9 +126,8 @@
     transition: width var(--duration-slow) ease, visibility var(--duration-slow);
 }
 
-/* Not offered, or docked with no Canvas row to rest in: it shrinks away in
-   place, and leaves the tab order once it has gone. */
-:root:not([data-home-rail-toggle]) .home-rail-toggle-slot,
+/* Docked with no Canvas row to rest in: it shrinks away in place, and leaves
+   the tab order once it has gone. */
 :root[data-content-collapsed]:not([data-home-rail]) .home-rail-toggle-slot {
     width: 0;
     visibility: hidden;

@@ -1,10 +1,10 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { afterEach, describe, expect, it } from 'vitest';
-import { FAKE_VERSION, NO_RULE_REPLY, resolveModel } from './claude.mjs';
+import { FAKE_VERSION, NO_RULE_REPLY, failToStartText, resolveModel } from './claude.mjs';
 import {
   SCENARIO_FLAGS, SESSION_FLAGS, UNREPLAYED_FLAGS, diffShapes, shapeOf, unknownKinds,
 } from './drift-check.mjs';
@@ -84,6 +84,25 @@ describe('the fake Claude Code', () => {
   it('answers a prompt it has no rule for with the fixed reply, never a guess', () => {
     const lines = runFake([], [user('What is the codeword?')]);
     expect(lines.at(-1)?.result).toBe(NO_RULE_REPLY);
+  });
+
+  it('reads the text of a Fail to start prompt, and nothing else', () => {
+    expect(failToStartText('Fail to start: "claude-gateway.example.com refused the request"')).toBe('claude-gateway.example.com refused the request');
+    expect(failToStartText('Please fail to start: "x"')).toBe('x');
+    expect(failToStartText('Say exactly: "x"')).toBeUndefined();
+  });
+
+  it('dies on a Fail to start prompt: its text on stderr, exit code 1, no init and no result', () => {
+    const input = [user('Fail to start: "claude-gateway.example.com refused the request"')].map((l) => `${JSON.stringify(l)}\n`).join('');
+    const run = spawnSync(process.execPath, [FAKE], { input, encoding: 'utf8', env: NO_DELAY });
+    expect(run.status).toBe(1);
+    expect(run.stderr).toBe('claude-gateway.example.com refused the request\n');
+    expect(run.stdout).toBe('');
+  });
+
+  it('starts normally when Fail to start arrives after the session began', () => {
+    const lines = runFake([], [user('Say exactly: "up"'), user('Fail to start: "late"')]);
+    expect(lines.filter((l) => l.type === 'result').map((l) => l.result)).toEqual(['up', NO_RULE_REPLY]);
   });
 
   it('answers control requests as the real CLI does, refusing set_reasoning_effort', () => {

@@ -1759,9 +1759,22 @@ lucidos planned state
 
 That option pair is a **floor**, not a fixed shape. The question tool needs at least two options, so `Request changes` fills the second slot only when the plan has no real fork. When it has one (a narrower scope, one layer instead of two), the fork takes the slot. `Request changes` is then dropped, not carried as a third option meaning only "I will type what I want changed".
 
-**The thread's measured context decides the shape, never the agent.** `mark --plan` reads `GET /api/v1/threads/:id/context` and prints the options to offer, and the edit gate prints the same. When the engine says the context is large enough, the card reads **`Implement in a new thread (Recommended)`** first and `Approve here` second. A real fork may join them, and `Request changes` never does. Otherwise it is today's floor. A size the CLI could not read prints today's floor and says the size is unknown.
+**The thread's measured context decides the shape, never the agent.** `mark --plan` reads `GET /api/v1/threads/:id/context` and prints the options to offer, and the edit gate prints the same. When the engine says the context is large enough, the card offers a new thread and names its *implementer*: backend, model and reasoning effort. Otherwise it is today's floor. A size the CLI could not read prints today's floor and says the size is unknown.
 
-Picking `Implement in a new thread` approves the plan. The agent runs `lucidos planned approve`, then hands the build to a *successor thread* with `lucidos successor spawn` (below) and ends its turn. The narrative names the plan path and says the user approved it. The successor's branch starts at the planning branch's last commit, so it already holds the plan, and the approved marker carries over. From a top-level planning thread the builder is top-level too, so it never reports back into the heavy thread.
+The large card reads, in order, never more than 4 options and never `Request changes`:
+
+1. `Implement in a new thread: <implementer> (Recommended)`.
+2. `Implement in a new thread: <this thread's implementer>`, only when it differs.
+3. `Approve here`.
+4. A real fork of the plan, if it has one.
+
+An implementer is named by the model's picker label and the effort, for example `Sonnet 5.5, high`. The backend is named only when it is not this thread's (`Codex GPT-5.6 Sol, high`). `mark --plan` prints this thread's implementer from the context reading.
+
+**The agent recommends the implementer, by its judgement of the plan** (ADR 0486). A fully specified plan with settled decisions suits a cheaper model. A plan that leaves design judgement to the builder keeps this thread's model. The agent says why in one line of its message.
+
+Picking an `Implement in a new thread` option approves the plan. The agent runs `lucidos planned approve`, then hands the build to a *successor thread* with `lucidos successor spawn` (below). It adds only the flags where the picked implementer differs from this thread's, as ids, since an omitted flag keeps this thread's. Then it ends its turn. A typed reply naming another implementer works the same way.
+
+The narrative names the plan path and says the user approved it. The successor's branch starts at the planning branch's last commit, so it already holds the plan, and the approved marker carries over. From a top-level planning thread the builder is top-level too, so it never reports back into the heavy thread.
 
 Only after the user approves does the agent run `lucidos planned approve`, flipping `proposed` to `planned` (gate-satisfying). A fork answer is an approval too: revise the plan file to that variant, re-commit, then flip it. If the user requests changes, revise the plan file, re-commit, and ask again (the marker stays `proposed`). The message carries the plan summary, or on a re-ask only what changed. The card asks one short question and never repeats the message. `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval.
 
@@ -1785,7 +1798,23 @@ Continue this thread in a *successor thread*, which carries on with a fresh cont
 
 ```bash
 lucidos successor spawn --narrative "$TMPDIR/handoff.md"
+
+# Build on another implementer (the plan card's pick):
+lucidos successor spawn --narrative "$TMPDIR/handoff.md" \
+  --coding-agent-model claude-sonnet-5-5 --reasoning-effort high
+lucidos successor spawn --narrative "$TMPDIR/handoff.md" \
+  --coding-agent codex --coding-agent-model gpt-5.6-sol --reasoning-effort medium
 ```
+
+**The successor runs on this thread's implementer unless the command names another.** The three flags are spelled as on `spawn-thread`:
+
+| Flag | Omitted |
+|---|---|
+| `--coding-agent <claude-code\|codex>` | this thread's backend |
+| `--coding-agent-model <id>` | this thread's model on the same backend, else the backend's default |
+| `--reasoning-effort <low\|medium\|high\|xhigh\|max>` | this thread's effort on the same backend while the successor's model accepts it, else the backend's default |
+
+Pass model ids, not picker labels. The engine refuses a model or effort the backend does not offer, before anything is recorded, with reason `implementer-not-offered` and the offered list. The command prints the implementer the successor runs on, under its link.
 
 What the handoff does:
 
@@ -1795,7 +1824,9 @@ What the handoff does:
 - **This thread archives itself** once the successor's first session starts and nothing blocks the archive. Otherwise it stays open and shows where it continued.
 - **Refused** for a thread that is not a coding-agent thread, an *integrated sub-thread*, and a thread already handed off or archived. A second request racing a handoff waits for the first, then is refused as already handed off. The composer's message handoff is also refused while the thread works. Also for a change waiting in the *landing lane*, and a worktree git could not read.
 
-The composer's **Send to a new thread** uses the same route with the user's next message instead of a narrative. `GET /api/v1/threads/:id/context` returns `{input_tokens, offer, nudge, applied}`: the thread's context size, the two decisions the composer and `planned mark` read, and whether the thread has an applied change. A thread that cannot hand off (an *integrated sub-thread*, or one already handed off) reads `offer` and `nudge` false.
+The composer's **Send to a new thread** uses the same route with the user's next message instead of a narrative. The route's body takes `coding_agent`, `coding_agent_model` and `reasoning_effort` beside either, and its reply carries `{successor_thread_id, link, implementer}`.
+
+`GET /api/v1/threads/:id/context` returns `{input_tokens, offer, nudge, applied, implementer}`. The first four are the thread's context size, the two decisions the composer and `planned mark` read, and whether the thread has an applied change. `implementer` is `{coding_agent, model, reasoning_effort}` for a coding-agent thread, a `null` model or effort meaning the backend's default, and `null` for any other thread. A thread that cannot hand off (an *integrated sub-thread*, or one already handed off) reads `offer` and `nudge` false.
 
 ### `lucidos frontend-preview start [--thread-id <uuid>]` / `lucidos frontend-preview stop` / `lucidos frontend-preview status`
 

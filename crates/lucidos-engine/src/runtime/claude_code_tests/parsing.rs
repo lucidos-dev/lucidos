@@ -638,6 +638,33 @@ fn a_sub_agent_frame_still_reports_while_a_parent_message_is_open() {
     assert_eq!(usages(&parent_end), vec![(2, 0, 7_096, 168)]);
 }
 
+fn usage_models(events: &[AgentEvent]) -> Vec<Option<&str>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Usage { model, .. } => Some(model.as_deref()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A sub-agent set to `model: haiku` streams its frames inside a parent call
+/// on another model. Each usage names the model of its own message.
+#[test]
+fn a_sub_agent_usage_names_its_own_model_not_the_parents() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, &message_start("msg_parent", 2, 0, 7_096));
+    let sub = parse_line(
+        &mut state,
+        &streamed_frame("msg_sub", TOOL_BLOCK, Some("toolu_parent"))
+            .replace("claude-sonnet-5", "claude-haiku-4-5-20251001"),
+    );
+    let parent_end = parse_line(&mut state, &message_delta(2, 0, 7_096, 168));
+
+    assert_eq!(usage_models(&sub), vec![Some("claude-haiku-4-5-20251001")]);
+    assert_eq!(usage_models(&parent_end), vec![Some("claude-sonnet-5")]);
+}
+
 /// The `parent_tool_use_id` of every tool call, tool result and usage report in
 /// `events`, in order. Other events carry no parent and are skipped.
 fn parents(events: &[AgentEvent]) -> Vec<Option<&str>> {

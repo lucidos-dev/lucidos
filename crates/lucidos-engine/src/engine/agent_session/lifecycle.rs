@@ -1,3 +1,6 @@
+use crate::engine::thread_events::{CodingAgentExit, CodingAgentExitStage};
+use crate::runtime::{AgentExitFacts, CodingAgent};
+
 /// What the idle handler should do after CC reports a turn-ending Result. The
 /// natural turn terminator and `CodingAgentIdled` have already landed, so
 /// nothing here emits an additional terminal event. `EndSession` MUST translate
@@ -929,24 +932,29 @@ impl WatchdogGate {
 }
 
 /// What the post-loop safety net should emit when CC's event loop ended without
-/// a natural terminator. Always lands SOMETHING terminal: either a
-/// `ContinuationRequested` so the spawn dispatcher boots a fresh `--resume`, or
+/// a natural terminator. Always lands SOMETHING terminal: a
+/// `ContinuationRequested` so the spawn dispatcher boots a fresh `--resume`, a
+/// `ResponseFailed` carrying the agent's own words, or
 /// `ResponseAborted(SafetyNet)` so the UI flips to the red-dot abort state.
 /// Without this guard a subprocess that died between events leaves the thread
 /// row stuck at `running`.
 ///
 /// Precedence: external terminal already emitted > watchdog fired > stray
-/// signal-kill > plain safety net. External terminal wins because the caller
-/// already landed one, and a second would relabel a finished turn. Watchdog wins
-/// over plain abort because its whole job is to bypass the user-visible abort
-/// when the network died mid-call.
+/// signal-kill > the agent's own failed exit > plain safety net. External
+/// terminal wins because the caller already landed one, and a second would
+/// relabel a finished turn. Watchdog wins over everything below it because its
+/// whole job is to bypass the user-visible abort when the network died mid-call.
 ///
 /// A stray signal-kill the engine did NOT initiate is the `exit=143` truncation
 /// bug: a SIGTERM reached the CC child with no deliberate cancel. It recovers
 /// the same way, by auto-resume rather than a red dot the user must clear.
 /// Gated on `!engine_cancelled`, so a deliberate teardown's own SIGKILL never
 /// masquerades as a stray kill.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// An agent that exits on its own with a non-zero code, or with words on
+/// stderr, did not hang: it said why it stopped. That is a failure the user
+/// must read, and a retry would repeat it. It never auto-resumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SafetyNetAction {
     /// Loop ended with a natural terminator, so the in-loop emit already closed
     /// the turn.
@@ -955,9 +963,15 @@ pub(super) enum SafetyNetAction {
     /// `ContinuationRequested` so the spawn dispatcher boots a fresh `--resume`
     /// without surfacing a user-visible abort.
     EmitContinuationRequested,
-    /// CC's event loop died without a natural terminator and the watchdog did
-    /// not fire (driver crash, EOF on stdout without a Result, parser glitch).
-    /// Emit `ResponseAborted(SafetyNet)` so the UI flips to the red-dot abort
+    /// The agent's process ended on its own and said why. Emit
+    /// `ResponseFailed` with the CLI's words, and no retry.
+    EmitFailed {
+        error: String,
+        agent_exit: CodingAgentExit,
+    },
+    /// CC's event loop died without a natural terminator and nothing said why
+    /// (driver crash, a silent exit 0, parser glitch). Emit
+    /// `ResponseAborted(SafetyNet)` so the UI flips to the red-dot abort
     /// state: the user needs to know the work did not complete.
     EmitAbortedSafetyNet,
     /// An external terminal already landed. Do not emit again, because a second
@@ -965,30 +979,79 @@ pub(super) enum SafetyNetAction {
     Skip,
 }
 
+/// Everything [`safety_net_action`] reads.
+pub(super) struct SafetyNetInput<'a> {
+    pub safety_net_fired: bool,
+    pub watchdog_fired: bool,
+    pub external_terminal_already_emitted: bool,
+    pub engine_cancelled: bool,
+    /// The agent's startup line arrived (Claude Code's `system/init`, Codex's
+    /// thread start). An exit before it is a start failure. Judged by timing,
+    /// never by the CLI's wording.
+    pub init_seen: bool,
+    pub exit: &'a AgentExitFacts,
+    pub coding_agent: CodingAgent,
+}
+
 /// Decide what the post-loop safety net should emit. Pure function;
 /// `run_session.rs` glues this to the actual emit calls.
-pub(super) fn safety_net_action(
-    safety_net_fired: bool,
-    watchdog_fired: bool,
-    external_terminal_already_emitted: bool,
-    killed_by_signal: bool,
-    engine_cancelled: bool,
-) -> SafetyNetAction {
-    if !safety_net_fired {
+pub(super) fn safety_net_action(input: &SafetyNetInput) -> SafetyNetAction {
+    if !input.safety_net_fired {
         return SafetyNetAction::Nothing;
     }
-    if external_terminal_already_emitted {
+    if input.external_terminal_already_emitted {
         return SafetyNetAction::Skip;
     }
-    if watchdog_fired {
+    if input.watchdog_fired {
         return SafetyNetAction::EmitContinuationRequested;
+    }
+    if input.engine_cancelled {
+        return SafetyNetAction::EmitAbortedSafetyNet;
     }
     // Stray external signal-kill with no deliberate engine cancel: recover like
     // the watchdog rather than surfacing an abort.
-    if killed_by_signal && !engine_cancelled {
+    if input.exit.killed_by_signal {
         return SafetyNetAction::EmitContinuationRequested;
     }
+    let failed_exit = input.exit.code.is_some_and(|code| code != 0);
+    if failed_exit || !input.exit.stderr_tail.is_empty() {
+        let stage = if input.init_seen {
+            CodingAgentExitStage::MidTurn
+        } else {
+            CodingAgentExitStage::Startup
+        };
+        return SafetyNetAction::EmitFailed {
+            error: exit_error_text(input.coding_agent, stage, input.exit),
+            agent_exit: CodingAgentExit {
+                stage,
+                code: input.exit.code,
+            },
+        };
+    }
     SafetyNetAction::EmitAbortedSafetyNet
+}
+
+/// What a failed exit tells the user: the CLI's own stderr, or a plain
+/// sentence naming the agent and the exit code when it wrote nothing.
+pub(super) fn exit_error_text(
+    coding_agent: CodingAgent,
+    stage: CodingAgentExitStage,
+    exit: &AgentExitFacts,
+) -> String {
+    if !exit.stderr_tail.is_empty() {
+        return exit.stderr_tail.clone();
+    }
+    let agent = coding_agent.display_name();
+    let when = match stage {
+        CodingAgentExitStage::Startup => "before its session began",
+        CodingAgentExitStage::MidTurn => "in the middle of a reply",
+    };
+    match exit.code {
+        Some(code) => {
+            format!("{agent} exited with code {code} {when} and wrote nothing to stderr.")
+        }
+        None => format!("{agent} exited {when} and wrote nothing to stderr."),
+    }
 }
 
 /// How many times in a row the engine auto-resumes a turn the backend ended on

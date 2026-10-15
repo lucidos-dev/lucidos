@@ -23,7 +23,8 @@ pub struct ProviderUsage {
 /// The usage a JSON body reports, in whichever provider's shape it carries.
 ///
 /// - Gemini: `usageMetadata`, with thinking billed as output.
-/// - OpenAI Chat Completions: `usage.prompt_tokens`.
+/// - OpenAI Chat Completions: `usage.prompt_tokens`, with cache reads and
+///   writes inside it (writes from OpenRouter's Anthropic models).
 /// - OpenAI Responses, Anthropic Messages: `usage.input_tokens`. Anthropic
 ///   reports cache reads and writes apart from it, so they are added back.
 ///   OpenAI reports both inside it, writes from GPT-5.6 on.
@@ -49,15 +50,11 @@ fn read(body: &Value) -> Option<ProviderUsage> {
     }
     let block = body.get("usage")?;
     if let Some(prompt) = count(block, "prompt_tokens") {
-        let cached = block
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
         return Some(usage(
             prompt,
             count(block, "completion_tokens").unwrap_or(0),
-            cached,
-            0,
+            detail(block, "prompt_tokens_details", "cached_tokens"),
+            detail(block, "prompt_tokens_details", "cache_write_tokens"),
         ));
     }
     let input = count(block, "input_tokens");
@@ -68,18 +65,20 @@ fn read(body: &Value) -> Option<ProviderUsage> {
     let (input, output) = (input.unwrap_or(0), output.unwrap_or(0));
     let cache_write = count(block, "cache_creation_input_tokens").unwrap_or(0);
     let cache_read = count(block, "cache_read_input_tokens").unwrap_or(0);
-    let openai_detail = |field: &str| {
-        block
-            .pointer(&format!("/input_tokens_details/{field}"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
     Some(usage(
         input.saturating_add(cache_write).saturating_add(cache_read),
         output,
-        cache_read + openai_detail("cached_tokens"),
-        cache_write + openai_detail("cache_write_tokens"),
+        cache_read + detail(block, "input_tokens_details", "cached_tokens"),
+        cache_write + detail(block, "input_tokens_details", "cache_write_tokens"),
     ))
+}
+
+/// One count from a `*_tokens_details` object, `0` when absent.
+fn detail(block: &Value, details: &str, field: &str) -> u64 {
+    block
+        .pointer(&format!("/{details}/{field}"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 /// The usage a stream sent as one JSON array reports, as Gemini's
@@ -169,6 +168,15 @@ mod tests {
         let written = json!({"usage": {"input_tokens": 40, "output_tokens": 3,
             "input_tokens_details": {"cached_tokens": 12, "cache_write_tokens": 20}}});
         assert_eq!(counts(from_json(&written).unwrap()), (40, 3, 12, 20));
+    }
+
+    /// OpenRouter reports an Anthropic cache write inside `prompt_tokens`, as it
+    /// does the read.
+    #[test]
+    fn chat_completions_counts_its_cache_write_inside_the_prompt() {
+        let chat = json!({"usage": {"prompt_tokens": 50, "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 10, "cache_write_tokens": 25}}});
+        assert_eq!(counts(from_json(&chat).unwrap()), (50, 7, 10, 25));
     }
 
     #[test]

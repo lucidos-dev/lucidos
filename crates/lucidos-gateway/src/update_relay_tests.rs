@@ -236,3 +236,110 @@ fn a_confirmed_run_outlives_the_claim_window() {
     );
     assert_eq!(relay.snapshot(later)["request"]["state"], "running");
 }
+
+// ── Refreshing the release check before refusing ────────────────────────────
+
+mod refreshing {
+    use super::*;
+    use crate::release_check::tests::{deployment_in, http_ok, origin_serving, Origin};
+    use crate::release_check::POLL_INTERVAL;
+
+    const NEWER: &str = r#"{"version":"99.0.0"}"#;
+    const NOTHING_NEWER: &str = "{}";
+
+    async fn check_against(dir: &std::path::Path, body: &str) -> (ReleaseCheck, Origin) {
+        let origin = origin_serving(http_ok(body), Duration::ZERO).await;
+        let check =
+            ReleaseCheck::with_origin(&deployment_in(dir, true), &origin.url, POLL_INTERVAL);
+        (check, origin)
+    }
+
+    #[tokio::test]
+    async fn a_release_the_gateway_has_not_polled_yet_is_found_and_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (check, origin) = check_against(dir.path(), NEWER).await;
+        let now = Instant::now();
+        let relay = attached(now);
+        assert_eq!(check.latest_version(), None);
+
+        let ticket = relay.request_refreshing(&check, now).await.unwrap();
+
+        assert_eq!(ticket.version, "99.0.0");
+        assert_eq!(origin.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_origin_naming_nothing_newer_still_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (check, origin) = check_against(dir.path(), NOTHING_NEWER).await;
+        let now = Instant::now();
+        let relay = attached(now);
+
+        let refused = relay.request_refreshing(&check, now).await;
+
+        assert_eq!(refused, Err(Refusal::NoNewerRelease));
+        assert_eq!(origin.requests(), 1);
+        assert_eq!(relay.snapshot(now)["request"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_failed_poll_says_so_instead_of_claiming_nothing_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let down =
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let origin = origin_serving(down.to_string(), Duration::ZERO).await;
+        let check =
+            ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
+        let now = Instant::now();
+        let relay = attached(now);
+
+        let refused = relay.request_refreshing(&check, now).await;
+
+        assert!(
+            matches!(refused, Err(Refusal::CheckFailed(_))),
+            "{refused:?}"
+        );
+        assert!(refused.unwrap_err().message().contains("503"));
+    }
+
+    #[tokio::test]
+    async fn a_release_already_known_is_queued_without_a_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let (check, origin) = check_against(dir.path(), NEWER).await;
+        check.refresh(false).await;
+        let now = Instant::now();
+        let relay = attached(now);
+
+        assert!(relay.request_refreshing(&check, now).await.is_ok());
+        assert_eq!(origin.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_a_missing_newer_release_reaches_the_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (check, origin) = check_against(dir.path(), NEWER).await;
+        let now = Instant::now();
+
+        let unattached = UpdateRelay::default();
+        assert_eq!(
+            unattached.request_refreshing(&check, now).await,
+            Err(Refusal::NoClient)
+        );
+
+        let blocked = UpdateRelay::default();
+        blocked.heartbeat(beat("1.0.0", Some("needs an admin password")), now);
+        assert_eq!(
+            blocked.request_refreshing(&check, now).await,
+            Err(Refusal::Blocked("needs an admin password".to_string()))
+        );
+
+        let busy = attached(now);
+        busy.request(Some("1.1.0"), now).unwrap();
+        assert_eq!(
+            busy.request_refreshing(&check, now).await,
+            Err(Refusal::InFlight)
+        );
+
+        assert_eq!(origin.requests(), 0);
+    }
+}

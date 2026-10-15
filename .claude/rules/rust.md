@@ -7,10 +7,11 @@ paths:
 
 # Rust Conventions
 
-- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with no custom error types. Three are blessed, each because a caller branches on it:
+- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with no custom error types. Four are blessed, each because a caller branches on it:
   - `LifecycleViolation` in `engine/thread_lifecycle.rs` carries `event_type`, `thread_type`, `current_section` and `reason`. The EventBus rejection path fails fast on that typed payload instead of parsing a string.
   - `llm::ModelNotServed` marks a provider's "no such model" answer. An unset default then moves to its next model (ADR 0403).
   - `lucidos_engine_socket::ConnectError`, and the gateway's `engine_hop::HopError` wrapping it, tell a socket nobody listens on from one another user holds. A probe reads the first as `Unreachable` and the second as `Foreign`, and the proxy answers them differently (ADR 0445).
+  - `agent_session::start_failure::AgentStartFailure` marks a coding-agent turn that could not begin because the agent's process had already exited. `fail_turn` and the Continue consumer read it with `agent_exit_of` to attach `agent_exit` to the `ResponseFailed` they write (ADR 0487).
   - A new custom error type needs the same structural reason. "I want a typed error for this layer" is not one. If the caller only formats the error into a string, use the boxed trait object.
   - `api::error::ApiError` is not an error type in this sense. It is the HTTP response shape (`status` plus a `{"error": msg}` body) for `/api/v1` handlers, read by its `IntoResponse` impl. Handlers return `Result<_, ApiError>` rather than hand-rolling a `(StatusCode, Json)` tuple. Internal code keeps the boxed trait object and converts at the handler boundary.
   - A refusal a client must tell apart from its siblings adds a slug with `ApiError::with_reason`. The body then reads `{"error": msg, "reason": slug}`, and every error without one keeps its old bytes.

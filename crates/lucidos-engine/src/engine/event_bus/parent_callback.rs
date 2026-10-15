@@ -664,7 +664,7 @@ impl EventBus {
                 last_response.clone().unwrap_or_default(),
                 SUCCESS_SUMMARY_CAP,
             ),
-            ThreadEvent::ResponseFailed { error } => (
+            ThreadEvent::ResponseFailed { error, .. } => (
                 ChildCompletionStatus::Failure,
                 error.clone(),
                 FAILURE_SUMMARY_CAP,
@@ -1197,7 +1197,10 @@ impl EventBus {
         Box::pin(self.notify_parent_if_child(
             child_thread_id,
             None,
-            &ThreadEvent::ResponseFailed { error },
+            &ThreadEvent::ResponseFailed {
+                error,
+                agent_exit: None,
+            },
             None,
         ))
         .await;

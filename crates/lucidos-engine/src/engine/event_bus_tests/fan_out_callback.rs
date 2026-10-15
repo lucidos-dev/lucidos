@@ -1886,6 +1886,7 @@ async fn emit_response_failed(bus: &EventBus, thread_id: Uuid, error: &str) {
         thread_id,
         event: ThreadEvent::ResponseFailed {
             error: error.into(),
+            agent_exit: None,
         },
         meta: EventMeta::NONE,
     })

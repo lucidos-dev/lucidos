@@ -317,6 +317,7 @@ async fn a_failed_turn_holding_a_wait_still_reports() {
         thread_id: child_id,
         event: ThreadEvent::ResponseFailed {
             error: "the build broke".into(),
+            agent_exit: None,
         },
         meta: EventMeta::NONE,
     })

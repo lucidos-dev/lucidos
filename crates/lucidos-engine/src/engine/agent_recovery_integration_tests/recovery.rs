@@ -431,6 +431,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
         thread_id: failed,
         event: ThreadEvent::ResponseFailed {
             error: "test error".into(),
+            agent_exit: None,
         },
         meta: cc_meta.clone(),
     })
@@ -614,6 +615,7 @@ async fn last_turn_end_mirrors_the_idle_gate() {
         (
             Some(ThreadEvent::ResponseFailed {
                 error: "stream interrupted".into(),
+                agent_exit: None,
             }),
             Some(TurnEnd::Unfinished),
         ),
@@ -767,6 +769,7 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
         failed,
         ThreadEvent::ResponseFailed {
             error: "stream ended".into(),
+            agent_exit: None,
         },
     )
     .await;

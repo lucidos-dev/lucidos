@@ -1,11 +1,8 @@
 import { effect } from '@preact/signals';
 import { useCallback, useLayoutEffect, useRef } from 'preact/hooks';
 import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
-import type { HomeBoard as HomeBoardData } from '../../api/client/widgets';
 import { homeThreadId } from '../../store/actions/homeThread';
-import { homeBoardFor } from '../../store/homeBoard';
 import { homeRailShown, homeRailWidth, persistHomeRailWidth, toggleHomeRail } from '../../store/homeRail';
-import type { Loadable } from '../../store/types';
 import { minHomeRailPx, splitBounds } from '../../store/paneMinimums';
 import { splitRatio, SPLIT_RATIO_KEY } from '../../store/store';
 import { lazyComponent } from '../../utils/lazyComponent';
@@ -79,20 +76,14 @@ function Rail() {
   );
 }
 
-/** Whether the toggle is offered: always while the rail shows, so it can be
- *  hidden, and while it is hidden only if the board has a tile to show. */
-export function homeRailToggleOffered(shown: boolean, board: Loadable<HomeBoardData>): boolean {
-  return shown || (board.status === 'loaded' && board.data.tiles.length > 0);
-}
-
 /** Shows and hides the rail. One control, in the window's corner in both
  *  states: it ends the rail's head while the rail shows, and the Canvas row
- *  while it is hidden (`styles/panels/home-board.css`). Not offered, it
- *  shrinks away in place rather than unmounting. */
+ *  while it is hidden (`styles/panels/home-board.css`). Offered whenever Home
+ *  exists, an empty board included, so a hidden rail can always come back. */
 export function HomeRailToggle() {
   const shown = homeRailShown.value;
   const home = homeThreadId.value;
-  const offered = !!home && homeRailToggleOffered(shown, homeBoardFor('desktop'));
+  const offered = !!home;
 
   useLayoutEffect(() => {
     const root = document.documentElement;

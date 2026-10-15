@@ -2,7 +2,8 @@
 
 - **Status**: Accepted (supersedes [ADR 0190](0190-mobile-update-route-is-a-toast.md)
   in part: its "one answer on a phone" decision and its rejection of a remote
-  install)
+  install; its rule that the relay needs a release the gateway already knows is
+  superseded by [0485](0485-phone-relay-waits-for-no-hourly-check.md))
 - **Date**: 2026-10-01
 
 ## Context

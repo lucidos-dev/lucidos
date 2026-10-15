@@ -123,6 +123,7 @@ async fn a_thread_scoped_replay_reads_only_its_thread_and_its_types() {
         mine,
         ThreadEvent::ResponseFailed {
             error: "not a replayed type".into(),
+            agent_exit: None,
         },
     )
     .await;

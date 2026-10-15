@@ -354,7 +354,7 @@ impl Projector {
             ThreadEvent::ResponseAborted { text, .. } => {
                 self.settle_reply(text, Some("interrupted"), id)
             }
-            ThreadEvent::ResponseFailed { error } => {
+            ThreadEvent::ResponseFailed { error, .. } => {
                 self.flush_round_text();
                 let (kind, text) = match self.pending_reply.take() {
                     Some(reply) => (EntryKind::Response, format!("{reply}\n\nfailed: {error}")),

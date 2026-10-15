@@ -9,7 +9,7 @@
 //! Memory only. A successful install restarts the service and this state with
 //! it, so the requesting session settles on the running version instead.
 
-use crate::release_check::version_is_newer;
+use crate::release_check::{version_is_newer, ReleaseCheck};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,6 +71,8 @@ pub enum Refusal {
     NoClient,
     Blocked(String),
     NoNewerRelease,
+    /// The forced poll failed, so the gateway cannot say what is published.
+    CheckFailed(String),
     InFlight,
 }
 
@@ -79,7 +81,12 @@ impl Refusal {
         match self {
             Refusal::NoClient => "the desktop app is not running on this machine".to_string(),
             Refusal::Blocked(reason) => reason.clone(),
-            Refusal::NoNewerRelease => "the desktop app is already up to date".to_string(),
+            Refusal::NoNewerRelease => {
+                "no release newer than the desktop app is published yet".to_string()
+            }
+            Refusal::CheckFailed(error) => {
+                format!("could not check for a newer release: {error}")
+            }
             Refusal::InFlight => "an update is already in progress".to_string(),
         }
     }
@@ -236,13 +243,13 @@ impl UpdateRelay {
         if let Some(reason) = &client.blocker {
             return Err(Refusal::Blocked(reason.clone()));
         }
+        if matches!(st.relay, Relay::Requested { .. } | Relay::Running { .. }) {
+            return Err(Refusal::InFlight);
+        }
         let version = latest
             .filter(|latest| version_is_newer(latest, &client.version))
             .ok_or(Refusal::NoNewerRelease)?
             .to_string();
-        if matches!(st.relay, Relay::Requested { .. } | Relay::Running { .. }) {
-            return Err(Refusal::InFlight);
-        }
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let ticket = Ticket {
             id: format!("{}-{n}", self.boot),
@@ -253,6 +260,32 @@ impl UpdateRelay {
             at: now,
         };
         Ok(ticket)
+    }
+
+    /// [`Self::request`] against the release check's newest version, forcing one
+    /// poll first when that version is not newer than the client.
+    ///
+    /// The hourly poll lags a fresh release, and a phone cannot ask the gateway
+    /// to look again. Only `NoNewerRelease` polls, so a request with no client,
+    /// a blocker or a run in flight never reaches the origin. The check keeps
+    /// its own floor, so a refused request cannot hammer the origin either.
+    pub async fn request_refreshing(
+        &self,
+        check: &ReleaseCheck,
+        now: Instant,
+    ) -> Result<Ticket, Refusal> {
+        let asked = self.request(check.latest_version().as_deref(), now);
+        if !matches!(asked, Err(Refusal::NoNewerRelease)) {
+            return asked;
+        }
+        let checked = check.refresh(true).await;
+        let refused = self.request(check.latest_version().as_deref(), Instant::now());
+        match (&refused, checked["last_error"].as_str()) {
+            (Err(Refusal::NoNewerRelease), Some(error)) => {
+                Err(Refusal::CheckFailed(error.to_string()))
+            }
+            _ => refused,
+        }
     }
 
     /// The wire shape on `gateway/status`. `client` is null when no client is

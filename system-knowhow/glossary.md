@@ -580,7 +580,7 @@ A *model registry* row whose provider retired the model. An engine update disabl
 Past turns keep the old name, since that model answered them. Decision: ADR 0418.
 
 ### Served model
-The model a provider's reply says answered a call: Gemini's `modelVersion`, or the `model` field from OpenAI and Anthropic. Recorded as `served_model` on `ContextCaptured`, beside `model`, the one Lucidos asked for. A served model that is neither the requested one nor a dated snapshot of it means another model answered. Either the provider rerouted the call, or Lucidos sent a *retired model*'s successor.
+The model a provider's reply says answered a call: Gemini's `modelVersion`, or the `model` field from OpenAI and Anthropic. Recorded as `served_model` on `ContextCaptured`, beside `model`, the one Lucidos asked for. A served model that is neither the requested one nor a dated snapshot of it means another model answered. Either the provider rerouted the call, or Lucidos sent a *retired model*'s successor. A Claude Code call records the reply's id in both fields, so it never reads as rerouted.
 
 ### Motion
 How much Lucidos moves on one device: **Settings → Appearance → Motion**, the device-scoped `motion` *preference*. **System** follows the device's reduce-motion switch. **Reduce** calms the app regardless: nothing slides, pulses or spins, and changes appear at once. **Full** keeps every animation even when the device asks for less. The page gets `data-motion="reduce"` or `data-motion="full"` before first paint, and apps read the same attribute. The Animation speed slider under **Settings → System → Debugging** is a diagnostic, and has no effect while Motion reduces.
@@ -1442,7 +1442,7 @@ Opening the panel reads the published changelog, so releases newer than your cop
 
 A release the updater is **offering** sits above that list, with the control to get it. With no offer, the control sits on the newest release ahead of you, since the changelog arrives before the update check. On the desktop app the control is **Update & Restart**, and the row wears no chip. A browser or phone has no updater, so the row keeps its **Available** or **Newer** chip and offers **How to Update**. That opens the page for your kind of install.
 
-One exception: with the desktop app open on the Mac that runs the workspace, a browser or phone gets **Update Desktop App** instead. The desktop app installs the release and restarts Lucidos, while your phone shows progress. It works only where nobody needs to be at the Mac. So it is not offered from the disk image, or from a folder that needs an administrator password.
+One exception: with the desktop app open on the Mac that runs the workspace, a browser or phone gets **Update Desktop App** instead, even for a release published a minute ago. Lucidos checks for the release when you tap. The desktop app installs the release and restarts Lucidos, while your phone shows progress. It works only where nobody needs to be at the Mac. So it is not offered from the disk image, or from a folder that needs an administrator password.
 
 An offered version is newer than the running binary, so its notes are not in that binary's history. They arrive with the update check. So the offer's notes appear only where a real update is pending, and never fall back to the installed list. That would show your CURRENT version's contents under the heading of the one you were about to install.
 
@@ -1640,6 +1640,11 @@ The user-clicked action that merges a *coding-agent thread*'s worktree branch in
 
 There is no "Apply & Restart" label: even for an **Apply\***, the restart is the separate *Switch to new version*, never Apply itself. A merged *change* touching engine-affecting source also starts a background engine rebuild (dev only). That surfaces later as *New version available / Switch to new version*. If the session didn't run *hardening* first, Apply runs it synchronously and the user waits. Source: `crates/lucidos-engine/src/engine/git_ops/restart_detection.rs` (`files_require_restart`).
 
+### Start failure
+A *coding-agent thread* whose agent process exited on its own before its session began, usually from an expired login or no network. Lucidos shows a red card headed "Claude Code could not start" (or "Codex could not start"). It quotes the CLI's own words and says why Lucidos did not retry.
+
+The card offers **Try again**, which is *Continue* and resends the message the agent never read. Lucidos never retries a start failure by itself, because one repeats until its cause is fixed. An exit after the session began gets the same card, headed "stopped unexpectedly". A hang or a stray signal kill still resumes once by itself.
+
 ### New version available / Switch to new version
 The affordance for moving the *engine* onto a newer version. Lucidos shows **"New version available"** (a dismissible toast plus a persistent control-panel badge). It offers **"Switch to new version"**: a deliberate, user-triggered restart behind a brief blocking overlay and a "Starting new version…" notice. Two sources feed it. In a **dev** build, *Apply*-ing a *change* to Lucidos's own source rebuilds the engine in the background, and the old engine serves until you switch. In a **packaged** build, the gateway finds a newer published release.
 
@@ -1822,12 +1827,17 @@ A new *coding-agent thread* that carries on a heavy thread's work with a fresh c
 
 Four moments start one:
 
-- picking `Implement in a new thread` on a plan card;
+- picking an `Implement in a new thread` option on a plan card;
 - **Send to a new thread** on the *successor strip*;
 - asking the agent to "handoff this session";
 - **Continue in a new thread** on the *successor strip*.
 
 Every handoff but **Send to a new thread** carries a *handoff narrative*, which the agent writes before it runs `lucidos successor spawn`.
+
+A successor runs on the old thread's *implementer* unless the handoff names another.
+
+### Implementer
+The coding agent that builds a thread's work: a backend, a model and a reasoning effort, such as Claude Code on Sonnet 5.5 at high effort. An unset model or effort means the backend's own default. On a large planning thread the plan card recommends one for the *successor thread*, and names the thread's own beside it. The planning agent picks the recommendation from how settled the plan is. `lucidos successor spawn` takes the choice as `--coding-agent`, `--coding-agent-model` and `--reasoning-effort`.
 
 ### Auto-compact trial
 An experiment on Claude Code threads: does a 400k-token auto-compact window cost less without hurting the work? The `coding_agent_auto_compact_trial` preference switches it. `ab` gives the window to half of all top-level threads, each together with its sub-threads and successors. A thread keeps the arm it first ran in. `on` gives it to all of them. When Claude Code compacts its context, the step says so, and the context counter drops.

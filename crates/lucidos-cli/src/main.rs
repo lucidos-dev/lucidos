@@ -1295,6 +1295,20 @@ enum SuccessorCmd {
         /// `lucidos successor --help` names.
         #[arg(long)]
         narrative: PathBuf,
+        /// Coding-agent backend for the successor. Defaults to this thread's.
+        #[arg(long, value_enum)]
+        coding_agent: Option<CliCodingAgent>,
+        /// Model for the successor (e.g. "sonnet", "gpt-5.6-sol"). Defaults
+        /// to this thread's on the same backend, else the backend's default.
+        #[arg(long = "coding-agent-model")]
+        coding_agent_model: Option<String>,
+        /// Thinking level for the successor. Defaults to this thread's on the
+        /// same backend while the successor's model accepts it.
+        #[arg(
+            long,
+            value_parser = clap::builder::PossibleValuesParser::new(crate::spawn_thread::EFFORT_LEVELS)
+        )]
+        reasoning_effort: Option<String>,
     },
 }
 
@@ -1546,7 +1560,20 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Successor { action } => {
             let ws = resolve_from_env()?;
             match action {
-                SuccessorCmd::Spawn { narrative } => successor::cmd_spawn(&ws, &narrative)?,
+                SuccessorCmd::Spawn {
+                    narrative,
+                    coding_agent,
+                    coding_agent_model,
+                    reasoning_effort,
+                } => successor::cmd_spawn(
+                    &ws,
+                    &narrative,
+                    successor::ImplementerChoice {
+                        coding_agent,
+                        model: coding_agent_model,
+                        reasoning_effort,
+                    },
+                )?,
             }
             Ok(0)
         }

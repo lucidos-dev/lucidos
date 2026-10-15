@@ -325,29 +325,79 @@ fn watchdog_diag_log_threshold_is_half_the_fire_limit() {
 // can't silently drop a branch (e.g. forget the `ContinuationRequested`
 // emit on watchdog fire, leaving threads stuck at "running" when the
 // network dies mid-call, or forget the stray-signal auto-resume).
-//
-// Args: (safety_net_fired, watchdog_fired, external_already,
-//        killed_by_signal, engine_cancelled).
+
+const GATEWAY_MESSAGE: &str = "Couldn't load settings from Cloud gateway \
+https://claude-gateway.example.com. Check your network connection, or sign in again with /login.";
+
+/// The old five-flag rows, on the input struct. A bare exit: no code, no
+/// stderr, and no startup line seen.
+fn safety_net_action_for(
+    safety_net_fired: bool,
+    watchdog_fired: bool,
+    external_already: bool,
+    killed_by_signal: bool,
+    engine_cancelled: bool,
+) -> SafetyNetAction {
+    safety_net_action(&SafetyNetInput {
+        safety_net_fired,
+        watchdog_fired,
+        external_terminal_already_emitted: external_already,
+        engine_cancelled,
+        init_seen: false,
+        exit: &AgentExitFacts {
+            killed_by_signal,
+            ..AgentExitFacts::default()
+        },
+        coding_agent: CodingAgent::ClaudeCode,
+    })
+}
+
+/// A fired net with the agent's own exit on it.
+fn safety_net_action_after_exit(
+    exit: AgentExitFacts,
+    init_seen: bool,
+    watchdog_fired: bool,
+    engine_cancelled: bool,
+    coding_agent: CodingAgent,
+) -> SafetyNetAction {
+    safety_net_action(&SafetyNetInput {
+        safety_net_fired: true,
+        watchdog_fired,
+        external_terminal_already_emitted: false,
+        engine_cancelled,
+        init_seen,
+        exit: &exit,
+        coding_agent,
+    })
+}
+
+fn exit_with(code: Option<i32>, stderr: &str) -> AgentExitFacts {
+    AgentExitFacts {
+        killed_by_signal: false,
+        code,
+        stderr_tail: stderr.to_string(),
+    }
+}
 
 #[test]
 fn safety_net_action_nothing_when_loop_ended_naturally() {
     // Loop emitted a natural terminator (Generated, Failed, Canceled,
     // Aborted) — no safety net needed. The other inputs are irrelevant.
     assert_eq!(
-        safety_net_action(false, false, false, false, false),
+        safety_net_action_for(false, false, false, false, false),
         SafetyNetAction::Nothing,
     );
     assert_eq!(
-        safety_net_action(false, true, false, false, false),
+        safety_net_action_for(false, true, false, false, false),
         SafetyNetAction::Nothing,
         "watchdog flag is irrelevant when the natural terminator already landed",
     );
     assert_eq!(
-        safety_net_action(false, false, true, false, false),
+        safety_net_action_for(false, false, true, false, false),
         SafetyNetAction::Nothing,
     );
     assert_eq!(
-        safety_net_action(false, false, false, true, false),
+        safety_net_action_for(false, false, false, true, false),
         SafetyNetAction::Nothing,
         "a signal kill is irrelevant when the natural terminator already landed",
     );
@@ -358,17 +408,17 @@ fn safety_net_action_skip_when_external_terminal_already_emitted() {
     // The engine-restart fast-path landed a terminal before reaching
     // cleanup — a second terminal would relabel the closed turn.
     assert_eq!(
-        safety_net_action(true, false, true, false, false),
+        safety_net_action_for(true, false, true, false, false),
         SafetyNetAction::Skip,
     );
     assert_eq!(
-        safety_net_action(true, true, true, false, false),
+        safety_net_action_for(true, true, true, false, false),
         SafetyNetAction::Skip,
         "external terminal wins over the watchdog too — no recovery, no abort \
          once a real terminal already closed the turn",
     );
     assert_eq!(
-        safety_net_action(true, false, true, true, false),
+        safety_net_action_for(true, false, true, true, false),
         SafetyNetAction::Skip,
         "external terminal wins over a stray signal-kill too",
     );
@@ -380,7 +430,7 @@ fn safety_net_action_continuation_requested_on_watchdog_fire() {
     // auto-recovery, not abort, so the user never sees a spurious
     // failure state.
     assert_eq!(
-        safety_net_action(true, true, false, false, false),
+        safety_net_action_for(true, true, false, false, false),
         SafetyNetAction::EmitContinuationRequested,
         "watchdog fire MUST route to auto-recovery, not abort",
     );
@@ -391,7 +441,7 @@ fn safety_net_action_continuation_requested_on_stray_signal_kill() {
     // The exit=143 bug: CC died from a stray external SIGTERM that the
     // engine did NOT initiate — auto-resume instead of a red-dot abort.
     assert_eq!(
-        safety_net_action(true, false, false, true, false),
+        safety_net_action_for(true, false, false, true, false),
         SafetyNetAction::EmitContinuationRequested,
         "a stray signal-kill with no engine cancel MUST auto-resume",
     );
@@ -405,7 +455,7 @@ fn safety_net_action_aborted_when_engine_cancelled_the_signal_kill() {
     // emits its own terminal so the safety net wouldn't fire; this pins the
     // gate regardless.)
     assert_eq!(
-        safety_net_action(true, false, false, true, true),
+        safety_net_action_for(true, false, false, true, true),
         SafetyNetAction::EmitAbortedSafetyNet,
         "engine-initiated signal kill MUST NOT auto-resume",
     );
@@ -417,9 +467,165 @@ fn safety_net_action_aborted_when_no_watchdog_no_external_terminal() {
     // abort so the UI flips out of "running" and the user knows the work
     // didn't complete.
     assert_eq!(
-        safety_net_action(true, false, false, false, false),
+        safety_net_action_for(true, false, false, false, false),
         SafetyNetAction::EmitAbortedSafetyNet,
         "non-watchdog non-signal safety net MUST emit ResponseAborted",
+    );
+}
+
+// ─── the agent's own exit ─────────────────────────────────────────────
+
+fn startup_failed(code: i32) -> CodingAgentExit {
+    CodingAgentExit {
+        stage: CodingAgentExitStage::Startup,
+        code: Some(code),
+    }
+}
+
+/// The incident: the retried `claude` exited 1 with its reason on stderr
+/// before its first line. The user must read that reason, and nothing may retry it.
+#[test]
+fn an_exit_before_the_startup_line_fails_loudly_with_the_cli_words() {
+    assert_eq!(
+        safety_net_action_after_exit(
+            exit_with(Some(1), GATEWAY_MESSAGE),
+            false,
+            false,
+            false,
+            CodingAgent::ClaudeCode
+        ),
+        SafetyNetAction::EmitFailed {
+            error: GATEWAY_MESSAGE.to_string(),
+            agent_exit: startup_failed(1),
+        },
+    );
+}
+
+#[test]
+fn a_silent_start_failure_names_the_agent_and_the_exit_code() {
+    for (agent, name) in [
+        (CodingAgent::ClaudeCode, "Claude Code"),
+        (CodingAgent::Codex, "Codex"),
+    ] {
+        let SafetyNetAction::EmitFailed { error, agent_exit } =
+            safety_net_action_after_exit(exit_with(Some(2), ""), false, false, false, agent)
+        else {
+            panic!("a non-zero exit with no stderr is still a failure");
+        };
+        assert_eq!(
+            error,
+            format!(
+                "{name} exited with code 2 before its session began and wrote nothing to stderr."
+            )
+        );
+        assert_eq!(agent_exit, startup_failed(2));
+    }
+}
+
+#[test]
+fn an_exit_after_the_startup_line_is_a_mid_turn_crash() {
+    let SafetyNetAction::EmitFailed { error, agent_exit } = safety_net_action_after_exit(
+        exit_with(Some(1), "Error: out of memory"),
+        true,
+        false,
+        false,
+        CodingAgent::ClaudeCode,
+    ) else {
+        panic!("a crash after init must fail the turn");
+    };
+    assert_eq!(error, "Error: out of memory");
+    assert_eq!(
+        agent_exit,
+        CodingAgentExit {
+            stage: CodingAgentExitStage::MidTurn,
+            code: Some(1)
+        }
+    );
+}
+
+#[test]
+fn stderr_alone_is_enough_to_fail_a_clean_exit() {
+    assert!(matches!(
+        safety_net_action_after_exit(
+            exit_with(Some(0), "something went wrong"),
+            false,
+            false,
+            false,
+            CodingAgent::Codex
+        ),
+        SafetyNetAction::EmitFailed { .. }
+    ));
+}
+
+#[test]
+fn a_silent_clean_exit_keeps_the_safety_net_abort() {
+    assert_eq!(
+        safety_net_action_after_exit(
+            exit_with(Some(0), ""),
+            true,
+            false,
+            false,
+            CodingAgent::ClaudeCode
+        ),
+        SafetyNetAction::EmitAbortedSafetyNet,
+    );
+}
+
+#[test]
+fn a_watchdog_kill_keeps_its_retry_whatever_the_exit_says() {
+    assert_eq!(
+        safety_net_action_after_exit(
+            exit_with(Some(1), GATEWAY_MESSAGE),
+            true,
+            true,
+            false,
+            CodingAgent::ClaudeCode
+        ),
+        SafetyNetAction::EmitContinuationRequested,
+        "a hang is not a start failure",
+    );
+}
+
+#[test]
+fn a_stray_signal_kill_before_the_startup_line_keeps_its_retry() {
+    let exit = AgentExitFacts {
+        killed_by_signal: true,
+        code: Some(143),
+        stderr_tail: "terminated".to_string(),
+    };
+    assert_eq!(
+        safety_net_action_after_exit(exit, false, false, false, CodingAgent::ClaudeCode),
+        SafetyNetAction::EmitContinuationRequested,
+    );
+}
+
+#[test]
+fn an_engine_teardown_with_words_on_stderr_is_not_the_agents_failure() {
+    assert_eq!(
+        safety_net_action_after_exit(
+            exit_with(None, "terminated by the engine"),
+            true,
+            false,
+            true,
+            CodingAgent::ClaudeCode
+        ),
+        SafetyNetAction::EmitAbortedSafetyNet,
+    );
+}
+
+#[test]
+fn an_external_terminal_wins_over_a_failed_exit() {
+    assert_eq!(
+        safety_net_action(&SafetyNetInput {
+            safety_net_fired: true,
+            watchdog_fired: false,
+            external_terminal_already_emitted: true,
+            engine_cancelled: false,
+            init_seen: false,
+            exit: &exit_with(Some(1), GATEWAY_MESSAGE),
+            coding_agent: CodingAgent::ClaudeCode,
+        }),
+        SafetyNetAction::Skip,
     );
 }
 

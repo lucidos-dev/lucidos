@@ -128,9 +128,10 @@ pub struct LlmResponse {
     /// chars/4 estimate (which over-counts base64 image bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u32>,
-    /// Cache-write token count: Anthropic, and OpenAI from GPT-5.6 on. `None`
-    /// on providers that report none. Together with `cache_read_tokens` lets the modal show
-    /// hit/miss rate so the user can see why a turn was cheap or expensive.
+    /// Cache-write token count: Anthropic, OpenRouter's Anthropic models, and
+    /// OpenAI from GPT-5.6 on. `None` on providers that report none. Together
+    /// with `cache_read_tokens` lets the modal show hit/miss rate so the user
+    /// can see why a turn was cheap or expensive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_tokens: Option<u32>,
     /// Cache-read token count. `None` on providers that report none.

@@ -2,6 +2,7 @@ use super::completion::{idle_exit, IdleExit};
 use super::idle_change_state::{resolve_idle_change_state, IdleChangeStateInput};
 use super::idle_snapshot::CodingAgentIdleSnapshot;
 use super::spawn_context::SpawnWorktreeContext;
+use crate::engine::agent_session::start_failure::AgentStartFailure;
 use crate::engine::agent_session::text_buffer::CodingAgentTextBuffer;
 use crate::engine::agentic_loop::should_flush;
 use crate::engine::change_ops::{now_epoch_millis, ProposeOutcome};
@@ -10,9 +11,11 @@ use crate::engine::git_ops::{
     auto_commit_preserving_marker, branch_head_sha, default_local_branch, describe_branch_changes,
     files_require_restart, has_full_harden_marker, is_external_repo_path, main_worktree,
 };
-use crate::engine::thread_events::{EventChannel, SessionEndReason};
+use crate::engine::thread_events::{
+    CodingAgentExit, CodingAgentExitStage, EventChannel, SessionEndReason,
+};
 use crate::engine::{AgentUserInput, LucidosEngine, ProcessResult, StopReason};
-use crate::runtime::{AgentEvent, AgentInput, CodingAgent};
+use crate::runtime::{AgentEvent, AgentExitFacts, AgentInput, CodingAgent};
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -97,38 +100,48 @@ async fn await_process_teardown(
     }
 }
 
+/// How a driver that wound down before the first prompt could be sent ended.
+#[derive(Debug, Default)]
+struct StartupDeath {
+    /// The cause to show: the driver's own `Result` error, else the CLI's
+    /// stderr, else a note that a signal killed it.
+    reason: Option<String>,
+    exit: AgentExitFacts,
+}
+
 /// The coding-agent driver dropped its input receiver before the engine could
 /// send the first prompt. That happens only when the driver task already wound
 /// down: the agent process failed to start, exited immediately, or its handshake
 /// failed. In every such path the driver flushes its REAL cause onto `events_rx`
-/// first, as a `Result { error }` or an `Exited { killed_by_signal }`. Recover
-/// it, so the thread surfaces an actionable reason.
+/// first, as a `Result { error }` or an `Exited`. Recover it, so the thread
+/// surfaces an actionable reason.
 ///
 /// Non-blocking on purpose. By the time the receiver-drop is observed the driver
 /// has returned, so every event it will ever emit is already buffered.
 /// `try_recv` drains the tail without awaiting.
-fn drain_startup_failure_reason(
+fn drain_startup_death(
     events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
-) -> Option<String> {
-    let mut reason: Option<String> = None;
-    let mut killed_by_signal = false;
+) -> StartupDeath {
+    let mut error: Option<String> = None;
+    let mut exit = AgentExitFacts::default();
     while let Ok(ev) = events_rx.try_recv() {
         match ev {
             // Last non-empty error wins: the driver emits the specific cause
             // before the terminal Exited.
             AgentEvent::Result { error: Some(e), .. } if !e.trim().is_empty() => {
-                reason = Some(e);
+                error = Some(e);
             }
-            AgentEvent::Exited {
-                killed_by_signal: k,
-            } => killed_by_signal = k,
+            AgentEvent::Exited { exit: facts } => exit = facts,
             _ => {}
         }
     }
-    reason.or_else(|| {
-        killed_by_signal
-            .then(|| "coding agent process was killed by a signal during startup".to_string())
-    })
+    let reason = error
+        .or_else(|| (!exit.stderr_tail.is_empty()).then(|| exit.stderr_tail.clone()))
+        .or_else(|| {
+            exit.killed_by_signal
+                .then(|| "coding agent process was killed by a signal during startup".to_string())
+        });
+    StartupDeath { reason, exit }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -152,6 +165,32 @@ fn classify_startup_failure(resumed: bool, cause: Option<String>) -> StartupFail
             "Coding agent exited during startup before the first prompt could be sent".to_string(),
         ),
     }
+}
+
+/// The error a start failure returns once the first prompt could not be sent.
+///
+/// A death that left facts becomes an [`AgentStartFailure`] carrying the CLI's
+/// own words, so the turn fails with its stage and exit code. One that left
+/// nothing (a driver that panicked) keeps the plain message.
+fn startup_failure_error(
+    coding_agent: CodingAgent,
+    death: StartupDeath,
+    plain_message: String,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    let StartupDeath { reason, exit } = death;
+    if reason.is_none() && exit.code.is_none() {
+        return plain_message.into();
+    }
+    let stage = CodingAgentExitStage::Startup;
+    Box::new(AgentStartFailure {
+        message: reason.unwrap_or_else(|| {
+            crate::engine::agent_session::lifecycle::exit_error_text(coding_agent, stage, &exit)
+        }),
+        exit: CodingAgentExit {
+            stage,
+            code: exit.code,
+        },
+    })
 }
 
 /// Where a Lucidos-**source** session roots when no `Lucidos` repository row
@@ -245,10 +284,45 @@ async fn usage_flushed_at_stop(
     flushed
 }
 
+/// The two model ids one coding-agent call records on its `ContextCaptured`.
+#[derive(Debug, PartialEq)]
+struct CallModels {
+    /// The id the reply named, never the picker alias it folds onto, so a
+    /// reader can price it. The agent strips the session's `[1m]` from its
+    /// echo, and it comes back here, since the context window keys on it.
+    model: String,
+    /// The *served model*: the id the reply named, verbatim. It always reads
+    /// as served as sent beside `model`, since one reply names both.
+    served_model: Option<String>,
+}
+
+impl CallModels {
+    /// `session_model` is the model the session was started on, and
+    /// `reported_model` the one the agent echoed for this call. A sub-agent's
+    /// call echoes its own model, never the session's.
+    fn of(session_model: Option<&str>, reported_model: Option<&str>) -> Self {
+        let reported_model = reported_model.filter(|m| !m.is_empty());
+        let with_session_window = |reported: &str| {
+            let reconciled =
+                crate::runtime::claude_code::reconcile_cc_model(session_model, reported);
+            match reconciled.ends_with("[1m]") {
+                true => format!("{reported}[1m]"),
+                false => reported.to_string(),
+            }
+        };
+        Self {
+            model: reported_model
+                .map(with_session_window)
+                .or_else(|| session_model.map(String::from))
+                .unwrap_or_default(),
+            served_model: reported_model.map(String::from),
+        }
+    }
+}
+
 impl LucidosEngine {
     /// Record one coding-agent API call as a `ContextCaptured` carrying its
-    /// usage. `session_model` is the model the session was started on, and
-    /// `reported_model` the one the agent echoed for this call.
+    /// usage. The two models are read as [`CallModels::of`] reads them.
     async fn record_coding_agent_usage(
         &self,
         thread_id: Uuid,
@@ -259,12 +333,11 @@ impl LucidosEngine {
         reported: ReportedUsage,
     ) {
         // Sections stay empty, because CC does not expose its system prompt
-        // or tool schemas. CC strips the [1m] suffix on the per-message model
-        // echo, so reconcile against the session model before measuring.
-        let snapshot_model = reported_model
-            .map(|m| crate::runtime::claude_code::reconcile_cc_model(session_model, m))
-            .or_else(|| session_model.map(String::from))
-            .unwrap_or_default();
+        // or tool schemas.
+        let CallModels {
+            model: snapshot_model,
+            served_model,
+        } = CallModels::of(session_model, reported_model);
         // The backend's own window wins, because this capture REPORTS a call
         // the engine did not make. `context_window_for` answers for a Lucidos
         // request, where 1M mode is gated on our `[1m]` suffix. A coding agent
@@ -312,7 +385,7 @@ impl LucidosEngine {
                         api_call_id: reported.api_call_id,
                         reasoning_effort: None,
                         duration_ms: reported.duration_ms,
-                        served_model: None,
+                        served_model,
                     },
                     meta: meta.clone(),
                 },
@@ -1090,10 +1163,12 @@ impl LucidosEngine {
             // The driver already wound down, so recover the real cause it
             // flushed onto `events_rx`. A bare "channel closed" hides what
             // actually failed.
-            let cause = drain_startup_failure_reason(&mut events_rx);
+            let death = drain_startup_death(&mut events_rx);
             return Err(
-                match classify_startup_failure(resume_session_id.is_some(), cause) {
-                    StartupFailure::Failed(e) => e,
+                match classify_startup_failure(resume_session_id.is_some(), death.reason.clone()) {
+                    StartupFailure::Failed(plain) => {
+                        startup_failure_error(coding_agent, death, plain)
+                    }
                     StartupFailure::StaleResume => {
                         log!(
                             "[AgentSession] thread {} could not resume sid={}: the coding agent has no such session. Retrying with a fresh one.",
@@ -1108,18 +1183,18 @@ impl LucidosEngine {
                             .emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
-                                    event: crate::engine::thread_events::ThreadEvent::SessionEnded {
-                                        reason: SessionEndReason::StaleResume,
-                                    },
+                                    event:
+                                        crate::engine::thread_events::ThreadEvent::SessionEnded {
+                                            reason: SessionEndReason::StaleResume,
+                                        },
                                     meta: meta.clone(),
                                 },
                                 "[AgentSession] SessionEnded (stale resume at startup)",
                             )
                             .await;
-                        STALE_RESUME_ERROR.to_string()
+                        STALE_RESUME_ERROR.into()
                     }
-                }
-                .into(),
+                },
             );
         }
 
@@ -1377,9 +1452,10 @@ impl LucidosEngine {
         // from `agent_cancel.is_cancelled()` because the stale-resume and
         // question-cancel paths also cancel the token for non-hang reasons.
         let mut watchdog_fired = false;
-        // True when the CC child died from a signal the engine did NOT initiate
-        // (the exit=143 stray SIGTERM). The safety net reads it to auto-resume.
-        let mut killed_by_signal = false;
+        // How the agent's process ended, from its `Exited`. The safety net
+        // classifies it: a stray signal kill auto-resumes, a failed exit fails
+        // the turn with the agent's own words.
+        let mut exit_facts = AgentExitFacts::default();
         // Bounded Esc fallback. A real Cancel forwards CC's native interrupt and
         // waits for CC to wind down and emit a `Result`. If CC does not honor it
         // within this window, escalate to the hard stop so Cancel is always
@@ -1422,8 +1498,8 @@ impl LucidosEngine {
                         }
                         Settled::Nothing => (false, Vec::new()),
                     };
-                    if let AgentEvent::Exited { killed_by_signal: ev_killed_by_signal } = ev {
-                        killed_by_signal = ev_killed_by_signal;
+                    if let AgentEvent::Exited { exit } = ev {
+                        exit_facts = exit;
                         // Final flush of any pending reasoning: surface what the
                         // process reasoned before it died.
                         self.flush_coding_agent_thought(
@@ -2961,7 +3037,8 @@ impl LucidosEngine {
             &agent_cancel,
             emitted_terminal_event,
             watchdog_fired,
-            killed_by_signal,
+            exit_facts,
+            init_session_id.is_some(),
             last_emitted_idle,
             is_external_repo,
             proposed_change,
@@ -3377,38 +3454,57 @@ mod unregistered_lucidos_root_tests {
 mod startup_failure_tests {
     use super::*;
 
+    const GATEWAY_MESSAGE: &str = "Couldn't load settings from Cloud gateway \
+https://claude-gateway.example.com. Check your network connection, or sign in again with /login.";
+
+    fn exited(exit: AgentExitFacts) -> AgentEvent {
+        AgentEvent::Exited { exit }
+    }
+
+    fn drained(events: Vec<AgentEvent>) -> StartupDeath {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        for ev in events {
+            tx.send(ev).unwrap();
+        }
+        drop(tx); // driver wound down
+        drain_startup_death(&mut rx)
+    }
+
     #[test]
     fn recovers_driver_result_error() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        tx.send(AgentEvent::Result {
-            text: String::new(),
-            duration_ms: 0,
-            error: Some("Failed to start Codex: No such file or directory".to_string()),
-        })
-        .unwrap();
-        tx.send(AgentEvent::Exited {
-            killed_by_signal: false,
-        })
-        .unwrap();
-        drop(tx); // driver wound down
-
+        let death = drained(vec![
+            AgentEvent::Result {
+                text: String::new(),
+                duration_ms: 0,
+                error: Some("Failed to start Codex: No such file or directory".to_string()),
+            },
+            exited(AgentExitFacts::default()),
+        ]);
         assert_eq!(
-            drain_startup_failure_reason(&mut rx).as_deref(),
+            death.reason.as_deref(),
             Some("Failed to start Codex: No such file or directory")
         );
     }
 
     #[test]
-    fn falls_back_to_signal_kill_when_no_result_error() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        tx.send(AgentEvent::Exited {
-            killed_by_signal: true,
-        })
-        .unwrap();
-        drop(tx);
+    fn the_cli_words_on_stderr_are_the_reason_when_the_driver_sent_no_error() {
+        let death = drained(vec![exited(AgentExitFacts {
+            killed_by_signal: false,
+            code: Some(1),
+            stderr_tail: GATEWAY_MESSAGE.to_string(),
+        })]);
+        assert_eq!(death.reason.as_deref(), Some(GATEWAY_MESSAGE));
+        assert_eq!(death.exit.code, Some(1));
+    }
 
+    #[test]
+    fn falls_back_to_signal_kill_when_no_result_error() {
+        let death = drained(vec![exited(AgentExitFacts {
+            killed_by_signal: true,
+            ..AgentExitFacts::default()
+        })]);
         assert_eq!(
-            drain_startup_failure_reason(&mut rx).as_deref(),
+            death.reason.as_deref(),
             Some("coding agent process was killed by a signal during startup")
         );
     }
@@ -3416,28 +3512,63 @@ mod startup_failure_tests {
     #[test]
     fn none_when_no_failure_signal() {
         // Clean exit, no error, no signal — caller uses its generic message.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        tx.send(AgentEvent::Exited {
-            killed_by_signal: false,
-        })
-        .unwrap();
-        drop(tx);
-
-        assert_eq!(drain_startup_failure_reason(&mut rx), None);
+        let death = drained(vec![exited(AgentExitFacts::default())]);
+        assert_eq!(death.reason, None);
     }
 
     #[test]
     fn ignores_empty_error_strings() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        tx.send(AgentEvent::Result {
+        let death = drained(vec![AgentEvent::Result {
             text: String::new(),
             duration_ms: 0,
             error: Some("   ".to_string()),
-        })
-        .unwrap();
-        drop(tx);
+        }]);
+        assert_eq!(death.reason, None);
+    }
 
-        assert_eq!(drain_startup_failure_reason(&mut rx), None);
+    #[test]
+    fn a_death_with_the_cli_words_becomes_a_typed_startup_failure() {
+        let death = drained(vec![exited(AgentExitFacts {
+            killed_by_signal: false,
+            code: Some(1),
+            stderr_tail: GATEWAY_MESSAGE.to_string(),
+        })]);
+        let error = startup_failure_error(CodingAgent::ClaudeCode, death, "plain".into());
+        assert_eq!(error.to_string(), GATEWAY_MESSAGE);
+        assert_eq!(
+            crate::engine::agent_session::start_failure::agent_exit_of(error.as_ref()),
+            Some(CodingAgentExit {
+                stage: CodingAgentExitStage::Startup,
+                code: Some(1)
+            })
+        );
+    }
+
+    #[test]
+    fn a_silent_death_with_an_exit_code_names_the_agent() {
+        let death = drained(vec![exited(AgentExitFacts {
+            code: Some(2),
+            ..AgentExitFacts::default()
+        })]);
+        let error = startup_failure_error(CodingAgent::Codex, death, "plain".into());
+        assert_eq!(
+            error.to_string(),
+            "Codex exited with code 2 before its session began and wrote nothing to stderr."
+        );
+    }
+
+    #[test]
+    fn a_death_that_left_no_facts_keeps_the_plain_message() {
+        let error = startup_failure_error(
+            CodingAgent::ClaudeCode,
+            StartupDeath::default(),
+            "plain".into(),
+        );
+        assert_eq!(error.to_string(), "plain");
+        assert_eq!(
+            crate::engine::agent_session::start_failure::agent_exit_of(error.as_ref()),
+            None
+        );
     }
 
     const NOT_FOUND: &str = "No conversation found with session ID: 2f27ec90";
@@ -3609,5 +3740,83 @@ mod usage_flushed_at_stop_tests {
         let flushed = usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(2)).await;
 
         assert!(flushed.is_empty());
+    }
+}
+
+/// Each coding-agent call records the model the reply named, never a picker
+/// alias, so Token Cost can price it.
+#[cfg(test)]
+mod call_models_tests {
+    use super::CallModels;
+    use crate::llm::served_model::served_as_sent;
+
+    /// The unpriced calls: a sub-agent set to `model: haiku` on an Opus
+    /// session recorded `haiku`. It records the id that answered, and reads
+    /// as served as sent, so no reader takes it for a reroute.
+    #[test]
+    fn an_alias_sub_agent_call_records_the_model_that_answered() {
+        let models = CallModels::of(
+            Some("claude-opus-5-5[1m]"),
+            Some("claude-haiku-4-5-20251001"),
+        );
+
+        assert_eq!(
+            models,
+            CallModels {
+                model: "claude-haiku-4-5-20251001".into(),
+                served_model: Some("claude-haiku-4-5-20251001".into()),
+            }
+        );
+    }
+
+    /// A session started on an alias with `[1m]` keeps the marker on the full
+    /// id, so the long context window still reaches a reader.
+    #[test]
+    fn an_alias_session_with_1m_keeps_the_marker_on_the_full_id() {
+        let models = CallModels::of(Some("opus[1m]"), Some("claude-opus-4-6"));
+
+        assert_eq!(models.model, "claude-opus-4-6[1m]");
+        assert!(served_as_sent(&models.model, "claude-opus-4-6"));
+    }
+
+    /// A sub-agent on another full id keeps that id in both fields, not the
+    /// session's.
+    #[test]
+    fn a_full_id_call_records_its_own_id_twice() {
+        let models = CallModels::of(Some("claude-opus-5-5[1m]"), Some("claude-sonnet-5"));
+
+        assert_eq!(
+            models,
+            CallModels {
+                model: "claude-sonnet-5".into(),
+                served_model: Some("claude-sonnet-5".into()),
+            }
+        );
+    }
+
+    /// The session's own call keeps its `[1m]` in `model`, and reads as
+    /// served as sent.
+    #[test]
+    fn a_main_session_call_is_served_as_sent() {
+        let models = CallModels::of(Some("claude-opus-5-5[1m]"), Some("claude-opus-5-5"));
+
+        assert_eq!(models.model, "claude-opus-5-5[1m]");
+        assert_eq!(models.served_model.as_deref(), Some("claude-opus-5-5"));
+        assert!(served_as_sent(&models.model, "claude-opus-5-5"));
+    }
+
+    /// Codex echoes no model per call. The session's model stands in for
+    /// `model`, and no reply named a served one.
+    #[test]
+    fn a_call_with_no_echoed_model_records_no_served_model() {
+        for reported in [None, Some("")] {
+            assert_eq!(
+                CallModels::of(Some("gpt-5.6-sol"), reported),
+                CallModels {
+                    model: "gpt-5.6-sol".into(),
+                    served_model: None,
+                }
+            );
+        }
     }
 }

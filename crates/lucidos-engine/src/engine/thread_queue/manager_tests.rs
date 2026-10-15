@@ -1721,6 +1721,7 @@ async fn a_user_thread_that_leaves_running_stops_counting() {
         response_generated(),
         crate::engine::thread_events::ThreadEvent::ResponseFailed {
             error: "boom".to_string(),
+            agent_exit: None,
         },
         user_question_asked(),
     ] {
@@ -2048,7 +2049,8 @@ fn moves_user_occupancy_selects_status_transitions() {
     assert!(moves_user_occupancy(&cc_idled()));
     assert!(moves_user_occupancy(&response_generated()));
     assert!(moves_user_occupancy(&ThreadEvent::ResponseFailed {
-        error: "x".into()
+        error: "x".into(),
+        agent_exit: None,
     }));
     assert!(moves_user_occupancy(&ThreadEvent::ContinuationRequested {
         reason: String::new()

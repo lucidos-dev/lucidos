@@ -13,7 +13,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
         .expect("spawn test child");
     let stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let stderr = child.stderr.take().expect("stderr");
+    let stderr = StderrTail::spawn(child.stderr.take().expect("stderr"), Vec::new());
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -23,7 +23,7 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
         child,
         stdin,
         BufReader::new(stdout),
-        BufReader::new(stderr),
+        stderr,
         events_tx,
         input_rx,
         control_rx,
@@ -114,7 +114,10 @@ async fn driver_task_parses_stdout_into_typed_events() {
     assert!(matches!(
         exited,
         AgentEvent::Exited {
-            killed_by_signal: false
+            exit: AgentExitFacts {
+                killed_by_signal: false,
+                ..
+            }
         }
     ));
 
@@ -157,7 +160,10 @@ async fn driver_task_cancellation_terminates_process() {
     assert!(matches!(
         exited,
         AgentEvent::Exited {
-            killed_by_signal: false
+            exit: AgentExitFacts {
+                killed_by_signal: false,
+                ..
+            }
         }
     ));
 }
@@ -180,7 +186,7 @@ async fn driver_task_flags_stray_signal_kill() {
     let pid = child.id().expect("child pid");
     let stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
-    let stderr = child.stderr.take().expect("stderr");
+    let stderr = StderrTail::spawn(child.stderr.take().expect("stderr"), Vec::new());
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (_input_tx, input_rx) = mpsc::unbounded_channel();
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
@@ -190,7 +196,7 @@ async fn driver_task_flags_stray_signal_kill() {
         child,
         stdin,
         BufReader::new(stdout),
-        BufReader::new(stderr),
+        stderr,
         events_tx,
         input_rx,
         control_rx,
@@ -211,7 +217,10 @@ async fn driver_task_flags_stray_signal_kill() {
         matches!(
             exited,
             AgentEvent::Exited {
-                killed_by_signal: true
+                exit: AgentExitFacts {
+                    killed_by_signal: true,
+                    ..
+                }
             }
         ),
         "a stray signal kill must set killed_by_signal=true, got {:?}",
@@ -234,8 +243,11 @@ async fn a_stray_kill_that_lands_after_stdout_closes_still_counts() {
         matches!(
             exited,
             AgentEvent::Exited {
-                killed_by_signal: true
+            exit: AgentExitFacts {
+                killed_by_signal: true,
+                ..
             }
+        }
         ),
         "a process that kills itself after closing stdout must set killed_by_signal=true, got {exited:?}",
     );
@@ -986,4 +998,81 @@ async fn a_refused_initialize_reports_claude_codes_error() {
         .expect_err("refused")
         .to_string();
     assert_eq!(err, "not now");
+}
+
+// ── the exit facts ───────────────────────────────────────────────────────
+
+const GATEWAY_MESSAGE: &str = "Couldn't load settings from Cloud gateway \
+https://claude-gateway.example.com. Check your network connection, or sign in again with /login.";
+
+/// The incident: `claude` exits 1 at once, before its first line, with the
+/// reason on stderr. Both must reach the engine on `Exited`.
+#[tokio::test]
+async fn a_start_failure_reports_its_exit_code_and_words_with_no_init() {
+    let script = format!("echo \"{GATEWAY_MESSAGE}\" >&2; exit 1");
+    let (mut agent, _cancel) = spawn_driver_for_test("sh", &["-c", &script]).await;
+
+    let exited =
+        output_ended_then_exited(&mut agent.events_rx, std::time::Duration::from_secs(10)).await;
+    let AgentEvent::Exited { exit } = exited else {
+        panic!("Exited is last");
+    };
+    assert_eq!(exit.code, Some(1));
+    assert_eq!(exit.stderr_tail, GATEWAY_MESSAGE);
+    assert!(!exit.killed_by_signal);
+    assert!(agent.events_rx.recv().await.is_none());
+}
+
+/// A child that writes far more than the pipe holds must not stall, and its
+/// result must still arrive. The tail is only the last 4 KB.
+#[tokio::test]
+async fn a_noisy_stderr_never_blocks_the_child() {
+    let script = format!(
+        "yes x | head -c 200000 >&2; printf '{}\\n{}\\n'; echo last-words >&2",
+        r#"{"type":"system","subtype":"init","session_id":"sess-1"}"#,
+        r#"{"type":"result","result":"done","duration_ms":42}"#,
+    );
+    let (mut agent, _cancel) = spawn_driver_for_test("sh", &["-c", &script]).await;
+
+    let init = tokio::time::timeout(std::time::Duration::from_secs(10), agent.events_rx.recv())
+        .await
+        .expect("a full stderr pipe must not block the child's stdout")
+        .expect("events channel should be open");
+    assert!(matches!(init, AgentEvent::Init { .. }), "got {init:?}");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), agent.events_rx.recv())
+        .await
+        .expect("result arrives")
+        .expect("events channel should be open");
+    assert!(
+        matches!(result, AgentEvent::Result { .. }),
+        "got {result:?}"
+    );
+    let exited =
+        output_ended_then_exited(&mut agent.events_rx, std::time::Duration::from_secs(10)).await;
+    let AgentEvent::Exited { exit } = exited else {
+        panic!("Exited is last");
+    };
+    assert!(
+        exit.stderr_tail.ends_with("last-words"),
+        "got {:?}",
+        exit.stderr_tail
+    );
+    assert!(exit.stderr_tail.len() <= crate::runtime::spawn_env::STDERR_TAIL_BYTES);
+    assert_eq!(exit.code, Some(0));
+}
+
+/// An engine-initiated cancel is no natural exit, so it carries no exit code.
+#[tokio::test]
+async fn an_engine_cancel_reports_no_exit_code() {
+    let (mut agent, cancel) = spawn_driver_for_test("sh", &["-c", "sleep 30"]).await;
+    cancel.cancel();
+    let exited = output_ended_then_exited(
+        &mut agent.events_rx,
+        GROUP_TEARDOWN_GRACE + std::time::Duration::from_secs(10),
+    )
+    .await;
+    let AgentEvent::Exited { exit } = exited else {
+        panic!("Exited is last");
+    };
+    assert_eq!(exit.code, None);
 }

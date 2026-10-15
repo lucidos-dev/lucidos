@@ -487,3 +487,66 @@ async fn a_harden_request_resumes_with_the_harden_message() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// Try again after a start failure must hand the agent the message it never
+/// read, with the same words the user typed (the I7 contract). The events are
+/// the ones a real start failure leaves.
+#[tokio::test]
+async fn a_start_failure_leaves_its_message_owed_to_the_next_continue() {
+    use crate::engine::agent_recovery::undelivered_input_after_start_failure;
+    use crate::engine::thread_events::{CodingAgentExit, CodingAgentExitStage};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+    crate::test_support::start_cc_session(&bus, thread_id, "claude-code/owed", None).await;
+
+    assert!(
+        undelivered_input_after_start_failure(&pool, thread_id)
+            .await
+            .is_none(),
+        "a thread that never failed owes nothing"
+    );
+
+    let received = bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: crate::test_support::message_received(
+                "Make the OpenRouter calls use prompt caching.",
+            ),
+            meta: cc_meta.clone(),
+        })
+        .await
+        .expect("emit succeeds")
+        .expect("persisted");
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseFailed {
+            error: "Couldn't load settings from Cloud gateway https://claude-gateway.example.com."
+                .into(),
+            agent_exit: Some(CodingAgentExit {
+                stage: CodingAgentExitStage::Startup,
+                code: Some(1),
+            }),
+        },
+        meta: EventMeta {
+            request_event_id: Some(received.event_id),
+            ..cc_meta
+        },
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("persisted");
+
+    let owed = undelivered_input_after_start_failure(&pool, thread_id)
+        .await
+        .expect("the message the agent never read is owed");
+    assert_eq!(owed.text, "Make the OpenRouter calls use prompt caching.");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

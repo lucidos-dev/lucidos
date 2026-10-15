@@ -11,8 +11,9 @@
 //! `CLAUDECODE` removal) stays in the agent's own `build_command`.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 
 use super::agent_run_marker::AGENT_RUN_ENV;
 use super::agent_runtime::SpawnArgs;
@@ -422,37 +423,106 @@ const TERM_SIGNAL: i32 = libc::SIGTERM;
 #[cfg(not(unix))]
 const TERM_SIGNAL: i32 = 15;
 
-/// Drain remaining stderr from an agent child (up to 4 KB).
-///
-/// Per-line timeout — 100 ms of stderr silence means we're done. A
-/// wall-clock timeout would block the post-loop cleanup whenever a
-/// grandchild (e.g., rustc) inherited stderr and kept the fd open after the
-/// agent's death: read_line on an inherited-but-silent fd is Pending
-/// forever. Per-line bounding returns the moment the agent's own stderr is
-/// drained, even if grandchildren hold the fd.
-pub(super) async fn drain_stderr(
-    stderr_reader: &mut BufReader<tokio::process::ChildStderr>,
-) -> String {
-    let mut output = String::with_capacity(4096);
-    let mut line = String::new();
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            stderr_reader.read_line(&mut line),
-        )
-        .await
-        {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(_)) => {
-                output.push_str(&line);
-                line.clear();
-                if output.len() > 4096 {
-                    break;
+/// How much of a child's stderr a failure keeps: the last 4 KB.
+pub(crate) const STDERR_TAIL_BYTES: usize = 4096;
+
+/// How much raw stderr the reader holds before masking. The extra half lets a
+/// secret that straddles the 4 KB cut be masked whole, then cut.
+const STDERR_BUFFER_BYTES: usize = 2 * STDERR_TAIL_BYTES;
+
+/// How long [`StderrTail::finish`] waits for the stderr pipe to close. A
+/// grandchild that inherited the pipe can hold it open after the agent died.
+/// So the wait is bounded, and the tail is whatever arrived by then.
+const STDERR_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The last [`STDERR_TAIL_BYTES`] of a child's stderr, read while the child
+/// runs. An unread pipe blocks the child once the OS buffer (about 64 KB)
+/// fills, so every driver reads continuously instead of after teardown.
+pub(crate) struct StderrTail {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    secrets: Vec<String>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl StderrTail {
+    /// Start reading `stderr`. `secrets` are masked out of the text
+    /// [`finish`](Self::finish) returns.
+    pub(crate) fn spawn(mut stderr: tokio::process::ChildStderr, secrets: Vec<String>) -> Self {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let sink = bytes.clone();
+        let reader = tokio::spawn(async move {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => push_capped(&mut sink.lock().unwrap(), &chunk[..n]),
                 }
             }
+        });
+        Self {
+            bytes,
+            secrets,
+            reader,
         }
     }
-    output
+
+    /// The masked tail, once the pipe closes or [`STDERR_SETTLE`] passes.
+    pub(crate) async fn finish(self) -> String {
+        let Self {
+            bytes,
+            secrets,
+            mut reader,
+        } = self;
+        if tokio::time::timeout(STDERR_SETTLE, &mut reader)
+            .await
+            .is_err()
+        {
+            reader.abort();
+        }
+        let text = tail_text(&bytes.lock().unwrap(), &secrets);
+        text
+    }
+}
+
+/// The secret values among the env a command was given, ready to mask out of
+/// what the child prints.
+pub(crate) fn command_secret_values(cmd: &tokio::process::Command) -> Vec<String> {
+    let env: Vec<(String, String)> = cmd
+        .as_std()
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+        .collect();
+    crate::core::injected_secret_values(&env)
+}
+
+/// Append `chunk` to `tail`, dropping the oldest bytes past the buffer cap.
+fn push_capped(tail: &mut Vec<u8>, chunk: &[u8]) {
+    tail.extend_from_slice(chunk);
+    if tail.len() > STDERR_BUFFER_BYTES {
+        let excess = tail.len() - STDERR_BUFFER_BYTES;
+        tail.drain(..excess);
+    }
+}
+
+/// Decode a captured buffer: masked first, then cut to the last
+/// [`STDERR_TAIL_BYTES`] on a character boundary, and trimmed.
+///
+/// Masking comes before the cut so no secret loses its prefix to the cut. The
+/// buffer's own front may start inside a character, and those bytes are
+/// skipped rather than shown as a replacement mark.
+fn tail_text(buffer: &[u8], secrets: &[String]) -> String {
+    let start = buffer
+        .iter()
+        .position(|b| b & 0xC0 != 0x80)
+        .unwrap_or(buffer.len());
+    let text = String::from_utf8_lossy(&buffer[start..]);
+    let masked =
+        crate::core::redact_postgres_secrets(&crate::core::redact_secret_values(&text, secrets));
+    let mut cut = masked.len().saturating_sub(STDERR_TAIL_BYTES);
+    while !masked.is_char_boundary(cut) {
+        cut += 1;
+    }
+    masked[cut..].trim().to_string()
 }
 
 /// Resolve `file_name` as an executable file on `path_var` — the ONE PATH
@@ -531,6 +601,7 @@ pub(crate) fn agent_compile_env(worktree: &Path) -> Vec<(&'static str, String)> 
 mod tests {
     use super::super::agent_run_marker::AgentRun;
     use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     /// A pid of 0 must never reach `kill`. `kill(0, sig)` signals the caller's
     /// OWN process group, so one `unwrap_or(0)` upstream turns a child
@@ -551,6 +622,98 @@ mod tests {
             Some(-4321),
             "a real child pid still targets its own group"
         );
+    }
+
+    // ── The stderr tail ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_tail_keeps_the_last_bytes_not_the_first() {
+        let mut tail = Vec::new();
+        push_capped(&mut tail, &vec![b'a'; STDERR_BUFFER_BYTES]);
+        push_capped(&mut tail, b"the end");
+        assert_eq!(tail.len(), STDERR_BUFFER_BYTES);
+        let text = tail_text(&tail, &[]);
+        assert_eq!(text.len(), STDERR_TAIL_BYTES);
+        assert!(text.ends_with("the end"));
+        assert!(text.starts_with('a'));
+    }
+
+    #[test]
+    fn a_secret_that_straddles_the_cut_is_masked_whole() {
+        let secret = "tok-0123456789";
+        let mut tail = Vec::new();
+        push_capped(&mut tail, "x".repeat(100).as_bytes());
+        push_capped(&mut tail, secret.as_bytes());
+        // The cut to 4 KB lands five bytes before the secret's end.
+        push_capped(&mut tail, "y".repeat(STDERR_TAIL_BYTES - 5).as_bytes());
+        let text = tail_text(&tail, &[secret.to_string()]);
+        assert!(!text.contains("56789"), "no suffix of the secret survives");
+        assert!(text.len() <= STDERR_TAIL_BYTES);
+    }
+
+    #[test]
+    fn a_cap_inside_a_multibyte_character_drops_the_partial_character() {
+        // "é" is two bytes. Filling the cap with it and adding one ASCII byte
+        // shifts the cut into the middle of a character.
+        let mut tail = Vec::new();
+        push_capped(&mut tail, "é".repeat(STDERR_TAIL_BYTES / 2).as_bytes());
+        push_capped(&mut tail, b"!");
+        let text = tail_text(&tail, &[]);
+        assert!(text.ends_with('!'));
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "a cut character is dropped, not shown as a mark"
+        );
+        assert!(text.starts_with('é'));
+    }
+
+    #[test]
+    fn a_planted_secret_and_a_database_password_are_masked() {
+        let secrets = vec!["tok-0123456789".to_string()];
+        let text = tail_text(
+            b"auth failed for tok-0123456789 via postgres://user:hunter22@db.example.com/app\n",
+            &secrets,
+        );
+        assert!(!text.contains("tok-0123456789"));
+        assert!(!text.contains("hunter22"));
+        assert!(text.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn an_empty_tail_is_an_empty_string() {
+        assert_eq!(tail_text(b"  \n", &[]), "");
+    }
+
+    #[test]
+    fn command_secret_values_reads_the_env_the_command_was_given() {
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.env("LUCIDOS_DATABASE_URL", "postgres://u:pw-secret@h/db");
+        cmd.env("HARMLESS", "visible-value");
+        let secrets = command_secret_values(&cmd);
+        assert!(secrets.iter().any(|v| v.contains("pw-secret")));
+        assert!(!secrets.iter().any(|v| v == "visible-value"));
+    }
+
+    /// A child that writes far more than the pipe holds must not block, and the
+    /// tail must end with its last words.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_writing_200_kb_to_stderr_is_never_blocked() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("yes x | head -c 200000 >&2; echo last-words >&2; exit 3")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let tail = StderrTail::spawn(child.stderr.take().unwrap(), Vec::new());
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+            .await
+            .expect("the child must not block on a full stderr pipe")
+            .unwrap();
+        assert_eq!(status.code(), Some(3));
+        let text = tail.finish().await;
+        assert!(text.ends_with("last-words"), "got {text:?}");
+        assert!(text.len() <= STDERR_TAIL_BYTES);
     }
 
     // ── The trigger claim stops at a handoff (ADR 0137) ────────────────────

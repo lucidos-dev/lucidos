@@ -20,6 +20,8 @@ export type {
   AnswerKind,
   CancelCause,
   ChildCompletionStatus,
+  CodingAgentExit,
+  CodingAgentExitStage,
   EngineReason,
   EventChannel,
   EventSubscription,

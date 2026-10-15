@@ -356,8 +356,9 @@ impl OpenAiProvider {
             stop_reason: meta.stop_reason,
             output_tokens: meta.output_tokens,
             input_tokens: meta.input_tokens,
-            // Both are parts of `input_tokens`, as OpenAI reports them. Only
-            // the Responses API reports writes, from GPT-5.6 on.
+            // Both are parts of `input_tokens`, as OpenAI reports them. Writes
+            // come from the Responses API (GPT-5.6 on) and from OpenRouter's
+            // Anthropic models.
             cache_creation_tokens: meta.cache_write_tokens,
             cache_read_tokens: meta.cache_read_tokens,
             served_model: meta.served_model,
@@ -410,14 +411,27 @@ impl StreamMeta {
         if let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
             self.output_tokens = Some(crate::llm::clamp_provider_token_count(completion, "OpenAI"));
         }
-        if let Some(cached) = usage
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(|v| v.as_u64())
-        {
-            if cached > 0 {
-                self.cache_read_tokens =
-                    Some(crate::llm::clamp_provider_token_count(cached, "OpenAI"));
-            }
+        if let Some(details) = usage.get("prompt_tokens_details") {
+            self.absorb_cache_details(details);
+        }
+    }
+
+    /// Read the cache counts from a `*_tokens_details` object. A zero stays
+    /// unset, so "cached nothing" reads the same as a server that reports no
+    /// count.
+    fn absorb_cache_details(&mut self, details: &serde_json::Value) {
+        let count = |field: &str| {
+            details
+                .get(field)
+                .and_then(|v| v.as_u64())
+                .filter(|&n| n > 0)
+                .map(|n| crate::llm::clamp_provider_token_count(n, "OpenAI"))
+        };
+        if let Some(read) = count("cached_tokens") {
+            self.cache_read_tokens = Some(read);
+        }
+        if let Some(written) = count("cache_write_tokens") {
+            self.cache_write_tokens = Some(written);
         }
     }
 
@@ -441,23 +455,8 @@ impl StreamMeta {
             if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                 self.output_tokens = Some(crate::llm::clamp_provider_token_count(output, "OpenAI"));
             }
-            if let Some(cached) = usage
-                .pointer("/input_tokens_details/cached_tokens")
-                .and_then(|v| v.as_u64())
-            {
-                if cached > 0 {
-                    self.cache_read_tokens =
-                        Some(crate::llm::clamp_provider_token_count(cached, "OpenAI"));
-                }
-            }
-            if let Some(written) = usage
-                .pointer("/input_tokens_details/cache_write_tokens")
-                .and_then(|v| v.as_u64())
-            {
-                if written > 0 {
-                    self.cache_write_tokens =
-                        Some(crate::llm::clamp_provider_token_count(written, "OpenAI"));
-                }
+            if let Some(details) = usage.get("input_tokens_details") {
+                self.absorb_cache_details(details);
             }
         }
         // For incomplete responses the reason lives at

@@ -490,3 +490,7 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0481: Engine database credentials stay out of subprocesses: the engine scrubs DATABASE_URL, injects a read-only LUCIDOS_DATABASE_URL to agent surfaces only, and refuses to boot a wiped schema](0481-engine-db-credentials-stay-out-of-subprocesses.md)
 - [0482: The bars over an app wait for the finger to lift](0482-bars-over-an-app-wait-for-the-finger.md)
 - [0483: A new workspace asks for its memory module in the memory choice; unset runs Classic](0483-a-new-workspace-asks-for-its-memory-module.md)
+- [0484: The Home rail's toggle is offered whenever Home exists, an empty board included](0484-home-rail-toggle-always-offered.md)
+- [0485: The update relay refreshes the gateway's release check before refusing, so a phone offers Update Desktop App without waiting for the hourly poll](0485-phone-relay-waits-for-no-hourly-check.md)
+- [0486: The new-thread plan card's implementer is the planning agent's judgement, not a rule or a plan score](0486-plan-card-implementer-is-the-agents-judgement.md)
+- [0487: A coding agent that exits on its own fails the turn with its own stderr, and a start failure is never retried automatically](0487-coding-agent-start-failures-fail-loudly.md)

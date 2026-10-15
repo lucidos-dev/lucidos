@@ -179,7 +179,10 @@ impl LucidosEngine {
             // already in the timeline as CodingAgentTextStreamed events. The
             // error string is what the frontend renders next to the red dot.
             TerminalKind::Failed { error } => {
-                crate::engine::thread_events::ThreadEvent::ResponseFailed { error }
+                crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                    error,
+                    agent_exit: None,
+                }
             }
         }
     }
@@ -479,6 +482,7 @@ impl LucidosEngine {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                     error: format!("Internal error: {}", panic_msg),
+                                    agent_exit: None,
                                 },
                                 // The channel lets a reader of the latest
                                 // coding-agent terminal see this one.

@@ -36,6 +36,14 @@ impl CodingAgent {
         }
     }
 
+    /// The name the user knows this backend by.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
+
     /// Parse a stored backend string. Unknown / legacy NULL-ish values fall
     /// back to `ClaudeCode` — every thread persisted before the column
     /// existed was a Claude Code thread.
@@ -241,17 +249,29 @@ pub enum AgentEvent {
     /// cut-off call's usage without waiting out the teardown. Codex reports
     /// usage per finished turn and holds no open call, so it never sends this.
     OutputEnded,
-    /// Process exited. Always the last event before `events_rx` closes.
-    /// Stderr is logged inside the runtime — consumers don't need to handle it.
-    ///
-    /// `killed_by_signal` is `true` when the agent process died from a signal
-    /// the engine did NOT initiate — a stray `SIGTERM`/`SIGKILL` (e.g. the
-    /// `exit=143` Node-caught-SIGTERM case) observed as the process's *natural*
-    /// exit status, before any engine-side teardown kill. The safety net reads
-    /// it to auto-resume an unexpectedly-killed mid-stream turn (via
-    /// `ContinuationRequested`) instead of surfacing a red-dot abort. A clean
-    /// exit, an EOF close, or an engine-initiated cancel all report `false`.
-    Exited { killed_by_signal: bool },
+    /// Process exited. Always the last event before `events_rx` closes. The
+    /// facts say how it ended; see [`AgentExitFacts`].
+    Exited { exit: AgentExitFacts },
+}
+
+/// How a coding agent's process ended, as the driver observed it. Drivers
+/// report facts and never judge them: whether this was a start failure, a crash
+/// or a clean close is decided once, in `agent_session::lifecycle`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentExitFacts {
+    /// True when the agent process died from a signal the engine did NOT
+    /// initiate: a stray `SIGTERM`/`SIGKILL` (the `exit=143` Node-caught-SIGTERM
+    /// case), observed as the process's *natural* exit status, before any
+    /// engine-side teardown kill. A clean exit, an EOF close, or an
+    /// engine-initiated cancel all report `false`.
+    pub killed_by_signal: bool,
+    /// The exit code of the process's natural exit. `None` when a signal ended
+    /// it or the engine tore it down. Also `None` for a driver with no single
+    /// process (Codex exec runs one child per turn).
+    pub code: Option<i32>,
+    /// The last 4 KB of the process's stderr, masked and trimmed. Empty when it
+    /// wrote nothing.
+    pub stderr_tail: String,
 }
 
 /// User input sent to a running agent.

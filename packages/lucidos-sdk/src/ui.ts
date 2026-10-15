@@ -15,10 +15,10 @@ import {
   followSystemThemeMode, fontBoldMark, fontEntry, isFontId, isWorkspaceFontId, themeBackground, themeEffectsAttribute, themeTokenNames,
   motionAttribute, parseThemeEffects, parseMotion, resolveReducedThemeEffects,
   parseResolvedTheme, parseStyleOverrides, parseUiScale, parseWorkspaceFont, sanitizeAppearancePush,
-  replaceInlineTokens, resolveFont, resolveThemeMode, sanitizeResolvedTheme, sanitizeWorkspaceFonts,
+  PAINTED_THEME_MODE_PUSH_KEY, repaintThemeMode, replaceInlineTokens, resolveFont, resolveThemeMode, sanitizeResolvedTheme, sanitizeWorkspaceFonts,
   resolveReducedMotion, resolveThemeModePreference,
   type FontId, type FontKey, type ThemeEffectsPref, type MotionPref, type ResolvedTheme,
-  type ThemeMode, type WorkspaceFont,
+  type ResolvedThemeMode, type ThemeMode, type WorkspaceFont,
 } from './appearance';
 import { registerFontsInUse } from './fontFaces';
 import { servedPrefs } from './boot/appearanceBoot';
@@ -61,6 +61,9 @@ let watchingPrefs = false;
 /** The theme mode PREFERENCE the last `applyPreferences()` settled on, which is what
  *  says whether this frame follows the OS at all. `null` until the first run. */
 let lastThemeModePreference: ThemeMode | null = null;
+/** What the last `paint` was given. The OS follower repaints from it with a
+ *  fresh OS read, so an OS flip costs no fetch in any frame. */
+let lastPaintInput: Record<string, string> | null = null;
 /** Kept alive for as long as its listener must be. See `watchPreferences`. */
 let systemThemeModeQuery: MediaQueryList | null = null;
 /** The motion preference at the last apply, so an OS flip can re-resolve it. */
@@ -83,12 +86,12 @@ function osPrefersLight(): boolean {
 
 /** Which theme mode preference this frame is on.
  *
- *  Before the first `applyPreferences()` resolves, fall back to the precedence
- *  the boot script already used. An app may call `watchPreferences()` first, or
- *  not await the fetch, and an OS flip in that window must not be dropped. */
+ *  Before the first paint, read the engine seed, then the mirror, then what boot
+ *  painted. An app may call `watchPreferences()` first, or not await the fetch,
+ *  and an OS flip in that window must not be dropped. */
 function currentThemeModePreference(): ThemeMode {
   return lastThemeModePreference ?? resolveThemeModePreference(
-    undefined,
+    servedPrefs()?.[THEME_MODE_KEY],
     wsLocalGet(THEME_MODE_STORAGE_KEY),
     () => document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
   );
@@ -469,8 +472,16 @@ async function fetchTheme(id: string): Promise<ResolvedTheme | null> {
  *
  * Every value falls back to the mirror sdk-prefs.js read, so a value missing
  * from `prefs` keeps what first paint showed rather than resetting it.
+ *
+ * Under `system`, a shell push paints the mode the shell painted. Any other
+ * repaint keeps the mode on `<html>` (`repaintThemeMode`). Only the OS
+ * follower passes `freshOsRead`, and so only it reads the OS.
  */
-function paint(prefs: Record<string, string>): void {
+function paint(prefs: Record<string, string>, freshOsRead = false): void {
+  lastPaintInput = prefs;
+  // Taken before the reassignment below, so a first paint compares against
+  // the preference the boot script painted.
+  const previous = currentThemeModePreference();
   // The preference is kept, not just its resolution: `watchPreferences` has to
   // know whether this frame follows the OS before it acts on an OS flip.
   lastThemeModePreference = resolveThemeModePreference(
@@ -478,7 +489,20 @@ function paint(prefs: Record<string, string>): void {
     wsLocalGet(THEME_MODE_STORAGE_KEY),
     () => document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
   );
-  const mode = resolveThemeMode(lastThemeModePreference, osPrefersLight());
+  const shellMode = prefs[PAINTED_THEME_MODE_PUSH_KEY];
+  let mode: ResolvedThemeMode;
+  if (freshOsRead) {
+    mode = resolveThemeMode(lastThemeModePreference, osPrefersLight());
+  } else if (lastThemeModePreference === 'system' && (shellMode === 'light' || shellMode === 'dark')) {
+    mode = shellMode;
+  } else {
+    mode = repaintThemeMode(
+      lastThemeModePreference,
+      previous,
+      document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
+      osPrefersLight,
+    );
+  }
   const themeTokens = activeTheme[mode];
   const root = document.documentElement;
   // Stale names go first, so the theme's own inline background below is
@@ -588,9 +612,8 @@ export const ui = {
     watchingPrefs = true;
     // Best-effort live re-application. A transient prefs-fetch failure must not
     // surface as an unhandled rejection. The next PreferencesChanged re-runs
-    // applyPreferences, as does an OS light/dark flip in a frame with no shell
-    // push, and the app keeps its appearance meanwhile. Warn, so a persistent
-    // failure is still visible to a developer.
+    // applyPreferences, and the app keeps its appearance meanwhile. Warn, so a
+    // persistent failure is still visible to a developer.
     const reapply = () => {
       ui.applyPreferences().catch((err) => {
         console.warn('[lucidos-sdk] live preference re-apply failed:', err);
@@ -644,17 +667,14 @@ export const ui = {
     // `crates/lucidos-app/src/store/actions/preferences.ts` carries the full
     // reasoning.
     //
-    // Sampling here rather than inside `applyPreferences` is what keeps a wake
-    // that changed nothing free: `applyPreferences` fetches. A pushed frame
-    // already holds everything it paints, so it repaints with no fetch at all.
+    // The apply repaints from the last paint's input with a fresh OS read, so
+    // an OS flip costs no fetch in any frame. Only it and a shell push, which
+    // carries the shell's guarded mode, may move a frame already on `system`.
     const { schedule: scheduleRefresh } = followSystemThemeMode({
       visible: () => document.visibilityState === 'visible',
       moved: () => currentThemeModePreference() === 'system'
         && document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) !== resolveThemeMode('system', osPrefersLight()),
-      apply: () => {
-        if (hostAppearance) paint(hostAppearance);
-        else reapply();
-      },
+      apply: () => paint(lastPaintInput ?? servedPrefs() ?? {}, true),
     });
     // Held in a variable rather than subscribed to inline. A `MediaQueryList`
     // with no strong reference has historically been collected in WebKit, which

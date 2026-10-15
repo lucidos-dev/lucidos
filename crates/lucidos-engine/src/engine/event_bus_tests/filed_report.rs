@@ -159,6 +159,7 @@ async fn a_declined_report_still_wakes_for_every_unclean_finish() {
     let unclean = [
         ThreadEvent::ResponseFailed {
             error: "the API refused".into(),
+            agent_exit: None,
         },
         ThreadEvent::ResponseCanceled {
             text: "partial".into(),

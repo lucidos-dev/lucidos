@@ -784,6 +784,58 @@ describe("applyThemeMode('system'): following the OS", () => {
 
     expect(painted).toEqual([]);
   });
+
+  describe('a repaint keeps the painted mode (ADR 0092)', () => {
+    // Startup's first preference load, a theme fetch and a theme file event all
+    // repaint through `applyTheme`. Only the follower may move the mode.
+    it('a theme re-lay while hidden paints nothing the OS says', async () => {
+      applyThemeMode('system');
+      painted = [];
+
+      setVisibility('hidden');
+      mqLight = true;
+      await refreshActiveTheme();
+
+      expect(painted).not.toContain('light');
+      expect(attrs['data-theme-mode']).toBe('dark');
+    });
+
+    it('a theme re-lay inside the settle window neither paints the flip early nor loses it', async () => {
+      applyThemeMode('system');
+      painted = [];
+
+      mqLight = true;
+      fireMediaQueryChange();
+      vi.advanceTimersByTime(SYSTEM_THEME_MODE_SETTLE_MS / 2);
+      await refreshActiveTheme();
+      expect(painted).not.toContain('light');
+
+      settle();
+      expect(attrs['data-theme-mode']).toBe('light');
+    });
+
+    it('a theme re-lay after the follower moved the mode keeps the new mode', async () => {
+      applyThemeMode('system');
+      mqLight = true;
+      fireMediaQueryChange();
+      settle();
+      painted = [];
+
+      await refreshActiveTheme();
+
+      expect(attrs['data-theme-mode']).toBe('light');
+    });
+
+    it('a change of preference into system resolves against the OS at once', () => {
+      applyThemeMode('dark');
+      painted = [];
+
+      mqLight = true;
+      applyThemeMode('system');
+
+      expect(painted).toEqual(['light']);
+    });
+  });
 });
 
 describe('applyThemeMode: native title-bar tint (Tauri)', () => {

@@ -1186,12 +1186,35 @@ describe('the relay route (ADR 0338)', () => {
     expect(updateRoute()).toBe('guide');
   });
 
-  // What's New names releases the gateway has not reached yet. The gateway
-  // refuses a request for one, so the relay is not offered for it.
-  it('needs a release the gateway knows, not one the caller asserts', () => {
+  // What's New names releases the gateway has not polled yet. The gateway
+  // refreshes its check before it refuses, so the caller's word is enough.
+  it('offers the relay for a release the caller names and the gateway has not polled', () => {
     storeSignals.releaseCheck.value = releaseCheckOf(null);
     storeSignals.updateRelay.value = attachedClient();
-    expect(updateRoute(true)).toBe('guide');
+    expect(updateRoute(true)).toBe('relay');
+    mocks.thisDeviceIsMobile.mockReturnValue(true);
+    expect(updateRoute(true)).toBe('relay');
+  });
+
+  // ADR 0190 took `check` from phones because both outcomes were dead ends. With
+  // a desktop app attached, a found release becomes the relay button.
+  it('lets a phone with a ready desktop app check when no release is known', () => {
+    mocks.thisDeviceIsMobile.mockReturnValue(true);
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    storeSignals.updateRelay.value = attachedClient();
+    expect(updateRoute(false)).toBe('check');
+  });
+
+  it('keeps a phone on desktop when a check could not help', () => {
+    mocks.thisDeviceIsMobile.mockReturnValue(true);
+    for (const desktop of [null, { client: null, request: null }, attachedClient('1.2.3', 'needs a password')]) {
+      storeSignals.releaseCheck.value = releaseCheckOf(null);
+      storeSignals.updateRelay.value = desktop;
+      expect(updateRoute(false)).toBe('desktop');
+    }
+    storeSignals.updateRelay.value = attachedClient();
+    storeSignals.releaseCheck.value = releaseCheckOf(null, { supported: false });
+    expect(updateRoute(false)).toBe('desktop');
   });
 
   it('never replaces an install the session can run itself', () => {

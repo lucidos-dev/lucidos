@@ -24,6 +24,12 @@ that matter.
 3. Run `lucidos successor spawn --narrative <file>`, put the link it prints in your final \
 message, and end your turn.
 
+The successor runs on this thread's implementer: its backend, model and reasoning effort. \
+`--coding-agent`, `--coding-agent-model` and `--reasoning-effort` name another, as on \
+`spawn-thread`. A model carries over only on the same backend. An effort carries over only \
+on the same backend while the successor's model accepts it. Lucidos refuses a model or effort the backend does not \
+offer, and lists the ones it does.
+
 The successor's branch starts at this thread's last commit, so its change carries all of this \
 thread's work, and this thread proposes nothing. It sits in this thread's place: top-level if \
 this thread is, otherwise a child of the same parent, which then waits on it. A top-level \
@@ -39,10 +45,38 @@ fn own_thread_id() -> Result<String, BoxError> {
     })
 }
 
+/// The *implementer* a handoff names for its successor. An unset field
+/// carries over from this thread, as the engine decides.
+#[derive(Debug, Default)]
+pub(crate) struct ImplementerChoice {
+    pub(crate) coding_agent: Option<crate::CliCodingAgent>,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+}
+
+/// The `POST /api/v1/threads/:id/successor` body for an agent's handoff.
+pub(crate) fn spawn_body(narrative: String, choice: ImplementerChoice) -> serde_json::Value {
+    let mut body = serde_json::json!({ "narrative": narrative });
+    if let Some(agent) = choice.coding_agent {
+        body["coding_agent"] = agent.as_wire().into();
+    }
+    if let Some(model) = choice.model {
+        body["coding_agent_model"] = model.into();
+    }
+    if let Some(effort) = choice.reasoning_effort {
+        body["reasoning_effort"] = effort.into();
+    }
+    body
+}
+
 /// POST the narrative and print the successor's link, as `spawn-thread`
-/// prints one. The engine checks the narrative's sections, the placement and
-/// the owner's authority, and refuses uncommitted work.
-pub(crate) fn cmd_spawn(ws: &Workspace, narrative_path: &std::path::Path) -> Result<(), BoxError> {
+/// prints one. The engine checks the narrative's sections, the implementer,
+/// the placement and the owner's authority, and refuses uncommitted work.
+pub(crate) fn cmd_spawn(
+    ws: &Workspace,
+    narrative_path: &std::path::Path,
+    choice: ImplementerChoice,
+) -> Result<(), BoxError> {
     let narrative = std::fs::read_to_string(narrative_path).map_err(|e| {
         format!(
             "Could not read the handoff narrative {}: {e}",
@@ -53,7 +87,7 @@ pub(crate) fn cmd_spawn(ws: &Workspace, narrative_path: &std::path::Path) -> Res
     let url = format!("{}/api/v1/threads/{thread_id}/successor", ws.base_url());
     let resp = http_client()?
         .post(&url)
-        .json(&serde_json::json!({ "narrative": narrative }))
+        .json(&spawn_body(narrative, choice))
         .send()
         .map_err(|e| format!("POST {url} failed: {e}"))?;
     let status = resp.status();
@@ -72,18 +106,55 @@ pub(crate) fn cmd_spawn(ws: &Workspace, narrative_path: &std::path::Path) -> Res
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("POST {url} answered without a link: {body}"))?;
     println!("{link}");
+    if let Some(implementer) = parse_implementer(&body["implementer"]) {
+        println!("It runs on {}.", implementer.describe());
+    }
     println!(
         "The successor carries on from here. Put this link in your final message and end your turn. Lucidos archives this thread once the successor starts and this turn settles."
     );
     Ok(())
 }
 
+/// A thread's *implementer*, as the engine reports it. An unset model or
+/// effort is the backend's own default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Implementer {
+    pub(crate) coding_agent: String,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+}
+
+impl Implementer {
+    /// One line naming all three, the way the card text quotes it.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{} with model {} at {} effort",
+            self.coding_agent,
+            self.model.as_deref().unwrap_or("(the backend's default)"),
+            self.reasoning_effort
+                .as_deref()
+                .unwrap_or("(the backend's default)"),
+        )
+    }
+}
+
+fn parse_implementer(value: &serde_json::Value) -> Option<Implementer> {
+    let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    Some(Implementer {
+        coding_agent: text("coding_agent")?,
+        model: text("model"),
+        reasoning_effort: text("reasoning_effort"),
+    })
+}
+
 /// This thread's context, as the engine decides it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ContextReading {
     Read {
         input_tokens: Option<u64>,
         offer: bool,
+        /// `None` when the engine did not report one.
+        implementer: Option<Implementer>,
     },
     /// The engine could not be asked, or did not answer.
     Unknown,
@@ -116,6 +187,7 @@ pub(crate) fn parse_context(body: &serde_json::Value) -> ContextReading {
         Some(offer) => ContextReading::Read {
             input_tokens: body.get("input_tokens").and_then(|v| v.as_u64()),
             offer,
+            implementer: body.get("implementer").and_then(parse_implementer),
         },
         None => ContextReading::Unknown,
     }
@@ -131,15 +203,61 @@ mod tests {
             parse_context(&serde_json::json!({"input_tokens": 5, "offer": true, "nudge": false})),
             ContextReading::Read {
                 input_tokens: Some(5),
-                offer: true
+                offer: true,
+                implementer: None,
             }
         );
         assert_eq!(
             parse_context(&serde_json::json!({"input_tokens": 900000, "offer": false})),
             ContextReading::Read {
                 input_tokens: Some(900_000),
-                offer: false
+                offer: false,
+                implementer: None,
             }
+        );
+    }
+
+    #[test]
+    fn the_reading_carries_the_threads_implementer() {
+        let reading = parse_context(&serde_json::json!({
+            "input_tokens": 5,
+            "offer": true,
+            "implementer": {"coding_agent": "claude-code", "model": "claude-opus-5-5", "reasoning_effort": null},
+        }));
+        let ContextReading::Read {
+            implementer: Some(implementer),
+            ..
+        } = reading
+        else {
+            panic!("no implementer: {reading:?}");
+        };
+        assert_eq!(
+            implementer.describe(),
+            "claude-code with model claude-opus-5-5 at (the backend's default) effort"
+        );
+    }
+
+    /// Only what the user picked goes on the wire: an omitted field is the
+    /// engine's to carry over.
+    #[test]
+    fn the_spawn_body_names_only_the_chosen_fields() {
+        assert_eq!(
+            spawn_body("n".into(), ImplementerChoice::default()),
+            serde_json::json!({"narrative": "n"})
+        );
+        let chosen = ImplementerChoice {
+            coding_agent: Some(crate::CliCodingAgent::Codex),
+            model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: Some("high".into()),
+        };
+        assert_eq!(
+            spawn_body("n".into(), chosen),
+            serde_json::json!({
+                "narrative": "n",
+                "coding_agent": "codex",
+                "coding_agent_model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+            })
         );
     }
 

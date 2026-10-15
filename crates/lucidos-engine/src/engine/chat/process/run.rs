@@ -225,13 +225,14 @@ impl LucidosEngine {
         guard: ThreadGuard,
         injection_rx: &mut mpsc::UnboundedReceiver<InjectedPrompt>,
     ) -> Box<dyn std::error::Error + Send + Sync> {
-        crate::engine::agentic_loop::ensure_failure_terminator_emitted(
+        crate::engine::agentic_loop::ensure_agent_failure_terminator_emitted(
             &self.event_bus,
             &self.pool,
             thread_id,
             anchor,
             channel,
             &error.to_string(),
+            crate::engine::agent_session::start_failure::agent_exit_of(error.as_ref()),
         )
         .await;
         let orphans = self

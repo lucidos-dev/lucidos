@@ -1841,6 +1841,29 @@ body:not(.is-touch) .code-block-copy-btn.copy-btn-copied {
     line-clamp: 3;
     overflow: hidden;
 }
+/* What a coding agent's CLI wrote when it exited, verbatim. A long dump scrolls
+   inside the card instead of pushing the actions off screen. */
+.exchange-error .exchange-error-output {
+    margin: 0.25rem 0 0.5rem;
+    padding: 0.5rem 0.625rem;
+    max-height: calc(12 * 1.4em);
+    overflow-y: auto;
+    background: color-mix(in srgb, var(--accent-red) 6%, var(--bg-primary));
+    border-radius: calc(var(--radius-control) * 0.5);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-md);
+    line-height: 1.4;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    opacity: 1;
+}
+/* The reason is an explanation, so it reads in the secondary colour and not red. */
+.exchange-error .exchange-error-reason {
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    opacity: 1;
+}
 /* The primary action sits rightmost, at the row's end. */
 .exchange-error-actions {
     display: flex;

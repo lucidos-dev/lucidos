@@ -1,5 +1,5 @@
 import { effect } from '@preact/signals';
-import { APPEARANCE_CHANNEL, readAppearancePush } from '@lucidos/appearance';
+import { APPEARANCE_CHANNEL, THEME_MODE_ATTRIBUTE, readAppearancePush } from '@lucidos/appearance';
 import { postToAppFrame } from './app-bridge';
 import { mountedAppFrames } from '../../utils/appFrame';
 import { appearanceVersion } from './preferences';
@@ -10,7 +10,10 @@ import { themeEffectsPreference } from '../../utils/themeEffects';
  *  `watchPreferences()` repaints the app from it, with no request, so the app
  *  moves with the shell and not after the debounced save. */
 function paintedAppearance(): Record<string, string> {
-  return readAppearancePush(key => localStorage.getItem(key));
+  return readAppearancePush(
+    key => localStorage.getItem(key),
+    document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
+  );
 }
 
 /** Hand one app frame the current appearance. Called as the frame loads, since

@@ -2180,6 +2180,26 @@
     }
 }
 
+/* The Home rail's toggle is no child of the bar (it is fixed to the window
+   corner, styles/panels/home-board.css). While the rail is hidden it rests on
+   the blue bar, so it wears the bar's icon colours. Shown, it sits on the
+   rail's own --bg-primary head, where a white glyph would vanish in light mode. */
+:root:not([data-home-rail]) .home-rail-toggle-slot .icon-btn {
+    color: var(--header-fg-muted);
+}
+
+:root:not([data-home-rail]) .home-rail-toggle-slot .icon-btn:focus-visible {
+    --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--header-fg) 55%, transparent);
+}
+
+@media (hover: hover) {
+    :root:not([data-home-rail]) .home-rail-toggle-slot .icon-btn:hover {
+        --header-control-veil: var(--header-control-veil-hover);
+        color: var(--header-fg);
+        background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
+    }
+}
+
 /* Titles + labels rendered directly on the bar. */
 .app-header .pane-header-title,
 .app-header .threads-header-title,

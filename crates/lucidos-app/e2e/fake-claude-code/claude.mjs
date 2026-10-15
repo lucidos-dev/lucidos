@@ -2,6 +2,8 @@
 // A fake Claude Code CLI for e2e runs on GitHub runners, which have no
 // logged-in Claude Code. It speaks the stream-json lines the engine parses
 // (runtime/claude_code_parse.rs) and answers `Say exactly: "X"` with X.
+// `Fail to start: "X"` makes the first turn die the way a CLI that cannot reach
+// its gateway does: X on stderr, exit code 1, and no `system/init` line.
 // Any other prompt gets NO_RULE_REPLY, so a spec that needs a real model
 // fails loudly instead of passing by luck. Such a spec carries the
 // @real-claude-code tag and stays on the local leg.
@@ -39,6 +41,10 @@ export function resolveModel(alias) {
 export function replyTo(prompt) {
   const match = /Say exactly:\s*"([^"]*)"/.exec(prompt);
   return match ? match[1] : NO_RULE_REPLY;
+}
+
+export function failToStartText(prompt) {
+  return /[Ff]ail to start:\s*"([^"]*)"/.exec(prompt)?.[1];
 }
 
 function promptText(content) {
@@ -84,6 +90,8 @@ export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS) {
 
   function turn(line) {
     const out = [];
+    const failure = initSent ? undefined : failToStartText(promptText(line.message?.content));
+    if (failure !== undefined) return { now: [], later: [], isTurn: false, failToStart: failure };
     if (!initSent) {
       initSent = true;
       out.push({
@@ -138,7 +146,11 @@ function main(argv) {
   let turns = Promise.resolve();
   const input = createInterface({ input: process.stdin });
   input.on('line', (raw) => {
-    const { now, later, isTurn } = session.handle(raw);
+    const { now, later, isTurn, failToStart } = session.handle(raw);
+    if (failToStart !== undefined) {
+      process.stderr.write(`${failToStart}\n`, () => process.exit(1));
+      return;
+    }
     if (!isTurn) {
       print(now);
       return;

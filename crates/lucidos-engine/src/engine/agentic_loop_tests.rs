@@ -640,6 +640,7 @@ async fn an_in_loop_failure_is_not_terminated_twice() {
         thread_id,
         event: ThreadEvent::ResponseFailed {
             error: "OpenAI streaming error [502]: Provider returned error".into(),
+            agent_exit: None,
         },
         meta,
     })
@@ -681,6 +682,7 @@ async fn an_earlier_failure_does_not_settle_the_current_exchange() {
         thread_id,
         event: ThreadEvent::ResponseFailed {
             error: "first failure".into(),
+            agent_exit: None,
         },
         meta: earlier_meta,
     })

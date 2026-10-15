@@ -33,9 +33,19 @@ describe('the rail reads like the panes', () => {
     const split = rule(shellCss, '.split-divider').props;
     const band = rule(railCss, '.home-rail-divider').props;
     expect(band.get('width')).toBe(split.get('width'));
-    // Clear in the header row like .app-header::after, the pane colour below.
-    expect(band.get('background')).toContain('var(--header-divider)');
-    expect(band.get('background')).toContain(split.get('background'));
+    // One solid colour from the window's top edge down: no clear header stretch.
+    expect(band.get('background')).toBe(split.get('background'));
+    expect(band.get('top')).toBe('0');
+    expect(band.get('bottom')).toBe('0');
+  });
+
+  it('wears the header icons\' colour on its toggle while docked on the bar', () => {
+    const colour = cssRules(shellCss).find(
+      r => r.selector.includes('.home-rail-toggle-slot .icon-btn') && r.props.has('color'),
+    );
+    expect(colour?.props.get('color')).toBe('var(--header-fg-muted)');
+    // Shown, the toggle sits on the rail's own head, not the blue bar.
+    expect(colour?.selector).toContain(':not([data-home-rail])');
   });
 
   it('draws no hairline of its own on its edge or under its head', () => {
@@ -112,11 +122,10 @@ describe('the rail toggle is one control in the window corner', () => {
     }
   });
 
-  it('shrinks away when not offered, or when docked with no Canvas row', () => {
+  it('shrinks away only when docked with no Canvas row', () => {
     const gone = slotRules().filter(r => r.props.get('width') === '0');
     expect(gone.length).toBe(1);
-    expect(gone[0].selector).toContain(':root:not([data-home-rail-toggle]) .home-rail-toggle-slot');
-    expect(gone[0].selector).toContain(':root[data-content-collapsed]:not([data-home-rail]) .home-rail-toggle-slot');
+    expect(gone[0].selector).toBe(':root[data-content-collapsed]:not([data-home-rail]) .home-rail-toggle-slot');
     expect(gone[0].props.get('visibility')).toBe('hidden');
   });
 

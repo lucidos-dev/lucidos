@@ -605,4 +605,4 @@ impl ReleaseCheck {
 
 #[cfg(test)]
 #[path = "release_check_tests.rs"]
-mod tests;
+pub(crate) mod tests;

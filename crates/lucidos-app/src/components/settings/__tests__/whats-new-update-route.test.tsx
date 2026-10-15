@@ -13,12 +13,14 @@ import { render } from 'preact';
 
 const mocks = vi.hoisted(() => ({
   isTauri: vi.fn(() => false),
+  thisDeviceIsMobile: vi.fn(() => false),
   engineChangelog: vi.fn(),
 }));
 
 vi.mock('../../../utils/platform', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../utils/platform')>()),
   isTauri: mocks.isTauri,
+  thisDeviceIsMobile: mocks.thisDeviceIsMobile,
 }));
 vi.mock('../../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client')>()),
@@ -32,6 +34,7 @@ import {
   latestTauriAppNotes,
   lucidosRelease,
   releaseCheck,
+  updateRelay,
   whatsNewTargetRelease,
 } from '../../../store/store';
 import { isNewerVersion } from '../../../utils/version';
@@ -77,6 +80,8 @@ describe('What’s New offers a route to every release it marks', () => {
     host = document.createElement('div');
     document.body.appendChild(host);
     mocks.isTauri.mockReturnValue(false);
+    mocks.thisDeviceIsMobile.mockReturnValue(false);
+    updateRelay.value = null;
     mocks.engineChangelog.mockResolvedValue(RELEASES);
     changelogReleases.value = { status: 'loaded', data: RELEASES };
     lucidosRelease.value = '0.31.0';
@@ -129,6 +134,35 @@ describe('What’s New offers a route to every release it marks', () => {
           tauri ? 'Update & Restart' : 'How to Update',
         );
       }
+    }
+  });
+
+  // The report that led to the relay's change: a phone opened this panel
+  // between the release and the gateway's next hourly poll, so the gateway
+  // knew nothing newer. The desktop app was attached and unblocked, and the
+  // panel offered "How to Update" instead of the relay.
+  it('offers the relay for a release the gateway has not polled yet', async () => {
+    updateRelay.value = { client: { version: '0.31.0', blocker: null }, request: null };
+    for (const mobile of [true, false]) {
+      mocks.thisDeviceIsMobile.mockReturnValue(mobile);
+      render(null, host);
+      await draw();
+      expect(row('0.31.1'), `mobile=${mobile}`).toEqual({ mark: 'Newer', action: 'Update Desktop App' });
+    }
+  });
+
+  // No client, or one that cannot install unattended: the old answers stand.
+  it('keeps the old answer when the desktop app cannot take it', async () => {
+    mocks.thisDeviceIsMobile.mockReturnValue(true);
+    for (const desktop of [
+      null,
+      { client: null, request: null },
+      { client: { version: '0.31.0', blocker: 'needs an admin password' }, request: null },
+    ]) {
+      updateRelay.value = desktop;
+      render(null, host);
+      await draw();
+      expect(row('0.31.1').action, JSON.stringify(desktop)).toBe('How to Update');
     }
   });
 

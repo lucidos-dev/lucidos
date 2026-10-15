@@ -28,7 +28,7 @@ import {
   THEME_MODE_KEY, THEME_MODE_STORAGE_KEY, UI_SCALE_STORAGE_KEY,
   FONT_BOLD_ATTRIBUTE, FONT_FAMILY_STORAGE_KEY, WORKSPACE_FONT_STORAGE_KEY,
   clampUiScale, followSystemThemeMode, fontBoldMark, isWorkspaceFontId, themeBackground, themeTokenNames, parseResolvedTheme,
-  parseUiScale, parseWorkspaceFont, replaceInlineTokens, resolveFont, resolveThemeMode,
+  parseUiScale, parseWorkspaceFont, repaintThemeMode, replaceInlineTokens, resolveFont, resolveThemeMode,
   sanitizeResolvedTheme,
   type FontPreference, type ThemeEffectsPref, type MotionPref, type ResolvedTheme,
   type ResolvedThemeMode, type ThemeMode, type WorkspaceFont,
@@ -485,18 +485,32 @@ function markThemeSwap(): void {
   }));
 }
 
+/** Paint `mode`. Under `system` that keeps the mode already on `<html>`, unless
+ *  the preference just moved into `system` (see "Following the OS" below). */
 export function applyThemeMode(mode: ThemeMode): void {
+  let sampledLight: boolean | null = null;
+  const resolved = repaintThemeMode(
+    mode,
+    lastAppliedThemeMode,
+    document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
+    () => (sampledLight = osPrefersLight()),
+  );
+  paintThemeMode(mode, resolved, sampledLight);
+}
+
+/** Write an already resolved mode. `sampledLight` is the OS read that resolved
+ *  it, or null when none did, so the breadcrumb never claims a sample it did
+ *  not take. */
+function paintThemeMode(mode: ThemeMode, resolved: ResolvedThemeMode, sampledLight: boolean | null): void {
   markThemeSwap();
-  const prefersLight = osPrefersLight();
-  const resolved = resolveThemeMode(mode, prefersLight);
   // The theme is per mode, so it is re-laid on every mode apply. Stale names
   // go first, so the mode's own inline background below is never removed.
   const themeTokens = activeTheme[resolved];
   clearStaleThemeTokens(themeTokens);
   paintedThemeMode.value = resolved;
   const bg = themeBackground(themeTokens) ?? THEME_MODE_BG[resolved];
-  // Theme mode flash telemetry. index.html installs __themeModeLogEvt as a fetch shim
-  // that POSTs to /api/v1/internal/client-log (engine.log breadcrumbs).
+  // Theme mode flash telemetry. The boot script installs __themeModeLogEvt as a fetch
+  // shim that POSTs to /api/v1/internal/client-log (engine.log breadcrumbs).
   type ThemeModeLogEvt = (label: string, info: unknown) => void;
   const logEvt = (window as unknown as { __themeModeLogEvt?: ThemeModeLogEvt }).__themeModeLogEvt;
   if (logEvt) {
@@ -504,7 +518,7 @@ export function applyThemeMode(mode: ThemeMode): void {
       input: mode,
       resolved,
       priorDataThemeMode: document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
-      mqLight: prefersLight,
+      mqLight: sampledLight,
     });
   }
   localStorage.setItem(THEME_MODE_STORAGE_KEY, mode);
@@ -712,13 +726,23 @@ export function setTheme(id: string, known?: ResolvedTheme): Promise<void> {
 // And a resume can read the snapshot's appearance while the page is visible.
 // An iOS wake can last under a second, and the media query lags it. The
 // confirming read keeps that wake from painting, and from being snapshotted.
+//
+// So only the follower moves a page that is already on `system`. Any other
+// repaint, such as a preference load or a theme re-lay, keeps the painted mode
+// (`repaintThemeMode`). Reading the OS there would skip every guard above. A
+// repaint also never cancels a pending follower read, since that would lose a
+// real flip.
 
-/** Re-resolves `system` when the OS appearance may have moved. */
+/** Re-resolves `system` when the OS appearance may have moved. Its apply takes
+ *  a fresh read: this is the one paint allowed to move the mode. */
 const systemThemeModeFollower = followSystemThemeMode({
   visible: () => document.visibilityState === 'visible',
   moved: () => currentThemeMode() === 'system'
     && document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE) !== resolveThemeMode('system', osPrefersLight()),
-  apply: () => applyThemeMode('system'),
+  apply: () => {
+    const light = osPrefersLight();
+    paintThemeMode('system', resolveThemeMode('system', light), light);
+  },
 });
 
 /** The three events one iOS wake delivers together, per
@@ -736,8 +760,9 @@ const SYSTEM_THEME_MODE_RESUME_EVENTS: ReadonlyArray<readonly [EventTarget, stri
 ];
 
 /** Subscribe to the OS appearance while the preference is `system`, and to
- *  nothing at all otherwise. Called from every `applyThemeMode`, so it tears the
- *  previous registration down first and is safe to run repeatedly. */
+ *  nothing at all otherwise. Called from every paint, so it tears the previous
+ *  registration down first and is safe to run repeatedly. Only leaving `system`
+ *  cancels a pending read. */
 function syncSystemThemeModeListener(mode: ThemeMode): void {
   const { schedule } = systemThemeModeFollower;
   systemThemeModeQuery?.removeEventListener('change', schedule);
@@ -745,8 +770,10 @@ function syncSystemThemeModeListener(mode: ThemeMode): void {
   for (const [target, type] of SYSTEM_THEME_MODE_RESUME_EVENTS) {
     target.removeEventListener(type, schedule);
   }
-  systemThemeModeFollower.cancel();
-  if (mode !== 'system') return;
+  if (mode !== 'system') {
+    systemThemeModeFollower.cancel();
+    return;
+  }
 
   systemThemeModeQuery = window.matchMedia('(prefers-color-scheme: light)');
   systemThemeModeQuery.addEventListener('change', schedule);
