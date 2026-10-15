@@ -16,7 +16,7 @@ import type { StoredEvent } from '../thread-event-types';
  * usually matches) still land, by re-targeting it at the turn that holds it.
  *
  * The set of self-stamping ids is declared once in `stampedEventIds`; the
- * tripwires here fail if `ChatExchange` or `WidgetCard` grows a stamp without
+ * tripwires here fail if `ChatExchange` or `InlineWidget` grows a stamp without
  * declaring it.
  */
 
@@ -60,9 +60,9 @@ describe('deepLinkAnchorForEvent', () => {
     expect(deepLinkAnchorForEvent(exchanges, 'tool-1')).toBe('start-2');
   });
 
-  /** "Show in thread" lands on the widget's card, not on the message before
-   *  it, so the card's stamp must be declared. */
-  it('returns the event itself for a WidgetShown, which stamps its own card', () => {
+  /** "Show in thread" lands on an old showing's inline widget, not on the
+   *  message before it, so the widget's stamp must be declared. */
+  it('returns the event itself for a WidgetShown, which stamps its own inline widget', () => {
     const exchanges = [exchange('start-1', [['ToolCalled', 'tool-1'], ['WidgetShown', 'widget-1']])];
     expect(deepLinkAnchorForEvent(exchanges, 'widget-1')).toBe('widget-1');
   });
@@ -126,7 +126,7 @@ describe('stampedEventIds', () => {
       .toEqual(['start-1', 'fail-1']);
   });
 
-  it('lists every widget card the turn showed', () => {
+  it("lists every old showing's inline widget in the turn", () => {
     expect(stampedEventIds(exchange('start-1', [['WidgetShown', 'w-1'], ['ToolCalled', 't-1'], ['WidgetShown', 'w-2']])))
       .toEqual(['start-1', 'w-1', 'w-2']);
   });
@@ -158,15 +158,16 @@ describe('stampedEventIds', () => {
     expect(stampsIn('../../../components/chat/ChatExchange.tsx')).toEqual([
       // The turn root: the exchange STARTER, and nothing for a turn with no
       // starter loaded (see `exchangeStarterId`).
-      'exchangeStarterId(exchange)',
+      'starterId',
       // The failure card: the `ResponseFailed`'s own id (`exchangeError`).
       'error.eventId || undefined',
     ]);
   });
 
-  it('matches every data-event-id a widget card stamps', () => {
-    // The card and its "no longer exists" form: the `WidgetShown`'s own id.
-    expect(stampsIn('../../../components/widgets/WidgetCard.tsx')).toEqual(['eventId', 'eventId']);
+  it('matches every data-event-id an inline widget stamps', () => {
+    // Its unavailable form takes the stamp it is handed; the widget hands it
+    // only for an old `WidgetShown`, its own id.
+    expect(stampsIn('../../../components/widgets/InlineWidget.tsx')).toEqual(['stamp', 'stamp']);
   });
 });
 

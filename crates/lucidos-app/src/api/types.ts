@@ -62,6 +62,11 @@ export interface ChatRequestBody {
   coding_agent?: CodingAgent;
   event_id?: string;
   thread_id?: string;
+  /** This page's input chain and the send's input sequence on the thread
+   *  (`InputPosition`, ADR 0449). The engine refuses a send a later one from
+   *  the same page overtook. */
+  input_chain?: string;
+  input_seq?: number;
   /** Set on a send whose `thread_id` names a thread the server has not seen
    *  yet, because THIS request is the one creating it (a raw new send, where
    *  the client mints the uuid). Without it the engine 404s an unknown id
@@ -407,6 +412,14 @@ export interface BackfillProgress {
   /** The ready flag is set: turns read the trees while older threads still
    *  fill in. */
   ready: boolean;
+  /** What the backfill has spent, while one is open. */
+  spent_usd: number | null;
+  /** Where it pauses, when its compactor model is priced. */
+  cap_usd: number | null;
+  /** The cap Continue would set. */
+  next_cap_usd: number | null;
+  /** The backfill spent its cap and waits for the user. Live work goes on. */
+  held: boolean;
   /** The order of the frame that announced this count. A snapshot carries the
    *  last frame's order, so a frame no newer than it was already counted. */
   seq: number;
@@ -483,6 +496,11 @@ export interface EffortCost {
   backfill_usd_central: number;
   daily_usd: Bounds;
   daily_usd_central: number;
+  /** What one turn costs once the backfill is done, at the standard rate. */
+  turn_usd: Bounds;
+  turn_usd_central: number;
+  /** Where a backfill at this tier pauses for the user. */
+  cap_usd: number;
 }
 
 /** `GET /api/v1/memory/tree-backfill/estimate`. Mirrors the Rust
@@ -496,6 +514,8 @@ export interface TreeBackfillEstimate {
   /** Until every tree is built, at the default seconds per call. */
   complete_secs: Bounds;
   daily_calls: Bounds;
+  /** Compactor calls one turn makes: the engine's measured seed. */
+  turn_calls: Bounds;
   /** One per compactor model, each carrying a row per reasoning tier. A
    *  tier the model cannot run is priced as the tier routing snaps it to. */
   costs: { model: string; by_effort: EffortCost[] }[];
@@ -520,6 +540,9 @@ export interface BackgroundModel {
   /** Whether `model` reads images. With `needs_vision`, `false` means the
    *  engine refuses the task rather than calling the model. */
   vision: boolean;
+  /** Whether the task asks no model at all: it runs only on measured models,
+   *  and none is reachable. The wake decision then wakes every parent. */
+  asks_no_model: boolean;
   /** The models the picker lists first, best first. */
   recommended: RecommendedSelection[];
 }

@@ -127,17 +127,19 @@ describe('what the pasteboard can do here', () => {
     expect(clipboardAbilitiesOf({ writeText: async () => {}, readText: async () => '' })).toEqual({
       copy: true,
       paste: true,
+      copyImage: false,
     });
     expect(clipboardAbilitiesOf({ writeText: async () => {} })).toEqual({
       copy: true,
       paste: false,
+      copyImage: false,
     });
   });
 
-  it('answers no to both when there is no clipboard at all', () => {
-    // A plain-http LAN origin is not a secure context, and has neither.
-    expect(clipboardAbilitiesOf(undefined)).toEqual({ copy: false, paste: false });
-    expect(clipboardAbilitiesOf({})).toEqual({ copy: false, paste: false });
+  it('answers no to every one when there is no clipboard at all', () => {
+    // A plain-http LAN origin is not a secure context, and has none of them.
+    expect(clipboardAbilitiesOf(undefined)).toEqual({ copy: false, paste: false, copyImage: false });
+    expect(clipboardAbilitiesOf({})).toEqual({ copy: false, paste: false, copyImage: false });
   });
 
   it('gates each control on its own ability', () => {

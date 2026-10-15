@@ -13,12 +13,13 @@
 //! reason constants, the superseded / orphan-recovery sweeps, and the
 //! in-process block orchestrator are here.
 //!
-//! Two pre-authorization short-circuits skip the card entirely (no event):
+//! The card is skipped in two cases:
 //!   * the server's `auto_approve` flag (an independent, coarser server-level
-//!     trust toggle — settable via `PUT /api/v1/mcp/auto-approve`), and
-//!   * a **non-interactive trigger thread** (`meta.channel == Trigger`): a
-//!     trigger has no human to prompt, so it auto-approves silently rather than
-//!     wedge waiting for a click.
+//!     trust toggle, settable via `PUT /api/v1/mcp/auto-approve`), and
+//!   * a **trigger thread** (`meta.channel == Trigger`), which has nobody to
+//!     prompt. There a call runs silently only when the trigger lists the
+//!     server in `mcp_servers`. Any other call is refused, and the user is
+//!     notified (ADR 0430).
 //!
 //! Restart-safe by the same shape as the command lane — a request left
 //! unresolved across a restart is cleared by
@@ -123,34 +124,67 @@ pub fn record_mcp_allow_grant(
 // Pre-authorization gate (pure — unit-tested)
 // ---------------------------------------------------------------------------
 
-/// Whether an MCP tool call needs a permission card. Pure decision, mirroring
+/// Whether an MCP tool call runs, asks, or is refused. Pure decision, mirroring
 /// the command guard's `action_for_lane` channel gate.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum McpGate {
-    /// Pre-authorized — run the tool with no card.
+    /// Pre-authorized: run the tool with no card.
     Proceed,
-    /// Interactive chat with no blanket grant — pause and ask the user.
+    /// Interactive chat with no blanket grant: pause and ask the user.
     Ask,
+    /// A trigger thread calling a server its trigger does not list. Nobody is
+    /// there to ask, so the call is refused and the user is notified.
+    Refuse,
 }
 
-/// The MCP gate decision from the two card-skipping short-circuits:
-///   * `auto_approve_flag` — the server's coarse server-level trust toggle.
-///   * a non-interactive **trigger** thread — no human to prompt, so it
-///     auto-approves silently (the user's explicit choice; an MCP card in a
-///     trigger would deadlock the unattended run).
+/// The MCP gate decision.
+///   * `auto_approve_flag`: the server's coarse server-level trust toggle,
+///     which proceeds on every channel.
+///   * a **trigger** thread proceeds only when `listed_by_trigger`: its
+///     definition names the server in `mcp_servers`. An MCP card in a trigger
+///     would deadlock the unattended run, so anything else is refused.
 ///
 /// The agentic loop serves the Lucidos Agent (chat + triggers), so `channel` is
 /// either `Some(Trigger)` (a scheduled trigger) or `None` (an ordinary chat
-/// turn — the loop does not stamp `Chat` on its per-turn meta). We gate on "is
-/// this a trigger?" so the common `None` chat case correctly reaches the ask
-/// lane. The file/session allowlist is consulted separately (inside
+/// turn, since the loop does not stamp `Chat` on its per-turn meta). We gate on
+/// "is this a trigger?" so the common `None` chat case reaches the ask lane.
+/// The file/session allowlist is consulted separately (inside
 /// `ask_mcp_permission`) on the `Ask` path.
-pub(crate) fn mcp_gate(auto_approve_flag: bool, channel: Option<EventChannel>) -> McpGate {
-    if auto_approve_flag || channel == Some(EventChannel::Trigger) {
-        McpGate::Proceed
-    } else {
-        McpGate::Ask
+pub(crate) fn mcp_gate(
+    auto_approve_flag: bool,
+    channel: Option<EventChannel>,
+    listed_by_trigger: bool,
+) -> McpGate {
+    match (auto_approve_flag, channel) {
+        (true, _) => McpGate::Proceed,
+        (false, Some(EventChannel::Trigger)) if listed_by_trigger => McpGate::Proceed,
+        (false, Some(EventChannel::Trigger)) => McpGate::Refuse,
+        (false, _) => McpGate::Ask,
     }
+}
+
+/// The tool result fed back to the LLM when a trigger thread calls a server
+/// its trigger does not list. `Error:`-prefixed for the same reason as
+/// [`denial_refusal`].
+pub(crate) fn unlisted_trigger_refusal(tool: &str, server_id: &str) -> String {
+    format!(
+        "Error: The MCP tool '{tool}' was NOT run. This trigger does not list MCP server \
+         '{server_id}' in its mcp_servers, so its fires may not call that server unattended. \
+         Do not call '{server_id}' again in this fire. The user has been notified, and can \
+         add the server to the trigger's mcp_servers."
+    )
+}
+
+/// The notification for a refused unlisted call: it names the trigger and
+/// the server, and says how to allow it. Returns the title and the message.
+fn unlisted_call_notification(trigger_name: &str, server_name: &str) -> (String, String) {
+    (
+        format!("{trigger_name}: MCP server '{server_name}' was refused"),
+        format!(
+            "This trigger called '{server_name}' without listing it in its MCP servers, so \
+             the call did not run. Add the server to the trigger if its fires need it."
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +455,114 @@ pub(crate) enum McpAsk {
     Refuse(String),
 }
 
+/// The notification for a refused unlisted MCP call, as it will be sent.
+pub(crate) struct UnlistedCallNotice {
+    pub title: String,
+    pub message: String,
+    pub tap: crate::scheduler::notifications::Tap,
+}
+
+/// The notice for a refused unlisted call in `thread_id`, or `None` when this
+/// thread already notified about this server. The agent is told to stop using
+/// the server, but a retry must not stack a second notification on the first.
+/// A failed read counts as not yet notified: one notice too many beats none.
+pub(crate) async fn unlisted_call_notice(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    trigger: Option<&crate::triggers::TriggerConfig>,
+    server_name: &str,
+) -> Option<UnlistedCallNotice> {
+    use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
+    let trigger_name = trigger.map_or("A trigger", |t| t.name.as_str());
+    let (title, message) = unlisted_call_notification(trigger_name, server_name);
+    let already: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM notifications WHERE thread_id = $1 AND title = $2)",
+    )
+    .bind(thread_id)
+    .bind(&title)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+    if already {
+        return None;
+    }
+    let tap = match trigger {
+        Some(t) => Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::Trigger,
+                id: Some(t.id.clone()),
+                ..Default::default()
+            }),
+        },
+        None => Tap::Modal,
+    };
+    Some(UnlistedCallNotice {
+        title,
+        message,
+        tap,
+    })
+}
+
 impl LucidosEngine {
+    /// The trigger whose fire `thread_id` is, read off the in-memory registry.
+    /// `None` for a chat thread, and for a trigger deleted since it fired.
+    pub(crate) async fn trigger_of_thread(
+        &self,
+        thread_id: Uuid,
+    ) -> Option<crate::triggers::TriggerConfig> {
+        let trigger_id: Option<String> = match sqlx::query_scalar(
+            "SELECT trigger_id FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(row) => row.flatten(),
+            Err(e) => {
+                crate::log!(
+                    "[McpPermission] Failed to read the trigger of thread {}: {}",
+                    thread_id,
+                    e
+                );
+                None
+            }
+        };
+        let trigger_id = trigger_id?;
+        self.trigger_configs.read().ok()?.get(&trigger_id).cloned()
+    }
+
+    /// Tell the user a trigger thread's MCP call was refused. See
+    /// [`unlisted_call_notice`] for the once-per-thread-and-server rule.
+    pub(crate) async fn notify_unlisted_trigger_mcp_call(
+        &self,
+        thread_id: Uuid,
+        trigger: Option<&crate::triggers::TriggerConfig>,
+        server_name: &str,
+    ) {
+        let Some(notice) = unlisted_call_notice(&self.pool, thread_id, trigger, server_name).await
+        else {
+            return;
+        };
+        if let Err(e) = self
+            .create_notification(
+                &notice.title,
+                &notice.message,
+                None,
+                Some(thread_id),
+                None,
+                notice.tap,
+                None,
+            )
+            .await
+        {
+            crate::log!(
+                "[McpPermission] Failed to notify about a refused MCP call in thread {}: {}",
+                thread_id,
+                e
+            );
+        }
+    }
+
     /// Auto-allow when a session or persisted allowlist pattern already covers
     /// `(server_id, tool)`; otherwise emit an `McpPermissionRequested`, block the
     /// loop until the user resolves it (or the turn is canceled), and translate
@@ -617,19 +758,115 @@ mod tests {
         assert!(!mcp_is_allowed("", "t", allowed_in(&["Mcp(:*)"])));
     }
 
+    /// The invariant "trigger consent" over its three cases: a trigger thread
+    /// calls a server silently only when the trigger lists it or the server
+    /// has auto-approve set. Neither is refused, never asked.
     #[test]
-    fn gate_proceeds_on_auto_approve_or_trigger_else_asks() {
-        // Trigger channel → silent auto-approve (Invariant I1).
+    fn a_trigger_thread_runs_only_a_listed_or_auto_approved_server() {
+        let trigger = Some(EventChannel::Trigger);
+        assert_eq!(mcp_gate(false, trigger, true), McpGate::Proceed, "listed");
         assert_eq!(
-            mcp_gate(false, Some(EventChannel::Trigger)),
+            mcp_gate(true, trigger, false),
+            McpGate::Proceed,
+            "auto-approve"
+        );
+        assert_eq!(mcp_gate(false, trigger, false), McpGate::Refuse, "neither");
+
+        // Chat keeps its card: the listing is a trigger's, and means nothing here.
+        assert_eq!(mcp_gate(true, None, false), McpGate::Proceed);
+        assert_eq!(
+            mcp_gate(true, Some(EventChannel::Chat), false),
             McpGate::Proceed
         );
-        // Server auto_approve flag → proceed on any channel.
-        assert_eq!(mcp_gate(true, None), McpGate::Proceed);
-        assert_eq!(mcp_gate(true, Some(EventChannel::Chat)), McpGate::Proceed);
-        // Ordinary chat turn (channel None) with no flag → ask.
-        assert_eq!(mcp_gate(false, None), McpGate::Ask);
-        assert_eq!(mcp_gate(false, Some(EventChannel::Chat)), McpGate::Ask);
+        assert_eq!(mcp_gate(false, None, false), McpGate::Ask);
+        assert_eq!(mcp_gate(false, None, true), McpGate::Ask);
+        assert_eq!(
+            mcp_gate(false, Some(EventChannel::Chat), false),
+            McpGate::Ask
+        );
+    }
+
+    /// One notification per thread and server, linking to the trigger. A
+    /// second refused call in the same fire finds the first and sends none.
+    #[tokio::test]
+    async fn a_refused_server_is_notified_once_per_thread() {
+        use crate::engine::event_bus::SystemEvent;
+        use crate::scheduler::notifications::{NavigateTarget, Tap};
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let mut trigger =
+            crate::triggers::TriggerConfig::from_created_payload(&serde_json::json!({
+                "trigger_id": "t-watch", "name": "Hourly watch", "schedule": ["0 0 * * * *"],
+                "timezone": "UTC", "run": { "type": "intent", "intent": "watch" },
+            }))
+            .unwrap();
+        trigger.mcp_servers = vec!["jira".to_string()];
+
+        let notice = unlisted_call_notice(&pool, thread_id, Some(&trigger), "Slack")
+            .await
+            .expect("the first refusal notifies");
+        match &notice.tap {
+            Tap::Navigate { to } => {
+                assert_eq!(to.target, NavigateTarget::Trigger);
+                assert_eq!(to.id.as_deref(), Some("t-watch"));
+            }
+            other => panic!("the notification must open the trigger: {other:?}"),
+        }
+        bus.emit(BusEvent::System(SystemEvent::NotificationCreated {
+            id: Uuid::new_v4().to_string(),
+            title: notice.title.clone(),
+            message: notice.message.clone(),
+            task_id: None,
+            app_id: None,
+            thread_id: Some(thread_id.to_string()),
+            event_id: None,
+            tap: notice.tap,
+            actor: None,
+        }))
+        .await
+        .unwrap();
+
+        assert!(
+            unlisted_call_notice(&pool, thread_id, Some(&trigger), "Slack")
+                .await
+                .is_none()
+        );
+        assert!(
+            unlisted_call_notice(&pool, thread_id, Some(&trigger), "GitHub")
+                .await
+                .is_some(),
+            "another server is another notice"
+        );
+        assert!(
+            unlisted_call_notice(&pool, Uuid::new_v4(), Some(&trigger), "Slack")
+                .await
+                .is_some(),
+            "another fire is another notice"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The refusal tells the agent to stop using the server in this fire, and
+    /// the notification names the trigger and the server.
+    #[test]
+    fn a_refused_unlisted_call_says_what_to_do_on_both_sides() {
+        let refusal = unlisted_trigger_refusal("mcp__slack__post", "slack");
+        assert!(refusal.starts_with("Error:"), "{refusal}");
+        assert!(refusal.contains("NOT run"), "{refusal}");
+        assert!(refusal.contains("again in this fire"), "{refusal}");
+        assert!(refusal.contains("mcp_servers"), "{refusal}");
+
+        let (title, message) = unlisted_call_notification("Hourly watch", "Slack");
+        assert!(
+            title.contains("Hourly watch") && title.contains("Slack"),
+            "{title}"
+        );
+        assert!(message.contains("MCP servers"), "{message}");
+        for text in [&refusal, &title, &message] {
+            assert!(!text.contains('\u{2014}'), "{text}");
+        }
     }
 
     /// The file and the gate agree: a broad grant persisted through

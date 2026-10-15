@@ -182,6 +182,25 @@ async fn archive_cascade_archives_idle_descendants() {
         "child must have exactly one ThreadArchived event"
     );
 
+    // Each archived member reports the row version its archive produced, so a
+    // client can hold its optimistic archive until the row gets there (ADR
+    // 0437). A later write to the row can only move it further on.
+    for id in [parent_id, child_id] {
+        let reported = body["summary_versions"][id.to_string()]
+            .as_i64()
+            .unwrap_or_else(|| panic!("no summary version for {id}: {body:?}"));
+        let stored: i64 =
+            sqlx::query_scalar("SELECT summary_version FROM thread_summaries WHERE thread_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read summary_version");
+        assert!(
+            reported > 0 && reported <= stored,
+            "{id}: reported {reported}, stored {stored}"
+        );
+    }
+
     cleanup_threads(&pool, &[parent_id, child_id]).await;
     pool.close().await;
 }

@@ -1,14 +1,14 @@
 // AUTO-GENERATED. Do not edit by hand.
-// Regenerate: cargo test -p lucidos-gateway generate_gateway_constants_file -- --ignored
+// Regenerate: ./scripts/codegen.sh
 //
-// Source of truth: the gateway constant each export names, under
-// crates/lucidos-gateway/src.
+// Source of truth: the constant each export names, in
+// crates/lucidos-gateway-constants/src/lib.rs.
 
-/** `PAIRING_CODE_DIGITS` in `auth.rs`. */
+/** `PAIRING_CODE_DIGITS` in `lucidos-gateway-constants`. */
 export const PAIRING_CODE_DIGITS = 8;
 
-/** `PAIR_PARAM` in `pairing_qr.rs`. */
+/** `PAIR_PARAM` in `lucidos-gateway-constants`. */
 export const PAIR_PARAM = "pair";
 
-/** `SIGIL` in `registry.rs`. */
+/** `SIGIL` in `lucidos-gateway-constants`. */
 export const SIGIL = "~";

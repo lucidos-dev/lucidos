@@ -396,63 +396,32 @@ fn classify_git_answer(
     }
 }
 
-/// Serializes the two workspace-repo operations that are only correct as a
-/// unit: advancing `refs/heads/main` and syncing the repo-root working tree to
-/// it ([`merge::ff_main_to`]), versus snapshotting that same working tree into
-/// a commit (`Engine::commit_dirty_logged` -> `ArtifactManager::commit_all_dirty`).
+/// The workspace repo lock. Every in-engine writer of the workspace repo holds
+/// it across its whole read, file change and commit. A merge holds it across
+/// catch-up, sha read, ref move and the repo-root tree sync.
 ///
-/// These two do not merely race on git's index lock -- they race on a SEMANTIC
-/// window that no retry can close, because neither side ever fails. `update-ref`
-/// publishes the merge instantly; the `checkout -f main` that brings the working
-/// tree along is a separate process. A `commit_all_dirty` landing in between
-/// resets its index to the NEW head and then stages the OLD working tree over
-/// it, so every file the merge just added is recorded as *deleted* and committed
-/// straight onto main. That is the 2026-08-03 nightly's lost `style-b.css`,
-/// which reproduced twice: once via a lost index-lock race (retried above) and
-/// once via this window.
+/// Two windows close only because both sides take it. A targeted data write
+/// saves a file, then commits it, and a `checkout -f main` between the two
+/// rewrites the file to its old bytes. A `commit_all_dirty` snapshot between
+/// `update-ref` and the tree sync stages the old tree over the new head, which
+/// commits every merged file as deleted.
 ///
-/// **Exactly two owners**, and each holds it for the REAL lifetime of its
-/// operation: `ff_main_to` across the ref move and the tree sync, and
-/// `commit_all_dirty` across the whole libgit2 snapshot. The snapshot's half is
-/// the subtle one, and is why [`lock_repo_worktree_owned`] exists: that snapshot
-/// runs in `spawn_blocking`, a blocking task cannot be cancelled, and a guard
-/// scoped to the CALLER's future is dropped the instant that future times out,
-/// while the closure is still inside `add_all` / `commit_index`. A guard that
-/// outlives only the caller does not exclude anything.
-///
-/// So no caller of `commit_all_dirty` may hold this lock: the callee takes it
-/// itself, and a caller holding it would queue behind its own snapshot.
-///
-/// Lock ordering: [`merge::MERGE_MUTEX`], then [`WORKSPACE_REPO_MUTEX`], then
-/// this one, wherever more than one is held. Nothing holding this lock takes
-/// either of the other two, so they cannot deadlock. Below it sits only the
-/// `ArtifactManager` repo handle, taken inside the snapshot's closure and never
-/// in the other direction.
-pub(crate) static REPO_WORKTREE_MUTEX: std::sync::LazyLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
-    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
+/// Take it through [`lock_workspace_repo`], whose [`WorkspaceRepoLock`] every
+/// commit helper requires. tokio's mutex is not re-entrant, so no holder may
+/// call a function that takes it itself: an `AppManager` write, a merge, or
+/// `commit_all_dirty`. Lock order: [`merge::MERGE_MUTEX`] first, then this.
+pub(crate) static WORKSPACE_REPO_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Held across every write+commit on the workspace repo (through
-/// `LucidosEngine::lock_workspace_repo`), across `apply_change`'s dirty check,
-/// and across `ff_main_to`'s publish and tree sync.
-///
-/// The last holder is what keeps a data write intact. The write saves a file,
-/// then commits that one path. A `checkout -f main` that resolved `main` before
-/// the commit rewrites the file to its old bytes after it, and the next
-/// `commit_all_dirty` records the revert. [`REPO_WORKTREE_MUTEX`] cannot close
-/// this: a targeted commit never takes it.
-///
-/// No holder may call `ff_main_to`: tokio's mutex is not re-entrant, so the
-/// merge would wait on its own caller.
-pub(crate) static WORKSPACE_REPO_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+/// Proof that the holder owns the workspace repo lock. Only `git_ops` can mint
+/// one, so a write that takes `&WorkspaceRepoLock` cannot run without the lock.
+/// The guard is `'static` and `Send`, so it can move into a `spawn_blocking`
+/// closure. It is then released when the blocking work really ends.
+pub(crate) struct WorkspaceRepoLock {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
 
-/// [`REPO_WORKTREE_MUTEX`] as an OWNED guard, so it can be moved into a
-/// `spawn_blocking` closure and released when the blocking work actually
-/// finishes. A borrowed `lock()` guard has to be held by the async caller, whose
-/// future can be dropped (by a timeout, or any other cancellation) while the
-/// uncancellable closure runs on with the lock already free.
-pub(crate) async fn lock_repo_worktree_owned() -> tokio::sync::OwnedMutexGuard<()> {
-    REPO_WORKTREE_MUTEX.clone().lock_owned().await
+pub(crate) async fn lock_workspace_repo() -> WorkspaceRepoLock {
+    MAIN_LOCKS.lock_repo().await
 }
 
 /// Retry budget for a git lock-file collision. A lock is held for one write

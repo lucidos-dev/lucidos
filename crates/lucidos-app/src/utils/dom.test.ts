@@ -12,7 +12,7 @@ if (typeof globalThis.HTMLElement === 'undefined') {
   };
 }
 
-import { focusIfNeeded, isTextInput, opensSoftwareKeyboard, viewportIsKeyboardShrunk } from './dom';
+import { focusIfNeeded, isTextInput, matrixTranslateX, opensSoftwareKeyboard, viewportIsKeyboardShrunk } from './dom';
 
 describe('focusIfNeeded', () => {
   const realDocument = (globalThis as any).document;
@@ -121,5 +121,17 @@ describe('viewportIsKeyboardShrunk', () => {
     // never shrinks the LAYOUT viewport for the keyboard, so the gap is large
     // whenever the keys are really up.
     expect(viewportIsKeyboardShrunk(784, 844)).toBe(false);
+  });
+});
+
+describe('matrixTranslateX', () => {
+  it('reads the x translation of a 2D and a 3D matrix', () => {
+    expect(matrixTranslateX('matrix(1, 0, 0, 1, -375, 0)')).toBe(-375);
+    expect(matrixTranslateX('matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -212.5, 0, 0, 1)')).toBe(-212.5);
+  });
+
+  it('reads no transform as no offset', () => {
+    expect(matrixTranslateX('none')).toBe(0);
+    expect(matrixTranslateX('')).toBe(0);
   });
 });

@@ -99,3 +99,10 @@ does not use it.
   is self, every descendant and anything under a standing instruction. The
   action here is narrower on purpose, and changing that route's reach would
   change it for every existing caller.
+
+## Amendment, 2026-10-12: archive removes the worktree, whatever it holds
+
+"Archive is not free" holds more strongly now. ADR 0458 removes an archived
+thread's worktree an hour after it idles, dirty or ahead of main, not only a
+merged, clean one. The work stays on the thread's branch, dirt included, and a
+later follow-up rebuilds the tree from it.

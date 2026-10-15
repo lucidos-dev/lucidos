@@ -145,10 +145,13 @@ impl LucidosEngine {
                             .unwrap_or(path)
                             .to_string();
 
-                        // Commit the screenshot to git
+                        // The runtime writes a new timestamped file, which a
+                        // merge's `checkout -f main` leaves alone. So only the
+                        // commit needs the repo lock.
+                        let held = self.lock_workspace_repo().await;
                         if let Err(e) = self
                             .artifact_manager
-                            .commit(&actual_path, &format!("Screenshot: {}", actual_path))
+                            .commit(&held, &actual_path, &format!("Screenshot: {}", actual_path))
                             .await
                         {
                             log!(@screenshot, "Failed to commit: {}", e);

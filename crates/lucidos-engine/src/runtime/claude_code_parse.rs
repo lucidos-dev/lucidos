@@ -1,6 +1,5 @@
 //! CC stream-output line parser, split out of claude_code.rs.
 use super::*;
-use crate::runtime::ReplayedInput;
 use std::collections::HashSet;
 
 /// The little parse state that spans lines of ONE Claude Code stdout stream.
@@ -39,6 +38,9 @@ struct CallUsage {
     output: u32,
     cache_read: u32,
     cache_creation: u32,
+    /// The 1-hour part of `cache_creation`, from the nested
+    /// `cache_creation.ephemeral_1h_input_tokens`. `None` with no split.
+    cache_creation_1h: Option<u32>,
 }
 
 impl CallUsage {
@@ -49,19 +51,22 @@ impl CallUsage {
     /// These counts with every count `usage` carries taking precedence. A
     /// `message_delta` holds the final counts, and may omit the input ones.
     fn updated_by(self, usage: &serde_json::Value) -> Self {
-        let count = |key: &str, fallback: u32| {
-            usage
+        let count_in = |block: &serde_json::Value, key: &str| {
+            block
                 .get(key)
                 .and_then(|v| v.as_u64())
-                .map_or(fallback, |n| {
-                    crate::llm::clamp_provider_token_count(n, "ClaudeCode")
-                })
+                .map(|n| crate::llm::clamp_provider_token_count(n, "ClaudeCode"))
         };
+        let count = |key: &str, fallback: u32| count_in(usage, key).unwrap_or(fallback);
+        let split_1h = usage
+            .get("cache_creation")
+            .and_then(|split| count_in(split, "ephemeral_1h_input_tokens"));
         Self {
             input: count("input_tokens", self.input),
             output: count("output_tokens", self.output),
             cache_read: count("cache_read_input_tokens", self.cache_read),
             cache_creation: count("cache_creation_input_tokens", self.cache_creation),
+            cache_creation_1h: split_1h.or(self.cache_creation_1h),
         }
     }
 
@@ -77,6 +82,13 @@ struct OpenCall {
     message_id: Option<String>,
     model: Option<String>,
     usage: CallUsage,
+    opened_at: std::time::Instant,
+}
+
+impl OpenCall {
+    fn duration_ms(&self) -> Option<u64> {
+        u64::try_from(self.opened_at.elapsed().as_millis()).ok()
+    }
 }
 
 impl CcStreamState {
@@ -131,6 +143,7 @@ impl CcStreamState {
         model: Option<String>,
         usage: CallUsage,
         parent_tool_use_id: Option<String>,
+        duration_ms: Option<u64>,
     ) -> Option<AgentEvent> {
         // The `&&` order matters: an all-zero frame must not claim the id,
         // so a later real frame carrying the same id still reports.
@@ -141,8 +154,10 @@ impl CcStreamState {
                 output_tokens: usage.output,
                 cache_read_tokens: usage.cache_read,
                 cache_creation_tokens: usage.cache_creation,
+                cache_creation_1h_tokens: usage.cache_creation_1h,
                 parent_tool_use_id,
                 api_call_id: message_id.map(String::from),
+                duration_ms,
             },
         )
     }
@@ -188,8 +203,15 @@ impl CcStreamState {
     /// billed the prompt either way.
     pub fn close_open_call(&mut self) -> Option<AgentEvent> {
         let open = self.open_call.take()?;
+        let duration_ms = open.duration_ms();
         // Only the parent's calls open (the `stream_event` arm).
-        self.report(open.message_id.as_deref(), open.model, open.usage, None)
+        self.report(
+            open.message_id.as_deref(),
+            open.model,
+            open.usage,
+            None,
+            duration_ms,
+        )
     }
 }
 
@@ -275,29 +297,13 @@ pub(super) fn is_input_replay(val: &serde_json::Value) -> bool {
     replayed && !carries_tool_result
 }
 
-/// What a replay carried: its text blocks and how many images. A string
-/// content is one text block.
-fn replayed_input(val: &serde_json::Value) -> ReplayedInput {
-    let content = val.get("message").and_then(|m| m.get("content"));
-    if let Some(text) = content.and_then(|c| c.as_str()) {
-        return ReplayedInput {
-            texts: vec![text.to_string()],
-            images: 0,
-        };
-    }
-    let blocks = content.and_then(|c| c.as_array()).map_or(&[][..], |b| b);
-    let of_type = |kind: &'static str| {
-        blocks
-            .iter()
-            .filter(move |b| b.get("type").and_then(|t| t.as_str()) == Some(kind))
-    };
-    ReplayedInput {
-        texts: of_type("text")
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .map(str::to_string)
-            .collect(),
-        images: of_type("image").count(),
-    }
+/// The input a replay names: the `uuid` the engine wrote it under. A replay
+/// Claude Code made of its own output, such as `/compact`'s stdout, carries a
+/// uuid no input has.
+fn replayed_input_uuid(val: &serde_json::Value) -> Option<uuid::Uuid> {
+    val.get("uuid")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
 }
 
 /// Parse a single JSON line from Claude Code's stream output.
@@ -364,6 +370,18 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                 } else {
                     Vec::new()
                 }
+            } else if subtype == "compact_boundary" {
+                let metadata = val.get("compact_metadata");
+                let tokens = |key: &str| metadata.and_then(|m| m.get(key)).and_then(|v| v.as_u64());
+                vec![AgentEvent::Compacted {
+                    trigger: metadata
+                        .and_then(|m| m.get("trigger"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    pre_tokens: tokens("pre_tokens"),
+                    post_tokens: tokens("post_tokens"),
+                }]
             } else {
                 Vec::new()
             }
@@ -489,6 +507,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                         model.map(String::from),
                         CallUsage::read(usage),
                         parent_tool_use_id,
+                        None,
                     );
                     match (report, held_by) {
                         (Some(report), Some(id)) if frame_drew_nothing => {
@@ -525,7 +544,10 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
         "user" => {
             let mut events = Vec::new();
             if is_input_replay(&val) {
-                events.push(AgentEvent::InputRead(Some(replayed_input(&val))));
+                match replayed_input_uuid(&val) {
+                    Some(input) => events.push(AgentEvent::InputRead { input }),
+                    None => log!("[ClaudeCode] a replay named no input uuid; it reads nothing"),
+                }
                 return events;
             }
             if let Some(content) = val
@@ -702,6 +724,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                             .and_then(|m| m.get("usage"))
                             .map(CallUsage::read)
                             .unwrap_or_default(),
+                        opened_at: std::time::Instant::now(),
                     });
                 }
                 Some("message_delta") if from_the_parent => {
@@ -709,11 +732,13 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                         let usage = event
                             .and_then(|e| e.get("usage"))
                             .map_or(open.usage, |u| open.usage.updated_by(u));
+                        let duration_ms = open.duration_ms();
                         events.extend(state.report(
                             open.message_id.as_deref(),
                             open.model,
                             usage,
                             None,
+                            duration_ms,
                         ));
                     }
                 }

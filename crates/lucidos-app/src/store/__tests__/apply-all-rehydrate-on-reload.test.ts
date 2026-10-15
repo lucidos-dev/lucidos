@@ -54,7 +54,7 @@ describe('refreshChangesState rehydrates the Apply All batch across reload', () 
     expect(toasts.value).toEqual([]);
   });
 
-  it('keeps naming the change in flight as "N of M" after a reload', async () => {
+  it('keeps naming the change in flight and the count done after a reload', async () => {
     const member = {
       id: 'c-2', request_id: 'r', thread_id: 't-2', thread_title: 'Collapse Menu',
       branch_name: 'b', repo_root: '/tmp/repo', description: 'd', file_count: 1, files: ['a.ts'],
@@ -73,7 +73,7 @@ describe('refreshChangesState rehydrates the Apply All batch across reload', () 
     await vi.waitFor(() => expect(applyAllBatch.value?.resolvedChangeIds).toEqual(['c-1']));
     const [row] = liveActivityRows();
     expect(row.label).toBe('Applying 3 changes');
-    expect(row.detail).toBe('2 of 3');
+    expect(row.detail).toBe('1 done');
     expect(row.body).toMatchObject({
       kind: 'apply-all',
       thread: { title: 'Collapse Menu', phase: 'Resolving merge conflict' },
@@ -104,7 +104,7 @@ describe('refreshChangesState rehydrates the Apply All batch across reload', () 
     await vi.waitFor(() => expect(applyAllBatch.value?.resolvingChangeIds).toEqual(['c-2']));
     const rows = liveActivityRows();
     expect(rows.map((r) => r.label)).toEqual(['Applying 3 changes', 'Resolving merge conflict: Collapse Menu']);
-    expect(rows[0].detail).toBe('3 of 3');
+    expect(rows[0].detail).toBe('1 done');
     expect(rows[0].body).toMatchObject({ kind: 'apply-all', thread: { title: 'Card Gate', phase: 'Merging' } });
   });
 

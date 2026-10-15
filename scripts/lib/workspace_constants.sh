@@ -17,11 +17,19 @@ DEFAULT_DEV_GATEWAY_PORT="5251"
 # crates/lucidos-gateway/src/postgres.rs, which says why each value is what it is.
 PG_IMAGE="pgvector/pgvector:pg18"
 PG_USER="lucidos"
-PG_PASSWORD="lucidos"
 PG_SHM_SIZE="1g"
 PG_MAX_CONNECTIONS="500"
 SHARED_DOCKER_CONTAINER="lucidos-pg-shared"
 SHARED_DOCKER_VOLUME="lucidos-pg-data-shared"
+
+# lucidos_local_token::SHARED_PG_PASSWORD_FILE: the shared cluster's password,
+# under ~/.lucidos. Read it through shared_pg_password (scripts/lib/pg_secret.sh).
+SHARED_PG_PASSWORD_FILE="pg-shared-password"
+
+# lucidos_local_token::TOKEN_BYTES and ::MINT_LOCK_SUFFIX: how pg_secret.sh mints
+# that file, the same way the gateway does.
+TOKEN_BYTES="32"
+MINT_LOCK_SUFFIX="lock"
 
 # lucidos_engine::paths::WORKTREES_SUBPATH: where a workspace keeps its
 # coding-agent worktrees, relative to its root.

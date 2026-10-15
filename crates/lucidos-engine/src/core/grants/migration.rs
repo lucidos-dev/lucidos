@@ -46,16 +46,8 @@ pub fn run(user_dir: Option<&Path>, workspace_path: &Path) {
         // No user dir means no global files to inherit from.
         return;
     };
-    seed_from(user_dir, &gateway_data_dir(user_dir), workspace_path);
-}
-
-/// The gateway's base dir, holding the workspace registry. Mirrors
-/// `resolve_app_data` in `lucidos-gateway/src/server.rs`, which the engine
-/// cannot call: ADR 0014 §1 keeps the two crates unlinked.
-fn gateway_data_dir(user_dir: &Path) -> PathBuf {
-    std::env::var_os("LUCIDOS_GATEWAY_DATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| user_dir.join("gateway"))
+    let gateway_data = lucidos_home::gateway_data_dir_under(user_dir);
+    seed_from(user_dir, &gateway_data, workspace_path);
 }
 
 /// The registry document, cut down to the one field this needs. Mirrors
@@ -77,7 +69,8 @@ struct RegistryEntry {
 /// An absent registry is `Ok(empty)`, the fresh-install and no-gateway case. A
 /// present but unparseable one is an error, never an empty list: reading it as
 /// "no workspaces" would write the machine record and close the door on an
-/// install whose grants were never copied.
+/// install whose grants were never copied. A blank file is unparseable too,
+/// since the gateway never leaves one.
 fn registered_workspace_dirs(gateway_data: &Path) -> Result<Vec<PathBuf>, BoxError> {
     let path = gateway_data.join("config/workspaces.json");
     let text = match std::fs::read_to_string(&path) {
@@ -85,9 +78,6 @@ fn registered_workspace_dirs(gateway_data: &Path) -> Result<Vec<PathBuf>, BoxErr
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("read {}: {e}", path.display()).into()),
     };
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
     let doc: RegistryDoc =
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
     Ok(doc

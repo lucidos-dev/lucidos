@@ -74,7 +74,7 @@ test.describe('Thread drawer — single keyboard focus (aria-activedescendant)',
     await expect(row).toBeVisible();
     // Mouse-only: present in the DOM, but removed from the Tab order so the
     // drawer stays one tab stop.
-    await expect(row.locator('.pin-thread-btn')).toHaveAttribute('tabindex', '-1');
+    await expect(row.locator('.pin-btn')).toHaveAttribute('tabindex', '-1');
     await expect(row.locator('button[aria-haspopup="menu"]')).toHaveAttribute('tabindex', '-1');
   });
 

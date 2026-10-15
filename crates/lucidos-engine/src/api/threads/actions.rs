@@ -9,19 +9,20 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::api::error::ApiError;
 use crate::api::thread_reach::{refuse_without_authority, ThreadReachVerb};
 use crate::api::AppState;
 use crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON;
 
 use super::{extract_thread_uuid, parse_thread_id};
 
-/// Read `is_saved` for a thread. `None` = the thread isn't in the projection.
-/// Drives the idempotent save/unsave short-circuit below.
+/// Whether the thread is saved, and its current `summary_version`, or `None`
+/// for a thread that does not exist.
 async fn thread_is_saved(
     state: &AppState,
     thread_id: Uuid,
-) -> Result<Option<bool>, (StatusCode, String)> {
-    sqlx::query_scalar("SELECT is_saved FROM thread_summaries WHERE thread_id = $1")
+) -> Result<Option<(bool, i64)>, (StatusCode, String)> {
+    sqlx::query_as("SELECT is_saved, summary_version FROM thread_summaries WHERE thread_id = $1")
         .bind(thread_id)
         .fetch_optional(&state.pool)
         .await
@@ -37,6 +38,15 @@ async fn thread_is_saved(
 pub(in crate::api) struct AnswerThreadQuestionBody {
     tool_use_id: String,
     answer: crate::engine::thread_events::AnswerKind,
+    /// The client's id for this answer, recorded as the answer event's id.
+    #[serde(default)]
+    event_id: Option<Uuid>,
+    /// The sending page's *input chain* and this answer's *input sequence*,
+    /// as on `POST /api/v1/chat/stream` (ADR 0449). Both or neither.
+    #[serde(default)]
+    input_chain: Option<String>,
+    #[serde(default)]
+    input_seq: Option<i64>,
 }
 
 /// POST /api/v1/threads/:thread_id/answer-question — answer a pending question
@@ -46,20 +56,23 @@ pub(in crate::api) struct AnswerThreadQuestionBody {
 /// CC-specific resume side-effects (`CodingAgentPromptSent` marker +
 /// `ContinueSignal` spawn).
 ///
-/// Returns 409 when the question is missing or already answered, and 400 for a
+/// Returns 409 when the question is missing or already answered, or when a
+/// later input from the same page overtook this answer. Returns 400 for a
 /// `Superseded` body (see below).
+///
+/// A positioned answer is admitted to the thread's input order, then recorded
+/// at once. A running turn may be blocked on this very question, so waiting
+/// behind an input admitted earlier could deadlock that turn. Admission and
+/// recording run as one detached task the handler awaits, so a dropped request
+/// cannot split them.
 pub(in crate::api) async fn answer_thread_question(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<AnswerThreadQuestionBody>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let thread_uuid = Uuid::parse_str(&thread_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Invalid thread_id" })),
-        )
-    })?;
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let thread_uuid =
+        Uuid::parse_str(&thread_id).map_err(|_| ApiError::bad_request("Invalid thread_id"))?;
     // `Superseded` is engine-internal and only the message router may write it,
     // because it asserts something no client can make true: that a follow-up
     // arrived and replaced this question. A client-supplied one would put that
@@ -71,13 +84,10 @@ pub(in crate::api) async fn answer_thread_question(
         body.answer,
         crate::engine::thread_events::AnswerKind::Superseded
     ) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Superseded is engine-internal: it is written only when a follow-up \
-                          replaces the question. Use Canceled to dismiss it, or send the \
-                          follow-up itself."
-            })),
+        return Err(ApiError::bad_request(
+            "Superseded is engine-internal: it is written only when a follow-up \
+             replaces the question. Use Canceled to dismiss it, or send the \
+             follow-up itself.",
         ));
     }
     // An answer is the user's own, so it is the owner's button wherever it
@@ -89,37 +99,129 @@ pub(in crate::api) async fn answer_thread_question(
         Some(thread_uuid),
         ThreadReachVerb::AnswerQuestion,
     )
-    .await
-    .map_err(|e| {
-        (
-            e.status_code(),
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-    })?;
+    .await?;
     let actor = crate::api::owner_approval::answering_actor(
         &state.pool,
         &headers,
         thread_uuid,
         &body.tool_use_id,
     )
-    .await
-    .map_err(|e| (e.status, Json(serde_json::json!({ "error": e.message }))))?;
-    use crate::engine::agent_question::{answer_pending_question, AnswerResult};
-    match answer_pending_question(
-        &state.engine,
-        thread_uuid,
-        body.tool_use_id,
-        body.answer,
-        actor,
-    )
-    .await
-    {
-        AnswerResult::Resumed => Ok(Json(serde_json::json!({ "ok": true }))),
-        AnswerResult::Conflict(msg) => Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": msg })),
-        )),
-    }
+    .await?;
+    use crate::engine::agent_question::{answer_pending_question_with_event_id, AnswerResult};
+    use crate::engine::{overtaken_message, InputAdmission, InputPosition, OVERTAKEN_REASON};
+    let position =
+        InputPosition::from_wire(body.input_chain.as_deref(), body.input_seq, body.event_id)
+            .map_err(ApiError::bad_request)?;
+    // No thread, no question: the answer is refused below, and must leave no
+    // chain row behind to make that id addressable.
+    let thread_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM thread_summaries WHERE thread_id = $1)")
+            .bind(thread_uuid)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::db)?;
+    let position = position.filter(|_| thread_exists);
+    let composer = composer_submission(&body.answer);
+    let device_id = headers
+        .get(crate::api::actor::HEADER_DEVICE_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let engine = state.engine.clone();
+    let answering = tokio::spawn(async move {
+        match engine
+            .input_order
+            .admit(engine.pool(), thread_uuid, position, body.event_id)
+            .await
+        {
+            // Placed, and released at once: see the doc comment.
+            Ok(InputAdmission::Admitted(_)) => {}
+            Ok(InputAdmission::Overtaken) => {
+                return Err(
+                    ApiError::new(StatusCode::CONFLICT, overtaken_message(thread_uuid))
+                        .with_reason(OVERTAKEN_REASON),
+                );
+            }
+            Err(e) => {
+                return Err(ApiError::internal(format!(
+                    "Could not admit the answer to thread {thread_uuid}: {e}"
+                )));
+            }
+        }
+        match answer_pending_question_with_event_id(
+            &engine,
+            thread_uuid,
+            body.tool_use_id,
+            body.answer,
+            actor,
+            body.event_id,
+        )
+        .await
+        {
+            AnswerResult::Resumed => {}
+            AnswerResult::Conflict(msg) => return Err(ApiError::new(StatusCode::CONFLICT, msg)),
+        }
+        // An answer typed into the composer consumes the thread's compose slot
+        // before the endpoint responds, as a send's accept does (ADR 0450). It
+        // runs once the answer is recorded, so a refused or repeated answer
+        // never consumes. The answer stands even if the consume fails.
+        if let Some((text, image_hashes)) = composer {
+            if let Err(e) = crate::api::threads_compose::consume_and_announce_compose_slot(
+                &state,
+                thread_uuid,
+                &text,
+                &image_hashes,
+                device_id,
+            )
+            .await
+            {
+                log!(
+                    "[Threads] Answer on {} recorded, but its compose slot was not consumed: {}",
+                    thread_uuid,
+                    e
+                );
+            }
+        }
+        Ok(Json(serde_json::json!({ "ok": true })))
+    });
+    answering
+        .await
+        .map_err(|e| ApiError::internal(format!("The answer could not be dispatched: {e}")))?
+}
+
+/// The composer content an answer submitted, or `None` for one that carried
+/// none (an option click). Multi-select folds the prompt's text and images in
+/// beside the toggled options.
+fn composer_submission(
+    answer: &crate::engine::thread_events::AnswerKind,
+) -> Option<(String, Vec<String>)> {
+    use crate::engine::thread_events::AnswerKind;
+    let text = match answer {
+        AnswerKind::FreeText { text, .. } => text.clone(),
+        AnswerKind::MultiSelected { text, .. } => text.clone().unwrap_or_default(),
+        _ => return None,
+    };
+    let image_hashes = answer.image_hashes().to_vec();
+    (!text.trim().is_empty() || !image_hashes.is_empty()).then_some((text, image_hashes))
+}
+
+/// The body a pin or unpin answers with: the row's `summary_version` once the
+/// write landed. The client holds its optimistic row until it sees that
+/// version (ADR 0437).
+fn summary_version_body(version: i64) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "summary_version": version }))
+}
+
+/// The version the emit's own aggregate carried. A thread event always has
+/// one, so a missing version is a projection bug, reported as such.
+fn emitted_version(
+    emitted: Option<crate::engine::event_bus::EmitResult>,
+) -> Result<i64, (StatusCode, String)> {
+    emitted.and_then(|r| r.summary_version).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The write landed but reported no summary version".to_string(),
+        )
+    })
 }
 
 /// POST /api/v1/threads/save — save a thread
@@ -127,7 +229,7 @@ pub(in crate::api) async fn save_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let thread_uuid = extract_thread_uuid(&request)?;
     // Idempotent: saving an already-saved thread is a 200 no-op, not a 409.
     // A duplicate / racing `/threads/save` (e.g. an iOS PWA double-submit)
@@ -137,8 +239,8 @@ pub(in crate::api) async fn save_thread(
     // pin + toasted a spurious "Thread cannot be saved" error.
     match thread_is_saved(&state, thread_uuid).await? {
         None => return Err((StatusCode::NOT_FOUND, "Thread not found".to_string())),
-        Some(true) => return Ok(StatusCode::OK),
-        Some(false) => {}
+        Some((true, version)) => return Ok(summary_version_body(version)),
+        Some((false, _)) => {}
     }
     // The home thread sits in no drawer section, so a pin would move it
     // nowhere (ADR 0362).
@@ -154,7 +256,7 @@ pub(in crate::api) async fn save_thread(
     }
     let actor = crate::api::actor::user_actor(&headers, None);
 
-    state
+    let emitted = state
         .engine
         .event_bus
         .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -185,7 +287,7 @@ pub(in crate::api) async fn save_thread(
         }
     });
 
-    Ok(StatusCode::OK)
+    Ok(summary_version_body(emitted_version(emitted)?))
 }
 
 /// POST /api/v1/threads/unsave — unsave a thread
@@ -193,18 +295,18 @@ pub(in crate::api) async fn unsave_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let thread_uuid = extract_thread_uuid(&request)?;
     // Idempotent mirror of save: unsaving an already-unsaved thread is a 200
     // no-op, not a 409.
     match thread_is_saved(&state, thread_uuid).await? {
         None => return Err((StatusCode::NOT_FOUND, "Thread not found".to_string())),
-        Some(false) => return Ok(StatusCode::OK),
-        Some(true) => {}
+        Some((false, version)) => return Ok(summary_version_body(version)),
+        Some((true, _)) => {}
     }
     let actor = crate::api::actor::user_actor(&headers, None);
 
-    state
+    let emitted = state
         .engine
         .event_bus
         .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -221,7 +323,7 @@ pub(in crate::api) async fn unsave_thread(
             )
         })?;
 
-    Ok(StatusCode::OK)
+    Ok(summary_version_body(emitted_version(emitted)?))
 }
 
 /// POST /api/v1/threads/rename — rename a thread (user-initiated)
@@ -803,4 +905,53 @@ pub(in crate::api) async fn get_thread_messages(
         "messages": messages,
         "timeline_events": timeline_events,
     })))
+}
+
+#[cfg(test)]
+mod composer_submission_tests {
+    use super::composer_submission;
+    use crate::engine::thread_events::AnswerKind;
+
+    #[test]
+    fn an_option_click_submits_no_composer_content() {
+        let answer = AnswerKind::Selected {
+            option_id: "opt-a".into(),
+        };
+        assert_eq!(composer_submission(&answer), None);
+    }
+
+    #[test]
+    fn typed_text_is_the_submission() {
+        let answer = AnswerKind::FreeText {
+            text: "night has passed by".into(),
+            image_hashes: vec![],
+        };
+        assert_eq!(
+            composer_submission(&answer),
+            Some(("night has passed by".into(), vec![]))
+        );
+    }
+
+    #[test]
+    fn a_multi_select_folds_in_the_prompt_text_and_images() {
+        let hash = "a".repeat(64);
+        let answer = AnswerKind::MultiSelected {
+            option_ids: vec!["opt-a".into()],
+            text: Some("and check the logs".into()),
+            image_hashes: vec![hash.clone()],
+        };
+        assert_eq!(
+            composer_submission(&answer),
+            Some(("and check the logs".into(), vec![hash]))
+        );
+    }
+
+    #[test]
+    fn whitespace_alone_submits_nothing() {
+        let answer = AnswerKind::FreeText {
+            text: "  \n".into(),
+            image_hashes: vec![],
+        };
+        assert_eq!(composer_submission(&answer), None);
+    }
 }

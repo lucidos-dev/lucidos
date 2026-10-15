@@ -1294,7 +1294,7 @@
     }
 }
 
-/* What an embed draws when its widget cannot: a quiet line in place. */
+/* What an option's widget draws when it cannot: a quiet line in place. */
 .widget-embed-unavailable {
     padding: var(--space-sm) var(--space-md);
     border: 1px dashed var(--border-color);

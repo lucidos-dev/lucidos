@@ -118,6 +118,7 @@ async fn teardown_skips_abort_for_question_parked_chat_thread() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "make a story".into(),
             user_image_hashes: vec![],
             device_id: None,

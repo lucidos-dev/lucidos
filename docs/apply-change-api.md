@@ -23,9 +23,9 @@ POST /api/v1/changes/{change_id}/apply
 
 ## Response shape
 
-Always JSON, with four statuses.
+Always JSON, with four HTTP statuses.
 
-- `200 OK` on accepted requests, including `noop`, `hardening` and `conflict`.
+- `200 OK` on accepted requests, including `noop`, `hardening`, `conflict` and `queued`.
 - `400 Bad Request` when the engine could not even consider the change (missing
   change, invalid status, and so on).
 - `403 Forbidden` when the caller is a thread with no authority over the
@@ -38,7 +38,7 @@ An idempotent re-apply of an already-applied change is NOT gated: it falls
 through to the engine and returns `200` with `status: "noop"`.
 
 ```ts
-type ApplyStatus = 'applied' | 'noop' | 'hardening' | 'conflict';
+type ApplyStatus = 'applied' | 'noop' | 'hardening' | 'conflict' | 'queued';
 
 interface ApplyChangeResult {
   status: ApplyStatus;
@@ -63,6 +63,54 @@ interface ApplyChangeResult {
 | `noop` | Nothing to merge. Either the change was already applied (idempotent re-apply) or the branch had no commits. The original `applied_commit` is echoed back on idempotent re-apply, so callers can still reference the merge. |
 | `hardening` | The change wasn't hardened, so a hardening recovery session was spawned. The change will auto-apply when hardening completes. `review_thread_id` points at the recovery thread. |
 | `conflict` | Merge conflict — a CC session is resolving it; `conflict_thread_id` points at the thread to focus. For a **live session whose `main` has diverged** and for the **temp-worktree merge**, resolution runs in the background: the call returns immediately and the change auto-applies (`ChangeApplied`) when resolution completes, or emits `ChangeApplyFailed` if it can't. (A clean fast-forward on a live session stays synchronous and returns `applied` instead — only true divergence goes async.) A second apply while one is already running for a live session also returns `conflict` ("already in progress"). |
+| `queued` | A Lucidos-source change waits in the *landing lane* (ADR 0463). It would not merge cleanly onto `main`, so it resolves in a lane batch. It waits for the next batch while one resolves, or for its *Apply All* press to hand over the rest (ADR 0480). `ChangeApplied` reports the landing, and `ChangeUnqueued` a change that left the lane without landing. A Lucidos-source change that merges cleanly lands at once and returns `applied`, with its own landing merge as `applied_commit`. |
+
+### Canceling a lane batch
+
+`POST /api/v1/changes/lane/cancel` with `{"batch_id": "<uuid>"}` fails the resolving lane batch whole and stops its lane thread. The batch id is on `LaneBatchStarted`. Every member stays pending and apply-ready, gets `ChangeUnqueued { reason: batch_failed }`, and waits for the next Apply. It answers `{"canceled": "<uuid>"}`, or `400` when no batch with that id is resolving. A caller without Apply's reach over every member is refused, as Apply refuses it.
+
+### Removing a waiting change
+
+`DELETE /api/v1/changes/<id>/queue` takes a change waiting in the landing lane back out. It gets `ChangeUnqueued { reason: removed }`, stays pending and apply-ready, and waits for the next Apply. It answers `{"message": "Removed from the landing lane."}`. A member of the open lane batch answers `409` with `"reason": "in_lane_batch"`: it leaves only with its batch, through the Cancel above. A change that is not waiting answers `409` with `"reason": "not_waiting_to_land"`, and an unknown id `404`.
+
+### The main check
+
+`GET /api/v1/changes`, every `ChangesUpdated` frame and `GET /api/v1/main-check` carry `main_check`, the *main check* (ADR 0464). A field a state has nothing for is absent:
+
+```json
+{
+  "state": "red",
+  "check_id": "<uuid>",
+  "from_sha": "<sha>",
+  "to_sha": "<sha>",
+  "run_url": "https://github.com/lucidos-dev/lucidos/actions/runs/<id>",
+  "fix_thread_id": "<uuid>",
+  "summary": "Failed: engine."
+}
+```
+
+`state` is `idle`, `running`, `passed`, `red` or `unavailable`. For `unavailable`, `summary` says why this checkout cannot run the check. `POST /api/v1/main-check/close` closes a red check for the maintainer and answers `{"message": "Closed the red main check."}`. It answers `409` with `"reason": "main_check_not_red"` when main is not red, and `403` with `"reason": "maintainer_only"` for any caller but the owner at a registered device: an agent, a script holding the machine-local token, or an app.
+
+### The lane on `GET /api/v1/changes`
+
+`GET /api/v1/changes` and every `ChangesUpdated` frame carry `landing_lane`:
+
+```json
+{
+  "open_batch": {
+    "batch_id": "<uuid>",
+    "lane_thread_id": "<uuid>",
+    "members": ["<change uuid>"],
+    "step": "resolving"
+  },
+  "waiting": ["<change uuid>"],
+  "gathering": false
+}
+```
+
+`open_batch` is `null` while no batch resolves. `members` lists the members still to land. `step` is `landing` from the lane thread's clean finish until `main` moves, and `resolving` otherwise. `waiting` lists the changes waiting for the next batch, in landing order. After an engine restart all three stay empty until the lane is rebuilt.
+
+`gathering` is `true` while an *Apply All* press is still handing changes over and no batch is open. What waits then forms one batch once the press is in.
 
 ## Examples
 
@@ -146,6 +194,7 @@ For automated callers (CC sessions, agentic loops, the assistant itself):
    - `"hardening"` → recovery session running. Re-poll later, or wait for
      the `ChangeApplied` event.
    - `"conflict"` → focus `conflict_thread_id` to let CC resolve.
+   - `"queued"` → the landing lane holds it. Wait for `ChangeApplied`.
 4. **Emit a domain event.** When `status === "applied"`, emit
    `ProjectHardened` (or whatever domain event is appropriate) referencing
    `applied_commit` so downstream consumers can correlate.
@@ -200,6 +249,7 @@ worked example.
 | `200` `{"status":"noop", "commits_applied":0, ...}` | Branch existed but had no commits, or the change was already applied via another path |
 | `200` `{"status":"hardening", ...}` | The change wasn't hardened. The recovery session will auto-apply when done. |
 | `200` `{"status":"conflict", "conflict_thread_id":"..."}` | The merge needs human/agent intervention. Focus the thread. |
+| `200` `{"status":"queued", ...}` | The landing lane holds the change behind or inside a resolving lane batch. |
 | `200` `{"status":"applied", "applied_commit":null, ...}` | External-repo handoff (no main merge happens). The branch is kept in the external repo for the user to push/PR. |
 
 ## Safety context

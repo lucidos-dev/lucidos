@@ -49,9 +49,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# The workspaces' image and credentials: PG_IMAGE, PG_USER and PG_PASSWORD.
+# The workspaces' image and user: PG_IMAGE and PG_USER.
 # shellcheck source=scripts/lib/workspace_constants.sh
 source "$SCRIPT_DIR/lib/workspace_constants.sh"
+# A fixed password, unlike the shared cluster's minted one: this container holds
+# only throwaway test databases, and it listens on loopback alone.
+TEST_PG_PASSWORD="lucidos"
 PG_CONTAINER="lucidos-pg-test"
 PG_PORT="${LUCIDOS_TEST_PG_PORT:-5510}"  # off the 5432+ workspace range on purpose
 
@@ -75,6 +78,18 @@ fi
 ensure_test_pg() {
     if [ "$FRESH" = "1" ]; then
         echo "[test-db] --fresh: removing existing $PG_CONTAINER"
+        docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
+    fi
+
+    # A container made before it was bound to loopback still listens on every
+    # interface with a public password. It holds only throwaway databases, so
+    # it is recreated rather than reused.
+    local host_ip
+    host_ip="$(docker inspect \
+        --format '{{(index (index .HostConfig.PortBindings "5432/tcp") 0).HostIp}}' \
+        "$PG_CONTAINER" 2>/dev/null || true)"
+    if docker inspect "$PG_CONTAINER" >/dev/null 2>&1 && [ "$host_ip" != "127.0.0.1" ]; then
+        echo "[test-db] recreating $PG_CONTAINER on loopback (it listened on '${host_ip:-all interfaces}')"
         docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
     fi
 
@@ -108,9 +123,9 @@ ensure_test_pg() {
         docker run -d \
             --name "$PG_CONTAINER" \
             -e POSTGRES_USER="$PG_USER" \
-            -e POSTGRES_PASSWORD="$PG_PASSWORD" \
+            -e POSTGRES_PASSWORD="$TEST_PG_PASSWORD" \
             -e POSTGRES_DB=lucidos \
-            -p "$PG_PORT:5432" \
+            -p "127.0.0.1:$PG_PORT:5432" \
             "$PG_IMAGE" \
             postgres -c max_connections=500 >/dev/null
     fi
@@ -176,7 +191,7 @@ ensure_test_pg
 # is guaranteed to exist when the trap fires.
 trap sweep_orphan_test_dbs EXIT
 
-export TEST_DATABASE_URL="postgres://$PG_USER:$PG_PASSWORD@localhost:$PG_PORT/postgres"
+export TEST_DATABASE_URL="postgres://$PG_USER:$TEST_PG_PASSWORD@localhost:$PG_PORT/postgres"
 echo "[test-db] TEST_DATABASE_URL=$TEST_DATABASE_URL"
 
 cd "$PROJECT_DIR"

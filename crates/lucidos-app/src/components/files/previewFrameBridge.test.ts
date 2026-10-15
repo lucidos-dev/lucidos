@@ -38,6 +38,7 @@ vi.mock('../../utils/basePath', async () => {
 });
 
 const {
+  ARTIFACT_PREVIEW_ALLOW,
   ARTIFACT_PREVIEW_SANDBOX,
   PREVIEW_BRIDGE_SOURCE,
   newBridgeNonce,
@@ -48,13 +49,12 @@ const {
   readPreviewFrameMessage,
   routePreviewFrameMessage,
   withPreviewBridge,
-  withPreviewCapability,
 } = await import('./previewFrameBridge');
 const { repositories } = await import('../../store/store');
 const { PREVIEW_HOST_SCHEMES, classifyPreviewLink, withPreviewBase } = await import('./previewIframeLinks');
 const { PREVIEW_FRAME_MESSAGE, PREVIEW_HOST_MESSAGE, askPreviewFind } = await import('../../utils/previewFrameProtocol');
 const { subscribeFrameSwipes } = await import('../../store/actions/frame-swipe-bridge');
-const PREVIEW_SWIPE_SOURCE = (await import('../../../../../packages/lucidos-sdk/src/generated/preview-swipe.js?raw')).default;
+const PREVIEW_SWIPE_SOURCE = (await import('../../../../../packages/lucidos-sdk/dist/preview-swipe.js?raw')).default;
 /** The committed swipe bundle, run as the bridge runs it. */
 const realSwiper = new Function(`${PREVIEW_SWIPE_SOURCE}\nreturn ${PREVIEW_SWIPE_LOCAL};`)() as object;
 
@@ -97,9 +97,17 @@ describe('the preview frame sandbox', () => {
     const src: string = PREVIEW_SOURCE;
     const frame = /function HtmlPreviewFrame[\s\S]*?<iframe([\s\S]*?)\/>/.exec(src)?.[1] ?? '';
     expect(frame).toContain('sandbox={ARTIFACT_PREVIEW_SANDBOX}');
+    expect(frame).toContain('allow={ARTIFACT_PREVIEW_ALLOW}');
     expect(frame).toContain('srcDoc={srcDoc}');
     expect(src).not.toMatch(/allow-same-origin/);
     expect(src).not.toMatch(/contentDocument/);
+  });
+
+  it('delegates fullscreen to every origin, or WebKit denies it', () => {
+    // A bare feature means `'src'`, which WebKit never matches against the
+    // frame's opaque origin, so a report's video cannot go fullscreen in the
+    // desktop app. Chromium special-cases the opaque frame.
+    expect(ARTIFACT_PREVIEW_ALLOW.split(';').map((f: string) => f.trim())).toContain('fullscreen *');
   });
 });
 
@@ -377,6 +385,7 @@ describe('the in-frame bridge script', () => {
 describe('the claim rule and the host router agree', () => {
   const ctx = {
     artifactPath: ARTIFACT, hostOrigin: 'https://localhost:5251', hostPath: '/myws/', workspaceId: 'myws',
+    workspacePath: '/Users/me/workspaces/myws',
   };
   const example: Record<string, string> = {
     http: 'http://example.com/',
@@ -738,25 +747,6 @@ describe('routePreviewFrameMessage', () => {
 // Stamping
 // ---------------------------------------------------------------------------
 
-describe('withPreviewCapability', () => {
-  it('splices the pass in ahead of the data segment', () => {
-    expect(withPreviewCapability('/myws/data/artifacts/r/a.html?rev=2', 'tok'))
-      .toBe('/myws/~cap/tok/data/artifacts/r/a.html?rev=2');
-    expect(withPreviewCapability('/data/artifacts/a.html', 'tok')).toBe('/~cap/tok/data/artifacts/a.html');
-  });
-
-  it('leaves the URL alone with no pass, or off the artifacts tree of the mount', () => {
-    expect(withPreviewCapability('/myws/data/artifacts/a.html', null)).toBe('/myws/data/artifacts/a.html');
-    for (const url of [
-      '/myws/api/v1/data/system-knowhow/x.html',
-      '/myws/api/v1/data/artifacts/x.html',
-      '/myws/data/knowhow/x.html',
-    ]) {
-      expect(withPreviewCapability(url, 'tok')).toBe(url);
-    }
-  });
-});
-
 describe('the stamped bridge script', () => {
   const cfg = { nonce: NONCE, bindings: [MAXIMIZE], hostSchemes: PREVIEW_HOST_SCHEMES, paneSwipe: true };
 
@@ -793,7 +783,7 @@ describe('the stamped bridge script', () => {
 
   it('carries the finder and the swipe inside its own function, where the artifact cannot reach them', async () => {
     const out = previewBridgeScript(cfg);
-    const finder = (await import('../../../../../packages/lucidos-sdk/src/generated/preview-find.js?raw')).default;
+    const finder = (await import('../../../../../packages/lucidos-sdk/dist/preview-find.js?raw')).default;
     // Pinned: each bundle's own name for its result is what the bridge reads.
     expect(finder).toContain(`var ${PREVIEW_FIND_LOCAL} =`);
     expect(PREVIEW_SWIPE_SOURCE).toContain(`var ${PREVIEW_SWIPE_LOCAL} =`);

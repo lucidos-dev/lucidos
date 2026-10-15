@@ -130,11 +130,14 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 # shellcheck source=scripts/lib/workspace_constants.sh
 source "$SCRIPT_DIR/lib/workspace_constants.sh"
+# shellcheck source=scripts/lib/pg_secret.sh
+source "$SCRIPT_DIR/lib/pg_secret.sh"
 
 # Arms are ordinary workspaces. They live beside every other one, so the
 # picker lists them without a nested root nobody else uses.
 export LUCIDOS_EVAL_ROOT="${LUCIDOS_EVAL_ROOT:-$HOME/workspaces}"
-export LUCIDOS_EVAL_PG_BASE="${LUCIDOS_EVAL_PG_BASE:-postgres://$PG_USER:$PG_PASSWORD@localhost:5435}"
+LUCIDOS_EVAL_PG_BASE="${LUCIDOS_EVAL_PG_BASE:-postgres://$PG_USER:$(shared_pg_password)@localhost:5435}"
+export LUCIDOS_EVAL_PG_BASE
 # The model, its label and provider, and the reasoning effort default in the
 # harness itself (`seed_pins` in crates/lucidos-eval/src/main.rs).
 

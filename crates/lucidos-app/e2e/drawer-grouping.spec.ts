@@ -144,15 +144,14 @@ test.describe('Drawer grouping', () => {
         await expect(tile(page, 'Review')).toHaveClass(/ongoing-tile-empty/);
         await shoot(page, 'ongoing-blocked');
 
-        // Drafts holds one thread, so the tap also opens it. On the phone that
-        // swipes to the thread pane, so come back to the drawer.
+        // Drafts holds one thread, and the tap still only selects: the drawer
+        // stays on screen and no row opens.
         await tile(page, 'Drafts').click();
-        if (isMobileViewport(page)) await openThreadDrawer(page);
         await expect(tile(page, 'Drafts')).toHaveAttribute('aria-current', 'true');
         await expect(visible(page, '.ongoing-tile[aria-current="true"]')).toHaveCount(1);
         await expect(rowTitles(page)).toHaveCount(1);
         await expect(rowTitles(page)).toHaveText(/^draft-/);
-        await expect(visible(page, '.ongoing-grouping [data-thread-nav].thread-row-focused .thread-row-title')).toHaveText(/^draft-/);
+        await expect(visible(page, '.ongoing-grouping [data-thread-nav].thread-row-focused')).toHaveCount(0);
         await shoot(page, 'ongoing-drafts');
 
         await tile(page, 'Review').click();

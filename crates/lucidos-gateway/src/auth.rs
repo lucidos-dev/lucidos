@@ -28,7 +28,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub use local_token::{ct_eq, path as local_token_path, HEADER_LOCAL_TOKEN, HEADER_WEBHOOK_TOKEN};
+pub use local_token::{
+    ct_eq, path as local_token_path, HEADER_HOOK_SOCKET_TOKEN, HEADER_LOCAL_TOKEN,
+};
 
 /// A credential header value that stays out of debug output.
 ///
@@ -103,10 +105,7 @@ impl<'a> PresentedCredential<'a> {
 /// device, short enough that a code read over a shoulder goes stale.
 const PAIRING_CODE_TTL: Duration = Duration::from_secs(300);
 
-/// Digits in a pairing code. Short enough to type on a phone. Its safety comes
-/// from the TTL and single use, not from the digits alone.
-/// The app reads it from the generated `gateway-constants.ts`.
-pub(crate) const PAIRING_CODE_DIGITS: u32 = 8;
+pub(crate) use lucidos_gateway_constants::PAIRING_CODE_DIGITS;
 
 /// What a request proved about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +228,7 @@ impl PairedDevices {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("json.tmp");
-        write_owner_only(&tmp, &serde_json::to_string_pretty(self)?)?;
+        local_token::write_owner_only(&tmp, &serde_json::to_string_pretty(self)?)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
@@ -264,8 +263,7 @@ pub fn paired_devices_path(app_data: &Path) -> PathBuf {
 ///
 /// `None` only when `HOME` is unset.
 pub fn legacy_paired_devices_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".lucidos/paired-devices.json"))
+    Some(lucidos_home::path()?.join("paired-devices.json"))
 }
 
 /// What [`load_or_seed`] found, for the caller's boot log.
@@ -585,33 +583,26 @@ fn mint_numeric_code() -> std::io::Result<String> {
     ))
 }
 
-/// Read the local token, minting it on first use. The gateway is the only
-/// process that mints; everyone else calls `lucidos_local_token::read`.
+/// Read the local token, minting it on first use. A gateway-less engine mints
+/// too, and `lucidos_local_token::ensure` settles which value lands.
 pub fn ensure_local_token() -> std::io::Result<String> {
     local_token::ensure()
 }
 
-/// Read the webhook-delivery token, minting it on first use.
+/// Read the hook socket token, minting it on first use.
 ///
-/// Minted by the gateway on the same terms as the local token, and read by the
-/// engine to recognise a delivery hop. It authorizes ONE engine route, so a
-/// funnel-exposed hook cannot become a workspace restart.
-pub fn ensure_webhook_token() -> std::io::Result<String> {
-    local_token::ensure_named(local_token::WEBHOOK_TOKEN_FILE)
+/// The gateway or an engine mints it on the same terms as the local token,
+/// whichever boots first. The engine reads it to recognise a delivery hop. It
+/// authorizes ONE engine route, so a funnel-exposed hook cannot become a
+/// workspace restart.
+pub fn ensure_hook_socket_token() -> std::io::Result<String> {
+    local_token::ensure_named(local_token::HOOK_SOCKET_TOKEN_FILE)
 }
 
 /// A fresh device id. Not a secret: it names a row in the paired-device store
 /// and appears in the devices list, so 8 bytes is plenty to avoid collisions.
 pub fn mint_device_id() -> std::io::Result<String> {
     local_token::mint_hex(8)
-}
-
-/// Write `contents` to `path` with mode 0600, never create-then-chmod.
-///
-/// Replaces what is there. The caller holds the authoritative value, unlike the
-/// token mint's exclusive create, which is racing to become it.
-fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
-    local_token::write_owner_only(path, contents, local_token::Exclusive::No)
 }
 
 /// Decide what an inbound request proved.
@@ -1347,14 +1338,14 @@ mod tests {
         // hook socket's. A `HeaderMap` reaches error and trace formatting on
         // those paths, so a credential that prints is a credential leaked.
         // Both fixtures avoid any substring of a header NAME, since
-        // `x-lucidos-webhook-token` itself ends in "hook-token".
+        // `x-lucidos-hook-socket-token` itself ends in "socket-token".
         let mut headers = HeaderMap::new();
         headers.insert(
             HEADER_LOCAL_TOKEN,
             sensitive_credential("aaaa1111").expect("a plain token builds"),
         );
         headers.insert(
-            HEADER_WEBHOOK_TOKEN,
+            HEADER_HOOK_SOCKET_TOKEN,
             sensitive_credential("bbbb2222").expect("a plain token builds"),
         );
         let rendered = format!("{headers:?}");

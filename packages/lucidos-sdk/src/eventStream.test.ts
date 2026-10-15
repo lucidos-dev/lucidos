@@ -26,12 +26,7 @@ const TARGETS: EventStreamTargets = {
 
 const NO_OP_HANDLERS = { onFrame: () => {}, onOpen: () => {}, onError: () => {} };
 
-const ANSWER: PongAnswer = {
-  device_id: 'dev-test',
-  is_active: true,
-  focused_thread_id: 't-1',
-  event_in_viewport: false,
-};
+const ANSWER: PongAnswer = { device_id: 'dev-test', outcome: 'shown' };
 
 describe('postPong', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
@@ -55,9 +50,7 @@ describe('postPong', () => {
     expect(JSON.parse(init.body as string)).toEqual({
       notification_id: 'n-1',
       device_id: 'dev-test',
-      is_active: true,
-      focused_thread_id: 't-1',
-      event_in_viewport: false,
+      outcome: 'shown',
     });
   });
 
@@ -187,6 +180,42 @@ describe('openEventStream', () => {
     onmessage({ data: { t: 'frame', data: '{"type":"NotificationCreated","data":{}}' } });
 
     expect(frames).toEqual(['{"type":"NotificationCreated","data":{}}']);
+  });
+
+  it('relays an open, a late-join open and a drop from the worker', () => {
+    // `lucidos.sse.onOpen` rests on these: an app re-reads its data on each
+    // open, the late-join one included, which a port joining a live stream gets.
+    const port = fakePort();
+    vi.stubGlobal('SharedWorker', class { port = port; });
+    const seen: string[] = [];
+
+    openEventStream(TARGETS, {
+      onFrame: () => {},
+      onOpen: () => seen.push('open'),
+      onError: () => seen.push('error'),
+    }, { pongs: false });
+    const onmessage = port.onmessage as unknown as (e: { data: unknown }) => void;
+    onmessage({ data: { t: 'open', lateJoin: true } });
+    onmessage({ data: { t: 'error' } });
+    onmessage({ data: { t: 'open' } });
+
+    expect(seen).toEqual(['open', 'error', 'open']);
+  });
+
+  it('relays an open and a drop from a direct stream', () => {
+    vi.stubGlobal('SharedWorker', undefined);
+    const seen: string[] = [];
+
+    openEventStream(TARGETS, {
+      onFrame: () => {},
+      onOpen: () => seen.push('open'),
+      onError: () => seen.push('error'),
+    }, { pongs: false });
+    FakeEventSource.last!.onopen!();
+    FakeEventSource.last!.onerror!();
+    FakeEventSource.last!.onopen!();
+
+    expect(seen).toEqual(['open', 'error', 'open']);
   });
 
   it('says goodbye when the document goes away without disconnecting', () => {

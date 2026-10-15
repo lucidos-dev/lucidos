@@ -14,7 +14,11 @@ license.workspace = true
 # four ways would drift the same way, and its failure mode is worse than a
 # missing feature: a stale copy is a caller that silently cannot authenticate.
 #
-# **It has no dependencies and must keep none.** That is the whole reason every
-# crate can take it.
+# **Its one dependency is `lucidos-home`, which has none, and both must keep it
+# that way.** That is the whole reason every crate can take it.
 
 [dependencies]
+lucidos-home = { path = "../lucidos-home" }
+
+[dev-dependencies]
+tempfile = "3"

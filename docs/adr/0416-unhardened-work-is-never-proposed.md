@@ -1,6 +1,6 @@
 # 0416: Unhardened Lucidos-source work is never proposed; a plan-only branch never hardens; Ready means apply-ready
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [0465](0465-integrated-sub-threads.md)
 - **Date**: 2026-10-10
 
 ## Context

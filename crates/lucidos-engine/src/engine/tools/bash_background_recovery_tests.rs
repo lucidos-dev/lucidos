@@ -14,6 +14,7 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "kick off the release".into(),
             user_image_hashes: vec![],
             device_id: None,

@@ -329,10 +329,14 @@ impl SettingsPage {
         path: "Settings → System → Disk Usage",
         view: "disk-usage",
     };
+    pub const MEMORY: Self = Self {
+        path: "Settings → System → Memory",
+        view: "memory",
+    };
 
     /// Every page above, for the test that holds each to a renderable view.
     #[cfg(test)]
-    pub const ALL: [Self; 3] = [Self::ACCOUNTS, Self::BACKUP, Self::DISK_USAGE];
+    pub const ALL: [Self; 4] = [Self::ACCOUNTS, Self::BACKUP, Self::DISK_USAGE, Self::MEMORY];
 
     /// A tap that deep-links here, the same way the LLM's `navigate_ui` does.
     pub fn tap(self) -> Tap {

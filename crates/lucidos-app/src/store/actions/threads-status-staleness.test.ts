@@ -38,7 +38,7 @@ import { applySummaryVersion, type ThreadAggregate, type ThreadState } from '../
 import type { ThreadSummary } from '../../api/threads';
 import { focusedThreadId, threadMap } from '../store';
 import { upsertThread, refreshThreadEvents } from './thread-loading';
-import { composeSentAt } from './compose';
+import { noteLocalComposeEdit, _resetComposeSyncForTesting } from '../composeSync';
 import { getDraft } from '../composeDrafts';
 
 vi.mock('../../api/threads', () => ({
@@ -119,6 +119,7 @@ function liveThread(overrides: Partial<ThreadState> & { status?: ThreadState['me
 beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
+  _resetComposeSyncForTesting();
 });
 
 describe('upsertThread: the version guard (loadAllThreads path)', () => {
@@ -147,19 +148,18 @@ describe('upsertThread: the version guard (loadAllThreads path)', () => {
 
   /** The same race at an EQUAL version, which is the common one: nothing
    *  raises the version until the send's `MessageReceived` lands. The send's
-   *  own stamp is what makes the snapshot stale. Unguarded, the composer came
-   *  back holding the sent text, ready to be sent twice. */
+   *  pending row and its pending compose edit are what make the snapshot stale.
+   *  Unguarded, the composer came back holding the sent text, ready to be sent
+   *  twice. */
   it('does not send a just-sent draft back to composing on a same-version GET from before the send', () => {
-    const requestStartedAt = Date.now() - 50;
-    const map = new Map([['t1', liveThread({ meta: { id: 't1', state: 'active' } as ThreadState['meta'] })]]);
-    composeSentAt.set('t1', Date.now());
-    try {
-      upsertThread(map, summary({ state: 'composing', summary_version: LIVE, compose_text: 'hello' }), false, requestStartedAt);
-      expect(map.get('t1')!.meta.state).toBe('active');
-      expect(getDraft('t1').text).toBe('');
-    } finally {
-      composeSentAt.delete('t1');
-    }
+    const map = new Map([['t1', liveThread({
+      meta: { id: 't1', state: 'active' } as ThreadState['meta'],
+      pendingUserMessages: [{ text: 'hello', eventId: 'e1', created: IDLE_AT }],
+    })]]);
+    noteLocalComposeEdit('t1');
+    upsertThread(map, summary({ state: 'composing', summary_version: LIVE, compose_text: 'hello' }), false);
+    expect(map.get('t1')!.meta.state).toBe('active');
+    expect(getDraft('t1').text).toBe('');
   });
 
   /** A GET that goes out AFTER the send, while its POST is still in flight,
@@ -170,7 +170,8 @@ describe('upsertThread: the version guard (loadAllThreads path)', () => {
       meta: { id: 't1', state: 'active' } as ThreadState['meta'],
       pendingUserMessages: [{ text: 'hello there', eventId: 'e1', created: IDLE_AT }],
     })]]);
-    upsertThread(map, summary({ state: 'composing', summary_version: LIVE, compose_text: 'hello th' }), false, Date.now());
+    noteLocalComposeEdit('t1');
+    upsertThread(map, summary({ state: 'composing', summary_version: LIVE, compose_text: 'hello th' }), false);
     expect(map.get('t1')!.meta.state).toBe('active');
     expect(getDraft('t1').text).toBe('');
   });

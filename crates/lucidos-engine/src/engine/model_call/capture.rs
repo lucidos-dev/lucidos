@@ -107,6 +107,8 @@ pub(crate) fn usage_from_response(response: &LlmResponse) -> Option<ApiUsage> {
         cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
         // Chat providers report one blended total per direction.
         modality: None,
+        service_tier: response.service_tier,
+        cache_creation_1h_tokens: None,
     })
 }
 
@@ -127,6 +129,8 @@ pub(crate) fn usage_from_judgment(usage: &JudgmentUsage) -> Option<ApiUsage> {
         cache_read_tokens: usage.cache_read_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
         modality: None,
+        service_tier: None,
+        cache_creation_1h_tokens: None,
     })
 }
 
@@ -139,6 +143,8 @@ pub(crate) fn usage_from_provider(usage: ProviderUsage) -> ApiUsage {
         cache_creation_tokens: usage.cache_creation_tokens,
         // Every raw shape it reads reports one blended total per direction.
         modality: None,
+        service_tier: None,
+        cache_creation_1h_tokens: None,
     }
 }
 
@@ -158,6 +164,8 @@ pub(crate) fn usage_from_image(
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
         modality: None,
+        service_tier: None,
+        cache_creation_1h_tokens: None,
     })
 }
 
@@ -418,6 +426,7 @@ mod tests {
             unknown_sse_dropped: 0,
             model_only_text: None,
             progress_notes: Vec::new(),
+            service_tier: None,
         }
     }
 

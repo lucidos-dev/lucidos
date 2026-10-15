@@ -90,8 +90,8 @@ pub enum VoiceEvent {
     ///
     /// **The one signal that does not wait on a transcriber** (ADR 0211). It is
     /// what opens a call's shut floor when the configured transcriber streams
-    /// no partials, and `whisper-1` is one such: it sends only the completed
-    /// frame, which is asynchronous and can land after the reply it prompted.
+    /// no partials. Such a model sends only the completed frame, which is
+    /// asynchronous and can land after the reply it prompted.
     ///
     /// It carries nothing and is written nowhere. A provider whose partials are
     /// reliable may leave it unemitted.

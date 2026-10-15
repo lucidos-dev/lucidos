@@ -7,7 +7,8 @@
 # Legitimate stops are pass-through. Three exit codes mean "stay dead":
 #   0   — graceful_shutdown completed (engine handled SIGUSR1 or SIGINT)
 #   130 — SIGINT default action  (Ctrl-C before handler installed)
-#   138 — SIGUSR1 default action (signal arrived before handler installed)
+#   128 + SIGUSR1 — SIGUSR1 default action (arrived before the handler).
+#         138 on Linux and 158 on macOS, so it is computed, never written.
 #
 # Defensive trap: when web-dev.sh kill_stale_processes does
 # `pkill -P <old_web_dev>` it SIGTERMs the supervisor (which is a direct
@@ -17,15 +18,17 @@
 # rebuild flow. The trap forwards the shutdown intent to the engine as
 # SIGUSR1 and exits.
 
-# Usage: run_supervised <pidfile> <logfile> <cmd...>
+# Usage: run_supervised <state_dir> <logfile> <cmd...>
 #
-# Writes the running child's pid to <pidfile> on every (re)start so
-# kill_stale_processes / stop.sh / is_protected_host_pid all read the
-# live pid even after a restart.
+# Writes no pidfile. The engine publishes `engine.pid` itself once it holds
+# the workspace's owner lock, so the file never names a successor still
+# waiting for its predecessor to exit (ADR 0438). <state_dir> receives the
+# crash sidecar below.
 run_supervised() {
-    local pidfile="$1"
+    local state_dir="$1"
     local logfile="$2"
     shift 2
+    local usr1_exit=$((128 + $(kill -l USR1)))
 
     # Capture the supervisor's actual PID. `$$` won't work — the supervisor
     # is launched as `( run_supervised ... ) &` from start_engine and bash
@@ -71,7 +74,6 @@ run_supervised() {
 
         "$@" >> "$logfile" 2>&1 &
         local child_pid=$!
-        echo "$child_pid" > "$pidfile"
         # Log every spawn so a respawn cycle reads as a continuous
         # supervisor narrative even when the child crashes before
         # logging anything itself.
@@ -100,9 +102,9 @@ run_supervised() {
             break
         fi
 
-        # 0 = graceful_shutdown; 130 = SIGINT default; 138 = SIGUSR1 default
+        # 0 = graceful_shutdown; 130 = SIGINT default; then SIGUSR1's default.
         case "$exit_code" in
-            0|130|138)
+            0|130|"$usr1_exit")
                 _sup_log "Child pid $child_pid exited cleanly ($exit_code), supervisor stopping"
                 break
                 ;;
@@ -113,9 +115,8 @@ run_supervised() {
         # Sidecar JSON the next engine reads + emits as
         # `EngineSupervisorRespawned` so the respawn is recorded in the
         # audit timeline even though it happens while the engine is dead.
-        # Path is derived from the pidfile location so the supervisor
-        # doesn't need a separate argument. Best-effort: a write failure
-        # here only loses one audit row, not the respawn itself.
+        # Best-effort: a write failure here only loses one audit row, not
+        # the respawn itself.
         #
         # Hand-rolled `printf` JSON is safe ONLY while every field stays
         # numeric or an ISO-8601 timestamp (no escaping needed). Adding a
@@ -123,7 +124,7 @@ run_supervised() {
         # switch to a real encoder (`jq -n …` — see `scripts/status.sh`
         # for the established pattern).
         local sidecar
-        sidecar="$(dirname "$pidfile")/engine.last-death.json"
+        sidecar="$state_dir/engine.last-death.json"
         local died_at
         died_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
         printf '{"old_pid":%d,"exit_code":%d,"died_at":"%s","supervisor_pid":%d}\n' \

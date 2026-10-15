@@ -58,6 +58,7 @@ pub(super) fn applied_event(
         actor: None,
         pre_merge_sha: None,
         post_merge_sha: None,
+        landing_merge_sha: None,
         path: String::new(),
     }
 }
@@ -81,6 +82,9 @@ pub(super) async fn start_cc_thread(bus: &EventBus, thread_id: Uuid) {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

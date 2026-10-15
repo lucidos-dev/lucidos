@@ -4,16 +4,19 @@
  * header and on both "Move to Current" actions. The inbox tray belongs to the
  * Ongoing grouping, which sits in the same header, so the two must never match.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, type ComponentChild } from 'preact';
 import { act } from 'preact/test-utils';
 import { ThreadDrawer, setSectionCollapsed } from '../ThreadDrawer';
 import { ThreadGroupingButton } from '../../layout/ThreadsHeaderControls';
-import { ThreadOverflowMenu } from '../../shared/ThreadOverflowMenu';
+import { ThreadOverflowItemsChunk, ThreadOverflowMenu } from '../../shared/ThreadOverflowMenu';
 import { getBannerActions, getWaitingState } from '../../chat/WaitingBanner';
 import { CurrentIcon, InboxIcon } from '../../shared/icons';
 import { threadMap, threadsLoaded, focusedThreadId, setDrawerGrouping } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
+
+// The menu's rows are code-split. Warm them, so a click opens it at once.
+beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 vi.mock('../../../store/actions/thread-loading', () => ({
   loadThreadEvents: vi.fn(),

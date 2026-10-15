@@ -10,13 +10,13 @@
  * reader sees. The stylesheet's half of it is scanned separately, in
  * `styles/__tests__/call-toggle-phase-paint.test.ts`.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 
 vi.mock('../../../store/voice', () => ({ pressCallToggle: vi.fn() }));
 
-import { CallToggle } from '../CallToggle';
+import { CallToggle, MicrophoneList } from '../CallToggle';
 import { preferences } from '../../../store/store';
 import { pressCallToggle } from '../../../store/voice';
 import { voiceCall } from '../../../store/voiceCall';
@@ -24,6 +24,10 @@ import { microphones } from '../../../store/microphones';
 import { CALL_IDLE, callStatusLabel } from '../../../voice/callState';
 import { tooltipWithShortcut } from '../../../store/actions/keybindings';
 import type { CallPhase, CallState } from '../../../voice/callState';
+
+// The picker's list is code-split, and the hold opens it once it is in
+// memory. Warm it, so a hold opens at once.
+beforeAll(() => MicrophoneList.preload());
 
 const PHASES: CallPhase[] = ['idle', 'connecting', 'listening', 'speaking', 'ending'];
 

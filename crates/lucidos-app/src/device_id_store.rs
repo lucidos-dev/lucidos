@@ -285,26 +285,24 @@ mod tests {
 
     #[test]
     fn save_then_load_roundtrips() {
-        let dir = std::env::temp_dir().join(format!("lucidos-devid-rt-{}", std::process::id()));
-        let path = store_path(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let path = store_path(dir.path());
         let mut map = DeviceIdMap::new();
         resolve_device_id(&mut map, "alpha", "id-a");
         save_map(&path, &map).unwrap();
         let loaded = load_map(&path);
         assert_eq!(loaded.get("alpha").map(String::as_str), Some("id-a"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_missing_or_corrupt_is_empty() {
-        let dir = std::env::temp_dir().join(format!("lucidos-devid-bad-{}", std::process::id()));
-        let path = store_path(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let path = store_path(dir.path());
         // Missing → empty.
         assert!(load_map(&path).is_empty());
         // Corrupt → empty (never wedges boot).
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{ not json").unwrap();
         assert!(load_map(&path).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1122,16 +1122,20 @@ fn s4_5_body_fits_exactly_at_the_ceiling_is_not_truncated() {
     assert!(build_real_web_push_message(&fitted.to_string()).is_ok());
 }
 
-// §2 Step A — decide_push_allowed unit tests. The matrix says the
-// engine sends the OS push iff no candidate device is "active" right
-// now; multi-tab same-device pongs OR within the device.
+// §2 Step A — decide_push_allowed unit tests. The engine sends the OS push
+// iff no page reports that it already handled the notification in the app.
+// Multi-tab same-device pongs OR within the device.
 
-fn pong(device_id: &str, is_active: bool) -> PresencePong {
+use crate::api::presence_pong::{
+    decide_push_allowed,
+    PresenceOutcome::{self, AutoRead, NotShown, Shown, Silenced},
+    PresencePong,
+};
+
+fn pong(device_id: &str, outcome: PresenceOutcome) -> PresencePong {
     PresencePong {
         device_id: device_id.into(),
-        is_active,
-        focused_thread_id: None,
-        event_in_viewport: false,
+        outcome,
     }
 }
 
@@ -1148,7 +1152,7 @@ fn s2_step_a_no_candidates_means_push_allowed() {
 fn s3_run_presence_check_when_sse_connected_even_with_no_candidate() {
     // The regression: iOS suspends the 30s heartbeat while the PWA is
     // foregrounded, so device_presence has ZERO candidates even though the
-    // EventSource is open and the page would pong is_active. The live
+    // EventSource is open and the page would pong `shown`. The live
     // SSE-connection count must still trigger the PresenceCheck (>0), so the
     // active page gets a chance to suppress the OS push.
     assert!(
@@ -1175,25 +1179,30 @@ fn s3_expected_pong_count_is_max_of_both_signals() {
 }
 
 #[test]
-fn s2_step_a_active_pong_means_push_not_allowed() {
-    let pongs = [pong("dev-1", true)];
-    assert!(!decide_push_allowed(&pongs));
+fn s2_step_a_a_handled_pong_means_push_not_allowed() {
+    // Shown, auto-read and toasts-off all mean the page already dealt with
+    // the notification, so a push on top would be a duplicate.
+    for outcome in [Shown, AutoRead, Silenced] {
+        assert!(
+            !decide_push_allowed(&[pong("dev-1", outcome)]),
+            "{outcome:?}"
+        );
+    }
 }
 
 #[test]
-fn s2_step_a_only_inactive_pongs_means_push_allowed() {
+fn s2_step_a_only_not_shown_pongs_means_push_allowed() {
     // Every connected page is in the background — push to anyone with
     // a subscription so the user is notified.
-    let pongs = [pong("dev-1", false), pong("dev-2", false)];
+    let pongs = [pong("dev-1", NotShown), pong("dev-2", NotShown)];
     assert!(decide_push_allowed(&pongs));
 }
 
 #[test]
-fn s2_multi_tab_one_active_one_hidden_treats_device_as_active() {
-    // Two tabs on the same browser → both pong with the same
-    // device_id. One active, one not. The OR-across-devices test (any
-    // active) makes this a non-push case without any extra grouping.
-    let pongs = [pong("dev-1", false), pong("dev-1", true)];
+fn s2_multi_tab_one_shown_one_hidden_suppresses_push() {
+    // Two tabs on the same browser → both pong with the same device_id. One
+    // showed the toast, one did not. Any handled pong settles it.
+    let pongs = [pong("dev-1", NotShown), pong("dev-1", Shown)];
     assert!(!decide_push_allowed(&pongs));
 }
 
@@ -1388,7 +1397,7 @@ async fn s3_deadline_long_enough_for_realistic_ios_cellular_pong() {
     // the page renders the toast synchronously when the PresenceCheck
     // SSE lands, but its pong POST round-trips back over cellular /
     // Tailscale slower than the engine's deadline. The engine then
-    // collects zero active pongs and fans out the OS push too.
+    // collects no `shown` pong and fans out the OS push too.
     //
     // Two RTT bands appear in real traces:
     //
@@ -1422,27 +1431,20 @@ async fn s3_deadline_long_enough_for_realistic_ios_cellular_pong() {
         tracker_clone.record(PresencePongRequest {
             notification_id: nid,
             device_id: "ios-cellular".into(),
-            is_active: true,
-            focused_thread_id: None,
-            event_in_viewport: false,
+            outcome: Shown,
         });
     });
 
     let _ =
         tokio::time::timeout(Duration::from_millis(DEADLINE_MS as u64), notify.notified()).await;
 
-    let pongs = tracker.collect(nid);
     assert!(
-        !decide_push_allowed(&pongs),
+        !tracker.decide(nid),
         "DEADLINE_MS={} is too short for a {} ms iOS-cellular pong — \
          engine times out before the page can answer, so push fires \
-         on top of the in-app toast. Got pongs={:?}",
+         on top of the in-app toast",
         DEADLINE_MS,
         SIMULATED_RTT_MS,
-        pongs
-            .iter()
-            .map(|p| (p.device_id.clone(), p.is_active))
-            .collect::<Vec<_>>(),
     );
 }
 

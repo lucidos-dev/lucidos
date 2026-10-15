@@ -1,14 +1,16 @@
 import { API } from '../../api/client';
 import { forgetThreadWidgets, onWidgetEvent } from './widgets';
-import type { ApplyEstimates, Change } from '../../api/client';
-import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@lucidos/event-stream';
+import type { ApplyEstimates, Change, LandingLane, MainCheck } from '../../api/client';
+import { EVENT_STREAM_RETRY_MS, eventStreamTargets, openEventStream, type EventStreamTargets } from '@lucidos/event-stream';
 import { getEventStream, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
-import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey, UNREAD_HOLD_EVENT_TYPES } from '../store';
-import { backgroundModelsVersion, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, removingQueuedMessageIds, queuedMessageRemovalKey, UNREAD_HOLD_EVENT_TYPES } from '../store';
+import { backgroundModelsVersion, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { describeRecommendedCleanupOutcome } from '../../utils/recommendedCleanup';
-import { isFormRequest, isWidgetEvent } from '../thread-events/thread-event-types';
-import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, NO_CHANGE, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
+import { isFormRequest, isHomeBoardEvent, isWidgetEvent } from '../thread-events/thread-event-types';
+import { onHomeBoardEvent } from './homeBoard';
+import { liftRowIntent, overlayRowIntent } from '../rowIntents';
+import { handleEvent, isChannelDefiningEvent, isSummaryCurrent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { settleDeliveredUnsentMessage } from './sendSettlement';
 import { noteImageLanded } from '../landedImages';
@@ -17,12 +19,8 @@ import { handleNotificationSSE, loadUnreadNotifications } from './notifications'
 import { dropDeletedThreads } from './threads-drop';
 import { loadThreadQueue } from './threadQueue';
 import { handlePresenceCheck, type PresenceCheckPayload } from './presence-pong';
-import {
-  dropAllNotificationToasts,
-  dropNotificationToast,
-  handleNotificationToastRequested,
-  type NotificationToastRequestedPayload,
-} from './in-app-notification-toast';
+import { noteArrivalWhileAway, noteArrivalWhilePresent } from './seen-target';
+import { dropAllNotificationToasts, dropNotificationToast } from './in-app-notification-toast';
 import {
   handleNativePushRequested,
   type NativePushRequestedPayload,
@@ -45,6 +43,8 @@ import {
 import { changeToastMessage } from './changeToast';
 import { changeHeadline, changeNamingFromEvents } from '../changeHeadline';
 import { batchSummary, clearApplyPhase, isBatchMember, openApplyPhase, setApplyPhase } from './applyProgress';
+import { handleLaneFrame, setLandingLaneFromServer } from './landingLane';
+import { handleMainCheckFrame, setMainCheckFromServer } from './mainCheck';
 import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences, refreshActiveTheme } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
@@ -64,8 +64,7 @@ import {
 } from './entityReferences';
 import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
-import { applyRemoteCompose, pendingComposePuts, hasUnsentLocalDraft, clearSupersededDraft, noteComposeEpoch } from './compose';
-import type { ComposeSelectionOverride } from '../composeSelections';
+import { acceptComposeReport, parseComposeReport, type ComposeReportWire } from '../composeSync';
 import { clearDraft, setDraft } from '../composeDrafts';
 import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
@@ -115,18 +114,6 @@ let needsResyncOnOpen = false;
  *  reconnects, collapse into one network round-trip. */
 let resyncInFlight: Promise<void> | null = null;
 
-// Events that clear optimistic Apply Now state. The apply completed or failed,
-// the backend took over on a merge conflict, or CC resumed work.
-const APPLY_NOW_CLEAR_EVENTS = new Set([
-  'ChangeApplied', 'ChangeApplyFailed',
-  'MergeConflictDetected', 'CodingAgentToolCalled', 'CodingAgentTextStreamed',
-  // Reasoning is the EARLIEST agent-resumed signal, preceding text and tools,
-  // so clear the stranded Apply-Now state on it too. A long reasoning pass
-  // would otherwise hold that state minutes longer than its siblings.
-  'CodingAgentThoughtStreamed',
-  'CodingAgentUserMessageSent', 'CodingAgentPromptSent', 'MessageReceived',
-]);
-
 /** The preference keys the Backup page renders, mirroring the `PREF_BACKUP_*`
  *  constants in the engine's `core/backup/mod.rs`. Only a `PreferencesChanged`
  *  carrying one of them makes that page re-read. Every other key must leave its
@@ -136,34 +123,6 @@ const BACKUP_PREFERENCE_KEYS = new Set([
   'backup_schedule',
   'backup_retention',
 ]);
-
-// ---------------------------------------------------------------------------
-// Apply Now — deferred SessionEnded cleanup
-// During Apply Now the backend kills CC (SessionEnded) then proposes changes
-// (ChangeProposed). We must keep applyingNowThreadIds set during this gap.
-// Safety timer: if ChangeProposed doesn't arrive within 30s, clear the state.
-// ---------------------------------------------------------------------------
-const applySessionEndedTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-function startApplySessionEndedTimer(threadId: string): void {
-  cancelApplySessionEndedTimer(threadId);
-  applySessionEndedTimers.set(threadId, setTimeout(() => {
-    applySessionEndedTimers.delete(threadId);
-    if (applyingNowThreadIds.value.has(threadId)) {
-      const next = new Map(applyingNowThreadIds.value);
-      next.delete(threadId);
-      applyingNowThreadIds.value = next;
-    }
-  }, 30_000));
-}
-
-function cancelApplySessionEndedTimer(threadId: string): void {
-  const timer = applySessionEndedTimers.get(threadId);
-  if (timer) {
-    clearTimeout(timer);
-    applySessionEndedTimers.delete(threadId);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Batched threadMap updates — coalesce rapid SSE events into one signal write
@@ -345,12 +304,12 @@ export function connectThreadEvents(): void {
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connectThreadEvents();
-      }, 3000);
+      }, EVENT_STREAM_RETRY_MS);
     },
   };
 
   // The shell answers a PresenceCheck, so it registers as a ponger. On a shared
-  // connection the worker ORs its ports' answers into the one pong the engine
+  // connection the worker merges its ports' answers into the one pong the engine
   // waits for.
   setEventStream(openEventStream(hostTargets(), handlers, { pongs: true }));
 }
@@ -396,10 +355,11 @@ export function resyncLoadedThreads(): Promise<void> {
         // A widget event missed in the gap changed the thread's widgets too.
         onWidgetEvent(focused);
       }
-      // Home's widgets feed its long-press menu and the widget windows from
-      // any thread, so a pin missed in the gap matters there too.
+      // Home's widgets decide Pin to Home in every thread's widget menu, so a
+      // pin missed in the gap matters there too.
       const home = homeThreadId.value;
       if (home && !(refreshFocused && home === focused)) onWidgetEvent(home);
+      onHomeBoardEvent();
     } finally {
       resyncInFlight = null;
     }
@@ -431,9 +391,10 @@ export function disconnectThreadEvents(): void {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
-  for (const timer of applySessionEndedTimers.values()) clearTimeout(timer);
-  applySessionEndedTimers.clear();
   markEventStreamStatus('disconnected');
+  // The closed transport's own error handler is now stale and stays silent, so
+  // app frames hear the drop here. Their next `open` is the reconnect.
+  fanOutEventStreamStatus('error');
   getEventStream()?.close();
   setEventStream(null);
 }
@@ -454,6 +415,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     : undefined;
   if (!threadId || !event || typeof event !== 'object' || !('type' in event)) return;
   if (isWidgetEvent(event)) onWidgetEvent(threadId);
+  if (isHomeBoardEvent(event) && threadId === homeThreadId.value) onHomeBoardEvent();
   // Live persisted events MUST carry an aggregate — its absence here (vs.
   // historical-replay where applyEventRows applies one snapshot at the end)
   // means the backend missed populating EmittedEvent.aggregate.
@@ -566,6 +528,9 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   }
 
   // seq from SSE: present (number > 0) for persisted events, null for transient
+  const aggregateWasCurrent = aggregate !== undefined && aggregate !== null
+    && isSummaryCurrent(thread.meta, aggregate.summaryVersion);
+  if (aggregateWasCurrent) liftRowIntent(thread.meta);
   const handled = handleEvent(map, threadId, seq, event, created, eventId, aggregate);
   if (handled.metaChanged) metaChanged = true;
   if (handled.retiredUnsentEventId) settleDeliveredUnsentMessage(handled.retiredUnsentEventId);
@@ -581,60 +546,20 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // The Not ready strip and the Blocked badge read the hold from events.
   if (UNREAD_HOLD_EVENT_TYPES.has(event.type)) metaChanged = true;
 
-  // Archive race guard. Every persisted SSE event carries the projection
-  // snapshot AT EVENT EMIT TIME. A cascade archive emits CodingAgentIdled for
-  // each descendant BEFORE the ThreadArchived row update lands, and that
-  // intermediate aggregate still has section='inbox'. Without this guard
-  // applyAggregateToMeta reverts the optimistic flip, so the row flies back to
-  // Review until the matching ThreadArchived SSE lands and neighbours shift
-  // twice. `archivingThreadIds` is the in-flight signal, set by
-  // handleArchiveThread for every cascade member. It clears in that function's
-  // finally, so post-archive SSE events apply their aggregate normally.
-  if (aggregate && archivingThreadIds.value.has(threadId)) {
-    if (thread.meta.section !== 'archived' || thread.meta.codingAgentChangeState.kind !== 'none') {
-      thread.meta.section = 'archived';
-      thread.meta.codingAgentChangeState = NO_CHANGE;
-      metaChanged = true;
-    }
-  }
+  // A row the user changed optimistically keeps that change over this
+  // frame's aggregate until the row reaches the version the write returned
+  // (ADR 0437). A cascade archive's `stop_agent` emits pre-archive frames,
+  // and they can land after the POST returned.
+  if (aggregateWasCurrent && overlayRowIntent(thread.meta)) metaChanged = true;
 
-  // **Compose-clear on a peer's send yields ONLY to the user's own unsent
-  // work.** Authorship, not DOM focus, is the guard. Two arms:
-  //   1. Origin-device echo. A send or discard from this device already mutated
-  //      local compose state synchronously. The later SSE echo would blank text
-  //      typed since, so drop it.
-  //   2. Unsent local draft. A non-empty draft this device authored, not since
-  //      submitted, is the user's unsent intent. It must never be blanked by an
-  //      inbound echo, the same `hasUnsentLocalDraft` invariant
-  //      stageDraftFromApi and applyRemoteCompose enforce. A SUPERSEDED draft,
-  //      whose text this very message carries, is not unsent work and does
-  //      clear.
-  //
-  // Deliberately NOT gated on `isComposeFocusedHere`. A focus guard would also
-  // keep a SERVER-ORIGINATED draft the user never typed. A follow-up drafted on
-  // a peer, synced here, then sent there, would sit as a ghost draft.
-  // `hasUnsentLocalDraft` is the correct line: false for a synced draft, true
-  // the moment the user types.
+  // The draft is not touched here: the send consumed the compose slot at
+  // accept, and the engine reported what that left (ADR 0450).
   if (event.type === 'MessageReceived') {
     if (thread.meta.state !== 'active') { thread.meta.state = 'active'; metaChanged = true; }
-    if (!isFromThisDevice(event) && !hasUnsentLocalDraft(threadId)) clearDraft(threadId);
-  }
-  // A free-form answer to a pending question is a submitted draft that becomes
-  // no MessageReceived, chat/process/run.rs rerouting the typed text straight
-  // to UserQuestionAnswered. The arm above never sees it, so without this the
-  // answered draft would linger.
-  //
-  // Scoped to the superseded case. Unlike a send, a question answer clears the
-  // shared draft server-side only when the submitted text IS that draft. An
-  // unrelated draft here must survive rather than diverge. The server's paired
-  // ThreadComposeChanged supplies the other half of the supersede test, and
-  // whichever frame lands second completes the clear.
-  if (event.type === 'UserQuestionAnswered' && seq !== null) {
-    clearSupersededDraft(threadId);
   }
   if (event.type === 'ThreadDiscarded') {
     if (thread.meta.state !== 'discarded') { thread.meta.state = 'discarded'; metaChanged = true; }
-    if (!isFromThisDevice(event)) {
+    if (!discardedHere(event)) {
       // Without releasing focus + nav, ThreadPane keeps routing to ThreadView
       // (state ≠ 'composing') and shows the empty-state instead of the fresh
       // compose layout. Skipped while typing here so keystrokes aren't yanked.
@@ -666,35 +591,6 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
 
   // Dispatch side effects for transient events
   handleTransientSideEffects(event, threadId);
-
-  // Manage optimistic "Apply Now" phase transitions.
-  // 'requesting' → 'applying' on ChangeProposed (backend started the merge).
-  // Clear entirely on events that mean the apply completed, failed, or backend took over.
-  //
-  // SessionEnded is special: during Apply Now the backend kills CC first (SessionEnded)
-  // then proposes the change (ChangeProposed). So SessionEnded must NOT clear the phase
-  // immediately — instead we defer with a safety timeout, cancelled if ChangeProposed
-  // or any other resolution event arrives.
-  if (applyingNowThreadIds.value.has(threadId)) {
-    if (event.type === 'ChangeProposed') {
-      cancelApplySessionEndedTimer(threadId);
-      const next = new Map(applyingNowThreadIds.value);
-      next.set(threadId, 'applying');
-      applyingNowThreadIds.value = next;
-      // Mark the change as applying in the Changes panel too — prevents brief
-      // "Apply"/"Discard" buttons on the newly-proposed change during Apply Now.
-      if (event.change_id) {
-        applyingChangeIds.value = new Set([...applyingChangeIds.value, event.change_id]);
-      }
-    } else if (event.type === 'SessionEnded') {
-      startApplySessionEndedTimer(threadId);
-    } else if (APPLY_NOW_CLEAR_EVENTS.has(event.type)) {
-      cancelApplySessionEndedTimer(threadId);
-      const next = new Map(applyingNowThreadIds.value);
-      next.delete(threadId);
-      applyingNowThreadIds.value = next;
-    }
-  }
 
   // Toast for change state transitions. An apply's progress is told only in
   // the Lucidos menu, so its one toast, keyed `applying-<thread>`, is the
@@ -749,6 +645,12 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     resolveBatchMember(event.change_id);
     const error = event.error ?? 'Unknown error';
     showToast(changeToastMessage('Failed to apply', threadId, error), 'error', { key: `applying-${threadId}`, onClick: () => focusThread(threadId) });
+  } else if (event.type === 'ChangeUnqueued') {
+    // The change left the landing lane without landing, so its apply ended.
+    // No toast: LaneBatchFailed reports a failed batch, ChangeApplyFailed a
+    // failed landing, and every other reason is the user's own action.
+    clearApplyPhase(threadId);
+    resolveBatchMember(event.change_id);
   }
 
   // After apply/discard/revert, reveal the app header on mobile so the result
@@ -771,8 +673,8 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     clearWipIfMatches((wipTid) => wipTid === threadId);
   }
 
-  // Clear applyingChangeIds when a change is resolved.
-  if (event.type === 'ChangeApplied' || event.type === 'ChangeApplyFailed') {
+  // Clear applyingChangeIds when a change's apply ends.
+  if (event.type === 'ChangeApplied' || event.type === 'ChangeApplyFailed' || event.type === 'ChangeUnqueued') {
     if (event.change_id && applyingChangeIds.value.has(event.change_id)) {
       const next = new Set(applyingChangeIds.value);
       next.delete(event.change_id);
@@ -840,7 +742,9 @@ function forgetStandingApply(threadId: string | undefined): void {
 export function handleGlobalEvent(type: string, data: Record<string, unknown>): void {
   switch (type) {
     case 'NotificationCreated':
-      // Bell badge only — the toast is driven by NotificationToastRequested (§4).
+      // Bell badge only: the toast rides PresenceCheck (§3, §4). The seen target hold goes first, ahead of the unread reload
+      // whose arrival starts the seen dwell.
+      if (typeof data.id === 'string') noteArrivalWhilePresent(data.id);
       handleNotificationSSE();
       break;
 
@@ -885,27 +789,23 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
     }
 
-    case 'PresenceCheck':
-      // Engine asked every connected page for live presence so it can
-      // decide whether to fan out the OS push. Pong only — the toast is
-      // driven by NotificationToastRequested below. See
-      // system-knowhow/notifications.md §3.
-      handlePresenceCheck(data as unknown as PresenceCheckPayload);
+    case 'PresenceCheck': {
+      // Engine asks every connected page what it does with a new notification,
+      // so it can decide whether to fan out the OS push. The page acts first
+      // (toast, auto-read, or the badge alone) and pongs what it did. A check
+      // too stale to act on, or one left to the OS, means the reader was away.
+      // So the seen target hold goes. See system-knowhow/notifications.md §3, §4.
+      const payload = data as unknown as PresenceCheckPayload;
+      const outcome = handlePresenceCheck(payload);
+      if (outcome === null || outcome === 'not_shown') noteArrivalWhileAway(payload.notification_id);
       break;
-
-    case 'NotificationToastRequested':
-      // Engine decided to suppress the OS push (an active device pong'd in)
-      // and is asking active pages to render the in-app toast instead. The
-      // §4 row matrix (in showInAppNotificationToast) decides toast vs.
-      // auto-read vs. no-op. See system-knowhow/notifications.md §4.
-      handleNotificationToastRequested(data as unknown as NotificationToastRequestedPayload);
-      break;
+    }
 
     case 'NativePushRequested':
-      // Engine allowed the OS push, no active device having pong'd, and asks a
-      // connected Tauri desktop app to render a NATIVE macOS banner. The
-      // WKWebView cannot receive the web push. Browser and PWA pages ignore it,
-      // the handler gating on isTauri. See system-knowhow/notifications.md §4.
+      // Engine allowed the OS push, no page having handled the notification,
+      // and asks a connected Tauri desktop app to render a NATIVE macOS banner.
+      // The WKWebView cannot receive the web push. Browser and PWA pages ignore
+      // it, the handler gating on isTauri. See system-knowhow/notifications.md §4.
       handleNativePushRequested(data as unknown as NativePushRequestedPayload);
       break;
 
@@ -963,6 +863,10 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       if (String(data.key ?? '') === 'response_styles') {
         responseStylesVersion.value++;
       }
+      // A release notice can be conditional on a preference, such as the Tree
+      // notice on `memory_module`. Only the engine knows which keys matter, so
+      // every change re-reads the list.
+      void loadReleaseNotices();
       break;
     // The `set_language` and `set_timezone` chat-agent tools write the
     // preference and emit LanguageSet or TimezoneSet, but NOT
@@ -988,10 +892,6 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // thread-scoped variant, from `refresh_app` and the end of a chat turn,
       // is handled in `handleTransientSideEffects`.
       void refreshAppUI(data.app_id as string | undefined);
-      // The running iframe is not the only surface reading those files. An
-      // open app source editor is too, and it must re-read rather than save
-      // over the merge. See `appSourceEpoch`.
-      appSourceEpoch.value++;
       break;
 
     case 'FrontendUpdateDeferred':
@@ -1092,8 +992,9 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // An Apply All batch started (possibly on another device). Reflect
       // "in progress" on the bulk buttons and mark every member as applying so
       // each pending row shows "Applying..." for the whole batch — not just the
-      // one being merged right now. ChangeApplied/ChangeApplyFailed clear each
-      // member id; ApplyAllBatchCompleted drops the bulk flag.
+      // one being merged right now. ChangeApplied, ChangeApplyFailed and
+      // ChangeUnqueued clear each member id; ApplyAllBatchCompleted drops the
+      // bulk flag.
       applyAllInProgress.value = true;
       const changeIds = (data.change_ids ?? []) as string[];
       applyAllBatch.value = { changeIds, resolvedChangeIds: [], applyingChangeIds: [], resolvingChangeIds: [] };
@@ -1130,6 +1031,24 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       }
       break;
     }
+
+    case 'LaneBatchStarted':
+    case 'LaneBatchLanded':
+    case 'LaneBatchFailed':
+      // The landing lane opened or closed its batch. What waits behind it
+      // arrives with the `ChangesUpdated` the lane sends beside it.
+      handleLaneFrame(type, data);
+      break;
+
+    case 'MainCheckStarted':
+    case 'MainCheckPassed':
+    case 'MainCheckFailed':
+    case 'MainCheckAbandoned':
+    case 'MainCheckRedClosed':
+      // The main check started or ended, or its red closed. The snapshot
+      // arrives whole with the `ChangesUpdated` the engine sends beside it.
+      handleMainCheckFrame(type, data);
+      break;
 
     case 'StandingApplyArmed': {
       // The owner armed a standing apply, possibly on another device. Every
@@ -1173,6 +1092,8 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       appliedChanges.value = { status: 'loaded', data: applied };
       setAsideChanges.value = { status: 'loaded', data: (data.set_aside ?? []) as Change[] };
       if (data.apply_estimates) applyEstimates.value = data.apply_estimates as ApplyEstimates;
+      setLandingLaneFromServer(data.landing_lane as LandingLane | undefined);
+      setMainCheckFromServer(data.main_check as MainCheck | undefined);
       // `changesHasMore` tracks whether more APPLIED changes are pageable, and
       // the ChangesUpdated payload carries no `has_more_applied`. Its
       // `total_pending` is literally `pending.len()`, so a pending-count
@@ -1328,72 +1249,25 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
     }
 
-    // ThreadComposeChanged is the SSE-only ephemeral notification emitted on
-    // every compose PUT. Routed to compose.ts which writes the threadMap
-    // entry's compose fields. Three guards layered together:
-    //   1. origin_device_id. The server rebroadcasts to every device including
-    //      the originator, so ignore our own echo. This suppresses only a
-    //      PRESENT origin equal to self. A broadcast with an ABSENT origin
-    //      bypasses the check, and applyRemoteCompose's own guard is the
-    //      backstop for the dangerous empty-payload case (see
-    //      docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md). A non-empty
-    //      absent-origin update still applies, carrying content, which is why
-    //      this check does not break on an absent origin.
-    //   2. pendingComposePuts. A debounced PUT may already be in flight with
-    //      newer text, which the SSE event for our previous PUT would clobber.
-    //   3. focused-textarea. With the user mid-keystroke on this thread's
-    //      input, dropping a peer's NON-empty update beats moving the cursor.
-    //      It must NOT drop a peer's EMPTY clear: that is the sent-elsewhere
-    //      signal, and gating it on focus preserved the peer's draft in a
-    //      focused but untyped textarea. applyRemoteCompose's own
-    //      hasUnsentLocalDraft guard still protects unsent local work.
+    // ThreadComposeChanged is a *compose report* (ADR 0437). The compose
+    // store orders it by revision and lays any pending local edit over it.
+    // So our own echo, a delayed frame and a peer's write take one path.
     case 'ThreadComposeChanged': {
       const id = data.id as string;
-      // Recorded BEFORE either guard below. The *compose epoch* is a fact about
-      // what the engine holds, not draft content. Neither our own echo nor a
-      // write in flight is a reason to ignore it. The device with a write in
-      // flight needs it most: its next write is fenced against this value, and
-      // learning it here saves a 412 round trip after every send.
-      noteComposeEpoch(id, data.compose_epoch as number | undefined);
-      const originDeviceId = data.origin_device_id as string | undefined;
-      if (originDeviceId && originDeviceId === getDeviceId()) break;
-      if (pendingComposePuts.has(id)) break;
-      const text = (data.text as string) ?? '';
-      const imageHashes = Array.isArray(data.image_hashes) ? data.image_hashes as string[] : [];
-      const modeRaw = data.mode as string | undefined;
-      const mode = modeRaw === 'claude_code' ? 'claude_code' : modeRaw === 'lucidos' ? 'lucidos' : null;
-      const isEmptyClear = text === '' && imageHashes.length === 0 && mode === null;
-      if (!isEmptyClear && isComposeFocusedHere(id)) break;
-      applyRemoteCompose(id, {
-        text,
-        image_hashes: imageHashes,
-        mode,
-        // Per-draft dropdown selection, DB-backed, hydrated into
-        // composeSelections so a peer's change syncs. Absent means
-        // setComposeSelectionFromServer clears any stale local entry, the DB
-        // being authoritative. An in-flight local pick is already protected by
-        // the pendingComposePuts guard above.
-        selection: (data.selection as ComposeSelectionOverride | null | undefined),
-      });
+      // A discarded thread holds no draft, whatever a late frame says.
+      const state = threadMap.value.get(id)?.meta.state;
+      if (state === undefined || state === 'discarded') break;
+      acceptComposeReport(id, parseComposeReport(data as ComposeReportWire));
       break;
     }
   }
 }
 
-/** True when an inbound thread event was emitted by this browser. Per-event
- *  field: `MessageReceived.device_id` or `ThreadDiscarded.actor.device_id`. A
- *  match means the local mutating action already updated state synchronously,
- *  so applying the SSE echo would clobber keystrokes typed since. */
-function isFromThisDevice(event: ThreadEvent | TransientEvent): boolean {
-  const me = getDeviceId();
-  switch (event.type) {
-    case 'MessageReceived':
-      return event.device_id === me;
-    case 'ThreadDiscarded':
-      return event.actor?.kind === 'device' && event.actor.device_id === me;
-    default:
-      return false;
-  }
+/** True when this browser discarded the thread itself. The local discard
+ *  already updated state synchronously, so its echo must not clobber
+ *  keystrokes typed since. */
+function discardedHere(event: Extract<ThreadEvent, { type: 'ThreadDiscarded' }>): boolean {
+  return event.actor?.kind === 'device' && event.actor.device_id === getDeviceId();
 }
 
 function clearComposeIfUnfocused(threadId: string): void {
@@ -1495,9 +1369,6 @@ function handleTransientSideEffects(
     // the app wherever it is open.
     case 'AppUiRefreshRequested':
       if (isForThisDevice(event.actor)) void refreshAppUI(event.app_id);
-      // The app's files changed whichever device reloads, so an open source
-      // editor re-reads either way. See `appSourceEpoch`.
-      appSourceEpoch.value++;
       break;
 
     // A capture names the turn's last used device, and only that page answers.

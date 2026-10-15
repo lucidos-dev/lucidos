@@ -39,7 +39,8 @@ pub(crate) async fn delivery_is_held(
     let is_delivery = match pre_emitted_origin {
         Some(PreEmittedOrigin::WaitReentry(_)) => true,
         Some(PreEmittedOrigin::EngineReentry(anchor)) => anchor_is_child_report(pool, anchor).await,
-        Some(PreEmittedOrigin::Message(_)) | None => false,
+        // A keep-alive runs on the coding-agent lane only, and never waits.
+        Some(PreEmittedOrigin::Message(_) | PreEmittedOrigin::KeepAlive(_)) | None => false,
     };
     is_delivery
         && crate::engine::agent_question::lookup_active_question_tool_use_id(pool, thread_id)

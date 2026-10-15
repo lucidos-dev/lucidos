@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 import {
-  navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, waitForVisibleInput,
+  navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, waitForVisibleInput, hideHomeRail,
 } from './helpers';
 import {
   psql, createCCThreadWithChange, cleanupCCThread, cleanupFileFromMain,
@@ -138,6 +138,9 @@ test.describe('CC stuck-in-waiting regression', () => {
       await page.addInitScript((tid: string) => {
         localStorage.setItem('lucidos-focused-thread', tid);
       }, threadId);
+      // The drawer opens beside the thread below, and the rail would squeeze
+      // the pane until its actions fold into the overflow menu.
+      await hideHomeRail(page);
       await navigateToApp(page);
 
       await applyAndDismiss(page, threadId);

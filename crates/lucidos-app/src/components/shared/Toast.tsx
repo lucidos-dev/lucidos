@@ -1,17 +1,14 @@
-import { computed } from '@preact/signals';
 import { useRef, useLayoutEffect } from 'preact/hooks';
-import { toasts, dismissToast, focusedPane, scaledDurationMs, splitRatio, toastPlacement } from '../../store/store';
+import { toasts, dismissToast, focusedPane, scaledDurationMs } from '../../store/store';
 import type { ToastAction, ToastItem } from '../../store/types';
 import { CloseIcon, ToneIcon } from './icons';
 import { linkifyText } from './linkifyText';
 import { toastHasClose, toastTabTarget } from './toastFocus';
 import { toastTap } from './toastTap';
 import { computeToastShifts } from './toastReflow';
-import { toastColumns, toastLayout } from './toastColumns';
 import { toastStackUrgency } from './toastUrgency';
 import { focusPaneMainControl } from '../layout/paneFocus';
 import { isReducedMotion } from '../../utils/motion';
-import { viewportIsMobile } from '../../utils/viewport';
 import { progressFillWidth } from './progressBar';
 
 // Reflow (FLIP) timing for the toast stack. When a toast is added/removed the
@@ -26,15 +23,6 @@ const REFLOW_EASING = 'cubic-bezier(0.22, 0, 0, 1)';
  *  beside the icon and a text action in a desktop toast, at the monospace body
  *  size. */
 export const INLINE_MESSAGE_MAX_CHARS = 60;
-
-/** Which per-pane stacks the toast container lays out this frame. Derived
- *  rather than read inline so the toast list re-renders when the LAYOUT flips,
- *  not on every `splitRatio` write: a divider drag writes the ratio on every
- *  pointermove, and a computed only wakes its readers when its value actually
- *  changes. */
-const paneLayout = computed(() =>
-  toastLayout(viewportIsMobile.value, splitRatio.value, toastPlacement.value),
-);
 
 /** Keyboard handling for whichever toast currently holds focus (the listener
  *  lives on the container; keydowns bubble up from the focused button):
@@ -200,35 +188,19 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
   // when the slider is off-centre.
   const entryDurationMs = scaledDurationMs(REFLOW_DURATION_MS);
 
-  // One stack per VISIBLE pane, so a toast only ever pushes down the toasts of
-  // its own pane (`toastColumns`). The pane split is decided here rather than
-  // left to CSS because a collapsed pane has to MERGE the two stacks back into
-  // one, which no amount of positioning can do to two separate columns.
-  const columns = toastColumns(items, paneLayout.value);
-
   return (
     <div
       ref={containerRef}
       class="toast-container"
-      /* The shape under comparison. Every difference between the four is a CSS
-         rule keyed on this, so the render stays one code path. Temporary, and it
-         goes with the picker (docs/temporary-measures.md). */
-      data-toast-placement={toastPlacement.value}
       /* Whether this stack may paint over an open modal (`toastUrgency.ts`).
          The container carries the z-index and is therefore one stacking
          context, so the answer is per stack rather than per toast. */
       data-toast-urgency={toastStackUrgency(items)}
       onKeyDown={handleToastKeyDown}
     >
-      {columns.map((column) => (
-        <div
-          key={column.pane ?? 'single'}
-          class="toast-column"
-          data-toast-pane={column.pane ?? undefined}
-        >
-          {column.items.map((t) => renderToast(t, entryDurationMs))}
-        </div>
-      ))}
+      <div class="toast-column">
+        {items.map((t) => renderToast(t, entryDurationMs))}
+      </div>
     </div>
   );
 }

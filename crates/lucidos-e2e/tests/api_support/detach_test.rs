@@ -4,8 +4,8 @@
 //! This suite is the USER's path: a caller with a credential but no origin
 //! token may move any nested thread. The agent's narrower rule needs a
 //! thread-bound origin token, and an outside HTTP client cannot get one (see
-//! `follow_up_test.rs`). The engine's tests over `authorize_child_detach`
-//! cover that rule instead.
+//! `follow_up_test.rs`). The engine's tests over `authorize_child_detach` and
+//! `move_child_to_top_level` cover that rule instead.
 //!
 //! Rows are seeded directly, as `cascade_archive_test.rs` does, so no LLM
 //! round-trip is needed to build a family.

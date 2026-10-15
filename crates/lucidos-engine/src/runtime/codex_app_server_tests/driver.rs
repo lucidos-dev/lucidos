@@ -56,10 +56,16 @@ done
 }
 
 fn stub_driver(turn_body: &str, resume: Option<&str>) -> StubSession {
+    stub_driver_scripted(&stub_script(turn_body), resume)
+}
+
+/// [`stub_driver`] over a whole stub script, for a child that answers a request
+/// differently from [`stub_script`].
+fn stub_driver_scripted(stub: &str, resume: Option<&str>) -> StubSession {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let requests_log = tmp.path().join("requests.log");
     let script = tmp.path().join("codex-stub.sh");
-    std::fs::write(&script, stub_script(turn_body)).expect("write stub");
+    std::fs::write(&script, stub).expect("write stub");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -132,11 +138,12 @@ const HAPPY_TURN_BODY: &str = r#"printf '{"method":"item/agentMessage/delta","pa
 #[tokio::test]
 async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
     let mut s = stub_driver(HAPPY_TURN_BODY, None);
+    let ping = uuid::Uuid::new_v4();
     s.input_tx
         .send(AgentInput {
             text: "ping".into(),
             images: vec![],
-            uuid: uuid::Uuid::new_v4(),
+            uuid: ping,
         })
         .expect("send input");
 
@@ -147,7 +154,7 @@ async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { input } if input == ping
     ));
     // Real streaming: the deltas arrive as separate Message events.
     assert!(matches!(
@@ -262,7 +269,7 @@ async fn approval_round_trip_accept_reaches_the_child() {
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
 
     // The bridge must surface the approval on permission_rx with the
@@ -312,7 +319,7 @@ async fn approval_gated_item_started_does_not_emit_tool_use_until_acceptance() {
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     let req = tokio::time::timeout(std::time::Duration::from_secs(30), s.permission_rx.recv())
         .await
@@ -356,7 +363,7 @@ async fn approval_deny_sends_decline() {
     let _ = next_event(&mut s.events_rx).await; // Init
     assert!(matches!(
         next_event(&mut s.events_rx).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     let req = tokio::time::timeout(std::time::Duration::from_secs(30), s.permission_rx.recv())
         .await
@@ -393,7 +400,7 @@ async fn interrupt_sends_turn_interrupt_and_turn_ends_canceled() {
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
@@ -442,7 +449,7 @@ async fn child_death_mid_turn_synthesizes_failed_result() {
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     assert!(matches!(
         next_event(&mut s.events_rx).await,
@@ -561,7 +568,7 @@ done
     ));
     assert!(matches!(
         next_event(&mut events_rx).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     assert!(matches!(
         next_event(&mut events_rx).await,
@@ -585,4 +592,56 @@ done
         "fallback must start a fresh thread"
     );
     cancel.cancel();
+}
+
+/// Codex rejected the turn. Its input will never be read, so the driver names it
+/// as rejected before the turn's `Result`. Otherwise the session idles owing an
+/// input nothing can settle.
+#[tokio::test]
+async fn a_rejected_turn_names_its_input_before_the_result() {
+    let stub = r##"#!/bin/sh
+LOG="$STUB_LOG"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"id":%s,"result":{"userAgent":"stub/0.139.0"}}\n' "$id"
+      ;;
+    *'"method":"thread/start"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"t-1"},"model":"gpt-5.5"}}\n' "$id"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":%s,"error":{"code":-32600,"message":"turn rejected"}}\n' "$id"
+      ;;
+  esac
+done
+"##;
+    let mut s = stub_driver_scripted(stub, None);
+    let rejected = uuid::Uuid::new_v4();
+    s.input_tx
+        .send(AgentInput {
+            text: "ping".into(),
+            images: vec![],
+            uuid: rejected,
+        })
+        .expect("send input");
+
+    let mut named = false;
+    loop {
+        match next_event(&mut s.events_rx).await {
+            AgentEvent::InputRead { .. } => panic!("a rejected turn read nothing"),
+            AgentEvent::InputRejected { input } => {
+                assert_eq!(input, rejected);
+                named = true;
+            }
+            AgentEvent::Result { error, .. } => {
+                assert!(error.is_some(), "the rejection is the turn's error");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(named, "the rejected input is named before the Result");
+    s.cancel.cancel();
 }

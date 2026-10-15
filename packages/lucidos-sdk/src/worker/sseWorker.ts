@@ -16,7 +16,7 @@
  * aggregated; see `collectPong`.
  */
 
-import { postPong, type PongAnswer } from '../eventStream';
+import { EVENT_STREAM_RETRY_MS, postPong, type PongAnswer } from '../eventStream';
 import {
   aggregatePongAnswers,
   PONG_COLLECT_MS,
@@ -44,10 +44,6 @@ let pongUrl = '';
  *  connected over a dead upstream. */
 let upstreamOpen = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-/** Matches the shell's own retry cadence, so a shared upstream recovers on the
- *  schedule a direct one did. */
-const RECONNECT_MS = 3000;
 
 /** Post to one client.
  *
@@ -117,7 +113,7 @@ function ensureSource(): void {
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       if (clients.size > 0) ensureSource();
-    }, RECONNECT_MS);
+    }, EVENT_STREAM_RETRY_MS);
   };
 }
 
@@ -126,7 +122,7 @@ function ensureSource(): void {
 // The engine waits for one pong per open SSE connection
 // (`expected_pong_count`, crates/lucidos-engine/src/scheduler/push.rs). With
 // one connection behind many documents, one pong is what it must get. So the
-// worker asks its ponging ports, ORs their answers, and POSTs exactly once.
+// worker asks its ponging ports, merges their answers, and POSTs exactly once.
 
 interface Collection {
   expected: number;

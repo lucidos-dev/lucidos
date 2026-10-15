@@ -46,6 +46,7 @@ vi.mock('./chat-changes', () => ({ addRestartGroup: vi.fn() }));
 // re-derive off it, so the mock must resolve a Promise.
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn(() => Promise.resolve()) }));
 vi.mock('./client-update', () => ({ syncClientUpdateFromBuild: vi.fn() }));
+vi.mock('./releaseNotices', () => ({ loadReleaseNotices: vi.fn() }));
 vi.mock('./artifacts', () => ({
   loadArtifacts: vi.fn(),
   openFilePreview: vi.fn(),
@@ -81,6 +82,7 @@ const { handleGlobalEvent } = await import('./thread-sync');
 const { loadPreferences } = await import('./preferences');
 const { syncClientUpdateFromBuild } = await import('./client-update');
 const { refreshLlmConfigured } = await import('./entityReferences');
+const { loadReleaseNotices } = await import('./releaseNotices');
 
 describe('handleGlobalEvent — preference events refresh the preferences cache', () => {
   beforeEach(() => {
@@ -115,6 +117,23 @@ describe('handleGlobalEvent — preference events refresh the preferences cache'
     expect(loadPreferences).toHaveBeenCalledTimes(1);
     await Promise.resolve();
     expect(syncClientUpdateFromBuild).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A release notice can be conditional on a preference: the Tree notice shows
+ * only while `memory_module` is Classic. Picking Tree must drop it, and its
+ * badge, without a reload.
+ */
+describe('handleGlobalEvent: a preference change re-reads the release notices', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each(['memory_module', 'theme-mode'])('%s re-reads them', (key) => {
+    // Only the engine knows which keys a condition reads, so every key does.
+    handleGlobalEvent('PreferencesChanged', { key, value: 'tree' });
+    expect(loadReleaseNotices).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -5,13 +5,16 @@
  * change has ended the previous file's session. The caret moves into the
  * field, unless a finger would raise a keyboard over the file.
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { FindBar } from '../FindBar';
-import { findQuery, findSurface, openFind, resetFind, setFindQuery } from '../../../store/actions/find-bar';
+import { findQuery, findSurface, findTargets, openFind, resetFind, setFindQuery } from '../../../store/actions/find-bar';
 import { fileFindScope, requestFind } from '../../../store/actions/find-request';
 import { findRequest } from '../../../store/store';
+
+// The bar's targets are code-split. Warm them, so an open lands at once.
+beforeAll(() => findTargets.preload());
 
 const OLD = fileFindScope('artifacts/old.md');
 const NEW = fileFindScope('artifacts/new.md');

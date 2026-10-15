@@ -191,8 +191,9 @@ pub(crate) fn format_request_error(
     let cause = root_cause(err);
     if err.is_connect() {
         format!(
-            "{method} {url} could not connect after {elapsed_s:.1}s ({cause}) — \
-             is the engine running? Try `./scripts/status.sh`."
+            "{method} {url} could not connect after {elapsed_s:.1}s ({cause}). \
+             Is the engine running? It refuses connections while it is stopped \
+             or restarting, so retry once it is back."
         )
     } else if err.is_timeout() {
         format!(
@@ -630,6 +631,14 @@ mod tests {
             msg.contains("engine running"),
             "msg must hint at engine status: {msg}"
         );
+        // A packaged install has no source checkout, so the hint names no
+        // repo script. A script trigger fired during a restart meets exactly
+        // this error, so the hint names that cause.
+        assert!(
+            !msg.contains("scripts/"),
+            "the hint must work without a checkout: {msg}"
+        );
+        assert!(msg.contains("restarting"), "msg must name a restart: {msg}");
         // Regression guard for the double-URL bug: reqwest's default Display
         // embeds the URL in "error sending request for url (URL)"; if we
         // included the raw err instead of root_cause(), the URL would

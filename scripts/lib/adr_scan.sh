@@ -7,10 +7,10 @@
 # Two problems shape everything here, both recorded in
 # docs/plans/2026-08-04-conflict-free-adr-index-and-numbering.md:
 #
-#   1. docs/adr/index.md is append-only and carries `merge=union`, so two
-#      branches adding an ADR at once both keep their line instead of
-#      conflicting. Union does not order or deduplicate what it keeps, which is
-#      why adr_index_sort and the duplicate check below exist.
+#   1. docs/adr/index.md is append-only and merges through the keyed
+#      `lucidos-sorted-lines` driver (ADR 0460), so two branches adding an ADR
+#      at once both keep their line. A clone without the driver merges it as
+#      text, which is why adr_index_sort and the duplicate check below exist.
 #   2. A number read off `main` alone collides silently, because two ADRs with
 #      different filenames merge clean. adr_claimed_numbers therefore reads
 #      every surface a concurrent branch could have claimed one from.

@@ -96,6 +96,8 @@ if [ "$(prose_kind a.rs)" = "src" ]; then pass "rust"; else fail "rust"; fi
 if [ "$(prose_kind a.tsx)" = "src" ]; then pass "tsx"; else fail "tsx"; fi
 if [ -z "$(prose_kind a.css)" ]; then pass "css is out of scope"; else fail "css is out of scope"; fi
 if [ -z "$(prose_kind a.sh)" ]; then pass "shell is out of scope"; else fail "shell is out of scope"; fi
+if [ -z "$(prose_kind crates/vendor/chromiumoxide/src/lib.rs)" ]; then pass "vendored source is out of scope"; else fail "vendored source is out of scope"; fi
+if [ "$(prose_kind crates/lucidos-engine/src/vendor.rs)" = "src" ]; then pass "a file merely named vendor is in scope"; else fail "a file merely named vendor is in scope"; fi
 
 echo "the four limits fire"
 if check_text md "$OVER_SENTENCE" | grep -q 'sentence of'; then pass "sentence over the limit"; else fail "sentence over the limit"; fi

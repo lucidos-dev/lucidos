@@ -4,14 +4,23 @@
 //! Every process the agent starts inherits it, whatever process group it lands
 //! in. Claude Code runs each Bash call in a group of its own, so tearing down
 //! the agent's group never reaches those calls. The marker does: once the agent
-//! is gone, [`reap_marked_groups`] tears down every process group holding a
+//! is gone, [`AgentRun::finish`] tears down every process group holding a
 //! process that carries it (ADR 0391).
 //!
 //! The environment is a kernel fact (ADR 0025, ADR 0251). A process whose
 //! environment cannot be read is never ours.
+//!
+//! A teardown that promises its threads an auto-resume reaps nothing. The
+//! session resuming a thread adopts its marker on the next engine. That
+//! session's own end then reaps what the old one left running (ADR 0478).
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use uuid::Uuid;
 
 pub(crate) const AGENT_RUN_ENV: &str = "LUCIDOS_AGENT_RUN";
 
@@ -25,7 +34,16 @@ pub(crate) struct AgentRunMarker(String);
 
 impl AgentRunMarker {
     pub(crate) fn mint() -> Self {
-        Self(uuid::Uuid::new_v4().simple().to_string())
+        Self::from_uuid(Uuid::new_v4())
+    }
+
+    /// A marker as `mint` writes one, or `None`.
+    fn parse(value: &str) -> Option<Self> {
+        Uuid::try_parse(value).ok().map(Self::from_uuid)
+    }
+
+    fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid.simple().to_string())
     }
 
     pub(crate) fn value(&self) -> &str {
@@ -37,18 +55,144 @@ impl AgentRunMarker {
     }
 }
 
+/// Set once a teardown promises its threads an auto-resume. From then on an
+/// agent's end leaves its marked processes running for the session that
+/// resumes it. The engine owns one, and every thread's [`AgentRun`] shares it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TeardownHandover(Arc<AtomicBool>);
+
+impl TeardownHandover {
+    pub(crate) fn hand_over(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_handed_over(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// One agent spawn's marker, and what the spawn's end does with the processes
+/// carrying it.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentRun {
+    marker: AgentRunMarker,
+    handover: TeardownHandover,
+    thread_id: Option<Uuid>,
+}
+
+impl AgentRun {
+    /// A spawn no later session continues, such as a side question. It mints
+    /// a fresh marker, records nothing, and always reaps.
+    pub(crate) fn unrecorded() -> Self {
+        Self {
+            marker: AgentRunMarker::mint(),
+            handover: TeardownHandover::default(),
+            thread_id: None,
+        }
+    }
+
+    /// The thread's own agent session. It adopts the marker an earlier engine
+    /// recorded for the thread, else mints one, then records its marker.
+    ///
+    /// Only a record another engine process wrote is adopted. In this engine
+    /// the previous session's sweep may still be running, and would reach the
+    /// new session too.
+    ///
+    /// So a session adopts only once its own record replaced the old one. A
+    /// failed write leaves the old record in place for the next session too.
+    /// The session then mints a fresh marker and loses only the handover.
+    pub(crate) fn for_thread(
+        workspace: &Path,
+        thread_id: Uuid,
+        handover: TeardownHandover,
+    ) -> Self {
+        let path = record_path(workspace, thread_id);
+        let mut marker = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|record| marker_from_another_engine(&record))
+            .unwrap_or_else(AgentRunMarker::mint);
+        if let Err(e) = write_record(&path, &marker) {
+            crate::log!(
+                "[AgentRunMarker] could not record the marker of thread {thread_id}, so a restart cannot hand its processes on: {e}"
+            );
+            marker = AgentRunMarker::mint();
+        }
+        Self {
+            marker,
+            handover,
+            thread_id: Some(thread_id),
+        }
+    }
+
+    pub(crate) fn marker(&self) -> &AgentRunMarker {
+        &self.marker
+    }
+
+    /// Call once the agent child is gone.
+    pub(crate) async fn finish(self, grace: Duration) {
+        let whose = match self.thread_id {
+            Some(thread_id) => format!("thread {thread_id}"),
+            None => "an unrecorded run".to_string(),
+        };
+        if self.handover.is_handed_over() {
+            let groups = scan_groups(&self.marker).await;
+            if !groups.is_empty() {
+                crate::log!(
+                    "[AgentRunMarker] leaving process groups {groups:?} of {whose} ({}) to the session that resumes it",
+                    self.marker.value()
+                );
+            }
+            return;
+        }
+        reap_marked_groups(self.marker, &whose, grace).await;
+    }
+}
+
+/// Names this engine process, so a record from another one can be told apart.
+static ENGINE_BOOT: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
+
+/// Where the marker of a thread's latest agent session is recorded.
+fn record_path(workspace: &Path, thread_id: Uuid) -> PathBuf {
+    workspace
+        .join(".lucidos/agent-runs")
+        .join(thread_id.to_string())
+}
+
+/// The marker in a `<engine boot> <marker>` record, when another engine
+/// process wrote it.
+fn marker_from_another_engine(record: &str) -> Option<AgentRunMarker> {
+    let (boot, marker) = record.trim_end().split_once(' ')?;
+    if boot == ENGINE_BOOT.as_str() {
+        return None;
+    }
+    AgentRunMarker::parse(marker)
+}
+
+/// Replace the record in one rename, so a reader never sees half of one.
+fn write_record(path: &Path, marker: &AgentRunMarker) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(
+        &mut file,
+        format!("{} {}\n", ENGINE_BOOT.as_str(), marker.value()).as_bytes(),
+    )?;
+    file.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 /// Tear down every process group holding a process that carries `marker`:
 /// SIGTERM, `grace`, then SIGKILL for what a fresh scan still finds.
 ///
 /// Call it once the agent child is gone. The second scan is what makes the
 /// SIGKILL safe: a group id from the first scan may have been recycled.
-pub(crate) async fn reap_marked_groups(marker: AgentRunMarker, grace: Duration) {
+async fn reap_marked_groups(marker: AgentRunMarker, whose: &str, grace: Duration) {
     let groups = scan_groups(&marker).await;
     if groups.is_empty() {
         return;
     }
     crate::log!(
-        "[AgentRunMarker] process groups {groups:?} outlived their agent ({}), sending SIGTERM",
+        "[AgentRunMarker] process groups {groups:?} outlived the agent of {whose} ({}), sending SIGTERM",
         marker.value()
     );
     signal_groups(&groups, SIGTERM);
@@ -56,7 +200,7 @@ pub(crate) async fn reap_marked_groups(marker: AgentRunMarker, grace: Duration) 
     let left = scan_groups(&marker).await;
     if !left.is_empty() {
         crate::log!(
-            "[AgentRunMarker] process groups {left:?} ignored SIGTERM ({}), sending SIGKILL",
+            "[AgentRunMarker] process groups {left:?} of {whose} ignored SIGTERM ({}), sending SIGKILL",
             marker.value()
         );
         signal_groups(&left, SIGKILL);

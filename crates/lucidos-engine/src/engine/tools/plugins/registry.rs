@@ -161,33 +161,37 @@ pub(crate) struct PluginBaseline {
     pub(crate) files: Vec<String>,
 }
 
-/// Every installed plugin's [`PluginBaseline`], keyed by canonical plugin id.
+/// The installed plugins as the install path needs them, keyed by canonical
+/// plugin id. `ids` holds every installed plugin. `baselines` holds only those
+/// with a recorded commit, so a legacy row is installed yet has no baseline.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InstalledPlugins {
+    pub(crate) ids: std::collections::BTreeSet<String>,
+    pub(crate) baselines: std::collections::BTreeMap<String, PluginBaseline>,
+}
+
+/// Every installed plugin, from one projection scan.
 ///
 /// Read whole rather than per id because the install path cannot name the id
 /// yet: it only learns it when the fetched `manifest.toml` parses, which happens
 /// inside the blocking task that this must be handed to. One projection scan is
 /// the same cost the Plugins panel already pays per load.
-pub(crate) async fn project_baselines(
+pub(crate) async fn project_installed_plugins(
     pool: &sqlx::PgPool,
-) -> Result<
-    std::collections::BTreeMap<String, PluginBaseline>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    Ok(project_installs(pool)
-        .await?
-        .into_iter()
-        .filter_map(|(id, payload)| {
-            let rec = InstalledRecord { payload };
-            let commit = rec.commit()?.to_string();
-            Some((
-                id,
-                PluginBaseline {
-                    commit,
-                    files: rec.files(),
-                },
-            ))
-        })
-        .collect())
+) -> Result<InstalledPlugins, Box<dyn std::error::Error + Send + Sync>> {
+    let mut installed = InstalledPlugins::default();
+    for (id, payload) in project_installs(pool).await? {
+        let rec = InstalledRecord { payload };
+        if let Some(commit) = rec.commit() {
+            let baseline = PluginBaseline {
+                commit: commit.to_string(),
+                files: rec.files(),
+            };
+            installed.baselines.insert(id.clone(), baseline);
+        }
+        installed.ids.insert(id);
+    }
+    Ok(installed)
 }
 
 pub(crate) struct InstalledRecord {
@@ -916,11 +920,12 @@ mod modification_status_tests {
     use crate::triggers::definition::TriggerDefinition;
     use std::path::{Path, PathBuf};
 
-    fn temp_workspace() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("lucidos_modstatus_{}", uuid::Uuid::new_v4()));
+    fn temp_workspace() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().to_path_buf();
         std::fs::create_dir_all(p.join("data")).unwrap();
         git2::Repository::init(&p).unwrap();
-        p
+        (tmp, p)
     }
 
     fn write_data(ws: &Path, rel: &str, content: &str) {
@@ -956,7 +961,7 @@ mod modification_status_tests {
 
     #[test]
     fn clean_install_is_not_modified() {
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "apps/demo/index.html", "<h1>hi</h1>");
         write_data(&ws, "knowhow/demo.md", "notes");
         let sha = install_commit(&ws, &["apps/demo/index.html", "knowhow/demo.md"]);
@@ -967,12 +972,11 @@ mod modification_status_tests {
             "a freshly installed plugin must not be modified: {:?}",
             status.modified_paths
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn editing_an_app_file_marks_modified() {
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "apps/demo/index.html", "<h1>hi</h1>");
         let sha = install_commit(&ws, &["apps/demo/index.html"]);
         write_data(&ws, "apps/demo/index.html", "<h1>EDITED</h1>");
@@ -983,12 +987,11 @@ mod modification_status_tests {
             status.modified_paths,
             vec!["apps/demo/index.html".to_string()]
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn adding_a_file_in_app_dir_marks_modified() {
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "apps/demo/index.html", "x");
         let sha = install_commit(&ws, &["apps/demo/index.html"]);
         // User adds a new (untracked) file inside the plugin's app dir.
@@ -1003,12 +1006,11 @@ mod modification_status_tests {
             .modified_paths
             .iter()
             .any(|p| p == "apps/demo/extra.js"));
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn build_output_in_app_dir_is_not_modified() {
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "apps/demo/index.html", "x");
         let sha = install_commit(&ws, &["apps/demo/index.html"]);
         write_data(&ws, "apps/demo/__pycache__/run.cpython-314.pyc", "bytecode");
@@ -1021,12 +1023,11 @@ mod modification_status_tests {
             "build output is not a local edit: {:?}",
             status.modified_paths
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn unrelated_new_file_in_shared_root_does_not_mark() {
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "knowhow/demo.md", "notes");
         let sha = install_commit(&ws, &["knowhow/demo.md"]);
         // A brand-new knowhow file the plugin never shipped → not attributable.
@@ -1037,24 +1038,22 @@ mod modification_status_tests {
             "an unrelated new knowhow file must not flag the plugin: {:?}",
             status.modified_paths
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn editing_recorded_knowhow_marks_modified() {
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "knowhow/demo.md", "notes");
         let sha = install_commit(&ws, &["knowhow/demo.md"]);
         write_data(&ws, "knowhow/demo.md", "EDITED notes");
         let status = plugin_modification_status(&ws, &record(Some(&sha), &["knowhow/demo.md"]));
         assert!(status.modified);
         assert_eq!(status.modified_paths, vec!["knowhow/demo.md".to_string()]);
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn reverting_an_edit_self_heals() {
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "knowhow/demo.md", "notes");
         let sha = install_commit(&ws, &["knowhow/demo.md"]);
         write_data(&ws, "knowhow/demo.md", "EDITED");
@@ -1062,18 +1061,16 @@ mod modification_status_tests {
         assert!(
             !plugin_modification_status(&ws, &record(Some(&sha), &["knowhow/demo.md"])).modified
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn legacy_record_without_commit_is_not_modified() {
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "knowhow/demo.md", "notes");
         install_commit(&ws, &["knowhow/demo.md"]);
         write_data(&ws, "knowhow/demo.md", "EDITED"); // even with an edit on disk...
                                                       // ...a record with no baseline commit cannot be judged → not modified.
         assert!(!plugin_modification_status(&ws, &record(None, &["knowhow/demo.md"])).modified);
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -1082,7 +1079,7 @@ mod modification_status_tests {
         // is re-serialized (different bytes) AND carries the registration stamps
         // (slug + plugin_id). A byte diff would false-positive; the semantic
         // compare (ignoring slug/plugin_id/group_id) must read as not-modified.
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "triggers/watch/trigger.toml", TRIGGER_TOML);
         let sha = install_commit(&ws, &["triggers/watch/trigger.toml"]);
         let mut def = TriggerDefinition::from_toml(TRIGGER_TOML).unwrap();
@@ -1098,12 +1095,11 @@ mod modification_status_tests {
             "a re-serialized-but-equivalent trigger must not flag: {:?}",
             status.modified_paths
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
     fn editing_trigger_definition_marks_modified() {
-        let ws = temp_workspace();
+        let (_tmp, ws) = temp_workspace();
         write_data(&ws, "triggers/watch/trigger.toml", TRIGGER_TOML);
         let sha = install_commit(&ws, &["triggers/watch/trigger.toml"]);
         let mut def = TriggerDefinition::from_toml(TRIGGER_TOML).unwrap();
@@ -1117,6 +1113,5 @@ mod modification_status_tests {
             status.modified,
             "an edited trigger intent must flag modified"
         );
-        let _ = std::fs::remove_dir_all(&ws);
     }
 }

@@ -24,11 +24,7 @@ use qrcode::QrCode;
 /// we echo back in `pair_url`.
 const MAX_ORIGIN_LEN: usize = 255;
 
-/// The URL parameter carrying the code to the pairing screen.
-///
-/// `crates/lucidos-app/src/utils/pairingCodeSeed.ts` reads it from the generated
-/// `gateway-constants.ts`, then strips it from the address bar.
-pub const PAIR_PARAM: &str = "pair";
+pub use lucidos_gateway_constants::PAIR_PARAM;
 
 /// The pairing code a query string carries, or `None`.
 ///

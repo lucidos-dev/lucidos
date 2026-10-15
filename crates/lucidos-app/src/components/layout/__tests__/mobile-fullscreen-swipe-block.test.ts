@@ -83,8 +83,9 @@ describe('pane swipe is off while pseudo-fullscreen', () => {
   // Order matters: the edge preventDefault must still run when fullscreen, or
   // suppressing our own swipe would hand the gesture straight to WebKit. The
   // fullscreen bail therefore sits AFTER the shouldSuppressEdgeNavigation block.
+  // PaneDrag runs the gate for every new touch, a refused one included.
   it('still suppresses native edge navigation before bailing out', () => {
-    const start = swipeSrc.match(/const onTouchStart[\s\S]*?\n {2}\}, \[\]\);/)?.[0] ?? '';
+    const start = swipeSrc.match(/function gateStripTouch[\s\S]*?\n\}\n/)?.[0] ?? '';
     expect(start).not.toBe('');
     const suppressAt = start.indexOf('shouldSuppressEdgeNavigation');
     const bailAt = start.indexOf('shouldStartPaneSwipe');

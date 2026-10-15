@@ -64,7 +64,7 @@ fn strips_our_own_namespace_and_the_headers_the_gateway_owns() {
     // prefix, which is why this is not a list of the four in use.
     for h in [
         "x-lucidos-local-token",
-        "x-lucidos-webhook-token",
+        "x-lucidos-hook-socket-token",
         "x-lucidos-agent-origin-token",
         "x-lucidos-device-id",
         "x-lucidos-target-workspace",
@@ -82,7 +82,7 @@ fn strips_our_own_namespace_and_the_headers_the_gateway_owns() {
     // closing assertion the gateway's sibling test carries.
     for h in [
         lucidos_local_token::HEADER_LOCAL_TOKEN,
-        lucidos_local_token::HEADER_WEBHOOK_TOKEN,
+        lucidos_local_token::HEADER_HOOK_SOCKET_TOKEN,
     ] {
         assert!(
             should_strip_request_header(&name(h)),
@@ -901,7 +901,7 @@ async fn the_engines_own_trust_headers_never_reach_an_upstream() {
     let url = format!("{}/x", base);
     let headers = hm(&[
         ("x-lucidos-local-token", "full-authority-machine-token"),
-        ("x-lucidos-webhook-token", "webhook-scope-token"),
+        ("x-lucidos-hook-socket-token", "hook-socket-scope-token"),
         ("x-lucidos-agent-origin-token", "thread-bound-token"),
         ("x-lucidos-device-id", "device-1"),
         ("x-forwarded-prefix", "/dev/"),

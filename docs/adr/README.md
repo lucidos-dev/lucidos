@@ -50,6 +50,6 @@ the sections above present. `--fix` restores the order.
 
 ## Index
 
-The one-line-per-decision index lives in [`index.md`](index.md), on its own so
-it can be `merge=union` without that attribute reaching any prose. Two branches
-adding an ADR at once therefore both keep their line instead of conflicting.
+The one-line-per-decision index lives in [`index.md`](index.md), a pure list.
+It merges through the keyed `lucidos-sorted-lines` driver (ADR 0460). Two
+branches adding an ADR at once therefore both keep their line, in number order.

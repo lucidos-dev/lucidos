@@ -34,7 +34,6 @@ pub(crate) const MIN_SECS: u64 = 1;
 ///
 /// The SDK reads it from the generated `engine-constants.ts`. `lucidos proxy`
 /// cannot import this crate, so a test pins its copy.
-#[cfg(test)]
 pub(crate) const CLIENT_WAIT_SECS: u64 = MAX_SECS + 60;
 
 /// Why `secs` is not a usable wait for `field`, if it is not.

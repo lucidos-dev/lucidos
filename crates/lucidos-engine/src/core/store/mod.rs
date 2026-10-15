@@ -17,11 +17,12 @@ pub use messages::{format_child_thread_completed_block, ChangeStatuses};
 use sqlx::PgPool;
 pub(crate) use threads::format_display_title;
 pub use threads::{
-    active_thread_statuses, attach_reader_fields, char_length, fetch_thread_aggregate, has_draft,
-    parse_status_filter_csv, parse_status_filter_values, status_value_list, text_preview,
-    thread_link, DraftSummary, EventWaitSummary, FilterFacet, FilterFacets, LegacyInitiator,
+    active_thread_statuses, attach_reader_fields, char_length, consume_compose_slot,
+    fetch_thread_aggregate, has_draft, parse_status_filter_csv, parse_status_filter_values,
+    status_value_list, still_working_sql, text_preview, thread_link, ComposeReport,
+    ComposeReportRow, DraftSummary, EventWaitSummary, FilterFacet, FilterFacets, LegacyInitiator,
     MessageMatch, StatusFilter, ThreadAggregate, ThreadSearchResult, ThreadSummary,
-    ThreadSummaryFilters, HAS_DRAFT_SQL, PREVIEW_CHARS, UNTITLED_THREAD,
+    ThreadSummaryFilters, COMPOSE_REPORT_COLS, HAS_DRAFT_SQL, PREVIEW_CHARS, UNTITLED_THREAD,
 };
 pub use types::*;
 use uuid::Uuid;

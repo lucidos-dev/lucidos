@@ -297,6 +297,7 @@ async fn change_applied_transitions_to_applied_with_commits() {
             actor: None,
             pre_merge_sha: Some("aaa".to_string()),
             post_merge_sha: Some("bbb".to_string()),
+            landing_merge_sha: None,
             path: String::new(),
         },
     )

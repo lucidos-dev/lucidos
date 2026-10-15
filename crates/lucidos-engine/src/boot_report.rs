@@ -122,13 +122,13 @@ mod tests {
         let summary = format_stage_summary(
             Duration::from_millis(1500),
             &[
-                ("startup lease", Duration::from_millis(3)),
+                ("pre-recovery setup", Duration::from_millis(3)),
                 ("worktree recovery", Duration::from_millis(1200)),
             ],
         );
         assert_eq!(
             summary,
-            "1500ms total: startup lease 3ms, worktree recovery 1200ms"
+            "1500ms total: pre-recovery setup 3ms, worktree recovery 1200ms"
         );
     }
 

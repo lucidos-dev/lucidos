@@ -182,10 +182,55 @@ async function bridgedFetch(wire: WireRequest, appId: string | null): Promise<un
 // The event stream, fanned out
 // ---------------------------------------------------------------------------
 
-/** App frames that asked for the stream, each beside the element it is. The
- *  shell holds ONE connection and relays to these, so ten open apps still cost
- *  one upstream. */
-const sseSubscribers = new Map<MessageEventSource, HTMLIFrameElement>();
+/** One app frame that asked for the stream: the element it is, and the event
+ *  types it listens to. `null` takes every frame, as an SDK that names no
+ *  types does. */
+interface SseSubscriber {
+  frame: HTMLIFrameElement;
+  types: ReadonlySet<string> | null;
+}
+
+/** App frames that asked for the stream. The shell holds ONE connection and
+ *  relays to these, so ten open apps still cost one upstream. */
+const sseSubscribers = new Map<MessageEventSource, SseSubscriber>();
+
+/** The listened types a frame sent, or `null` when it named none. */
+function listenedTypes(args: unknown): ReadonlySet<string> | null {
+  const types = (args as { types?: unknown } | null)?.types;
+  if (!Array.isArray(types)) return null;
+  return new Set(types.filter((t): t is string => typeof t === 'string'));
+}
+
+/** The event types a frame dispatches to in the SDK: a thread event's own type
+ *  and `ThreadEvent`, else the system event's type. Empty when unreadable. */
+export function frameEventTypes(data: string): string[] {
+  let parsed: { type?: unknown; data?: { event?: { type?: unknown } } } | null;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return [];
+  }
+  const outer = parsed?.type;
+  if (typeof outer !== 'string') return [];
+  if (outer !== 'ThreadEvent') return [outer];
+  const inner = parsed?.data?.event?.type;
+  return typeof inner === 'string' ? [inner, outer] : [outer];
+}
+
+/** Whether a subscriber listens to a frame of these types. A `*` listener
+ *  takes them all (ADR 0432). */
+function wants(subscriber: SseSubscriber, types: () => readonly string[]): boolean {
+  if (!subscriber.types || subscriber.types.has('*')) return true;
+  return types().some((t) => subscriber.types!.has(t));
+}
+
+/** Whether the shell's stream is up RIGHT NOW, not whether it ever was.
+ *
+ *  A frame that subscribes to a live stream missed its `open`. So it gets one
+ *  at once, as a port joining the shared worker does. Subscribing while the
+ *  stream is down gets none: the app would re-read its data over a dead
+ *  stream, then again on the real open. */
+let hostStreamOpen = false;
 
 /** Post to one app frame. Its origin is opaque, so `'*'` is the only target
  *  that reaches it; the message goes to that window object and no other. */
@@ -199,14 +244,18 @@ function postToFrame(target: MessageEventSource, message: unknown): void {
  *  query. This runs once per event-stream frame, and a streaming turn is
  *  thousands of them: a `querySelectorAll` per frame per subscriber would put
  *  work back on the main thread this change exists to protect. */
-function fanOut(payload: unknown): void {
-  for (const [target, frame] of [...sseSubscribers]) {
-    if (!frame.isConnected) {
+function fanOut(payload: unknown, accepts: (subscriber: SseSubscriber) => boolean = () => true): void {
+  for (const [target, subscriber] of [...sseSubscribers]) {
+    if (!subscriber.frame.isConnected) {
       sseSubscribers.delete(target);
       continue;
     }
-    postToFrame(target, { type: BRIDGE_PUSH_TYPE, channel: 'sse', data: payload });
+    if (accepts(subscriber)) postStreamTo(target, payload);
   }
+}
+
+function postStreamTo(target: MessageEventSource, payload: unknown): void {
+  postToFrame(target, { type: BRIDGE_PUSH_TYPE, channel: 'sse', data: payload });
 }
 
 /** Push one thing to one app frame, on a named channel.
@@ -225,15 +274,20 @@ export function postToAppFrame(
   return true;
 }
 
-/** One event-stream frame, verbatim, to every app that asked for it. */
+/** One event-stream frame, verbatim, to every app that listens to its type.
+ *  The frame is parsed at most once, and only when a typed subscriber needs
+ *  it: a streaming turn is thousands of frames. */
 export function fanOutEventFrame(data: string): void {
   if (sseSubscribers.size === 0) return;
-  fanOut({ kind: 'frame', data });
+  let types: string[] | null = null;
+  const frameTypes = () => (types ??= frameEventTypes(data));
+  fanOut({ kind: 'frame', data }, (subscriber) => wants(subscriber, frameTypes));
 }
 
-/** The upstream opened or dropped. An app has no resync to run, but the SDK's
- *  handlers are the same shape as the shell's, so both arms are relayed. */
+/** The upstream opened or dropped. An app re-reads its data on each open
+ *  (`lucidos.sse.onOpen`), since nothing replays what landed in the gap. */
 export function fanOutEventStreamStatus(kind: 'open' | 'error'): void {
+  hostStreamOpen = kind === 'open';
   if (sseSubscribers.size === 0) return;
   fanOut({ kind });
 }
@@ -494,7 +548,15 @@ async function runOp(
 ): Promise<unknown> {
   switch (op) {
     case 'fetch': return bridgedFetch(args as WireRequest, appIdForFrame(frame));
-    case 'sse.open': sseSubscribers.set(source, frame); return null;
+    case 'sse.open':
+      sseSubscribers.set(source, { frame, types: listenedTypes(args) });
+      if (hostStreamOpen) postStreamTo(source, { kind: 'open' });
+      return null;
+    case 'sse.types': {
+      const subscriber = sseSubscribers.get(source);
+      if (subscriber) subscriber.types = listenedTypes(args);
+      return null;
+    }
     case 'sse.close': sseSubscribers.delete(source); return null;
     case 'storage.prime': return runStorageOp(frame, args, storagePrime);
     case 'storage.set': return runStorageOp(frame, args, storageSet);
@@ -547,4 +609,5 @@ export function installAppBridge(): () => void {
  *  cases. Not part of the runtime surface. */
 export function _resetAppBridgeForTesting(): void {
   sseSubscribers.clear();
+  hostStreamOpen = false;
 }

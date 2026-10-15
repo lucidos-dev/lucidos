@@ -1,7 +1,7 @@
 import { computed } from '@preact/signals';
-import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadIsBlocked, threadInReview, ONGOING_GROUPS, selectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, ONGOING_PARTS, isSplitOngoingGroup, type OngoingFilter, type OngoingGroup, type OngoingPart, type SplitOngoingGroup, type ThreadChannel } from '../../store/store';
+import { effectiveThreadStatus, getThreadDisplaySection, threadMap, threadIsBlocked, threadInReview, changeAwaitsApply, ONGOING_GROUPS, selectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, ONGOING_PARTS, isSplitOngoingGroup, type OngoingFilter, type OngoingGroup, type OngoingPart, type SplitOngoingGroup, type ThreadChannel } from '../../store/store';
 import { threadVisualStatus } from '../shared/threadVisualStatus';
-import { byRecent, byCreated, changeReadyToReview, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
+import { byRecent, byCreated, recencyKey, reviewTier, isExcludedFromSections } from '../../store/thread-events';
 import type { ThreadState } from '../../store/thread-events';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
 import type { ThreadStatus } from '../../store/thread-events';
@@ -689,8 +689,8 @@ export function blockedThreads(threads: ReadonlyMap<string, ThreadState>): Threa
     return out;
 }
 
-/** Review group rows: every settled Current/Saved thread with a change ready
- *  to apply or a read request (see `threadInReview`). Mirrors
+/** Review group rows: every settled Current/Saved thread with a change
+ *  awaiting Apply or a read request (see `threadInReview`). Mirrors
  *  `draftThreads`/`blockedThreads`: bypasses the channel/trigger/repo filters
  *  and the lifecycle section grouping. Ordered most-recent-first. */
 export function reviewThreads(threads: ReadonlyMap<string, ThreadState>): ThreadState[] {
@@ -708,8 +708,8 @@ export function reviewThreads(threads: ReadonlyMap<string, ThreadState>): Thread
  *
  *  Reading the dot keeps In flight apart from the other ongoing groups. The
  *  dot puts a question, a failure and a pause ahead of `waiting`, and Blocked
- *  owns those. A ready change with only sub-threads reads `changes`, which is
- *  Review's. A stopped sub-thread needs the user even while its own children
+ *  owns those. A change awaiting Apply with only sub-threads reads `changes`,
+ *  which is Review's. A stopped sub-thread needs the user even while its own children
  *  run, so Blocked keeps it. */
 export function threadIsInFlight(thread: ThreadState): boolean {
     if (isExcludedFromSections(thread)) return false;
@@ -721,15 +721,18 @@ export function threadIsInFlight(thread: ThreadState): boolean {
 }
 
 /** In flight group rows: every thread `threadIsInFlight` takes, roots
- *  most-recent-first, each sub-thread nested under its parent when the parent
- *  is in flight too. Mirrors `blockedThreads`/`reviewThreads`: bypasses the
- *  channel/trigger/repo filters and the lifecycle section grouping. */
+ *  newest-created-first, each sub-thread nested under its parent when the
+ *  parent is in flight too. The user acts on these threads while they stay
+ *  listed, so the order must not read their last action: a row never moves,
+ *  and a row that leaves only closes its gap. Mirrors
+ *  `blockedThreads`/`reviewThreads`: bypasses the channel/trigger/repo filters
+ *  and the lifecycle section grouping. */
 export function inFlightThreads(threads: ReadonlyMap<string, ThreadState>): NestedThread[] {
     const out: ThreadState[] = [];
     for (const t of threads.values()) {
         if (threadIsInFlight(t)) out.push(t);
     }
-    out.sort(byRecent);
+    out.sort(byCreated);
     return nestByParent(out);
 }
 
@@ -739,7 +742,7 @@ export function inFlightThreads(threads: ReadonlyMap<string, ThreadState>): Nest
  *  `threadIsInFlight` takes only those two dots. */
 export function ongoingPartOf(group: SplitOngoingGroup, row: NestedThread): OngoingPart {
     switch (group) {
-        case 'review': return changeReadyToReview(row.thread.meta) ? 'changes' : 'unread';
+        case 'review': return changeAwaitsApply(row.thread.meta) ? 'changes' : 'unread';
         case 'in-flight': return effectiveThreadStatus(row.thread) === 'running' ? 'running' : 'waiting';
     }
 }
@@ -782,8 +785,8 @@ export function ongoingGroupRows(threads: ReadonlyMap<string, ThreadState>, grou
 
 export type OngoingGroupList = { group: OngoingGroup; rows: NestedThread[] };
 
-/** The loaded threads' ongoing groups, recomputed only when a thread or a
- *  draft changes. The drawer's Ongoing list and the post-archive hand-off
+/** The loaded threads' ongoing groups, recomputed only when a thread, a
+ *  draft, a pending change or the landing lane changes. The drawer's Ongoing list and the post-archive hand-off
  *  both read it, so neither rebuilds the groups on an unrelated render. */
 export const ongoingGroupLists = computed<OngoingGroupList[]>(() => ongoingGroups(threadMap.value, ONGOING_GROUPS));
 

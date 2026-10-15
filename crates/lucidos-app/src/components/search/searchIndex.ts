@@ -125,7 +125,6 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'whats-new:releases', label: 'Releases', subview: 'whats-new', path: "Settings → System → What's New", anchor: 'whats-new:releases', keywords: 'releases release notes changelog versions' },
   { id: 'debugging:communication-surfaces', label: 'Communication surfaces', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:communication-surfaces', keywords: 'communication surfaces toast banner popover dialog samples gallery' },
   { id: 'surfaces:toasts', label: 'Toasts', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces', anchor: 'surfaces:toasts', keywords: 'toast toasts samples' },
-  { id: 'surfaces:toast-placement', label: 'Placement', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces → Toasts', anchor: 'surfaces:toast-placement', keywords: 'toast placement position corner top bottom' },
   { id: 'surfaces:popovers', label: 'Popovers', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces', anchor: 'surfaces:popovers', keywords: 'popover popovers samples' },
   { id: 'surfaces:dialogs', label: 'Dialogs', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces', anchor: 'surfaces:dialogs', keywords: 'dialog dialogs confirm modal samples' },
   { id: 'surfaces:banners', label: 'Banners', subview: 'communication-surfaces', path: 'Settings → System → Communication Surfaces', anchor: 'surfaces:banners', keywords: 'banner banners samples' },
@@ -171,7 +170,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:memory-extraction', label: 'Memory extraction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:memory-extraction' },
   { id: 'models:query-classification', label: 'Query classification', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:query-classification', keywords: 'query classification retrieval memory typesafe jev clef system one judgment' },
   { id: 'models:conversation-summary', label: 'Conversation summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:conversation-summary' },
-  { id: 'models:read-decision', label: 'Read decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:read-decision' },
+  { id: 'models:read-decision', label: 'Read decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:read-decision', keywords: 'read decision review worth reading typesafe jev openai decisions openrouter system one judgment' },
+  { id: 'models:wake-decision', label: 'Wake decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:wake-decision', keywords: 'wake decision sub-thread child parent filed report typesafe jev openai decisions openrouter system one judgment' },
   // Lands on the Vertex header, not on the Region row itself. That row sits
   // inside the provider's block, which renders only while Vertex is switched
   // on. An anchor pointing at it scrolls to nothing whenever it is off. The
@@ -196,10 +196,11 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:xai', label: 'xAI', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:xai', keywords: 'xai grok api key' },
   { id: 'models:local', label: 'Local (OpenAI-compatible)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:local', keywords: 'local ollama lm studio llama vllm openai compatible base url self-hosted' },
   // A provider's "In use by" row sits in its folded body, so it lands on the
-  // provider's header, which always renders.
+  // provider's header, which always renders. A chat provider's header has its
+  // own entry above.
   ...Object.values(SYSTEM_ONE_PROVIDERS).flatMap((p): SettingsSearchEntry[] => [
-    { id: p.anchor, label: p.label, subview: 'models', path: `Settings → ${SYSTEM_ONE_PROVIDER_LOCATION}`, anchor: p.anchor, keywords: 'system one judgment provider api key' },
-    { id: `${p.anchor}-usage`, label: `${p.label}: in use by`, subview: 'models', path: `Settings → ${SYSTEM_ONE_PROVIDER_LOCATION} → ${p.label}`, anchor: p.anchor, keywords: 'in use by sites command guard query classification judgment' },
+    ...(p.chatProvider ? [] : [{ id: p.anchor, label: p.label, subview: 'models', path: `Settings → ${SYSTEM_ONE_PROVIDER_LOCATION}`, anchor: p.anchor, keywords: 'system one judgment provider api key' } satisfies SettingsSearchEntry]),
+    { id: `${p.anchor}-usage`, label: `${p.label}: in use by`, subview: 'models', path: `Settings → ${SYSTEM_ONE_PROVIDER_LOCATION} → ${p.label}`, anchor: p.anchor, keywords: 'in use by sites command guard query classification read decision judgment system one' },
   ]),
 
   // Appearance & Behavior subview (Links absorbed the retired Links and

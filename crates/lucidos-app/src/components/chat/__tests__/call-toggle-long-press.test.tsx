@@ -10,16 +10,20 @@
  * thing under test. The gesture, the swallow and the published opener only
  * exist together.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 
 vi.mock('../../../store/voice', () => ({ pressCallToggle: vi.fn() }));
 
-import { CallToggle } from '../CallToggle';
+import { CallToggle, MicrophoneList } from '../CallToggle';
 import { preferences } from '../../../store/store';
 import { pressCallToggle } from '../../../store/voice';
 import { microphones } from '../../../store/microphones';
 import { SYSTEM_DEFAULT_LABEL } from '../../../voice/microphone';
+
+// The picker's list is code-split, and the hold opens it once it is in
+// memory. Warm it, so a hold opens at once.
+beforeAll(() => MicrophoneList.preload());
 
 let host: HTMLDivElement;
 

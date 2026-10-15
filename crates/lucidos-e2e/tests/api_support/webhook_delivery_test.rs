@@ -2,7 +2,7 @@
 //! delivery becomes.
 //!
 //! The unit tests cover the ledger and the payload as separate pieces. This is
-//! the wiring between them, over real HTTP. A claim taken in the wrong order,
+//! the wiring between them, over real HTTP. A ledger row written out of step,
 //! or a header dropped on the floor, shows up here and nowhere else.
 
 use crate::support::{base_url, db_url, unique_marker, user_client};

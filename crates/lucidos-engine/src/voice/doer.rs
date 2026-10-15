@@ -205,7 +205,7 @@ impl TurnStarter for ThreadTurn {
             let _user_slot = engine
                 .thread_queue
                 .acquire_user_slot(
-                    Some(thread_id),
+                    thread_id,
                     crate::engine::thread_queue::truncate_summary(&message),
                 )
                 .await;
@@ -222,6 +222,7 @@ impl TurnStarter for ThreadTurn {
                     None,
                     None,
                     Some(thread_id),
+                    None,
                     None,
                     None,
                     None,

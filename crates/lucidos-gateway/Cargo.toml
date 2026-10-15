@@ -20,9 +20,16 @@ path = "src/main.rs"
 
 [dependencies]
 lucidos-tailscale = { path = "../lucidos-tailscale" }
+lucidos-home = { path = "../lucidos-home" }
 lucidos-local-token = { path = "../lucidos-local-token" }
+# The only road to an engine: its Unix socket, connected only once the kernel
+# names this user as the listener (ADR 0014 §1 keeps the engine crate out).
+lucidos-engine-socket = { path = "../lucidos-engine-socket" }
+lucidos-owner-lock = { path = "../lucidos-owner-lock" }
 lucidos-frame-capability = { path = "../lucidos-frame-capability" }
 lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
+lucidos-pg-url = { path = "../lucidos-pg-url" }
+lucidos-gateway-constants = { path = "../lucidos-gateway-constants" }
 # Enumerating the machine's Lucidos installs, shared with `lucidos-app` so the
 # control plane and the client cannot describe one machine two ways.
 lucidos-installs = { path = "../lucidos-installs" }
@@ -66,6 +73,9 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # proxy forwards to the engine is percent-encoded. Already in the lockfile via
 # the engine, which decodes it.
 urlencoding = "2.1.3"
+# Temp files the gateway writes, such as a legacy migration's plaintext dump,
+# are created owner-only. Already a dependency of the engine.
+tempfile = "3"
 
 # macOS reports a process's processor time in Mach ticks, and converting them
 # needs `mach_timebase_info`. `libc` deprecates its copy in favour of this crate,
@@ -74,7 +84,11 @@ urlencoding = "2.1.3"
 mach2 = "0.4"
 
 [dev-dependencies]
-tempfile = "3"
+# Stages a listener held by a stranger, which one user cannot otherwise do.
+lucidos-engine-socket = { path = "../lucidos-engine-socket", features = ["test-support"] }
+# A stand-in engine serving a router on an engine socket, as the real one does.
+hyper = { version = "1", features = ["server"] }
+hyper-util = { version = "0.1", features = ["service"] }
 # A self-signed cert for the https stand-in gateway in `peers_tests.rs`. Minted
 # per run rather than checked in, so no test starts failing on an expiry date.
 # Pinned to the `aws_lc_rs` backend `rustls` above already uses, so this adds no

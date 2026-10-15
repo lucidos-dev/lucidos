@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { threadMap, focusedThreadId, changes, confirmState, applyingNowThreadIds, discardingCCThreadIds, archivingThreadIds, armingStandingApplyThreadIds } from '../store';
+import { threadMap, focusedThreadId, changes, confirmState, applyNowRequests, discardingCCThreadIds, armingStandingApplyThreadIds } from '../store';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 import type { Change } from '../../api/client';
 import { makeThreadState } from './threads-test-helpers';
@@ -14,6 +14,7 @@ import {
   overlayStack,
   _resetOverlayStackForTesting,
 } from '../overlayStack';
+import { _resetRowIntentsForTesting } from '../rowIntents';
 
 function setThread(state: ThreadState): void {
   threadMap.value = new Map([[state.meta.id, state]]);
@@ -39,9 +40,9 @@ beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
   changes.value = { status: 'loaded', data: [] };
-  applyingNowThreadIds.value = new Map();
+  applyNowRequests.value = new Map();
   discardingCCThreadIds.value = new Set();
-  archivingThreadIds.value = new Set();
+  _resetRowIntentsForTesting();
   armingStandingApplyThreadIds.value = new Set();
   confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
   _resetComposeDraftsForTesting();
@@ -292,7 +293,7 @@ describe('resolveChangeMenuActions', () => {
 
   it('is empty while an apply is in flight', () => {
     proposedCcThread();
-    applyingNowThreadIds.value = new Map([['t1', 'applying']]);
+    applyNowRequests.value = new Map([['t1', null]]);
     expect(resolveChangeMenuActions('t1')).toEqual([]);
   });
 
@@ -362,7 +363,7 @@ describe('runCloseCascade no-op gates', () => {
     }));
     changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
     focusedThreadId.value = 't1';
-    applyingNowThreadIds.value = new Map([['t1', 'applying']]);
+    applyNowRequests.value = new Map([['t1', null]]);
 
     await runCloseCascade();
     expect(confirmState.value.visible).toBe(false);

@@ -291,6 +291,36 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
       expect(openExternal).not.toHaveBeenCalled();
     });
 
+    // The reported bug: on the iOS PWA a bare disk path went to `window.open`,
+    // which resolved it against the page origin and landed on the gateway.
+    it.each([
+      '/Users/me/Downloads/Lucidos.dmg',
+      'file:///Users/me/Downloads/Lucidos.dmg',
+    ])('a browser says it cannot open %s, and navigates nowhere', (target) => {
+      platformMocks.isTauri = false;
+
+      void openLocalFileOnConfirm(target, 'thread "Release"');
+
+      expect(window.open).not.toHaveBeenCalled();
+      expect(window.location.href).toBe(APP_URL);
+      expect(confirmState.value.visible).toBe(false);
+      expect(toasts.value).toHaveLength(1);
+      expect(toasts.value[0].type).toBe('error');
+      expect(toasts.value[0].message).toContain(target);
+      expect(toasts.value[0].message).toContain('(requested by thread "Release")');
+    });
+
+    // `extractLocalFileTarget` also claims a protocol-relative URL
+    // (docs/code-review-priors.md). It is a web page, not a disk path.
+    it('a browser still opens a protocol-relative url in a tab', () => {
+      platformMocks.isTauri = false;
+
+      void openLocalFileOnConfirm('//example.com/page');
+
+      expect(window.open).toHaveBeenCalledWith('//example.com/page', '_blank', 'noopener');
+      expect(toasts.value).toEqual([]);
+    });
+
     it('a web url still opens at once, with no confirm', () => {
       platformMocks.isTauri = true;
 

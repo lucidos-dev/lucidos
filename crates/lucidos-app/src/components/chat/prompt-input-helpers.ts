@@ -264,55 +264,6 @@ export function composeHasContent(
   return text.trim().length > 0 || attachedImagesCount > 0 || uploadInFlight;
 }
 
-/** What a submit sends, out of the two places the composer keeps its text.
- *
- *  **The draft decides.** The Send face is rendered from it, through
- *  `composeHasContent` above, and `sendCompose` sends it. Gating on the textarea
- *  instead lit the button from one value and refused it from another. The two
- *  need only drift apart for the press to die in silence, which is what four
- *  reports of a dead composer button look like. The plan behind this is
- *  docs/plans/2026-08-27-the-composer-sends-the-draft-it-is-showing.md.
- *
- *  The textarea is not ignored. Text the store lacks is sent, and handed back to
- *  the store as well. So nothing typed is lost, and `sendCompose` cannot go on
- *  to send an empty copy. `domText` is null when there is no textarea node,
- *  which is an absent source rather than a disagreement.
- *
- *  Both are compared trimmed, matching what the submit paths already send, so
- *  trailing whitespace never reads as a disagreement. */
-export interface ComposerText {
-  /** The trimmed text to send, and what the caller's own empty check reads. */
-  text: string;
-  /** The RAW textarea value to write into the store before dispatching, or null
-   *  when the store already holds the text. Raw, so the recovery alters nothing
-   *  the user typed. */
-  storeWrite: string | null;
-  /** The two sources held different text. The impossible state itself, so the
-   *  caller reports it. */
-  disagreed: boolean;
-}
-
-export function resolveComposerText(draftText: string, domText: string | null): ComposerText {
-  const draft = draftText.trim();
-  if (domText === null) return { text: draft, storeWrite: null, disagreed: false };
-  const dom = domText.trim();
-  if (draft === dom) return { text: draft, storeWrite: null, disagreed: false };
-  if (draft.length > 0) return { text: draft, storeWrite: null, disagreed: true };
-  return { text: dom, storeWrite: domText, disagreed: true };
-}
-
-/** What the user is told when the two disagreed, and null when they agreed. It
- *  names which copy was sent, because the box may be showing the other one.
- *
- *  It takes the whole resolution rather than a side, so neither caller repeats
- *  the reading of `storeWrite` that decides which copy that was. */
-export function composerTextDisagreementToast(resolved: ComposerText): string | null {
-  if (!resolved.disagreed) return null;
-  return resolved.storeWrite === null
-    ? 'The text on screen and the saved draft differed. Sent the saved draft.'
-    : 'The saved draft was empty. Sent the text on screen.';
-}
-
 /** Whether the optimistic `submittingThreadIds` flag should be released.
  *
  *  **Stop is offered only while the focused thread has a turn in flight**, and
@@ -476,21 +427,17 @@ export function computeSubmitMultiCount(toggledCount: number, customAnswerText: 
  *  live and blank, so the user re-picks every option. The reported failure cost
  *  three picks twice over before the third attempt landed.
  *
- *  Only where the user has put nothing new there since. A fresh pick made
- *  during the failure window is the newer answer. Restoring text over a fresh
- *  keystroke would also leave the draft and the box disagreeing, and
- *  `resolveComposerText` settles that in favour of the stale copy. `null` for
- *  either field means leave that one alone. */
+ *  Only where the user has put nothing new there since. A fresh pick or a
+ *  fresh keystroke made during the failure window is the newer answer. `null`
+ *  for either field means leave that one alone. */
 export function recoverableAnswerDraft(args: {
   sentIds: string[];
   sentText: string;
   currentIds: string[];
   currentDraft: string;
-  /** The textarea's live value, or null when no node is mounted. */
-  domText: string | null;
 }): { ids: string[] | null; text: string | null } {
   const idsFree = args.currentIds.length === 0;
-  const textFree = args.currentDraft.length === 0 && (args.domText ?? '').length === 0;
+  const textFree = args.currentDraft.length === 0;
   return {
     ids: args.sentIds.length > 0 && idsFree ? args.sentIds : null,
     text: args.sentText.length > 0 && textFree ? args.sentText : null,

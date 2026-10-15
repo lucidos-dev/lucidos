@@ -3,8 +3,8 @@ use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::llm::tool_names as tn;
 use crate::triggers::{
-    normalize_route_setting, resolve_trigger_provider_update, validate_trigger_provider,
-    validate_trigger_reasoning_effort, EventSubscription, TriggerRun,
+    normalize_mcp_servers, normalize_route_setting, resolve_trigger_provider_update,
+    validate_trigger_provider, validate_trigger_reasoning_effort, EventSubscription, TriggerRun,
 };
 // Lets the never-fires diagnosis and the AND-footgun check read a parsed
 // schedule's day-of-month / month / day-of-week ordinal sets, instead of
@@ -263,6 +263,13 @@ impl LucidosEngine {
                     Ok(None) => {}
                     Err(e) => return Ok(format!("Error: {}", e)),
                 }
+                let mcp_servers = match mcp_servers_arg(args.get("mcp_servers")) {
+                    Ok(ids) => ids.unwrap_or_default(),
+                    Err(e) => return Ok(e),
+                };
+                if !mcp_servers.is_empty() {
+                    event_payload["mcp_servers"] = serde_json::json!(mcp_servers);
+                }
 
                 self.trigger_registry_writer()
                     .write_created_minting_slug(&trigger_id_str, event_payload, name, None)
@@ -330,9 +337,14 @@ impl LucidosEngine {
                                 .join(", ");
                             format!("  Event: on {}\n", rendered)
                         };
+                        let mcp_display = if config.mcp_servers.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  MCP servers: {}\n", config.mcp_servers.join(", "))
+                        };
                         result.push_str(&format!(
-                            "- **{}** (ID: {}) [{}]\n{}{}  Status: {}\n  Last run: {}\n  Run: {}\n\n",
-                            config.name, config.id, trigger_type, schedule_display, event_display, status, last_run, run_info
+                            "- **{}** (ID: {}) [{}]\n{}{}{}  Status: {}\n  Last run: {}\n  Run: {}\n\n",
+                            config.name, config.id, trigger_type, schedule_display, event_display, mcp_display, status, last_run, run_info
                         ));
                     }
                     Ok(result)
@@ -462,6 +474,11 @@ impl LucidosEngine {
                     Err(e) => return Ok(format!("Error: {}", e)),
                 };
 
+                let new_mcp_servers = match mcp_servers_arg(args.get("mcp_servers")) {
+                    Ok(ids) => ids,
+                    Err(e) => return Ok(e),
+                };
+
                 if new_name.is_none()
                     && new_run.is_none()
                     && new_cron.is_none()
@@ -473,6 +490,7 @@ impl LucidosEngine {
                     && new_model.is_none()
                     && new_reasoning_effort.is_none()
                     && new_provider.is_none()
+                    && new_mcp_servers.is_none()
                 {
                     return Ok(
                         "Error: At least one field besides trigger_id must be provided".to_string(),
@@ -529,6 +547,10 @@ impl LucidosEngine {
                 if let Some(ref provider) = new_provider {
                     update_payload["provider"] = serde_json::json!(provider);
                     updated_fields.push("provider");
+                }
+                if let Some(ref ids) = new_mcp_servers {
+                    update_payload["mcp_servers"] = serde_json::json!(ids);
+                    updated_fields.push("mcp_servers");
                 }
 
                 // Ensure trigger still has at least one firing mechanism
@@ -869,6 +891,25 @@ fn warning_suffix(warnings: &[String]) -> String {
         return String::new();
     }
     format!("\n\nWARNING: {}", warnings.join("\nWARNING: "))
+}
+
+/// Parse the LLM tool's `mcp_servers` argument. `None` when absent. `null`
+/// clears, so it reads as an empty list, and so does `[]`. A single string is
+/// one id. Anything else is an `Error: ...` string the LLM can read directly.
+pub(crate) fn mcp_servers_arg(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<Vec<String>>, String> {
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Null) => Ok(Some(Vec::new())),
+        Some(serde_json::Value::String(id)) => Ok(Some(normalize_mcp_servers([id.as_str()]))),
+        Some(serde_json::Value::Array(ids)) if ids.iter().all(|v| v.is_string()) => Ok(Some(
+            normalize_mcp_servers(ids.iter().filter_map(|v| v.as_str())),
+        )),
+        Some(_) => Err(
+            "Error: 'mcp_servers' must be an array of MCP server ids, e.g. [\"slack\"]".to_string(),
+        ),
+    }
 }
 
 /// Parse the LLM tool's `on` argument into a Vec of subscriptions, accepting:

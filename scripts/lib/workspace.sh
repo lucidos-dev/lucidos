@@ -28,9 +28,10 @@
 WORKSPACE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/docker.sh
 source "$WORKSPACE_LIB_DIR/docker.sh"
-# For `ports_file_set`, which detect_tls and swap_ports both write through. The
-# entry scripts source this first anyway, so re-sourcing only redefines the same
-# functions. What it buys is that a caller of workspace.sh alone still has it.
+# For `ports_file_set`, which detect_tls and swap_ports both write through, and
+# for the flock helpers it sources. The entry scripts source this first anyway,
+# so re-sourcing only redefines the same functions. What it buys is that a
+# caller of workspace.sh alone still has them.
 # shellcheck source=scripts/lib/ports.sh
 source "$WORKSPACE_LIB_DIR/ports.sh"
 
@@ -45,6 +46,10 @@ source "$WORKSPACE_LIB_DIR/proc_env.sh"
 # The ports, names and paths this file shares with the Rust crates.
 # shellcheck source=scripts/lib/workspace_constants.sh
 source "$WORKSPACE_LIB_DIR/workspace_constants.sh"
+# shellcheck source=scripts/lib/pg_secret.sh
+source "$WORKSPACE_LIB_DIR/pg_secret.sh"
+# shellcheck source=scripts/lib/storage_root.sh
+source "$WORKSPACE_LIB_DIR/storage_root.sh"
 # For `prune_stale_debug_objects`, which every engine build runs (ADR 0408).
 # shellcheck source=scripts/lib/stale_objects.sh
 source "$WORKSPACE_LIB_DIR/stale_objects.sh"
@@ -271,7 +276,7 @@ resolve_workspace_path() {
 # ── resolve_workspace ───────────────────────────────────────────────────
 # Same name resolution as resolve_workspace_path, plus the side effects
 # needed to *start* a workspace: creates the workspace dir + subdirs if
-# missing, and sets ENGINE_PIDFILE / FRONTEND_PIDFILE / ENGINE_LOG / PG_NAME.
+# missing, and sets ENGINE_LOG / PG_NAME.
 # Use from start scripts (web-dev.sh, tauri-dev.sh, e2e). For stop / status
 # / tail, use resolve_workspace_path instead.
 resolve_workspace() {
@@ -280,11 +285,11 @@ resolve_workspace() {
         WORKSPACE="$HOME/workspaces/$WORKSPACE"
     fi
 
-    # Create if needed, then resolve to absolute path
+    # Create if needed, then resolve to absolute path.
     if [ ! -d "$WORKSPACE" ]; then
         echo "Creating workspace: $WORKSPACE"
-        mkdir -p "$WORKSPACE"
     fi
+    ensure_storage_root "$WORKSPACE"
     WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 
     # One-time rebrand migration. Old name spelled via variable so this block
@@ -339,14 +344,9 @@ resolve_workspace() {
     mkdir -p "$WORKSPACE/.lucidos"
 
     # Workspace-scoped state files
-    ENGINE_PIDFILE="$WORKSPACE/.lucidos/engine.pid"
-    FRONTEND_PIDFILE="$WORKSPACE/.lucidos/frontend.pid"
-    # NOTE: `vite build --watch` is NOT workspace-scoped — it produces the SHARED
-    # crates/lucidos-app/dist/ that every workspace of this checkout serves
-    # (the engine serves it directly via LUCIDOS_STATIC_DIR, ADR 0014), so it's a
-    # checkout-level singleton tracked by build_watch_pidfile (below), not a
-    # per-workspace pid. A legacy per-workspace build-watch.pid from pre-singleton
-    # runs is cleaned up by kill_stale_processes / stop.sh.
+    # The build-watch is NOT workspace-scoped: it produces the SHARED
+    # crates/lucidos-app/dist/ that every workspace of this checkout serves, so
+    # it is a checkout-level singleton (start_frontend_built, below).
     ENGINE_LOG="$WORKSPACE/.lucidos/engine.log"
 
     # Compute a short name for the postgres container from workspace path
@@ -398,7 +398,7 @@ shared_pg_psql() {
     local port
     port="$(external_pg_port)"
     if [ -n "$port" ]; then
-        PGPASSWORD="$PG_PASSWORD" psql -h 127.0.0.1 -p "$port" -U "$PG_USER" -d "$db" "$@"
+        PGPASSWORD="$(shared_pg_password)" psql -h 127.0.0.1 -p "$port" -U "$PG_USER" -d "$db" "$@"
     else
         docker exec "$(shared_pg_container)" psql -U "$PG_USER" -d "$db" "$@"
     fi
@@ -410,8 +410,10 @@ workspace_database_name() {
     echo "lucidos_$id"
 }
 
+# Carries the secret, so it goes only into a child's environment, never argv
+# or a file another user can read.
 workspace_database_url() {
-    echo "postgres://$PG_USER:$PG_PASSWORD@localhost:$PG_PORT/$(workspace_database_name)"
+    echo "postgres://$PG_USER:$(shared_pg_password)@localhost:$PG_PORT/$(workspace_database_name)"
 }
 
 _shared_pg_ident() {
@@ -515,16 +517,20 @@ _ensure_shared_postgres_container() {
         echo "Starting shared PostgreSQL (port $PG_PORT, container $container)"
         docker volume create "$volume" >/dev/null || return 1
         # The gateway starts this same cluster when no script got there first, so
-        # image, credentials and sizing come from workspace_constants.sh. The
+        # image, user and sizing come from workspace_constants.sh. The
         # gateway's postgres.rs says why the shared memory and connection limits
         # are raised.
-        if ! docker run -d \
+        # POSTGRES_PASSWORD is named without a value, so docker reads it from
+        # the environment and the secret stays out of argv.
+        local password
+        password="$(shared_pg_password)" || return 1
+        if ! POSTGRES_PASSWORD="$password" docker run -d \
             --name "$container" \
             --restart unless-stopped \
             --shm-size="$PG_SHM_SIZE" \
             -p "127.0.0.1:$PG_PORT:5432" \
             -e POSTGRES_USER="$PG_USER" \
-            -e POSTGRES_PASSWORD="$PG_PASSWORD" \
+            -e POSTGRES_PASSWORD \
             -e POSTGRES_DB=postgres \
             -v "$volume:/var/lib/postgresql" \
             --label "lucidos.shared-postgres=true" \
@@ -566,7 +572,8 @@ _ensure_shared_postgres_container() {
             ready_streak=$((ready_streak + 1))
             if [ "$ready_streak" -ge "$ready_needed" ]; then
                 echo " ready!"
-                return 0
+                _set_shared_pg_password "$container"
+                return $?
             fi
         elif [ "$ready_streak" -gt 0 ]; then
             # It answered, then stopped answering: that is the init server going
@@ -579,6 +586,18 @@ _ensure_shared_postgres_container() {
     echo ""
     echo "ERROR: shared PostgreSQL did not become ready" >&2
     return 1
+}
+
+# Set the role's password to the minted secret, on every start. A cluster made
+# before the secret existed still holds the old public password, and the image
+# applies POSTGRES_PASSWORD only on first init. The statement goes in on stdin
+# from the printf builtin, so the secret never reaches argv. The gateway does
+# the same in `set_password_docker` (crates/lucidos-gateway/src/postgres.rs).
+_set_shared_pg_password() {
+    local container="$1" password
+    password="$(shared_pg_password)" || return 1
+    printf 'ALTER ROLE %s PASSWORD %s;\n' "$(_shared_pg_ident "$PG_USER")" "$(_shared_pg_literal "$password")" \
+        | docker exec -i "$container" psql -U "$PG_USER" -d postgres -X -q -v ON_ERROR_STOP=1 >/dev/null
 }
 
 _shared_database_exists() {
@@ -1043,256 +1062,6 @@ _migrate_postgres_volume_if_needed() {
     echo ""
 }
 
-# One-time MAJOR-version migration (PG 17 → 18). The named volume was created
-# when the image was pgvector/pgvector:pg17, whose PGDATA was the volume root
-# (/var/lib/postgresql/data). PG 18's image relocated PGDATA to
-# /var/lib/postgresql/18/docker and mounts the volume at the parent
-# /var/lib/postgresql, so the old cluster cannot be opened in place — a logical
-# dump/restore is required.
-#
-# Boots a throwaway PG 17 server on the old volume, pg_dump's the `lucidos`
-# database to <workspace>/.lucidos, verifies the archive, then removes the old
-# volume so _start_postgres_container can initdb a fresh PG 18 cluster into the
-# (recreated) named volume. _restore_postgres_major_dump_if_pending finishes the
-# restore once the PG 18 server is up.
-#
-# Idempotent: no-op when the volume is absent (fresh install) or already in PG 18
-# layout (/18/docker/PG_VERSION present). The dump archive is kept (never
-# deleted) so the migration is recoverable. Returns non-zero ONLY when an
-# in-progress migration could not complete safely (caller aborts the start).
-_migrate_postgres_major_if_needed() {
-    local volume_name="lucidos-pg-data-$PG_NAME"
-    local image_peek="pgvector/pgvector:pg18"   # always present once compose has run
-    local pending="$WORKSPACE/.lucidos/pg-major-migrate.pending.dump"
-
-    # No volume → fresh install; compose will initdb a PG 18 cluster.
-    docker volume inspect "$volume_name" >/dev/null 2>&1 || return 0
-
-    # Already PG 18 layout → nothing to do.
-    if docker run --rm -v "$volume_name:/v" "$image_peek" \
-        sh -c 'test -f /v/18/docker/PG_VERSION' >/dev/null 2>&1; then
-        return 0
-    fi
-
-    # Old layout keeps PGDATA at the volume root. Read its catalog major version.
-    local old_ver
-    old_ver=$(docker run --rm -v "$volume_name:/v" "$image_peek" \
-        sh -c 'cat /v/PG_VERSION 2>/dev/null' | tr -d '[:space:]')
-    # No PG_VERSION at root and no 18/docker → empty/foreign volume; let compose
-    # initdb fresh rather than risk a destructive guess.
-    [ -n "$old_ver" ] || return 0
-    if [ "$old_ver" -ge 18 ] 2>/dev/null; then
-        return 0
-    fi
-    # Boot the image matching the volume's actual catalog version (a newer
-    # server cannot open an older cluster). The project has only shipped PG 17,
-    # but deriving the tag keeps the migration correct for any past major.
-    local image_old="pgvector/pgvector:pg${old_ver}"
-
-    echo ""
-    echo "Migrating PostgreSQL cluster PG $old_ver → 18 (logical dump/restore)."
-    echo "(One-time. PG 18 relocated PGDATA, so the PG $old_ver cluster cannot be opened in place.)"
-    echo "  Volume:  $volume_name"
-    echo "  Archive: $pending"
-
-    # Release the volume from the workspace container before booting a temp one.
-    docker rm -f "lucidos-pg-$PG_NAME" >/dev/null 2>&1 || true
-
-    local tmp="lucidos-pg-migrate-$PG_NAME"
-    docker rm -f "$tmp" >/dev/null 2>&1 || true
-
-    echo "  Booting temporary PG $old_ver to dump the event store..."
-    if ! docker run -d --name "$tmp" \
-        -v "$volume_name:/var/lib/postgresql/data" \
-        -e POSTGRES_USER=lucidos -e POSTGRES_PASSWORD=lucidos -e POSTGRES_DB=lucidos \
-        "$image_old" >/dev/null 2>&1; then
-        echo "ERROR: could not start temporary PG $old_ver for migration (old volume intact)." >&2
-        return 1
-    fi
-
-    local ready=""
-    for _ in $(seq 1 60); do
-        if docker exec "$tmp" pg_isready -U lucidos >/dev/null 2>&1; then ready=1; break; fi
-        sleep 1
-    done
-    if [ -z "$ready" ]; then
-        echo "ERROR: temporary PG $old_ver did not become ready; aborting (old volume intact)." >&2
-        docker logs --tail 30 "$tmp" >&2 || true
-        docker rm -f "$tmp" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    mkdir -p "$WORKSPACE/.lucidos"
-    echo "  Dumping 'lucidos' database (custom format)..."
-    if ! docker exec "$tmp" pg_dump -U lucidos -d lucidos -Fc -f /tmp/lucidos.dump; then
-        echo "ERROR: pg_dump failed; aborting (old volume intact)." >&2
-        docker rm -f "$tmp" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    # Verify the archive lists a non-empty TOC before trusting it.
-    if ! docker exec "$tmp" sh -c 'pg_restore -l /tmp/lucidos.dump | grep -q .'; then
-        echo "ERROR: dump archive verification failed; aborting (old volume intact)." >&2
-        docker rm -f "$tmp" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    if ! docker cp "$tmp:/tmp/lucidos.dump" "$pending" >/dev/null 2>&1; then
-        echo "ERROR: could not copy dump out of temporary container; aborting (old volume intact)." >&2
-        docker rm -f "$tmp" >/dev/null 2>&1 || true
-        return 1
-    fi
-    docker rm -f "$tmp" >/dev/null 2>&1 || true
-
-    # Dump is verified and on the host — safe to drop the old volume so compose
-    # recreates it in the PG 18 layout. The archive at $pending is the backup.
-    if ! docker volume rm "$volume_name" >/dev/null 2>&1; then
-        echo "ERROR: could not remove old volume $volume_name after dumping." >&2
-        echo "       Dump archive preserved at $pending" >&2
-        return 1
-    fi
-    echo "  PG $old_ver cluster dumped; old volume removed. A fresh PG 18 cluster will be initialized."
-}
-
-# Finish a pending PG 17 → 18 migration: restore the dumped `lucidos` database
-# into the freshly-initialized PG 18 cluster. No-op when no migration is pending.
-# Called by _start_postgres_container once the PG 18 server is ready and BEFORE
-# the vector extension is (re)created — the dump already carries it.
-_restore_postgres_major_dump_if_pending() {
-    local pending="$WORKSPACE/.lucidos/pg-major-migrate.pending.dump"
-    [ -f "$pending" ] || return 0
-
-    local container="lucidos-pg-$PG_NAME"
-    local archived
-    archived="$WORKSPACE/.lucidos/pg-major-migrate.restored-$(date +%Y%m%d%H%M%S).dump"
-
-    # Guard against double-apply: only restore into a pristine cluster. If the
-    # event store already exists (a prior restore that completed but failed to
-    # archive the marker), skip and archive the dump.
-    if docker exec "$container" psql -U lucidos -d lucidos -tAc \
-        "SELECT to_regclass('public.events') IS NOT NULL" 2>/dev/null | grep -q t; then
-        echo "PG 18 cluster already populated; skipping restore. Dump archived at $archived"
-        mv "$pending" "$archived" 2>/dev/null || true
-        return 0
-    fi
-
-    echo "Restoring event store into PG 18 from $pending ..."
-    if ! docker cp "$pending" "$container:/tmp/restore.dump" >/dev/null 2>&1; then
-        echo "ERROR: could not copy dump into $container; PG 17 archive kept at $pending" >&2
-        return 1
-    fi
-    # -U lucidos is required: `docker exec` runs as the image's root user (it
-    # bypasses the entrypoint's gosu drop to postgres), so without it pg_restore
-    # connects as PG role "root", which does not exist.
-    if ! docker exec "$container" pg_restore -U lucidos --no-owner --no-privileges \
-        --exit-on-error -d lucidos /tmp/restore.dump; then
-        echo "ERROR: pg_restore failed restoring the PG 17 → 18 migration." >&2
-        echo "       The PG 17 dump is preserved at $pending — re-run after fixing the cause:" >&2
-        echo "         docker cp $pending $container:/tmp/restore.dump" >&2
-        echo "         docker exec $container pg_restore -U lucidos --no-owner --no-privileges -d lucidos /tmp/restore.dump" >&2
-        return 1
-    fi
-    docker exec "$container" rm -f /tmp/restore.dump >/dev/null 2>&1 || true
-    mv "$pending" "$archived" 2>/dev/null || true
-    echo "PG 17 → 18 migration complete. Dump archived at $archived"
-}
-
-_start_postgres_container() {
-    # Resolve a free PG host port BEFORE creating the container. The nominal
-    # 5432+offset slot may be squatted by a sibling workspace's sticky container;
-    # walk forward to a free (or our own) port so `docker compose up` doesn't
-    # collide. This is decoupled from the vite/api offset on purpose — ports.sh
-    # no longer drifts the user-facing ports for a PG conflict, so it's resolved
-    # here instead. `_pg_port_is_ours_or_free` accepts our own container (we
-    # recreate it below). Re-export so docker-compose and DATABASE_URL pick it up.
-    local pg_steps=0
-    while ! _pg_port_is_ours_or_free "$PG_PORT"; do
-        local squatter
-        squatter=$(docker ps --filter "publish=$PG_PORT" --format "{{.Names}}" 2>/dev/null | head -1)
-        echo "[ports] PG port $PG_PORT occupied${squatter:+ by container $squatter}, trying $(( PG_PORT + 1 ))" >&2
-        PG_PORT=$(( PG_PORT + 1 ))
-        pg_steps=$(( pg_steps + 1 ))
-        if [ "$pg_steps" -gt 1000 ]; then
-            echo "ERROR: could not find a free PostgreSQL port near $(( PG_PORT - pg_steps ))" >&2
-            return 1
-        fi
-    done
-    export PG_PORT
-    export LUCIDOS_PG_PORT="$PG_PORT"
-
-    echo "Starting PostgreSQL for workspace: $WORKSPACE (port $PG_PORT, container lucidos-pg-$PG_NAME)"
-
-    docker rm -f "lucidos-pg-$PG_NAME" 2>/dev/null || true
-
-    if ! docker compose -p "lucidos-$PG_NAME" -f "$PROJECT_DIR/docker-compose.dev.yml" up -d 2>&1; then
-        local squatter
-        squatter=$(docker ps --filter "publish=$PG_PORT" --format "{{.Names}}" 2>/dev/null | head -1)
-        if [ -n "$squatter" ]; then
-            echo "ERROR: port $PG_PORT is already bound by container '$squatter'" >&2
-            echo "Stop it first: docker stop $squatter" >&2
-        else
-            local pid
-            pid=$(lsof -ti :"$PG_PORT" -sTCP:LISTEN 2>/dev/null | head -1)
-            if [ -n "$pid" ]; then
-                local cmd
-                cmd=$(ps -p "$pid" -o command= 2>/dev/null | head -c 80)
-                echo "ERROR: port $PG_PORT is already bound by pid $pid ($cmd)" >&2
-            else
-                echo "ERROR: docker compose up failed (see output above)" >&2
-            fi
-        fi
-        return 1
-    fi
-
-    echo -n "Waiting for PostgreSQL"
-    for _ in {1..30}; do
-        if docker exec "lucidos-pg-$PG_NAME" pg_isready -U lucidos > /dev/null 2>&1; then
-            echo " ready!"
-            break
-        fi
-        echo -n "."
-        sleep 1
-    done
-
-    # Finish a pending PG 17 → 18 migration (restore into the fresh cluster)
-    # before anything else touches the database. A failed restore aborts the
-    # start so the engine never boots on a half-restored event store.
-    _restore_postgres_major_dump_if_pending || return 1
-
-    docker exec "lucidos-pg-$PG_NAME" psql -U lucidos -d lucidos -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1 || true
-}
-
-# ── pid_is_live ─────────────────────────────────────────────────────────
-# True if pid $1 is a process that is actually still running. A ZOMBIE (state
-# `Z`, `<defunct>`) is NOT: it has already exited and only lingers in the
-# process table until its parent reaps it.
-#
-# This exists because `kill -0 <pid>` SUCCEEDS for a zombie, so a bare signal
-# probe reports a dead engine as running. On 2026-07-31 a workspace engine had
-# been a defunct child of the gateway for a day, `status.sh --json` still said
-# `engine_running: true`, and the workspace switcher rendered a healthy dot that
-# sent an iOS PWA to a port nothing was listening on.
-#
-# `ps -o state=` is the portable answer (macOS and Linux both print a single
-# state letter, `Z` for a zombie) and it also covers the pid-does-not-exist
-# case, where `ps` exits non-zero and prints nothing. A non-numeric or empty
-# pid (a truncated / garbage pidfile) is never live.
-pid_is_live() {
-    local pid="$1" state
-    [ -n "$pid" ] || return 1
-    case "$pid" in
-        *[!0-9]*) return 1 ;;
-    esac
-    state="$(ps -o state= -p "$pid" 2>/dev/null)" || return 1
-    # Strip the padding `ps` adds around the state column before matching.
-    state="${state//[[:space:]]/}"
-    [ -n "$state" ] || return 1
-    case "$state" in
-        Z*) return 1 ;;
-    esac
-    return 0
-}
-
 # ── _pid_in_list ────────────────────────────────────────────────────────
 # True if pid $1 appears in the space-separated list $2.
 _pid_in_list() {
@@ -1500,17 +1269,13 @@ kill_stale_processes() {
     # accidental `xargs kill` from CC subprocess test scripts (see
     # main.rs shutdown_signal). SIGUSR1 is the legitimate stop signal.
     if [ -n "$BUILD" ] && [ -z "$skip_engine_kill" ]; then
-        if [ -f "$ENGINE_PIDFILE" ]; then
-            local old_pid
-            old_pid="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
-            if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-                echo "Stopping existing engine for rebuild (PID $old_pid)..."
-                kill -USR1 "$old_pid" 2>/dev/null || true
-                engine_pids_to_reap="$old_pid"
-                killed=1
-            fi
-            rm -f "$ENGINE_PIDFILE"
-        fi
+        local old_pid
+        for old_pid in $(engine_pids_to_signal "$WORKSPACE"); do
+            echo "Stopping existing engine for rebuild (PID $old_pid)..."
+            kill -USR1 "$old_pid" 2>/dev/null || true
+            engine_pids_to_reap="${engine_pids_to_reap:+$engine_pids_to_reap }$old_pid"
+            killed=1
+        done
 
         # Full `-b` rebuild in gateway mode (not --engine-only Apply, which is
         # skip_engine_kill): also stop the ONE shared gateway so the freshly built
@@ -1556,31 +1321,9 @@ kill_stale_processes() {
         fi
     fi
 
-    # Release this workspace's frontend marker (skip in --engine-only mode). In
-    # built mode the marker is the SHARED build-watch pid (the engine serves
-    # dist/ directly, no per-workspace preview) — release_frontend_marker removes
-    # the file without killing the shared watch; a distinct dev-server pid (e2e)
-    # is killed.
-    if [ -z "$ENGINE_ONLY" ]; then
-        [ -n "$(release_frontend_marker "$FRONTEND_PIDFILE")" ] && killed=1
-    fi
-
-    # The --built mode `vite build --watch` is now a checkout-level singleton
-    # shared across workspaces (build_watch_pidfile), so a per-workspace restart
-    # must NOT tear it down — start_frontend_built reuses it when healthy and
-    # rebuilds only when it's dead, dist/ is broken, or this is a SOLO `-b`.
-    # Clean up a legacy per-workspace build-watch from pre-singleton runs so it
-    # can't linger as an orphan duplicating the shared one.
-    if [ -z "$ENGINE_ONLY" ] && [ -f "$WORKSPACE/.lucidos/build-watch.pid" ]; then
-        local legacy_bw
-        legacy_bw="$(cat "$WORKSPACE/.lucidos/build-watch.pid" 2>/dev/null || true)"
-        if [ -n "$legacy_bw" ] && kill -0 "$legacy_bw" 2>/dev/null; then
-            echo "Stopping legacy per-workspace build-watch (PID $legacy_bw)..."
-            kill "$legacy_bw" 2>/dev/null || true
-            killed=1
-        fi
-        rm -f "$WORKSPACE/.lucidos/build-watch.pid"
-    fi
+    # The build-watch is a checkout-level singleton shared across workspaces,
+    # so a per-workspace restart never touches it. start_frontend_built reuses a
+    # running one.
 
     # Wait for killed processes to release their ports before the caller
     # builds + launches the replacements. The engine needs an explicit wait:
@@ -1602,52 +1345,40 @@ kill_stale_processes() {
     fi
 }
 
-# ── select_tauri_dev_watchers ───────────────────────────────────────────
-# Print the PID of every `cargo tauri dev` watcher running from <app_dir>.
+# ── select_dev_windows ──────────────────────────────────────────────────
+# Print the PID of every dev window running <window_bin>, this checkout's
+# published dev window binary.
 #
-# Cargo execs an external subcommand, so the live process is `cargo-tauri
-# tauri dev ...`: argv[0] is `cargo-tauri`, and the phrase "cargo tauri dev"
-# appears nowhere in it. Selection is on argv[0] plus the `tauri dev`
-# subcommand (ADR 0025), and the cwd decides ownership, so a Tauri project
-# elsewhere on this machine is never selected.
+# Selection is on argv[0] alone (ADR 0025). The launcher starts the window by
+# its resolved path, and the window's own re-exec keeps that path, so a window
+# from another checkout, or a process that only mentions the path, never
+# matches. A path holding a space is matched as a prefix ending in a space.
 #
-# Test seams: `_tauri_dev_ps_feed` prints `<pid> <args>` lines, and
-# `_tauri_dev_cwd` prints one process's cwd.
-_tauri_dev_ps_feed() {
+# Test seam: `_dev_window_ps_feed` prints `<pid> <args>` lines.
+_dev_window_ps_feed() {
     ps -Ao pid=,args= 2>/dev/null || true
 }
 
-_tauri_dev_cwd() {
-    lsof -a -d cwd -p "$1" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+select_dev_windows() {
+    local window_bin="$1" pid args
+    while read -r pid args; do
+        case "$args" in
+            "$window_bin" | "$window_bin "*) printf '%s\n' "$pid" ;;
+            *) ;;
+        esac
+    done < <(_dev_window_ps_feed)
 }
 
-select_tauri_dev_watchers() {
-    local app_dir pid exe sub1 sub2 _rest
-    app_dir="$(cd "$1" 2>/dev/null && pwd -P)" || return 0
-    while read -r pid exe sub1 sub2 _rest; do
-        [ "${exe##*/}" = "cargo-tauri" ] || continue
-        [ "$sub1 $sub2" = "tauri dev" ] || continue
-        # `if`, never `&&`: the caller reads this under `set -e`.
-        if [ "$(_tauri_dev_cwd "$pid")" = "$app_dir" ]; then printf '%s\n' "$pid"; fi
-    done < <(_tauri_dev_ps_feed)
-}
-
-# ── stop_tauri_dev_watchers ─────────────────────────────────────────────
-# Stop the previous `cargo tauri dev` for <app_dir>, and the window it runs.
-# The watcher goes first so it cannot respawn the window. It installs no
-# signal handler (tauri.conf's beforeDevCommand is empty), so it dies without
-# passing the signal on, and its children are stopped by PID.
-stop_tauri_dev_watchers() {
-    local watcher children
-    for watcher in $(select_tauri_dev_watchers "$1"); do
-        if command -v is_protected_host_pid >/dev/null 2>&1 && is_protected_host_pid "$watcher"; then
+# ── stop_dev_windows ────────────────────────────────────────────────────
+# Stop this checkout's previous dev window, so a relaunch leaves one.
+stop_dev_windows() {
+    local window
+    for window in $(select_dev_windows "$1"); do
+        if command -v is_protected_host_pid >/dev/null 2>&1 && is_protected_host_pid "$window"; then
             continue
         fi
-        children="$(pgrep -P "$watcher" 2>/dev/null || true)"
-        echo "Stopping the previous Tauri window (watcher PID $watcher)..."
-        kill "$watcher" 2>/dev/null || true
-        # shellcheck disable=SC2086 # one PID per word
-        [ -z "$children" ] || kill $children 2>/dev/null || true
+        echo "Stopping the previous dev window (PID $window)..."
+        kill "$window" 2>/dev/null || true
     done
 }
 
@@ -1757,6 +1488,9 @@ publish_launch_binary() {
         return 1
     fi
     chmod +x "$tmp" 2>/dev/null || true
+    # The mtime says when this file was published, not when cargo linked it. A
+    # dev window compares it with its engine's start (ADR 0461).
+    touch "$tmp" 2>/dev/null || true
     if [ "$sign" = "sign" ]; then
         sign_engine_binary "$tmp"
     fi
@@ -1818,6 +1552,41 @@ publish_launch_binaries() {
     return $rc
 }
 
+# ── The dev window's launch binary (ADR 0461) ───────────────────────────
+# tauri-dev.sh runs the desktop window from the launch dir, beside the engine
+# and gateway. The build that publishes them publishes it too, so one switch
+# moves all three. Only a checkout that has run a dev window builds it: its
+# first published binary is the opt-in, so a worktree, an e2e build or a
+# machine without Tauri's libraries never compiles the app.
+dev_window_bin() {
+    echo "$1/lucidos-app"
+}
+
+run_dev_window_cargo_build() {
+    cargo_build_in_slot "dev window build" -p lucidos-app
+}
+
+# A running window re-execs onto a NEW file at its path after the next switch,
+# so a rebuild with identical bytes must leave the published file alone.
+publish_dev_window_binary() {
+    local src="$1" dst="$2"
+    if cmp -s "$src" "$dst"; then
+        return 0
+    fi
+    publish_launch_binary "$src" "$dst"
+}
+
+# Build and publish the dev window alone, for the first launch on a checkout.
+# Every later build compiles it with the engine, in build_or_find_engine.
+build_dev_window() {
+    local launch_dir="$1"
+    echo ""
+    echo "Building the dev window..."
+    run_dev_window_cargo_build || return 1
+    publish_dev_window_binary "$(dev_window_bin "$PROJECT_DIR/target/$(engine_build_profile)")" \
+        "$(dev_window_bin "$launch_dir")"
+}
+
 # Classify a published binary's baked build id against the checkout's current
 # HEAD: `current`, `stale`, or `unknown`.
 #
@@ -1875,13 +1644,45 @@ run_engine_cargo_build() {
     if [ -n "${ENGINE_BUILD_FEATURES:-}" ]; then
         feature_args=(--features "$ENGINE_BUILD_FEATURES")
     fi
+    cargo_build_in_slot "engine build" \
+        -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
+}
+
+# `cargo build --locked <args>` under a build slot, in the profile RELEASE
+# picks. The label names the build in the slot's queue.
+cargo_build_in_slot() {
+    local label="$1"
+    shift
     local slot="$PROJECT_DIR/scripts/with-build-slot.sh"
     if [ -n "${RELEASE:-}" ]; then
-        "$slot" --label "engine build (release)" -- \
-            cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli --release
+        "$slot" --label "$label (release)" -- cargo build --locked "$@" --release
     else
-        "$slot" --label "engine build" -- \
-            cargo build --locked -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
+        "$slot" --label "$label" -- cargo build --locked "$@"
+    fi
+}
+
+# Compile every launch binary: the engine, gateway and CLI, then the dev window
+# when <with_window> is set. All of it compiles before anything is published,
+# so a failure leaves the previous version whole and a switch never finds a
+# half-built one (ADR 0461).
+run_launch_cargo_builds() {
+    run_engine_cargo_build || return 1
+    if [ -n "$1" ]; then
+        run_dev_window_cargo_build || return 1
+    fi
+}
+
+# Publish every launch binary run_launch_cargo_builds compiled. Non-zero only
+# when the dev window could not be published. The engine half keeps its own
+# fallback in build_or_find_engine.
+publish_all_launch_binaries() {
+    local uplift_dir="$1" launch_dir="$2" with_window="$3"
+    publish_launch_binaries "$uplift_dir" "$launch_dir" || true
+    # After the engine: an engine started after the window's publish time must
+    # already run this build, or the window would move ahead of it.
+    if [ -n "$with_window" ]; then
+        publish_dev_window_binary "$(dev_window_bin "$uplift_dir")" "$(dev_window_bin "$launch_dir")" \
+            || return 1
     fi
 }
 
@@ -1944,9 +1745,12 @@ build_or_find_engine() {
         return 0
     fi
 
-    local launch_dir uplift_dir
+    local launch_dir uplift_dir with_window=""
     launch_dir="$(launch_bin_dir)"
     uplift_dir="$PROJECT_DIR/target/$(engine_build_profile)"
+    if [ -f "$(dev_window_bin "$launch_dir")" ]; then
+        with_window=1
+    fi
 
     # The build waits on cargo's own lock for any cargo holding target/. Never
     # signal it or delete its lock file: it may be another worktree's build
@@ -1955,9 +1759,9 @@ build_or_find_engine() {
     echo "Building engine..."
     # A caller in an `||` or `if` runs with errexit off, so a failed compile
     # must fail here, or the uplift fallback below serves a stale binary.
-    run_engine_cargo_build || return 1
+    run_launch_cargo_builds "$with_window" || return 1
     prune_stale_debug_objects "$uplift_dir/deps"
-    publish_launch_binaries "$uplift_dir" "$launch_dir" || true
+    publish_all_launch_binaries "$uplift_dir" "$launch_dir" "$with_window" || return 1
 
     # Did this build actually produce a binary for the source on disk now? If
     # HEAD moved while cargo was running, it didn't — rebuild ONCE against the
@@ -1971,9 +1775,9 @@ build_or_find_engine() {
     if [ "$state" = "stale" ]; then
         echo "Built engine is not the source now on disk (HEAD moved during the build,"
         echo "or another build clobbered the shared uplift path) — rebuilding once..."
-        run_engine_cargo_build || return 1
+        run_launch_cargo_builds "$with_window" || return 1
         prune_stale_debug_objects "$uplift_dir/deps"
-        publish_launch_binaries "$uplift_dir" "$launch_dir" || true
+        publish_all_launch_binaries "$uplift_dir" "$launch_dir" "$with_window" || return 1
         state="$(published_build_state "$launch_dir/lucidos-engine")"
     fi
     if [ "$state" = "stale" ]; then
@@ -1983,6 +1787,7 @@ build_or_find_engine() {
         echo "         Something keeps rebuilding an earlier checkout state. The running"
         echo "         engine will refuse to offer it as a new version; rebuild with -b."
     fi
+
 
     # The published pair is already signed with the stable dev identity — that
     # happens inside publish_launch_binaries, on the temp file, BEFORE the
@@ -2039,8 +1844,7 @@ swap_ports() {
         "API_PORT=$ENGINE_PORT" \
         "VITE_PORT=$ENGINE_PORT" \
         "PG_PORT=$PG_PORT" \
-        "PG_DATABASE=$(workspace_database_name)" \
-        "DATABASE_URL=$(workspace_database_url)"
+        "PG_DATABASE=$(workspace_database_name)"
 
     # LUCIDOS_API_PORT here is the ENGINE's port (the legacy/direct + tauri/e2e
     # paths spawn the engine on it). start_gateway overrides LUCIDOS_API_PORT to
@@ -2092,7 +1896,7 @@ enable_clamshell_prevention() {
 # ~/.lucidos/network.toml owns the address when it exists. The shell only
 # chooses between pinning a bind and deferring to that resolver.
 network_toml_exists() {
-    [ -f "$HOME/.lucidos/network.toml" ]
+    [ -f "$(lucidos_home_dir)/network.toml" ]
 }
 
 # Bind for a directly-launched engine (start_engine): legacy no-gateway dev
@@ -2193,7 +1997,18 @@ record_engine_scheme() {
 ENGINE_DRAIN_WAIT_S=10
 
 # ── start_engine ────────────────────────────────────────────────────────
-# Run engine in background, write PID, wait for health (30s). The engine holds
+# The pid of the engine that owns this workspace, when this launch's supervisor
+# started it. An engine from any earlier launch prints nothing.
+engine_pid_of_this_launch() {
+    local pid parent
+    pid="$(engine_live_pid "$WORKSPACE")"
+    [ -n "$pid" ] || return 0
+    parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [ "$parent" = "$ENGINE_SUPERVISOR_PID" ] && echo "$pid"
+    return 0
+}
+
+# Run engine in background and wait for health. The engine holds
 # the Mac awake itself while work runs (ADR 0366), so no caffeinate here.
 # Reuses an existing healthy engine if one is already running for this workspace.
 # Sets ENGINE_PID.
@@ -2209,9 +2024,9 @@ start_engine() {
     # one. The scheme is probed, never assumed (see engine_health_scheme).
     local live_scheme existing_pid
     live_scheme="$(engine_health_scheme "$ENGINE_PORT")"
-    if [ -n "$live_scheme" ] && [ -f "$ENGINE_PIDFILE" ]; then
-        existing_pid="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
-        if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+    if [ -n "$live_scheme" ]; then
+        existing_pid="$(engine_live_pid "$WORKSPACE")"
+        if [ -n "$existing_pid" ]; then
             adopt_engine_scheme "$live_scheme"
             echo ""
             echo "Reusing existing engine (PID $existing_pid) on port $ENGINE_PORT"
@@ -2235,15 +2050,15 @@ start_engine() {
         holder="$(lsof -ti :"$ENGINE_PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
         holder_cmd="$(ps -p "$holder" -o comm= 2>/dev/null || true)"
         # Re-probe rather than reuse live_scheme. This branch is also reached
-        # when the holder IS healthy and merely unclaimable, because no live pid
-        # in our pidfile names it, and a message that says nothing answers would
+        # when the holder IS healthy and merely unclaimable, because no engine
+        # owns this workspace, and a message that says nothing answers would
         # send the reader hunting the wrong fault.
         held_scheme="$(engine_health_scheme "$ENGINE_PORT")"
         echo ""
         echo "ERROR: port $ENGINE_PORT is held by ${holder_cmd:-an unknown process} (PID ${holder:-unknown})"
         if [ -n "$held_scheme" ]; then
-            echo "       It is healthy over $held_scheme, but no live pid in"
-            echo "       $ENGINE_PIDFILE claims it, so this launch cannot adopt it."
+            echo "       It is healthy over $held_scheme, but no engine holds"
+            echo "       $(engine_lock_path "$WORKSPACE"), so this launch cannot adopt it."
         else
             echo "       and nothing answers /api/v1/health there on http or https."
         fi
@@ -2276,51 +2091,30 @@ start_engine() {
     # Spawn the supervisor (engine_supervisor.sh:run_supervised) as a
     # backgrounded subshell. It loops the engine binary so an unexpected
     # kill (SIGKILL from a stale worktree's ports.sh, OOM, panic) becomes
-    # a 1–30 s blip instead of a session outage. Legit stops (exit 0 /
-    # 130 / 138 from SIGUSR1/SIGINT, or SIGTERM to the supervisor itself
-    # from kill_stale_processes' `pkill -P`) flow through cleanly.
-    ( run_supervised "$ENGINE_PIDFILE" "$ENGINE_LOG" "$ENGINE_BIN" ) &
+    # a 1–30 s blip instead of a session outage. Legit stops (exit 0, or
+    # the default exit of SIGINT or SIGUSR1, or SIGTERM to the supervisor
+    # itself from kill_stale_processes' `pkill -P`) flow through cleanly.
+    ( run_supervised "$WORKSPACE/.lucidos" "$ENGINE_LOG" "$ENGINE_BIN" ) &
     ENGINE_SUPERVISOR_PID=$!
-
-    # Wait for the supervisor to write the engine pid. The supervisor
-    # rewrites the pidfile on every (re)start, so this also picks up a
-    # within-startup restart (engine crashes immediately, supervisor
-    # respawns it).
-    local pid_deadline=$(( $(date +%s) + 5 ))
-    while [ "$(date +%s)" -lt "$pid_deadline" ]; do
-        if [ -s "$ENGINE_PIDFILE" ]; then
-            ENGINE_PID="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
-            [ -n "$ENGINE_PID" ] && kill -0 "$ENGINE_PID" 2>/dev/null && break
-        fi
-        sleep 0.1
-    done
-    if [ -z "${ENGINE_PID:-}" ] || ! kill -0 "$ENGINE_PID" 2>/dev/null; then
-        echo ""
-        echo "ERROR: Engine supervisor did not start the engine within 5s. Check logs:"
-        tail -10 "$ENGINE_LOG"
-        kill -KILL "$ENGINE_SUPERVISOR_PID" 2>/dev/null || true
-        exit 1
-    fi
 
     # Wait for engine to be ready. Cold boot does pgvector init, migrations and
     # the memory index load, which can push past 30s on a fresh workspace or a
     # slow disk. Give it 90s before declaring failure. (The embedding model is
     # NOT in that window: it loads in the background and boot never waits on
     # it.)
-    # Re-read $ENGINE_PIDFILE each tick so a supervisor restart during
-    # startup updates ENGINE_PID rather than failing the kill -0 check.
+    #
+    # Ready means the engine of THIS launch owns the workspace and answers. The
+    # engine publishes engine.pid itself once it holds the owner lock, so until
+    # then the file may still name a predecessor that is draining (ADR 0438).
     echo -n "Waiting for engine"
     local engine_ready=""
     for _ in {1..90}; do
-        ENGINE_PID="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
-        if [ -z "$ENGINE_PID" ] || ! kill -0 "$ENGINE_PID" 2>/dev/null; then
-            # Supervisor is between restarts; wait one tick for the next
-            # spawn before checking health.
-            echo -n "."
-            sleep 1
-            continue
+        if ! kill -0 "$ENGINE_SUPERVISOR_PID" 2>/dev/null; then
+            break
         fi
-        if curl -sk "$PROTO://localhost:$ENGINE_PORT/api/v1/health" >/dev/null 2>&1; then
+        ENGINE_PID="$(engine_pid_of_this_launch)"
+        if [ -n "$ENGINE_PID" ] \
+            && curl -sk "$PROTO://localhost:$ENGINE_PORT/api/v1/health" >/dev/null 2>&1; then
             echo " ready!"
             engine_ready="yes"
             break
@@ -2355,9 +2149,8 @@ start_engine() {
 # legacy direct-engine model (engine serves the app at / directly).
 
 # The gateway's app-data dir is machine-global (one gateway per machine), so it
-# is keyed off $HOME, not $WORKSPACE. Mirrors the gateway's own resolve_app_data
-# default ($HOME/.lucidos/gateway).
-gateway_data_dir() { echo "${LUCIDOS_GATEWAY_DATA:-$HOME/.lucidos/gateway}"; }
+# is keyed off $HOME, not $WORKSPACE. `gateway_data_dir` lives in
+# storage_root.sh, beside the home it defaults under.
 gateway_pidfile()  { echo "$(gateway_data_dir)/gateway.pid"; }
 gateway_log()      { echo "$(gateway_data_dir)/gateway.log"; }
 
@@ -2371,7 +2164,8 @@ gateway_log()      { echo "$(gateway_data_dir)/gateway.log"; }
 # A missing file is normal and falls through to a plain `curl`: a workspace can
 # run with no gateway at all, and every caller here already tolerates failure.
 gateway_curl() {
-    local token_file="$HOME/.lucidos/local-token"
+    local token_file
+    token_file="$(lucidos_home_dir)/local-token"
     if [ -r "$token_file" ]; then
         curl -H "x-lucidos-local-token: $(cat "$token_file")" "$@"
     else
@@ -2389,20 +2183,18 @@ gateway_curl() {
 # spawns (`engine_env_overrides` in crates/lucidos-gateway/src/stack.rs), so the
 # engine being stopped carries the answer in its own environment.
 
-# The gateway port of the engine recorded in the pidfile $1, or nothing.
+# The gateway port of the engine that owns workspace $1, or nothing.
 #
-# Nothing means: no pidfile, a stale pid, an engine started with no gateway
-# (LUCIDOS_NO_GATEWAY dev, the e2e harness), or a platform whose `ps` refuses
-# `-E`. Only macOS prints another process's environment that way, and Linux
-# lands on the same fallback the whole script used before. The caller falls back
-# and says so, rather than guessing which gateway a dead engine belonged to.
+# Nothing means: no engine holds the workspace's lock, an engine started with no
+# gateway (LUCIDOS_NO_GATEWAY dev, the e2e harness), or a platform whose `ps`
+# refuses `-E`. Only macOS prints another process's environment that way, and
+# Linux lands on the same fallback the whole script used before. The caller
+# falls back and says so, rather than guessing which gateway an engine belonged
+# to.
 engine_gateway_port() {
     local pid
-    pid="$(cat "$1" 2>/dev/null || true)"
-    case "$pid" in
-        '' | *[!0-9]*) return 0 ;;
-    esac
-    kill -0 "$pid" 2>/dev/null || return 0
+    pid="$(engine_live_pid "$1")"
+    [ -n "$pid" ] || return 0
     proc_env_value "$(ps -E -p "$pid" -o command= 2>/dev/null)" LUCIDOS_GATEWAY_PORT
 }
 
@@ -2435,7 +2227,7 @@ workspace_slug() {
     [ -n "$s" ] && echo "$s" || echo "workspace"
 }
 
-# The URL a desktop window loads (tauri-dev.sh passes it as Tauri's devUrl).
+# The URL a dev window loads (tauri-dev.sh passes it as LUCIDOS_DEV_WINDOW_URL).
 #
 # Gateway mode reaches the workspace through the gateway at /<slug>/, which is
 # the door the packaged app navigates to (desktop.rs). That prefix is what
@@ -2454,54 +2246,34 @@ desktop_window_url() { # <gateway_mode> <proto> <gateway_port> <ws_id> <engine_p
     fi
 }
 
-# Seed/refresh this workspace's entry in the SHARED gateway registry, preserving
-# every other workspace's entry AND this workspace's user-set display name +
-# autostart toggle (so a picker rename / autostart flip sticks across relaunch —
-# only the runtime fields dir/port are refreshed). A brand-new entry
-# is appended with autostart OFF (manual): an explicit launch starts it this
-# session, but it won't auto-start on a future gateway boot unless the user opts
-# in via the picker toggle. The registry `port` is the engine's own port
-# (ENGINE_PORT = VITE_PORT, ADR 0014 §4): the gateway spawns the engine on
-# loopback there and proxies `/<slug>/` to it. Sets GATEWAY_WS_ID.
-seed_gateway_registry() {
-    local data reg id name
-    data="$(gateway_data_dir)"
-    mkdir -p "$data/config"
-    reg="$data/config/workspaces.json"
-    id="$(workspace_slug)"
-    name="$(basename "$WORKSPACE")"
-    GATEWAY_WS_ID="$id"
-    python3 - "$reg" "$id" "$name" "$WORKSPACE" "$ENGINE_PORT" <<'PY'
-import json, sys
-reg, wid, name, wdir, port = sys.argv[1:6]
-try:
-    with open(reg) as f:
-        data = json.load(f)
-except Exception:
-    data = {}
-wss = data.get("workspaces", [])
-found = False
-for w in wss:
-    if w.get("id") == wid:
-        # Preserve user-set name + autostart; refresh only the runtime fields.
-        w["dir"] = wdir
-        w["port"] = int(port)
-        # ADR 0014 §6/§7: steady state is one shared PG cluster with one
-        # database per workspace. A legacy database_url meant "migrate from
-        # per-workspace PG"; once web-dev has migrated/verified this workspace,
-        # remove it so the gateway provisions/uses the shared DB.
-        w.pop("database_url", None)
-        w.setdefault("autostart", False)
-        found = True
-        break
-if not found:
-    wss.append({"id": wid, "name": name, "dir": wdir, "port": int(port),
-                "autostart": False})
-data["workspaces"] = wss
-with open(reg, "w") as f:
-    json.dump(data, f, indent=2)
-PY
-    echo "Gateway registry: $reg  (workspace '$id' → engine :$ENGINE_PORT, database $(workspace_database_name), shared gateway :$GATEWAY_PORT)"
+# Register this workspace with the gateway at `base` (default: the dev
+# gateway on GATEWAY_PORT), and set GATEWAY_WS_ID from its answer.
+#
+# Through the adopt endpoint, never by writing workspaces.json: the gateway owns
+# that file and writes it under its own lock (ADR 0438). The port is the
+# engine's own (ENGINE_PORT = VITE_PORT, ADR 0014 §4). Name and autostart are
+# left out, so a re-adopt keeps what the picker set, and a new entry is named
+# after its directory with autostart off.
+#
+# A refusal fails the launch and quotes the gateway. Carrying on would leave a
+# window on a route the gateway does not know.
+adopt_into_gateway() { # [base-url]
+    local base="${1:-$PROTO://localhost:$GATEWAY_PORT}" body response code
+    body="$(python3 -c 'import json, sys; print(json.dumps({"dir": sys.argv[1], "port": int(sys.argv[2])}))' \
+        "$WORKSPACE" "$ENGINE_PORT")"
+    response="$(gateway_curl -sk --max-time 10 -w '\n%{http_code}' -X POST \
+        -H 'content-type: application/json' --data "$body" \
+        "$base/~/api/v1/control/workspaces/adopt" 2>/dev/null || true)"
+    code="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+    if [ "$code" != 200 ]; then
+        echo "ERROR: the gateway at $base did not register $WORKSPACE (HTTP ${code:-no answer})." >&2
+        [ -z "$response" ] || echo "       It said: $response" >&2
+        return 1
+    fi
+    GATEWAY_WS_ID="$(printf '%s' "$response" \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["workspace"]["id"])')" || return 1
+    echo "Gateway: workspace '$GATEWAY_WS_ID' → engine :$ENGINE_PORT, database $(workspace_database_name), gateway at $base"
 }
 
 # Wait for /<slug>/api/v1/health — the engine the gateway spawned.
@@ -2531,8 +2303,8 @@ wait_for_workspace_health() {
 # rather than adopt the one already answering.
 #
 # Pure, so the decision is testable without a gateway. Args: $1 = ENGINE_ONLY,
-# $2 = non-empty when our engine is already serving its port AND the gateway
-# already knows this workspace, which is what makes it adoptable.
+# $2 = non-empty when our engine is already serving its port. The launch has
+# just registered the workspace, so the gateway's supervise tick adopts it.
 #
 # A restart is the wrong ask when the engine is already up. It tears down every
 # in-flight thread, and those settle crash-shaped because a script carries no
@@ -2552,28 +2324,6 @@ workspace_engine_restart_is_needed() { # <engine_only> <engine_is_live>
     return 1
 }
 
-# Whether the gateway on GATEWAY_PORT already lists this workspace.
-#
-# A running gateway holds its registry in memory and re-reads the file only when
-# the restart POST asks it to (`sync_registry_from_disk`). `adopt_running_engines`
-# walks that same in-memory list, so it can never pick up an entry
-# `seed_gateway_registry` has only written to disk. Adopting an engine for a slug
-# the gateway has never heard of would therefore leave the window on a route
-# nothing serves, for as long as that gateway lives.
-#
-# An unreachable or unparseable answer reads as "does not list it", so the POST
-# still goes out. Falling back to the old unconditional behaviour is the safe
-# direction here.
-gateway_lists_workspace() {
-    local body
-    body="$(gateway_curl -sk --max-time "${LUCIDOS_HEALTH_PROBE_TIMEOUT_S:-2}" \
-        "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces" 2>/dev/null || true)"
-    case "$body" in
-        *"\"id\":\"$GATEWAY_WS_ID\""*|*"\"id\": \"$GATEWAY_WS_ID\""*) return 0 ;;
-    esac
-    return 1
-}
-
 # Make sure this workspace's engine is running, and reachable at /<slug>/.
 #
 # The health wait runs on BOTH branches. An adopted engine may have no gateway
@@ -2586,8 +2336,7 @@ gateway_lists_workspace() {
 # so its branch cannot count on that publish either.
 ensure_workspace_engine_running() {
     local live=""
-    if engine_on_port_serves_workspace "$ENGINE_PORT" "$WORKSPACE" \
-        && gateway_lists_workspace; then
+    if engine_on_port_serves_workspace "$ENGINE_PORT" "$WORKSPACE"; then
         live=1
     fi
     if workspace_engine_restart_is_needed "${ENGINE_ONLY:-}" "$live"; then
@@ -2602,10 +2351,10 @@ ensure_workspace_engine_running() {
 # Start (or reuse) the ONE shared workspace gateway on the fixed GATEWAY_PORT. It
 # spawns + supervises each workspace's engine network-bound on its own
 # ENGINE_PORT (so the app is reachable directly there too, ADR 0014 §4) and
-# routes /<slug>/ + the picker at /~/. Because new workspaces default to
-# autostart OFF, the gateway's own boot does NOT spawn this workspace — so AFTER
-# the gateway is up we always POST its control API to start (or respawn, for an
-# Apply) THIS workspace's engine. Sets GATEWAY_PID; leaves ENGINE_SUPERVISOR_PID
+# routes /<slug>/ + the picker at /~/. Once the gateway is up, this workspace is
+# registered through its adopt endpoint. New workspaces default to autostart
+# OFF, so the gateway's own boot does NOT spawn this one, and
+# ensure_workspace_engine_running starts (or respawns, for an Apply) it. Sets GATEWAY_PID; leaves ENGINE_SUPERVISOR_PID
 # EMPTY (the detached gateway supervisor is a machine-global daemon web-dev.sh
 # must never `wait` on — its non-tty wait falls back to the pidfile poll).
 start_gateway() {
@@ -2613,7 +2362,8 @@ start_gateway() {
     # GATEWAY_PORT (fixed, see swap_ports) and ENGINE_PORT (=VITE_PORT) are set by
     # swap_ports. The gateway's data dir / pidfile / log are machine-global.
     local gw_pidfile gw_log
-    mkdir -p "$(gateway_data_dir)"
+    ensure_storage_root "$(lucidos_home_dir)"
+    ensure_storage_root "$(gateway_data_dir)"
     gw_pidfile="$(gateway_pidfile)"
     gw_log="$(gateway_log)"
 
@@ -2665,6 +2415,7 @@ start_gateway() {
             echo "Reusing existing gateway (PID $existing) on port $GATEWAY_PORT"
             GATEWAY_PID="$existing"; ENGINE_SUPERVISOR_PID=""
             enable_clamshell_prevention
+            adopt_into_gateway || exit 1
             ensure_workspace_engine_running
             return
         fi
@@ -2695,8 +2446,11 @@ start_gateway() {
         if [ -n "$occ" ] && { [[ "$occ_cmd" == *lucidos-gateway* ]] || [[ "$occ_cmd" == *lucidos-engine* ]]; }; then
             echo "Reclaiming gateway port $GATEWAY_PORT from $occ_cmd (PID $occ)..."
             kill -USR1 "$occ" 2>/dev/null || true
-            local _i; for _i in $(seq 1 10); do port_is_free "$GATEWAY_PORT" && break; sleep 0.3; done
-            port_is_free "$GATEWAY_PORT" || kill -KILL "$occ" 2>/dev/null || true
+            # Wait for the process, not the port. A draining gateway closes its
+            # listener at once but holds the data dir's owner lock until it
+            # exits, and the fresh gateway would exit 75 against it (ADR 0438).
+            local _i; for _i in $(seq 1 10); do kill -0 "$occ" 2>/dev/null || break; sleep 0.3; done
+            kill -0 "$occ" 2>/dev/null && kill -KILL "$occ" 2>/dev/null || true
         fi
     fi
 
@@ -2708,7 +2462,11 @@ start_gateway() {
     # on the daemon, and ENGINE_SUPERVISOR_PID is left EMPTY in gateway mode (the
     # gateway, not start_engine, owns the engines) so web-dev.sh's non-tty wait
     # falls back to the pidfile poll instead of blocking on the daemon.
-    ( unset "$AGENT_RUN_ENV"; run_gateway_supervised "$gw_pidfile" "$gw_log" "$GATEWAY_BIN" ) &
+    #
+    # Two launches racing here are safe: the gateway that loses the data dir's
+    # owner lock exits with the already-running code, its supervisor stops,
+    # and gateway.pid keeps naming the winner (ADR 0438).
+    ( unset "$AGENT_RUN_ENV"; run_gateway_supervised "$(gateway_data_dir)" "$gw_log" "$GATEWAY_BIN" ) &
     GATEWAY_SUPERVISOR_PID=$!
     disown "$GATEWAY_SUPERVISOR_PID" 2>/dev/null || true
     ENGINE_SUPERVISOR_PID=""
@@ -2738,9 +2496,9 @@ start_gateway() {
         exit 1
     fi
     # Fresh gateway is up. Its boot adopts already-running engines + spawns
-    # autostart workspaces, but NOT this just-launched one (autostart defaults
-    # OFF), so start it explicitly. Same call the reuse path makes, so both paths
-    # end with this workspace's engine running.
+    # autostart workspaces, but it has not heard of this one yet. Register it,
+    # then start it, exactly as the reuse path does.
+    adopt_into_gateway || exit 1
     ensure_workspace_engine_running
 }
 
@@ -2752,234 +2510,90 @@ start_gateway() {
 # (cleanup_processes) likewise leaves the shared gateway running. To stop the
 # gateway itself: `kill $(cat "$(gateway_data_dir)/gateway.pid")`.
 
-# ── running_frontend_workspaces_in_project ─────────────────────────────
-# Echo workspace names whose frontend.pid points to a live Vite process
-# whose physical cwd is inside the given project directory. Comparison
-# uses `pwd -P`, so a Vite running from one physical checkout (e.g. main)
-# does NOT match a different physical checkout (e.g. a CC worktree under
-# .lucidos/worktrees/) — installs in one don't corrupt the other's
-# node_modules. Assumes Vite was spawned with cwd inside its project root
-# (see start_vite); a Vite launched with `--root` from elsewhere would
-# slip past this check.
-# Subshell so `nullglob` doesn't leak into the caller's shell options.
-running_frontend_workspaces_in_project() (
-    shopt -s nullglob
-    local project="$1"
-    # Optional pid to ignore. In BUILT mode `start_frontend_built` records the
-    # shared build-watch pid as every workspace's `frontend.pid`, so the marker
-    # alone cannot tell a Vite dev server from the watcher itself. A caller
-    # asking "is a dev server holding node_modules" passes the build-watch pid
-    # and gets the honest answer; every existing caller passes nothing and keeps
-    # the ref-count semantics `teardown_shared_build_watch_if_idle` needs.
-    local exclude_pid="${2:-}"
-    local project_real
-    project_real="$(cd "$project" 2>/dev/null && pwd -P || true)"
-    [ -n "$project_real" ] || return 0
-    local pidfile
-    for pidfile in "$HOME"/workspaces/*/.lucidos/frontend.pid; do
-        local pid ws_dir vite_cwd vite_real
-        # `cat … || true` keeps a transient unreadable file from killing the
-        # subshell under the caller's `set -e`.
-        pid="$(cat "$pidfile" 2>/dev/null || true)"
-        [ -n "$pid" ] || continue
-        # An `if`, not a bare `A && B && continue`: a caller running under
-        # `set -e` aborts the whole subshell on the miss, which reads as "no
-        # frontend is running" and is the wrong answer in the unsafe direction.
-        if [ -n "$exclude_pid" ] && [ "$pid" = "$exclude_pid" ]; then continue; fi
-        kill -0 "$pid" 2>/dev/null || continue
-        # `lsof -p PID -a -d cwd -Fn` prints `n<path>` for the cwd FD entry.
-        vite_cwd="$(lsof -p "$pid" -a -d cwd -Fn 2>/dev/null | awk '/^n/ {print substr($0,2); exit}')"
-        [ -n "$vite_cwd" ] || continue
-        vite_real="$(cd "$vite_cwd" 2>/dev/null && pwd -P || true)"
-        [ -n "$vite_real" ] || continue
-        # Conflict if vite's cwd is the project root or anywhere inside it.
-        # Trailing slashes prevent `/a/b` from matching `/a/bb`.
-        case "$vite_real/" in
-            "$project_real/"|"$project_real"/*)
-                ws_dir="${pidfile%/.lucidos/frontend.pid}"
-                echo "${ws_dir##*/}"
-                ;;
-        esac
-    done
-)
-
 # ── shared build-watch (checkout-level singleton) ───────────────────────
-# `vite build --watch` produces the SHARED crates/lucidos-app/dist/ that every
+# The build-watch produces the SHARED crates/lucidos-app/dist/ that every
 # workspace of this checkout serves (each engine serves it directly via
-# LUCIDOS_STATIC_DIR, ADR 0014). It is therefore a checkout-level singleton, NOT
-# per workspace: the first workspace to start it owns it; later workspaces reuse
-# it (start_frontend_built). Rebuilding it per workspace would republish a
-# byte-fresh sw.js into the shared dist/ and spuriously fire the "New version
-# available" toast on every OTHER workspace's open tab (the determinism guard
-# means identical source never changes the BUILD_ID — so the toast only fires
-# when a republish drags those tabs forward).
-build_watch_pidfile() { echo "$PROJECT_DIR/crates/lucidos-app/.build-watch/pid"; }
-build_watch_log()     { echo "$PROJECT_DIR/crates/lucidos-app/.build-watch/log"; }
+# LUCIDOS_STATIC_DIR, ADR 0014). So exactly one runs per checkout, and the last
+# consumer to go tears it down. Three locks in .build-watch/, one role each
+# (ADR 0438):
+#
+#   watch.lock      the watcher's owner lock, held for its whole life. Taken
+#                   blocking (build_watch_exec.pl), so probing it is sound.
+#   start.lock      a launcher deciding whether to spawn one. It passes to the
+#                   wrapper, which releases it once it owns watch.lock.
+#   consumers.lock  shared by every engine serving this dist/ (the engine takes
+#                   it itself), and by a launcher while it starts the watch.
+#                   Teardown takes it exclusively without waiting.
+#
+# The paths match lucidos_owner_lock::build_watch, which the engine reads. A
+# gateway test pins them (the_shell_reads_the_pidfiles_the_owners_write).
+build_watch_dir()            { echo "$PROJECT_DIR/crates/lucidos-app/.build-watch"; }
+build_watch_log()            { echo "$(build_watch_dir)/log"; }
+build_watch_lock()           { echo "$(build_watch_dir)/watch.lock"; }
+build_watch_pidfile()        { echo "$(build_watch_dir)/pid"; }
+build_watch_start_lock()     { echo "$(build_watch_dir)/start.lock"; }
+build_watch_consumers_lock() { echo "$(build_watch_dir)/consumers.lock"; }
 
-# ── host seams (overridden by the test) ─────────────────────────────────
-# Both fail CLOSED when the test replaces them: a synthetic feed is the whole
-# answer, never a fall-back to the real host (ADR 0025). Same posture as
-# preflight_reclaim.sh's seams.
+# The descriptors the build-watch steps hold their locks on. Teardown reuses the
+# start descriptor to wait on watch.lock, since nothing holds start.lock then.
+BUILD_WATCH_CONSUMERS_FD=8
+BUILD_WATCH_START_FD=9
 
-# Every process on this host, one `<pid> <argv>` line each. Deliberately NOT
-# `pgrep -x lucidos-engine`: on macOS pgrep EXCLUDES ancestors of the calling
-# process, and a coding-agent session runs under the very engine whose workspace
-# must be counted. Deliberately also NOT `ps -E` here, which would print every
-# process's whole environment; the environment is read per engine below.
-_build_watch_ps_listing() {
-    ps -ax -o pid=,command= 2>/dev/null
+# 0 while a watcher runs, 1 when none does, 2 when the probe failed.
+build_watch_running() { lock_is_held "$(build_watch_lock)"; }
+
+# The watcher's pid, while one runs.
+build_watch_live_pid() { live_pid "$(build_watch_lock)" "$(build_watch_pidfile)"; }
+
+# Stop a build-watch started before the watch lock existed. It holds no lock,
+# so nothing else can see it, and a new watcher would run beside it. It is the
+# one named by the old pidfile, running `node dev-build-watch.mjs`. Temporary
+# measure: docs/temporary-measures.md § "Pre-lock engine pidfile fallback".
+stop_pre_lock_build_watch() {
+    [ ! -e "$(build_watch_lock)" ] || return 0
+    local pid cmd
+    pid="$(pidfile_pid_running "$(build_watch_pidfile)" node)"
+    [ -n "$pid" ] || return 0
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null)" || return 0
+    cmd="${cmd#* }"
+    [ "${cmd%% *}" = dev-build-watch.mjs ] || return 0
+    echo "Stopping a build-watch from before the watch lock (PID $pid)"
+    kill "$pid" 2>/dev/null || true
 }
 
-# One engine's environment, as `ps -E` prints it: argv first, then NAME=value.
-_build_watch_proc_env() {
-    ps -E -p "$1" -o command= 2>/dev/null
-}
-
-# ── engines_serving_checkout_dist ───────────────────────────────────────
-# Echo the pid of every LIVE engine serving a dist/ inside the given checkout.
-# Returns non-zero when the answer could not be established, which is NOT the
-# same as echoing nothing.
+# Tear down the shared build-watch when nothing serves this checkout any more.
 #
-# This is the authoritative answer to "is anything still serving this checkout",
-# and ADR 0219 is why it asks processes rather than marker files: ownership is
-# what a process answers. `frontend.pid` is written only by start_frontend_built,
-# so an engine the GATEWAY spawned (a lazy start, the restart control API, every
-# in-app Switch) carries no marker and was invisible. One such engine was serving
-# the dev workspace when an unrelated stop read the ref-count as empty and killed
-# the watch out from under it.
+# One exclusive, non-blocking try on consumers.lock decides it. Granted means
+# no engine serves this dist/ and no launcher is starting the watch, and none
+# can register until this lets go. So the decision and the kill cannot be split
+# by a consumer arriving. A refusal always says so.
 #
-# Selection is on argv[0] and never on the whole command line (ADR 0025): a
-# coding-agent session carries its transcript inside a ~22 KB argument, so a
-# substring test matches any session whose conversation quotes this path.
-#
-# Unknown is propagated at BOTH probes, not just the first. The listing is one
-# guard; the per-engine environment read is the other, and leaving it unguarded
-# put the original bug back one level down for an engine whose environment we
-# can see listed but cannot read.
-#
-# `exclude_pid` is the engine THIS caller has already stopped, and it is the
-# exact counterpart of removing `frontend.pid` before the marker scan: a
-# workspace on its way out must not count itself. Without it the primary caller
-# is a guaranteed no-op, because `stop.sh` signals the engine and reaches here
-# milliseconds later while a graceful drain still has seconds to run.
-engines_serving_checkout_dist() (
-    local project="$1" exclude_pid="${2:-}" project_real listing pid argv
-    project_real="$(cd "$project" 2>/dev/null && pwd -P || true)"
-    [ -n "$project_real" ] || return 0
-    listing="$(_build_watch_ps_listing)" || return 1
-    # A herestring, NOT a pipe: a `while` in a pipeline runs in a subshell, and
-    # `return 1` there would exit that subshell rather than this function, so an
-    # unknown discovered mid-loop could not be reported at all.
-    while read -r pid argv; do
-        [ -n "$pid" ] || continue
-        if [ -n "$exclude_pid" ] && [ "$pid" = "$exclude_pid" ]; then continue; fi
-        case "${argv%% *}" in
-            */lucidos-engine | lucidos-engine) ;;
-            *) continue ;;
-        esac
-        local env_line probe_rc=0 static_dir static_real
-        env_line="$(_build_watch_proc_env "$pid")" || probe_rc=$?
-        # A FAILED probe means the pid left between the snapshot and now, so it
-        # serves nothing and skipping it is the right answer.
-        [ "$probe_rc" -eq 0 ] || continue
-        # A probe that succeeded but carried no environment is a LIVE engine we
-        # cannot characterize, and that is unknown rather than "not serving".
-        # Every readable environment has PATH, so its absence is the test.
-        case "$env_line" in
-            *" PATH="*) ;;
-            *) return 1 ;;
-        esac
-        static_dir="$(proc_env_value "$env_line" LUCIDOS_STATIC_DIR)"
-        # Readable environment, no static dir: this engine serves no dist/ at
-        # all, which is a real answer rather than a missing one.
-        [ -n "$static_dir" ] || continue
-        # A dist/ that will not resolve is compared LEXICALLY rather than
-        # dropped. Dropping is the unsafe direction: an engine mid-publish
-        # (dist.staging is renamed onto dist/) would stop counting for exactly
-        # as long as the rename takes, which is when a teardown must not fire.
-        static_real="$(cd "$static_dir" 2>/dev/null && pwd -P || true)"
-        [ -n "$static_real" ] || static_real="$static_dir"
-        # Trailing slashes stop `/a/b` matching `/a/bb`, and keep a worktree's
-        # own dist/ from counting as the main checkout's. Both the resolved and
-        # the literal project path are tried, since only one side may resolve.
-        case "$static_real/" in
-            "$project_real/" | "$project_real"/* | "$project/" | "$project"/*) echo "$pid" ;;
-        esac
-    done <<< "$listing"
-)
-
-# Tear down the shared build-watch only when NO workspace of this checkout is
-# still serving the frontend. Call AFTER this workspace's frontend.pid has been
-# removed, so running_frontend_workspaces_in_project no longer counts us. No-op
-# when no shared build-watch is recorded.
-#
-# Two keep-alive votes, and either one alone spares the watch. The marker scan
-# covers the legacy per-workspace Vite dev server that release_frontend_marker
-# contemplates. The engine query covers every engine-served workspace, whoever
-# spawned it. Each says only "keep it alive", so neither can cause a wrong kill.
-#
-# Every refusal SAYS SO. A silent teardown is why the original incident took
-# hours to read back from a status file that still reported a healthy build.
-#
-# `$1` is the engine this caller has just stopped, excluded from the engine vote
-# for the same reason `frontend.pid` is removed before the marker scan: neither
-# vote may be cast by the workspace on its way out. `cleanup_processes` passes
-# nothing, since its engine deliberately keeps running.
+# It waits for the watcher to exit before letting go, so a launch that
+# registers next never reuses a dying watch. Callers that just stopped their
+# own engine wait for it to exit first, since a draining engine still holds its
+# consumer lock.
 teardown_shared_build_watch_if_idle() {
-    local stopped_engine_pid="${1:-}"
-    local pidfile; pidfile="$(build_watch_pidfile)"
-    [ -f "$pidfile" ] || return 0
-    local marked; marked="$(running_frontend_workspaces_in_project "$PROJECT_DIR")"
-    if [ -n "$marked" ]; then
-        echo "Keeping the shared frontend build-watch: workspace(s) $marked still serve this checkout"
+    [ -d "$(build_watch_dir)" ] || return 0
+    local rc=0
+    flock_try "$BUILD_WATCH_CONSUMERS_FD" "$(build_watch_consumers_lock)" ex || rc=$?
+    if [ "$rc" -eq 1 ]; then
+        echo "Keeping the shared frontend build-watch: an engine or a launch still uses $PROJECT_DIR"
         return 0
     fi
-    # An unreadable process table is UNKNOWN, and unknown never authorizes the
-    # kill. The costs are lopsided: a wrong "still serving" leaks one node
-    # process until the next launch, a wrong "nothing serving" is the incident.
-    local serving rc=0
-    serving="$(engines_serving_checkout_dist "$PROJECT_DIR" "$stopped_engine_pid")" || rc=$?
     if [ "$rc" -ne 0 ]; then
-        echo "Keeping the shared frontend build-watch: could not read the process table to see who serves $PROJECT_DIR"
+        echo "Keeping the shared frontend build-watch: could not read its consumer lock"
         return 0
     fi
-    if [ -n "$serving" ]; then
-        echo "Keeping the shared frontend build-watch: engine(s) $(echo "$serving" | tr '\n' ' ')still serve this checkout"
-        return 0
-    fi
-    local pid; pid="$(cat "$pidfile" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        echo "Stopping shared frontend build-watch (PID $pid) — no workspaces left serving this checkout"
+    local pid
+    pid="$(build_watch_live_pid)"
+    if [ -n "$pid" ]; then
+        echo "Stopping the shared frontend build-watch (PID $pid): nothing serves this checkout any more"
         kill "$pid" 2>/dev/null || true
+        if flock_open "$BUILD_WATCH_START_FD" "$(build_watch_lock)" ex; then
+            flock_close "$BUILD_WATCH_START_FD"
+        fi
     fi
-    rm -f "$pidfile"
-}
-
-# ── release_frontend_marker ─────────────────────────────────────────────
-# Release a workspace's frontend marker (its `.lucidos/frontend.pid`). ADR 0014:
-# the engine serves the built dist/ directly — there is no per-workspace `vite
-# preview`. In built mode frontend.pid records the SHARED build-watch pid purely
-# for ref-counting (running_frontend_workspaces_in_project), so it must NEVER be
-# killed here (peers may share it) — only the FILE is removed; the shared watch's
-# fate is decided by teardown_shared_build_watch_if_idle. A frontend.pid that
-# differs from the shared build-watch pid is a genuine per-workspace process (the
-# legacy/e2e live dev server) and IS killed. Echoes "1" if it killed a process.
-release_frontend_marker() {
-    local pidfile="$1"
-    [ -f "$pidfile" ] || return 0
-    local fpid bwpid
-    fpid="$(cat "$pidfile" 2>/dev/null || true)"
-    bwpid="$(cat "$(build_watch_pidfile)" 2>/dev/null || true)"
-    if [ -n "$fpid" ] && [ "$fpid" != "$bwpid" ] && kill -0 "$fpid" 2>/dev/null; then
-        # Human message to stderr so callers' `$(release_frontend_marker …)` capture
-        # gets ONLY the "1" sentinel on stdout (and still surfaces the line).
-        echo "Stopping frontend dev server (PID $fpid)" >&2
-        kill "$fpid" 2>/dev/null || true
-        rm -f "$pidfile"
-        echo "1"
-        return 0
-    fi
-    rm -f "$pidfile"
+    flock_close "$BUILD_WATCH_CONSUMERS_FD"
 }
 
 # ── _resolve_npm_install_root ─────────────────────────────────────────
@@ -3039,14 +2653,11 @@ _deps_manifest_files() {
 
 # ── ensure_npm_deps ───────────────────────────────────────────────────
 # Run npm install if node_modules is missing or incomplete (no npm install
-# marker), or the dependency fingerprint changed (see _deps_fingerprint — content, not mtime). Refuses if any other
-# workspace has a running frontend dev server inside THIS project
-# ($PROJECT_DIR) — npm workspaces hoists deps to one shared node_modules
-# tree, so mutating it under a running Vite silently corrupts its in-memory
-# module graph (stale inodes) and turns it into a wedged "200 with wrong
-# body" server — manifesting as a blank page in the browser. Vites running
-# from a different physical checkout (e.g. a CC worktree) don't share
-# node_modules with this project and aren't blocked.
+# marker), or the dependency fingerprint changed (see _deps_fingerprint — content, not mtime). Refuses while
+# THIS checkout's build-watch runs: npm workspaces hoists deps to one shared
+# node_modules tree, and replacing it under a running build corrupts that build
+# (a blank page in the browser). The watch lock is per checkout, so a watch in
+# another checkout (e.g. a CC worktree) does not block.
 # Usage: ensure_npm_deps "path/to/package" "label"
 ensure_npm_deps() {
     local dir="$1"
@@ -3082,48 +2693,36 @@ ensure_npm_deps() {
     fi
 
     if [ -n "$needs_install" ]; then
-        local active
-        active="$(running_frontend_workspaces_in_project "$PROJECT_DIR")"
-        if [ -n "$active" ]; then
+        local watch_rc=0 holder
+        build_watch_running || watch_rc=$?
+        if [ "$watch_rc" -ne 1 ]; then
+            holder="this checkout's build-watch (PID $(build_watch_live_pid))"
+            [ "$watch_rc" -eq 0 ] || holder="this checkout's build-watch, whose lock could not be read,"
             # Two non-disruptive paths deliberately keep the running frontend
             # alive and so MUST NOT touch its shared node_modules:
-            #   • --engine-only (CC Apply switch): kill_stale_processes skips the
-            #     Vite + build-watch teardown when ENGINE_ONLY is set, so the
-            #     restart never killed it.
+            #   • --engine-only (CC Apply switch): a per-workspace restart never
+            #     touches the shared build-watch.
             #   • --engine-build (Apply background rebuild): just compiles the new
             #     on-disk binary and exits — no restart, no teardown at all.
-            # For BOTH, build_sdk runs (before the ENGINE_ONLY early-exit in
-            # web-dev.sh, and unconditionally on the --engine-build path), so a
-            # hard-fail (exit 1) here kills the whole build/restart: an engine-only
-            # restart would leave the workspace with NO engine, and a background
-            # rebuild would report "New engine version failed to build" even though
-            # the engine binary compiled fine. So we skip the install, keep the
-            # existing (working) node_modules, and let it proceed; the deferred deps
-            # land on the next full frontend restart (the stamp is intentionally
-            # left un-updated so that restart re-detects the change). Outside these
-            # two paths a running frontend IS a genuine conflict — a second
-            # workspace launch against shared deps — so hard-fail and say so.
+            # For BOTH, generate_build_outputs runs, so a hard-fail here kills the whole build
+            # or restart. So skip the install and keep the working node_modules.
+            # The stamp stays un-updated, so the next full restart re-detects the
+            # change. Outside these two paths a running build-watch IS a genuine
+            # conflict, so hard-fail and say so.
             if [ -n "${ENGINE_ONLY:-}" ] || [ -n "${ENGINE_BUILD_ONLY:-}" ]; then
-                echo "" >&2
-                echo "WARNING: $label changed ($needs_install) but a frontend in this checkout is running for:" >&2
-                while IFS= read -r ws; do
-                    [ -n "$ws" ] && echo "  - $ws" >&2
-                done <<< "$active"
                 local skip_ctx="engine restart"
                 [ -n "${ENGINE_BUILD_ONLY:-}" ] && skip_ctx="background build"
-                echo "Skipping install to keep that frontend alive; the $skip_ctx will still proceed." >&2
-                echo "Run a full restart (./scripts/stop.sh -w <name> then ./scripts/web-dev.sh -w <name>) to pick up the new dependencies." >&2
+                echo "" >&2
+                echo "WARNING: $label changed ($needs_install) but $holder is running." >&2
+                echo "Skipping install to keep it alive; the $skip_ctx will still proceed." >&2
+                echo "The build-watch installs the new dependencies before its next build." >&2
                 echo "" >&2
                 return 0
             fi
             echo "" >&2
-            echo "ERROR: $label install needed ($needs_install), but a frontend in this checkout is running for:" >&2
-            while IFS= read -r ws; do
-                [ -n "$ws" ] && echo "  - $ws" >&2
-            done <<< "$active"
-            echo "" >&2
-            echo "Installing now would silently corrupt those Vite processes (blank page)." >&2
-            echo "Stop them first:  ./scripts/stop.sh -w <name>" >&2
+            echo "ERROR: $label install needed ($needs_install), but $holder is running." >&2
+            echo "Installing now would corrupt the build it is running (blank page)." >&2
+            echo "Stop every workspace of this checkout first:  ./scripts/stop.sh -w <name>" >&2
             echo "" >&2
             exit 1
         fi
@@ -3150,14 +2749,23 @@ ensure_frontend_deps() {
     ensure_npm_deps "$FRONTEND_DIR" "frontend dependencies"
 }
 
-# ── build_sdk ──────────────────────────────────────────────────────────
-# Build the Lucidos SDK bundle (packages/lucidos-sdk → dist/sdk.js).
-# The engine serves this at /api/v1/sdk.js for app UIs.
-build_sdk() {
+# ── generate_build_outputs ─────────────────────────────────────────────
+# Write every generated file (scripts/codegen.sh): the Rust-rendered TS, CSS
+# and JSON, then the SDK bundles in packages/lucidos-sdk/dist/, which the
+# engine serves (/api/v1/sdk.js and the scripts beside it). Runs after
+# build_or_find_engine. When that just compiled, a codegen cache miss renders
+# with the lucidos-codegen it built beside the engine, for free.
+generate_build_outputs() {
     # SDK deps are hoisted to root node_modules by npm workspaces
     ensure_npm_deps "$PROJECT_DIR" "workspace dependencies"
-    echo "Building Lucidos SDK..."
-    (cd "$PROJECT_DIR/packages/lucidos-sdk" && npm run build)
+    echo "Generating build outputs..."
+    local codegen_bin
+    codegen_bin="$PROJECT_DIR/target/$(engine_build_profile)/lucidos-codegen"
+    local -a bin_args=()
+    if [ -n "${BUILD:-}" ] && [ -x "$codegen_bin" ]; then
+        bin_args=(--bin "$codegen_bin")
+    fi
+    "$PROJECT_DIR/scripts/codegen.sh" ${bin_args[@]+"${bin_args[@]}"}
 }
 
 # ── start_vite ──────────────────────────────────────────────────────────
@@ -3188,10 +2796,8 @@ start_vite() {
 # watcher is dropped. Mirrors the one-shot build scripts/lib/e2e.sh uses.
 #
 # Always rebuilds: run.sh passes -b on every launch (so a `git pull` + restart
-# picks up new source), and a fresh `vite build` here is sub-second. Writes NO
-# frontend.pid — there is no process to ref-count, so release_frontend_marker /
-# teardown_shared_build_watch_if_idle stay no-ops for this path (they no-op when
-# the marker files are absent).
+# picks up new source), and a fresh `vite build` here is sub-second. It starts
+# no watcher, so it takes none of the build-watch locks.
 build_frontend_oneshot() {
     echo "Building frontend (one-shot vite build)..."
     # Drop the atomic-publish scratch dirs a prior `vite build --watch` may have
@@ -3217,102 +2823,90 @@ build_frontend_oneshot() {
 # CC harden.
 #
 # The build-watch + dist/ are a CHECKOUT-LEVEL singleton shared by every workspace
-# of this checkout (build_watch_pidfile). This launch REUSES a healthy shared
-# build-watch instead of rebuilding when another workspace is already serving the
-# checkout — a rebuild would republish a byte-fresh sw.js into the shared dist/ and
-# spuriously fire "New version available" on those workspaces' open tabs. A SOLO
-# `-b` restart still rebuilds from scratch (matches the pre-singleton behavior).
-# (The build-watch can no longer serve stale CSS: each rebuild is a fresh `vite
-# build` process with no incremental cache — so there is no wedge to remedy.)
+# of this checkout, held by locks (see the shared build-watch section above).
+# This launch reuses a running watch and starts one only when none runs. A live
+# watch already serves current source, so nothing here replaces it.
+#
+# Holds consumers.lock shared until the watch it reused or started has
+# published dist/, so no teardown can stop that watch first. The engine took
+# its own consumer lock at boot. Holds start.lock while it decides, so two
+# launches never both spawn one.
 start_frontend_built() {
-    local bw_pidfile bw_log
-    bw_pidfile="$(build_watch_pidfile)"
+    local bw_log
     bw_log="$(build_watch_log)"
-    mkdir -p "${bw_pidfile%/*}"
+    mkdir -p "$(build_watch_dir)"
 
-    local existing_pid="" healthy=""
-    if [ -f "$bw_pidfile" ]; then existing_pid="$(cat "$bw_pidfile" 2>/dev/null || true)"; fi
-    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null && [ -f "$FRONTEND_DIR/dist/index.html" ]; then
-        healthy=1
+    flock_open "$BUILD_WATCH_CONSUMERS_FD" "$(build_watch_consumers_lock)" sh || exit 1
+    if ! flock_open "$BUILD_WATCH_START_FD" "$(build_watch_start_lock)" ex; then
+        flock_close "$BUILD_WATCH_CONSUMERS_FD"
+        exit 1
     fi
 
-    # No age-based recycle needed any more: the build-watch (dev-build-watch.mjs)
-    # runs a CLEAN `vite build` in a fresh child process per change, so it has no
-    # long-lived incremental cache to wedge. The served dist/ always reflects the
-    # current source no matter how long the watch has run — the old "recycle an
-    # over-age watch to clear a stale-CSS wedge" heuristic is obsolete.
+    stop_pre_lock_build_watch
+    local watch_rc=0 spawned=""
+    build_watch_running || watch_rc=$?
+    case "$watch_rc" in
+        0)
+            BUILD_WATCH_PID="$(build_watch_live_pid)"
+            flock_close "$BUILD_WATCH_START_FD"
+            echo "Reusing shared frontend build-watch (PID $BUILD_WATCH_PID) serving $FRONTEND_DIR/dist."
+            ;;
+        1)
+            echo "Building frontend (fresh vite build per change)..."
+            # The wrapper inherits start.lock and releases it once it owns
+            # watch.lock. It clears dist/ as the owner, publishes its pid, then
+            # execs the watcher, which LUCIDOS_ATOMIC_DIST-publishes each build.
+            # Output goes to a log (not /dev/null) so a build failure is one
+            # `tail` away. LUCIDOS_CLI_BIN lets the watcher raise a notification
+            # when a build fails. Absolute, the convention `desktop.rs`
+            # `spawn_gateway` uses. LUCIDOS_WORKSPACE is already exported by
+            # `resolve_workspace`, and the CLI needs both.
+            local cli_bin="${ENGINE_BIN:+${ENGINE_BIN%/*}/lucidos}"
+            # The watcher must not inherit this launch's consumer lock, or it
+            # would count itself as a consumer for its whole life.
+            (flock_close "$BUILD_WATCH_CONSUMERS_FD" && cd "$FRONTEND_DIR" \
+                && unset "$AGENT_RUN_ENV" && LUCIDOS_CLI_BIN="$cli_bin" exec perl "$WORKSPACE_LIB_DIR/build_watch_exec.pl" \
+                "$FRONTEND_DIR" "$(build_watch_lock)" "$(build_watch_pidfile)" "$BUILD_WATCH_START_FD" \
+                node dev-build-watch.mjs) > "$bw_log" 2>&1 &
+            BUILD_WATCH_PID=$!
+            spawned=1
+            flock_close "$BUILD_WATCH_START_FD"
+            ;;
+        *)
+            flock_close "$BUILD_WATCH_START_FD"
+            flock_close "$BUILD_WATCH_CONSUMERS_FD"
+            echo "ERROR: could not read $(build_watch_lock), so this launch cannot tell whether a build-watch runs." >&2
+            exit 1
+            ;;
+    esac
 
-    # Is another workspace of THIS checkout currently serving the shared dist/?
-    # (This workspace's own frontend.pid was removed by kill_stale_processes, so
-    # it is not counted here.)
-    local others_serving
-    others_serving="$(running_frontend_workspaces_in_project "$PROJECT_DIR")"
-
-    # Reuse the healthy shared build-watch when another workspace is serving the
-    # checkout (don't disturb their tabs) OR this isn't an explicit `-b` rebuild
-    # (the watch already keeps dist/ current). Otherwise (re)build and take
-    # ownership — covers a dead/broken watch and the solo `-b` rebuild.
-    if [ -n "$healthy" ] && { [ -n "$others_serving" ] || [ -z "${BUILD:-}" ]; }; then
-        echo "Reusing shared frontend build-watch (PID $existing_pid) serving $FRONTEND_DIR/dist."
-        BUILD_WATCH_PID="$existing_pid"
-    else
-        if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-            echo "Replacing existing frontend build-watch (PID $existing_pid)..."
-            kill "$existing_pid" 2>/dev/null || true
+    echo -n "Waiting for the frontend build (log: $bw_log)"
+    local build_deadline=$((SECONDS + 180))
+    while (( SECONDS < build_deadline )); do
+        # A spawned watcher counts only once it owns watch.lock: before that,
+        # dist/index.html may be the previous session's, which it is about to
+        # delete.
+        if [ -f "$FRONTEND_DIR/dist/index.html" ] \
+            && { [ -z "$spawned" ] || [ "$(build_watch_live_pid)" = "$BUILD_WATCH_PID" ]; }; then
+            echo " done!"
+            break
         fi
-        echo "Building frontend (fresh vite build per change)..."
-        # Clean slate. dist/ is the LIVE dir the engine serves; dist.staging/dist.prev
-        # are the atomic-publish scratch dirs (LUCIDOS_ATOMIC_DIST in vite.config.ts):
-        # each build builds into dist.staging and renames it onto dist/ only after a
-        # complete build, so a failed/interrupted rebuild can't leave the engine
-        # serving a shell-less dist/ (the "404 on every page" failure mode).
-        rm -rf "${FRONTEND_DIR:?}/dist" "$FRONTEND_DIR/dist.staging" "$FRONTEND_DIR/dist.prev"
-        # dev-build-watch.mjs runs a clean `vite build` (fresh process, no
-        # incremental cache → no stale-CSS wedge) on every change, setting
-        # LUCIDOS_ATOMIC_DIST for each child build itself. Output goes to a log
-        # (not /dev/null) so a build failure is one `tail` away. `exec` makes the
-        # tracked pid the node watcher itself, so teardown's `kill` lands on it
-        # (firing its SIGTERM handler → kills the in-flight build, no orphan).
-        # LUCIDOS_CLI_BIN lets the watcher raise a notification when a build
-        # fails, which is the only way a wedged build is visible before somebody
-        # reads the log. Absolute path, the same convention `desktop.rs`
-        # `spawn_gateway` uses. LUCIDOS_WORKSPACE is already exported by
-        # `resolve_workspace`, and the CLI needs both.
-        local cli_bin="${ENGINE_BIN:+${ENGINE_BIN%/*}/lucidos}"
-        (cd "$FRONTEND_DIR" && unset "$AGENT_RUN_ENV" && LUCIDOS_CLI_BIN="$cli_bin" exec node dev-build-watch.mjs) > "$bw_log" 2>&1 &
-        BUILD_WATCH_PID=$!
-        echo "$BUILD_WATCH_PID" > "$bw_pidfile"
-
-        echo -n "Waiting for initial frontend build (log: $bw_log)"
-        local build_deadline=$((SECONDS + 180))
-        while (( SECONDS < build_deadline )); do
-            if [ -f "$FRONTEND_DIR/dist/index.html" ]; then echo " done!"; break; fi
-            if ! kill -0 "$BUILD_WATCH_PID" 2>/dev/null; then
-                echo ""
-                echo "ERROR: frontend build-watch exited before producing dist/index.html. See $bw_log" >&2
-                rm -f "$bw_pidfile"
-                exit 1
-            fi
-            echo -n "."
-            sleep 1
-        done
-        if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
+        if [ -n "$spawned" ] && ! kill -0 "$BUILD_WATCH_PID" 2>/dev/null; then
             echo ""
-            echo "ERROR: initial frontend build did not complete within 180s. See $bw_log" >&2
-            kill "$BUILD_WATCH_PID" 2>/dev/null || true
-            rm -f "$bw_pidfile"
+            echo "ERROR: frontend build-watch exited before producing dist/index.html. See $bw_log" >&2
+            flock_close "$BUILD_WATCH_CONSUMERS_FD"
             exit 1
         fi
+        echo -n "."
+        sleep 1
+    done
+    flock_close "$BUILD_WATCH_CONSUMERS_FD"
+    if (( SECONDS >= build_deadline )); then
+        echo ""
+        echo "ERROR: the frontend build did not complete within 180s. See $bw_log" >&2
+        if [ -n "$spawned" ]; then kill "$BUILD_WATCH_PID" 2>/dev/null || true; fi
+        exit 1
     fi
-
-    # No `vite preview` (ADR 0014): the engine serves dist/ directly via
-    # LUCIDOS_STATIC_DIR. Record this workspace's "serving" marker as the SHARED
-    # build-watch pid so teardown ref-counting (running_frontend_workspaces_in_project
-    # → teardown_shared_build_watch_if_idle) keeps the watch alive while any
-    # workspace of the checkout is up, and tears it down when the last one stops.
-    # release_frontend_marker never kills this pid (it matches the build-watch).
-    FRONTEND_PID="$BUILD_WATCH_PID"
-    echo "$FRONTEND_PID" > "$FRONTEND_PIDFILE"
 }
 
 # ── sleep_prevention_status ─────────────────────────────────────────────
@@ -3371,8 +2965,8 @@ show_banner() {
         fi
     fi
     # ADR 0014: the engine serves the built dist/ directly (no Vite in the
-    # serving path) in every mode, including tauri-dev (the window loads dist/
-    # from the engine via devUrl). An --engine-only restart leaves the running
+    # serving path) in every mode, including tauri-dev (the dev window loads
+    # dist/ through the gateway or the engine). An --engine-only restart leaves the running
     # build-watch untouched.
     if [ "$mode" = "engine-only" ]; then
         echo "  Frontend:    built dist/ served by the engine (unchanged)"
@@ -3392,13 +2986,9 @@ show_banner() {
 cleanup_processes() {
     echo ""
     release_sleep_lock
-    # Release this workspace's frontend marker (never kills the shared build-watch
-    # — see release_frontend_marker; ADR 0014).
-    release_frontend_marker "$FRONTEND_PIDFILE" >/dev/null
-    # The `vite build --watch` is a checkout-level singleton shared across
-    # workspaces; tear it down only when no workspace is still serving this
-    # checkout's frontend (this workspace's frontend.pid was removed just above,
-    # so it no longer counts).
+    # The build-watch is a checkout-level singleton. This workspace's engine
+    # keeps running and keeps its consumer lock, so this tears the watch down
+    # only when that engine has already gone.
     teardown_shared_build_watch_if_idle
     echo "Engine still running for workspace: $WORKSPACE (port $ENGINE_PORT)"
     echo "Stop with: ./scripts/stop.sh -w $WORKSPACE"

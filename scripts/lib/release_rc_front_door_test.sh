@@ -370,11 +370,11 @@ else
 fi
 
 # The ordering property itself: inside push_release_candidate, the arm call must
-# appear BEFORE the git push of the rc branch. This is the whole point of the
+# appear BEFORE the push of the rc branch. This is the whole point of the
 # file, so it is asserted structurally rather than by comment.
 fn="$(awk '/^push_release_candidate\(\) \{/,/^\}/' "$RELEASE_SH")"
 arm_line="$(printf '%s' "$fn" | grep -n 'rc_front_door_arm' | head -1 | cut -d: -f1)"
-push_line="$(printf '%s' "$fn" | grep -n 'push --force .*RC_BRANCH' | head -1 | cut -d: -f1)"
+push_line="$(printf '%s' "$fn" | grep -n 'release_tree_push .*RC_BRANCH.* --force' | head -1 | cut -d: -f1)"
 if [[ -n "$arm_line" && -n "$push_line" ]]; then
   if (( arm_line < push_line )); then
     pass "the RC front door is armed before the branch push (line $arm_line < $push_line)"

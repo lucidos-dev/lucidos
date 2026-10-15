@@ -28,6 +28,7 @@ use super::LucidosEngine;
 use crate::api::frontend_snapshot;
 use crate::engine::engine_version::BuildState;
 use chrono::{DateTime, Utc};
+use lucidos_owner_lock::{build_watch, ConsumerLock};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
@@ -95,7 +96,7 @@ fn build_succeeded_since(status_json: &str, since: DateTime<Utc>) -> bool {
 /// `served_dir` is `<app>/dist`, and the watcher keeps its state one level up in
 /// `<app>/.build-watch/`.
 fn build_watch_dir(served_dir: &Path) -> Option<PathBuf> {
-    Some(served_dir.parent()?.join(".build-watch"))
+    Some(build_watch::dir(served_dir.parent()?))
 }
 
 fn read_build_status(served_dir: &Path) -> Option<String> {
@@ -113,7 +114,7 @@ fn read_build_succeeded_since(served_dir: &Path, since: DateTime<Utc>) -> bool {
     read_build_status(served_dir).is_some_and(|status| build_succeeded_since(&status, since))
 }
 
-/// What the build-watch is doing, as far as its pidfile can say.
+/// What the build-watch is doing, as far as its owner lock can say.
 ///
 /// Three states, because two would have to lie about one of them. The status
 /// file alone cannot tell them apart: it records the last COMPLETED build, so a
@@ -122,65 +123,73 @@ fn read_build_succeeded_since(served_dir: &Path, since: DateTime<Utc>) -> bool {
 /// nothing had rebuilt for five hours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuildWatchState {
-    /// The pidfile names a live process.
+    /// A watcher holds `.build-watch/watch.lock`.
     Running,
-    /// The pidfile is gone, unreadable or names a dead process. Both the
-    /// teardown and a failed initial build remove it, so on a stack that uses
-    /// a watch its absence means the watch went away.
+    /// The directory exists and nobody holds the watch lock. The kernel drops
+    /// the lock when the watcher dies, so this is exactly "the watch went
+    /// away".
     Stopped,
     /// No `.build-watch/` at all, so this checkout has never run one. Packaged
     /// is the case that matters: it serves its own bundled Resources, nowhere
     /// near a checkout. Never reported as stopped, because nobody here was
-    /// promised a watch in the first place.
+    /// promised a watch in the first place. A probe that fails also lands here,
+    /// since it cannot say the watch stopped.
     ///
-    /// A checkout that HAS run `web-dev.sh` keeps the directory for good, since
-    /// the teardown removes only the pidfile. So a later one-shot stack over
-    /// the same `dist/` (e2e, `run.sh`) reads Stopped rather than Unknown. That
-    /// is the honest answer there: nothing is watching, and a relaunch is what
-    /// republishes.
+    /// A checkout that HAS run `web-dev.sh` keeps the directory for good. So a
+    /// later one-shot stack over the same `dist/` (e2e, `run.sh`) reads Stopped
+    /// rather than Unknown. That is the honest answer there: nothing is
+    /// watching, and a relaunch is what republishes.
     Unknown,
 }
 
-/// Pure: the state, from what the filesystem and a liveness probe reported.
-///
-/// `pid` is `None` for a missing or unparseable pidfile, which reads the same
-/// as a dead one: either way nothing is watching.
-fn classify_build_watch(dir_exists: bool, pid: Option<i32>, alive: bool) -> BuildWatchState {
-    if !dir_exists {
-        return BuildWatchState::Unknown;
-    }
-    match pid {
-        Some(_) if alive => BuildWatchState::Running,
-        _ => BuildWatchState::Stopped,
-    }
-}
-
-/// Is this pid a live process? `kill(pid, 0)` signals nothing and only asks.
-///
-/// `EPERM` counts as alive: the process exists, we merely may not signal it.
-/// Only `ESRCH` means there is no such process.
-fn pid_is_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: signal 0 delivers nothing. It only performs the existence and
-    // permission checks and reports them through errno.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 /// The build-watch's state for the checkout that owns `served_dir`, read from
-/// the pidfile beside the status file [`read_build_failure`] uses.
+/// the watch lock beside the status file [`read_build_failure`] uses. The
+/// watcher takes that lock blocking, so the probe can never make it lose.
 fn read_build_watch_state(served_dir: &Path) -> BuildWatchState {
-    let Some(dir) = build_watch_dir(served_dir) else {
+    let Some(app) = served_dir.parent() else {
         return BuildWatchState::Unknown;
     };
-    let pid = std::fs::read_to_string(dir.join("pid"))
-        .ok()
-        .and_then(|raw| raw.trim().parse::<i32>().ok());
-    classify_build_watch(dir.is_dir(), pid, pid.is_some_and(pid_is_alive))
+    if !build_watch::dir(app).is_dir() {
+        return BuildWatchState::Unknown;
+    }
+    match lucidos_owner_lock::is_held(&build_watch::watch_lock_path(app)) {
+        Ok(true) => BuildWatchState::Running,
+        Ok(false) => BuildWatchState::Stopped,
+        Err(_) => BuildWatchState::Unknown,
+    }
+}
+
+/// Where this engine registers as a consumer of its checkout's build-watch, or
+/// `None` when `source` is not a dev checkout's `dist/` (packaged, headless).
+fn build_watch_consumer_lock(source: &Path) -> Option<PathBuf> {
+    let app = source.parent()?;
+    app.join(build_watch::SCRIPT)
+        .is_file()
+        .then(|| build_watch::consumers_lock_path(app))
+}
+
+/// Held for this engine's whole life once registered.
+static BUILD_WATCH_CONSUMER: std::sync::OnceLock<ConsumerLock> = std::sync::OnceLock::new();
+
+/// Register this engine as a consumer of the build-watch that republishes
+/// `source`. The teardown takes the consumer lock exclusively without waiting,
+/// so it cannot stop the watch while any engine serves this checkout (ADR
+/// 0438). `main` calls it before waiting for a predecessor. Taken on a thread,
+/// because a teardown in progress must not stall boot. No-op outside a dev
+/// checkout.
+pub fn register_as_build_watch_consumer(source: &Path) {
+    let Some(path) = build_watch_consumer_lock(source) else {
+        return;
+    };
+    std::thread::spawn(move || match ConsumerLock::acquire(&path) {
+        Ok(lock) => {
+            let _ = BUILD_WATCH_CONSUMER.set(lock);
+        }
+        Err(e) => crate::log!(
+            "[Frontend] could not register with the build-watch at {}: {e}",
+            path.display()
+        ),
+    });
 }
 
 /// Whether the source `dist/` has been republished with a client different from
@@ -797,11 +806,12 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        applying_git_gate, build_failure_reason, build_succeeded_since, classify_build_watch,
-        frontend_advance_is_safe, live_refresh_elapsed, peer_git_gate, pid_is_alive,
-        read_build_failure, read_build_succeeded_since, read_build_watch_state, source_rebuilt,
-        BuildState, BuildWatchState,
+        applying_git_gate, build_failure_reason, build_succeeded_since, build_watch_consumer_lock,
+        frontend_advance_is_safe, live_refresh_elapsed, peer_git_gate, read_build_failure,
+        read_build_succeeded_since, read_build_watch_state, source_rebuilt, BuildState,
+        BuildWatchState,
     };
+    use lucidos_owner_lock::{build_watch, OwnerLock};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1023,71 +1033,32 @@ mod tests {
     }
 
     #[test]
-    fn a_watch_is_stopped_when_its_pid_is_gone_or_dead() {
-        // The incident: the teardown removed the pidfile and the status file
-        // kept reporting the healthy build from hours earlier.
-        assert_eq!(
-            classify_build_watch(true, None, false),
-            BuildWatchState::Stopped
-        );
-        assert_eq!(
-            classify_build_watch(true, Some(4242), false),
-            BuildWatchState::Stopped
-        );
-        assert_eq!(
-            classify_build_watch(true, Some(4242), true),
-            BuildWatchState::Running
-        );
-    }
-
-    #[test]
-    fn a_stack_with_no_watch_directory_is_unknown_not_stopped() {
-        // Packaged serving and e2e's one-shot build never run a watch. Telling
-        // either that "the build-watch is not running" names a thing that was
-        // never there, and points at a relaunch that would not help.
-        assert_eq!(
-            classify_build_watch(false, None, false),
-            BuildWatchState::Unknown
-        );
-        // Even if a stale pidfile somehow survived without its directory.
-        assert_eq!(
-            classify_build_watch(false, Some(4242), true),
-            BuildWatchState::Unknown
-        );
-    }
-
-    #[test]
-    fn the_watch_state_is_read_beside_the_served_dist() {
+    fn the_watch_state_is_read_from_the_watch_lock_beside_the_served_dist() {
         // Same `<app>/dist` to `<app>/.build-watch/` relationship the status
         // file uses, so the two can never disagree about where to look.
         let dir = tempfile::tempdir().unwrap();
         let app = dir.path();
-        let watch = app.join(".build-watch");
-        std::fs::create_dir_all(&watch).unwrap();
+        std::fs::create_dir_all(build_watch::dir(app)).unwrap();
 
-        // A torn-down watch: the directory keeps its log and status, the
-        // pidfile is gone.
-        std::fs::write(watch.join("status.json"), r#"{"ok": true}"#).unwrap();
+        // A watch that went away: the directory keeps its log, status and a
+        // pidfile naming a live process, but nobody holds the lock.
+        std::fs::write(build_watch::dir(app).join("status.json"), r#"{"ok": true}"#).unwrap();
+        std::fs::write(build_watch::pid_path(app), std::process::id().to_string()).unwrap();
         assert_eq!(
             read_build_watch_state(&app.join("dist")),
             BuildWatchState::Stopped
         );
 
-        // Our own pid stands in for a live watch. Nothing is signalled: the
-        // probe is `kill(pid, 0)`, which only asks.
-        std::fs::write(watch.join("pid"), format!("{}\n", std::process::id())).unwrap();
+        // The release itself is the crate's to test: a sibling test's fork can
+        // hold the descriptor until it execs, so it is observed promptly, not
+        // instantly.
+        let _watcher = OwnerLock::acquire(&build_watch::watch_lock_path(app)).unwrap();
         assert_eq!(
             read_build_watch_state(&app.join("dist")),
             BuildWatchState::Running
         );
 
-        // A truncated or garbage pidfile reads as stopped, never as running.
-        std::fs::write(watch.join("pid"), "not-a-pid").unwrap();
-        assert_eq!(
-            read_build_watch_state(&app.join("dist")),
-            BuildWatchState::Stopped
-        );
-
+        // Packaged serving and e2e's one-shot build never run a watch.
         let bare = tempfile::tempdir().unwrap();
         assert_eq!(
             read_build_watch_state(&bare.path().join("dist")),
@@ -1096,12 +1067,18 @@ mod tests {
     }
 
     #[test]
-    fn pid_zero_and_negatives_are_never_alive() {
-        // `kill(0, 0)` signals the caller's whole process group and `kill(-1, 0)`
-        // reaches every process it may. Neither is a liveness question, so the
-        // guard runs before the syscall rather than after it.
-        assert!(!pid_is_alive(0));
-        assert!(!pid_is_alive(-1));
-        assert!(pid_is_alive(std::process::id() as i32));
+    fn only_a_dev_checkouts_dist_registers_as_a_build_watch_consumer() {
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(checkout.path().join(build_watch::SCRIPT), "").unwrap();
+        assert_eq!(
+            build_watch_consumer_lock(&checkout.path().join("dist")),
+            Some(build_watch::consumers_lock_path(checkout.path()))
+        );
+        // A packaged bundle serves `Resources/frontend`, with no watch script.
+        let bundle = tempfile::tempdir().unwrap();
+        assert_eq!(
+            build_watch_consumer_lock(&bundle.path().join("frontend")),
+            None
+        );
     }
 }

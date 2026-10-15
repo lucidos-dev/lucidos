@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 import type { Page } from './fixtures';
-import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, disarmFollowSeed } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, disarmFollowSeed, hideHomeRail } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -174,6 +174,7 @@ test.describe('A turn control holds itself still', () => {
       // is made. What gets measured is that haul, hundreds of pixels of it,
       // rather than the sub-pixel drift under test.
       await disarmFollowSeed(page);
+      await hideHomeRail(page);
       await navigateToApp(page);
       await openThreadDrawer(page);
       await clearToasts(page);

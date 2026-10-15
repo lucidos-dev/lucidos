@@ -102,8 +102,10 @@ test.describe('an app capture goes to the device it names', () => {
       const result = await ask(withApp);
       expect(result.slice(0, 200), 'the named device sent its capture').toMatch(/^\[APP_CAPTURE:/);
       expect(result, 'the capture carries the DOM').toContain(DOM_PROBE);
+      // The engine replies once the POST lands, and Playwright reports the
+      // request on its own channel, which can trail that reply on WebKit.
+      await expect.poll(() => answersWithApp.count).toBe(1);
       expect(answersWithoutApp.count, 'the page without the app must not answer').toBe(0);
-      expect(answersWithApp.count).toBe(1);
 
       const shot = /^\[APP_CAPTURE:([^\]]+)\]/.exec(result)?.[1] ?? '';
       const picture = await page.evaluate(async (b64) => {
@@ -136,6 +138,7 @@ test.describe('an app capture goes to the device it names', () => {
       // says which device it came from. The page with the app stays silent.
       const missed = await ask(withoutApp);
       expect(missed).toMatch(/^Error from ".+", the user's last used device in this turn: No app UI is currently open/);
+      await expect.poll(() => answersWithoutApp.count).toBe(1);
       expect(answersWithApp.count, 'the page with the app must not answer a capture for another device').toBe(1);
     } finally {
       await otherContext.close();

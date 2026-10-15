@@ -144,8 +144,21 @@ fn other_system_events_not_persisted() {
         progress: Default::default()
     }
     .is_persisted());
-    assert!(SystemEvent::TreeBackfillCompleted { total: 3 }.is_persisted());
+    assert!(SystemEvent::TreeBackfillCompleted {
+        total: 3,
+        spent_usd: None
+    }
+    .is_persisted());
     assert!(SystemEvent::TreeBackfillReset {}.is_persisted());
+    assert!(SystemEvent::TreeBackfillCapReached {
+        spent_usd: 1.0,
+        cap_usd: 1.0
+    }
+    .is_persisted());
+    assert!(SystemEvent::TreeBackfillEnded {
+        spent_usd: Some(1.0)
+    }
+    .is_persisted());
     assert!(!SystemEvent::Toast {
         message: "hi".into(),
         level: "info".into()

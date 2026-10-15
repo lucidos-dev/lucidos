@@ -12,9 +12,9 @@ import {
 } from './helpers';
 import { ensureHomeThread } from './db-helpers';
 
-/** Only the user names the home thread (ADR 0362). Its menu offers Rename…
- *  but not Suggest name, and a turn on it raises no suggested name. No suffix,
- *  so desktop Chromium, phone Chromium and iPhone WebKit all run it. */
+/** Only the user names the home thread (ADR 0362). Its Rename dialog offers
+ *  no Suggest link, and a turn on it leaves its title alone. No suffix, so
+ *  desktop Chromium, phone Chromium and iPhone WebKit all run it. */
 test.describe('Naming the home thread', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -23,16 +23,18 @@ test.describe('Naming the home thread', () => {
     await waitForThreadTitle(page);
   });
 
-  test('a turn raises no suggested name, and the menu offers Rename… alone', async ({ page }) => {
+  test('a turn keeps the title, and Rename offers no Suggest link', async ({ page }) => {
     await sendMessage(page, `Say exactly: "${uniqueMessage('home-naming')}"`);
     await waitForResponse(page);
 
-    await expect(page.locator('.toast-container').getByText('Suggested name')).toHaveCount(0);
     expect(await getVisibleTitleText(page)).toBe('Home');
 
     expect(await clickVisibleElement(page, '.thread-title-menu')).toBe(true);
     const menu = page.locator('.thread-overflow-menu');
-    await expect(menu.getByRole('menuitem', { name: 'Rename…', exact: true })).toBeVisible();
-    await expect(menu.getByRole('menuitem', { name: 'Suggest name', exact: true })).toHaveCount(0);
+    await menu.getByRole('menuitem', { name: 'Rename…', exact: true }).click();
+    const dialog = page.locator('.confirm-dialog');
+    await expect(dialog.locator('.prompt-input')).toHaveValue('Home');
+    await expect(dialog.locator('[data-role="prompt-suggest"]')).toHaveCount(0);
+    await dialog.locator('[data-role="prompt-cancel"]').click();
   });
 });

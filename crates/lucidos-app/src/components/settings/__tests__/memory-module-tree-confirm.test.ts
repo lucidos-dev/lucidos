@@ -37,6 +37,7 @@ const ESTIMATE: TreeBackfillEstimate = {
   usable_secs: { low: 20 * 60, high: 80 * 60 },
   complete_secs: { low: 6 * 3600, high: 19 * 3600 },
   daily_calls: { low: 700, high: 900 },
+  turn_calls: { low: 7.6, high: 10.9 },
   costs: [{
     model: 'gpt-6.1-sol',
     by_effort: [{
@@ -47,6 +48,9 @@ const ESTIMATE: TreeBackfillEstimate = {
       backfill_usd_central: 1700,
       daily_usd: { low: 12, high: 30 },
       daily_usd_central: 20,
+      turn_usd: { low: 0.04, high: 0.09 },
+      turn_usd_central: 0.06,
+      cap_usd: 2550,
     }, {
       effort: 'medium',
       usable_secs: { low: 30 * 60, high: 60 * 60 },
@@ -55,6 +59,9 @@ const ESTIMATE: TreeBackfillEstimate = {
       backfill_usd_central: 2000,
       daily_usd: { low: 13, high: 38 },
       daily_usd_central: 24,
+      turn_usd: { low: 0.05, high: 0.11 },
+      turn_usd_central: 0.07,
+      cap_usd: 3000,
     }],
   }],
 };
@@ -99,6 +106,7 @@ describe('choosing Tree', () => {
         reachable: true,
         not_served: [],
         needs_vision: false,
+        asks_no_model: false,
         vision: true,
         recommended: [
           { model: 'gpt-6.1-sol', effort: 'low' },
@@ -130,11 +138,12 @@ describe('choosing Tree', () => {
     resolve(ESTIMATE);
     await settle();
     const estimate = host.querySelector('[data-role="tree-estimate"]')?.textContent ?? '';
-    expect(estimate).toContain('210K–260K');
-    expect(estimate).toContain('$1,100–$2,300');
+    expect(estimate).toContain('210K to 260K');
+    expect(estimate).toContain('$1,100 to $2,300');
+    expect(estimate).toContain('Pauses at$2,550');
     // The chosen tier's own times, from its measured call time.
     expect(estimate).toContain('Usable in30 minutes');
-    expect(estimate).toContain('Complete in2–3 hours');
+    expect(estimate).toContain('Complete in2 to 3 hours');
     expect(button(host, 'Start Tree').disabled).toBe(false);
     expect(setMemoryModule).not.toHaveBeenCalled();
 
@@ -180,6 +189,19 @@ describe('choosing Tree', () => {
     expect(setMemoryModule).not.toHaveBeenCalled();
   });
 
+  /** Classic runs while unset, and shows pressed, but pressing it answers the
+   *  memory choice, so it still writes. */
+  it('writes Classic on a workspace that never chose', async () => {
+    const store = await import('../../../store/store');
+    unmount = await mount(host);
+    store.preferences.value = { status: 'loaded', data: {} };
+    await settle();
+    expect(button(host, 'Classic').getAttribute('aria-pressed')).toBe('true');
+
+    button(host, 'Classic').click();
+    expect(setMemoryModule).toHaveBeenCalledExactlyOnceWith('classic');
+  });
+
   it('shows only the error when the estimate fails, and Try again reads it again', async () => {
     getTreeBackfillEstimate
       .mockRejectedValueOnce(new Error('Request timed out after 60000ms'))
@@ -195,7 +217,7 @@ describe('choosing Tree', () => {
     button(host, 'Try again').click();
     await settle();
     expect(getTreeBackfillEstimate).toHaveBeenCalledTimes(2);
-    expect(host.querySelector('[data-role="tree-estimate"]')?.textContent).toContain('210K–260K');
+    expect(host.querySelector('[data-role="tree-estimate"]')?.textContent).toContain('210K to 260K');
     expect(host.textContent).not.toContain('Could not estimate the cost');
     expect(button(host, 'Start Tree').disabled).toBe(false);
   });
@@ -209,8 +231,9 @@ describe('choosing Tree', () => {
     await settle();
     const estimate = host.querySelector('[data-role="tree-estimate"]')?.textContent ?? '';
     expect(estimate).toContain('No estimate for this model');
+    expect(estimate).toContain('No cap for this model');
     // The times fall back to the default seconds per call.
-    expect(estimate).toContain('Complete in6–19 hours');
+    expect(estimate).toContain('Complete in6 to 19 hours');
   });
 
   it('says when it cannot read the compactor model, and still allows Start', async () => {
@@ -242,6 +265,9 @@ describe('choosing Tree', () => {
             backfill_usd_central: 3400,
             daily_usd: { low: 24, high: 60 },
             daily_usd_central: 40,
+            turn_usd: { low: 0.08, high: 0.18 },
+            turn_usd_central: 0.12,
+            cap_usd: 5100,
           }],
         },
       ],
@@ -256,7 +282,7 @@ describe('choosing Tree', () => {
     button(host, 'Tree').click();
     await settle();
     expect(host.querySelector('[data-role="tree-estimate"]')?.textContent)
-      .toContain('$2,200–$4,600');
+      .toContain('$2,200 to $4,600');
   });
 
   /** Each tier shows its own price and time. */
@@ -272,8 +298,8 @@ describe('choosing Tree', () => {
     button(host, 'Tree').click();
     await settle();
     const estimate = host.querySelector('[data-role="tree-estimate"]')?.textContent ?? '';
-    expect(estimate).toContain('$1,200–$3,100');
-    expect(estimate).toContain('Complete in2–5 hours');
+    expect(estimate).toContain('$1,200 to $3,100');
+    expect(estimate).toContain('Complete in2 to 5 hours');
   });
 
   /** At the recommended tier there is nothing to say. Off it, one click

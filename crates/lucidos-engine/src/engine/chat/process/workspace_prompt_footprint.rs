@@ -333,15 +333,16 @@ pub(crate) fn oauth_account_line(account: &crate::core::OAuthAccountInfo) -> Str
     )
 }
 
-/// Build `[STOPPED MCP SERVERS]` from one summary line per stopped server.
-/// Empty when every server runs.
-pub(crate) fn build_stopped_mcp_servers_section(summaries: &[String]) -> String {
-    if summaries.is_empty() {
+/// Build `[MCP SERVERS]` from one line per configured server, each stating
+/// its status in the reading thread (ADR 0430). Empty when the workspace has
+/// no MCP server.
+pub(crate) fn build_mcp_servers_section(lines: &[String]) -> String {
+    if lines.is_empty() {
         return String::new();
     }
     format!(
-        "[STOPPED MCP SERVERS]\nThese MCP servers are configured but not running:\n{}\n[END STOPPED MCP SERVERS]",
-        summaries.join("\n")
+        "[MCP SERVERS]\nThe MCP servers of this workspace. Only a server enabled in this thread sends its tools here.\n{}\n[END MCP SERVERS]",
+        lines.join("\n")
     )
 }
 
@@ -897,6 +898,8 @@ mod tests {
             reusable: false,
             params: Default::default(),
             built_in: false,
+            sizes: Vec::new(),
+            transparent: false,
         }];
         let rendered = build_apps_section(&apps);
         let bullet = rendered
@@ -926,6 +929,8 @@ mod tests {
             reusable: false,
             params: Default::default(),
             built_in: false,
+            sizes: Vec::new(),
+            transparent: false,
         }];
         assert!(build_apps_section(&apps)
             .contains("- **Documents** (id: `documents`): Browse and search saved documents.\n"));
@@ -987,13 +992,13 @@ mod tests {
 
     /// The flight picker that prompted ADR 0405: the agent listed flights as
     /// question options, named the widget after the trip, and pointed at the
-    /// wrong place. ADR 0407 put the widget inline as a card.
+    /// wrong place. ADR 0466 has the agent embed it in its reply.
     #[test]
     fn the_widgets_section_says_where_how_big_what_name_and_when() {
         for automatic in [true, false] {
             let section = build_widgets_section(&[], automatic);
             for rule in [
-                "shows inline at this turn as a card",
+                "then embed it in your reply",
                 "not on the shelf unless pinned",
                 "one phone screen with no scroll area inside",
                 "top screen carries the answer",
@@ -1037,7 +1042,7 @@ mod tests {
         assert!(build_stored_credentials_section(&[]).is_empty());
         assert!(build_email_accounts_section(&[]).is_empty());
         assert!(build_oauth_accounts_section(&[]).is_empty());
-        assert!(build_stopped_mcp_servers_section(&[]).is_empty());
+        assert!(build_mcp_servers_section(&[]).is_empty());
     }
 
     fn summary(id: &str, name: &str, description: &str) -> KnowhowSummary {

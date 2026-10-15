@@ -123,6 +123,7 @@ mod tests {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "hello".into(),
                 user_image_hashes: vec![],
                 device_id: None,

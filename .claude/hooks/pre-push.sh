@@ -2,6 +2,7 @@
 # Pre-push hook: block git push unless `lucidos hardened query` reports FRESH
 # (i.e. /harden has run for the current HEAD). FRESH implies tests passed —
 # /harden runs the test suites for the layers touched as part of its flow.
+# NOT_NEEDED (the branch lands plan files only) passes too, as at Apply.
 
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
@@ -23,7 +24,7 @@ COMMIT_COUNT=$(echo "$UNPUSHED" | wc -l | tr -d ' ')
 STATE=$(cd "$REPO_ROOT" && lucidos hardened query 2>/dev/null)
 
 case "$STATE" in
-  FRESH)
+  FRESH|NOT_NEEDED)
     exit 0
     ;;
   STALE)

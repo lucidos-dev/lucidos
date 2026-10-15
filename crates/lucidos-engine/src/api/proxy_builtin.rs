@@ -342,7 +342,7 @@ async fn resolve_openai(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCod
     // Same resolution order as the OpenAI LLM provider: credential → env → Codex.
     let key = resolve_openai_api_key(
         cred,
-        std::env::var("OPENAI_API_KEY").ok(),
+        std::env::var(crate::llm::OPENAI_API_KEY_ENV).ok(),
         crate::llm::openai::codex_detect::load(),
     )
     .map(|(k, _)| k);
@@ -363,7 +363,7 @@ async fn resolve_openai(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCod
 
 async fn resolve_openrouter(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, String)> {
     let cred = credential_pair(pool, "openrouter").await?;
-    let key = resolve_bearer_key(cred, std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok());
+    let key = resolve_bearer_key(cred, std::env::var(crate::llm::OPENROUTER_API_KEY_ENV).ok());
     let Some(key) = key else {
         return Err(unconfigured_msg(
             "openrouter",

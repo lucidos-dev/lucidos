@@ -1,7 +1,8 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, threadSearchQuery, threadSearchResults } from '../store';
+import { showToast, showConfirm, threadMap, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, threadSearchQuery, threadSearchResults } from '../store';
 import { appliedThreadFilter } from '../appliedThreadFilter';
+import { homeFace, takeHomeLanding } from '../homeBoard';
 import { revealThreadPane } from './pane';
-import type { ThreadMeta, ThreadSection, ThreadState } from '../thread-events';
+import type { ThreadMeta, ThreadState } from '../thread-events';
 import { deepLinkAnchorInThread, describeWaitSubscription, NO_CHANGE } from '../thread-events';
 import type { ConfirmDetailGroup, ConfirmDetails } from '../types';
 import { threadPassesChannelFilter } from '../threadFilter';
@@ -9,9 +10,10 @@ import { computeFamilyGraph, filterByTopThread, ongoingFilter, orderedCurrentFor
 import type { FamilyGraph } from '../../components/drawer/family-graph';
 import { saveThread, unsaveThread, archiveThread, unarchiveThreads, type ArchiveSkippedMember } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
-import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sectionMutatedAt, threadEventsStillArriving } from './thread-loading';
-import { refreshThreadList } from './thread-list-refresh';
+import { abandonRowIntent, acknowledgeRowIntent, archiveRequestInFlight, holdRowIntent, rowRequestInFlight, type RowFields, type RowIntent } from '../rowIntents';
+import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, threadEventsStillArriving } from './thread-loading';
 import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
+import { acknowledgeComposeEdits, knownComposeEpoch, noteLocalComposeEdit, type ComposeReport } from '../composeSync';
 import { scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll, stopFollowingBottom } from '../../components/chat/scrollStateHandle';
 import { pushThreadNavState } from './thread-navigation';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
@@ -76,6 +78,9 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // retires at its own optimistic focus instead.
   if (!wasFocused) stopFollowingBottom();
   setFocusedThread(threadId);
+  // Every way into Home picks the face a phone shows (ADR 0432): the board for
+  // the Home icon and a cold start, the chat for a link or a notification.
+  if (threadMap.value.get(threadId)?.meta.home) homeFace.value = takeHomeLanding();
   rememberOpenedViewRows(threadId);
   resetCodingAgentPendingPreferences();
   // Focusing a thread does NOT position its transcript. `useScrollMemory` owns
@@ -404,36 +409,84 @@ export function formatArchiveSkippedToast(skipped: ArchiveSkippedMember[]): stri
   return `${head} ${lines.join(' ')} Archive again once that is done.`;
 }
 
-function updateThreadMeta(threadId: string, patch: Partial<{ saved: boolean; section: ThreadSection }>): void {
+/** Run `change` on fresh copies of the given threads' meta, and publish the
+ *  map when any of them changed, so every row reader re-renders. */
+export function changeRows(threadIds: Iterable<string>, change: (meta: ThreadMeta) => boolean): void {
   const map = new Map(threadMap.value);
-  const thread = map.get(threadId);
-  if (thread) {
-    map.set(threadId, { ...thread, meta: { ...thread.meta, ...patch } });
-    threadMap.value = map;
+  let changed = false;
+  for (const id of threadIds) {
+    const thread = map.get(id);
+    if (!thread) continue;
+    const meta = { ...thread.meta };
+    if (change(meta)) {
+      map.set(id, { ...thread, meta });
+      changed = true;
+    }
+  }
+  if (changed) threadMap.value = map;
+}
+
+/** The versions to wait for when an engine that predates versioned answers
+ *  acknowledges a write: any row newer than the one this page held as the
+ *  request went out. Read before the request, since a frame can beat the
+ *  response and the write's own version is then already here. */
+export function versionsBeyondCurrent(threadIds: Iterable<string>): Map<string, number> {
+  const versions = new Map<string, number>();
+  for (const id of threadIds) {
+    const thread = threadMap.value.get(id);
+    if (thread) versions.set(id, thread.meta.summaryVersion + 1);
+  }
+  return versions;
+}
+
+/** Lay an optimistic row change over the given threads until the server
+ *  acknowledges it (ADR 0437). */
+function holdRows(threadIds: Iterable<string>, kind: RowIntent['kind'], fields: RowFields): void {
+  changeRows(threadIds, (meta) => {
+    holdRowIntent(meta, kind, fields);
+    return true;
+  });
+}
+
+const ROW_WRITE_VERBS: Record<RowIntent['kind'], string> = { archive: 'archiving', discard: 'discarding', pin: 'pinning', unpin: 'unpinning' };
+
+/** Refuse a row write while the row's previous one is still out, and say
+ *  why. Returns whether it refused. */
+function refuseWhileRowWriteInFlight(threadId: string): boolean {
+  const inFlight = rowRequestInFlight(threadId);
+  if (inFlight) showToast(`Still ${ROW_WRITE_VERBS[inFlight]} this thread. Try again in a moment.`, 'info');
+  return inFlight !== null;
+}
+
+/** Pin or unpin one thread: the row moves at once and holds until it reaches
+ *  the version the server answered with. A refusal shows the server's row
+ *  again and says why. */
+async function writePin(
+  threadId: string,
+  kind: 'pin' | 'unpin',
+  write: (threadId: string) => Promise<{ summary_version?: number }>,
+): Promise<void> {
+  if (refuseWhileRowWriteInFlight(threadId)) return;
+  const legacyVersion = versionsBeyondCurrent([threadId]).get(threadId);
+  // A pinned thread is never archived (ADR 0312): the engine moves it to the
+  // inbox in the same event, so the optimistic pin does too.
+  holdRows([threadId], kind, kind === 'pin' ? { saved: true, section: 'inbox' } : { saved: false });
+  try {
+    const { summary_version } = await write(threadId);
+    const version = summary_version ?? legacyVersion;
+    changeRows([threadId], (meta) => version === undefined
+      ? abandonRowIntent(meta, kind)
+      : acknowledgeRowIntent(meta, kind, version));
+  } catch (e) {
+    changeRows([threadId], (meta) => abandonRowIntent(meta, kind));
+    showToast(`Failed to ${kind} thread: ${errorDetail(e)}`, 'error');
   }
 }
 
 export async function handleSaveThread(threadId: string): Promise<void> {
   const thread = threadMap.value.get(threadId);
   if (!thread || thread.meta.saved) return;
-
-  // A pinned thread is never archived (ADR 0312): the engine moves it to the
-  // inbox in the same event, so the optimistic flip does too.
-  const priorSection = thread.meta.section;
-  sectionMutatedAt.set(threadId, Date.now());
-  updateThreadMeta(threadId, { saved: true, section: 'inbox' });
-  try {
-    await saveThread(threadId);
-  } catch (e) {
-    // A 409 means the thread is already saved — the desired end-state already
-    // holds (a racing/duplicate submit, or a stale client hitting an older
-    // engine). Keep the optimistic pin and stay quiet; only real failures
-    // (network, 5xx) revert + toast. The server is idempotent now, so a fresh
-    // engine won't even 409 here — this is defense in depth.
-    if (e instanceof ApiError && e.httpCode === 409) return;
-    updateThreadMeta(threadId, { saved: false, section: priorSection });
-    showToast(`Failed to pin thread: ${errorDetail(e)}`, 'error');
-  }
+  await writePin(threadId, 'pin', saveThread);
 }
 
 export async function handleUnsaveThread(threadId: string): Promise<void> {
@@ -443,17 +496,7 @@ export async function handleUnsaveThread(threadId: string): Promise<void> {
   if (!await showConfirm('Remove this thread from the Pinned section?', 'Remove', { variant: 'default' })) {
     return;
   }
-
-  updateThreadMeta(threadId, { saved: false });
-  try {
-    await unsaveThread(threadId);
-  } catch (e) {
-    // Mirror of the save path: a 409 means the thread is already unsaved, so
-    // the desired end-state holds — keep the optimistic unpin and stay quiet.
-    if (e instanceof ApiError && e.httpCode === 409) return;
-    updateThreadMeta(threadId, { saved: true });
-    showToast(`Failed to unpin thread: ${errorDetail(e)}`, 'error');
-  }
+  await writePin(threadId, 'unpin', unsaveThread);
 }
 
 // ---------------------------------------------------------------------------
@@ -624,19 +667,27 @@ export function subscriptionsStoppedByArchive(
 }
 
 /** Clear a thread's unsent reply draft — local signal plus the server compose
- *  row. Snapshots the draft so a failed PUT restores it: local and server must
- *  not diverge, or the discarded draft silently reappears on the next load.
- *  Deliberately uses the leaf `composeDrafts` helpers + `putComposeOnThread`
- *  rather than compose.ts's `updateCompose`, so core thread CRUD doesn't pull
- *  the chat-send graph (compose.ts → chat.ts) into its imports. */
+ *  row. The clear stays a pending edit until the PUT answers (ADR 0437). So no
+ *  report can put the draft back meanwhile. A failed PUT restores the draft.
+ *  It uses the leaf store helpers and `putComposeOnThread`, not compose.ts's
+ *  `updateCompose`. So core thread CRUD keeps the chat-send graph (compose.ts
+ *  → chat.ts) out of its imports. */
 function discardThreadDraft(threadId: string): void {
   const prior = getDraft(threadId);
   const restore: ComposeDraft = { ...prior, image_hashes: [...prior.image_hashes] };
+  const seq = noteLocalComposeEdit(threadId);
   clearDraft(threadId);
-  void putComposeOnThread(threadId, '', [], null).catch((e) => {
-    setDraft(threadId, restore);
-    showToast(`Couldn't discard draft: ${errorDetail(e)}`, 'error');
-  });
+  void putComposeOnThread(threadId, '', [], null, undefined, knownComposeEpoch(threadId))
+    .then((result) => {
+      // A stale write still answers with the engine's draft, which a
+      // submission has just consumed.
+      const fallback: ComposeReport = { revision: null, epoch: null, text: '', imageHashes: [], mode: null, selection: null };
+      acknowledgeComposeEdits(threadId, seq, result.report ?? fallback);
+    })
+    .catch((e) => {
+      setDraft(threadId, restore);
+      showToast(`Couldn't discard draft: ${errorDetail(e)}`, 'error');
+    });
 }
 
 /** Move an archived thread, and the sub-threads Archive took with it, back to
@@ -653,8 +704,12 @@ export async function handleUnarchiveThread(threadId: string): Promise<void> {
 export const ARCHIVE_PINNED_CONFIRM = 'Archiving unpins this thread. Move it to the archive?';
 
 export async function handleArchiveThread(threadId: string): Promise<void> {
-  if (archivingThreadIds.value.has(threadId)) return;
+  if (archiveRequestInFlight(threadId)) return;
   if (discardingCCThreadIds.value.has(threadId)) return; // Can't archive while discarding
+  if (applyingNowThreadIds.value.has(threadId)) {
+    showToast('This thread is applying its change. Archive it once the apply ends.', 'info');
+    return;
+  }
 
   // Archiving a pinned thread unpins it: a pinned thread is never archived
   // (ADR 0312). Confirm before it leaves the Pinned section.
@@ -722,53 +777,20 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     if (!proceed) return;
   }
 
-  // Clear stale apply state — applying and archiving are mutually exclusive.
-  // If the user is archiving, any in-progress or stale apply is abandoned.
-  if (applyingNowThreadIds.value.has(threadId)) {
-    const next = new Map(applyingNowThreadIds.value);
-    next.delete(threadId);
-    applyingNowThreadIds.value = next;
-  }
+  if (refuseWhileRowWriteInFlight(threadId)) return;
 
   // Snapshot the position anchor BEFORE the optimistic flip — once the
   // cascade leaves the active view, visibleCandidatesAround() can't compute it.
   const candidates = visibleCandidatesAround(threadId);
 
-  // Snapshot section, pin and change state on every family member so we can
-  // roll back if the API rejects (409 blocking, 500 mid-cascade). All three are
-  // required to leave Current and Pinned: `displaySection` keeps a pinned
-  // thread in Pinned and one with a pending change in Current, whatever
-  // `section` says. An archive leaves the branch's work at `none`: the archive
-  // net sets a pending change aside, and `ThreadArchived` clears what remains.
-  // `cascade` was collected up front (above the draft confirm).
-  type Snap = Pick<ThreadMeta, 'section' | 'saved' | 'codingAgentChangeState'>;
-  const snapshot = new Map<string, Snap>();
-  const optimistic = new Map(threadMap.value);
-  // Stamp BEFORE the flip so any in-flight GET issued before this moment is
-  // considered stale wrt section/change state. See `sectionMutatedAt`
-  // in thread-loading.ts for the iOS-PWA-resume race this prevents.
-  const flippedAt = Date.now();
-  for (const tid of cascade) {
-    const t = optimistic.get(tid);
-    if (!t) continue;
-    sectionMutatedAt.set(tid, flippedAt);
-    snapshot.set(tid, {
-      section: t.meta.section,
-      saved: t.meta.saved,
-      codingAgentChangeState: t.meta.codingAgentChangeState,
-    });
-    optimistic.set(tid, {
-      ...t,
-      meta: { ...t.meta, section: 'archived', saved: false, codingAgentChangeState: NO_CHANGE },
-    });
-  }
-  threadMap.value = optimistic;
-
-  // Every cascade member gets the in-flight flag, not just the root: the
-  // backend's stop_agent emits CodingAgentIdled for each descendant with the
-  // PRE-archive aggregate (section='inbox'), so the SSE archive-race guard
-  // in thread-sync.ts needs to recognise descendants as in-flight too.
-  archivingThreadIds.value = new Set([...archivingThreadIds.value, ...cascade]);
+  // Every family member leaves Current and Pinned at once. Each holds a row
+  // intent until its row reaches the version the archive answered with (ADR
+  // 0437). All three fields are needed: `displaySection` keeps a pinned thread
+  // in Pinned and one with a pending change in Current, whatever `section`
+  // says. An archive leaves the branch's work at `none`: the archive net sets
+  // a pending change aside, and `ThreadArchived` clears what remains.
+  const legacyVersions = versionsBeyondCurrent(cascade);
+  holdRows(cascade, 'archive', { section: 'archived', saved: false, codingAgentChangeState: NO_CHANGE });
 
   // The SSE `ThreadArchived` cascade arriving later just confirms what we
   // already did.
@@ -787,20 +809,19 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     unfocusThread({ revealPane: false });
   }
 
-  let skipped: ArchiveSkippedMember[] = [];
   try {
-    skipped = (await archiveThread(threadId)).skipped ?? [];
-    // A member the engine left unarchived goes back where it was, and the user
-    // is told which and why. The optimistic flip hid it.
+    const { skipped = [], summary_versions: versions } = await archiveThread(threadId);
+    // A member the engine did not archive shows the server's row again: it
+    // skipped it, or it was never in the engine's family. The user is told
+    // about each skip. An engine that sends no versions archived them all.
     const skippedIds = new Set(skipped.map((m) => m.thread_id));
+    changeRows(cascade, (meta) => {
+      const version = versions ? versions[meta.id] : legacyVersions.get(meta.id);
+      return skippedIds.has(meta.id) || version === undefined
+        ? abandonRowIntent(meta, 'archive')
+        : acknowledgeRowIntent(meta, 'archive', version);
+    });
     if (skipped.length > 0) {
-      const restored = new Map(threadMap.value);
-      for (const tid of skippedIds) {
-        const t = restored.get(tid);
-        const snap = snapshot.get(tid);
-        if (t && snap) restored.set(tid, { ...t, meta: { ...t.meta, ...snap } });
-      }
-      threadMap.value = restored;
       // The target itself stayed open: give it its focus back, as a rejected
       // archive does, unless the user has moved on meanwhile.
       if (skippedIds.has(threadId) && focusedThreadId.value === nextId) {
@@ -817,28 +838,14 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
       }
     }
   } catch (e) {
-    const restored = new Map(threadMap.value);
-    for (const [tid, snap] of snapshot) {
-      const t = restored.get(tid);
-      if (!t) continue;
-      restored.set(tid, { ...t, meta: { ...t.meta, ...snap } });
-    }
-    threadMap.value = restored;
+    changeRows(cascade, (meta) => abandonRowIntent(meta, 'archive'));
     // Re-focus the rejected thread only if the user hasn't actively navigated
     // away during the in-flight API call — a user who picked a different
     // thread made a deliberate choice we shouldn't yank them out of.
     const stillOnAutoFocus = focusedThreadId.value === nextId;
-    if (stillOnAutoFocus && restored.has(threadId)) {
+    if (stillOnAutoFocus && threadMap.value.has(threadId)) {
       focusThread(threadId, { revealPane: false });
     }
     showArchiveError(e, threadId);
-  } finally {
-    const next = new Set(archivingThreadIds.value);
-    for (const tid of cascade) next.delete(tid);
-    archivingThreadIds.value = next;
   }
-  // The snapshot is from before the archive. The in-flight guard dropped any
-  // update a skipped member had meanwhile, and its apply or Discard often ends
-  // first. So re-read the list now the guard is off.
-  if (skipped.length > 0) void refreshThreadList();
 }

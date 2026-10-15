@@ -284,7 +284,7 @@ describe('--mobile-header-offset stays off the document root', () => {
     // Only the prompt's HEIGHT, which moves on a resize, may reach `bottom`.
     const offsetUses = mobileCss.split('\n').filter((line: string) => line.includes('--mobile-prompt-offset'));
     expect(offsetUses.length).toBeGreaterThan(0);
-    for (const line of offsetUses) expect(line).toMatch(/^\s*translate: 0 var\(--mobile-prompt-offset/);
+    for (const line of offsetUses) expect(line).toMatch(/^\s*translate: 0 .*var\(--mobile-prompt-offset/);
   });
 
   it('keeps the prompt offset off the root too, on the prompt and the down chevron', () => {
@@ -382,10 +382,11 @@ describe('the dynamic bars glide on a compositor transition', () => {
   }
   const transitionOf = (css: string, selector: string) => declarationOf(css, selector, 'transition');
 
-  it('gives every bar its layer from the start, the prompt included', () => {
+  it('gives every bar its layer from the start, the prompt and the app panel included', () => {
     // Without one, WebKit builds the layer as the glide begins and drops a frame.
     for (const selector of [
       '.app-header',
+      '.mobile-swipe-pane .content-pane-body.has-app-ui .app-ui-inline',
       '.mobile-swipe-pane .mobile-thread-title-row',
       ':root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area',
     ]) {
@@ -1402,46 +1403,18 @@ function createTransformTracker() {
 }
 
 describe('shouldKeepHeaderVisible', () => {
-  // The bug this guards against: opening an app pinned the header on every
-  // pane (threads, chat, content) because the gate was `overlay === 'app-ui'`
-  // alone. The fix narrows it to the content pane where the iframe lives —
-  // on threads/chat panes the iframe is off-screen, so its scroll events
-  // can't reach the parent and the header should hide normally.
-  it('app-ui overlay forces visible on the content pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', dynamicBars: true, findOpen: false })).toBe(true);
+  it('lets the bars move when dynamic bars are on and no find bar is open, an app included', () => {
+    expect(shouldKeepHeaderVisible({ dynamicBars: true, findOpen: false })).toBe(false);
   });
 
-  it('app-ui overlay does NOT force visible on the threads pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: 'app-ui', dynamicBars: true, findOpen: false })).toBe(false);
-  });
-
-  it('app-ui overlay does NOT force visible on the chat pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: 'app-ui', dynamicBars: true, findOpen: false })).toBe(false);
-  });
-
-  it('non-app-ui overlay on content pane does NOT force visible', () => {
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', dynamicBars: true, findOpen: false })).toBe(false);
-  });
-
-  it('no overlay on any pane does NOT force visible', () => {
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: true, findOpen: false })).toBe(false);
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: true, findOpen: false })).toBe(false);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: null, dynamicBars: true, findOpen: false })).toBe(false);
-  });
-
-  it('pinned bars (dynamic bars off) force visible regardless of pane or overlay', () => {
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: false, findOpen: false })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: false, findOpen: false })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'app-ui', dynamicBars: false, findOpen: false })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'url-preview', dynamicBars: false, findOpen: false })).toBe(true);
+  it('pins the bars when dynamic bars are off', () => {
+    expect(shouldKeepHeaderVisible({ dynamicBars: false, findOpen: false })).toBe(true);
   });
 
   // The find bar docks under the header, and each step scrolls. A header that
   // slides with those scrolls drags the bar along.
-  it('an open find bar forces visible on every pane', () => {
-    expect(shouldKeepHeaderVisible({ view: 'thread', overlayType: null, dynamicBars: true, findOpen: true })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'content', overlayType: 'file-preview', dynamicBars: true, findOpen: true })).toBe(true);
-    expect(shouldKeepHeaderVisible({ view: 'threads', overlayType: null, dynamicBars: true, findOpen: true })).toBe(true);
+  it('pins the bars while a find bar is open', () => {
+    expect(shouldKeepHeaderVisible({ dynamicBars: true, findOpen: true })).toBe(true);
   });
 });
 

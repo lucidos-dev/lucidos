@@ -7,13 +7,12 @@ import { inAppBrowserAvailable } from '../../store/actions/preferences';
 import { openAppById } from '../../store/actions/apps';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
-import { isReducedMotion, scaledDurationMs } from '../../utils/motion';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
 import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
 import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 import { MENU_ITEM_LABELS, type MenuItem } from '../../store/types';
-import { drawerAnchor, drawerClosing, drawerOpen, drawerSide, forceCloseDrawer } from './drawerState';
+import { closeDrawer, drawerAnchor, drawerClosing, drawerOpen, drawerSide } from './drawerState';
 import { GlyphBadge } from '../shared/GlyphBadge';
 import { AppIcon } from '../shared/AppIcon';
 import { CategoryIcon } from '../shared/CategoryIcon';
@@ -22,37 +21,6 @@ import { CategoryIcon } from '../shared/CategoryIcon';
  *  Settings are rendered below with a badge of their own, and Notifications is
  *  reached from the bell rather than from here. */
 const menuItems: MenuItem[] = ['files', 'apps', 'plugins', 'triggers'];
-
-/** Close the drawer. Returns `false` when it is already closed or closing, so
- *  the dismiss hook keeps the paired click un-swallowed. `drawerOpen` normally
- *  stays `true` through the slide-out. Without that `false` the hook would eat
- *  a tap on a neighbor button (file-search, content actions) as a dismiss.
- *
- *  Reduced motion has no slide-out to wait for. The CSS drops the animation on
- *  `.drawer.closing`, and an element with no animation fires no `animationend`.
- *  So the close reads `isReducedMotion()`, the value the CSS keys on through
- *  `data-motion`, and closes at once. A scaled fallback timer covers the rest:
- *  motion turning reduced mid-slide, or a frame that never paints. A real close
- *  still returns `true` and the tap is still swallowed. */
-export function closeDrawer(): boolean {
-  if (!drawerOpen.value || drawerClosing.value) return false;
-  if (isReducedMotion()) {
-    forceCloseDrawer();
-    return true;
-  }
-  drawerClosing.value = true;
-  const close = ++closeGeneration;
-  setTimeout(() => {
-    if (close === closeGeneration && drawerClosing.value) forceCloseDrawer();
-  }, scaledDurationMs(DRAWER_SLIDE_OUT_MS) + DRAWER_SLIDE_OUT_SLACK_MS);
-  return true;
-}
-
-/** The `.drawer.closing` slide-out at 1x (`--duration-normal`, mobile.css). */
-const DRAWER_SLIDE_OUT_MS = 200;
-const DRAWER_SLIDE_OUT_SLACK_MS = 100;
-/** Bumped per close, so a stale fallback cannot cut a later close short. */
-let closeGeneration = 0;
 
 interface PinnedUi {
   appId: string;

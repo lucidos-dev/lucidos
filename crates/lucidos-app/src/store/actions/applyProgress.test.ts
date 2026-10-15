@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { ApplyEstimates, Change } from '../../api/client';
-import { NO_APPLY_ESTIMATES, applyAllBatch, applyingNowThreadIds, applyPhases, threadMap, toasts, type ApplyPhaseReading } from '../store';
+import { NO_APPLY_ESTIMATES, applyAllBatch, applyNowRequests, applyPhases, threadMap, toasts, type ApplyPhaseReading } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
 import { focusThread } from './threads';
 import {
@@ -61,7 +61,7 @@ beforeEach(() => {
   ]);
   applyPhases.value = new Map();
   applyAllBatch.value = null;
-  applyingNowThreadIds.value = new Map();
+  applyNowRequests.value = new Map();
   toasts.value = [];
   vi.clearAllMocks();
 });

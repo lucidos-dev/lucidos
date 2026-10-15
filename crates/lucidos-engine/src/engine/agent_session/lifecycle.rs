@@ -4,8 +4,9 @@
 /// to a plain loop break at the call site, not `stop.notify_one()`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum IdleAction {
-    /// Conflict-resolution session: break the run loop so post-loop cleanup
-    /// tears down CC and removes the merge worktree.
+    /// Resolution session (a merge fix or a lane thread): break the run loop
+    /// so its completion applies, lands or reports the resolution. A
+    /// follow-up still on its way keeps the session for one more turn.
     EndSession,
     /// Normal user session: kill CC; the next message resumes a fresh process.
     ExitSubprocess,
@@ -14,10 +15,10 @@ pub(super) enum IdleAction {
     Nothing,
 }
 
-/// Conflict resolution wins regardless of shutdown: the merge worktree is
-/// throwaway and recovery never resumes a conflict session.
-pub(super) fn idle_action(is_conflict: bool, is_shutdown: bool) -> IdleAction {
-    if is_conflict {
+/// A resolution session wins regardless of shutdown: its completion owns the
+/// resolution, and recovery never resumes a merge fix.
+pub(super) fn idle_action(is_resolution_session: bool, is_shutdown: bool) -> IdleAction {
+    if is_resolution_session {
         IdleAction::EndSession
     } else if is_shutdown {
         IdleAction::Nothing
@@ -162,9 +163,9 @@ pub(super) fn terminate_decision(
 /// and an Apply or Discard stop, which owns the change itself.
 ///
 /// External repos never produce Lucidos changes, and a shutdown is mid-work
-/// rather than idle. A conflict-resolution session runs in a `merge-tmp`
-/// worktree where the merge IS the change being applied. Proposing there
-/// creates a phantom second change row nothing resolves.
+/// rather than idle. A resolution session works where the merge IS what lands:
+/// a merge fix's worktree, or a lane thread's integration branch. Proposing
+/// there creates a phantom second change row nothing resolves.
 ///
 /// A live event wait holds a clean idle's proposal (ADR 0395): the agent parked
 /// mid-work, and the wait re-opens the thread. That idle only keeps an existing
@@ -174,7 +175,7 @@ pub(super) fn idle_change_write(
     session: IdleSession,
     terminal_kind: &Option<TerminalKind>,
 ) -> Option<IdleChangeWrite> {
-    if session.is_external_repo || session.is_shutdown || session.is_conflict_session {
+    if session.is_external_repo || session.is_shutdown || session.is_resolution_session {
         return None;
     }
     match terminal_kind {
@@ -194,7 +195,7 @@ pub(super) fn idle_change_write(
 pub(super) struct IdleSession {
     pub(super) is_external_repo: bool,
     pub(super) is_shutdown: bool,
-    pub(super) is_conflict_session: bool,
+    pub(super) is_resolution_session: bool,
     /// The thread holds an event wait that has not been delivered, expired or
     /// canceled.
     pub(super) holds_live_wait: bool,
@@ -505,6 +506,48 @@ pub(super) fn conflict_resolution_cleanup_action(
     }
     ConflictResolutionCleanupAction::Abort {
         message: "Conflict resolution did not finish cleanly — merge aborted. The change is still pending; try applying again.",
+    }
+}
+
+/// How a lane thread's run ended, for the landing lane.
+///
+/// A user Stop ends the turn and keeps the batch open, as Stop keeps any
+/// session resumable. That covers a Stop the run loop took (`stop`) and a
+/// turn the agent ended as canceled. An Apply, Discard or Archive on the
+/// thread fails the batch: the thread is not coming back to it.
+///
+/// Otherwise it is the decision [`conflict_resolution_cleanup_action`] makes:
+/// only a clean `Generated` turn with nothing unmerged completes, and a
+/// pending continuation hands the batch on (`None`). Anything else fails the
+/// batch whole.
+pub(super) fn lane_thread_end(
+    has_unmerged: bool,
+    last_terminal: &Option<TerminalKind>,
+    continuation_pending: bool,
+    stop: Option<crate::engine::StopReason>,
+) -> Option<crate::engine::landing_lane::LaneThreadEnd> {
+    use crate::engine::landing_lane::{LaneThreadEnd, LANE_THREAD_CLOSED};
+    use crate::engine::thread_events::CancelCause;
+    use crate::engine::StopReason;
+    match stop {
+        Some(StopReason::UserStop) => return Some(LaneThreadEnd::Stopped),
+        Some(StopReason::Apply | StopReason::Discard | StopReason::Archive) => {
+            return Some(LaneThreadEnd::Failed(LANE_THREAD_CLOSED.to_string()))
+        }
+        None => {}
+    }
+    match conflict_resolution_cleanup_action(has_unmerged, last_terminal, continuation_pending) {
+        ConflictResolutionCleanupAction::Apply => Some(LaneThreadEnd::Completed),
+        ConflictResolutionCleanupAction::HandOff => None,
+        ConflictResolutionCleanupAction::Abort { .. } => Some(match last_terminal {
+            Some(TerminalKind::Canceled(CancelCause::UserAction)) => {
+                LaneThreadEnd::Failed(LANE_THREAD_CLOSED.to_string())
+            }
+            Some(TerminalKind::Canceled(_)) => LaneThreadEnd::Stopped,
+            _ => LaneThreadEnd::Failed(
+                "The lane thread ended without finishing its merges.".to_string(),
+            ),
+        }),
     }
 }
 
@@ -1003,19 +1046,19 @@ pub(super) fn transient_api_failure_error(terminal: &Option<TerminalKind>) -> Op
 ///   it is down.
 /// * Engine shutdown: recovery re-adopts in-flight threads after restart, and a
 ///   continuation emitted into a dying engine races that.
-/// * Conflict-resolution session: it carries an apply's merge duty and a parked
-///   actor, and its cleanup decides hand-off from the watchdog's own flags. A
-///   third continuation source in that interlock is out of scope.
+/// * Resolution session: it carries an apply's merge duty or a lane batch, and
+///   its cleanup decides hand-off from the watchdog's own flags. A third
+///   continuation source in that interlock is out of scope.
 pub(super) fn auto_resume_after_api_error(
     terminal: &Option<TerminalKind>,
     resumes_spent: i64,
     is_shutdown: bool,
-    is_conflict_session: bool,
+    is_resolution_session: bool,
 ) -> bool {
     terminal.as_ref().is_some_and(is_transient_api_failure)
         && resumes_spent < MAX_API_ERROR_AUTO_RESUMES
         && !is_shutdown
-        && !is_conflict_session
+        && !is_resolution_session
 }
 
 /// What the engine owes the parent once it has settled whether the terminal it

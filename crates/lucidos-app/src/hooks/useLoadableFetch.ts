@@ -25,14 +25,8 @@ export function useLoadableFetch<T>(
      *  a REFRESH of the same thing, e.g. an SSE epoch. Wrong when they name a
      *  different thing, e.g. another file, where the old content is a lie. */
     keepLoadedWhileRefetching?: boolean;
-    /** Checked when the reply lands, not when the fetch starts. Return false
-     *  to drop it. The dep-change cancel cannot cover this: what makes a reply
-     *  unwanted here is something that did NOT change the deps, such as the
-     *  user typing into the very content being re-read. Read it from a ref;
-     *  state read at render time is a render behind. */
-    stillWanted?: () => boolean;
-    /** Called when a wanted reply lands, loaded or failed. A cancelled or
-     *  unwanted fetch never calls it. */
+    /** Called when a reply lands, loaded or failed. A cancelled fetch never
+     *  calls it. */
     onSettled?: () => void;
   } = {},
 ): LoadableFetchResult<T> {
@@ -41,17 +35,16 @@ export function useLoadableFetch<T>(
 
   useEffect(() => {
     let canceled = false;
-    const wanted = () => !canceled && (opts.stillWanted?.() ?? true);
     if (opts.keepLoadedWhileRefetching) setLoadable(loadingIfFresh);
     else setLoadable({ status: 'loading' });
     fetcher()
       .then((data) => {
-        if (!wanted()) return;
+        if (canceled) return;
         setLoadable({ status: 'loaded', data });
         opts.onSettled?.();
       })
       .catch((e: unknown) => {
-        if (!wanted()) return;
+        if (canceled) return;
         setLoadable(toFailed(e));
         opts.onSettled?.();
       });

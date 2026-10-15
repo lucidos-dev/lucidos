@@ -464,6 +464,8 @@ impl LucidosEngine {
             binary_override: copy.binary_override.as_deref(),
             permission_mode: copy.permission_mode.as_deref(),
             additional_directories: &copy.additional_directories,
+            auto_compact: None,
+            agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
         };
         let reply =
             crate::runtime::claude_code::ask_side_question(args, question, images, deadline)

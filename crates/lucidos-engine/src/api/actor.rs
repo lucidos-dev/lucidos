@@ -425,9 +425,9 @@ pub fn subprocess_origin_env_vars(
 /// ports and took down its own host).
 ///
 ///   * `LUCIDOS_HOST_PID`     — always set; the engine's own pid.
-///   * `LUCIDOS_FRONTEND_PID` — set only when `<workspace>/.lucidos/frontend.pid`
-///     exists and is non-blank (web-dev mode; Tauri / production-bundled
-///     installs have no separate Vite process).
+///   * `LUCIDOS_FRONTEND_PID` — the checkout's build-watch, set only while a
+///     watcher holds the watch lock beside `LUCIDOS_STATIC_DIR` (web-dev mode;
+///     Tauri / production-bundled installs run no build-watch).
 ///   * `LUCIDOS_API_PORT`     — re-exported when the engine itself was given
 ///     one, so the pre-kill hook can block `lsof -ti :<port> | xargs kill`
 ///     patterns targeting the engine port.
@@ -441,17 +441,13 @@ pub fn subprocess_origin_env_vars(
 ///     Absent in legacy / Tauri / production (engine on the user-facing port —
 ///     the ports file resolves it), keyed off `LUCIDOS_BIND_LOOPBACK`, which
 ///     only the gateway sets.
-pub fn host_protection_env_vars(workspace_path: &std::path::Path) -> Vec<(&'static str, String)> {
+pub fn host_protection_env_vars() -> Vec<(&'static str, String)> {
     let mut vars: Vec<(&'static str, String)> = Vec::with_capacity(4);
     vars.push(("LUCIDOS_HOST_PID", std::process::id().to_string()));
-    let frontend_pid_path = workspace_path.join(".lucidos/frontend.pid");
-    if let Ok(contents) = std::fs::read_to_string(&frontend_pid_path) {
-        // Validate as u32: a multi-line pidfile (or other junk) would
-        // otherwise inject an embedded newline into the env var and break the
-        // hook's regex match — silently disabling the guard for that pid.
-        if let Ok(pid) = contents.trim().parse::<u32>() {
-            vars.push(("LUCIDOS_FRONTEND_PID", pid.to_string()));
-        }
+    if let Some(pid) = std::env::var_os("LUCIDOS_STATIC_DIR")
+        .and_then(|dir| build_watch_pid(std::path::Path::new(&dir)))
+    {
+        vars.push(("LUCIDOS_FRONTEND_PID", pid.to_string()));
     }
     if let Ok(api_port) = std::env::var("LUCIDOS_API_PORT") {
         if !api_port.is_empty() {
@@ -477,6 +473,13 @@ pub fn host_protection_env_vars(workspace_path: &std::path::Path) -> Vec<(&'stat
         }
     }
     vars
+}
+
+/// The pid of the build-watch republishing `static_dir`, while one runs. Parsed
+/// as a `u32`, so a junk pidfile cannot inject a newline into the env var and
+/// silently disable the hook's match.
+pub(crate) fn build_watch_pid(static_dir: &std::path::Path) -> Option<u32> {
+    lucidos_owner_lock::build_watch::live_pid(static_dir.parent()?)
 }
 
 /// Cross-workspace origin info, extracted from request body `caller_*` fields.

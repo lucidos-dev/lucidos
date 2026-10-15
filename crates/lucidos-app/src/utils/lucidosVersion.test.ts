@@ -8,7 +8,7 @@ import { dirname, resolve } from 'node:path';
 import { lucidosVersionLabel, lucidosVersionTooltip } from './lucidosVersion';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const HEADER_MARK = resolve(here, '../components/layout/HeaderMark.tsx');
+const BRAND_MENU_ROWS = resolve(here, '../components/layout/BrandMenuRows.tsx');
 
 describe('lucidosVersionLabel', () => {
   it('is the bare release when the code matches it', () => {
@@ -60,7 +60,7 @@ describe('the Lucidos menu identity row', () => {
    * assertion is about which SOURCE the row reads, which a render test could
    * only observe indirectly.
    */
-  const source = readFileSync(HEADER_MARK, 'utf-8');
+  const source = readFileSync(BRAND_MENU_ROWS, 'utf-8');
 
   it('reads the umbrella release and its dirty flag', () => {
     expect(source).toMatch(/lucidosVersionLabel\(release, releaseDirty\)/);

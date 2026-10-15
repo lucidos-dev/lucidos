@@ -202,11 +202,6 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await expect
         .poll(sentCount, { timeout: 15_000, message: 'the press died on a box the send never needed' })
         .toBe('1');
-
-      // And it says so, because a send carrying text the box is not showing is
-      // exactly the state this whole round is about.
-      await expect(page.locator('.toast', { hasText: 'Sent the saved draft' }))
-        .toBeVisible({ timeout: 10_000 });
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

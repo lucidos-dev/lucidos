@@ -21,8 +21,8 @@ impl LucidosEngine {
         // is best-effort — failures (e.g. zero-commit branch, missing
         // worktree on disk) leave the field as `None`.
         let worktree_head_sha = match snapshot.worktree_path {
-            Some(p) => external_edits::git_head_sha(p).await,
-            None => None,
+            Some(p) if !snapshot.keep_alive => external_edits::git_head_sha(p).await,
+            _ => None,
         };
         // Clear any permission card still dangling at this turn boundary. A live
         // card blocks the turn (so idle can't fire during a genuine wait); by
@@ -52,7 +52,9 @@ impl LucidosEngine {
                         requires_restart: snapshot.requires_restart,
                         cc_session_id,
                         coding_agent,
-                        reason: None,
+                        reason: snapshot.keep_alive.then(|| {
+                            crate::engine::thread_events::KEEP_ALIVE_IDLE_REASON.to_string()
+                        }),
                         worktree_path: snapshot
                             .worktree_path
                             .map(|p| p.to_string_lossy().into_owned()),
@@ -75,4 +77,8 @@ pub(super) struct CodingAgentIdleSnapshot<'a> {
     pub(super) requires_restart: bool,
     pub(super) bg_bash_pending: bool,
     pub(super) worktree_path: Option<&'a std::path::Path>,
+    /// The turn was a *cache keep-alive*. Its idle carries the keep-alive
+    /// reason and no HEAD, so the next real turn still diffs against the last
+    /// real idle.
+    pub(super) keep_alive: bool,
 }

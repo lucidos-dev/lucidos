@@ -5,12 +5,6 @@ use crate::engine::LucidosEngine;
 use uuid::Uuid;
 
 impl LucidosEngine {
-    pub(crate) fn clear_spawn_debounce(&self, thread_id: Uuid) {
-        if let Ok(mut spawns) = self.last_spawn.lock() {
-            spawns.remove(&thread_id);
-        }
-    }
-
     /// Which backend drives this thread, from the `thread_summaries`
     /// projection. NULL / missing row / DB error all default to `ClaudeCode`
     /// — every thread persisted before the column existed was CC, and the
@@ -342,6 +336,7 @@ impl LucidosEngine {
             .emit(crate::engine::event_bus::BusEvent::Thread {
                 thread_id,
                 event: crate::engine::thread_events::ThreadEvent::CodingAgentPromptSent {
+                    input_event_id: None,
                     text: prompt.to_string(),
                     coding_agent,
                     origin: Some(MessageOrigin::engine(reason)),
@@ -367,6 +362,87 @@ impl LucidosEngine {
         // Fire-and-forget: the watcher cleans up on panic; nobody awaits it.
         // Dropping the JoinHandle detaches the already-spawned watcher (it keeps running).
         drop(Self::monitor_cc_task(engine, thread_id, handle));
+    }
+
+    /// Send `prompt` to the coding-agent thread `thread_id` as an engine turn,
+    /// through the router like any message. The first turn opens the thread,
+    /// named `title`, in the inbox. A lane thread and a fix thread open this
+    /// way, so they keep the ordinary steps, questions and recovery.
+    pub(crate) fn spawn_engine_coding_turn(
+        self: &std::sync::Arc<Self>,
+        thread_id: Uuid,
+        prompt: String,
+        title: Option<String>,
+        reason: EngineReason,
+    ) {
+        self.spawn_engine_coding_turn_or_else(thread_id, prompt, title, reason, |_| {});
+    }
+
+    /// [`Self::spawn_engine_coding_turn`], calling `on_failure` with the
+    /// error when the turn fails.
+    pub(crate) fn spawn_engine_coding_turn_or_else(
+        self: &std::sync::Arc<Self>,
+        thread_id: Uuid,
+        prompt: String,
+        title: Option<String>,
+        reason: EngineReason,
+        on_failure: impl FnOnce(&str) + Send + 'static,
+    ) {
+        let engine = self.clone();
+        Self::spawn_cc_task_guarded(engine.clone(), thread_id, async move {
+            let result = engine
+                .process_message_with_steps(
+                    &prompt,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                    None,
+                    Some(thread_id),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    crate::engine::thread_events::ActorMode::Engine,
+                    None,
+                    None,
+                    None,
+                    title.as_deref(),
+                    Some(MessageOrigin::engine(reason)),
+                    None,
+                    crate::engine::FollowUpUrgency::Normal,
+                    None,
+                )
+                .await;
+            match result {
+                Ok(res) if !res.orphaned_injections.is_empty() => {
+                    crate::api::chat::process_orphan_chain(
+                        engine.clone(),
+                        res.thread_id,
+                        res.orphaned_injections,
+                    )
+                    .await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    crate::log!("[AgentSession] engine turn on {} failed: {}", thread_id, e);
+                    on_failure(&e.to_string());
+                    crate::engine::claude_code::emit_background_task_failure(
+                        &engine,
+                        thread_id,
+                        &e,
+                        "[AgentSession] engine turn failure",
+                    )
+                    .await;
+                }
+            }
+        });
     }
 
     /// Monitor a spawned CC task's JoinHandle. If it panics, emit `ResponseFailed`
@@ -780,6 +856,7 @@ mod tests {
                 event: ThreadEvent::MessageReceived {
                     provider: None,
                     voice_session_id: None,
+                    wake_mode: None,
                     text: "so go?".into(),
                     user_image_hashes: vec![],
                     device_id: None,
@@ -984,6 +1061,7 @@ mod tests {
                 .emit(BusEvent::Thread {
                     thread_id,
                     event: ThreadEvent::CodingAgentPromptSent {
+                        input_event_id: None,
                         text: "continue".into(),
                         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                         origin: None,

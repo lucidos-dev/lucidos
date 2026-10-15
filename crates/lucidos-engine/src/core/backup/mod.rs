@@ -1164,20 +1164,13 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Apply `pg_env_vars(database_url)` onto `cmd`. Returns `Err` when the URL
-/// does not match the expected shape, so the caller fails loudly. Otherwise it
-/// spawns a subprocess that inherits zero `PG*` vars and gets a confusing
-/// connection error from libpq.
+/// Apply the libpq env for `database_url` onto `cmd`. Returns `Err` when the
+/// URL does not parse, so the caller fails loudly. Otherwise it would spawn a
+/// subprocess that inherits zero `PG*` vars and gets a confusing connection
+/// error from libpq.
 fn apply_pg_env(cmd: &mut std::process::Command, database_url: &str) -> Result<(), BoxError> {
-    let vars = crate::core::pg_env_vars(database_url);
-    if vars.is_empty() {
-        return Err(
-            "database URL does not match expected postgres(ql)://user:pass@host[:port]/db shape"
-                .into(),
-        );
-    }
-    for (k, v) in vars {
-        cmd.env(k, v);
+    for (key, value) in lucidos_pg_url::PgUrl::parse(database_url)?.env() {
+        cmd.env(key, value);
     }
     Ok(())
 }
@@ -1276,17 +1269,11 @@ fn pg_dump(database_url: &str, output_path: &Path) -> Result<(), BoxError> {
 
 /// The target database name from a postgres URL, for `psql --dbname`.
 ///
-/// We pull the name from the same `pg_env_vars` parse that seeds the `PG*` env.
-/// Host, port, user and password still flow via env, kept out of argv, and only
-/// the dbname lands on the command line.
+/// We pull the name from the same parse that seeds the `PG*` env. Host, port,
+/// user and password still flow via env, kept out of argv, and only the dbname
+/// lands on the command line.
 fn pg_dbname(database_url: &str) -> Result<String, BoxError> {
-    crate::core::pg_env_vars(database_url)
-        .into_iter()
-        .find_map(|(k, v)| (k == "PGDATABASE").then_some(v))
-        .ok_or_else(|| -> BoxError {
-            "database URL does not match expected postgres(ql)://user:pass@host[:port]/db shape"
-                .into()
-        })
+    Ok(lucidos_pg_url::PgUrl::parse(database_url)?.database)
 }
 
 /// Session-level SET parameters that exist in newer PostgreSQL versions but not

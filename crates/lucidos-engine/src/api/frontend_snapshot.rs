@@ -220,17 +220,18 @@ mod tests {
 
     #[test]
     fn packaged_serves_the_original_dir_unchanged() {
-        let tmp = std::env::temp_dir().join(format!("lucidos-fe-snap-pkg-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let tmp = scratch.path().to_path_buf();
         let dist = tmp.join("dist");
         write(&dist.join("index.html"), "<html>packaged</html>");
         let resolved = resolve_served_dir_inner(dist.clone(), &tmp, /* packaged */ true);
         assert_eq!(resolved, dist, "packaged must serve the bundled dir as-is");
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn dev_pins_generation_zero_that_survives_source_republish() {
-        let tmp = std::env::temp_dir().join(format!("lucidos-fe-snap-dev-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let tmp = scratch.path().to_path_buf();
         let dist = tmp.join("dist");
         write(&dist.join("index.html"), "<html>OLD</html>");
         write(&dist.join("assets/app.js"), "OLD-JS");
@@ -262,24 +263,24 @@ mod tests {
             std::fs::read_to_string(served.join("assets/app.js")).unwrap(),
             "OLD-JS"
         );
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn missing_source_falls_back_to_the_original_dir() {
-        let tmp = std::env::temp_dir().join(format!("lucidos-fe-snap-miss-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let tmp = scratch.path().to_path_buf();
         let dist = tmp.join("dist"); // never created — no index.html
         let resolved = resolve_served_dir_inner(dist.clone(), &tmp, /* packaged */ false);
         assert_eq!(
             resolved, dist,
             "a missing/unbuilt source must fall back to the original dir, not 404"
         );
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn re_snapshot_into_a_new_generation_leaves_the_old_one_intact() {
-        let tmp = std::env::temp_dir().join(format!("lucidos-fe-snap-gen-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let tmp = scratch.path().to_path_buf();
         let dist = tmp.join("dist");
         write(&dist.join("index.html"), "<html>v0</html>");
         write(&dist.join("sw.js"), "const BUILD_ID = 'aaaa';");
@@ -313,24 +314,23 @@ mod tests {
             "remove_snapshot_dir drops the superseded snapshot"
         );
         assert!(gen1.exists(), "and leaves the current one");
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn read_build_id_handles_missing_and_unstamped() {
-        let tmp = std::env::temp_dir().join(format!("lucidos-fe-snap-bid-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let tmp = scratch.path().to_path_buf();
         assert_eq!(read_build_id(&tmp), None, "no sw.js → None");
         write(&tmp.join("sw.js"), "// no marker here");
         assert_eq!(read_build_id(&tmp), None, "no BUILD_ID marker → None");
         write(&tmp.join("sw.js"), "const BUILD_ID = '__DEV__';\n// rest");
         assert_eq!(read_build_id(&tmp).as_deref(), Some("__DEV__"));
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn read_source_commit_takes_only_a_full_sha() {
-        let tmp = std::env::temp_dir().join(format!("lucidos-fe-snap-src-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let tmp = scratch.path().to_path_buf();
         assert_eq!(read_source_commit(&tmp), None, "no stamp is unknown");
         let stamp = tmp.join(SOURCE_COMMIT_FILE);
         for bad in ["", "\n", "not a commit\n", "abc123\n", &"g".repeat(40)] {
@@ -340,6 +340,5 @@ mod tests {
         let sha = "0123456789abcdef0123456789abcdef01234567";
         write(&stamp, &format!("{sha}\n"));
         assert_eq!(read_source_commit(&tmp).as_deref(), Some(sha));
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

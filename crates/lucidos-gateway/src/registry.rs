@@ -19,15 +19,14 @@
 //! URL on future starts so the old cluster can be explicitly decommissioned.
 
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The reserved sigil that prefixes all gateway-owned paths (`/~/…`). A
-/// workspace slug can never start with it. The app reads it from the
-/// generated `gateway-constants.ts`.
-pub const SIGIL: char = '~';
+pub use lucidos_gateway_constants::SIGIL;
 
 /// One registered workspace.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -56,7 +55,7 @@ pub struct Workspace {
     /// working without anyone opening a window). This is the default every
     /// gateway-provisioned workspace is born with, see
     /// [`Workspace::gateway_provisioned`]. `false` (what the dev launcher
-    /// seeds, and what the picker toggle can set) → the workspace is **listed**
+    /// registers, and what the picker toggle can set) → the workspace is **listed**
     /// in the picker but its engine is started only on an explicit open/launch
     /// (lazy).
     ///
@@ -86,9 +85,8 @@ impl Workspace {
     /// already set up.
     ///
     /// Not for a workspace the gateway merely *registers*: the dev launcher
-    /// seeds an absolute `dir` outside app-data and wants autostart off (see
-    /// `scripts/lib/workspace.sh`), and it writes the registry itself rather
-    /// than calling this.
+    /// adopts an absolute `dir` outside app-data with autostart off, through
+    /// `GatewayState::adopt_workspace`.
     ///
     /// [`autostart`]: Workspace::autostart
     pub fn gateway_provisioned(id: String, name: String, port: u16) -> Self {
@@ -147,10 +145,10 @@ impl Registry {
     /// first-run state — the gateway boots with no workspaces and the smart root
     /// serves the picker, where the user names their first one). A present but
     /// unparseable file is a hard error: silently discarding it would orphan
-    /// every registered workspace's data behind a fresh empty registry.
+    /// every registered workspace's data behind a fresh empty registry. A blank
+    /// file is one of those: [`Registry::save`] never leaves one.
     pub fn load(path: &Path) -> Result<Self, BoxError> {
         match std::fs::read_to_string(path) {
-            Ok(s) if s.trim().is_empty() => Ok(Self::default()),
             Ok(s) => serde_json::from_str(&s)
                 .map_err(|e| format!("parse {}: {e}", path.display()).into()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -172,7 +170,7 @@ impl Registry {
     /// being flipped back on every boot.
     ///
     /// The caller decides WHEN this is appropriate: the packaged gateway runs it
-    /// at startup, while dev does not, because the dev launcher seeds
+    /// at startup, while dev does not, because the dev launcher registers
     /// `autostart: false` on purpose and would otherwise find every workspace it
     /// has ever launched spawning at once.
     pub fn migrate_to_current(&mut self) -> Option<usize> {
@@ -192,15 +190,39 @@ impl Registry {
 
     /// Persist the registry to `path` atomically (write a sibling temp file,
     /// then rename) so a crash mid-write can't truncate the registry and strand
-    /// every workspace.
+    /// every workspace. The temp file is created exclusively under a name no
+    /// other write uses, so two writers never share one.
     pub fn save(&self, path: &Path) -> Result<(), BoxError> {
+        static SAVES: AtomicU64 = AtomicU64::new(0);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json.as_bytes())?;
-        std::fs::rename(&tmp, path)?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("{} has no file name", path.display()))?;
+        // The clock as well as the pid and counter: a re-exec keeps the pid and
+        // restarts the counter.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let tmp = path.with_file_name(format!(
+            ".{name}.{}.{nanos}.{}.tmp",
+            std::process::id(),
+            SAVES.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Synced before the rename, so a crash cannot leave a blank registry.
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(json.as_bytes()).and_then(|()| f.sync_all()))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("save {}: {e}", path.display()).into());
+        }
         Ok(())
     }
 
@@ -465,31 +487,50 @@ mod tests {
 
     #[test]
     fn load_missing_is_empty_present_garbage_errors() {
-        let dir = std::env::temp_dir().join(format!("lucidos-reg-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("workspaces.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
 
         // Missing → empty.
         let reg = Registry::load(&path).unwrap();
         assert!(reg.workspaces.is_empty());
 
-        // Empty file → empty.
+        // Empty file → hard error. No writer leaves one, so a blank file is
+        // outside damage, and reading it as empty is what wiped registries.
         std::fs::write(&path, "   \n").unwrap();
-        assert!(Registry::load(&path).unwrap().workspaces.is_empty());
+        let err = Registry::load(&path).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
 
         // Garbage → hard error (never silently drop registered workspaces).
         std::fs::write(&path, "{ not json").unwrap();
         assert!(Registry::load(&path).is_err());
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// The temp name used to be fixed. A second writer's temp file at that
+    /// name, here a directory standing in for one, made every save fail.
+    #[test]
+    fn a_save_never_shares_its_temp_file_with_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+
+        Registry::default().save(&path).unwrap();
+
+        assert!(Registry::load(&path).unwrap().workspaces.is_empty());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n != "workspaces.json" && n != "workspaces.json.tmp")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     #[test]
     fn save_then_load_roundtrips() {
-        let dir = std::env::temp_dir().join(format!("lucidos-reg-rt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("config/workspaces.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config/workspaces.json");
 
         let mut reg = Registry::default();
         reg.add(Workspace {
@@ -519,8 +560,6 @@ mod tests {
         // The autostart flag round-trips per entry.
         assert!(loaded.get("myws").unwrap().autostart);
         assert!(!loaded.get("default").unwrap().autostart);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -625,9 +664,8 @@ mod tests {
 
     #[test]
     fn the_version_round_trips_through_disk() {
-        let dir = std::env::temp_dir().join(format!("lucidos-reg-ver-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("workspaces.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
         let mut reg = legacy_registry();
         reg.migrate_to_current();
         reg.save(&path).unwrap();
@@ -635,7 +673,6 @@ mod tests {
         let loaded = Registry::load(&path).unwrap();
         assert_eq!(loaded.version, REGISTRY_VERSION);
         assert!(loaded.get("myws").unwrap().autostart);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Display names are unique ─────────────────────────────────────────────

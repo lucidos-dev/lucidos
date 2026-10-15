@@ -65,16 +65,14 @@ export const TALKER_MODELS = [
  *  agent's answer reaches it as written.
  *
  *  The two streaming models lead, because they are the ones built for a
- *  microphone: each emits the transcript as the caller speaks. The rest
- *  transcribe a turn once it is committed. Exported so a test can read the
+ *  microphone: each emits the transcript as the caller speaks. The default
+ *  follows and transcribes a turn once it is committed. OpenAI retired the
+ *  older models, and the engine refuses them. Exported so a test can read the
  *  order. */
 export const TRANSCRIBER_MODELS = [
   { value: 'gpt-live-transcribe', label: 'GPT live transcribe' },
   { value: 'gpt-realtime-whisper', label: 'GPT Realtime Whisper' },
   { value: 'gpt-transcribe', label: 'GPT transcribe' },
-  { value: 'gpt-4o-mini-transcribe', label: 'GPT-4o mini transcribe' },
-  { value: 'gpt-4o-transcribe', label: 'GPT-4o transcribe' },
-  { value: 'whisper-1', label: 'Whisper' },
 ];
 
 /** The voices a talker can speak in. Free text beside them, because the set

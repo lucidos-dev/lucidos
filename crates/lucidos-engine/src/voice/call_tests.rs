@@ -332,6 +332,7 @@ async fn a_turn_starts(bus: &EventBus, thread_id: uuid::Uuid) {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "what have I got running".to_string(),
             user_image_hashes: vec![],
             device_id: None,
@@ -497,7 +498,7 @@ fn opening() -> SessionOpening {
         instructions: "You are Lucidos.".to_string(),
         resident_block: "[WHAT YOU ALREADY KNOW]".to_string(),
         voice: "marin".to_string(),
-        transcriber: "gpt-4o-mini-transcribe".to_string(),
+        transcriber: "gpt-transcribe".to_string(),
         audio: AudioFormat::default(),
         language: None,
     }
@@ -519,6 +520,8 @@ fn usage() -> ApiUsage {
             output_text_tokens: 20,
             output_audio_tokens: 44,
         }),
+        service_tier: None,
+        cache_creation_1h_tokens: None,
     }
 }
 
@@ -572,6 +575,9 @@ async fn a_coding_agent_thread(bus: &EventBus) -> uuid::Uuid {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: crate::engine::thread_events::EventMeta {
             channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
@@ -7003,9 +7009,9 @@ async fn the_callers_first_sound_cuts_nothing_off() {
 
 /// The provider hearing the caller start is enough, with no transcript at all.
 ///
-/// The opener a transcriber cannot withhold. `whisper-1` streams no partials,
-/// and its completed frame is asynchronous, so it can land after the reply it
-/// prompted. Waiting for one drops the answer to the caller's first sentence.
+/// The opener a transcriber cannot withhold. A model that streams no partials
+/// sends only an asynchronous completed frame, which can land after the reply
+/// it prompted. Waiting for one drops the answer to the caller's first sentence.
 #[tokio::test]
 async fn the_caller_starting_to_speak_opens_the_floor_with_no_transcript() {
     let (pool, db_name) = setup_test_db().await;
@@ -7268,6 +7274,97 @@ async fn an_engine_relay_reopens_a_spent_floor() {
         "{:?}",
         said
     );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A talker whose `open` lands the doer's answer on the thread and then lags
+/// the call's subscription. It runs after the call subscribes and before its
+/// loop first reads the thread, so the lag is certain rather than timed.
+struct AnswerLostToALag<'a> {
+    inner: MockVoiceProvider,
+    bus: &'a EventBus,
+    thread_id: uuid::Uuid,
+    answer: &'static str,
+}
+
+#[async_trait::async_trait]
+impl crate::voice::provider::VoiceProvider for AnswerLostToALag<'_> {
+    fn name(&self) -> &'static str {
+        crate::voice::provider::VoiceProvider::name(&self.inner)
+    }
+
+    fn model(&self) -> &str {
+        crate::voice::provider::VoiceProvider::model(&self.inner)
+    }
+
+    async fn open(
+        &self,
+        opening: SessionOpening,
+    ) -> Result<Box<dyn crate::voice::provider::VoiceSession>, BoxError> {
+        a_turn_starts(self.bus, self.thread_id).await;
+        seed_thread_event(
+            self.bus,
+            self.thread_id,
+            ThreadEvent::ResponseGenerated {
+                text: self.answer.to_string(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+            },
+        )
+        .await;
+        crate::test_support::flood_past_bus_capacity(self.bus);
+        crate::voice::provider::VoiceProvider::open(&self.inner, opening).await
+    }
+}
+
+/// The answer the caller is waiting for must reach them even when a burst
+/// lagged the call's view of the thread, and reach them once.
+#[tokio::test]
+async fn an_answer_lost_to_a_lag_is_still_said_once() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let (inner, talker) = MockVoiceProvider::driven();
+    let log = inner.log();
+    let provider = AnswerLostToALag {
+        inner,
+        bus: &bus,
+        thread_id,
+        answer: "Two things are running.",
+    };
+    let turns = RecordingTurns::default();
+    let hang_up = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&hang_up));
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            say(&talker, the_caller_opens_the_floor()).await;
+            until("the answer to be said out loud", || {
+                log.lock().unwrap().asked_to_speak.len() == 1
+            })
+            .await;
+            hang_up.notify_one();
+        }
+    );
+
+    let said = log.lock().unwrap().asked_to_speak.clone();
+    assert_eq!(said.len(), 1, "said once, never twice: {:?}", said);
+    assert!(said[0].contains("Two things are running."), "{:?}", said);
 
     teardown_test_db(&db_name).await;
 }

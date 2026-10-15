@@ -102,7 +102,9 @@ The 1 h window had stood in for liveness. Liveness is now asked directly. A
 thread is active when any of three things holds:
 
 - it has a live agent session;
-- a coding-agent spawn for it is in flight (`SpawnsInFlight`);
+- a coding-agent spawn for it is in flight. Since ADR 0442 the spawn's claimed
+  `agent_sessions` entry answers this, from before worktree setup until the run lets
+  go, and `SpawnsInFlight` is gone;
 - it has a running background task.
 
 The old session-only probe missed the last two. A spawn sets up the worktree,

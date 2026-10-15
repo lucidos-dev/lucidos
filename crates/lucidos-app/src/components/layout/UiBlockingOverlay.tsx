@@ -42,20 +42,25 @@ export function UiBlockingOverlay() {
     document.documentElement.setAttribute('data-ui-blocked', '');
 
     // Mark every sibling of the overlay inert so panels, drawers, and modals
-    // stop receiving clicks, focus, and input. The toast container stays
-    // interactive, so a toast raised during the refresh is still readable and
-    // dismissable.
+    // stop receiving clicks, focus, and input. The overlay layer's home and the
+    // layer itself are wrappers with no box, so the walk goes through them to
+    // the overlays. The toast container stays interactive, so a toast raised
+    // during the refresh is still readable and dismissable.
     const inerted: HTMLElement[] = [];
-    const root = overlay.parentElement;
-    if (root) {
-      for (const child of Array.from(root.children) as HTMLElement[]) {
+    const inertChildrenOf = (parent: Element) => {
+      for (const child of Array.from(parent.children) as HTMLElement[]) {
         if (child === overlay) continue;
+        if (child.matches('[data-overlay-layer-home], .overlay-layer')) {
+          inertChildrenOf(child);
+          continue;
+        }
         if (child.classList.contains('toast-container')) continue;
         if (child.hasAttribute('inert')) continue;
         child.setAttribute('inert', '');
         inerted.push(child);
       }
-    }
+    };
+    if (overlay.parentElement) inertChildrenOf(overlay.parentElement);
 
     // No safety timeout here — a client refresh always ends in a page reload that
     // tears this overlay down. (The engine-restart safety timeout lives in

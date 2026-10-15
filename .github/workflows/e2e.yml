@@ -1,7 +1,8 @@
-# E2E GitHub mode (ADRs 0382, 0386): run the e2e suites a driver asked for.
+# E2E GitHub mode (ADRs 0382, 0386, 0464): run the suites a driver asked for.
 #
 # Unless a run stays local, `./scripts/e2e*.sh` pushes a stripped, scanned,
-# parentless commit to an e2e/<run-id> branch, with its selection in
+# parentless commit to an e2e/<run-id> branch. So does the main check
+# (`scripts/main-check.sh`), on a stripped copy of main. The selection is in
 # .github/e2e-request.json. This workflow runs from that push. The driver
 # downloads every shard's output, reports it like a local run, and deletes the
 # branch.
@@ -11,6 +12,8 @@
 #   - Triggers: push to e2e/** runs a selection; push to main only seeds the
 #     dependency caches every e2e/* branch can read. GitHub scopes caches by
 #     branch, so a cache saved on an e2e/* branch would only evict others.
+#   - Every job but seed-cache waits on the plan, so only a request runs it.
+#   - Every action is pinned by commit.
 #   - mobile-webkit runs on macOS, the WebKit port iOS ships (ADR 0175).
 #   - Artifacts live one day. Traces upload only for a failed shard.
 
@@ -43,6 +46,7 @@ jobs:
       macos: ${{ steps.plan.outputs.macos }}
       has_linux: ${{ steps.plan.outputs.has_linux }}
       has_macos: ${{ steps.plan.outputs.has_macos }}
+      has_engine: ${{ steps.plan.outputs.has_engine }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - id: plan
@@ -196,6 +200,38 @@ jobs:
           retention-days: 1
           if-no-files-found: ignore
 
+  # The engine suite, against a disposable pgvector Postgres in Docker. Only
+  # the main check asks for it (scripts/main-check.sh).
+  engine:
+    needs: plan
+    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_engine == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: v0-rust-e2e
+          shared-key: linux
+          save-if: false
+      - name: Prepare the runner
+        run: |
+          git config --global user.name "Lucidos e2e"
+          git config --global user.email "lucidos-e2e@users.noreply.github.com"
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq ripgrep >/dev/null
+      - name: Run the engine suite
+        run: ./scripts/e2e-github-shard.sh run engine engine
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: e2e-out-engine
+          path: e2e-out/engine
+          retention-days: 1
+
   # The only jobs that save a cache. Mirror main moves at each release, and
   # every e2e/* branch can read what main saved.
   seed-cache:
@@ -224,3 +260,6 @@ jobs:
       - name: Compile the API and WASM suites' test binaries
         if: matrix.key == 'linux'
         run: cargo test --locked -p lucidos-e2e --no-run
+      - name: Compile the engine suite's test binary
+        if: matrix.key == 'linux'
+        run: cargo test --locked -p lucidos-engine --lib --no-run

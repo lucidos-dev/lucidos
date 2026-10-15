@@ -23,6 +23,7 @@ fn message(text: &str) -> ThreadEvent {
     ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,
+        wake_mode: None,
         text: text.to_string(),
         user_image_hashes: vec![],
         device_id: None,
@@ -108,9 +109,13 @@ async fn resume_in(
     let window_end = window_end_sequence(pool, thread_id)
         .await
         .expect("window end");
-    let anchor_event_id = emit_resume_anchor(bus, thread_id, anchor, NOTE, channel, None)
-        .await
-        .expect("anchor emit");
+    let ResumeAnchorClaim::Anchored(anchor_event_id) =
+        emit_resume_anchor(bus, thread_id, anchor, NOTE, channel, None)
+            .await
+            .expect("anchor emit")
+    else {
+        panic!("no other resume claims this anchor");
+    };
     let recovered = ingest_queued_messages_for_resume(
         ResumeStores {
             bus,
@@ -176,6 +181,7 @@ async fn the_reported_case_answers_the_queued_message() {
         thread_id,
         ChatResumeAnchor::NewBoundary {
             interrupted_turn: Some(turn),
+            resumed_abort: None,
         },
         EventChannel::Chat,
     )
@@ -222,6 +228,7 @@ async fn two_queued_messages_are_ingested_in_order_after_the_note() {
         thread_id,
         ChatResumeAnchor::NewBoundary {
             interrupted_turn: Some(turn),
+            resumed_abort: None,
         },
         EventChannel::Chat,
     )
@@ -273,6 +280,7 @@ async fn a_retracted_queued_message_stays_retracted_across_a_restart() {
         thread_id,
         ChatResumeAnchor::NewBoundary {
             interrupted_turn: Some(turn),
+            resumed_abort: None,
         },
         EventChannel::Chat,
     )
@@ -322,6 +330,7 @@ async fn a_message_ingested_before_the_abort_is_not_recovered() {
         thread_id,
         ChatResumeAnchor::NewBoundary {
             interrupted_turn: Some(turn),
+            resumed_abort: None,
         },
         EventChannel::Chat,
     )
@@ -339,8 +348,9 @@ async fn a_message_ingested_before_the_abort_is_not_recovered() {
     teardown_test_db(&db_name).await;
 }
 
-/// The first pass writes the marker the second pass reads, so a double Continue
-/// ingests the message once. That write is the whole idempotency mechanism.
+/// The first pass writes the marker the second pass reads, so two resumes that
+/// both pass the anchor ingest the message once. Neither claims an abort here,
+/// which isolates the marker from the anchor's own claim.
 #[tokio::test]
 async fn a_double_continue_ingests_the_queued_message_once() {
     let (pool, db_name) = setup_test_db().await;
@@ -353,6 +363,7 @@ async fn a_double_continue_ingests_the_queued_message_once() {
 
     let anchor = ChatResumeAnchor::NewBoundary {
         interrupted_turn: Some(turn),
+        resumed_abort: None,
     };
     let (_, first) = resume(&bus, &pool, thread_id, anchor, EventChannel::Chat).await;
     let (_, second) = resume(&bus, &pool, thread_id, anchor, EventChannel::Chat).await;
@@ -366,6 +377,79 @@ async fn a_double_continue_ingests_the_queued_message_once() {
         .filter(|(injected, ..)| *injected == Some(queued))
         .count();
     assert_eq!(naming_it, 1, "announced exactly once");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Invariant I9: one abort is resumed at most once. Two Continue clicks race to
+/// the anchor, and whichever order they land in, the index lets one claim it.
+/// The loser emits nothing: no boundary, no engine note, no rerun.
+#[tokio::test]
+async fn two_concurrent_resumes_of_one_abort_claim_it_once() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    let turn = emit(&bus, thread_id, message("summarize the tickets")).await;
+    abort(&bus, thread_id, turn).await;
+    let abort_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM events WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("abort id");
+    let anchor = ChatResumeAnchor::NewBoundary {
+        interrupted_turn: Some(turn),
+        resumed_abort: Some(abort_id),
+    };
+    let claim = || emit_resume_anchor(&bus, thread_id, anchor, NOTE, EventChannel::Chat, None);
+
+    let (first, second) = tokio::join!(claim(), claim());
+    let mut claims = [first.expect("first claim"), second.expect("second claim")];
+    claims.sort_by_key(|c| matches!(c, ResumeAnchorClaim::AlreadyResumed));
+    assert!(
+        matches!(claims[0], ResumeAnchorClaim::Anchored(_)),
+        "one resume anchors: {claims:?}"
+    );
+    assert_eq!(claims[1], ResumeAnchorClaim::AlreadyResumed);
+    assert_eq!(
+        claim().await.expect("a later claim"),
+        ResumeAnchorClaim::AlreadyResumed,
+        "a later click finds the abort already claimed"
+    );
+    assert_eq!(count_of(&pool, thread_id, "ContinuationStarted").await, 1);
+    assert_eq!(
+        count_of(&pool, thread_id, "PromptInjected").await,
+        1,
+        "the loser writes no engine note"
+    );
+
+    // The claim is per abort: the rerun's own interruption can be resumed.
+    abort(&bus, thread_id, turn).await;
+    let next_abort: Uuid = sqlx::query_scalar(
+        "SELECT id FROM events WHERE aggregate_id = $1 AND event_type = 'ResponseAborted' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("next abort id");
+    let next = emit_resume_anchor(
+        &bus,
+        thread_id,
+        ChatResumeAnchor::NewBoundary {
+            interrupted_turn: Some(turn),
+            resumed_abort: Some(next_abort),
+        },
+        NOTE,
+        EventChannel::Chat,
+        None,
+    )
+    .await
+    .expect("next claim");
+    assert!(matches!(next, ResumeAnchorClaim::Anchored(_)));
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -453,6 +537,7 @@ async fn a_trigger_thread_keeps_its_channel_through_the_recovery() {
         thread_id,
         ChatResumeAnchor::NewBoundary {
             interrupted_turn: Some(turn),
+            resumed_abort: None,
         },
         EventChannel::Trigger,
     )
@@ -495,6 +580,7 @@ async fn an_anchor_without_an_interrupted_turn_recovers_nothing() {
         thread_id,
         ChatResumeAnchor::NewBoundary {
             interrupted_turn: None,
+            resumed_abort: None,
         },
         EventChannel::Chat,
     )
@@ -531,6 +617,7 @@ async fn a_recovered_attachment_reaches_the_resumed_turn() {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "what is wrong with this?".into(),
             user_image_hashes: vec![blob.hash.clone()],
             device_id: None,
@@ -553,6 +640,7 @@ async fn a_recovered_attachment_reaches_the_resumed_turn() {
         thread_id,
         ChatResumeAnchor::NewBoundary {
             interrupted_turn: Some(turn),
+            resumed_abort: None,
         },
         EventChannel::Chat,
     )
@@ -598,6 +686,7 @@ async fn a_retraction_mid_batch_still_beats_the_recovery() {
         thread_id,
         ChatResumeAnchor::NewBoundary {
             interrupted_turn: Some(turn),
+            resumed_abort: None,
         },
         EventChannel::Chat,
     )

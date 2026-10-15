@@ -16,7 +16,7 @@ beforeEach(() => {
 });
 
 /** An Apply All is told in the Lucidos menu's activity group, which carries
- *  its position, its thread and Cancel. It raises no toast of its own while it
+ *  its count, its thread and Cancel. It raises no toast of its own while it
  *  runs (ADR 0306). */
 describe('an Apply All in flight', () => {
   it('raises no toast from start to finish', () => {

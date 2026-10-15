@@ -441,7 +441,7 @@ mod tests {
             instructions: TALKER_INSTRUCTIONS.to_string(),
             resident_block: "[RESIDENT] the block".to_string(),
             voice: "marin".to_string(),
-            transcriber: "gpt-4o-mini-transcribe".to_string(),
+            transcriber: "gpt-transcribe".to_string(),
             audio: AudioFormat::default(),
             language: None,
         }
@@ -486,6 +486,8 @@ mod tests {
             cache_read_tokens: 800,
             cache_creation_tokens: 0,
             modality: None,
+            service_tier: None,
+            cache_creation_1h_tokens: None,
         };
         let provider = MockVoiceProvider::ending_after(vec![
             VoiceEvent::UserTurnEnded {

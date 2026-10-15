@@ -369,10 +369,116 @@ echo ""
 echo "test: effectful wrappers are defined"
 for fn in service_detect_manager service_port_in_use service_list_instance_names service_write_file \
           service_launchd_load service_launchd_unload service_launchd_wait_gone \
-          service_systemd_load service_systemd_unload \
+          service_systemd_load service_systemd_stop service_systemd_unload \
           service_health_wait service_stop_embedded_runtime; do
     if type "$fn" >/dev/null 2>&1; then pass "$fn defined"; else fail "$fn missing"; fi
 done
+
+# ── the stop waits for signalled engines before it stops Postgres ───────────
+# Each pid is a reparented `sleep`, not this shell's child, so it is reaped when
+# it exits, as a real engine is.
+echo ""
+echo "test: the stop waits for signalled engines to exit"
+orphan_sleep() { ( sleep "$1" >/dev/null 2>&1 & echo $! ); }
+WG_PID="$(orphan_sleep 1)"
+WG_START="$(date +%s)"
+_service_wait_engines_gone 10 "$WG_PID"
+WG_SPENT=$(( $(date +%s) - WG_START ))
+if ! kill -0 "$WG_PID" 2>/dev/null && [ "$WG_SPENT" -lt 5 ]; then
+    pass "an engine that exits ends the wait (${WG_SPENT}s)"
+else
+    fail "the wait did not end with the engine (pid $WG_PID, ${WG_SPENT}s)"
+fi
+WG_PID="$(orphan_sleep 30)"
+# shellcheck disable=SC2329 # called by _service_wait_engines_gone
+( ps() { echo "/opt/lucidos/lucidos-engine"; }; _service_wait_engines_gone 1 "$WG_PID" 2>/dev/null )
+sleep 0.3
+if kill -0 "$WG_PID" 2>/dev/null; then
+    fail "an engine past the deadline was not killed"
+    kill -KILL "$WG_PID" 2>/dev/null
+else
+    pass "an engine past the deadline gets SIGKILL"
+fi
+WG_PID="$(orphan_sleep 30)"
+# shellcheck disable=SC2329 # called by _service_wait_engines_gone
+( ps() { echo "/bin/sleep 30"; }; _service_wait_engines_gone 1 "$WG_PID" )
+if kill -0 "$WG_PID" 2>/dev/null; then
+    pass "a pid now running another program is never killed"
+    kill -KILL "$WG_PID" 2>/dev/null
+else
+    fail "the wait killed a pid that no longer runs the engine"
+fi
+
+# ── service.sh's engine pid check agrees with flock.sh's (ADR 0438) ──────────
+# service.sh carries its own copy because uninstall.sh fetches it alone. This is
+# the pin: both copies give the same answer for every lock state.
+# shellcheck source=scripts/lib/flock.sh
+source "$SCRIPT_DIR/flock.sh"
+# shellcheck source=scripts/lib/flock_test_support.sh
+source "$SCRIPT_DIR/flock_test_support.sh"
+echo ""
+echo "test: service.sh's engine pid check answers as flock.sh's does"
+LK="$(mktemp -d)"
+mkdir -p "$LK/data/workspaces/ws/.lucidos"
+LKWS="$LK/data/workspaces/ws"
+# With no lock file, both fall back to a live pid whose argv[0] is the engine.
+echo "$$" >"$LKWS/.lucidos/engine.pid"
+LK_SVC="$( ps() { echo "/opt/lucidos/lucidos-engine"; }; _service_engine_live_pid "$LKWS" )"
+LK_SH="$( ps() { echo "/opt/lucidos/lucidos-engine"; }; engine_live_pid "$LKWS" )"
+if [ "$LK_SVC" = "$$" ] && [ "$LK_SH" = "$$" ]; then pass "both keep a pre-lock engine's pidfile"; else fail "pre-lock: service='$LK_SVC' flock='$LK_SH'"; fi
+LK_SVC="$( ps() { echo "/bin/bash x"; }; _service_engine_live_pid "$LKWS" )"
+LK_SH="$( ps() { echo "/bin/bash x"; }; engine_live_pid "$LKWS" )"
+if [ -z "$LK_SVC" ] && [ -z "$LK_SH" ]; then pass "neither trusts a pre-lock pid running another program"; else fail "pre-lock other program: service='$LK_SVC' flock='$LK_SH'"; fi
+: >"$LKWS/.lucidos/engine.lock"
+channel_open 6 "$LK/bystander.go"
+( read -r _ <&6 ) &
+BYSTANDER=$!
+echo "$BYSTANDER" >"$LKWS/.lucidos/engine.pid"
+if [ -z "$(_service_engine_live_pid "$LKWS")" ] && [ -z "$(engine_live_pid "$LKWS")" ]; then
+    pass "a live pid with no lock held is trusted by neither"
+else
+    fail "an unlocked pid was trusted: service='$(_service_engine_live_pid "$LKWS")' flock='$(engine_live_pid "$LKWS")'"
+fi
+service_stop_embedded_runtime "$LK/data" "$LK/runtime"
+if kill -0 "$BYSTANDER" 2>/dev/null; then pass "the stop signalled nothing"; else fail "the stop signalled an unlocked pid"; fi
+if [ -f "$LKWS/.lucidos/engine.pid" ]; then pass "the stop left the pidfile to its owner"; else fail "the stop deleted engine.pid"; fi
+echo go >&6
+wait "$BYSTANDER" 2>/dev/null
+channel_close 6
+start_lock_holder "$LK" "$LKWS/.lucidos/engine.lock" ex "$LKWS/.lucidos/engine.pid"
+# The holder is a perl process, so `ps` is stubbed to say what it runs.
+LK_SVC="$( ps() { echo "/opt/lucidos/lucidos-engine"; }; _service_engine_live_pid "$LKWS" )"
+LK_SH="$( ps() { echo "/opt/lucidos/lucidos-engine"; }; engine_pids_to_signal "$LKWS" )"
+if [ "$LK_SVC" = "$HOLDER_PID" ] && [ "$LK_SH" = "$HOLDER_PID" ]; then
+    pass "a held lock vouches for its pid in both"
+else
+    fail "held: service='$LK_SVC' flock='$LK_SH' holder=$HOLDER_PID"
+fi
+LK_SVC="$( ps() { echo "/bin/bash x"; }; _service_engine_live_pid "$LKWS" )"
+LK_SH="$( ps() { echo "/bin/bash x"; }; engine_pids_to_signal "$LKWS" )"
+if [ -z "$LK_SVC" ] && [ -z "$LK_SH" ]; then
+    pass "neither signals a held pid that now runs another program"
+else
+    fail "held, other program: service='$LK_SVC' flock='$LK_SH'"
+fi
+# shellcheck disable=SC2329 # called by service_stop_embedded_runtime
+# The holder is this shell's child, so it lingers as a zombie until the wait
+# below reaps it. A short exit window keeps the stop from sitting it out.
+( ps() { echo "/opt/lucidos/lucidos-engine"; }; service_stop_embedded_runtime "$LK/data" "$LK/runtime" 1 )
+wait "$HOLDER_PID" 2>/dev/null
+if kill -0 "$HOLDER_PID" 2>/dev/null; then
+    fail "the engine holding the lock was not stopped"
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
+else
+    pass "the engine holding the lock got SIGUSR1"
+fi
+echo "not-a-pid" >"$LKWS/.lucidos/engine.pid"
+if [ -z "$(_service_engine_live_pid "$LKWS")" ] && [ -z "$(engine_live_pid "$LKWS")" ]; then
+    pass "garbage is no pid in either"
+else
+    fail "garbage read as a pid"
+fi
+rm -rf "$LK"
 
 # ── INTEGRATION: --no-service → FOREGROUND launch (no registration) ──────────
 echo ""

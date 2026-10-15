@@ -7,6 +7,7 @@ mod apply_all_batches;
 pub(crate) mod apply_all_driver;
 pub(crate) mod apply_estimate;
 mod archive_request;
+pub mod auto_compact_trial;
 pub(crate) mod aux_purpose;
 mod background_build;
 pub mod cc_permission;
@@ -37,13 +38,18 @@ pub mod event_wait;
 pub mod form_requests;
 pub mod frontend_preview;
 mod frontend_refresh;
+pub use frontend_refresh::register_as_build_watch_consumer;
 pub(crate) mod git_ops;
+pub mod home_board;
 pub mod home_thread;
 pub mod http;
 pub(crate) mod image_size_hint;
 pub(crate) mod inline_question_repair;
 pub(crate) mod inline_tool_call_repair;
+pub(crate) mod integrated;
+mod landing_lane;
 pub mod loaded_knowhow;
+mod main_check;
 pub mod mcp_permission;
 /// `pub(crate)` for `relevance_score` / `age_in_days`: the `/memory/search`
 /// endpoint ranks with the SAME formula as the pre-turn injection, so a
@@ -63,11 +69,12 @@ pub mod release_notices;
 pub(crate) mod repo_directory_grants;
 mod session_seed;
 pub mod standing_apply;
-pub mod startup_lease;
+pub mod successor;
 pub mod summary_tree;
 pub mod supervisor_respawn_sidecar;
 pub(crate) mod text_search;
 pub mod thread_events;
+pub(crate) mod thread_family;
 pub mod thread_lifecycle;
 pub mod thread_queue;
 pub(crate) mod thread_search;
@@ -80,7 +87,13 @@ pub(crate) mod tools;
 pub(crate) mod trigger_group_writes;
 pub(crate) mod trigger_writes;
 pub(crate) mod turn_end;
+pub use turn_end::{
+    decide_read_for_eval, decide_wake_for_eval, read_decision_chat_judge, wake_decision_chat_judge,
+    AnsweredQuestion, EvalReadDecision, EvalWakeDecision, InFlight, OpeningSource, ParentView,
+    PushedNotification, TurnRead,
+};
 pub mod types;
+pub(crate) mod until_restored;
 pub(crate) mod user_profile;
 pub mod widget_embed;
 pub mod widget_guidance;
@@ -100,6 +113,10 @@ pub(crate) use model_call::AuxCapture;
 // live session" to the frontend, so misclassifying it runs the wrong fallback).
 pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
 pub(crate) use change_ops::SET_ASIDE_APPLY_REFUSAL;
+pub(crate) use landing_lane::LaneRemoval;
+pub(crate) use main_check::{
+    CloseRefusal as MainCheckCloseRefusal, MainCheckSnapshot, RedCloseReason,
+};
 // The child-follow-up vocabulary, re-exported for the HTTP route in
 // `api::threads::follow_up`, which is outside `engine`. Only the ack and the
 // refusal taxonomy: the delivery half stays reachable solely as
@@ -111,7 +128,9 @@ pub(crate) use chat::child_detach::{ChildDetachError, DetachAck, DetachCaller};
 pub(crate) use chat::child_follow_up::{
     ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpReach, FollowUpUrgency,
 };
-pub(crate) use chat::follow_up_order::{FollowUpOrder, FollowUpTurn};
+pub(crate) use chat::input_order::{
+    overtaken_message, InputAdmission, InputOrder, InputPosition, InputTurn, OVERTAKEN_REASON,
+};
 pub(crate) use chat::PreEmittedOrigin;
 pub(crate) use chat::{generate_thread_title, title_call, IMAGE_DESCRIPTION_PROMPT};
 #[cfg(test)]
@@ -132,7 +151,7 @@ pub mod spawn_dispatcher {
     pub use super::agent_session::spawn_dispatcher::{SpawnDispatcher, SpawnRequest};
 }
 
-use crate::core::{AppManager, ArtifactManager, CredentialStore, EventStore};
+use crate::core::{AppManager, ArtifactManager, EventStore};
 use crate::llm::LlmProvider;
 use crate::memory::{EmbedderSlot, PgVectorIndex};
 use crate::runtime::{
@@ -438,17 +457,16 @@ pub struct LucidosEngine {
     rebuilding_memory: AtomicBool,
     cancel_rebuild: AtomicBool,
     /// Set once the engine has begun graceful shutdown or a restart (`main.rs`
-    /// signal handler and `abort_in_flight_for_restart`). The scheduler's event
-    /// subscriber reads it to stop firing event-triggers: the terminator events
-    /// emitted during cleanup (`ResponseAborted{EngineShutdown}`,
-    /// `CodingAgentIdled`, `SessionEnded`) otherwise fan out to triggers whose
-    /// scripts call back into the HTTP API being torn down — `lucidos ...` gets
-    /// connection-refused and the script dies, surfacing a spurious
-    /// "<trigger> failed" push. Never reset; the process is on its way out.
-    /// An `Arc` so a detached task can hold it. The background-bash completion
-    /// watcher outlives its turn and holds no engine handle. It must not wake a
-    /// coding-agent session on an engine that is leaving. See
-    /// `tools/bash.rs::spawn_bash_completion_watcher`.
+    /// signal handler and `abort_in_flight_for_restart`). Never reset; the
+    /// process is on its way out.
+    ///
+    /// The one shutdown signal. From the moment it is set, no trigger fire
+    /// starts: the scheduler drops event fires and refuses cron fires, and the
+    /// Thread Queue holds queued ones for the next engine. A fire started now
+    /// would call back into the HTTP API being torn down. It would fail on a
+    /// refused connection and send a spurious "<trigger> failed" push.
+    ///
+    /// An `Arc` because the Thread Queue holds a clone of it.
     shutting_down: Arc<AtomicBool>,
     /// Acquired via `scheduler::BackupGuard::try_acquire`. POST /api/v1/backup
     /// returns 409 when the guard is held; the scheduled cron skips its tick.
@@ -589,11 +607,15 @@ pub struct LucidosEngine {
     /// Neither needs distinguishing: both stamp `MessageOrigin::system()`, and
     /// nothing reads this outside a teardown.
     teardown_actor: std::sync::Mutex<Option<thread_events::MessageOrigin>>,
+    /// Set by `begin_teardown` when the teardown promises an auto-resume. Every
+    /// thread's agent run reads it at its end, to leave its processes running
+    /// for the session that resumes it (ADR 0478).
+    teardown_handover: crate::runtime::agent_run_marker::TeardownHandover,
     /// Thread ids `recover_orphaned_worktrees` decided to auto-resume after a
     /// user-initiated *Switch to new version* (in-flight coding-agent threads with
-    /// a device-attributed teardown boundary). Drained by `main.rs` AFTER the spawn
-    /// dispatcher subscribes — recovery runs before it, so emitting
-    /// `ContinuationRequested` during recovery would be missed. A crash-interrupted
+    /// a device-attributed teardown boundary). Drained by `main.rs` after the
+    /// apply recoveries, which read it to see a conflict resolution about to
+    /// resume. A crash-interrupted
     /// thread is NOT enqueued here (it keeps the manual Continue affordance) — the
     /// loop-safety guarantee.
     pending_switch_resumes: std::sync::Mutex<Vec<Uuid>>,
@@ -672,6 +694,8 @@ pub struct LucidosEngine {
     pub frontend_origin: std::sync::Mutex<Option<String>>,
     /// Active coding-agent sessions keyed by thread_id.
     pub(crate) agent_sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+    /// The changes an apply holds right now. See `change_ops::apply_claim`.
+    pub(crate) apply_claims: Arc<change_ops::apply_claim::ApplyClaims>,
     /// The live workspace *view snapshots* of the Tree memory module, one per
     /// view budget. A cache: a restart folds them afresh.
     pub(crate) view_snapshots: crate::engine::summary_tree::view::ViewSnapshots,
@@ -680,19 +704,12 @@ pub struct LucidosEngine {
     /// Registered coding-agent backends (Claude Code, Codex, …).
     /// Engine code spawns agents via this registry instead of naming a concrete runtime.
     pub(crate) agent_runtimes: HashMap<CodingAgent, Arc<dyn AgentRuntime>>,
-    /// Per-thread time of the last coding-agent spawn, for the spawn debounce.
-    /// Keyed by thread_id so concurrent starts on different threads are not blocked.
-    last_spawn: std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
     /// The system prompt each thread's latest Claude Code spawn appended. A
     /// side question's session copy appends the same one, so its prompt prefix
     /// matches and the transcript reads from the prompt cache. Memory only: a
     /// thread missing from it, after a restart or an eviction, answers every
     /// side question uncached and without that prompt until its next spawn.
     pub(crate) cc_system_prompts: std::sync::Mutex<HashMap<Uuid, String>>,
-    /// Spawns past the spawn debounce that have not returned yet. Together with
-    /// `agent_sessions` this answers whether anybody owns a thread. Shared with
-    /// the worktree cleanup's liveness probe.
-    spawns_in_flight: Arc<agent_session::SpawnsInFlight>,
     /// Pre-spawn map of `cc_thread_id` → `app_id` for app coding-agent
     /// threads. `spawn_agent_thread` stashes the app id here before
     /// `process_message_with_steps` runs; `run_direct_agent` pops it in to
@@ -700,20 +717,12 @@ pub struct LucidosEngine {
     /// `SessionStarted` event lands (the value is then persisted on the
     /// event payload and in `thread_summaries.coding_agent_kind`).
     pub(crate) pending_app_spawn: std::sync::Mutex<HashMap<Uuid, String>>,
-    /// Keeps a thread's coding-agent follow-ups in the order they were sent.
-    /// See `chat::follow_up_order`.
-    pub(crate) follow_up_order: FollowUpOrder,
+    /// Keeps a thread's admitted inputs in the order admission gave them.
+    /// See `chat::input_order`.
+    pub(crate) input_order: InputOrder,
     /// Client event ids `POST /chat/stream` already accepted, so a re-post
     /// starts nothing. See `chat::accepted_messages`.
     pub(crate) accepted_messages: chat::accepted_messages::AcceptedMessages,
-    /// Per-thread spawn-coalescer. Phase 2 made every Claude Code subprocess exit on
-    /// idle, so two rapid follow-ups (within ~250ms) used to either race two
-    /// subprocesses or drop the second message with a "duplicate request"
-    /// error. The coalescer elects one leader per thread; followers within
-    /// the debounce window queue their messages for the leader to drain into
-    /// a single combined CC input. Phase 5's event-driven dispatcher will
-    /// subsume this. See `agent_session/cc_spawn_coalesce.rs`.
-    pub(crate) cc_spawn_coalesce: agent_session::CcSpawnCoalescer,
     /// Limits concurrent CC process startups to prevent CPU contention.
     /// Acquired before spawn_or_resume(), released after Init event.
     cc_startup_semaphore: Arc<tokio::sync::Semaphore>,
@@ -763,6 +772,19 @@ pub struct LucidosEngine {
     /// auto-trait-check for Send.
     pub(crate) apply_all_drive_tx:
         tokio::sync::mpsc::UnboundedSender<apply_all_driver::ApplyAllDriveMsg>,
+    /// The landing lane's driver channel. Apply, the change emitters, Discard
+    /// and Set aside send here, and only the driver task reads it.
+    pub(crate) landing_lane_tx: tokio::sync::mpsc::UnboundedSender<landing_lane::LaneMsg>,
+    /// The lane as clients see it. Only the lane's driver writes it, after
+    /// each message it handles.
+    pub(crate) landing_lane_snapshot: std::sync::RwLock<landing_lane::LaneSnapshot>,
+    /// The main check's driver channel. The bus subscriber, Close and
+    /// recovery send here, and only the driver task reads it.
+    pub(crate) main_check_tx: tokio::sync::mpsc::UnboundedSender<main_check::MainCheckMsg>,
+    /// The main check as clients see it. Only its driver writes it.
+    pub(crate) main_check_snapshot: std::sync::RwLock<main_check::MainCheckSnapshot>,
+    /// The running check's child, so shutdown can stop it.
+    pub(crate) main_check_runner: Arc<main_check::RunnerSlot>,
     /// Threads carrying a *standing apply*: the owner's instruction to apply a
     /// change once the thread settles (ADR 0168 clause 5). The in-memory half
     /// of `standing_applies`, so the bus subscriber filters on a lock rather
@@ -871,6 +893,10 @@ pub struct LucidosEngine {
     ///
     /// The indirection is required, not stylistic: see `WAIT_REENTRY_RX`.
     pub(crate) wait_reentry_tx: tokio::sync::mpsc::UnboundedSender<event_wait::WaitReentryRequest>,
+    /// When the engine last sent each thread a *cache keep-alive*. A cache
+    /// only: it stops a second beat while the first one's request is still
+    /// on its way. The schedule itself derives from persisted events.
+    pub(crate) keep_alive_beats: event_wait::KeepAliveBeats,
 }
 
 /// RAII guard that removes a thread from active_threads when dropped.
@@ -936,6 +962,10 @@ thread_local! {
     /// `start_apply_all_driver` (called after `Arc::new(engine)`) can pick
     /// it up.
     static APPLY_ALL_DRIVE_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<apply_all_driver::ApplyAllDriveMsg>>> = const { std::cell::RefCell::new(None) };
+    /// Landing lane receiver, same pattern as `APPLY_ALL_DRIVE_RX`.
+    static LANDING_LANE_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<landing_lane::LaneMsg>>> = const { std::cell::RefCell::new(None) };
+    /// Main check receiver, same pattern as `APPLY_ALL_DRIVE_RX`.
+    static MAIN_CHECK_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<main_check::MainCheckMsg>>> = const { std::cell::RefCell::new(None) };
     /// Event-wait re-entry receiver, same pattern again. Here the channel is
     /// load-bearing rather than a convenience: registration runs its catch-up
     /// scan inline, so without it `run_agentic_loop` awaits a delivery which
@@ -945,54 +975,106 @@ thread_local! {
     static WAIT_REENTRY_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<event_wait::WaitReentryRequest>>> = const { std::cell::RefCell::new(None) };
 }
 
+/// What one read of the bus asks of a subscriber that mirrors a setting.
+#[derive(Debug, PartialEq)]
+enum MirrorRead<T> {
+    /// Nothing this mirror cares about changed.
+    Ignore,
+    /// Refresh the mirror.
+    Refresh(T),
+    /// The bus closed: the engine is going down.
+    Stop,
+}
+
 fn spawn_vertex_region_subscriber(
     mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
     location: crate::llm::vertex::LocationHandle,
+    pool: sqlx::PgPool,
 ) {
-    tokio::spawn(async move {
-        use event_bus::{BusEvent, SystemEvent};
-        use tokio::sync::broadcast::error::RecvError;
-        loop {
-            let emitted = match rx.recv().await {
-                Ok(e) => e,
-                // Lag = subscriber fell behind. Skip the dropped events but
-                // keep listening; without this the loop would exit on a
-                // single lag and stop tracking vertex_region changes for the
-                // rest of the engine's lifetime.
-                Err(RecvError::Lagged(n)) => {
-                    log!(
-                        "[Preferences] vertex_region subscriber lagged by {} events — continuing",
-                        n
-                    );
-                    continue;
-                }
-                Err(RecvError::Closed) => break,
-            };
-            let BusEvent::System(SystemEvent::PreferencesChanged { key, value, .. }) =
-                &emitted.typed
-            else {
-                continue;
-            };
-            if key != crate::core::prefs::VERTEX_REGION.key() {
-                continue;
+    tokio::spawn(
+        async move { while follow_vertex_region(rx.recv().await, &location, &pool).await {} },
+    );
+}
+
+/// Apply one read of the bus to the live Vertex region. Returns `false` once
+/// the bus closes.
+async fn follow_vertex_region(
+    received: Result<event_bus::EmittedEvent, tokio::sync::broadcast::error::RecvError>,
+    location: &crate::llm::vertex::LocationHandle,
+    pool: &sqlx::PgPool,
+) -> bool {
+    use event_bus::{BusEvent, SystemEvent};
+    let read = match received {
+        Ok(emitted) => match &emitted.typed {
+            BusEvent::System(SystemEvent::PreferencesChanged {
+                key,
+                value: Some(region),
+                ..
+            }) if key == crate::core::prefs::VERTEX_REGION.key() => {
+                MirrorRead::Refresh(Some(region.clone()))
             }
-            let Some(new_region) = value else { continue };
-            match location.write() {
-                Ok(mut guard) => {
-                    let old = std::mem::replace(&mut *guard, new_region.clone());
-                    log!(
-                        "[Preferences] vertex_region updated live: {} → {}",
-                        old,
-                        new_region
-                    );
+            _ => MirrorRead::Ignore,
+        },
+        Err(e) => lag_or_stop(e, "[Preferences] vertex_region", None),
+    };
+    let region = match read {
+        MirrorRead::Ignore => return true,
+        MirrorRead::Stop => return false,
+        MirrorRead::Refresh(Some(region)) => region,
+        // A lag carries no region, so read the stored one.
+        MirrorRead::Refresh(None) => {
+            match crate::core::prefs::VERTEX_REGION.try_stored(pool).await {
+                // A cleared setting keeps the live region, as a live clear does.
+                Ok(stored) => match stored.filter(|s| !s.is_empty()) {
+                    Some(region) => region,
+                    None => return true,
+                },
+                Err(e) => {
+                    log!("[Preferences] vertex_region re-read failed: {}", e);
+                    return true;
                 }
-                Err(e) => log!(
-                    "[Preferences] vertex_region update skipped (lock poisoned): {}",
-                    e
-                ),
             }
         }
-    });
+    };
+    match location.write() {
+        Ok(mut guard) => {
+            let old = std::mem::replace(&mut *guard, region.clone());
+            if old != region {
+                log!(
+                    "[Preferences] vertex_region updated live: {} → {}",
+                    old,
+                    region
+                );
+            }
+        }
+        Err(e) => log!(
+            "[Preferences] vertex_region update skipped (lock poisoned): {}",
+            e
+        ),
+    }
+    true
+}
+
+/// A lag or a closed bus, as a mirror read. A lag may have hidden a change,
+/// so it refreshes with `on_lag`: the mirror re-reads its state rather than
+/// guessing what the dropped events said.
+fn lag_or_stop<T>(
+    e: tokio::sync::broadcast::error::RecvError,
+    subscriber: &str,
+    on_lag: T,
+) -> MirrorRead<T> {
+    use tokio::sync::broadcast::error::RecvError;
+    match e {
+        RecvError::Lagged(n) => {
+            log!(
+                "{} subscriber lagged by {} events, re-reading its state",
+                subscriber,
+                n
+            );
+            MirrorRead::Refresh(on_lag)
+        }
+        RecvError::Closed => MirrorRead::Stop,
+    }
 }
 
 /// Keep the in-memory model→provider [`ModelRegistry`] in sync with the `models`
@@ -1004,37 +1086,38 @@ fn spawn_models_registry_subscriber(
     registry: crate::llm::model_registry::ModelRegistry,
     pool: sqlx::PgPool,
 ) {
-    tokio::spawn(async move {
-        use event_bus::{BusEvent, SystemEvent};
-        use tokio::sync::broadcast::error::RecvError;
-        loop {
-            let emitted = match rx.recv().await {
-                Ok(e) => e,
-                // Lag = subscriber fell behind. Skip the dropped events but keep
-                // listening, so a single lag doesn't stop tracking model changes
-                // for the rest of the engine's lifetime.
-                Err(RecvError::Lagged(n)) => {
-                    log!(
-                        "[ModelRegistry] registry subscriber lagged by {} events — continuing",
-                        n
-                    );
-                    continue;
-                }
-                Err(RecvError::Closed) => break,
-            };
-            if !matches!(
-                &emitted.typed,
-                BusEvent::System(
-                    SystemEvent::ModelCreated { .. }
-                        | SystemEvent::ModelUpdated { .. }
-                        | SystemEvent::ModelDeleted { .. }
-                )
-            ) {
-                continue;
-            }
-            crate::llm::model_registry::reload(&registry, &pool).await;
+    tokio::spawn(
+        async move { while follow_models_table(rx.recv().await, &registry, &pool).await {} },
+    );
+}
+
+/// Apply one read of the bus to the model registry. Returns `false` once the
+/// bus closes.
+async fn follow_models_table(
+    received: Result<event_bus::EmittedEvent, tokio::sync::broadcast::error::RecvError>,
+    registry: &crate::llm::model_registry::ModelRegistry,
+    pool: &sqlx::PgPool,
+) -> bool {
+    use event_bus::{BusEvent, SystemEvent};
+    let read = match received {
+        Ok(emitted) => match &emitted.typed {
+            BusEvent::System(
+                SystemEvent::ModelCreated { .. }
+                | SystemEvent::ModelUpdated { .. }
+                | SystemEvent::ModelDeleted { .. },
+            ) => MirrorRead::Refresh(()),
+            _ => MirrorRead::Ignore,
+        },
+        Err(e) => lag_or_stop(e, "[ModelRegistry] registry", ()),
+    };
+    match read {
+        MirrorRead::Ignore => true,
+        MirrorRead::Stop => false,
+        MirrorRead::Refresh(()) => {
+            crate::llm::model_registry::reload(registry, pool).await;
+            true
         }
-    });
+    }
 }
 
 /// What in this event changed the LLM provider configuration, if anything.
@@ -1061,6 +1144,20 @@ fn provider_config_trigger(event: &event_bus::BusEvent) -> Option<String> {
             Some(format!("the '{key}' preference"))
         }
         _ => None,
+    }
+}
+
+/// What one read of the bus asks of the provider subscriber. A rebuild carries
+/// the label of what changed, for the log.
+fn provider_config_read(
+    received: Result<event_bus::EmittedEvent, tokio::sync::broadcast::error::RecvError>,
+) -> MirrorRead<String> {
+    match received {
+        Ok(emitted) => match provider_config_trigger(&emitted.typed) {
+            Some(trigger) => MirrorRead::Refresh(trigger),
+            None => MirrorRead::Ignore,
+        },
+        Err(e) => lag_or_stop(e, "[Providers] config", "a broadcast lag".to_string()),
     }
 }
 
@@ -1093,24 +1190,11 @@ fn spawn_provider_config_subscriber(
     ctx: crate::llm::ProviderBuildContext,
 ) {
     tokio::spawn(async move {
-        use tokio::sync::broadcast::error::RecvError;
         loop {
-            let emitted = match rx.recv().await {
-                Ok(e) => e,
-                // Lag = subscriber fell behind. Skip the dropped events but keep
-                // listening, so a single lag doesn't stop tracking provider
-                // config changes for the rest of the engine's lifetime.
-                Err(RecvError::Lagged(n)) => {
-                    log!(
-                        "[Providers] config subscriber lagged by {} events, continuing",
-                        n
-                    );
-                    continue;
-                }
-                Err(RecvError::Closed) => break,
-            };
-            let Some(trigger) = provider_config_trigger(&emitted.typed) else {
-                continue;
+            let trigger = match provider_config_read(rx.recv().await) {
+                MirrorRead::Ignore => continue,
+                MirrorRead::Stop => break,
+                MirrorRead::Refresh(trigger) => trigger,
             };
             match crate::llm::build_active_provider(Some(&pool), &ctx).await {
                 Ok(crate::llm::ProviderBuildOutcome::Install {
@@ -1605,6 +1689,10 @@ mod migration_tests;
 #[cfg(test)]
 #[path = "mod_tests/provider_config_trigger.rs"]
 mod provider_config_trigger_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/config_mirrors_after_lag.rs"]
+mod config_mirrors_after_lag_tests;
 
 #[cfg(test)]
 #[path = "mod_tests/lifecycle.rs"]

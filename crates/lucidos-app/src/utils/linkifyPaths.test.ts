@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, hrefLineRef, labelLineRef, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractWorkspaceDiskDataPath, extractBareAppRef, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, hrefLineRef, labelLineRef, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
 import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
 
 describe('DATA_PATH_PREFIXES', () => {
@@ -423,6 +423,46 @@ describe('extractLocalFileTarget', () => {
     ['#anchor', null],
   ])('returns null for %s', (href, expected) => {
     expect(extractLocalFileTarget(href)).toBe(expected);
+  });
+});
+
+describe('extractWorkspaceDiskDataPath', () => {
+  const WS = '/Users/me/workspaces/dev';
+
+  it.each([
+    // The reported bug: a coding agent linked its artifacts by disk path.
+    [`${WS}/data/artifacts/marketing/phone-100.png`, 'artifacts/marketing/phone-100.png'],
+    [`file://${WS}/data/artifacts/report.pdf`, 'artifacts/report.pdf'],
+    [`${WS}/data/knowhow/email/triage.md#L12`, 'knowhow/email/triage.md'],
+    // Markdown percent-encodes a destination with a space in it.
+    ['/Users/me/My%20Workspaces/dev/data/artifacts/a%20b.md', 'artifacts/a b.md'],
+  ])('maps %s -> %s', (href, expected) => {
+    const root = href.includes('My%20Workspaces') ? '/Users/me/My Workspaces/dev' : WS;
+    expect(extractWorkspaceDiskDataPath(href, root)).toBe(expected);
+  });
+
+  it('tolerates a trailing slash on the workspace root', () => {
+    expect(extractWorkspaceDiskDataPath(`${WS}/data/artifacts/x.md`, `${WS}/`)).toBe('artifacts/x.md');
+  });
+
+  it.each([
+    // Outside the workspace: still the OS opener's.
+    ['/tmp/build/out.dmg', WS],
+    [`${WS}/.lucidos/worktrees/t/src/main.rs`, WS],
+    // A sibling folder that merely shares the prefix.
+    ['/Users/me/workspaces/dev2/data/artifacts/x.md', WS],
+    // A dot segment can climb out of data/, so the prefix proves nothing.
+    [`${WS}/data/artifacts/../../secret.txt`, WS],
+    [`${WS}/data/./artifacts/x.md`, WS],
+    // The data folder itself, or a sub-tree with nothing under it.
+    [`${WS}/data/`, WS],
+    [`${WS}/data/artifacts/`, WS],
+    // A workspace-relative path is extractDataPathTarget's, not this one's.
+    ['artifacts/x.md', WS],
+    // The root is not known yet (health still loading).
+    [`${WS}/data/artifacts/x.md`, ''],
+  ])('returns null for %s', (href, root) => {
+    expect(extractWorkspaceDiskDataPath(href, root)).toBeNull();
   });
 });
 

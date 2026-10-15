@@ -56,6 +56,25 @@ async fn a_branch_editing_what_main_edited_is_predicted_to_conflict() {
 }
 
 #[tokio::test]
+async fn the_conflict_list_names_only_conflicting_paths() {
+    // Tier 3 names these in MergeConflictDetected, not the change's whole list.
+    let (_tmp, repo) = diverged_repo().await;
+    git_cmd(&["checkout", "clash"], &repo).await.unwrap();
+    commit_file(&repo, "untouched-by-main.txt", "x", "a clean addition").await;
+    git_cmd(&["checkout", "main"], &repo).await.unwrap();
+    assert_eq!(
+        predict_merge_into_main(&repo, "clash")
+            .await
+            .into_conflicts(),
+        vec!["init.txt".to_string()]
+    );
+    assert!(predict_merge_into_main(&repo, "fresh")
+        .await
+        .into_conflicts()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn a_missing_branch_or_repo_is_unknown_never_clean() {
     let (_tmp, repo) = diverged_repo().await;
     assert_eq!(

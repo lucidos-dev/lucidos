@@ -14,8 +14,9 @@
  */
 
 import { HEADER_DEVICE_ID } from '@lucidos/engine-constants';
+import { DEVICE_ID_KEY } from './deviceIdKey';
 
-export const DEVICE_ID_KEY = 'lucidos-device-id';
+export { DEVICE_ID_KEY };
 
 /** This browser's device id, or null if none has been minted yet. */
 export function readDeviceId(): string | null {

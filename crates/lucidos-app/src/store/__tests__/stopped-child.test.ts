@@ -96,3 +96,28 @@ describe('work held for hardening and the attention badge', () => {
     expect(threadIsBlocked(thread)).toBe(false);
   });
 });
+
+describe('a ChildReportFiled note on the parent', () => {
+  const filedNote = {
+    type: 'ChildReportFiled',
+    child_thread_id: CHILD_ID,
+    child_thread_title: 'Check the venue',
+    status: 'success',
+    summary: 'It opens at nine.',
+  } as ThreadEvent;
+
+  /** It woke nothing, so no response follows it and it never spins. */
+  it('is a turnless boundary that reads as done', () => {
+    expect(isTurnlessBoundary(filedNote)).toBe(true);
+    const { map, id } = makeThread();
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'spawn a child for the venue' },
+      { type: 'ResponseGenerated', text: 'Spawned it.' },
+      filedNote,
+    ] as ThreadEvent[]);
+    const exchanges = getExchanges(map, id);
+    expect(exchanges).toHaveLength(2);
+    expect(exchanges[1].userEvent.type).toBe('ChildReportFiled');
+    expect(exchangeStatus(exchanges[1], '', true, false, false, true)).toBe('done');
+  });
+});

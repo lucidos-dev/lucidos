@@ -51,6 +51,10 @@ pub struct ChatJudgmentProvider {
     provider: Arc<dyn LlmProvider>,
     /// The effort half of the site's *model selection*.
     reasoning: Option<String>,
+    /// Whether the call forces the answer tool. A forced call cannot answer
+    /// in text and runs without thinking, and a model that always thinks
+    /// refuses it, which fails the call.
+    forced: bool,
 }
 
 impl ChatJudgmentProvider {
@@ -58,7 +62,25 @@ impl ChatJudgmentProvider {
         Self {
             provider,
             reasoning,
+            forced: false,
         }
+    }
+
+    /// Force the answer tool, for a site whose every call must answer.
+    pub fn forcing_the_answer(self) -> Self {
+        Self {
+            forced: true,
+            ..self
+        }
+    }
+}
+
+/// The state as the model reads it: a text state as itself, anything else as
+/// pretty JSON.
+pub(crate) fn state_text(state: &Value) -> String {
+    match state {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
     }
 }
 
@@ -70,7 +92,7 @@ pub(crate) fn user_message(state: &Value, questions: &[(String, Question)]) -> S
         .collect();
     format!(
         "State:\n{}\n\nQuestions:\n{}",
-        serde_json::to_string_pretty(state).unwrap_or_default(),
+        state_text(state),
         serde_json::to_string_pretty(&Value::Object(questions)).unwrap_or_default(),
     )
 }
@@ -242,7 +264,9 @@ impl JudgmentProvider for ChatJudgmentProvider {
                     content: MessageContent::Text(message),
                 }],
                 vec![tool],
-                crate::llm::ModelSelection::default().with_effort(self.reasoning.as_deref()),
+                crate::llm::ModelSelection::default()
+                    .with_effort(self.reasoning.as_deref())
+                    .with_forced_tool(self.forced.then_some(ANSWER_TOOL)),
                 Some(SYSTEM_PROMPT),
                 None,
                 call,

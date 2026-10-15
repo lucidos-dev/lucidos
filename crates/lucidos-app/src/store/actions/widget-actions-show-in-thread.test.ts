@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 /**
- * "Show in thread" lands on the widget's card (ADR 0407). A folded turn draws
- * no body, so the card is not in the DOM until the turn unfolds.
+ * "Show in thread" lands on the inline widget (ADRs 0407, 0466). A folded turn
+ * draws no body, so the widget is not in the DOM until the turn unfolds.
  */
 
 const expandExchange = vi.fn();
@@ -17,8 +17,8 @@ vi.mock('../store', async (importOriginal) => ({
 vi.mock('../thread-events', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../thread-events')>()),
   computeExchanges: () => [
-    { userSeq: 3, steps: [{ event: { type: 'ToolCalled', _eventId: 'tool-1' } }] },
-    { userSeq: 7, steps: [{ event: { type: 'WidgetShown', _eventId: 'shown-1' } }] },
+    { userSeq: 3, userEvent: { _eventId: 'starter-3' }, steps: [{ event: { type: 'ToolCalled', _eventId: 'tool-1' } }] },
+    { userSeq: 7, userEvent: { _eventId: 'starter-7' }, steps: [{ event: { type: 'WidgetShown', _eventId: 'shown-1' } }] },
   ],
 }));
 vi.mock('./event-navigation', () => ({
@@ -33,10 +33,16 @@ describe('showWidgetInThread', () => {
     showEventWhereItLives.mockClear();
   });
 
-  it('unfolds the turn that showed the widget, then lands on its card', () => {
+  it('unfolds the turn that showed the widget, then lands on its inline widget', () => {
     showWidgetInThread('thread-1', 'shown-1');
     expect(expandExchange).toHaveBeenCalledWith('thread-1', 7);
     expect(showEventWhereItLives).toHaveBeenCalledWith('shown-1');
+  });
+
+  it("unfolds the turn a reply's pin named by its starter", () => {
+    showWidgetInThread('thread-1', 'starter-3');
+    expect(expandExchange).toHaveBeenCalledWith('thread-1', 3);
+    expect(showEventWhereItLives).toHaveBeenCalledWith('starter-3');
   });
 
   it('still navigates when no loaded turn holds the event', () => {

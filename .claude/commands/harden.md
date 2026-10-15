@@ -1,18 +1,46 @@
 Harden the code: review changed code for reuse, quality, and efficiency, then fix any issues found. Check for bugs and CLAUDE.md compliance, then run the test suites for what was touched (iterating from Phase 1 if anything fails). Run this before finishing your session.
 
-**No postpone option.** Never tell the user you're "postponing", "deferring", or "skipping" `/harden`. There is no such mode — if you say it, you're misleading them, because Apply will run hardening synchronously when the marker is `MISSING` (and the user waits at that point). Either Phase 0 reports `ALREADY_HARDENED` (say so and stop) or you run the full skill. The only honest answers are "already hardened — skipping" or "running hardening now".
+**No postpone option.** Never tell the user you're "postponing", "deferring", or "skipping" `/harden`. There is no such mode, so saying it misleads them. Apply runs hardening synchronously when the marker is `MISSING`, and the user waits at that point. Either Phase 0 reports `ALREADY_HARDENED` or `PLAN_ONLY` (say so and stop) or you run the full skill. The only honest answers are "already hardened, skipping", "plans only, no hardening needed" or "running hardening now".
 
 ## Phase 0: Check if Already Hardened
 
-`lucidos hardened query` prints `FRESH`, `STALE`, or `MISSING` for the branch
-in `$PWD`. `FRESH` means HEAD still matches the SHA recorded by the last
-`/harden`; `STALE` means CC has committed since then and a re-run is needed.
+`lucidos hardened query` prints `FRESH`, `STALE`, `MISSING` or `NOT_NEEDED`
+for the branch in `$PWD`. `FRESH` means HEAD still matches the SHA recorded by
+the last `/harden`; `STALE` means CC has committed since then and a re-run is
+needed. `NOT_NEEDED` means the branch lands implementation plans only: the
+engine decides that with the same predicate Apply reads, and Apply never
+hardens such a branch.
 
 ```bash
-[ "$(lucidos hardened query 2>/dev/null)" = "FRESH" ] && echo "ALREADY_HARDENED" || echo "NOT_HARDENED"
+case "$(lucidos hardened query 2>/dev/null)" in
+  FRESH) echo "ALREADY_HARDENED" ;;
+  NOT_NEEDED) echo "PLAN_ONLY" ;;
+  *) echo "NOT_HARDENED" ;;
+esac
 ```
 
-If the output is `ALREADY_HARDENED`, inform the user: "Already hardened — skipping." and stop. Do NOT re-run hardening.
+If the output is `ALREADY_HARDENED`, inform the user: "Already hardened, skipping." and stop. Do NOT re-run hardening.
+
+If the output is `PLAN_ONLY`, inform the user: "This branch carries only implementation plans, which need no hardening." and stop. Do NOT mark it hardened: the hardening runs on the branch that implements the plan.
+
+On `NOT_HARDENED`, clear the review head an earlier run left, since only this
+run's iterations may read it (§ Later iterations review only the fix):
+
+```bash
+rm -f .lucidos/harden-review-head
+```
+
+Then read the tier this branch runs (ADR 0465):
+
+```bash
+lucidos hardened expected-tier 2>/dev/null || echo full
+```
+
+`fast` means an *integrated sub-thread*: its parent merges its branch and runs
+every suite once over the merged work. The fast tier changes four phases:
+Phase 0.3 is skipped, Phase 4 merges no `main`, Phase 4.5's script selects the
+fast suites itself, and Phase 5 marks `--tier fast`. Review runs as usual.
+`full` is every other branch, and the rest of this file as written.
 
 ## Phase 0.3: Catch Up With main
 
@@ -23,20 +51,27 @@ Apply spawns a resolver that hardens everything a second time (ADR 0345).
 Run it once per `/harden`, and only after Phase 0 printed `NOT_HARDENED`. A
 merge into a `FRESH` branch would make its marker stale.
 
+**Skip it on the fast tier.** An integrated sub-thread never merges `main`:
+its parent merges it, once, over all its children's work.
+
 1. If `git rev-parse -q --verify MERGE_HEAD` succeeds, a merge is already in
    progress. Go to step 4 and finish it, since any commit now concludes it.
 2. Commit your own uncommitted work, as its own commit. It must not ride
    inside the merge commit.
-3. Merge:
+3. Register the merge drivers, then merge:
 
    ```bash
+   ./scripts/merge-drivers.sh
    git merge main --no-edit
    ```
 
-   A clean merge commits itself, and "Already up to date" needs nothing.
-   Either way, go on to Phase 0.4.
+   The registration is idempotent. If it refuses (an old `lucidos` CLI), the
+   merge still runs, as plain text. A clean merge commits itself, and
+   "Already up to date" needs nothing. Either way, go on to Phase 0.4.
 4. On a conflict, resolve every file. Read both sides and keep what each one
    meant, then `git add` the file. Ask the user when a conflict is ambiguous.
+   A conflict left in a registry `.gitattributes` names (ADR 0460) is a real
+   one: both sides edited the same entry.
 5. Make sure no marker survives. This must print nothing, since `git add`
    accepts a file that still holds markers:
 
@@ -58,8 +93,13 @@ again. The earlier run already reviewed every line the branch wrote
 (ADR 0295, ADR 0315).
 
 ```bash
-./scripts/harden-scope.sh "$(lucidos hardened sha 2>/dev/null)"
+HARDEN_REVIEWED_HEADS="$(lucidos hardened integrated-heads 2>/dev/null)" \
+  ./scripts/harden-scope.sh "$(lucidos hardened sha 2>/dev/null)"
 ```
+
+`HARDEN_REVIEWED_HEADS` names the heads this branch's integrated children
+hardened. Every commit under one counts as reviewed, as a commit on `main`
+does. So a merge of such a child adds only its resolution to the review.
 
 The first line is the answer:
 
@@ -70,8 +110,8 @@ The first line is the answer:
 - `FULL <reason>`: go on to Phase 0.5 as usual.
 
 The lines after it name what to review: `commit <sha>` (own commits, oldest
-first), `merge <sha>`, `overlap <path>`, and `codex-base <sha>`. The review
-covers these inputs, and nothing else:
+first), `merge <sha>`, `overlap <path>`, `codex-base <sha>`, and
+`fork-point <sha>`. The review covers these inputs, and nothing else:
 
 - **The new lines:** one file holding each commit's patch and each merge's
   resolution. `git show --remerge-diff` shows what the resolver wrote against
@@ -83,41 +123,43 @@ covers these inputs, and nothing else:
     for m in <each merge sha>; do git show --remerge-diff --format= "$m"; done
   } > .lucidos/review-target.diff
   ```
-- **The overlap:** each `overlap` path is a file the branch changed that a
-  merge also changed. Read the branch's change there against main's new code.
-  A semantic conflict can merge clean.
+- **The overlap:** each `overlap` path is a file both sides of a merge
+  changed. Read the branch's change there against the other side's. A
+  semantic conflict can merge clean.
 
 The phases then run as follows:
 
-- Phases 0.5 and 0.6 are skipped. Phase 0.75 is skipped for `MERGE_ONLY`,
-  which the earlier run settled. For `INCREMENTAL` it checks the new commits.
+- Phases 0.5 and 0.6 are skipped.
 - Phase 1 kickoff starts the early suite run unchanged. With a `codex-base`
   line, the Codex review runs against that base. `INCREMENTAL` without one
   runs it against `main`, which after Phase 0.3 is the branch's own change. A
   hardened SHA as the base would pull in all of main's new code. `MERGE_ONLY`
   skips it.
-- Phase 1 runs `code-review` with `.lucidos/review-target.diff` as its
-  target. An empty file means a clean merge with nothing resolved: note
-  "Phase 1: clean merge" and move on.
-- Phase 2 runs all three angles **inline**, as the small-diff tier does. Bug
-  detection and compliance read the review target. The regression angle reads
-  the overlap paths and each commit's files.
-- Phase 2.5 gates on the review target. Phase 3 validates inline.
+- Phase 1 runs `code-review` **inline**, with `.lucidos/review-target.diff`
+  as its target, and also reads each overlap path. An empty file means a
+  clean merge with nothing resolved: note "Phase 1: clean merge" and move on.
+- Phase 2.5 gates on the review target.
 - **Phases 4, 4.5 and 5 run unchanged.** Every suite `harden-suites.sh`
   selects for the branch still runs, because a merge that mixes sides needs
   the full suite (`CLAUDE.md`).
 
-**Re-run the check on every iteration.** A Phase 4 fix is a new commit, and
-the marker moves only in Phase 5. So after a merge-only pass, the next pass
-answers `INCREMENTAL` and reviews the fix together with the merges.
+**A `fork-point` line means the branch has no marker of its own.** Its
+children's runs reviewed what they cover, and the listed commits are the
+branch's own since it forked. That may be a lot of new work, so Phases 0.5
+and 0.6 run as usual, and Phase 1 runs the way they pick. Every review input
+is still the review target above.
+
+This check runs in the first iteration only. A later iteration has its own (§ Later
+iterations review only the fix).
 
 ## Phase 0.5: Detect Docs-Only Diff
 
 Run `git diff main...HEAD --name-only`. If every changed file ends in `.md` or `.txt`, the diff is **docs-only**. In docs-only mode:
 
-- Skip Phase 1 (`/code-review` looks for code-shaped bugs that don't apply to prose).
-- Skip Phase 2 Agent 1 (no code logic to bug-check).
-- Phase 2 Agents 2 and 3 (compliance, regression), Phase 3, Phase 4, Phase 5 still run.
+- Phase 1 skips both kickoff steps and runs `code-review` **inline**, with
+  only the compliance, prose, private-data and buried-finding angles. The
+  correctness angles look for code-shaped bugs that prose does not have.
+- Phase 3, Phase 4 and Phase 5 still run.
 - Phase 2.5 auto-skips for docs-only via its own packaged-runtime gate.
 - Phase 4.5 still runs `scripts/harden-suites.sh`, which picks the suites a docs-only diff needs. A `system-knowhow/**` edit runs the always-loaded budget tests, and a compiled-in file such as `CHANGELOG.md` runs the Rust suite.
 
@@ -125,10 +167,10 @@ Do NOT extend this fast path to "string-only" or "comment-only" `.rs` edits. Str
 
 ## Phase 0.6: Detect a Small Diff
 
-A small diff keeps every angle but runs Phase 2 and Phase 3 inline, even on
-Claude Code. Three subagents re-reading a one-token diff cost more than the
-review itself. The check ignores `.md` and `.txt` files, so a plan or glossary
-edit alongside a small fix does not push it over.
+A small diff keeps every angle but runs the Phase 1 review inline, even on
+Claude Code. A subagent re-reading a one-token diff costs more than the review
+itself. The check ignores `.md` and `.txt` files, so a plan or glossary edit
+alongside a small fix does not push it over.
 
 ```bash
 files=$(git diff main...HEAD --name-only -- . ':(exclude)*.md' ':(exclude)*.txt')
@@ -145,29 +187,74 @@ fi
 
 In small-diff mode:
 
-- Phase 1 runs unchanged, Codex review included. It is the phase that finds
-  real bugs in small CSS diffs, such as a forced-colors regression.
-- Phase 2 runs all three angles **inline and sequentially**, as the Codex
-  bullet there describes.
-- Phase 3 validates each finding inline rather than with a subagent per finding.
-- Phase 2.5, Phase 4, Phase 4.5 and Phase 5 run unchanged.
+- Phase 1 runs `code-review` **inline**, Codex review included. It is the
+  phase that finds real bugs in small CSS diffs, such as a forced-colors
+  regression.
+- Phase 2.5, Phase 3, Phase 4, Phase 4.5 and Phase 5 run unchanged.
 
-**Re-run the check on every iteration.** A fix that grows the diff past the
-threshold sends the next pass through the full procedure.
+This check runs in the first iteration only. A later iteration sizes its fix itself
+(§ Later iterations review only the fix).
 
 A `.rs`, `.sql`, `.sh`, `Cargo.toml`, `Cargo.lock` or `Makefile` change is never
 small, whatever its size. The reason is the one Phase 0.5 gives for `.rs`
 strings, and it also keeps every Phase 2.5 surface out of this mode.
 
-## Phase 0.75: Planning-Invariant Backstop
+## Every iteration records its verdict
 
-If the diff is complex per `CLAUDE.md` (ADR/design-thread-backed, cross-layer, routing/topology/storage/security/migration/process, or otherwise non-local), verify that the session produced an implementation plan before the first code edit and that final verification maps back to its invariants.
+An iteration runs from Phase 1 to its verdict. Count them from 1. Record each
+one just before you act on its verdict: before any "return to Phase 1", and
+before Phase 5.
 
-This is a backstop, not the first time invariants should appear. Do not invent a late checklist to justify an already-written diff. If no implementation plan exists for a complex diff, flag it as a `CLAUDE.md` compliance issue in Phase 2 Agent 2 and create one from the available prompt/thread/docs before continuing with review/test work. If the plan exposes missing verification or a violated invariant, treat that as a real hardening finding and fix or verify it before Phase 5.
+```bash
+lucidos events emit HardenRunCompleted --summary "harden iteration <n>: <pass|fail>" \
+  --payload "{\"thread_id\": \"$LUCIDOS_THREAD_ID\", \"branch\": \"$(git branch --show-current)\", \"head_sha\": \"$(git rev-parse HEAD)\", \"iteration\": <n>, \"verdict\": \"<pass|fail>\", \"failed_phase\": \"<phase, or empty on pass>\", \"tier\": \"<full|fast>\", \"findings\": {\"code_review\": <n>, \"codex\": <n>, \"fixed\": <n>}}"
+```
+
+- `failed_phase` names the gate that failed, such as `4.5 prose` or
+  `4.5 engine tests`.
+- `findings` counts this iteration's findings by source. `code_review` is what
+  the review returned, and `codex` what Codex returned (0 when it did not
+  run). `fixed` is how many of them led to a fix. A re-measure compares yield
+  per source against ADR 0476.
+- A domain event carries no thread of its own, so `thread_id` is what ties the
+  run to its thread. The auto-compact trial counts these
+  (`docs/plans/2026-10-13-auto-compact-trial-and-successor-threads.md`).
+
+An emit that fails never blocks hardening: note it and go on.
+
+## Later iterations review only the fix
+
+Every "return to Phase 1" in this file starts a later iteration. The iteration before
+reviewed every line up to the review head, so a later iteration reviews only what
+came after it (ADR 0476). Phases 0 to 0.6 do not run again.
+
+1. Find the new lines. Phase 4 writes the review head at the end of every
+   iteration:
+
+   ```bash
+   ./scripts/harden-scope.sh "$(cat .lucidos/harden-review-head 2>/dev/null)"
+   ```
+
+   A `FULL` answer means the head is missing or unusable: run the iteration as
+   the first iteration does. Otherwise build `.lucidos/review-target.diff` from
+   the `commit` and `merge` lines exactly as Phase 0.4 does, and read each
+   `overlap` path.
+2. Size the target:
+
+   ```bash
+   grep -E '^[+-]' .lucidos/review-target.diff | grep -cvE '^(\+\+\+|---)( |$)'
+   ```
+
+3. **60 lines or fewer:** run Phase 1 with no kickoff Codex review, and the
+   review **inline** on the target. **Over 60:** run Phase 1 as the first iteration
+   does, on the target. The Codex review takes `CODEX_BASE` from a
+   `codex-base` line, else `main`.
+4. Phases 2.5 to 5 then run as usual.
 
 ## Phase 1: Run /code-review
 
-**Docs-only fast path:** if Phase 0.5 flagged this diff as docs-only, skip this phase entirely and proceed to Phase 2.
+**Docs-only:** if Phase 0.5 flagged this diff as docs-only, skip both kickoff
+steps below and run the review inline, with the angles Phase 0.5 names.
 
 ### Phase 1 kickoff: start the early suite run (Claude Code only)
 
@@ -214,12 +301,19 @@ mkdir -p .lucidos && ./scripts/harden-suites.sh start --early > .lucidos/harden-
 
 ### Phase 1 kickoff: launch Codex review in parallel (advisory, Claude Code only)
 
-Before running the `code-review` skill, kick off a Codex review of the branch diff **in the background** so it overlaps Phases 1–3 and adds ~no wall-clock (median 97s across the 25 recorded runs on this repo, with a tail out to 11 min, so it fits inside the Claude review phases). It is a fourth reviewer running on the *same* cadence as the others: because `/harden` loops (Phase 4.5 failure → back to Phase 1), each iteration launches a fresh Codex review on the updated diff, exactly like `code-review` and the Phase 2 agents re-run.
+Before running the `code-review` skill, kick off a Codex review of the branch
+diff **in the background**. It overlaps Phases 1 to 3 and adds almost no wall
+clock. The 25 recorded runs on this repo took a median 97s, with a tail out to
+11 min.
+
+It is the second reviewer beside `code-review`, and the only one from another
+model family. A later iteration launches it only for a fix over 60 lines (§ Later
+iterations review only the fix).
 
 This step is **advisory**: its findings feed the same validate→fix pipeline as every other reviewer (joined in Phase 3), but Codex being unavailable, slow, erroring, or timing out NEVER blocks the hardened marker.
 
 - **Claude Code only.** A Codex-backed `/harden` run is already Codex reviewing this diff — skip this step and note "Codex review: skipped (Codex-backend run)".
-- **Docs-only:** this whole phase is skipped, so Codex review is skipped too (it's a code reviewer, not a prose reviewer).
+- **Docs-only:** skipped, since Codex is a code reviewer, not a prose reviewer.
 - **Merge-only or incremental (Phase 0.4):** with a `codex-base <sha>` line, prefix the script in the launch call below with `CODEX_BASE=<sha>`. `INCREMENTAL` without one keeps the default base `main`. `MERGE_ONLY` skips this step: note "Codex review: skipped (merge-only)", since the earlier run already covered the branch.
 
 `./scripts/harden-codex-review.sh` runs the review. It resolves the companion installed with the `codex` plugin, so never hardcode a path. Run the launch below as **one** Bash call. The subshell runs behind a shell `&`, because Claude Code's own background mode is off under Lucidos (ADR 0358). It writes the review to `.lucidos/codex-review.out` and drops `.lucidos/codex-review.done` when it ends, which is what Phase 3 joins on: Claude Code has no blocking wait tool. `CODEX_BASE` defaults to `main`, matching `/harden`'s diff base of `main...HEAD`:
@@ -240,94 +334,57 @@ The script header documents what it guarantees:
 
 ### Phase 1 review
 
-Run the **repo-owned** `code-review` skill (`.claude/skills/code-review/SKILL.md`) at **medium** effort. It reviews the branch diff for correctness bugs at the high-confidence end of the precision/recall slider — fewer findings, very low false-positive rate, complementary to Phase 2's broader bug-detection agent.
+Run the **repo-owned** `code-review` skill (`.claude/skills/code-review/SKILL.md`)
+at **high** effort. It is the one Claude review of the iteration, beside Codex
+(ADR 0476). Its target is `git diff main...HEAD`, or
+`.lucidos/review-target.diff` when Phase 0.4 or a later iteration built one.
 
-- **Claude Code:** invoke via the Skill tool — `Skill skill: "code-review" args: "medium"`. The project skill overrides Claude Code's built-in of the same name, so this resolves to the repo copy.
-- **Codex / any agent without a Skill tool:** the skill is NOT in your available-skills list (it lives only on disk). **Read `.claude/skills/code-review/SKILL.md` and follow its phases directly** against the branch diff at medium effort. Do not skip Phase 1 just because the Skill tool can't find it.
-
-(Background: this phase used to invoke Claude Code's built-in `code-review` skill — the renamed `/simplify`. Built-in and plugin skills are invisible to Codex, which only sees skills on disk under `.claude/skills/`, so a Codex `/harden` run couldn't find it. The procedure is now vendored into `.claude/skills/code-review/` so both backends run the same phases; the apply step lives here in the harden orchestrator, not in the skill.)
+- **Claude Code, first iteration of a full diff:** run it in ONE `Agent` subagent,
+  so its file reads stay out of your long context. Tell it to read the skill
+  file and follow it at high effort against the target. Also tell it that it
+  runs as a subagent for `/harden` Phase 1, so it reports as the skill's Output
+  section says. Under Lucidos the call blocks and returns the report inline
+  (ADR 0358). Do not pass `run_in_background`: the parameter does not exist.
+- **Inline cases** (small diff, docs-only, merge-only, incremental, or a small
+  later-iteration fix): invoke it in your own session, `Skill skill: "code-review"
+  args: "high"`. The project skill overrides Claude Code's built-in of the same
+  name.
+- **Codex / any agent without a Skill or Agent tool:** the skill is NOT in your
+  available-skills list. **Read `.claude/skills/code-review/SKILL.md` and
+  follow its phases directly**, inline, at high effort. Do not skip Phase 1
+  because the Skill tool can't find it. Continue to Phase 3 in the same turn,
+  and do not stop until Phase 5 has written the marker.
 
 When `code-review` returns its findings:
 
-- **No bugs flagged:** record that, proceed to Phase 2.
-- **Bugs flagged:** for each finding, read the cited file and confirm the bug is real, to the Phase 3 validation standard. Then **fix the real ones directly**. Skip findings that are false positives, depend on uncertain runtime state, or duplicate something Phase 2 will catch better. Run `./scripts/harden-suites.sh stop` before the first edit, per the kickoff rules above.
-- **Commit any fixes** before proceeding to Phase 2, since Phase 2's diff input needs to include them. Name the files: `git add <file>`, never `git commit -a`.
+- **No findings:** record that and go on to Phase 2.5.
+- **Findings:** the skill's own verifier already confirmed each one, so do not
+  validate them again. Act on each by its `category`:
+  - `correctness`: fix it. If reading the code to fix it shows the finding is
+    wrong, drop it and say why.
+  - `compliance`: fix it. A rule requires each one, such as a registry row, a
+    glossary entry or a placeholder for private data.
+  - `cleanup`: list it in the Phase 4 report. Do not fix it and do not ask
+    about it. A fix can void the early suite run and start another iteration.
+- Run `./scripts/harden-suites.sh stop` before the first edit, per the kickoff
+  rules above.
+- **Commit any fixes** before Phase 2.5. Name the files: `git add <file>`,
+  never `git commit -a`.
 
 Do NOT pass `--comment` (that mode posts to GitHub PRs, which Lucidos does not use).
 
-**Report Phase 1 in prose — the findings are structured data, not a message.**
-The `code-review` skill reports its findings through a **structured channel** (its
-Output section): the `ReportFindings` tool on Claude Code — which renders them
-structurally, never as text — or, for backends without that tool, an in-band
-array it hands back with an explicit `No findings.` in the empty case. Either
-way the findings are the skill's handoff to *you*, NOT text for the reader:
-translate the result into one sentence of prose ("Phase 1: no findings" or
-"Phase 1 flagged N issues: …") and **never paste a findings array — empty `[]`/`{}`
-or populated, fenced or inline — into your reply.** A bare `[]` in the chat is
-meaningless noise; it is the recurring bug the structured-channel handoff exists
-to prevent. The fix is deliberately at the **source** (the repo-owned skill),
-NOT a frontend content-filter — see `docs/temporary-measures.md` § "code-review
-findings array leaking into chat".
+**Report Phase 1 in prose. The findings are structured data, not a message.**
+The skill hands them to *you* through its Output section: a subagent's final
+report, the `ReportFindings` tool, or an in-band list with an explicit
+`No findings.` in the empty case. Translate the result into one sentence of
+prose, such as "Phase 1: no findings" or "Phase 1 flagged N issues: …".
 
-## Phase 2: Run Three Hardening Agents
-
-Run `git diff main...HEAD` to get the current diff (including any Phase 1 fixes). Also run `git diff main...HEAD --name-only` to get the list of changed files. Run the three angles below:
-
-**Subagents are optional — the angles are not.** Mirrors the `code-review` skill's contract:
-
-- **Small diff (Phase 0.6), merge-only or incremental (Phase 0.4):** run the three angles inline, as the Codex bullet below describes, on any backend.
-- **Claude Code:** launch the three agents as parallel subagents, all three in ONE assistant message (faster, independent perspectives). Under Lucidos each `Agent` call blocks and hands you its report inline, because Claude Code's background mode is off (ADR 0358). Do not pass `run_in_background`: the parameter does not exist, so the call fails. One message keeps the three parallel. Never wait by launching a filler agent, sleeping, or asking a placeholder question.
-- **Codex / any agent without a Task tool:** you have NO subagent capability — do NOT try to spawn agents, and do NOT improvise a "simulated parallel" pass (that interleaves output and stalls the turn, which is exactly how a Codex `/harden` run dies right after Phase 1). Run all three angles **yourself, inline and sequentially** — Agent 1, then Agent 2, then Agent 3 — in this same session, collecting findings as you go. The analysis and output are identical; only the execution is serial. Then continue to Phase 3 in the same turn — do not stop or idle until Phase 5 has written the marker.
-
-### Agent 1: Bug Detection
-
-**Docs-only fast path:** if Phase 0.5 flagged this diff as docs-only, skip this agent (Agents 2 and 3 still run).
-
-Scan the diff for bugs and incorrect logic that Phase 1's `code-review medium` would have missed at its high-confidence threshold. Tag each finding with a severity:
-
-- 🔴 **Bug** — will break production, must fix before merging
-- 🟡 **Nit** — worth fixing but not blocking
-
-Do NOT use a "pre-existing" category. If a bug exists in a file touched by this branch, it must be classified as 🔴 or 🟡 based on severity — "it was already broken" is not a valid excuse to skip it.
-
-Focus on:
-- Code that will fail to compile or parse (syntax errors, type errors, missing imports, unresolved references)
-- Code that will definitely produce wrong results regardless of inputs (clear logic errors)
-- Security vulnerabilities in the changed code (injection, auth bypass, data exposure)
-
-**HIGH SIGNAL ONLY.** Do NOT flag:
-- Code style or quality concerns (already covered by Phase 1 `code-review`)
-- Potential issues that depend on specific inputs or state
-- Subjective suggestions or improvements
-- Anything listed in `docs/code-review-priors.md` — the ledger of patterns
-  already flagged by past reviews and dismissed with evidence (guarded byte
-  slices, documented catch-silencers, deliberate `[]`-until-loaded filters,
-  …). Include the file in the agent's prompt. Re-flagging a prior requires
-  NEW evidence that the guard/contract changed, not re-derivation of the
-  original suspicion.
-
-### Agent 2: CLAUDE.md Compliance
-
-Check the changes against all applicable CLAUDE.md files (root and any in directories containing modified files). Flag only clear, unambiguous violations where you can quote the exact rule being broken.
-
-This includes **`.claude/rules/no-private-data.md`** — flag any private/personal/company-internal data the diff introduces into a shipping file (everything except `docs/plans/**` and `WORKSPACES.md` ships publicly, test fixtures and comments included). That rule is the single source of truth for the definition, the attribution carve-out, and the approved placeholders; flag against it and name the placeholder to use. (The `code-review` skill from Phase 1 carries the same check as a review angle — this agent is the compliance-side backstop.)
-
-It ALSO includes **`.claude/rules/temporary-measures.md`**: the **temporary-measures & marker-hygiene** check (one check, three faces). Apply the inclusion test to the diff: *does it add something meant to go away with a concrete condition for when?*
-
-The first two faces are an impermanent thing and a bare marker. The impermanent thing is a `remove after X` / `diagnostic-only` / `temporary` / `workaround until …` comment, a new feature flag or kill-switch, or a sunset back-compat shim. The marker is a bare `TODO` / `FIXME` / `HACK` / `XXX`. Either MUST have a matching row in `docs/temporary-measures.md`: the right typed section, a concrete removal condition, and for a measure a parent-investigation id. Flag any such addition that lacks a row. **The escape valve is to register it, not to delete or reword the marker.**
-
-This closes the loophole the rule exists for. Rewording a `TODO: remove after X` into a plain `// remove after X` comment dodged tracking. So a plain impermanence comment counts the same as a raw marker, and both need a row. Do NOT flag things on the rule's OUT list, which are tracked elsewhere or not at all: permanent back-compat or old-data tolerance, site-local suppressions (`#[allow(...)]`, `@ts-expect-error`, `eslint-disable`), ADR-recorded design decisions, and open-ended tech debt.
-
-The third face is the **defending comment**, per `.claude/rules/prose.md` § "What a comment is for". Flag any added or changed comment that argues a shortcut, workaround or known-wrong behaviour is acceptable ("fine for now", "good enough", "deliberately skipped"). It is the same laundering one step further: the impermanence is gone from the wording, not from the code. Fix the root cause, or register the gap with a removal condition, or record it as a known limitation in a plan or ADR. A comment that states an invariant ("callers must hold the lock") is not a finding. Diff-scoped only: never flag an untouched comment in the existing tree.
-
-Do NOT flag:
-- General best practices not mentioned in CLAUDE.md
-- Issues silenced by lint ignore comments
-- Pedantic nitpicks
-
-### Agent 3: Regression Check
-
-For each modified file, run `git log --oneline -10 <file>` to see recent history. Check if the current changes revert, contradict, or undermine recent fixes or intentional refactors. Only flag clear regressions where you can point to a specific prior commit that the new change undoes.
+**Never paste a findings array into your reply**: not empty `[]`/`{}`, not
+populated, not fenced, not inline. A bare `[]` in the chat is meaningless
+noise, and preventing it is why the handoff is structured. The fix is
+deliberately at the **source** (the repo-owned skill), NOT a frontend
+content-filter. See `docs/temporary-measures.md` § "code-review findings array
+leaking into chat".
 
 ## Phase 2.5: Packaged-Runtime Dependency & Fail-Fast Check
 
@@ -354,7 +411,7 @@ If the diff edits the resource set or a staging/service/spawn-env path, run `./s
 If you launched a background Codex review in Phase 1, join it now: `.lucidos/codex-review.done` exists once it has ended. The last line of `.lucidos/codex-review.out` is the status line, and everything above it is the review. Read the status line first: it decides which case below applies.
 
 - **`verdict returned`:** fold Codex's findings into the validation set below. Treat each like any other reviewer's finding: confirm it against source, fix a real 🔴 in Phase 4, discard a false positive. Log recurring dismissals to `docs/code-review-priors.md`. Codex frequently returns "no actionable bugs": record that outcome and move on.
-- **Still running:** give it one bounded foreground wait on the marker, with `timeout: 600000`: `for i in $(seq 1 300); do [ -f .lucidos/codex-review.done ] && break; sleep 1; done`. The default timeout would kill the loop at 2 minutes. Cap the wait at ~5 minutes *since it was launched in Phase 1*. Usually it is already done, since Phases 1 to 2 ran in parallel with it. Remember the probe loop can hold the task for up to a minute before the review even starts, and a retry runs a second review.
+- **Still running:** give it one bounded foreground wait on the marker, with `timeout: 240000`: `for i in $(seq 1 230); do [ -f .lucidos/codex-review.done ] && break; sleep 1; done`. The default timeout would kill the loop at 2 minutes, and a longer loop outlives the prompt cache. Cap the wait at ~5 minutes *since it was launched in Phase 1*. Usually it is already done, since Phase 1 ran in parallel with it. Remember the probe loop can hold the task for up to a minute before the review even starts, and a retry runs a second review.
 - **`NO VERDICT`:** the reviewer started and failed twice. That is a lost review angle, never a pass and never "unavailable". Say so now, and quote the status line verbatim in the Phase 4 report, upstream cause included. It is still advisory, so proceed.
 - **`unavailable`, or abandoned after the wait:** it is advisory. Note "Codex review: unavailable (advisory), proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex task is still running when a new one launches, you may abandon the stale one.)
 
@@ -365,16 +422,21 @@ bitten once. The CLI moved its default model to one the local login could not
 reach, and every review then 403'd. `codex login status` names the login, and a
 reachable `model` in `~/.codex/config.toml` fixes it.
 
-Then validate every finding (Codex's included) per the rest of this phase.
+Then validate the findings that no verifier has checked, per the rest of this
+phase.
 
-### Validate every finding
+### Validate Codex and Phase 2.5 findings
 
-Once all three angles are done, validate each issue found. (Done means the parallel subagents are joined, or, for Codex and any agent without subagents, your own three inline passes are complete.) **Per the same subagents-are-optional rule:** Claude Code launches a parallel validation subagent per finding, all in ONE message. Codex and any agent without a Task tool validate each finding **inline and sequentially** in this same session. So do a small diff (Phase 0.6) and a merge-only or incremental run (Phase 0.4). Either way the validator must:
-- Read the relevant source files (not just the diff)
-- Confirm the issue actually exists in the code
-- Discard findings that are false positives or depend on assumptions about runtime state
+Validate each Codex finding and each Phase 2.5 finding **inline**, in your own
+session. `code-review` findings skip this step, since the skill's verifier
+already checked them (ADR 0476). For each one:
 
-Only issues confirmed by validation proceed to the report.
+- Read the relevant source files, not just the diff.
+- Confirm the issue actually exists in the code.
+- Discard findings that are false positives or depend on assumptions about
+  runtime state.
+
+Only confirmed findings proceed to the report.
 
 When validation dismisses a finding about a **pattern likely to be re-flagged
 by future reviews** (a guarded construct that looks unguarded, a documented
@@ -386,12 +448,27 @@ don't need an entry; recurring-shaped ones do.
 ## Phase 4: Report and Fix
 
 - If **no validated issues**: report "No bugs or compliance issues found."
-- If **validated issues found**: list each issue grouped by severity (🔴 Bug, 🟡 Nit) with file, line, and description. Fix 🔴 bugs directly. Ask the user about 🟡 nits.
-- **Either way, name what the Codex angle returned.** A `NO VERDICT` status line goes in verbatim, so the report never reads as four reviewers when it had three.
+- If **validated issues found**: list each issue grouped by severity (🔴 Bug,
+  🟡 Nit) with file, line, and description. Fix 🔴 bugs and rule violations
+  directly. List 🟡 nits and Phase 1 `cleanup` findings without fixing them,
+  and do not ask the user about them. A fix can void the early suite run and
+  start another iteration (ADR 0476).
+- **Either way, name what the Codex angle returned.** A `NO VERDICT` status
+  line goes in verbatim, so the report never reads as two reviewers when it
+  had one.
 
-**A failure that also fails on `main` is main's bug, and another thread may be fixing it.** Run `git merge main --no-edit` first, since main moves every few minutes. Fix it here only if it still fails after that merge.
+**A failure that also fails on `main` is main's bug, and another thread may be fixing it.** Run `lucidos main-check status` first. When main is red with a failure that matches, its fix thread owns it (ADR 0464). Do not fix it in this branch: note it in the report and carry on. Otherwise run `git merge main --no-edit`, since main moves every few minutes. Fix it here only if it still fails after that merge.
+
+On the fast tier, merge no `main`. Note the failure for the parent, whose run merges it.
 
 Commit any fixes from this phase before proceeding to Phase 4.5, naming the files. A fix outside `HARDEN_SAFE_PATHS` stops the early suite run first (`./scripts/harden-suites.sh stop`), per the Phase 1 kickoff rules. A new entry in `docs/code-review-priors.md` needs no stop.
+
+Then record the review head. Every line up to it has had this iteration's
+review, so a later iteration starts from it (§ Later iterations review only the fix):
+
+```bash
+mkdir -p .lucidos && git rev-parse HEAD > .lucidos/harden-review-head
+```
 
 ## Phase 4.5: Verify Tests Pass
 
@@ -437,13 +514,15 @@ whole-tree consistency check costing milliseconds, and running it
 unconditionally is what catches a duplicate ADR number that arrived through a
 **merge** rather than through this branch's own edits.
 
-`docs/adr/index.md` carries `merge=union` (see `.gitattributes`), which is what
-stops two branches appending an ADR line from conflicting, and that conflict was
-a recurring, guaranteed tax before 2026-08-04. Union keeps both lines but
-neither orders nor deduplicates them, so this gate covers the rest: a duplicate
-number (silent, because two ADRs with different filenames merge clean), an ADR
-with no index line or an index line with no ADR, an index left out of order by a
-union merge, and a missing required section.
+`docs/adr/index.md` merges through the keyed `lucidos-sorted-lines` driver
+(ADR 0460), which keeps concurrent lines sorted and one per number. This gate
+covers the rest:
+
+- a duplicate number, silent because two ADRs with different filenames merge
+  clean;
+- an ADR with no index line, or an index line with no ADR;
+- an index out of order after a hand edit or a merge without the driver;
+- a missing required section.
 
 Out of order is the one it can repair: `./scripts/check-adrs.sh --fix`. A
 duplicate number is reported with both paths and the next free number, never
@@ -542,6 +621,25 @@ caches saved only on `main`, one-day artifacts, and `mobile-webkit` on macOS.
 It also fails when another workflow starts triggering on `e2e/`. Fix a failure
 by restoring the limit, never by loosening the check.
 
+### Also always: the public mirror has one door
+
+```bash
+./scripts/mirror-push-gate.sh
+./scripts/check-mirror-pushers.sh
+```
+
+Whole-tree, unconditional, under a second. The first line installs the
+mirror's refusing push URL in the shared git config. A bare `git push lucidos`
+then fails from a machine's first hardening run.
+
+Only `release_tree_push`
+(`scripts/lib/release_tree.sh`) may write to the public mirror, because it
+scans the tree and checks the ancestry first (ADR 0462). The gate fails when a
+tracked script, workflow or Rust source runs a git push outside its short
+allowlist, or names the mirror's git URL. The allowlist and its reasons are in
+the script header. Fix a failure by routing the push through
+`release_tree_push`, never by widening the allowlist.
+
 ### Also always: system-knowhow points at things that exist
 
 ```bash
@@ -573,6 +671,24 @@ The rule this backs is `.claude/rules/system-knowhow.md`, which also owns the
 half no script can see: a check whose names all resolve but whose meaning has
 gone stale.
 
+### Also always: the workspace audit's scans catch what they must
+
+```bash
+./scripts/check-audit-scans.sh
+```
+
+Whole-tree, unconditional, milliseconds. It evaluates every `scan` line under
+`system-knowhow/workspace-audit/` the way the audit's `scan()` does. It then
+runs each pattern through `grep -E` against the hit and miss rows in its
+`FIXTURES` block.
+
+A scan that misses a form reports zero hits, and the audit reads zero as clean.
+The `db-defaults` scan once needed whitespace after `psql`, so an argv list
+(`["psql",...]`) never matched. A real audit missed two broken callers that way.
+
+Fix a failure in the pattern. Change a fixture only when the form it pins is
+genuinely not the scan's concern. A new scan needs a hit row.
+
 ### Also always: registered hooks can actually run
 
 ```bash
@@ -593,21 +709,23 @@ looks exactly like a hook that was never added.
 
 `scripts/harden-suites.sh` owns the suites: which ones run, their commands,
 the early suite run, and whether its result still counts (ADR 0292). Join it
-in the foreground with `timeout: 600000`:
+in the foreground with `timeout: 240000`:
 
 ```bash
 ./scripts/harden-suites.sh wait
 ```
 
-`wait` joins the run, then runs the two Codex driver modules alone, then
-prints one line per suite and a verdict. Act on its exit status:
+`wait` joins the run. It then starts the two Codex driver modules alone in the
+background and joins them too. Last, it prints one line per suite and a
+verdict. It returns within 230 s, inside the 5-minute prompt cache, so exit 3
+is routine: re-issue it. Act on its exit status:
 
 | Exit | Verdict | Do this |
 |---|---|---|
 | 0 | PASS | Proceed to Phase 5. |
 | 1 | FAIL | Read the named log, fix, commit, return to Phase 1. |
 | 2 | RERUN | Format, start a normal run, and `wait` again (below). |
-| 3 | still running | Re-issue `wait`. It says if the Codex review is what it waits on. |
+| 3 | still running | Re-issue `wait`. It says if the Codex review or the driver tests are what it waits on. |
 
 **A start that refused shows up as MISSING.** `start` writes to
 `.lucidos/harden-suites-start.log`, so read that log before starting again.
@@ -621,6 +739,11 @@ run behind a shell `&`, as at the kickoff, and `wait` again:
 ```bash
 ./scripts/harden-suites.sh start > .lucidos/harden-suites-start.log 2>&1 &
 ```
+
+**A VOID that says the safe-path allowlist is off names the files that turned
+it off.** Read each one. A file that never reads the path goes on
+`HS_READ_CHECK_KNOWN` in `scripts/lib/harden_suites.sh`, at the count the
+check printed, in this change. Otherwise every later early run voids on it too.
 
 **Codex-backend and docs-only runs start here.** They have no early run, so
 they format, run `start` (Codex in the foreground), then `wait`.
@@ -636,10 +759,17 @@ But their 30 s and 60 s timeouts fail under load. On 2026-08-10 a run that
 overlapped the two took 539s against the usual 82s. Twelve driver tests
 failed, and every one passed alone moments later.
 
-So the early run skips both modules, and `wait` runs them by themselves. If
+So the early run skips both modules, and `wait` starts them by themselves. If
 Phase 3 abandoned the Codex review, re-issue
 `./scripts/harden-suites.sh wait --codex-abandoned`. Never treat a driver-test
 failure as a finding until that module has run alone on a quiet host.
+
+**The fast tier is the script's call, not yours.** `start` asks the engine
+for the tier and records it, and an integrated sub-thread's run prints
+`fast tier` beside its suites. No variable overrides the engine's answer. The fast tier keeps `make lint` (clippy and
+rustfmt, in place of the engine suite), tsc, Vitest, `vite build` and the
+script tests. It drops every crate's test suite, the installer, the release
+path and the first-paint check: the integrating parent runs them all.
 
 **Suite selection lives in code.** `hs_select_suites` maps the branch's
 changed paths to suites, and `hs_suite_command` holds each suite's command.
@@ -722,6 +852,13 @@ postcss parse under the ordinary Vitest run. Neither gate subsumes the other:
 `vite build` resolves `@import` (which a per-file parse cannot), and the guard
 reaches a file `vite build` cannot see.
 
+**A first-paint input runs the growth check** (ADR 0454). The row selects on a
+coarse path superset, and `first-paint-growth.mjs` decides precisely. It builds
+the merge base with main and this tree, and fails growth over 2 kB raw that
+carries no `First-paint-growth:` trailer. This phase merges main first, so the
+base is recent. On FAIL, move what the first frame does not draw behind a
+dynamic import. Otherwise add the trailer, saying why the first frame needs it.
+
 **`make lint`, not `cargo check` — this is THE per-change lint gate.** Lucidos is
 not PR-based: Apply merges the branch into `main` directly, so there is no CI
 stage between a change and `main`. `/harden` *is* that stage — it runs before
@@ -751,9 +888,14 @@ on their own.
 
 Run each suite un-piped: the exit-file pattern above already preserves the real exit. If you must trim, redirect to a log and capture `$?` first (`make test > /tmp/t.log 2>&1; echo "EXIT: $?"`), then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line. See `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
 
+Either way, record the iteration first (§ Every iteration records its verdict).
+
 If the verdict is PASS, proceed to Phase 5.
 
-If it is FAIL: fix the failures (or the code that caused them), commit the fixes, and **return to Phase 1**. Fixes are new code that hasn't been reviewed by `/code-review` or the hardening agents, so re-run the cycle on the updated diff. Iterate until tests pass on a fully-hardened diff.
+If it is FAIL: fix the failures (or the code that caused them), commit the
+fixes, and **return to Phase 1**. Fixes are new code no review has seen, so
+the next iteration reviews them (§ Later iterations review only the fix). Iterate
+until tests pass on a fully-hardened diff.
 
 ## Phase 5: Create Marker
 
@@ -763,6 +905,16 @@ HEAD as hardened in the parent workspace's DB:
 ```bash
 lucidos hardened mark
 ```
+
+On the fast tier, mark the tier you ran instead:
+
+```bash
+lucidos hardened mark --tier fast
+```
+
+The engine refuses a fast marker on any branch but an integrated sub-thread's,
+since it would not count there. A fast marker hands the child's branch up to
+its parent, and Lucidos proposes nothing for it.
 
 All the git inspection and the HTTP call live in that subcommand, so this stays
 a stable one-liner even when the storage scheme changes.

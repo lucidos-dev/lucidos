@@ -5,6 +5,8 @@
 - **Amended by**: [0391](0391-agent-teardown-reaps-by-agent-run-marker.md). The
   turn's process group named below never held a Bash call. The teardown now
   reaps the early run by agent run marker.
+- **Amended by**: [0478](0478-switch-hands-agent-processes-to-the-resumed-session.md).
+  The early run survives a Switch, and the resumed `/harden` joins it.
 
 ## Context
 

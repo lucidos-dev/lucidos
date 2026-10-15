@@ -1,5 +1,5 @@
 import { useEffect } from 'preact/hooks';
-import { composeViewActive, mobileView, panelOverlay, preferences, type MobileView, type PanelOverlay } from '../store/store';
+import { composeViewActive, mobileView, preferences } from '../store/store';
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
 import { isOverlayField } from '../utils/softwareKeyboard';
 import { afterPressSettles } from '../utils/pointerPress';
@@ -17,26 +17,24 @@ import { isRepaintNudging } from '../utils/webkitRepaint';
 import { isUserScrolling } from '../utils/scrollActivity';
 import { currentMobileDynamicBars } from '../store/actions/preferences';
 import { findSurface } from '../store/actions/find-bar';
+import {
+  parseAppScrollMessage, parseAppTouchMessage, type AppScrollMessage, type AppTouchMessage,
+} from '../store/actions/app-scroll-bridge';
+import { APP_PANEL_SELECTOR } from '../store/appFullscreenHost';
+import { CANVAS_APP_FRAME_SELECTOR } from '../utils/appFrame';
 
 /** Pure rule for when hide-on-scroll should be inert and the header pinned visible.
  *  Pinned bars (dynamic bars off) win everywhere. An open find bar pins them
- *  too: it docks under the header, and each step scrolls. The content pane with
- *  an open app-UI iframe pins, because its scroll events leak to the parent.
- *  Other panes don't have that problem and hide normally. */
-export function shouldKeepHeaderVisible(opts: {
-  view: MobileView;
-  overlayType: NonNullable<PanelOverlay>['type'] | null | undefined;
-  dynamicBars: boolean;
-  findOpen: boolean;
-}): boolean {
-  if (!opts.dynamicBars || opts.findOpen) return true;
-  return opts.view === 'content' && opts.overlayType === 'app-ui';
+ *  too: it docks under the header, and each step scrolls. An app moves them
+ *  like any pane, through the scroll its SDK reports (ADR 0469). */
+export function shouldKeepHeaderVisible(opts: { dynamicBars: boolean; findOpen: boolean }): boolean {
+  return !opts.dynamicBars || opts.findOpen;
 }
 
 /** Pixel height for the `--mobile-header-height` spacer that sits below the
  *  fixed header. Collapses to the safe-area inset only while the header is
  *  actually sliding off to make room for the keyboard. When the header is
- *  pinned visible (`disabled`: pinned bars or app-ui), it never slides off,
+ *  pinned visible (`disabled`: pinned bars or the find bar), it never slides off,
  *  so the spacer MUST stay at full header height — otherwise content slides up
  *  behind the still-visible header (editing a device name on an iOS PWA with
  *  the bars pinned rendered the input under the header). */
@@ -194,6 +192,10 @@ const SCROLL_SELECTORS: Record<string, string> = {
   content: '.mobile-swipe-pane .content-pane-body',
 };
 
+/** Set on the app panel while the header is away, so it glides up with the
+ *  header and grows into the room it left (styles/mobile.css). */
+export const APP_PANEL_BARS_AWAY_ATTR = 'data-bars-away';
+
 /**
  * Dynamic bars: the mobile header, the thread's title bar and its prompt glide
  * away on a scroll down and back on a scroll up.
@@ -206,6 +208,9 @@ const SCROLL_SELECTORS: Record<string, string> = {
  * No scroll but the reader's own moves them. A reply scrolling the thread holds
  * them where they are (ADR 0337). Our own navigations, a pane swipe and the
  * keyboard closing bring them back.
+ *
+ * Over an app they move only once the finger lifts. A panel that moves under a
+ * resting finger turns the drag around on iOS (ADR 0482).
  *
  * Clamps scrollTop to [0, maxScroll] so iOS Safari elastic bounce at the
  * bottom/top doesn't move the header.
@@ -267,14 +272,33 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let promptResizeObserver: ResizeObserver | null = null;
     let promptHeight = 0;
     let lastPromptOffsetRem = 0;
+    // The Canvas pane's app panel and its frame. Only the bound frame's
+    // reports count, and `appScroll` is where its scroller last rested.
+    let appPanelEl: HTMLElement | null = null;
+    let appFrameEl: HTMLIFrameElement | null = null;
+    let appScroll: { top: number; max: number } | null = null;
+    let lastAppPanelAway = false;
+    // A finger is on the bound app, so every bar holds `heldOffset`. The intent
+    // still follows the scroll, and the bars take it on the lift.
+    let appTouching = false;
+    let heldOffset = 0;
+    let lastHeaderTranslate = '';
 
-    /** Bring every bar back, and start the direction afresh. */
+    /** Bring every bar back, and start the direction afresh. A reveal is a
+     *  navigation, so it also lets go of a finger it may never see lift. */
     function revealBars() {
       intent = BARS_SHOWN;
+      appTouching = false;
     }
 
-    /** Re-read the position the edge rules depend on. */
+    /** Re-read the position the edge rules depend on. Over an app, that is
+     *  where the app's own scroller last reported, since the pane never scrolls. */
     function measureContainer(container: Element) {
+      if (appPanelEl && container.contains(appPanelEl)) {
+        viewScrollTop = appScroll ? Math.min(Math.max(0, appScroll.top), appScroll.max) : 0;
+        distanceToBottomPx = appScroll ? appScroll.max - viewScrollTop : Infinity;
+        return;
+      }
       viewScrollTop = clampedScrollTop(container);
       distanceToBottomPx = distanceToBottom(container, viewScrollTop);
     }
@@ -288,7 +312,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
      *    at the notch / dynamic-island clearance so focused inputs near the top
      *    of the page don't end up behind iOS chrome. Resolves to 0 on platforms
      *    without a safe-area inset (Android, pre-notch iPhones, desktop).
-     *  Header pinned visible (pinned bars / app-ui) or keyboard closed → actual
+     *  Header pinned visible (pinned bars / find bar) or keyboard closed → actual
      *    header height, so content stays clear of the still-visible header. */
     function updateHeaderVar() {
       const heightPx = spacerHeightPx({
@@ -384,6 +408,23 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       return true;
     }
 
+    /** Bind the Canvas pane's app panel and its frame. The frame scrolls out of
+     *  the host's sight, so the SDK reports its scroll instead (ADR 0469). A new
+     *  frame is a new app, or the same one reloaded, so its position starts unknown. */
+    function bindAppPanel(): boolean {
+      const panel = document.querySelector<HTMLElement>(`.mobile-swipe-pane ${APP_PANEL_SELECTOR}`);
+      const frame = document.querySelector<HTMLIFrameElement>(`.mobile-swipe-pane ${CANVAS_APP_FRAME_SELECTOR}`);
+      if (panel === appPanelEl && frame === appFrameEl) return false;
+      if (appPanelEl !== panel) {
+        appPanelEl?.removeAttribute(APP_PANEL_BARS_AWAY_ATTR);
+        lastAppPanelAway = false;
+      }
+      appPanelEl = panel;
+      appFrameEl = frame;
+      appScroll = null;
+      return true;
+    }
+
     /** Publish `--mobile-prompt-height`, the transcript's bottom spacer under
      *  the overlaid prompt (styles/mobile.css). It moves only when the prompt
      *  resizes, never per scroll frame, so the root is the right place for it. */
@@ -424,7 +465,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
      *  the answer may have changed, never to animate. */
     function applyTransform() {
       const onThreadPane = currentViewKey === 'thread';
-      const offset = headerRef.current ? chromeOffsetPx({
+      const offset = appTouching ? heldOffset : headerRef.current ? chromeOffsetPx({
         disabled,
         keyboardOpen,
         away: intent.away,
@@ -432,6 +473,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         headerHeight: cachedHeight,
         titleBarHeight: onThreadPane ? titleBarHeight : 0,
       }) : 0;
+      heldOffset = offset;
       // Read before any style write below, so the reads force no style flush.
       // Only an away header off the thread pane needs the transcript's position.
       // With no transcript there, both bars read it as at rest and stay shown.
@@ -451,9 +493,12 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         }) / cachedRemSize;
         // The header moves by its own height at most. On the thread pane the
         // title bar's extra height reaches only the bar's own offset.
-        const headerTranslate = Math.max(-cachedHeight, offset);
-        headerRef.current.style.translate = headerTranslate !== 0
-          ? `0 ${headerTranslate / cachedRemSize}rem` : '';
+        const headerOffset = Math.max(-cachedHeight, offset);
+        const headerTranslate = headerOffset !== 0 ? `0 ${headerOffset / cachedRemSize}rem` : '';
+        if (headerTranslate !== lastHeaderTranslate) {
+          lastHeaderTranslate = headerTranslate;
+          headerRef.current.style.translate = headerTranslate;
+        }
         // Guarded to avoid needless style invalidation.
         const offsetRem = offset / cachedRemSize;
         if (offsetRem !== lastOffsetRem) {
@@ -481,6 +526,13 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         // Never a layout property, and on the two consumers only.
         if (promptEl) promptEl.style.translate = promptOffsetRem ? `0 ${promptOffsetRem}rem` : '';
         downChevronEl?.style.setProperty('--mobile-prompt-offset', `${promptOffsetRem}rem`);
+      }
+      // The app panel follows the header's scroll away, never the keyboard's:
+      // the keyboard already collapses the spacer above it.
+      const appPanelAway = offset < 0 && !keyboardOpen;
+      if (appPanelEl && appPanelAway !== lastAppPanelAway) {
+        lastAppPanelAway = appPanelAway;
+        appPanelEl.toggleAttribute(APP_PANEL_BARS_AWAY_ATTR, appPanelAway);
       }
     }
 
@@ -626,6 +678,35 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       applyTransform();
     }
 
+    /** A finger landed on the Canvas pane's app or lifted off it. On the lift
+     *  the bars take whatever the intent then holds. */
+    function onAppTouch(touch: AppTouchMessage) {
+      const next = touch.touching && currentViewKey === 'content' && !disabled;
+      if (next === appTouching) return;
+      appTouching = next;
+      if (!next) applyTransform();
+    }
+
+    /** The reader scrolled the Canvas pane's app. It folds into the intent
+     *  exactly as a host scroller's delta does in `onScroll`. */
+    function onAppScroll(report: AppScrollMessage) {
+      appScroll = { top: report.top, max: report.max };
+      if (!headerRef.current || cachedHeight === 0 || !currentContainer || disabled) return;
+      if (currentViewKey !== 'content') return;
+      recoverKeyboardState();
+      intent = nextBarsIntent(intent, report.delta, BARS_TRAVEL_REM * cachedRemSize);
+      measureContainer(currentContainer);
+      applyTransform();
+    }
+
+    /** Only the bound frame's messages count: a new frame is a new app. */
+    function onAppMessage(e: MessageEvent) {
+      const message = parseAppTouchMessage(e) ?? parseAppScrollMessage(e);
+      if (!message || !appFrameEl || message.source !== appFrameEl.contentWindow) return;
+      if ('touching' in message) onAppTouch(message);
+      else onAppScroll(message);
+    }
+
     /** iOS Safari sometimes misses focusout — when swiping scroll-snap panes,
      *  or when the focused input is removed mid-edit. syncToScroll re-applies
      *  the offsets; updateHeaderVar alone leaves the header stuck a header
@@ -665,12 +746,19 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // position while the header is scrolled away.
       const rebound = bindOffsetConsumers(container);
       bindPrompt();
+      // Opening, closing or reloading an app brings the bars back, as a
+      // navigation does.
+      const appRebound = bindAppPanel();
+      if (appRebound) revealBars();
 
       if (container === currentContainer) {
         // Nothing else changed, but freshly-bound elements need the current
         // offset written to them now. The container-change path below reaches
         // its own applyTransform.
-        if (rebound) applyTransform();
+        if (rebound || appRebound) {
+          if (appRebound && container) measureContainer(container);
+          applyTransform();
+        }
         return;
       }
 
@@ -699,6 +787,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
 
     refreshHeight();
     attachListener();
+    window.addEventListener('message', onAppMessage);
 
     // Hide header and collapse spacer when any prompt input gains focus.
     // applyTransform checks keyboardOpen independently of the intent,
@@ -713,7 +802,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // An overlay's field moves nothing behind the overlay: header, spacer
       // and transcript all hold still.
       if (isOverlayField(target)) return;
-      // Header pinned visible (pinned bars / app-ui): it never slides off for
+      // Header pinned visible (pinned bars / find bar): it never slides off for
       // the keyboard, so the spacer must stay full-height. Collapsing it here
       // would slide content up behind the still-visible header (editing a
       // device name on an iOS PWA rendered the input under the header).
@@ -853,17 +942,13 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         document.documentElement.toggleAttribute('data-mobile-dynamic-bars', dynamicBars);
         updatePromptHeightVar();
       }
-      const next = shouldKeepHeaderVisible({
-        view: mobileView.value,
-        overlayType: panelOverlay.value?.type,
-        dynamicBars,
-        findOpen: findSurface.value !== null,
-      });
+      const next = shouldKeepHeaderVisible({ dynamicBars, findOpen: findSurface.value !== null });
       if (next === disabled) return;
       disabled = next;
+      appTouching = false;
       // Pinning resets the keyboard state, since the pinned header never
-      // slides off for it. iOS Safari may also miss focusout on opening app
-      // UI, and the spacer would then collapse under a visible header.
+      // slides off for it. iOS Safari may also miss focusout as the find bar
+      // opens, and the spacer would then collapse under a visible header.
       if (disabled && keyboardOpen) {
         keyboardOpen = false;
         updateHeaderVar();
@@ -919,10 +1004,8 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     const unsub = mobileView.subscribe(() => {
       attachListener();
       refreshHeight();
-      recomputeDisabled();
     });
 
-    const unsubOverlay = panelOverlay.subscribe(recomputeDisabled);
     const unsubPrefs = preferences.subscribe(recomputeDisabled);
     const unsubFind = findSurface.subscribe(recomputeDisabled);
     // Entering or leaving the compose-empty view: its prompt never slides, and
@@ -940,6 +1023,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
       document.removeEventListener('reveal-mobile-bars', onRevealBars);
+      window.removeEventListener('message', onAppMessage);
       window.removeEventListener('resize', refreshHeight);
       window.visualViewport?.removeEventListener('resize', refreshHeight);
       if (coldStartPollId !== null) cancelAnimationFrame(coldStartPollId);
@@ -950,7 +1034,6 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       if (titleBarResizeObserver) titleBarResizeObserver.disconnect();
       unsubRebased();
       unsub();
-      unsubOverlay();
       unsubPrefs();
       unsubFind();
       unsubCompose();
@@ -967,6 +1050,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // The offsets live on their consumers, not the root (bindOffsetConsumers).
       titleBarEl?.style.removeProperty('--mobile-header-offset');
       chevronEl?.style.removeProperty('--mobile-header-offset');
+      appPanelEl?.removeAttribute(APP_PANEL_BARS_AWAY_ATTR);
     };
   }, [mobileLayout]);
 }

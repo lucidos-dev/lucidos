@@ -183,6 +183,6 @@ describe('theme part consumers', () => {
   it('loads the generated @property rules and resets in the shell and in app frames', () => {
     expect(read(resolve(styles, 'global.css'))).toContain("@import './generated/theme-parts.css';");
     expect(read(resolve(repo, 'crates/lucidos-engine/src/api/sdk.rs')))
-      .toContain('include_str!("../../../lucidos-app/src/styles/generated/theme-parts-frame.css")');
+      .toContain('parts::codegen::frame_css()');
   });
 });

@@ -6,6 +6,7 @@
  * handleThreadEvent or handleGlobalEvent.
  */
 import { refreshThreadWidgetsNaming } from './widgets';
+import { refreshHomeBoardsNaming } from './homeBoard';
 import { forgetAppById } from './appsById';
 import { reloadFilterFacetsIfLoaded } from './thread-loading';
 import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, marketplaceScanning, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion, memoryEntriesVersion, promptFootprintVersion } from '../store';
@@ -234,7 +235,10 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       if (appId && name) patchRecentsMetadata(appId, 'apps', name);
       void loadApps();
       // A widget's name or reusable flag may have changed (ADR 0402).
-      if (appId) refreshThreadWidgetsNaming(appId);
+      if (appId) {
+        refreshThreadWidgetsNaming(appId);
+        refreshHomeBoardsNaming(appId);
+      }
       promptFootprintVersion.value++;
       break;
     }
@@ -250,7 +254,10 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       }
       void loadApps();
       // Delete (a thread) removes its widgets: re-read every thread that showed one.
-      if (appId) refreshThreadWidgetsNaming(appId);
+      if (appId) {
+        refreshThreadWidgetsNaming(appId);
+        refreshHomeBoardsNaming(appId);
+      }
       promptFootprintVersion.value++;
       break;
     }
@@ -402,6 +409,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'McpServerRegistered':
     case 'McpServerUpdated':
     case 'McpServerRemoved':
+    case 'McpServerStopped':
     case 'McpServerDisabledToolsChanged':
       mcpServersVersion.value++;
       break;

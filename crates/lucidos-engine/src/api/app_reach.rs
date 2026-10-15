@@ -85,10 +85,12 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/changes/:id/bring-back", Host, &[]),
     ("/changes/:id/file", Host, &[]),
     ("/changes/:id/revert", Host, &[]),
+    ("/changes/:id/queue", Host, &[]),
     ("/changes/applied", Host, &[]),
     ("/changes/apply-all", Host, &[]),
     ("/changes/apply-all/cancel", Host, &[]),
     ("/changes/discard-all", Host, &[]),
+    ("/changes/lane/cancel", Host, &[]),
     ("/changes/for-repo/:repo_id", Host, &[]),
     ("/chat/cancel", Host, &[]),
     ("/chat/queued-message/remove", Host, &[]),
@@ -159,12 +161,14 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/handshake-scripts/approve", Host, &[]),
     ("/health", App, &["GET"]),
     ("/history", Host, &[]),
+    ("/home-board", Host, &[]),
     ("/internal/approve-plan", Agent, &[]),
     ("/internal/ask-user-question", Agent, &[]),
     ("/internal/client-log", Agent, &[]),
     ("/internal/client-logs", Agent, &[]),
     ("/internal/coding-agent-diff-refresh", Agent, &[]),
     ("/internal/hardened-state", Agent, &[]),
+    ("/internal/integrated-heads", Agent, &[]),
     ("/internal/mark-hardened", Agent, &[]),
     ("/internal/mark-planned", Agent, &[]),
     ("/internal/permission-prompt", Agent, &[]),
@@ -179,6 +183,8 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/themes/parts", App, &["GET"]),
     ("/themes/resolve", App, &["POST"]),
     ("/themes/tokens", App, &["GET"]),
+    ("/main-check", Host, &[]),
+    ("/main-check/close", Host, &[]),
     ("/mcp-allowed-tools", Host, &[]),
     ("/mcp-permission/consent", Host, &[]),
     ("/mcp/auto-approve", Host, &[]),
@@ -197,6 +203,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/memory/tree", Host, &[]),
     ("/memory/tree-backfill", Host, &[]),
     ("/memory/tree-backfill/estimate", Host, &[]),
+    ("/memory/tree-backfill/cap", Host, &[]),
     ("/memory/tree/threads", Host, &[]),
     ("/messages", Host, &[]),
     ("/models", App, &["GET"]),
@@ -301,10 +308,17 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
         Agent,
         &[],
     ),
+    (
+        "/threads/:thread_id/background-tasks/:task_id/wait",
+        Agent,
+        &[],
+    ),
     ("/threads/:thread_id/cc-diff", Host, &[]),
     ("/threads/:thread_id/continue", Host, &[]),
     ("/threads/:thread_id/harden", Host, &[]),
     ("/threads/:thread_id/detach", Host, &[]),
+    ("/threads/:thread_id/context", Host, &[]),
+    ("/threads/:thread_id/successor", Host, &[]),
     ("/threads/:thread_id/event-waits", Agent, &[]),
     (
         "/threads/:thread_id/event-waits/:wait_id/cancel",
@@ -316,9 +330,12 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/threads/:thread_id/follow-up", Host, &[]),
     ("/threads/:thread_id/images", Host, &[]),
     ("/threads/:thread_id/images/:index", Host, &[]),
+    ("/threads/:thread_id/mcp-servers/:id/disable", Host, &[]),
+    ("/threads/:thread_id/mcp-servers/:id/enable", Host, &[]),
     ("/threads/:thread_id/messages", Host, &[]),
     ("/threads/:thread_id/read-request", Agent, &[]),
     ("/threads/:thread_id/read-request/seen", Host, &[]),
+    ("/threads/:thread_id/wake-decision", Agent, &[]),
     ("/threads/archive", Host, &[]),
     ("/threads/archive-all", Host, &[]),
     ("/threads/archive-all-preflight", Host, &[]),
@@ -352,9 +369,9 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/webhooks/ingress", Host, &[]),
     ("/webhooks/refusals", Host, &[]),
     ("/widgets", Host, &[]),
+    ("/widgets/arrange", Host, &[]),
     ("/widgets/make-reusable", Host, &[]),
     ("/widgets/pin", Host, &[]),
-    ("/widgets/show", Host, &[]),
     ("/widgets/stop-reusing", Host, &[]),
     ("/widgets/thread", Host, &[]),
     ("/widgets/unpin", Host, &[]),
@@ -508,6 +525,9 @@ fn form_decode(component: &str) -> String {
         .map(|decoded| decoded.into_owned())
         .unwrap_or(spaced)
 }
+
+#[path = "app_reach_codegen.rs"]
+pub(crate) mod codegen;
 
 #[cfg(test)]
 #[path = "app_reach_tests.rs"]

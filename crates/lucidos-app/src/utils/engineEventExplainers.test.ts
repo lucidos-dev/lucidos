@@ -137,8 +137,8 @@ describe('every explainer is plain', () => {
       ...ABORT_CAUSES.map(describeAbortCause),
       ...CANCEL_CAUSES.map(describeCancelCause),
       ...(['continuation_started', 'session_recovered', 'orphan_recovery', 'harden_retrigger',
-        'stale_session', 'archived_branch_work', 'merge_conflict', 'missing_hardening',
-        'missing_plan'] as const)
+        'stale_session', 'archived_branch_work', 'unmerged_integrated_work', 'successor_residue', 'merge_conflict', 'main_check_red',
+        'missing_hardening', 'missing_plan'] as const)
         .map(kind => describeEngineReason({ kind })),
     ];
     for (const text of texts) expect(text).not.toMatch(ENGINE_INTERNALS);

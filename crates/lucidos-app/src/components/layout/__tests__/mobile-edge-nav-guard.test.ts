@@ -10,7 +10,7 @@ import {
 //
 // A standalone iOS PWA exposes NO CSS opt-out for this gesture. WebKit's edge
 // recognizer also commits before the in-app SwipeTouch 8px horizontal lock, so
-// an onTouchMove preventDefault runs too late. The only reliable fix is to
+// a touchmove preventDefault runs too late. The only reliable fix is to
 // preventDefault on the touchstart itself when it begins at a screen edge.
 //
 // Bug 1: swiping out of an open thread fired the native back gesture, showing

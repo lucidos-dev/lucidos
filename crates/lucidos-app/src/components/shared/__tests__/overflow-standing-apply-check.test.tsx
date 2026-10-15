@@ -4,7 +4,7 @@
  * check at the row's END, after the words, so the label keeps the column its
  * siblings' icons give it. The label itself carries no check glyph.
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import type { TaggedAction } from '../../../store/actions/threadActions';
@@ -28,8 +28,11 @@ vi.mock('../../../store/actions/threadActions', async (importOriginal) => {
     };
 });
 
-import { ThreadOverflowMenu } from '../ThreadOverflowMenu';
+import { ThreadOverflowItemsChunk, ThreadOverflowMenu } from '../ThreadOverflowMenu';
 import { standingApplyThreadIds } from '../../../store/store';
+
+// The menu's rows are code-split. Warm them, so a click opens it at once.
+beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 let host: HTMLElement | null = null;
 

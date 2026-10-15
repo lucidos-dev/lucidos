@@ -366,8 +366,14 @@ impl LucidosEngine {
                 None
             };
             if let Some(cap_message) = cap_message {
-                self.gate_chat_turn_end(thread_id, origin_id, read_decided, &cap_message)
-                    .await;
+                self.gate_chat_turn_end(
+                    thread_id,
+                    origin_id,
+                    read_decided,
+                    &cap_message,
+                    crate::engine::turn_end::TurnFinish::CutShort,
+                )
+                .await;
                 let msg = emit_iteration_cap_response_generated(
                     &self.event_bus,
                     thread_id,
@@ -388,32 +394,32 @@ impl LucidosEngine {
                 ));
             }
 
-            // What this round owes the stopped-server list in `messages[0]`,
-            // filled in by the refresh below and appended with the tail.
+            // What this round owes the server list in `messages[0]`, filled
+            // in by the refresh below and appended with the tail.
             let mut mcp_correction: Option<String> = None;
 
-            // The MCP tool surface can move under a running turn: the model
-            // starts or stops a server with the `mcp` tool, or the user does
-            // it from Settings. Rebuild the slice when it has. A server
-            // started this turn is then callable in the very next round,
-            // rather than only after the next user message.
+            // This thread's MCP slice can move under a running turn: the
+            // model enables or starts a server with the `mcp` tool, or the
+            // user stops one from Settings. A server enabled this turn is
+            // then callable in the very next round.
             //
             // Gated on a generation the manager bumps, because this is the one
             // mid-turn change to the array Lucidos makes. The array is the
             // FIRST cache segment, so re-sending it forfeits every tier behind
-            // it. A speculative rebuild per round would pay that on every
-            // turn. See ADR 0088, and ADR 0195 for why this one is worth it.
+            // it. The generation is workspace-wide, so the refresh rewrites
+            // the array only when THIS thread's slice changed (ADR 0430). See
+            // ADR 0088, and ADR 0195 for why that one write is worth it.
             if tools.mcp_generation() != self.mcp_manager.tool_surface_generation() {
                 let before = tools.defs().len();
-                let before_servers = tools.mcp_server_ids();
+                let before_servers = tools.mcp_server_ids().clone();
                 let before_notice = tools.mcp_dropped_notice().map(str::to_owned);
-                tools.refresh_mcp(
+                let changed = tools.refresh_mcp(
                     self.mcp_manager
-                        .tool_surface(tools.mcp_char_ceiling())
+                        .tool_surface(thread_id, tools.mcp_char_ceiling())
                         .await,
                 );
                 mcp_correction = [
-                    mcp_surface_correction(&before_servers, &tools.mcp_server_ids()),
+                    mcp_surface_correction(&before_servers, tools.mcp_server_ids()),
                     mcp_dropped_correction(before_notice.as_deref(), tools.mcp_dropped_notice()),
                 ]
                 .into_iter()
@@ -423,13 +429,15 @@ impl LucidosEngine {
                 // array has to leave the trimmer less room. Recomputed from
                 // the fixed total rather than nudged, so it cannot drift.
                 message_budget = budget_with_no_tools.saturating_sub(tools.defs_chars());
-                log!(
-                    "[AgenticLoop] thread={} round={} MCP tools changed mid-turn: {} → {} tools in the array",
-                    thread_id,
-                    rounds,
-                    before,
-                    tools.defs().len()
-                );
+                if changed {
+                    log!(
+                        "[AgenticLoop] thread={} round={} MCP tools changed mid-turn: {} to {} tools in the array",
+                        thread_id,
+                        rounds,
+                        before,
+                        tools.defs().len()
+                    );
+                }
             }
 
             // Pin the current turn's user message so removal cannot drop it
@@ -1204,7 +1212,8 @@ impl LucidosEngine {
             // read decision, so the model kept its question. Its reply only
             // says why, and the turn ends on the draft the user already has.
             let kept_draft = prose_nudge_draft.take().filter(|_| {
-                response.tool_calls.is_empty() || calls_only_the_read_decision(&response.tool_calls)
+                response.tool_calls.is_empty()
+                    || calls_only_turn_end_decisions(&response.tool_calls)
             });
             if let Some(draft) = &kept_draft {
                 log!(
@@ -1599,8 +1608,16 @@ impl LucidosEngine {
                     .filter(|c| !c.is_empty());
 
                 if let Some(clean_response) = cleaned {
-                    self.gate_chat_turn_end(thread_id, origin_id, read_decided, &clean_response)
-                        .await;
+                    self.gate_chat_turn_end(
+                        thread_id,
+                        origin_id,
+                        read_decided,
+                        &clean_response,
+                        crate::engine::turn_end::TurnFinish::Finished(
+                            crate::engine::thread_events::ChildCompletionStatus::Success,
+                        ),
+                    )
+                    .await;
                     self.event_bus
                         .emit_or_log(
                             crate::engine::event_bus::BusEvent::Thread {
@@ -1697,8 +1714,16 @@ impl LucidosEngine {
                         thread_id,
                         diagnostic
                     );
-                    self.gate_chat_turn_end(thread_id, origin_id, read_decided, "")
-                        .await;
+                    self.gate_chat_turn_end(
+                        thread_id,
+                        origin_id,
+                        read_decided,
+                        "",
+                        crate::engine::turn_end::TurnFinish::Finished(
+                            crate::engine::thread_events::ChildCompletionStatus::Success,
+                        ),
+                    )
+                    .await;
                     self.event_bus
                         .emit_or_log(
                             crate::engine::event_bus::BusEvent::Thread {
@@ -1829,8 +1854,14 @@ impl LucidosEngine {
                                 consecutive_same_call
                             );
                             let msg = "I listed the available files but wasn't able to complete the task. Could you give me more specific instructions?";
-                            self.gate_chat_turn_end(thread_id, origin_id, read_decided, msg)
-                                .await;
+                            self.gate_chat_turn_end(
+                                thread_id,
+                                origin_id,
+                                read_decided,
+                                msg,
+                                crate::engine::turn_end::TurnFinish::CutShort,
+                            )
+                            .await;
                             self.event_bus.emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
@@ -1881,8 +1912,14 @@ impl LucidosEngine {
                             consecutive_same_call
                         );
                         let msg = format!("I read the file `{}` but wasn't able to complete the task with it. Could you give me more specific instructions?", path_for_msg);
-                        self.gate_chat_turn_end(thread_id, origin_id, read_decided, &msg)
-                            .await;
+                        self.gate_chat_turn_end(
+                            thread_id,
+                            origin_id,
+                            read_decided,
+                            &msg,
+                            crate::engine::turn_end::TurnFinish::CutShort,
+                        )
+                        .await;
                         self.event_bus
                             .emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
@@ -1947,8 +1984,14 @@ impl LucidosEngine {
                             target
                         );
                         let msg = format!("I tried to process `{}` but it failed repeatedly. The error may need to be resolved before retrying.", target);
-                        self.gate_chat_turn_end(thread_id, origin_id, read_decided, &msg)
-                            .await;
+                        self.gate_chat_turn_end(
+                            thread_id,
+                            origin_id,
+                            read_decided,
+                            &msg,
+                            crate::engine::turn_end::TurnFinish::CutShort,
+                        )
+                        .await;
                         self.event_bus
                             .emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
@@ -2592,10 +2635,11 @@ impl LucidosEngine {
                 return Err(reason.into());
             }
 
-            // A reply whose only call was its read decision has already said
-            // everything: the turn ends on its text, with no round to spend
-            // (ADR 0417). Whatever the final-answer branch would still send
-            // back takes the ordinary path instead.
+            // A reply whose only calls were its turn-end decisions has already
+            // said everything: the turn ends on its text, with no round to
+            // spend (ADR 0417). Whatever the final-answer branch would still
+            // send back takes the ordinary path instead. The gate still forces
+            // the decision the round did not make.
             if let Some(answer) = self
                 .final_answer_beside_decision(FinalAnswerBesideDecision {
                     response: &response,
@@ -2615,6 +2659,16 @@ impl LucidosEngine {
                 })
                 .await
             {
+                self.gate_chat_turn_end(
+                    thread_id,
+                    origin_id,
+                    read_decided,
+                    &answer,
+                    crate::engine::turn_end::TurnFinish::Finished(
+                        crate::engine::thread_events::ChildCompletionStatus::Success,
+                    ),
+                )
+                .await;
                 self.refresh_apps_modified_this_turn(thread_id, &modified_app_uis)
                     .await;
                 self.event_bus
@@ -2631,7 +2685,7 @@ impl LucidosEngine {
                                 crate::engine::thread_events::AgentParticipant::LucidosAgent,
                             ),
                         },
-                        "[AgenticLoop] ResponseGenerated (beside the read decision)",
+                        "[AgenticLoop] ResponseGenerated (beside the turn-end decisions)",
                     )
                     .await;
                 *terminator_settled = true;

@@ -3,9 +3,9 @@ use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_follow
 use crate::engine::agent_session::lifecycle::{
     auto_resume_after_api_error, classify_session_end_action, conflict_abort_deletes_temp_state,
     conflict_resolution_cleanup_action, discarded_worktree_removal, held_completion_release,
-    should_auto_commit_on_cleanup, transient_api_failure_error, ConflictResolutionCleanupAction,
-    HeldCompletionRelease, SafetyNetAction, SessionEndAction, TerminalKind, TurnCancel,
-    WorktreeRemoval, MAX_API_ERROR_AUTO_RESUMES,
+    lane_thread_end, should_auto_commit_on_cleanup, transient_api_failure_error,
+    ConflictResolutionCleanupAction, HeldCompletionRelease, SafetyNetAction, SessionEndAction,
+    TerminalKind, TurnCancel, WorktreeRemoval, MAX_API_ERROR_AUTO_RESUMES,
 };
 use crate::engine::agent_session::resume::{
     api_error_auto_resumes_spent, change_description_fallback,
@@ -117,18 +117,18 @@ pub(super) fn idle_exit(
 /// The entry stays in the map until the final reap, so Stop keeps accepting
 /// requests, and HTTP has already said yes to this one. Carried out after the
 /// reap, through the same no-session path a slightly later click would take.
-/// Two cases stay out. A conflict session's cleanup never discards. And the
+/// Two cases stay out. A resolution session's cleanup never discards. And the
 /// worktree must not be deleted under another session: one a continuation is
 /// resuming (the safety net's or the auto-resume's), or one already spawning.
 pub(super) fn carries_out_late_discard(
     at_snapshot: Option<StopReason>,
     at_reap: Option<StopReason>,
-    is_conflict_session: bool,
+    is_resolution_session: bool,
     another_session_coming: bool,
 ) -> bool {
     at_reap == Some(StopReason::Discard)
         && at_snapshot != Some(StopReason::Discard)
-        && !is_conflict_session
+        && !is_resolution_session
         && !another_session_coming
 }
 
@@ -209,7 +209,7 @@ impl LucidosEngine {
         thread_id: Uuid,
         terminal: &Option<TerminalKind>,
         is_shutdown: bool,
-        is_conflict_session: bool,
+        is_resolution_session: bool,
     ) {
         let Some(error) = transient_api_failure_error(terminal) else {
             return;
@@ -220,7 +220,8 @@ impl LucidosEngine {
             crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON,
         )
         .await;
-        if !auto_resume_after_api_error(terminal, resumes_spent, is_shutdown, is_conflict_session) {
+        if !auto_resume_after_api_error(terminal, resumes_spent, is_shutdown, is_resolution_session)
+        {
             log!(
                 "[AgentSession] thread {} ended on a transient upstream API failure with {} of {} auto-resumes spent: not resuming, so its parent hears about the failure now",
                 thread_id,
@@ -388,13 +389,19 @@ impl LucidosEngine {
         thread_id: Uuid,
         request_id: Uuid,
         meta: &crate::engine::thread_events::EventMeta,
-        conflict_change: Option<crate::core::changes::Change>,
+        conflict: Option<(
+            crate::core::changes::Change,
+            &crate::engine::change_ops::apply_claim::ApplyClaim,
+        )>,
+        lane_duty: Option<crate::engine::landing_lane::LaneDuty>,
+        // Set once this run gave the lane its answer, or handed the batch on.
+        lane_answered: &mut bool,
         cwd: PathBuf,
         repo_root: PathBuf,
         branch_name: String,
         worktree_path: Option<PathBuf>,
         images: Vec<String>,
-        mut msg_rx: tokio::sync::mpsc::UnboundedReceiver<crate::engine::AgentUserInput>,
+        msg_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::engine::AgentUserInput>,
         claude_text_buf: String,
         last_terminal_kind: Option<TerminalKind>,
         // What the run loop's released *auto-resume hold* handed back: the error
@@ -428,11 +435,10 @@ impl LucidosEngine {
                 s.idle_notify.notify_waiters();
             }
         }
-        self.clear_spawn_debounce(thread_id);
 
         // Drain follow-ups queued while CC was busy. Convert to orphaned injections
         // so the caller re-processes them instead of showing "interrupted".
-        let cc_orphans = lost_followups_to_orphans(drain_lost_followups(&mut msg_rx));
+        let cc_orphans = lost_followups_to_orphans(drain_lost_followups(msg_rx));
 
         // Safety net: CC's event loop ended without a natural terminator.
         // The decision tree is pinned by `safety_net_action` (lifecycle.rs):
@@ -488,6 +494,9 @@ impl LucidosEngine {
         match net_action {
             SafetyNetAction::Nothing | SafetyNetAction::Skip => {}
             SafetyNetAction::EmitContinuationRequested => {
+                // Before the emit: a continuation that re-attaches a merge
+                // duty may take this run's apply claim from here on.
+                external_continuation_requested.store(true, std::sync::atomic::Ordering::Release);
                 crate::engine::thread_events::emit_continuation_requested_or_log(
                     &self.event_bus,
                     thread_id,
@@ -541,7 +550,7 @@ impl LucidosEngine {
                 .and_then(|s| s.pending_stop)
         };
         let should_discard = matches!(pending_stop, Some(StopReason::Discard));
-        let is_conflict_session = conflict_change.is_some();
+        let is_resolution_session = conflict.is_some() || lane_duty.is_some();
 
         let continuation_requested = self
             .maybe_auto_resume_after_api_error(
@@ -610,7 +619,34 @@ impl LucidosEngine {
             });
         }
 
-        if let Some(change) = conflict_change {
+        if let Some(duty) = lane_duty {
+            // The lane lands, keeps or fails the batch from this report. Same
+            // rule as a conflict resolution: an unanswered probe counts as
+            // unmerged.
+            let has_unmerged = crate::engine::git_ops::git_answer_when_ok(
+                &["diff", "--name-only", "--diff-filter=U"],
+                &cwd,
+                |o| !o.stdout.is_empty(),
+            )
+            .await
+            .or_unknown(true);
+            let continuation_pending = net_action == SafetyNetAction::EmitContinuationRequested
+                || external_continuation_requested.load(std::sync::atomic::Ordering::Acquire);
+            *lane_answered = true;
+            match lane_thread_end(
+                has_unmerged,
+                &last_terminal_kind,
+                continuation_pending,
+                pending_stop,
+            ) {
+                Some(end) => self.report_lane_thread_end(duty.batch_id, thread_id, end),
+                None => log!(
+                    "[AgentSession] Lane batch {} handed off to the continuation of thread {}",
+                    duty.batch_id,
+                    thread_id
+                ),
+            }
+        } else if let Some((change, apply_claim)) = conflict {
             // Conflict resolution cleanup — merge happened in a worktree, ff-merge to main.
             // `or_unknown(true)` (assume conflicts REMAIN when git could not be
             // asked): a `false` here is what lets `conflict_resolution_cleanup_action`
@@ -638,12 +674,19 @@ impl LucidosEngine {
             // `Skip` there, and only its dedicated flag distinguishes that
             // recovery from a restart abort / concurrent cancel (which must
             // still Abort).
-            let cleanup_action = conflict_resolution_cleanup_action(
-                has_unmerged,
-                &last_terminal_kind,
-                net_action == SafetyNetAction::EmitContinuationRequested
-                    || external_continuation_requested.load(std::sync::atomic::Ordering::Acquire),
-            );
+            // A continuation that took the apply claim over owns the merge now.
+            // This run neither merges nor aborts under it.
+            let cleanup_action = if apply_claim.is_current() {
+                conflict_resolution_cleanup_action(
+                    has_unmerged,
+                    &last_terminal_kind,
+                    net_action == SafetyNetAction::EmitContinuationRequested
+                        || external_continuation_requested
+                            .load(std::sync::atomic::Ordering::Acquire),
+                )
+            } else {
+                ConflictResolutionCleanupAction::HandOff
+            };
             // Both non-HandOff arms take the parked apply actor: the HTTP
             // Apply call that triggered this CC merge returned long ago; the
             // user's actor was parked in `pending_apply_actors` at
@@ -800,15 +843,16 @@ impl LucidosEngine {
                             let requires_restart_effective =
                                 change.requires_restart && !kind_ctx.is_app();
                             self.emit_change_applied(
+                                apply_claim,
                                 change.thread_id.unwrap_or(thread_id),
-                                change.id,
                                 requires_restart_effective,
                                 files_have_client_update(&change.files),
                                 commits,
                                 change.thread_title.clone(),
                                 apply_actor.clone(),
-                                Some(pre_sha.clone()),
-                                Some(post_sha.clone()),
+                                Some(crate::engine::change_ops::AppliedMerge::new(
+                                    &pre_sha, &post_sha,
+                                )),
                             )
                             .await;
                             self.maybe_emit_app_ui_refresh(
@@ -1068,6 +1112,9 @@ impl LucidosEngine {
                                             requires_restart,
                                             bg_bash_pending: false,
                                             worktree_path: worktree_path.as_deref(),
+                                            keep_alive: self
+                                                .event_bus
+                                                .in_keep_alive_turn(thread_id),
                                         },
                                         meta,
                                         coding_agent,
@@ -1077,7 +1124,11 @@ impl LucidosEngine {
                             }
                             // No agent is left to nudge. The next session on
                             // this branch proposes once the hold clears.
-                            Ok(ProposeOutcome::Held(_) | ProposeOutcome::Unfinished) => {}
+                            Ok(
+                                ProposeOutcome::Held(_)
+                                | ProposeOutcome::Unfinished
+                                | ProposeOutcome::AwaitingLanding(_),
+                            ) => {}
                             Err(e) => {
                                 log!("[AgentSession] Failed to propose change: {}", e);
                             }
@@ -1144,37 +1195,51 @@ impl LucidosEngine {
         let auto_apply = matches!(pending_stop_at_reap, Some(StopReason::Apply));
 
         // A Discard can land the same way, after the cleanup above read the
-        // stop, and the cleanup then proposed the change instead.
-        let another_session_coming = continuation_requested
-            || net_action == SafetyNetAction::EmitContinuationRequested
-            || self.coding_agent_owns_thread(thread_id).await;
+        // stop, and the cleanup then proposed the change instead. The reap
+        // freed the thread, so the discard holds it for its length: a run that
+        // claimed it first is resuming into this worktree, and is left alone.
+        let another_session_coming =
+            continuation_requested || net_action == SafetyNetAction::EmitContinuationRequested;
         if carries_out_late_discard(
             pending_stop,
             pending_stop_at_reap,
-            is_conflict_session,
+            is_resolution_session,
             another_session_coming,
         ) {
-            log!(
-                "[AgentSession] A Discard for thread {} arrived after its cleanup; carrying it out now",
-                thread_id
-            );
-            if let Err(e) = self
-                .clone_arc()
-                .end_stale_waiting_session(thread_id, true, None)
-                .await
-            {
-                log!(
-                    "[AgentSession] Late Discard for thread {} failed: {}",
+            match self.hold_thread_for_worktree_reset(thread_id).await {
+                Ok(Some(_hold)) => {
+                    log!(
+                        "[AgentSession] A Discard for thread {} arrived after its cleanup; carrying it out now",
+                        thread_id
+                    );
+                    if let Err(e) = self
+                        .clone_arc()
+                        .end_stale_waiting_session(thread_id, true, None)
+                        .await
+                    {
+                        log!(
+                            "[AgentSession] Late Discard for thread {} failed: {}",
+                            thread_id,
+                            e
+                        );
+                    }
+                    // Finalize's own Discard settles this unconditionally. The
+                    // path above settles only through a pending change it discards.
+                    self.event_bus
+                        .settle_child(thread_id, crate::engine::event_bus::ChildSettle::Discarded)
+                        .await;
+                    proposed_change = false;
+                }
+                Ok(None) => log!(
+                    "[AgentSession] A late Discard for thread {} found a new run on the thread; leaving its worktree alone",
+                    thread_id
+                ),
+                Err(e) => log!(
+                    "[AgentSession] Could not hold thread {} for its late Discard: {}",
                     thread_id,
                     e
-                );
+                ),
             }
-            // Finalize's own Discard settles this unconditionally. The path
-            // above settles only through a pending change it discards.
-            self.event_bus
-                .settle_child(thread_id, crate::engine::event_bus::ChildSettle::Discarded)
-                .await;
-            proposed_change = false;
         }
 
         // SessionEnded is now terminal-only (Phase 4 of CC resume architecture).
@@ -1430,9 +1495,8 @@ mod tests {
             );
         }
         assert!(
-            src.contains("reap_own_session_entry(") && src.contains("idle_exit("),
-            "the stale-resume retry reaps through the shared helper, and the idle exit \
-             through `idle_exit`, which wraps it"
+            src.contains("idle_exit("),
+            "the idle exit reaps through `idle_exit`, which wraps the shared helper"
         );
     }
 

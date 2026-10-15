@@ -13,6 +13,7 @@ import {
   CODEX_BACKEND_TOOLS,
   SESSION_PATH_TOOLS,
 } from '@lucidos/engine-constants';
+import { parseMcpToolName } from '../../utils/mcpToolName';
 
 interface PermissionEvent {
   request_id: string;
@@ -211,8 +212,8 @@ function toolAction(toolName: string, withArg: boolean): ComponentChildren {
   const known = TOOL_ACTIONS[toolName];
   if (known) return withArg ? known[0] : known[1];
   const on = withArg ? ' on' : '';
-  const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
-  if (mcp) return <>use the <strong>{mcp[2]}</strong> tool from <strong>{mcp[1]}</strong>{on}</>;
+  const mcp = parseMcpToolName(toolName);
+  if (mcp) return <>use the <strong>{mcp.tool}</strong> tool from <strong>{mcp.server}</strong>{on}</>;
   return <>use the <strong>{toolName}</strong> tool{on}</>;
 }
 
@@ -236,8 +237,8 @@ export function grantText(pattern: string): string {
 /** A coding-agent tool named for a sentence: a tool-server tool by its own
  *  name and its server's, never the joined `mcp__server__tool` id. */
 function toolText(toolName: string): string {
-  const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
-  return mcp ? `The ${mcp[2]} tool from ${mcp[1]}` : `The ${toolName} tool`;
+  const mcp = parseMcpToolName(toolName);
+  return mcp ? `The ${mcp.tool} tool from ${mcp.server}` : `The ${toolName} tool`;
 }
 
 /** Mirrors the engine's `derive_allow_pattern` for the narrow scope: returns

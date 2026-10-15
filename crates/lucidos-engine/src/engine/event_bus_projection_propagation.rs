@@ -307,13 +307,20 @@ pub(crate) async fn reconcile_proposal_lifecycle_end(
 ///
 /// New work also ends a *stopped child*: the turn it starts is what will
 /// report, so `is_stopped_child` clears in the same write (ADR 0252).
+///
+/// A child that handed off to a successor owes its parent nothing more, so
+/// new work on it re-arms nothing: the successor reports in its place.
+///
+/// The new turn starts undecided too: `parent_wake_requested` goes back to
+/// NULL, so a no from an earlier turn never files this turn's report.
 pub(crate) async fn mark_parent_callback_pending(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     child_id: Uuid,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE thread_summaries SET parent_callback_pending = TRUE, is_stopped_child = FALSE \
-         WHERE thread_id = $1 AND parent_thread_id IS NOT NULL",
+        "UPDATE thread_summaries SET parent_callback_pending = TRUE, is_stopped_child = FALSE, \
+                parent_wake_requested = NULL \
+         WHERE thread_id = $1 AND parent_thread_id IS NOT NULL AND successor_thread_id IS NULL",
     )
     .bind(child_id)
     .execute(&mut **tx)
@@ -340,8 +347,12 @@ pub(crate) async fn mark_stopped_child(
 }
 
 /// Settle what `child_id` owed its parent, because the parent's
-/// `ChildThreadCompleted` for it just landed. Clears both the marker and
-/// `is_stopped_child`, and returns whether the child WAS stopped.
+/// `ChildThreadCompleted` or `ChildReportFiled` for it just landed. Clears the
+/// marker and `is_stopped_child`, and returns whether the child WAS stopped.
+///
+/// It also spends the child's wake decision: a decision governs the one report
+/// it was made for. A chat child woken by its own child's card writes no start
+/// event, so its next turn then reads undecided.
 ///
 /// The caller needs that answer because this write lands on the CHILD's row
 /// inside the PARENT's event. The projection samples attention only for the
@@ -354,7 +365,8 @@ pub(crate) async fn settle_parent_callback(
 ) -> Result<bool, sqlx::Error> {
     let was_stopped: Option<bool> = sqlx::query_scalar(
         "UPDATE thread_summaries t \
-         SET parent_callback_pending = FALSE, is_stopped_child = FALSE \
+         SET parent_callback_pending = FALSE, is_stopped_child = FALSE, \
+             parent_wake_requested = NULL \
          FROM (SELECT thread_id, is_stopped_child FROM thread_summaries \
                WHERE thread_id = $1 FOR UPDATE) prev \
          WHERE t.thread_id = prev.thread_id \

@@ -47,6 +47,9 @@ mod workspace_label_test;
 #[path = "api_support/chat_test.rs"]
 mod chat_test;
 
+#[path = "api_support/input_order_test.rs"]
+mod input_order_test;
+
 #[path = "api_support/threads_test.rs"]
 mod threads_test;
 
@@ -101,6 +104,10 @@ mod failed_turn_follow_up_test;
 mod read_decision_test;
 #[path = "api_support/read_request_test.rs"]
 mod read_request_test;
+#[path = "api_support/wake_decision_test.rs"]
+mod wake_decision_test;
+#[path = "api_support/wake_mode_test.rs"]
+mod wake_mode_test;
 
 #[path = "api_support/agent_question_test.rs"]
 mod agent_question_test;
@@ -283,3 +290,6 @@ mod side_question_test;
 
 #[path = "api_support/text_search_test.rs"]
 mod text_search_test;
+
+#[path = "api_support/successor_test.rs"]
+mod successor_test;

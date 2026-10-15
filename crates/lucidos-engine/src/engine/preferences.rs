@@ -132,6 +132,12 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
         return Err(reason.to_string());
     }
 
+    // A retired model id would read as the default while Settings showed the
+    // dead id, so every writer is refused here and told the replacement.
+    if let Some(refusal) = prefs::retired_value_refusal(key, value) {
+        return Err(refusal);
+    }
+
     // A timezone write updates in-memory `user_timezone` and is loaded back at
     // startup. A malformed IANA name would silently degrade trigger scheduling
     // to UTC (`scheduler::task_runner` falls back). The tool pre-validates too,
@@ -193,6 +199,18 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retired model id is refused where Settings, the SDK and raw HTTP
+    /// arrive, not only in the agent's tool. Stored, it would read as the
+    /// default while the picker showed the dead id.
+    #[test]
+    fn a_retired_model_id_is_refused_on_the_shared_write_path() {
+        for (key, retired, replacement) in prefs::RETIRED_VALUES {
+            let err = refuse_bad_value(key, retired, PrefSideEffect::None)
+                .expect_err("a retired model id must not be stored");
+            assert!(err.contains(replacement), "{key}: {err}");
+        }
+    }
 
     /// Every retired key is refused on the path Settings and raw HTTP share,
     /// whatever the value, and the refusal says why.

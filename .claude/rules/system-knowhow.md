@@ -40,6 +40,8 @@ paths:
   - "crates/lucidos-engine/src/core/apps.rs"
   - "crates/lucidos-app/src/store/actions/app-bridge.ts"
   - "crates/lucidos-cli/**"
+  - "crates/lucidos-capabilities/**"
+  - "crates/lucidos-engine/src/capability_manifest/**"
   - "crates/lucidos-engine/src/scheduler/push.rs"
   - "crates/lucidos-engine/src/core/device_presence.rs"
   - "crates/lucidos-engine/src/api/presence.rs"
@@ -69,9 +71,10 @@ paths:
   - "crates/lucidos-engine/src/runtime/python.rs"
   - "crates/lucidos-engine/src/engine/thread_queue/**"
   - "crates/lucidos-engine/src/api/thread_queue.rs"
-  # The deterministic half of this rule. Editing the gate should load what the
+  # The deterministic half of this rule. Editing a gate should load what the
   # gate is for.
   - "scripts/check-knowhow-refs.sh"
+  - "scripts/check-audit-scans.sh"
 ---
 
 # System-Knowhow Maintenance
@@ -101,7 +104,7 @@ When you touch any of the surfaces in the left column, you MUST update the file 
 | `crates/lucidos-app/src/components/apps/appFrameSandbox.ts` (the app frame's sandbox attribute), `crates/lucidos-engine/src/api/app_reach.rs` (*route reach*: which routes an app may call), or `crates/lucidos-app/src/store/actions/app-bridge.ts` (what the *app bridge* carries: the ops, the header and storage rules) | `system-knowhow/js-sdk.md` § Setup (what an app reaches the engine through, and what its own `fetch` / `EventSource` / storage can still do), AND `system-knowhow/workspace-audit/apps.md` "What an isolated app frame can no longer do" plus its § Remediation mapping. The audit OWNS those detection patterns, per [ADR 0227](../../docs/adr/0227-app-frames-get-their-own-renderer-process.md), so widening or narrowing the frame's reach without touching them leaves the sweep hunting for a break that moved. |
 | `crates/lucidos-engine/src/core/apps.rs` (`AppReveal`: the manifest's `reveal` values and how they parse) or `crates/lucidos-app/src/components/apps/appFrameReveal.ts` (when the cover lifts, the fuse lengths, when the load bar runs) | `system-knowhow/js-sdk.md` § Showing the app once its content is ready, AND `system-knowhow/workspace-audit/apps.md` "The ready signal" plus its `ready-signal` scan and § Remediation table, AND the *ready signal* glossary entry |
 | `crates/lucidos-cli/**` (the `lucidos` CLI — new subcommand, flag change, output shape change) | `system-knowhow/lucidos-cli.md` |
-| `crates/lucidos-engine/src/capability_manifest/**` (the *capability parity manifest* — a domain/operation/arg added or changed, or a `llm`/`cli`/`sdk` target flag flipped) | Regenerate the generated surfaces (`cargo test -p lucidos-engine --lib -- --ignored generate_cli_commands_file generate_sdk_capabilities_file`) so the staleness tests pass; wire any NEW `cli`-domain enum into `crates/lucidos-cli/src/main.rs` (`Command` variant + `run()` arm); add/adjust the grouped LLM handler under `engine/tools/` so its recognised actions match the manifest; register any NEW `sdk`-domain facade in `packages/lucidos-sdk/src/generated/capabilities.test.ts`; AND update `system-knowhow/lucidos-cli.md` / `system-knowhow/js-sdk.md` for the affected surface. See `docs/adr/0018-capability-parity-manifest.md`. |
+| `crates/lucidos-capabilities/**` + `crates/lucidos-engine/src/capability_manifest/**` (the *capability parity manifest* — a domain/operation/arg added or changed, or a `llm`/`cli`/`sdk` target flag flipped) | The manifest data lives in `crates/lucidos-capabilities/src/lib.rs`, and the CLI and SDK surfaces regenerate from it (`crates/lucidos-cli/build.rs`, `./scripts/codegen.sh`); wire any NEW `cli`-domain enum into `crates/lucidos-cli/src/main.rs` (`Command` variant + `run()` arm); add/adjust the grouped LLM handler under `engine/tools/` so its recognised actions match the manifest; register any NEW `sdk`-domain facade in `packages/lucidos-sdk/src/capabilities.test.ts`; AND update `system-knowhow/lucidos-cli.md` / `system-knowhow/js-sdk.md` for the affected surface. See `docs/adr/0018-capability-parity-manifest.md`. |
 | `crates/lucidos-engine/src/{api,core}/plugins.rs` + `crates/lucidos-engine/src/engine/tools/plugins/` (plugin manifest schema, install / uninstall / list flow, plugin LLM tools) | `system-knowhow/plugins.md`, AND `docs/taxonomy.md` § plugins if the layout / install semantics changed |
 | `crates/lucidos-engine/src/llm/tools/**` + `crates/lucidos-engine/src/engine/tools/**` (LLM tool added/removed/renamed, args schema changed) | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (system prompts advertise tools), AND `system-knowhow/best-practices.md` / `system-knowhow/intent-registry.md` if the tool's intent maps there |
 | `crates/lucidos-engine/src/core/preference_catalog.rs` (the *preference catalog* — a settable-key added/removed/renamed, its scope/allowed-values/default/side-effect changed, or a human-only or engine entry changed) | `system-knowhow/preferences.md` (the agent-facing key table — a `cargo test` sync test in `preference_catalog.rs` already fails if a catalog or internal key is undocumented), AND the *preference* / *preference catalog* glossary entries if the user-facing semantics shifted |
@@ -172,6 +175,8 @@ Its sources are the files in its own § "Sources of truth" table, plus `system-k
 - No check has quietly grown a **copy** of a rule its source owns. That is how the retired-event check ended up citing two names that were never event renames. Cite the section, name the severity, and stop.
 
 `./scripts/check-knowhow-refs.sh` catches the mechanical half in `/harden`: a repo path or sibling knowhow file that no longer exists, an invented retired event name, and a severity word outside the audit's own legend. It cannot see a check that has gone semantically stale, so the four bullets above still need a human.
+
+`./scripts/check-audit-scans.sh` tests what each `scan` line matches. It runs every pattern against the fixture lines in its `FIXTURES` block. Change a scan, and add a hit row for the form it must catch and a miss row for the form it must not. A new scan fails the gate until it has a hit row.
 
 ## Maintaining workspace-learning
 

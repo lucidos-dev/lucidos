@@ -10,8 +10,10 @@ const here: string = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(here, '../ImagePopup.tsx'), 'utf-8');
 const css = readFileSync(resolve(here, '../../../styles/components.css'), 'utf-8');
 
+/** The first rule whose selector list names `selector`, alone or grouped. */
 function rule(selector: string): string {
-  const block = css.match(new RegExp(`^\\${selector}\\s*\\{[^}]*\\}`, 'm'));
+  const name = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const block = css.match(new RegExp(`^(?:[^{}\\n]+,\\s*)*${name}\\s*(?:,\\s*[^{}\\n]+)*\\{[^}]*\\}`, 'm'));
   expect(block, `no ${selector} rule found`).not.toBeNull();
   return block![0];
 }
@@ -149,8 +151,8 @@ describe('image popup: the chrome is pinned to the viewport', () => {
   // .image-popup-content clips its children, so pinch-zoom stays inside the
   // box. Anything positioned against that box and sitting outside it is simply
   // not drawn: the close button spent that way off the top of the screen.
-  it('close, counter and zoom cluster are all fixed', () => {
-    for (const selector of ['.image-popup-close', '.image-popup-counter', '.image-popup-zoom']) {
+  it('close, copy, counter and zoom cluster are all fixed', () => {
+    for (const selector of ['.image-popup-close', '.image-popup-copy', '.image-popup-counter', '.image-popup-zoom']) {
       expect(rule(selector), `${selector} must not be positioned against the clipped box`)
         .toMatch(/position:\s*fixed/);
     }

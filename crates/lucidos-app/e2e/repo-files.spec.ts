@@ -1,7 +1,7 @@
 import { test, expect, Page } from './fixtures';
 import {
   apiRequest, assertHealthy, clickHeaderAction, clickVisibleElement, headerActionOffered,
-  navigateToApp, openFilesPanel,
+  hideHomeRail, navigateToApp, openFilesPanel,
 } from './helpers';
 import { WORKSPACE, psql, git, getDbPort } from './db-helpers';
 import { randomUUID } from 'crypto';
@@ -295,6 +295,7 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
       localStorage.setItem('lucidos-diff-side-by-side', 'false');
     });
+    await hideHomeRail(page);
   });
 
   test.afterEach(async ({ page }) => {

@@ -117,9 +117,7 @@ async fn s3_presence_pong_endpoint_accepts_valid_payload() {
         .json(&serde_json::json!({
             "notification_id": uuid::Uuid::new_v4(),
             "device_id": "presence-pong-test",
-            "is_active": true,
-            "focused_thread_id": null,
-            "event_in_viewport": false,
+            "outcome": "shown",
         }))
         .send()
         .await
@@ -183,7 +181,7 @@ async fn s3_notification_with_connected_sse_but_no_candidate_runs_presence_check
     // SSE, NOT only when a `device_presence` heartbeat row is fresh. iOS
     // suspends the 30s heartbeat while the PWA is foregrounded, so the
     // device_presence row ages out even though the EventSource is still open
-    // and the page would pong `is_active`. Gating purely on heartbeat
+    // and the page would pong `shown`. Gating purely on heartbeat
     // freshness skipped the check → the OS push fired on top of an active
     // foreground PWA (the "push while active for a while" report). This test
     // pins the live-SSE-connection gate: with ZERO device_presence candidates
@@ -374,22 +372,15 @@ async fn s3_notification_with_visible_device_emits_presence_check_sse() {
     );
 }
 
-#[tokio::test]
-async fn s4_active_pong_emits_toast_request_and_suppresses_push() {
-    let _guard = fan_out_test_lock().lock().await;
-
-    // Spec §2/§4 — the fix for "toast AND OS push at the same time". When a
-    // device pongs `is_active: true`, the engine must (a) suppress the OS push
-    // entirely AND (b) emit a NotificationToastRequested SSE so the active
-    // page renders the in-app toast instead. The two surfaces are mutually
-    // exclusive by this single decision, not by a page-side timing race.
-    //
-    // The SSE reader doubles as the pong sender: when it sees the
-    // PresenceCheck for our notification it POSTs an active pong (which is
-    // exactly when the engine's tracker slot exists), then keeps reading
-    // until the NotificationToastRequested frame lands.
+/// Register a pushable device, mark it visible, and answer the PresenceCheck
+/// for one new notification with `outcome`, as a page does once it has acted.
+/// Returns the device id, the notification id and the check's SSE line.
+///
+/// The reader matches the check by the unique suffix in its title. So a
+/// sibling test's check on the same stream is ignored.
+async fn answer_presence_check(outcome: &str) -> (String, String, String) {
     reset_presence_state().await;
-    let suffix = unique_marker("active-pong");
+    let suffix = unique_marker(&format!("ack-{outcome}"));
     let device_id = register_test_subscription(&suffix).await;
 
     // Mark the same device visible so it's the lone PresenceCheck candidate.
@@ -403,7 +394,9 @@ async fn s4_active_pong_emits_toast_request_and_suppresses_push() {
     assert_eq!(resp.status(), 200);
 
     let sse_device_id = device_id.clone();
-    let sse_handle: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
+    let reader_suffix = suffix.clone();
+    let pong_outcome = outcome.to_string();
+    let sse_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
         let resp = http_client()
             .get(format!("{}/api/v1/events", base_url()))
             .header("Accept", "text/event-stream")
@@ -417,95 +410,109 @@ async fn s4_active_pong_emits_toast_request_and_suppresses_push() {
         let reader = StreamReader::new(byte_stream);
         let mut lines = BufReader::new(reader).lines();
 
-        let mut collected = Vec::new();
-        let mut ponged = false;
         let deadline = tokio::time::sleep(Duration::from_secs(8));
         tokio::pin!(deadline);
         loop {
             tokio::select! {
                 line = lines.next_line() => match line {
                     Ok(Some(line)) => {
-                        // First sight of the PresenceCheck → answer it active.
-                        // The tracker slot is guaranteed to exist by now (the
-                        // engine emits the PresenceCheck right after expect()).
-                        if !ponged && line.contains("\"type\":\"PresenceCheck\"") {
-                            ponged = true;
-                            if let Some(nid) = extract_notification_id(&line) {
-                                let _ = http_client()
-                                    .post(format!("{}/api/v1/presence-pong", base_url()))
-                                    .json(&serde_json::json!({
-                                        "notification_id": nid,
-                                        "device_id": sse_device_id,
-                                        "is_active": true,
-                                        "focused_thread_id": null,
-                                        "event_in_viewport": false,
-                                    }))
-                                    .send()
-                                    .await;
-                            }
+                        // The tracker slot exists by now: the engine emits the
+                        // PresenceCheck right after expect().
+                        if line.contains("\"type\":\"PresenceCheck\"") && line.contains(&reader_suffix) {
+                            let nid = extract_notification_id(&line).expect("notification_id on the check");
+                            let resp = http_client()
+                                .post(format!("{}/api/v1/presence-pong", base_url()))
+                                .json(&serde_json::json!({
+                                    "notification_id": nid,
+                                    "device_id": sse_device_id,
+                                    "outcome": pong_outcome,
+                                }))
+                                .send()
+                                .await
+                                .expect("presence-pong post");
+                            assert_eq!(resp.status(), 200);
+                            return Some(line);
                         }
-                        let saw_toast = line.contains("\"type\":\"NotificationToastRequested\"");
-                        collected.push(line);
-                        if saw_toast { break; }
                     }
-                    Ok(None) | Err(_) => break,
+                    Ok(None) | Err(_) => return None,
                 },
-                _ = &mut deadline => break,
+                _ = &mut deadline => return None,
             }
         }
-        collected
     });
 
     // Give the SSE subscriber a moment to register before producing the
     // notification.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let notification_id = create_notification(
-        &format!("Test active-pong {}", suffix),
-        "should toast, not push",
-    )
-    .await;
+    let notification_id =
+        create_notification(&format!("Test ack {}", suffix), "the page acts first").await;
 
-    let lines = sse_handle.await.expect("SSE task panicked");
+    let check_line = sse_handle
+        .await
+        .expect("SSE task panicked")
+        .unwrap_or_else(|| panic!("no PresenceCheck reached the page for {notification_id}"));
+    (device_id, notification_id, check_line)
+}
 
-    // (a) The engine asked active pages to render the in-app toast.
-    let toast_line = lines
-        .iter()
-        .find(|l| l.contains("\"type\":\"NotificationToastRequested\""))
-        .unwrap_or_else(|| {
-            panic!(
-                "Expected a NotificationToastRequested SSE event after an active pong for {}; \
-                 got {} lines, last 5: {:?}",
-                notification_id,
-                lines.len(),
-                lines.iter().rev().take(5).collect::<Vec<_>>(),
-            )
-        });
-    assert!(
-        toast_line.contains(&notification_id),
-        "NotificationToastRequested must carry notification_id={}; line was: {}",
-        notification_id,
-        toast_line,
-    );
-
-    // (b) The OS push was suppressed — no push_log row for this device. Give
-    // any (erroneous) fan-out a generous window to have written before we
-    // assert its absence.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+async fn push_log_rows(notification_id: &str, device_id: &str) -> i64 {
     let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
-    let push_count: i64 = sqlx::query_scalar(
+    let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM push_log WHERE notification_id = $1::uuid AND device_id = $2",
     )
-    .bind(&notification_id)
-    .bind(&device_id)
+    .bind(notification_id)
+    .bind(device_id)
     .fetch_one(&pool)
     .await
     .expect("count push_log");
     pool.close().await;
+    count
+}
+
+#[tokio::test]
+async fn s4_a_shown_ack_suppresses_the_push_and_the_check_carries_the_toast() {
+    let _guard = fan_out_test_lock().lock().await;
+
+    // Spec §3/§4. The page puts the toast on screen from the check itself and
+    // then reports it shown. That report, and only that, suppresses the push.
+    let (device_id, notification_id, check_line) = answer_presence_check("shown").await;
+
+    assert!(
+        check_line.contains(&notification_id) && check_line.contains("the page acts first"),
+        "the PresenceCheck must carry the toast for notification={notification_id}; line was: {check_line}",
+    );
+
+    // Give any (erroneous) fan-out a generous window to have written before we
+    // assert its absence. A shown ack settles the decision at once.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let push_count = push_log_rows(&notification_id, &device_id).await;
     assert_eq!(
         push_count, 0,
-        "an active device must NOT receive an OS push (got {} push_log rows for notification={} device={})",
-        push_count, notification_id, device_id,
+        "a page that showed the toast must NOT also get an OS push \
+         (got {push_count} push_log rows for notification={notification_id} device={device_id})",
+    );
+}
+
+#[tokio::test]
+async fn s4_a_not_shown_ack_leaves_the_push_to_the_os() {
+    let _guard = fan_out_test_lock().lock().await;
+
+    // The page answered, but its shell was not in front, so it showed nothing.
+    // An answer alone suppresses nothing: the push goes out.
+    let (device_id, notification_id, _) = answer_presence_check("not_shown").await;
+
+    let mut push_count = 0;
+    for _ in 0..50 {
+        push_count = push_log_rows(&notification_id, &device_id).await;
+        if push_count > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        push_count > 0,
+        "a not_shown answer must leave the OS push to go out \
+         (no push_log row for notification={notification_id} device={device_id})",
     );
 }
 
@@ -514,7 +521,7 @@ async fn s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscriptio
     let _guard = fan_out_test_lock().lock().await;
 
     // Spec §1/§4 — the native desktop surface. On the push-ALLOWED branch (no
-    // active device pong'd in) the engine emits a NativePushRequested SSE so a
+    // page handled the check) the engine emits a NativePushRequested SSE so a
     // connected Tauri app can render a native macOS banner — it can't receive
     // the web push (WKWebView has no service-worker push).
     //
@@ -526,7 +533,7 @@ async fn s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscriptio
     // decision alive, and push-allowed broadcasts NativePushRequested.
     //
     // The SSE reader never pongs, so it counts toward `expected_pongs` but
-    // reports no `is_active` → after DEADLINE_MS the engine decides
+    // reports nothing → after DEADLINE_MS the engine decides
     // push_allowed=true and emits the native frame.
     reset_presence_state().await;
     let suffix = unique_marker("native-push");

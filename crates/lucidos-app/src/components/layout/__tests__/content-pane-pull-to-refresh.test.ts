@@ -34,7 +34,7 @@ describe('content pane pull to refresh', () => {
     expect(pane.indexOf('<PullRefreshAffordance />')).toBeGreaterThan(bodyClose);
   });
 
-  it('leads the desktop row with Refresh, beside the hamburger', () => {
+  it('leads the desktop row with Refresh, after the hamburger', () => {
     // Out of the trailing cluster, so it never folds into the ⋯ menu.
     expect(desktopHeader).toMatch(/<HamburgerButton \/>\s*<ContentRefreshButton \/>/);
     expect(contentActions).not.toMatch(/busy/);

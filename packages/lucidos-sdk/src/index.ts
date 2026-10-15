@@ -15,6 +15,7 @@ import { oauth } from './oauth';
 import { request } from './request';
 import { storage } from './storage';
 import { params } from './params';
+import { widget } from './widgetFrame';
 
 export const lucidos = {
   configure,
@@ -46,6 +47,8 @@ export const lucidos = {
   storage,
   // A widget's params for the place it shows (ADR 0415).
   params,
+  // Where a widget shows, and its size as a Home board tile (ADR 0432).
+  widget,
   _capture: capture,
 };
 

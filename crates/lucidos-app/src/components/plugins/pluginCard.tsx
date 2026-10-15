@@ -11,7 +11,8 @@ import { contentLabel } from './pluginContent';
 import { NO_ENGINE_REQUIREMENT_CHIP, NO_ENGINE_REQUIREMENT_SENTENCE } from './engineRequirement';
 
 /** The parts a Plugins panel row and the plugin detail page share, so the two
- *  cannot disagree about a plugin's status, chips or buttons. */
+ *  cannot disagree about a plugin's status, chips or buttons. The row shows
+ *  a subset; the detail page shows all of it. */
 
 export function statusLabel(plugin: MarketplacePlugin): string {
   switch (plugin.status) {
@@ -30,7 +31,7 @@ function actionLabel(plugin: MarketplacePlugin): string {
  *    with the engine's reason when this Lucidos cannot install that version
  *  - installed with an unfinished setup thread → Setup (opens that thread)
  *  - installed and setup done (or none) with an app → Open (launches it)
- *  - installed with nothing to open → no button; the status badge says it
+ *  - installed with nothing to open → no button; the row says Installed
  *  An out-of-date install always shows Update first, before Setup/Open. */
 type CardAction =
   | { kind: 'install'; label: string; blockedReason?: string }
@@ -89,7 +90,8 @@ function pluginIconSrc(plugin: MarketplacePlugin): string | undefined {
   return url ? pluginMediaUrl(url) : undefined;
 }
 
-/** The name with the status and Modified badges beside it. */
+/** The detail page's name, with the version and Modified badges beside it.
+ *  A Store row shows the name alone. */
 export function PluginTitle({ plugin, nameClass }: { plugin?: MarketplacePlugin; nameClass: string }) {
   const sk = useSkeleton();
   return (
@@ -111,18 +113,37 @@ export function PluginTitle({ plugin, nameClass }: { plugin?: MarketplacePlugin;
   );
 }
 
-/** Marketplace, file count, content and category chips, and the engine notes. */
-export function PluginMeta({ plugin }: { plugin?: MarketplacePlugin }) {
-  const sk = useSkeleton();
-  const blockedReason = plugin && !plugin.engine_compatible && plugin.status !== 'installed'
+/** Why this Lucidos cannot install the plugin, beside the disabled Install. */
+function engineBlockedReason(plugin?: MarketplacePlugin): string | undefined {
+  return plugin && !plugin.engine_compatible && plugin.status !== 'installed'
     ? plugin.engine_incompatible_reason
     : undefined;
+}
+
+function EngineRequirementChip({ reason }: { reason: string }) {
+  return (
+    <span class="label label-warning" data-role="engine-requirement">
+      {reason}
+    </span>
+  );
+}
+
+/** The detail page's line under the name: where the plugin comes from and how
+ *  many files it has. */
+export function PluginSource({ plugin }: { plugin?: MarketplacePlugin }) {
+  const source = plugin
+    ? [plugin.marketplace_name, fileCountLabel(plugin.files_count)].filter(Boolean).join(' · ')
+    : undefined;
+  return <SkText class="plugin-detail-source" as="div" w="10rem">{source}</SkText>;
+}
+
+/** The detail page's content and category chips, and the engine notes. The
+ *  no-requirement note informs an install, so an installed plugin drops it. */
+export function PluginMeta({ plugin }: { plugin?: MarketplacePlugin }) {
+  const sk = useSkeleton();
+  const blockedReason = engineBlockedReason(plugin);
   return (
     <div class="app-store-plugin-meta">
-      {(sk || plugin?.marketplace_name) && (
-        <SkText w="6rem">{plugin?.marketplace_name}</SkText>
-      )}
-      <SkText w="3rem">{plugin && fileCountLabel(plugin.files_count)}</SkText>
       {sk && <SkBlock w="4rem" h="1rem" round />}
       {plugin?.content.map((kind) => (
         <span class="label label-neutral" key={kind}>
@@ -134,12 +155,8 @@ export function PluginMeta({ plugin }: { plugin?: MarketplacePlugin }) {
           {categoryLabel(c)}
         </span>
       ))}
-      {blockedReason && (
-        <span class="label label-warning" data-role="engine-requirement">
-          {blockedReason}
-        </span>
-      )}
-      {plugin && plugin.engine_requirement == null && (
+      {blockedReason && <EngineRequirementChip reason={blockedReason} />}
+      {plugin && plugin.status !== 'installed' && plugin.engine_requirement == null && (
         <span
           class="label label-neutral"
           data-role="engine-undeclared"
@@ -152,6 +169,18 @@ export function PluginMeta({ plugin }: { plugin?: MarketplacePlugin }) {
   );
 }
 
+/** The row keeps one note: why its Install is disabled. Every other chip waits
+ *  on the detail page, so the list stays calm. */
+export function PluginRowNote({ plugin }: { plugin?: MarketplacePlugin }) {
+  const blockedReason = engineBlockedReason(plugin);
+  if (!blockedReason) return null;
+  return (
+    <div class="app-store-plugin-meta">
+      <EngineRequirementChip reason={blockedReason} />
+    </div>
+  );
+}
+
 interface PluginActionsProps {
   plugin?: MarketplacePlugin;
   /** True while this plugin's install is being staged. */
@@ -159,21 +188,24 @@ interface PluginActionsProps {
   onInstall?: (plugin: MarketplacePlugin) => void;
 }
 
-/** Propose upstream, Uninstall and the primary button. A tap never reaches the
- *  row behind it, which opens the plugin detail page. */
-export function PluginActions({ plugin, busy = false, onInstall }: PluginActionsProps) {
-  const sk = useSkeleton();
-  const isInstalled = !!plugin && plugin.status !== 'available';
+interface PrimaryButton {
+  label: string;
+  onClick: () => void;
+  blockedReason?: string;
+}
+
+function primaryButton(
+  plugin: MarketplacePlugin | undefined,
+  onInstall: PluginActionsProps['onInstall'],
+): PrimaryButton | null {
   const action = plugin ? cardPrimaryAction(plugin) : { kind: 'none' as const };
-  let primary: { label: string; onClick: () => void; blockedReason?: string } | null = null;
   switch (action.kind) {
     case 'install':
-      primary = {
+      return {
         label: action.label,
         onClick: () => plugin && onInstall?.(plugin),
         blockedReason: action.blockedReason,
       };
-      break;
     case 'setup':
       // The catalog surfaces this button for a present-or-queued setup thread;
       // a gone one resolves to Open. A QUEUED one has no thread_summaries row
@@ -181,19 +213,52 @@ export function PluginActions({ plugin, busy = false, onInstall }: PluginActions
       // be undone by ThreadView's stale-pointer cleanup and land on the compose
       // view. `focusSpawnedThread` holds the focus until the row arrives,
       // exactly as the confirm path in plugin-install.ts does.
-      primary = { label: 'Setup', onClick: () => focusSpawnedThread(action.threadId) };
-      break;
+      return { label: 'Setup', onClick: () => focusSpawnedThread(action.threadId) };
     case 'open':
-      primary = { label: 'Open', onClick: () => void openAppById(action.appId) };
-      break;
+      return { label: 'Open', onClick: () => void openAppById(action.appId) };
     case 'none':
-      break;
+      return null;
   }
+}
+
+function PrimaryActionButton({ plugin, busy = false, onInstall }: PluginActionsProps) {
+  const sk = useSkeleton();
+  const primary = primaryButton(plugin, onInstall);
+  if (!sk && !primary) return null;
+  return (
+    <SkBlock w="4.5rem" h="2rem" round>
+      <button
+        class="action-btn"
+        type="button"
+        disabled={busy || !!primary?.blockedReason}
+        onClick={primary?.onClick}
+      >
+        {busy ? 'Staging' : primary?.label}
+      </button>
+    </SkBlock>
+  );
+}
+
+/** A Plugins panel row's one button: Install, Update, Setup or Open. With
+ *  nothing to press, the row says Installed, since it shows no version badge.
+ *  A tap never reaches the row behind it, which opens the plugin detail page. */
+export function PluginRowAction(props: PluginActionsProps) {
+  const { plugin } = props;
   return (
     <div class="list-row-actions" onClick={(e) => e.stopPropagation()}>
-      {plugin?.modified && (
-        <ProposeUpstreamButton pluginId={plugin.id} pluginName={plugin.name} />
-      )}
+      {plugin && cardPrimaryAction(plugin).kind === 'none'
+        ? <span class="app-store-plugin-installed">Installed</span>
+        : <PrimaryActionButton {...props} />}
+    </div>
+  );
+}
+
+/** The detail page's buttons: Uninstall and the primary. */
+export function PluginActions(props: PluginActionsProps) {
+  const { plugin } = props;
+  const isInstalled = !!plugin && plugin.status !== 'available';
+  return (
+    <div class="list-row-actions">
       {isInstalled && (
         <button
           class="action-btn action-btn-secondary"
@@ -203,18 +268,21 @@ export function PluginActions({ plugin, busy = false, onInstall }: PluginActions
           Uninstall
         </button>
       )}
-      {(sk || primary) && (
-        <SkBlock w="4.5rem" h="2rem" round>
-          <button
-            class="action-btn"
-            type="button"
-            disabled={busy || !!primary?.blockedReason}
-            onClick={primary?.onClick}
-          >
-            {busy ? 'Staging' : primary?.label}
-          </button>
-        </SkBlock>
-      )}
+      <PrimaryActionButton {...props} />
+    </div>
+  );
+}
+
+/** The detail page's note on a locally changed plugin, with the offer to send
+ *  the changes to its author. */
+export function PluginModifiedNotice({ plugin }: { plugin: MarketplacePlugin }) {
+  if (!plugin.modified) return null;
+  const count = plugin.modified_paths?.length ?? 0;
+  const what = count > 0 ? `${fileCountLabel(count)} in this plugin` : 'this plugin';
+  return (
+    <div class="plugin-detail-modified">
+      <span>You changed {what}. An update keeps your changes where it can.</span>
+      <ProposeUpstreamButton pluginId={plugin.id} pluginName={plugin.name} />
     </div>
   );
 }

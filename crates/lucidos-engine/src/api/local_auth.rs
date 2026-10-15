@@ -65,22 +65,23 @@ use std::sync::OnceLock;
 pub enum EngineScope {
     /// The machine-local token: every route.
     Full,
-    /// The webhook token: one route, the delivery hop.
+    /// The hook socket token: one route, the delivery hop.
     WebhookDelivery,
 }
 
 /// The credentials this engine accepts, and whether it checks them at all.
 ///
 /// Read ONCE at startup rather than per request. The read is a file read, and
-/// this sits in front of every request including the SSE stream. The gateway
-/// mints both tokens before it spawns any engine, so there is no window where a
-/// fresher value would have been found (`lucidos_gateway::server::run`).
+/// this sits in front of every request including the SSE stream. The engine
+/// reads or mints each token under the mint lock the gateway also takes, and
+/// nothing replaces a published token. So no later read could find a fresher
+/// value, whichever of the two booted first.
 #[derive(Debug, Clone)]
 pub struct EngineAuth {
     /// False on a loopback bind, where reaching the socket is the proof.
     required: bool,
     local: Option<String>,
-    webhook: Option<String>,
+    hook_socket: Option<String>,
 }
 
 impl EngineAuth {
@@ -91,14 +92,20 @@ impl EngineAuth {
     /// fatal: refusing every caller is the safe end of the trade, and
     /// `/api/v1/health` still answers so a supervisor can see the process.
     ///
-    /// The local token is minted here when the file is absent. See
-    /// [`local_token_for_this_engine`].
+    /// Both tokens are minted here when their file is absent. See
+    /// [`token_for_this_engine`].
     pub fn resolve(choice: &BindChoice) -> Self {
         let required = auth_required(choice);
         let auth = EngineAuth {
             required,
-            local: local_token_for_this_engine(),
-            webhook: local_token::read_named(local_token::WEBHOOK_TOKEN_FILE),
+            local: token_for_this_engine(
+                local_token::LOCAL_TOKEN_FILE,
+                "no caller can prove it is a local process",
+            ),
+            hook_socket: token_for_this_engine(
+                local_token::HOOK_SOCKET_TOKEN_FILE,
+                "no webhook delivery can reach this engine on a wide bind",
+            ),
         };
         // One file read serves both questions. Publishing here rather than
         // reading again keeps the door and the attribution answer from ever
@@ -106,7 +113,7 @@ impl EngineAuth {
         publish_local_token(auth.local.clone());
         if required {
             let scope = crate::net_config::bind_scope_label(choice);
-            if auth.local.is_none() && auth.webhook.is_none() {
+            if auth.local.is_none() && auth.hook_socket.is_none() {
                 crate::log!(
                     "[API] bound to {scope} with no credential on disk, so every call is \
                      refused. The mint above says why it could not write one; bind \
@@ -125,17 +132,17 @@ impl EngineAuth {
         EngineAuth {
             required: false,
             local: None,
-            webhook: None,
+            hook_socket: None,
         }
     }
 
     /// A locked door holding exactly these two secrets.
     #[cfg(test)]
-    pub fn locked_for_tests(local: Option<&str>, webhook: Option<&str>) -> Self {
+    pub fn locked_for_tests(local: Option<&str>, hook_socket: Option<&str>) -> Self {
         EngineAuth {
             required: true,
             local: local.map(str::to_string),
-            webhook: webhook.map(str::to_string),
+            hook_socket: hook_socket.map(str::to_string),
         }
     }
 
@@ -145,28 +152,27 @@ impl EngineAuth {
     }
 }
 
-/// The machine-local token, minting it when no gateway has.
+/// The named token, minting it when no gateway has yet.
 ///
 /// The gateway mints before it spawns any engine, so a fronted engine finds
-/// that value and this writes nothing. A bare single-engine run has no gateway
-/// to mint for it, and until this existed it had no token file at all.
+/// that value and this writes nothing. Two engines mint anyway:
 ///
-/// That gap was not academic. The engine's own build-watch reaches
-/// `POST /api/v1/events/emit` through the CLI, holding no thread-bound origin
-/// token, so the machine-local token is the only identity it can present. With
-/// no file, `api::mutating_gate` would refuse the engine's own rebuild.
+/// - A bare single-engine run has no gateway. Its build-watch reaches
+///   `POST /api/v1/events/emit` through the CLI with no thread-bound origin
+///   token, so the local token is the only identity it can present. With no
+///   file, `api::mutating_gate` would refuse the engine's own rebuild.
+/// - An engine that boots before its gateway does. A gateway re-exec re-adopts
+///   running engines, so an engine that cached "absent" would refuse every
+///   delivery until it restarted. The gateway reads what this one minted.
 ///
-/// A mint that fails is logged and treated as absent, which is exactly the
-/// posture the caller had before. It is never fatal: on the loopback bind that
-/// ships everywhere, nothing is refused for want of it.
-fn local_token_for_this_engine() -> Option<String> {
-    match local_token::ensure_named(local_token::LOCAL_TOKEN_FILE) {
+/// A mint that fails is logged with `consequence` and treated as absent. It is
+/// never fatal: on the loopback bind that ships everywhere, nothing is refused
+/// for want of it.
+fn token_for_this_engine(name: &str, consequence: &str) -> Option<String> {
+    match local_token::ensure_named(name) {
         Ok(token) => Some(token),
         Err(e) => {
-            crate::log!(
-                "[API] could not read or mint the machine-local token ({e}), so no caller \
-                 can prove it is a local process"
-            );
+            crate::log!("[API] could not read or mint ~/.lucidos/{name} ({e}), so {consequence}");
             None
         }
     }
@@ -212,8 +218,8 @@ pub fn presented_scope(headers: &HeaderMap, auth: &EngineAuth) -> Option<EngineS
             return Some(EngineScope::Full);
         }
     }
-    if let Some(expected) = auth.webhook.as_deref() {
-        if presented(headers, local_token::HEADER_WEBHOOK_TOKEN)
+    if let Some(expected) = auth.hook_socket.as_deref() {
+        if presented(headers, local_token::HEADER_HOOK_SOCKET_TOKEN)
             .is_some_and(|t| local_token::ct_eq(t, expected))
         {
             return Some(EngineScope::WebhookDelivery);
@@ -458,12 +464,12 @@ mod tests {
         assert!(!carries_local_token(&blank, Some("local-secret")));
     }
 
-    /// The webhook token reaches one route and names no local process. Its
+    /// The hook socket token reaches one route and names no local process. Its
     /// holder is whatever `tailscale funnel` exposed, so reading it as local
     /// would hand the open internet the engine's own identity.
     #[test]
-    fn the_webhook_token_never_names_a_local_process() {
-        let h = hm(&[(local_token::HEADER_WEBHOOK_TOKEN, "hook-secret")]);
+    fn the_hook_socket_token_never_names_a_local_process() {
+        let h = hm(&[(local_token::HEADER_HOOK_SOCKET_TOKEN, "hook-secret")]);
         assert!(!carries_local_token(&h, Some("hook-secret")));
     }
 
@@ -475,9 +481,9 @@ mod tests {
     }
 
     #[test]
-    fn the_webhook_token_proves_only_its_own_scope() {
+    fn the_hook_socket_token_proves_only_its_own_scope() {
         let auth = EngineAuth::locked_for_tests(Some("local-secret"), Some("hook-secret"));
-        let h = hm(&[(local_token::HEADER_WEBHOOK_TOKEN, "hook-secret")]);
+        let h = hm(&[(local_token::HEADER_HOOK_SOCKET_TOKEN, "hook-secret")]);
         assert_eq!(
             presented_scope(&h, &auth),
             Some(EngineScope::WebhookDelivery)
@@ -493,8 +499,12 @@ mod tests {
             // Presenting one secret under the OTHER name must not work, or the
             // scope would be the caller's to choose.
             (local_token::HEADER_LOCAL_TOKEN, "hook-secret"),
-            (local_token::HEADER_WEBHOOK_TOKEN, "local-secret"),
-            (local_token::HEADER_WEBHOOK_TOKEN, ""),
+            (local_token::HEADER_HOOK_SOCKET_TOKEN, "local-secret"),
+            (local_token::HEADER_HOOK_SOCKET_TOKEN, ""),
+            // The header's name before the rename, pinned as a wire literal.
+            // An older gateway still sends it. It must grant nothing, even
+            // carrying the current secret.
+            ("x-lucidos-webhook-token", "hook-secret"),
         ] {
             assert_eq!(
                 presented_scope(&hm(&[(name, value)]), &auth),
@@ -513,7 +523,7 @@ mod tests {
         assert_eq!(presented_scope(&hm(&[]), &auth), None);
         for name in [
             local_token::HEADER_LOCAL_TOKEN,
-            local_token::HEADER_WEBHOOK_TOKEN,
+            local_token::HEADER_HOOK_SOCKET_TOKEN,
         ] {
             assert_eq!(presented_scope(&hm(&[(name, "")]), &auth), None);
             assert_eq!(presented_scope(&hm(&[(name, "anything")]), &auth), None);
@@ -566,7 +576,7 @@ mod tests {
         ] {
             assert!(
                 !scope_allows(EngineScope::WebhookDelivery, path),
-                "a webhook credential must not reach {path}"
+                "the hook socket token must not reach {path}"
             );
         }
     }
@@ -746,11 +756,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_webhook_credential_delivers_and_can_do_nothing_else() {
+    async fn a_hook_socket_token_delivers_and_can_do_nothing_else() {
         // `t3-inbound-auth-scopes` in one test: the delivery lands, and the
         // same credential is refused everywhere else. 403 rather than 401,
         // because the caller DID authenticate. It just cannot reach this.
-        let hdr = &[(local_token::HEADER_WEBHOOK_TOKEN, "hook-secret")];
+        let hdr = &[(local_token::HEADER_HOOK_SOCKET_TOKEN, "hook-secret")];
         assert_eq!(
             call(locked(), "/api/v1/webhooks/abc/deliver", hdr).await,
             StatusCode::IM_A_TEAPOT
@@ -759,7 +769,7 @@ mod tests {
             assert_eq!(
                 call(locked(), path, hdr).await,
                 StatusCode::FORBIDDEN,
-                "a webhook credential must not reach {path}"
+                "the hook socket token must not reach {path}"
             );
         }
     }

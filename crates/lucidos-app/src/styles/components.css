@@ -215,6 +215,41 @@
     font-size: var(--font-size-md);
 }
 
+/* A prompt that can suggest an answer puts its Suggest link at the end of the
+   message line. The spinner grows to the left, so the label holds still. */
+.prompt-message-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-md);
+}
+
+.prompt-message {
+    flex: 1;
+    min-width: 0;
+}
+
+/* Inline flow, not flex: the label's text then gives the row its baseline,
+   which a leading spinner would otherwise take over. */
+.prompt-suggest {
+    flex-shrink: 0;
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+}
+
+.prompt-suggest[aria-disabled="true"] {
+    cursor: default;
+}
+
+.prompt-suggest .mini-spinner {
+    --spinner-color: var(--accent);
+    margin-right: var(--space-xs);
+}
+
+/* The field locks while a suggestion loads, and its text steps back. */
+.prompt-input[readonly] {
+    color: var(--text-muted);
+}
+
 .prompt-textarea {
     resize: vertical;
     min-height: 4.5rem;
@@ -407,11 +442,10 @@
     --code-surface: var(--surface-bg);
 }
 
-/* Toast notifications — positioned below header. The container spans the full
-   width and holds one .toast-column per VISIBLE pane, each centered over its own
-   pane (desktop block below). Mobile shows one pane at a time, so it gets a
-   single full-width column. --z-toast sits above .ui-blocking-overlay so the
-   restart toast stays visible when the dim overlay covers the header. */
+/* Toast notifications. Mobile draws one full-width stack below the header;
+   desktop moves it to the window's bottom-right corner (block further down).
+   --z-toast sits above .ui-blocking-overlay so the restart toast stays visible
+   when the dim overlay covers the header. */
 .toast-container {
     /* The widest a toast gets, read by the toast and by the corner placement,
        which sizes the container rather than the toast. */
@@ -455,48 +489,13 @@
     z-index: calc(var(--z-modal) - 1);
 }
 
-/* One stack per visible pane. A toast is pinned to the pane that was focused
-   WHEN IT APPEARED (ToastItem.pane, frozen in showToast) and lands in that
-   pane's column, so it displaces only that pane's other toasts. Which columns
-   exist is decided in JS (toastColumns.ts): a collapsed pane leaves ONE column
-   for the survivor, and mobile has a single full-width one, which is why there
-   is no collapse handling here. Newest-first inside a column, matching the
-   newest-first array showToast prepends to. */
+/* The one stack, newest first, matching the newest-first array showToast
+   prepends to. */
 .toast-column {
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 0.5rem;
-}
-
-/* Desktop: each column spans its own pane, so `align-items: center` above
-   centers its toasts over that pane and the toast's own `width: calc(100% - 2rem)`
-   measures against the pane rather than the viewport. The geometry is the shared
-   header vars from shell.css (--co drawer width, --ddo drawer-divider offset,
-   --divider-x split position, --divider-width), i.e. the same segmentation the
-   header focus wash uses, so a column tracks its pane through a divider drag.
-   The percentages inside those vars resolve against .toast-container, which
-   spans the viewport exactly as the header does. */
-@media (--desktop-layout) {
-    .toast-column {
-        position: absolute;
-        top: 0;
-        /* Geometry easing matched to the panes so a collapse/expand slides the
-           column with its pane instead of teleporting it. Switched off during a
-           divider drag by the data-pane-resizing kill rule in shell.css, for the
-           same 1:1 tracking the header regions get. */
-        transition: left var(--duration-slow) ease, width var(--duration-slow) ease;
-    }
-
-    .toast-column[data-toast-pane="thread"] {
-        left: calc(var(--co) + var(--ddo));
-        width: calc(var(--divider-x) - var(--co) - var(--ddo));
-    }
-
-    .toast-column[data-toast-pane="content"] {
-        left: calc(var(--divider-x) + var(--divider-width));
-        width: calc(100% - var(--divider-x) - var(--divider-width));
-    }
 }
 
 .toast {
@@ -856,73 +855,6 @@
     margin-top: calc((var(--toast-close-size) - var(--toast-spinner-size)) / 2);
 }
 
-/* ─── Toast placement shapes (TEMPORARY: a comparison, see
-   docs/temporary-measures.md) ───
-
-   Four shapes, one of which survives. The pane columns above are the
-   `data-toast-placement="pane"` case and need no rule of their own, since they
-   are what the base CSS already draws. The other three are all ONE column, so
-   `toastLayout` answers `single` for them and only geometry differs here.
-
-   The problem the bleed shapes solve: a card narrower than the viewport sits ON
-   the pane divider, with the seam visible above and below it. A bar that runs
-   edge to edge COVERS the divider for its whole width instead, so the seam
-   emerges below the stack and reads as layering. */
-
-/* All three cross-pane shapes share one column spanning the container, so they
-   opt OUT of the desktop rule that absolutely positions a column over its pane.
-   Without this the lone column would shrink-wrap at the viewport's left edge
-   there, since it carries no [data-toast-pane] and so picks up no left/width.
-   Stated outside the media query because static is already the mobile value. */
-.toast-container[data-toast-placement="bottom-right"] .toast-column,
-.toast-container[data-toast-placement="top-bleed"] .toast-column,
-.toast-container[data-toast-placement="bottom-bleed"] .toast-column,
-.toast-container[data-toast-placement="card"] .toast-column {
-    position: static;
-}
-
-/* Both bleed shapes: the bar IS the full width, so the side insets, the width
-   cap, the side borders and the corner radius all go. The bars butt against
-   each other with no gap, so a burst reads as one band rather than a scatter of
-   cards. Safe-area insets stay on the container, since a notch or a rounded
-   corner still eats the edge a full-bleed bar runs to. */
-.toast-container[data-toast-placement="top-bleed"],
-.toast-container[data-toast-placement="bottom-bleed"] {
-    left: var(--safe-area-left);
-    right: var(--safe-area-right);
-}
-
-.toast-container[data-toast-placement="top-bleed"] .toast-column,
-.toast-container[data-toast-placement="bottom-bleed"] .toast-column {
-    gap: 0;
-}
-
-.toast-container[data-toast-placement="top-bleed"] .toast,
-.toast-container[data-toast-placement="bottom-bleed"] .toast {
-    width: 100%;
-    max-width: none;
-    border-radius: 0;
-    border-left-width: 0;
-    border-right-width: 0;
-}
-
-/* Bottom: anchored to the bottom edge instead of below the header, with the
-   column reversed so the newest bar is nearest the edge it enters from. The
-   thread pane's composer is bottom-docked on both layouts, so this shape sits
-   over the prompt input, which is exactly what the comparison is for. */
-.toast-container[data-toast-placement="bottom-bleed"] {
-    top: auto;
-    bottom: var(--safe-area-bottom);
-}
-
-.toast-container[data-toast-placement="bottom-bleed"] .toast-column {
-    flex-direction: column-reverse;
-}
-
-/* Card needs nothing beyond the static column above: the base .toast-column
-   already centres, and .toast keeps its --toast-max-width cap. That IS the shape the
-   per-pane columns replaced, kept here so the comparison has its baseline. */
-
 /* Bottom-right corner, the spot VS Code and IntelliJ both default to. Anchored
    to the WINDOW, not to a pane, so it holds still through a divider drag and
    never meets the seam, because it never goes near the middle.
@@ -932,7 +864,7 @@
    keeps the base top placement. That breakpoint split is what Material and
    Carbon both call for, rather than an inconsistency between the two. */
 @media (--desktop-layout) {
-    .toast-container[data-toast-placement="bottom-right"] {
+    .toast-container {
         top: auto;
         left: auto;
         bottom: max(1rem, var(--safe-area-bottom));
@@ -945,17 +877,17 @@
 
     /* Newest nearest the corner it enters from, so the stack grows upward and
        the toast the user just caused is the one under their eye. */
-    .toast-container[data-toast-placement="bottom-right"] .toast-column {
+    .toast-container .toast-column {
         flex-direction: column-reverse;
     }
 
-    .toast-container[data-toast-placement="bottom-right"] .toast {
+    .toast-container .toast {
         width: 100%;
     }
 }
 
-/* A bottom-anchored stack has to rise INTO place: the shared `toast-in` drops
-   from above, which reads as the toast falling out of the stack it is joining.
+/* A toast rises INTO place on both layouts. In the corner stack the shared
+   `toast-in` drop would read as the toast falling out of the stack it joins.
    Only the direction changes, so the duration and easing stay shared, and the
    inline duration Toast.tsx sets for the animation-speed slider still lands. */
 @keyframes toast-in-up {
@@ -963,8 +895,7 @@
     to { opacity: 1; transform: translateY(0); }
 }
 
-.toast-container[data-toast-placement="bottom-right"] .toast,
-.toast-container[data-toast-placement="bottom-bleed"] .toast {
+.toast-container .toast {
     animation-name: toast-in-up;
 }
 
@@ -1342,7 +1273,8 @@
    multiple lands on the grid. Keep each box's total a 0.5rem multiple plus its
    borders. A padding or gap may be fractional alone, as long as the pair sums
    to one. */
-.image-popup-close {
+.image-popup-close,
+.image-popup-copy {
     position: fixed;
     top: 1.5rem;
     right: 1.5rem;
@@ -1357,12 +1289,18 @@
     z-index: 1;
 }
 
+/* Copy sits left of Close, a half-rem gap between the two. */
+.image-popup-copy {
+    right: 3.5rem;
+}
+
 /* .icon-btn's own hover is a THEME fill (--bg-hover plus --text-primary), which
    on this dark overlay reads as a blue tile in the dark theme and as a
    near-white one in the light theme, where it swallows the glyph. The chrome
    here is theme-independent, so it darkens like the nav buttons instead. */
 @media (hover: hover) {
-    .image-popup-close:hover {
+    .image-popup-close:hover,
+    .image-popup-copy:hover {
         background: rgba(0, 0, 0, 0.85);
         color: #fff;
     }
@@ -1498,6 +1436,7 @@
    individual rules set. The close button and the nav chevrons darken on hover,
    and without it here they snap. */
 .image-popup-close,
+.image-popup-copy,
 .floating-mobile-close,
 .image-popup-nav,
 .image-popup-counter,
@@ -1509,6 +1448,7 @@
    lands at once rather than with the fade, so a control on its way out is dead
    from the first frame. */
 .image-popup-content.chrome-hidden .image-popup-close,
+.image-popup-content.chrome-hidden .image-popup-copy,
 .image-popup-content.chrome-hidden .floating-mobile-close,
 .image-popup-content.chrome-hidden .image-popup-nav,
 .image-popup-content.chrome-hidden .image-popup-counter,
@@ -1543,7 +1483,8 @@
        quarter-rem is a fraction of a pixel at the 112.5% mobile root, and this
        is a bordered circle, so it owes the whole-pixel rule over
        .image-popup-close. The env() term is the platform's and stays as it is. */
-    .floating-mobile-close {
+    .floating-mobile-close,
+    .image-popup-copy {
         display: flex;
         align-items: center;
         justify-content: center;
@@ -1560,9 +1501,15 @@
         z-index: 1;
     }
 
-    .floating-mobile-close svg {
+    .floating-mobile-close svg,
+    .image-popup-copy svg {
         width: 1.25rem;
         height: 1.25rem;
+    }
+
+    /* Left of Close, a whole rem between them. */
+    .image-popup-copy {
+        right: calc(5rem + var(--safe-area-right));
     }
 
     /* Mobile relies on swipe for navigation — chevrons would steal thumb

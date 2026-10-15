@@ -27,7 +27,7 @@ import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followCanceledTurn, followSentMessage, followSideQuestion } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon, WarningIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
-import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
+import { codingAgentMenuOpenRequest } from './controlMenuRequests';
 import { isComposeContext, PromptRowControls, promptRowToggles } from './PromptRowControls';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
 import { OverflowMenu } from '../shared/OverflowMenu';
@@ -35,17 +35,17 @@ import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../ho
 import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
 import { composerBannerState, getBannerActions, getWaitingState, getStandaloneActions } from './WaitingBanner';
-import { composeHasContent, sideQuestionModeActive, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, threadHasConversation, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, sideQuestionModeActive, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, threadHasConversation, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, type UploadSendIntent } from './prompt-input-helpers';
 import { canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting } from '../../store/canceledQuestions';
 import { SplitButton } from '../shared/SplitButton';
 import { NotReadyStrip } from './NotReadyStrip';
+import { SuccessorStrip } from './SuccessorStrip';
 export * from './prompt-input-helpers';
 import { composeHandlers } from './composeHandlers';
 import { focusIfNeeded } from '../../utils/dom';
 import { threadEntryFocusTarget } from './choiceCardNav';
 import { focusIntoPane } from '../layout/paneFocus';
-import { syncTextareaValue, shouldSkipSyncWhileEditing, resolveEmptyDraftSync, promptOverrideSyncSeq, promptOverrideReplacesDraft } from './promptValueSync';
-import { reportDraftClobbered } from './deadKeystrokeProbe';
+import { syncTextareaValue, promptCaretToEndSeq } from './promptValueSync';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
 import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom, easeEmptiedTextarea, remeasureTextareaForPlaceholder } from './promptResize';
 import { isMobile } from '../../utils/viewport';
@@ -353,23 +353,20 @@ export function PromptInput() {
   const composeText = getDraft(tid).text;
   const hasText = composeText.length > 0;
 
-  // Preserve cursor on same-thread re-syncs; let it end-snap on thread switch.
-  // shouldSkipSyncWhileEditing protects in-flight keystrokes — see its docstring.
+  // The box shows the draft, and nothing else, after every render: the draft
+  // is the message's one copy. A keystroke writes the draft in `handleInput`
+  // before any render, so this never fights typing. A report from the engine
+  // cannot replace a draft with an edit pending (`store/composeSync.ts`).
+  //
+  // The caret keeps its offset on a same-thread write, and end-snaps on a
+  // thread switch, or when a programmatic write replaced the draft.
   const prevTidRef = useRef<string | null | undefined>(undefined);
-  // Whether the box holds characters the COMPOSER did not put there. Set by the
-  // user's own `onInput`, cleared by every write the composer makes through
-  // `writeComposerValue`. `resolveEmptyDraftSync` reads it to tell a keystroke
-  // the store is missing from a synced draft a peer is entitled to clear.
-  const typedSinceComposerWroteRef = useRef(false);
   // Whether the PREVIOUS render was the centered compose view. Drives the
   // compose-to-compose height animation, which must NOT fire on a
   // compose-to-active switch, where the ThreadPane FLIP owns the transition.
   const wasComposeViewRef = useRef(false);
-  // A deliberate programmatic override (welcome starter suggestion) bumps this
-  // counter to force the very next sync past the skip-while-editing guard. Track
-  // the last value we acted on so a bump forces exactly one sync.
-  const overrideSyncSeq = promptOverrideSyncSeq.value;
-  const lastOverrideSyncSeqRef = useRef(overrideSyncSeq);
+  const caretToEndSeq = promptCaretToEndSeq.value;
+  const lastCaretToEndSeqRef = useRef(caretToEndSeq);
   // A layout effect, so the box holds the new thread's text before ThreadPane's
   // FLIP measures where the prompt docks. A child's layout effects run first.
   useLayoutEffect(() => {
@@ -377,57 +374,26 @@ export function PromptInput() {
     if (!el) return;
     const sameThread = prevTidRef.current === tid;
     const isComposeView = composeViewActive.value;
-    const thisElementActive = document.activeElement === el;
-    // A one-shot override, a suggestion replacing an in-progress draft, must
-    // land in the textarea whatever the focus and content are.
-    // `requestPromptOverrideSync` bumps the counter after the draft write, so
-    // this render sees both.
-    const forceOverride = overrideSyncSeq !== lastOverrideSyncSeqRef.current;
-    lastOverrideSyncSeqRef.current = overrideSyncSeq;
-    // An empty canonical draft must still reach the textarea, or a cleared
-    // draft leaves stale text in a focused box. What it may NEVER do is erase
-    // characters the user typed. `resolveEmptyDraftSync` rules on that, and
-    // rules the same way `resolveComposerText` does at send time. An override
-    // outranks it: that write is deliberate and programmatic.
-    const adopting = !forceOverride && composeText === '' && resolveEmptyDraftSync({
-      domText: el.value,
-      typedSinceComposerWrote: typedSinceComposerWroteRef.current,
-      thisElementActive,
-      sameThread,
-    }) === 'adopt';
-    const forceEmptySync = composeText === '';
-    // An override that REPLACED the draft end-snaps the caret, the same as a
-    // thread switch: the old offset indexes text that is gone. An appending
-    // override keeps it, since the prefix it points into is untouched.
-    const preserveCursor = sameThread
-      && !(forceOverride && promptOverrideReplacesDraft.value);
-    if (adopting) adoptComposerText(el);
-    if (!adopting
-        && (forceEmptySync || forceOverride || !shouldSkipSyncWhileEditing(el, sameThread, thisElementActive))) {
-      // The composer is claiming the box's value, so nothing standing in it is
-      // unaccounted-for typing any more. Set before the write, and whether or
-      // not the write changes anything: a box that already matches the draft
-      // holds no keystroke the store is missing either.
-      typedSinceComposerWroteRef.current = false;
-      if (syncTextareaValue(el, composeText, preserveCursor)) {
-        // A compose-view to compose-view switch keeps the centered layout put, so
-        // the ThreadPane FLIP never fires and the textarea would insta-resize.
-        // Ease its height from the previous view's to the new one instead.
-        //
-        // Gated on `composeViewActive`, NOT on both being composing threads: the
-        // blank view has no thread id. A compose-to-active switch flips
-        // `composeViewActive`, so this is false there and the FLIP owns it.
-        // Capture the old inline height BEFORE `autoResize` overwrites it.
-        // Desktop-only and motion-respecting, mirroring the ThreadPane FLIP.
-        const animateSwitch = !sameThread && wasComposeViewRef.current && isComposeView
-          && !isMobile() && !isReducedMotion();
-        const fromHeight = animateSwitch ? el.style.height : '';
-        autoResize();
-        if (animateSwitch && fromHeight) {
-          animateTextareaHeightFrom(el, fromHeight);
-        } else {
-          requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
-        }
+    const caretToEnd = caretToEndSeq !== lastCaretToEndSeqRef.current;
+    lastCaretToEndSeqRef.current = caretToEndSeq;
+    if (syncTextareaValue(el, composeText, sameThread && !caretToEnd)) {
+      // A compose-view to compose-view switch keeps the centered layout put, so
+      // the ThreadPane FLIP never fires and the textarea would insta-resize.
+      // Ease its height from the previous view's to the new one instead.
+      //
+      // Gated on `composeViewActive`, NOT on both being composing threads: the
+      // blank view has no thread id. A compose-to-active switch flips
+      // `composeViewActive`, so this is false there and the FLIP owns it.
+      // Capture the old inline height BEFORE `autoResize` overwrites it.
+      // Desktop-only and motion-respecting, mirroring the ThreadPane FLIP.
+      const animateSwitch = !sameThread && wasComposeViewRef.current && isComposeView
+        && !isMobile() && !isReducedMotion();
+      const fromHeight = animateSwitch ? el.style.height : '';
+      autoResize();
+      if (animateSwitch && fromHeight) {
+        animateTextareaHeightFrom(el, fromHeight);
+      } else {
+        requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
       }
     }
     if (!sameThread && !isMobile()) {
@@ -441,7 +407,7 @@ export function PromptInput() {
     }
     prevTidRef.current = tid;
     wasComposeViewRef.current = isComposeView;
-  }, [tid, composeText, overrideSyncSeq]);
+  }, [tid, composeText, caretToEndSeq]);
 
   // A font change moves the height the SAME value needs. `resizeTextarea` reads
   // only the value, so it would keep a box too tall after a smaller UI scale.
@@ -461,32 +427,11 @@ export function PromptInput() {
     if (el) resizeTextarea(el);
   }
 
-  /** Write the composer's OWN value into the box. The only way to set it.
-   *
-   *  Every such write also says the box no longer holds anything the user
-   *  typed, and keeping the two in one call is the point: a bare `el.value =`
-   *  would leave the flag set, and the next empty-draft sync would then adopt
-   *  text the composer itself put there. Pinned by `promptValueSync.test.ts`. */
+  /** Empty the box at once, for a gesture that empties the draft in the same
+   *  task. The box shows the cleared draft a render early, so the height can
+   *  ease down while the gesture is still under way. */
   function writeComposerValue(el: HTMLTextAreaElement, text: string): void {
     el.value = text;
-    typedSinceComposerWroteRef.current = false;
-  }
-
-  /** Take the characters standing in the box into the draft, because a clear
-   *  ran under the user's fingers. The box is left exactly as it is.
-   *
-   *  This is the send path's verdict, applied at sync time: see
-   *  `resolveEmptyDraftSync`. It goes through the store write a keystroke
-   *  takes, so the draft, the Send face and the debounced PUT agree afterwards.
-   *  The next render then takes the ordinary skip branch. */
-  function adoptComposerText(el: HTMLTextAreaElement): void {
-    const text = el.value;
-    const thread = tid ? threadMap.value.get(tid) : undefined;
-    reportDraftClobbered({
-      charCount: text.length,
-      threadStatus: thread ? effectiveThreadStatus(thread) : 'none',
-    });
-    updateCompose(ensureFocusedComposeThread(), { text });
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -580,12 +525,10 @@ export function PromptInput() {
       else askComposerSideQuestion(threadId, sideQuestion.question, currentImages);
       return Promise.resolve();
     }
-    // Empty the box HERE, where this send actually dispatches. `submit` cleared
-    // it at its own dispatch point and returned before that one, the send being
-    // owed to an upload. Left alone, the box would still claim to hold unsent
-    // typing. The next empty-draft sync would then adopt the message just sent
-    // straight back as a draft. Past the three returns above, each of which
-    // cancels the send and must leave what the user typed alone.
+    // Empty the box HERE, where this send actually dispatches: `submit` returned
+    // before its own clear, the send being owed to an upload. Past the three
+    // returns above, each of which cancels the send and must leave what the
+    // user typed alone.
     //
     // Only when the box on screen is THIS thread's. A queued send is retried
     // per thread, so it can fire after the reader has moved to another one.
@@ -605,16 +548,13 @@ export function PromptInput() {
   async function submit() {
     const el = inputRef.current;
     const threadId = focusedThreadId.value;
-    // ONE source for "is there anything to send": the draft the Send face was
-    // rendered from, and the value `sendCompose` goes on to send. The textarea
-    // only fills a gap the store has. See `resolveComposerText`.
+    // The draft is the one source for "is there anything to send": the Send
+    // face was rendered from it, and `sendCompose` goes on to send it.
     //
-    // The node itself is no longer required. It is needed to clear the box and
-    // to reset its height, and both sit under a null check below. A missing node
-    // used to return here, which is a dead button that says nothing.
+    // The node itself is not required. It is needed to clear the box and to
+    // reset its height, and both sit under a null check below.
     const draftText = getDraft(threadId).text;
-    const resolved = resolveComposerText(draftText, el ? el.value : null);
-    const msg = resolved.text;
+    const msg = draftText.trim();
     const currentImages = threadId ? getAttachedImages(threadId) : [];
     const uploadInFlight = threadId ? hasInFlightUploads(threadId) : false;
     // The same reading the Send face was lit from, so a press on a LIT face can
@@ -625,19 +565,8 @@ export function PromptInput() {
     // something on screen is the shape the user reports as a dead button, so it
     // says which it is. Every other return below dispatches or speaks.
     if (!composeHasContent(msg, currentImages.length, uploadInFlight)) {
-      const onScreen = (el?.value.length ?? 0) > 0 || draftText.length > 0;
-      if (onScreen) showToast('Nothing to send: the message is only spaces.', 'info');
+      if (draftText.length > 0) showToast('Nothing to send: the message is only spaces.', 'info');
       return;
-    }
-    // Only with a thread to hold a draft. Without one there is no stored copy,
-    // so the box is the only source and there is nothing to disagree with.
-    const disagreement = threadId ? composerTextDisagreementToast(resolved) : null;
-    if (disagreement) showToast(disagreement, 'warning');
-    // Before every return below, and before the dispatch: a queued upload send
-    // re-reads the draft later, and `sendCompose` re-reads it now. Either would
-    // otherwise carry the empty copy the recovery just repaired.
-    if (threadId && resolved.storeWrite !== null) {
-      updateCompose(threadId, { text: resolved.storeWrite });
     }
     const thread = threadId ? threadMap.value.get(threadId) : undefined;
     const useCodingAgent = effectiveSendMode(thread) === 'claude_code';
@@ -764,11 +693,6 @@ export function PromptInput() {
     autoResize();
     const el = inputRef.current;
     if (!el) return;
-    // The box now holds the user's characters rather than the composer's. Set
-    // before every early return below, so a keystroke the rest of this function
-    // declines to store is still protected from the next empty-draft sync. See
-    // `resolveEmptyDraftSync`.
-    typedSinceComposerWroteRef.current = true;
     const val = el.value;
     // Codex shares the legacy claude_code channel but has no slash-command
     // surface, so Codex prompts keep the slash as normal message text.
@@ -1200,14 +1124,9 @@ export function PromptInput() {
     const focused = focusedThreadId.value;
     if (!focused) return;
     const el = inputRef.current;
-    // The same one source as `submit`. This button's own count comes from
-    // `computeSubmitMultiCount(..., composeText)`, which is the draft, so
-    // reading the textarea here enabled it from one value and answered from
-    // another. See `resolveComposerText`.
-    const resolved = resolveComposerText(getDraft(focused).text, el ? el.value : null);
-    const text = resolved.text;
-    const disagreement = composerTextDisagreementToast(resolved);
-    if (disagreement) showToast(disagreement, 'warning');
+    // The same one source as `submit`: this button's own count comes from
+    // `computeSubmitMultiCount(..., composeText)`, which is the draft.
+    const text = getDraft(focused).text.trim();
     const ids = getMultiSelectedIds(pendingMultiQ.toolUseId);
     const gate = uploadsGate(focused);
     if (gate === 'failed') {
@@ -1254,13 +1173,11 @@ export function PromptInput() {
     if (outcome === 'refused') {
       // Hand the answer back so a retry is one tap. See
       // `recoverableAnswerDraft` for what a fresh pick or keystroke protects.
-      const box = inputRef.current;
       const recovered = recoverableAnswerDraft({
         sentIds: ids,
         sentText: text,
         currentIds: getMultiSelectedIds(pendingMultiQ.toolUseId),
         currentDraft: getDraft(focused).text,
-        domText: box ? box.value : null,
       });
       if (recovered.ids) setMultiSelectedIds(pendingMultiQ.toolUseId, recovered.ids);
       // Through the draft, never the box: the sync effect above writes the
@@ -1660,6 +1577,7 @@ export function PromptInput() {
         </div>
       </Disclosure>
       <NotReadyStrip key="not-ready" />
+      <SuccessorStrip key="successor" />
       <div key="prompt-box" class="prompt-box">
         <div class="prompt-row">
           <textarea

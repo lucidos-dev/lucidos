@@ -8,7 +8,7 @@ fn opening() -> SessionOpening {
         instructions: "You are Lucidos.".to_string(),
         resident_block: "[WHAT YOU ALREADY KNOW]\nWorkspace: dev".to_string(),
         voice: "marin".to_string(),
-        transcriber: "gpt-4o-mini-transcribe".to_string(),
+        transcriber: "gpt-transcribe".to_string(),
         audio: AudioFormat::default(),
         language: None,
     }
@@ -153,13 +153,13 @@ fn the_talker_is_told_that_handing_over_is_what_settles_a_card() {
 #[test]
 fn the_opening_frame_configures_no_transcriber_and_no_language() {
     let mut opening = opening();
-    opening.transcriber = "gpt-4o-mini-transcribe".to_string();
+    opening.transcriber = "gpt-transcribe".to_string();
     opening.language = Some(crate::voice::language::SpokenLanguage {
         code: Some("nb".to_string()),
         name: "Norwegian".to_string(),
     });
     let start = session_start("gpt-live-1", &opening).to_string();
-    for absent in ["transcription", "gpt-4o-mini-transcribe", "\"nb\""] {
+    for absent in ["transcription", "gpt-transcribe", "\"nb\""] {
         assert!(
             !start.contains(absent),
             "{} reached the opening frame",

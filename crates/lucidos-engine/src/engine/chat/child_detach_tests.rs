@@ -14,6 +14,7 @@ async fn emit_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>, tex
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -181,6 +182,52 @@ async fn the_ladder_lets_an_agent_move_only_its_direct_children() {
         authorize(&pool, DetachCaller::User, sibling).await,
         Err(ChildDetachError::Discarded(sibling))
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// --- whose button it is ----------------------------------------------------
+
+async fn move_out(
+    bus: &EventBus,
+    caller: DetachCaller,
+    target: Uuid,
+) -> Result<DetachAck, ChildDetachError> {
+    LucidosEngine::move_child_to_top_level(bus, caller, target, EventMeta::NONE).await
+}
+
+/// An agent moves its own child in a turn nobody's device opened: creating a
+/// top-thread needs no owner authority (ADR 0475).
+#[tokio::test]
+async fn an_agent_moves_its_child_with_no_owner_turn() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let parent = spawn(&bus, None, "parent").await;
+    let child = spawn(&bus, Some(parent), "child").await;
+
+    let ack = move_out(&bus, DetachCaller::Agent(Some(parent)), child)
+        .await
+        .expect("the ladder is the whole check");
+    assert_eq!(ack.former_parent_id, parent);
+    assert_eq!(row(&pool, child).await.parent_thread_id, None);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The user's device moves a child with no owner turn anywhere.
+#[tokio::test]
+async fn the_user_moves_a_child_with_no_owner_turn() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let parent = spawn(&bus, None, "parent").await;
+    let child = spawn(&bus, Some(parent), "child").await;
+
+    move_out(&bus, DetachCaller::User, child)
+        .await
+        .expect("the user needs nobody's instruction");
+    assert_eq!(row(&pool, child).await.parent_thread_id, None);
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -439,6 +486,7 @@ async fn a_card_arriving_after_the_move_is_dropped() {
             summary: "late".into(),
             pending_change_ids: vec![],
             sub_thread_pending_changes: vec![],
+            integrated_branch: None,
         },
         ThreadEvent::ChildThreadStopped {
             child_thread_id: child,

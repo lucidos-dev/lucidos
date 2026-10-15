@@ -144,29 +144,7 @@ pub async fn load_trigger_run_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{setup_test_db, teardown_test_db};
-    use uuid::Uuid;
-
-    async fn insert_trigger_event(
-        pool: &PgPool,
-        trigger_id: &str,
-        event_type: &str,
-        created: &str,
-        payload: serde_json::Value,
-    ) {
-        sqlx::query(
-            "INSERT INTO events (id, event_type, payload, aggregate, aggregate_id, created) \
-             VALUES ($1, $2, $3, 'trigger', $4, $5::timestamptz)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(event_type)
-        .bind(payload)
-        .bind(trigger_id)
-        .bind(created)
-        .execute(pool)
-        .await
-        .expect("insert trigger event");
-    }
+    use crate::test_support::{seed_trigger_event, setup_test_db, teardown_test_db};
 
     #[test]
     fn recorded_run_time_prefers_the_payload_and_falls_back_to_created() {
@@ -198,7 +176,7 @@ mod tests {
         let (pool, db) = setup_test_db().await;
         let t = "11111111-1111-1111-1111-111111111111";
 
-        insert_trigger_event(
+        seed_trigger_event(
             &pool,
             t,
             "TriggerCreated",
@@ -207,7 +185,7 @@ mod tests {
         )
         .await;
         // Yesterday's run: both clocks agree.
-        insert_trigger_event(
+        seed_trigger_event(
             &pool,
             t,
             "TriggerExecuted",
@@ -216,7 +194,7 @@ mod tests {
         )
         .await;
         // The incident row: the DB clock is 280 s behind the engine clock.
-        insert_trigger_event(
+        seed_trigger_event(
             &pool,
             t,
             "TriggerExecuted",
@@ -249,7 +227,7 @@ mod tests {
         let t = "22222222-2222-2222-2222-222222222222";
 
         // No `last_run` at all (pre-payload-field legacy row).
-        insert_trigger_event(
+        seed_trigger_event(
             &pool,
             t,
             "TriggerExecuted",
@@ -257,7 +235,7 @@ mod tests {
             serde_json::json!({ "trigger_id": t }),
         )
         .await;
-        insert_trigger_event(
+        seed_trigger_event(
             &pool,
             t,
             "TriggerExecuted",
@@ -288,7 +266,7 @@ mod tests {
         let t = "33333333-3333-3333-3333-333333333333";
         let other = "44444444-4444-4444-4444-444444444444";
 
-        insert_trigger_event(
+        seed_trigger_event(
             &pool,
             t,
             "TriggerCreated",
@@ -297,7 +275,7 @@ mod tests {
         )
         .await;
         // A different trigger's run must not leak into this one's history.
-        insert_trigger_event(
+        seed_trigger_event(
             &pool,
             other,
             "TriggerExecuted",
@@ -325,7 +303,7 @@ mod tests {
 
         for i in 0..(RECENT_RUN_WINDOW + 10) {
             let ts = format!("2026-07-29T0{}:{:02}:00Z", 4 + i / 60, i % 60);
-            insert_trigger_event(
+            seed_trigger_event(
                 &pool,
                 t,
                 "TriggerExecuted",

@@ -9,6 +9,7 @@
  */
 
 import type { PongAnswer } from '../eventStream';
+import { PRESENCE_OUTCOMES_BY_STRENGTH } from '../generated/engine-constants';
 
 /** How long the worker waits for its ports to answer a `PresenceCheck`.
  *
@@ -42,14 +43,12 @@ export type ToPort =
 
 /** Merge every attached document's answer into the one pong the engine expects.
  *
- *  `is_active` and `event_in_viewport` are ORed, which is what the engine
- *  already does across tabs on one device (`system-knowhow/notifications.md`
- *  §3). Doing it here keeps `expected_pong_count` equal to the open-connection
- *  count, so the engine neither stalls to its deadline nor decides early.
- *
- *  `focused_thread_id` prefers an ACTIVE document's, because the engine reads
- *  it to decide whether the user is looking at the source thread. A hidden
- *  tab's focused thread says nothing about that.
+ *  Keeps the strongest outcome (`PRESENCE_OUTCOMES_BY_STRENGTH`, strongest
+ *  first). So one document that handled the notification suppresses the push
+ *  for the connection. The engine does the same across
+ *  tabs on one device (`system-knowhow/notifications.md` §3). Doing it here
+ *  keeps `expected_pong_count` equal to the open-connection count, so the
+ *  engine neither stalls to its deadline nor decides early.
  *
  *  `device_id` is read from the first answer. Every document of one workspace
  *  in one browser profile shares it, being workspace-scoped localStorage.
@@ -57,13 +56,7 @@ export type ToPort =
  *  Returns null for no answers, which means nothing to POST. */
 export function aggregatePongAnswers(answers: PongAnswer[]): PongAnswer | null {
   if (answers.length === 0) return null;
-  const active = answers.filter((a) => a.is_active);
-  const preferred = active.length > 0 ? active : answers;
-  return {
-    device_id: answers[0].device_id,
-    is_active: active.length > 0,
-    event_in_viewport: answers.some((a) => a.event_in_viewport),
-    focused_thread_id:
-      preferred.find((a) => a.focused_thread_id !== null)?.focused_thread_id ?? null,
-  };
+  const outcome =
+    PRESENCE_OUTCOMES_BY_STRENGTH.find((o) => answers.some((a) => a.outcome === o)) ?? 'not_shown';
+  return { device_id: answers[0].device_id, outcome };
 }

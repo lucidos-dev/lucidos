@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // available in the node test env. Mock just those predicates; keep the rest real.
 vi.mock('../utils/dom', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/dom')>();
-  return { ...actual, isTextInput: vi.fn(() => false), isThreadTranscript: vi.fn(() => false) };
+  return { ...actual, isTextInput: vi.fn(() => false), isThreadTranscript: vi.fn(() => false), isInteractiveTarget: vi.fn(() => false) };
 });
 
 // The new shortcuts' own actions are tested beside their buttons. Here only
@@ -37,7 +37,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 import { dispatchEscape, classifyChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt, isMacTextEditingKey } from './useKeyboardShortcuts';
-import { isTextInput, isThreadTranscript } from '../utils/dom';
+import { isTextInput, isThreadTranscript, isInteractiveTarget } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
 import { focusedPane, focusedThreadId, panelOverlay, splitRatio, searchEverywhereAnchor, searchEverywhereOpen, threadMap } from '../store/store';
 import { makeThreadState } from '../store/__tests__/thread-events-helpers';
@@ -55,6 +55,7 @@ beforeEach(() => {
   _resetOverlayStackForTesting();
   vi.mocked(isTextInput).mockReturnValue(false);
   vi.mocked(isThreadTranscript).mockReturnValue(false);
+  vi.mocked(isInteractiveTarget).mockReturnValue(false);
 });
 
 describe('dispatchEscape (non-destructive Escape policy)', () => {
@@ -201,6 +202,16 @@ describe('shouldTypeToFocusPrompt (bare-typing → prompt textarea)', () => {
 
   it('still focuses the prompt for a printable LETTER while the transcript is focused (type → compose)', () => {
     vi.mocked(isThreadTranscript).mockReturnValue(true);
+    expect(shouldTypeToFocusPrompt(ev({ key: 'a' }), { mobile: false, overlayOpen: false })).toBe(true);
+  });
+
+  it('leaves Space to a focused button, which Space presses', () => {
+    vi.mocked(isInteractiveTarget).mockReturnValue(true);
+    expect(shouldTypeToFocusPrompt(ev({ key: ' ' }), { mobile: false, overlayOpen: false })).toBe(false);
+  });
+
+  it('still focuses the prompt for a printable LETTER while a button is focused', () => {
+    vi.mocked(isInteractiveTarget).mockReturnValue(true);
     expect(shouldTypeToFocusPrompt(ev({ key: 'a' }), { mobile: false, overlayOpen: false })).toBe(true);
   });
 

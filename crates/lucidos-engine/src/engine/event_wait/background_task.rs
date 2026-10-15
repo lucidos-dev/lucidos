@@ -247,8 +247,9 @@ impl LucidosEngine {
 pub(super) enum ArmingPlan<'a> {
     /// Arm one wait over these tasks. Never empty.
     Arm(Vec<&'a RunningTaskHandle>),
-    /// Every running task is already watched, so arming again would deliver one
-    /// completion to the thread twice. Not a refusal: the thread IS covered.
+    /// Every running task is already watched, or polled by its owner, so arming
+    /// again would deliver one completion twice. Not a refusal: the thread IS
+    /// covered.
     NothingUncovered,
     /// A cap says no, and the thread will therefore go quiet with work still
     /// running. Carries the reason for the log, because this is the failure
@@ -269,7 +270,7 @@ pub(super) fn plan_wait<'a>(
 ) -> ArmingPlan<'a> {
     let uncovered: Vec<&RunningTaskHandle> = running
         .iter()
-        .filter(|h| !h.stop_requested)
+        .filter(|h| !h.stop_requested && !h.polled)
         .filter(|h| {
             !live
                 .iter()

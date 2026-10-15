@@ -1,14 +1,73 @@
-//! Naming a thread in the `thread_summaries` projection.
+//! The `thread_summaries` projection: naming a thread, and what a proposal
+//! may name.
 //!
-//! The contract these pin is an ordering one: a title event updates a row and
+//! The naming contract is an ordering one: a title event updates a row and
 //! never creates it, so it has to follow the thread's first `MessageReceived`.
 //! ADR 0240 holds the reasoning and the rejected upsert.
 
 use super::write_thread_title;
 use crate::engine::event_bus::{BusEvent, EventBus};
-use crate::engine::thread_events::{ActorMode, EventMeta, ThreadEvent};
-use crate::test_support::{setup_test_db, teardown_test_db};
+use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
+use crate::test_support::{setup_test_db, start_cc_session, teardown_test_db};
 use uuid::Uuid;
+
+/// A lane batch's integration branch is never a change, whoever proposes it
+/// (ADR 0463). The projection is the one place every `ChangeProposed` passes,
+/// so it refuses the event and the emit writes nothing.
+#[tokio::test]
+async fn a_proposal_naming_a_lane_branch_is_refused_and_writes_nothing() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let branch = crate::engine::git_ops::lane_branch(Uuid::new_v4());
+    start_cc_session(&bus, thread_id, &branch, None).await;
+
+    let emitted = bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ChangeProposed {
+                change_id: Uuid::new_v4().to_string(),
+                description: Some("the batch".into()),
+                files: vec!["a.rs".into()],
+                requires_restart: false,
+                origin: None,
+                commit_sha: None,
+                branch_name: branch.clone(),
+                repo_root: "/repo".into(),
+                hardened: true,
+                incomplete: false,
+                set_aside: false,
+                path: String::new(),
+                diff: String::new(),
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            },
+        })
+        .await;
+
+    assert!(emitted.is_err(), "a lane branch proposal must be refused");
+    assert!(
+        bus.changes_projection()
+            .get_open_by_branch(&branch)
+            .await
+            .unwrap()
+            .is_none(),
+        "no change row names the lane branch"
+    );
+    let persisted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'ChangeProposed'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, 0, "the refused event rolls back with its writes");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
 
 /// Emit a thread's first message, which is what creates its projection row.
 async fn first_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>) {
@@ -17,6 +76,7 @@ async fn first_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>) {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "one prompt-wording change in the engine".into(),
             user_image_hashes: vec![],
             device_id: None,

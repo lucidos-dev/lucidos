@@ -160,6 +160,7 @@ async fn change_applied_clears_the_change_state() {
         actor: None,
         pre_merge_sha: None,
         post_merge_sha: None,
+        landing_merge_sha: None,
         path: String::new(),
     })
     .await;

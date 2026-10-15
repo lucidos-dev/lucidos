@@ -390,6 +390,7 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         // is `None`.
         model_only_text: narration,
         progress_notes: Vec::new(),
+        service_tier: None,
     }
 }
 

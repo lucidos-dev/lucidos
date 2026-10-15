@@ -14,7 +14,7 @@ import { loadingIfFresh, toFailed, type Loadable } from '../../store/types';
 import { formatTimeAgo, formatDateTime } from '../../utils/formatTime';
 import { errorDetail } from '../../utils/errorDetail';
 import { storedThreadTitle } from '../../utils/threadTitle';
-import { dateRangeLabel, entriesLabel, isSourceText, lineSpan, pendingNote } from './summaryTree';
+import { ENTRY_KIND_LABELS, dateRangeLabel, entriesLabel, entryKindOf, isSourceText, lineSpan, pendingNote } from './summaryTree';
 import type {
   RecallDateResponse,
   RecallLine,
@@ -70,6 +70,7 @@ function TreeLineRow({ line }: { line?: RecallLine }) {
   const [opened, open] = useLatestRead<Opened>();
   const showLoading = useDelayedLoading(opened);
   const span = line ? lineSpan(line.id) : null;
+  const kinded = line ? entryKindOf(line.text) : null;
 
   const read = useCallback(async (): Promise<Opened> => {
     const id = line!.id;
@@ -111,9 +112,10 @@ function TreeLineRow({ line }: { line?: RecallLine }) {
             <SkBlock w="4.5rem" h="1rem" round>
               <span class="tree-line-span">{span !== null && entriesLabel(span)}</span>
             </SkBlock>
+            {kinded?.kind && <span class="tree-line-kind" data-kind={kinded.kind}>{ENTRY_KIND_LABELS[kinded.kind]}</span>}
             {date && <DateLabel date={date} />}
           </span>
-          <SkText class="tree-line-text" w="18rem">{line?.text}</SkText>
+          <SkText class="tree-line-text" w="18rem">{kinded?.text}</SkText>
         </span>
       </button>
       <Disclosure open={!sk && expanded && (opened.status === 'loaded' || opened.status === 'failed' || showLoading)}>

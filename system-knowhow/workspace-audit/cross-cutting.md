@@ -14,7 +14,7 @@ the report. This file carries its scan, its checks and its fixes.
 Append these lines to the root's scan preamble, before its receipts tail:
 
 ```bash
-scan removed-flags "spawn-thread[^|]*--(parent|cc-model)|run_coding_agent\([^)]*repo[[:space:]]*=|threads (list|count)[^|]*--has-diff" $all
+scan removed-flags "spawn-thread[^|]*--(parent|cc-model)|run_coding_agent\([^)]*repo[[:space:]]*=|threads[\\\"',[:space:]]+(list|count)[^|]*--has-diff" $all
 scan removed-fields "coding_agent_(applying|has_diff|proposed|incomplete|requires_restart)" $all
 scan cred-env "CRED_[A-Z0-9_]+" --exclude-dir=auth $all
 scan auth-header "Authorization|X-API-Key" $inc apps

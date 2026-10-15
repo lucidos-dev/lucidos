@@ -13,11 +13,15 @@
  * inputs. They dispatch no `animationend` at all and assert synchronously: no
  * event and no timer may stand between the call and the closed state.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { closeDrawer } from '../Drawer';
-import { drawerClosing, drawerOpen, forceCloseDrawer, openDrawer } from '../drawerState';
+import { beforeAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { closeDrawer, drawerClosing, drawerOpen, forceCloseDrawer, openDrawer } from '../drawerState';
 import { motionPreference, osReducesMotion } from '../../../utils/motion';
 import type { MotionPref } from '@lucidos/appearance';
+import { DrawerChunk } from '../drawerState';
+
+// The drawer is code-split and opens once it is in memory. Warm it, so an
+// open lands at once.
+beforeAll(() => DrawerChunk.preload());
 
 function setMotion(pref: MotionPref, osReduces: boolean): void {
   motionPreference.value = pref;

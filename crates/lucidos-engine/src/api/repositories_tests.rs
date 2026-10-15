@@ -496,6 +496,7 @@ async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uui
         event: crate::engine::thread_events::ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "implement the ticket".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -521,6 +522,9 @@ async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uui
             coding_agent_folder: String::new(),
             app_id: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta(),
     })

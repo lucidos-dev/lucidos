@@ -6,7 +6,7 @@ import { navigateVisitKey, notificationTarget } from './visitKeys';
 /** Targets that deliberately name no revisitable place. Every other advertised
  *  target must produce a key. A new one landing as a silent null would quietly
  *  stop its own notifications from ever clearing. */
-const NO_PLACE = new Set<string>(['url', 'new-app', 'new-trigger', 'new-chat']);
+const NO_PLACE = new Set<string>(['url', 'new-app', 'new-trigger', 'new-chat', 'home-board']);
 
 /** Every id-bearing field populated, so each branch finds what it needs. */
 function kitchenSink(target: string) {

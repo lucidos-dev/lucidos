@@ -8,6 +8,7 @@ import { render } from 'preact';
 import { widgetMenuItems, type WidgetMenuTarget } from '../WidgetMenu';
 import { threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
+import { threadWidgets } from '../../../store/widgets';
 
 let host: HTMLElement | null = null;
 function unmount(): void {
@@ -45,5 +46,22 @@ describe('widgetMenuItems', () => {
     expect(labels({ threadId: 'home' })).toContain('Pin to Home');
     expect(labels({ threadId: 'home', pinned: true })).toContain('Unpin from Home');
     threadMap.value = new Map();
+  });
+
+  /** Every thread but Home offers Pin to Home beside Pin to shelf (ADR 0432). */
+  it('offers Pin to Home in another thread, until the instance is on the board', () => {
+    threadMap.value = new Map([['home', makeThreadState('home', { meta: { title: 'Home', home: true } })]]);
+    const pinnedTo = (apps: string[]) => {
+      threadWidgets.value = new Map([['home', { status: 'loaded', data: apps.map((app_id) => (
+        { app_id, name: app_id, reusable: true, reveal: 'on-load' as const, sizes: ['medium' as const], pinned: true }
+      )) }]]);
+    };
+    pinnedTo([]);
+    expect(labels({})).toEqual(expect.arrayContaining(['Pin to shelf', 'Pin to Home']));
+    pinnedTo(['w']);
+    expect(labels({})).not.toContain('Pin to Home');
+    expect(labels({ threadId: 'home' })).not.toContain('Pin to shelf');
+    threadMap.value = new Map();
+    threadWidgets.value = new Map();
   });
 });

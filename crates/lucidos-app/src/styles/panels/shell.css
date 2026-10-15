@@ -344,8 +344,14 @@
 
 /* --- Pane headers --- */
 
-.pane-header {
+/* The header row's inline padding. On :root because things outside the row
+   line up with it: the Home rail's toggle, and rows that put their actions in
+   the same slot as the header's icons. */
+:root {
     --header-padding-x: 0.625rem;
+}
+
+.pane-header {
     /* The gap between the bar's own children, named because something else has
        to cancel it: the mobile pane-dot band is a flex item of this column and
        pulls itself up over this gap (see .mobile-dot-indicator in mobile.css).
@@ -776,6 +782,9 @@
         --sr: var(--split-ratio, 0.4);
         --ddo: 0px; /* drawer-divider offset: 0 when closed */
         --divider-x: calc(var(--co) + var(--ddo) + var(--sr) * (100% - var(--co) - var(--ddo)));
+        /* The same x for a `position: fixed` reader. Its 100% is the window,
+           so it still holds the Home rail's room, which the shell gave up. */
+        --divider-x-in-window: calc(var(--divider-x) - var(--sr) * var(--home-rail-room));
         /* `.icon-btn.header-icon`'s box (global/host-components.css), which four
            rules below reserve room for or measure against. It was written out
            as a `2.25rem` literal at each of them with a note that there was no
@@ -795,23 +804,24 @@
            brand cluster to clear. Sized to the WIDER of the two ends and paid
            at both, because the cluster is centred on the PANE. Spending the
            difference on one side is what would stop it being centred.
-           - leading: the drawer toggle, wherever it rests, and Home while it
-             is shown (the override on .pane-header-brand).
-           - trailing: the actions at their widest, which is setup + compose +
-             search, 3 buttons and 2 gaps, plus the row's padding.
+           - leading: the drawer toggle, wherever it rests, then New thread,
+             and Home while it is shown (the override on .pane-header-brand).
+           - trailing: the actions at their widest, which is setup + search,
+             2 buttons and 1 gap, plus the row's padding.
            The leading term is not decoration. The packaged macOS build starts
            the toggle 80px in, and below 100% ui-scale that end is the wider one
            on every build. Reading it as "the drawer toggle alone, so narrower"
            is what let the back chevron land on the toggle. */
-        --brand-trail-end: calc(0.5rem + 3 * var(--header-icon-box) + 2 * 0.25rem);
+        --brand-trail-end: calc(0.5rem + 2 * var(--header-icon-box) + 0.25rem);
         --brand-side-reserve: max(
-            calc(var(--header-lead-inset) + var(--header-icon-box)),
+            calc(var(--header-lead-inset) + 2 * var(--header-icon-box) + 0.25rem),
             var(--brand-trail-end)
         );
         /* The content pane's copy of the reserve above, and the same rule: room
            kept at EACH end of the row for the centred title cluster to clear,
-           sized to the WIDER of the two ends. The leading end is one hamburger;
-           the trailing one is the actions cluster on the clamp's middle arm,
+           sized to the WIDER of the two ends. The leading end is described
+           below. The trailing one is the actions cluster on the clamp's
+           middle arm,
            which is three boxes (two context icons riding the row, plus the
            bell) and the two gaps between them. A third icon rides only where
            the box sits at its span cap and leaves more room; anywhere tighter,
@@ -824,7 +834,7 @@
            appearing at a width the stylesheet says has room to spare.
 
            Sized to the trailing end on both sides, deliberately. The leading
-           end (the hamburger and Refresh) is a box and a gap narrower.
+           end (the hamburger and Refresh) is narrower.
            Spending that difference on the title would stop it being centred on
            the pane, which is the whole point of the arrangement.
 
@@ -1015,6 +1025,14 @@
         --ddo: var(--divider-width); /* account for drawer divider element */
     }
 
+    /* The Home rail's toggle, docked at the Canvas row's trailing end while
+       the rail is hidden (.home-rail-toggle-slot), widens that end by its box
+       and a gap. Both content reserves grow by exactly that. */
+    :root[data-home-rail-toggle]:not([data-home-rail]) {
+        --content-side-reserve: calc(4 * var(--header-icon-box) + 5 * 0.25rem);
+        --content-unfolded-reserve: calc(8 * var(--header-icon-box) + 9 * 0.25rem);
+    }
+
     /* The header's fill, painted as ONE box. At --titlebar-strip-continues 0
        the box is exactly the header's. At 1 it also covers the band above, so
        a striped fill lines up across the join: a pattern restarts at each
@@ -1043,15 +1061,19 @@
         background: none;
     }
 
-    /* Divider between chat and panel header areas — centered on the split bar.
-       Full-height + same width as the pane .split-divider below it, so the two
-       would read as one continuous divider. Painted with --header-divider,
-       currently transparent (seam disabled — see the token definition). */
+    /* Divider between chat and panel header areas, centered on the split bar.
+       Same width as the pane .split-divider below it, so the two read as one
+       continuous divider. Painted with --header-divider, which is transparent
+       unless a theme turns it on.
+
+       Both dividers rise through the reclaimed macOS title-bar band, like
+       .header-focus-wash, so they run to the window's top edge. Off the macOS
+       Tauri build --titlebar-inset is unset and the rise is 0px. */
     .app-header::after {
         content: '';
         position: absolute;
         left: var(--divider-x);
-        top: 0;
+        top: calc(-1 * var(--titlebar-inset, 0px));
         bottom: 0;
         width: var(--divider-width);
         background: var(--header-divider);
@@ -1065,7 +1087,7 @@
         content: '';
         position: absolute;
         left: var(--co);
-        top: 0;
+        top: calc(-1 * var(--titlebar-inset, 0px));
         bottom: 0;
         width: var(--divider-width);
         background: var(--header-divider);
@@ -1128,8 +1150,15 @@
            clip-path, not `overflow: clip`: the packaged macOS webview makes a
            `clip` box a scroll container (see .pane-header-brand). */
         clip-path: inset(calc(-1 * var(--focus-ring-width)));
-        transition: left var(--duration-slow) ease,
+        transition: left var(--duration-slow) ease, padding-right var(--duration-slow) ease,
                     opacity var(--duration-slow) ease, visibility var(--duration-slow);
+    }
+
+    /* Room for the Home rail's toggle, docked past the bell while the rail is
+       hidden. Padding rather than a moved `right`, so the title stays centred
+       on the pane. */
+    :root[data-home-rail-toggle]:not([data-home-rail]) .app-header .content-header-elements {
+        padding-right: calc(var(--header-icon-box) + var(--pane-header-gap));
     }
 
     /* Packaged macOS: the row never starts left of the traffic lights, whatever
@@ -1518,12 +1547,13 @@
            reach of every automated surface (no WebDriver reaches WKWebView,
            ADR 0016). A clip-path is no scroll container on any engine. */
         clip-path: inset(-100% calc(-1 * var(--focus-ring-width)));
-        /* The actions cluster is pinned to the trailing edge. Home, when
-           present, leads the row through its own auto margin below, so the
-           actions stay at the trailing edge whether or not it is there. */
+        /* The actions cluster is pinned to the trailing edge. New thread
+           leads the row through its own auto margin below, so the actions
+           stay at the trailing edge whether or not Home is there. */
         justify-content: flex-end;
-        /* Room at the leading edge for Home. With the drawer open the region
-           starts at the drawer divider and the row gap is enough. */
+        /* Room at the leading edge for New thread and Home. With the drawer
+           open the region starts at the drawer divider and the row gap is
+           enough. */
         padding-left: var(--pane-header-gap);
         transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
                     padding-left var(--duration-slow) ease,
@@ -1538,6 +1568,11 @@
 
     .app-header .pane-header-brand > .home-thread-btn {
         flex-shrink: 0;
+        margin-right: var(--pane-header-gap);
+    }
+
+    .app-header .pane-header-brand > .brand-compose-btn {
+        flex-shrink: 0;
         margin-right: auto;
     }
 
@@ -1545,7 +1580,7 @@
        cluster's reserve grows with it. The reserve stays the WIDER end. */
     .app-header .pane-header-brand:has(> .home-thread-btn) {
         --brand-side-reserve: max(
-            calc(var(--header-lead-inset) + 2 * var(--header-icon-box) + var(--pane-header-gap)),
+            calc(var(--header-lead-inset) + 3 * var(--header-icon-box) + 2 * var(--pane-header-gap)),
             var(--brand-trail-end)
         );
     }
@@ -1579,8 +1614,10 @@
        it without reading its note. */
 
     /* Why no pane width can put an end of this box on a flanking control. Write
-       `lead` for --header-lead-inset plus one --header-icon-box, and `natural`
-       for --desktop-nav-min-span. The box's leading edge resolves to
+       `lead` for --header-lead-inset plus one --header-icon-box, plus a box
+       and a gap per control leading the row (New thread, Home, the dock
+       toggle). Write `natural` for --desktop-nav-min-span. The box's leading
+       edge resolves to
        max(--brand-side-reserve, (pane - natural) / 2), and both arms clear
        `lead`:
        - the reserve is a max() that includes `lead`;
@@ -1856,16 +1893,22 @@
         left: 0;
         right: 0;
         background-color: transparent;
-        /* The underline cue (--focus-header-underline), drawn as an inset
-           shadow so it adds no layout. At rest its colour is transparent. */
-        box-shadow: inset 0 calc(-1 * var(--focus-header-underline-width)) 0 0 transparent;
         /* Slower than --duration-slow on purpose, so the wash blooms up like a
            light turning on rather than popping in. Scaled like every token in
            global/base.css, or it would be the one animation in the app that
-           ignores the animation-speed slider. A shadow is painted, not
-           composited, so fading it conjures no layer either. */
-        transition: background-color calc(0.33s * var(--duration-scale)) ease-out,
-                    box-shadow calc(0.33s * var(--duration-scale)) ease-out;
+           ignores the animation-speed slider. */
+        transition: background-color calc(0.33s * var(--duration-scale)) ease-out;
+    }
+    /* The underline cue (--focus-header-underline), drawn as an inset shadow so
+       it adds no layout. It lives on ::after, which spans the box exactly: the
+       tint may overhang a divider, but the line stops at the pane's edge. A
+       shadow is painted, not composited, so fading it conjures no layer. */
+    .header-focus-wash::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        box-shadow: inset 0 calc(-1 * var(--focus-header-underline-width)) 0 0 transparent;
+        transition: box-shadow calc(0.33s * var(--duration-scale)) ease-out;
     }
     /* Drawer: extend the RIGHT edge over the drawer divider (--ddo wide when open,
        0 when closed). Left is the window edge. */
@@ -1891,6 +1934,10 @@
     :root[data-focused-pane="thread"]:not([data-thread-collapsed]) .header-focus-wash[data-pane="thread"]::before,
     :root[data-focused-pane="content"]:not([data-content-collapsed]) .header-focus-wash[data-pane="content"]::before {
         background-color: var(--focus-header-tint);
+    }
+    :root[data-focused-pane="drawer"][data-thread-drawer-open] .header-focus-wash[data-pane="drawer"]::after,
+    :root[data-focused-pane="thread"]:not([data-thread-collapsed]) .header-focus-wash[data-pane="thread"]::after,
+    :root[data-focused-pane="content"]:not([data-content-collapsed]) .header-focus-wash[data-pane="content"]::after {
         box-shadow: inset 0 calc(-1 * var(--focus-header-underline-width)) 0 0 var(--focus-header-underline);
     }
 
@@ -1914,7 +1961,6 @@
     :root[data-pane-resizing] .thread-toggle-slot,
     :root[data-pane-resizing] .thread-drawer,
     :root[data-pane-resizing] .header-focus-wash,
-    :root[data-pane-resizing] .toast-column,
     :root[data-pane-resizing] .split-layout.pane-animate .pane {
         transition: none;
     }

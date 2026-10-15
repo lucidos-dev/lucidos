@@ -1114,6 +1114,37 @@ fn apply_update_replaces_and_clears_side_effect_grant() {
     assert!(config.side_effect_grant.is_empty());
 }
 
+// --- MCP servers (ADR 0430) ---
+
+#[test]
+fn mcp_servers_parse_trimmed_and_once_and_an_update_replaces_or_clears_them() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+        "mcp_servers": [" slack ", "slack", "", 7, "jira"],
+    });
+    let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.mcp_servers, ["slack", "jira"]);
+
+    config.apply_update(&json!({ "trigger_id": "t1", "name": "T2" }));
+    assert_eq!(config.mcp_servers, ["slack", "jira"], "absent leaves it");
+
+    config.apply_update(&json!({ "trigger_id": "t1", "mcp_servers": ["github"] }));
+    assert_eq!(config.mcp_servers, ["github"]);
+
+    config.apply_update(&json!({ "trigger_id": "t1", "mcp_servers": null }));
+    assert!(config.mcp_servers.is_empty(), "null clears");
+
+    let without = json!({
+        "trigger_id": "t2", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+    });
+    assert!(TriggerConfig::from_created_payload(&without)
+        .unwrap()
+        .mcp_servers
+        .is_empty());
+}
+
 // -- schedule_error / next_runs --
 
 /// Build a schedule-only config from a `TriggerCreated` payload.

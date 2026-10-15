@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # e2e-github.sh: run e2e suites on GitHub's runners (ADR 0382).
 #
-#   ./scripts/e2e-github.sh <all|api|browser|wasm|embedder> [the suite's own flags]
+#   ./scripts/e2e-github.sh <all|api|browser|wasm|embedder> [--commit <sha>] [the suite's own flags]
+#   ./scripts/e2e-github.sh main-check --commit <sha>
 #
 # The e2e scripts hand over here unless the run must stay local (ADR 0386),
 # so call it as `./scripts/e2e.sh` and friends. Flags mean what they mean locally:
@@ -10,10 +11,14 @@
 #   browser  -f <spec>, --webkit, --no-webkit, -- <playwright args>
 #            (a *.spec.ts among the Playwright args narrows both legs to it)
 #
+# --commit tests that commit instead of HEAD. main-check is the main check's
+# selection (scripts/main-check.sh): the engine suite plus every e2e suite.
+#
 # Specs with a test tagged @real-claude-code run here, as the local leg, in
-# parallel with the remote run. Everything else runs on GitHub, where the
-# browser shards answer Claude Code with the fake. The report and exit code
-# match a local run; 76 means the run produced no verdict.
+# parallel with the remote run. Under --commit they do not run: the local leg
+# could test only this checkout's files. Everything else runs on GitHub, where
+# the browser shards answer Claude Code with the fake. The report and exit
+# code match a local run; 76 means the run produced no verdict.
 
 set -uo pipefail
 
@@ -23,9 +28,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 suite="${1:-}"
 shift || true
 case "$suite" in
-    all | api | browser | wasm | embedder) ;;
+    all | api | browser | wasm | embedder | main-check) ;;
     *)
-        echo "usage: $0 <all|api|browser|wasm|embedder> [flags]" >&2
+        echo "usage: $0 <all|api|browser|wasm|embedder|main-check> [--commit <sha>] [flags]" >&2
         exit 1
         ;;
 esac
@@ -57,6 +62,30 @@ for arg in "$@"; do
     [ "$arg" != -- ] || break
     [[ " ${E2E_GITHUB_LOCAL_ONLY_FLAGS[*]} " != *" $arg "* ]] || refuse "$arg"
 done
+
+# --commit belongs to the driver, so it comes out before a suite reads its flags.
+commit=""
+commit_given=""
+suite_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) suite_args+=("$@"); break ;;
+        --commit) commit_given=1; commit="${2:-}"; shift ;;
+        --commit=*) commit_given=1; commit="${1#--commit=}" ;;
+        *) suite_args+=("$1") ;;
+    esac
+    shift
+done
+set -- ${suite_args[@]+"${suite_args[@]}"}
+if [ -n "$commit_given" ] && [ -z "$commit" ]; then
+    echo "e2e-github.sh: --commit needs a commit" >&2
+    exit 1
+fi
+
+# The main check has no local fallback and no local leg: whatever stops it
+# short of a GitHub verdict is no verdict (scripts/main-check.sh). This is the
+# exit for whatever stops a run before it reaches GitHub.
+pre_run_exit=1
 
 case "$suite" in
     all)
@@ -96,6 +125,12 @@ case "$suite" in
         suites=("$suite")
         [ $# -eq 0 ] || refuse "an argument to $suite"
         ;;
+    main-check)
+        suites=("${E2E_GITHUB_MAIN_CHECK_SUITES[@]}")
+        [ $# -eq 0 ] || refuse "an argument to main-check"
+        [ -n "$commit" ] || { echo "e2e-github.sh: main-check tests a named commit; pass --commit <sha>" >&2; exit 1; }
+        pre_run_exit="$E2E_GITHUB_NO_VERDICT_EXIT"
+        ;;
 esac
 
 spec_args=()
@@ -126,7 +161,7 @@ for arg in ${pw_args[@]+"${pw_args[@]}"}; do
     esac
 done
 
-e2e_github_preflight "$PROJECT_DIR" || exit 1
+e2e_github_preflight "$PROJECT_DIR" "$commit" || exit "$pre_run_exit"
 
 # ── Split the browser selection into the remote and local legs ──────────
 projects=()
@@ -140,23 +175,20 @@ if [[ " ${suites[*]} " == *" browser "* ]]; then
 $(e2e_browser_projects ${skip_webkit:+--no-webkit})
 EOF
     fi
-    spec_dir="$PROJECT_DIR/crates/lucidos-app/e2e"
-    if [ "${#spec_args[@]}" -gt 0 ]; then
-        candidates=()
-        for s in "${spec_args[@]}"; do
-            [ -f "$spec_dir/$s" ] || { echo "e2e-github.sh: no spec named $s" >&2; exit 1; }
-            candidates+=("$spec_dir/$s")
-        done
-    else
-        candidates=("$spec_dir"/*.spec.ts)
+    # Under --commit the specs come from that commit, never the working tree.
+    routes="$(e2e_github_split_specs "$PROJECT_DIR" "$commit" ${spec_args[@]+"${spec_args[@]}"})" || exit "$pre_run_exit"
+    while read -r leg name; do
+        case "$leg" in
+            local) local_specs+=("$name") ;;
+            remote) remote_specs+=("$name") ;;
+        esac
+    done <<EOF
+$routes
+EOF
+    if [ -n "$commit" ] && [ "${#local_specs[@]}" -gt 0 ]; then
+        echo "[e2e-github] testing $commit: ${#local_specs[@]} Claude Code spec(s) need this host and do not run"
+        local_specs=()
     fi
-    for f in "${candidates[@]}"; do
-        if e2e_spec_needs_real_claude_code "$f"; then
-            local_specs+=("$(basename "$f")")
-        else
-            remote_specs+=("$(basename "$f")")
-        fi
-    done
 fi
 
 run_id="$(e2e_github_run_id)"
@@ -196,13 +228,9 @@ pushed=""
 local_pid=""
 # shellcheck disable=SC2329 # called by the EXIT trap below
 cleanup() {
-    if [ -n "$run_db_id" ] && [ -z "$run_done" ]; then
-        echo "[e2e-github] cancelling run $run_db_id" >&2
-        e2e_github_cancel "$run_db_id"
-    fi
-    if [ -n "$pushed" ]; then
-        e2e_github_delete_branch "$PROJECT_DIR" "$branch" || echo "[e2e-github] could not delete $branch; the next run's sweep will" >&2
-    fi
+    local unfinished=""
+    [ -n "$run_done" ] || unfinished="$run_db_id"
+    e2e_github_stop_run "$PROJECT_DIR" "$branch" "$unfinished" "$pushed"
     if [ -n "$local_pid" ] && kill -0 "$local_pid" 2>/dev/null; then
         kill -TERM "$local_pid" 2>/dev/null
         wait "$local_pid" 2>/dev/null
@@ -272,17 +300,19 @@ fi
 # ── The remote leg ───────────────────────────────────────────────────────
 remote_rc=0
 if [ "${#remote_suites[@]}" -gt 0 ]; then
-    commit="$(e2e_github_build_commit "$PROJECT_DIR" "$request" "$run_id")" || {
+    pushed_commit="$(e2e_github_build_commit "$PROJECT_DIR" "$request" "$run_id" "${commit:-HEAD}")" || {
         echo "ERROR: nothing was pushed." >&2
         exit "$E2E_GITHUB_NO_VERDICT_EXIT"
     }
-    e2e_github_push "$PROJECT_DIR" "$commit" "$branch" || {
+    e2e_github_push "$PROJECT_DIR" "$pushed_commit" "$branch" || {
         echo "ERROR: the push to $E2E_GITHUB_REMOTE/$branch was refused." >&2
         exit "$E2E_GITHUB_NO_VERDICT_EXIT"
     }
     pushed=1
-    run_db_id="$(e2e_github_find_run "$branch" "$commit")" || exit "$E2E_GITHUB_NO_VERDICT_EXIT"
-    conclusion="$(e2e_github_wait "$run_db_id" | tail -1)"
+    run_db_id="$(e2e_github_find_run "$branch" "$pushed_commit")" || exit "$E2E_GITHUB_NO_VERDICT_EXIT"
+    # Under pipefail a wait that gave up fails the pipeline, though tail ends 0.
+    # The EXIT trap then cancels the run.
+    conclusion="$(e2e_github_wait "$run_db_id" | tail -1)" || exit "$E2E_GITHUB_NO_VERDICT_EXIT"
     run_done=1
     echo "[e2e-github] run concluded: ${conclusion:-unknown}"
     if ! e2e_github_download "$run_db_id" "$out_dir"; then
@@ -304,7 +334,7 @@ if [ -n "$local_pid" ]; then
     echo "══ browser: Claude Code specs (local leg) ══"
     cat "$local_log"
     echo "── local leg exit code: $local_rc ──"
-    [ "$overall" -ne 0 ] || overall="$local_rc"
+    overall="$(e2e_github_worse_rc "$overall" "$local_rc")"
 fi
 
 echo ""

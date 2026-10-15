@@ -101,7 +101,7 @@ describe('drawer status mark starts the title line', () => {
     // box, and the needle hangs below. The eye reads the body, whose center
     // sits 2.5 units above the box's. A new glyph needs a new offset.
     expect(iconsTsx).toContain('<path d="M12 17v5" />');
-    expect(decl(block(drawerCss, '.thread-row-actions .pin-thread-btn svg {'), 'translate'))
+    expect(decl(block(drawerCss, '.thread-row-actions .pin-btn svg {'), 'translate'))
       .toBe('0 calc(100% * 2.5 / 24)');
   });
 

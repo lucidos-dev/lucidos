@@ -424,10 +424,6 @@
     }
 }
 
-.icon-btn.pinned {
-    color: var(--accent);
-}
-
 /* A crossfade between layers stacked in one grid cell
    (components/shared/CrossfadeStack.tsx). Every layer stays mounted, so a swap
    is a transition that can reverse mid-way. `min-width: 0` lets a layer
@@ -1028,11 +1024,12 @@ html[data-theme-mode="dark"] .split-button.open::before {
     color: var(--accent-red);
 }
 
-/* Saved pin (PinThreadButton): the icon is already filled (PinIcon filled) —
- * the accent-colored filled silhouette alone signals the pinned state. No
+/* A pinned PinButton: the icon is already filled (PinIcon filled), so the
+ * accent-colored filled silhouette alone signals the pinned state. No
  * frame/background tint (the hover background still applies transiently, like
- * every icon-btn). Shared across the drawer row + thread title headers. */
-.pin-thread-btn.active {
+ * every icon-btn). Shared by the drawer rows, the thread title headers and the
+ * apps panel rows. */
+.pin-btn.active {
     color: var(--accent);
 }
 
@@ -1979,8 +1976,9 @@ mark.search-match {
 /* ── App icon (ADR 0414) ─────────────────────────────────────────────────────
    The one tile every app and widget picture sits on (`AppIcon`). A surface
    sizes it through --app-icon-size, and a large one rounds it more through
-   --app-icon-radius. An image sits on a small neutral tile. The monogram
-   tile tints the theme hue `AppIcon` picks from the app id. */
+   --app-icon-radius. An image fills the tile unframed, since most icons
+   draw their own background. The monogram tile tints the theme hue
+   `AppIcon` picks from the app id. */
 .app-icon {
     flex: none;
     display: inline-flex;
@@ -1993,12 +1991,6 @@ mark.search-match {
     overflow: hidden;
     -webkit-user-select: none;
     user-select: none;
-}
-
-.app-icon-image {
-    padding: calc(var(--app-icon-size, 1rem) * 0.1);
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
 }
 
 .app-icon-image img {

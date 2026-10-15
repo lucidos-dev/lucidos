@@ -39,7 +39,7 @@ import {
   appliedChanges,
   setAsideChanges,
   applyingChangeIds,
-  applyingNowThreadIds,
+  applyNowRequests,
   applyAllInProgress,
   standingApplyThreadIds,
   armingStandingApplyThreadIds,
@@ -129,7 +129,7 @@ beforeEach(() => {
   appliedChanges.value = { status: 'loaded', data: [] };
   setAsideChanges.value = { status: 'loaded', data: [] };
   applyingChangeIds.value = new Set();
-  applyingNowThreadIds.value = new Map();
+  applyNowRequests.value = new Map();
   applyAllInProgress.value = false;
   standingApplyThreadIds.value = new Set();
   armingStandingApplyThreadIds.value = new Set();

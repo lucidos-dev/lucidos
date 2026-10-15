@@ -13,7 +13,6 @@ impl LucidosEngine {
     pub fn worktree_cleanup_active_threads(&self) -> Arc<dyn worktree_cleanup::ActiveThreads> {
         Arc::new(worktree_cleanup::EngineActiveThreads::new(
             self.agent_sessions.clone(),
-            self.spawns_in_flight.clone(),
             self.bash_background.clone(),
         ))
     }
@@ -103,13 +102,9 @@ impl LucidosEngine {
     /// [`SpawnRequest`] against `run_direct_agent`. Started once at engine
     /// boot, after `SpawnDispatcher::spawn(..)` returns the receiver end.
     ///
-    /// Today only `SpawnRequest::Continue` flows through this channel — the
-    /// chat HTTP handler still owns the spawn for `MessageReceived` (see
-    /// `spawn_dispatcher` module docs). For a continue request we re-enter
-    /// `run_direct_agent` with `--resume` against the existing session id and
-    /// the continuation text from `continue_input_for_reason` as its input.
-    /// Phase 5.3 owns enriching this with the real recovery payload (worktree
-    /// path, branch, system prompt).
+    /// A continue request re-enters `run_direct_agent` with `--resume` against
+    /// the existing session id and the continuation text from
+    /// `continue_input_for_reason` as its input.
     pub fn start_spawn_request_consumer(
         self: &Arc<Self>,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::engine::spawn_dispatcher::SpawnRequest>,
@@ -176,6 +171,48 @@ impl LucidosEngine {
                                 }
                             };
 
+                            // Claimed before anything is emitted. A second Continue
+                            // click finds this run's entry and opens no exchange.
+                            let mut claim = loop {
+                                match engine.claim_thread_for_spawn(thread_id, None).await {
+                                    Ok(Some(claim)) => break Ok(claim),
+                                    Err(e) => break Err(e),
+                                    Ok(None) => {
+                                        // A live run holds the thread, and reads
+                                        // the input as a follow-up.
+                                        let input =
+                                            crate::engine::agent_recovery::continue_input_for_reason(
+                                                engine.pool(),
+                                                engine.workspace_path(),
+                                                thread_id,
+                                                continue_reason.as_deref(),
+                                            )
+                                            .await;
+                                        let routed = engine
+                                            .route_to_live_run(
+                                                thread_id,
+                                                crate::engine::AgentUserInput {
+                                                    text: input,
+                                                    images: None,
+                                                    origin_event_id: Some(event_id),
+                                                    kind: crate::engine::AgentInputKind::User,
+                                                    completion: None,
+                                                },
+                                            )
+                                            .await;
+                                        if routed {
+                                            crate::log!(
+                                                "[SpawnConsumer] Continue thread={} event={} routed to the live run",
+                                                thread_id,
+                                                event_id
+                                            );
+                                            return;
+                                        }
+                                        // The run let go meanwhile: claim again.
+                                    }
+                                }
+                            };
+
                             // ContinuationStarted opens the resume exchange in
                             // the timeline before any CC text streams. CC's
                             // own `--resume` system carries the prior context
@@ -185,9 +222,11 @@ impl LucidosEngine {
                             // follow-up CC events fold into the existing
                             // AskUserQuestion exchange instead of being
                             // mislabeled "Resumed after engine restart".
-                            if crate::engine::agent_recovery::continue_should_open_resume_exchange(
-                                continue_reason.as_deref(),
-                            ) {
+                            if claim.is_ok()
+                                && crate::engine::agent_recovery::continue_should_open_resume_exchange(
+                                    continue_reason.as_deref(),
+                                )
+                            {
                                 engine
                                     .event_bus
                                     .emit_or_log(
@@ -203,6 +242,7 @@ impl LucidosEngine {
                                                 // local hang/stray-signal interrupt, NOT
                                                 // a restart.
                                                 reason: continue_reason.clone(),
+                                                resumed_abort_id: None,
                                             },
                                             meta: crate::engine::thread_events::EventMeta {
                                                 channel: Some(
@@ -233,7 +273,33 @@ impl LucidosEngine {
                                     continue_reason.as_deref(),
                                 )
                                 .await;
-                            let conflict_change_id = conflict_duty.as_ref().map(|(c, _)| c.id);
+                            // The duty carries the change's apply claim. One that
+                            // another apply holds is that apply's to finish.
+                            let conflict_claim = match conflict_duty.as_ref() {
+                                Some((change, _)) => {
+                                    let claim = engine
+                                        .claim_pending_change(change.id)
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            crate::log!(
+                                                "[SpawnConsumer] Could not claim change {} for its merge duty: {}",
+                                                change.id,
+                                                e
+                                            );
+                                            None
+                                        });
+                                    if claim.is_none() {
+                                        crate::log!(
+                                            "[SpawnConsumer] Continue thread={} leaves the merge duty for change {} to the apply that holds it",
+                                            thread_id,
+                                            change.id
+                                        );
+                                    }
+                                    claim
+                                }
+                                None => None,
+                            };
+                            let conflict_duty = conflict_duty.filter(|_| conflict_claim.is_some());
                             let conflict_worktree =
                                 conflict_duty.as_ref().map(|(_, pair)| pair.clone());
 
@@ -272,27 +338,30 @@ impl LucidosEngine {
                                     continue_reason.as_deref(),
                                 )
                                 .await;
-                            let mut result = engine
-                                .run_direct_agent(
-                                    request_id,
-                                    thread_id,
-                                    &continue_input,
-                                    None,
-                                    event_id,
-                                    &[],
-                                    None,
-                                    &cancel_token,
-                                    conflict_change_id,
-                                    conflict_worktree.clone(),
-                                    None,
-                                    None,
-                                    resume_sid,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                )
-                                .await;
+                            let mut result = match claim.as_mut() {
+                                Err(e) => Err(e.to_string().into()),
+                                Ok(claim) => {
+                                    engine
+                                        .run_direct_agent(
+                                            claim,
+                                            request_id,
+                                            &continue_input,
+                                            None,
+                                            event_id,
+                                            None,
+                                            &cancel_token,
+                                            conflict_claim.as_ref(),
+                                            conflict_worktree.clone(),
+                                            None,
+                                            None,
+                                            resume_sid,
+                                            None,
+                                            None,
+                                            None,
+                                        )
+                                        .await
+                                }
+                            };
 
                             // What to do next is decided by the pure
                             // `continue_recovery` (see its doc for why the retry
@@ -323,39 +392,41 @@ impl LucidosEngine {
                                         continue_reason.as_deref(),
                                     )
                                     .await;
-                                result = engine
-                                    .run_direct_agent(
-                                        request_id,
-                                        thread_id,
-                                        &retry_text,
-                                        None,
-                                        event_id,
-                                        &[],
-                                        None,
-                                        &cancel_token,
-                                        conflict_change_id,
-                                        conflict_worktree.clone(),
-                                        None,
-                                        None,
-                                        // No sid — the one we had is dead.
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                    )
-                                    .await;
+                                result = match claim.as_mut() {
+                                    Err(e) => Err(e.to_string().into()),
+                                    Ok(claim) => {
+                                        engine
+                                            .run_direct_agent(
+                                                claim,
+                                                request_id,
+                                                &retry_text,
+                                                None,
+                                                event_id,
+                                                None,
+                                                &cancel_token,
+                                                conflict_claim.as_ref(),
+                                                conflict_worktree.clone(),
+                                                None,
+                                                None,
+                                                // No sid — the one we had is dead.
+                                                None,
+                                                None,
+                                                None,
+                                                None,
+                                            )
+                                            .await
+                                    }
+                                };
                             }
 
+                            // Let go before the settle, which claims the thread itself.
+                            drop(claim);
                             let final_err = err_text(&result);
                             let settle = match crate::engine::agent_recovery::continue_recovery(
                                 final_err.as_deref(),
                                 retried,
                             ) {
                                 ContinueRecovery::Settle => true,
-                                ContinueRecovery::SettleUnlessOwned => {
-                                    !engine.coding_agent_owns_thread(thread_id).await
-                                }
                                 ContinueRecovery::Nothing | ContinueRecovery::RetryFresh => false,
                             };
                             if settle {
@@ -426,14 +497,13 @@ impl LucidosEngine {
                                 let settle_actor = continue_actor.clone().unwrap_or_else(
                                     crate::engine::thread_events::MessageOrigin::system,
                                 );
-                                match crate::engine::claude_code::settle_stuck_running_thread(
-                                    engine.pool(),
-                                    &engine.event_bus,
-                                    thread_id,
-                                    Some(settle_actor),
-                                    crate::engine::claude_code::SettleTerminal::StuckProjection,
-                                )
-                                .await
+                                match engine
+                                    .settle_unclaimed_running_thread(
+                                        thread_id,
+                                        Some(settle_actor),
+                                        crate::engine::claude_code::SettleTerminal::StuckProjection,
+                                    )
+                                    .await
                                 {
                                     Ok(true) => crate::log!(
                                         "[SpawnConsumer] Settled thread {} left `running` by a failed continuation",
@@ -745,6 +815,19 @@ impl LucidosEngine {
             .connect(database_url)
             .await?;
 
+        // A database migrated before whose migration table is gone was wiped.
+        // Migrating it would open the workspace blank, so stop and say so.
+        if let Some(message) = crate::core::migration_marker::refuse_wiped_database(
+            &workspace_path,
+            database_url,
+            &pool,
+        )
+        .await
+        {
+            crate::boot_failure::report(&message).await;
+            return Err(message.into());
+        }
+
         // Run sqlx migrations before any schema init calls
         crate::boot_report::report(crate::boot_report::MIGRATING);
         let migrator = sqlx::migrate!();
@@ -775,6 +858,7 @@ impl LucidosEngine {
             }
             return Err(e.into());
         }
+        crate::core::migration_marker::record_migrated(&workspace_path, database_url, &pool).await;
         // The boot load in main.rs ran before this migrator. On a fresh database
         // it found no `models` table, and every model would read as unknown.
         crate::llm::model_registry::reload(&model_registry, &pool).await;
@@ -893,20 +977,9 @@ impl LucidosEngine {
         // Providers) is preferred, then the OPENAI_API_KEY launch env var, then a
         // key auto-detected from the Codex CLI's auth file (apikey login) as the
         // lowest-precedence fallback. Used for the image provider.
-        let openai_credential = match CredentialStore::get(&pool, "openai").await {
-            Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
-            Ok(None) => None,
-            Err(e) => {
-                log!("[Startup] Failed to read OpenAI credential: {}", e);
-                None
-            }
-        };
-        let openai_api_key = crate::llm::resolve_openai_api_key(
-            openai_credential,
-            std::env::var("OPENAI_API_KEY").ok(),
-            crate::llm::openai::codex_detect::load(),
-        )
-        .map(|(key, _source)| key);
+        let openai_api_key = crate::llm::openai::openai_api_key(&pool)
+            .await
+            .map(|(key, _source)| key);
 
         // Memory index uses PostgreSQL + pgvector for vector search
         let memory_index = match PgVectorIndex::new(pool.clone()).await {
@@ -1110,6 +1183,8 @@ impl LucidosEngine {
             }
         }
 
+        crate::engine::agent_session::end_interrupted_applies(&pool, &event_bus).await;
+
         // Surface — but do NOT discard — pending changes whose branches no
         // longer exist. The user resolves these from Review explicitly; the
         // engine never auto-discards on the user's behalf. Apply on a
@@ -1156,11 +1231,10 @@ impl LucidosEngine {
 
         let mcp_manager = crate::mcp::McpManager::new(pool.clone(), event_bus.clone());
 
-        let user_dir = std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".lucidos"));
+        let user_dir = lucidos_home::path();
 
         if let Some(ref ud) = user_dir {
+            lucidos_home::ensure_storage_root(ud)?;
             crate::core::user_dir::ensure_git_init(ud);
         }
 
@@ -1203,7 +1277,11 @@ impl LucidosEngine {
         // context window.
         let engine_model_registry = model_registry.clone();
 
-        spawn_vertex_region_subscriber(event_bus.subscribe(), vertex_location.clone());
+        spawn_vertex_region_subscriber(
+            event_bus.subscribe(),
+            vertex_location.clone(),
+            pool.clone(),
+        );
         spawn_models_registry_subscriber(event_bus.subscribe(), model_registry, pool.clone());
 
         // Hot-swap the active LLM provider when a provider credential or a
@@ -1239,6 +1317,9 @@ impl LucidosEngine {
         // Shared with the Thread Queue too: its overflow guard performs a real
         // trigger write, and a lock only the engine held would not serialize it.
         let trigger_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+        // Shared with the Thread Queue, which holds trigger fires once it is
+        // set. One atomic, so the queue and the scheduler read the same signal.
+        let shutting_down = Arc::new(AtomicBool::new(false));
 
         // Thread Queue admission control. Policy is event-sourced — the
         // latest CapacityPolicyChanged event is the configuration.
@@ -1250,6 +1331,7 @@ impl LucidosEngine {
             workspace_path.clone(),
             trigger_write_lock.clone(),
             capacity_policy,
+            shutting_down.clone(),
         ));
 
         let version_tracking = crate::engine::engine_version::VersionTracking::from_env();
@@ -1282,7 +1364,7 @@ impl LucidosEngine {
             summarizing_threads: Default::default(),
             rebuilding_memory: AtomicBool::new(false),
             cancel_rebuild: AtomicBool::new(false),
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutting_down,
             backup_in_progress: AtomicBool::new(false),
             database_health: Default::default(),
             build_state: std::sync::RwLock::new(crate::engine::engine_version::BuildState::Idle),
@@ -1306,6 +1388,7 @@ impl LucidosEngine {
             frontend_preview_lifecycle: tokio::sync::Mutex::new(()),
             restart_actor: std::sync::Mutex::new(None),
             teardown_actor: std::sync::Mutex::new(None),
+            teardown_handover: Default::default(),
             pending_switch_resumes: std::sync::Mutex::new(Vec::new()),
             active_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             thread_completion: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1367,6 +1450,7 @@ impl LucidosEngine {
             pending_uninstalls: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             frontend_origin: std::sync::Mutex::new(None),
             agent_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            apply_claims: Arc::default(),
             view_snapshots: Default::default(),
             find_cache: Default::default(),
             agent_runtimes: {
@@ -1376,18 +1460,16 @@ impl LucidosEngine {
                 m
             },
             live_waits: Arc::new(crate::engine::event_wait::LiveWaits::new()),
+            keep_alive_beats: Default::default(),
             wait_reentry_tx: {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 crate::engine::WAIT_REENTRY_RX.with(|cell| cell.borrow_mut().replace(rx));
                 tx
             },
-            last_spawn: std::sync::Mutex::new(HashMap::new()),
             cc_system_prompts: std::sync::Mutex::new(HashMap::new()),
-            spawns_in_flight: Arc::default(),
             pending_app_spawn: std::sync::Mutex::new(HashMap::new()),
-            follow_up_order: Default::default(),
+            input_order: Default::default(),
             accepted_messages: Default::default(),
-            cc_spawn_coalesce: agent_session::CcSpawnCoalescer::new(),
             cc_startup_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             mcp_manager,
             pending_cc_permission: Arc::new(std::sync::Mutex::new(
@@ -1410,6 +1492,19 @@ impl LucidosEngine {
                 APPLY_ALL_DRIVE_RX.with(|cell| cell.borrow_mut().replace(rx));
                 tx
             },
+            landing_lane_tx: {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                crate::engine::LANDING_LANE_RX.with(|cell| cell.borrow_mut().replace(rx));
+                tx
+            },
+            landing_lane_snapshot: std::sync::RwLock::default(),
+            main_check_tx: {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                crate::engine::MAIN_CHECK_RX.with(|cell| cell.borrow_mut().replace(rx));
+                tx
+            },
+            main_check_snapshot: std::sync::RwLock::default(),
+            main_check_runner: Arc::default(),
             standing_applies: Arc::new(crate::engine::standing_apply::ArmedThreads::default()),
             self_arc: std::sync::OnceLock::new(),
             trigger_configs,

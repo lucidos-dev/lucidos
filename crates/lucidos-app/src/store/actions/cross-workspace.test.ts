@@ -7,8 +7,11 @@ const mocks = vi.hoisted(() => ({
   openUrl: vi.fn(),
   showToast: vi.fn(),
   isTauri: vi.fn(() => false),
+  isStandalone: vi.fn(() => false),
+  replaceDocument: vi.fn(),
   windowOpen: vi.fn(),
   focusThreadOrBootstrap: vi.fn(),
+  showWorkspaceInNativeWindow: vi.fn(() => Promise.resolve()),
   // Mutable per-test stand-in for basePath's load-time `WORKSPACE_ID` const:
   // non-null = this page is served behind the gateway under `/<slug>/`; null =
   // served directly on an engine port. Read via a getter so the SUT sees the
@@ -24,16 +27,22 @@ vi.mock('../../api/client/control', () => ({
   listWorkspaces: mocks.listWorkspaces,
   locateWorkspace: mocks.locateWorkspace,
 }));
-vi.mock('../../utils/basePath', () => ({
-  get WORKSPACE_ID() {
-    return mocks.workspaceId;
-  },
-  get GATEWAY_PORT() {
-    return mocks.gatewayPort;
-  },
-}));
+vi.mock('../../utils/basePath', async () => {
+  const actual = await vi.importActual<typeof import('../../utils/basePath')>('../../utils/basePath');
+  return {
+    isWorkspaceSlug: actual.isWorkspaceSlug,
+    get WORKSPACE_ID() {
+      return mocks.workspaceId;
+    },
+    get GATEWAY_PORT() {
+      return mocks.gatewayPort;
+    },
+  };
+});
+vi.mock('../../utils/tauri', () => ({ showWorkspaceInNativeWindow: mocks.showWorkspaceInNativeWindow }));
 vi.mock('./artifacts', () => ({ openUrl: mocks.openUrl }));
-vi.mock('../../utils/platform', () => ({ isTauri: mocks.isTauri }));
+vi.mock('../../utils/platform', () => ({ isTauri: mocks.isTauri, isStandalone: mocks.isStandalone, isMac: false }));
+vi.mock('../../utils/documentNavigation', () => ({ replaceDocument: mocks.replaceDocument }));
 // Stub the heavy threads module — we only need the routing spy, not its chain.
 vi.mock('./threads', () => ({ focusThreadOrBootstrap: mocks.focusThreadOrBootstrap }));
 
@@ -42,8 +51,16 @@ vi.mock('../store', async () => {
   return { ...actual, showToast: mocks.showToast };
 });
 
-const { openThreadInWorkspace, openThreadAcrossWorkspaces, ensureCrossWorkspaceThreadTitle, crossWorkspaceThreadTitle } =
-  await import('./cross-workspace');
+const {
+  openThreadInWorkspace,
+  openThreadAcrossWorkspaces,
+  ensureCrossWorkspaceThreadTitle,
+  crossWorkspaceThreadTitle,
+  parseWorkspaceThreadUrl,
+  openWorkspaceThreadUrl,
+  THREAD_HASH_RE,
+} = await import('./cross-workspace');
+const { landingHash, landingName } = await import('../../utils/workspaceLanding');
 const { workspaceName } = await import('../store');
 
 const TID = '1c2419a1-aaaa-bbbb-cccc-ddddeeeeffff';
@@ -81,6 +98,7 @@ const stubLocation = (origin: string) => {
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.isTauri.mockReturnValue(false);
+  mocks.isStandalone.mockReturnValue(false);
   // No other install carries it, which is what every pre-existing case assumes.
   mocks.locateWorkspace.mockResolvedValue(null);
   mocks.gatewayPort = 5251;
@@ -151,14 +169,43 @@ describe('openThreadInWorkspace — behind the gateway', () => {
     expect(mocks.windowOpen).toHaveBeenCalledWith(`https://tail.host:5251/dev/#thread=${TID}`, 'lucidos-ws-dev');
   });
 
-  it('uses openUrl (panel) under Tauri', async () => {
+  // `openUrl` under Tauri is the OS browser, which took the user out of
+  // Lucidos. The shell opens the workspace's own window, landed on the thread.
+  it('opens a native window on the thread under Tauri', async () => {
     mocks.isTauri.mockReturnValue(true);
     mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'dev', name: 'dev' })]);
 
     await openThreadInWorkspace('dev', TID);
 
-    expect(mocks.openUrl).toHaveBeenCalledWith(`https://localhost:5251/dev/#thread=${TID}`);
+    expect(mocks.showWorkspaceInNativeWindow).toHaveBeenCalledWith('dev', { thread: TID });
+    expect(mocks.openUrl).not.toHaveBeenCalled();
     expect(mocks.windowOpen).not.toHaveBeenCalled();
+  });
+
+  it('says so when the native window could not be opened', async () => {
+    mocks.isTauri.mockReturnValue(true);
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'dev', name: 'dev' })]);
+    mocks.showWorkspaceInNativeWindow.mockRejectedValueOnce('"dev" is not a workspace');
+
+    await openThreadInWorkspace('dev', TID);
+
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to open thread in workspace 'dev'"),
+      'error',
+    );
+  });
+
+  // An installed app has no tabs. iOS loads a `window.open` in the same view
+  // and pushes, so the page left behind is one stray back swipe away.
+  it('replaces this page on an installed app, leaving nothing to go back to', async () => {
+    mocks.isStandalone.mockReturnValue(true);
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'dev', name: 'dev' })]);
+
+    await openThreadInWorkspace('dev', TID);
+
+    expect(mocks.replaceDocument).toHaveBeenCalledWith(`https://localhost:5251/dev/#thread=${TID}`);
+    expect(mocks.windowOpen).not.toHaveBeenCalled();
+    expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
   it('toasts when the workspace is not registered with the gateway', async () => {
@@ -206,6 +253,33 @@ describe('openThreadInWorkspace: a workspace on another install', () => {
       'lucidos-ws-5252-peer-ws',
     );
     expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
+  // The shell composes window URLs on the caller's own origin, so it cannot
+  // reach another install's gateway. That one keeps `openUrl`.
+  it('keeps openUrl under Tauri for a workspace on another install', async () => {
+    mocks.isTauri.mockReturnValue(true);
+    mocks.locateWorkspace.mockResolvedValue(PEER);
+
+    await openThreadInWorkspace('peer-ws', TID);
+
+    expect(mocks.openUrl).toHaveBeenCalledWith(`http://localhost:5252/peer-ws/#thread=${TID}`);
+    expect(mocks.showWorkspaceInNativeWindow).not.toHaveBeenCalled();
+  });
+
+  // Another origin is outside the installed app. Replacing would strand the app
+  // there with no way back, so the browser takes it instead.
+  it('hands another origin to the browser on an installed app', async () => {
+    mocks.isStandalone.mockReturnValue(true);
+    mocks.locateWorkspace.mockResolvedValue(PEER);
+
+    await openThreadInWorkspace('peer-ws', TID);
+
+    expect(mocks.replaceDocument).not.toHaveBeenCalled();
+    expect(mocks.windowOpen).toHaveBeenCalledWith(
+      `http://localhost:5252/peer-ws/#thread=${TID}`,
+      'lucidos-ws-5252-peer-ws',
+    );
   });
 
   // Two installs may both serve a slug, so a tab named off the slug alone would
@@ -395,6 +469,104 @@ describe('openThreadAcrossWorkspaces', () => {
     // before its first await, so we can assert the routing decision without flushing.
     expect(mocks.focusThreadOrBootstrap).not.toHaveBeenCalled();
     expect(mocks.listWorkspaces).toHaveBeenCalled();
+  });
+});
+
+describe('parseWorkspaceThreadUrl', () => {
+  beforeEach(() => {
+    stubLocation('https://localhost:5251');
+  });
+
+  it('reads the slug and the thread out of a workspace thread URL', () => {
+    expect(parseWorkspaceThreadUrl(`https://localhost:5251/demo/#thread=${TID}`)).toEqual({
+      slug: 'demo',
+      threadId: TID,
+    });
+    expect(parseWorkspaceThreadUrl(`https://localhost:5251/my-ws/#thread=${TID}`)).toEqual({
+      slug: 'my-ws',
+      threadId: TID,
+    });
+    // Without the trailing slash too.
+    expect(parseWorkspaceThreadUrl(`https://localhost:5251/demo#thread=${TID}`)).toEqual({
+      slug: 'demo',
+      threadId: TID,
+    });
+  });
+
+  // A null keeps the link on its ordinary route, so each of these still opens
+  // as a web page.
+  it('leaves every other URL alone', () => {
+    for (const href of [
+      `https://elsewhere.example/demo/#thread=${TID}`,
+      `http://localhost:5251/demo/#thread=${TID}`,
+      `https://localhost:5252/demo/#thread=${TID}`,
+      `https://localhost:5251/demo/apps/x/#thread=${TID}`,
+      `https://localhost:5251/#thread=${TID}`,
+      `https://localhost:5251/~/#thread=${TID}`,
+      `https://localhost:5251/Demo/#thread=${TID}`,
+      `https://localhost:5251/demo/?x=1#thread=${TID}`,
+      'https://localhost:5251/demo/',
+      `https://localhost:5251/demo/#notification=${TID}&thread=${TID}`,
+      `https://localhost:5251/demo/#thread=${TID}&event=1`,
+      // Not a canonical id, which the desktop shell would refuse anyway.
+      'https://localhost:5251/demo/#thread=abc',
+      'https://localhost:5251/demo/#thread=1c2419a1aaaa-bbbb-cccc-ddddeeeeffff',
+      'not a url',
+    ]) {
+      expect(parseWorkspaceThreadUrl(href), href).toBeNull();
+    }
+  });
+});
+
+describe('openWorkspaceThreadUrl', () => {
+  beforeEach(() => {
+    mocks.workspaceId = 'demo';
+    stubLocation('https://localhost:5251');
+  });
+
+  it('focuses the thread in place when the URL names this workspace', () => {
+    mocks.isTauri.mockReturnValue(true);
+
+    openWorkspaceThreadUrl({ slug: 'demo', threadId: TID });
+
+    expect(mocks.focusThreadOrBootstrap).toHaveBeenCalledWith(TID);
+    expect(mocks.showWorkspaceInNativeWindow).not.toHaveBeenCalled();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+    expect(mocks.replaceDocument).not.toHaveBeenCalled();
+    expect(mocks.windowOpen).not.toHaveBeenCalled();
+  });
+
+  it("opens another workspace's window on the thread under Tauri", async () => {
+    mocks.isTauri.mockReturnValue(true);
+
+    openWorkspaceThreadUrl({ slug: 'dev', threadId: TID });
+    await vi.waitFor(() =>
+      expect(mocks.showWorkspaceInNativeWindow).toHaveBeenCalledWith('dev', { thread: TID }),
+    );
+
+    expect(mocks.focusThreadOrBootstrap).not.toHaveBeenCalled();
+    expect(mocks.openUrl).not.toHaveBeenCalled();
+  });
+
+  // The same named tab a workspace row and a thread link reach.
+  it("opens another workspace's tab on the thread in a browser", () => {
+    openWorkspaceThreadUrl({ slug: 'dev', threadId: TID });
+
+    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://localhost:5251/dev/#thread=${TID}`, 'lucidos-ws-dev');
+  });
+});
+
+// The packaged shell composes this fragment in Rust and the page router reads
+// it here; `window_target.rs` pins the same literal on its side.
+describe('the thread landing', () => {
+  it('writes the fragment the hash router reads', () => {
+    expect(landingHash({ thread: TID })).toBe(`#thread=${TID}`);
+    expect(THREAD_HASH_RE.exec(landingHash({ thread: TID }))?.[1]).toBe(TID);
+  });
+
+  it('names itself to the shell as thread:<uuid>', () => {
+    expect(landingName({ thread: TID })).toBe(`thread:${TID}`);
+    expect(landingName('notifications')).toBe('notifications');
   });
 });
 

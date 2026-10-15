@@ -1,4 +1,5 @@
 use super::super::LucidosEngine;
+use super::bash_background::{CompletionDelivery, TaskSpec};
 use super::bash_background_recovery;
 use super::ToolOutcome;
 use crate::core::shell::{
@@ -415,10 +416,13 @@ impl LucidosEngine {
             .start_background_task(
                 thread_id,
                 command,
-                args.get("description").and_then(|v| v.as_str()),
-                timeout_secs,
                 self.workspace_path(),
                 &env_vars,
+                TaskSpec {
+                    timeout_secs,
+                    description: args.get("description").and_then(|v| v.as_str()),
+                    delivery: CompletionDelivery::EventWait,
+                },
             )
             .await?;
 
@@ -438,15 +442,14 @@ impl LucidosEngine {
     /// `run_python_background`, and by a coding agent's
     /// `lucidos background-task run`. They differ in the directory the task
     /// runs in and in its env: only the chat agent's carries the secrets.
-    /// `description` is the agent's name for the work, shown on the wait.
+    /// `spec.description` is the agent's name for the work, shown on the wait.
     pub(crate) async fn start_background_task(
         &self,
         thread_id: uuid::Uuid,
         command: &str,
-        description: Option<&str>,
-        timeout_secs: u64,
         cwd: &std::path::Path,
         env_vars: &[(String, String)],
+        spec: TaskSpec<'_>,
     ) -> Result<(String, chrono::DateTime<chrono::Utc>), String> {
         let safe_command = redact_postgres_secrets(command);
         log!(
@@ -456,14 +459,7 @@ impl LucidosEngine {
 
         let (task_id, finish_rx) = self
             .bash_background
-            .spawn(
-                command,
-                timeout_secs,
-                cwd,
-                env_vars,
-                Some(thread_id),
-                description,
-            )
+            .spawn_task(command, cwd, env_vars, Some(thread_id), spec)
             .await
             .map_err(|e| format!("Error: failed to spawn background command: {}", e))?;
 
@@ -476,7 +472,7 @@ impl LucidosEngine {
                 event: ThreadEvent::BackgroundBashStarted {
                     task_id: task_id.clone(),
                     command: safe_command.clone(),
-                    timeout_secs,
+                    timeout_secs: spec.timeout_secs,
                     started_at,
                 },
                 meta: EventMeta::NONE,
@@ -598,8 +594,23 @@ impl LucidosEngine {
                 }
             },
         };
-        let wait = std::time::Duration::from_secs(wait_secs);
+        self.drain_background_output(
+            task_id,
+            std::time::Duration::from_secs(wait_secs),
+            thread_id,
+        )
+        .await
+    }
 
+    /// The body of `bash_output`, with the wait already clamped by the caller.
+    /// `lucidos background-task output` and `wait` read through here too, so
+    /// every surface renders one task the same way.
+    pub(crate) async fn drain_background_output(
+        &self,
+        task_id: &str,
+        wait: std::time::Duration,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
         // A message from the user outranks the rest of the wait: the loop
         // only picks injections up BETWEEN iterations, so without this the
         // follow-up sits unread for up to two minutes while we block.
@@ -959,19 +970,26 @@ mod tests {
     /// process takes `SIGPIPE` on its next write. `run_bash` would then report
     /// a survivor it had just killed. Reading on, and discarding, is the fix.
     ///
-    /// The chain writes to the inherited pipe a second after the grace has
-    /// expired, then touches the marker. A closed read end kills it before it
-    /// gets there.
+    /// The chain stays silent until the test creates `go`, which it does only
+    /// once `Detached` is back. Then it writes to the inherited pipe and
+    /// touches the marker. A closed read end kills it before it gets there.
+    ///
+    /// The late write waits on `go`, not on a timer. A starved host stretches
+    /// the quiet window past any fixed delay, the write lands inside it, and
+    /// the wait reports `Completed`. The loop also ends once the tempdir is
+    /// gone, so a failed run leaves no process behind.
     #[tokio::test]
     async fn a_detached_process_is_not_killed_by_the_pipes_closing() {
-        let marker =
-            std::env::temp_dir().join(format!("lucidos-detached-live-{}", std::process::id()));
-        // Unrecoverable cleanup: a leftover from an earlier aborted run.
-        let _ = std::fs::remove_file(&marker);
+        let tmp = tempfile::tempdir().unwrap();
+        let go = tmp.path().join("go");
+        let marker = tmp.path().join("marker");
 
         let child = spawn_like_the_tool(&format!(
-            "echo queued && sleep 1 && echo late && touch '{}' & echo done",
-            marker.display()
+            "echo queued && until [ -e '{go}' ] || [ ! -d '{dir}' ]; do sleep 0.05; done \
+             && [ -e '{go}' ] && echo late && touch '{marker}' & echo done",
+            dir = tmp.path().display(),
+            go = go.display(),
+            marker = marker.display(),
         ));
         let waited = wait_for_shell(child, Duration::from_secs(30))
             .await
@@ -981,13 +999,15 @@ mod tests {
             "expected Detached, got {waited:?}"
         );
 
-        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        std::fs::write(&go, "").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
             marker.exists(),
             "the detached chain died, most likely on SIGPIPE from a closed read end"
         );
-        // Unrecoverable cleanup: the marker has served its purpose.
-        let _ = std::fs::remove_file(&marker);
     }
 
     /// One pipe closes while the other stays live and keeps producing, so the
@@ -1044,10 +1064,8 @@ mod tests {
     /// would create it a second later.
     #[tokio::test]
     async fn a_timeout_reports_a_timeout_and_kills_the_shell() {
-        let marker =
-            std::env::temp_dir().join(format!("lucidos-timeout-kill-{}", std::process::id()));
-        // Unrecoverable cleanup: a leftover from an earlier aborted run.
-        let _ = std::fs::remove_file(&marker);
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("marker");
 
         let child = spawn_like_the_tool(&format!("sleep 1; touch '{}'", marker.display()));
         let waited = wait_for_shell(child, Duration::from_millis(200))

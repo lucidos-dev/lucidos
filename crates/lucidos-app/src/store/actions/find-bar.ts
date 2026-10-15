@@ -6,29 +6,33 @@
  * reaches its text. An app frame is isolated (ADR 0227), so it is asked over
  * the app bridge, and its SDK matches there. The HTML preview is isolated too,
  * and its bridge carries a copy of the same matcher. A text preview is the
- * host's own DOM, so the matcher runs here (`@lucidos/find`). The transcript
+ * host's own DOM, so the host runs the matcher (`@lucidos/find`). The transcript
  * counts the thread's data and draws a match on a step (`transcript-find.ts`).
+ * The targets live in `find-targets.ts`, loaded on demand; this module decides
+ * which one a query goes to.
  *
  * Plans: `docs/plans/2026-10-07-find-in-app.md` and
  * `docs/plans/2026-10-07-find-in-previews-and-transcript.md`.
  */
 
 import { effect, signal } from '@preact/signals';
-import { createFinder, createPainter, highlightApiPresent, type ClearBand, type FindResult } from '@lucidos/find';
-import { askFrame, tellFrame } from './app-bridge';
-import { getVisibleAppFrame } from './apps';
+import type { FindResult } from '@lucidos/find';
 import {
   filePreviewEditing, filePreviewSource, findRequest, focusedPane, focusedThreadId, lineScrollTarget, mobileView,
-  panelOverlay,
+  panelOverlay, threadMap,
 } from '../store';
 import { MIN_FIND_QUERY_CHARS, findQueryChars } from './find-request';
-import { transcriptSearchable, transcriptTarget } from './transcript-find';
 import { parseRepoPath } from '../repoPath';
 import { dataPreviewBody, repoPreviewBody } from '../../components/files/previewBody';
-import { isElementVisible } from '../../utils/elementVisibility';
+import { lazyModule, whenLoaded, type PendingOpen } from '../../utils/lazyComponent';
+import { prefetchWhenIdle } from '../../utils/idlePrefetch';
 import { holdSoftwareKeyboard } from '../../utils/softwareKeyboard';
 import { hasCoarsePointer, isMobile } from '../../utils/viewport';
-import { PREVIEW_FRAME_ROLE, askPreviewFind, postToPreviewFrame } from '../../utils/previewFrameProtocol';
+
+/** The matcher and the targets, fetched once the boot splash lifts (ADR 0436).
+ *  The bar opens only once they are in memory, so `run` can always reach them. */
+export const findTargets = lazyModule(() => import('./find-targets'));
+prefetchWhenIdle(findTargets);
 
 /** Where a find bar lives, and what it searches. */
 export type FindSurface = 'content' | 'thread';
@@ -47,8 +51,6 @@ export const findResult = signal<FindBarResult>({ status: 'idle' });
 /** Bumped on every open that takes focus. The bar answers by focusing its field. */
 export const findFocusRequest = signal(0);
 
-/** How long an app frame gets to answer. An app with no SDK never does. */
-export const FIND_TIMEOUT_MS = 2000;
 const TYPING_DEBOUNCE_MS = 120;
 
 /** Something the bar can search. `run` resolves to null when the text could
@@ -58,21 +60,6 @@ export interface FindTarget {
   run(query: string, step?: 1 | -1, fromLine?: number): Promise<FindResult | null>;
   clear(): void;
   unsearchable: string;
-}
-
-function isCount(n: unknown): n is number {
-  return typeof n === 'number' && Number.isInteger(n) && n >= 0;
-}
-
-/** Read a frame's answer. It crossed a `postMessage` from code the host does
- *  not trust, so anything but a well-formed count is refused. */
-export function parseFindReply(value: unknown): FindResult | null {
-  const v = value as { total?: unknown; current?: unknown; capped?: unknown } | null;
-  if (!v || typeof v !== 'object') return null;
-  const { total, current } = v;
-  if (!isCount(total) || !isCount(current) || current > total) return null;
-  if ((total === 0) !== (current === 0)) return null;
-  return { total, current, capped: v.capped === true };
 }
 
 /** How the content pane's view is searched. Null means it has no text the bar
@@ -97,88 +84,26 @@ export function contentFindKind(): ContentFindKind | null {
   return body === 'markdown' || body === 'csv' || body === 'slides' || body === 'source' ? 'page' : null;
 }
 
-function visibleElement(selector: string): HTMLElement | null {
-  for (const el of document.querySelectorAll<HTMLElement>(selector)) {
-    if (isElementVisible(el)) return el;
-  }
-  return null;
+/** Whether the thread has anything to search: a real thread, not a draft. */
+function transcriptSearchable(threadId: string): boolean {
+  const thread = threadMap.value.get(threadId);
+  return !!thread && thread.meta.state !== 'composing';
 }
 
-const FILE_UNSEARCHABLE = 'This file can’t be searched';
-
-/** The highlight registry is the document's, so the host has one painter. */
-const hostPainter = createPainter(highlightApiPresent);
-
-/** A text preview's body, without the repo preview's file tree beside it. */
-function pageRoot(): Element | null {
-  const body = visibleElement('.file-preview-frame-body');
-  return body?.querySelector('.repo-preview-split-main') ?? body;
+/** Whether `surface` shows something the bar can search. Needs no target. */
+function searchable(surface: FindSurface): boolean {
+  if (surface === 'content') return contentFindKind() !== null;
+  const threadId = focusedThreadId.value;
+  return !!threadId && transcriptSearchable(threadId);
 }
 
-/** What the open bar leaves of the screen. On a phone it sticks over the top
- *  of the file, so a match under it is out of view. */
-function pageBand(): ClearBand | undefined {
-  const bar = visibleElement('.file-preview-frame > .find-bar-slot');
-  return bar ? { top: bar.getBoundingClientRect().bottom, bottom: window.innerHeight } : undefined;
-}
-
-const pageFinder = createFinder(pageRoot, hostPainter, pageBand);
-
-/** The source view's row for `line`, which a requested find starts from. */
-function lineRow(line: number | undefined): Element | undefined {
-  if (line === undefined) return undefined;
-  return pageRoot()?.querySelector(`[data-line="${line}"]`) ?? undefined;
-}
-
-const pageTarget: FindTarget = {
-  run: (query, step, fromLine) => Promise.resolve(pageFinder.find(query, step, lineRow(fromLine))),
-  clear: () => pageFinder.clear(),
-  unsearchable: FILE_UNSEARCHABLE,
-};
-
-const appTarget: FindTarget = {
-  run(query, step) {
-    const frame = getVisibleAppFrame();
-    if (!frame) return Promise.resolve(null);
-    return askFrame(frame, 'find', step ? { query, step } : { query }, FIND_TIMEOUT_MS)
-      .then(parseFindReply, () => null);
-  },
-  clear() {
-    const frame = getVisibleAppFrame();
-    if (frame) tellFrame(frame, 'find', { clear: true });
-  },
-  unsearchable: 'This app can’t be searched',
-};
-
-function previewFrameWindow(): Window | null {
-  const frame = visibleElement(`iframe[data-role="${PREVIEW_FRAME_ROLE}"]`) as HTMLIFrameElement | null;
-  return frame?.contentWindow ?? null;
-}
-
-const previewFrameTarget: FindTarget = {
-  run(query, step) {
-    const win = previewFrameWindow();
-    if (!win) return Promise.resolve(null);
-    return askPreviewFind(win, step ? { query, step } : { query }, FIND_TIMEOUT_MS)
-      .then(parseFindReply, () => null);
-  },
-  clear() {
-    postToPreviewFrame(previewFrameWindow(), { kind: 'find', id: '', args: { clear: true } });
-  },
-  unsearchable: FILE_UNSEARCHABLE,
-};
-
+/** What a query on `surface` runs against. Only an open bar asks, and the bar
+ *  opens only once `findTargets` is in memory. */
 function targetFor(surface: FindSurface): FindTarget | null {
-  if (surface === 'thread') {
-    const threadId = focusedThreadId.value;
-    return threadId && transcriptSearchable(threadId) ? transcriptTarget(threadId, hostPainter) : null;
-  }
-  switch (contentFindKind()) {
-    case 'app': return appTarget;
-    case 'preview-frame': return previewFrameTarget;
-    case 'page': return pageTarget;
-    default: return null;
-  }
+  if (!searchable(surface)) return null;
+  const targets = findTargets.get();
+  if (surface === 'thread') return targets.threadTarget(focusedThreadId.value!);
+  return targets.contentTarget(contentFindKind()!);
 }
 
 /** The surface Mod+F would search: the focused pane, if what it shows has a
@@ -186,12 +111,12 @@ function targetFor(surface: FindSurface): FindTarget | null {
 export function focusedFindSurface(): FindSurface | null {
   const pane = isMobile() ? mobileView.value : focusedPane.value;
   if (pane !== 'content' && pane !== 'thread') return null;
-  return targetFor(pane) ? pane : null;
+  return searchable(pane) ? pane : null;
 }
 
 /** Whether `surface` shows something the bar can search, for its button. */
 export function findAvailable(surface: FindSurface): boolean {
-  return targetFor(surface) !== null;
+  return searchable(surface);
 }
 
 let typingTimer: ReturnType<typeof setTimeout> | null = null;
@@ -203,6 +128,9 @@ let activeTarget: FindTarget | null = null;
 let stopLandingWait = (): void => {};
 /** The landing wait's ticket. It is still the latest while the wait pends. */
 let landingTicket: number | null = null;
+/** An open still waiting on `findTargets`, and the surface it is for. */
+let pendingOpen: PendingOpen | null = null;
+let pendingSurface: FindSurface | null = null;
 
 function cancelTyping(): void {
   if (typingTimer !== null) clearTimeout(typingTimer);
@@ -244,10 +172,37 @@ function run(step?: 1 | -1, fromLine?: number): Promise<void> {
  *  the bar's field focuses a render later, outside the gesture, so this holds
  *  the keyboard for it now. Without `focus`, the caret stays where it is. */
 export function openFind(surface: FindSurface, { focus = true }: { focus?: boolean } = {}): void {
+  openFindThen(surface, focus, () => {});
+}
+
+/** Open the bar once `findTargets` is in memory, which is at once when warm,
+ *  then run `then`. A newer open replaces a waiting one. */
+function openFindThen(surface: FindSurface, focus: boolean, then: () => void): void {
   if (focus) holdSoftwareKeyboard();
-  if (findSurface.value && findSurface.value !== surface) closeFind();
-  findSurface.value = surface;
-  if (focus) findFocusRequest.value++;
+  pendingOpen?.cancel();
+  pendingSurface = surface;
+  pendingOpen = whenLoaded(findTargets, () => {
+    if (findSurface.value && findSurface.value !== surface) closeFind();
+    findSurface.value = surface;
+    if (focus) findFocusRequest.value++;
+    then();
+  }, null);
+}
+
+/** Take back an open still waiting on its code, for `surface` or for any.
+ *  True when there was one. */
+function takeBackOpen(surface?: FindSurface): boolean {
+  if (!pendingOpen?.pending || (surface && pendingSurface !== surface)) return false;
+  pendingOpen.cancel();
+  return true;
+}
+
+/** `surface`'s view went away or changed what it shows. Close its session,
+ *  or take back an open still waiting for it, so neither lands on the next
+ *  view. */
+export function endFindOn(surface: FindSurface): void {
+  if (findSurface.value === surface) closeFind();
+  else takeBackOpen(surface);
 }
 
 /** The bar on `surface` now shows `scope`, and its scope change has ended the
@@ -258,10 +213,11 @@ export function takeFindRequest(surface: FindSurface, scope: string): void {
   const request = findRequest.peek();
   if (request?.scope !== scope) return;
   findRequest.value = null;
-  openFind(surface, { focus: !hasCoarsePointer() });
-  cancelTyping();
-  findQuery.value = request.query;
-  runAfterLineLanding(request.line);
+  openFindThen(surface, !hasCoarsePointer(), () => {
+    cancelTyping();
+    findQuery.value = request.query;
+    runAfterLineLanding(request.line);
+  });
 }
 
 /** Search from `line` once the router's line landing is done. `LineNumberedCode`
@@ -285,6 +241,7 @@ function runAfterLineLanding(line: number): void {
 /** The Mod+F action. It closes an open bar, as Escape does, and otherwise
  *  opens the bar on the focused pane, when that pane has a target. */
 export function toggleFocusedFind(): void {
+  if (takeBackOpen()) return;
   if (findSurface.value) {
     closeFind();
     return;
@@ -294,6 +251,7 @@ export function toggleFocusedFind(): void {
 }
 
 export function toggleFind(surface: FindSurface): void {
+  if (takeBackOpen(surface)) return;
   if (findSurface.value === surface) closeFind();
   else openFind(surface);
 }
@@ -308,6 +266,7 @@ export function closeFind(): void {
 /** Forget the session without touching a target, for when the view goes away
  *  and takes its text with it. */
 export function resetFind(): void {
+  pendingOpen?.cancel();
   cancelTyping();
   stopLandingWait();
   latestTicket++;

@@ -8,7 +8,7 @@
  * the overlay's anchor, so a second tap closes. And Pin has to reach the menu,
  * now that no button carries it.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { MobileThreadTitleBar } from '../../layout/MobileAppHeader';
 import { ThreadTitlePin } from '../ThreadTitle';
@@ -30,6 +30,10 @@ vi.mock('../../../store/actions/thread-loading', () => ({
 }));
 
 import { handleSaveThread } from '../../../store/actions/threads';
+import { ThreadOverflowItemsChunk } from '../../shared/ThreadOverflowMenu';
+
+// The menu's rows are code-split. Warm them, so a click opens it at once.
+beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 const THREAD_ID = 'title-1';
 const TITLE = 'Run the nightly build';
@@ -153,7 +157,7 @@ afterEach(() => {
 describe('the mobile title row', () => {
   it('draws no pin and no ⋯, only the title as a menu button', () => {
     mount();
-    expect(host.querySelector('.pin-thread-btn')).toBeNull();
+    expect(host.querySelector('.pin-btn')).toBeNull();
     const menuButtons = host.querySelectorAll('button[aria-haspopup="menu"]');
     expect(menuButtons).toHaveLength(1);
     expect(menuButtons[0]).toBe(titleButton());
@@ -274,6 +278,6 @@ describe('the desktop title row', () => {
   it('keeps its pin', () => {
     viewportIsMobile.value = false;
     render(<ThreadTitlePin thread={makeThread()} />, host);
-    expect(host.querySelector('.pin-thread-btn')).not.toBeNull();
+    expect(host.querySelector('.pin-btn')).not.toBeNull();
   });
 });

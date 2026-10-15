@@ -2,9 +2,9 @@ import { effect, signal } from '@preact/signals';
 import { ApiError } from '../../api/client';
 import { fetchEventLocation } from '../../api/threads';
 import { EVENT_RESOLVE_DEADLINE_MS } from '../../components/chat/scrollState';
-import { UNANCHORABLE_ASYNC_EVENTS, changeReadyToReview, landingTarget, computeExchanges, deepLinkAnchorInThread } from '../thread-events';
+import { UNANCHORABLE_ASYNC_EVENTS, landingTarget, computeExchanges, deepLinkAnchorInThread } from '../thread-events';
 import type { LandingGroup, LandingTarget } from '../thread-events';
-import { showToast, threadMap, focusedThreadId, effectiveThreadStatus } from '../store';
+import { showToast, threadMap, focusedThreadId, effectiveThreadStatus, changeAwaitsApply } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
 import { ensureThreadByIdInMap, ensureWholeThreadLoaded, loadThreadEvents, threadEventsStillArriving } from './thread-loading';
 import { focusThread, landOnEvent } from './threads';
@@ -380,7 +380,7 @@ async function landOnTarget(threadId: string, group: LandingGroup): Promise<void
 function landingTargetIn(threadId: string, group: LandingGroup): LandingTarget | null {
   const thread = threadMap.value.get(threadId);
   if (!thread?.eventsLoaded) return null;
-  const changeReady = group === 'review' && changeReadyToReview(thread.meta);
+  const changeReady = group === 'review' && changeAwaitsApply(thread.meta);
   return landingTarget(computeExchanges(thread), effectiveThreadStatus(thread), group, changeReady);
 }
 

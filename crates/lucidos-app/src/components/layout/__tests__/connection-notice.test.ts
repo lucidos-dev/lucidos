@@ -19,7 +19,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { VNode } from 'preact';
-import { connectionNoticeRow } from '../HeaderMark';
+import { connectionNoticeRow } from '../BrandMenuRows';
 import { connectionNotice } from '../../../utils/connectionNotice';
 import { vnodeToText } from '../../chat/__tests__/vnodeToText';
 import type { ConnectionStatus } from '../../../store/types';

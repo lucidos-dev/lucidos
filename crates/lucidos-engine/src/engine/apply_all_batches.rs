@@ -25,7 +25,7 @@ use uuid::Uuid;
 /// format keeps the `failed` field of `ApplyAllBatchCompleted` self-
 /// describing (tuple serialization would emit a positional JSON array
 /// downstream consumers couldn't introspect).
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApplyFailure {
     pub change_id: Uuid,
     pub error: String,
@@ -156,6 +156,19 @@ impl BatchProgress {
         }
     }
 
+    /// The applying member waits in the landing lane. It parks like a
+    /// conflict, but never goes back in the queue: a failed lane batch queues
+    /// nothing by itself (ADR 0463).
+    pub(crate) fn park_in_lane(&mut self, change_id: Uuid) -> Advance {
+        let advance = self.park(change_id);
+        if advance != Advance::Duplicate {
+            if let Some(m) = self.member_mut(change_id) {
+                m.requeued = true;
+            }
+        }
+        advance
+    }
+
     /// Restore a queued member to the state a restart found it in: a live
     /// or resuming session owns it, resolving a conflict or not.
     ///
@@ -240,6 +253,16 @@ impl BatchProgress {
             .collect()
     }
 
+    /// Whether the press can start nothing more: no member is queued or
+    /// applying. The landing lane then opens one batch for what conflicted
+    /// (ADR 0480).
+    pub(crate) fn is_submitted(&self) -> bool {
+        !self
+            .members
+            .iter()
+            .any(|m| matches!(m.status, MemberStatus::Queued | MemberStatus::Applying))
+    }
+
     /// True when every member has resolved. The driver emits
     /// `ApplyAllBatchCompleted` and removes the batch from the registry.
     pub(crate) fn is_complete(&self) -> bool {
@@ -307,6 +330,15 @@ impl ApplyAllRegistry {
     /// drain + remove each batch under one lock.
     pub(crate) fn batch_ids(&self) -> Vec<Uuid> {
         self.inner.keys().copied().collect()
+    }
+
+    /// The `change_ids` no batch holds, in order. A change belongs to one
+    /// running batch at most.
+    pub(crate) fn not_in_any_batch(&self, change_ids: Vec<Uuid>) -> Vec<Uuid> {
+        change_ids
+            .into_iter()
+            .filter(|id| self.batch_for_change(*id).is_none())
+            .collect()
     }
 
     /// Find the batch that contains `change_id`, if any. Returns the batch
@@ -488,6 +520,63 @@ mod tests {
         assert_eq!(
             batch.resolve(ids[0], Err(collision())),
             Advance::Start(ids[0])
+        );
+    }
+
+    /// A press is submitted once it can start nothing more. Members waiting in
+    /// the lane or on a resolver do not hold it. So the lane opens one batch
+    /// for the press before any of them lands.
+    #[test]
+    fn a_press_is_submitted_once_nothing_is_queued_or_applying() {
+        let ids = uuids(3);
+        let mut batch = started(&ids);
+        assert!(!batch.is_submitted());
+        assert_eq!(batch.park_in_lane(ids[0]), Advance::Start(ids[1]));
+        assert!(!batch.is_submitted());
+        assert_eq!(
+            batch.resolve(ids[1], Err("refused".into())),
+            Advance::Start(ids[2])
+        );
+        assert!(!batch.is_submitted(), "the last member is applying");
+        assert_eq!(batch.park(ids[2]), Advance::Wait);
+        assert!(batch.is_submitted(), "only parked members are left");
+        assert_eq!(batch.park_in_lane(Uuid::new_v4()), Advance::Duplicate);
+        assert!(batch.is_submitted(), "a stranger's report changes nothing");
+        assert!(!batch.is_complete());
+        batch.resolve(ids[0], Ok(()));
+        batch.resolve(ids[2], Ok(()));
+        assert!(batch.is_submitted(), "a complete press stays submitted");
+    }
+
+    /// A change already in a running batch stays out of a second one, so two
+    /// presses never share a member.
+    #[test]
+    fn a_change_joins_one_running_batch_at_most() {
+        let ids = uuids(3);
+        let mut reg = ApplyAllRegistry::default();
+        reg.insert(started(&ids[..2]));
+        assert_eq!(reg.not_in_any_batch(ids.clone()), vec![ids[2]]);
+        assert!(reg.not_in_any_batch(ids[..2].to_vec()).is_empty());
+    }
+
+    /// A failed lane batch queues nothing by itself, so a lane member never
+    /// earns the collision retry.
+    #[test]
+    fn a_member_waiting_in_the_landing_lane_is_never_requeued() {
+        let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
+        let mut batch = BatchProgress::new(Uuid::new_v4(), ids.clone(), None);
+        assert_eq!(batch.start_next(), Some(ids[0]));
+        assert_eq!(batch.park_in_lane(ids[0]), Advance::Start(ids[1]));
+        let collided = format!(
+            "{}: overlap",
+            crate::engine::git_ops::CONCURRENT_MAIN_CONFLICT
+        );
+        batch.resolve(ids[1], Ok(()));
+        assert_eq!(batch.resolve(ids[0], Err(collided)), Advance::Complete);
+        assert_eq!(
+            batch.failures().len(),
+            1,
+            "the lane decided, and nothing retries"
         );
     }
 

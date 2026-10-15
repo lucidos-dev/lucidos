@@ -768,6 +768,94 @@ fn conflict_resolution_cleanup_only_applies_clean_generated_turns() {
     }
 }
 
+/// A lane thread's run reports to the lane by the merge-fix rule. Only a clean
+/// generated turn completes. A failed or unfinished turn fails the batch
+/// whole, and a pending continuation hands the batch on without a report.
+#[test]
+fn a_lane_thread_run_completes_fails_or_hands_off_like_a_merge_fix() {
+    use crate::engine::landing_lane::LaneThreadEnd;
+
+    assert_eq!(
+        lane_thread_end(false, &Some(TerminalKind::Generated), false, None),
+        Some(LaneThreadEnd::Completed)
+    );
+    assert_eq!(
+        lane_thread_end(true, &Some(TerminalKind::Generated), false, None),
+        Some(LaneThreadEnd::Failed(
+            "The lane thread ended without finishing its merges.".into()
+        ))
+    );
+    assert_eq!(
+        lane_thread_end(
+            false,
+            &Some(TerminalKind::Failed {
+                error: "boom".into()
+            }),
+            false,
+            None
+        ),
+        Some(LaneThreadEnd::Failed(
+            "The lane thread ended without finishing its merges.".into()
+        ))
+    );
+    assert_eq!(
+        lane_thread_end(true, &None, true, None),
+        None,
+        "a continuation carries the batch on"
+    );
+    assert_eq!(
+        lane_thread_end(false, &Some(TerminalKind::Generated), true, None),
+        Some(LaneThreadEnd::Completed),
+        "a clean finish beats a racing continuation"
+    );
+}
+
+/// A Stop on a lane thread ends the turn, as on any thread, and keeps the
+/// batch open for the thread's next turn. Only Archive or Discard, which end
+/// the thread's part, fail it.
+#[test]
+fn a_stopped_lane_thread_keeps_its_batch_open() {
+    use crate::engine::landing_lane::LaneThreadEnd;
+    use crate::engine::thread_events::CancelCause;
+    use crate::engine::StopReason;
+
+    for cause in [CancelCause::UserStop, CancelCause::SupersededByFollowup] {
+        assert_eq!(
+            lane_thread_end(true, &Some(TerminalKind::Canceled(cause)), false, None),
+            Some(LaneThreadEnd::Stopped),
+            "a canceled turn leaves the batch open: {cause:?}"
+        );
+    }
+    assert_eq!(
+        lane_thread_end(
+            false,
+            &Some(TerminalKind::Generated),
+            false,
+            Some(StopReason::UserStop)
+        ),
+        Some(LaneThreadEnd::Stopped),
+        "a Stop the run loop took beats the previous turn's clean end"
+    );
+    for stop in [StopReason::Archive, StopReason::Discard] {
+        assert!(
+            matches!(
+                lane_thread_end(false, &None, false, Some(stop)),
+                Some(LaneThreadEnd::Failed(_))
+            ),
+            "{stop:?} fails the batch"
+        );
+    }
+    assert!(matches!(
+        lane_thread_end(
+            false,
+            &Some(TerminalKind::Canceled(CancelCause::UserAction)),
+            false,
+            None
+        ),
+        Some(LaneThreadEnd::Failed(_))
+    ));
+}
+
 /// A pending auto-recovery continuation transfers the merge duty instead of
 /// aborting — for interrupted turns, regardless of leftover unmerged files (a
 /// stray-killed merge turn is EXPECTED to leave conflicts behind for the

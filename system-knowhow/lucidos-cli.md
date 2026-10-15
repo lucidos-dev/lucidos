@@ -13,8 +13,9 @@ A shell command on the `PATH` of every subprocess Lucidos spawns: Python scripts
 - spawn a new *thread* with `lucidos spawn-thread`: a chat thread, or a *coding-agent thread* on a repo or an app folder. `--coding-agent claude-code|codex` picks the backend, `--folder data/apps/<id>` targets an app worktree
 - subscribe the calling thread to an event instead of polling, and finish. The engine re-opens the thread when the event lands: `lucidos await-event`
 - read what this thread is subscribed to, and stop watching: `lucidos event-waits list` / `lucidos event-waits cancel`
-- run work that has to outlive a coding agent's turn, and be re-opened when it finishes: `lucidos background-task run --description "<what it is>" -- <command>`
+- run work longer than one foreground call, and poll it (`lucidos background-task run --poll`, then `wait <id>`) or be re-opened when it finishes (`run` alone)
 - list pending and applied *changes* (`lucidos changes list`), and apply a pending one: `lucidos changes apply <id>`
+- read whether main is red, and by what: `lucidos main-check status`
 - read system-knowhow and user knowhow: `lucidos knowhow list` / `lucidos knowhow read <id>`. An *app coding-agent thread* cannot see `system-knowhow/`, so this is how it pulls app-building guides
 - call an external API configured in `data/config/apis.json`. The engine injects the auth header, so the credential never appears in the script
 - send a push notification to the user without an LLM thread
@@ -93,6 +94,23 @@ still happens when the coding-agent turn idles.
 Do not call it from scripts. It needs the subprocess-origin headers the CLI
 attaches in spawned subprocesses.
 
+### Hidden: `lucidos merge-driver`
+
+A git merge driver, run by git for a path whose `.gitattributes` line names
+`merge=lucidos-sorted-lines` or `merge=lucidos-blocks`.
+Git passes the base, ours and theirs files. The driver writes the merge over
+ours and exits 0 for a clean merge or 1 for a conflict.
+
+- `sorted-lines` merges a list of numbered `- ` lines by number and keeps it
+  sorted.
+- `blocks` merges markdown by heading and top-level bullet, so two entries
+  added at one spot both stay. An entry both sides edited gets git's line
+  merge.
+
+Exit 2 means it did not merge, for example a file it cannot key. The
+registered command then merges the path as plain text. Nothing registers these
+drivers except a repository's own setup, so the subcommand is inert elsewhere.
+
 ### Hidden: `lucidos cc-agent-guard`
 
 The PreToolUse hook Claude Code runs before every `Agent` call in a Lucidos
@@ -170,7 +188,7 @@ an HTTP call rather than a write outside the worktree.
 
 ```bash
 # from a local file you generated elsewhere
-$ lucidos data write artifacts/data-analysis/2026-04-20/report.html --from /tmp/report.html
+$ lucidos data write artifacts/data-analysis/2026-04-20/report.html --from "${TMPDIR:-/tmp}/report.html"
 
 # from stdin (default; also `--from -`)
 $ echo '{"hello": "world"}' | lucidos data write artifacts/foo.json
@@ -178,7 +196,7 @@ $ echo '{"hello": "world"}' | lucidos data write artifacts/foo.json
 
 Two outputs:
 
-- **stderr**: the resolved absolute filesystem path, so you can capture it separately (`… 2>/tmp/path`). The path is always the last line.
+- **stderr**: the resolved absolute filesystem path, so you can capture it separately (`… 2>"${TMPDIR:-/tmp}/path"`). The path is always the last line.
 - **stdout**: a ready-to-paste clickable Lucidos chat link, like `lucidos spawn-thread` prints:
 
 ```bash
@@ -200,7 +218,7 @@ A picture (`gif`, `jpeg`, `jpg`, `png`, `svg`, `webp`) prints as a markdown
 opens a preview on tap. So paste the line as printed:
 
 ```bash
-$ lucidos data write artifacts/design/options.png --from /tmp/options.png
+$ lucidos data write artifacts/design/options.png --from "${TMPDIR:-/tmp}/options.png"
 ![options.png](artifacts/design/options.png#1600x1200)   # stdout
 The user cannot see this picture yet. ...                # stderr, before the path
 ```
@@ -477,6 +495,7 @@ $ lucidos threads detach --thread 9c1f2b40-...
 ```
 
 - **From inside a thread you can move only your own DIRECT children.** The engine reads the calling thread off the origin token, exactly as for `follow-up`. Anything else is a 403. Outside a thread, with no origin token, it moves any thread that has a parent.
+- **It needs nothing else.** Moving your own child out creates a top-thread, and any thread may create one (ADR 0475).
 - **Nothing is stopped.** The child keeps running, finishes on its own and proposes any change. Its result goes to its own timeline only.
 - **The former parent gets nothing more.** No completion card, no follow-up, and it leaves `--my-children`. A card the child earned before the move still arrives.
 - **It frees no child slot while the child runs.** The moved child counts against the former parent's cap until it finishes.
@@ -489,30 +508,36 @@ Archive this thread, or one of its own direct children (ADR 0310). Wraps `POST /
 
 ```bash
 $ lucidos threads archive --thread 9c1f2b40-...
-{"archived":["9c1f2b40-..."],"skipped":[]}
+{"archived":["9c1f2b40-..."],"skipped":[],"summary_versions":{"9c1f2b40-...":12}}
 
 $ lucidos threads archive --thread current
 {"requested":"4b7e0c11-...","detail":"This thread is archived once its turn ends and it has settled."}
 ```
+
+`summary_versions` gives each archived thread's row version once its archive landed. A client that moved the row early holds it until the row reaches that version.
 
 - **From inside a thread you can archive only yourself and your own DIRECT children.** The engine reads the calling thread off the origin token, and resolves `current` to it. Anything else is a 403 with `not_your_thread`, an unknown id a 404, and a discarded thread a 409. Outside a thread, with no origin token, it archives any thread, as the Archive button does.
 - **A child is archived now**, with its own sub-threads. **`current` is archived once this turn ends** and the thread has settled. A new message into it before then keeps it open.
 - **The home thread is never archived**, by anyone: a 409 with `home_thread`.
 - **The Archive button's refusals apply.** A running target or one waiting on the user is a 409 with `parent_not_archivable`. A pending change is `parent_has_pending_changes`, and a blocking sub-thread is `descendants_blocking`. A target parked on an event wait with unproposed work is `parent_holds_held_proposal`: stop waiting first. Each body carries a `message` saying what to do.
 - **A pinned target is a 409 with `thread_pinned`**: only the user archives a pinned thread. A pinned sub-thread of the target stays open and is listed under `skipped`.
-- **Archiving lets the worktree be reclaimed**, so a later follow-up rebuilds it.
+- **Archiving removes the worktree about an hour later.** Uncommitted work is committed on the thread's branch first, and the branch stays while it holds unapplied commits. A later follow-up rebuilds the worktree from it.
 
-### `lucidos spawn-thread --to <WS> --message <M> [--image <path> ...] [--coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--coding-agent-model <M>] [--reasoning-effort <level>]`
+### `lucidos spawn-thread --to <WS> --message <M> [--image <path> ...] [--coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--wake-mode <mode>] [--integrated] [--title <T>] [--model <M>] [--coding-agent-model <M>] [--reasoning-effort <level>]`
 
 Start a new *thread* in another (or this same) workspace: a *chat thread* by default, or a *coding-agent thread* with a coding-agent flag. `--to` takes an absolute path, or a bare workspace name. A bare name resolves against `$LUCIDOS_WORKSPACES_ROOT` when set, else the directory holding your own workspace, else `~/workspaces`. So a sibling workspace is always reachable by name. Caller provenance (`caller_*` fields) defaults from `$LUCIDOS_WORKSPACE` / `$LUCIDOS_THREAD_ID` / `$LUCIDOS_EVENT_ID`, which the engine sets on every spawned subprocess. Prints a clickable `[title](thread:<ws>/<uuid>)` markdown link on stdout.
 
 A workspace on another install is not a sibling: a packaged app and a dev checkout serve separate workspace sets, so pass its absolute path. That is the only route there, since `run_coding_agent(workspace=…)` takes a basename alone.
 
-`--relation top` (the default) starts an independent thread that does not report back. `--relation child` is a same-workspace spawn with a callback: the calling thread auto-resumes when the child finishes.
+`--relation top` (the default) starts an independent thread that does not report back. `--relation child` is a same-workspace spawn with a callback: the child reports to the calling thread when it finishes.
+
+Pick `--relation child` only when the calling thread will act on the result. A child's report costs the caller a turn or a filed report, and a top-thread costs it nothing (`system-knowhow/orchestrating-sub-threads.md` § Child or top-thread).
+
+`--wake-mode` sets the child's *wake mode*, so it needs `--relation child`. `wake` re-opens this thread for every report: use it when you need the result to continue. `wake-when-all-done` files each clean report until no other child of the batch still works, then wakes you. `no-wake` files every clean report, for a result the user reads that you may still want next turn. Omitted, it is `wake`, or `no-wake` when the calling thread is the home thread. A failure wakes you under every mode, the mode lasts the child's life, and the engine refuses any other value.
 
 **A spawn needs something to say.** A blank `--message` with no `--image` exits non-zero before any request, and the target engine refuses one with a 400 too. No thread is created either way. The usual cause is `--message "$(cat brief.md)"` where `brief.md` was never written, so guard it: `test -s brief.md && lucidos spawn-thread … --message "$(cat brief.md)"`.
 
-A top-thread sits under the workspace, not under you, so creating one is the *workspace owner*'s call (ADR 0168). From a thread, `--relation top` needs their standing instruction: a turn they opened, or a trigger firing they authorized. Failing that, it needs their *owner approval* for that one spawn. Without either it exits non-zero on a 403 that names them. Ask for an approval with `lucidos ask-owner-approval create-top-thread`, below. `--relation child` stays inside your own subtree and needs nothing.
+Neither relation needs the *workspace owner*. Any thread may create a top-thread, in any turn (ADR 0475). A top-thread still sits under the workspace, not under you, so you gain no reach over it.
 
 **Images:** `--image <path>` attaches an image file to the message. Repeat it for several. The target engine judges each one exactly as it judges an image attached in the app. It reads the format from the bytes, takes PNG, JPEG, WebP, GIF and HEIC, and fits a large image to the model's size limit. Any other format fails the whole spawn with a 415 naming it, before any thread starts. The file extension does not matter, and a missing file fails before any request.
 
@@ -559,22 +584,36 @@ $ lucidos spawn-thread --to dev --coding-agent claude-code \
 [Ideation session](thread:dev/9b07…)
 ```
 
-### `lucidos ask-owner-approval <verb> [--thread <uuid>] --reason <R>`
+**Integrated sub-threads:** `--integrated` spawns an *integrated sub-thread*, a follow-up of your own work that folds into your branch. Use it for follow-ups of your own Lucidos-source work, so the whole set lands as your one change. It needs `--relation child` and a coding-agent flag, and does not work with `--mode human`. The child must be Lucidos source (no `--folder`), and you must be a Lucidos-source coding-agent thread. The CLI or the engine refuses anything else, naming the flag to fix.
 
-Ask the *workspace owner* to let this thread do one act outside its own subtree, once: an *owner approval* (ADR 0387). Use it when a clause-4 act was refused, or will be, and the owner has not opened your current turn. Examples: a top-thread, or applying another thread's change.
+- The child runs the *fast tier* of `/harden` and proposes nothing. It has no change and no Apply.
+- Its report names its branch and the head its `/harden` certified. Merge it into your branch with `git merge <branch>` when it arrives. The engine never writes your branch.
+- Your own `/harden` then reviews only what no child's run reviewed, and runs every suite once over the merged work.
+- If you are archived with a child's branch unmerged, its work is set aside like any archived thread's.
+
+```bash
+$ lucidos spawn-thread --relation child --integrated --to "$(basename "$LUCIDOS_WORKSPACE")" \
+    --coding-agent claude-code --title "Follow-up: retry the probe" \
+    --message "Make the health probe retry once on a refused connection."
+```
+
+### `lucidos ask-owner-approval <verb> --thread <uuid> --reason <R>`
+
+Ask the *workspace owner* to let this thread do one act outside its own subtree, once: an *owner approval* (ADR 0387). Use it when a clause-4 act was refused, or will be, and the owner has not opened your current turn. Examples: applying another thread's change, or archiving a thread outside your subtree.
 
 It takes two steps, because a question card lives inside the turn that asks it:
 
-1. Run `lucidos ask-owner-approval create-top-thread --reason "The e2e fix belongs in its own thread."`. It records the request on your own thread and prints an id like `owner-approval:<uuid>`.
+1. Run `lucidos ask-owner-approval apply --thread <uuid> --reason "The release needs the e2e fix first."`. It records the request on your own thread and prints an id like `owner-approval:<uuid>`.
 2. Call `AskUserQuestion` (Codex: `ask_user_question`) with exactly one question whose text is that id, and any two options. Lucidos shows its own card in that question's place: it names the act, offers **Allow once** and **Don't allow**, and quotes your reason as yours.
 
 If the owner answers **Allow once**, do the act next, in this turn. The first matching call spends the approval. A second attempt, the same verb at another thread, or any other verb is refused again. The approval also ends when your thread's next turn starts. An engine resume and an event-wait wake do not count as one.
 
-- **Verbs**: `create-top-thread` takes no `--thread`. These each take `--thread <uuid>`: `archive`, `cancel`, `continue`, `apply`, `discard`, `set-aside`, `bring-back`, `revert`, `control`, `ask-side-question`, `dismiss-side-question`. `answer-question` and `resolve-permission` are refused: a card never asks to answer another card.
-- **Refusals**: a 409 when you already hold the authority (inside your own subtree, or your turn carries the standing instruction). A 403 outside a coding-agent session. A 400 for a missing reason or a target that does not fit the verb.
+- **Verbs**, each with `--thread <uuid>`: `archive`, `cancel`, `continue`, `apply`, `discard`, `set-aside`, `bring-back`, `revert`, `control`, `ask-side-question`, `dismiss-side-question`, and `spawn-successor`, naming your parent, to start your *successor thread* under it. `answer-question` and `resolve-permission` are refused: a card never asks to answer another card.
+- **No approval for a spawn.** Creating a top-thread and moving your own child to top level need none (ADR 0475). `create-top-thread` and `detach-child` answer a 409 that says so.
+- **Refusals**: a 409 when you already hold the authority (inside your own subtree, or your turn carries the standing instruction). A 403 outside a coding-agent session. A 400 for a missing reason or a missing `--thread`.
 - **Only the owner can allow it.** An agent answering the card is refused, including the agent that asked. "Don't allow", Cancel, a typed reply, or no answer allows nothing.
 
-Over `POST /api/v1/owner-approvals`, with body `{verb, target_thread_id?, reason}`. The request lands on the thread your origin token names.
+Over `POST /api/v1/owner-approvals`, with body `{verb, target_thread_id, reason}`. The request lands on the thread your origin token names.
 
 ### `lucidos await-event --on <EventType> [--on <EventType> ...] [--condition <JSON>] --timeout-secs <N> --reason <R>`
 
@@ -598,16 +637,20 @@ by name. It is **not** for external state with no Lucidos event (a third-party
 API, a file another process may write): nothing would be delivered, so poll.
 
 **And never subscribe to your own child's completion.** A thread spawned with
-`lucidos spawn-thread --relation child` already re-opens this one. When it
-finishes, the engine emits `ChildThreadCompleted` here and re-opens this thread
-with the child's status, summary, `pending_change_ids` and
-`sub_thread_pending_changes`. A wait on it buys nothing and costs two things:
+`lucidos spawn-thread --relation child` reports to this one on its own. When it
+fails, or its *wake mode* wakes you, the engine emits `ChildThreadCompleted`
+here and re-opens this thread with the child's status, summary,
+`pending_change_ids` and `sub_thread_pending_changes`. A clean report its mode
+files lands as a `ChildReportFiled`, which re-opens nothing: you read it at the
+front of your next prompt. So when you need the result to continue, pass
+`--wake-mode wake`. A wait on your own child buys nothing and costs two things:
 one of the subscriptions the loop cap allows, and a second clock. A child that
 outlives `--timeout-secs` re-opens this thread with a pointless expiry, then
 again when it finishes.
 
-Await a `ChildThreadCompleted` only for a completion that is **not** your own
-child's, named with `--condition '{"child_thread_id": "<uuid>"}'`. Matching is
+Await a `ChildThreadCompleted`, with `--on ChildReportFiled` beside it, only for
+a completion that is **not** your own child's, named with
+`--condition '{"child_thread_id": "<uuid>"}'`. Matching is
 workspace-wide, so that is any thread's child, not only a descendant of yours.
 A coding-agent session another thread spawned is a first-class thing to watch.
 A session **nobody** spawned (the user started it) has no
@@ -673,20 +716,34 @@ $ lucidos await-event --on ChangeProposed --condition '{"file_count": {"$gt": 0}
     --timeout-secs 1800 --reason "the refactor to propose its change"
 ```
 
-### `lucidos background-task run [--description <T>] [--timeout-secs <N>] -- <command>` / `output <task_id>` / `stop <task_id>`
+### `lucidos background-task run [--poll] [--description <T>] [--timeout-secs <N>] -- <command>` / `wait <task_id> [--max-secs <N>]` / `output <task_id>` / `stop <task_id>`
 
-Run work that has to outlive your turn, then **end your turn**. The engine runs
-the command as a *background task* in this thread's worktree. It arms an event
-wait on the task's `BackgroundBashCompleted` before `run` returns. When the task
-finishes, the engine re-opens this thread with the exit status and the tail of
-its output. Nothing waits in the meantime, so no turn re-reads its context.
+Run work longer than one foreground call. The engine runs the command as a
+*background task* in this thread's worktree. Pick the wait by how long the work
+should take:
 
-Use it for anything longer than a foreground call can hold: a full test suite,
-an e2e run, a release build. A command you background yourself (`&`, `nohup`)
-dies when your turn ends, because the engine stops every process you started.
-Claude Code's own background mode is off in a Lucidos session, so a foreground
-call that outruns its timeout is killed. Anything that surely fits in 10 minutes is
-simpler as one foreground call with the maximum timeout.
+- **About 3 minutes or less:** no background task. Run it as one foreground
+  call, with an explicit `timeout: 240000` in Claude Code.
+- **Longer, the usual case:** `run --poll`, then `wait <task_id>` in the
+  foreground. Each `wait` blocks until the task finishes or 230 s pass, then
+  prints the new output. Re-issue it until it reports `finished`. No event
+  wait is armed, so nothing re-opens the thread later.
+- **An open-ended wait**, such as a run queued behind a held lock: `run`
+  without `--poll`, then **end your turn**. The
+  engine arms an event wait on the task's `BackgroundBashCompleted` before
+  `run` returns. When the task finishes, it re-opens this thread with the exit
+  status and the tail of its output.
+
+The 230 s cap is the point of polling. A Claude Code prompt cache lives 5
+minutes from the last request. After a longer gap, the next request pays to
+re-read the whole context. A poll keeps every gap inside that window. Either
+way the engine kills a task still running after its `--timeout-secs`, at most
+an hour.
+
+A command you background yourself (`&`, `nohup`) dies when your turn ends,
+because the engine stops every process you started. Claude Code's own
+background mode is off in a Lucidos session, so a foreground call that outruns
+its timeout is killed.
 
 - **One argument after `--` runs as written**, so quote a pipeline or a
   redirect as a single string. Several arguments run as exactly those words.
@@ -696,10 +753,14 @@ simpler as one foreground call with the maximum timeout.
   thread waits on. Without it the row shows the command line.
 - `--timeout-secs` kills a task still running after that long. Default and
   maximum: 3600.
-- `run` prints a `status`. `watched` means end your turn now. `unwatched` means
-  the thread hit a subscription limit and nothing will wake it: stop the task
-  and run the command in the foreground. `finished` means it was quick, and the
-  output is already in the response.
+- `run` prints a `status`. `polled` means call `wait` now. `watched` means end
+  your turn now. `unwatched` means the thread hit a subscription limit and
+  nothing will wake it: stop the task and poll it instead. `finished` means it
+  was quick, and the output is already in the response.
+- `wait` prints what `output` prints. While the task runs, that is the new
+  output plus a `message` saying to wait again. Once it has finished, it is the
+  final record, with `exit_code` and `status`. A `wait` that runs out of time
+  never stops the task. `--max-secs` returns sooner, and the cap is 230.
 - The re-open message carries each output stream's last 4000 bytes. `output
   <task_id>` prints more: what arrived since your last read while the task
   runs, and its final record once it has finished.
@@ -726,9 +787,14 @@ on its own signals nothing, so a `nohup … &` it started keeps running. The cha
 agent's `run_bash_background` behaves the same way.
 
 ```bash
-# The normal shape: start the suite, then end your turn.
-$ lucidos background-task run --description "the engine test suite" \
+# The usual case: start the suite, then wait in the foreground.
+$ lucidos background-task run --poll --description "the engine test suite" \
     -- 'lucidos build-slot -- cargo test > .lucidos/test.log 2>&1'
+$ lucidos background-task wait 5f0c2e1a-…   # re-issue until it reports finished
+
+# An open-ended wait: start it watched, then end your turn.
+$ lucidos background-task run --description "the nightly e2e sweep" \
+    -- './scripts/e2e.sh > .lucidos/e2e.log 2>&1'
 
 # Look in on it, or give up on it.
 $ lucidos background-task output 5f0c2e1a-…
@@ -922,6 +988,33 @@ hear now. A request clears once the end of your reply has been on screen for
 a second. The user's next message or an archive also clears it. A later `no`
 never clears it.
 
+### `lucidos wake-parent yes|no`
+
+Record this turn's *wake decision*, for a sub-thread whose parent declared no
+*wake mode*: whether your report wakes your parent thread. Run it before your
+final message. The answer is required, and the bare form is refused. It is the coding-agent counterpart of the chat
+agent's `wake_parent` tool, and records the same events:
+`ParentWakeRequested` for `yes`, `ParentWakeNotRequested` for `no`. It takes the
+thread from `$LUCIDOS_THREAD_ID` and has no thread flag. A thread with no parent
+gets a 409. A child whose parent declared its wake mode records nothing: the
+answer has status `declared`, and its report follows the mode.
+
+Say `yes` when your parent must act on the report now: it waits for this result
+to take a next step, combine results, retry, or decide something only it can.
+Say `no` when the report only informs. The user reads your findings in your own
+thread, and your parent reads the report on its next turn.
+
+```bash
+$ lucidos wake-parent no
+{"status":"file","message":"Recorded. When this turn ends cleanly, your report is filed on your parent thread, which reads it on its next turn. A failure still wakes it, and a follow-up that reaches you first reopens the decision."}
+```
+
+A `no` binds only a clean finish. A failure, a cancel or a turn an engine
+restart cut short always wakes the parent. A turn that ends without deciding is
+decided by one model call, and any doubt wakes the parent. A decision binds one
+report: your next turn starts undecided, and so does a follow-up that reaches
+you mid-turn.
+
 ### `lucidos notify --title <T> --message <M> [--app-id <APP>] [--tap <T>] [--thread-id <UUID>] [--event-id <UUID>] [--fragment <FRAG>]`
 
 Send a push notification via the parent workspace. It persists to the inbox AND fans out as a web push to subscribed devices, exactly like a `send_notification` LLM tool call. Any subprocess (Python script, bash script, scheduled `script:`-typed trigger) can call it without an LLM thread.
@@ -1034,7 +1127,7 @@ per-device key. The chat agent's in-process equivalent is the grouped
 
 Manage *triggers*: scheduled (cron) and/or event-driven automations. Generated
 from the manifest. The rich fields (`run`, `on`, `cron_expressions`,
-`side_effect_grant`) are passed as JSON strings.
+`side_effect_grant`, `mcp_servers`) are passed as JSON strings.
 
 ```bash
 $ lucidos triggers list
@@ -1073,8 +1166,8 @@ back rather than assuming the schedule means what you intended.
 `system-knowhow/triggers.md` § "Writing cron expressions" has the recipes.
 
 `create`/`update` accept `--name`, `--run`, `--cron-expressions`, `--on`,
-`--app-id`, `--go-to-review`, `--group-id`, `--side-effect-grant`, `--slug`,
-`--model`, `--reasoning-effort`, `--provider`;
+`--app-id`, `--go-to-review`, `--group-id`, `--side-effect-grant`,
+`--mcp-servers`, `--slug`, `--model`, `--reasoning-effort`, `--provider`;
 `update`/`delete`/`run` take `--id <uuid>`. The chat agent's in-process
 equivalent is the grouped `triggers` tool (`action: create | list | update |
 delete | pause | resume | run`). Pause/resume are tool-only there; the CLI
@@ -1208,42 +1301,60 @@ The routes answer in any workspace, from whatever summary trees exist; a
 Classic workspace has none. The Lucidos Agent reaches the same four through its
 `recall` tool, offered only once a Tree workspace's trees are ready.
 
-### `lucidos widgets list | thread [--thread-id T] | show --app-id <ID> [--thread-id T] [--params JSON] [--label L] | pin … | unpin … | make-reusable --app-id <ID> | stop-reusing --app-id <ID>`
+### `lucidos widgets list | thread [--thread-id T] | pin --app-id <ID> [--thread-id T] [--params JSON] [--label L] [--shown-event-id E] | unpin … | make-reusable --app-id <ID> | stop-reusing --app-id <ID> | board --layout L | arrange --layout L --tiles JSON`
 
 A thread's widgets, the *widget shelf* in its title row, and *reusable
 widgets*. A widget is an app folder whose app manifest says
-`"kind": "widget"`. It shows inline in its thread as a *widget card*, never in
-the apps list. Only a pinned widget has a chip on the shelf. Home draws no shelf:
-its pins list in Home's long-press menu instead. `--thread-id` defaults to
-`$LUCIDOS_THREAD_ID`, the session's own thread.
+`"kind": "widget"`. A reply embeds it, `![Name](app:<id>)`, and it shows there
+as an *inline widget*, never in the apps list. Only a pinned widget has a chip
+on the shelf. Home draws no shelf: its pins are tiles on the *Home board*.
+`--thread-id` defaults to `$LUCIDOS_THREAD_ID`, the session's own thread.
 
 ```bash
 $ lucidos widgets thread
 $ lucidos widgets pin --app-id fare-grid
 $ lucidos widgets unpin --app-id fare-grid
 $ lucidos widgets make-reusable --app-id fare-grid
-$ lucidos widgets show --app-id fare-grid --thread-id <uuid>
-$ lucidos widgets show --app-id lucidos-sound-player \
+$ lucidos widgets pin --app-id lucidos-sound-player \
     --params '{"clip":"artifacts/voices/marin.mp3"}' --label Marin
 $ lucidos widgets list
+$ lucidos widgets board --layout desktop
+$ lucidos widgets arrange --layout phone \
+    --tiles '[{"app_id":"clock","size":"small"},{"app_id":"inbox","size":"medium","hidden":true}]'
 ```
 
-- `show`, `pin` and `unpin` name a *widget instance*: the widget plus
+- `pin` and `unpin` name a *widget instance*: the widget plus
   `--params`, a JSON object of the names its manifest declares (ADR 0415).
   Two param sets are two instances, each with its own chip. `--label` names
   the instance's chip; it is not part of the instance.
-- `thread` lists the *thread widgets*: every instance shown or pinned in the thread, and which are pinned.
-- `show` puts a *widget card* in the thread. It adds no chip to the shelf.
-  Another thread's widget must be reusable first.
+- `thread` lists the *thread widgets*: every instance pinned in the thread, or
+  shown there by an old `WidgetShown`, and which are pinned.
 - `pin` puts the instance's chip on the shelf, and `unpin` takes it off. Each
   writes one thread event (`WidgetPinned`, `WidgetUnpinned`). No file and no
-  commit change, and the widget card stays. A pin needs no earlier showing,
-  since a *widget embed* records none.
+  commit change, and the inline widget stays. A pin needs no earlier showing,
+  since a *widget embed* records none. Another thread's widget must be
+  reusable first. `--shown-event-id` names an event of the turn that draws the
+  widget, so "Show in thread" lands there. It must be an event in that thread.
+- There is no `show`: a widget shows in a thread by an embed in a reply
+  (ADR 0466).
 - `make-reusable` and `stop-reusing` flip the `reusable` flag in the app
   manifest and commit it. A widget that stops being reusable belongs to its
   origin thread again, so Delete (a thread) on that thread removes it. When
-  that thread was deleted, `stop-reusing` is refused.
+  that thread was deleted, `stop-reusing` is refused. It is refused too while
+  Home pins the widget, since deleting its thread would empty the tile.
 - `list` names the reusable widgets.
+- `board` reads the *Home board* of one *layout class*, `phone` or
+  `desktop`: Home's pinned widgets in board order, each with its size, the
+  sizes it takes, and whether it is hidden. `GET /api/v1/home-board?layout=`.
+- `arrange` writes one `HomeBoardArranged` for a layout class and prints the
+  board it gives. Each tile names a widget instance pinned to Home, once, at a
+  size its manifest declares; anything else is refused. A pinned instance the
+  list leaves out keeps its place after the named ones. A new pin always
+  starts at its widget's default size: `pin` takes no size.
+  `POST /api/v1/widgets/arrange`.
+- `pin` to the home thread on another thread's own widget makes the widget
+  reusable first, in the same action, and the answer says
+  `"made_reusable": true`.
 
 Make a widget with the chat agent's `create_app` (`kind="widget"`), or write
 the folder yourself with `kind`, `origin_thread_id` and `reusable` in its
@@ -1266,7 +1377,7 @@ $ lucidos env-vars delete --name GITHUB_TOKEN_NOTE
 ```
 
 Names must match `[A-Z_][A-Z0-9_]*` and not be engine-reserved (`CRED_*`,
-`OAUTH_*`, `PG*`, `PATH`, internal `LUCIDOS_*`). **For secrets (API keys,
+`OAUTH_*`, `PATH`, internal `LUCIDOS_*`). **For secrets (API keys,
 tokens, passwords) use a credential, never this**: env var values appear in
 logs and events. `set` is an upsert (create-or-replace).
 
@@ -1370,17 +1481,26 @@ engine refuses `lucidos.request` from an app frame (ADR 0231). A script running
 as a subprocess is a different caller, and uses this subcommand rather than a
 hand-rolled GET.
 
-### `lucidos mcp list | start --id <id> | stop --id <id> | remove --id <id>`
+### `lucidos mcp list | enable | disable | start | stop | remove`
 
-Manage MCP servers: which are running, what tools they offer, and what those
-tools cost in context.
+Manage MCP servers: which are running, which threads use them, what tools they
+offer, and what those tools cost in context.
 
 ```bash
 $ lucidos mcp list
+$ lucidos mcp enable --thread-id <uuid> --id slack
+$ lucidos mcp disable --thread-id <uuid> --id slack
 $ lucidos mcp start --id slack
 $ lucidos mcp stop --id slack
 $ lucidos mcp remove --id backstage
 ```
+
+A running server's tools reach only the threads that enabled it (ADR 0430).
+`enable` switches a server on for one thread, starting it if it is not running,
+and wraps `POST /api/v1/threads/<uuid>/mcp-servers/<id>/enable`. `disable` wraps
+the matching `/disable` route and switches it off in that thread only. `start`
+from the CLI enables no thread. `stop` ends the process and switches the server
+off in every thread, and so does `remove`.
 
 `list` returns `servers`, `totals`, `model` and `context_window`. Every server
 carries its tools with a `wire_name` (the name a call must use), `chars` and
@@ -1393,22 +1513,26 @@ start, and `tools_observed_at` stamps when. `never-observed` means the server
 has never connected, so its tool list is unknown: that is NOT the same as a
 server with no tools, and a script must not report it as costing nothing.
 
-`totals` splits the cost. `tokens` is what running servers add to every request
-right now. `stopped_tokens` is what the stopped ones would add if started, and
-`disabled_tokens` what the switched-off tools would add back. Divide by
-`context_window` for the share of the resolved model's window.
+`totals` splits the cost a thread pays when it enables the servers. `tokens` is
+what the running servers would add, `stopped_tokens` what the stopped ones
+would add, and `disabled_tokens` what the switched-off tools would add back.
+`budget` is the worst case: one thread that enables every server, after the MCP
+share of the context. Divide by `context_window` for the share of the resolved
+model's window. A thread that enables nothing pays none of it.
 
 **Nothing starts MCP servers at boot.** A server is running only if something
 started it in the current engine process, so `running` resets on every restart.
+A thread keeps what it enabled, and its next turn starts those servers again.
 
 A server whose id cannot ride a wire tool name reports `dispatchable: false`.
 None of its tools can ever be called, `start` refuses it with a 422, and
 `remove` is the only useful verb. Registering a server is the chat agent's `mcp`
 tool, which takes the command and args this surface does not.
 
-Switching individual tools off is `PUT /api/v1/mcp/servers/<id>/disabled-tools`
-with `{"disabled_tools": ["<wire name>", ...]}`, a full replacement rather than a
-delta. No CLI flag for it: the set is a selection, not a scalar.
+Switching one tool off or back on is `PATCH /api/v1/mcp/servers/<id>/disabled-tools`
+with `{"wire_name": "<wire name>", "disabled": true}`. It answers with the stored
+set. Each call names one tool, so two clients switching different tools both
+land. No CLI flag for it.
 
 ### `lucidos changes list [--sub-threads-of <uuid> | --my-sub-threads]`
 
@@ -1477,7 +1601,7 @@ The response carries:
 
 | Field | Meaning |
 |---|---|
-| `status` | `applied`, `noop`, `hardening`, or `conflict` (see `docs/apply-change-api.md` for the full table) |
+| `status` | `applied`, `noop`, `hardening`, `conflict` or `queued` (see `docs/apply-change-api.md` for the full table). `queued` means the *landing lane* holds a Lucidos-source change, and `ChangeApplied` follows when it lands. |
 | `applied_commit` | 40-char SHA on `main` AFTER the merge (present on `applied` and idempotent `noop`) |
 | `previous_commit` | 40-char SHA on `main` BEFORE the merge |
 | `commits_applied` | Number of commits added to `main` (0 for `noop`) |
@@ -1545,15 +1669,47 @@ If you need the underlying URL for an operation the CLI covers, use
 § "Workspace resolution" for why. See `docs/apply-change-api.md` for the apply
 response shape and the full workflow.
 
-### `lucidos hardened mark` / `lucidos hardened query` / `lucidos hardened sha`
+### `lucidos main-check status [--json]`
 
-Record or read the hardening marker (see *Hardening* in the glossary): the HEAD SHA the last `/harden` run covered on a *Lucidos-source* coding-agent branch. All three resolve repo_root and branch from `$PWD`'s git worktree. They wrap `POST /api/v1/internal/mark-hardened` and `GET /api/v1/internal/hardened-state`. `mark` must run from a Lucidos-spawned process (a coding-agent session or an engine-spawned script) or from a shell on the machine holding the machine-local token. The engine refuses anyone else with 403, including a request that came through the gateway.
+Where the *main check* stands: the GitHub run on a stripped copy of `main` after changes landed. Wraps `GET /api/v1/main-check`. One fact per line:
 
 ```bash
-lucidos hardened mark    # /harden Phase 5: record HEAD as hardened
-lucidos hardened query   # FRESH (HEAD matches), STALE (commits since), or MISSING
-lucidos hardened sha     # the recorded SHA, fresh or stale; exit 1 when MISSING
+$ lucidos main-check status
+Main is red: Failed: engine, browser chromium.
+Range: 4f1c2a9e0b7d..9b1a77c3e210
+Run: https://github.com/lucidos-dev/lucidos/actions/runs/12345
+Fix thread: [Fix main](thread:myws/6fa459ea-ee8a-3ca4-894e-db77e160355e)
 ```
+
+The state is one of:
+
+| State | Meaning |
+|---|---|
+| `running` | A check runs now. The line names the sha it tests and the range it covers, then its run. |
+| `passed` | The last check passed, and nothing landed since. |
+| `red` | The last check failed. Its *fix thread* owns it, and no check starts until a change from that thread lands or the maintainer closes the red. |
+| `idle` | No check runs and main is not red. The next landing starts one. |
+| `unavailable` | This checkout cannot run the check: no release library, or no `lucidos` remote. |
+
+`--json` prints the engine's snapshot instead: `{state, check_id?, from_sha?, to_sha?, run_url?, fix_thread_id?, summary?}`. Exit non-zero on a transport or HTTP error.
+
+**Read it before fixing a failure that also fails on `main`.** When main is red with the same failure, the fix thread owns it. Do not fix it on your branch: say so, and carry on with your own change. There is no CLI form for closing a red. Only the maintainer closes one, from the Lucidos menu.
+
+### `lucidos hardened mark [--tier fast|full]` / `query` / `sha` / `tier` / `expected-tier` / `integrated-heads`
+
+Record or read the hardening marker (see *Hardening* in the glossary): the HEAD SHA the last `/harden` run covered on a *Lucidos-source* coding-agent branch, and the tier it ran. Every subcommand resolves repo_root and branch from `$PWD`'s git worktree. They wrap `POST /api/v1/internal/mark-hardened`, `GET /api/v1/internal/hardened-state` and `GET /api/v1/internal/integrated-heads`. `mark` must run from a Lucidos-spawned process (a coding-agent session or an engine-spawned script) or from a shell on the machine holding the machine-local token. The engine refuses anyone else with 403, including a request that came through the gateway.
+
+```bash
+lucidos hardened mark              # /harden Phase 5: record HEAD as hardened, full tier
+lucidos hardened mark --tier fast  # an integrated sub-thread's /harden Phase 5
+lucidos hardened query             # FRESH (HEAD matches), STALE (commits since), MISSING, or NOT_NEEDED
+lucidos hardened sha               # the recorded SHA, fresh or stale; exit 1 with no marker
+lucidos hardened tier              # the recorded tier, fast or full; exit 1 with no marker
+lucidos hardened expected-tier     # the tier /harden runs here: fast or full
+lucidos hardened integrated-heads  # your integrated children's hardened heads, one per line
+```
+
+**A fast marker counts only for an integrated sub-thread.** The engine refuses `--tier fast` on any other branch with a 409, since it would not count there. A full marker counts everywhere. `query` answers for the tier the branch needs, so a fast marker on a branch that needs the full run reads `MISSING`. A branch that lands implementation plans only reads `NOT_NEEDED` in place of `STALE` or `MISSING`: Apply never hardens it, so `/harden` stops there.
 
 Run from a coding-agent session, `mark` also stops every background task the thread still has running, since this hardening supersedes it. Their completions will not re-open the thread (ADR 0369). It then prints what it stopped, and every wait still live on the thread:
 
@@ -1603,9 +1759,9 @@ lucidos planned state
 
 That option pair is a **floor**, not a fixed shape. The question tool needs at least two options, so `Request changes` fills the second slot only when the plan has no real fork. When it has one (a narrower scope, one layer instead of two), the fork takes the slot. `Request changes` is then dropped, not carried as a third option meaning only "I will type what I want changed".
 
-A heavy planning thread may also offer **`Implement in a new thread`**: one holding a long grill or many pictures, for a plan spanning several phases or layers. It counts like a fork, so `Request changes` is dropped whenever it appears. Picking it approves the plan. The agent runs `lucidos planned approve`, spawns a child coding-agent thread with `lucidos spawn-thread --to "$LUCIDOS_WORKSPACE" --relation child --coding-agent <claude-code|codex>`, and ends its turn. Without the backend flag the spawn starts a chat thread, which cannot build.
+**The thread's measured context decides the shape, never the agent.** `mark --plan` reads `GET /api/v1/threads/:id/context` and prints the options to offer, and the edit gate prints the same. When the engine says the context is large enough, the card reads **`Implement in a new thread (Recommended)`** first and `Approve here` second. A real fork may join them, and `Request changes` never does. Otherwise it is today's floor. A size the CLI could not read prints today's floor and says the size is unknown.
 
-The child's worktree starts from `main`, so its first step is `git merge <planning branch>` to get the plan commit. It then runs `mark --plan` and `approve` on the same plan without asking again. `mark --plan` prints this guidance, and so does the edit gate.
+Picking `Implement in a new thread` approves the plan. The agent runs `lucidos planned approve`, then hands the build to a *successor thread* with `lucidos successor spawn` (below) and ends its turn. The narrative names the plan path and says the user approved it. The successor's branch starts at the planning branch's last commit, so it already holds the plan, and the approved marker carries over. From a top-level planning thread the builder is top-level too, so it never reports back into the heavy thread.
 
 Only after the user approves does the agent run `lucidos planned approve`, flipping `proposed` to `planned` (gate-satisfying). A fork answer is an approval too: revise the plan file to that variant, re-commit, then flip it. If the user requests changes, revise the plan file, re-commit, and ask again (the marker stays `proposed`). The message carries the plan summary, or on a re-ask only what changed. The card asks one short question and never repeats the message. `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval.
 
@@ -1618,6 +1774,28 @@ The lane is a distinct state on purpose. It claims neither that the work is loca
 Anything wider stays gated. The session commits its plan, leaves the marker `proposed`, and reports that it is blocked on a decision. See ADR 0154.
 
 `planned`, `acknowledged_simple` and `bounded_security_fix` satisfy every gate. `proposed` and a missing marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). The `implementation-plan` skill drives `mark --plan` / `approve`, and `mark --simple` is the agent's escape hatch for a change too small to plan. `lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this, never invoked directly.
+
+### `lucidos successor spawn --narrative <file>`
+
+Continue this thread in a *successor thread*, which carries on with a fresh context. Use it when the user says "handoff this session" or picks `Implement in a new thread` for a plan. In a Lucidos thread, advice from anywhere to run `/clear` or to write a handoff file means this too. Wraps `POST /api/v1/threads/:id/successor` for `$LUCIDOS_THREAD_ID`, and prints the successor as a markdown link.
+
+1. **Commit your work.** The engine refuses a worktree with uncommitted changes, so nothing is left behind.
+2. **Write a *handoff narrative*** to a file outside the repo. It needs one markdown heading for each of: Outcomes, Decisions, Gotchas, State, Next step, Files. The engine names any it lacks and refuses the handoff.
+3. **Run the command, put the link in your final message, and end your turn.**
+
+```bash
+lucidos successor spawn --narrative "$TMPDIR/handoff.md"
+```
+
+What the handoff does:
+
+- **The successor's branch starts at this thread's last commit**, so its change carries all of this thread's work. This thread proposes nothing from then on: its work waits as *unproposed work* with reason `carried_by_successor`, and a pending change is withdrawn. The plan marker carries over to the successor's branch.
+- **The successor sits in this thread's place.** It is top-level if this thread is, otherwise a child of the same parent with the same wake mode. The parent then waits on the successor, and this thread files no report.
+- **Authority follows the placement.** A top-level successor needs none, as `spawn-thread --relation top` needs none (ADR 0475). A child successor, from a turn the owner did not open, needs `spawn-successor` on the parent. A thread can hand off only itself.
+- **This thread archives itself** once the successor's first session starts and nothing blocks the archive. Otherwise it stays open and shows where it continued.
+- **Refused** for a thread that is not a coding-agent thread, an *integrated sub-thread*, and a thread already handed off or archived. A second request racing a handoff waits for the first, then is refused as already handed off. The composer's message handoff is also refused while the thread works. Also for a change waiting in the *landing lane*, and a worktree git could not read.
+
+The composer's **Send to a new thread** uses the same route with the user's next message instead of a narrative. `GET /api/v1/threads/:id/context` returns `{input_tokens, offer, nudge, applied}`: the thread's context size, the two decisions the composer and `planned mark` read, and whether the thread has an applied change. A thread that cannot hand off (an *integrated sub-thread*, or one already handed off) reads `offer` and `nudge` false.
 
 ### `lucidos frontend-preview start [--thread-id <uuid>]` / `lucidos frontend-preview stop` / `lucidos frontend-preview status`
 
@@ -2092,8 +2270,8 @@ lucidos webhooks update --id <uuid> \
 
 The resend answers 200 with `"duplicate": true` and the event id the first
 delivery emitted, so the sender stops retrying. A resend that lands while the
-first delivery is still being handled gets a 503 instead: that one can still
-fail, and telling the sender "done" would lose the delivery. Omit `header`
+first delivery is still being handled waits for it, then gets that same answer.
+If the first one failed, the resend is delivered instead. Omit `header`
 and the key is a digest of the body, which collapses two identical bodies inside
 the window. `window_secs` defaults to an hour and is capped at seven days;
 `0` switches deduping back off.
@@ -2142,7 +2320,7 @@ The canonical end of an analysis or report session. An analysis app's prompt use
 ARTIFACT="artifacts/data-analysis/$(date +%Y-%m-%d)/report.html"
 
 # 1. Write the artifact under data/.
-lucidos data write "$ARTIFACT" --from /tmp/report.html
+lucidos data write "$ARTIFACT" --from "${TMPDIR:-/tmp}/report.html"
 
 # 2. Tell the workspace it's ready.
 lucidos events emit AnalysisCompleted \
@@ -2176,7 +2354,7 @@ Compare the pre-proxy form, which leaks the credential into argv and shell histo
 # Don't do this: $CRED_COMFORT shows up in `ps`, in shell history, and
 # in any log that captures the script's invocation.
 curl -sf -H "Authorization: Bearer $CRED_COMFORT" \
-  https://accsmart.panasonic.com/api/v1/devices > /tmp/x.json
+  https://accsmart.panasonic.com/api/v1/devices > "${TMPDIR:-/tmp}/x.json"
 ```
 
 ### Idempotent skip-if-already-done

@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use super::AppState;
 use crate::engine::aux_purpose::{
-    model_key, recommended, recommended_effort, ModelSource, BACKGROUND_ROWS,
+    asks_no_model, model_key, recommended, recommended_effort, ModelSource, BACKGROUND_ROWS,
 };
 use crate::engine::ContextPurpose;
 use crate::llm::model_registry::ModelRegistry;
@@ -32,6 +32,9 @@ pub(crate) struct BackgroundModel {
     /// Whether `model` reads images. With `needs_vision`, a `false` here means
     /// the engine refuses the task rather than calling the model.
     pub(crate) vision: bool,
+    /// Whether the task asks no model at all: it runs only on measured models,
+    /// and none is reachable. The wake decision then wakes every parent.
+    pub(crate) asks_no_model: bool,
     /// The models Settings lists first, best first. The first a configured
     /// provider serves is the default.
     pub(crate) recommended: Vec<RecommendedSelection>,
@@ -80,6 +83,7 @@ async fn get_background_models(
                 not_served: selection.not_served.clone(),
                 needs_vision: selection.needs_vision,
                 vision: selection.vision,
+                asks_no_model: asks_no_model(*purpose, selection.source),
                 recommended: recommended_selections(*purpose, state.engine.model_registry()),
             },
         );

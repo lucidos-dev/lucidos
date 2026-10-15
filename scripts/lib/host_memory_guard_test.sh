@@ -23,7 +23,14 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SANDBOX="$(mktemp -d)"
-cleanup() { rm -rf "$SANDBOX"; }
+E2E_ENGINE_HOLDER=""
+E2E_ENGINE_HOLDER_RELEASE=""
+cleanup() {
+    if [ -n "$E2E_ENGINE_HOLDER" ]; then
+        release_lock_holder "$E2E_ENGINE_HOLDER" "$E2E_ENGINE_HOLDER_RELEASE"
+    fi
+    rm -rf "$SANDBOX"
+}
 trap cleanup EXIT
 
 OUT="$SANDBOX/out"
@@ -55,6 +62,16 @@ _host_mem_proc_started() { return 0; }
 # the real ~/workspaces/e2e-test, so a test host with a live e2e run cannot leak
 # into these results. The attribution tests below override this per test.
 export E2E_WORKSPACE="$SANDBOX/e2e-test"
+
+# The guard trusts an engine pidfile only while its engine lock is held (ADR
+# 0438), so the sandbox workspace gets a holder process for the whole file. The
+# tests then write the synthetic pid they need into the pidfile.
+# shellcheck source=scripts/lib/flock_test_support.sh
+source "$SCRIPT_DIR/flock_test_support.sh"
+mkdir -p "$E2E_WORKSPACE/.lucidos"
+start_lock_holder "$SANDBOX" "$E2E_WORKSPACE/.lucidos/engine.lock" ex
+E2E_ENGINE_HOLDER="$HOLDER_PID"
+E2E_ENGINE_HOLDER_RELEASE="$HOLDER_RELEASE"
 
 # Pin the browser-cache discriminator to its default token, so the WebKit
 # classification stays hermetic. The guard reads PLAYWRIGHT_BROWSERS_PATH to
@@ -2789,6 +2806,7 @@ test_an_agent_alive_at_two_boundaries_is_a_leftover() {
     reset_state
     reset_left_behind
     mkdir -p "$ws/.lucidos"
+    start_lock_holder "$SANDBOX" "$ws/.lucidos/engine.lock" ex
     echo 4242 > "$ws/.lucidos/engine.pid"
     (
         E2E_WORKSPACE="$ws"
@@ -2814,6 +2832,7 @@ test_an_agent_alive_at_two_boundaries_is_a_leftover() {
     assert_says "$OUT/lb.out" "after nav chunk 2/52: LEFTOVER coding-agent subprocess pid=111" "the agent alive across a whole chunk is named"
     assert_silent_about "$OUT/lb.out" "LEFTOVER coding-agent subprocess pid=222" "a recycled pid is a new process, never a leftover"
     assert_says "$OUT/lb.out" "e2e engine 1000 to 1012 MB, workspace apps 3 to 3, files 40 to 40, commits 12 to 12; at most 2 coding-agent subprocess(es) at one boundary, 1 LEFTOVER." "the run summary adds it up"
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 }
 
 test_a_new_engine_starts_a_new_growth_baseline() {
@@ -2822,6 +2841,7 @@ test_a_new_engine_starts_a_new_growth_baseline() {
     reset_state
     reset_left_behind
     mkdir -p "$ws/.lucidos"
+    start_lock_holder "$SANDBOX" "$ws/.lucidos/engine.lock" ex
     (
         E2E_WORKSPACE="$ws"
         _host_mem_workspace_counts() { echo "0 0 1"; }
@@ -2833,6 +2853,7 @@ test_a_new_engine_starts_a_new_growth_baseline() {
         _host_mem_left_behind_report "nav chunk 41/52"
     ) >"$OUT/lb2.out" 2>&1
     assert_says "$OUT/lb2.out" "after nav chunk 41/52: left behind: e2e engine 900 MB (0 MB since its first boundary)" "the restarted engine is its own baseline"
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 }
 
 test_an_unreadable_engine_pid_still_gives_a_baseline() {

@@ -29,17 +29,38 @@ impl CodingAgentChangeOps for LucidosEngine {
             }
             Some(LiveSessionInfo {
                 worktree_path: s.worktree_path.clone()?,
-                idle_notify: s.idle_notify.clone(),
                 msg_tx: s.msg_tx.clone(),
                 last_event_at: s.last_event_at.clone(),
             })
         })
     }
 
-    fn spawn_merge_session(&self, thread_id: Uuid, change_id: Uuid, description: &str) {
+    fn spawn_merge_session(
+        &self,
+        thread_id: Uuid,
+        apply_claim: crate::engine::change_ops::apply_claim::ApplyClaim,
+        description: &str,
+    ) {
         let engine = self.clone_arc();
         let description = description.to_string();
+        let change_id = apply_claim.change_id();
         Self::spawn_cc_task_guarded(engine.clone(), thread_id, async move {
+            let mut spawn_claim = match engine.claim_thread_or_refuse(thread_id).await {
+                Ok(claim) => claim,
+                Err(e) => {
+                    log!(
+                        "[MergeConflict] No merge session for change {}: {}",
+                        change_id,
+                        e
+                    );
+                    // Announced as the apply's outcome, so Apply All moves on.
+                    let actor = engine.pending_apply_actors.take(change_id);
+                    engine
+                        .emit_apply_failed(thread_id, change_id, &e.to_string(), actor)
+                        .await;
+                    return;
+                }
+            };
             let change = match engine.changes().get_by_id(change_id).await {
                 Ok(Some(c)) => c,
                 Ok(None) => {
@@ -59,14 +80,19 @@ impl CodingAgentChangeOps for LucidosEngine {
                 }
             };
 
-            // `files` is the change's full file list, not necessarily
-            // conflicting: this Tier-3 spawn has no worktree path in hand to
-            // probe.
+            // The temp branch starts at `main`, so the conflicts are those of
+            // merging the change into `main`, the same paths Tiers 1 and 2 name.
+            let conflicts = crate::engine::git_ops::predict_merge_into_main(
+                std::path::Path::new(&change.repo_root),
+                &change.branch_name,
+            )
+            .await
+            .into_conflicts();
             let prompt = engine
                 .start_merge_and_get_prompt(
                     thread_id,
                     change_id,
-                    change.files.clone(),
+                    conflicts,
                     &change.branch_name,
                     Some("You are running in a temporary merge worktree."),
                     Some(&description),
@@ -106,22 +132,20 @@ impl CodingAgentChangeOps for LucidosEngine {
             // Direct run_direct_agent (bypasses process_message_with_steps):
             // engine-driven Tier-3 merge orchestration. The prompt is
             // engine-synthesized via `start_merge_and_get_prompt`, and the
-            // call needs `Some(change_id)` to bind CC to the change row.
+            // session holds the change's apply claim for its whole run.
             // process_message_with_steps has a conflict_change_id param but
             // also does its own MR emit + title gen + register_thread_queued,
             // which this merge has already arranged via `emit_automated_prompt`.
             let result = engine
                 .run_direct_agent(
+                    &mut spawn_claim,
                     request_id,
-                    thread_id,
                     &prompt,
                     None,
                     origin_id,
-                    &[],
                     None,
                     &cancel_token,
-                    Some(change_id),
-                    None,
+                    Some(&apply_claim),
                     None,
                     None,
                     None,
@@ -168,12 +192,15 @@ impl CodingAgentChangeOps for LucidosEngine {
     async fn run_merge_session_tier2(
         &self,
         thread_id: Uuid,
-        change_id: Uuid,
+        apply_claim: &crate::engine::change_ops::apply_claim::ApplyClaim,
+        thread_hold: crate::engine::agent_session::spawn_claim::SpawnClaim,
         wt_path: &Path,
         branch_name: &str,
         description: &str,
         resume_token: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let change_id = apply_claim.change_id();
+        let mut spawn_claim = self.hand_apply_hold_to_run(thread_hold).await;
         // Probe the worktree for the actual conflicting files so the panel
         // shows real numbers — mirrors apply_now::merge_via_cc_session.
         let conflict_files = probe_merge_conflicts(wt_path).await;
@@ -201,20 +228,18 @@ impl CodingAgentChangeOps for LucidosEngine {
         // unified router's surface — chat doesn't have worktree-bound
         // sessions or CC `--resume` tokens.
         self.run_direct_agent(
+            &mut spawn_claim,
             request_id,
-            thread_id,
             &merge_prompt,
             None,
             origin_id,
-            &[],
             None,
             &cancel_token,
-            Some(change_id),
+            Some(apply_claim),
             Some((wt_path.to_path_buf(), branch_name.to_string())),
             None,
             None,
             resume_token,
-            None,
             None,
             None,
             None,

@@ -31,6 +31,11 @@ impl ThreadQueueKind {
             Self::CodingAgent => "coding-agent",
         }
     }
+
+    /// A trigger's own fire, as opposed to a thread spawned by running work.
+    pub fn is_trigger_fire(&self) -> bool {
+        matches!(self, Self::EventTrigger | Self::Cron)
+    }
 }
 
 /// What happens when a trigger's queue hits `max_queued_per_trigger`.

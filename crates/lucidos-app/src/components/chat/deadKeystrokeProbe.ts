@@ -27,14 +27,13 @@ import { readViewport } from './probeViewport';
  *  business in a log line (`.claude/rules/no-private-data.md`). Lengths and
  *  flags only. */
 
-/** How a keystroke goes missing. Three, and they partition the path a character
- *  takes from the keyboard to the screen.
+/** How a keystroke goes missing, on the path a character takes from the
+ *  keyboard to the draft.
  *
  *  `input-never-arrived` is the one that says the fault is not ours: WebKit
  *  announced an edit and then delivered none. `keystroke-lost` is the edit
- *  reaching the box and not the store. `draft-clobbered` is both of those
- *  working and a clear wiping the result. */
-export type KeystrokeVerdict = 'draft-clobbered' | 'keystroke-lost' | 'input-never-arrived';
+ *  reaching the box and not the store. */
+export type KeystrokeVerdict = 'keystroke-lost' | 'input-never-arrived';
 
 /** How long an announced edit has to actually arrive. Well past a frame, and
  *  short enough that the line still belongs to the keystroke that caused it. */
@@ -67,20 +66,6 @@ function record(verdict: KeystrokeVerdict, data: Record<string, unknown>): void 
 /** A keystroke reached the draft, so whatever was wrong is over. */
 function noteHealthy(): void {
   linesThisEpisode = 0;
-}
-
-/** The composer repaired an empty draft that reached a box holding typed
- *  characters. Called from `PromptInput`'s sync effect, the only place that can
- *  see it: `resolveEmptyDraftSync` answered `adopt`.
- *
- *  Not a toast, deliberately. The characters are still on screen and the draft
- *  now holds them, so the user has nothing to do and nothing to read. The line
- *  records that a clear ran under their fingers, which is the fault itself. */
-export function reportDraftClobbered(facts: {
-  charCount: number;
-  threadStatus: string;
-}): void {
-  record('draft-clobbered', facts);
 }
 
 /** Install the probe. Idempotent, and gated per verdict rather than as a whole.

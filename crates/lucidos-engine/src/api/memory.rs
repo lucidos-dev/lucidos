@@ -307,6 +307,70 @@ pub(super) async fn get_tree_backfill_estimate(
 }
 
 #[derive(Deserialize)]
+pub(super) struct RaiseTreeBackfillCap {
+    /// The cap the user saw when pressing Continue.
+    from_cap_usd: f64,
+}
+
+/// `POST /api/v1/memory/tree-backfill/cap`: Continue a backfill held at its
+/// spending cap. The cap moves one step, which the engine sets, and the
+/// compactor picks the raise up from its event. A press against a cap that
+/// has moved since, a second click or another device, is refused.
+pub(super) async fn raise_tree_backfill_cap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RaiseTreeBackfillCap>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use crate::engine::event_bus::{BusEvent, SystemEvent};
+    let actor = super::actor::require_user_actor(&headers, state.engine.pool(), None).await?;
+    let episode = crate::engine::summary_tree::spend::load(state.engine.pool())
+        .await
+        .map_err(ApiError::db)?
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "No Tree memory backfill is running"))?;
+    // The compactor's running total can read held a little before the events
+    // do, so either counts: a refusal there would leave a held backfill stuck.
+    let held = episode.held()
+        || state
+            .engine
+            .summary_tree()
+            .backfill_progress()
+            .is_some_and(|p| p.held);
+    if !held && episode.cap_usd.is_some() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "This Tree memory backfill has not reached its spending cap",
+        )
+        .with_reason("not-held"));
+    }
+    if episode
+        .cap_usd
+        .is_some_and(|cap| (cap - body.from_cap_usd).abs() > 1e-9)
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "The Tree memory spending cap already moved",
+        )
+        .with_reason("cap-moved"));
+    }
+    let cap_usd = episode.next_cap().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "This Tree memory backfill has no spending cap: its model is not priced",
+        )
+    })?;
+    state
+        .engine
+        .event_bus
+        .emit(BusEvent::System(SystemEvent::TreeBackfillCapRaised {
+            cap_usd,
+            actor: Some(actor),
+        }))
+        .await
+        .map_err(|e| ApiError::internal(format!("Could not raise the backfill cap: {e}")))?;
+    Ok(Json(serde_json::json!({ "cap_usd": cap_usd })))
+}
+
+#[derive(Deserialize)]
 pub(super) struct SummaryTreeQuery {
     thread: Option<Uuid>,
 }
@@ -374,6 +438,7 @@ pub(super) fn router() -> Router<AppState> {
             "/memory/tree-backfill/estimate",
             get(get_tree_backfill_estimate),
         )
+        .route("/memory/tree-backfill/cap", post(raise_tree_backfill_cap))
         .route(
             "/memory/rebuild",
             post(rebuild_memory).delete(cancel_rebuild_memory),

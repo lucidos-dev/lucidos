@@ -4,8 +4,16 @@ import { PromptInput } from '../chat/PromptInput';
 import { CreateThreadView } from '../chat/CreateThreadView';
 import { ThreadView } from '../chat/ThreadView';
 import { HomeWelcomeTitle } from '../chat/HomeWelcomeTitle';
+import { WelcomeMessage } from '../chat/WelcomeMessage';
 import { isReducedMotion } from '../../utils/motion';
-import { isMobile } from '../../utils/viewport';
+import { isMobile, viewportIsMobile } from '../../utils/viewport';
+import { homeThreadId } from '../../store/actions/homeThread';
+import { homeFace } from '../../store/homeBoard';
+import { lazyComponent } from '../../utils/lazyComponent';
+import { prefetchWhenIdle } from '../../utils/idlePrefetch';
+
+const HomeBoard = lazyComponent(() => import('../home/HomeBoard').then(m => m.HomeBoard));
+prefetchWhenIdle(HomeBoard);
 
 /** The compose-to-thread prompt slide, at 1x. Both inline transitions and the
  *  safety timer below scale from this one base. So the app's most prominent
@@ -20,6 +28,10 @@ export function ThreadPane() {
   const isHomeWelcome = homeWelcomeActive.value;
   // Shared with PromptInput's height animation via composeViewActive so both agree.
   const isComposeEmpty = composeViewActive.value;
+  // A phone shows Home as one pane with two faces: the board, and the chat slid
+  // up over it (ADR 0432). Its prompt stays docked under both.
+  const phoneHome = viewportIsMobile.value && !!tid && tid === homeThreadId.value;
+  const face = homeFace.value;
 
   const promptRef = useRef<HTMLDivElement>(null);
   const promptYRef = useRef<number | null>(null);
@@ -148,18 +160,30 @@ export function ThreadPane() {
   }, [isComposeEmpty]);
 
   return (
-    <div class={`thread-pane${isComposeEmpty ? ' compose-empty' : ''}`} data-drop-zone="attach">
+    <div class={`thread-pane${isComposeEmpty && !phoneHome ? ' compose-empty' : ''}`} data-drop-zone="attach">
       {/* Keyed with the body, so the title coming and going never remounts
           the body, and with it the prompt the FLIP below measures. */}
-      {tid && isHomeWelcome && <HomeWelcomeTitle key="home-title" threadId={tid} />}
+      {tid && isHomeWelcome && !phoneHome && <HomeWelcomeTitle key="home-title" threadId={tid} />}
       <div key="body" class="thread-pane-body">
         {/* The prompt keeps its node through the compose-to-thread swap, since
             useHideOnScroll measures that node. The keys stop the diff pairing
             the thread view's div with the prompt's div by tag. */}
-        {tid && !isComposingDraft && !isHomeWelcome
+        {phoneHome ? (
+          <div key="home" class="home-pane" data-home-face={face}>
+            {/* Stays mounted under the chat, so sliding the chat back down
+                finds every tile as it was within the off-screen hold. */}
+            <div class="home-pane-board">
+              <HomeBoard layout="phone" hidden={face === 'chat'} welcome={isHomeWelcome ? <WelcomeMessage /> : null} />
+            </div>
+            <div class="home-pane-chat" inert={face === 'board'}>
+              {isHomeWelcome ? <CreateThreadView /> : <div class="thread-view-clip"><ThreadView /></div>}
+            </div>
+          </div>
+        ) : tid && !isComposingDraft && !isHomeWelcome
           ? <div key="thread" class="thread-view-clip"><ThreadView /></div>
           : <CreateThreadView key="compose" />}
-        <div key="prompt" class="prompt-area" ref={promptRef}>
+        {/* On a phone in Home, a tap in the prompt slides the chat up. */}
+        <div key="prompt" class="prompt-area" ref={promptRef} onFocusIn={phoneHome ? () => { homeFace.value = 'chat'; } : undefined}>
           <PromptInput />
         </div>
       </div>

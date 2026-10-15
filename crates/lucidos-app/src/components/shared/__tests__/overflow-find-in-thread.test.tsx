@@ -4,14 +4,17 @@
  * transcript's find bar on a phone. A drawer row's menu does not: the item is
  * present exactly when the host passes `onFindInThread`.
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
-import { ThreadOverflowMenu } from '../ThreadOverflowMenu';
+import { ThreadOverflowItemsChunk, ThreadOverflowMenu } from '../ThreadOverflowMenu';
 import { ThreadTitleMenu } from '../../chat/ThreadTitle';
 import { FindBar } from '../FindBar';
-import { resetFind } from '../../../store/actions/find-bar';
+import { findTargets, resetFind } from '../../../store/actions/find-bar';
 import type { ThreadState } from '../../../store/thread-events';
+
+// The menu's rows are code-split. Warm them, so a click opens it at once.
+beforeAll(() => Promise.all([ThreadOverflowItemsChunk.preload(), findTargets.preload()]));
 
 let host: HTMLElement | null = null;
 const realMatchMedia = window.matchMedia;

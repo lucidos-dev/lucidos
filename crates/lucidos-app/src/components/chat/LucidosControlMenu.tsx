@@ -1,4 +1,3 @@
-import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { useSignal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import { chatModels, showToast } from '../../store/store';
@@ -20,12 +19,13 @@ import { accountChatEffort } from '../../store/actions/preferences';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import { pairLabelOf } from '../../store/modelSelection';
 import { LUCIDOS_AGENT_LABEL } from '../../store/thread-events';
-import { LucidosMarkIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
 import { anchoredPanelStyle, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { viewportIsMobile } from '../../utils/viewport';
-import { keepFocusOnPress } from '../../utils/dom';
-import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
+import { ModelSelectionPicker, controlMenuParts } from './controlMenuParts';
+import { takeControlMenuPress } from './controlMenuRequests';
+import { ControlMenuTrigger, LUCIDOS_MENU_LABEL, LUCIDOS_TRIGGER_CLASS, LucidosMenuIcon } from './ControlMenuTrigger';
+import { usePendingOpen } from '../../hooks/usePendingOpen';
 import { keyboardHolder, returnKeyboard } from '../shared/keyboardHandoff';
 
 /** The Lucidos Agent's model + reasoning picker — the chat-agent sibling of
@@ -55,6 +55,7 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
   const menuRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const open = useSignal(false);
+  const pendingOpen = usePendingOpen();
   // The prompt, when it held the keyboard as the menu opened. The filter box
   // takes the keyboard from it, and closing hands it back.
   const keyboardHolderRef = useRef<HTMLElement | null>(null);
@@ -82,6 +83,19 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
   }
 
   useEffect(() => close, []);
+
+  function openPicker(trigger: HTMLElement) {
+    const holder = keyboardHolder();
+    pendingOpen.open(controlMenuParts, () => {
+      keyboardHolderRef.current = holder;
+      open.value = true;
+    }, trigger);
+  }
+
+  // A press that landed on the placeholder before this code arrived.
+  useEffect(() => {
+    if (menuRef.current && takeControlMenuPress('lucidos')) openPicker(menuRef.current);
+  }, []);
 
   // Composing draft → THIS draft's override (?? account default); active thread →
   // this thread's pending pick ?? its last message ?? the account default.
@@ -140,27 +154,13 @@ export function LucidosControlMenu({ threadId, composeContext }: { threadId?: st
 
   return (
     <div class="control-menu" data-row-item ref={menuRef}>
-      <button
-        // `lucidos-commands-btn` is the marker that distinguishes the Lucidos
-        // Agent model picker from the coding-agent control button (both share
-        // the `commands-btn` base style). Surfaces that need only the
-        // coding-agent control — e.g. the `.commands-btn:not(.lucidos-commands-btn)`
-        // e2e selector — rely on it, so keep it on this button.
-        class="icon-btn header-icon commands-btn lucidos-commands-btn"
-        data-tooltip={tooltipWithShortcut(`${LUCIDOS_AGENT_LABEL} model`, 'openAgentMenu')}
-        aria-label={`${LUCIDOS_AGENT_LABEL} model`}
-        onMouseDown={keepFocusOnPress}
-        onClick={() => {
-          if (open.value) { close(); return; }
-          keyboardHolderRef.current = keyboardHolder();
-          open.value = true;
-        }}
-      >
-        {/* The flat mark, not `<LucidosMark/>`: this button is one of the
-            prompt bar's gray icons, so the glyph paints in `currentColor` and
-            carries no gradient tile. `.icon-btn.header-icon svg` sizes it. */}
-        <LucidosMarkIcon />
-      </button>
+      <ControlMenuTrigger label={LUCIDOS_MENU_LABEL} extraClass={LUCIDOS_TRIGGER_CLASS} onClick={(e) => {
+        if (open.value) { close(); return; }
+        if (pendingOpen.takeBack()) return;
+        openPicker(e.currentTarget as HTMLElement);
+      }}>
+        <LucidosMenuIcon />
+      </ControlMenuTrigger>
       <Overlay
         open={open.value}
         onClose={close}

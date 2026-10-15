@@ -491,7 +491,7 @@ async function captureAppUIInner(appId: string, requestId: string, saveFormat?: 
     // A hidden tab stays silent. It shares the device id of the visible one,
     // which may have the app open, and its quick "no app" would win the race.
     if (document.visibilityState !== 'visible') return;
-    await postAppCapture(requestId, '', 'Error: No app UI is currently open. Ask the user to open the app, or use navigate_ui (target=app-ui) first. refresh_app no longer opens.');
+    await postAppCapture(requestId, '', 'Error: No app UI is currently open. Open it with navigate_ui (target=app, app_id), then capture again. refresh_app does not open it.');
     return;
   }
 

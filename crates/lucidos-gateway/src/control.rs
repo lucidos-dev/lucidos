@@ -277,6 +277,11 @@ struct AdoptBody {
     /// re-adopt must not silently undo it.
     #[serde(default)]
     autostart: Option<bool>,
+    /// The engine's loopback port, for a caller that allocates ports itself
+    /// (the dev launcher). Absent lets the registry pick one for a new entry,
+    /// and leaves an existing entry's port alone.
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -360,6 +365,7 @@ async fn adopt(
             std::path::Path::new(body.dir.trim()),
             body.name.as_deref(),
             body.autostart,
+            body.port,
         )
         .await?;
     Ok(Json(json!({ "workspace": ws })))
@@ -384,9 +390,10 @@ async fn restore(
     // The streamed temp archive is removed on ANY early return from here on — a
     // connection dropped mid-upload, a malformed trailing field, or a missing
     // key — via this guard, so a (possibly multi-GB) `.enc` is never orphaned in
-    // the temp dir. It's disarmed only when ownership passes to
-    // `restore_workspace` (which then owns cleanup).
-    let mut guard: Option<TempFileGuard> = None;
+    // the temp dir. It's kept only when ownership passes to
+    // `restore_workspace` (which then owns cleanup). `tempfile` creates it
+    // owner-only, so the archive is never readable by another local user.
+    let mut guard: Option<tempfile::TempPath> = None;
     let mut filename = String::new();
     let mut key: Option<String> = None;
     let mut name: Option<String> = None;
@@ -402,13 +409,14 @@ async fn restore(
         match field_name.as_deref() {
             Some("file") => {
                 filename = field.file_name().unwrap_or_default().to_string();
-                let path = std::env::temp_dir().join(format!(
-                    "lucidos-restore-{}.enc",
-                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                ));
-                let g = TempFileGuard::arm(path);
-                stream_field_to_file(field, g.path()).await?;
-                guard = Some(g);
+                let path = tempfile::Builder::new()
+                    .prefix("lucidos-restore-")
+                    .suffix(".enc")
+                    .tempfile()
+                    .map_err(|e| ApiError::internal(format!("temp file: {e}")))?
+                    .into_temp_path();
+                stream_field_to_file(field, &path).await?;
+                guard = Some(path);
             }
             Some("key") => {
                 key = Some(
@@ -439,34 +447,11 @@ async fn restore(
 
     // Hand the temp file to the restore flow; it removes it when the background
     // restore finishes, or on its own error paths.
-    let tmp = guard.disarm();
+    let tmp = guard
+        .keep()
+        .map_err(|e| ApiError::internal(format!("temp file: {e}")))?;
     let (id, ws_name) = state.restore_workspace(tmp, filename, key, name).await?;
     Ok(Json(json!({ "id": id, "name": ws_name })))
-}
-
-/// Removes its path on drop unless [`disarm`](TempFileGuard::disarm)ed. Guards
-/// the uploaded restore archive so a multipart error after the file part was
-/// streamed never orphans the (possibly multi-GB) temp file.
-struct TempFileGuard(Option<std::path::PathBuf>);
-
-impl TempFileGuard {
-    fn arm(path: std::path::PathBuf) -> Self {
-        Self(Some(path))
-    }
-    fn path(&self) -> &std::path::Path {
-        self.0.as_deref().expect("guard armed")
-    }
-    fn disarm(mut self) -> std::path::PathBuf {
-        self.0.take().expect("guard armed")
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.0.take() {
-            let _ = std::fs::remove_file(p);
-        }
-    }
 }
 
 /// Current restore-flow state for the picker's poll (idle / running+phase /
@@ -689,7 +674,7 @@ async fn set_release_check_config(
 /// drops while the new image binds, and the picker's poll reconnects.
 async fn gateway_reload(State(state): State<GatewayState>) -> Result<StatusCode, ApiError> {
     state
-        .reload_gateway()
+        .reload_gateway(None)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::ACCEPTED)
 }

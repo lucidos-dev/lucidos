@@ -47,10 +47,22 @@ impl LucidosEngine {
                     .as_str()
                     .or_else(|| args["instructions"].as_str())
                     .unwrap_or("");
+                let sizes = match args.get("sizes").filter(|v| !v.is_null()) {
+                    None => None,
+                    Some(value) => {
+                        let names: Vec<String> = serde_json::from_value(value.clone())
+                            .map_err(|_| "sizes must be a list of size names")?;
+                        Some(crate::core::apps::parse_widget_sizes(&names)?)
+                    }
+                };
                 let kind = match args["kind"].as_str() {
+                    None | Some("app") if sizes.is_some() => {
+                        return Err("only a widget takes sizes".into())
+                    }
                     None | Some("app") => crate::core::NewAppKind::App,
                     Some("widget") => crate::core::NewAppKind::Widget {
                         origin_thread_id: thread_id,
+                        sizes,
                     },
                     Some(other) => {
                         return Err(
@@ -65,7 +77,7 @@ impl LucidosEngine {
                 };
                 let (path, commit) = self
                     .app_manager
-                    .create_app(&self.event_bus, id, name, description, files, kind)
+                    .create_app(&self.event_bus, id, name, description, files, kind.clone())
                     .await
                     .map_err(|e| format!("creating app: {}", e))?;
                 let commit = &commit[..commit.floor_char_boundary(8)];
@@ -79,21 +91,10 @@ impl LucidosEngine {
                         name, path, commit, lint
                     ));
                 }
-                // A widget shows where it was made: that is its whole point.
-                crate::engine::widgets::emit_widget_change(
-                    &self.event_bus,
-                    crate::engine::widgets::WidgetChange::Show,
-                    crate::engine::widgets::WidgetInstance {
-                        app_id: id.to_string(),
-                        ..Default::default()
-                    },
-                    thread_id,
-                    Some(super::agent_tool_actor(thread_id)),
-                )
-                .await?;
+                // A reply draws it, so the agent embeds it there (ADR 0466).
                 Ok(format!(
-                    "Created widget '{}' at {} (commit: {}) and showed it in this thread{}",
-                    name, path, commit, lint
+                    "Created widget '{name}' at {path} (commit: {commit}). Embed it in your \
+                     reply to show it: ![{name}](app:{id}){lint}"
                 ))
             }
             "list_apps" => list_apps_text(&self.app_manager),

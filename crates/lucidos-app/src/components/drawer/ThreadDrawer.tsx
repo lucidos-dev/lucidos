@@ -1,7 +1,7 @@
 import type { ComponentChildren, RefObject } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
-import { batch, effect, signal, useSignal } from '@preact/signals';
+import { batch, computed, effect, signal, useSignal } from '@preact/signals';
 import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerGrouping, setDrawerGrouping, selectedOngoingGroup, setSelectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, isSplitOngoingGroup, type OngoingFilter, type OngoingPart, type SplitOngoingGroup, ONGOING_GROUPS, type OngoingGroup, type DrawerGrouping, repositories, focusedPane, scaledDurationMs, showToast, ALL_CHANNELS, clearThreadFilter } from '../../store/store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../../store/appliedThreadFilter';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
@@ -14,6 +14,7 @@ import { focusPane, showThreadList } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
 import { handleArchiveAll } from '../../store/actions/archive-all';
 import { openOngoingThread } from '../../store/actions/event-navigation';
+import { preferencesSettled } from '../../store/actions/preferences';
 import type { LandingGroup } from '../../store/thread-events';
 import { loadOlderThreads, reloadAfterFilterChange, filterChangedSinceLoad, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
 import { ThreadStatusIcon } from '../shared/ThreadStatusIcon';
@@ -26,6 +27,7 @@ import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton
 import { SectionHeaderContent } from '../shared/SectionHeader';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
+import { applyNavFocus } from '../shared/focusMarker';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 import { getDraft } from '../../store/composeDrafts';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
@@ -38,7 +40,8 @@ import { useDelayedFlag, useDelayedLoading, useLingeringFlag } from '../../hooks
 import { PANE_TRANSITION_MS } from '../layout/splitHelpers';
 import { readSavedScroll, useScrollMemory } from '../../hooks/useScrollMemory';
 import { forgetSavedScroll } from '../../store/savedScroll';
-import { useRowActionsGesture } from './useRowActionsGesture';
+import { useRowActionsGesture } from '../shared/useRowActionsGesture';
+import { RowWindowContext, WindowedRows, replanDrawerRowWindow, revealDrawerRow, rowWindowIsMounted, useRowWindowController } from './WindowedRows';
 import { getRemPx } from '../../utils/dom';
 import { isMobile } from '../../utils/viewport';
 import { scrollBehavior } from '../../utils/motion';
@@ -170,6 +173,12 @@ function flatThreadNodes(ids: readonly string[], group?: OngoingGroup): DrawerNa
  *  nav key (`__section_<name>`). */
 const highlightedKey = signal<string | null>(null);
 
+/** The highlighted thread row, or null when the highlight is on a header. */
+const highlightedRowKey = computed(() => {
+    const key = highlightedKey.value;
+    return key && !isSectionNavKey(key) ? key : null;
+});
+
 /** Ordered list of keyboard-navigable nodes, set by the list on screen: its
  *  headers and threads, or search's threads alone. */
 const navNodes = signal<DrawerNavNode[]>([]);
@@ -194,19 +203,12 @@ export function selectHighlighted() {
     else if (!isSectionNavKey(key)) openListedThread(key);
 }
 
-/** Press an Ongoing tile: select its group and open the group's first thread
- *  as a tap on that row would. A press on the selected tile of a split group
- *  (Review, In flight) steps its filter instead, and opens the first row it
- *  keeps. On the phone the drawer is its own pane, so it opens only a sole
- *  row: with several, opening would swipe the reader off the list they asked
- *  to see. Before the threads load, no group is known to hold just one. An
- *  empty list only selects. */
+/** Press an Ongoing tile: select its group. A press on the selected tile of a
+ *  split group (Review, In flight) steps its filter instead. It never opens a
+ *  thread, so the thread pane stays where it is (ADR 0459). */
 function pressOngoingTile(group: OngoingGroup): void {
     if (isSplitOngoingGroup(group) && selectedOngoingGroup.value === group) stepOngoingFilter();
     else setSelectedOngoingGroup(group);
-    const rows = selectedOngoingRows.value;
-    if (isMobile() && !(threadsLoaded.value && rows.length === 1)) return;
-    if (rows[0]) openListedThread(rows[0].thread.meta.id);
 }
 
 /** Open a thread row of the drawer's current list the way a click on it does:
@@ -420,6 +422,12 @@ function setHighlight(key: string): void {
 }
 
 function scrollNavKeyIntoView(key: string): void {
+    // A Folders row may sit outside the row window, so the window mounts it
+    // and its viewport before scrolling.
+    if (!isSectionNavKey(key) && rowWindowIsMounted()) {
+        revealDrawerRow(key, 'nearest');
+        return;
+    }
     const sel = isSectionNavKey(key)
         ? `[data-flip-id="${key}"], [data-tile-nav="${key}"]`
         : `[data-thread-nav="${key}"]`;
@@ -601,8 +609,9 @@ export function planFoldersReveal(
 }
 
 /** Show `threadId`'s row in the thread list: open the list, undo whatever
- *  hides the row, and scroll to it. It always lands on the Folders grouping,
- *  where every thread has its place (ADR 0410). The thread filter is the
+ *  hides the row, scroll to it and mark it with the navigation focus marker.
+ *  It always lands on the Folders grouping, where every thread has its place
+ *  (ADR 0410). The thread filter is the
  *  user's own choice, so a filtered-out thread gets a toast offering to clear
  *  it rather than a silent reset. */
 export function revealThreadInFolders(threadId: string): void {
@@ -631,7 +640,10 @@ export function revealThreadInFolders(threadId: string): void {
         for (const id of plan.collapsedAncestors) setFamilyCollapsed(id, false);
         for (const id of plan.archivedAncestorsToReveal) setArchivedRevealed(id, true);
     });
-    scrollToRevealedRow(threadId);
+    revealDrawerRow(threadId, 'centre', (row, list) => {
+        applyNavFocus(row);
+        followRowUntilSettled(row, list);
+    });
 }
 
 /** Search overrides both groupings, so a reveal ends it. */
@@ -640,8 +652,6 @@ function clearThreadSearch(): void {
     threadSearchResults.value = { status: 'not-loaded' };
 }
 
-/** Frames to wait for the row to mount after the list opens and expands. */
-const REVEAL_MAX_FRAMES = 10;
 const DRAWER_SCROLL_KEY = 'lucidos-scroll-thread-drawer';
 /** The page-in in flight, if any. Its identity is its cancellation token: a
  *  new page-in or an unmount replaces or clears it, and the old loop stops. */
@@ -653,6 +663,15 @@ let drawerRestoreSettled = false;
  *  drawer reopen does not re-attach, so it finds nothing armed and pages
  *  nothing in. */
 let drawerRestoreArmed = false;
+
+/** Where the drawer's scroll memory is about to put the list, while it has not
+ *  settled. The row window renders that place too, so the restore lands on
+ *  rows rather than a gap. */
+function pendingDrawerRestoreTop(): number | null {
+    if (drawerRestoreSettled) return null;
+    const saved = readSavedScroll(DRAWER_SCROLL_KEY);
+    return saved?.kind === 'offset' ? saved.top : null;
+}
 
 /** Glide only the list, never its ancestors: on mobile the list sits in a
  *  swipe pane, and `scrollIntoView` would also scroll the swipe container. */
@@ -668,20 +687,6 @@ function centreRowInList(row: HTMLElement, list: HTMLElement): void {
 function rowContentCentre(row: HTMLElement, list: HTMLElement): number {
     const r = row.getBoundingClientRect();
     return r.top + r.height / 2 - list.getBoundingClientRect().top + list.scrollTop;
-}
-
-function scrollToRevealedRow(threadId: string): void {
-    let frames = 0;
-    const step = () => {
-        const row = document.querySelector<HTMLElement>(`.thread-drawer-list [data-thread-nav="${threadId}"]`);
-        const list = row?.closest<HTMLElement>('.thread-drawer-list');
-        if (!row || !list) {
-            if (frames++ < REVEAL_MAX_FRAMES) requestAnimationFrame(step);
-            return;
-        }
-        followRowUntilSettled(row, list);
-    };
-    requestAnimationFrame(step);
 }
 
 /** Frames the row and the list width must hold still before the reveal stops
@@ -773,20 +778,24 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     const listRef = useRef<HTMLDivElement>(null);
     // A signal, so only the drawing re-renders when one is taken, not the list.
     const leavingDrawing = useSignal<LeavingDrawing | null>(null);
-    // Restore only under Folders: the saved offset is for that list.
+    // Remember and restore only the open Folders list: the saved offset is
+    // for that list, and a shut drawer empties it. Wait for the preferences
+    // too: they can still move every row, and the phone's list reserves the
+    // header, backup reminder included, in its own top spacer.
     // Declared before the hook, so the reset runs before each attach.
-    const restorePaused = activeView !== 'folders';
+    const memoryPaused = activeView !== 'folders' || !visible || !preferencesSettled.value;
     useEffect(() => {
         drawerRestoreSettled = false;
         drawerRestoreArmed = true;
-    }, [restorePaused]);
+    }, [memoryPaused]);
     useScrollMemory(listRef, DRAWER_SCROLL_KEY, {
-        paused: restorePaused,
+        paused: memoryPaused,
         // Busy until the first threads land and the page-in takes over.
         restoreIsBusy: () => !threadsLoaded.value || drawerRestoreArmed || activePageIn !== null,
         onRestoreSettled: () => {
             drawerRestoreSettled = true;
             drawerRestoreArmed = false;
+            replanDrawerRowWindow();
         },
     });
 
@@ -821,9 +830,16 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
         setThreadFilterPaneVisible(visible);
     }, [visible]);
 
+    const openWidth = `${threadDrawerWidth.value}px`;
     return (
         <div class={`thread-drawer${visible ? '' : ' thread-drawer-collapsed'}`}
-             style={visible ? { width: `${threadDrawerWidth.value}px` } : undefined}
+             // The desktop drawer slides open and shut by its width. Its body
+             // keeps the open width throughout (drawer.css), so rows never
+             // rewrap mid-slide and a saved offset means the same rows.
+             style={{
+                 ...(visible ? { width: openWidth } : {}),
+                 ...(forceVisible ? {} : { '--thread-drawer-open-width': openWidth }),
+             }}
              onPointerDown={(e) => handleDrawerPointerDown(e.target)}>
             {/* The list and the layers over it, in one box. */}
             <div class="thread-drawer-body">
@@ -846,7 +862,7 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
                             <LeavingViewSnapshot grouping={grouping} list={listRef} drawing={leavingDrawing}>
                                 {activeView === 'search' ? <SearchResults />
                                     : activeView === 'ongoing' ? <OngoingList />
-                                    : <ThreadList />}
+                                    : <ThreadList frozen={!visible} />}
                             </LeavingViewSnapshot>
                         </div>
                     )}
@@ -869,8 +885,9 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
 import { ongoingBreakdown, ongoingFilter, ongoingPartOf, stepOngoingFilter, composingThreads, collapsedAncestorIds, computeDrawerCategorization, depthStyle, filterHiddenArchived, inboxThreadCount, nestByParent, renderedFamilyRows, ongoingGroupLists, selectedOngoingRows, threadHasUnsentDraft, visibleChildrenCount } from './family-graph';
 import type { DrawerCategorization, FamilyGraph, NestedThread } from './family-graph';
 export * from './family-graph';
-function ThreadList() {
+function ThreadList({ frozen }: { frozen: boolean }) {
     const containerRef = useRef<HTMLDivElement>(null);
+    const rowWindow = useRowWindowController(containerRef, frozen, pendingDrawerRestoreTop, highlightedRowKey);
     const sentinelRef = useRef<HTMLDivElement>(null);
     const hydrated = threadsLoaded.value;
 
@@ -1084,14 +1101,17 @@ function ThreadList() {
     // Once per mount, bring the saved position into reach (see
     // `pageInToSavedScroll`). The drawer's scroll memory restores it the moment
     // the list is tall enough.
+    // It waits for the preferences as that restore does, so it takes the arm
+    // the restore's own attach sets, not an earlier one.
     // When it ends, hand back to the fill loop: a short list's first page
     // request may have lost the race to it.
+    const restoreCanAttach = preferencesSettled.value;
     useEffect(() => {
         const list = containerRef.current?.closest<HTMLElement>('.thread-drawer-list');
-        if (!hydrated || !list) return;
+        if (!hydrated || !restoreCanAttach || !list) return;
         void pageInToSavedScroll(list).then(() => void loadWhileSentinelVisible());
         return () => { activePageIn = null; };
-    }, [hydrated]);
+    }, [hydrated, restoreCanAttach]);
 
     const hasMore = threadHasMore.value;
     // Pagination feeds the Archive section, so a collapsed Archive has nothing
@@ -1127,61 +1147,83 @@ function ThreadList() {
         return () => observer.disconnect();
     }, [hydrated, hasMore, paginationAllowed, loadWhileSentinelVisible]);
 
-    if (!hydrated) {
-        return (
-            <div ref={containerRef} />
-        );
-    }
+    // A section's rows, as the row window takes them: ids, a layout key per
+    // row, and a builder for the rows it renders.
+    const windowedRows = (s: typeof sections[number]) => (
+        <WindowedRows
+            name={s.name}
+            ids={s.threads.map(n => n.thread.meta.id)}
+            layoutKeys={s.threads.map(n => {
+                const id = n.thread.meta.id;
+                // A draft's title is its text, so its height changes as the
+                // reader types. It is never cached: it renders wherever it is.
+                return n.thread.meta.state === 'composing'
+                    ? null
+                    : threadRowLayoutKey(threadRowLayoutProps(n.thread, {
+                        depth: n.depth,
+                        hiddenArchivedCount: decorations.hiddenDirectChildCount.get(id) ?? 0,
+                        isArchivedRevealed: revealedArchivedSet.has(id),
+                        enableFamilyToggle: true,
+                    }));
+            })}
+            renderRow={(i) => {
+                const n = s.threads[i];
+                if (n.thread.meta.state === 'composing') {
+                    return <ComposingThreadRow key={n.thread.meta.id} thread={n.thread} depth={n.depth} />;
+                }
+                const id = n.thread.meta.id;
+                const root = familyGraph.rootByThread.get(id);
+                const familyIsLifted = root !== undefined && decorations.liftedRoots.has(root);
+                const isRoot = root === id;
+                const naturalSection = getThreadDisplaySection(n.thread);
+                const routedSection = decorations.routedByThread.get(id);
+                const isLiftedParent = familyIsLifted && isRoot;
+                const isResponsibleChild = familyIsLifted && !isRoot && naturalSection === routedSection;
+                return (
+                    <ThreadRow
+                        key={id}
+                        threadId={id}
+                        status={statusMap.get(id)!}
+                        depth={n.depth}
+                        isLiftedParent={isLiftedParent}
+                        isResponsibleChild={isResponsibleChild}
+                        isArchivedSubThread={decorations.archivedSubThreads.has(id)}
+                        hiddenArchivedCount={decorations.hiddenDirectChildCount.get(id) ?? 0}
+                        isArchivedRevealed={revealedArchivedSet.has(id)}
+                        enableFamilyToggle
+                    />
+                );
+            }}
+        />
+    );
 
     return (
-        <div ref={containerRef} class="thread-drawer-rows">
-            {sections.map(s => {
-                if (s.threads.length === 0) return null;
-                const { title, Icon } = SECTION_META[s.name];
-                return (
-                    <DrawerSection key={s.name} sectionKey={s.name} title={title} Icon={Icon} count={s.count} hasRunning={s.hasRunning}
-                        action={s.name === 'current' && s.count > 0 ? <ArchiveAllButton /> : undefined}>
-                        {s.threads.map(n => {
-                            if (n.thread.meta.state === 'composing') {
-                                return <ComposingThreadRow key={n.thread.meta.id} thread={n.thread} depth={n.depth} />;
-                            }
-                            const id = n.thread.meta.id;
-                            const root = familyGraph.rootByThread.get(id);
-                            const familyIsLifted = root !== undefined && decorations.liftedRoots.has(root);
-                            const isRoot = root === id;
-                            const naturalSection = getThreadDisplaySection(n.thread);
-                            const routedSection = decorations.routedByThread.get(id);
-                            const isLiftedParent = familyIsLifted && isRoot;
-                            const isResponsibleChild = familyIsLifted && !isRoot && naturalSection === routedSection;
-                            return (
-                                <ThreadRow
-                                    key={id}
-                                    threadId={id}
-                                    status={statusMap.get(id)!}
-                                    depth={n.depth}
-                                    isLiftedParent={isLiftedParent}
-                                    isResponsibleChild={isResponsibleChild}
-                                    isArchivedSubThread={decorations.archivedSubThreads.has(id)}
-                                    hiddenArchivedCount={decorations.hiddenDirectChildCount.get(id) ?? 0}
-                                    isArchivedRevealed={revealedArchivedSet.has(id)}
-                                    enableFamilyToggle
-                                />
-                            );
-                        })}
-                    </DrawerSection>
-                );
-            })}
-            {sections.every(s => s.threads.length === 0) && (
-                <div class="empty-state">No threads</div>
+        <RowWindowContext.Provider value={rowWindow}>
+            {!hydrated ? <div ref={containerRef} /> : (
+                <div ref={containerRef} class="thread-drawer-rows">
+                    {sections.map(s => {
+                        if (s.threads.length === 0) return null;
+                        const { title, Icon } = SECTION_META[s.name];
+                        return (
+                            <DrawerSection key={s.name} sectionKey={s.name} title={title} Icon={Icon} count={s.count} hasRunning={s.hasRunning}
+                                action={s.name === 'current' && s.count > 0 ? <ArchiveAllButton /> : undefined}>
+                                {windowedRows(s)}
+                            </DrawerSection>
+                        );
+                    })}
+                    {sections.every(s => s.threads.length === 0) && (
+                        <div class="empty-state">No threads</div>
+                    )}
+                    {/* The next page's rows, drawn above the sentinel that asked for them. */}
+                    <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} row={() => <ThreadRowContent />} />}>
+                        {null}
+                    </LoadingFade>
+                    {hasMore && paginationAllowed && (
+                        <div ref={sentinelRef} class="thread-drawer-load-more" />
+                    )}
+                </div>
             )}
-            {/* The next page's rows, drawn above the sentinel that asked for them. */}
-            <LoadingFade showSkeleton={showLoadingMore} skeleton={<ListSkeletonOf count={2} row={() => <ThreadRowContent />} />}>
-                {null}
-            </LoadingFade>
-            {hasMore && paginationAllowed && (
-                <div ref={sentinelRef} class="thread-drawer-load-more" />
-            )}
-        </div>
+        </RowWindowContext.Provider>
     );
 }
 
@@ -1615,6 +1657,90 @@ interface ThreadRowContentProps {
     onClick: () => void;
 }
 
+/** What each row prop does to the row's box. A `layout` prop can change its
+ *  height, so it is part of the *layout key* the row window measures under.
+ *  A new prop must be classified here before the row compiles. */
+export const THREAD_ROW_PROP_ROLES = {
+    id: 'identity',
+    flipId: 'identity',
+    depth: 'layout',
+    title: 'layout',
+    createdLabel: 'layout',
+    channel: 'layout',
+    codingAgent: 'layout',
+    contextName: 'layout',
+    totalChildren: 'layout',
+    hasDraft: 'layout',
+    isHome: 'layout',
+    collapsible: 'layout',
+    isCollapsed: 'layout',
+    hiddenArchivedCount: 'layout',
+    isArchivedRevealed: 'layout',
+    visualStatus: 'paint',
+    needsReview: 'paint',
+    isSaved: 'paint',
+    isFocused: 'paint',
+    isHighlighted: 'paint',
+    isLiftedParent: 'paint',
+    isResponsibleChild: 'paint',
+    isArchivedSubThread: 'paint',
+    onToggleFamily: 'handler',
+    onToggleArchivedRevealed: 'handler',
+    onShowInFolders: 'handler',
+    onClick: 'handler',
+} as const satisfies Record<keyof ThreadRowContentProps, 'layout' | 'paint' | 'handler' | 'identity'>;
+
+type ThreadRowLayoutName = {
+    [K in keyof typeof THREAD_ROW_PROP_ROLES]: (typeof THREAD_ROW_PROP_ROLES)[K] extends 'layout' ? K : never
+}[keyof typeof THREAD_ROW_PROP_ROLES];
+
+/** Every layout prop of a thread row, each one required. */
+export type ThreadRowLayoutProps = { [K in ThreadRowLayoutName]-?: ThreadRowContentProps[K] };
+
+const THREAD_ROW_LAYOUT_NAMES = (Object.keys(THREAD_ROW_PROP_ROLES) as (keyof typeof THREAD_ROW_PROP_ROLES)[])
+    .filter((k): k is ThreadRowLayoutName => THREAD_ROW_PROP_ROLES[k] === 'layout');
+
+/** The row window's layout key for a thread row: equal keys, equal heights. */
+export function threadRowLayoutKey(layout: ThreadRowLayoutProps): string {
+    return THREAD_ROW_LAYOUT_NAMES.map(k => String(layout[k])).join('\u0000');
+}
+
+export interface ThreadRowLayoutInput {
+    depth: number;
+    hiddenArchivedCount: number;
+    isArchivedRevealed?: boolean;
+    enableFamilyToggle?: boolean;
+}
+
+/** A thread row's layout props: what the row renders its box from, and what
+ *  the row window keys a row it has not mounted on. Reads no highlight or
+ *  focus, so keying every row never subscribes the list to either. */
+export function threadRowLayoutProps(
+    thread: ThreadState,
+    { depth, hiddenArchivedCount, isArchivedRevealed, enableFamilyToggle }: ThreadRowLayoutInput,
+): ThreadRowLayoutProps {
+    const { meta } = thread;
+    // Archiving a child never decrements totalChildrenCount. Subtract the ones
+    // hidden by default, so the chevron names only what actually renders.
+    const liveChildrenCount = meta.totalChildrenCount - hiddenArchivedCount;
+    const collapsible = !!enableFamilyToggle && liveChildrenCount > 0;
+    return {
+        depth,
+        title: threadDisplayTitle(thread),
+        createdLabel: formatCreatedTimestamp(meta.createdAt),
+        channel: meta.channel,
+        codingAgent: meta.codingAgent,
+        contextName: threadContextName(meta),
+        totalChildren: liveChildrenCount,
+        hasDraft: threadHasUnsentDraft(thread),
+        isHome: meta.home === true,
+        collapsible,
+        isCollapsed: collapsible && collapsedFamilies.value.has(meta.id),
+        hiddenArchivedCount: enableFamilyToggle ? hiddenArchivedCount : 0,
+        isArchivedRevealed,
+    };
+}
+
 /** The family toggle's visible text, which is also its accessible name. Both
  *  states name the count, so opening a family never hides how big it is. */
 export function familyDisclosureLabel(totalChildren: number, isCollapsed: boolean): string {
@@ -1859,39 +1985,21 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
     const visualStatus = visualStatusFor(status, meta);
     const isFocused = focusedThreadId.value === meta.id;
     const isHighlighted = highlightedKey.value === meta.id;
-    const hasDraft = threadHasUnsentDraft(thread);
-    // Archiving a child never decrements totalChildrenCount. Subtract the ones
-    // hidden by default, so the chevron names only what actually renders.
-    const liveChildrenCount = meta.totalChildrenCount - hiddenArchivedCount;
-    const hasLiveFamily = !!enableFamilyToggle && liveChildrenCount > 0;
-    const isCollapsed = hasLiveFamily && collapsedFamilies.value.has(meta.id);
 
     return (
         <ThreadRowContent
+            {...threadRowLayoutProps(thread, { depth, hiddenArchivedCount, isArchivedRevealed, enableFamilyToggle })}
             id={meta.id}
-            depth={depth}
             flipId={meta.id}
-            title={threadDisplayTitle(thread)}
-            createdLabel={formatCreatedTimestamp(meta.createdAt)}
-            channel={meta.channel}
-            codingAgent={meta.codingAgent}
             visualStatus={visualStatus}
-            contextName={threadContextName(meta)}
-            totalChildren={liveChildrenCount}
             needsReview={meta.section === 'inbox' && status !== 'running'}
-            hasDraft={hasDraft}
             isSaved={meta.saved}
-            isHome={meta.home === true}
             isFocused={isFocused}
             isHighlighted={isHighlighted}
             isLiftedParent={isLiftedParent}
             isResponsibleChild={isResponsibleChild}
             isArchivedSubThread={isArchivedSubThread}
-            collapsible={hasLiveFamily}
-            isCollapsed={isCollapsed}
             onToggleFamily={() => toggleFamilyCollapse(meta.id)}
-            hiddenArchivedCount={enableFamilyToggle ? hiddenArchivedCount : 0}
-            isArchivedRevealed={isArchivedRevealed}
             onToggleArchivedRevealed={() => toggleArchivedRevealed(meta.id)}
             // Folders draws no Home, so there is nowhere to show it.
             onShowInFolders={offerShowInFolders && !meta.home ? () => revealThreadInFolders(meta.id) : undefined}
@@ -1939,21 +2047,22 @@ const ONGOING_GROUP_META: Record<OngoingGroup, { title: string; empty: string; I
     'in-flight': { title: 'In flight', empty: 'Nothing in flight', Icon: InFlightIcon },
 };
 
-/** How a part's count reads on its tile: "1 change", "2 changes", "3 unread". */
-function ongoingPartLabel(part: OngoingPart, count: number): string {
-    return part === 'changes' && count === 1 ? '1 change' : `${count} ${part}`;
+/** The word after a part's count on its tile: "1 change", "2 changes", "3 unread". */
+function ongoingPartWord(part: OngoingPart, count: number): string {
+    return part === 'changes' && count === 1 ? 'change' : part;
 }
 
 /** A split group's parts, in words, one count per line: "1 running" over
- *  "2 waiting" (drawer.css). A part with no rows is left out, and the part the
- *  filter lists is marked. */
+ *  "2 waiting", the counts in one column (drawer.css). A part with no rows is
+ *  left out, and the part the filter lists is marked. */
 function OngoingTileBreakdown({ group, rows, filter }: { group: SplitOngoingGroup; rows: readonly NestedThread[]; filter: OngoingFilter }) {
     const parts = ongoingBreakdown(group, rows).filter(({ count }) => count > 0);
     return (
         <span class="ongoing-tile-breakdown">
             {parts.map(({ part, count }) => (
                 <span key={part} class={`ongoing-tile-breakdown-part${part === filter ? ' ongoing-tile-breakdown-part-listed' : ''}`}>
-                    {ongoingPartLabel(part, count)}
+                    <span class="ongoing-tile-breakdown-count">{count}</span>
+                    <span class="ongoing-tile-breakdown-word">{` ${ongoingPartWord(part, count)}`}</span>
                 </span>
             ))}
         </span>
@@ -1961,7 +2070,7 @@ function OngoingTileBreakdown({ group, rows, filter }: { group: SplitOngoingGrou
 }
 
 /** One Ongoing tile: its group's count, icon and name. A press selects the
- *  group and may open its first thread (`pressOngoingTile`). Split out so the
+ *  group (`pressOngoingTile`). Split out so the
  *  highlight subscription lives here, as in `DrawerSectionTitle`. The count
  *  stays blank until the threads load, so a cold boot never claims a group is
  *  empty. */
@@ -1991,8 +2100,10 @@ function OngoingTile({ group, rows, hydrated, selected }: {
              aria-current={selected ? 'true' : undefined}
              aria-label={filter === 'all' ? label : `${label}, showing ${filter}`}>
             <span class="ongoing-tile-top">
-                <span class="ongoing-tile-count">{hydrated ? rows.length : ''}</span>
-                {isSplitOngoingGroup(group) && <OngoingTileBreakdown group={group} rows={rows} filter={filter} />}
+                <span class="ongoing-tile-figures">
+                    <span class="ongoing-tile-count">{hydrated ? rows.length : ''}</span>
+                    {isSplitOngoingGroup(group) && <OngoingTileBreakdown group={group} rows={rows} filter={filter} />}
+                </span>
                 <span class="ongoing-tile-icon"><Icon size="var(--icon-size-sm)" /></span>
             </span>
             <span class={`ongoing-tile-label${running ? ' running-shimmer' : ''}`}>{title}</span>

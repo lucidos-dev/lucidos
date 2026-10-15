@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-16
+- **Amended by**: [0430: An MCP server is enabled per thread](0430-mcp-servers-are-enabled-per-thread.md),
+  which keys the per-round refresh per thread: a moved generation makes each
+  turn recompute its own slice, and only a changed slice rewrites the array
 
 ## Context
 

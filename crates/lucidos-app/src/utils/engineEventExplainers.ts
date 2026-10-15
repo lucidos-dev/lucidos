@@ -105,8 +105,14 @@ export function describeEngineReason(reason: EngineReason): string {
       return 'The agent behind this thread had stopped running. Lucidos tidied up after it and offered its work as a change.';
     case 'archived_branch_work':
       return 'This thread was archived with work that was never offered as a change. Lucidos set it aside so it is not lost. Bring it back from the Changes panel to apply it.';
+    case 'unmerged_integrated_work':
+      return 'This thread’s work was meant to reach the project inside its parent’s change. That change was applied without it. Lucidos set the work aside so it is not lost. Bring it back from the Changes panel to apply it.';
+    case 'successor_residue':
+      return 'This thread kept working after it continued in a successor thread. You applied or discarded the successor’s change without that later work, so Lucidos set the work aside to keep it. Bring it back from the Changes panel to apply it.';
     case 'merge_conflict':
       return 'Your changes conflict with newer changes in the project: a merge conflict. Lucidos asked the agent to resolve it before your changes can be applied.';
+    case 'main_check_red':
+      return 'The main check failed: the tests that run on GitHub after changes land found main broken. Lucidos started this thread to find the cause and fix it.';
     case 'missing_hardening':
       return `${REVIEW_RULE} It had not run yet, so Lucidos asked the agent to run it.`;
     case 'missing_plan':
@@ -123,6 +129,8 @@ export function describeEngineReason(reason: EngineReason): string {
         : 'A trigger ran on its schedule and sent this message.';
     case 'event_wait':
       return describeEventWait(reason);
+    case 'cache_keep_alive':
+      return 'The agent was waiting, so Lucidos nudged it to keep its prompt cache warm. Once that cache expires, after 5 minutes or an hour depending on how the agent is billed, its next step pays to read the whole conversation again.';
   }
 }
 

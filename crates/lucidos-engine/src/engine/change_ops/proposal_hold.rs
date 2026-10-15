@@ -10,8 +10,9 @@
 
 use super::{load_apply_kind_context, ApplyKindContext};
 use crate::engine::git_ops::{
-    bounded_fix_refusal_for, is_harden_marker_present, lands_plan_files_only, needs_hardening,
-    plan_marker_files, plan_marker_state, BoundedFixInputs, PlanMarkerKind, PlanMarkerState,
+    bounded_fix_refusal_for, harden_marker, has_full_harden_marker, lands_plan_files_only,
+    needs_hardening, plan_marker_files, plan_marker_state, BoundedFixInputs, HardenMarkerState,
+    HardenTier, PlanMarkerKind, PlanMarkerState,
 };
 use crate::engine::LucidosEngine;
 use std::path::Path;
@@ -140,6 +141,12 @@ pub(crate) enum ProposalHold {
     Plan(PlanHold),
     /// The work never ran `/harden`, so Apply would harden it first.
     HardeningMissing,
+    /// An integrated sub-thread's hardened work. It hands its branch up to
+    /// its parent, whose agent merges it, so it never becomes a change.
+    IntegratedIntoParent,
+    /// The thread handed off to a successor thread. Its branch work rides on
+    /// the successor's branch, so this thread never proposes it.
+    CarriedBySuccessor,
 }
 
 impl ProposalHold {
@@ -152,6 +159,8 @@ impl ProposalHold {
                  Press Harden on the thread: the hardening run proposes the change when it \
                  finishes."
             }
+            ProposalHold::IntegratedIntoParent => INTEGRATED_HAS_NO_APPLY,
+            ProposalHold::CarriedBySuccessor => CARRIED_HAS_NO_APPLY,
         }
     }
 
@@ -164,9 +173,21 @@ impl ProposalHold {
                  so Apply would have to harden it first. Run `/harden` now over the whole \
                  batch of commits, then end your turn: Lucidos then proposes the change."
             }
+            ProposalHold::IntegratedIntoParent => INTEGRATED_HAS_NO_APPLY,
+            ProposalHold::CarriedBySuccessor => CARRIED_HAS_NO_APPLY,
         }
     }
 }
+
+/// Why an integrated sub-thread's work has no Apply.
+const INTEGRATED_HAS_NO_APPLY: &str =
+    "This thread is integrated into its parent. Lucidos never proposes its work: the parent's \
+     agent merges its branch, and the parent's change carries it.";
+
+/// Why a thread that handed off has no Apply.
+const CARRIED_HAS_NO_APPLY: &str =
+    "This thread continued in a successor thread, whose branch carries its work. Lucidos \
+     never proposes it here: the successor's change carries it to Apply.";
 
 /// The plan floor for a branch whose thread kind is already loaded. Skips the
 /// marker read for an exempt thread.
@@ -225,6 +246,11 @@ async fn read_proposal_floor(
 /// Why a proposal of `files` is held, or `None` when it may become a change.
 /// Lucidos-source work the plan floor clears is held until it is hardened,
 /// unless it lands plan files only.
+///
+/// An integrated sub-thread's work is never proposed, unless it lands plan
+/// files only. A fresh marker of either tier hands it up to the parent;
+/// without one it waits for hardening. Every other branch counts only a full
+/// marker, fresh or stale.
 pub(crate) async fn read_proposal_hold(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -232,13 +258,36 @@ pub(crate) async fn read_proposal_hold(
     branch_name: &str,
     files: &[String],
 ) -> Option<ProposalHold> {
+    if crate::engine::successor::handed_off(pool, thread_id).await {
+        return Some(ProposalHold::CarriedBySuccessor);
+    }
     match read_proposal_floor(pool, thread_id, repo_root, branch_name, files).await {
         PlanFloor::Held(hold) => Some(ProposalHold::Plan(hold)),
         PlanFloor::Exempt => None,
         PlanFloor::Clear(_) | PlanFloor::PlanOnly => {
-            let hardened = is_harden_marker_present(pool, repo_root, branch_name).await;
+            if crate::engine::integrated::thread_is_integrated(pool, thread_id).await {
+                let fresh = harden_marker(pool, repo_root, branch_name)
+                    .await
+                    .state_for(HardenTier::Fast)
+                    == HardenMarkerState::Fresh;
+                return integrated_hold(fresh, files);
+            }
+            let hardened = has_full_harden_marker(pool, repo_root, branch_name).await;
             needs_hardening(hardened, files).then_some(ProposalHold::HardeningMissing)
         }
+    }
+}
+
+/// An integrated sub-thread's hold: handed up once a fresh marker covers its
+/// work, held for hardening until then. A branch of plan files alone needs no
+/// hardening and has no marker to hand up, so it proposes like any other.
+fn integrated_hold(fresh_marker: bool, files: &[String]) -> Option<ProposalHold> {
+    if lands_plan_files_only(files) {
+        None
+    } else if fresh_marker {
+        Some(ProposalHold::IntegratedIntoParent)
+    } else {
+        Some(ProposalHold::HardeningMissing)
     }
 }
 
@@ -324,6 +373,35 @@ mod tests {
         assert!(!apply_must_harden(&app, false, None));
     }
 
+    /// An integrated sub-thread proposes no code: hardened work is handed
+    /// up, and unhardened work waits for hardening. A plan alone needs no
+    /// hardening and leaves no marker to hand up, so it proposes normally.
+    #[test]
+    fn an_integrated_hold_proposes_only_a_plan() {
+        let code = vec!["src/main.rs".to_string()];
+        let plan = vec!["docs/plans/2026-10-13-x.md".to_string()];
+        let mixed = vec![plan[0].clone(), code[0].clone()];
+        assert_eq!(
+            integrated_hold(true, &code),
+            Some(ProposalHold::IntegratedIntoParent)
+        );
+        assert_eq!(
+            integrated_hold(false, &code),
+            Some(ProposalHold::HardeningMissing)
+        );
+        assert_eq!(
+            integrated_hold(false, &mixed),
+            Some(ProposalHold::HardeningMissing)
+        );
+        assert_eq!(integrated_hold(false, &plan), None);
+        assert_eq!(integrated_hold(true, &plan), None);
+        assert_eq!(
+            integrated_hold(false, &[]),
+            Some(ProposalHold::HardeningMissing),
+            "no files is no evidence of a plan"
+        );
+    }
+
     #[test]
     fn app_and_external_threads_are_exempt_whatever_the_marker() {
         for k in [CodingAgentKind::App, CodingAgentKind::External] {
@@ -384,6 +462,9 @@ mod tests {
                 coding_agent_kind: CodingAgentKind::App,
                 coding_agent_folder: "/home/u/ws/data/apps/habit-tracker".into(),
                 app_id: Some("habit-tracker".into()),
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

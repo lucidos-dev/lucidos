@@ -290,6 +290,54 @@ describe('trackPaneSwipe', () => {
     expect(t.onRelease).toHaveBeenCalledExactlyOnceWith(0);
   });
 
+  it('follows a drag whose touched node left the DOM to its release', () => {
+    // An app re-rendering its list drops the row under the finger. The rest of
+    // the touch then fires on that detached row and never reaches the surface.
+    const t = setup();
+    const row = Object.assign(new EventTarget(), { localName: 'div', parentElement: null });
+    t.start([200, 100], row);
+    t.move([190, 100]);
+    row.dispatchEvent(touch('touchmove', [[50, 100]]));
+    expect(t.onDrag).toHaveBeenLastCalledWith(-142);
+    row.dispatchEvent(touch('touchend', []));
+    expect(t.onRelease).toHaveBeenCalledExactlyOnceWith(1);
+  });
+
+  it('snaps back when a detached node takes the touchcancel', () => {
+    const t = setup();
+    const row = Object.assign(new EventTarget(), { localName: 'div', parentElement: null });
+    t.start([200, 100], row);
+    t.move([150, 100]);
+    row.dispatchEvent(touch('touchcancel', []));
+    expect(t.onRelease).toHaveBeenCalledExactlyOnceWith(0);
+  });
+
+  it('stops listening on the touched node once its drag ends', () => {
+    const t = setup();
+    const row = Object.assign(new EventTarget(), { localName: 'div', parentElement: null });
+    t.start([200, 100], row);
+    t.move([100, 100]);
+    t.release();
+    t.onDrag.mockClear();
+    row.dispatchEvent(touch('touchmove', [[50, 100]]));
+    row.dispatchEvent(touch('touchend', []));
+    expect(t.onDrag).not.toHaveBeenCalled();
+    expect(t.onRelease).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops listening on a live drag\'s touched node after cleanup', () => {
+    const t = setup();
+    const row = Object.assign(new EventTarget(), { localName: 'div', parentElement: null });
+    t.start([200, 100], row);
+    t.move([190, 100]);
+    t.onDrag.mockClear();
+    t.cleanup();
+    row.dispatchEvent(touch('touchmove', [[50, 100]]));
+    row.dispatchEvent(touch('touchend', []));
+    expect(t.onDrag).not.toHaveBeenCalled();
+    expect(t.onRelease).not.toHaveBeenCalled();
+  });
+
   it('stops listening after cleanup', () => {
     const t = setup();
     t.cleanup();

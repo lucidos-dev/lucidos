@@ -461,8 +461,6 @@ fn copy_tree(from: &Path, to: &Path) -> Fallible<()> {
 pub struct BootedEngine {
     pub child: std::process::Child,
     pub base_url: String,
-    /// Where [`stop_engine`] removes the pidfile it wrote.
-    workspace: PathBuf,
 }
 
 /// Whether the arm engines serve https, and with which certificate.
@@ -536,11 +534,14 @@ impl EngineTls {
     }
 }
 
-/// Drop and recreate this arm's database.
+/// Drop and recreate this arm's database, and forget the workspace's migration
+/// marker first. A rerun reuses the workspace directory, and the engine would
+/// refuse the fresh database as wiped (ADR 0481).
 ///
 /// Destructive, and gated on the workspace name having passed
 /// [`checked_eval_workspace`] first. The caller owns that order.
-pub fn recreate_database(pg_base: &str, database: &str) -> Fallible<()> {
+pub fn recreate_database(pg_base: &str, database: &str, workspace: &Path) -> Fallible<()> {
+    lucidos_engine::core::migration_marker::forget(workspace)?;
     let admin = format!("{}/postgres", pg_base.trim_end_matches('/'));
     let (drop, create) = recreate_statements(database);
     psql(&admin, &["-c", &drop, "-c", &create])
@@ -596,9 +597,8 @@ pub fn migrate_by_booting(
 /// adopts this engine on the first proxy hit, rather than spawning a second one
 /// against the same database. See [`crate::gateway::registered_port`].
 ///
-/// The pidfile it writes is the same one `lucidos_gateway::stack::spawn_engine`
-/// writes, at the path the picker's Stop and the gateway's stale-engine reclaim
-/// both read.
+/// The engine publishes its own pidfile once it owns the workspace, which is
+/// what the picker's Stop and the gateway's reclaim read (ADR 0438).
 pub fn boot_engine(
     engine_bin: &Path,
     workspace: &Path,
@@ -618,7 +618,6 @@ pub fn boot_engine(
         ))
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", engine_bin.display()))?;
-    write_pidfile(workspace, child.id());
     let base_url = format!("{}://127.0.0.1:{port}", tls.scheme());
     let mut child = child;
     if let Err(error) = wait_for_health(&mut child, &base_url, Duration::from_secs(120)) {
@@ -626,14 +625,9 @@ pub fn boot_engine(
         // database connection the next attempt needs.
         let _ = child.kill();
         let _ = child.wait();
-        remove_pidfile(workspace);
         return Err(error);
     }
-    Ok(BootedEngine {
-        child,
-        base_url,
-        workspace: workspace.to_path_buf(),
-    })
+    Ok(BootedEngine { child, base_url })
 }
 
 /// Everything one arm's engine is launched with.
@@ -713,34 +707,7 @@ const FORCE_QUERY_CLASSIFICATION_VALUE: &str = "all";
 pub fn stop_engine(mut engine: BootedEngine) -> Fallible<()> {
     engine.child.kill()?;
     engine.child.wait()?;
-    // The process is gone, so the file would only offer the gateway's reclaim a
-    // pid the operating system is free to hand to somebody else.
-    remove_pidfile(&engine.workspace);
     Ok(())
-}
-
-/// Where a workspace's engine records its pid, for the gateway to read.
-fn pidfile(workspace: &Path) -> PathBuf {
-    workspace.join(".lucidos/engine.pid")
-}
-
-/// Record this engine's pid. Not fatal: the engine is already up and serving,
-/// and only the picker's Stop and the gateway's reclaim lose sight of it.
-fn write_pidfile(workspace: &Path, pid: u32) {
-    let path = pidfile(workspace);
-    let written = std::fs::create_dir_all(workspace.join(".lucidos"))
-        .and_then(|()| std::fs::write(&path, pid.to_string()));
-    if let Err(e) = written {
-        eprintln!(
-            "[eval] could not write {}: {e}. The picker's Stop and the gateway's stale-engine \
-             reclaim will not see this engine.",
-            path.display()
-        );
-    }
-}
-
-fn remove_pidfile(workspace: &Path) {
-    let _ = std::fs::remove_file(pidfile(workspace));
 }
 
 /// Poll `base_url` until OUR engine answers, or the deadline passes.
@@ -889,9 +856,12 @@ pub async fn write_arm_preference(
     Ok(())
 }
 
+/// The URL reaches psql as libpq's `PG*` env, so its password stays out of
+/// argv, where `ps` shows it to every local user.
 fn psql(database_url: &str, args: &[&str]) -> Fallible<()> {
+    let url = lucidos_pg_url::PgUrl::parse(database_url)?;
     let output = std::process::Command::new("psql")
-        .arg(database_url)
+        .envs(url.env())
         .args(args)
         .output()
         .map_err(|e| format!("cannot run psql: {e}"))?;
@@ -954,29 +924,21 @@ mod tests {
     /// would pass a name check, and clearing the data tree would follow it.
     #[test]
     fn a_correctly_named_symlink_is_refused() {
-        let root = std::env::temp_dir().join(format!(
-            "lucidos-eval-symlink-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let target = root.join("somebody-elses-workspace");
-        let link = root.join("eval-lean-1");
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("somebody-elses-workspace");
+        let link = root.path().join("eval-lean-1");
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let err = checked_eval_workspace(&link).unwrap_err().to_string();
         assert!(err.contains("it is a symlink"), "got: {err}");
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn a_real_directory_with_the_prefix_is_still_accepted() {
-        let root = std::env::temp_dir().join(format!(
-            "lucidos-eval-real-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let workspace = root.join("eval-lean-1");
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("eval-lean-1");
         std::fs::create_dir_all(&workspace).unwrap();
         checked_eval_workspace(&workspace).unwrap();
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn opus() -> RunLabel {

@@ -7,9 +7,10 @@ paths:
 
 # Rust Conventions
 
-- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with no custom error types. Two are blessed, each because a caller branches on it:
+- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with no custom error types. Three are blessed, each because a caller branches on it:
   - `LifecycleViolation` in `engine/thread_lifecycle.rs` carries `event_type`, `thread_type`, `current_section` and `reason`. The EventBus rejection path fails fast on that typed payload instead of parsing a string.
   - `llm::ModelNotServed` marks a provider's "no such model" answer. An unset default then moves to its next model (ADR 0403).
+  - `lucidos_engine_socket::ConnectError`, and the gateway's `engine_hop::HopError` wrapping it, tell a socket nobody listens on from one another user holds. A probe reads the first as `Unreachable` and the second as `Foreign`, and the proxy answers them differently (ADR 0445).
   - A new custom error type needs the same structural reason. "I want a typed error for this layer" is not one. If the caller only formats the error into a string, use the boxed trait object.
   - `api::error::ApiError` is not an error type in this sense. It is the HTTP response shape (`status` plus a `{"error": msg}` body) for `/api/v1` handlers, read by its `IntoResponse` impl. Handlers return `Result<_, ApiError>` rather than hand-rolling a `(StatusCode, Json)` tuple. Internal code keeps the boxed trait object and converts at the handler boundary.
   - A refusal a client must tell apart from its siblings adds a slug with `ApiError::with_reason`. The body then reads `{"error": msg, "reason": slug}`, and every error without one keeps its old bytes.
@@ -54,7 +55,13 @@ Only conversational data goes through HTTP API. DB access, vector search, embedd
 
 ## Intra-host scheme — never hardcode `http`/`https`
 
-An HTTP call between co-located Lucidos processes (engine → gateway control API, gateway ↔ engine, any `127.0.0.1` hop) MUST resolve its scheme through **`net_config::tls_scheme` / `tls_scheme_from` / `peer_scheme_order`** (the constants `SCHEME_HTTP` / `SCHEME_HTTPS`) — never a hardcoded `http://` or `https://` in the URL. A process serves TLS iff **both** `LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY` point at non-empty paths: **dev keeps the certs → `https`**; the **packaged gateway strips them → `http`** (see `crates/lucidos-gateway/src/stack.rs` + `crates/lucidos-app/src/desktop.rs`, and the dev-vs-packaged table in ADR 0014). For a call to a peer whose scheme *should* match ours but might not, use `peer_scheme_order()` — it puts the resolved scheme first and the other protocol second, so a mismatch still connects (supports both). A self-signed dev cert on a loopback hop is accepted with `reqwest`'s `danger_accept_invalid_certs(true)` + `no_proxy()`, matching the gateway's `build_health_client` and the dev scripts' `curl -sk`.
+An HTTP call between co-located Lucidos processes MUST resolve its scheme through **`net_config::tls_scheme` / `tls_scheme_from` / `peer_scheme_order`** (the constants `SCHEME_HTTP` / `SCHEME_HTTPS`). That covers engine → gateway control API and any other `127.0.0.1` hop. Never hardcode `http://` or `https://` in the URL.
+
+- A process serves TLS iff **both** `LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY` point at non-empty paths. **Dev keeps the certs → `https`**; the **packaged gateway strips them → `http`**. See `crates/lucidos-gateway/src/stack.rs`, `crates/lucidos-app/src/desktop.rs` and the dev-vs-packaged table in ADR 0014.
+- A peer's scheme *should* match ours but might not. For that call use `peer_scheme_order()`: it tries the resolved scheme first and the other one second, so a mismatch still connects.
+- A self-signed dev cert on a loopback hop is accepted with `reqwest`'s `danger_accept_invalid_certs(true)` + `no_proxy()`. The gateway's peer probe and the dev scripts' `curl -sk` do the same.
+
+**The gateway's hop to an engine has no scheme.** It goes over the *engine socket* through `engine_hop`, never a TCP URL (ADR 0445).
 
 **One exception: the Vertex relay** (`runtime/vertex_relay.rs`). Its socket never serves TLS, whatever `LUCIDOS_TLS_*` says, because Claude Code's Node runtime does not trust the dev certificate. So its `http://` is fixed by construction, and `tls_scheme` would give the wrong answer (ADR 0260).
 

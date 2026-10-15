@@ -10,17 +10,20 @@ import { render } from 'preact';
 
 vi.mock('../continueStoppedThread', () => ({ continueStoppedThread: vi.fn() }));
 vi.mock('../../../api/client', () => ({ hardenThread: vi.fn(() => Promise.resolve()) }));
+vi.mock('../../../store/actions/threads', () => ({ focusThreadOrBootstrap: vi.fn() }));
 
-import { NOT_READY_COPY, NotReadyStrip } from '../NotReadyStrip';
+import { NOT_READY_COPY, NotReadyStrip, notReadyLabel } from '../NotReadyStrip';
 import { continueStoppedThread } from '../continueStoppedThread';
 import { hardenThread } from '../../../api/client';
+import { focusThreadOrBootstrap } from '../../../store/actions/threads';
 import { focusedThreadId, notReadyReason, threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import type { CodingAgentChangeState } from '../../../api/threads';
 import type { UnproposedReason } from '../../../generated/thread-event-wire';
 import type { StoredEvent } from '../../../store/thread-events';
 
-const REASONS = Object.keys(NOT_READY_COPY) as UnproposedReason[];
+const STRIP_REASONS = Object.keys(NOT_READY_COPY) as (keyof typeof NOT_READY_COPY)[];
+const REASONS: UnproposedReason[] = [...STRIP_REASONS, 'carried_by_successor'];
 
 type MetaOverrides = NonNullable<NonNullable<Parameters<typeof makeThreadState>[1]>['meta']>;
 
@@ -28,8 +31,8 @@ function codingAgentThread(change: CodingAgentChangeState, meta: MetaOverrides =
   return makeThreadState('t1', { meta: { channel: 'claude_code', section: 'inbox', codingAgentChangeState: change, ...meta } });
 }
 
-function mount(change: CodingAgentChangeState): HTMLElement {
-  threadMap.value = new Map([['t1', codingAgentThread(change)]]);
+function mount(change: CodingAgentChangeState, meta: MetaOverrides = {}): HTMLElement {
+  threadMap.value = new Map([['t1', codingAgentThread(change, meta)]]);
   focusedThreadId.value = 't1';
   const host = document.createElement('div');
   document.body.appendChild(host);
@@ -123,7 +126,7 @@ describe('notReadyReason', () => {
 
 describe('NotReadyStrip', () => {
   it('shows the label and the hint for each reason', () => {
-    for (const reason of REASONS) {
+    for (const reason of STRIP_REASONS) {
       const host = mount({ kind: 'unproposed', reason });
       const text = host.querySelector('.not-ready-strip')?.textContent ?? '';
       expect(text).toContain(NOT_READY_COPY[reason].label);
@@ -170,6 +173,45 @@ describe('NotReadyStrip', () => {
       expect(host.querySelector('[disabled]')).toBeNull();
       render(null, host);
     }
+  });
+
+  it('names the parent an integrated sub-thread folds into, and offers nothing to press', () => {
+    const host = mount({ kind: 'unproposed', reason: 'integrated_into_parent' }, { parentThreadTitle: 'Fix the drawer' });
+    const text = host.querySelector('.not-ready-strip')?.textContent ?? '';
+    expect(text).toContain('Integrated into Fix the drawer');
+    expect(text).toContain(NOT_READY_COPY.integrated_into_parent.hint);
+    const labels = [...host.querySelectorAll('button')].map((b) => b.textContent?.trim());
+    expect(labels).not.toContain('Harden');
+    expect(labels).not.toContain('Continue');
+    expect(labels).not.toContain('Apply');
+  });
+
+  it('falls back to its parent in general before the title is known', () => {
+    expect(notReadyLabel('integrated_into_parent', undefined)).toBe('Integrated into its parent');
+    expect(notReadyLabel('hardening_missing', { parentThreadTitle: 'Fix the drawer' })).toBe(NOT_READY_COPY.hardening_missing.label);
+  });
+
+  describe('for a handed-off thread', () => {
+    const successor = { thread_id: 's1', title: 'Fix the drawer (continued)' };
+    const handedOff = { kind: 'unproposed', reason: 'carried_by_successor' } as const;
+
+    it('draws a quiet link, not the amber strip', () => {
+      const host = mount(handedOff, { successor });
+      expect(host.querySelector('.not-ready-strip')).toBeNull();
+      expect(host.querySelector('[data-role="continued-here"]')?.textContent).toBe('Continued here');
+    });
+
+    it('opens the successor thread from "here"', () => {
+      const host = mount(handedOff, { successor });
+      host.querySelector<HTMLButtonElement>('.continued-here-link')?.click();
+      expect(focusThreadOrBootstrap).toHaveBeenCalledWith('s1');
+    });
+
+    it('says where the work went without a link before the successor is known', () => {
+      const host = mount(handedOff);
+      expect(host.querySelector('[data-role="continued-here"]')?.textContent).toBe('Continued in a new thread');
+      expect(host.querySelector('button')).toBeNull();
+    });
   });
 
   it('draws nothing for a proposal', () => {

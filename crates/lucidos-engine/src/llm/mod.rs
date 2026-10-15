@@ -39,10 +39,11 @@ pub use model_registry::{ModelRegistry, ProviderKind};
 pub use not_served::ModelNotServed;
 pub use openai::{
     resolve_bearer_key, resolve_openai_api_key, OpenAiKeySource, OpenAiProvider,
-    OPENAI_DEFAULT_BASE_URL,
+    OPENAI_API_KEY_ENV, OPENAI_DEFAULT_BASE_URL,
 };
 pub use provider::{
-    ContentBlock, LlmProvider, Message, MessageContent, ModelSelection, TokenCallback, ToolCall,
+    CacheMode, ContentBlock, LlmProvider, Message, MessageContent, ModelSelection, ServiceTier,
+    TokenCallback, ToolCall,
 };
 pub use provider_build::{
     boot_without_provider_enabled, build_active_provider, ProviderBuildContext,
@@ -68,6 +69,10 @@ use std::time::Duration;
 /// provider (`provider_build`) and the builtin `openrouter` proxy
 /// (`api::proxy_builtin`).
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// The launch environment's OpenRouter key, read below a stored `openrouter`
+/// credential.
+pub const OPENROUTER_API_KEY_ENV: &str = "LUCIDOS_OPENROUTER_API_KEY";
 
 /// xAI's OpenAI-compatible API root, serving the Grok family. Single home
 /// shared by the LLM provider (`provider_build`) and the builtin `xai` proxy

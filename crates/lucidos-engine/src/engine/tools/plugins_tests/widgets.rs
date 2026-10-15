@@ -17,7 +17,7 @@ const WIDGET: &[u8] = br#"{"name": "Board", "kind": "widget", "reusable": true, 
 /// it away with the rest of the plugin.
 #[tokio::test]
 async fn uninstall_removes_the_plugins_widget() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_archive(
@@ -56,5 +56,4 @@ async fn uninstall_removes_the_plugins_widget() {
         .await
         .expect("uninstall");
     assert!(!scratch.join("data/apps/board").exists());
-    let _ = std::fs::remove_dir_all(&scratch);
 }

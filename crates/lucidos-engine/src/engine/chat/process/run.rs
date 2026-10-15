@@ -127,22 +127,36 @@ pub(super) async fn resolve_route_overrides(
 }
 
 impl LucidosEngine {
-    /// The tools a chat turn offers, with the MCP slice fitted to a model of
-    /// `context_window`. A side question sends the same array, so the two
-    /// share one prompt-cache prefix.
+    /// The tools a chat turn of `thread_id` offers, with the MCP slice fitted
+    /// to a model of `context_window`. A side question sends the same array,
+    /// so the two share one prompt-cache prefix.
+    ///
+    /// A thread that reports to a parent also gets `wake_parent`, after the
+    /// workspace's schemas and before the MCP slice. It is the one
+    /// thread-shaped schema: every schema before it keeps the workspace's
+    /// shared cache prefix, and a sub-thread's prefix diverges only from it.
     pub(super) async fn chat_turn_tools(
         &self,
+        thread_id: Uuid,
         gates: &crate::llm::ToolCapabilities,
         context_window: usize,
     ) -> crate::engine::agentic_loop::TurnTools {
-        let tools = super::system_prompt::chat_tools(gates);
+        let mut tools = super::system_prompt::chat_tools(gates);
+        if crate::engine::turn_end::wake_decision::WakeDuty::owes_a_decision(&self.pool, thread_id)
+            .await
+        {
+            tools.push(crate::llm::tools::wake_parent_tool());
+        }
         // MCP server management is the grouped `mcp` manifest tool, one of
-        // `chat_tools`. Tools discovered from running servers join here.
-        // The stamp rides with the tools so the loop can tell whether what it
-        // holds is still current. It is the only part of the array that can
-        // move mid-turn; see `TurnTools`.
+        // `chat_tools`. The tools of the running servers this thread enabled
+        // join here (ADR 0430). The stamp rides with the tools so the loop
+        // can tell whether what it holds is still current. It is the only
+        // part of the array that can move mid-turn; see `TurnTools`.
         let mcp_char_ceiling = crate::mcp::mcp_tool_char_ceiling(context_window);
-        let mcp_surface = self.mcp_manager.tool_surface(mcp_char_ceiling).await;
+        let mcp_surface = self
+            .mcp_manager
+            .tool_surface(thread_id, mcp_char_ceiling)
+            .await;
         crate::engine::agentic_loop::TurnTools::new(tools, mcp_surface, mcp_char_ceiling)
     }
 }
@@ -202,8 +216,6 @@ impl LucidosEngine {
     /// Idempotent: the gate skips the emit when a terminator already landed
     /// for `anchor`. A turn is finished either way by the time this returns,
     /// which is the promise `process_message_with_steps` makes to its callers.
-    // The turn's anchor plus the guard and channel its tail consumes.
-    #[allow(clippy::too_many_arguments)]
     async fn fail_turn(
         &self,
         thread_id: Uuid,
@@ -235,7 +247,7 @@ impl LucidosEngine {
     ///
     /// Must stay a plain `fn`: the spawned chain re-enters this turn's own
     /// future type, and an `async` caller holding it would be a type cycle.
-    pub(in crate::engine::chat) fn resubmit_orphans_of_failed_turn(
+    pub(crate) fn resubmit_orphans_of_failed_turn(
         &self,
         thread_id: Uuid,
         orphans: Vec<InjectedPrompt>,
@@ -281,6 +293,7 @@ impl LucidosEngine {
         url_context: Option<crate::api::UrlContext>, // webpage content from Tauri panel webview
         parent_thread_id: Option<Uuid>, // parent thread if spawned by run_thread
         spawning_event_id: Option<Uuid>, // event in parent thread that triggered the spawn (mode != Human only)
+        wake_mode: Option<crate::engine::thread_events::WakeMode>, // a child's spawning message only
         mode: ActorMode,
         cc_model: Option<&str>, // CC-specific model override (from compose view pre-session selection)
         coding_agent: Option<crate::runtime::CodingAgent>, // backend for a NEW coding-agent thread; stored value wins on follow-ups
@@ -290,12 +303,12 @@ impl LucidosEngine {
         voice_session_id: Option<Uuid>, // set when this message was spoken on a call
         external_cancel: Option<CancellationToken>, // forwarded into the per-thread cancel_token (used by triggers)
         urgency: crate::engine::FollowUpUrgency, // child follow-up only: preempt the child's in-flight turn
-        follow_up_turn: Option<crate::engine::FollowUpTurn>, // released once this message is recorded and routed
+        input_turn: Option<crate::engine::InputTurn>, // released once this message is recorded and routed
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Everything up to the release runs after every earlier follow-up to
-        // this thread has been recorded and routed. Every return releases it.
-        let mut follow_up_turn = follow_up_turn;
-        if let Some(turn) = follow_up_turn.as_mut() {
+        // Everything up to the release runs after every input admitted to this
+        // thread before it has been recorded and routed. Every return releases it.
+        let mut input_turn = input_turn;
+        if let Some(turn) = input_turn.as_mut() {
             turn.wait_for_predecessor().await;
         }
         let urgent = urgency.is_urgent();
@@ -405,7 +418,9 @@ impl LucidosEngine {
                 )
                 .await
             {
-                use crate::engine::agent_question::{answer_pending_question, AnswerResult};
+                use crate::engine::agent_question::{
+                    answer_pending_question_with_event_id, AnswerResult,
+                };
                 use crate::engine::thread_events::AnswerKind;
                 let engine_arc: std::sync::Arc<Self> = self.clone_arc();
                 let image_hashes =
@@ -431,12 +446,13 @@ impl LucidosEngine {
                     text: user_message.to_string(),
                     image_hashes,
                 };
-                match answer_pending_question(
+                match answer_pending_question_with_event_id(
                     &engine_arc,
                     thread_id,
                     pending_tool_use_id,
                     answer,
                     origin.clone(),
+                    event_id.and_then(|raw| Uuid::parse_str(raw).ok()),
                 )
                 .await
                 {
@@ -561,7 +577,13 @@ impl LucidosEngine {
         // once CC interrupts and the in-memory waiter is gc'd. Unlike the
         // question free-form path above, this does NOT consume the message —
         // the typed text still routes to CC below as a normal follow-up.
-        if use_coding_agent == Some(true) && !is_new_thread && !user_message.is_empty() {
+        // A keep-alive is invisible, so it must not move any card either.
+        let keep_alive = pre_emitted_origin.is_some_and(PreEmittedOrigin::is_keep_alive);
+        if use_coding_agent == Some(true)
+            && !is_new_thread
+            && !user_message.is_empty()
+            && !keep_alive
+        {
             // An engine re-entry on a live session overtakes no card, so the
             // user can still approve the request it would deny.
             if !super::super::process_helpers::reentry_reaches_live_session(
@@ -700,31 +722,34 @@ impl LucidosEngine {
         //
         // This handles both idle sessions (msg picked up immediately) and busy sessions
         // (msg queued in the channel, picked up after current work finishes).
-        if use_coding_agent == Some(true) && !is_new_thread {
-            // Check if there's a live Claude Code session to route to.
-            let has_session = {
-                let sessions = self.agent_sessions.lock().await;
-                sessions
-                    .get(&thread_id)
-                    .map(|s| s.is_live())
-                    .unwrap_or(false)
-            };
-
-            // Race-bridge: when CC's spawn is still in flight, agent_sessions
-            // is empty but active_threads holds the thread. Wait for the
-            // session to register so this follow-up routes via msg_tx as the
-            // fast-path intends. See `wait_for_cc_session_alive`.
-            let has_session = has_session
-                || super::super::process_helpers::wait_for_cc_session_alive(
-                    &self.agent_sessions,
-                    &self.active_threads,
-                    thread_id,
-                    std::time::Duration::from_secs(30),
-                    std::time::Duration::from_millis(100),
-                )
-                .await;
-
-            if has_session {
+        let mut spawn_claim = None;
+        if use_coding_agent == Some(true) {
+            loop {
+                // One `agent_sessions` lock hold either claims the thread for
+                // this message's spawn or finds the run that holds it. A
+                // follow-up during startup finds the starting run and queues.
+                let claim = if keep_alive {
+                    self.claim_thread_for_keep_alive(thread_id).await?
+                } else {
+                    self.claim_thread_for_spawn(thread_id, coding_agent).await?
+                };
+                if let Some(claim) = claim {
+                    self.name_requested_settings(&claim, cc_model, reasoning_effort)
+                        .await;
+                    spawn_claim = Some(claim);
+                    break;
+                }
+                // Something else has the thread now, so this beat is skipped.
+                if keep_alive {
+                    log!("[KeepAlive] Thread {thread_id} is busy, so this beat is skipped");
+                    return Ok(terminal_result(
+                        String::new(),
+                        vec![],
+                        request_id,
+                        thread_id,
+                        false,
+                    ));
+                }
                 // Interrupt-and-redirect. Interrupt the live turn (it ends as a
                 // resumable Canceled boundary: no spurious ResponseGenerated,
                 // no change proposed for the redirected-away work), then fall
@@ -757,17 +782,15 @@ impl LucidosEngine {
                     // or process exit) BEFORE emitting the follow-up's
                     // MessageReceived, so the turn's Canceled terminal is
                     // sequenced first (coding-agent exchanges group by sequence
-                    // order — see the MessageReceived-first note below). Unlike
-                    // apply_now's wait_for_idle, the boundary may ALREADY have
-                    // been reached by the time we get here (the graceful
-                    // interrupt can idle the turn before we register a waiter),
-                    // so re-check is_waiting each iteration instead of relying on
-                    // a future idle_notify alone. The engine's 8s interrupt
+                    // order — see the MessageReceived-first note below). The
+                    // graceful interrupt can idle the turn before we register
+                    // a waiter, so the boundary may already be behind us.
+                    // Re-check is_waiting each iteration as well. The engine's 8s interrupt
                     // escalation hard-kills a non-idling turn (→ process_exited),
                     // and REDIRECT_INTERRUPT_MAX_WAIT is the backstop above that.
                     // If the session died, the msg_tx send below fails and the
-                    // lost-race fall-through below routes the follow-up via the
-                    // slow `--resume` path instead of dropping it.
+                    // next pass of the claim loop spawns a `--resume` for the
+                    // follow-up instead of dropping it.
                     let redirect_deadline = std::time::Instant::now()
                         + super::super::process_helpers::REDIRECT_INTERRUPT_MAX_WAIT;
                     loop {
@@ -840,6 +863,7 @@ impl LucidosEngine {
                                 device_id,
                                 parent_thread_id,
                                 spawning_event_id,
+                                wake_mode,
                                 mode,
                                 None,
                                 None,
@@ -854,9 +878,9 @@ impl LucidosEngine {
                             },
                         })
                         .await?;
-                    // Stash the emitted id so a lost-race fall-through to the slow
-                    // path (below) doesn't re-emit MessageReceived — mirrors the
-                    // non-CC injection fast-path. On the success path we return
+                    // Stash the emitted id so a lost race, which claims the thread
+                    // and takes the slow path, doesn't re-emit MessageReceived:
+                    // mirrors the non-CC injection fast-path. On the success path we return
                     // before the slow path reads it, so this is harmless there.
                     if let Some(result) = emit_result {
                         pre_emitted_origin = Some(PreEmittedOrigin::Message(result.event_id));
@@ -886,6 +910,7 @@ impl LucidosEngine {
                                     images,
                                     origin_event_id,
                                     kind: input_kind,
+                                    completion: None,
                                 })
                                 .is_ok();
                             if let (true, Some(id)) = (sent, origin_event_id) {
@@ -912,18 +937,14 @@ impl LucidosEngine {
                 }
 
                 // The live session went away or is terminating between the
-                // has_session check and the send — most commonly the idle-
-                // termination race: the session loop set `process_exited` and
-                // cancelled the subprocess (see the ExitSubprocess arm in
-                // run_session/run.rs) while this follow-up was in flight. Don't
-                // emit a routing failure ("please try again") and don't drop the
-                // message — fall through to the slow path so it spawns a fresh
-                // `--resume` session and runs as the next turn. MessageReceived
-                // was already emitted above (`pre_emitted_origin` is set), so the
-                // slow path won't re-emit it. Mirrors the non-CC injection
-                // fast-path's lost-race fallback below.
+                // claim's look and the send, most commonly the idle exit. Don't
+                // emit a routing failure and don't drop the message. The next
+                // pass waits for that run to let go, then claims the thread. The
+                // message then spawns a fresh `--resume` session as the next turn.
+                // MessageReceived was already emitted above (`pre_emitted_origin`
+                // is set), so the slow path won't re-emit it.
                 log!(
-                    "[Chat] CC follow-up lost the live-session race for thread {} — falling back to slow path (resume)",
+                    "[Chat] CC follow-up lost the live-session race for thread {} — claiming the thread for a resume",
                     thread_id
                 );
             }
@@ -1000,6 +1021,7 @@ impl LucidosEngine {
                                 device_id,
                                 parent_thread_id,
                                 spawning_event_id,
+                                wake_mode,
                                 mode,
                                 model_override,
                                 reasoning_effort,
@@ -1098,6 +1120,24 @@ impl LucidosEngine {
         // (remove-then-drain, see below). Only a panic falls back to its Drop impl.
         let (cancel_token, mut injection_rx, guard) = match admitted {
             Some(registration) => registration,
+            // A keep-alive never queues behind a turn, and never evicts one.
+            None if keep_alive => match crate::engine::try_register_thread(
+                &self.active_threads,
+                &self.thread_completion,
+                thread_id,
+            ) {
+                crate::engine::Admission::Admitted(registration) => registration,
+                crate::engine::Admission::Busy { .. } => {
+                    log!("[KeepAlive] Thread {thread_id} has a turn running, so this beat is skipped");
+                    return Ok(terminal_result(
+                        String::new(),
+                        vec![],
+                        request_id,
+                        thread_id,
+                        false,
+                    ));
+                }
+            },
             None => self.register_thread_queued(thread_id).await,
         };
 
@@ -1157,6 +1197,7 @@ impl LucidosEngine {
                         device_id,
                         parent_thread_id,
                         spawning_event_id,
+                        wake_mode,
                         mode,
                         req_model,
                         req_effort,
@@ -1198,9 +1239,9 @@ impl LucidosEngine {
             };
             emit_result.event_id
         };
-        // Recorded, and the thread is registered, so a later follow-up now
-        // queues behind this turn rather than racing it. Release it.
-        drop(follow_up_turn.take());
+        // Recorded, and the thread is registered, so a later input now queues
+        // behind this turn rather than racing it. Release it.
+        drop(input_turn.take());
 
         // Publish this turn's anchor on the handle. Everything below stamps
         // `request_event_id: Some(origin_id)` on its events and on its own
@@ -1248,41 +1289,37 @@ impl LucidosEngine {
                 .await);
         }
 
-        // `_guard` MUST stay alive across this await so cancel_thread lands
-        // on the per-thread cancel_token (see process_cc.rs module doc).
+        // `guard` stays alive across this await: the run's `chat_cancel` arm
+        // listens on its token (see process_cc.rs module doc).
         if use_coding_agent == Some(true) {
-            // Agent-spawned threads via a parent's tool call (run_thread →
-            // spawn_agent_thread) skip the 250ms CC_SPAWN_DEBOUNCE — no
-            // user keyboard in the loop, no rapid-fire to coalesce.
-            // Discriminator: mode=Agent + parent linkage (the spawn comes
-            // from a tool call). Wake-from-child callbacks also pass
-            // mode=Agent but have parent_thread_id=None, so they keep
-            // coalescing as before.
-            let skip_coalesce = mode == ActorMode::Agent
-                && parent_thread_id.is_some()
-                && spawning_event_id.is_some();
             // Returns straight out, so the post-loop net below never sees it.
             // The branch emits its own terminator on most failures; the gate
             // in `fail_turn` makes this a no-op whenever it did.
+            // The keep-alive holds the thread now, so its turn is the only
+            // one the flag can describe until it clears it again below.
+            let _keep_alive_turn = match keep_alive {
+                true => Some(self.event_bus.begin_keep_alive_turn(thread_id).await),
+                false => None,
+            };
             let cc_result = self
                 .run_cc_chat_branch(
-                    thread_id,
+                    spawn_claim
+                        .take()
+                        .expect("the coding-agent lane claims the thread before it registers"),
                     request_id,
                     user_message,
                     user_images,
                     repo_id,
                     cc_model,
                     reasoning_effort,
-                    coding_agent,
                     conflict_change_id,
                     origin_id,
                     spawning_event_id,
                     &cancel_token,
                     chat_start,
-                    skip_coalesce,
                 )
                 .await;
-            return match cc_result {
+            let outcome = match cc_result {
                 Err(e) => Err(self
                     .fail_turn(
                         thread_id,
@@ -1295,6 +1332,7 @@ impl LucidosEngine {
                     .await),
                 ok => ok,
             };
+            return outcome;
         }
 
         // ── Turn setup ──────────────────────────────────────────────────────
@@ -1643,16 +1681,31 @@ impl LucidosEngine {
         let resolved_model = model_override.unwrap_or_else(|| provider.default_model());
         let context_window = self.context_window_for(resolved_model, chosen_provider);
 
-        // The one setup await that is checkpointed rather than raced: it can be
-        // mid-RPC to a running MCP server, and dropping it there is not the pure
-        // read the other phases are. So the checkpoint goes AFTER it, where it
-        // catches a Stop that landed during the RPC. Before it the check would
-        // be near-dead, since the preceding phase is raced and would already
-        // have exited. The two remaining awaits (stopped-server summaries, the
-        // capture preference) are in-memory / single-row and are followed
-        // immediately by the loop's own pre-iteration check.
+        // The setup awaits that are checkpointed rather than raced: starting
+        // the thread's MCP servers spawns processes, and dropping that half
+        // done is not the pure read the other phases are. So the checkpoint
+        // goes AFTER them, where it catches a Stop that landed meanwhile.
+        // Before them the check would be near-dead, since the preceding phase
+        // is raced and would already have exited. The two remaining awaits
+        // (the server list, the capture preference) are in-memory or
+        // single-row and are followed immediately by the loop's own check.
+        //
+        // Enabled survives a restart and running does not, so the setup
+        // starts this thread's enabled servers before it reads its slice
+        // (ADR 0430). A failure leaves the turn running without that server,
+        // and becomes that server's line in `[MCP SERVERS]`. A trigger fire
+        // first enables the servers its trigger lists, so round 1 has them.
+        let mut mcp_start_failures = match &trigger {
+            Some(tc) => {
+                self.mcp_manager
+                    .enable_listed(thread_id, &tc.mcp_servers)
+                    .await
+            }
+            None => Vec::new(),
+        };
+        mcp_start_failures.extend(self.mcp_manager.start_enabled_servers(thread_id).await);
         let tools = self
-            .chat_turn_tools(&capabilities.gates, context_window)
+            .chat_turn_tools(thread_id, &capabilities.gates, context_window)
             .await;
         if cancel_token.is_cancelled() {
             return Ok(self
@@ -1843,23 +1896,28 @@ impl LucidosEngine {
         if !todo_list_block.is_empty() {
             user_message_parts.push(&todo_list_block);
         }
-        // Add stopped MCP servers context so the LLM knows they exist.
-        // Initialised to empty `String` (not a conditional `let mcp_stopped_context;`)
-        // so the same `&str` reference can be reused by `build_capture_sections`
-        // below without violating control-flow init checks. Empty strings are
-        // filtered out of both the user-message parts and the capture rows.
+        // One line per configured MCP server, in this thread's own status, so
+        // the model knows what it can enable (ADR 0430). Always a `String`, so
+        // `build_capture_sections` below can borrow it; an empty one is
+        // filtered out of both the message parts and the capture rows.
         //
         // Read once, and this block is fixed for the turn: rewriting it would
         // forfeit the message-prefix cache. The tool array is NOT fixed (ADR
-        // 0195), so a server the agent starts mid-turn leaves this list wrong.
-        // The loop corrects it in the round's tail rather than here, via
-        // `agentic_loop::mcp_surface_correction`.
-        let mcp_stopped_context =
-            super::workspace_prompt_footprint::build_stopped_mcp_servers_section(
-                &self.mcp_manager.get_stopped_server_summaries().await,
-            );
-        if !mcp_stopped_context.is_empty() {
-            user_message_parts.push(&mcp_stopped_context);
+        // 0195), so a server the agent enables mid-turn leaves this list
+        // wrong. The loop corrects it in the round's tail rather than here,
+        // via `agentic_loop::mcp_surface_correction`.
+        let mcp_servers_context = super::workspace_prompt_footprint::build_mcp_servers_section(
+            &self
+                .mcp_manager
+                .server_lines(
+                    &self.mcp_manager.enabled_servers(thread_id).await,
+                    &mcp_start_failures,
+                    trigger.as_ref().map(|tc| tc.mcp_servers.as_slice()),
+                )
+                .await,
+        );
+        if !mcp_servers_context.is_empty() {
+            user_message_parts.push(&mcp_servers_context);
         }
         if let Some(notice) = tools.mcp_dropped_notice() {
             user_message_parts.push(notice);
@@ -1923,7 +1981,7 @@ impl LucidosEngine {
             &app_context_section,
             &file_context_section,
             &url_context_section,
-            &mcp_stopped_context,
+            &mcp_servers_context,
             tools.mcp_dropped_notice().unwrap_or_default(),
             &setup_reminder,
             &thread_depth_context,

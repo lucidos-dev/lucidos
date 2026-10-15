@@ -20,11 +20,32 @@ import { spawnSync } from 'node:child_process';
 // @ts-expect-error: same
 import fs from 'node:fs';
 // @ts-expect-error: same
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
 import type { Plugin } from 'vite';
-import { SOURCE_COMMIT_FILE } from '../../../packages/lucidos-sdk/src/generated/engine-constants';
+
+/** The generated copy of the engine constants. */
+const ENGINE_CONSTANTS = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  '../../../packages/lucidos-sdk/src/generated/engine-constants.ts',
+);
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
+
+/**
+ * `SOURCE_COMMIT_FILE` from the generated engine constants, read as text.
+ *
+ * Vite bundles its config, imports included, before the config's first line
+ * runs. That first line is what writes the generated files on a fresh
+ * checkout, so the config cannot import one.
+ */
+export function sourceCommitFile(): string {
+  const text = fs.readFileSync(ENGINE_CONSTANTS, 'utf8');
+  const found = /^export const SOURCE_COMMIT_FILE = "([^"]+)";$/m.exec(text);
+  if (!found) throw new Error(`${ENGINE_CONSTANTS} no longer exports SOURCE_COMMIT_FILE as a string`);
+  return found[1];
+}
 
 /** `git rev-parse HEAD` in `cwd`, or `null` when git cannot answer. */
 export function readHeadCommit(cwd: string): string | null {
@@ -48,7 +69,7 @@ export function sourceCommitStamp(
     },
     writeBundle(options) {
       if (!commit) return;
-      fs.writeFileSync(resolve(options.dir ?? defaultOutDir, SOURCE_COMMIT_FILE), `${commit}\n`);
+      fs.writeFileSync(resolve(options.dir ?? defaultOutDir, sourceCommitFile()), `${commit}\n`);
     },
   };
 }

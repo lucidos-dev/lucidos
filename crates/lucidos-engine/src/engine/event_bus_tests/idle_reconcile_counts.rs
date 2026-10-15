@@ -37,6 +37,7 @@ async fn test_change_applied_reconciles_parent_active_children_count() {
             actor: None,
             pre_merge_sha: None,
             post_merge_sha: None,
+            landing_merge_sha: None,
             path: String::new(),
         },
         meta: EventMeta::NONE,
@@ -218,6 +219,7 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fan out".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -242,6 +244,7 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "child".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -340,6 +343,7 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fan out".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -364,6 +368,7 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "child".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -565,6 +570,9 @@ async fn test_cc_child_stale_resume_does_not_decrement_parent() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })

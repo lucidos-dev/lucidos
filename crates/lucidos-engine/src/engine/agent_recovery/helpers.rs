@@ -16,8 +16,8 @@ pub const ENGINE_RESTART_INTERRUPT_REASON: &str = "engine_restart_interrupt";
 
 /// Tag stamped on `ContinuationRequested.reason` when the user clicks the
 /// "click to continue" affordance after a mid-turn interrupt. The continue
-/// endpoint emits with this reason; the spawn dispatcher classifies it as a
-/// `SpawnTrigger::ContinuationRequested` and starts the next CC turn.
+/// endpoint emits with this reason, and the spawn dispatcher starts the next
+/// CC turn.
 pub const USER_CLICKED_CONTINUE_REASON: &str = "user_clicked_continue";
 
 /// Tag stamped on `ContinuationRequested.reason` when the user answers an
@@ -121,9 +121,6 @@ pub enum ContinueRecovery {
     /// Errored with no retry left. Settle the projection so the thread cannot
     /// sit at `running` with no live subprocess.
     Settle,
-    /// Lost the spawn debounce to a winner that may still be starting, or may
-    /// have died. Settle only if no coding-agent spawn owns the thread.
-    SettleUnlessOwned,
 }
 
 /// Decide the spawn consumer's next move for a continuation, from the error the
@@ -152,28 +149,20 @@ pub enum ContinueRecovery {
 ///   `is_stale_resume_signal` requires one — but crash-safety here is a floor,
 ///   not an inference.)
 ///
-/// A lost race must NOT settle blindly. The spawn guard rejected us because
-/// another spawn owns the thread, so the `running` projection is TRUE. Settling
-/// would emit a terminal against a working session. Two guards report the loss:
-///
-/// - `AGENT_ALREADY_RUNNING_ERROR`: the winner's session is live, so the winner
-///   emits its own terminal. A continuation races a user message this way,
-///   because the consumer holds no thread lock.
-/// - `DUPLICATE_SPAWN_ERROR`: the winner started seconds ago. After a switch,
-///   the event-wait delivery and the boot auto-resume race this way. The
-///   winner may still be starting, or may have already failed, and then our
-///   own `ContinuationStarted` holds the row at `running`. So the consumer
-///   asks `coding_agent_owns_thread`, which counts spawns still starting up.
+/// A lost race must NOT settle. The consumer claims the thread before it emits
+/// or runs anything (`claim_thread_or_refuse`). A claim that finds a live run
+/// reports `AGENT_ALREADY_RUNNING_ERROR`: that run owns the turn and emits its
+/// own terminal, so settling would emit one against a working session.
 ///
 /// Every other error settles: the failure modes that skip their own terminal are
 /// exactly the ones we cannot enumerate, and settling is idempotent
 /// (`settle_stuck_running_thread` re-checks `running` first).
 pub fn continue_recovery(error: Option<&str>, retried: bool) -> ContinueRecovery {
-    use crate::engine::claude_code::{AGENT_ALREADY_RUNNING_ERROR, DUPLICATE_SPAWN_ERROR};
     match error {
         None => ContinueRecovery::Nothing,
-        Some(e) if e == AGENT_ALREADY_RUNNING_ERROR => ContinueRecovery::Nothing,
-        Some(e) if e == DUPLICATE_SPAWN_ERROR => ContinueRecovery::SettleUnlessOwned,
+        Some(e) if e == crate::engine::claude_code::AGENT_ALREADY_RUNNING_ERROR => {
+            ContinueRecovery::Nothing
+        }
         Some(e) if !retried && e == crate::engine::claude_code::STALE_RESUME_ERROR => {
             ContinueRecovery::RetryFresh
         }
@@ -301,9 +290,8 @@ pub(crate) async fn continue_retry_input(
 ///
 /// The dirtiness gate is the same one every `WorktreeCleanup` caller applies
 /// before that helper, and it belongs here for the same reason. Which of the
-/// two worktrees is stale is a guess. The helper opens with
-/// `git worktree remove --force`, so an uncommitted edit in the loser goes with
-/// it. `is_worktree_dirty` answers "dirty" when git could not say, so an
+/// two worktrees is stale is a guess. The helper deletes the tree whatever it
+/// holds, so an uncommitted edit in the loser goes with it. `is_worktree_dirty` answers "dirty" when git could not say, so an
 /// unreadable tree is kept. Keeping it costs one skipped cleanup, and the next
 /// restart tries again.
 pub(crate) async fn cleanup_stale_worktree(wt_path: &Path) {

@@ -40,8 +40,8 @@ export function marketplaceDropdownOptions(
 
 export function PluginsView() {
   // One unified list (StoreTab) lists every plugin the same way whether installed
-  // or not — a status badge marks the installed ones, an Uninstall button removes
-  // them. The All | Installed toggle just narrows that one list (default All);
+  // or not. The row's button, or the word Installed, marks the installed ones,
+  // and each detail page carries Uninstall. The All | Installed toggle just narrows that one list (default All);
   // the category pills and live search compose on top. (The former Installed |
   // Store tabs and the separate installed-only list are gone.)
   const installedOnly = pluginsInstalledOnly.value;

@@ -353,7 +353,7 @@ fn reject_items_named_like_build_output(root: &Path) -> Result<(), ValidationErr
 /// its origin (ADR 0414). A thread-owned widget belongs to a thread in the
 /// author's workspace, which no other workspace has.
 fn validate_widgets(plugin_id: &str, root: &Path) -> Result<(), ValidationError> {
-    use super::apps::{AppKind, AppManifest};
+    use super::apps::{check_widget_manifest, AppKind, AppManifest};
     let Ok(entries) = std::fs::read_dir(root.join("apps")) else {
         return Ok(());
     };
@@ -368,11 +368,13 @@ fn validate_widgets(plugin_id: &str, root: &Path) -> Result<(), ValidationError>
         let Ok(app) = serde_json::from_str::<AppManifest>(&text) else {
             continue;
         };
-        if AppKind::from_manifest(&name, app.kind.as_deref()) != AppKind::Widget {
-            continue;
-        }
         let invalid =
             |reason: String| ValidationError::InvalidWidget(format!("apps/{name}"), reason);
+        let kind = AppKind::from_manifest(&name, app.kind.as_deref());
+        check_widget_manifest(kind, &app).map_err(invalid)?;
+        if kind != AppKind::Widget {
+            continue;
+        }
         if app.origin_thread_id.is_some() {
             return Err(invalid(
                 "it names an origin_thread_id, and a shipped widget names its plugin instead"

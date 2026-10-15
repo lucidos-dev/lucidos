@@ -471,6 +471,7 @@ async fn a_queued_child_holds_a_slot() {
         depth: 0,
         parent_thread_id: Some(root),
         spawning_event_id: None,
+        wake_mode: None,
         title: None,
         model: None,
         reasoning_effort: None,

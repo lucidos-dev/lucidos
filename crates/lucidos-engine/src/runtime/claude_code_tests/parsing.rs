@@ -1,5 +1,4 @@
 use super::*;
-use crate::runtime::ReplayedInput;
 
 /// Parse one line against a fresh stream, for the majority of tests below that
 /// judge a single frame in isolation. Anything about state that spans lines
@@ -64,6 +63,36 @@ fn parse_system_init_carries_the_claude_code_version() {
     match &parse_one_line(r#"{"type":"system","subtype":"init","session_id":"s-1"}"#)[0] {
         AgentEvent::Init { agent_version, .. } => assert_eq!(agent_version, &None),
         other => panic!("Expected Init, got {:?}", other),
+    }
+}
+
+/// The shape Claude Code 2.1.296 wrote when it compacted at a 400k window.
+#[test]
+fn parse_compact_boundary_records_the_compaction() {
+    let line = r#"{"type":"system","subtype":"compact_boundary","session_id":"s-1","uuid":"0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9","compact_metadata":{"trigger":"auto","pre_tokens":384213,"post_tokens":58702}}"#;
+    match &parse_one_line(line)[..] {
+        [AgentEvent::Compacted {
+            trigger,
+            pre_tokens,
+            post_tokens,
+        }] => {
+            assert_eq!(trigger, "auto");
+            assert_eq!(*pre_tokens, Some(384_213));
+            assert_eq!(*post_tokens, Some(58_702));
+        }
+        other => panic!("Expected Compacted, got {other:?}"),
+    }
+    let without_after = r#"{"type":"system","subtype":"compact_boundary","session_id":"s-1","compact_metadata":{"trigger":"manual","pre_tokens":120000}}"#;
+    match &parse_one_line(without_after)[..] {
+        [AgentEvent::Compacted {
+            trigger,
+            post_tokens,
+            ..
+        }] => {
+            assert_eq!(trigger, "manual");
+            assert_eq!(*post_tokens, None);
+        }
+        other => panic!("Expected Compacted, got {other:?}"),
     }
 }
 
@@ -209,6 +238,51 @@ fn parse_assistant_extracts_usage() {
         }
         other => panic!("Expected Usage, got {:?}", other),
     }
+}
+
+fn cache_creation_1h(events: &[AgentEvent]) -> Vec<Option<u32>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Usage {
+                cache_creation_1h_tokens,
+                ..
+            } => Some(*cache_creation_1h_tokens),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The usage block splits a cache write by lifetime, spelled as in a real
+/// transcript. The cache keep-alive times its beats from the 1-hour part.
+#[test]
+fn an_assistant_frame_reports_the_1_hour_part_of_its_cache_write() {
+    let split = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":54002,"cache_read_input_tokens":0,"output_tokens":354,"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":54002,"ephemeral_5m_input_tokens":0}}}}"#;
+    assert_eq!(
+        cache_creation_1h(&parse_one_line(split)),
+        vec![Some(54_002)]
+    );
+
+    let unsplit = assistant_usage_frame(None, 1_234, 56);
+    assert_eq!(
+        cache_creation_1h(&parse_one_line(&unsplit)),
+        vec![None],
+        "a block with no split reports none, not a zero"
+    );
+}
+
+/// A streamed call's `message_delta` may omit the split, so the one its
+/// `message_start` reported stands.
+#[test]
+fn a_streamed_call_keeps_the_split_its_message_start_reported() {
+    let mut state = CcStreamState::default();
+    let start = stream_event(
+        r#"{"type":"message_start","message":{"id":"msg_ttl","model":"claude-sonnet-5","usage":{"input_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":900,"output_tokens":4,"cache_creation":{"ephemeral_1h_input_tokens":900,"ephemeral_5m_input_tokens":0}}}}"#,
+        None,
+    );
+    parse_line(&mut state, &start);
+    let events = parse_line(&mut state, &message_delta(2, 0, 900, 40));
+    assert_eq!(cache_creation_1h(&events), vec![Some(900)]);
 }
 
 #[test]
@@ -479,6 +553,39 @@ fn a_streamed_call_reports_the_final_output_count_from_its_message_delta() {
         _ => None,
     });
     assert_eq!(model.as_deref(), Some("claude-sonnet-5"));
+}
+
+/// The capture lands when a call ends, so the cache keep-alive dates the
+/// request from the call's own duration. A parent call carries one, measured
+/// from its `message_start`. A sub-agent's frame-reported call carries none.
+#[test]
+fn a_streamed_parent_call_reports_how_long_it_streamed() {
+    let mut state = CcStreamState::default();
+    parse_line(&mut state, &message_start("msg_d", 2, 0, 10));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let events = parse_line(&mut state, &message_delta(2, 0, 10, 5));
+    let duration = events.iter().find_map(|e| match e {
+        AgentEvent::Usage { duration_ms, .. } => Some(*duration_ms),
+        _ => None,
+    });
+    assert!(
+        matches!(duration, Some(Some(ms)) if ms >= 20),
+        "the call streamed for at least 20 ms, got {duration:?}"
+    );
+
+    let sub = parse_line(
+        &mut state,
+        &streamed_frame("msg_s", TEXT_BLOCK, Some("toolu_agent")),
+    );
+    let sub_duration = sub.iter().find_map(|e| match e {
+        AgentEvent::Usage { duration_ms, .. } => Some(*duration_ms),
+        _ => None,
+    });
+    assert_eq!(
+        sub_duration,
+        Some(None),
+        "a sub-agent call has no stream to time"
+    );
 }
 
 /// A call stopped mid-stream still billed its prompt. With no
@@ -838,50 +945,31 @@ fn parse_legacy_tool_result_error() {
 }
 
 /// With `--replay-user-messages`, Claude Code echoes each stdin input when it
-/// takes it in. That echo is the read report (ADR 0268). The shapes are copied
-/// from the real CLI: a text input, the output of a local `/compact`, and the
+/// takes it in, under the uuid the engine wrote it with. That echo is the read
+/// report (ADR 0268). The shapes are copied from Claude Code 2.1.280: a text
+/// input, a local command, the joined replay of queued inputs, and the
 /// interrupt notice, which carries no replay flag.
 #[test]
-fn a_replayed_input_reads_as_consumed() {
-    let text = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Also check the totals."}]},"isReplay":true}"#;
-    assert!(matches!(
-        parse_one_line(text).as_slice(),
-        [AgentEvent::InputRead(Some(_))]
-    ));
-    let compact = r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"isReplay":true}"#;
-    assert!(matches!(
-        parse_one_line(compact).as_slice(),
-        [AgentEvent::InputRead(Some(_))]
-    ));
+fn a_replay_reads_the_input_its_uuid_names() {
+    let reads = |line: &str| match parse_one_line(line).as_slice() {
+        [AgentEvent::InputRead { input }] => input.to_string(),
+        other => panic!("expected one read, got {other:?}"),
+    };
+    let text = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Also check the totals."}]},"uuid":"a1c239d7-468a-44a2-a7e9-94eccaf35e82","isReplay":true}"#;
+    assert_eq!(reads(text), "a1c239d7-468a-44a2-a7e9-94eccaf35e82");
+    let local_command = r#"{"type":"user","message":{"role":"user","content":"<command-name>/cost</command-name>\n            <command-message>cost</command-message>\n            <command-args></command-args>"},"uuid":"4918add5-c30c-48ed-abb6-c942627f825d","isReplay":true}"#;
+    assert_eq!(reads(local_command), "4918add5-c30c-48ed-abb6-c942627f825d");
+    let joined = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"say A"},{"type":"text","text":"say B"}]},"uuid":"0a336693-706e-47c2-9fbd-c45597b2c063","isReplay":true}"#;
+    assert_eq!(reads(joined), "0a336693-706e-47c2-9fbd-c45597b2c063");
     let interrupted = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#;
     assert!(parse_one_line(interrupted).is_empty());
 }
 
-/// Inputs queued behind a busy turn come back in ONE replay. The shapes are
-/// copied from the real CLI: plain inputs join into one text, and an image
-/// among them keeps every input's blocks apart.
+/// A replay that names no input reads nothing, rather than a guessed one.
 #[test]
-fn a_replay_carries_what_every_queued_input_said() {
-    let replayed = |line: &str| match parse_one_line(line).as_slice() {
-        [AgentEvent::InputRead(Some(replay))] => replay.clone(),
-        other => panic!("expected one replay, got {other:?}"),
-    };
-    let joined = r#"{"type":"user","message":{"role":"user","content":"Say exactly: two\nSay exactly: three"},"isReplay":true}"#;
-    assert_eq!(
-        replayed(joined),
-        ReplayedInput {
-            texts: vec!["Say exactly: two\nSay exactly: three".into()],
-            images: 0,
-        }
-    );
-    let with_image = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"two"},{"type":"text","text":"three"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}},{"type":"text","text":"four"}]},"isReplay":true}"#;
-    assert_eq!(
-        replayed(with_image),
-        ReplayedInput {
-            texts: vec!["two".into(), "three".into(), "four".into()],
-            images: 1,
-        }
-    );
+fn a_replay_without_a_uuid_reads_nothing() {
+    let line = r#"{"type":"user","message":{"role":"user","content":"say hi"},"isReplay":true}"#;
+    assert!(parse_one_line(line).is_empty());
 }
 
 /// A tool result is Claude Code's own output, so it never reports an input

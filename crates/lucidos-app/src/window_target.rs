@@ -94,7 +94,7 @@ pub(crate) fn workspace_url(origin: &str, workspace: &str) -> String {
     format!("{origin}/{workspace}/")
 }
 
-/// A view inside a workspace a row activation can ask to land on.
+/// A view inside a workspace that opening it can ask to land on.
 ///
 /// The page names one, and this composes the fragment. It never takes the
 /// fragment itself. Every `window-*` webview holds the full IPC permission set
@@ -104,18 +104,46 @@ pub(crate) fn workspace_url(origin: &str, workspace: &str) -> String {
 ///
 /// `utils/workspaceLanding.ts` is the frontend mirror, and writes the same
 /// fragment for the two mechanisms that never reach this process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceLanding {
     /// That workspace's notifications view, from the Lucidos menu's
     /// notifications group.
     Notifications,
+    /// One thread in that workspace, from a thread link or a pasted thread URL.
+    Thread(ThreadId),
+}
+
+/// A thread id in canonical form: a lowercase, hyphenated UUID. The only id
+/// shape a landing carries into a URL, so a page cannot smuggle text past it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThreadId(String);
+
+impl ThreadId {
+    /// `id` when it is exactly 8-4-4-4-12 lowercase hex digits, else `None`.
+    fn parse(id: &str) -> Option<Self> {
+        let groups: Vec<&str> = id.split('-').collect();
+        let canonical = groups.len() == 5
+            && groups
+                .iter()
+                .zip([8, 4, 4, 4, 12])
+                .all(|(group, len)| group.len() == len)
+            && groups.iter().all(|g| {
+                g.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            });
+        canonical.then(|| Self(id.to_string()))
+    }
 }
 
 impl WorkspaceLanding {
     /// The landing a page named, or `None` for a name this build does not
     /// serve. Exact match: no trimming and no case folding, so a caller that
-    /// drifted is refused rather than guessed at.
+    /// drifted is refused rather than guessed at. A thread is named
+    /// `thread:<uuid>`.
     pub(crate) fn parse(name: &str) -> Option<Self> {
+        if let Some(id) = name.strip_prefix("thread:") {
+            return ThreadId::parse(id).map(Self::Thread);
+        }
         match name {
             "notifications" => Some(Self::Notifications),
             _ => None,
@@ -123,16 +151,17 @@ impl WorkspaceLanding {
     }
 
     /// The URL fragment this landing is delivered as, leading `#` included.
-    fn fragment(self) -> &'static str {
+    fn fragment(&self) -> String {
         match self {
-            Self::Notifications => "#notifications",
+            Self::Notifications => "#notifications".to_string(),
+            Self::Thread(ThreadId(id)) => format!("#thread={id}"),
         }
     }
 }
 
 /// What to append to a workspace URL for `landing`, or `""` for no landing.
-fn landing_fragment(landing: Option<WorkspaceLanding>) -> &'static str {
-    landing.map_or("", WorkspaceLanding::fragment)
+fn landing_fragment(landing: Option<&WorkspaceLanding>) -> String {
+    landing.map_or_else(String::new, WorkspaceLanding::fragment)
 }
 
 /// What an app window's current URL says about where it is pointed.
@@ -257,7 +286,7 @@ pub(crate) fn choose_workspace_target(
     let url = format!(
         "{}{}",
         workspace_url(origin, workspace),
-        landing_fragment(landing)
+        landing_fragment(landing.as_ref())
     );
 
     let on_workspace = labels_in(windows, WindowContext::Workspace(workspace));
@@ -634,12 +663,49 @@ mod tests {
         assert_eq!(landing_fragment(None), "");
     }
 
+    const THREAD: &str = "3448b7a4-52d9-4243-8b17-58a7364484ed";
+
+    /// The literal `THREAD_HASH_RE` in `store/actions/cross-workspace.ts`
+    /// matches, and the frontend's `landingHash` writes. A pair of tests holds
+    /// the two in step, as for notifications.
+    #[test]
+    fn the_thread_landing_is_the_thread_hash_the_page_router_reads() {
+        let landing = WorkspaceLanding::parse(&format!("thread:{THREAD}")).unwrap();
+        assert_eq!(landing.fragment(), format!("#thread={THREAD}"));
+    }
+
+    /// The page supplies the id. So only a canonical UUID may reach a URL
+    /// loaded under the `window-*` IPC grant (ADR 0028).
+    #[test]
+    fn a_thread_landing_accepts_only_a_canonical_uuid() {
+        for bad in [
+            "thread:",
+            "thread",
+            // Not lowercase, braced, unhyphenated, or a URN.
+            "thread:3448B7A4-52D9-4243-8B17-58A7364484ED",
+            "thread:{3448b7a4-52d9-4243-8b17-58a7364484ed}",
+            "thread:3448b7a452d942438b1758a7364484ed",
+            "thread:urn:uuid:3448b7a4-52d9-4243-8b17-58a7364484ed",
+            // Groups of the wrong length, a non-hex digit, trailing text.
+            "thread:3448b7a4-52d9-4243-8b17-58a7364484e",
+            "thread:3448b7a45-2d9-4243-8b17-58a7364484ed",
+            "thread:3448b7a4-52d9-4243-8b17-58a7364484eg",
+            "thread:3448b7a4-52d9-4243-8b17-58a7364484ed#notifications",
+            "thread:3448b7a4-52d9-4243-8b17-58a7364484ed/../x",
+            " thread:3448b7a4-52d9-4243-8b17-58a7364484ed",
+            "Thread:3448b7a4-52d9-4243-8b17-58a7364484ed",
+            "thread=3448b7a4-52d9-4243-8b17-58a7364484ed",
+        ] {
+            assert_eq!(WorkspaceLanding::parse(bad), None, "{bad:?} was accepted");
+        }
+    }
+
     #[test]
     fn a_landing_rides_every_target_the_chooser_can_pick() {
-        const LANDING: Option<WorkspaceLanding> = Some(WorkspaceLanding::Notifications);
+        let landing = || Some(WorkspaceLanding::Notifications);
         // A new window.
         assert_eq!(
-            choose_workspace_target(&[], "main", "work", ORIGIN, LANDING),
+            choose_workspace_target(&[], "main", "work", ORIGIN, landing()),
             Some(WorkspaceTarget::NewWindow {
                 url: "http://localhost:3210/work/#notifications".to_string(),
             })
@@ -647,7 +713,7 @@ mod tests {
         // The picker window this click came from.
         let picker = windows(&[("main", "http://localhost:3210/~/")]);
         assert_eq!(
-            choose_workspace_target(&picker, "main", "work", ORIGIN, LANDING),
+            choose_workspace_target(&picker, "main", "work", ORIGIN, landing()),
             Some(WorkspaceTarget::Navigate {
                 label: "main".to_string(),
                 url: "http://localhost:3210/work/#notifications".to_string(),
@@ -675,6 +741,20 @@ mod tests {
             Some(WorkspaceTarget::Navigate {
                 label: "window-1".to_string(),
                 url: "http://localhost:3210/work/#notifications".to_string(),
+            })
+        );
+        // A thread landing navigates the same window, onto the thread.
+        assert_eq!(
+            choose_workspace_target(
+                &open,
+                "main",
+                "work",
+                ORIGIN,
+                WorkspaceLanding::parse(&format!("thread:{THREAD}"))
+            ),
+            Some(WorkspaceTarget::Navigate {
+                label: "window-1".to_string(),
+                url: format!("http://localhost:3210/work/#thread={THREAD}"),
             })
         );
         // And the window count stays bounded by the workspace count: never a

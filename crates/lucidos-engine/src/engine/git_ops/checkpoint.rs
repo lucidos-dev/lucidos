@@ -57,13 +57,24 @@ pub(crate) fn command_post_image_ref(checkpoint_id: &str) -> String {
     format!("refs/lucidos/command-post-images/{checkpoint_id}")
 }
 
-/// A throwaway index path for one checkpoint op, in the OS temp dir keyed by the
-/// (UUID) checkpoint id and the side being written, so concurrent workspaces
-/// never collide. git writes tree objects into the repo's own object store
-/// regardless of where the index lives, so the location only needs to be
-/// writable.
-fn temp_index_path(checkpoint_id: &str, slot: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("lucidos-checkpoint-{checkpoint_id}-{slot}.index"))
+/// A throwaway index for one checkpoint op, alone in an owner-only temp
+/// directory. The index lists workspace paths, and git writes it under the
+/// umask. git writes tree objects into the repo's own object store wherever
+/// the index lives. Dropping it removes the index.
+struct TempIndex(tempfile::TempDir);
+
+impl TempIndex {
+    fn new() -> Result<Self, String> {
+        tempfile::Builder::new()
+            .prefix("lucidos-checkpoint-")
+            .tempdir()
+            .map(TempIndex)
+            .map_err(|e| format!("create a checkpoint index dir: {e}"))
+    }
+
+    fn path(&self) -> PathBuf {
+        self.0.path().join("index")
+    }
 }
 
 /// Trim a git command's stdout to a SHA, or surface stderr as an error.
@@ -82,14 +93,9 @@ fn ok_stdout(out: std::process::Output, what: &str) -> Result<String, String> {
 /// Shared by both sides of a checkpoint so the pre and post images are built
 /// exactly alike and their diff reflects the command rather than a difference
 /// in how they were taken.
-async fn snapshot_onto_ref(
-    repo_root: &Path,
-    ref_name: &str,
-    tmp_index: &Path,
-    message: &str,
-) -> Result<(), String> {
-    // Drop any stale index left by a crashed prior run before staging.
-    let _ = std::fs::remove_file(tmp_index);
+async fn snapshot_onto_ref(repo_root: &Path, ref_name: &str, message: &str) -> Result<(), String> {
+    let index = TempIndex::new()?;
+    let tmp_index = index.path();
     // A committer identity is forced via env so `commit-tree` works even when
     // the workspace repo has no user.name/email in its config (the engine
     // commits artifacts through git2 with a per-commit signature, not config).
@@ -101,7 +107,7 @@ async fn snapshot_onto_ref(
         ("GIT_COMMITTER_EMAIL", OsStr::new("lucidos@localhost")),
     ];
 
-    let result = async {
+    async {
         // Stage the whole working tree (respecting .gitignore) into the empty
         // throwaway index. Every file becomes an addition, so the resulting
         // tree is a faithful snapshot of the current working tree, including
@@ -141,10 +147,7 @@ async fn snapshot_onto_ref(
         }
         Ok(())
     }
-    .await;
-    // Always remove the throwaway index, success or failure.
-    let _ = std::fs::remove_file(tmp_index);
-    result
+    .await
 }
 
 /// Write the **pre** image, before the reversible command runs. Returns `Err`
@@ -167,7 +170,6 @@ pub(crate) async fn create_command_checkpoint(
     snapshot_onto_ref(
         repo_root,
         &command_checkpoint_ref(checkpoint_id),
-        &temp_index_path(checkpoint_id, "pre"),
         &format!("lucidos command checkpoint {checkpoint_id}"),
     )
     .await
@@ -183,7 +185,6 @@ pub(crate) async fn create_command_post_image(
     snapshot_onto_ref(
         repo_root,
         &command_post_image_ref(checkpoint_id),
-        &temp_index_path(checkpoint_id, "post"),
         &format!("lucidos command post-image {checkpoint_id}"),
     )
     .await
@@ -253,11 +254,11 @@ pub(crate) async fn restore_command_checkpoint(
         return Ok(());
     }
 
-    let tmp_index = temp_index_path(checkpoint_id, "restore");
-    let _ = std::fs::remove_file(&tmp_index);
+    let index = TempIndex::new()?;
+    let tmp_index = index.path();
     let envs: &[(&str, &OsStr)] = &[("GIT_INDEX_FILE", tmp_index.as_os_str())];
 
-    let result = async {
+    async {
         // Load the checkpoint tree into the throwaway index …
         let read = git_cmd_env(&["read-tree", &ref_name], repo_root, envs).await?;
         if !read.status.success() {
@@ -298,9 +299,7 @@ pub(crate) async fn restore_command_checkpoint(
         }
         Ok(())
     }
-    .await;
-    let _ = std::fs::remove_file(&tmp_index);
-    result
+    .await
 }
 
 /// How many paths one `checkout-index` call names.
@@ -587,12 +586,12 @@ async fn unchanged_since_post_image(
     checkpoint_id: &str,
     paths: &[String],
 ) -> Option<BTreeSet<String>> {
-    let tmp_index = temp_index_path(checkpoint_id, "verify");
-    let _ = std::fs::remove_file(&tmp_index);
+    let index = TempIndex::new().ok()?;
+    let tmp_index = index.path();
     let envs: &[(&str, &OsStr)] = &[("GIT_INDEX_FILE", tmp_index.as_os_str())];
     let post = command_post_image_ref(checkpoint_id);
 
-    let result = async {
+    async {
         let read = git_cmd_env(&["read-tree", &post], repo_root, envs)
             .await
             .ok()?;
@@ -645,9 +644,7 @@ async fn unchanged_since_post_image(
                 .collect(),
         )
     }
-    .await;
-    let _ = std::fs::remove_file(&tmp_index);
-    result
+    .await
 }
 
 /// Remove the files the checkpointed command created, then prune the

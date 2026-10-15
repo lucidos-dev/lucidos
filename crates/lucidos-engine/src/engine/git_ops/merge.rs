@@ -64,40 +64,96 @@ async fn catchup_with_main(
     }
 }
 
-/// Serialized merge queue: only one merge-to-main operation at a time.
-/// Prevents race conditions when multiple coding-agent sessions try to apply changes
-/// simultaneously. Each merge acquires this lock, catches up with main
-/// (which may have moved from a previous merge), and fast-forwards.
-pub(crate) static MERGE_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+/// One merge to `main` at a time. Taken before [`WORKSPACE_REPO_MUTEX`].
+pub(crate) static MERGE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Fast-forward refs/heads/main to `branch_sha` using update-ref.
-/// Works regardless of HEAD state (detached or on a branch).
+/// The two locks a merge to `main` takes, in this order. Production passes
+/// [`MAIN_LOCKS`]. A test passes a pair of its own, so no other test queues on it.
+pub(crate) struct MainLocks {
+    pub(super) merge: &'static tokio::sync::Mutex<()>,
+    pub(super) repo: &'static tokio::sync::Mutex<()>,
+}
+
+pub(crate) static MAIN_LOCKS: MainLocks = MainLocks {
+    merge: &MERGE_MUTEX,
+    repo: &WORKSPACE_REPO_MUTEX,
+};
+
+impl MainLocks {
+    pub(crate) async fn lock_merge(&self) -> tokio::sync::MutexGuard<'static, ()> {
+        self.merge.lock().await
+    }
+
+    pub(crate) async fn lock_repo(&self) -> WorkspaceRepoLock {
+        WorkspaceRepoLock {
+            _guard: self.repo.lock().await,
+        }
+    }
+
+    /// Both locks, in order, for anything that moves `main` outside a merge:
+    /// a revert, or a commit on the repo root. A landing pass holds the merge
+    /// lock from reading `main` to moving it. So this keeps every other mover
+    /// out of that window (ADR 0463).
+    pub(crate) async fn lock_main(&self) -> MainMoveLock {
+        let merge = self.lock_merge().await;
+        MainMoveLock {
+            _repo: self.lock_repo().await,
+            _merge: merge,
+        }
+    }
+
+    /// A pair of locks nothing else queues on.
+    #[cfg(test)]
+    pub(crate) fn private_for_test() -> &'static MainLocks {
+        Box::leak(Box::new(MainLocks {
+            merge: Box::leak(Box::new(tokio::sync::Mutex::new(()))),
+            repo: Box::leak(Box::new(tokio::sync::Mutex::new(()))),
+        }))
+    }
+}
+
+/// Proof that the holder owns both locks of [`MainLocks::lock_main`]. The repo
+/// lock is declared first, so it is released first.
+pub(crate) struct MainMoveLock {
+    _repo: WorkspaceRepoLock,
+    _merge: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Read `main` and the branch, then fast-forward `main` to the branch. The
+/// caller's repo lock keeps both reads and the ref move on one `main`.
+pub(crate) async fn ff_main_to_branch(
+    held: &WorkspaceRepoLock,
+    repo_root: &Path,
+    branch_name: &str,
+) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    let main_sha = branch_head_sha(repo_root, "main").await.unwrap_or_default();
+    let branch_sha = branch_head_sha(repo_root, branch_name)
+        .await
+        .unwrap_or_default();
+    ff_main_to_locked(held, repo_root, &branch_sha, &main_sha).await
+}
+
+/// Fast-forward refs/heads/main to `branch_sha` using update-ref, then sync the
+/// repo-root working tree to it. Works whether HEAD is detached or on a branch.
 /// Returns (pre_sha, post_sha) on success.
-pub(crate) async fn ff_main_to(
+///
+/// The repo lock spans the ref move AND the tree sync, so no workspace repo
+/// writer runs between them. A `main` moved by a git command outside the engine
+/// fails the merge-base check or `update-ref`'s old-value guard, loudly.
+pub(crate) async fn ff_main_to_locked(
+    _held: &WorkspaceRepoLock,
     repo_root: &Path,
     branch_sha: &str,
     main_sha: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    // An unresolved ref reaches here as an empty string: every caller resolves
-    // through `branch_head_sha`, which checks the exit status and answers
-    // `None`, and then applies `unwrap_or_default`. Reject that up front.
-    // Otherwise a
+    // An unresolved ref reaches here as an empty string: `branch_head_sha`
+    // answers `None`, and the caller applies `unwrap_or_default`. Otherwise a
     // `merge-base` that also failed leaves both sides empty, the ff-ability
     // guard below compares equal, and an `update-ref` fires on refs nobody
-    // could resolve. Deliberately ahead of the lock below: it reads no repo
-    // state, so an unresolvable ref should fail fast rather than queue behind
-    // an unrelated worktree snapshot.
+    // could resolve.
     if branch_sha.is_empty() || main_sha.is_empty() {
         return Err("Cannot fast-forward: could not resolve the branch and main revisions".into());
     }
-
-    // Both held across the ref move AND the working-tree sync below. The first
-    // keeps a data write's save and commit wholly before or after them, the
-    // second keeps out a `commit_all_dirty` snapshot. Each lock's doc names the
-    // failure it prevents and the order all three are taken in.
-    let _repo_guard = WORKSPACE_REPO_MUTEX.lock().await;
-    let _worktree_guard = REPO_WORKTREE_MUTEX.lock().await;
 
     // Verify ff-ability: main must be an ancestor of the branch
     let merge_base = git_cmd(&["merge-base", "main", branch_sha], repo_root)
@@ -126,34 +182,26 @@ pub(crate) async fn ff_main_to(
             // it was detached, e.g. by a failed `pull --rebase`) and resets the
             // working tree + index to match the new main.
             //
-            // This sync MUST land, so it waits out a concurrent lock-file
-            // holder instead of giving up on the first collision. `main` is already
-            // advanced at this point, so a repo-root working tree left at the old
-            // commit reads as "every file the merge added has been deleted" -- and
-            // the next `commit_all_dirty` (script output, artifact write, any
-            // auto-commit that stages all of data/) commits exactly that deletion on
-            // top of main, silently reverting the change that was just applied. That
-            // is how a concurrent app-thread apply lost a merged file on 2026-08-03.
-            // The collision itself is routine: libgit2 (via ArtifactManager) and
-            // these shell calls write the same index lock without waiting for each
-            // other. `ensure_head_on_main` is NOT a safety net for it -- that only
-            // aborts a stale rebase and re-attaches a detached HEAD, and HEAD is
-            // already on main here.
+            // This sync MUST land. `main` is already advanced, so a repo-root
+            // tree left at the old commit reads as "every merged file deleted".
+            // The next `commit_all_dirty` would commit exactly that deletion.
+            // The repo lock keeps the engine's own writers out, but a git
+            // process outside the engine can still hold the index lock. So the
+            // sync waits out a lock-file holder instead of failing on the first
+            // collision. `ensure_head_on_main` is NOT a safety net for it: it
+            // only aborts a stale rebase and re-attaches a detached HEAD.
             let sync_err =
                 match git_cmd_await_lock_file(&["checkout", "-f", "main"], repo_root).await {
                     Ok(o) if o.status.success() => None,
                     Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
                     Err(e) => Some(e),
                 };
-            // A sync that still fails after the retries FAILS the merge rather than
-            // reporting a clean apply over a tree it knows is stale. Both retry
-            // loops above re-enter here on the Err, and by then the ff itself is a
-            // no-op (main and the branch are already equal), so an ordinary
-            // collision just costs another attempt. If every attempt loses, the
-            // caller surfaces a failed apply, which is recoverable (main carries the
-            // commits, so a re-apply takes the already-merged idempotent path)
-            // whereas silently reverting the merged files is not. Logged as well as
-            // returned, because the Tier-3 fast path discards the Err.
+            // A sync that still fails after the lock-file waits FAILS the merge
+            // rather than reporting a clean apply over a tree it knows is stale.
+            // A failed apply is recoverable: main carries the commits, so a
+            // re-apply takes the already-merged idempotent path. Silently
+            // reverting the merged files is not. Logged as well as returned,
+            // because the Tier-3 fast path discards the Err.
             if let Some(err) = sync_err {
                 let short = &branch_sha[..branch_sha.floor_char_boundary(8)];
                 log!(
@@ -178,60 +226,35 @@ pub(crate) async fn ff_main_to(
     }
 }
 
-/// Catch up with main, then fast-forward main to the branch.
-/// Retries up to 3 times to handle the race where main moves between
-/// catchup and ff (e.g. from a concurrent background push).
-/// On success, deletes the branch.
+/// Catch up with main, then fast-forward main to the branch, all under one hold
+/// of the merge and repo locks. On success, deletes the branch.
 /// Returns (pre_merge_sha, post_merge_sha) on success for revert tracking.
-///
-/// Serialized via MERGE_MUTEX -- only one merge-to-main at a time.
 pub(crate) async fn catchup_and_ff_to_main(
     repo_root: &Path,
     worktree_path: &Path,
     branch_name: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    let _merge_guard = MERGE_MUTEX.lock().await;
-
-    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-    for attempt in 1..=3 {
-        catchup_with_main(worktree_path).await?;
-
-        let main_sha = branch_head_sha(repo_root, "main").await.unwrap_or_default();
-        let branch_sha = branch_head_sha(repo_root, branch_name)
-            .await
-            .unwrap_or_default();
-
-        match ff_main_to(repo_root, &branch_sha, &main_sha).await {
-            Ok(shas) => {
-                let _ = git_cmd(&["branch", "-D", branch_name], repo_root).await;
-                push_main_in_background(repo_root);
-                return Ok(shas);
-            }
-            Err(e) => {
-                if attempt < 3 {
-                    log!(
-                        "[Changes] ff-merge attempt {}/3 failed ({}), retrying after catchup",
-                        attempt,
-                        e
-                    );
-                }
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(format!(
-        "Fast-forward merge to main failed after 3 retries: {}",
-        last_err
-            .as_ref()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown error".to_string())
-    )
-    .into())
+    catchup_and_ff_to_main_under(&MAIN_LOCKS, repo_root, worktree_path, branch_name).await
 }
 
-/// Catch up in the merge worktree, then fast-forward main to the temp branch.
-/// Retries up to 3 times (re-catching up each time) before removing the worktree.
+pub(crate) async fn catchup_and_ff_to_main_under(
+    locks: &MainLocks,
+    repo_root: &Path,
+    worktree_path: &Path,
+    branch_name: &str,
+) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    let _merge_guard = locks.merge.lock().await;
+    let held = locks.lock_repo().await;
+    catchup_with_main(worktree_path).await?;
+    let shas = ff_main_to_branch(&held, repo_root, branch_name).await?;
+    drop(held);
+    let _ = git_cmd(&["branch", "-D", branch_name], repo_root).await;
+    push_main_in_background(repo_root);
+    Ok(shas)
+}
+
+/// Catch up in the merge worktree, then fast-forward main to the temp branch,
+/// all under one hold of the merge and repo locks.
 /// Returns (pre_merge_sha, post_merge_sha) on success for revert tracking.
 ///
 /// Throwaway state is reclaimed on BOTH exits, and only when it really is
@@ -243,66 +266,34 @@ pub(crate) async fn catchup_and_ff_to_main(
 /// worktree (ADR 0035), and dropping the change branch costs the thread its
 /// resumability the way `SessionEndAction::KeepEmptyBranch` describes. The
 /// Tier-2 fast path in `apply_change` keeps both for exactly that reason.
-///
-/// Serialized via MERGE_MUTEX -- only one merge-to-main at a time.
 pub(crate) async fn ff_merge_to_main(
     repo_root: &Path,
     wt_path: &str,
     temp_branch: &str,
     feature_branch: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    let _merge_guard = MERGE_MUTEX.lock().await;
-
-    let mut attempt = 0;
-    let err: Box<dyn std::error::Error + Send + Sync> = loop {
-        attempt += 1;
-        // A catch-up conflict fails every retry the same way, so it ends the
-        // loop at once and takes the same cleanup as exhausted retries.
-        if let Err(e) = catchup_with_main(Path::new(wt_path)).await {
-            break e;
-        }
-        if temp_branch != feature_branch
-            && !temp_branch_contains_change(repo_root, temp_branch, feature_branch).await
-        {
-            break format!(
-                "The conflict resolution did not merge {feature_branch}, so nothing was applied"
-            )
-            .into();
-        }
-
-        let main_sha = branch_head_sha(repo_root, "main").await.unwrap_or_default();
-        let branch_sha = branch_head_sha(repo_root, temp_branch)
-            .await
-            .unwrap_or_default();
-
-        // Worktree stays alive until merge succeeds so retries can re-catchup
-        match ff_main_to(repo_root, &branch_sha, &main_sha).await {
-            Ok(shas) => {
-                if temp_branch == feature_branch {
-                    log!(
-                        "[Changes] ff-merge applied {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
-                        feature_branch
-                    );
-                } else {
-                    let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
-                    let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
-                    // `-d`, not `-D`: git itself refuses to drop a branch main lacks.
-                    let _ = git_cmd(&["branch", "-d", feature_branch], repo_root).await;
-                }
-                push_main_in_background(repo_root);
-                return Ok(shas);
-            }
-            Err(e) if attempt < 3 => {
+    let merged = {
+        let _merge_guard = MAIN_LOCKS.merge.lock().await;
+        let held = MAIN_LOCKS.lock_repo().await;
+        catch_up_and_publish(&held, repo_root, wt_path, temp_branch, feature_branch).await
+    };
+    let err = match merged {
+        Ok(shas) => {
+            if temp_branch == feature_branch {
                 log!(
-                    "[Changes] ff-merge attempt {}/3 failed ({}), retrying after catchup",
-                    attempt,
-                    e
+                    "[Changes] ff-merge applied {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
+                    feature_branch
                 );
+            } else {
+                let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
+                let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
+                // `-d`, not `-D`: git itself refuses to drop a branch main lacks.
+                let _ = git_cmd(&["branch", "-d", feature_branch], repo_root).await;
             }
-            Err(e) => {
-                break format!("Fast-forward merge to main failed after 3 retries: {e}").into();
-            }
+            push_main_in_background(repo_root);
+            return Ok(shas);
         }
+        Err(e) => e,
     };
 
     // The merge failed. Clean up ONLY throwaway temp state: on a Tier-2 (or
@@ -323,6 +314,27 @@ pub(crate) async fn ff_merge_to_main(
         );
     }
     Err(err)
+}
+
+/// [`ff_merge_to_main`]'s locked part: catch up, check the resolution kept the
+/// change, then move `main`.
+async fn catch_up_and_publish(
+    held: &WorkspaceRepoLock,
+    repo_root: &Path,
+    wt_path: &str,
+    temp_branch: &str,
+    feature_branch: &str,
+) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    catchup_with_main(Path::new(wt_path)).await?;
+    if temp_branch != feature_branch
+        && !temp_branch_contains_change(repo_root, temp_branch, feature_branch).await
+    {
+        return Err(format!(
+            "The conflict resolution did not merge {feature_branch}, so nothing was applied"
+        )
+        .into());
+    }
+    ff_main_to_branch(held, repo_root, temp_branch).await
 }
 
 /// Whether a Tier-3 temp branch holds every commit of the change branch.
@@ -534,7 +546,7 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
         .or_unknown(true);
     if !head_ok {
         log!("[Changes] HEAD is detached -- re-attaching to main");
-        // Same lock contention as the sync in ff_main_to: a detached HEAD that
+        // Same lock contention as the sync in ff_main_to_locked: a detached HEAD that
         // stays detached because a concurrent artifact commit held a lock makes
         // every later `git status` report false dirty files.
         match git_cmd_await_lock_file(&["checkout", "-f", "main"], repo_root).await {

@@ -209,16 +209,12 @@ impl LucidosEngine {
     /// `MemorySource::Artifact { path, .. }` expects: relative to
     /// `data/artifacts/`.
     ///
-    /// Sources of inconsistency this hides:
-    /// - `tools/files.rs`, `tools/import.rs`, `tools/email.rs` already strip the
-    ///   `artifacts/` prefix before emitting → path arrives bare ("notes.md").
-    /// - `tools/python.rs` walks staged files under `data/` and emits the
-    ///   data-relative path → for files under `data/artifacts/` the path arrives
-    ///   prefixed ("artifacts/output.csv"). For files under other data subdirs
-    ///   (apps/, knowhow/) the prefix is different and they are not artifacts at
-    ///   all. The caller's subsequent read fails and the consumer
-    ///   silently skips, matching `walk_artifact_history` which only sees
-    ///   `data/artifacts/` paths.
+    /// Every writer emits the bare form now ("notes.md"). Event rows that
+    /// `tools/python.rs` stored before it did carry the data-relative form
+    /// ("artifacts/output.csv"), and a rebuild still reads them. Such a row
+    /// can also name a path outside `artifacts/` ("apps/x/state.json"). Its
+    /// read then fails and the consumer skips it, matching
+    /// `walk_artifact_history`, which only sees `data/artifacts/` paths.
     pub(crate) fn canonicalize_artifact_path(path: &str) -> &str {
         path.strip_prefix("artifacts/").unwrap_or(path)
     }

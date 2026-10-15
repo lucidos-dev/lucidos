@@ -26,8 +26,8 @@ import {
   postToPreviewFrame,
   settlePreviewFind,
 } from '../../utils/previewFrameProtocol';
-import PREVIEW_FIND_SOURCE from '../../../../../packages/lucidos-sdk/src/generated/preview-find.js?raw';
-import PREVIEW_SWIPE_SOURCE from '../../../../../packages/lucidos-sdk/src/generated/preview-swipe.js?raw';
+import PREVIEW_FIND_SOURCE from '../../../../../packages/lucidos-sdk/dist/preview-find.js?raw';
+import PREVIEW_SWIPE_SOURCE from '../../../../../packages/lucidos-sdk/dist/preview-swipe.js?raw';
 import { forwardPreviewSwipe } from '../../store/actions/frame-swipe-bridge';
 import {
   PREVIEW_HOST_SCHEMES,
@@ -57,29 +57,10 @@ export const ARTIFACT_PREVIEW_SANDBOX =
  * `autoplay` and `fullscreen` keep a report's media playing and its video's
  * fullscreen button working. `clipboard-write` keeps its Copy buttons working.
  * The same calls the app frame makes (`appFrameSandbox.ts`), minus
- * `encrypted-media`, which no report needs.
+ * `encrypted-media`, which no report needs. `fullscreen *` names every origin
+ * for the reason given there: WebKit denies a bare one to an opaque frame.
  */
-export const ARTIFACT_PREVIEW_ALLOW = 'autoplay; fullscreen; clipboard-write';
-
-/** The path segment that carries a frame capability. Mirrors
- *  `lucidos-frame-capability::SEGMENT`. */
-const CAPABILITY_SEGMENT = '~cap';
-
-/**
- * Splice the asset pass into an artifact's URL on the `/data` mount, ahead of
- * its `/data/artifacts/` segment.
- *
- * The preview's `<base href>` is built from the result. So every relative ref
- * in the artifact carries the pass to the gateway, which the frame's cookieless
- * requests need (ADR 0238). `null` is no gateway, where nothing needs proving.
- * A URL off the mount comes back untouched: the pass reaches no `/api/v1`.
- */
-export function withPreviewCapability(fileUrl: string, capability: string | null): string {
-  if (!capability) return fileUrl;
-  const at = fileUrl.indexOf('/data/artifacts/');
-  if (at === -1 || fileUrl.slice(0, at).endsWith('/api/v1')) return fileUrl;
-  return `${fileUrl.slice(0, at)}/${CAPABILITY_SEGMENT}/${capability}${fileUrl.slice(at)}`;
-}
+export const ARTIFACT_PREVIEW_ALLOW = 'autoplay; fullscreen *; clipboard-write';
 
 /**
  * A fresh per-render nonce. The host drops a message that does not carry it.

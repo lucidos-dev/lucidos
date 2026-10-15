@@ -109,6 +109,9 @@ finish unwatched.
   guarantee. `EventBus` is the only sanctioned writer (`.claude/rules/rust.md`),
   and the tests in `event_bus_tests/committed_horizon.rs` cover all three of
   its append paths.
+- The dispatcher's lag arm also replays the `ThreadArchived` and
+  `ThreadDiscarded` rows a lag dropped, through `LagReplay`, before it rescans
+  (ADR 0453). The rescan still reads from each wait's own watermark.
 
 ## Alternatives considered
 

@@ -260,6 +260,29 @@ pub(crate) async fn record_planned(
     Ok(())
 }
 
+/// Copy `from_branch`'s marker onto `to_branch`, a successor thread's fresh
+/// branch. The successor carries the same work, so the user's decision on it
+/// carries too. A branch that already holds a marker keeps its own.
+pub(crate) async fn carry_planned(
+    pool: &sqlx::PgPool,
+    repo_root: &Path,
+    from_branch: &str,
+    to_branch: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO planned_branches (repo_root, branch_name, state, plan_path, reason, files, head_sha, planned_at) \
+         SELECT repo_root, $3, state, plan_path, reason, files, head_sha, NOW() \
+         FROM planned_branches WHERE repo_root = $1 AND branch_name = $2 \
+         ON CONFLICT (repo_root, branch_name) DO NOTHING",
+    )
+    .bind(canonical_repo_root(repo_root))
+    .bind(from_branch)
+    .bind(to_branch)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Whether `path` (repo-relative) is a plan file: what the `implementation-plan`
 /// skill writes, and what the `cc-plan-gate` hook never blocks.
 pub(crate) fn is_plan_file(path: &str) -> bool {

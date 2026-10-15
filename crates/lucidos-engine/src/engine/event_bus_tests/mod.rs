@@ -6,15 +6,25 @@
 use super::*;
 pub(crate) use crate::engine::thread_events::{
     ActorMode, AnswerKind, EventChannel, EventMeta, MessageOrigin, SessionEndReason, ThreadEvent,
+    WakeMode,
 };
 pub(crate) use crate::engine::thread_lifecycle::CodingAgentChangeState;
 pub(crate) use crate::test_support::{
     read_change_state, read_change_state_kind, seed_change_state, setup_test_db, start_cc_session,
-    teardown_test_db,
+    teardown_test_db, wait_until_blocked_on_locks,
 };
 
 /// Create a parent Chat thread and a child thread, returning (parent_id, child_id).
 async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uuid, Uuid) {
+    spawn_parent_child_with_mode(bus, child_channel, None).await
+}
+
+/// [`spawn_parent_child`], with the child spawned under `wake_mode`.
+async fn spawn_parent_child_with_mode(
+    bus: &EventBus,
+    child_channel: EventChannel,
+    wake_mode: Option<WakeMode>,
+) -> (Uuid, Uuid) {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
@@ -23,6 +33,7 @@ async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uui
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do something".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -47,6 +58,7 @@ async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uui
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode,
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -80,6 +92,9 @@ async fn emit_cc_session_started(bus: &EventBus, child_id: Uuid) {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })
@@ -185,6 +200,7 @@ fn thread_message(thread_id: Uuid, parent: Option<Uuid>, text: &str) -> BusEvent
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -201,30 +217,6 @@ fn thread_message(thread_id: Uuid, parent: Option<Uuid>, text: &str) -> BusEvent
             ..EventMeta::NONE
         },
     }
-}
-
-/// Block until this database has `n` backends waiting on a lock. That is the
-/// signal that a racing statement reached its lock, rather than merely having
-/// been spawned. Scoped to `current_database()`, so a concurrent test's
-/// disposable database cannot satisfy it.
-///
-/// Panics rather than returning on timeout: a race that never materialised
-/// means the test proved nothing, and passing quietly is how it would rot.
-async fn wait_until_blocked_on_locks(pool: &PgPool, n: i64) {
-    for _ in 0..200 {
-        let blocked: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        if blocked >= n {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    panic!("fewer than {n} backends ever blocked on a lock, so the race never happened");
 }
 
 /// Helper: emit CodingAgentIdled with the given flags. When `has_changes=true`,
@@ -441,6 +433,7 @@ async fn emit_cc_message_received(
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -515,13 +508,16 @@ async fn emit_cc_recovery_pair(bus: &EventBus, child_id: Uuid) {
 
 mod active_children_count;
 mod ancestor_rebroadcast;
+mod atomic_emit;
 mod blocking_attention_counts;
 mod branch_work_and_actor;
 mod change_apply_archive;
 mod command_permission;
 mod committed_horizon;
 mod crash_cut_child;
+mod enabled_mcp_servers;
 mod fan_out_callback;
+mod filed_report;
 mod has_response;
 mod idle_reconcile_counts;
 mod initiator_actor;
@@ -546,6 +542,9 @@ mod session_lifecycle;
 mod side_question_projection;
 mod stopped_child;
 mod thread_state_and_eviction;
+mod trigger_provenance;
 mod voice_session_projection;
 mod waiting_child;
 mod waiting_children_count;
+mod wake_decision;
+mod wake_mode;

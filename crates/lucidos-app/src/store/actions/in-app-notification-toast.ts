@@ -1,16 +1,19 @@
 // The §4 matrix of system-knowhow/notifications.md. Driven by the engine's
-// `NotificationToastRequested` SSE (handleNotificationToastRequested below),
-// which the engine emits ONLY after it decides to suppress the OS push — so a
-// toast and a push can never both fire for one notification. We do NOT fire
-// from NotificationCreated (that flushes from the iOS PWA SSE queue after a
-// push tap and would leak a duplicate toast).
+// `PresenceCheck` SSE (presence-pong.ts), which carries the toast. The page
+// acts here FIRST and then reports what it did, and the engine suppresses the
+// OS push only on that report. So a page that hides after answering still
+// leaves the reader the toast it answered for. The native desktop frame
+// (`NativePushRequested`, native-push.ts) comes through here too, when its
+// window came forward since it answered. We do NOT fire from
+// NotificationCreated (that flushes from the iOS PWA SSE queue after a push
+// tap and would leak a duplicate toast).
 //
 // It owns the toast's whole lifetime, arrival to removal. A notification toast
 // lives exactly as long as its row is unread on this page. That is what
 // `installNotificationToastLifetime` at the foot of this file enforces.
 
 import { effect, untracked } from '@preact/signals';
-import type { Tap } from '@lucidos/sdk';
+import type { PresenceOutcome } from '@lucidos/event-stream';
 import type { Loadable, Notification } from '../types';
 import { markReadOptimistic, viewNotification } from './notifications';
 import { switchMenuItem } from './menu';
@@ -25,7 +28,9 @@ import {
   type DeepLinkTarget,
 } from './notification-deeplink';
 import { currentNotificationToasts } from './preferences';
+import { appFullscreenHost } from '../appFullscreenHost';
 import {
+  appPseudoFullscreen,
   dismissToast,
   focusedThreadId,
   removeToast,
@@ -34,6 +39,7 @@ import {
   threadsLoaded,
   toasts,
   unreadNotifications,
+  workspaceUnavailable,
 } from '../store';
 import { isInViewport } from '../../utils/viewport';
 import { isPageActive } from '../../utils/pageActive';
@@ -51,13 +57,40 @@ export function notificationToastKey(id: string): string {
   return `${NOTIFICATION_TOAST_PREFIX}${id}`;
 }
 
+/** Whether the SHELL is the surface in front of the user.
+ *
+ *  Only the shell can show a toast. An app filling the screen means they are
+ *  looking at the app, so the notification belongs to the OS.
+ *
+ *  That also makes a fullscreen app agree with a popped-out app window. The two
+ *  look identical to the user, and a popped-out one has always taken the push.
+ *
+ *  Pure over its three inputs, so it is testable without a DOM. */
+export function isShellActive(
+  pageActive: boolean,
+  nativeFullscreen: boolean,
+  pseudoFullscreen: boolean,
+): boolean {
+  return pageActive && !nativeFullscreen && !pseudoFullscreen;
+}
+
+/** `isShellActive` against the live signals. */
+export function shellIsActive(): boolean {
+  return isShellActive(
+    isPageActive(),
+    appFullscreenHost.value !== null,
+    appPseudoFullscreen.value,
+  );
+}
+
 /** Spec §4 row labels. Row 5 (offline) doesn't apply — we only run when
- *  an SSE event landed, meaning the page is online by definition. */
-export type InAppRow = 'row1_auto_read' | 'row2_or_3_toast_and_badge' | 'row4_hidden';
+ *  an SSE event landed, meaning the page is online by definition. The shell
+ *  not being in front covers Row 4 (hidden) and an app filling the screen. */
+export type InAppRow = 'row1_auto_read' | 'row2_or_3_toast_and_badge' | 'shell_not_active';
 
 /** Apply the §4 matrix to a notification's deep-link target. */
 export function classifyInAppRow(target: DeepLinkTarget): InAppRow {
-  if (!isPageActive()) return 'row4_hidden';
+  if (!shellIsActive()) return 'shell_not_active';
   // Row 1 requires a non-null event_id per spec §2 — when null the device
   // falls through to Row 2 (if thread matches) or Row 3.
   if (
@@ -129,22 +162,24 @@ function dispatched(): boolean {
   return true;
 }
 
-interface InAppNotificationToastInput {
+/** A notification as the engine offers it to the page, ready to show. */
+export interface InAppNotification {
   title: string;
   body: string;
   target: DeepLinkTarget;
 }
 
-export function showInAppNotificationToast({ title, body, target }: InAppNotificationToastInput): void {
+/** Decide what this page does with a notification, do it, and say what it did.
+ *
+ *  One synchronous step, so the answer can never describe a page that has
+ *  since changed: the toast is on screen before the caller reports `shown`. */
+export function presentInAppNotification({ title, body, target }: InAppNotification): PresenceOutcome {
+  // While the workspace is unavailable `showToast` draws nothing, so this page
+  // cannot honestly report `shown`. The OS push is the surface then.
+  if (workspaceUnavailable()) return 'not_shown';
   const row = classifyInAppRow(target);
 
-  if (row === 'row4_hidden') {
-    // Bell badge updates via the parent SSE dispatch's handleNotificationSSE
-    // (loadUnreadNotifications). Suppress the toast — by the time the user
-    // resumes the PWA it's stale and sits on top of a deep-link landing
-    // (see work-tracker `pwa-stale-sticky-notification-toast-on-resume`).
-    return;
-  }
+  if (row === 'shell_not_active') return 'not_shown';
 
   if (row === 'row1_auto_read') {
     // User is literally looking at the source event. Mark read — which drops it
@@ -152,18 +187,17 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
     // optimistic removal invalidates the in-flight set reload handleNotificationSSE
     // kicked off, so the created notification can't briefly surface on the badge.
     if (target.notification) markReadOptimistic(target.notification);
-    return;
+    return 'auto_read';
   }
 
   // The user has turned in-app toasts off, so the notification waits on the
-  // bell badge and in the Notifications panel instead of interrupting. The gate
-  // sits HERE rather than in two other tempting places. Not in the engine: its
-  // push-suppressed decision is about presence, which this preference does not
-  // change, and moving it there would mean no toast AND a push. Not in
+  // bell badge and in the Notifications panel instead of interrupting. It still
+  // suppresses the push: the preference is about interruption, not presence,
+  // and no toast AND a push would be the opposite of what was asked. Not in
   // `showToast`: an apply-change or error toast answers something the user just
   // did, and this silences only the unsolicited kind. Below the Row 1 branch on
   // purpose, so reading the source event still marks it read.
-  if (!currentNotificationToasts()) return;
+  if (!currentNotificationToasts()) return 'silenced';
 
   // Row 2 or 3: active page, on a different thread OR the same thread
   // scrolled away from the source event. Toast + badge (badge already
@@ -176,7 +210,7 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
 
   if (overflowIsShowing() || individualCount >= MAX_INDIVIDUAL_TOASTS) {
     foldIntoOverflow(notifId);
-    return;
+    return 'shown';
   }
 
   const safeTitle = title.length > 0 ? title : 'Lucidos';
@@ -218,50 +252,7 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
   // body-less one is its title alone.
   const [toastTitle, message] = body ? [safeTitle, body] : [undefined, safeTitle];
   showToast(message, 'info', { title: toastTitle, key: toastKey, onClick });
-}
-
-/** Wall-clock budget after which a `NotificationToastRequested` is too stale
- *  to render. The engine emits this only on the push-suppressed branch, so
- *  there is no OS push to collide with — but a toast that flushes seconds
- *  late from the iOS PWA SSE queue (after the user resumed the PWA) would sit
- *  on top of whatever they're now doing. Drop it; the bell badge (driven by
- *  NotificationCreated) already reflects the notification. Sized to
- *  comfortably cover PresenceCheck's deadline (`DEADLINE_MS` = 2s) plus a
- *  pong round-trip so a legitimately just-decided toast always renders.
- *  Exported so tests assert against the same constant. */
-export const TOAST_REQUEST_STALE_AFTER_MS = 5000;
-
-export interface NotificationToastRequestedPayload {
-  notification_id: string;
-  title: string;
-  body: string;
-  thread_id?: string | null;
-  event_id?: string | null;
-  app_id?: string | null;
-  tap?: Tap | null;
-  /** Engine wall-clock at emit time. Drives the freshness gate. */
-  sent_at_ms: number;
-}
-
-/** SSE handler for the engine's §4 in-app toast trigger. Fired after the
- *  engine suppresses the OS push (an active device pong'd in). Delegates to
- *  showInAppNotificationToast, which applies the §4 row matrix: render the
- *  toast (Row 2/3), auto-read silently (Row 1), or no-op (Row 4 hidden). See
- *  system-knowhow/notifications.md §4. */
-export function handleNotificationToastRequested(payload: NotificationToastRequestedPayload): void {
-  if (Date.now() - payload.sent_at_ms > TOAST_REQUEST_STALE_AFTER_MS) {
-    return;
-  }
-  showInAppNotificationToast({
-    title: payload.title,
-    body: payload.body,
-    target: {
-      notification: payload.notification_id,
-      thread: payload.thread_id ?? null,
-      event: payload.event_id ?? null,
-      tap: payload.tap ?? null,
-    },
-  });
+  return 'shown';
 }
 
 /** The notifications the overflow toast stands for.
@@ -323,8 +314,8 @@ function showOverflowToast(): void {
 /** The ids whose toasts a read has made stale: held as unread a moment ago,
  *  not any more.
  *
- *  A TRANSITION, never bare absence. A toast rides `NotificationToastRequested`
- *  while the reload `NotificationCreated` kicked off is still in flight, so a
+ *  A TRANSITION, never bare absence. A toast rides `PresenceCheck` while the
+ *  reload `NotificationCreated` kicked off is still in flight, so a
  *  brand-new row reads as absent too. Dropping on absence would take down the
  *  toast for a notification nobody has seen yet. */
 export function toastsToDrop(

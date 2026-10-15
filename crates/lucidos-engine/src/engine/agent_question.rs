@@ -1237,6 +1237,20 @@ pub async fn answer_pending_question(
     answer: AnswerKind,
     actor: Option<MessageOrigin>,
 ) -> AnswerResult {
+    answer_pending_question_with_event_id(engine, thread_id, tool_use_id, answer, actor, None).await
+}
+
+/// [`answer_pending_question`], recorded under the client's own event id. A
+/// person's answer carries one, so its *input sequence* names it (ADR 0449)
+/// and a re-post finds it recorded.
+pub async fn answer_pending_question_with_event_id(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    tool_use_id: String,
+    answer: AnswerKind,
+    actor: Option<MessageOrigin>,
+    event_id: Option<Uuid>,
+) -> AnswerResult {
     match find_pending_question(engine, thread_id, &tool_use_id).await {
         Ok(Some(false)) => {}
         Ok(Some(true)) => {
@@ -1319,6 +1333,7 @@ pub async fn answer_pending_question(
                 answer: answer.clone(),
             },
             meta: EventMeta {
+                event_id,
                 channel: Some(answer_channel),
                 actor: actor.clone(),
                 ..EventMeta::NONE
@@ -1326,8 +1341,10 @@ pub async fn answer_pending_question(
         })
         .await
     {
-        let msg = e.to_string();
-        if msg.contains("events_user_question_answered_unique") {
+        if crate::engine::event_bus::violates_unique_index(
+            &*e,
+            "events_user_question_answered_unique",
+        ) {
             return AnswerResult::Conflict(format!(
                 "Question {} on thread {} was answered concurrently",
                 tool_use_id, thread_id
@@ -1526,6 +1543,7 @@ pub(crate) fn resume_anchor_for_ask(
             );
             ChatResumeAnchor::NewBoundary {
                 interrupted_turn: None,
+                resumed_abort: None,
             }
         }
     }
@@ -1727,6 +1745,7 @@ pub(crate) async fn emit_resume_marker_for_cc_answer(
         BusEvent::Thread {
             thread_id,
             event: ThreadEvent::CodingAgentPromptSent {
+                input_event_id: None,
                 text: String::new(),
                 coding_agent,
                 origin: actor.clone(),
@@ -1776,11 +1795,13 @@ async fn ensure_resume_after_answer(
     if answer_resolves_without_resume(answer) {
         return false;
     }
+    // A run still starting, or an apply holding the thread, has no process
+    // that is blocked on this answer. The continuation carries it instead.
     let has_live_subprocess = {
         let sessions = agent_sessions.lock().await;
         sessions
             .get(&thread_id)
-            .map(|s| s.is_live())
+            .map(|s| s.is_live() && s.is_running())
             .unwrap_or(false)
     };
     if has_live_subprocess {
@@ -1828,7 +1849,7 @@ async fn arm_question_resume_if_live(
     }
     let mut sessions = agent_sessions.lock().await;
     match sessions.get_mut(&thread_id) {
-        Some(s) if s.is_live() => {
+        Some(s) if s.is_live() && s.is_running() => {
             s.question_resume_pending = true;
             true
         }

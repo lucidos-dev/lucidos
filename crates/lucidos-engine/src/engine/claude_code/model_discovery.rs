@@ -53,6 +53,8 @@ impl LucidosEngine {
                 binary_override: binary_override.as_deref(),
                 permission_mode: permission_mode.as_deref(),
                 additional_directories: &[],
+                auto_compact: None,
+                agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
             };
             match crate::runtime::claude_code::probe_cc_models(args).await {
                 Ok(found) => {

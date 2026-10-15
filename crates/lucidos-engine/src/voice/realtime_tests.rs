@@ -6,7 +6,7 @@ fn opening() -> SessionOpening {
         instructions: "You are Lucidos.".to_string(),
         resident_block: "[WHAT YOU ALREADY KNOW]\nWorkspace: dev".to_string(),
         voice: "marin".to_string(),
-        transcriber: "gpt-4o-mini-transcribe".to_string(),
+        transcriber: "gpt-realtime-whisper".to_string(),
         audio: AudioFormat::default(),
         language: None,
     }
@@ -47,10 +47,10 @@ fn a_resolved_language_pins_the_transcriber() {
 #[test]
 fn the_configured_transcriber_is_the_one_asked_for() {
     let picked = SessionOpening {
-        transcriber: "whisper-1".to_string(),
+        transcriber: "gpt-live-transcribe".to_string(),
         ..opening()
     };
-    assert_eq!(transcription_of(&picked)["model"], "whisper-1");
+    assert_eq!(transcription_of(&picked)["model"], "gpt-live-transcribe");
 }
 
 /// An opening that names none still transcribes. A mute call is the worse
@@ -78,25 +78,25 @@ fn an_unresolved_language_leaves_the_transcriber_alone() {
     assert_eq!(transcription_of(&speaking("Klingon")), untouched);
 }
 
-/// The live model spells the same pin as an array. A singular `language` here
-/// is a field it does not read, so the call would go back to guessing.
+/// The current transcribers spell the same pin as an array, which OpenAI
+/// documents for both. The default is one of them, so every call that names a
+/// language takes this branch.
 #[test]
-fn the_live_transcriber_takes_its_language_as_an_array() {
-    let config = transcription_of(&transcribing(LIVE_TRANSCRIBE_MODEL, "Norwegian"));
-    assert_eq!(config["languages"], serde_json::json!(["no"]));
-    assert_eq!(config.get("language"), None, "{}", config);
+fn the_current_transcribers_take_their_language_as_an_array() {
+    for model in ["gpt-live-transcribe", "gpt-transcribe"] {
+        let config = transcription_of(&transcribing(model, "Norwegian"));
+        assert_eq!(config["languages"], serde_json::json!(["no"]), "{}", model);
+        assert_eq!(config.get("language"), None, "{} {}", model, config);
+    }
+    assert!(LANGUAGES_ARRAY_TRANSCRIBERS
+        .contains(&crate::core::prefs::MODEL_VOICE_TRANSCRIBER.default_text()));
 }
 
 /// Every other model keeps the singular key, unchanged. The provider refuses a
 /// payload holding both, so neither branch may write the other one's key.
 #[test]
 fn every_other_transcriber_keeps_the_singular_language() {
-    for model in [
-        "gpt-transcribe",
-        "gpt-4o-mini-transcribe",
-        "gpt-4o-transcribe",
-        "whisper-1",
-    ] {
+    for model in ["gpt-realtime-whisper", "some-new-transcriber"] {
         let config = transcription_of(&transcribing(model, "Norwegian"));
         assert_eq!(config["language"], "no", "{}", model);
         assert_eq!(config.get("languages"), None, "{}", model);
@@ -108,7 +108,7 @@ fn every_other_transcriber_keeps_the_singular_language() {
 /// satisfy, which is worse than letting it guess.
 #[test]
 fn an_unresolved_language_writes_neither_key_whichever_model_transcribes() {
-    for model in [LIVE_TRANSCRIBE_MODEL, "gpt-4o-mini-transcribe"] {
+    for model in ["gpt-transcribe", "gpt-realtime-whisper"] {
         for preference in ["", "Klingon"] {
             let config = transcription_of(&transcribing(model, preference));
             assert_eq!(config.get("language"), None, "{} {}", model, preference);
@@ -641,8 +641,8 @@ fn another_invalid_request_error_still_ends_the_call() {
 ///
 /// It is not nothing either, which is the half that changed. It says the caller
 /// opened their mouth, and that is the floor's one opener no transcriber can
-/// withhold (ADR 0211). `whisper-1` streams no partials at all, so without it
-/// the reply to the caller's first sentence is dropped whole.
+/// withhold (ADR 0211). A transcriber that streams no partials at all would
+/// otherwise drop the reply to the caller's first sentence whole.
 #[test]
 fn the_caller_starting_to_speak_is_its_own_event_and_not_an_interruption() {
     let frame = serde_json::json!({ "type": "input_audio_buffer.speech_started" });
@@ -744,8 +744,16 @@ async fn a_real_session_accepts_the_opening_payload() {
         .unwrap_or_else(|_| "gpt-realtime-2.1".to_string());
     println!("opening a session on {}", model);
 
+    // The default transcriber with a language pinned, so the run also asks
+    // whether the provider takes that model's `languages` array.
+    let pinned = SessionOpening {
+        transcriber: crate::core::prefs::MODEL_VOICE_TRANSCRIBER
+            .default_text()
+            .to_string(),
+        ..speaking("Norwegian")
+    };
     let provider = RealtimeProvider::new(api_key, model);
-    let mut session = provider.open(opening()).await.expect("connect");
+    let mut session = provider.open(pinned).await.expect("connect");
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {

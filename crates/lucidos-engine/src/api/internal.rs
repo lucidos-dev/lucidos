@@ -277,6 +277,25 @@ pub(super) struct MarkHardenedRequest {
     pub repo_root: String,
     pub branch_name: String,
     pub head_sha: String,
+    /// `fast` or `full`. Absent means `full`, which is every marker a CLI
+    /// predating the tier writes.
+    #[serde(default)]
+    pub tier: Option<String>,
+}
+
+/// Why a mark of `requested` is refused for a branch that expects `expected`,
+/// or `None` when it may be written. On a branch that needs the full run, a
+/// fast marker reads as missing everywhere. So it is refused while the agent
+/// can still run the rest.
+fn tier_refusal(
+    requested: crate::engine::git_ops::HardenTier,
+    expected: crate::engine::git_ops::HardenTier,
+) -> Option<&'static str> {
+    (!requested.covers(expected)).then_some(
+        "This branch needs the full /harden: it is not an integrated sub-thread's, or its \
+         work became a change of its own. A fast marker would not count for its proposal or \
+         its Apply. Run the full /harden, then `lucidos hardened mark`.",
+    )
 }
 
 #[derive(Deserialize)]
@@ -450,13 +469,33 @@ pub(super) async fn mark_hardened(
     State(state): State<AppState>,
     Json(body): Json<MarkHardenedRequest>,
 ) -> impl IntoResponse {
+    use crate::engine::git_ops::HardenTier;
     if let Some(refusal) = marker_write_refusal(&headers) {
         return refusal;
+    }
+    let tier = match body.tier.as_deref() {
+        None => HardenTier::Full,
+        Some(raw) => match HardenTier::parse(raw) {
+            Some(tier) => tier,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown tier `{raw}`: expected `fast` or `full`"),
+                )
+                    .into_response()
+            }
+        },
+    };
+    let expected =
+        crate::engine::integrated::expected_harden_tier(state.engine.pool(), &body.branch_name)
+            .await;
+    if let Some(refusal) = tier_refusal(tier, expected) {
+        return (StatusCode::CONFLICT, refusal).into_response();
     }
     let repo_root = std::path::PathBuf::from(&body.repo_root);
     match state
         .engine
-        .record_hardened(&repo_root, &body.branch_name, &body.head_sha)
+        .record_hardened(&repo_root, &body.branch_name, &body.head_sha, tier)
         .await
     {
         Ok(()) => {
@@ -538,10 +577,26 @@ pub(super) struct QueryHardenedQuery {
 
 #[derive(Serialize)]
 struct QueryHardenedResponse {
+    /// The marker's state for the tier this branch needs. A fast marker on a
+    /// branch that needs the full run is `MISSING`. `NOT_NEEDED` replaces
+    /// `STALE` and `MISSING` on a branch that lands plan files only, which
+    /// Apply never hardens.
     state: &'static str,
-    /// The HEAD the last `/harden` recorded. Absent when `state` is `MISSING`.
+    /// The HEAD the last `/harden` recorded, of either tier. Absent with no
+    /// marker at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     head_sha: Option<String>,
+    /// The recorded marker's tier, `fast` or `full`. Absent with no marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier: Option<&'static str>,
+    /// The tier `/harden` runs on this branch: `fast` for an integrated
+    /// sub-thread, `full` for every other.
+    expected_tier: &'static str,
+}
+
+#[derive(Serialize)]
+struct IntegratedHeadsResponse {
+    heads: Vec<String>,
 }
 
 /// Body for `POST /api/v1/internal/mark-planned`. `state` is `"proposed"` (a
@@ -732,19 +787,34 @@ pub(super) async fn approve_plan(
 
 /// GET /api/v1/internal/hardened-state?repo_root=...&branch_name=... — invoked by
 /// `lucidos hardened query` so the `harden.md` skill and `pre-push.sh` hook
-/// share the DB-backed marker that `mark-hardened` writes.
+/// share the DB-backed marker that `mark-hardened` writes. `lucidos hardened
+/// sha`, `tier` and `expected-tier` read the same answer.
 pub(super) async fn query_hardened(
     State(state): State<AppState>,
     Query(q): Query<QueryHardenedQuery>,
 ) -> impl IntoResponse {
-    use crate::engine::git_ops::{HardenMarker, HardenMarkerState};
+    use crate::engine::git_ops::{lands_plan_files_only, HardenMarker, HardenMarkerState};
     let repo_root = std::path::PathBuf::from(&q.repo_root);
     let marker = state.engine.harden_marker(&repo_root, &q.branch_name).await;
-    let label = match marker.state() {
+    let expected =
+        crate::engine::integrated::expected_harden_tier(state.engine.pool(), &q.branch_name).await;
+    let marker_state = marker.state_for(expected);
+    // Unknown landing files read as code to harden, never as a plan.
+    let plan_only = !matches!(marker_state, HardenMarkerState::Fresh)
+        && lands_plan_files_only(
+            &state
+                .engine
+                .landing_files(&repo_root, &q.branch_name)
+                .await
+                .unwrap_or_default(),
+        );
+    let label = match marker_state {
         HardenMarkerState::Fresh => "FRESH",
+        _ if plan_only => "NOT_NEEDED",
         HardenMarkerState::Stale => "STALE",
         HardenMarkerState::Missing => "MISSING",
     };
+    let tier = marker.tier().map(|t| t.as_str());
     let head_sha = match marker {
         HardenMarker::Recorded { head_sha, .. } => Some(head_sha),
         HardenMarker::Missing => None,
@@ -752,8 +822,30 @@ pub(super) async fn query_hardened(
     Json(QueryHardenedResponse {
         state: label,
         head_sha,
+        tier,
+        expected_tier: expected.as_str(),
     })
     .into_response()
+}
+
+/// GET /api/v1/internal/integrated-heads?repo_root=...&branch_name=..., invoked
+/// by `lucidos hardened integrated-heads`. Lists the heads the `/harden` runs
+/// of the branch's integrated children certified, which `/harden` Phase 0.4
+/// hands to `scripts/harden-scope.sh` as already reviewed.
+pub(super) async fn query_integrated_heads(
+    State(state): State<AppState>,
+    Query(q): Query<QueryHardenedQuery>,
+) -> impl IntoResponse {
+    match crate::engine::integrated::integrated_child_heads(state.engine.pool(), &q.branch_name)
+        .await
+    {
+        Ok(heads) => Json(IntegratedHeadsResponse { heads }).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("integrated_child_heads: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1006,6 +1098,10 @@ pub(super) async fn ask_user_question(
         .into_response();
     }
 
+    // Taken now, so an MCP ask refused below still takes its ordinal.
+    let flushes = state.engine.question_flushes(thread_id).await;
+    let ask = flushes.as_ref().map(|f| f.ask(&body.tool_use_id));
+
     // An ask naming an owner approval request shows the engine's card in its
     // place (ADR 0387). Everything below then reads that card, exactly as it
     // would read the agent's own question.
@@ -1028,11 +1124,18 @@ pub(super) async fn ask_user_question(
             }
         };
 
+    let text_persisted = async move {
+        // No session loop means no text still on its way.
+        if let (Some(flushes), Some(ask)) = (flushes, ask) {
+            flushes.wait_for(ask).await;
+        }
+    };
     if let Some(refusal) = crate::engine::question_card_gate::refuse_coding_agent_card(
         &state.pool,
         thread_id,
         &body.tool_use_id,
         &questions,
+        text_persisted,
     )
     .await
     {
@@ -1174,6 +1277,7 @@ pub(super) fn router() -> Router<AppState> {
             post(coding_agent_diff_refresh),
         )
         .route("/internal/hardened-state", get(query_hardened))
+        .route("/internal/integrated-heads", get(query_integrated_heads))
         .route("/internal/mark-planned", post(mark_planned))
         .route("/internal/planned-state", get(query_planned))
         .route("/internal/approve-plan", post(approve_plan))
@@ -1189,6 +1293,17 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fast marker is refused where the full run is needed. A full one is
+    /// always welcome, an integrated sub-thread's included.
+    #[test]
+    fn a_fast_mark_is_refused_on_a_branch_that_needs_the_full_run() {
+        use crate::engine::git_ops::HardenTier::{Fast, Full};
+        assert!(tier_refusal(Fast, Full).is_some());
+        assert!(tier_refusal(Fast, Fast).is_none());
+        assert!(tier_refusal(Full, Fast).is_none());
+        assert!(tier_refusal(Full, Full).is_none());
+    }
 
     #[test]
     fn every_question_tool_is_auto_allowed_to_avoid_redundant_card() {

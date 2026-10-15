@@ -433,6 +433,16 @@ export function getTreeBackfill(): Promise<TreeBackfill> {
   return json(`${API}/memory/tree-backfill`);
 }
 
+/** Continue a backfill held at `fromCap`, the cap the user saw. The engine
+ *  sets the new cap and answers with it, or refuses a cap that has moved. */
+export function raiseTreeBackfillCap(fromCap: number): Promise<{ cap_usd: number }> {
+  return json(`${API}/memory/tree-backfill/cap`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from_cap_usd: fromCap }),
+  });
+}
+
 /** The estimate scans a workspace's whole history. It answers in about a
  *  second on millions of events. A cold database cache or a busy host can
  *  stretch that past `json()`'s 10s default, and a deliberate one-off read
@@ -705,7 +715,7 @@ export type FootprintVerdict = 'used' | 'unused' | 'not-yet-judged' | 'not-loade
 
 export interface FootprintItem {
   kind: 'app' | 'reusable-widget' | 'knowhow' | 'intent' | 'response-style' | 'user-profile'
-    | 'email-account' | 'oauth-account' | 'credential' | 'mcp-server' | 'mcp-tool' | 'app-knowhow';
+    | 'email-account' | 'oauth-account' | 'credential' | 'mcp-server' | 'app-knowhow';
   id: string;
   name: string;
   chars: number;
@@ -713,12 +723,17 @@ export interface FootprintItem {
   usage?: { last_used_days_ago: number | null; verdict: FootprintVerdict };
   /** A knowhow doc's file, relative to `data/`. */
   path?: string;
+  /** An MCP server's schemas only: threads that enabled it, and threads that
+   *  called one of its tools, over the unused window (ADR 0430). */
+  mcp_threads?: { enabled: number; called: number };
 }
 
 export interface FootprintSection {
   id: string;
   title: string;
-  when: 'every-turn' | 'gated' | 'open-app' | 'tools-dropped';
+  /** `mcp-enabled` rides only threads that enable an MCP server, so it is not
+   *  in `total_chars`. */
+  when: 'every-turn' | 'gated' | 'open-app' | 'tools-dropped' | 'mcp-enabled';
   chars: number;
   over_ceiling: boolean;
   items: FootprintItem[];

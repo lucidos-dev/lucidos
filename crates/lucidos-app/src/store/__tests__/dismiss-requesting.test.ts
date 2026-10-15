@@ -2,18 +2,18 @@
  * Tests for the dismiss flow and mutual exclusivity of applying/dismissing states.
  *
  * Regression: clicking "Archive" on an idle CC thread must not flash through a gap
- * where the WaitingBanner disappears. getWaitingState() checks archivingThreadIds
+ * where the WaitingBanner disappears. getWaitingState() checks the in-flight archive
  * before resolveActions, keeping the "Archive..." button visible throughout dismiss.
  *
- * Invariant: applyingNowThreadIds, archivingThreadIds, and discardingCCThreadIds
+ * Invariant: applyingNowThreadIds and discardingCCThreadIds
  * must never contain the same thread. Each action guards against the others.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   threadMap,
   focusedThreadId,
-  archivingThreadIds,
   applyingNowThreadIds,
+  applyNowRequests,
   discardingCCThreadIds,
   cancelingThreadIds,
   changes,
@@ -29,7 +29,6 @@ vi.mock('../../api/threads', () => ({
 
 vi.mock('../actions/thread-loading', () => ({
   loadThreadEvents: vi.fn(),
-  sectionMutatedAt: new Map<string, number>(),
 }));
 
 vi.mock('../../components/chat/promptFocus', () => ({
@@ -37,6 +36,7 @@ vi.mock('../../components/chat/promptFocus', () => ({
 }));
 
 import { handleArchiveThread } from '../actions/threads';
+import { _holdArchiveForTesting, _resetRowIntentsForTesting, archiveRequestInFlight } from '../rowIntents';
 
 function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer', section: 'archived' | 'inbox'): ThreadState {
   return {
@@ -75,8 +75,8 @@ function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'wait
 beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
-  archivingThreadIds.value = new Set();
-  applyingNowThreadIds.value = new Map();
+  _resetRowIntentsForTesting();
+  applyNowRequests.value = new Map();
   discardingCCThreadIds.value = new Set();
   cancelingThreadIds.value = new Set();
   changes.value = { status: 'loaded', data: [] };
@@ -85,11 +85,11 @@ beforeEach(() => {
 describe('Done dismiss does not flash Requesting state', () => {
   it('returns dismiss-in-progress state even after SSE changes status to idle', () => {
     // Setup: CC thread is idle (ThreadDismissed SSE already arrived) but dismiss API
-    // hasn't returned yet — archivingThreadIds still has the thread.
+    // hasn't returned yet, so the archive is still in flight.
     const thread = makeCCThread('t1', 'idle', 'archived');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
-    archivingThreadIds.value = new Set(['t1']);
+    _holdArchiveForTesting(['t1']);
 
     const state = getWaitingState();
 
@@ -130,21 +130,20 @@ describe('Done dismiss does not flash Requesting state', () => {
     }
   });
 
-  it('dismiss clears stale applying state — states are mutually exclusive', async () => {
-    // Scenario: applyingNowThreadIds has thread (e.g., from a stale apply attempt)
-    // and user clicks Done. handleArchiveThread must clear applying state before
-    // setting dismissing state — the two must never coexist for the same thread.
+  it('refuses to archive while an apply runs — states are mutually exclusive', async () => {
+    // The engine owns "applying" (ADR 0437), so there is no stale state to
+    // clear: an archive waits for the apply to end, as an apply waits for an
+    // archive.
     const thread = makeCCThread('t1', 'waiting', 'inbox');
+    thread.meta.applyInFlight = true;
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
-    applyingNowThreadIds.value = new Map([['t1', 'requesting']]);
 
     await handleArchiveThread('t1');
 
-    // Applying state must have been cleared — states are mutually exclusive
-    expect(applyingNowThreadIds.value.has('t1')).toBe(false);
-    // Dismiss completed and cleaned up
-    expect(archivingThreadIds.value.has('t1')).toBe(false);
+    expect(applyingNowThreadIds.value.has('t1')).toBe(true);
+    expect(archiveRequestInFlight('t1')).toBe(false);
+    expect(threadMap.value.get('t1')!.meta.section).toBe('inbox');
   });
 });
 
@@ -153,7 +152,7 @@ describe('Apply button never shows Requesting label', () => {
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
-    applyingNowThreadIds.value = new Map([['t1', 'requesting']]);
+    applyNowRequests.value = new Map([['t1', null]]);
 
     const state = getWaitingState();
     expect(state).not.toBeNull();
@@ -191,7 +190,7 @@ describe('Discard hides Apply and shows "Discard..."', () => {
     const thread = makeCCThread('t1', 'waiting', 'inbox');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
-    applyingNowThreadIds.value = new Map([['t1', 'requesting']]);
+    applyNowRequests.value = new Map([['t1', null]]);
     discardingCCThreadIds.value = new Set(['t1']);
 
     const state = getWaitingState();
@@ -490,7 +489,7 @@ describe('Apply Now — SessionEnded must not clear applying state', () => {
     thread.meta.codingAgentChangeState = { kind: 'proposed', requires_restart: false };
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
-    applyingNowThreadIds.value = new Map([['t1', 'requesting']]);
+    applyNowRequests.value = new Map([['t1', null]]);
 
     const state = getWaitingState();
     expect(state).not.toBeNull();

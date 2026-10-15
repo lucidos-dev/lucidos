@@ -20,34 +20,6 @@ impl LucidosEngine {
         Self::spawn_cc_task_guarded(engine.clone(), thread_id, async move {
             let prompt = "Your changes have not been hardened. Run /harden now.";
 
-            let origin_id = match engine
-                .emit_automated_prompt(thread_id, prompt, EngineReason::HardenRetrigger)
-                .await
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    log!(
-                        "[ClaudeCode] Failed to emit hardening prompt for thread {}: {}",
-                        thread_id,
-                        e
-                    );
-                    engine
-                        .event_bus
-                        .emit_or_log(
-                            crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
-                                    error: format!("Failed to emit prompt: {}", e),
-                                },
-                                meta: crate::engine::thread_events::EventMeta::NONE,
-                            },
-                            "[ClaudeCode] ResponseFailed",
-                        )
-                        .await;
-                    return;
-                }
-            };
-
             let request_id = Uuid::new_v4();
             let cancel_token = tokio_util::sync::CancellationToken::new();
 
@@ -59,34 +31,67 @@ impl LucidosEngine {
                  CRITICAL: Never run `exit` as a bash command.",
                 branch_name
             );
-            // Direct run_direct_agent (bypasses process_message_with_steps):
-            // engine-driven auto-harden. Needs `system_prompt_override` to
-            // swap CC's normal system prompt for the hardening-only directive
-            // above, and `recovery_worktree: Some((worktree_path, branch_name))`
-            // to reuse the same change worktree. Neither hook exists on the
-            // unified router's surface; this is engine plumbing, not a user
-            // turn.
-            let result = engine
-                .run_direct_agent(
-                    request_id,
-                    thread_id,
-                    prompt,
-                    None,
-                    origin_id,
-                    &[],
-                    None,
-                    &cancel_token,
-                    None,
-                    Some((worktree_path, branch_name)), // recovery_worktree — reuse existing worktree
-                    None,
-                    Some(hardening_system_prompt),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .await;
+            // Claimed before the prompt is emitted, so a live run on the
+            // thread refuses the hardening instead of sharing its worktree.
+            let result = match engine.claim_thread_or_refuse(thread_id).await {
+                Err(e) => Err(e),
+                Ok(mut claim) => {
+                    let origin_id = match engine
+                        .emit_automated_prompt(thread_id, prompt, EngineReason::HardenRetrigger)
+                        .await
+                    {
+                        Ok(id) => id,
+                        Err(e) => {
+                            log!(
+                                "[ClaudeCode] Failed to emit hardening prompt for thread {}: {}",
+                                thread_id,
+                                e
+                            );
+                            engine
+                                .event_bus
+                                .emit_or_log(
+                                    crate::engine::event_bus::BusEvent::Thread {
+                                        thread_id,
+                                        event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                                            error: format!("Failed to emit prompt: {}", e),
+                                        },
+                                        meta: crate::engine::thread_events::EventMeta::NONE,
+                                    },
+                                    "[ClaudeCode] ResponseFailed",
+                                )
+                                .await;
+                            return;
+                        }
+                    };
+
+                    // Direct run_direct_agent (bypasses process_message_with_steps):
+                    // engine-driven auto-harden. Needs `system_prompt_override` to
+                    // swap CC's normal system prompt for the hardening-only directive
+                    // above, and `recovery_worktree: Some((worktree_path, branch_name))`
+                    // to reuse the same change worktree. Neither hook exists on the
+                    // unified router's surface; this is engine plumbing, not a user
+                    // turn.
+                    engine
+                        .run_direct_agent(
+                            &mut claim,
+                            request_id,
+                            prompt,
+                            None,
+                            origin_id,
+                            None,
+                            &cancel_token,
+                            None,
+                            Some((worktree_path, branch_name)), // recovery_worktree — reuse existing worktree
+                            None,
+                            Some(hardening_system_prompt),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                }
+            };
 
             let Some(change_id) = auto_apply_change_id else {
                 match result {
@@ -304,6 +309,7 @@ impl LucidosEngine {
             device_id,
             parent_thread_id,
             spawning_event_id,
+            wake_mode,
             repo_id,
             caller_title,
             app_id,
@@ -360,9 +366,8 @@ impl LucidosEngine {
             // slow path emits MessageReceived (with channel=ClaudeCode and the
             // `ThreadLink { mode: Agent }` origin the spawn site stamped, which
             // names the launching thread whatever the relation), registers the
-            // thread, runs `run_cc_chat_branch` with `skip_coalesce=true`
-            // (computed from mode=Agent + parent linkage, so a top spawn keeps
-            // coalescing), and dispatches to `run_direct_agent`.
+            // thread, and runs `run_cc_chat_branch`, which dispatches to
+            // `run_direct_agent` on the thread's spawn claim.
             let result = engine
                 .process_message_with_steps(
                     &prompt_owned,
@@ -387,6 +392,7 @@ impl LucidosEngine {
                     None,
                     parent_thread_id,
                     spawning_event_id,
+                    wake_mode,
                     ActorMode::Agent,
                     // `cc_model` — the caller's pin, validated against this
                     // backend's picker at the tool boundary. It reaches

@@ -4,12 +4,16 @@
  * thread menu and a right-click opens it, as on the mobile row. The pin stays
  * beside it, and the row draws no ⋯.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { DesktopThreadTitleBar } from '../ThreadView';
 import { threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
+import { ThreadOverflowItemsChunk } from '../../shared/ThreadOverflowMenu';
+
+// The menu's rows are code-split. Warm them, so a click opens it at once.
+beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 vi.mock('../../../store/actions/threads', () => ({
   focusThread: vi.fn(),
@@ -60,7 +64,7 @@ describe('the desktop title', () => {
   });
 
   it('keeps the pin beside it, and draws no ⋯', () => {
-    expect(host.querySelector('.thread-view-header .pin-thread-btn')).not.toBeNull();
+    expect(host.querySelector('.thread-view-header .pin-btn')).not.toBeNull();
     const menuButtons = host.querySelectorAll('.thread-view-header button[aria-haspopup="menu"]');
     expect(menuButtons).toHaveLength(1);
     expect(menuButtons[0]).toBe(titleButton());

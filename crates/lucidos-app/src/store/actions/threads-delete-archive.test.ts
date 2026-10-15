@@ -38,8 +38,9 @@ vi.hoisted(() => {
 import { makeThreadState } from './threads-test-helpers';
 import { archiveThread, deletePreflight, deleteThreadFamily } from '../../api/threads';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { archivingThreadIds, confirmState, focusedThreadId, threadMap } from '../store';
+import { confirmState, focusedThreadId, threadMap } from '../store';
 import { handleDeleteThread } from './threads-delete';
+import { _resetRowIntentsForTesting } from '../rowIntents';
 
 vi.mock('../../api/threads', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/threads')>()),
@@ -74,7 +75,7 @@ beforeEach(() => {
   threadMap.value = new Map();
   _resetComposeDraftsForTesting();
   focusedThreadId.value = null;
-  archivingThreadIds.value = new Set();
+  _resetRowIntentsForTesting();
   confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
   (globalThis as any).innerWidth = 1024;
 });

@@ -6,6 +6,7 @@
 //! the emit helpers are grouped by responsibility seam in the sibling modules.
 
 mod actor;
+mod apply_now;
 mod capture;
 mod cause;
 mod channel;
@@ -13,6 +14,8 @@ mod emit;
 mod event;
 mod event_impl;
 mod form_request;
+mod home_board;
+mod mcp;
 mod memory;
 mod meta;
 mod question;
@@ -22,18 +25,26 @@ mod triage;
 
 pub use actor::{
     ActorMode, AgentParticipant, EngineReason, EventWaitOutcome, MessageOrigin,
-    PluginSetupOccasion, ThreadDirection,
+    PluginSetupOccasion, ThreadDirection, CACHE_KEEP_ALIVE_REASON_KIND,
 };
+pub use apply_now::ApplyNowOutcome;
 pub use capture::CaptureFormat;
-pub use cause::{AbortCause, CancelCause, EventWaitCancelCause, UnproposedReason};
+pub use cause::{AbortCause, CancelCause, EventWaitCancelCause, UnproposedReason, UnqueueReason};
 pub use channel::{EventChannel, TriggerInvocation};
 pub use event::ThreadEvent;
+pub use event_impl::{
+    not_a_keep_alive_idle_sql, KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON,
+};
 pub use form_request::FormRequestOutcome;
+pub use home_board::{ArrangedTile, LayoutClass};
+pub use mcp::McpEnablementSource;
 pub use memory::RecalledMemory;
 pub use meta::EventMeta;
+pub(crate) use question::with_image_note;
 pub use question::{AnswerKind, OwnerApproval, QuestionOption, WidgetEmbed};
 pub use session::{
-    ChildCompletionStatus, SessionEndReason, SubThreadPendingChange, VoiceSessionEndReason,
+    ChildCompletionStatus, IntegratedBranch, SessionEndReason, SubThreadPendingChange,
+    VoiceSessionEndReason, WakeMode,
 };
 pub use todo::{TodoItem, TodoStatus};
 pub use triage::TriageProposalEntry;
@@ -67,9 +78,8 @@ mod question_tests;
 #[cfg(test)]
 #[path = "../thread_events_tests/todo.rs"]
 mod todo_tests;
-#[cfg(test)]
-#[path = "../thread_events_tests/ts_codegen.rs"]
-mod ts_codegen;
+pub(crate) mod ts_codegen;
+
 #[cfg(test)]
 #[path = "../thread_events_tests/variants.rs"]
 mod variant_tests;

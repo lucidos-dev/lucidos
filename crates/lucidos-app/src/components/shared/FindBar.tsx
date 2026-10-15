@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'preact/hooks';
 import type { RefObject } from 'preact';
 import {
-  closeFind, findFocusRequest, findQuery, findResult, findStatusText, findSurface,
+  closeFind, endFindOn, findFocusRequest, findQuery, findResult, findStatusText, findSurface,
   setFindQuery, stepFind, takeFindRequest, type FindSurface,
 } from '../../store/actions/find-bar';
 import { findRequest } from '../../store/store';
@@ -81,9 +81,7 @@ export function FindBar({ surface, scope, placeholder }: {
 
   // Unmount and a scope change both end this surface's session, and take its
   // highlights with it.
-  useEffect(() => () => {
-    if (findSurface.value === surface) closeFind();
-  }, [surface, scope]);
+  useEffect(() => () => endFindOn(surface), [surface, scope]);
 
   // After the cleanup above, so a request opens on a session of its own.
   useEffect(() => {

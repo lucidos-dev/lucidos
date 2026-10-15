@@ -17,7 +17,7 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
 
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "delete me on uninstall");
@@ -124,13 +124,12 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
         "uninstall must hide the install record from subsequent lookups"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
 #[tokio::test]
 async fn install_then_conflict_then_overwrite_then_uninstall() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let workspace = scratch.clone();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
@@ -311,8 +310,6 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         }
         other => panic!("expected PluginUninstalled, got {:?}", other),
     }
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// Regression test for the uninstall half of the plugin git-tracking bug:
@@ -332,7 +329,7 @@ name = "Uninstall Track Plugin"
 description = "test"
 source = "https://github.com/x/uninstall-track"
 "#;
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_archive(
@@ -423,8 +420,6 @@ source = "https://github.com/x/uninstall-track"
         "working tree must be clean after uninstall commit, dirty: {:?}",
         dirty
     );
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 // ---- uninstall confirm-flow unit tests ------------------------------
@@ -455,7 +450,7 @@ fn is_safe_data_path_rejects_traversal_and_unknown_roots() {
 
 #[test]
 fn prune_empty_parents_stops_at_content_dir_root() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let data_dir = scratch.join("data");
     let nested = data_dir.join("apps/myapp/sub/leaf.html");
     std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
@@ -478,13 +473,11 @@ fn prune_empty_parents_stops_at_content_dir_root() {
         data_dir.join("apps").is_dir(),
         "content-dir root must NOT be pruned even when empty"
     );
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
 fn prune_empty_parents_leaves_non_empty_dir_alone() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let data_dir = scratch.join("data");
     let leaf = data_dir.join("knowhow/sibling-file.md");
     let other = data_dir.join("knowhow/keep.md");
@@ -497,13 +490,11 @@ fn prune_empty_parents_leaves_non_empty_dir_alone() {
 
     assert!(other.is_file(), "sibling file must survive prune");
     assert!(data_dir.join("knowhow").is_dir());
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
 fn prepare_uninstall_request_partitions_present_and_missing() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let data_dir = scratch.join("data");
     std::fs::create_dir_all(data_dir.join("apps/foo")).unwrap();
     std::fs::write(data_dir.join("apps/foo/index.html"), b"<html/>").unwrap();
@@ -554,8 +545,6 @@ fn prepare_uninstall_request_partitions_present_and_missing() {
     // PendingUninstall registered under the returned uninstall_id.
     let uninstall_id = parsed["uninstall_id"].as_str().unwrap();
     assert!(pending.lock().unwrap().contains_key(uninstall_id));
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[tokio::test]
@@ -613,7 +602,7 @@ async fn uninstall_with_bus_handles_file_disappearing_between_prepare_and_confir
     // Race: prepare snapshots the file as present, then the user (or another
     // process) deletes it manually before clicking Confirm. uninstall_with_bus
     // must NOT fail — fold it into files_missing and continue.
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let data_dir = scratch.join("data");
     std::fs::create_dir_all(data_dir.join("knowhow")).unwrap();
     std::fs::write(data_dir.join("knowhow/stays.md"), b"x").unwrap();
@@ -645,6 +634,4 @@ async fn uninstall_with_bus_handles_file_disappearing_between_prepare_and_confir
         "raced-missing file must end up in files_missing"
     );
     assert!(!data_dir.join("knowhow/stays.md").exists());
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }

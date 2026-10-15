@@ -2,6 +2,7 @@ import { signal, computed, batch, type ReadonlySignal, type Signal } from '@prea
 import type { WidgetParams } from '../utils/widgetParams';
 import { hydratePinnedAppsFromStorage } from './actions/pinnedApps';
 import { minDrawerWidth } from './paneMinimums';
+import { DRAWER_GROUPING_KEY, SELECTED_ONGOING_GROUP_KEY, THREAD_DRAWER_WIDTH_KEY } from './drawerKeys';
 import type {
   ThreadQueueResponse,
   MenuItem,
@@ -43,7 +44,7 @@ import { errorDetail } from '../utils/errorDetail';
 import { holdSoftwareKeyboard } from '../utils/softwareKeyboard';
 import { restartDialogState, appUpdateDialogState } from './progressDialogCopy';
 import { clampToastText } from '../components/shared/toastMessage';
-import type { SubscriptionGroup, ThreadState, ThreadStatus, Exchange } from './thread-events';
+import type { SubscriptionGroup, ThreadMeta, ThreadState, ThreadStatus, Exchange } from './thread-events';
 import { changeReadyToReview, computeExchanges, isExcludedFromSections, plainEventName } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
@@ -52,12 +53,15 @@ import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import type { UnproposedReason } from '../generated/thread-event-wire';
 import { resetContentScroll } from './savedScroll';
-import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort, PendingCommits, ReleaseNoticeView } from '../api/client';
+import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort, PendingCommits, ReleaseNoticeView, ThreadContext } from '../api/client';
 import type { UpdateRelay, ReleaseCheck } from '../api/client/control';
-import type { ApplyEstimates } from '../api/client/changes';
+import type { ApplyEstimates, LandingLane, MainCheck } from '../api/client/changes';
 import type { EnvironmentVariable, ModelInfo, ResponseStyle } from '../api/types';
+import type { ChunkGate } from '../utils/lazyComponent';
 import { markSwUpdateDismissed, markEngineVersionDismissed } from '../hooks/sw-update';
 import { parseRepoPath } from './repoPath';
+import { archivePending } from './rowIntents';
+import { withoutPendingReads, withPendingReadsShown, type PendingReads } from './notificationReads';
 
 /** localStorage key holding the focused thread id across reloads. Focus is
  *  per-device, not worth round-tripping through the server. */
@@ -429,6 +433,8 @@ export function aliasRetiredSettingsSubview(raw: string): string {
   localStorage.removeItem('lucidos-plugins-tab');
 }
 const savedMenuItem = localStorage.getItem('lucidos-active-menu-item');
+/** A device with no saved panel opens Files. The Home board has its own
+ *  place: the rail on desktop, Home's face on a phone. */
 export const activeMenuItem = signal<MenuItem>(
   savedMenuItem && (MENU_ITEMS as readonly string[]).includes(savedMenuItem)
     ? (savedMenuItem as MenuItem)
@@ -615,46 +621,6 @@ export const currentModel = signal(DEFAULT_CHAT_MODEL);
 // import without loading this one. Re-exported for the store's own importers.
 export { animationSpeed, speedMultiplier, durationScale, scaledDurationMs } from '../utils/motion';
 
-// --- Toast placement (temporary: a shape comparison, see docs/temporary-measures.md) ---
-
-/** Where the toast stack sits and what a toast is shaped like.
- *
- *   - `bottom-right`: one stack in the window's bottom-right corner, the spot
- *     VS Code and IntelliJ both default to. Anchored to the WINDOW rather than
- *     a pane, so it holds still through a divider drag and never meets the seam.
- *   - `top-bleed` / `bottom-bleed`: ONE stack spanning both panes, edge to edge.
- *     A full-bleed bar COVERS the pane divider for its whole width, where a
- *     narrower card straddles it with the seam showing above and below.
- *   - `card`: one stack, the toast still a capped card, centred on the viewport.
- *     This is the shape the per-pane columns replaced.
- *   - `pane`: today's behaviour, one column per visible pane.
- *
- *  The shapes exist only so they can be compared in the running app. Exactly
- *  one survives, and the picker goes with the losers. */
-export type ToastPlacement = 'bottom-right' | 'top-bleed' | 'bottom-bleed' | 'card' | 'pane';
-
-const TOAST_PLACEMENTS: readonly ToastPlacement[] = [
-  'bottom-right', 'top-bleed', 'bottom-bleed', 'card', 'pane',
-];
-
-/** The one gate on the value, shared by the stored-value read below and the
- *  picker. Both need it, and a second hand-written list of the same strings
- *  would let a value be storable but unpickable, or the reverse. */
-export function isToastPlacement(value: string | null): value is ToastPlacement {
-  return value !== null && TOAST_PLACEMENTS.includes(value as ToastPlacement);
-}
-
-/** Device-local, like the animation-speed slider beside it: this is a diagnostic
- *  for judging a shape, not a preference anyone should have to keep in sync
- *  across devices. An unrecognised stored value falls back to the default rather
- *  than reaching the CSS as an attribute matching no rule. */
-function storedToastPlacement(): ToastPlacement {
-  const raw = localStorage.getItem('lucidos-toast-placement');
-  return isToastPlacement(raw) ? raw : 'bottom-right';
-}
-
-export const toastPlacement = signal<ToastPlacement>(storedToastPlacement());
-
 // --- Threads ---
 export const threadDrawerOpen = signal(
   localStorage.getItem('lucidos-thread-drawer-open') === 'true'
@@ -666,7 +632,6 @@ export const threadDrawerOpen = signal(
  *    - `ongoing`: the ongoing groups (`ONGOING_GROUPS`), every thread type.
  *
  *  Any unknown stored value restores `folders`. */
-const DRAWER_GROUPING_KEY = 'lucidos-drawer-grouping';
 export type DrawerGrouping = 'folders' | 'ongoing';
 
 function restoreDrawerGrouping(): DrawerGrouping {
@@ -699,8 +664,6 @@ export type OngoingGroup = typeof ONGOING_GROUPS[number];
  *  Exactly one is selected, empty or not. Persisted per device; a missing or
  *  unknown stored value restores Blocked, which is how a device that
  *  stored the group's old name, `attention`, lands on it. */
-const SELECTED_ONGOING_GROUP_KEY = 'lucidos-drawer-selected-ongoing-group';
-
 function restoreSelectedOngoingGroup(): OngoingGroup {
   const saved = localStorage.getItem(SELECTED_ONGOING_GROUP_KEY);
   return ONGOING_GROUPS.find(g => g === saved) ?? 'blocked';
@@ -747,7 +710,7 @@ export function setOngoingFilterChoice(filter: OngoingFilter): void {
   ongoingFilterChoiceState.value = filter;
 }
 export const DEFAULT_DRAWER_WIDTH = 300;
-export const THREAD_DRAWER_WIDTH_KEY = 'lucidos-thread-drawer-width';
+export { THREAD_DRAWER_WIDTH_KEY };
 
 // Clamp at load: a width persisted under a smaller root font size would
 // otherwise render an overflowing header until the next drag corrects it. The
@@ -991,7 +954,7 @@ export const archiveThreadCount = signal(0);
 export function effectiveThreadStatus(thread: ThreadState): ThreadStatus {
   // Archive = user acknowledged any prior failed/aborted state. Drop the red
   // status dot immediately, before the ThreadArchived SSE round-trip lands.
-  if (archivingThreadIds.value.has(thread.meta.id)) return 'idle';
+  if (archivePending(thread.meta.id)) return 'idle';
   // Apply is deliberately NOT an optimistic running flip. The thread stays in
   // Review while the backend finishes a clean fast-path apply, or wakes the
   // agent for harden or merge-conflict resolution. The agent's own activity
@@ -1132,6 +1095,31 @@ export function notReadyReason(thread: ThreadState | undefined): UnproposedReaso
   return agentHoldsUnreadMessage(thread) ? null : change.reason;
 }
 
+/** What the composer offers a large coding-agent thread at a clean idle. The
+ *  engine's context reading decides the size (`offer`, `nudge`).
+ *
+ *  - `send`: an Apply landed and the user typed a new request, so it can go
+ *    to a fresh *successor thread* instead.
+ *  - `continue`: an empty composer on a thread past the nudge, so the agent
+ *    can hand off.
+ *
+ *  A clean idle has nothing pending, no open card, no running turn, no event
+ *  wait and no queued message. `null` otherwise. */
+export function successorOffer(
+  thread: ThreadState | undefined,
+  context: ThreadContext | null,
+  draft: { text: string; imageCount: number },
+): 'send' | 'continue' | null {
+  if (!thread || !context || thread.meta.channel !== 'claude_code') return null;
+  if (thread.meta.successor || thread.meta.section === 'archived') return null;
+  if (effectiveThreadStatus(thread) !== 'idle' || thread.meta.liveEventWaitCount > 0) return null;
+  if (thread.meta.codingAgentChangeState.kind !== 'none' || agentHoldsUnreadMessage(thread)) return null;
+  const typed = draft.text.trim() !== '';
+  if (typed && draft.imageCount === 0 && context.offer && context.applied) return 'send';
+  if (!typed && draft.imageCount === 0 && context.nudge) return 'continue';
+  return null;
+}
+
 /** Whether an idle coding agent still holds the newest message unread, so its
  *  next turn starts by itself (ADR 0268). A message queued behind a turn that
  *  ended unfinished is the case. Only `idle` counts: a failed session reads
@@ -1158,16 +1146,24 @@ function agentHoldsUnreadMessage(thread: ThreadState): boolean {
 /** The events that can end an unread hold without changing thread meta. */
 export const UNREAD_HOLD_EVENT_TYPES: ReadonlySet<string> = new Set(['CodingAgentInputRead', 'QueuedMessageRemoved']);
 
+/** Whether the thread's pending change waits on the user's Apply. A change
+ *  the landing lane holds does not: the lane decides when it lands, and the
+ *  thread shows where it stands there in place of Apply. Review and the
+ *  status dot both read it, so they agree. */
+export function changeAwaitsApply(meta: Pick<ThreadMeta, 'id' | 'codingAgentChangeState'>): boolean {
+  return changeReadyToReview(meta)
+    && lanePlace(landingLane.value, pendingChangeForThread(meta.id)?.id) === null;
+}
+
 /** Whether a thread is ready for review: it is the user's turn to look. It
  *  sits in the Current or Saved section, its turn has ended, and it carries a
- *  pending coding-agent change (`changeReadyToReview`) or a *read request*
- *  (ADR 0409).
+ *  change awaiting Apply (`changeAwaitsApply`) or a *read request* (ADR 0409).
  *
  *  A read request lists whatever the thread still waits on, since it has no
  *  Apply to guard (ADR 0424). A change lists only once the thread has settled.
- *  The badge must never claim a thread with no Apply button showing, so this
- *  mirrors the three states in which `available_thread_actions` withholds
- *  Apply:
+ *  The badge must never claim a thread with no Apply button showing. The
+ *  landing lane withholds it on the client (`changeAwaitsApply`), and this
+ *  mirrors the three states in which `available_thread_actions` withholds it:
  *
  *  - `running`: a follow-up turn is in flight, so the WaitingBanner shows
  *    Cancel rather than Apply.
@@ -1181,7 +1177,7 @@ export function threadInReview(thread: ThreadState): boolean {
   if (isExcludedFromSections(thread)) return false;
   const section = getThreadDisplaySection(thread);
   if (section !== 'current' && section !== 'saved') return false;
-  if (changeReadyToReview(thread.meta)) return !threadUnsettled(thread);
+  if (changeAwaitsApply(thread.meta)) return !threadUnsettled(thread);
   return readRequestStanding(thread);
 }
 
@@ -1643,12 +1639,30 @@ export const diffWholeFileEffective = computed<boolean>(() => {
 
 // --- Claude Code ---
 /** Change IDs currently being applied through conflict resolution or hardening revival.
- *  Set from MergeConflictDetected SSE events, cleared by ChangeApplied/ChangeApplyFailed. */
+ *  Set from MergeConflictDetected SSE events, cleared by ChangeApplied,
+ *  ChangeApplyFailed and ChangeUnqueued. */
 export const applyingChangeIds = signal<Set<string>>(new Set());
-/** Thread IDs with an optimistic "Apply Now" in progress.
- *  Tracks the phase: 'requesting' (waiting for backend) → 'applying' (ChangeProposed arrived).
- *  Cleared when the apply completes, fails, or the backend takes over. */
-export const applyingNowThreadIds = signal<Map<string, 'requesting' | 'applying'>>(new Map());
+/** Apply Now clicks the engine has not yet shown on the thread's row: a
+ *  pending intent each (ADR 0437). Maps a thread to the summary version the
+ *  POST answered with, or null while it is out. The click holds until the row
+ *  reaches that version, which carries the apply's own `apply_in_flight`. */
+export const applyNowRequests = signal<ReadonlyMap<string, number | null>>(new Map());
+/** Threads with an Apply Now running or requested. The engine's projected
+ *  `meta.applyInFlight` is the answer, and a click bridges the moment before
+ *  the row shows it. Nothing else starts or ends it: not a timer, not another
+ *  event. */
+export const applyingNowThreadIds = computed<ReadonlySet<string>>(() => {
+  const applying = new Set<string>();
+  const threads = threadMap.value;
+  for (const [id, thread] of threads) {
+    if (thread.meta.applyInFlight) applying.add(id);
+  }
+  for (const [id, asked] of applyNowRequests.value) {
+    const version = threads.get(id)?.meta.summaryVersion;
+    if (asked === null || version === undefined || version < asked) applying.add(id);
+  }
+  return applying;
+});
 /** Whether an "Apply All" batch is running. Drives the busy state of the bulk
  *  Apply All and Discard All buttons. Set optimistically on the click, and by
  *  the ApplyAllBatchStarted SSE event so a batch started on another device
@@ -1674,6 +1688,32 @@ export interface ApplyAllBatch {
 export const applyAllBatch = signal<ApplyAllBatch | null>(null);
 /** The Apply All Cancel was pressed and the batch has not completed yet. */
 export const applyAllCanceling = signal(false);
+/** The *landing lane* with nothing in it. */
+export const EMPTY_LANDING_LANE: LandingLane = { open_batch: null, waiting: [], gathering: false };
+/** The landing lane as the engine reports it: the open lane batch and what
+ *  waits for the next one. Replaced by every `GET /api/v1/changes` and every
+ *  `ChangesUpdated` frame, opened by `LaneBatchStarted`, and closed by
+ *  `LaneBatchLanded` / `LaneBatchFailed`. */
+export const landingLane = signal<LandingLane>(EMPTY_LANDING_LANE);
+/** Where a pending change stands in the lane. */
+export type LanePlace = 'in-batch' | 'waiting';
+/** Where `changeId` stands in `lane`, or `null` when it is not in the lane. */
+export function lanePlace(lane: LandingLane, changeId: string | undefined): LanePlace | null {
+  if (!changeId) return null;
+  if (lane.open_batch?.members.includes(changeId)) return 'in-batch';
+  if (lane.waiting.includes(changeId)) return 'waiting';
+  return null;
+}
+/** The lane batch whose Cancel was pressed, until it closes. */
+export const landingLaneCanceling = signal<string | null>(null);
+/** The *main check* before anything has run. */
+export const IDLE_MAIN_CHECK: MainCheck = { state: 'idle' };
+/** The main check as the engine reports it. Replaced by every
+ *  `GET /api/v1/changes` and every `ChangesUpdated` frame, and moved by the
+ *  `MainCheck*` frames between them. */
+export const mainCheck = signal<MainCheck>(IDLE_MAIN_CHECK);
+/** The red check whose Close was pressed, until it closes. */
+export const mainCheckClosing = signal<string | null>(null);
 /** The key of the summary toast an Apply All ends with. */
 export const APPLY_ALL_SUMMARY_TOAST_KEY = 'apply-all-summary';
 /** What an apply is doing past a plain merge, keyed by THREAD: a thread holds
@@ -1705,8 +1745,6 @@ export const standingApplyThreadIds = signal<Set<string>>(new Set());
 /** Threads whose arm or disarm request is in flight, so a second tap can't fire
  *  a duplicate. */
 export const armingStandingApplyThreadIds = signal<Set<string>>(new Set());
-/** Thread IDs where archive is in progress (prevents duplicate API calls). */
-export const archivingThreadIds = signal<Set<string>>(new Set());
 /** Thread IDs whose change discard is in progress: hides Apply, shows "Discard...". */
 export const discardingCCThreadIds = signal<Set<string>>(new Set());
 /** Thread IDs where Cancel was clicked while an exchange is active. Disables
@@ -1989,14 +2027,32 @@ export const expandedFolders = signal<Set<string>>(
 );
 
 // --- Notifications ---
-export const notifications = signal<Loadable<Notification[]>>({ status: 'not-loaded' });
+/** The inbox browse list as the server last served it. Written only by the
+ *  loads in actions/notifications.ts; everything else reads `notifications`. */
+export const servedNotifications = signal<Loadable<Notification[]>>({ status: 'not-loaded' });
+/** The unread set as the server last served it. Written only by the loads in
+ *  actions/notifications.ts; everything else reads `unreadNotifications`. */
+export const servedUnreadNotifications = signal<Loadable<Notification[]>>({ status: 'not-loaded' });
+/** Reads the user made that the server has not yet confirmed (see
+ *  `PendingReads`). */
+export const pendingNotificationReads = signal<PendingReads>(new Map());
+/** The load epoch each served list came from, which decides whether it
+ *  already reflects an acknowledged read. */
+export const servedNotificationEpochs = signal<{ browse: number; unread: number }>({ browse: 0, unread: 0 });
+/** The inbox browse list as the user sees it: served, with pending reads
+ *  shown as read. */
+export const notifications = computed(() => withPendingReadsShown(
+  servedNotifications.value, pendingNotificationReads.value, servedNotificationEpochs.value.browse,
+));
 /** Single source of truth for unread notifications. The bell badge is a pure
  *  projection of this set, and NO separately-fetched count exists to drift
- *  from it. Maintained by actions/notifications.ts: loaded on startup, resume
- *  and notification SSE, with optimistic removal on mark-read. Bounded,
- *  because unread is naturally small and the load is capped, so a pathological
- *  backlog renders as "99+". */
-export const unreadNotifications = signal<Loadable<Notification[]>>({ status: 'not-loaded' });
+ *  from it. It is the served set without the pending reads, so a load the
+ *  server answered before a read committed never brings the row back.
+ *  Bounded, because unread is naturally small and the load is capped, so a
+ *  pathological backlog renders as "99+". */
+export const unreadNotifications = computed(() => withoutPendingReads(
+  servedUnreadNotifications.value, pendingNotificationReads.value, servedNotificationEpochs.value.unread,
+));
 /** Bell-badge count, DERIVED from the unread set and never independently
  *  fetched. The count IS the set's length, so the badge cannot contradict the
  *  notifications themselves. */
@@ -2179,13 +2235,6 @@ export const installedPlugins = signal<Loadable<InstalledPlugin[]>>({ status: 'n
  *  iframe src, so Preact propagates the reload to every iframe instance. 0 is
  *  the initial load, which needs no cache-buster. */
 export const appRefreshKey = signal(0);
-/** Incremented on every `AppUiRefreshRequested` frame: an app's files just
- *  changed on disk. `appRefreshKey` above reloads the running iframe. This one
- *  tells the app SOURCE editor to re-read what it shows, so an open editor
- *  cannot save a snapshot that predates an agent's edits. The editor freezes
- *  its epoch once the user types, because a draft outranks the disk
- *  (ADR 0118). */
-export const appSourceEpoch = signal(0);
 /** The WIP app preview. When set, the app UI iframe renders from the named app
  *  coding-agent thread's worktree instead of the live workspace data.
  *
@@ -2238,11 +2287,14 @@ export const appSearchQuery = signal('');
 export const preferences = signal<Loadable<Record<string, string>>>({ status: 'not-loaded' });
 
 // --- Confirm dialog ---
-export const confirmState = signal<ConfirmState>({
-  visible: false,
-  message: '',
-  okLabel: 'Delete',
-});
+const CONFIRM_CLOSED: ConfirmState = { visible: false, message: '', okLabel: 'Delete' };
+export const confirmState = signal<ConfirmState>(CONFIRM_CLOSED);
+
+/** Close the confirm, settling its `showConfirm` promise with `value`. */
+export function settleConfirm(value: boolean): void {
+  confirmState.peek().resolve?.(value);
+  confirmState.value = CONFIRM_CLOSED;
+}
 
 /** The WRITABLE progress-dialog slot, for a dialog nothing else derives.
  *
@@ -2304,10 +2356,14 @@ export const activeProgressDialog = computed<ProgressDialogState>(() => {
 });
 
 // --- Prompt dialog ---
-export const promptState = signal<PromptState>({
-  visible: false,
-  message: '',
-});
+const PROMPT_CLOSED: PromptState = { visible: false, message: '' };
+export const promptState = signal<PromptState>(PROMPT_CLOSED);
+
+/** Close the prompt, settling its `showPrompt` promise with `value`. */
+export function settlePrompt(value: string | null): void {
+  promptState.peek().resolve?.(value);
+  promptState.value = PROMPT_CLOSED;
+}
 
 // --- File preview modal ---
 /** A file shown over the shell without navigating it away: an app's
@@ -2340,6 +2396,12 @@ export const toasts = signal<ToastItem[]>([]);
  *  (see `scheduleAutoDismiss`). A caller with no action button to wait on opts
  *  back in here, so every such banner shares one tunable. */
 export const TOAST_AUTO_DISMISS_MS = 5_000;
+
+/** How long a toast with no named delay stays up, or `undefined` to wait to be
+ *  answered. A problem waits, and so does a toast its caller says waits. */
+export function defaultToastDurationMs(type: ToastType, waits: boolean): number | undefined {
+  return waits || type === 'error' || type === 'warning' ? undefined : TOAST_AUTO_DISMISS_MS;
+}
 /** Pending auto-dismiss timers for keyed toasts. Cleared when the same key is
  *  re-shown, restarting the window, or when the toast is dismissed some other
  *  way. Without the cleanup the Map entry survives until the timeout fires. */
@@ -2397,7 +2459,7 @@ export function showToast(rawMessage: string, type: ToastType = 'info', opts?: {
   // timed toast lowered behind a modal is one the reader never sees.
   const autoMs = key
     ? autoDismissMs
-    : autoDismissMs ?? (action || onClick || type === 'error' || type === 'warning' ? undefined : TOAST_AUTO_DISMISS_MS);
+    : autoDismissMs ?? defaultToastDurationMs(type, Boolean(action || onClick));
   const persistent = autoMs === undefined;
   // If a key is provided, update an existing toast with the same key instead of creating a new one
   if (key) {
@@ -2408,19 +2470,14 @@ export function showToast(rawMessage: string, type: ToastType = 'info', opts?: {
       return;
     }
   }
-  // Freeze the toast over the pane focused right now, so a later focus switch
-  // cannot make it jump panes. The drawer counts as the thread pane. The
-  // keyed-update branch above deliberately does NOT touch `pane`, so an
-  // in-place update keeps the toast where it first appeared.
-  const pane = focusedPane.value === 'content' ? 'content' : 'thread';
-  // A plain toast repeated while its twin is up over the same pane counts on
-  // that card. A burst of identical failures (every lazy chunk of a stale
-  // build) would otherwise bury the screen in copies. A toast that acts never
-  // merges, since two cards with the same words may carry different handlers.
+  // A plain toast repeated while its twin is up counts on that card. A burst
+  // of identical failures (every lazy chunk of a stale build) would otherwise
+  // bury the screen in copies. A toast that acts never merges, since two cards
+  // with the same words may carry different handlers.
   const plain = !key && !action && !secondaryAction && !onClick && !spinning && progress == null;
   const twin = plain
     ? toasts.value.find((t) => !t.key && !t.action && !t.secondaryAction && !t.onClick && !t.spinning
-        && t.progress == null && t.pane === pane && t.type === type && t.title === title && t.message === message)
+        && t.progress == null && t.type === type && t.title === title && t.message === message)
     : undefined;
   if (twin) {
     toasts.value = toasts.value.map((t) => t === twin ? { ...t, count: (t.count ?? 1) + 1, persistent } : t);
@@ -2428,10 +2485,9 @@ export function showToast(rawMessage: string, type: ToastType = 'info', opts?: {
     return;
   }
   const id = ++toastIdCounter;
-  // Prepend, so the newest toast renders at the top of its pane's column and
-  // pushes that pane's existing toasts down. Each column is pinned to the top
-  // of the viewport, so array order runs top to bottom.
-  toasts.value = [{ id, title, message, type, key, action, secondaryAction, onClick, spinning, progress, dismissable, persistent, pane }, ...toasts.value];
+  // Prepend: the array runs newest first. The stack draws the newest nearest
+  // the edge it enters from, the top on a phone and the corner on desktop.
+  toasts.value = [{ id, title, message, type, key, action, secondaryAction, onClick, spinning, progress, dismissable, persistent }, ...toasts.value];
   if (key) {
     scheduleAutoDismiss(key, autoMs);
     return;
@@ -2517,6 +2573,31 @@ export interface ConfirmOptions {
   acknowledge?: boolean;
 }
 
+/** The chunk the confirm and prompt dialogs draw from. `App` registers it, so
+ *  a dialog turns visible only once it can draw (ADR 0436). Unregistered, as
+ *  before the shell loads or in a test, a dialog shows at once. */
+let askDialogChunk: ChunkGate | null = null;
+export function registerAskDialogChunk(chunk: ChunkGate | null): void {
+  askDialogChunk = chunk;
+}
+
+/** Run `show` once the dialogs can draw, which is at once when warm. A call a
+ *  later one replaced, or one whose chunk failed, runs `decline` instead. */
+function whenAskDialogsDraw(show: () => void, decline: () => void, current: () => boolean): void {
+  const chunk = askDialogChunk;
+  if (!chunk || chunk.isLoaded()) {
+    show();
+    return;
+  }
+  void chunk.preload().then((loaded) => {
+    if (loaded && current()) show();
+    else decline();
+  });
+}
+
+let confirmCalls = 0;
+let promptCalls = 0;
+
 export function showConfirm(
   message: string,
   okLabel: string,
@@ -2526,20 +2607,23 @@ export function showConfirm(
   // Promise as `false` before showing the new one.
   const prior = confirmState.peek();
   if (prior.visible) prior.resolve?.(false);
+  const call = ++confirmCalls;
 
   return new Promise((resolve) => {
-    confirmState.value = {
-      visible: true,
-      message,
-      okLabel,
-      title: options.title,
-      cancelLabel: options.cancelLabel,
-      variant: options.variant,
-      resolve,
-      extraAction: options.extraAction,
-      details: options.details,
-      acknowledge: options.acknowledge,
-    };
+    whenAskDialogsDraw(() => {
+      confirmState.value = {
+        visible: true,
+        message,
+        okLabel,
+        title: options.title,
+        cancelLabel: options.cancelLabel,
+        variant: options.variant,
+        resolve,
+        extraAction: options.extraAction,
+        details: options.details,
+        acknowledge: options.acknowledge,
+      };
+    }, () => resolve(false), () => call === confirmCalls);
   });
 }
 
@@ -2556,24 +2640,29 @@ export function showPrompt(
     okLabel?: string;
     cancelLabel?: string;
     multiline?: boolean;
+    suggest?: PromptState['suggest'];
   }
 ): Promise<string | null> {
   const prior = promptState.peek();
   if (prior.visible) prior.resolve?.(null);
   holdSoftwareKeyboard();
+  const call = ++promptCalls;
 
   return new Promise((resolve) => {
-    promptState.value = {
-      visible: true,
-      message,
-      title: options?.title,
-      defaultValue: options?.defaultValue,
-      placeholder: options?.placeholder,
-      okLabel: options?.okLabel,
-      cancelLabel: options?.cancelLabel,
-      multiline: options?.multiline,
-      resolve,
-    };
+    whenAskDialogsDraw(() => {
+      promptState.value = {
+        visible: true,
+        message,
+        title: options?.title,
+        defaultValue: options?.defaultValue,
+        placeholder: options?.placeholder,
+        okLabel: options?.okLabel,
+        cancelLabel: options?.cancelLabel,
+        multiline: options?.multiline,
+        suggest: options?.suggest,
+        resolve,
+      };
+    }, () => resolve(null), () => call === promptCalls);
   });
 }
 
@@ -2727,7 +2816,8 @@ export const backgroundModelsVersion = signal(0);
 export const backupPreferencesVersion = signal(0);
 
 /** Bumped on every `McpServerRegistered` / `McpServerUpdated` /
- *  `McpServerRemoved` / `McpServerDisabledToolsChanged` frame. Settings → MCP
+ *  `McpServerRemoved` / `McpServerStopped` / `McpServerDisabledToolsChanged`
+ *  frame. Settings → MCP
  *  Servers re-reads `/mcp/servers` on it. A server the agent registers, or a
  *  tool switched off on another device, then reaches the open page
  *  (ADR 0118). */

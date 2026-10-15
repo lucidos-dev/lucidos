@@ -39,10 +39,10 @@ import {
   readPreviewFrameMessage,
   routePreviewFrameMessage,
   withPreviewBridge,
-  withPreviewCapability,
 } from './previewFrameBridge';
 import { PREVIEW_FRAME_ROLE } from '../../utils/previewFrameProtocol';
-import { artifactPreviewCapability, peekArtifactPreviewCapability } from '../../store/actions/frame-capability';
+import { announceFrameGone } from '../../store/actions/frame-swipe-bridge';
+import { artifactPreviewCapability, peekArtifactPreviewCapability, withPreviewCapability } from '../../store/actions/frame-capability';
 import { forwardableBindings } from '../../store/actions/keybindings';
 import type { ShortcutId } from '../../utils/shortcuts';
 import { currentUiScale } from '../../store/actions/preferences';
@@ -611,14 +611,22 @@ function HtmlPreviewFrame({ content, url, path, withCapability, modal }: {
   const frameRef = useRef<HTMLIFrameElement>(null);
   // A layout effect, so the listener is in place in the commit's own task,
   // before the new document can load and post.
+  //
+  // A new nonce is a new document, and the old one's messages no longer pass.
+  // So a pane drag it leads hears that it went away, or the panes would wait
+  // for a release the host now drops. The window is the same across documents.
   useLayoutEffect(() => {
+    const documentWindow = frameRef.current?.contentWindow ?? null;
     const onMessage = (e: MessageEvent) => {
       const frameWindow = frameRef.current?.contentWindow ?? null;
       const msg = readPreviewFrameMessage(e, frameWindow, nonce);
       if (msg) routePreviewFrameMessage(msg, { artifactPath: path, declaresOwnBase, frameWindow });
     };
     window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      announceFrameGone(documentWindow);
+    };
   }, [nonce, path, declaresOwnBase]);
 
   return (

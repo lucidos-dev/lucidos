@@ -156,6 +156,7 @@ calling a category clean.
 | `cred-env` | a credential read from the environment | `cross-cutting` |
 | `auth-header` | an auth header built in app UI code | `cross-cutting` |
 | `machine-path` | a hardcoded home or machine path | `scripts` |
+| `db-defaults` | database access that may lean on libpq defaults the engine no longer sets | `scripts` |
 | `plugin-manifests` | authored plugin-root `manifest.toml` files and whether each declares `engine` | `plugins` |
 | `prompt-footprint` | the sections the footprint report lists | `prompt-footprint` |
 
@@ -283,7 +284,9 @@ old-to-new mappings, and which fixes may join "Do all suggested fixes".
 - **A deletion never joins "Do all suggested fixes".** Deleting an app or a
   knowhow doc gets its own card, naming the item.
 - **Never raise a ceiling or change a preference to clear a finding.** Only the
-  user's own words may move one.
+  user may move one: in their own words, or by picking the separate card
+  option a section offers for it. That option never joins "Do all suggested
+  fixes".
 
 ## Out of scope
 
@@ -299,7 +302,7 @@ Each run gets its own timestamped directory. Don't overwrite previous reports: d
 
 ## Maintenance
 
-A change to a referenced source-of-truth file (new SDK call, new convention, deprecation) can make a check stale. Every check lives in one section file, so update that file. A check citing a heading or filename breaks silently when the source renames it. `.claude/rules/system-knowhow.md` § `Maintaining workspace-audit` says when this file must change with its sources. `./scripts/check-knowhow-refs.sh` catches the mechanical half in `/harden`.
+A change to a referenced source-of-truth file (new SDK call, new convention, deprecation) can make a check stale. Every check lives in one section file, so update that file. A check citing a heading or filename breaks silently when the source renames it. `.claude/rules/system-knowhow.md` § `Maintaining workspace-audit` says when this file must change with its sources. `./scripts/check-knowhow-refs.sh` catches the mechanical half in `/harden`. `./scripts/check-audit-scans.sh` runs every scan line against fixture lines, so a scan change needs a fixture row for the form it must catch.
 
 **Several checks own their detection patterns outright**, rather than citing another file. Change what a check detects, and update its section's scan lines, the check and its § Remediation table in the same change:
 

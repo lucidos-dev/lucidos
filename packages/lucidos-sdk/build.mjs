@@ -3,15 +3,16 @@ import { buildAllBootBundles } from './appearanceBoot.build.mjs';
 import { buildSseWorkerBundle } from './sseWorker.build.mjs';
 import { writePreviewBundles } from './previewBundles.build.mjs';
 
-// The appearance FOUC bundles. Unlike `dist/sdk.js` below these are CHECKED IN,
-// because the engine `include_str!`s one of them. See the build module's header.
+// Every output lands in dist/ and is never committed. `scripts/codegen.sh`
+// runs this after the Rust-generated TS these bundles import.
+
+// The appearance FOUC bundles. See the build module's header.
 await buildAllBootBundles();
 
-// The shared SSE worker, checked in for the same reason. See its build module.
+// The shared SSE worker. See its build module.
 await buildSseWorkerBundle();
 
-// The HTML preview's finder and pane swipe, checked in because the host
-// imports them as text.
+// The HTML preview's finder and pane swipe, which the host imports as text.
 await writePreviewBundles();
 
 await build({

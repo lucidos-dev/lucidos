@@ -61,8 +61,8 @@ pub const MOCK_TOOL_CALL_SENTINEL: &str = "MOCK_TOOL_CALL:";
 /// text without another round.
 pub const MOCK_READ_BESIDE_REPLY_SENTINEL: &str = "MOCK_READ_BESIDE_REPLY";
 
-/// A message carrying this makes a forced `request_read` answer `read: true`.
-/// Without it the forced decision is `read: false`, as for most replies.
+/// A message carrying this makes the forced read decision answer yes. Without
+/// it the decision is no, as for most replies.
 pub const MOCK_READ_YES_SENTINEL: &str = "MOCK_READ_YES";
 
 /// Sentinel that makes a turn's model call wait, then fail:
@@ -86,18 +86,31 @@ pub fn scripted_failure_delay(messages: &[Message]) -> Option<u64> {
         .ok()
 }
 
-/// The arguments the mock answers a forced call to `tool` with.
-fn forced_arguments(tool: &str, messages: &[Message]) -> serde_json::Value {
-    if tool != crate::llm::tool_names::REQUEST_READ {
-        return serde_json::json!({});
-    }
-    let read = messages.iter().any(|m| match &m.content {
+/// The arguments the mock answers a forced call to `tool` with. A forced
+/// judgment answers every yes/no question in the tool's schema: no, or yes
+/// when the turn carries the sentinel. A choice question stays unanswered.
+fn forced_arguments(
+    tool: &str,
+    tools: &[ToolDefinition],
+    messages: &[Message],
+) -> serde_json::Value {
+    let schema = tools.iter().find(|t| t.name == tool).map(|t| &t.parameters);
+    let yes = messages.iter().any(|m| match &m.content {
         MessageContent::Text(text) => text.contains(MOCK_READ_YES_SENTINEL),
         MessageContent::Blocks(blocks) => blocks.iter().any(
             |b| matches!(b, ContentBlock::Text { text, .. } if text.contains(MOCK_READ_YES_SENTINEL)),
         ),
     });
-    serde_json::json!({ crate::llm::tools::READ_ARG: read })
+    let probability = if yes { 1.0 } else { 0.0 };
+    let answers: serde_json::Map<String, serde_json::Value> = schema
+        .and_then(|s| s.get("properties"))
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, property)| property.get("type").and_then(|t| t.as_str()) == Some("number"))
+        .map(|(id, _)| (id.clone(), serde_json::json!(probability)))
+        .collect();
+    serde_json::Value::Object(answers)
 }
 
 /// Sentinel that makes the mock end its reply on a question typed as prose:
@@ -144,6 +157,15 @@ pub struct MockProvider {
 /// threads across three test files on the run that first exercised this.
 const REQUEST_LINE_MARKER: &str = "Request:";
 
+/// This turn's request: the text after the LAST marker. The assembler appends
+/// it once at the end, so a quoted "Request:" in history cannot shadow it. A
+/// prompt with no marker, such as a side question's, has no request line and
+/// scripts nothing, because everything in it quotes other turns.
+fn request_line(text: &str) -> Option<&str> {
+    text.rsplit_once(REQUEST_LINE_MARKER)
+        .map(|(_, request)| request)
+}
+
 /// Decide whether this turn should subscribe, and to what.
 ///
 /// Returns the event type to watch when THIS turn's request asks for it and the
@@ -177,10 +199,9 @@ pub fn scripted_await_event(messages: &[Message]) -> Option<String> {
 /// Pull the event name off `MOCK_SUBSCRIBE_ON:<EventType>` on the request line.
 /// Whitespace-delimited, so the sentinel can sit inside an ordinary sentence.
 fn sentinel_event_type(text: &str) -> Option<String> {
-    // After the LAST request marker: the assembler appends it once at the end,
-    // and a quoted "Request:" inside history must not shadow the real one.
-    let request = text.rsplit(REQUEST_LINE_MARKER).next()?;
-    let rest = request.split(MOCK_AWAIT_EVENT_SENTINEL).nth(1)?;
+    let rest = request_line(text)?
+        .split(MOCK_AWAIT_EVENT_SENTINEL)
+        .nth(1)?;
     let name = rest.split_whitespace().next()?;
     (!name.is_empty()).then(|| name.to_string())
 }
@@ -252,11 +273,7 @@ fn sentinel_line(messages: &[Message], sentinel: &str) -> Option<String> {
 /// Whether this turn's request line carries `sentinel`, for a sentinel that
 /// takes no arguments.
 fn request_line_has(messages: &[Message], sentinel: &str) -> bool {
-    let has = |text: &str| {
-        text.rsplit(REQUEST_LINE_MARKER)
-            .next()
-            .is_some_and(|request| request.contains(sentinel))
-    };
+    let has = |text: &str| request_line(text).is_some_and(|request| request.contains(sentinel));
     messages.last().is_some_and(|m| match &m.content {
         MessageContent::Text(text) => has(text),
         MessageContent::Blocks(blocks) => blocks
@@ -267,8 +284,7 @@ fn request_line_has(messages: &[Message], sentinel: &str) -> bool {
 
 fn sentinel_line_in(message: &Message, sentinel: &str) -> Option<String> {
     let from_text = |text: &str| {
-        let request = text.rsplit(REQUEST_LINE_MARKER).next()?;
-        let rest = request.split(sentinel).nth(1)?;
+        let rest = request_line(text)?.split(sentinel).nth(1)?;
         let line = rest.lines().next()?.trim();
         (!line.is_empty()).then(|| line.to_string())
     };
@@ -322,7 +338,7 @@ impl LlmProvider for MockProvider {
                 tool_calls: vec![ToolCall {
                     id: format!("toolu_mock_forced_{tool}"),
                     name: tool.to_string(),
-                    arguments: forced_arguments(tool, &messages),
+                    arguments: forced_arguments(tool, &tools, &messages),
                     thought_signature: None,
                 }],
                 stop_reason: Some("tool_use".to_string()),
@@ -369,6 +385,7 @@ impl LlmProvider for MockProvider {
                 unknown_sse_dropped: 0,
                 model_only_text: None,
                 progress_notes: Vec::new(),
+                service_tier: None,
             });
         }
 
@@ -394,6 +411,7 @@ impl LlmProvider for MockProvider {
                 unknown_sse_dropped: 0,
                 model_only_text: None,
                 progress_notes: Vec::new(),
+                service_tier: None,
             });
         }
 
@@ -423,6 +441,7 @@ impl LlmProvider for MockProvider {
                 unknown_sse_dropped: 0,
                 model_only_text: None,
                 progress_notes: Vec::new(),
+                service_tier: None,
             });
         }
 
@@ -448,6 +467,7 @@ impl LlmProvider for MockProvider {
                 unknown_sse_dropped: 0,
                 model_only_text: None,
                 progress_notes: Vec::new(),
+                service_tier: None,
             });
         }
 
@@ -504,6 +524,7 @@ impl LlmProvider for MockProvider {
             unknown_sse_dropped: 0,
             model_only_text: None,
             progress_notes: Vec::new(),
+            service_tier: None,
         })
     }
 
@@ -525,8 +546,8 @@ mod tests {
         assert!(!request_line_has(&quoted, MOCK_READ_BESIDE_REPLY_SENTINEL));
     }
 
-    /// A forced call answers with its one tool: `read: false` by default, and
-    /// `read: true` when the turn carries the sentinel.
+    /// A forced judgment answers its yes/no questions: no by default, and yes
+    /// when the turn carries the sentinel.
     #[tokio::test]
     async fn a_forced_call_answers_with_its_tool() {
         let provider = MockProvider::new(MOCK_MODEL.to_string());
@@ -540,9 +561,15 @@ mod tests {
                 provider
                     .chat(
                         messages,
-                        vec![crate::llm::tools::request_read_tool()],
+                        vec![crate::llm::judgment::chat::answer_tool(&[(
+                            "read".to_string(),
+                            crate::llm::judgment::Question::Noul {
+                                instructions: "Read it?".to_string(),
+                                criteria: None,
+                            },
+                        )])],
                         ModelSelection::default()
-                            .with_forced_tool(Some(crate::llm::tool_names::REQUEST_READ)),
+                            .with_forced_tool(Some(crate::llm::judgment::chat::ANSWER_TOOL)),
                         None,
                         None,
                         crate::llm::metered::CallToken::for_test(),
@@ -551,19 +578,17 @@ mod tests {
                     .unwrap()
             }
         };
+        let read = "read";
         let no = decide("thanks").await;
         assert_eq!(no.tool_calls.len(), 1);
-        assert_eq!(no.tool_calls[0].name, "request_read");
         assert_eq!(
-            no.tool_calls[0].arguments[crate::llm::tools::READ_ARG],
-            false
+            no.tool_calls[0].name,
+            crate::llm::judgment::chat::ANSWER_TOOL
         );
+        assert_eq!(no.tool_calls[0].arguments[read], 0.0);
         assert!(no.content.is_none());
         let yes = decide(&format!("write the report {MOCK_READ_YES_SENTINEL}")).await;
-        assert_eq!(
-            yes.tool_calls[0].arguments[crate::llm::tools::READ_ARG],
-            true
-        );
+        assert_eq!(yes.tool_calls[0].arguments[read], 1.0);
     }
 
     #[tokio::test]
@@ -700,10 +725,7 @@ mod tests {
         ] {
             let resp = provider
                 .chat(
-                    vec![Message {
-                        role: "user".to_string(),
-                        content: MessageContent::Text(format!("Summarise:\n{line}")),
-                    }],
+                    assembled("", &line),
                     vec![],
                     ModelSelection::default(),
                     None,
@@ -866,6 +888,20 @@ mod tests {
         assert_eq!(err.to_string(), MOCK_SCRIPTED_FAILURE);
         let answered = call(vec![]).await.expect("a tool-less call answers");
         assert_eq!(answered.content.as_deref(), Some(MOCK_RESPONSE));
+    }
+
+    /// A side question sends no request line, only memory and history, which
+    /// can quote another thread's sentinel.
+    #[test]
+    fn a_prompt_with_no_request_line_scripts_nothing() {
+        let msgs = vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text(
+                "[RECENT]\nanother thread: MOCK_FAIL_AFTER_MS: 1\n[END RECENT]\n\nwhat is X?"
+                    .to_string(),
+            ),
+        }];
+        assert_eq!(scripted_failure_delay(&msgs), None);
     }
 
     #[test]

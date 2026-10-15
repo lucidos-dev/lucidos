@@ -14,6 +14,7 @@ async fn test_session_started_updates_source_in_projection() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fix something".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -57,6 +58,9 @@ async fn test_session_started_updates_source_in_projection() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -110,6 +114,7 @@ async fn test_last_user_and_agent_action_attributed_separately() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do the thing".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -205,6 +210,7 @@ async fn a_prompt_injected_is_a_user_action_only_from_a_human() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do the thing".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -277,6 +283,7 @@ async fn test_session_started_does_not_update_last_activity() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fix it".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -318,6 +325,9 @@ async fn test_session_started_does_not_update_last_activity() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -360,6 +370,7 @@ async fn test_session_ended_transitions_to_terminal_status() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fix it".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -441,6 +452,7 @@ async fn test_session_ended_stale_resume_keeps_status_running() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "include the ios suite too".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -469,6 +481,9 @@ async fn test_session_ended_stale_resume_keeps_status_running() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -537,6 +552,7 @@ async fn test_permission_request_transitions_status_to_waiting_for_user_answer()
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "edit my skill".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -566,6 +582,9 @@ async fn test_permission_request_transitions_status_to_waiting_for_user_answer()
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -656,6 +675,7 @@ async fn test_session_started_stores_repo_id() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "analyze this repo".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -686,6 +706,9 @@ async fn test_session_started_stores_repo_id() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -719,6 +742,9 @@ async fn test_session_started_stores_repo_id() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -755,6 +781,7 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "parent task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -780,6 +807,7 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -846,6 +874,9 @@ async fn session_started_locks_coding_agent_backend_in_projection() {
         coding_agent_kind: Default::default(),
         coding_agent_folder: String::new(),
         app_id: None,
+        integrated: false,
+        auto_compact_window: None,
+        auto_compact_arm: None,
     };
     let meta = EventMeta {
         channel: Some(EventChannel::ClaudeCode),
@@ -917,6 +948,7 @@ fn continuation_started(thread_id: Uuid, channel: EventChannel) -> BusEvent {
             branch: String::new(),
             origin: None,
             reason: None,
+            resumed_abort_id: None,
         },
         meta: EventMeta {
             channel: Some(channel),
@@ -944,6 +976,7 @@ async fn chat_continuation_started_does_not_flip_thread_to_coding_agent() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "what's the weather".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1044,6 +1077,9 @@ async fn coding_agent_continuation_started_keeps_is_coding_agent_true() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -1095,6 +1131,9 @@ async fn chat_channel_continuation_started_never_clears_is_coding_agent() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -1124,11 +1163,8 @@ async fn chat_channel_continuation_started_never_clears_is_coding_agent() {
 
 #[tokio::test]
 async fn chat_continuation_started_preserves_the_stored_draft() {
-    // The arm wipes the compose fields because a coding-agent session start
-    // consumes the thread's prompt. A chat Continue consumes nothing — the
-    // user clicked Continue, they did not send — so the draft must survive.
-    // (It also must, because this arm emits no `compose_cleared_broadcast`:
-    // a silent clear leaves every peer device showing a ghost draft.)
+    // A Continue consumes nothing: the user clicked Continue, they did not
+    // send. Only a send's accept consumes the compose slot (ADR 0450).
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -1138,6 +1174,7 @@ async fn chat_continuation_started_preserves_the_stored_draft() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "what's the weather".into(),
             user_image_hashes: vec![],
             device_id: None,

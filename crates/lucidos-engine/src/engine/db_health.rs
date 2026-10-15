@@ -37,6 +37,11 @@
 //! When the pool cannot answer, the probe also says why, so the slowness warning
 //! can name the fix (ADR 0301). A direct connection outside the pool tells a
 //! used-up pool from a database that does not answer.
+//!
+//! The same ticker watches for a wiped schema (ADR 0481). When the migration
+//! marker names this database and `_sqlx_migrations` is confirmed gone twice
+//! in a row, the engine reports the terminal boot failure and stops. Only a
+//! query that answered counts, so an outage never reads as a wipe.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -45,6 +50,7 @@ use std::time::Duration;
 use sqlx::{Connection, PgConnection, PgPool};
 
 use super::LucidosEngine;
+use crate::core::migration_marker::{self, MigrationTable};
 
 /// How often the background task probes. Matches the frontend's own health poll,
 /// so a recovery surfaces within about one client tick of actually happening.
@@ -79,6 +85,22 @@ pub fn apply_probe(reachable: bool, consecutive_failures: u32, probe_ok: bool) -
         reachable && failures < FAILURES_BEFORE_UNREACHABLE,
         failures,
     )
+}
+
+/// Consecutive confirmed misses of `_sqlx_migrations` before the engine treats
+/// its database as wiped. One miss could be a restore caught mid-flight.
+const MISSES_BEFORE_WIPED: u32 = 2;
+
+/// Fold one schema probe into the run of consecutive misses. Returns the new
+/// count and whether the database now counts as wiped. An unanswered probe
+/// leaves the count alone: it is evidence of nothing.
+pub fn apply_schema_probe(misses: u32, table: MigrationTable) -> (u32, bool) {
+    let misses = match table {
+        MigrationTable::Present => 0,
+        MigrationTable::Missing => misses.saturating_add(1),
+        MigrationTable::Unknown => misses,
+    };
+    (misses, misses >= MISSES_BEFORE_WIPED)
 }
 
 /// Postgres refuses a new connection with this SQLSTATE when every slot is taken.
@@ -192,6 +214,24 @@ impl LucidosEngine {
         self.database_health.load()
     }
 
+    /// Report the wiped database and stop, when the migration marker agrees
+    /// it is this database. `false` when it does not, and the engine runs on.
+    async fn stop_on_wiped_database(&self) -> bool {
+        let workspace = self.workspace_path();
+        let named = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            migration_marker::marker_names(workspace, &crate::core::database_url(), self.pool()),
+        )
+        .await;
+        if named != Ok(true) {
+            return false;
+        }
+        crate::log!("[DbHealth] The database lost its migration table; stopping");
+        crate::boot_failure::report(&crate::boot_failure::wiped_database_message(workspace)).await;
+        request_own_shutdown();
+        true
+    }
+
     /// Start the background reachability probe. Spawned once at boot, alongside
     /// the other periodic engine tasks in `main.rs`.
     ///
@@ -203,6 +243,7 @@ impl LucidosEngine {
         let engine = self.clone();
         tokio::spawn(async move {
             let mut failures: u32 = 0;
+            let mut schema_misses: u32 = 0;
             let mut ticker = tokio::time::interval(PROBE_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -215,6 +256,23 @@ impl LucidosEngine {
                 let (reachable, next_failures) =
                     apply_probe(was.is_reachable(), failures, failure.is_none());
                 failures = next_failures;
+                // Only after the pool answered, and bounded like it, so a tick
+                // still never lasts much past twice `PROBE_TIMEOUT`.
+                let table = if failure.is_none() {
+                    tokio::time::timeout(
+                        PROBE_TIMEOUT,
+                        migration_marker::migration_table(engine.pool()),
+                    )
+                    .await
+                    .unwrap_or(MigrationTable::Unknown)
+                } else {
+                    MigrationTable::Unknown
+                };
+                let (misses, wiped) = apply_schema_probe(schema_misses, table);
+                schema_misses = misses;
+                if wiped && engine.stop_on_wiped_database().await {
+                    return;
+                }
                 let now = DatabaseHealth::settle(reachable, failure);
                 if now != was {
                     engine.database_health.store(now);
@@ -238,9 +296,53 @@ impl LucidosEngine {
     }
 }
 
+/// Stop through the engine's own graceful path, the SIGUSR1 `main.rs` handles,
+/// so agent sessions and background tasks are torn down too.
+#[cfg(unix)]
+fn request_own_shutdown() {
+    // SAFETY: kill takes no pointers; getpid names this process.
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGUSR1);
+    }
+}
+
+#[cfg(not(unix))]
+fn request_own_shutdown() {
+    std::process::exit(1);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{apply_probe, DatabaseHealth, DatabaseHealthCell, FAILURES_BEFORE_UNREACHABLE};
+    use super::{
+        apply_probe, apply_schema_probe, DatabaseHealth, DatabaseHealthCell, MigrationTable,
+        FAILURES_BEFORE_UNREACHABLE,
+    };
+
+    #[test]
+    fn one_missing_table_is_not_a_wipe_and_two_in_a_row_are() {
+        assert_eq!(apply_schema_probe(0, MigrationTable::Missing), (1, false));
+        assert_eq!(apply_schema_probe(1, MigrationTable::Missing), (2, true));
+    }
+
+    #[test]
+    fn a_present_table_resets_the_run() {
+        assert_eq!(apply_schema_probe(1, MigrationTable::Present), (0, false));
+        assert_eq!(apply_schema_probe(0, MigrationTable::Missing), (1, false));
+    }
+
+    /// The load-bearing negative case: during a Docker or socket outage the
+    /// query errors, and that must never count toward a wipe (ADR 0037).
+    #[test]
+    fn an_unanswered_probe_leaves_the_run_alone() {
+        assert_eq!(apply_schema_probe(0, MigrationTable::Unknown), (0, false));
+        assert_eq!(apply_schema_probe(1, MigrationTable::Unknown), (1, false));
+        let (misses, wiped) = apply_schema_probe(1, MigrationTable::Unknown);
+        assert_eq!(
+            apply_schema_probe(misses, MigrationTable::Missing),
+            (2, true)
+        );
+        assert!(!wiped);
+    }
 
     #[test]
     fn a_direct_connection_that_answers_means_the_pool_is_used_up() {

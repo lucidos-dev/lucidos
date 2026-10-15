@@ -5,20 +5,20 @@
 use super::super::*;
 
 impl LucidosEngine {
-    /// Mark the engine as shutting down / restarting. Idempotent — the flag is
+    /// Mark the engine as shutting down / restarting. Idempotent: the flag is
     /// never cleared because the process is on its way out. Called at the very
     /// start of both shutdown paths (the `main.rs` signal handler and
-    /// `abort_in_flight_for_restart`) so the scheduler stops firing
-    /// event-triggers before any terminator cleanup event is emitted.
+    /// `abort_in_flight_for_restart`), so no trigger fire starts once any
+    /// terminator cleanup event is emitted.
     pub fn mark_shutting_down(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// True once shutdown / restart has begun. The scheduler's event subscriber
-    /// reads this to skip event-trigger dispatch: a trigger fired from a
-    /// shutdown-cleanup event would spawn a script that calls back into the
-    /// HTTP API being torn down, producing a spurious "<trigger> failed" push.
+    /// True once shutdown / restart has begun. Every trigger-fire path reads
+    /// this one signal: event dispatch, both cron paths, and the Thread Queue's
+    /// admission. A fire started now would call back into the HTTP API being
+    /// torn down, producing a spurious "<trigger> failed" push.
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -68,7 +68,10 @@ impl LucidosEngine {
             let all = guard.keys().copied().collect();
             let (ids, flags) = guard
                 .iter()
-                .filter(|(_, s)| s.is_in_flight())
+                // An apply's hold runs no turn, so there is nothing to abort.
+                .filter(|(_, s)| {
+                    s.is_in_flight() && !matches!(s.phase, crate::engine::SessionPhase::Applying)
+                })
                 .map(|(tid, s)| (*tid, s.external_terminal_emitted.clone()))
                 .unzip();
             (all, ids, flags)
@@ -316,11 +319,14 @@ impl LucidosEngine {
         // *Switch to new version* fingerprint. It does NOT produce a `SessionEnded`
         // (the post-loop cleanup bails out early during shutdown), and the retired
         // `SessionEndReason::Completed` this comment used to contrast with is long gone.
-        let sessions: Vec<(
+        // Thread, interrupt, stop, and the startup cancel of a run still starting.
+        type SessionHandles = (
             uuid::Uuid,
             std::sync::Arc<tokio::sync::Notify>,
             std::sync::Arc<tokio::sync::Notify>,
-        )> = {
+            Option<tokio_util::sync::CancellationToken>,
+        );
+        let sessions: Vec<SessionHandles> = {
             let guard = self.agent_sessions.lock().await;
             for s in guard.values() {
                 s.shutting_down
@@ -328,7 +334,16 @@ impl LucidosEngine {
             }
             guard
                 .iter()
-                .map(|(tid, s)| (*tid, s.interrupt.clone(), s.stop.clone()))
+                .map(|(tid, s)| {
+                    let startup_cancel = match &s.phase {
+                        crate::engine::SessionPhase::Starting { startup_cancel } => {
+                            Some(startup_cancel.clone())
+                        }
+                        crate::engine::SessionPhase::Running { .. }
+                        | crate::engine::SessionPhase::Applying => None,
+                    };
+                    (*tid, s.interrupt.clone(), s.stop.clone(), startup_cancel)
+                })
                 .collect()
         };
 
@@ -368,7 +383,7 @@ impl LucidosEngine {
         // per-thread lookups in `abort_in_flight_for_restart` above: serial
         // awaits here would hold every session's Esc behind N round-trips on a
         // busy restart.
-        let parked: Vec<bool> = futures::future::join_all(sessions.iter().map(|(tid, _, _)| {
+        let parked: Vec<bool> = futures::future::join_all(sessions.iter().map(|(tid, _, _, _)| {
             crate::engine::agent_recovery::preserve_question_park_at_shutdown(
                 &self.pool,
                 "session sweep",
@@ -377,13 +392,16 @@ impl LucidosEngine {
             )
         }))
         .await;
-        for ((tid, interrupt, stop), is_parked) in sessions.iter().zip(parked) {
+        for ((tid, interrupt, stop, startup_cancel), is_parked) in sessions.iter().zip(parked) {
             if is_parked {
                 stop.notify_one();
                 continue;
             }
             log!("[Shutdown] Interrupting Claude Code session {}", tid);
-            interrupt.notify_one();
+            match startup_cancel {
+                Some(startup_cancel) => startup_cancel.cancel(),
+                None => interrupt.notify_one(),
+            }
         }
 
         // Phase 2: Poll until all sessions are gone or 10 seconds elapse.
@@ -401,7 +419,7 @@ impl LucidosEngine {
                 // The stop arm reads `is_shutdown=true` (set above) and emits
                 // `Aborted(EngineShutdown)` for actively-working sessions, nothing
                 // for idle sessions — never `ResponseCanceled` here.
-                for (tid, _, stop) in &sessions {
+                for (tid, _, stop, _) in &sessions {
                     if self.agent_sessions.lock().await.contains_key(tid) {
                         stop.notify_one();
                     }

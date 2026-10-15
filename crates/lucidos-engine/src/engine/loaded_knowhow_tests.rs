@@ -311,6 +311,7 @@ mod persisted {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "hi".to_string(),
             user_image_hashes: vec![],
             device_id: None,

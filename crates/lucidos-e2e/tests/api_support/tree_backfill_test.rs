@@ -114,6 +114,26 @@ async fn the_estimate_prices_a_backfill_before_anything_is_spent() {
         complete_high("medium") >= complete_high("low"),
         "{by_effort:?}"
     );
+
+    // A turn costs money even with nothing to build: the memory choice shows
+    // a fresh workspace this price.
+    let turn_calls = &body["turn_calls"];
+    let (calls_low, calls_high) = (
+        turn_calls["low"].as_f64().unwrap(),
+        turn_calls["high"].as_f64().unwrap(),
+    );
+    assert!(0.0 < calls_low && calls_low <= calls_high, "{body}");
+    let turn = &row("low")["turn_usd"];
+    let (turn_low, turn_high) = (
+        turn["low"].as_f64().unwrap(),
+        turn["high"].as_f64().unwrap(),
+    );
+    let turn_central = row("low")["turn_usd_central"].as_f64().unwrap();
+    assert!(0.0 < turn_low && turn_low <= turn_high, "{by_effort:?}");
+    assert!(
+        (turn_low..=turn_high).contains(&turn_central),
+        "{by_effort:?}"
+    );
 }
 
 /// Off on Classic, running then ready on Tree, off again on Classic.
@@ -192,4 +212,24 @@ async fn the_tree_browser_reads_a_top_and_the_threads_with_trees() {
 
     let (status, body) = get_json(&format!("/memory/tree?thread={}", uuid::Uuid::new_v4())).await;
     assert_eq!(status, 400, "an unknown thread is refused: {body}");
+}
+
+/// Continue raises only a backfill that has a cap. The e2e compactor runs on
+/// the mock model, which the catalog does not price, so no backfill here has
+/// one: the raise is refused and records nothing.
+#[tokio::test]
+async fn raising_the_cap_of_an_uncapped_backfill_is_refused() {
+    let resp = user_client()
+        .await
+        .post(format!("{}/api/v1/memory/tree-backfill/cap", base_url()))
+        .json(&json!({ "from_cap_usd": 0.0 }))
+        .send()
+        .await
+        .expect("cap request failed");
+    assert_eq!(resp.status(), 409);
+    let body: Value = resp.json().await.expect("Invalid JSON");
+    assert!(
+        body["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{body}"
+    );
 }

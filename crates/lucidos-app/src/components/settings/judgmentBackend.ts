@@ -1,6 +1,8 @@
 import type { CredentialInfo, Loadable } from '../../store/types';
 import {
   PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI_KEY,
+  PROVIDER_ENABLED_OPENAI_KEY,
+  PROVIDER_ENABLED_OPENROUTER_KEY,
   PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM_KEY,
   PROVIDER_ENABLED_TYPESAFE_KEY,
   SYSTEM_ONE_CUSTOM_MODEL_KEY,
@@ -8,6 +10,7 @@ import {
   switchValueReadsAsOff,
   type BackgroundModelKey,
   type BackgroundReasoningKey,
+  type SwitchableProvider,
 } from '../../store/actions/preferences';
 import type { ModelSelectionPatch } from '../../hooks/useModelSelection';
 import type { ModelChoice } from '../../store/modelSelection';
@@ -18,7 +21,16 @@ import {
   SYSTEM_ONE_CUSTOM_CREDENTIAL_SERVICE,
   SYSTEM_ONE_ENDPOINT_IDS,
   TYPESAFE_CREDENTIAL_SERVICE,
+  WAKE_DECISION_DEFAULT_ENDPOINT,
 } from '@lucidos/engine-constants';
+import {
+  PREF_JUDGMENT_COMMAND_GUARD,
+  PREF_JUDGMENT_QUERY_CLASSIFICATION,
+  PREF_JUDGMENT_READ_DECISION,
+  PREF_JUDGMENT_WAKE_DECISION,
+  PREF_MODEL_WAKE_DECISION,
+  PREF_REASONING_WAKE_DECISION,
+} from '@lucidos/preference-catalog';
 
 /**
  * Which backend answers a judgment site, decided in the site's model control.
@@ -43,8 +55,10 @@ export { TYPESAFE_API_KEY_ENV } from '@lucidos/engine-constants';
 export const SYSTEM_ONE_PROVIDER_LOCATION = 'Models → Providers';
 
 /** One System One provider: a row on Settings → Models → Providers with its
- *  own key and master switch. */
-export type SystemOneProviderId = 'typesafe' | 'cloudflare-workers-ai' | 'system-one-custom';
+ *  own key and master switch. OpenRouter and OpenAI are chat providers too,
+ *  and their rows are the chat provider rows. */
+export type SystemOneProviderId =
+  | 'typesafe' | 'openrouter' | 'cloudflare-workers-ai' | 'openai' | 'system-one-custom';
 
 export interface SystemOneProviderSpec {
   id: SystemOneProviderId;
@@ -54,6 +68,20 @@ export interface SystemOneProviderSpec {
   /** The credential service holding its key. */
   credentialService: string;
   switchKey: string;
+  /** The chat provider whose key this row reuses. `/health` then reports it
+   *  configured from sources this page cannot see, such as a launch
+   *  environment key or a Codex login. */
+  chatProvider?: SwitchableProvider;
+}
+
+/** A System One row that rides a chat provider: its id, anchor and credential
+ *  service are all that provider's id. */
+function chatProviderRow(
+  id: SystemOneProviderId & SwitchableProvider,
+  label: string,
+  switchKey: string,
+): SystemOneProviderSpec {
+  return { id, label, anchor: `models:${id}`, credentialService: id, switchKey, chatProvider: id };
 }
 
 export const SYSTEM_ONE_PROVIDERS: Record<SystemOneProviderId, SystemOneProviderSpec> = {
@@ -64,6 +92,8 @@ export const SYSTEM_ONE_PROVIDERS: Record<SystemOneProviderId, SystemOneProvider
     credentialService: TYPESAFE_CREDENTIAL_SERVICE,
     switchKey: PROVIDER_ENABLED_TYPESAFE_KEY,
   },
+  openrouter: chatProviderRow('openrouter', 'OpenRouter', PROVIDER_ENABLED_OPENROUTER_KEY),
+  openai: chatProviderRow('openai', 'OpenAI', PROVIDER_ENABLED_OPENAI_KEY),
   'cloudflare-workers-ai': {
     id: 'cloudflare-workers-ai',
     label: 'Cloudflare Workers AI (Clef)',
@@ -101,6 +131,16 @@ export const SYSTEM_ONE_ENDPOINTS: readonly SystemOneEndpointSpec[] = [
     choice: { value: 'typesafe-jev', label: 'TypeSafe (Jev)', description: TYPED, reasoningEfforts: [] },
   },
   {
+    id: 'openrouter',
+    provider: 'openrouter',
+    choice: {
+      value: 'openrouter-system-one',
+      label: 'OpenRouter System One',
+      description: 'Jev, or the System One model named on the OpenRouter row',
+      reasoningEfforts: [],
+    },
+  },
+  {
     id: 'clef',
     provider: 'cloudflare-workers-ai',
     choice: { value: 'cloudflare-clef', label: 'Cloudflare Clef', description: TYPED, reasoningEfforts: [] },
@@ -116,20 +156,41 @@ export const SYSTEM_ONE_ENDPOINTS: readonly SystemOneEndpointSpec[] = [
     },
   },
   {
+    id: 'openai',
+    provider: 'openai',
+    choice: {
+      value: 'openai-decisions',
+      label: 'OpenAI Decisions',
+      description: 'GPT-6 Luna, typed judgment',
+      reasoningEfforts: [],
+    },
+  },
+  {
     id: 'custom',
     provider: 'system-one-custom',
     choice: { value: 'system-one-custom', label: 'Custom System One', description: TYPED, reasoningEfforts: [] },
   },
 ];
 
-export type JudgmentSite = 'command-guard' | 'query-classification';
+export type JudgmentSite =
+  | 'command-guard'
+  | 'query-classification'
+  | 'read-decision'
+  | 'wake-decision';
 
 /** Every site with a control, in the order the provider rows list them. */
-export const JUDGMENT_SITES: readonly JudgmentSite[] = ['command-guard', 'query-classification'];
+export const JUDGMENT_SITES: readonly JudgmentSite[] = [
+  'command-guard',
+  'query-classification',
+  'read-decision',
+  'wake-decision',
+];
 
 export const JUDGMENT_PREFERENCE_KEY: Record<JudgmentSite, string> = {
-  'command-guard': 'judgment_command_guard',
-  'query-classification': 'judgment_query_classification',
+  'command-guard': PREF_JUDGMENT_COMMAND_GUARD.key,
+  'query-classification': PREF_JUDGMENT_QUERY_CLASSIFICATION.key,
+  'read-decision': PREF_JUDGMENT_READ_DECISION.key,
+  'wake-decision': PREF_JUDGMENT_WAKE_DECISION.key,
 };
 
 /** The model half of the site's *model selection*, used while it runs on chat.
@@ -137,25 +198,62 @@ export const JUDGMENT_PREFERENCE_KEY: Record<JudgmentSite, string> = {
 export const JUDGMENT_MODEL_KEY: Record<JudgmentSite, BackgroundModelKey> = {
   'command-guard': 'model_command_judge',
   'query-classification': 'model_query_classification',
+  'read-decision': 'model_read_decision',
+  'wake-decision': PREF_MODEL_WAKE_DECISION.key,
 };
 
 /** The effort half, written with the model and never on its own. */
 export const JUDGMENT_REASONING_KEY: Record<JudgmentSite, BackgroundReasoningKey> = {
   'command-guard': 'reasoning_command_judge',
   'query-classification': 'reasoning_query_classification',
+  'read-decision': 'reasoning_read_decision',
+  'wake-decision': PREF_REASONING_WAKE_DECISION.key,
 };
 
 /** What each site is called on screen. */
 export const JUDGMENT_SITE_LABEL: Record<JudgmentSite, string> = {
   'command-guard': 'Command guard',
   'query-classification': 'Query classification',
+  'read-decision': 'Read decision',
+  'wake-decision': 'Wake decision',
 };
 
 /** Where its control is, for a provider row to point at. */
 export const JUDGMENT_SITE_LOCATION: Record<JudgmentSite, string> = {
   'command-guard': 'Permissions → Command safety',
   'query-classification': 'Models → Background tasks',
+  'read-decision': 'Models → Background tasks',
+  'wake-decision': 'Models → Background tasks',
 };
+
+/** The row an unset preference runs on. Mirrors the engine's
+ *  `JudgmentSite::default_endpoint`: only the wake decision has one
+ *  (ADRs 0435, 0472). */
+export const JUDGMENT_SITE_DEFAULT: Partial<Record<JudgmentSite, string>> = {
+  'wake-decision': WAKE_DECISION_DEFAULT_ENDPOINT,
+};
+
+/**
+ * The row the engine runs `site` on, or `null` for chat.
+ *
+ * A stored value decides, as `pickedEndpoint` reads it. An unset or blank one
+ * takes the site's default while `/health` lists that row's chat provider and
+ * its switch is on, exactly as `system_one_or_default_for` does. A chat model
+ * pinned for the site is a choice of chat, so the default never moves it.
+ */
+export function sitePick(
+  site: JudgmentSite,
+  prefs: Loadable<Record<string, string>>,
+  chatProviders: readonly string[] | null,
+): SystemOneEndpointSpec | null {
+  const stored = storedJudgmentValue(prefs, site);
+  if (stored?.trim()) return pickedEndpoint(stored);
+  if (prefs.status !== 'loaded' || prefs.data[JUDGMENT_MODEL_KEY[site]]?.trim()) return null;
+  const fallback = pickedEndpoint(JUDGMENT_SITE_DEFAULT[site]);
+  const chatProvider = fallback ? SYSTEM_ONE_PROVIDERS[fallback.provider].chatProvider : undefined;
+  const served = !!chatProvider && !!chatProviders?.includes(chatProvider);
+  return fallback && served && !systemOneSwitchedOff(prefs, fallback.provider) ? fallback : null;
+}
 
 /**
  * The System One row a stored preference value picks, or `null` for chat.
@@ -173,13 +271,17 @@ export function pickedEndpoint(value: string | undefined | null): SystemOneEndpo
  *
  * TypeSafe and Cloudflare need a stored key. The custom endpoint needs a URL
  * and a model, as the engine does; its key is optional, because a self-hosted
- * model often takes none.
+ * model often takes none. OpenRouter and OpenAI are set up whenever their chat
+ * provider is, which `/health` reports as `chatProviders`.
  */
 export function systemOneConfigured(
   provider: SystemOneProviderId,
   credentials: Loadable<CredentialInfo[]>,
   prefs: Loadable<Record<string, string>>,
+  chatProviders: readonly string[] | null,
 ): boolean {
+  const chatProvider = SYSTEM_ONE_PROVIDERS[provider].chatProvider;
+  if (chatProvider && chatProviders?.includes(chatProvider)) return true;
   if (provider === 'system-one-custom') {
     return prefs.status === 'loaded'
       && !!prefs.data[SYSTEM_ONE_CUSTOM_URL_KEY]?.trim()
@@ -231,9 +333,10 @@ export function systemOneConsumers(
   provider: SystemOneProviderId,
   prefs: Loadable<Record<string, string>>,
   keyStored: boolean,
+  chatProviders: readonly string[] | null,
 ): string[] {
   const sites = JUDGMENT_SITES
-    .filter((site) => pickedEndpoint(storedJudgmentValue(prefs, site))?.provider === provider)
+    .filter((site) => sitePick(site, prefs, chatProviders)?.provider === provider)
     .map((site) => JUDGMENT_SITE_LABEL[site]);
   return provider === 'typesafe' && keyStored ? [JUDGE_TOOL_LABEL, ...sites] : sites;
 }

@@ -633,8 +633,8 @@ pub(crate) async fn recent_subscriptions(
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     // The `CASE` guarding the uuid cast keeps one malformed delivery row from
     // failing the read, which would refuse every wait on this thread forever.
-    // A `ChildThreadCompleted` lands on the waiting parent, so its source is
-    // the child it names, not the row's own thread.
+    // A `ChildThreadCompleted` or `ChildReportFiled` lands on the waiting
+    // parent, so its source is the child it names, not the row's own thread.
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events s \
          WHERE s.aggregate = 'thread' \
@@ -662,7 +662,7 @@ pub(crate) async fn recent_subscriptions(
                  AND d.event_type = 'EventWaitDelivered' \
                  AND d.payload->>'wait_id' = s.payload->>'wait_id' \
                  AND (CASE \
-                     WHEN src.event_type = 'ChildThreadCompleted' \
+                     WHEN src.event_type IN ('ChildThreadCompleted', 'ChildReportFiled') \
                          THEN src.payload->>'child_thread_id' \
                      WHEN src.aggregate = 'thread' THEN src.aggregate_id \
                      ELSE src.payload->'actor'->>'source_thread_id' \

@@ -700,7 +700,8 @@ impl SlotHolder {
     }
 }
 
-/// `$LUCIDOS_BUILD_SLOT_DIR`, else `$HOME/.lucidos/build-slots`.
+/// `$LUCIDOS_BUILD_SLOT_DIR`, else `$HOME/.lucidos/build-slots`. The second
+/// asserts the Lucidos home as a storage root first.
 ///
 /// Machine-wide on purpose: host RAM is machine-wide, several workspaces run
 /// at once by design, and an external-repo agent session builds outside every
@@ -712,11 +713,8 @@ pub fn default_pool_dir() -> Result<PathBuf, BoxError> {
             return Ok(PathBuf::from(trimmed));
         }
     }
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set, so there is no pool to open")?;
-    if home.trim().is_empty() {
-        return Err("HOME is empty, so there is no pool to open".into());
-    }
-    Ok(PathBuf::from(home).join(".lucidos").join("build-slots"))
+    let home = lucidos_home::ensure().map_err(|e| format!("no pool to open: {e}"))?;
+    Ok(home.join("build-slots"))
 }
 
 #[cfg(test)]

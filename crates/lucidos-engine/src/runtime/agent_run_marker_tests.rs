@@ -126,8 +126,8 @@ fn the_daemon_launchers_drop_the_marker() {
         "workspace.sh names the marker as the engine does"
     );
     for launch in [
-        "run_gateway_supervised \"$gw_pidfile\"",
-        "exec node dev-build-watch.mjs",
+        "run_gateway_supervised \"$(gateway_data_dir)\"",
+        "exec perl \"$WORKSPACE_LIB_DIR/build_watch_exec.pl\"",
     ] {
         let line = script
             .lines()
@@ -194,7 +194,7 @@ async fn the_sweep_reaps_its_own_marker_and_nothing_else() {
         ("SCCACHE_START_SERVER", "1"),
     ]);
 
-    reap_marked_groups(marker, Duration::from_millis(200)).await;
+    reap_marked_groups(marker, "a test", Duration::from_millis(200)).await;
 
     let escaped_died = wait_for_exit(&mut escaped);
     let survivors = [
@@ -212,4 +212,168 @@ async fn the_sweep_reaps_its_own_marker_and_nothing_else() {
     for (name, alive) in survivors {
         assert!(alive, "{name} survives the sweep");
     }
+}
+
+/// Write the record an earlier engine process would have left for `thread`.
+fn record_from_another_engine(workspace: &Path, thread: Uuid, marker: &AgentRunMarker) {
+    let path = record_path(workspace, thread);
+    std::fs::create_dir_all(path.parent().expect("record dir")).expect("create record dir");
+    std::fs::write(&path, format!("an-earlier-engine {}\n", marker.value())).expect("write");
+}
+
+#[test]
+fn a_thread_session_adopts_the_marker_an_earlier_engine_recorded() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let thread = Uuid::new_v4();
+    let earlier = AgentRunMarker::mint();
+    record_from_another_engine(workspace.path(), thread, &earlier);
+
+    let run = AgentRun::for_thread(workspace.path(), thread, TeardownHandover::default());
+
+    assert_eq!(
+        run.marker(),
+        &earlier,
+        "the resumed session carries the old marker"
+    );
+}
+
+/// Inside one engine the previous session's sweep may still be running, so
+/// adopting its marker would let that sweep kill the new session.
+#[test]
+fn a_thread_session_never_adopts_a_marker_this_engine_recorded() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let thread = Uuid::new_v4();
+
+    let first = AgentRun::for_thread(workspace.path(), thread, TeardownHandover::default());
+    let second = AgentRun::for_thread(workspace.path(), thread, TeardownHandover::default());
+    let recorded = std::fs::read_to_string(record_path(workspace.path(), thread)).expect("record");
+
+    assert_ne!(
+        first.marker(),
+        second.marker(),
+        "each session mints its own"
+    );
+    assert!(
+        recorded.trim_end().ends_with(second.marker().value()),
+        "the record names the latest session: {recorded}"
+    );
+}
+
+#[test]
+fn an_unreadable_record_mints_a_fresh_marker() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let thread = Uuid::new_v4();
+    let path = record_path(workspace.path(), thread);
+    std::fs::create_dir_all(path.parent().expect("record dir")).expect("create record dir");
+    std::fs::write(&path, "garbage").expect("write");
+
+    let run = AgentRun::for_thread(workspace.path(), thread, TeardownHandover::default());
+
+    assert_eq!(
+        AgentRunMarker::parse(run.marker().value()).as_ref(),
+        Some(run.marker()),
+        "a fresh marker"
+    );
+}
+
+/// A failed write leaves the old record in place. Adopting from it would hand
+/// the next session in this engine the same marker, within reach of this
+/// session's sweep.
+#[cfg(unix)]
+#[test]
+fn a_session_that_cannot_record_its_marker_never_adopts_one() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        // Root writes through a read-only directory, so no write fails here.
+        return;
+    }
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let thread = Uuid::new_v4();
+    let earlier = AgentRunMarker::mint();
+    record_from_another_engine(workspace.path(), thread, &earlier);
+    let dir = record_path(workspace.path(), thread)
+        .parent()
+        .expect("record dir")
+        .to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+
+    let run = AgentRun::for_thread(workspace.path(), thread, TeardownHandover::default());
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_ne!(
+        run.marker(),
+        &earlier,
+        "a session that cannot record mints its own"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn wait_a_grace(child: &mut std::process::Child) -> bool {
+    std::thread::sleep(Duration::from_millis(500));
+    child.try_wait().expect("try_wait").is_none()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn a_handed_over_run_leaves_its_processes_running() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let handover = TeardownHandover::default();
+    let run = AgentRun::for_thread(workspace.path(), Uuid::new_v4(), handover.clone());
+    let mut suites = sleeper(&[(AGENT_RUN_ENV, run.marker().value())]);
+
+    handover.hand_over();
+    run.finish(Duration::from_millis(200)).await;
+
+    let alive = wait_a_grace(&mut suites);
+    let _ = suites.kill();
+    let _ = suites.wait();
+    assert!(alive, "a teardown that promises a resume reaps nothing");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn a_run_not_handed_over_reaps_on_finish() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let run = AgentRun::for_thread(
+        workspace.path(),
+        Uuid::new_v4(),
+        TeardownHandover::default(),
+    );
+    let mut escaped = sleeper(&[(AGENT_RUN_ENV, run.marker().value())]);
+
+    run.finish(Duration::from_millis(200)).await;
+
+    let died = wait_for_exit(&mut escaped);
+    let _ = escaped.kill();
+    let _ = escaped.wait();
+    assert!(died, "a turn end still reaps (ADR 0391)");
+}
+
+/// The handed-over processes stay bounded: the session that resumes the thread
+/// carries the same marker, so its own end reaps them.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn the_resumed_session_reaps_what_the_handed_over_run_left() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let thread = Uuid::new_v4();
+    let handover = TeardownHandover::default();
+    let before = AgentRun::for_thread(workspace.path(), thread, handover.clone());
+    let mut suites = sleeper(&[(AGENT_RUN_ENV, before.marker().value())]);
+    handover.hand_over();
+    let marker = before.marker().clone();
+    before.finish(Duration::from_millis(200)).await;
+    // What the next engine finds on disk.
+    record_from_another_engine(workspace.path(), thread, &marker);
+
+    let resumed = AgentRun::for_thread(workspace.path(), thread, TeardownHandover::default());
+    resumed.finish(Duration::from_millis(200)).await;
+
+    let died = wait_for_exit(&mut suites);
+    let _ = suites.kill();
+    let _ = suites.wait();
+    assert!(
+        died,
+        "the resumed session's end reaps the handed-over processes"
+    );
 }

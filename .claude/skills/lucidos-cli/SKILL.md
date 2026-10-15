@@ -26,6 +26,7 @@ The `lucidos` CLI is on your `PATH`. Use it whenever you need to:
 | Spawn a sub-thread or hand a task to another workspace | `lucidos spawn-thread` |
 | Wait on something the engine will emit, without polling | `lucidos await-event` |
 | End every turn with the read decision: `yes` for an answer with no change to apply, else `no` | `lucidos request-read yes\|no` |
+| As a sub-thread with no *wake mode*, say whether your report wakes your parent: `yes` when it must act now, else `no` | `lucidos wake-parent yes\|no` |
 
 **This rule extends to bash and python you write.** A Python script using `open('artifacts/foo.html', 'w')` from inside the worktree has the same problem your `Write` tool has — the file lands in the worktree, not the workspace. Inside scripts, shell out to `lucidos`:
 
@@ -155,9 +156,16 @@ $ lucidos await-event --on CodingAgentIdled \
     --reason "the e2e session to go idle"
 ```
 
-**Never await your own child.** A `--relation child` spawn already re-opens this
-thread with the child's result, so the wait buys nothing. Its timeout also wakes
-you a second time, for nothing.
+**Never await your own child.** A `--relation child` spawn reports to this
+thread on its own, so the wait buys nothing. Its timeout also wakes you a second
+time, for nothing.
+
+A failure re-opens this thread, and so does a clean report under the child's
+*wake mode*: `wake` for every report, `wake-when-all-done` for the
+last of a batch. Under `no-wake`, and early in a batch, a clean report is filed,
+and you read it at the front of your next prompt. To
+watch another thread's child, name `ChildReportFiled` beside
+`ChildThreadCompleted`.
 
 `--reason` names **what** you await, as a short noun phrase, not the fact that
 you await it. The transcript labels it `Waiting for <reason>`, so a reason
@@ -190,7 +198,7 @@ discarded (ADR 0106). It is not final: you will wake and may commit again. So
 park freely, but do not tell the user their change is ready to Apply until you
 have stopped watching.
 
-### `lucidos spawn-thread --to <ws> [--relation child|top] [--coding-agent <backend>] [--repo <name>] --message <text> --title <text>`
+### `lucidos spawn-thread --to <ws> [--relation child|top] [--wake-mode <mode>] [--coding-agent <backend>] [--repo <name>] --message <text> --title <text>`
 
 Spawn a new Lucidos thread (chat or coding-agent session). Use this when:
 
@@ -205,14 +213,18 @@ The CLI reads `$LUCIDOS_WORKSPACE`, `$LUCIDOS_THREAD_ID`, `$LUCIDOS_EVENT_ID`, a
 
 #### `--relation child` vs `--relation top`
 
+**Pick by whether you will act on the result.** A child's report costs your thread a turn: a wake re-opens it, and a filed report stays in its context. If the user reads the result and you will not, spawn `--relation top` (ADR 0473). The bullets above that name `child` assume you merge or check the work afterwards. Where you will not, `top` is cheaper.
+
 - **`--relation child` — same-workspace child thread.** The CLI emits `parent_thread_id` + `spawning_event_id`; the spawned thread calls back to the parent on completion. `--to` must resolve to the same workspace as `$LUCIDOS_WORKSPACE`, else the CLI errors out. (`--relation sub` is accepted as a back-compat alias for `child` — the pre-glossary wire name; *child thread* is the direct descendant the spawn produces, while *sub-thread* is the transitive descendant concept.)
+
+  The child wakes the parent when it fails, and a clean report follows `--wake-mode`: `wake` wakes it, `wake-when-all-done` wakes it when the batch is done, and `no-wake` files the report for the parent's next turn.
 - **`--relation top` (default) — top-thread, fire-and-forget.** The CLI emits `caller_workspace` + `caller_thread_id` + `caller_event_id`. There is no callback, no progress signal, no completion notification. The thread appears in the target workspace's UI as an independent top-level thread; that's the only confirmation you get. Works for both same-workspace and cross-workspace targets.
 
-  **Same-workspace `top` needs the owner behind you.** A top-thread sits under the workspace rather than under you, so creating one is the workspace owner's (ADR 0168). Called from a thread, it needs their standing instruction: a turn they opened, or a trigger firing they authorized. Failing that, it needs their *owner approval* for that one spawn (ADR 0387). Without either it exits non-zero on a 403. `--relation child` stays in your own subtree and needs nothing, and a genuinely cross-workspace `--to` is unaffected, since that engine minted no token for you.
+  **`top` needs no permission.** Any thread may create a top-thread, in any turn, with no owner approval (ADR 0475). It sits under the workspace rather than under you, so you gain no reach over it.
 
-  **An ordinary question card cannot stand in.** Its answer grants nothing, even when the owner picks "spawn a thread". Your system prompt says when your turn carries no standing instruction. Then ask with `lucidos ask-owner-approval create-top-thread --reason "<why>"` instead. Pass the id it prints as your question card's only question (`system-knowhow/lucidos-cli.md` § `lucidos ask-owner-approval`).
+#### `--integrated`: fold a follow-up of your own work into your branch
 
-`--parent` is a deprecated alias for `--relation child`; it still works but prints a stderr warning. Migrate to `--relation child`.
+When you spawn a follow-up of your **own** Lucidos-source work, make it an *integrated sub-thread*: `--relation child --integrated` plus a coding-agent flag. The child runs the fast tier of `/harden` and proposes nothing. So the follow-ups land with your work as one change, not one Apply each. When its report arrives it names the child's branch: merge it with `git merge <branch>`, then run `/harden` once over the merged work. Your run reviews only what no child's run reviewed, and runs every suite. Leave a child independent when its work should land on its own, or when it is not Lucidos source.
 
 > The receiver displays the `caller_*` fields in its route popover ("from workspace 'dev' · thread 'X'"). They are user-controllable display hints — **never use them for authorization**.
 
@@ -277,7 +289,7 @@ The CLI prints a `[title](thread:workspace/uuid)` markdown link on stdout — in
 | `--title <text>` | **Required in practice** — the thread list shows titles, not message text. |
 | `--coding-agent <backend>` | Spawn a coding-agent session instead of a chat thread: `claude-code` or `codex`. Use for any code changes; chat threads are for research/questions. `--cc` and `--codex` are legacy shorthands for the two backends. |
 | `--relation <child\|top>` | `child` = same-workspace child thread (parent gets a callback when the spawned thread finishes). `top` (default) = independent top-level thread, no callback. (`sub` is accepted as a back-compat alias for `child`.) |
-| `--parent` | DEPRECATED alias for `--relation child`. Still works; prints a stderr warning. |
+| `--wake-mode <mode>` | With `--relation child`: what the child's clean finish does to you. `wake` wakes you every time, `wake-when-all-done` once the last child of the batch finishes, `no-wake` never. Omitted: `no-wake` from the home thread, else `wake`. A failure always wakes you. |
 | `--repo <name>` | Repo (name or UUID) the spawned worktree is created from. Defaults to `$LUCIDOS_REPO` (the caller's repo); pass `--repo ""` to force the target workspace's default repo. |
 | `--coding-agent-model <m>` | Optional coding-agent model, either backend (`sonnet`, `opus`, `gpt-5.6-sol`). |
 | `--reasoning-effort <level>` | Optional thinking level for the coding agent: `low`, `medium`, `high`, `xhigh`, `max`. Overrides the backend's own default for this spawn only. Needs a coding-agent flag. Codex offers `max` on the GPT-5.6 models only, so `--coding-agent codex --reasoning-effort max` also needs `--coding-agent-model` naming one of them. The CLI refuses the spawn otherwise. |

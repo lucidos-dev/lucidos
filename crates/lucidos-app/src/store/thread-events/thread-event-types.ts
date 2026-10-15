@@ -7,7 +7,7 @@ import type {
 } from '../../generated/thread-event-wire';
 
 // The wire types are GENERATED from the Rust event source
-// (`thread_events_tests/ts_codegen.rs`). Re-exported here so every consumer
+// (`engine/thread_events/ts_codegen.rs`). Re-exported here so every consumer
 // keeps one import path for "what an event looks like", and so a payload
 // field can no longer be hand-mirrored. What stays hand-written in this file
 // is everything the wire does not decide: the display labels, the summary
@@ -97,6 +97,14 @@ export type WidgetEvent = Extract<ThreadEvent, { type: (typeof WIDGET_EVENT_TYPE
 
 export function isWidgetEvent(event: { type: string }): event is WidgetEvent {
   return (WIDGET_EVENT_TYPES as readonly string[]).includes(event.type);
+}
+
+/** The home thread's events the Home board folds (ADR 0432): its pins, its
+ *  unpins and its arrangements. */
+export const HOME_BOARD_EVENT_TYPES = [...WIDGET_SHELF_CHANGE_TYPES, 'HomeBoardArranged'] as const;
+
+export function isHomeBoardEvent(event: { type: string }): boolean {
+  return (HOME_BOARD_EVENT_TYPES as readonly string[]).includes(event.type);
 }
 
 export type ThreadInitiator = 'user' | 'system';
@@ -271,15 +279,17 @@ export function isUserStoppedWait(event: { type: string; cause?: string }): bool
  *  continues out of it. Grouping opens an exchange for it and hands the
  *  running turn straight back, and the panel draws its header alone.
  *
- *  Three qualify. The user's Stop waiting (`isUserStoppedWait`). A
+ *  Four qualify. The user's Stop waiting (`isUserStoppedWait`). A
  *  `ChildThreadStopped` on a parent (ADR 0252): a user Stop paused one of its
- *  children. And a `ChildThreadDetached` on a parent (ADR 0278): one of its
- *  children moved to top level. Neither wakes the parent, so no response
+ *  children. A `ChildThreadDetached` on a parent (ADR 0278): one of its
+ *  children moved to top level. And a `ChildReportFiled`: a child's report its
+ *  child said needs no action now. None wakes the parent, so no response
  *  follows. */
 export function isTurnlessBoundary(event: { type: string; cause?: string }): boolean {
   return isUserStoppedWait(event)
     || event.type === 'ChildThreadStopped'
-    || event.type === 'ChildThreadDetached';
+    || event.type === 'ChildThreadDetached'
+    || event.type === 'ChildReportFiled';
 }
 
 /** The wait's `reason` as a bare subject, for a label that already said "wait".

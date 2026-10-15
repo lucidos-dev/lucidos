@@ -221,17 +221,16 @@ mod tests {
 
     #[test]
     fn load_returns_none_for_missing() {
-        let dir = std::env::temp_dir().join("lucidos_test_intents_missing");
-        let _ = std::fs::create_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let result = IntentStore::load(&dir, "nonexistent");
         assert!(result.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_finds_standalone_trigger() {
-        let dir = std::env::temp_dir().join("lucidos_test_standalone_trigger_intent");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let trigger_dir = dir.join("triggers").join("my-trigger");
         std::fs::create_dir_all(&trigger_dir).unwrap();
         std::fs::write(
@@ -244,14 +243,12 @@ mod tests {
         assert_eq!(intent.id, "my-trigger");
         assert_eq!(intent.name, "My Trigger");
         assert_eq!(intent.content, "Do the thing.");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_finds_app_intent() {
-        let dir = std::env::temp_dir().join("lucidos_test_app_intent");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let intents_dir = dir.join("apps").join("my-app").join("intents");
         std::fs::create_dir_all(&intents_dir).unwrap();
         std::fs::write(
@@ -263,14 +260,12 @@ mod tests {
         let intent = IntentStore::load(&dir, "my-app/my-recipe").unwrap();
         assert_eq!(intent.id, "my-app/my-recipe");
         assert_eq!(intent.name, "My Recipe");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_finds_app_trigger() {
-        let dir = std::env::temp_dir().join("lucidos_test_app_trigger_intent");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let triggers_dir = dir.join("apps").join("my-app").join("triggers");
         std::fs::create_dir_all(&triggers_dir).unwrap();
         std::fs::write(
@@ -282,14 +277,12 @@ mod tests {
         let intent = IntentStore::load(&dir, "my-app/daily-check").unwrap();
         assert_eq!(intent.id, "my-app/daily-check");
         assert_eq!(intent.name, "Daily Check");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_all_discovers_from_all_locations() {
-        let dir = std::env::temp_dir().join("lucidos_test_load_all_intents");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         // App intent
         let app_intents = dir.join("apps").join("app1").join("intents");
@@ -317,7 +310,5 @@ mod tests {
         assert!(ids.contains(&"app1/recipe"));
         assert!(ids.contains(&"app1/daily"));
         assert!(ids.contains(&"reminder"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

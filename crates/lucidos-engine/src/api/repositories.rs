@@ -410,7 +410,7 @@ pub async fn get_thread_cc_diff(
 /// worktree on a temp branch. That tree belongs to the merge, so the Diff
 /// button answers from the thread's own worktree while one runs. A Tier-1
 /// in-place merge never leaves the thread's own worktree.
-fn live_thread_worktree(
+pub(in crate::api) fn live_thread_worktree(
     session: Option<&crate::engine::types::AgentSession>,
 ) -> Option<std::path::PathBuf> {
     use crate::engine::types::ConflictBinding;
@@ -431,7 +431,7 @@ fn live_thread_worktree(
 /// The read-side sibling of `resume::resolve_worktree_path`, which answers the
 /// spawn-side question: where to PUT a worktree. That one invents a path when
 /// none is there, so it can never say "gone". This one has to.
-async fn resolve_diff_worktree(
+pub(in crate::api) async fn resolve_diff_worktree(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     live_session: Option<std::path::PathBuf>,

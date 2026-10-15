@@ -79,6 +79,11 @@ If it does not exist, this is a first run and the whole ladder applies.
 value, `not-set` included, skip the literacy card. The user already answered,
 usually in the first-run setup or in Settings.
 
+**Leave `memory_module` alone.** The user picks it in the *memory choice* when
+the workspace first opens. Tree costs money, so never set it here. If they ask
+about memory, point them at Settings → System → Memory, which shows the cost
+first.
+
 Then open with one or two sentences and the first card at once. Say concretely
 what happens and what they get: a few questions, then you build what fits. Word
 it as **"we build", never "I build"**: every piece comes from what they tell

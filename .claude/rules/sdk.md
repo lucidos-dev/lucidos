@@ -25,7 +25,8 @@ paths:
 
 ## Build & runtime
 
-- Bundle: `cd packages/lucidos-sdk && npm run build` (esbuild → `dist/sdk.js`, IIFE, sourcemap).
+- Bundle: `./scripts/codegen.sh`. It renders the Rust-generated TS the SDK imports, then runs `npm run build` here. esbuild writes `dist/sdk.js` (IIFE, sourcemap) and the boot, worker and preview bundles beside it. Nothing in `dist/` is committed.
+- The engine reads `dist/appearance-boot.iframe.js` and `dist/sse-worker.js` at runtime, like `sdk.js`. A missing one answers 503, never a stub.
 - Served by the engine at `/api/v1/sdk.js` (debug builds re-read every request; release caches once on first request, so a restart is needed). The engine restart trigger lives in `crates/lucidos-engine/src/engine/git_ops/restart_detection.rs` (`files_require_restart`); any change under `packages/lucidos-sdk/` already triggers it.
 - Internal helpers (`_fetch.ts`, `_validate.ts`) are leading-underscore — not part of the public surface, don't reference them from `js-sdk.md`.
 

@@ -608,7 +608,8 @@ async fn sequential_apply_two_changes_succeeds() {
     let branch2 = format!("e2e-test/change2-{}", suffix);
     let file1 = format!("e2e-test1-{}.txt", suffix);
     let file2 = format!("e2e-test2-{}.txt", suffix);
-    let wt_dir = std::env::temp_dir().join(format!("e2e-wt-changes-{}", suffix));
+    let wt_tmp = tempfile::tempdir().unwrap();
+    let wt_dir = wt_tmp.path();
 
     // Use a worktree to create branches without touching the main working tree
     git(&[
@@ -620,14 +621,14 @@ async fn sequential_apply_two_changes_succeeds() {
         "main",
     ]);
     std::fs::write(wt_dir.join(&file1), "change 1").unwrap();
-    git_in(&wt_dir, &["add", &file1]);
-    git_in(&wt_dir, &["commit", "-m", "e2e test change 1"]);
+    git_in(wt_dir, &["add", &file1]);
+    git_in(wt_dir, &["commit", "-m", "e2e test change 1"]);
 
     // Create branch2 from branch1 with another file (so it's ff-able after branch1)
-    git_in(&wt_dir, &["checkout", "-b", &branch2]);
+    git_in(wt_dir, &["checkout", "-b", &branch2]);
     std::fs::write(wt_dir.join(&file2), "change 2").unwrap();
-    git_in(&wt_dir, &["add", &file2]);
-    git_in(&wt_dir, &["commit", "-m", "e2e test change 2"]);
+    git_in(wt_dir, &["add", &file2]);
+    git_in(wt_dir, &["commit", "-m", "e2e test change 2"]);
 
     // Remove the worktree (branches are kept)
     let _ = std::process::Command::new("git")
@@ -912,15 +913,16 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
     let branch = format!("e2e-test/parent-{}", suffix);
     let file1 = format!("e2e-parent-first-{}.txt", suffix);
     let file2 = format!("e2e-parent-second-{}.txt", suffix);
-    let wt_dir = std::env::temp_dir().join(format!("e2e-wt-parent-{}", suffix));
+    let wt_tmp = tempfile::tempdir().unwrap();
+    let wt_dir = wt_tmp.path();
     let wt = wt_dir.to_str().unwrap();
 
     let _tree = crate::support::workspace_tree_lock().write().await;
 
     git(&["worktree", "add", wt, "-b", &branch, "main"]);
     std::fs::write(wt_dir.join(&file1), "first round").unwrap();
-    git_in(&wt_dir, &["add", &file1]);
-    git_in(&wt_dir, &["commit", "-m", "e2e parent: first round"]);
+    git_in(wt_dir, &["add", &file1]);
+    git_in(wt_dir, &["commit", "-m", "e2e parent: first round"]);
 
     // A delegating parent: idle, with a sub-thread still running.
     let parent = Uuid::new_v4();
@@ -944,7 +946,7 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
         true,
     )
     .await;
-    let head = String::from_utf8(git_in(&wt_dir, &["rev-parse", "HEAD"]).stdout).unwrap();
+    let head = String::from_utf8(git_in(wt_dir, &["rev-parse", "HEAD"]).stdout).unwrap();
     let mark = local_process_client()
         .post(format!("{}/api/v1/internal/mark-hardened", base_url()))
         .json(&json!({ "repo_root": repo_root, "branch_name": branch, "head_sha": head.trim() }))
@@ -993,8 +995,8 @@ async fn a_parents_commits_after_an_apply_come_back_as_a_new_change() {
     // The parent wakes and commits again on the same branch, in the same
     // worktree the apply kept and reset to main.
     std::fs::write(wt_dir.join(&file2), "second round").unwrap();
-    git_in(&wt_dir, &["add", &file2]);
-    git_in(&wt_dir, &["commit", "-m", "e2e parent: second round"]);
+    git_in(wt_dir, &["add", &file2]);
+    git_in(wt_dir, &["commit", "-m", "e2e parent: second round"]);
 
     // The proposal path mints a new id, because no pending change is left on
     // the branch. The one-pending-per-branch index must not trip on the

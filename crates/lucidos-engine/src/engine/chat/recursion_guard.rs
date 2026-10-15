@@ -13,7 +13,7 @@ pub(crate) const MAX_THREAD_DEPTH: i32 = 3;
 /// failed child has reported, and frees its slot.
 ///
 /// Unqualified columns, so `thread_summaries` must be the only source of them.
-static LIVE_CHILD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+pub(crate) static LIVE_CHILD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "(status IN ({running}, {asking}, {paused}) OR live_event_wait_count > 0)",
         running = ThreadStatus::Running.sql_literal(),

@@ -25,12 +25,15 @@ pub(crate) fn deliver_control_request(
     session: &mut crate::engine::AgentSession,
     request: crate::runtime::ControlRequest,
 ) -> Result<crate::runtime::TakesEffect, &'static str> {
+    let crate::engine::SessionPhase::Running { control_tx } = &session.phase else {
+        return Err("The coding agent is still starting. Try again in a moment.");
+    };
+    let control_tx = control_tx.clone();
     let reach = session.coding_agent.control_reach(&request);
     let takes_effect = reach.takes_effect(session.is_in_flight());
     record_control_request(session, &request);
     if reach != crate::runtime::ControlReach::NextSpawn {
-        session
-            .control_tx
+        control_tx
             .send(request)
             .map_err(|_| "Control channel closed")?;
     }
@@ -80,6 +83,10 @@ pub(crate) enum InterruptRoute {
 /// "already waiting" whether or not its loop is still there: an interrupt
 /// would stop nothing either way.
 pub(crate) fn interrupt_route(session: &crate::engine::AgentSession) -> InterruptRoute {
+    if matches!(session.phase, crate::engine::SessionPhase::Applying) {
+        // No turn runs while an apply holds the thread.
+        return InterruptRoute::AlreadyWaiting;
+    }
     if session.is_in_flight() {
         InterruptRoute::Interrupt
     } else if session.is_waiting {
@@ -97,12 +104,6 @@ impl LucidosEngine {
             .await
             .get(&thread_id)
             .is_some_and(|s| s.is_live())
-    }
-
-    /// Whether any coding-agent spawn owns the thread: a live session, or a
-    /// spawn still starting up that has not registered one yet.
-    pub(crate) async fn coding_agent_owns_thread(&self, thread_id: Uuid) -> bool {
-        self.spawns_in_flight.contains(thread_id) || self.is_agent_running_for(thread_id).await
     }
 
     /// Stop a running Claude Code session via the generic stop signal.
@@ -171,14 +172,9 @@ impl LucidosEngine {
                 let stale_result = self
                     .end_stale_waiting_session(tid, discard, actor.clone())
                     .await;
-                let settled = settle_stuck_running_thread(
-                    &self.pool,
-                    &self.event_bus,
-                    tid,
-                    actor,
-                    SettleTerminal::StuckProjection,
-                )
-                .await?;
+                let settled = self
+                    .settle_unclaimed_running_thread(tid, actor, SettleTerminal::StuckProjection)
+                    .await?;
                 if settled {
                     Ok(())
                 } else {
@@ -215,6 +211,19 @@ impl LucidosEngine {
             .await
             .get(&thread_id)
             .and_then(|s| s.pending_stop)
+    }
+
+    /// The live session's question flushes, which a card's gate waits on.
+    /// `None` with no session: then no loop has text still on its way.
+    pub(crate) async fn question_flushes(
+        &self,
+        thread_id: Uuid,
+    ) -> Option<std::sync::Arc<crate::engine::question_card_gate::QuestionFlushes>> {
+        self.agent_sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .map(|s| s.question_flushes.clone())
     }
 
     /// Read and clear the device that clicked Cancel on a live session (stamped
@@ -294,25 +303,20 @@ impl LucidosEngine {
                 if interrupt_route(session) == InterruptRoute::AlreadyWaiting {
                     return Err(SESSION_ALREADY_WAITING.into());
                 }
-                // Record who clicked Cancel BEFORE the notify so the run_session
-                // interrupt arm can drain it and stamp `ResponseCanceled.actor`
+                // Record who clicked Cancel BEFORE the signal so the interrupt
+                // arm, or the canceled startup, can stamp `ResponseCanceled.actor`
                 // with the originating device (the popover's Device row).
                 session.cancel_actor = actor;
-                session.interrupt.notify_one();
+                session.interrupt_or_cancel_startup();
                 Ok(true)
             } else {
                 drop(guard);
                 if self.cancel_thread(tid, actor.clone()) {
                     return Ok(true);
                 }
-                let settled = settle_stuck_running_thread(
-                    &self.pool,
-                    &self.event_bus,
-                    tid,
-                    actor.clone(),
-                    terminal,
-                )
-                .await?;
+                let settled = self
+                    .settle_unclaimed_running_thread(tid, actor.clone(), terminal)
+                    .await?;
                 // No live session will settle what the stopped turn left, so
                 // this Stop withholds it (ADR 0400).
                 if settled && terminal == SettleTerminal::CanceledQuestion {
@@ -327,7 +331,7 @@ impl LucidosEngine {
             let mut any = false;
             for session in guard.values() {
                 if interrupt_route(session) == InterruptRoute::Interrupt {
-                    session.interrupt.notify_one();
+                    session.interrupt_or_cancel_startup();
                     any = true;
                 }
             }

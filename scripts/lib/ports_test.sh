@@ -49,8 +49,8 @@ export HOME="$SANDBOX"
 # `kill` is a bash builtin, but a function of the same name wins, and
 # `command kill` still reaches the builtin for the calls we allow:
 #   kill -0 <pid>  — a pure liveness probe, never lethal. ports.sh leans on it
-#                    (is_protected_host_pid, _acquire_registry_lock, the
-#                    reclaim escalation guard), so it always passes through.
+#                    (the reclaim escalation guard), so it always passes
+#                    through.
 #   anything else  — allowed only for a pid this file spawned or synthesized
 #                    (own_pid). Every other target is refused, logged loudly,
 #                    and recorded for the end-of-run assertion. A missing stub
@@ -109,6 +109,8 @@ own_pid "$LIVE_PID"
 
 # shellcheck source=ports.sh
 source "$SCRIPT_DIR/ports.sh"
+# shellcheck source=scripts/lib/flock_test_support.sh
+source "$SCRIPT_DIR/flock_test_support.sh"
 
 # Two tests below replace the reclaim helper to drive allocate_ports' branches.
 # `unset -f` does NOT put the library's version back: bash keeps no stack of
@@ -219,7 +221,7 @@ reset_env() {
 
 write_pidfile() {
     local ws="$1"
-    local kind="$2"   # engine or frontend
+    local kind="$2"   # the pidfile's name, e.g. engine
     local pid="$3"
     local dir="$HOME/workspaces/$ws/.lucidos"
     mkdir -p "$dir"
@@ -329,25 +331,30 @@ test_protects_frontend_pid_from_env_var() {
 # isn't in the e2e-test invocation's env, but it IS on disk under
 # ~/workspaces/dev/.lucidos/engine.pid. We must protect it anyway.
 test_protects_pid_from_other_workspace_pidfile() {
-    echo "test: another workspace's engine.pid protects that PID"
+    echo "test: another workspace's engine.pid protects that PID while its lock is held"
     reset_env
     write_pidfile "dev" "engine" "$LIVE_PID"
+    start_lock_holder "$SANDBOX" "$HOME/workspaces/dev/.lucidos/engine.lock" ex
     if is_protected_host_pid "$LIVE_PID"; then
         pass "scanned ~/workspaces/dev/.lucidos/engine.pid"
     else
         fail "expected 0 for pidfile-scan match, got $?"
     fi
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 }
 
-# ── Test 4: frontend.pid on disk is also protected ─────────────────────
-test_protects_pid_from_other_workspace_frontend_pidfile() {
-    echo "test: another workspace's frontend.pid protects that PID"
+# ── Test 4: a pidfile whose lock nobody holds protects nothing ─────────
+# The pid is alive, but no engine owns the workspace: the shape of a pid the OS
+# handed to an unrelated process after the engine died (ADR 0438).
+test_unlocked_pidfile_does_not_protect() {
+    echo "test: a live pid in an engine.pid nobody's lock vouches for is not protected"
     reset_env
-    write_pidfile "myws" "frontend" "$LIVE_PID"
+    write_pidfile "myws" "engine" "$LIVE_PID"
+    : > "$HOME/workspaces/myws/.lucidos/engine.lock"
     if is_protected_host_pid "$LIVE_PID"; then
-        pass "scanned ~/workspaces/myws/.lucidos/frontend.pid"
+        fail "an unlocked pidfile protected pid $LIVE_PID"
     else
-        fail "expected 0 for frontend pidfile-scan match, got $?"
+        pass "the pid counts only while engine.lock is held"
     fi
 }
 
@@ -519,6 +526,7 @@ test_pidfile_scan_is_not_confined_to_home() {
     local other="$SANDBOX/passwd-home"
     mkdir -p "$other/workspaces/sibling/.lucidos"
     echo "$LIVE_PID" > "$other/workspaces/sibling/.lucidos/engine.pid"
+    start_lock_holder "$SANDBOX" "$other/workspaces/sibling/.lucidos/engine.lock" ex
 
     local saved_home="$_LUCIDOS_PASSWD_HOME"
     local saved_flag="$_LUCIDOS_PASSWD_HOME_RESOLVED"
@@ -534,13 +542,13 @@ test_pidfile_scan_is_not_confined_to_home() {
         fail "pid $LIVE_PID not protected — the scan is still confined to \$HOME"
     fi
 
-    # The second root is liveness-gated exactly like $HOME: a stale pidfile
-    # naming a recycled pid must not protect an unrelated process.
-    echo "999997" > "$other/workspaces/sibling/.lucidos/engine.pid"
-    if is_protected_host_pid 999997; then
-        fail "a dead pid in the second root was protected — the kill -0 gate was lost"
+    # The second root is lock-gated exactly like $HOME: once no engine holds
+    # the lock, the pidfile protects nothing.
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
+    if is_protected_host_pid "$LIVE_PID"; then
+        fail "an unlocked pidfile in the second root still protected pid $LIVE_PID"
     else
-        pass "the second root is liveness-gated like \$HOME"
+        pass "the second root is lock-gated like \$HOME"
     fi
 
     _LUCIDOS_PASSWD_HOME="$saved_home"
@@ -1327,39 +1335,192 @@ test_ports_file_correct_in_engine_only_mode() {
     fi
 }
 
-# ── Test 26: registry_save under N concurrent writers preserves every
-# entry exactly once. Each writer must serialize behind the registry
-# lock so no read-modify-write window can lose a sibling's append.
-test_registry_save_handles_concurrent_writers() {
+# ── Test 26: N concurrent allocations claim N distinct offsets ─────────
+# No interleaving is forced here: this is the load test beside the
+# deterministic one below.
+test_concurrent_allocations_claim_distinct_offsets() {
     reset_state
-    echo "test: registry_save handles concurrent writers without corruption"
+    echo "test: concurrent allocations for new workspaces claim distinct offsets"
 
-    local N=20
+    local N=12
     local i
     for i in $(seq 1 $N); do
-        ( registry_save "/sandbox/ws-$i" "$i" ) &
+        mkdir -p "$SANDBOX/ws-many-$i/.lucidos"
+        ( allocate_ports "$SANDBOX/ws-many-$i" >/dev/null 2>&1 ) &
     done
     wait
 
-    local lines unique_workspaces
+    local lines unique_offsets
     lines=$(wc -l < "$LUCIDOS_PORT_REGISTRY" | tr -d ' ')
-    unique_workspaces=$(awk -F'\t' '{print $1}' "$LUCIDOS_PORT_REGISTRY" | sort -u | wc -l | tr -d ' ')
+    unique_offsets=$(awk -F'\t' '{print $2}' "$LUCIDOS_PORT_REGISTRY" | sort -u | wc -l | tr -d ' ')
 
     if [ "$lines" = "$N" ]; then
-        pass "registry has exactly $N entries after $N concurrent writers"
+        pass "registry has exactly $N entries after $N concurrent allocations"
     else
         fail "expected $N entries, got $lines (corruption or lost writes)"
     fi
-
-    if [ "$unique_workspaces" = "$N" ]; then
-        pass "all $N workspaces are present (no clobber)"
+    if [ "$unique_offsets" = "$N" ]; then
+        pass "all $N offsets are distinct"
     else
-        fail "expected $N unique workspaces, got $unique_workspaces"
+        fail "expected $N distinct offsets, got $unique_offsets: $(cat "$LUCIDOS_PORT_REGISTRY")"
+    fi
+}
+
+# ── Test 26a: an allocation never chooses while another is mid-flight ───
+# The audit's interleaving, forced with FIFOs rather than timing. Allocation B
+# pauses between choosing its offset and saving it. Allocation R then starts.
+# Whatever R does first is written to one FIFO: it either reads the registry
+# ("R read") or reports it is waiting for the lock ("R waiting"). With no lock
+# around the choice, R reads the registry B has not written yet, and both
+# save offset 0.
+test_an_allocation_waits_for_one_in_flight() {
+    reset_state
+    echo "test: a second allocation waits for one that has chosen but not saved"
+    local wsb wsr events release first second rc_b=0 rc_r=0
+    wsb="$(make_workspace "$SANDBOX/ws-in-flight")"
+    wsr="$(make_workspace "$SANDBOX/ws-rival")"
+    events="$SANDBOX/alloc.events"
+    release="$SANDBOX/alloc.release"
+    channel_open 6 "$events"
+    channel_open 5 "$release"
+
+    local real_save real_next
+    real_save="$(declare -f registry_save)"
+    real_next="$(declare -f registry_next_offset)"
+    eval "_real_${real_save}"
+    eval "_real_${real_next}"
+
+    (
+        # shellcheck disable=SC2329 # a seam: invoked by allocate_ports
+        registry_save() { echo "B chose $2" > "$events"; read -r _ < "$release"; _real_registry_save "$@"; }
+        allocate_ports "$wsb" >/dev/null 2>&1
+    ) &
+    local b=$!
+    read -r first <&6
+    case "$first" in
+        "B chose 0") pass "B paused inside its allocation, holding offset 0" ;;
+        *) fail "expected B to choose offset 0, got '$first'" ;;
+    esac
+
+    (
+        # shellcheck disable=SC2329 # a seam: invoked by allocate_ports
+        registry_next_offset() { echo "R read" > "$events"; _real_registry_next_offset; }
+        # shellcheck disable=SC2329 # a seam: invoked by flock_open
+        _flock_waiting() { echo "R waiting" > "$events"; }
+        allocate_ports "$wsr" >/dev/null 2>&1
+    ) &
+    local r=$!
+    read -r first <&6
+    echo go >&5
+    if [ "$first" = "R waiting" ]; then
+        pass "R waited for the lock instead of reading the registry"
+        read -r second <&6
+        [ "$second" = "R read" ] || fail "expected R to read once B saved, got '$second'"
+    else
+        fail "R read the registry while B held an unsaved offset ($first)"
+    fi
+    wait "$b" || rc_b=$?
+    wait "$r" || rc_r=$?
+    channel_close 6
+    channel_close 5
+    [ "$rc_b" -eq 0 ] && [ "$rc_r" -eq 0 ] || fail "an allocation failed (B=$rc_b R=$rc_r)"
+
+    local off_b off_r
+    off_b="$(registry_lookup "$wsb")"
+    off_r="$(registry_lookup "$wsr")"
+    if [ -n "$off_b" ] && [ -n "$off_r" ] && [ "$off_b" != "$off_r" ]; then
+        pass "distinct offsets (B=$off_b R=$off_r)"
+    else
+        fail "B and R share an offset (B=$off_b R=$off_r)"
+    fi
+    unset -f _real_registry_save _real_registry_next_offset
+}
+
+# ── Test 26b: the walk never lands on an offset another entry owns ─────
+# The owner's engine is down, so its ports read free, but the offset is still
+# theirs: taking it would hand them a foreign engine on their next launch.
+test_the_walk_skips_an_offset_another_workspace_owns() {
+    reset_state
+    echo "test: the walk skips an offset another registry entry owns"
+    local ws other
+    ws="$(make_workspace "$SANDBOX/ws-walker")"
+    other="$(make_workspace "$SANDBOX/ws-owner")"
+    mkdir -p "$(dirname "$LUCIDOS_PORT_REGISTRY")"
+    printf '%s\t0\n%s\t1\n' "$ws" "$other" > "$LUCIDOS_PORT_REGISTRY"
+    OCCUPIED_PORTS="5173"
+    # shellcheck disable=SC2329 # a seam: invoked indirectly by allocate_ports
+    _try_reclaim_stale_lucidos_on_port() { return 1; }
+
+    allocate_ports "$ws" >/dev/null 2>&1
+    restore_reclaim_fn
+
+    if [ "${VITE_PORT:-}" = "5175" ]; then
+        pass "walked past the owned offset 1 to 2 (VITE_PORT=$VITE_PORT)"
+    else
+        fail "expected VITE_PORT=5175, got ${VITE_PORT:-unset}"
+    fi
+    if [ "$(registry_lookup "$other")" = "1" ]; then
+        pass "the owner keeps its offset"
+    else
+        fail "the owner's entry changed: $(cat "$LUCIDOS_PORT_REGISTRY")"
+    fi
+}
+
+# ── Test 26b2: a duplicate an older allocator left never moves a running ─
+# workspace off its own offset. The gateway refuses to move the port of a
+# running workspace, so a walk here would fail every launch.
+test_a_duplicate_offset_keeps_the_running_workspace() {
+    reset_state
+    echo "test: a running workspace keeps its registered offset despite a duplicate"
+    local ws other
+    ws="$(make_workspace "$SANDBOX/ws-dup-running")"
+    other="$(make_workspace "$SANDBOX/ws-dup-other")"
+    mkdir -p "$(dirname "$LUCIDOS_PORT_REGISTRY")"
+    printf '%s\t0\n%s\t0\n' "$ws" "$other" > "$LUCIDOS_PORT_REGISTRY"
+    OCCUPIED_PORTS="5173"
+    HEALTH_PORT=5173
+    HEALTH_WORKSPACE="$ws"
+
+    allocate_ports "$ws" >/dev/null 2>&1
+    if [ "${VITE_PORT:-}" = "5173" ]; then
+        pass "stayed on its own offset (VITE_PORT=$VITE_PORT)"
+    else
+        fail "walked off its own offset to ${VITE_PORT:-unset}"
+    fi
+}
+
+# ── Test 26c: a holder killed mid-allocation leaves nothing to reclaim ──
+test_a_killed_holder_leaves_nothing_to_reclaim() {
+    reset_state
+    echo "test: a SIGKILLed lock holder leaves the next allocation free to run"
+    local ws
+    ws="$(make_workspace "$SANDBOX/ws-after-death")"
+    mkdir -p "$(dirname "$LUCIDOS_PORT_REGISTRY")"
+    start_lock_holder "$SANDBOX" "$LUCIDOS_PORT_REGISTRY.lock" ex
+    own_pid "$HOLDER_PID"
+    kill -KILL "$HOLDER_PID"
+    wait "$HOLDER_PID" 2>/dev/null || true
+
+    local waited="" real_wait
+    real_wait="$(declare -f _flock_waiting)"
+    # shellcheck disable=SC2329 # a seam: invoked by flock_open
+    _flock_waiting() { waited=1; }
+    if allocate_ports "$ws" >/dev/null 2>&1; then
+        pass "allocated at once"
+    else
+        fail "allocation failed after the holder died"
+    fi
+    eval "$real_wait"
+    if [ -z "$waited" ]; then pass "nothing to wait for"; else fail "waited on a dead holder's lock"; fi
+    if [ -e "$LUCIDOS_PORT_REGISTRY.lockd" ]; then
+        fail "a mkdir lock directory was created"
+    else
+        pass "no mkdir lock directory"
     fi
 }
 
 # ── Test 27: registry_save failure propagates through allocate_ports.
-# A lock-acquire timeout or mktemp failure must bubble up — silently
+# An mktemp or write failure must bubble up — silently
 # swallowing it leaves the file written but the offset unpersisted, so
 # the next restart can't find the entry and picks a fresh one (drift).
 test_registry_save_failure_propagates() {
@@ -1507,7 +1668,7 @@ test_kill_shim_refuses_foreign_pid
 test_protects_host_pid_from_env_var
 test_protects_frontend_pid_from_env_var
 test_protects_pid_from_other_workspace_pidfile
-test_protects_pid_from_other_workspace_frontend_pidfile
+test_unlocked_pidfile_does_not_protect
 test_does_not_protect_arbitrary_pid
 test_stale_pidfile_does_not_protect
 test_empty_pid_is_not_protected
@@ -1543,7 +1704,11 @@ test_another_workspaces_engine_is_neither_adopted_nor_killed
 test_allocate_ports_engine_only_short_circuits
 test_ports_file_records_user_facing_port
 test_ports_file_correct_in_engine_only_mode
-test_registry_save_handles_concurrent_writers
+test_concurrent_allocations_claim_distinct_offsets
+test_an_allocation_waits_for_one_in_flight
+test_the_walk_skips_an_offset_another_workspace_owns
+test_a_duplicate_offset_keeps_the_running_workspace
+test_a_killed_holder_leaves_nothing_to_reclaim
 test_registry_save_failure_propagates
 test_allocating_ports_keeps_the_keys_other_writers_own
 test_setting_a_key_twice_leaves_one_line

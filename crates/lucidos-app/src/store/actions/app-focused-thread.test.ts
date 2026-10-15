@@ -32,13 +32,13 @@ describe('installAppFocusedThreadSync', () => {
 
   it('pushes each change to every mounted app frame', () => {
     const canvas = mountFrame();
-    const widgetWindow = mountFrame();
+    const boardTile = mountFrame();
     stop = installAppFocusedThreadSync();
 
     setFocusedThread('thread-b');
     setFocusedThread(null);
 
-    for (const posted of [canvas, widgetWindow]) {
+    for (const posted of [canvas, boardTile]) {
       expect(posted).toEqual([pushOf('thread-a'), pushOf('thread-b'), pushOf(null)]);
     }
   });

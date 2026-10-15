@@ -1,10 +1,17 @@
-import { updateAvailable, engineNewVersionReady, engineVersionPending, engineRebuildWedged, mobileView } from '../../store/store';
+import {
+  updateAvailable,
+  engineNewVersionReady,
+  engineVersionPending,
+  engineRebuildWedged,
+  mobileView,
+  type ApplyPhase,
+} from '../../store/store';
 import { crossWorkspaceUnreadTotal } from '../../store/actions/app-badge';
 import { liveActivityRows, type ActivityRow } from '../../store/actions/activityRows';
 // One cap for both header counts, so the mark and the menu rows cannot start
 // eliding at different numbers. Each site's own box is its own business; the
 // number at which a count stops being spelled out is shared.
-import { countLabel } from './NotificationsMenuRows';
+import { countLabel } from './unreadCountLabel';
 import { HourglassIcon, ReloadIcon } from '../shared/icons';
 import { GlyphBadge } from '../shared/GlyphBadge';
 
@@ -35,20 +42,71 @@ export function brandBadgeState(activityCount: number): BrandBadgeState {
 }
 
 /** What the state badge stands for, in the menu's own words, or `undefined`
- *  when it is not drawn. The MARK speaks it, in its label and its tooltip:
- *  the badge is click-through, so neither a pointer nor a screen reader ever
- *  lands on the badge itself. */
+ *  when it is not drawn. The MARK speaks it in its label, and its tooltip
+ *  shows it through {@link brandTooltipRows}: the badge is click-through, so
+ *  neither a pointer nor a screen reader ever lands on the badge itself. */
 export function brandBadgeLabel(rows: ActivityRow[]): string | undefined {
   if (rows.length > 0) return rows.map((r) => r.label).join(' · ');
-  const newVersion = engineNewVersionReady();
-  const update = updateAvailable.value;
-  if (newVersion && update) return 'New version available · Client update available';
-  if (newVersion) return 'New version available';
-  if (update) return 'Client update available';
-  if (engineVersionPending.value) {
-    return engineRebuildWedged.value ? 'New code pending · no rebuild can deliver it' : 'New code pending';
+  const notices = brandNotices();
+  if (notices.length === 0) return undefined;
+  return notices.map((n) => `${n.label} ${n.value}`).join(' · ');
+}
+
+/** One row of the mark's hover tooltip, in the `data-tooltip-rows` shape. */
+export interface BrandTooltipRow {
+  label: string;
+  value: string;
+}
+
+/** The version notices the state badge stands for while no job runs. Each
+ *  reads as one phrase when its label and value are joined with a space. */
+function brandNotices(): BrandTooltipRow[] {
+  const notices: BrandTooltipRow[] = [];
+  if (engineNewVersionReady()) notices.push({ label: 'New version', value: 'available' });
+  if (updateAvailable.value) notices.push({ label: 'Client update', value: 'available' });
+  if (notices.length === 0 && engineVersionPending.value) {
+    notices.push({
+      label: 'New code',
+      value: engineRebuildWedged.value ? 'pending · no rebuild can deliver it' : 'pending',
+    });
   }
-  return undefined;
+  return notices;
+}
+
+/** A single-thread apply's phase, as a tooltip label a thread count reads under. */
+const APPLY_TOOLTIP_LABEL: Record<ApplyPhase | 'applying', string> = {
+  merging: 'Merging',
+  'resolving-conflict': 'Merge conflicts',
+  hardening: 'Hardening',
+  applying: 'Applying',
+};
+
+/** The mark's hover tooltip: what is going on, as counts at a glance.
+ *
+ *  The menu names every thread, so single-thread applies collapse to one row
+ *  per phase. The connection gets a row only while it is degraded, because a
+ *  lit mark already says it is fine. That row pairs the state with what
+ *  happens next, the short notice. */
+export function brandTooltipRows(
+  unreadCount: number,
+  rows: ActivityRow[],
+  connection: { title: string; detail: string } | null,
+): BrandTooltipRow[] {
+  const out: BrandTooltipRow[] = [];
+  if (connection) out.push({ label: connection.title, value: connection.detail });
+  if (unreadCount > 0) out.push({ label: 'Unread', value: String(unreadCount) });
+  const threadsPerPhase = new Map<string, number>();
+  for (const row of rows) {
+    if (row.body.kind === 'apply-thread') {
+      const label = APPLY_TOOLTIP_LABEL[row.body.thread.reading?.phase ?? 'applying'];
+      threadsPerPhase.set(label, (threadsPerPhase.get(label) ?? 0) + 1);
+    } else {
+      out.push({ label: row.label, value: row.detail ?? '' });
+    }
+  }
+  for (const [label, count] of threadsPerPhase) out.push({ label, value: String(count) });
+  if (rows.length === 0) out.push(...brandNotices());
+  return out;
 }
 
 /** The unread count in words, or `null` when there is nothing to say.
@@ -78,7 +136,7 @@ export function unreadBadgeLabel(count: number): string | null {
  *  the mark underneath. A `data-tooltip` here could never fire: `useTooltip`
  *  resolves its target by walking UP from the hovered element, and this badge
  *  is never that element. The mark speaks the count instead, through
- *  {@link unreadBadgeLabel} in its own label and tooltip. */
+ *  {@link unreadBadgeLabel} in its label and an Unread row in its tooltip. */
 export function UnreadBrandBadge() {
   const count = crossWorkspaceUnreadTotal.value;
   if (count <= 0) return null;

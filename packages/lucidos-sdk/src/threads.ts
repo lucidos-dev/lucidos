@@ -7,7 +7,10 @@ export type UnproposedReason =
   | 'plan_awaiting_approval'
   | 'outside_bound'
   | 'hardening_missing'
-  | 'turn_incomplete';
+  | 'turn_incomplete'
+  | 'awaiting_landing'
+  | 'integrated_into_parent'
+  | 'carried_by_successor';
 
 /** What a coding-agent thread's branch holds. Mirrors the engine wire (ADR
  *  0400). `none`: no work. `unproposed`: work with no pending change, and

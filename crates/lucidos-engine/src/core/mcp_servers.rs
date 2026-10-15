@@ -96,7 +96,7 @@ fn normalize_disabled_tools(names: &[String]) -> Vec<String> {
 /// The registry of external MCP servers whose tools the agent can call.
 ///
 /// **No caller can skip the event.** [`Self::register`], [`Self::unregister`],
-/// [`Self::set_auto_approve`] and [`Self::set_disabled_tools`] are the reachable
+/// [`Self::set_auto_approve`] and [`Self::set_tool_disabled`] are the reachable
 /// mutators that change what the user chose; the raw row writes are private to
 /// this module. Each moves the agent's own tool surface or the permission on
 /// it, so each belongs on the timeline: before this, adding an MCP server from
@@ -260,50 +260,54 @@ impl McpServerStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Replace a server's disabled-tool set. **Private on purpose**:
-    /// [`Self::set_disabled_tools`] emits.
-    ///
-    /// Same self-join shape as [`Self::set_auto_approve_row`], and for the same
-    /// reason: `rows_affected` answers "does it exist", never "did it change".
-    /// Returns `None` when no such server exists, `Some(changed)` otherwise.
-    async fn set_disabled_tools_row(
-        pool: &PgPool,
-        id: &str,
-        disabled_tools: &[String],
-    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
-        let changed: Option<bool> = sqlx::query_scalar(
-            "UPDATE mcp_servers AS m SET disabled_tools = $2 \
-             FROM (SELECT id, disabled_tools FROM mcp_servers WHERE id = $1) AS prior \
-             WHERE m.id = prior.id \
-             RETURNING (prior.disabled_tools IS DISTINCT FROM $2)",
-        )
-        .bind(id)
-        .bind(disabled_tools)
-        .fetch_optional(pool)
-        .await?;
-        Ok(changed)
-    }
-
-    /// Set which of a server's tools are switched off, by wire name, and
+    /// Switch one of a server's tools off or back on, by wire name, and
     /// announce it. Disabling a tool takes it out of every request, so it
     /// changes the agent's own tool surface exactly as a registration does.
     ///
+    /// The read and the write share one row lock, so two switches on the same
+    /// server, from two clients or two tabs, both land. Each call names only
+    /// its own tool, so writes commute (ADR 0437).
+    ///
     /// Announces only when the set actually MOVED, the same rule
-    /// [`Self::set_auto_approve`] follows. Re-saving the current selection is
-    /// not a change and must not re-fire subscribers.
+    /// [`Self::set_auto_approve`] follows.
     ///
     /// Returns the stored set, or `None` when no such server exists.
-    pub async fn set_disabled_tools(
+    pub async fn set_tool_disabled(
         pool: &PgPool,
         event_bus: &EventBus,
         id: &str,
-        disabled_tools: &[String],
+        wire_name: &str,
+        disabled: bool,
         actor: Option<MessageOrigin>,
     ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
-        let wanted = normalize_disabled_tools(disabled_tools);
-        let Some(changed) = Self::set_disabled_tools_row(pool, id, &wanted).await? else {
+        let mut tx = pool.begin().await?;
+        let current: Option<Vec<String>> =
+            sqlx::query_scalar("SELECT disabled_tools FROM mcp_servers WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(current) = current else {
             return Ok(None);
         };
+        let current = normalize_disabled_tools(&current);
+        let mut wanted: Vec<String> = current
+            .iter()
+            .filter(|name| name.as_str() != wire_name)
+            .cloned()
+            .collect();
+        if disabled {
+            wanted.push(wire_name.to_string());
+        }
+        let wanted = normalize_disabled_tools(&wanted);
+        let changed = wanted != current;
+        if changed {
+            sqlx::query("UPDATE mcp_servers SET disabled_tools = $2 WHERE id = $1")
+                .bind(id)
+                .bind(&wanted)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         if changed {
             event_bus
                 .emit_or_log(
@@ -601,15 +605,9 @@ mod tests {
         McpServerStore::set_tools(&pool, "srv", &[tool("alpha")])
             .await
             .unwrap();
-        McpServerStore::set_disabled_tools(
-            &pool,
-            &bus,
-            "srv",
-            &["mcp__srv__alpha".to_string()],
-            None,
-        )
-        .await
-        .unwrap();
+        McpServerStore::set_tool_disabled(&pool, &bus, "srv", "mcp__srv__alpha", true, None)
+            .await
+            .unwrap();
 
         let again = McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd2", &[], &env, None)
             .await
@@ -617,6 +615,66 @@ mod tests {
         assert_eq!(again.tools.len(), 1, "the manifest survives a re-register");
         assert!(again.tools_observed_at.is_some());
         assert_eq!(again.disabled_tools, vec!["mcp__srv__alpha".to_string()]);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Two switches on one server both land, whatever their timing. The test
+    /// holds the row lock itself, starts a switch, and commits a change of its
+    /// own only once that switch waits on the lock. A switch that read the set
+    /// before locking would then write it back without that change.
+    #[tokio::test]
+    async fn two_switches_on_one_server_both_land() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd", &[], &HashMap::new(), None)
+            .await
+            .unwrap();
+
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM mcp_servers WHERE id = 'srv' FOR UPDATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let switch = tokio::spawn({
+            let (pool, bus) = (pool.clone(), bus.clone());
+            async move {
+                McpServerStore::set_tool_disabled(&pool, &bus, "srv", "mcp__srv__beta", true, None)
+                    .await
+                    .unwrap()
+            }
+        });
+        // The synchronization point: the switch is blocked on the row lock, or
+        // it finished without ever taking it.
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 || switch.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        sqlx::query(
+            "UPDATE mcp_servers SET disabled_tools = ARRAY['mcp__srv__alpha'] WHERE id = 'srv'",
+        )
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+        holder.commit().await.unwrap();
+
+        let both = vec!["mcp__srv__alpha".to_string(), "mcp__srv__beta".to_string()];
+        assert_eq!(switch.await.unwrap(), Some(both.clone()));
+        let stored: Vec<String> =
+            sqlx::query_scalar("SELECT disabled_tools FROM mcp_servers WHERE id = 'srv'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, both);
 
         crate::test_support::teardown_test_db(&db_name).await;
     }
@@ -646,51 +704,51 @@ mod tests {
         assert_eq!(emitted(&pool, "McpServerUpdated").await, 0);
         assert_eq!(emitted(&pool, "McpServerDisabledToolsChanged").await, 0);
 
-        let disabled = vec!["mcp__srv__beta".to_string(), "mcp__srv__alpha".to_string()];
-        let stored = McpServerStore::set_disabled_tools(&pool, &bus, "srv", &disabled, None)
+        let switch = |wire: &'static str, disabled: bool| {
+            let (pool, bus) = (pool.clone(), bus.clone());
+            async move {
+                McpServerStore::set_tool_disabled(&pool, &bus, "srv", wire, disabled, None)
+                    .await
+                    .unwrap()
+            }
+        };
+        switch("mcp__srv__beta", true)
             .await
-            .unwrap()
+            .expect("the server exists");
+        let stored = switch("mcp__srv__alpha", true)
+            .await
             .expect("the server exists");
         assert_eq!(
             stored,
             vec!["mcp__srv__alpha".to_string(), "mcp__srv__beta".to_string()],
-            "stored as a set, so a reordered save is not a change"
-        );
-        assert_eq!(emitted(&pool, "McpServerDisabledToolsChanged").await, 1);
-
-        // Re-sending the same selection in another order still reports the
-        // server exists, and must not announce.
-        let resent = vec!["mcp__srv__alpha".to_string(), "mcp__srv__beta".to_string()];
-        assert!(
-            McpServerStore::set_disabled_tools(&pool, &bus, "srv", &resent, None)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            emitted(&pool, "McpServerDisabledToolsChanged").await,
-            1,
-            "re-saving the current selection changed nothing"
-        );
-
-        // Clearing it IS a change: the tools come back.
-        assert!(
-            McpServerStore::set_disabled_tools(&pool, &bus, "srv", &[], None)
-                .await
-                .unwrap()
-                .is_some()
+            "stored as a set, in one order whatever the order of the switches"
         );
         assert_eq!(emitted(&pool, "McpServerDisabledToolsChanged").await, 2);
 
+        // Switching a tool off that is already off changes nothing.
+        assert!(switch("mcp__srv__alpha", true).await.is_some());
+        assert_eq!(
+            emitted(&pool, "McpServerDisabledToolsChanged").await,
+            2,
+            "re-sending the current state changed nothing"
+        );
+
+        // Switching it back on IS a change: the tool comes back.
+        let stored = switch("mcp__srv__alpha", false)
+            .await
+            .expect("the server exists");
+        assert_eq!(stored, vec!["mcp__srv__beta".to_string()]);
+        assert_eq!(emitted(&pool, "McpServerDisabledToolsChanged").await, 3);
+
         assert!(
-            McpServerStore::set_disabled_tools(&pool, &bus, "missing", &disabled, None)
+            McpServerStore::set_tool_disabled(&pool, &bus, "missing", "mcp__x__y", true, None)
                 .await
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             emitted(&pool, "McpServerDisabledToolsChanged").await,
-            2,
+            3,
             "a write that matched no row must not announce"
         );
 

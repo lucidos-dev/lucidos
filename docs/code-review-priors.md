@@ -15,6 +15,53 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **A lane batch's integration branch may carry commits beyond its landing
+  merges.** A reviewer reports that the landing check finds each member's
+  landing merge anywhere on the first-parent range, so extra or reordered
+  commits pass. That is the design: the lane thread's `/harden` fix commits and
+  its catch-up merges of `main` sit on that branch, and the batch lands them
+  whole (ADR 0463). Revert stays exact, since each `ChangeApplied` names its own
+  landing merge. Re-flag only if a member could land without its own landing
+  merge. (`landing_lane/integration.rs`.)
+- **A mock engine's wake decision asks no model and wakes the parent.** A
+  reviewer reports that `asks_no_model` treats the mock selection, which
+  reports `ModelSource::ChatModel`, as no measured model, so the gate skips the
+  call. That is the intended outcome. Before ADR 0448 the unforced mock
+  answered in text, which is no answer, so a mock engine woke every parent
+  then too. No test drives the gate on a mock and expects a filed report.
+  Re-flag only if one must.
+- **Two `wake-when-all-done` children finishing together can both wake the
+  parent.** A reviewer reports that each fan-in reads "no batch sibling still
+  working" from a post-commit snapshot, so both wake, and asks for an atomic
+  claim. The double wake is accepted on purpose: the last terminal to commit
+  always wakes, so no wake is ever lost. Two cards on a parent are the
+  ordinary multi-child case (ADR 0451). Re-flag only if two batch children can
+  both file with neither waking. (`event_bus/parent_callback.rs`.)
+- **The gateway already needs `HOME` before it asserts the Lucidos home.** A
+  reviewer reports that `lucidos_home::ensure()?` at the top of the gateway's
+  `run()` breaks a launch with `LUCIDOS_GATEWAY_DATA` set and `HOME` unset.
+  That launch never booted: `run()` also mints the local token with
+  `auth::ensure_local_token()?`, which resolves `~/.lucidos/local-token` and
+  fails fatally without `HOME`. Re-flag only if the token stops living under
+  `HOME`. (`lucidos-gateway/src/server.rs`, `lucidos-local-token`.)
+
+- **A Codex input still owed when its driver fails needs no settle.** A
+  reviewer reports that an app-server failure (a dead child, a failed
+  handshake) emits a failed `Result` without `InputRejected`, so the input
+  stays owed forever. But every such path leaves the session loop, and the
+  driver then sends `Exited`. `Exited` ends the coding-agent session and drops
+  its `InputLedger`, so nothing waits on the input. Only a turn that fails
+  while the driver lives on must name its input, and those do. Re-flag only if
+  a failure path can return without `Exited`.
+
+- **A trigger fire admitted just before shutdown begins may still start.** A
+  reviewer reports a check-to-spawn race in the Thread Queue's shutdown hold:
+  `held_for_shutdown` reads false under the state lock, the flag flips during
+  `prepare_entry` or the admission emits, and the fire starts anyway. Admission
+  under that lock is the boundary on purpose. A fire admitted before shutdown
+  is already in flight, and in-flight runs finish (ADR 0429). Re-flag only if
+  a fire can be admitted after the flag is set.
+
 - **A call that names no effort runs at the model's default effort.** A
   reviewer reports a call passing `ModelSelection::default()` (a file summary,
   a memory check) with no effort, and expects the provider's default. But
@@ -433,28 +480,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   CALLER of `run_direct_agent`, not inside it.** Reviewers see per-caller settle
   logic (today `agent_recovery::continue_recovery`, driven from the spawn
   consumer) and propose hoisting it into `run_direct_agent` so every caller
-  inherits the floor. It cannot go there: `run_direct_agent` also returns `Err`
-  when its spawn guard rejects the call because a **live** session already owns
-  the thread (`AGENT_ALREADY_RUNNING_ERROR`). At that point the caller owns
-  nothing and the `running` projection is TRUE — it belongs to the turn that won
-  the race — so a settle inside the callee would emit a terminal against a
-  working session. Only the caller knows whether it owns the turn. For the same
-  reason any caller-side backstop must carve that error out (the `Nothing` arm in
-  `continue_recovery`). The spawn debounce's `DUPLICATE_SPAWN_ERROR` is the same
-  lost race before the winner registers. It settles only when
-  `coding_agent_owns_thread` says no spawn owns the thread. Re-flag only if the
-  guard stops returning `Err` for a live-session collision.
-  (`agent_session/run_session/run.rs`, `agent_recovery/helpers.rs`,
+  inherits the floor. Only the caller knows whether it owns the turn: a caller
+  whose claim found a live run (`claim_thread_or_refuse`, reporting
+  `AGENT_ALREADY_RUNNING_ERROR`) owns nothing, and the `running` projection is
+  TRUE. So a caller-side backstop must carve that error out (the `Nothing` arm in
+  `continue_recovery`). Re-flag only if a claim stops reporting a live run.
+  (`agent_session/spawn_claim.rs`, `agent_recovery/helpers.rs`,
   `engine_impl/construction.rs`.)
-
-- **`coding_agent_owns_thread` then settle is not atomic, on purpose.** A new
-  spawn can start between the ownership check and the `StaleSettle` emit, and
-  every settle path shares that window (watchdog, boot sweep, user Stop). It
-  needs a fresh request in the microseconds after the earlier owner finished,
-  and closing it means locking spawn entry across an async DB emit. The slot is
-  entered before the debounce stamp, so a spawn moving from starting to live is
-  always seen. Re-flag only with a trigger wider than a same-instant request.
-  (`claude_code/control.rs`, `agent_session/spawns_in_flight.rs`.)
 
 - **`STALE_RESUME_ERROR` is returned to the caller rather than retried inside
   `run_session`, and that is not a missing abstraction.** Three callers each
@@ -741,8 +773,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the pairing emit and session registration.
   (`engine/change_ops/mod.rs`, `engine/change_ops/apply.rs`, ADR 0060.)
 
-- **`BACKGROUND_PROCESS_RULE`'s `/tmp/$(basename "$PWD").log` example is unique
-  per session, not a shared path** (2026-08-13, Codex). The rule tells the agent
+- **`BACKGROUND_PROCESS_RULE`'s `${TMPDIR:-/tmp}/$(basename "$PWD").log` example
+  is unique per session, not a shared path** (2026-08-13, Codex). The rule tells the agent
   to redirect a chatty command's output so a long log never floods its context,
   and builds the example path from the worktree's basename. A `/tmp` name reads as
   collision-prone across concurrent sessions. It is not: the engine prompt
@@ -920,7 +952,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   changed it and had to change it back.
 
   The apply pipeline that runs immediately before it publishes to `main`:
-  `catchup_and_ff_to_main` and `ff_main_to` both take the literal. Resolving
+  `catchup_and_ff_to_main` and `ff_main_to_branch` both take the literal. Resolving
   the real default here makes the reset base disagree with where the work
   landed. On a repo carrying both `main` and a different `origin/HEAD`, the
   reset then rewinds the session branch off the applied commits. A wrong base
@@ -1146,18 +1178,6 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the resolver starts re-taking a verdict on `EventWaitDelivered` or
   `EventWaitExpired`.
 
-- **A standing apply left armed after `AnchorMissing` is correct, not a
-  stranded arm.** `thread_to_resolve` skips `EventWaitDelivered` and
-  `EventWaitExpired`, so a resolution whose wake anchor failed to persist
-  re-takes no verdict. But the thread is stranded too: it holds a dangling call
-  that the boot orphan sweep settles, and the user then presses Continue. Firing
-  in between would merge a branch the agent is about to resume (ADR 0106). The
-  arm resolves on the thread's next event or on `recover_standing_applies` at
-  boot (ADR 0266, "A lost wake still resolves").
-
-  Re-flag only if `AnchorMissing` gains an in-process recovery that wakes the
-  thread without a restart. That path would then have to re-take the verdict.
-
 - **`AuxModelSource` collapsing to `Option` at every production call site is
   the point, not dead structure.** A reviewer sees `resolve_selection` treat
   `Turn`, `BackendPinned` and `AgentModel` alike in one match arm, and
@@ -1299,6 +1319,20 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **The memory choice's Use Tree is enabled for a model the estimate cannot
+  price.** A reviewer reports that Use Tree waits only for the estimate, so an
+  unpriced compactor model starts Tree with no price shown. That matches the
+  Start Tree dialog in Settings, which allows an unpriced model on purpose: a
+  local model has no price to show. The tiles say "No estimate for this model"
+  rather than hiding it, so the user sees there is no figure. Re-flag only if
+  Start Tree starts requiring a price. (`components/settings/MemoryChoice.tsx`.)
+- **A failed pending-intent write shows the server's state; it does not keep
+  or retry the intent.** A reviewer sees a failed request drop its intent (an
+  MCP tool switch, a row intent, a notification read) and asks to resend it.
+  ADR 0437 settles that a refused write shows the server's state and says why
+  with a toast, and a retry is the path it replaced. Re-flag only a failure
+  that drops the intent with no toast.
 
 - **A keepMounted modal's exit drawing does not bring back the iOS ghost
   pixels.** A reviewer cites the file-search fixes and reads the fading copy
@@ -1800,9 +1834,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   extractor documented as "absolute POSIX path" whose `href.startsWith('/')`
   test also matches `//example.com/x`, which HTML resolves as a same-scheme URL,
   and concludes a real external link is being handed to the OS opener. The read
-  is right; the consequence is not. On the web path `openLocalFile` is
-  `window.open(target, '_blank', 'noopener')`, so a protocol-relative URL opens
-  in a new tab, i.e. exactly the correct behavior. And returning `null` for `//`
+  is right; the consequence is not. On the web path `openLocalFile` toasts a
+  disk path. A `//` target still goes to `window.open`, so a protocol-relative
+  URL opens in a new tab, i.e. exactly the correct behavior. And returning `null` for `//`
   makes it strictly worse: the chat handler's terminal guard (ADR 0038) is the
   next branch, so a legitimate external link would be swallowed with a
   "points nowhere" toast instead of opening. Closing it properly means teaching
@@ -1811,51 +1845,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   matches `https?://`). Re-flag only with a case where the Tauri branch's
   `openExternal` is reached with one, or evidence the shape occurs in practice.
   (`crates/lucidos-app/src/utils/linkifyPaths.ts`,
-  `crates/lucidos-app/src/components/chat/ChatExchange.tsx`.)
-
-- **`serverDraft` letting an inbound compose report overwrite a newer PUT ack is
-  the accepted, self-healing trade-off — the alternative re-breaks the bug it was
-  added for.** A reviewer (Codex flagged this P1) may note that
-  `applyRemoteCompose` records every `ThreadComposeChanged` payload as the
-  server's current compose state, and that a delayed frame could therefore
-  overwrite a newer PUT acknowledgement, briefly making a *superseded draft* look
-  clearable when the server actually still holds it. Three reasons it stands:
-  (1) The frame is already filtered — our own echo (`origin_device_id`) and any
-  in-flight local write (`pendingComposePuts`) are dropped before
-  `applyRemoteCompose`, so this needs an SSE frame delayed past a *separate*
-  successful PUT round-trip, in conjunction with the user re-typing the exact
-  submitted text against a stale watermark. (2) It is transient, not data loss:
-  the server still holds the text, so the next thread-summary snapshot re-stages
-  it into the composer via `stageDraftFromApi`. (3) The obvious "fix" — refusing
-  to let an EMPTY report downgrade a non-empty ack — makes a genuine peer clear
-  invisible until the next snapshot, which is exactly the ghost-draft bug
-  `docs/plans/2026-07-28-superseded-compose-drafts.md` exists to fix. The
-  principled fix is a server-stamped compose version on `ThreadComposeChanged`
-  plus the PUT response, so the two reports can be ordered; re-flag with that
-  design, not with the ordering suspicion alone.
-  (`store/actions/compose.ts` `serverDraft` / `applyRemoteCompose`.)
-
-- **`lastSyncedComposeMode` going stale on a dropped peer frame is the accepted
-  residual its sibling already carries.** A reviewer (Codex flagged this P2) may
-  note that `thread-sync.ts` drops a `ThreadComposeChanged` while
-  `pendingComposePuts` holds. A peer's mode change inside our PUT's round trip is
-  therefore never recorded. Our own ack records the older mode, and every later
-  write sends `mode: null`. The engine keeps the peer's value while this device's
-  picker still shows ours.
-
-  Four reasons it stands. (1) `lastSyncedImageHashes` two lines above has the
-  same window and the same outcome, so fixing this for mode alone is
-  inconsistent rather than safer. (2) It self-heals: the next thread-summary
-  snapshot passes the staleness guards, and `stageDraftFromApi` rewrites both the
-  draft's mode and this map. (3) No send is misrouted, because `sendCompose`
-  binds the channel from the local picker rather than from the stored
-  `compose_mode`. (4) It needs two devices changing one draft's channel inside a
-  single round trip, which the 2026-08-06 compose-ordering plan scoped out as
-  last-write-wins.
-
-  The principled fix is the server-stamped compose version the prior above
-  names. Re-flag with that design, not with the ordering suspicion.
-  (`store/actions/compose.ts` `composeModeForWrite` / `noteServerComposeMode`.)
+  `crates/lucidos-app/src/store/actions/artifacts.ts`,
+  `crates/lucidos-app/src/components/shared/markdownLinkClick.ts`.)
 
 - **`initiateEngineRestart` dismissing the `engine-new-version` switch toast on
   a spawn-FAILURE path is intentional; the badge is the recovery affordance.** A
@@ -2567,8 +2558,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   The old bug is unreachable rather than tolerated: it needed two panes each
   holding their own toasts, and there is now one stack for all of them. Origin
   moved off the axis entirely, and each message goes to the surface matching its
-  weight instead. Per-pane survives as one option in the placement picker while
-  the shape is being chosen (`docs/temporary-measures.md`).
+  weight instead. The placement picker and the per-pane columns are gone, and
+  `styles/__tests__/toast-corner-geometry.test.ts` pins the one corner stack.
 
   Re-flag only if per-pane columns come back AND a toast in one pane again
   displaces the other's.
@@ -3631,11 +3622,10 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   is chosen: the alternative (skip the emit on error) can silently strand a
   user's auto-resume, which is the exact zombie bug the mechanism exists to fix.
   The double-actuation corner needs a transient DB failure precisely on the guard
-  query AND a scan-vs-commit timing race, and is bounded downstream by the
-  per-thread spawn coalescer (`cc_spawn_coalesce.rs`) and `run_direct_agent`'s
-  single-lock "already running for this thread" guard — worst case is one refused
-  duplicate spawn attempt, never two live `--resume` subprocesses. Re-flag only if
-  one of those downstream guards is removed or the default flips.
+  query AND a scan-vs-commit timing race, and is bounded downstream by the spawn
+  claim (`agent_session/spawn_claim.rs`, ADR 0442): the second actuation finds the
+  first run's entry and spawns nothing. Never two live `--resume` subprocesses.
+  Re-flag only if the claim is removed or the default flips.
   (`crates/lucidos-engine/src/engine/agent_session/spawn_dispatcher.rs`,
   `crates/lucidos-engine/src/engine/engine_version.rs`.)
 
@@ -4493,3 +4483,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   it, so on a set-aside change it always reads absent. Re-flag only if the
   engine starts sending thread state on set-aside changes.
   (`core/changes.rs`, `store/store.ts`.)
+
+- **An optional preference's `read` already treats blank as unset.** A
+  reviewer sees `prefs::X.read(pool).await.unwrap_or_else(|| default)` on a
+  `Pref<Optional>` and argues a cleared Settings field stores `""`, which then
+  reaches the wire as an empty value. It cannot: `Pref<Optional>::read` and
+  `try_read` pass through `nonblank`, which trims and returns `None` for an
+  empty string. `try_stored` does not, so a caller reading the raw row filters
+  blank itself. Re-flag only a `try_stored` caller that skips that filter.
+  (`core/preferences.rs`, `llm/judgment/endpoint.rs`.)

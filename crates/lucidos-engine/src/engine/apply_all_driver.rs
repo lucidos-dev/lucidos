@@ -150,12 +150,14 @@ pub(crate) enum ApplyAllDriveMsg {
     Applied(Uuid),
     Failed(Uuid, String),
     Parked(Uuid),
+    /// The member waits in the landing lane, which decides how it ends.
+    Laned(Uuid),
 }
 
 impl ApplyAllDriveMsg {
     fn change_id(&self) -> Uuid {
         match self {
-            Self::Applied(id) | Self::Failed(id, _) | Self::Parked(id) => *id,
+            Self::Applied(id) | Self::Failed(id, _) | Self::Parked(id) | Self::Laned(id) => *id,
         }
     }
 }
@@ -242,20 +244,22 @@ impl LucidosEngine {
             0
         };
 
-        let Some(first) = pending.first() else {
+        let started = self.start_apply_all_batch(change_ids, actor.clone()).await;
+        let Some((batch_id, members)) = started else {
             return Ok(ApplyAllOutcome::NothingToApply {
                 total_pending,
                 not_ready,
                 armed,
             });
         };
-        let batch_id = self
-            .start_apply_all_batch(change_ids.clone(), actor.clone())
-            .await;
+        let first = pending
+            .iter()
+            .find(|c| c.id == members[0])
+            .expect("a batch member is one of the pending changes");
         let first_result = self.apply_batch_member(first.id, actor).await;
         Ok(ApplyAllOutcome::Started {
             batch_id,
-            batch_size: change_ids.len(),
+            batch_size: members.len(),
             armed,
             first_branch: first.branch_name.clone(),
             first_result,
@@ -331,23 +335,30 @@ impl LucidosEngine {
         batch_member_skip_reason(&change, thread_unsettled)
     }
 
-    /// Seed a new Apply All batch. Emits the durable `ApplyAllBatchStarted`
-    /// event (recoverable on restart) and adds the live batch to the
-    /// in-memory registry. Returns the batch_id so the HTTP handler can
-    /// surface it to the caller.
+    /// Seed a new Apply All batch from the `change_ids` no running batch
+    /// holds. Emits the durable `ApplyAllBatchStarted` event (recoverable on
+    /// restart), opens its press in the landing lane, and adds the live batch
+    /// to the in-memory registry. Returns the batch id and its members, or
+    /// `None` when every change already belongs to a running batch.
     ///
     /// The first member is marked applying here, and the caller applies it
     /// synchronously, so it gets a useful response. Subsequent applies flow
     /// through the driver task via `notify_apply_all`.
+    ///
+    /// Everything runs under the registry lock, so two presses never share a
+    /// change. Its reports would reach only one of them, and the other's press
+    /// would stay open in the lane for good. A Cancel also waits for the press
+    /// to open before it submits it.
     pub(crate) async fn start_apply_all_batch(
         &self,
         change_ids: Vec<Uuid>,
         actor: Option<MessageOrigin>,
-    ) -> Uuid {
-        debug_assert!(
-            !change_ids.is_empty(),
-            "start_apply_all_batch: change_ids must be non-empty",
-        );
+    ) -> Option<(Uuid, Vec<Uuid>)> {
+        let mut reg = self.apply_all_batches.lock().await;
+        let change_ids = reg.not_in_any_batch(change_ids);
+        if change_ids.is_empty() {
+            return None;
+        }
         let batch_id = Uuid::new_v4();
         self.event_bus
             .emit_or_log(
@@ -381,11 +392,12 @@ impl LucidosEngine {
                 e
             );
         }
-        let mut progress = BatchProgress::new(batch_id, change_ids, actor);
+        let mut progress = BatchProgress::new(batch_id, change_ids.clone(), actor);
         progress.start_next();
-        self.apply_all_batches.lock().await.insert(progress);
+        self.open_lane_press(batch_id);
+        reg.insert(progress);
         log!("[ApplyAll] batch {} seeded", batch_id);
-        batch_id
+        Some((batch_id, change_ids))
     }
 
     /// Delete a batch's durable membership row. Called wherever the batch is
@@ -407,10 +419,14 @@ impl LucidosEngine {
     /// Cancel every in-flight Apply All batch — the user clicked Cancel on the
     /// batch toast. For each batch, in order:
     /// 1. Remove it from the registry, so the driver stops advancing.
-    /// 2. Interrupt the live sessions of unresolved members: the one hardening
-    ///    or merging, and every parked resolver.
-    /// 3. Mark every still-pending member canceled, so the batch is complete.
-    /// 4. Emit `ApplyAllBatchCompleted`.
+    /// 2. Take unresolved members out of the landing lane: a waiting one
+    ///    leaves it, and a lane batch holding one fails whole. Then submit the
+    ///    press, so the lane stops gathering for it.
+    /// 3. Interrupt the live sessions of the other unresolved members: the one
+    ///    hardening or merging, and every parked resolver. A lane member's
+    ///    source thread is never interrupted: the lane, not its agent, holds it.
+    /// 4. Mark every still-pending member canceled, so the batch is complete.
+    /// 5. Emit `ApplyAllBatchCompleted`.
     ///
     /// Semantics: already-applied members stay applied; the in-flight apply
     /// aborts back to pending (best-effort — a merge that already landed before
@@ -442,12 +458,20 @@ impl LucidosEngine {
         if finals.is_empty() {
             return 0;
         }
+        let in_lane: std::collections::HashSet<Uuid> = self
+            .cancel_lane_members(pending_by_batch.concat(), actor.clone())
+            .await
+            .into_iter()
+            .collect();
+        for final_state in &finals {
+            self.submit_lane_press(final_state.batch_id());
+        }
         // Interrupt the live coding-agent sessions: the member mid-harden or
         // merge, and every parked resolver. The queued members have no live
         // session (interrupt is a lookup miss for them), so this only touches
         // the applies actually running.
         for pending in &pending_by_batch {
-            for &change_id in pending {
+            for &change_id in pending.iter().filter(|id| !in_lane.contains(id)) {
                 let thread_id = match self.changes().get_by_id(change_id).await {
                     Ok(Some(c)) => c.thread_id,
                     _ => None,
@@ -648,7 +672,7 @@ impl LucidosEngine {
     /// or spawning the next apply.
     async fn advance_apply_all_batch(self: &std::sync::Arc<Self>, msg: ApplyAllDriveMsg) {
         let change_id = msg.change_id();
-        let next_step = {
+        let (batch_id, submitted, next_step) = {
             let mut reg = self.apply_all_batches.lock().await;
             let Some(batch_id) = reg.batch_for_change(change_id) else {
                 return;
@@ -660,8 +684,10 @@ impl LucidosEngine {
                 ApplyAllDriveMsg::Applied(id) => batch.resolve(id, Ok(())),
                 ApplyAllDriveMsg::Failed(id, error) => batch.resolve(id, Err(error)),
                 ApplyAllDriveMsg::Parked(id) => batch.park(id),
+                ApplyAllDriveMsg::Laned(id) => batch.park_in_lane(id),
             };
-            match advance {
+            let submitted = batch.is_submitted();
+            let step = match advance {
                 // A duplicate or late report, e.g. the conflict-recovery
                 // cleanup emits `ChangeApplied` and the post-CC merge re-check
                 // then emits `ChangeApplyFailed` for the same change_id.
@@ -687,8 +713,13 @@ impl LucidosEngine {
                     next_change: next,
                     actor: batch.actor(),
                 },
-            }
+            };
+            (batch_id, submitted, step)
         };
+        // Repeating it is harmless: the lane releases the queue once.
+        if submitted {
+            self.submit_lane_press(batch_id);
+        }
         match next_step {
             NextStep::Complete {
                 batch_id,

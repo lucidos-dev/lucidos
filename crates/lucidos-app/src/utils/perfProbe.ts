@@ -9,8 +9,8 @@
  *  - Long tasks: fallback duration when LoAF is unavailable.
  *
  * TWO SINKS, and the second is the one a phone has. Every line goes to
- * `console.warn` AND to `recordPerfSample`, which reaches `engine.log` as a
- * `[Client/perf]` line. An iOS PWA offers no console at all, so console-only
+ * `console.warn` AND to `recordPerfSample`, which reaches the engine's log as a
+ * `[Client/perf]` line (`docs/client-logs.md` says which file). An iOS PWA offers no console at all, so console-only
  * output made this module unreadable on the device that most needed it. The
  * queue's own default-off gate decides whether a sample is kept. The console
  * half is what a desktop session gets free; the queue half is what a
@@ -71,7 +71,7 @@ export function targetStructure(node: Node | null): string {
  *
  *  It is the fastest way to recognise which control was tapped while reading a
  *  live console, and it is user content: a thread title, a file name, the first
- *  words of a message. `engine.log` persists what it is given, so sending this
+ *  words of a message. The engine log persists what it is given, so sending this
  *  would park workspace text in a log forever
  *  (.claude/rules/no-private-data.md). The console is local and ephemeral, so
  *  it keeps the convenience. */

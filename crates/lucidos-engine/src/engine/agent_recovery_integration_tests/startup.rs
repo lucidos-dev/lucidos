@@ -72,9 +72,15 @@ async fn startup_proposes_held_back_change_for_eligible_thread() {
     )
     .await
     .expect("record a satisfying plan marker");
-    crate::engine::git_ops::record_hardened(&pool, &repo_root, branch, "abc")
-        .await
-        .expect("record the harden marker");
+    crate::engine::git_ops::record_hardened(
+        &pool,
+        &repo_root,
+        branch,
+        "abc",
+        crate::engine::git_ops::HardenTier::Full,
+    )
+    .await
+    .expect("record the harden marker");
 
     // Selection picks exactly this thread.
     let selected = select_unproposed_idle_cc_threads(&pool).await;
@@ -260,6 +266,80 @@ async fn startup_holds_a_held_back_change_whose_branch_has_no_plan_marker() {
             reason: Some(UnproposedReason::PlanMissing)
         }
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A lane thread that finished cleanly before a restart looks like held-back
+/// work. Its branch is the batch's integration branch, which the landing lane
+/// lands (ADR 0463). The sweep skips it before any git work: it neither
+/// proposes nor withholds, with or without the markers.
+#[tokio::test]
+async fn startup_skips_a_lane_threads_integration_branch() {
+    use super::propose_held_back_changes_on_startup_with_roots;
+    use crate::engine::thread_lifecycle::CodingAgentChangeState;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    for marked in [false, true] {
+        let branch = crate::engine::git_ops::lane_branch(Uuid::new_v4());
+        let (_tmp, repo_root, thread_id) =
+            stuck_thread_with_held_back_work(&pool, &bus, &branch).await;
+        if marked {
+            crate::engine::git_ops::record_planned(
+                &pool,
+                &repo_root,
+                &branch,
+                crate::engine::git_ops::PlanMarkerKind::AcknowledgedSimple,
+                None,
+                Some("test fixture"),
+                &[],
+                "abc",
+            )
+            .await
+            .expect("record a satisfying plan marker");
+            crate::engine::git_ops::record_hardened(
+                &pool,
+                &repo_root,
+                &branch,
+                "abc",
+                crate::engine::git_ops::HardenTier::Full,
+            )
+            .await
+            .expect("record the harden marker");
+        }
+
+        propose_held_back_changes_on_startup_with_roots(
+            &pool,
+            &bus,
+            &repo_root,
+            &repo_root,
+            &[thread_id],
+        )
+        .await;
+
+        let proposals: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = 'ChangeProposed'",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            proposals, 0,
+            "marked={marked}: a lane branch is never proposed"
+        );
+        assert!(
+            withheld_payloads(&pool, thread_id).await.is_empty(),
+            "marked={marked}: a lane branch is never withheld either"
+        );
+        assert_eq!(
+            crate::test_support::read_change_state(&pool, thread_id).await,
+            CodingAgentChangeState::Unproposed { reason: None },
+            "marked={marked}"
+        );
+    }
 
     pool.close().await;
     teardown_test_db(&db_name).await;

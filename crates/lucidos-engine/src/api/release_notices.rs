@@ -39,10 +39,12 @@ async fn list(
     State(state): State<AppState>,
 ) -> Result<Json<release_notices::NoticeView>, ApiError> {
     let running = running_release()?;
+    let facts = release_notices::NoticeFacts::read(&state.pool).await;
     let cursor = release_notices::stored_cursor(&state.pool).await;
     Ok(Json(release_notices::view(
         release_notices::all(),
         &running,
+        &facts,
         cursor.as_deref(),
     )))
 }
@@ -72,7 +74,8 @@ async fn resolve(
     }
     // Before the resolve, which walks the workspace past the notice.
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None).await?;
-    let moved = release_notices::resolve(&state.pool, notices, &running, &body.id)
+    let facts = release_notices::NoticeFacts::read(&state.pool).await;
+    let moved = release_notices::resolve(&state.pool, notices, &running, &facts, &body.id)
         .await
         .map_err(ApiError::db)?;
     if moved {

@@ -30,9 +30,9 @@ vi.mock('../shared/Disclosure', () => import('../shared/__tests__/disclosureStub
 
 const {
   notifyRows,
-  countLabel,
   notificationsMenuGroup,
 } = await import('./NotificationsMenuRows');
+const { countLabel } = await import('./unreadCountLabel');
 type NotificationsGroupProps = import('./NotificationsMenuRows').NotificationsGroupProps;
 
 function ws(id: string, unread?: number, health: WorkspaceStatus['health'] = 'healthy'): WorkspaceStatus {

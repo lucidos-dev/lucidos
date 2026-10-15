@@ -141,6 +141,9 @@ impl ResolvedModelSelection {
             // A turn: never capped, so a long valid stream runs to its end.
             attempt_timeout: None,
             forced_tool: None,
+            service_tier: None,
+            // A turn's next request reads what its end write stored.
+            cache_mode: crate::llm::CacheMode::Implicit,
         }
     }
 }
@@ -489,6 +492,43 @@ impl PreferenceStore {
         }
         if let Err(e) = Self::delete(pool, event_bus, LEGACY_CHAT_EFFORT_KEY, None).await {
             log!("[Preferences] Could not delete the legacy chat tier: {}", e);
+        }
+    }
+
+    /// Rewrite each stored model id its provider retired onto its replacement
+    /// (`prefs::RETIRED_VALUES`), announcing and logging each one. A re-run
+    /// finds nothing retired. Every key in the table is global.
+    pub async fn replace_retired_values(pool: &PgPool, event_bus: &EventBus) {
+        let keys: std::collections::BTreeSet<&str> = prefs::RETIRED_VALUES
+            .iter()
+            .map(|(key, _, _)| *key)
+            .collect();
+        for key in keys {
+            let stored = match Self::get(pool, key).await {
+                Ok(Some(stored)) => stored,
+                Ok(None) => continue,
+                Err(e) => {
+                    log_read_failure(key, &e);
+                    continue;
+                }
+            };
+            let Some(replacement) = prefs::retired_value_replacement(key, &stored) else {
+                continue;
+            };
+            match Self::set(pool, event_bus, key, replacement, None).await {
+                Ok(()) => log!(
+                    "[Preferences] {}: {} is retired, replaced by {}",
+                    key,
+                    stored.trim(),
+                    replacement
+                ),
+                Err(e) => log!(
+                    "[Preferences] Could not replace the retired {} in {}: {}",
+                    stored.trim(),
+                    key,
+                    e
+                ),
+            }
         }
     }
 
@@ -1403,6 +1443,89 @@ mod tests {
             Some("max"),
             "a stored tier wins"
         );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Boot moves a stored retired model onto its replacement, and a mini
+    /// choice stays mini. A live value stays put, and a re-run writes nothing.
+    #[tokio::test]
+    async fn the_startup_rewrite_moves_each_retired_model_onto_its_replacement() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let seeded = [
+            (
+                prefs::IMAGE_MODEL.key(),
+                "gpt-image-1",
+                "gpt-image-2.5-flare",
+            ),
+            (
+                prefs::MODEL_VOICE_TALKER.key(),
+                "gpt-realtime-mini",
+                "gpt-realtime-2.1-mini",
+            ),
+            (
+                prefs::MODEL_VOICE_TRANSCRIBER.key(),
+                "whisper-1",
+                "gpt-transcribe",
+            ),
+            (prefs::VOICE_TALKER_VOICE.key(), "cedar", "cedar"),
+        ];
+        for (key, stored, _) in seeded {
+            crate::test_support::seed_preference(&pool, key, stored)
+                .await
+                .unwrap();
+        }
+
+        let seeding = emitted(&pool, "PreferencesChanged").await;
+
+        PreferenceStore::replace_retired_values(&pool, &bus).await;
+        for (key, _, expected) in seeded {
+            assert_eq!(
+                PreferenceStore::get(&pool, key).await.unwrap().as_deref(),
+                Some(expected),
+                "{key}"
+            );
+        }
+        assert_eq!(emitted(&pool, "PreferencesChanged").await, seeding + 3);
+
+        PreferenceStore::replace_retired_values(&pool, &bus).await;
+        assert_eq!(
+            emitted(&pool, "PreferencesChanged").await,
+            seeding + 3,
+            "a re-run finds nothing retired, so it says nothing"
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A retired row that escaped the rewrite, say from a restored backup,
+    /// must not dial a dead model. It reads as the default instead.
+    #[tokio::test]
+    async fn a_retired_model_that_escaped_the_rewrite_reads_as_the_default() {
+        let (pool, db_name) = setup_test_db().await;
+        for (key, stored) in [
+            (prefs::IMAGE_MODEL.key(), "gpt-image-1.5"),
+            (prefs::MODEL_VOICE_TALKER.key(), "gpt-4o-realtime"),
+            (prefs::MODEL_VOICE_TRANSCRIBER.key(), "gpt-4o-transcribe"),
+        ] {
+            crate::test_support::seed_preference(&pool, key, stored)
+                .await
+                .unwrap();
+        }
+
+        for pref in [
+            &prefs::IMAGE_MODEL,
+            &prefs::MODEL_VOICE_TALKER,
+            &prefs::MODEL_VOICE_TRANSCRIBER,
+        ] {
+            assert_eq!(
+                pref.read(&pool).await,
+                pref.default_text(),
+                "{}",
+                pref.key()
+            );
+        }
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

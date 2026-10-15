@@ -25,7 +25,8 @@
 #                  ships and you can read the real card. A shipped install is
 #                  never release-dirty and sees it on its own release.
 #   title          one line. The modal's heading and the panel row's label.
-#   body           markdown. A link is how a notice points at a settings page.
+#   body           markdown. A link is how a notice points at a settings page:
+#                  `[Settings > System > Memory](settings:memory)`.
 #   action_label   optional, and paired with action_prompt. Draws one button.
 #   action_prompt  optional. The button SENDS this sentence as a new message,
 #                  so write what the user would say, and make sure the knowhow
@@ -33,6 +34,11 @@
 #                  REACH that knowhow. Spelling out what it will then do
 #                  restates what the recipe owns, and goes stale the day the
 #                  recipe moves.
+#   only_when      optional. A condition the workspace must meet, or the notice
+#                  is hidden as if unreleased. So never write "if you already
+#                  did this, ignore it": name the condition instead. The names
+#                  are `NoticeCondition` in release_notices.rs:
+#                    on-classic-memory   the workspace chose Classic memory.
 #
 # One action per notice, at most. Two things to do is two notices, because
 # acting closes the modal and moves the reader on to the next one.
@@ -162,6 +168,91 @@ presses your buttons only when you ask it to in that message.
 It used to sit behind a switch under Experimental. The switch is gone, so \
 Home shows even if you had it off. Its history is still there.
 
-Home costs nothing while you leave it alone: it works only when you write in \
-it.
+Home works when you write in it or talk to it out loud. It also works when \
+something it started for you comes back to it, such as a thread or a wait for \
+an event. It starts no work by itself. Work that belongs to no thread, such as \
+a summary of a file written outside any thread, records its cost on Home.
 """
+
+[[notice]]
+id = "mcp-servers-reach-only-their-threads"
+since = "0.48.2"
+title = "MCP servers now reach only the threads that use them"
+body = """
+A running MCP server used to add its tools to every thread. Now a thread \
+switches a server on for itself when it needs it, so a thread that \
+never uses a server no longer pays for its tools.
+
+A trigger that uses an MCP server should list it in its MCP servers. Its fires \
+then have the server from the first step. A fire may call only a listed \
+server, or one with Auto-approve on. A call to any other server is refused, \
+and you get a notification naming the trigger.
+
+An audit of your triggers finds each one that used a server it does not list, \
+and says what to add.
+"""
+action_label = "Audit my triggers"
+action_prompt = "Audit my workspace's triggers."
+
+[[notice]]
+id = "home-board"
+since = "0.48.2"
+title = "Widgets pinned to Home now live on the Home board"
+body = """
+Home now has two faces: the Home board and the Home chat. Every widget you \
+pinned to Home is a tile on the board, live, at its default size.
+
+On a desktop, the board is a rail at the right edge of the window, beside \
+your threads. The button in the window's top-right corner hides the rail. \
+While the board has a tile, the same button shows it again. Drag the rail's \
+edge to change its width. The Home icon opens the Home chat.
+
+On a phone, the Home icon opens Home on the board, with the prompt under it. \
+Tap the prompt to slide the chat up, and tap the Home icon again to slide it \
+back down.
+
+Holding the Home icon no longer lists Home's widgets. They are all on the \
+board now. Add on the board pins another widget to Home. Edit moves, resizes \
+and removes tiles. A tile's menu hides it on the kind of screen you use: a \
+desktop or a phone.
+"""
+
+[[notice]]
+id = "move-to-tree-memory"
+since = "0.48.2"
+title = "Tree memory is ready to try"
+only_when = "on-classic-memory"
+body = """
+A new workspace now asks which memory module to use. Yours stays on Classic, \
+which is almost free.
+
+Tree gives every turn a layered summary of the whole workspace and of the \
+thread. The agent can open any line down to the exact message. In our tests it \
+scored as well as Classic or better. It costs money: a compactor model writes \
+the summaries after each turn, so the cost grows with use and depends on the \
+model.
+
+To try it, open [Settings > System > Memory](settings:memory). Lucidos first \
+shows what the one-time summary of your workspace costs, and how long it takes. \
+Until it is done, turns stay on Classic.
+"""
+
+[[notice]]
+id = "workspace-database-handle"
+since = "0.48.2"
+title = "Scripts reach the workspace database through LUCIDOS_DATABASE_URL"
+body = """
+Lucidos no longer gives scripts, triggers and coding agents its database \
+login through the `PGHOST`, `PGUSER` and `DATABASE_URL` variables. A bare \
+`psql`, or a connection string left empty by mistake, used to land on your \
+workspace database. Now it reaches nothing.
+
+Scripts get `LUCIDOS_DATABASE_URL` instead, and it opens read-only. Use \
+`psql "$LUCIDOS_DATABASE_URL"`. A deliberate write starts with \
+`BEGIN READ WRITE`.
+
+A script or trigger that ran bare `psql` stops working until it names the \
+variable. An audit finds each one and says how to fix it.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."

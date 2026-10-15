@@ -24,9 +24,9 @@ When unsure, ask one question, then act: "Do you want to open this regularly, or
 
 ## Widgets: a small answer inline in the thread
 
-A *widget* is an app that lives in the thread that made it. It is not in the apps list. `create_app` with `kind: "widget"` makes one and records this thread as its origin. It shows inline at that turn as a *widget card*: a bar with its name and menu, and the widget under it. The frame is as tall as the content, so the card never scrolls inside. Past about one phone screen, the card clips with a fade and an Expand button that opens the widget full size in Canvas.
+A *widget* is an app that lives in the thread that made it. It is not in the apps list. `create_app` with `kind: "widget"` makes one and records this thread as its origin. Embed it in your reply, `![Name](app:<id>)`, and it shows there as an *inline widget*: a bar with its name and menu, and the widget under it. The frame is as tall as the content, so it never scrolls inside. Past about one phone screen, it clips with a fade and an Expand button that opens the widget full size in Canvas.
 
-A widget has a chip on the thread's *widget shelf*, under the title, only once pinned. Showing one adds no chip. The *home thread* draws no shelf. Holding Home lists its pinned widgets from anywhere, and in Home a tap on the Home icon does too. A pick floats one in a *widget window* the user can drag. So it may draw over any screen, at the width of a phone.
+A widget has a chip on the thread's *widget shelf*, under the title, only once pinned. Embedding one adds no chip. The *home thread* draws no shelf: a widget pinned to Home is a tile on the *Home board*. That board stays in view in a rail beside everything on desktop, and on Home's board face on a phone. So a tile may sit beside any screen, at the width of two board cells.
 
 **When to choose one.**
 - A comparison or a dataset that is easier to scan and click than to read: a fare comparison, a week's trend, a chart with a toggle.
@@ -37,19 +37,19 @@ The system prompt says whether automatic widgets are on. When they are off, make
 
 **When to pin one.** Pin with `widgets(action="pin")` only when the user will come back to the widget in this thread, such as a picker. A one-off answer stays unpinned, so a thread of ten one-offs keeps an empty shelf.
 
-**Build it exactly like an app.** The same scaffold, theme rules and SDK apply, and data still comes through `lucidos.*` (see *Live data* below). Five differences:
+**Build it exactly like an app.** The same scaffold, theme rules and SDK apply. Data still comes through `lucidos.*`, and a widget keeps it current the same way: one `render()`, called on each stream open and each matching file event (see *Live data* below). Five differences:
 
-- **Small: one phone screen, no scroll area inside.** Put the answer on the top screen, because a taller card clips. One focused view, at most two actions, no tabs, no navigation, no settings screen. If it needs more, build an app.
+- **Small: one phone screen, no scroll area inside.** Put the answer on the top screen, because a taller inline widget clips. One focused view, at most two actions, no tabs, no navigation, no settings screen. If it needs more, build an app.
 - **Hold a phone height budget.** By default show about 5 list rows and one control row. Put the sort and the filter in that one row, and never stack two toolbars. Put the rest of the rows behind a "Show more" button.
-- **Named by what it does**, in two or three words: "Flight picker", "Fare grid", "Run chart". The card's bar shows the name, so the trip, dates and other specifics go inside the widget and in its description.
+- **Named by what it does**, in two or three words: "Flight picker", "Fare grid", "Run chart". The inline widget's bar shows the name, so the trip, dates and other specifics go inside the widget and in its description.
 - **Height follows the content.** The host sizes the frame to `document.body`. Never give the body `height: 100vh` or a full-height flex layout, or the frame cannot shrink. Load the SDK, which reports the height. See `system-knowhow/js-sdk.md` § Sizing a widget to its content.
-- **Its manifest says so.** `create_app` writes `"kind": "widget"` and `"origin_thread_id"`. Keep both, and `"reusable"` and `"params"`, when you rewrite `manifest.json`. A widget a plugin ships names `"origin_plugin_id"` instead and is always reusable: see `system-knowhow/plugins.md` § Shipping widgets.
+- **Its manifest says so.** `create_app` writes `"kind": "widget"` and `"origin_thread_id"`. Keep both, and `"reusable"`, `"params"`, `"sizes"` and `"transparent"`, when you rewrite `manifest.json`. A widget a plugin ships names `"origin_plugin_id"` instead and is always reusable: see `system-knowhow/plugins.md` § Shipping widgets.
 
-**How a widget looks.** A widget is one strong shape on calm ground. The card around it already draws a frame and the name, so the widget draws neither.
+**How a widget looks.** A widget is one strong shape on calm ground. The inline widget around it already draws a frame and the name, so the widget draws neither.
 
 - **Lead with one shape, not a table.** Pick the shape that carries the answer: a `.ring` for one score, a `.bar-run` for a short series, a `.choice-row` for a pick, or one large number. Markup and options are in `system-knowhow/js-sdk.md` § Widget shapes. Keep a table for an app, or behind "Show more".
-- **No title, or one short line.** The card bar shows the name. Open with the answer itself, in one short sentence. Never write a heading that repeats the name.
-- **No panel around the widget, and no border inside the card.** The body is the ground. Separate the parts with space, never with a hairline or a box in a box: `body { padding: var(--space-lg); display: grid; gap: var(--space-xl); }`.
+- **No title, or one short line.** The bar shows the name. Open with the answer itself, in one short sentence. Never write a heading that repeats the name.
+- **No panel around the widget, and no border inside it.** The body is the ground. Separate the parts with space, never with a hairline or a box in a box: `body { padding: var(--space-lg); display: grid; gap: var(--space-xl); }`.
 - **Theme tokens only. The accent marks the one thing that matters**, such as the suggested day or the picked choice. Paint the rest with `--text-*` and `--bg-*`.
 - **Soft shapes on the theme's corners.** Use `--radius-round` for choices, pills and bars, and `--radius-surface` for a larger tile. A square theme then squares them too.
 - **Tap targets are choices.** Give each data item a `.choice`, and set `aria-pressed` on the pick. Add at most one `.action-btn`, for the one action that follows the pick.
@@ -57,7 +57,6 @@ The system prompt says whether automatic widgets are on. When they are off, make
 - **Show only data you have.** A reading for a day still to come is a guess. Show a guess as a suggestion with its reason ("clear calendar, readiness up four days"), never as a value in a ring or a bar.
 - **A calm tap.** The picked choice fills, and a ring or bar slides to its new value, on the `--duration-*` tokens. Nothing bounces. Under `data-motion="reduce"` it all stands still (§ Motion that explains).
 - **Small type, one large value.** Body text is `--font-size-sm`, and a label over a part is `--font-size-xs` in `--text-muted`. Only the one key value goes up, to `--font-size-2xl` or `--font-size-3xl`.
-- **A small form for a floating window.** In minimal mode a widget window shows the widget alone on a see-through page, at its content's width. See `system-knowhow/js-sdk.md` § Drawing for a widget window. Under `html[data-widget-mode="minimal"]`, show the main shape and its one line, and hide the rest. Give that form a fill of its own on `--radius-surface`, and keep its top right corner free for the window's controls.
 
 **Params: one widget, many places.** A widget can take *widget params*, a JSON object given for each place it shows. A sound player takes the clip; a chart takes the series. Declare the names in the manifest, and read the object with `lucidos.params()` (`system-knowhow/js-sdk.md` § lucidos.params):
 
@@ -78,30 +77,50 @@ const { clip } = lucidos.params();   // {} when the widget was given none
 
 The host carries them in the frame URL, so they are visible there. Never put a credential in a param. Params over 2 KB are refused: put large data in a file and pass its path.
 
+**Sizes: how big its Home board tile may be.** A widget pinned to Home is a tile on the *Home board*, at one of three *widget sizes*: `small` (one square cell), `medium` (two cells wide, one high) or `large` (two by two). A widget that declares none takes all three and starts medium, so draw for each. Declare `sizes` only to drop one the widget cannot draw well, default first, with `create_app`'s `sizes` or in the manifest. Only a widget takes sizes, and each name may appear once.
+
+```json
+{ "name": "Clock", "kind": "widget", "sizes": ["small", "medium"], "transparent": true }
+```
+
+**Transparent: a widget with its own shape.** A tile draws a rounded surface behind the widget. Set `"transparent": true` for a widget that draws its own shape, such as a round clock: its tile and page are then see-through. Give the shape a fill of its own.
+
+**The size contract on the Home board.** Five rules:
+
+1. The tile sets the box, and the frame fills it exactly. A content-size report never sizes a tile.
+2. Draw for the size you are told, under `html[data-widget-size="small"]` and its siblings or with `lucidos.widget.size()`. Never scroll inside a tile.
+3. Content past the tile is clipped under a fade. The tile's menu offers Open in Canvas, which opens the widget full size.
+4. A layout may ask for a size the widget no longer declares, as after an update. The tile then shows the nearest smaller declared size, else the nearest larger.
+5. Sizes are names, never pixels. A cell is one size in rem at every board width, and a narrower board shows fewer columns.
+
+**A tap leads into the work.** A tile is a way in: tapping a row opens its thread or app with `lucidos.ui.navigate` (`system-knowhow/js-sdk.md` § lucidos.ui). Keep a tile live from data the workspace holds: a trigger fetches, writes to `data/` and emits an event, and the widget re-reads on that event. A tile that polls on a timer keeps a renderer busy for nothing, so stop timers when `lucidos.widget.onVisibility` says it is hidden.
+
 **Embed a widget wherever a picture draws.** A *widget embed*, `![label](app:<id>?params={...})`, draws the widget live: in a question option's description or preview, in a card's `message`, and in a reply. The alt text is its label. Only the leading `!` draws it, exactly as for a picture. The params are a JSON object, written raw or percent-encoded.
 
 - **In an option**, the engine lifts the embed into the option, and the card draws the widget under the option's label. One embed per option. A broken embed, an unknown or non-widget id, another thread's widget that is not reusable, or params the manifest does not take refuse the card. Fix the embed and ask again.
 - **In a reply**, a bad embed cannot be refused, so it reads "This widget is not available" in place. While the reply streams it shows its label; the widget mounts once the text is final.
-- **An embed records no showing.** Its frame in a reply offers Pin to shelf (Pin to Home in Home) and Open in Canvas. A pin adds the instance to the *thread widgets*.
+- **An embed records no showing.** A pin from its inline widget adds the instance to the *thread widgets*, and names the turn, so "Show in thread" lands there.
 
 **Built-in widgets ship with Lucidos.** A *built-in widget* is a reusable widget under an id starting `lucidos-`, such as `lucidos-sound-player` or `lucidos-video-player` (each takes param `clip`: a workspace path or an https URL). It is read-only: no tool, route or CLI command can change, delete or stop reusing it, and `create_app` refuses a new `lucidos-` id. Read its files at `apps/<id>/` to build your own from it. Prefer a built-in over building the same thing again.
 
 **Only one sound plays at a time.** A clip that starts in one app or widget pauses the others. So a voice sample per option never talks over another (`system-knowhow/js-sdk.md` § One sound at a time).
 
-**What the user can do with it**, from the ⋯ menu on the card or the chip. Each action is also yours:
+**What the user can do with it**, from the ⋯ menu on the inline widget or the chip. Each action is also yours:
 
 | Menu action | Tool |
 |---|---|
-| Open in Canvas, full size (the card's Expand does the same) | `navigate_ui` to the widget's id |
+| Open in Canvas, full size (Expand does the same) | `navigate_ui` to the widget's id |
 | Make reusable, offering it to every thread | `widgets(action="make_reusable")` |
-| Show a reusable widget in another thread | `widgets(action="show", thread_id=…)` |
+| Show a widget in this thread | Embed it in your reply: `![Name](app:<id>)` |
 | Pin to shelf, for a widget the user will come back to in this thread (Pin to Home in the home thread) | `widgets(action="pin")` |
-| Unpin from shelf (the card stays; Unpin from Home in the home thread) | `widgets(action="unpin")` |
+| Pin to Home from another thread: a tile on the Home board. A widget that belongs to its thread is made reusable first | `widgets(action="pin", thread_id=<the home thread>)` |
+| Arrange the Home board: order, size, hide on phone or desktop. Only when the user asks in this turn | `widgets(action="arrange")`, after `widgets(action="board")` |
+| Unpin from shelf (the inline widget stays; Unpin from Home in the home thread) | `widgets(action="unpin")` |
 | Make app | Build a new app with `create_app`, reading the widget's files. The widget stays as it is. |
 
-Show, pin and unpin take `params` and `label` too: one set of params is one *widget instance*, with its own card and chip. `widgets(action="show", app_id="lucidos-sound-player", params={"clip": "artifacts/voices/marin.mp3"}, label="Marin")` shows that player with that clip.
+An embed, a pin and an unpin take params and a label too: one set of params is one *widget instance*, with its own inline widget and chip. `![Marin](app:lucidos-sound-player?params={"clip":"artifacts/voices/marin.mp3"})` shows that player with that clip.
 
-`widgets(action="thread")` lists the *thread widgets*: every instance shown or pinned in a thread, and which are pinned.
+`widgets(action="thread")` lists the *thread widgets*: every instance pinned in a thread, or shown there by an old `WidgetShown`, and which are pinned.
 
 Deleting the thread deletes its own widgets. A reusable widget, and an app made from a widget, stay.
 
@@ -216,10 +235,11 @@ Don't design on paper. Scaffold the smallest thing that shows the idea (`create_
 
 ## App icon
 
-Every app and every widget gets an icon. Lucidos draws it on the apps panel, the menu drawer, the widget shelf and card, Search Everywhere, the history menu and the coding-agent App row. Widgets need one most: the shelf shows them side by side.
+Every app and every widget gets an icon. Lucidos draws it on the apps panel, the menu drawer, Search Everywhere, the history menu and the coding-agent App row. A widget's shelf chip and inline widget draw it too. Widgets need one most: the shelf shows them side by side.
 
 - **Pass `icon_svg` to `create_app`.** It saves the SVG as `assets/icon.svg` and sets the manifest's `"icon": "assets/icon.svg"`.
-- **Draw for 18px.** A square `viewBox`, one bold motif in full colour, no text and no fine detail. Lucidos sets it on a small neutral tile, so leave a little margin.
+- **The name is words only.** Never put an emoji or other pictograph in an app or widget name. Lucidos draws the icon beside the name, so a leading emoji shows two icons side by side. Draw the motif in the SVG icon instead.
+- **Draw for 18px.** A square `viewBox`, one bold motif in full colour, no text and no fine detail. Lucidos draws it unframed, clipped to a rounded square, so give it its own background or leave a little margin.
 - **The field has one meaning:** a relative path inside the app folder to an SVG, PNG or WebP file of at most 512 KiB. An emoji, a glyph name, a `..` path or a missing file counts as no icon.
 - **Without a valid icon, a monogram tile stands in:** the first letter of the name on a tile coloured from the theme. It is a fallback, not a design choice.
 - **To add or change an icon later,** write the file under `assets/` and set `icon` in `manifest.json`.
@@ -293,7 +313,7 @@ A "no" on any line means the app is not finished:
 - Does **every** `.action-btn-confirm` / `.action-btn-danger` / `.action-btn-secondary` still carry the base `.action-btn`?
 - Does a **view switch, sort or filter** show its current choice with `.action-btn` variants? → use `.segmented-btn.active`, or `.pill-bar-btn` with `aria-pressed`.
 - Is **every `:hover`** you wrote inside `@media (hover: hover)`?
-- For a **widget**: does it fit one phone screen, with about 5 rows, one control row and the rest behind "Show more"? Does it lead with one shape instead of a table, with no title and no border inside the card?
+- For a **widget**: does it fit one phone screen, with about 5 rows, one control row and the rest behind "Show more"? Does it lead with one shape instead of a table, with no title and no border inside it?
 - Any **magic font-size number** (`0.95rem`, `0.78rem`, `18px`) instead of a `--font-size-*` token? → snap it to the nearest scale step.
 - Any **`font-family`** declaration whose value isn't a token? → delete it. Keep one only for a deliberately different face, set to `var(--font-mono)` or `var(--font-ui)`.
 - Only **real theme tokens**? The token set is closed: `--space-{xs,sm,md,lg,xl}`, `--radius-{sm,md,lg}`, the theme's corner steps `--radius-{control,surface,round}`, `--font-size-{3xs,2xs,xs,sm,md,lg,xl,2xl,3xl,display}`, `--font-ui` / `--font-mono` (full list in `js-sdk.md` § Theme variables). Don't invent tokens like `--space-2xl`, `--font-size-4xs`, or `--sans` / `--mono`. An undefined `var()` silently drops the rule. Write **`--font-ui`** for the UI font; `--font-family` / `--font` are only tolerated aliases.
@@ -380,21 +400,108 @@ See `system-knowhow/js-sdk.md` § Reduced motion, and § Theme variables for the
 
 ## Live data
 
-This applies to apps and widgets alike. Data written into the HTML freezes the moment you write it: a flight picker with its fares in the markup shows last week's prices.
+This applies to apps and widgets alike. **An app shows the current state of its data, whoever changed it**: the user in this app, the agent, a trigger, a script, or another device. The shell keeps itself correct the same way, from events.
 
-- **Keep data out of the HTML.** Read it at load through `lucidos.data` (workspace files), `lucidos.events` (the event store) or `lucidos.proxy` (an outside API).
-- **Subscribe to the event that changes it.** Call `lucidos.sse.on` with that event's name, and re-render in place: update the rows and numbers, and keep the user's scroll position and selection.
-- **For outside data such as fares, let a trigger refresh it.** The trigger writes fresh data to a file under `artifacts/` and emits an event. The widget listens for that event and reads the file again, so it never polls.
+- **Keep data out of the HTML.** Markup freezes the moment you write it: a flight picker with its fares in the markup shows last week's prices. Read the data through `lucidos.data` (workspace files), `lucidos.events` (the event store) or `lucidos.proxy` (an outside API).
+- **Keep the app's data in a file under `artifacts/<app-id>/`**, so one path names it.
+
+### The events a file change emits
+
+The engine announces each file write it makes. Listen for the event, check it names your file, and read the file again.
+
+| Where the file is | Events | Payload field |
+|---|---|---|
+| Under `artifacts/` | `ArtifactCreated`, `ArtifactUpdated`, `ArtifactDeleted` | `artifact_path`, relative to `artifacts/`: `fare-watch/fares.json` |
+| Anywhere else in `data/` | `DataFileWritten`, `DataFileEdited`, `DataFileDeleted` | `path`, relative to `data/`: `config/fares.json` |
+
+These come from the agent's file tools (`write_file`, `edit_file`, `copy_file`, `delete_file`), from `run_python`, and from the data API. The data API carries `lucidos.data.*`, so your app's own writes, and `lucidos data write`.
+
+A data API write to an `artifacts/` path emits both: the `Artifact*` event, and a `DataFile*` event whose `path` keeps the `artifacts/` prefix. Listen to the `Artifact*` events for a file under `artifacts/`, and to the `DataFile*` events for any other file. Never both, or each write renders twice.
+
+### Some writes announce nothing
+
+No event, so no open app sees the change until it reloads:
+
+- `run_bash`, and anything it starts.
+- `run_python_background`. It writes straight to `data/`, with no staging.
+- A script that writes with a plain `open()` outside `run_python`, however it was started.
+
+**A script that feeds an app writes through `lucidos data write`.** The CLI is on `PATH` in every subprocess Lucidos starts, and it goes through the data API, so the write is announced like any other:
+
+```bash
+python fetch_fares.py > "${TMPDIR:-/tmp}/fares.json"
+lucidos data write artifacts/fare-watch/fares.json --from "${TMPDIR:-/tmp}/fares.json"
+```
+
+See `system-knowhow/lucidos-cli.md` § `lucidos data write`.
+
+### One `render()`, called from every place the data can change
 
 ```js
+const PATH = 'artifacts/fare-watch/fares.json';
+const ARTIFACT = PATH.slice('artifacts/'.length);   // what artifact_path carries
+let shown = null;   // the text on screen now
+let reads = 0;      // so a slow read never paints over a newer one
+
 async function render() {
-  const fares = JSON.parse(await lucidos.data.read('artifacts/fare-watch/fares.json'));
-  // Update the existing rows; do not rebuild the page.
+  const read = ++reads;
+  let text;
+  try {
+    text = await lucidos.data.read(PATH);
+  } catch (err) {
+    if (err.httpCode !== 404) throw err;   // a real failure: show it, never hide it
+    text = '';   // deleted, or not written yet: draw the empty state
+  }
+  if (read !== reads || text === shown) return;
+  shown = text;
+  // Update the rows and numbers in place. Keep the scroll position and the
+  // selection, and leave alone any field that has focus or an unsaved edit.
 }
-lucidos.sse.connect();
-lucidos.sse.on('FaresRefreshed', render);
-render();
+
+function renderIfMine(data) {
+  if (data.artifact_path === ARTIFACT) render();
+}
+
+lucidos.sse.onOpen(render);   // the first load, and every reconnect
+lucidos.sse.on('ArtifactCreated', renderIfMine);
+lucidos.sse.on('ArtifactUpdated', renderIfMine);
+lucidos.sse.on('ArtifactDeleted', renderIfMine);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') render();
+});
+addEventListener('pageshow', (event) => {
+  if (event.persisted) render();
+});
 ```
+
+- **Call `render` from `lucidos.sse.onOpen`, not on load.** It runs on the first open, and at once if the stream is already open. A second call on load reads everything twice at startup.
+- **The reconnect is not optional.** The stream does not replay what landed while it was down: a network drop, an engine restart, a phone that slept. `onOpen` runs again on each reopen, and the read catches the app up.
+- **The resume listeners cover a dead stream that looks alive.** iOS can resume a suspended PWA with its stream silently stalled. A read when the page comes back is cheap, and the `shown` check makes a read that finds nothing new cost no repaint.
+- **Check the path.** Every file write in the workspace reaches every listener.
+- **Re-render in place.** Update what changed, never rebuild the page. A rebuild loses the scroll position, the selection and the user's place in a form.
+
+### Your own write
+
+The event for your own write comes back to you. Handle it so the screen never flickers and never fights the user's typing:
+
+```js
+async function save(fares) {
+  const text = JSON.stringify(fares, null, 2);
+  shown = text;   // the screen already shows this: its echo is now a no-op
+  await lucidos.data.write(PATH, text);
+}
+```
+
+- **Update the screen when the user acts, then write.** Do not wait for the event to show the user their own change.
+- **Set `shown` before the write.** The echo then reads the same text and stops at the `shown` check.
+- **Never overwrite a field the user is editing.** Skip a field that has focus or holds an unsaved edit, and render it when the user leaves it.
+
+### Outside data: a trigger keeps it fresh
+
+For data from outside, such as fares, a trigger refreshes it on a schedule so the app never polls. Use the same `render`:
+
+- **The trigger writes the file.** Its write is announced, so the listeners above pick it up with nothing more.
+- **Or the trigger emits a domain event**, such as `FaresRefreshed`, when the data lives in the event store rather than in a file. Then `render` reads it with `lucidos.events.query`, and the app calls `lucidos.sse.on('FaresRefreshed', render)` beside `lucidos.sse.onOpen(render)`.
 
 See `system-knowhow/js-sdk.md` § lucidos.sse, and `system-knowhow/triggers.md` for the trigger.
 
@@ -418,10 +525,10 @@ While the app coding-agent thread is open, the user can preview the in-flight ap
 `capture_app` / `refresh_app` are **agent self-check tools**: they reload the open app UI and snapshot it back to you. Use them *only while iterating on an app with the user*, when that app is the subject of the current turn. Never use them in threads that aren't about an app (research, data tasks, general chat).
 
 - **You usually don't need them at all.** The engine auto-refreshes edited apps at the end of your turn (see the chat path above). Reserve a manual `capture_app` for when you must *look* at the result mid-turn before the next edit.
-- **They reach one screen: the turn's *last used device*,** the same one `navigate_ui` sends to. Only that device reloads and answers. A failure names it: `Error from "<device>", …` when it has no app open, or a timeout naming the device that did not answer. A timeout adds a hint when Lucidos is not visible there. Tell the user which device you looked at.
-- **On "No app UI is currently open", prefer the visible path: ask the user to open the app.** That's the error's first suggested recovery. Calling `navigate_ui(target=app-ui)` yourself is acceptable **only** mid app-iteration, when opening *that* app is clearly the next step. Don't yank an app onto the user's screen out of the blue.
+- **They reach one screen: the turn's *last used device*,** the same one `navigate_ui` sends to. To capture another device, pass `capture_app` a `device` from Known devices, as `navigate_ui` takes. Only the target device reloads and answers. A failure names it: `Error from "<device>", …` when it has no app open, or a timeout naming the device that did not answer. A timeout adds a hint when Lucidos is not visible there. Tell the user which device you looked at.
+- **On "No app UI is currently open", open the app yourself.** Call `navigate_ui(target="app", app_id=...)` with the same `device`, then capture again. Never ask the user to open it. Do this only while the app is the subject of the turn, because it takes over the user's screen.
 - **To keep a screenshot, pass `save_as_artifact`** (`screenshots/board.png`, relative to `data/artifacts/`). The picture is then sharp, at the device's pixel ratio, in the format the extension names: `.png`, `.jpg` or `.webp`. You see the same picture. A device that cannot encode the format saves nothing and says so; retry with `.png`.
-- **Never retry the same `capture_app` / `refresh_app` call after it fails.** The identical call trips the circuit breaker. On "No app UI is currently open", **switch strategy**: ask the user, or `navigate_ui` once.
+- **Never retry the same `capture_app` / `refresh_app` call after it fails.** The identical call trips the circuit breaker. On "No app UI is currently open", **switch strategy**: `navigate_ui` once, then capture.
 - **In background / trigger / cron threads, don't attempt `capture_app` / `refresh_app` (or navigate-to-app) at all.** Such a turn has no *last used device*, so no single screen takes the navigate. The capture goes to every connected page, and the first answer wins, usually "No app UI is currently open".
 
 ## Common mistakes to avoid

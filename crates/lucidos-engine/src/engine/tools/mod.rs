@@ -319,6 +319,7 @@ impl LucidosEngine {
             tn::DETACH_CHILD_THREAD => self.execute_detach_child_thread(args, thread_id).await,
             tn::ARCHIVE_THREAD => self.execute_archive_thread(args, thread_id).await,
             tn::REQUEST_READ => self.execute_request_read(args, thread_id).await,
+            tn::WAKE_PARENT => self.execute_wake_parent(args, thread_id).await,
             tn::TRIAGE_THREADS => self.execute_triage_threads(thread_id).await,
             tn::APPLY_THREAD_TRIAGE => self.execute_apply_thread_triage(args, thread_id).await,
             tn::LIST_CHANGES => self.execute_list_changes(args, thread_id).await,
@@ -344,9 +345,12 @@ impl LucidosEngine {
             | tn::LIST_MCP_SERVERS
             | tn::START_MCP_SERVER
             | tn::STOP_MCP_SERVER
-            | tn::REMOVE_MCP_SERVER => {
-                to_outcome(self.execute_mcp_management_tool(name, args).await)
-            }
+            | tn::ENABLE_MCP_SERVER
+            | tn::DISABLE_MCP_SERVER
+            | tn::REMOVE_MCP_SERVER => to_outcome(
+                self.execute_mcp_management_tool(name, args, thread_id)
+                    .await,
+            ),
             _ if name.starts_with("mcp__") => {
                 // Safety fallback — MCP tools are handled by handle_special_tool() before reaching here
                 Err(format!(
@@ -724,7 +728,8 @@ impl LucidosEngine {
 
     /// LLM tool: move a child thread this thread spawned to top level
     /// (ADR 0278). The caller is `execute_tool`'s ambient thread, as for a
-    /// follow-up, so the model picks which child but never who it is.
+    /// follow-up, so the model picks which child but never who it is. The
+    /// engine's move asks the owner's gate, as it does for the route.
     async fn execute_detach_child_thread(
         &self,
         args: &serde_json::Value,
@@ -824,6 +829,31 @@ impl LucidosEngine {
         record_agent_read_decision(&self.event_bus, thread_id, decision)
             .await
             .map_err(|e| format!("Error: recording the read decision failed: {e}"))?;
+        Ok(decision.ack().to_string())
+    }
+
+    /// LLM tool: a child thread's *wake decision* on this turn's report. The
+    /// thread is the ambient one, and only a thread with a parent may decide.
+    /// A child with a declared wake mode records nothing (ADR 0451).
+    async fn execute_wake_parent(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::turn_end::wake_decision::{
+            record_agent_wake_decision, WakeDecision, WakeDuty,
+        };
+        let decision = WakeDecision::from_tool_args(args)?;
+        match WakeDuty::of_thread(&self.pool, thread_id).await {
+            WakeDuty::NoParent => {
+                return Err("Error: this thread has no parent thread to wake.".to_string())
+            }
+            WakeDuty::Declared(mode) => return Ok(WakeDecision::declared_ack(mode)),
+            WakeDuty::Decide => {}
+        }
+        record_agent_wake_decision(&self.event_bus, thread_id, decision)
+            .await
+            .map_err(|e| format!("Error: recording the wake decision failed: {e}"))?;
         Ok(decision.ack().to_string())
     }
 
@@ -1791,7 +1821,7 @@ pub(crate) fn parse_send_notification_args(
 
     // When this trigger fired in response to a thread-scoped event (e.g.
     // `UserQuestionAsked`), the originating thread lives in a task-local
-    // set by `handle_domain_event`. Prefer it as the deep-link target.
+    // set by `fire_matching_triggers`. Prefer it as the deep-link target.
     // Otherwise the push would point at the trigger LLM's own thread, which
     // the user has no reason to open.
     let link_thread = crate::scheduler::user_tasks::ORIGIN_THREAD_ID

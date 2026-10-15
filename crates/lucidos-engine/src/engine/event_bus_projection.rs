@@ -17,6 +17,8 @@
 //! The `impl EventBus` methods keep their original call paths; the helpers are
 //! shared sibling-to-sibling, so nothing outside this module changes.
 
+#[path = "event_bus_projection_keep_alive.rs"]
+pub(crate) mod keep_alive;
 #[path = "event_bus_projection_propagation.rs"]
 mod propagation;
 #[path = "event_bus_projection_system.rs"]

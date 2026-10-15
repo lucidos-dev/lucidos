@@ -124,9 +124,8 @@ mod startup_sweep_branch_work {
         // refresh_branch_work_for_active_cc_threads with a repo whose
         // branch has commits: if the gate didn't filter, the state would
         // become unproposed.
-        let workspace_path =
-            std::env::temp_dir().join(format!("lucidos-sweep-test-{}", Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_path = tmp.path().to_path_buf();
         crate::engine::agent_recovery::refresh_branch_work_for_active_cc_threads(
             &pool,
             &workspace_path,
@@ -151,7 +150,6 @@ mod startup_sweep_branch_work {
             "sweep must not mark an archived thread's branch as work (archive_state={archive_state})"
         );
 
-        let _ = std::fs::remove_dir_all(&workspace_path);
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -516,6 +514,9 @@ mod startup_sweep_branch_work {
                     .to_string_lossy()
                     .into(),
                 app_id: Some("habit-tracker".into()),
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),
@@ -641,6 +642,7 @@ mod settle_orphaned_running_sweep {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "hi".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -804,33 +806,108 @@ mod settle_orphaned_running_sweep {
         teardown_test_db(&db_name).await;
     }
 
-    /// Two starts run later in boot on their own: the parent-resume refire
-    /// takes a bare `ChildThreadCompleted`, and the spawn dispatcher's
-    /// backfill takes a bare `ContinuationRequested`. An abort would record an
-    /// interruption that never happened, and would stop the dispatcher.
+    /// The parent-resume refire runs a bare `ChildThreadCompleted` later in
+    /// boot. An abort would record an interruption that never happened.
     #[tokio::test]
     async fn idles_a_start_boot_will_run_without_an_abort() {
-        for start in ["ChildThreadCompleted", "ContinuationRequested"] {
-            let (pool, db_name) = setup_test_db().await;
-            let (bus, _rx) = EventBus::new(pool.clone());
-            let thread_id = Uuid::new_v4();
-            died_cc_turn(&bus, thread_id).await;
-            idled(&bus, thread_id).await;
-            bare_start(&pool, thread_id, start).await;
-            force_running(&pool, thread_id).await;
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        died_cc_turn(&bus, thread_id).await;
+        idled(&bus, thread_id).await;
+        bare_start(&pool, thread_id, "ChildThreadCompleted").await;
+        force_running(&pool, thread_id).await;
 
-            settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
+        settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
 
-            assert_eq!(
-                status_of(&pool, thread_id).await.as_deref(),
-                Some("idle"),
-                "{start}"
-            );
-            assert_eq!(aborted_count(&pool, thread_id).await, 0, "{start}");
+        assert_eq!(status_of(&pool, thread_id).await.as_deref(), Some("idle"));
+        assert_eq!(aborted_count(&pool, thread_id).await, 0);
 
-            pool.close().await;
-            teardown_test_db(&db_name).await;
-        }
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The boot order for a `ContinuationRequested` the previous process never
+    /// started, on a thread recovery does not own. The settle runs first, then
+    /// the spawn dispatcher's orphan scan, which reads only `running` threads.
+    ///
+    /// Nothing at boot may drive the request: a crash never auto-resumes. So
+    /// the settle must end it with an event, and the user keeps Continue.
+    #[tokio::test]
+    async fn an_unstarted_continuation_ends_with_an_abort_at_boot() {
+        use crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON;
+        use crate::engine::agent_session::spawn_dispatcher::{SpawnDispatcher, SpawnRequest};
+        use std::sync::Arc;
+
+        let (pool, db_name) = setup_test_db().await;
+        let (previous, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        died_cc_turn(&previous, thread_id).await;
+        idled(&previous, thread_id).await;
+        previous
+            .emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ContinuationRequested {
+                    reason: USER_CLICKED_CONTINUE_REASON.to_string(),
+                },
+                meta: meta(EventChannel::ClaudeCode),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            status_of(&pool, thread_id).await.as_deref(),
+            Some("running")
+        );
+
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let bus = Arc::new(bus);
+        settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
+        let (handle, mut spawn_rx) = SpawnDispatcher::spawn(pool.clone(), bus.clone());
+
+        assert_eq!(
+            aborted_count(&pool, thread_id).await,
+            1,
+            "a request nothing will start ends with an abort, not a bare idle"
+        );
+        assert_eq!(
+            abort_cause(&pool, thread_id).await.as_deref(),
+            Some("recovery_after_restart")
+        );
+        assert_eq!(status_of(&pool, thread_id).await.as_deref(), Some("failed"));
+
+        // A request on a fresh thread is the barrier: the dispatcher finishes
+        // its orphan scan before it reads the channel, so the barrier comes
+        // first only when the scan sent nothing.
+        let barrier = Uuid::new_v4();
+        start_cc_session(&bus, barrier, "claude-code/barrier", None).await;
+        let barrier_event = bus
+            .emit(BusEvent::Thread {
+                thread_id: barrier,
+                event: ThreadEvent::ContinuationRequested {
+                    reason: USER_CLICKED_CONTINUE_REASON.to_string(),
+                },
+                meta: meta(EventChannel::ClaudeCode),
+            })
+            .await
+            .unwrap()
+            .unwrap()
+            .event_id;
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), spawn_rx.recv())
+            .await
+            .expect("the dispatcher sent nothing")
+            .expect("channel open");
+        assert_eq!(
+            sent,
+            SpawnRequest::Continue {
+                thread_id: barrier,
+                event_id: barrier_event,
+            },
+            "the settled request must not be driven"
+        );
+
+        handle.abort();
+        pool.close().await;
+        teardown_test_db(&db_name).await;
     }
 
     /// A thread the recovery loop already owns is left for that path to resume.
@@ -1128,8 +1205,8 @@ mod settle_stranded_trigger_runs_sweep {
 //
 // They are tested together because the failure mode is them DISAGREEING about the
 // start set: the same abort then counts as consumed for one and live for the
-// other. The startup lease guarantees the predecessor's teardown emit has landed
-// before recovery reads either.
+// other. The engine's owner lock guarantees the predecessor's teardown emit has landed
+// before recovery reads either (ADR 0438).
 mod restart_boundary_reads {
     use crate::engine::agent_recovery::recovery::{
         boundary_abort_already_emitted, switch_was_user_initiated,
@@ -1156,6 +1233,7 @@ mod restart_boundary_reads {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -1186,6 +1264,7 @@ mod restart_boundary_reads {
                 branch: "feature-branch".into(),
                 origin: None,
                 reason: Some("engine_restart_interrupt".into()),
+                resumed_abort_id: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

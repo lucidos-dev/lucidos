@@ -1062,7 +1062,7 @@ pub(crate) fn match_sentinel(
                     payload,
                 })
             },
-            Some("Install panel sent to the user. It stays open in this thread until they click Confirm or Cancel. Do not chat-ask about overwrites and do not claim the install succeeded: the panel resolves it and the next user message will tell you the outcome."),
+            Some("Install panel sent to the user. It stays open in this thread until they click Install (or Update) or Cancel. Do not chat-ask about overwrites and do not claim the install succeeded: the panel resolves it and the next user message will tell you the outcome."),
         ),
         (
             PLUGIN_UNINSTALL_REQUEST_PREFIX,
@@ -1074,7 +1074,7 @@ pub(crate) fn match_sentinel(
                     payload,
                 })
             },
-            Some("Uninstall panel sent to the user. It stays open in this thread until they click Confirm or Cancel. Do not chat-ask which files to delete and do not claim files were removed: the panel resolves it and the next user message will tell you the outcome."),
+            Some("Uninstall panel sent to the user. It stays open in this thread until they click Uninstall or Cancel. Do not chat-ask which files to delete and do not claim files were removed: the panel resolves it and the next user message will tell you the outcome."),
         ),
         (
             "[EMAIL_CONFIRM]",
@@ -1743,9 +1743,13 @@ pub(crate) struct FinalAnswerBesideDecision<'a> {
     pub(crate) wake_nudges_forced: usize,
 }
 
-/// Whether a round's calls are its read decision and nothing else.
-pub(crate) fn calls_only_the_read_decision(calls: &[crate::llm::provider::ToolCall]) -> bool {
-    !calls.is_empty() && calls.iter().all(|c| c.name == tn::REQUEST_READ)
+/// Whether a round's calls are its turn-end decisions and nothing else: the
+/// read decision, the wake decision, or both.
+pub(crate) fn calls_only_turn_end_decisions(calls: &[crate::llm::provider::ToolCall]) -> bool {
+    !calls.is_empty()
+        && calls
+            .iter()
+            .all(|c| c.name == tn::REQUEST_READ || c.name == tn::WAKE_PARENT)
 }
 
 impl LucidosEngine {
@@ -1764,7 +1768,7 @@ impl LucidosEngine {
             || input.injections_pending
             || input.cancelled
             || !input.response.progress_notes.is_empty()
-            || !calls_only_the_read_decision(&input.response.tool_calls)
+            || !calls_only_turn_end_decisions(&input.response.tool_calls)
         {
             return None;
         }
@@ -2274,14 +2278,13 @@ pub(crate) fn round_capture_sections(
 ///
 /// Almost all of it is fixed for the turn: a family is offered on workspace
 /// capability, never on the thread (ADR 0088). The MCP slice is the exception.
-/// The model can start, stop or remove a server with the `mcp` tool, and so
-/// can the user from Settings, while the turn runs. The array used to be
-/// frozen at setup, so a server started mid-turn stayed uncallable until the
-/// next user message.
+/// It is a function of the running servers and of the servers THIS thread
+/// enabled (ADR 0430), and both can move while the turn runs.
 ///
 /// `mcp_generation` is what the loop compares against
-/// `McpManager::tool_surface_generation()` each round. See
-/// `docs/plans/2026-09-16-mcp-tools-register-mid-turn.md`.
+/// `McpManager::tool_surface_generation()` each round. A moved generation
+/// says some thread's slice may have moved, so the loop recomputes this
+/// one's. Only a changed slice rewrites the array.
 pub(crate) struct TurnTools {
     defs: Vec<ToolDefinition>,
     names: Vec<String>,
@@ -2292,6 +2295,8 @@ pub(crate) struct TurnTools {
     mcp_char_ceiling: usize,
     /// What the MCP slice left out, as the line the model is told.
     mcp_dropped_notice: Option<String>,
+    /// The running servers this thread enabled, as of the last refresh.
+    mcp_servers: std::collections::BTreeSet<String>,
 }
 
 impl TurnTools {
@@ -2309,8 +2314,10 @@ impl TurnTools {
             mcp_generation: 0,
             mcp_char_ceiling,
             mcp_dropped_notice: None,
+            mcp_servers: std::collections::BTreeSet::new(),
         };
         tools.refresh_mcp(surface);
+        tools.remeasure();
         tools
     }
 
@@ -2347,31 +2354,36 @@ impl TurnTools {
         self.mcp_dropped_notice.as_deref()
     }
 
-    /// Every MCP server the array currently offers a tool for.
+    /// The running servers this thread enabled, as of the last refresh.
     ///
-    /// Read either side of a refresh to see which servers came up and which
-    /// went away. Sorted, so the line built from it reads the same each time.
-    pub(crate) fn mcp_server_ids(&self) -> std::collections::BTreeSet<String> {
-        self.defs
-            .iter()
-            .filter_map(|t| crate::mcp::McpManager::parse_mcp_tool_name(&t.name))
-            .map(|(server_id, _)| server_id)
-            .collect()
+    /// Read either side of a refresh to see which servers this thread gained
+    /// and lost. Sorted, so the line built from it reads the same each time.
+    pub(crate) fn mcp_server_ids(&self) -> &std::collections::BTreeSet<String> {
+        &self.mcp_servers
     }
 
-    /// Swap the MCP slice for what the servers offer now.
+    /// Take the slice this thread's servers offer now. Returns whether the
+    /// array changed.
     ///
-    /// Only that slice: re-deriving the engine-authored families would change
-    /// nothing and cost a read, and their order is what keeps the cacheable
-    /// head of the array stable. The new tools land at the tail, where the
-    /// turn's setup put them.
-    pub(crate) fn refresh_mcp(&mut self, surface: crate::mcp::McpToolSurface) {
-        self.defs
-            .retain(|t| crate::mcp::McpManager::parse_mcp_tool_name(&t.name).is_none());
-        self.mcp_dropped_notice = surface.dropped_notice();
-        self.defs.extend(surface.tools);
+    /// The stamp always moves. The array moves only when the slice differs,
+    /// so a generation bumped by another thread's enable rewrites nothing
+    /// here. Only the slice ever moves: the engine-authored head stays in
+    /// place and in order, which keeps it the cacheable prefix of the array.
+    pub(crate) fn refresh_mcp(&mut self, surface: crate::mcp::McpToolSurface) -> bool {
         self.mcp_generation = surface.generation;
+        self.mcp_servers = surface.servers.clone();
+        let is_mcp =
+            |t: &ToolDefinition| crate::mcp::McpManager::parse_mcp_tool_name(&t.name).is_some();
+        let head_len = self.defs.iter().take_while(|t| !is_mcp(t)).count();
+        let notice = surface.dropped_notice();
+        if self.defs[head_len..] == surface.tools[..] && self.mcp_dropped_notice == notice {
+            return false;
+        }
+        self.defs.truncate(head_len);
+        self.defs.extend(surface.tools);
+        self.mcp_dropped_notice = notice;
         self.remeasure();
+        true
     }
 
     fn remeasure(&mut self) {
@@ -2380,31 +2392,37 @@ impl TurnTools {
     }
 }
 
-/// Which MCP servers came up or went away since the request was assembled.
-/// `None` when the same servers are offered.
+/// Which servers this thread gained or lost since the request was
+/// assembled. `None` when it offers the same servers.
 ///
-/// `[STOPPED MCP SERVERS]` is built once at turn setup and sits in the first
-/// message. That message is fixed for the turn, which is what keeps the prefix
-/// cache. The array moves per round (ADR 0195), so the two disagree the moment
-/// a server starts. The model then reads a server it just started as stopped,
-/// and either starts it again or tells the user it is not running.
+/// `[MCP SERVERS]` is built once at turn setup and sits in the first message.
+/// That message is fixed for the turn, which is what keeps the prefix cache.
+/// The array moves per round (ADR 0195), so the two disagree the moment this
+/// thread enables or loses a server. The model would then read a server it
+/// just enabled as unavailable, and enable it again or tell the user so.
 pub(crate) fn mcp_surface_correction(
     before: &std::collections::BTreeSet<String>,
     after: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
-    let came_up: Vec<&str> = after.difference(before).map(String::as_str).collect();
-    let went_away: Vec<&str> = before.difference(after).map(String::as_str).collect();
+    let gained: Vec<&str> = after.difference(before).map(String::as_str).collect();
+    let lost: Vec<&str> = before.difference(after).map(String::as_str).collect();
 
     let mut parts: Vec<String> = Vec::new();
-    if !came_up.is_empty() {
-        parts.push(format!("running and callable now: {}", came_up.join(", ")));
+    if !gained.is_empty() {
+        parts.push(format!(
+            "enabled in this thread and callable now: {}",
+            gained.join(", ")
+        ));
     }
-    if !went_away.is_empty() {
-        parts.push(format!("no longer running: {}", went_away.join(", ")));
+    if !lost.is_empty() {
+        parts.push(format!(
+            "no longer offered in this thread: {}",
+            lost.join(", ")
+        ));
     }
     (!parts.is_empty()).then(|| {
         format!(
-            "[MCP UPDATE] {}. This corrects the stopped-server list above.",
+            "[MCP UPDATE] {}. This corrects the MCP server list above.",
             parts.join("; ")
         )
     })

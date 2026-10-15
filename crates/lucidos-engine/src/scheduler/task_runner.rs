@@ -5,8 +5,7 @@
 
 use crate::api::SharedEngine;
 use crate::triggers::TriggerConfig;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -49,14 +48,12 @@ fn track(tracked: &mut HashMap<uuid::Uuid, TrackedTask>, task_id: uuid::Uuid, ta
 /// task observes between executions and inside the agentic loop. Cancel the
 /// token instead of aborting the handle to let the task emit its terminal
 /// events before exiting.
-#[allow(clippy::too_many_arguments)]
 fn spawn_task_runner(
     trigger_id: String,
     task_name: String,
     cron_expressions: Vec<String>,
     timezone: String,
     engine: SharedEngine,
-    shutdown_flag: Arc<AtomicBool>,
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
 ) -> (JoinHandle<()>, CancellationToken) {
     let cancel_token = CancellationToken::new();
@@ -71,7 +68,6 @@ fn spawn_task_runner(
             cron_expressions,
             timezone,
             engine,
-            shutdown_flag,
             trigger_configs,
             task_cancel,
         )
@@ -90,14 +86,12 @@ fn spawn_task_runner(
 }
 
 /// The main task loop - runs until task is deleted/disabled, shutdown is requested, or an error occurs
-#[allow(clippy::too_many_arguments)]
 async fn run_task_loop(
     trigger_id: String,
     task_name: String,
     cron_expressions: Vec<String>,
     timezone: String,
     engine: SharedEngine,
-    shutdown_flag: Arc<AtomicBool>,
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     cancel_token: CancellationToken,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -140,10 +134,10 @@ async fn run_task_loop(
     )
     .await?;
 
-    // Main scheduling loop — exits when shutdown is signaled (between executions, not mid-execution)
+    // Exits once shutdown begins, between executions and never mid-execution.
     loop {
-        if shutdown_flag.load(Ordering::Relaxed) {
-            return Ok("shutdown requested".to_string());
+        if engine.is_shutting_down() {
+            return Ok(FireRefusal::ShuttingDown.as_str().to_string());
         }
         if cancel_token.is_cancelled() {
             return Ok("cancelled".to_string());
@@ -177,8 +171,8 @@ async fn run_task_loop(
         // where monotonic timers (tokio::time::sleep) don't advance.
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
         loop {
-            if shutdown_flag.load(Ordering::Relaxed) {
-                return Ok("shutdown requested".to_string());
+            if engine.is_shutting_down() {
+                return Ok(FireRefusal::ShuttingDown.as_str().to_string());
             }
             let now = chrono::Utc::now();
             if now >= next_utc {
@@ -195,16 +189,14 @@ async fn run_task_loop(
             }
         }
 
-        // Read fresh state (event-sourced) — exit the loop on pause/delete.
-        // The Thread Queue executor re-reads the full config at run time.
+        // Fresh registry state, read after the wait. The Thread Queue executor
+        // re-reads the full config at run time.
         let paused = {
             let configs = trigger_configs.read().unwrap();
             configs.get(&trigger_id).map(|c| c.paused)
         };
-        match paused {
-            Some(false) => {}
-            Some(true) => return Ok("trigger paused".to_string()),
-            None => return Ok("trigger deleted".to_string()),
+        if let Some(refusal) = scheduled_fire_refusal(engine.is_shutting_down(), paused) {
+            return Ok(refusal.as_str().to_string());
         }
 
         // Validate we're not too late (past grace window)
@@ -275,6 +267,48 @@ async fn run_task_loop(
                 return Ok("cancelled".to_string());
             }
         }
+    }
+}
+
+/// Why a cron fire must not start now.
+///
+/// Both cron paths, the on-time fire and the missed-slot catch-up, ask
+/// [`scheduled_fire_refusal`] right before they submit. The shutdown rule
+/// across every trigger path is ADR 0429.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FireRefusal {
+    /// Engine shutdown has begun, so the API the run may call back into is
+    /// closing. The slot is left unrun and records no `TriggerExecuted`, so the
+    /// next engine's missed-slot catch-up fires it.
+    ShuttingDown,
+    Paused,
+    /// The trigger is gone from the registry.
+    Deleted,
+}
+
+impl FireRefusal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ShuttingDown => "engine shutting down",
+            Self::Paused => "trigger paused",
+            Self::Deleted => "trigger deleted",
+        }
+    }
+}
+
+/// Decide whether a cron fire may start now.
+///
+/// `shutting_down` is `LucidosEngine::is_shutting_down`, the signal the event
+/// path reads too. `paused` is the registry's answer, `None` for a deleted
+/// trigger. Shutdown wins, so the log names the real reason.
+fn scheduled_fire_refusal(shutting_down: bool, paused: Option<bool>) -> Option<FireRefusal> {
+    if shutting_down {
+        return Some(FireRefusal::ShuttingDown);
+    }
+    match paused {
+        Some(false) => None,
+        Some(true) => Some(FireRefusal::Paused),
+        None => Some(FireRefusal::Deleted),
     }
 }
 
@@ -387,15 +421,11 @@ async fn check_and_execute_missed(
         let now_utc = chrono::Utc::now();
         let delay = now_utc - missed_utc;
 
-        // Read config from in-memory state
         let config = {
             let configs = trigger_configs.read().unwrap();
             configs.get(trigger_id).cloned()
         };
-        let config = match config {
-            Some(c) if !c.paused => c,
-            _ => return Ok(()), // Trigger deleted or paused
-        };
+        let paused = config.as_ref().map(|c| c.paused);
 
         // Guard: only fire a slot we can positively show is still due. Reached
         // only once a missed slot has actually been found, but every path that
@@ -403,20 +433,31 @@ async fn check_and_execute_missed(
         // update/enable, and the health monitor's crash restart — funnels its
         // catch-up through here, so this is the single choke point for all of
         // them.
-        let history = crate::triggers::load_trigger_run_history(engine.pool(), trigger_id).await;
-        if let Err(e) = &history {
+        let skip = match scheduled_fire_refusal(engine.is_shutting_down(), paused) {
+            Some(refusal) => Some(refusal.as_str()),
+            None => {
+                let history =
+                    crate::triggers::load_trigger_run_history(engine.pool(), trigger_id).await;
+                if let Err(e) = &history {
+                    log!(
+                        "[Scheduler] Task '{}' run-history lookup failed: {}",
+                        task_name,
+                        e
+                    );
+                }
+                let in_memory_last_run = config.and_then(|c| c.last_run);
+                match catch_up_decision(missed_utc, in_memory_last_run, history) {
+                    CatchUp::Skip(reason) => Some(reason.as_str()),
+                    CatchUp::Fire => None,
+                }
+            }
+        };
+        if let Some(reason) = skip {
             log!(
-                "[Scheduler] Task '{}' run-history lookup failed: {}",
-                task_name,
-                e
-            );
-        }
-        if let CatchUp::Skip(reason) = catch_up_decision(missed_utc, config.last_run, history) {
-            log!(
-                "[Scheduler] Task '{}' missed at {} — not executing: {}",
+                "[Scheduler] Task '{}' missed at {}, not executing: {}",
                 task_name,
                 missed.format("%H:%M:%S"),
-                reason.as_str()
+                reason
             );
             return Ok(());
         }
@@ -474,7 +515,6 @@ async fn check_and_execute_missed(
 ///
 /// What only this function can do is the arming itself, because `tracked_tasks`
 /// belongs to the `SchedulerManager`, not the engine.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_trigger_event(
     event_type: &str,
     trigger_id: &str,
@@ -482,7 +522,6 @@ pub(super) async fn handle_trigger_event(
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: &SharedEngine,
-    shutdown_flag: &Arc<AtomicBool>,
 ) {
     // `TriggerExecuted` reaches this function too (the subscriber routes the
     // whole trigger family here) and does no work below, so it must not pay for
@@ -503,14 +542,7 @@ pub(super) async fn handle_trigger_event(
         "TriggerCreated" => {
             if let Some(config) = config.as_ref() {
                 if !config.paused && !config.schedule.is_empty() {
-                    register_and_track(
-                        config,
-                        tracked_tasks,
-                        engine,
-                        shutdown_flag,
-                        trigger_configs,
-                    )
-                    .await;
+                    register_and_track(config, tracked_tasks, engine, trigger_configs).await;
                     crate::log!(
                         "[Scheduler] Registered new trigger: {} ({})",
                         config.name,
@@ -523,14 +555,7 @@ pub(super) async fn handle_trigger_event(
             if let Some(config) = config.as_ref() {
                 cancel_tracked_task(tracked_tasks, task_uuid).await;
                 if !config.paused && !config.schedule.is_empty() {
-                    register_and_track(
-                        config,
-                        tracked_tasks,
-                        engine,
-                        shutdown_flag,
-                        trigger_configs,
-                    )
-                    .await;
+                    register_and_track(config, tracked_tasks, engine, trigger_configs).await;
                 }
                 crate::log!("[Scheduler] Updated trigger: {}", trigger_id);
                 // An update can unpause — queued fires for this trigger may
@@ -559,14 +584,7 @@ pub(super) async fn handle_trigger_event(
         "TriggerEnabled" => {
             if let Some(config) = config.as_ref() {
                 if !config.schedule.is_empty() {
-                    register_and_track(
-                        config,
-                        tracked_tasks,
-                        engine,
-                        shutdown_flag,
-                        trigger_configs,
-                    )
-                    .await;
+                    register_and_track(config, tracked_tasks, engine, trigger_configs).await;
                 }
                 crate::log!("[Scheduler] Resumed trigger: {}", trigger_id);
                 // Resume unblocks the trigger's queued fires — drain so they
@@ -589,7 +607,6 @@ pub(super) async fn register_and_track(
     config: &TriggerConfig,
     tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: &SharedEngine,
-    shutdown_flag: &Arc<AtomicBool>,
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
 ) {
     let task_uuid = trigger_id_to_uuid(&config.id);
@@ -599,7 +616,6 @@ pub(super) async fn register_and_track(
         config.schedule.clone(),
         config.timezone.clone(),
         engine.clone(),
-        shutdown_flag.clone(),
         trigger_configs.clone(),
     );
     let mut tracked = tracked_tasks.write().await;
@@ -656,7 +672,6 @@ pub(super) async fn rearm_after_lag(
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     tracked_tasks: &Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: &SharedEngine,
-    shutdown_flag: &Arc<AtomicBool>,
 ) {
     // Read under the write lock for the reason `handle_trigger_event` gives.
     let configs: Vec<TriggerConfig> = {
@@ -674,14 +689,7 @@ pub(super) async fn rearm_after_lag(
             LagRepair::Arm => {}
             LagRepair::Rearm => cancel_tracked_task(tracked_tasks, task_uuid).await,
         }
-        register_and_track(
-            config,
-            tracked_tasks,
-            engine,
-            shutdown_flag,
-            trigger_configs,
-        )
-        .await;
+        register_and_track(config, tracked_tasks, engine, trigger_configs).await;
         repaired += 1;
         crate::log!(
             "[Scheduler] Lag repair: {:?} trigger '{}' ({})",
@@ -830,40 +838,50 @@ async fn report_depth_cap(
     }
 }
 
-/// Handle a domain event from the EventBus — fire matching event-based triggers.
+/// Fire the `on_event` triggers one event matches, a thread event, a system
+/// frame or a domain event alike.
 ///
-/// `origin_thread_id` is the thread the firing event lives in (only set for
-/// thread-scoped events like `UserQuestionAsked`). It propagates via a
-/// task-local so `send_notification` can deep-link the resulting push back to
-/// the originating conversation instead of the trigger LLM's own thread.
+/// `dispatch.origin_thread_id` is the thread the firing event lives in. It
+/// propagates via a task-local so `send_notification` can deep-link the
+/// resulting push back to the originating conversation instead of the trigger
+/// LLM's own thread.
 ///
-/// `source_event_id` is the UUID of the event row that fired the trigger
-/// (used by the popover panel to deep-link to the event).
+/// `source_event_id` is the event that fired the trigger. The popover panel
+/// deep-links to it, and a lag replay reads it off `ThreadQueued`.
 ///
-/// `emitting_trigger_id` is the trigger whose fire emitted this event, if any.
-/// The matcher drops it, so a trigger is never woken by its own fire.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_domain_event(
-    event_type: &str,
-    payload: &serde_json::Value,
-    depth: u32,
-    emitting_trigger_id: Option<&str>,
-    origin_thread_id: Option<uuid::Uuid>,
-    source_event_id: Option<uuid::Uuid>,
+/// `dispatch.emitting_trigger_id` is the trigger whose fire emitted this event,
+/// if any. The matcher drops it, so a trigger is never woken by its own fire.
+///
+/// `excluded` names triggers a lag replay must not wake for this event: one
+/// that already fired for it, or one that did not exist yet. Live, it is empty.
+pub(super) async fn fire_matching_triggers(
+    dispatch: &super::TriggerDispatch,
+    source_event_id: uuid::Uuid,
+    excluded: &HashSet<String>,
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     engine: &SharedEngine,
 ) {
+    let super::TriggerDispatch {
+        event_type,
+        payload,
+        depth,
+        emitting_trigger_id,
+        origin_thread_id,
+    } = dispatch;
+    let (depth, origin_thread_id) = (*depth, *origin_thread_id);
     // Evaluated per branch rather than once up front: the shutdown arm must not
     // scan at all, and the cap arm needs the matches only to decide whether the
     // suppression is worth reporting. An in-memory scan of the config map.
     let matching = || {
         let configs = trigger_configs.read().unwrap();
-        crate::triggers::find_matching_event_triggers(
+        let mut matched = crate::triggers::find_matching_event_triggers(
             &configs,
             event_type,
             payload,
-            emitting_trigger_id,
-        )
+            emitting_trigger_id.as_deref(),
+        );
+        matched.retain(|t| !excluded.contains(&t.id));
+        matched
     };
 
     let ceiling = engine.thread_queue.policy().await.max_event_trigger_depth;
@@ -929,7 +947,7 @@ pub(super) async fn handle_domain_event(
                     event_payload: payload.clone(),
                     depth: next_depth,
                     origin_thread_id,
-                    source_event_id,
+                    source_event_id: Some(source_event_id),
                 },
                 None,
                 None,
@@ -1006,10 +1024,9 @@ fn finished_runner_action(config: &TriggerConfig) -> FinishedRunner {
 pub(super) async fn check_task_health_and_restart(
     tracked: Arc<RwLock<HashMap<uuid::Uuid, TrackedTask>>>,
     engine: SharedEngine,
-    shutdown_flag: Arc<AtomicBool>,
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
 ) {
-    if shutdown_flag.load(Ordering::Relaxed) {
+    if engine.is_shutting_down() {
         return;
     }
 
@@ -1084,7 +1101,6 @@ pub(super) async fn check_task_health_and_restart(
             schedule.clone(),
             timezone.clone(),
             engine.clone(),
-            shutdown_flag.clone(),
             trigger_configs.clone(),
         );
 
@@ -1111,6 +1127,7 @@ pub(super) async fn check_task_health_and_restart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Insert a tracked task that observes the cancel token and records when it
     /// was woken. Returns the task_id and a flag the task flips on cancel.
@@ -1483,6 +1500,130 @@ mod tests {
         );
     }
 
+    // ── A cron fire that comes due during shutdown ──────────────────────────
+    //
+    // Regression suite for a restart where the old engine, already shutting
+    // down, started a script trigger. Its `lucidos` callback met a closed API,
+    // and the failed run then counted as the slot's run, so the new engine's
+    // catch-up never retried it.
+
+    #[test]
+    fn a_cron_fire_due_after_shutdown_began_is_not_started() {
+        assert_eq!(
+            scheduled_fire_refusal(true, Some(false)),
+            Some(FireRefusal::ShuttingDown)
+        );
+    }
+
+    #[test]
+    fn shutdown_is_named_over_a_pause_or_a_delete() {
+        assert_eq!(
+            scheduled_fire_refusal(true, Some(true)),
+            Some(FireRefusal::ShuttingDown)
+        );
+        assert_eq!(
+            scheduled_fire_refusal(true, None),
+            Some(FireRefusal::ShuttingDown)
+        );
+    }
+
+    #[test]
+    fn a_live_trigger_on_a_running_engine_fires() {
+        assert_eq!(scheduled_fire_refusal(false, Some(false)), None);
+        assert_eq!(
+            scheduled_fire_refusal(false, Some(true)),
+            Some(FireRefusal::Paused)
+        );
+        assert_eq!(
+            scheduled_fire_refusal(false, None),
+            Some(FireRefusal::Deleted)
+        );
+    }
+
+    /// A trigger that existed long before the slot and ran at yesterday's.
+    async fn seed_trigger_that_ran_yesterday(pool: &sqlx::PgPool, trigger_id: &str) {
+        use crate::test_support::seed_trigger_event;
+        seed_trigger_event(
+            pool,
+            trigger_id,
+            "TriggerCreated",
+            "2026-10-01T09:00:00Z",
+            serde_json::json!({ "trigger_id": trigger_id, "name": "Thread cost snapshot" }),
+        )
+        .await;
+        seed_trigger_event(
+            pool,
+            trigger_id,
+            "TriggerExecuted",
+            "2026-10-10T16:10:04Z",
+            serde_json::json!({
+                "trigger_id": trigger_id,
+                "last_run": "2026-10-10T16:10:04Z",
+                "status": "ok",
+            }),
+        )
+        .await;
+    }
+
+    /// What the next engine's catch-up decides for `slot`, from the event store.
+    /// The replayed in-memory `last_run` is the same history, read at boot.
+    async fn next_engine_decision(
+        pool: &sqlx::PgPool,
+        trigger_id: &str,
+        slot: chrono::DateTime<chrono::Utc>,
+    ) -> CatchUp {
+        let history = crate::triggers::load_trigger_run_history(pool, trigger_id).await;
+        let replayed_last_run = history.as_ref().ok().and_then(|h| h.last_run);
+        catch_up_decision(slot, replayed_last_run, history)
+    }
+
+    #[tokio::test]
+    async fn the_next_engine_catches_up_only_the_slot_shutdown_refused() {
+        use crate::test_support::{seed_trigger_event, setup_test_db, teardown_test_db};
+        let (pool, db) = setup_test_db().await;
+        let slot = utc("2026-10-11T16:10:00Z");
+
+        // The old engine refused the slot, so it recorded no run for it.
+        let refused = "66666666-6666-6666-6666-666666666666";
+        seed_trigger_that_ran_yesterday(&pool, refused).await;
+        assert_eq!(
+            scheduled_fire_refusal(true, Some(false)),
+            Some(FireRefusal::ShuttingDown)
+        );
+        assert_eq!(
+            next_engine_decision(&pool, refused, slot).await,
+            CatchUp::Fire,
+            "a slot the shutdown refused is caught up by the next engine"
+        );
+
+        // A healthy engine ran the slot, once OK and once failing for real.
+        for (trigger_id, status) in [
+            ("77777777-7777-7777-7777-777777777777", "ok"),
+            ("88888888-8888-8888-8888-888888888888", "failed"),
+        ] {
+            seed_trigger_that_ran_yesterday(&pool, trigger_id).await;
+            seed_trigger_event(
+                &pool,
+                trigger_id,
+                "TriggerExecuted",
+                "2026-10-11T16:10:09Z",
+                serde_json::json!({
+                    "trigger_id": trigger_id,
+                    "last_run": "2026-10-11T16:10:09Z",
+                    "status": status,
+                }),
+            )
+            .await;
+            assert_eq!(
+                next_engine_decision(&pool, trigger_id, slot).await,
+                CatchUp::Skip(SkipReason::AlreadyRan),
+                "a slot that ran {status} on a healthy engine is not fired again"
+            );
+        }
+
+        teardown_test_db(&db).await;
+    }
+
     /// The ceiling every walk below runs against, and the shipped default.
     const CEILING: u32 = crate::engine::thread_queue::DEFAULT_MAX_EVENT_TRIGGER_DEPTH;
 
@@ -1528,7 +1669,7 @@ mod tests {
                 fires <= CEILING + 1,
                 "the chain must terminate, not run away"
             );
-            // `handle_domain_event`'s `next_depth`, then the queue's scope.
+            // `fire_matching_triggers`'s `next_depth`, then the queue's scope.
             let next_depth = observed_depth + 1;
             observed_depth = EVENT_TRIGGER_DEPTH
                 .scope(next_depth, async { current_event_trigger_depth() })
@@ -1598,7 +1739,7 @@ mod tests {
                 fires <= CEILING + 1,
                 "the chain must terminate even when every hop crosses a spawn"
             );
-            // `handle_domain_event`'s `next_depth`, carried on the request...
+            // `fire_matching_triggers`'s `next_depth`, carried on the request...
             let carried = observed_depth + 1;
             // ...and re-established inside the queue's spawn.
             observed_depth = tokio::spawn(

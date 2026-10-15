@@ -10,9 +10,51 @@ import { pressCallToggle } from '../../store/voice';
 import { callIsOffered } from '../../voice/callOffer';
 import { resolveCodingAgent } from '../../store/composeSelections';
 import { effectiveCodingAgentBackend } from './promptToggleMode';
-import { CodingAgentControlMenu } from './CodingAgentControlMenu';
-import { LucidosControlMenu } from './LucidosControlMenu';
+import { lazyComponent } from '../../utils/lazyComponent';
+import { pressControlMenu } from './controlMenuRequests';
+import {
+  CodingAgentIcon, ControlMenuTrigger, LUCIDOS_MENU_LABEL, LUCIDOS_TRIGGER_CLASS, LucidosMenuIcon, codingAgentMenuLabel,
+  menuCodingAgent,
+} from './ControlMenuTrigger';
 import { followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from './scrollState';
+
+/** The coding-agent menu's button, drawn until the menu's code arrives. A
+ *  press is held for the menu, which takes it as it mounts (ADR 0436). */
+function CodingAgentMenuPlaceholder({ codingAgent, threadId, composeThreadId }: {
+  codingAgent?: CodingAgent | null;
+  threadId?: string;
+  composeThreadId?: string;
+}) {
+  const agent = menuCodingAgent(codingAgent, threadId, composeThreadId);
+  return (
+    <div class="control-menu" data-row-item>
+      <ControlMenuTrigger label={codingAgentMenuLabel(agent)} onClick={(e) => pressControlMenu('coding-agent', e.currentTarget as Element)}>
+        <CodingAgentIcon agent={agent} />
+      </ControlMenuTrigger>
+    </div>
+  );
+}
+
+/** The Lucidos Agent picker's button, drawn the same way. */
+function LucidosMenuPlaceholder() {
+  return (
+    <div class="control-menu" data-row-item>
+      <ControlMenuTrigger label={LUCIDOS_MENU_LABEL} extraClass={LUCIDOS_TRIGGER_CLASS} onClick={(e) => pressControlMenu('lucidos', e.currentTarget as Element)}>
+        <LucidosMenuIcon />
+      </ControlMenuTrigger>
+    </div>
+  );
+}
+
+/** The two menus load as the row first renders, off the first-paint set. */
+export const LazyCodingAgentControlMenu = lazyComponent(
+  () => import('./CodingAgentControlMenu').then((m) => m.CodingAgentControlMenu),
+  CodingAgentMenuPlaceholder,
+);
+export const LazyLucidosControlMenu = lazyComponent(
+  () => import('./LucidosControlMenu').then((m) => m.LucidosControlMenu),
+  LucidosMenuPlaceholder,
+);
 
 /** The row's leading controls: its anchor, and whichever of the two fixed
  *  toggles are still standing.
@@ -59,13 +101,13 @@ export function PromptRowControls({
   return (
     <>
       {codingAgent !== null ? (
-        <CodingAgentControlMenu
+        <LazyCodingAgentControlMenu
           threadId={codingAgentThreadId}
           composeThreadId={composeThreadId}
           codingAgent={codingAgent}
         />
       ) : (
-        <LucidosControlMenu threadId={lucidosThreadId} composeContext={composeContext} />
+        <LazyLucidosControlMenu threadId={lucidosThreadId} composeContext={composeContext} />
       )}
       {toggles.map((a) => (
         <Fragment key={a.key}>{renderHeaderAction(a, attrsFor(a.key))}</Fragment>

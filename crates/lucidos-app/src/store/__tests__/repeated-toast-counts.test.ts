@@ -45,13 +45,14 @@ describe('a repeated plain toast counts instead of stacking', () => {
     expect(toasts.value).toHaveLength(4);
   });
 
-  it('keeps a repeat over the other pane on a card of its own', () => {
+  it('counts a repeat raised from the other pane on the same card', () => {
     focusedPane.value = 'thread';
     showToast('Failed', 'error');
     focusedPane.value = 'content';
     showToast('Failed', 'error');
 
-    expect(toasts.value.map((t) => t.pane)).toEqual(['content', 'thread']);
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].count).toBe(2);
   });
 
   it('never merges a toast that acts', () => {

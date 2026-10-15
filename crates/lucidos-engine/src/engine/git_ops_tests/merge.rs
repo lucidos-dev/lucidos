@@ -1,6 +1,16 @@
 use super::common::make_test_repo;
 use super::*;
 
+/// The ref move as every merge runs it: under the workspace repo lock.
+async fn ff_main_to(
+    repo_root: &std::path::Path,
+    branch_sha: &str,
+    main_sha: &str,
+) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    let held = lock_workspace_repo().await;
+    ff_main_to_locked(&held, repo_root, branch_sha, main_sha).await
+}
+
 #[test]
 fn merge_direction_filter_rejects_main_into_branch() {
     let branch = "claude-code/20260325-115419-8fded7";
@@ -567,147 +577,11 @@ async fn ff_main_to_fails_when_the_working_tree_cannot_be_synced() {
     );
 }
 
-/// Regression (2026-08-03, second occurrence): `update-ref` publishes the merge
-/// instantly while the `checkout -f main` that syncs the repo-root working tree
-/// is a separate process. A `commit_all_dirty` landing in that window resets its
-/// index to the NEW head, stages the OLD working tree over it, and commits every
-/// just-merged file as deleted, straight onto main. Retrying cannot close it:
-/// neither side fails. `ff_main_to` must therefore hold REPO_WORKTREE_MUTEX
-/// across publish AND sync, which this pins by taking the lock first and proving
-/// main cannot move until it is released.
-#[tokio::test]
-async fn ff_main_to_cannot_publish_main_while_a_worktree_snapshot_holds_the_lock() {
-    let (_tmp, repo) = make_test_repo().await;
-
-    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
-    tokio::fs::write(repo.join("feature.txt"), "new feature")
-        .await
-        .unwrap();
-    let _ = git_cmd(&["add", "."], &repo).await;
-    let _ = git_cmd(&["commit", "-m", "add feature"], &repo).await;
-
-    let main_sha =
-        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
-            .trim()
-            .to_string();
-    let feature_sha = String::from_utf8_lossy(
-        &git_cmd(&["rev-parse", "feature"], &repo)
-            .await
-            .unwrap()
-            .stdout,
-    )
-    .trim()
-    .to_string();
-    let _ = git_cmd(&["checkout", "main"], &repo).await;
-
-    // Stand in for `commit_dirty_logged`, which holds this lock while it
-    // snapshots the working tree.
-    let snapshot_guard = REPO_WORKTREE_MUTEX.lock().await;
-
-    let merge_repo = repo.clone();
-    let merge_branch = feature_sha.clone();
-    let merge_main = main_sha.clone();
-    let merging =
-        tokio::spawn(async move { ff_main_to(&merge_repo, &merge_branch, &merge_main).await });
-
-    // While the snapshot holds the lock the merge must not have published main,
-    // so a snapshot of the working tree can never disagree with the ref.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let during =
-        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
-            .trim()
-            .to_string();
-    assert_eq!(
-        during, main_sha,
-        "main must not advance while a worktree snapshot holds REPO_WORKTREE_MUTEX"
-    );
-
-    drop(snapshot_guard);
-    merging
-        .await
-        .expect("merge task panicked")
-        .expect("ff_main_to should succeed once the snapshot releases the lock");
-
-    let after =
-        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
-            .trim()
-            .to_string();
-    assert_eq!(
-        after, feature_sha,
-        "main must advance once the lock is free"
-    );
-    assert!(
-        repo.join("feature.txt").exists(),
-        "the merged file must be in the working tree by the time the lock is released"
-    );
-}
-
-/// A targeted data write is a save and a `commit_data_path`, both under the
-/// workspace repo lock. A `checkout -f main` that resolved `main` before that
-/// commit rewrites the file to its old bytes after it, and the next
-/// `commit_all_dirty` records the revert. So `ff_main_to` must hold the
-/// workspace repo lock across publish AND sync, as it holds the snapshot's.
-#[tokio::test]
-async fn ff_main_to_cannot_publish_main_while_a_data_write_holds_the_repo_lock() {
-    let (_tmp, repo) = make_test_repo().await;
-
-    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
-    tokio::fs::write(repo.join("feature.txt"), "new feature")
-        .await
-        .unwrap();
-    let _ = git_cmd(&["add", "."], &repo).await;
-    let _ = git_cmd(&["commit", "-m", "add feature"], &repo).await;
-    let rev = |name: &'static str| {
-        let repo = repo.clone();
-        async move {
-            String::from_utf8_lossy(&git_cmd(&["rev-parse", name], &repo).await.unwrap().stdout)
-                .trim()
-                .to_string()
-        }
-    };
-    let main_sha = rev("main").await;
-    let feature_sha = rev("feature").await;
-    let _ = git_cmd(&["checkout", "main"], &repo).await;
-
-    // Stand in for a data write between its save and its commit.
-    let data_write_guard = WORKSPACE_REPO_MUTEX.lock().await;
-
-    let merge_repo = repo.clone();
-    let merge_branch = feature_sha.clone();
-    let merge_main = main_sha.clone();
-    let merging =
-        tokio::spawn(async move { ff_main_to(&merge_repo, &merge_branch, &merge_main).await });
-
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(
-        rev("main").await,
-        main_sha,
-        "main must not advance while a data write holds the workspace repo lock"
-    );
-
-    drop(data_write_guard);
-    merging
-        .await
-        .expect("merge task panicked")
-        .expect("ff_main_to should succeed once the data write releases the lock");
-    assert_eq!(
-        rev("main").await,
-        feature_sha,
-        "main must advance once the lock is free"
-    );
-}
-
-/// Regression (2026-08-03, same class as the two above): the exclusion above is
-/// only worth what its LIFETIME is worth, and it used to be held by the
-/// snapshot's caller around a `tokio::time::timeout`. `commit_all_dirty` does
-/// its libgit2 work inside `spawn_blocking`, and a blocking task cannot be
-/// cancelled: when the 30s ceiling fired, `commit_dirty_logged` logged the
-/// timeout, returned, and dropped its guard while the closure was still inside
-/// `reset_index_to_head` / `add_all` / `commit_index`. A concurrent `ff_main_to`
-/// then took the free lock and published main mid-snapshot, which is exactly the
-/// interleaving that records every just-merged file as deleted. The guard now
-/// travels INTO the blocking closure, so it is released when the snapshot really
-/// finishes rather than when its caller walks away.
+/// The snapshot's lock must live as long as its blocking closure, not as long
+/// as its caller. `commit_all_dirty` stages inside `spawn_blocking`, which
+/// cannot be cancelled. A guard held by the caller is dropped when its timeout
+/// fires, mid-snapshot, and a merge publishing then records every merged file
+/// as deleted. The guard travels INTO the closure instead.
 #[tokio::test]
 async fn a_timed_out_auto_commit_snapshot_still_excludes_a_concurrent_publish() {
     let (_tmp, repo) = make_test_repo().await;
@@ -738,7 +612,7 @@ async fn a_timed_out_auto_commit_snapshot_still_excludes_a_concurrent_publish() 
 
     // Stall the snapshot at a real contention point: the ArtifactManager's repo
     // handle, which every artifact commit takes. `commit_all_dirty`'s closure
-    // parks there AFTER it owns the worktree exclusion, which is the state this
+    // parks there AFTER it owns the repo lock, which is the state this
     // test is about. The oneshot makes the stall observably in place before the
     // snapshot starts, so nothing here depends on a sleep.
     let repo_handle = artifacts.repo_handle_for_test();
@@ -751,11 +625,11 @@ async fn a_timed_out_auto_commit_snapshot_still_excludes_a_concurrent_publish() 
     });
     held_rx.await.expect("the stall task must take the handle");
 
-    // REPO_WORKTREE_MUTEX is process-global and every other `ff_main_to` test in
-    // this binary takes it too. Own it first and register the snapshot as the
-    // next waiter (tokio hands the lock out in request order), so the guard the
-    // assertions below are about is provably the snapshot's own.
-    let queue_head = REPO_WORKTREE_MUTEX.lock().await;
+    // WORKSPACE_REPO_MUTEX is process-global and other tests in this binary take
+    // it too. Own it first and register the snapshot as the next waiter, since
+    // tokio hands the lock out in request order. The guard the assertions below
+    // are about is then provably the snapshot's own.
+    let queue_head = WORKSPACE_REPO_MUTEX.lock().await;
     let mut snapshot = Box::pin(artifacts.commit_all_dirty("Script task output"));
     tokio::select! {
         biased;
@@ -1012,6 +886,100 @@ async fn catchup_and_ff_with_concurrent_main_commit() {
         &repo,
     )
     .await;
+}
+
+/// The I8 test below runs on a private lock pair, so this pins that
+/// production merges take the global locks every writer takes.
+#[test]
+fn production_merges_take_the_global_merge_and_repo_locks() {
+    assert!(std::ptr::eq(MAIN_LOCKS.merge, &MERGE_MUTEX));
+    assert!(std::ptr::eq(MAIN_LOCKS.repo, &WORKSPACE_REPO_MUTEX));
+}
+
+/// I8: a merge catches up with `main`, reads it and moves it as one step under
+/// the repo lock. A writer that commits to `main` under that lock lands before
+/// the catch-up. So the only attempt succeeds and keeps both commits.
+#[tokio::test]
+async fn a_locked_writer_cannot_move_main_between_catch_up_and_ref_move() {
+    let (_tmp, repo) = make_test_repo().await;
+    let wt_tmp = tempfile::tempdir().unwrap();
+    let wt_dir = wt_tmp.path().join("wt");
+    let wt = wt_dir.to_str().unwrap();
+    let _ = git_cmd(&["worktree", "add", "-b", "feature", wt, "main"], &repo).await;
+    tokio::fs::write(wt_dir.join("feature.txt"), "feature")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &wt_dir).await;
+    let _ = git_cmd(&["commit", "-m", "feature"], &wt_dir).await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+
+    // A pair of its own, so the merge below is the only thing that can queue
+    // on these locks.
+    let locks: &'static MainLocks = Box::leak(Box::new(MainLocks {
+        merge: Box::leak(Box::new(tokio::sync::Mutex::new(()))),
+        repo: Box::leak(Box::new(tokio::sync::Mutex::new(()))),
+    }));
+    let writer = locks.repo.lock().await;
+    let mut merge = std::pin::pin!(catchup_and_ff_to_main_under(
+        locks, &repo, &wt_dir, "feature"
+    ));
+    tokio::select! {
+        biased;
+        r = &mut merge => panic!("the merge finished while a writer held the repo lock: {r:?}"),
+        _ = std::future::ready(()) => {}
+    }
+
+    // The writer commits to main, as a data write does under the lock.
+    tokio::fs::write(repo.join("writer.txt"), "data write")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "writer.txt"], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "data write"], &repo).await;
+    drop(writer);
+    // tokio hands a released lock to its first waiter, so a merge already
+    // queued on it, before its catch-up, now owns it.
+    assert!(
+        locks.repo.try_lock().is_err(),
+        "the merge must wait for the repo lock before it catches up with main"
+    );
+
+    merge
+        .await
+        .expect("the merge must succeed on its only attempt");
+    assert!(repo.join("feature.txt").exists());
+    assert!(repo.join("writer.txt").exists());
+
+    let _ = git_cmd(&["worktree", "remove", "--force", wt], &repo).await;
+}
+
+/// A dirty-tree snapshot is a workspace repo writer like any other, so it
+/// waits for the repo lock before it stages anything.
+#[tokio::test]
+async fn an_auto_commit_snapshot_waits_for_the_workspace_repo_lock() {
+    let (_tmp, repo) = make_test_repo().await;
+    let artifacts = crate::core::ArtifactManager::new(repo.clone()).unwrap();
+    tokio::fs::create_dir_all(repo.join("data")).await.unwrap();
+    tokio::fs::write(repo.join("data/output.txt"), "script output")
+        .await
+        .unwrap();
+
+    let writer = WORKSPACE_REPO_MUTEX.lock().await;
+    let mut snapshot = std::pin::pin!(artifacts.commit_all_dirty("Script task output"));
+    tokio::select! {
+        biased;
+        _ = &mut snapshot => panic!("the snapshot finished while a writer held the repo lock"),
+        _ = std::future::ready(()) => {}
+    }
+    drop(writer);
+    // tokio hands a released lock to its first waiter, which the snapshot
+    // became on its first poll.
+    assert!(
+        WORKSPACE_REPO_MUTEX.try_lock().is_err(),
+        "the snapshot must queue on the workspace repo lock"
+    );
+
+    let commit = snapshot.await.unwrap();
+    assert!(commit.is_some(), "the snapshot commits the dirty file");
 }
 
 /// Sequential apply of two changes must leave a clean working tree after each.
@@ -1609,6 +1577,6 @@ fn a_concurrent_main_conflict_is_recognised_inside_its_wrappers() {
         "Merge failed after conflict resolution: {raw}"
     )));
     assert!(!is_concurrent_main_conflict(
-        "Fast-forward merge to main failed after 3 retries: update-ref failed"
+        "update-ref failed: cannot lock ref 'refs/heads/main'"
     ));
 }

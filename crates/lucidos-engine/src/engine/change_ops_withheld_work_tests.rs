@@ -151,9 +151,15 @@ async fn a_plan_hold_announces_the_branch_files_and_reason_once() {
     )
     .await
     .expect("record a satisfying plan marker");
-    crate::engine::git_ops::record_hardened(&pool, &repo, BRANCH, "abc")
-        .await
-        .expect("record the harden marker");
+    crate::engine::git_ops::record_hardened(
+        &pool,
+        &repo,
+        BRANCH,
+        "abc",
+        crate::engine::git_ops::HardenTier::Full,
+    )
+    .await
+    .expect("record the harden marker");
     assert_eq!(
         hold_of(&pool, &bus, &input(thread_id, &repo_str, "work", &work)).await,
         None
@@ -203,13 +209,169 @@ async fn unhardened_work_is_held_but_a_plan_alone_is_not() {
         );
     }
 
-    record_hardened(&pool, &repo, BRANCH, "abc")
-        .await
-        .expect("record the harden marker");
+    record_hardened(
+        &pool,
+        &repo,
+        BRANCH,
+        "abc",
+        crate::engine::git_ops::HardenTier::Full,
+    )
+    .await
+    .expect("record the harden marker");
     mark(PlanMarkerKind::Planned).await.expect("mark planned");
     assert_eq!(
         hold_of(&pool, &bus, &input(thread_id, &repo_str, "work", &code)).await,
         None
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// The branch head, as a marker records it.
+async fn branch_head(repo: &std::path::Path) -> String {
+    String::from_utf8(git_cmd(&["rev-parse", BRANCH], repo).await.unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+/// An integrated sub-thread proposes no code. Without a fresh marker its work
+/// waits for hardening, as independent work does. With a fresh marker of
+/// either tier it is handed up as `integrated_into_parent`, and no
+/// `ChangeProposed` is ever written. A plan alone proposes normally.
+#[tokio::test]
+async fn an_integrated_child_hands_up_hardened_work_and_never_proposes() {
+    use crate::engine::git_ops::{record_hardened, record_planned, HardenTier, PlanMarkerKind};
+
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (_tmp, repo, wt) = make_repo_and_worktree(BRANCH).await;
+    std::fs::write(wt.join("a.txt"), "work").unwrap();
+    git_cmd(&["add", "."], &wt).await.unwrap();
+    git_cmd(&["commit", "-m", "work"], &wt).await.unwrap();
+    let thread_id = Uuid::new_v4();
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: String::new(),
+            branch: BRANCH.into(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            integrated: true,
+            auto_compact_window: None,
+            auto_compact_arm: None,
+        },
+    )
+    .await;
+    record_planned(
+        &pool,
+        &repo,
+        BRANCH,
+        PlanMarkerKind::AcknowledgedSimple,
+        None,
+        Some("test fixture"),
+        &[],
+        "abc",
+    )
+    .await
+    .expect("record a satisfying plan marker");
+    let repo_str = repo.to_string_lossy().to_string();
+    let code = files(&["a.txt"]);
+    let work = input(thread_id, &repo_str, "work", &code);
+    let hold = || hold_of(&pool, &bus, &work);
+
+    assert_eq!(hold().await, Some(ProposalHold::HardeningMissing));
+
+    let head = branch_head(&repo).await;
+    record_hardened(&pool, &repo, BRANCH, "stale", HardenTier::Fast)
+        .await
+        .expect("record a stale fast marker");
+    assert_eq!(
+        hold().await,
+        Some(ProposalHold::HardeningMissing),
+        "a stale marker hands nothing up"
+    );
+
+    for tier in [HardenTier::Fast, HardenTier::Full] {
+        record_hardened(&pool, &repo, BRANCH, &head, tier)
+            .await
+            .expect("record a fresh marker");
+        assert_eq!(
+            hold().await,
+            Some(ProposalHold::IntegratedIntoParent),
+            "{tier:?}"
+        );
+        assert_eq!(
+            read_change_state(&pool, thread_id).await,
+            CodingAgentChangeState::Unproposed {
+                reason: Some(UnproposedReason::IntegratedIntoParent)
+            }
+        );
+    }
+    let withheld = payloads(&pool, thread_id, "ProposalWithheld").await;
+    assert_eq!(withheld.last().unwrap()["reason"], "integrated_into_parent");
+    assert!(payloads(&pool, thread_id, "ChangeProposed")
+        .await
+        .is_empty());
+
+    // A plan alone needs no hardening, and no parent would ever be told of
+    // it, so it proposes like independent work.
+    let plan = files(&["docs/plans/2026-10-13-x.md"]);
+    assert_eq!(
+        hold_of(&pool, &bus, &input(thread_id, &repo_str, "plan", &plan)).await,
+        None
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A fast marker certifies only an integrated sub-thread. Independent work
+/// that carries one is still held as `hardening_missing`, and Apply still
+/// has to harden it first.
+#[tokio::test]
+async fn an_independent_branch_with_only_a_fast_marker_is_not_hardened() {
+    use crate::engine::git_ops::{
+        has_full_harden_marker, record_hardened, record_planned, HardenTier, PlanMarkerKind,
+    };
+
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (_tmp, repo, thread_id) = thread_with_work(&bus).await;
+    record_planned(
+        &pool,
+        &repo,
+        BRANCH,
+        PlanMarkerKind::AcknowledgedSimple,
+        None,
+        Some("test fixture"),
+        &[],
+        "abc",
+    )
+    .await
+    .expect("record a satisfying plan marker");
+    let head = branch_head(&repo).await;
+    record_hardened(&pool, &repo, BRANCH, &head, HardenTier::Fast)
+        .await
+        .expect("record the fast marker");
+    let repo_str = repo.to_string_lossy().to_string();
+    let code = files(&["a.txt"]);
+
+    assert_eq!(
+        hold_of(&pool, &bus, &input(thread_id, &repo_str, "work", &code)).await,
+        Some(ProposalHold::HardeningMissing)
+    );
+    let kind = load_apply_kind_context(&pool, Some(thread_id)).await;
+    let hardened = has_full_harden_marker(&pool, &repo, BRANCH).await;
+    assert!(!hardened, "a fast marker is no full marker");
+    assert!(
+        apply_must_harden(&kind, hardened, Some(&code)),
+        "Apply hardens a branch carrying only a fast marker"
     );
 
     pool.close().await;
@@ -639,6 +801,87 @@ async fn a_hold_withdraws_an_open_change_the_turn_committed_past() {
             reason: Some(UnproposedReason::HardeningMissing)
         }
     );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A queued change is frozen. A turn that commits past it proposes nothing
+/// and withdraws nothing: its work waits as `awaiting_landing`. Once the
+/// change lands, the next decision proposes again.
+#[tokio::test]
+async fn work_after_a_queued_change_waits_for_its_landing() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (tmp, repo, thread_id) = thread_with_work(&bus).await;
+    let repo_str = repo.to_string_lossy().to_string();
+    let work = files(&["a.txt"]);
+    let change_id = Uuid::new_v4();
+    emit(&bus, thread_id, proposed(change_id, "work", &work, false)).await;
+    let snapshot = String::from_utf8(git_cmd(&["rev-parse", BRANCH], &repo).await.unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ChangeQueued {
+            change_id: change_id.to_string(),
+            snapshot_sha: snapshot,
+        },
+    )
+    .await;
+
+    let at_snapshot =
+        withhold_for_landing(&pool, &bus, &input(thread_id, &repo_str, "work", &work))
+            .await
+            .expect("read the lane");
+    assert_eq!(at_snapshot, Some(change_id));
+    assert!(
+        payloads(&pool, thread_id, "ProposalWithheld")
+            .await
+            .is_empty(),
+        "nothing new to withhold"
+    );
+
+    let wt = tmp.path().join("wt");
+    std::fs::write(wt.join("b.txt"), "more").unwrap();
+    git_cmd(&["add", "."], &wt).await.unwrap();
+    git_cmd(&["commit", "-m", "more"], &wt).await.unwrap();
+    let more = files(&["a.txt", "b.txt"]);
+    let moved = withhold_for_landing(&pool, &bus, &input(thread_id, &repo_str, "more", &more))
+        .await
+        .expect("read the lane");
+    assert_eq!(moved, Some(change_id));
+    let withheld = payloads(&pool, thread_id, "ProposalWithheld").await;
+    assert_eq!(withheld.len(), 1);
+    assert_eq!(withheld[0]["reason"], "awaiting_landing");
+    assert!(payloads(&pool, thread_id, "ChangeWithdrawn")
+        .await
+        .is_empty());
+    assert_eq!(status_of(&pool, change_id).await, ChangeStatus::Pending);
+
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ChangeApplied {
+            change_id: change_id.to_string(),
+            requires_restart: false,
+            client_update: false,
+            commits: vec![],
+            thread_title: None,
+            actor: None,
+            pre_merge_sha: None,
+            post_merge_sha: None,
+            landing_merge_sha: None,
+            path: String::new(),
+        },
+    )
+    .await;
+    let landed = withhold_for_landing(&pool, &bus, &input(thread_id, &repo_str, "more", &more))
+        .await
+        .expect("read the lane");
+    assert_eq!(landed, None, "the landed change frees the next proposal");
 
     pool.close().await;
     teardown_test_db(&db).await;

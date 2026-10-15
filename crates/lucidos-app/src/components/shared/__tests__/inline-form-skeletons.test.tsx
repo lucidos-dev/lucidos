@@ -8,7 +8,6 @@ import { act } from 'preact/test-utils';
 vi.mock('../../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client')>()),
   getCredentialValue: () => new Promise(() => {}),
-  readAppSourceApi: () => new Promise(() => {}),
 }));
 
 import { CredentialModal } from '../../credentials/CredentialModal';

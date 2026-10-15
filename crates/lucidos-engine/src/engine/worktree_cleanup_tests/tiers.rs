@@ -555,7 +555,11 @@ async fn archived_thread_worktree_reclaimed_with_ample_disk() {
         1,
         "an archived thread's worktree must be reclaimed even with ample disk"
     );
-    assert_eq!(cleaned[0].1, 0, "fully-merged archived worktree → Tier 0");
+    assert_eq!(
+        cleaned[0].1, 2,
+        "the archived removal reports a full removal"
+    );
+    assert!(cleaned[0].3, "a fully merged branch goes with the tree");
     assert!(!worktree.exists(), "archived worktree dir must be removed");
 
     pool.close().await;

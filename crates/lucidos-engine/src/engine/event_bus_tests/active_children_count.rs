@@ -705,6 +705,7 @@ async fn followed_up_live_coding_agent_child_reports_its_own_completion() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::CodingAgentPromptSent {
+            input_event_id: None,
             text: "go the other way".into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             origin: None,
@@ -838,6 +839,7 @@ async fn an_empty_resume_marker_is_not_a_start_event() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::CodingAgentPromptSent {
+            input_event_id: None,
             text: String::new(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             origin: None,
@@ -1057,6 +1059,7 @@ async fn attribution_without_linkage_counts_no_child_and_wakes_nobody() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "spawn something independent".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1082,6 +1085,7 @@ async fn attribution_without_linkage_counts_no_child_and_wakes_nobody() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "independent work".into(),
             user_image_hashes: vec![],
             device_id: None,

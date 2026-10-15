@@ -11,7 +11,6 @@
  * Plan: `docs/plans/2026-10-07-find-in-previews-and-transcript.md`.
  */
 
-import { signal } from '@preact/signals';
 import {
   MAX_FIND_MATCHES, collectPageText, matchSpans, queryPattern, revealRange, spanToRange, stepIndex,
   type ClearBand, type FindPainter, type FindResult,
@@ -30,9 +29,7 @@ import { ensureWholeThreadLoaded } from './thread-loading';
 import { markRevealScroll, stopFollowingBottom } from '../../components/chat/scrollState';
 import { isElementVisible } from '../../utils/elementVisibility';
 
-/** A turn the transcript is asked to draw, by `exchangeKey`. ThreadView
- *  answers it by moving its render window down to that turn. */
-export const transcriptRenderRequest = signal<{ threadId: string; key: string } | null>(null);
+import { transcriptRenderRequest } from './transcriptRenderRequest';
 
 /** One searchable stretch of the transcript: a user's message, or one reply
  *  chunk, as the plain text the transcript draws for it. A reply chunk carries
@@ -249,12 +246,6 @@ let session: {
 } | null = null;
 
 const NONE: FindResult = { total: 0, current: 0, capped: false };
-
-/** Whether the thread has anything to search: a real thread, not a draft. */
-export function transcriptSearchable(threadId: string): boolean {
-  const thread = threadMap.value.get(threadId);
-  return !!thread && thread.meta.state !== 'composing';
-}
 
 export function transcriptTarget(threadId: string, painter: FindPainter): FindTarget {
   const clear = () => {

@@ -19,7 +19,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { recoverableAnswerDraft } from '../prompt-input-helpers';
 
-const untouched = { currentIds: [], currentDraft: '', domText: '' };
+const untouched = { currentIds: [], currentDraft: '' };
 
 describe('recoverableAnswerDraft', () => {
   it('gives the toggled options back so a retry is one tap', () => {
@@ -38,26 +38,19 @@ describe('recoverableAnswerDraft', () => {
     // The user re-picked while the POST was in flight. That is the newer
     // answer, so the stale one stays gone.
     expect(recoverableAnswerDraft({
-      sentIds: ['opt-0'], sentText: '', currentIds: ['opt-2'], currentDraft: '', domText: '',
+      sentIds: ['opt-0'], sentText: '', currentIds: ['opt-2'], currentDraft: '',
     }).ids).toBeNull();
   });
 
-  it('keeps a fresh keystroke, whichever copy of the composer holds it', () => {
-    // The draft copy...
+  it('keeps a fresh keystroke', () => {
     expect(recoverableAnswerDraft({
-      sentIds: [], sentText: 'old', currentIds: [], currentDraft: 'new', domText: '',
-    }).text).toBeNull();
-    // ...and the textarea copy, which a keystroke reaches first. Restoring over
-    // it would leave the two disagreeing. `resolveComposerText` prefers the
-    // draft, so the stale text is what a retry would send.
-    expect(recoverableAnswerDraft({
-      sentIds: [], sentText: 'old', currentIds: [], currentDraft: '', domText: 'new',
+      sentIds: [], sentText: 'old', currentIds: [], currentDraft: 'new',
     }).text).toBeNull();
   });
 
-  it('restores with no textarea node mounted', () => {
+  it('restores into an empty composer', () => {
     expect(recoverableAnswerDraft({
-      sentIds: ['opt-0'], sentText: 'text', currentIds: [], currentDraft: '', domText: null,
+      sentIds: ['opt-0'], sentText: 'text', currentIds: [], currentDraft: '',
     })).toEqual({ ids: ['opt-0'], text: 'text' });
   });
 

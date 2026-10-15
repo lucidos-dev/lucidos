@@ -15,7 +15,8 @@ vi.mock('../../api/client', async (importOriginal) => ({
 import { installUnsentMessageRestore, restoreUnsentMessages, _resetUnsentMessageRestoreForTesting } from './unsentMessageRestore';
 import { ensureThreadByIdInMap, upsertThread } from './thread-loading';
 import type { ThreadSummary } from '../../api/threads';
-import { forgetComposeState, noteServerDraft, _resetUndeliveredComposeDraftsForTesting } from './compose';
+import { forgetComposeState, _resetUndeliveredComposeDraftsForTesting } from './compose';
+import { _recordServerComposeForTesting as noteServerDraft } from '../composeSync';
 import { retryUnsentMessage, UNSENT_AFTER_RELOAD_COPY, unsentMessageCopy } from './chat';
 import { settleDeliveredUnsentMessage } from './sendSettlement';
 import { ApiError, submitChat } from '../../api/client';
@@ -124,7 +125,7 @@ describe('restoreUnsentMessages', () => {
     expect(copies).toEqual([UNSENT_AFTER_RELOAD_COPY, unsentMessageCopy(1)]);
   });
 
-  it('a Retry after the reload re-posts the stored request unchanged', async () => {
+  it('a Retry after the reload re-posts the stored request, placed in this page\'s inputs', async () => {
     const stored = record('e-1');
     await seed(stored);
     await restoreUnsentMessages();
@@ -132,7 +133,9 @@ describe('restoreUnsentMessages', () => {
 
     expect(await retryUnsentMessage('e-1')).toBe('sent');
 
-    expect(mockedSubmitChat.mock.calls[0][0]).toEqual(stored.body);
+    // The reloaded page is a new input chain (ADR 0449); the request is otherwise as stored.
+    const reposted = mockedSubmitChat.mock.calls[0][0];
+    expect(reposted).toEqual({ ...stored.body, input_chain: pageOwnerId, input_seq: reposted.input_seq });
     expect(await storedIds()).toEqual([]);
   });
 
@@ -357,7 +360,7 @@ function summary(threadId: string, state: 'composing' | 'active', composeText: s
 describe('a thread-list read after the restore', () => {
   function read(info: ThreadSummary): void {
     const map = new Map(threadMap.value);
-    upsertThread(map, info, false, Date.now() + 1000);
+    upsertThread(map, info, false);
     threadMap.value = map;
   }
 

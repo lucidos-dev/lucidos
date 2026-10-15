@@ -1,6 +1,6 @@
 import { Overlay } from './Overlay';
 import { SurfaceHead } from './Surface';
-import { renderMarkdown } from '../../utils/renderMarkdown';
+import { ReleaseNoticeBody } from './ReleaseNoticeBody';
 import {
   acknowledgeReleaseNotice,
   dismissReleaseNoticeModal,
@@ -52,10 +52,7 @@ export function ReleaseNoticeModal() {
               invents a sequence the reader is not in. */}
           {remaining > 1 && <span class="release-notice-step">1 of {remaining}</span>}
         </div>
-        <div
-          class="markdown-content release-notice-body"
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(notice.body) }}
-        />
+        <ReleaseNoticeBody body={notice.body} onLinkClick={dismissReleaseNoticeModal} />
         {notice.action_deferred && notice.action_label && (
           <p class="release-notice-deferred">
             {notice.action_label} comes with a later notice, so you do it once.

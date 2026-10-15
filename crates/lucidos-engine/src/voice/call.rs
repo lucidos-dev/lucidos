@@ -34,7 +34,7 @@ use super::provider::{wait_until, SessionOpening, VoiceEvent, VoiceProvider, Voi
 use super::wire::{ClientControl, ServerFrame};
 use super::{build, language, resident};
 use crate::core::store::messages::spoken_merge::join_spoken;
-use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus};
+use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus, LagReplay, ReplayScope};
 use crate::engine::thread_events::{
     AgentParticipant, CancelCause, EventMeta, MessageOrigin, ThreadEvent, VoiceSessionEndReason,
 };
@@ -365,7 +365,7 @@ pub async fn run_call(
     // Subscribed before the talker can produce a word. Nothing the doer
     // emits can then land in the gap between opening a session and watching
     // for one.
-    let thread = bus.subscribe();
+    let (thread, replay) = LagReplay::subscribe(bus, ReplayScope::Thread(subject.thread_id), None);
 
     let mut session = match provider.open(opening).await {
         Ok(session) => session,
@@ -413,6 +413,7 @@ pub async fn run_call(
         capture: AuxCapture::new(bus, subject.thread_id, ContextPurpose::Voice),
         subject: subject.clone(),
         thread,
+        replay,
         talker_has_the_floor: false,
         interrupted: false,
         reply_was_cut_off: CutReply::Running,
@@ -480,8 +481,6 @@ pub async fn run_call(
 /// after the select statement ends, where the talker session is free to be
 /// borrowed again.
 enum Step {
-    /// Nothing to act on this round.
-    Nothing,
     CallerAudio(Vec<u8>),
     BargeIn,
     /// The caller opened their mouth, measured on their own device.
@@ -490,8 +489,9 @@ enum Step {
     Talker(VoiceEvent),
     /// The talker closed the session on its own side.
     TalkerGone,
-    /// Boxed because the payload dwarfs every other variant here.
-    Thread(Box<EmittedEvent>),
+    /// One read of the thread's traffic. Boxed because the payload dwarfs
+    /// every other variant here.
+    Thread(Box<Result<EmittedEvent, RecvError>>),
     /// The caller has been waiting [`CALLER_WAITED_LONG_ENOUGH`] with nothing
     /// answering them.
     NobodyAnsweredTheCaller,
@@ -550,6 +550,8 @@ struct Call<'a> {
     capture: AuxCapture,
     subject: CallSubject,
     thread: Receiver<EmittedEvent>,
+    /// What a lag of `thread` dropped, read back from this thread's rows.
+    replay: LagReplay,
     /// True while the talker owes the caller the rest of a sentence.
     ///
     /// Claimed by its WORDS, and by [`Call::say`] asking it for some. Never by
@@ -861,13 +863,12 @@ impl Call<'_> {
                     Some(event) => Step::Talker(event),
                     None => Step::TalkerGone,
                 },
-                from_thread = self.thread.recv() => thread_step(from_thread),
+                from_thread = self.thread.recv() => Step::Thread(Box::new(from_thread)),
                 _ = wait_until(owed) => Step::NobodyAnsweredTheCaller,
                 _ = wait_until(asked) => Step::AskNeverGotItsWords,
             };
 
             match step {
-                Step::Nothing => {}
                 Step::CallerAudio(pcm) => {
                     if let Err(e) = session.push_audio(&pcm).await {
                         log!("[Voice] The talker stopped taking audio: {}", e);
@@ -904,7 +905,17 @@ impl Call<'_> {
                     );
                     return provider_failed(transport).await;
                 }
-                Step::Thread(emitted) => self.on_thread_event(*emitted, session).await,
+                // A lag hands back the thread's dropped rows, so the caller
+                // still hears an answer or a card the burst hid. A closed bus
+                // means the engine is going down under the call.
+                Step::Thread(received) => {
+                    let Some(frames) = self.replay.read(*received, self.bus.pool()).await else {
+                        return VoiceSessionEndReason::EngineShutdown;
+                    };
+                    for emitted in frames {
+                        self.on_thread_event(emitted, session).await;
+                    }
+                }
                 Step::NobodyAnsweredTheCaller => {
                     self.nobody_answered_the_caller(session, transport).await
                 }
@@ -2209,22 +2220,6 @@ impl From<CallerFrame> for Step {
             CallerFrame::Undecodable => Step::Undecodable,
             CallerFrame::Closed => Step::Ended(VoiceSessionEndReason::Disconnected),
         }
-    }
-}
-
-/// One read of the thread's traffic, as a step.
-fn thread_step(received: Result<EmittedEvent, RecvError>) -> Step {
-    match received {
-        Ok(emitted) => Step::Thread(Box::new(emitted)),
-        // A busy call missed some of the thread's traffic. Narration is
-        // best-effort, so carry on rather than ending a call over a lost
-        // progress note.
-        Err(RecvError::Lagged(missed)) => {
-            log!("[Voice] The call missed {} thread events", missed);
-            Step::Nothing
-        }
-        // The bus is gone, so the engine is going down under the call.
-        Err(RecvError::Closed) => Step::Ended(VoiceSessionEndReason::EngineShutdown),
     }
 }
 

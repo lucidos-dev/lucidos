@@ -26,6 +26,7 @@ pub mod intents;
 pub mod keep_awake;
 pub mod knowhow;
 pub mod mcp_servers;
+pub mod migration_marker;
 pub mod models;
 pub mod oauth;
 pub mod oauth_registry;
@@ -67,69 +68,43 @@ use std::borrow::Cow;
 pub fn database_url() -> String {
     static BOOT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://lucidos:lucidos@localhost:5432/lucidos".to_string())
+            .unwrap_or_else(|_| "postgres://lucidos@localhost:5432/lucidos".to_string())
     });
     BOOT.clone()
 }
 
-/// Process-lifetime cache of `pg_env_vars(&database_url())`. DATABASE_URL does
-/// not change once the engine starts, so the URL is parsed once and callers get
-/// a slice they can iterate or clone-extend.
-pub fn pg_env_vars_cached() -> &'static [(String, String)] {
-    static CACHED: std::sync::LazyLock<Vec<(String, String)>> =
-        std::sync::LazyLock::new(|| pg_env_vars(&database_url()));
-    CACHED.as_slice()
+/// Pin [`database_url`], then remove `DATABASE_URL` from the engine's own
+/// process env, so no subprocess inherits the engine's database (ADR 0481).
+///
+/// Call it at boot, before anything spawns and before
+/// `environment_variables::apply_to_process_env`. A user variable named
+/// `DATABASE_URL` applied after it still reaches children.
+pub fn scrub_database_url_from_process_env() {
+    database_url();
+    std::env::remove_var("DATABASE_URL");
 }
 
-/// Parse a `postgres(ql)://user:password@host[:port]/dbname[?...]` URL into the
-/// libpq env-var bundle (`PGUSER`/`PGPASSWORD`/`PGHOST`/`PGPORT`/`PGDATABASE`).
+/// The engine-owned variable naming the workspace database, read-only by
+/// default. A name no libpq tool or ORM reads unasked (ADR 0481).
+pub const LUCIDOS_DATABASE_URL: &str = "LUCIDOS_DATABASE_URL";
+
+/// The `LUCIDOS_DATABASE_URL` pair for an agent-facing subprocess: coding-agent
+/// sessions, chat `run_bash` / `run_python`, scripts, triggers and background
+/// tasks. Nothing else gets it.
 ///
-/// These are injected into every subprocess the engine spawns, so a caller can
-/// run `psql -c '…'` bare and never put the password in argv. argv is
-/// persisted into tool-call event payloads and rendered in the steps UI; env
-/// vars are not.
-///
-/// An unrecognized URL yields an empty Vec. Skipping the injection beats
-/// emitting a half-broken bundle that confuses libpq.
-pub(crate) fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
-    // The `:password` segment is OPTIONAL. The packaged Postgres backend uses
-    // trust auth on loopback and hands the engine a passwordless URL. A
-    // required group would reject it, breaking a picker restore. An `@` is
-    // still required, so `postgres://no-at-sign/db` stays empty.
-    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r"^postgres(?:ql)?://([^:@/?]+)(?::([^@/?]*))?@([^:/?]+)(?::(\d+))?/([^?]+)",
-        )
-        .expect("postgres URL regex must compile")
-    });
-    let Some(caps) = RE.captures(database_url) else {
-        return Vec::new();
-    };
-    let user = urlencoding::decode(&caps[1])
-        .unwrap_or_default()
-        .into_owned();
-    let host = caps[3].to_string();
-    let port = caps
-        .get(4)
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| "5432".to_string());
-    let dbname = urlencoding::decode(&caps[5])
-        .unwrap_or_default()
-        .into_owned();
-    let mut vars = vec![("PGUSER".to_string(), user)];
-    // Only when the URL carried a password segment, so libpq does not try to
-    // send one for a trust-auth URL. An explicit empty password (`user:@host`)
-    // still emits an empty PGPASSWORD.
-    if let Some(pw) = caps.get(2) {
-        let password = urlencoding::decode(pw.as_str())
-            .unwrap_or_default()
-            .into_owned();
-        vars.push(("PGPASSWORD".to_string(), password));
-    }
-    vars.push(("PGHOST".to_string(), host));
-    vars.push(("PGPORT".to_string(), port));
-    vars.push(("PGDATABASE".to_string(), dbname));
-    vars
+/// The command then names the variable, so the password never enters a
+/// persisted tool-call argv. `None` when the boot URL does not parse.
+pub fn lucidos_database_url_env() -> Option<(String, String)> {
+    static URL: std::sync::LazyLock<Option<String>> =
+        std::sync::LazyLock::new(|| read_only_database_url(&database_url()));
+    URL.clone()
+        .map(|url| (LUCIDOS_DATABASE_URL.to_string(), url))
+}
+
+pub(crate) fn read_only_database_url(database_url: &str) -> Option<String> {
+    lucidos_pg_url::PgUrl::parse(database_url)
+        .map(|url| url.read_only_url())
+        .ok()
 }
 
 /// Convert a credential `service_name` or an OAuth provider name into the
@@ -248,10 +223,11 @@ pub fn redact_secret_values(text: &str, secrets: &[String]) -> String {
 /// drain windows, or be cut by `Stream::push` trimming its front. And
 /// `runtime::python` writes a raw copy under `.lucidos/exhaust/` first.
 ///
-/// A `CRED_*_USERNAME`, an `OAUTH_*_EMAIL` and `PGPASSWORD` are deliberately
-/// not secrets. Masking by value is safe only while the value is unique, and
-/// every dev workspace's Postgres password is the literal `lucidos`: also the
-/// user, the database and every path. [`redact_postgres_secrets`] covers that.
+/// A `CRED_*_USERNAME` and an `OAUTH_*_EMAIL` are deliberately not secrets.
+/// Masking by value is safe only while the value is unique. So the whole
+/// `LUCIDOS_DATABASE_URL` is masked, never its password alone: every dev
+/// workspace's password is the literal `lucidos`, also the user, the database
+/// and every path. [`redact_postgres_secrets`] covers a password elsewhere.
 pub fn injected_secret_values(env_vars: &[(String, String)]) -> Vec<String> {
     env_vars
         .iter()
@@ -261,6 +237,7 @@ pub fn injected_secret_values(env_vars: &[(String, String)]) -> Vec<String> {
                 // Engine-minted, thread-bound, and accepted on every mutating
                 // route, so it is a credential in the sense that matters here.
                 || key == crate::api::actor::ENV_AGENT_ORIGIN_TOKEN
+                || key == LUCIDOS_DATABASE_URL
         })
         .map(|(_, value)| value.clone())
         .collect()
@@ -518,7 +495,7 @@ pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, SessionMessage, Step, ThreadEventRow,
     ThreadSummary,
 };
-pub use webhook_deliveries::{Claim, DeliveryLedger};
+pub use webhook_deliveries::DeliveryLedger;
 pub use webhooks::{Webhook, WebhookStore};
 
 /// The commit whose tree an index was built from, and so the only parent a
@@ -1033,31 +1010,68 @@ pub fn format_byte_size(bytes: usize) -> String {
 
 #[cfg(test)]
 mod database_url_tests {
-    use super::database_url;
+    use super::{database_url, scrub_database_url_from_process_env};
+
+    /// Both tests set and restore `DATABASE_URL`, so they must not interleave.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn restore_database_url(prior: Option<std::ffi::OsString>) {
+        match prior {
+            Some(v) => std::env::set_var("DATABASE_URL", v),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+    }
 
     /// The reported case: a user stores `DATABASE_URL` for their own project,
     /// and startup copies it into the process env after the engine connected.
     /// Every later backup ran `pg_dump` against that project instead.
     #[test]
     fn a_later_database_url_variable_does_not_move_the_engine() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let booted = database_url();
         let prior = std::env::var_os("DATABASE_URL");
-        // SAFETY: test-only. Nothing else in this crate's tests reads
-        // DATABASE_URL, which is why this names a URL no test connects to.
-        unsafe {
-            std::env::set_var(
-                "DATABASE_URL",
-                "postgres://user:pw@localhost:5432/someone_elses_app",
-            );
-        }
+        // Nothing else in this crate's tests reads DATABASE_URL, which is why
+        // this names a URL no test connects to.
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres://user:pw@localhost:5432/someone_elses_app",
+        );
         let after = database_url();
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var("DATABASE_URL", v),
-                None => std::env::remove_var("DATABASE_URL"),
-            }
-        }
+        restore_database_url(prior);
         assert_eq!(after, booted);
+    }
+
+    fn child_database_url() -> Option<String> {
+        let output = std::process::Command::new("env")
+            .output()
+            .expect("spawn env");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("DATABASE_URL="))
+            .map(str::to_string)
+    }
+
+    /// The incident: every engine child inherited the engine's own database
+    /// URL. A plain spawn, with no per-site env clearing, must not see it,
+    /// while a user variable applied later still reaches the child (ADR 0481).
+    #[test]
+    fn no_child_inherits_the_engines_database_url_but_a_user_one_reaches_it() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let booted = database_url();
+        let prior = std::env::var_os("DATABASE_URL");
+        std::env::set_var("DATABASE_URL", &booted);
+
+        scrub_database_url_from_process_env();
+        let after_scrub = child_database_url();
+        let user_url = "postgres://user:pw@localhost:5432/someone_elses_app";
+        std::env::set_var("DATABASE_URL", user_url);
+        let after_user_var = child_database_url();
+        let engine_url = database_url();
+        restore_database_url(prior);
+
+        assert_eq!(after_scrub, None, "the engine's URL reached a child");
+        assert_eq!(after_user_var.as_deref(), Some(user_url));
+        assert_eq!(engine_url, booted, "the engine itself still knows its URL");
     }
 }
 
@@ -1691,6 +1705,14 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             "Stopping MCP server '{}'...",
             args["id"].as_str().unwrap_or("server")
         ),
+        "enable_mcp_server" => format!(
+            "Enabling MCP server '{}' in this thread...",
+            args["id"].as_str().unwrap_or("server")
+        ),
+        "disable_mcp_server" => format!(
+            "Disabling MCP server '{}' in this thread...",
+            args["id"].as_str().unwrap_or("server")
+        ),
         "remove_mcp_server" => format!(
             "Removing MCP server '{}'...",
             args["id"].as_str().unwrap_or("server")
@@ -1836,6 +1858,10 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some(false) => "No read needed".to_string(),
             _ => "Asking you to read this reply...".to_string(),
         },
+        "wake_parent" => match args[crate::llm::tools::WAKE_ARG].as_bool() {
+            Some(false) => "Filing the report for the parent thread".to_string(),
+            _ => "Waking the parent thread...".to_string(),
+        },
         "triage_threads" => "Triaging threads...".to_string(),
         "apply_thread_triage" => "Applying the approved triage...".to_string(),
         "list_changes" => "Listing changes...".to_string(),
@@ -1914,11 +1940,12 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             let widget = args["app_id"].as_str().unwrap_or("widget");
             match args["action"].as_str() {
                 Some("thread") => "Reading this thread's widgets...".to_string(),
-                Some("show") => format!("Showing widget '{}'...", widget),
                 Some("pin") => format!("Pinning widget '{}' to the shelf...", widget),
                 Some("unpin") => format!("Unpinning widget '{}' from the shelf...", widget),
                 Some("make_reusable") => format!("Making widget '{}' reusable...", widget),
                 Some("stop_reusing") => format!("Stopping reuse of widget '{}'...", widget),
+                Some("board") => "Reading the Home board...".to_string(),
+                Some("arrange") => "Arranging the Home board...".to_string(),
                 _ => "Listing reusable widgets...".to_string(),
             }
         }
@@ -2037,6 +2064,14 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             ),
             Some("stop") => format!(
                 "Stopping MCP server '{}'...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            Some("enable") => format!(
+                "Enabling MCP server '{}' in this thread...",
+                args["id"].as_str().unwrap_or("server")
+            ),
+            Some("disable") => format!(
+                "Disabling MCP server '{}' in this thread...",
                 args["id"].as_str().unwrap_or("server")
             ),
             Some("remove") => format!(

@@ -4,24 +4,61 @@
 # `/harden` Phase 4.5 test suites and owns the early suite run (ADR 0292).
 # Sourced by that script and by harden_suites_test.sh. Defines functions only.
 #
-# Four rules live here and nowhere else:
+# Six rules live here and nowhere else:
 #   - which suites a list of changed paths selects (hs_select_suites);
+#   - whether the branch changes what codegen renders (hs_generated_drift);
+#   - what the fast tier drops from that selection (hs_fast_tier_suite);
 #   - the command each suite runs (hs_suite_command);
 #   - HARDEN_SAFE_PATHS, the paths no suite reads (hs_is_safe_path);
 #   - the read check that turns that list off when a source may read it.
 
-# The two Codex driver modules. An early run skips them and `wait` runs them
+# The two Codex driver modules. An early run skips them and `wait` starts them
 # alone once the Codex review is joined: their timeouts fail under load.
 HS_DRIVER_MODULES="runtime::codex::driver_tests runtime::codex_app_server::driver_tests"
+
+# How long one `wait` blocks by default, in seconds. The Claude Code prompt
+# cache lives 5 minutes from the start of the last request, so a join returns
+# well inside that and the agent re-issues it (ADR 0470).
+# shellcheck disable=SC2034 # read by scripts/harden-suites.sh and its test
+HS_WAIT_BUDGET=230
 
 # True for a suite that runs cargo. Those share one lane and run one at a
 # time, since two cargo test runs in one worktree can OOM the host. Every other
 # suite gets a lane of its own.
 hs_is_cargo_suite() {
     case "$1" in
-        rust | shell-lint | app-lib | cli | gateway | engine-filtered | driver) return 0 ;;
+        rust | lint | shell-lint | app-lib | cli | gateway | engine-filtered | driver) return 0 ;;
     esac
     return 1
+}
+
+# The tier of `/harden` a branch runs, from whatever named it: `fast` for an
+# integrated sub-thread, `full` for anything else, an empty answer included.
+hs_normalize_tier() { # <answer>
+    if [ "${1:-}" = fast ]; then echo fast; else echo full; fi
+}
+
+# The tier a branch runs. The engine's answer wins, so no variable can drop
+# a full branch's suites. HARDEN_TIER names the tier only when no engine
+# answers, which is the hermetic tests' case.
+hs_resolve_tier() { # <engine-answer> <HARDEN_TIER>
+    if [ -n "${1:-}" ]; then
+        hs_normalize_tier "$1"
+    else
+        hs_normalize_tier "${2:-}"
+    fi
+}
+
+# What the fast tier runs in place of a full-tier suite, or nothing for a
+# suite it drops. The fast tier keeps the lint, the frontend checks and the
+# script tests. It drops every crate's test suite, the installer, the release
+# path and the first-paint check: the integrating parent runs them all once.
+hs_fast_tier_suite() { # <suite>
+    case "$1" in
+        rust) echo lint ;;
+        shell-lint | ts | vite | vitest | harden-suites | harden-scope | harden-codex-review) echo "$1" ;;
+    esac
+    return 0
 }
 
 # Files no suite reads, at compile time or at run time, as an extended regex.
@@ -49,10 +86,16 @@ HS_ANCHOR_RE='CARGO_MANIFEST_DIR|repo_root\(|include_str!|include_bytes!|__dirna
 # Files that name a safe path beside an anchor without reading it, and how many
 # such lines each has. A new file, or a higher count, trips the read check.
 HS_READ_CHECK_KNOWN='crates/lucidos-app/e2e/markdown-table-columns.spec.ts 1
+crates/lucidos-app/src/components/chat/__tests__/chat-link-click.test.ts 1
+crates/lucidos-app/src/styles/__tests__/iframe-css-no-shared-component-restyle.test.ts 1
+crates/lucidos-engine/src/core/changes.rs 1
+crates/lucidos-engine/src/engine/change_ops_withheld_work_tests.rs 2
 crates/lucidos-engine/src/engine/event_bus_tests/proposed_apply_cycle.rs 1
 crates/lucidos-engine/src/engine/frontend_refresh.rs 1
 crates/lucidos-engine/src/engine/git_ops/plan_marker.rs 1
-crates/lucidos-engine/src/engine/thread_events_tests/ts_codegen.rs 1'
+crates/lucidos-engine/src/engine/successor_tests.rs 2
+crates/lucidos-engine/src/engine/thread_events_tests/ts_codegen.rs 1
+crates/lucidos-engine/src/engine/thread_lifecycle_tests/invariants.rs 1'
 
 # Print "path count" for each source file that may read a safe path and is not
 # in HS_READ_CHECK_KNOWN at that count. Returns 1 when it prints anything, and
@@ -201,7 +244,7 @@ hs_vitest_inputs() { # <root>
 # The files outside system-knowhow/ that a `value_pins_tests` module reads, one
 # list per crate. Each holds a copy of a Rust constant it cannot import (ADR
 # 0368). harden_suites_test.sh checks each list against the paths its test names.
-HS_GATEWAY_PINNED="install.sh scripts/lib/service.sh scripts/lib/workspace_constants.sh crates/lucidos-app/tauri.conf.json README.md"
+HS_GATEWAY_PINNED="install.sh scripts/lib/service.sh scripts/lib/workspace_constants.sh crates/lucidos-app/tauri.conf.json crates/lucidos-app/e2e/db-helpers.ts crates/lucidos-e2e/tests/api_support/mod.rs README.md"
 HS_ENGINE_PINNED="scripts/lib/workspace_constants.sh scripts/status.sh README.md"
 
 hs_is_listed() { # <path> <space-separated list>
@@ -230,15 +273,48 @@ hs_engine_filters() { # changed paths on stdin
     return 0
 }
 
+# Print "drift" when the branch changes a generated file, which a changed path
+# need not show: generated files are build outputs. A Rust change that
+# renames a wire field must still run the TS suites. Renders the branch when
+# its codegen fingerprint differs from the merge base's, then compares the two
+# renderings. No rendering for the base, or a render that fails, counts as drift.
+# HS_CODEGEN replaces scripts/codegen.sh in the tests.
+hs_generated_drift() { # <root>
+    local root=$1 codegen=${HS_CODEGEN:-$1/scripts/codegen.sh} base head_dir base_dir
+    base=$(git -C "$root" merge-base main HEAD 2>/dev/null) || { echo drift; return 0; }
+    [ "$("$codegen" --fingerprint "$base")" = "$("$codegen" --fingerprint)" ] && return 0
+    if ! "$codegen" >&2 \
+        || ! head_dir=$("$codegen" --cache-dir) \
+        || ! base_dir=$("$codegen" --cache-dir "$base") \
+        || ! diff -rq "$base_dir" "$head_dir" >/dev/null; then
+        echo drift
+    fi
+    return 0
+}
+
 # Read changed paths on stdin and print the selected suites, one per line.
 # This is the `/harden` Phase 4.5 test-selection table. A path listed in the
 # compile-inputs file selects the Rust suite whatever its extension: a crate
 # compiles it in, so a docs-only or frontend-only edit to it can break a build.
 # A path in the cli-inputs file also selects the CLI tests. The CLI pins engine
 # files that way, and `make test` never runs its tests. A path in the
-# vitest-inputs file (hs_vitest_inputs) selects the Vitest suite.
-hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file]
-    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} p rust="" shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" self="" scope="" codex="" paths=""
+# vitest-inputs file (hs_vitest_inputs) selects the Vitest suite. A non-empty
+# drift file (hs_generated_drift) selects the TS suite. The `fast` tier narrows
+# the selection through hs_fast_tier_suite.
+hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [tier]
+    local suite
+    if [ "$(hs_normalize_tier "${5:-}")" = fast ]; then
+        hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" | while IFS= read -r suite; do
+            hs_fast_tier_suite "$suite"
+        done
+        return 0
+    fi
+    hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}"
+}
+
+# The full tier's selection, which hs_select_suites narrows for the fast tier.
+hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file]
+    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} drift=${4:-/dev/null} p rust="" shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" firstpaint="" self="" scope="" codex="" paths=""
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         paths="$paths$p
@@ -254,7 +330,8 @@ hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-fi
         esac
         case "$p" in
             crates/lucidos-app/src/*.rs) app=1 ;;
-            crates/lucidos-cli/*) cli=1 ;;
+            # The CLI's build script renders its commands from the manifest.
+            crates/lucidos-cli/* | crates/lucidos-capabilities/*) cli=1 ;;
             *) grep -q -x -F -- "$p" "$cli_inputs" 2>/dev/null && cli=1 ;;
         esac
         case "$p" in
@@ -273,11 +350,17 @@ hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-fi
             *.ts | *.tsx) ts=1 ;;
             crates/lucidos-app/src/*.css) css=1 ;;
         esac
+        # A superset of first-paint-growth.mjs's isFirstPaintInput, which decides.
+        case "$p" in
+            *.rs | */Cargo.toml) ;;
+            crates/lucidos-app/* | packages/* | system-widgets/* | package.json | package-lock.json) firstpaint=1 ;;
+        esac
     done
     # A changed path selects Vitest when it, or a directory above it, is named.
     printf '%s' "$paths" | awk 'NR == FNR { want[$0] = 1; next }
         { p = $0; while (p != "") { if (p in want) { hit = 1; exit } if (!sub(/\/[^\/]*$/, "", p)) break } }
         END { exit !hit }' "$vitest_inputs" - 2>/dev/null && vitest=1
+    [ -s "$drift" ] && ts=1
 
     if [ -n "$rust" ]; then
         echo rust
@@ -297,6 +380,7 @@ hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-fi
         [ -n "$css" ] && echo vite
         [ -n "$vitest" ] && echo vitest
     fi
+    [ -n "$firstpaint" ] && echo first-paint
     [ -n "$install" ] && echo install
     [ -n "$release" ] && echo release
     [ -n "$self" ] && echo harden-suites
@@ -322,15 +406,16 @@ hs_suite_command() { # <suite> <early|normal> <changed-paths-file>
                 echo "make lint && make test"
             fi
             ;;
-        shell-lint) echo "make lint" ;;
+        shell-lint | lint) echo "make lint" ;;
         app-lib) echo "cargo test --locked -p lucidos-app --lib" ;;
         cli) echo "cargo test --locked -p lucidos-cli" ;;
         gateway) echo "cargo test --locked -p lucidos-gateway" ;;
         engine-filtered) echo "./scripts/test-engine.sh -- -- $(hs_engine_filters < "$paths_file")" ;;
         driver) echo "./scripts/test-engine.sh -- -- $HS_DRIVER_MODULES" ;;
-        ts) echo "cd crates/lucidos-app && npx tsc --noEmit && npm test && npx vite build" ;;
+        ts) echo "cd crates/lucidos-app && npm run typecheck && npm test && npx vite build" ;;
         vite) echo "cd crates/lucidos-app && npx vite build" ;;
         vitest) echo "cd crates/lucidos-app && npm test" ;;
+        first-paint) echo "cd crates/lucidos-app && node first-paint-growth.mjs check" ;;
         install) echo "bash scripts/lib/install_test.sh" ;;
         release) echo "bash scripts/lib/release_draft_test.sh && bash scripts/lib/release_rc_gate_test.sh" ;;
         harden-suites) echo "bash scripts/lib/harden_suites_test.sh" ;;

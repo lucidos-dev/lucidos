@@ -192,32 +192,6 @@ export function updateAppApi(
   });
 }
 
-export interface UiSourceFile {
-  name: string;
-  content: string;
-}
-
-export function readAppSourceApi(
-  appId: string,
-): Promise<{ files: UiSourceFile[] }> {
-  return json(
-    `${API}/app/${encodeURIComponent(appId)}/source`
-  );
-}
-
-export function writeAppSourceApi(
-  appId: string,
-  files: UiSourceFile[]
-): Promise<{ commit: string }> {
-  return json(
-    `${API}/app/${encodeURIComponent(appId)}/source`,
-    {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ files }),
-    }
-  );
-}
 
 /** The iframe src for an app, optionally previewing a thread's worktree and
  *  optionally targeting a place inside the app.

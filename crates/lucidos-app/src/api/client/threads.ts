@@ -1,6 +1,7 @@
 import { API, json, mutatingFetchIdempotent, throwIfNotOk } from './_core';
 import { postWithUploadProgress, type UploadObserver } from './uploadProgress';
 import type { ComposeSelectionOverride } from '../../store/composeSelections';
+import { parseComposeReport, type ComposeReport, type ComposeReportWire } from '../../store/composeReport';
 
 // --- Compose state machine (threads-as-drafts) ---
 //
@@ -16,8 +17,11 @@ import type { ComposeSelectionOverride } from '../../store/composeSelections';
  *  mode toggle when two devices race the first keystroke.
  *
  *  Bounded by `THREAD_START_TIMEOUT_MS`, so an engine that never answers turns
- *  into a transient failure the caller can retry, not a wait with no end. */
-export async function ensureThreadStarted(id: string, mode: string): Promise<void> {
+ *  into a transient failure the caller can retry, not a wait with no end.
+ *
+ *  Resolves with the draft's *compose report*, or `null` from an engine that
+ *  answers without one. */
+export async function ensureThreadStarted(id: string, mode: string): Promise<ComposeReport | null> {
   const res = await mutatingFetchIdempotent(`${API}/threads`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -25,6 +29,14 @@ export async function ensureThreadStarted(id: string, mode: string): Promise<voi
     signal: AbortSignal.timeout(THREAD_START_TIMEOUT_MS),
   });
   await throwIfNotOk(res);
+  return readComposeReport(res);
+}
+
+/** The *compose report* a response carries, or `null` when it carries none:
+ *  an empty body, or one from an engine that predates reports. */
+async function readComposeReport(res: Response): Promise<ComposeReport | null> {
+  const body = await res.json().catch(() => null) as ComposeReportWire | null;
+  return typeof body?.summary_version === 'number' ? parseComposeReport(body) : null;
 }
 
 export const THREAD_START_TIMEOUT_MS = 15_000;
@@ -33,12 +45,14 @@ export const THREAD_START_TIMEOUT_MS = 15_000;
  *
  *  `stale` is NOT an error, which is why it is a return value rather than a
  *  throw: the write was composed against a *compose epoch* a submission has
- *  since consumed, so the engine dropped it and handed back the current epoch.
- *  The caller adopts that value and re-issues. Throwing would route it into the
- *  "the engine refused, tell the user" branch, and the user has nothing to fix. */
+ *  since consumed, so the engine dropped it and handed back its current
+ *  *compose report*. The caller adopts the epoch and re-issues. Throwing would
+ *  route it into the "the engine refused, tell the user" branch, and the user
+ *  has nothing to fix. `applied` carries the report the write left, or `null`
+ *  from an engine that answers without one. */
 export type ComposePutResult =
-  | { status: 'applied' }
-  | { status: 'stale'; composeEpoch: number };
+  | { status: 'applied'; report: ComposeReport | null }
+  | { status: 'stale'; report: ComposeReport };
 
 /** PUT /api/v1/threads/:id/compose. `image_hashes` semantics mirror the
  *  SQL COALESCE on the backend: `null` preserves, `[]` clears, `[h,…]`
@@ -79,12 +93,11 @@ export async function putComposeOnThread(
     // leave the caller unable to make progress, so fall through to the throw
     // rather than guessing an epoch: a refusal the caller cannot act on is at
     // least a refusal the user is told about.
-    const body = await res.json().catch(() => null);
-    const epoch = (body as { compose_epoch?: unknown } | null)?.compose_epoch;
-    if (typeof epoch === 'number') return { status: 'stale', composeEpoch: epoch };
+    const body = await res.clone().json().catch(() => null) as ComposeReportWire | null;
+    if (typeof body?.compose_epoch === 'number') return { status: 'stale', report: parseComposeReport(body) };
   }
   await throwIfNotOk(res);
-  return { status: 'applied' };
+  return { status: 'applied', report: await readComposeReport(res) };
 }
 
 /** Response shape from `POST /api/v1/threads/:id/blobs`. */
@@ -128,15 +141,19 @@ export function blobPreviewUrl(hash: string): string {
   return `${API}/blobs/${encodeURIComponent(hash)}/preview`;
 }
 
-/** Discard a composing thread. 410 (already discarded) and 404 (never
- *  existed) are the desired end-state — caller swallows. 409 (Active /
- *  Archived) is a real conflict — caller surfaces. */
-export async function deleteThread(id: string): Promise<void> {
+/** DELETE /api/v1/threads/:id: discard a composing thread. Resolves with the
+ *  `summary_version` its `ThreadDiscarded` produced, or `null` when the engine
+ *  discarded nothing (already gone) or answered without one. 410 (already
+ *  discarded) and 404 (never existed) are the desired end-state — caller
+ *  swallows. 409 (Active / Archived) is a real conflict — caller surfaces. */
+export async function deleteThread(id: string): Promise<number | null> {
   const res = await mutatingFetchIdempotent(
     `${API}/threads/${encodeURIComponent(id)}`,
     { method: 'DELETE' },
   );
   await throwIfNotOk(res);
+  const body = await res.json().catch(() => null) as { summary_version?: unknown } | null;
+  return typeof body?.summary_version === 'number' ? body.summary_version : null;
 }
 
 // --- Search Everywhere ---

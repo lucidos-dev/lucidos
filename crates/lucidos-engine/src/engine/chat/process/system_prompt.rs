@@ -509,7 +509,7 @@ __TRIGGER_VS_EVENT_WAIT_RULE__
 
 TRIGGERS:
 - Cron is 6 fields (sec min hour dom month dow) in the user's LOCAL timezone; DST is handled automatically.
-- In a trigger thread, report only what is noteworthy: request_read true so the run waits under Review, and send_notification when the user should hear now. If nothing changed, just finish. Errors are reported automatically.
+- In a trigger thread, always call request_read: true only for findings the user would otherwise miss, false when the run found nothing new or your notification carried the news. send_notification when the user should hear now. Errors are reported automatically.
 
 IMPORTING DATA & CREDENTIALS:
 - API data: check credentials and the builtin provider proxies (proxy_request), request_credential only if neither has it, http_request, write_file to imported/<service>/. A local file is import_file with the full path.
@@ -573,7 +573,8 @@ EVENTS (the `events` tool):
 
 PARALLEL WORK (FAN-OUT):
 - run_coding_agent starts a coding-agent thread for code work; run_thread starts a Lucidos thread for non-code work; follow_up_child_thread steers a child you already spawned, and `threads` 'detach_child' stops waiting for one. You can only address your own DIRECT children, which the `threads` tool's 'list' action lists with `my_children: true`.
-- A DIRECT CHILD REPORTS BACK ON ITS OWN: when it finishes, fails, is canceled or is cut by an engine crash, the engine re-opens THIS thread with its status, summary and pending change ids. Say what you're waiting for and END YOUR TURN.
+- A DIRECT CHILD REPORTS BACK ON ITS OWN: when it finishes, fails, is canceled or is cut by an engine crash, its status, summary and pending change ids reach THIS thread. A failure always re-opens it. A clean report follows the spawn's `wake_mode`: 'wake' re-opens it, 'wake-when-all-done' once the last such child finishes, 'no-wake' FILES it for your next turn. Default: 'no-wake' from the home thread, 'wake' elsewhere. The mode lasts the child's life. Say what you're waiting for and END YOUR TURN.
+- WON'T ACT ON THE RESULT? relation='top': a child's report costs you a turn.
 - NEVER `await_event` ON YOUR OWN CHILD's `CodingAgentIdled`, `ResponseGenerated` or `ChildThreadCompleted`: a second wake for one finish.
 - `interrupted` means a crash cut its turn and nothing resumes it: follow_up_child_thread continues it. Only same-workspace children spawned with these tools report; a grandchild reports to your child, not you.
 - For a pipeline where step N depends on step N-1, spawn ONE child per response and wait for the callback. Never batch sequential spawns into one response.
@@ -1020,7 +1021,8 @@ Do NOT refuse to discuss the user's own personal information from their own file
 
 /// The tools a chat turn offers under `gates`, in wire order, before the MCP
 /// slice: the flat schemas, the notification tool, the grouped manifest tools,
-/// then the chat tail.
+/// then the chat tail. A sub-thread with no wake mode adds `wake_parent` after
+/// them (see `chat_turn_tools`), which no workspace-wide budget counts.
 pub(crate) fn chat_tools(
     gates: &crate::llm::ToolCapabilities,
 ) -> Vec<crate::llm::provider::ToolDefinition> {
@@ -1172,7 +1174,7 @@ mod tests {
         coding_surface_section, setup_device, setup_or_language_section, static_prompt_body,
         system_prompt_footprint, wire_chars, workspace_identity_section, ASK_USER_QUESTION_RULE,
         MANDATORY_PREFS, MEMORY_CORRECTIONS_RULE_CLASSIC, MEMORY_CORRECTIONS_RULE_TREE,
-        NAMES_NOT_IDS_RULE, NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE,
+        NAMES_NOT_IDS_RULE, NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE, SYSTEM_PROMPT_BASE,
         TRIGGER_VS_EVENT_WAIT_RULE, WORKSPACE_ASSETS_KNOWHOW_RULE,
     };
     use crate::core::prefs::{self, PrefScope};
@@ -1656,7 +1658,40 @@ mod tests {
     /// the agent can drop a loaded knowhow doc it is done with. A loaded doc
     /// costs thousands of tokens on every turn it stays. The schema was cut
     /// to its id argument, and the lifecycle text lives in the block header.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 129_119;
+    ///
+    /// Raised by 101 to a measured 129,220 for `capture_app`'s `device`. The
+    /// agent takes a plugin's screenshots on the phone while the turn's last
+    /// used device is the laptop. The description is `navigate_ui`'s own.
+    ///
+    /// Raised by 34 to a measured 129,254 for `create_app`'s `name` saying no
+    /// emoji. An emoji in the name draws a second icon beside the app's own.
+    ///
+    /// Raised by 239 to a measured 129,493 for the `mcp` tool's `enable` and
+    /// `disable` actions (ADR 0430). A running server's tools now reach only
+    /// the threads that enable it, which takes its schemas off every other
+    /// request.
+    ///
+    /// Raised by 154 to a measured 129,647 for the `triggers` tool's
+    /// `mcp_servers` (ADR 0430). A trigger's fires may call only the MCP
+    /// servers it lists, so the agent that writes a trigger has to list them.
+    ///
+    /// Raised by 674 for filed reports: FAN-OUT and the spawn tools say a
+    /// clean report wakes the parent only when the child says it must act. A
+    /// parent that believed every report re-opens it would wait for a wake
+    /// that never comes.
+    ///
+    /// Raised by 847 to a measured 131,168 for the Home board (ADR 0432): the
+    /// `widgets` tool's board and arrange actions, `create_app`'s `sizes`, the
+    /// `home-board` navigate target, each listed widget's sizes, and one
+    /// `## Widgets` sentence. It says to arrange Home only when the user asks,
+    /// and never to size a new pin. Every arrangement the UI makes needs an
+    /// agent path (plan invariant), and each text was cut first.
+    ///
+    /// Raised by 30 to a measured 131,198 for ADR 0472: the `TRIGGERS` rule
+    /// now asks every trigger run for its own read decision, which keeps
+    /// routine runs out of Review. Its wording was cut first, and
+    /// `request_read`'s description dropped the duplicate clause.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 131_198;
 
     /// The gate set the ratchet bills.
     ///
@@ -1778,6 +1813,23 @@ mod tests {
     /// by phrase, and the reason enumerates it.
     const PER_TOOL_CEILING_EXCEPTIONS: &[(&str, usize, &str)] = &[
         (
+            "create_app",
+            1_583,
+            "it makes both kinds, so it carries the app-only scaffold guidance \
+             and the widget-only args together. Past the shared ceiling by \
+             `sizes` (ADR 0432): a widget's Home board sizes are chosen while \
+             writing the call that creates it, and its enum is the frozen size \
+             contract plugins build on",
+        ),
+        (
+            "widgets",
+            1_571,
+            "the Home board's arrange action (ADR 0432) takes a list of tiles, \
+             which no scalar arg can express, so it carries its own schema with \
+             the frozen size and layout enums. Arranging is prompt-first: every \
+             change the board's edit mode makes has this one agent path",
+        ),
+        (
             "await_event",
             2_845,
             "four tests pin thirteen distinct phrases on it (forward-only plus \
@@ -1806,7 +1858,7 @@ mod tests {
         ),
         (
             "triggers",
-            3_250,
+            3_401,
             "seven actions, each contributing its own summary line and its own \
              `(requires: …)` clause, plus the create schema's union shapes for \
              `cron` and `on`. system-knowhow/triggers.md deliberately does NOT \
@@ -1819,7 +1871,10 @@ mod tests {
              0119: `on` carries the condition operator set, so three new names \
              and the field-path rule land here rather than in the knowhow. \
              Raised from 2,980 by the trigger `provider` pin: a null-union over \
-             the seven provider names, declared once on create like `model`",
+             the seven provider names, declared once on create like `model`. \
+             Raised from 3,250 by `mcp_servers` (ADR 0430): a null-union over a \
+             string array, since a trigger's fires may call only the MCP servers \
+             it lists",
         ),
         (
             "manage_models",
@@ -1833,8 +1888,8 @@ mod tests {
         ),
         (
             "navigate_ui",
-            2_595,
-            "the two frozen enums the SDK is generated from (17 targets, 21 \
+            2_607,
+            "the two frozen enums the SDK is generated from (18 targets, 21 \
              settings views) are 447 chars before a word of prose; the settings \
              gloss is routing information available on no other surface, and \
              it names only the views whose own value does not (`mcp` is not \
@@ -1848,7 +1903,8 @@ mod tests {
              the model used to reach there now need their own value. Raised \
              from 2,494 by `device`: a navigate reaches one device, and the \
              user asking from the phone to open it on the laptop is chosen \
-             while writing the call",
+             while writing the call. Raised from 2,595 by the `home-board` \
+             target (ADR 0432), the one value that lands the Home board",
         ),
         (
             "request_credential",
@@ -2439,6 +2495,15 @@ mod tests {
             "`CodingAgentIdled`, `ResponseGenerated` or `ChildThreadCompleted`",
             "`interrupted`",
             "a grandchild reports to your child, not you",
+            // I12 of the wake-mode plan: the modes, the defaults, and that a
+            // failure always wakes.
+            "A failure always re-opens it",
+            "follows the spawn's `wake_mode`",
+            "'no-wake' FILES it for your next turn",
+            "Default: 'no-wake' from the home thread, 'wake' elsewhere",
+            "The mode lasts the child's life",
+            // ADR 0473: work this thread will not act on is a top-thread.
+            "WON'T ACT ON THE RESULT? relation='top'",
         ] {
             assert!(
                 section.contains(needle),
@@ -3337,6 +3402,30 @@ mod tests {
 
         let section = workspace_identity_section("shared", outside, "", "");
         assert!(section.contains("WORKSPACE: shared (/srv/lucidos/ws)"));
+    }
+
+    /// A trigger run makes its own read decision. A routine run that found
+    /// nothing, or repeats its own push, stays out of Review (ADR 0472).
+    #[test]
+    fn the_trigger_rule_has_the_run_decide_its_own_read() {
+        let rule = SYSTEM_PROMPT_BASE
+            .lines()
+            .find(|l| l.starts_with("- In a trigger thread"))
+            .expect("the TRIGGERS block states the trigger-run rule");
+        for must in [
+            "always call request_read: true only for findings the user would otherwise miss",
+            "false when the run found nothing new or your notification carried the news",
+        ] {
+            assert!(rule.contains(must), "missing {must:?}:\n{rule}");
+        }
+        assert!(
+            !SYSTEM_PROMPT_BASE.contains("just finish"),
+            "\"just finish\" leaves the decision to the forced call"
+        );
+        assert!(
+            !rule.contains("__"),
+            "the cached prefix holds no per-run data"
+        );
     }
 
     /// Three things have to hold together. The destination question must be

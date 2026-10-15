@@ -14,7 +14,9 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText, useSkeleton } from '../shared/Skeleton';
 import { ProseSkeleton } from '../files/previewSkeletons';
 import { pluginRowsInScope, pluginRowsSettled, refreshPluginsPanel } from './StoreTab';
-import { PluginActions, PluginIcon, PluginMeta, PluginTitle } from './pluginCard';
+import {
+  PluginActions, PluginIcon, PluginMeta, PluginModifiedNotice, PluginSource, PluginTitle,
+} from './pluginCard';
 import { renderPluginReadme } from './pluginReadme';
 
 interface PluginDetailPageProps {
@@ -72,6 +74,7 @@ function PluginDetailBody({ plugin, name }: { plugin?: MarketplacePlugin; name: 
   return (
     <div class="plugin-detail-column">
       <PluginDetailHead plugin={plugin} />
+      <PluginModifiedNotice plugin={plugin} />
       <MediaStrip plugin={plugin} />
       {plugin.media.readme_url && <Readme readme={readme.loadable} showLoading={readme.showLoading} />}
       <MediaProblems problems={plugin.media.problems} />
@@ -79,8 +82,8 @@ function PluginDetailBody({ plugin, name }: { plugin?: MarketplacePlugin; name: 
   );
 }
 
-/** The header: icon, name and badges, the full description, the chips and the
- *  row's own buttons. Self-skeletonizing. */
+/** The header: icon, name, badges and source beside the buttons, then the
+ *  full description and the chips at full width. Self-skeletonizing. */
 function PluginDetailHead({ plugin }: { plugin?: MarketplacePlugin }) {
   const sk = useSkeleton();
   const [busy, setBusy] = useState(false);
@@ -93,18 +96,21 @@ function PluginDetailHead({ plugin }: { plugin?: MarketplacePlugin }) {
     }
   }
   return (
-    <div class="plugin-detail-head">
-      <div class="plugin-detail-icon">
-        <PluginIcon plugin={plugin} />
+    <div class="plugin-detail-intro">
+      <div class="plugin-detail-head">
+        <div class="plugin-detail-icon">
+          <PluginIcon plugin={plugin} />
+        </div>
+        <div class="plugin-detail-heading">
+          <PluginTitle plugin={plugin} nameClass="title plugin-detail-name" />
+          <PluginSource plugin={plugin} />
+        </div>
+        <PluginActions plugin={plugin} busy={busy} onInstall={(p) => void stageInstall(p)} />
       </div>
-      <div class="plugin-detail-heading">
-        <PluginTitle plugin={plugin} nameClass="title plugin-detail-name" />
-        {(sk || plugin?.description) && (
-          <SkText class="plugin-detail-description" as="div" w="20rem">{plugin?.description}</SkText>
-        )}
-        <PluginMeta plugin={plugin} />
-      </div>
-      <PluginActions plugin={plugin} busy={busy} onInstall={(p) => void stageInstall(p)} />
+      {(sk || plugin?.description) && (
+        <SkText class="plugin-detail-description" as="div" w="20rem">{plugin?.description}</SkText>
+      )}
+      <PluginMeta plugin={plugin} />
     </div>
   );
 }

@@ -12,7 +12,9 @@ pub(crate) use build::{build_session_messages, CHANGES_MOVED_ON_NOTE};
 pub(crate) use build::{
     build_session_messages_with, newest_conversation_summary, reported_change_ids, CachedSummary,
 };
-pub use build::{format_child_thread_completed_block, ChangeStatuses};
+pub use build::{
+    format_child_report_filed_block, format_child_thread_completed_block, ChangeStatuses,
+};
 pub(crate) use resume::{
     build_resume_tool_blocks_with_skip_ids, collect_tool_pairs_chronological,
     find_orphan_tool_called_ids, parse_event_address, synthesize_tool_use_id,

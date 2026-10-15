@@ -274,6 +274,17 @@ fn withheld(reason: UnproposedReason) -> &'static str {
         }
         UnproposedReason::HardeningMissing => "The work is not ready: it has not been hardened.",
         UnproposedReason::TurnIncomplete => "The work is not ready: its turn did not finish.",
+        UnproposedReason::AwaitingLanding => {
+            "The work is not ready: the thread's change is still waiting in the landing lane."
+        }
+        UnproposedReason::IntegratedIntoParent => {
+            "The work never becomes a change: the thread is integrated into its parent, whose \
+             change carries it."
+        }
+        UnproposedReason::CarriedBySuccessor => {
+            "The work never becomes a change here: the thread continued in a successor thread, \
+             whose change carries it."
+        }
     }
 }
 

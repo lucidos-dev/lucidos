@@ -4,6 +4,7 @@ import { installScrollMemory } from './scroll';
 import { installKeyboardForwarding } from './keyboardForward';
 import { installAppPullToRefresh } from './pullToRefresh';
 import { installAppPaneSwipe } from './paneSwipe';
+import { installAppScrollReport } from './appScroll';
 import { installTooltips } from './tooltip';
 import { primeDevicePreferences } from './ui';
 import { installAutocorrectStamp } from './autocorrectStamp';
@@ -83,6 +84,9 @@ if (typeof document !== 'undefined') {
   // A sideways drag anywhere in the app swipes the host's panes, as it does
   // over the transcript. Same reason: only the SDK can see the frame's touches.
   installAppPaneSwipe();
+  // The app's scroll moves the host's mobile header, as a transcript's does.
+  // Same reason again: the frame's own document scrolls, out of the host's sight.
+  installAppScrollReport();
 
   document.addEventListener('click', (e: MouseEvent) => {
     const target = e.target as Element | null;

@@ -32,11 +32,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// it never leaves the engine (the plan's decision 3).
 const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
 
-/// The one transcriber that spells its language pin as an array.
+/// The transcribers that spell their language pin as an array.
 ///
-/// A constant, because `transcription()` branches on this id and the picker in
-/// `VoiceSection.tsx` offers it. That function says what the branch does.
-const LIVE_TRANSCRIBE_MODEL: &str = "gpt-live-transcribe";
+/// A list, because `transcription()` branches on these ids and the picker in
+/// `VoiceSection.tsx` offers them. That function says what the branch does.
+const LANGUAGES_ARRAY_TRANSCRIBERS: &[&str] = &["gpt-live-transcribe", "gpt-transcribe"];
 
 /// How many talker events may queue before the reader waits.
 ///
@@ -290,10 +290,11 @@ fn function(name: &str, description: &str, argument: Option<(&str, &str)>) -> Va
 /// Nynorsk. The plan is
 /// `docs/plans/2026-08-29-a-call-speaks-one-language-and-gives-one-answer.md`.
 ///
-/// **Which key carries it depends on the model.** [`LIVE_TRANSCRIBE_MODEL`]
-/// reads `languages`, an array of codes. Every other model reads the singular
-/// `language`. The provider refuses a payload holding both, so this writes
-/// exactly one of them. An unresolved language still writes neither.
+/// **Which key carries it depends on the model.** The
+/// [`LANGUAGES_ARRAY_TRANSCRIBERS`] read `languages`, an array of codes. Every
+/// other model reads the singular `language`. The provider refuses a payload
+/// holding both, so this writes exactly one of them. An unresolved language
+/// still writes neither.
 ///
 /// The workspace's choice arrives on [`SessionOpening::transcriber`]. An empty
 /// one falls back to the catalog default, so it still transcribes rather than
@@ -305,7 +306,7 @@ fn transcription(opening: &SessionOpening) -> Value {
     };
     let mut config = json!({ "model": model });
     if let Some(code) = opening.language.as_ref().and_then(|l| l.code.as_deref()) {
-        if model == LIVE_TRANSCRIBE_MODEL {
+        if LANGUAGES_ARRAY_TRANSCRIBERS.contains(&model) {
             config["languages"] = json!([code]);
         } else {
             config["language"] = json!(code);
@@ -349,9 +350,9 @@ pub fn map_event(value: &Value) -> Vec<VoiceEvent> {
             }
         }
         // A partial, emitted while the caller is still speaking. Which
-        // transcriber is configured decides whether any arrive: the `gpt-4o`
-        // ones and [`LIVE_TRANSCRIBE_MODEL`] stream them, `whisper-1` sends
-        // only the completed frame below. Silence there is ordinary.
+        // transcriber is configured decides whether any arrive. A model that
+        // streams none sends only the completed frame below, so silence there
+        // is ordinary.
         // An EMPTY delta is dropped with an absent one. It carries no words, and
         // the client draws whatever it is sent: one would flip the bubble from
         // the pulse to an empty caption with a caret under it.
@@ -378,7 +379,7 @@ pub fn map_event(value: &Value) -> Vec<VoiceEvent> {
         // see [`done_events`], which explains why mapping it to one would
         // report a cut on every turn.
         //
-        // Load-bearing for `whisper-1`, which streams no partials at all. Its
+        // Load-bearing for a transcriber that streams no partials at all. Its
         // completed frame is asynchronous, so waiting for one drops the reply
         // to the caller's very first sentence.
         "input_audio_buffer.speech_started" => vec![VoiceEvent::CallerStartedSpeaking],
@@ -589,6 +590,8 @@ fn done_usage(value: &Value) -> ApiUsage {
         cache_read_tokens: read("/input_token_details/cached_tokens"),
         cache_creation_tokens: 0,
         modality: usage.and_then(done_modality),
+        service_tier: None,
+        cache_creation_1h_tokens: None,
     };
     warn_on_modality_drift(&reported);
     reported

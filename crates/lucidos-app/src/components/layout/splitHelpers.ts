@@ -76,7 +76,8 @@ export function clampSplitRatio(pointerPx: number, totalPx: number, bounds: Spli
  *  overlap survives the change that fixed it.
  *
  *  A MIGRATION, not a resize policy. It runs when the split first has a width,
- *  and again when Home raises the floor (SplitLayout). It corrects only a ratio
+ *  again when Home raises the floor, and once the Home board's rail has slid in
+ *  (SplitLayout). It corrects only a ratio
  *  the clamp would already have refused.
  *  Re-clamping on every container resize is a different decision, and a larger
  *  one: it would hold the Conversation floor by squeezing the Canvas pane under
@@ -146,6 +147,23 @@ export function computeDrawerStepWidth(
   if (maxPx < minPx) return null;
   const next = Math.min(Math.max(width + deltaPx, minPx), maxPx);
   return next === width ? null : next;
+}
+
+/** The widest the Home board's rail may go. `roomPx` is the split's width plus
+ *  the rail's, the room the two share. The Conversation pane holds its width,
+ *  so a wider rail comes out of the Canvas. With one pane collapsed, it comes
+ *  out of the other. */
+export function homeRailCeiling(roomPx: number, threadPx: number, ratio: number, bounds: SplitBounds): number {
+  if (ratio <= 0) return roomPx - bounds.minContentPx;
+  if (ratio >= 1) return roomPx - bounds.minThreadPx;
+  return roomPx - threadPx - bounds.minContentPx;
+}
+
+/** The width the rail draws at: the one the user set, held to what leaves the
+ *  two split panes their floors in this window, and never below its own. A
+ *  width saved on a larger display is kept, and drawn narrower here. */
+export function drawnHomeRailWidth(savedPx: number, viewportPx: number, floorPx: number, bounds: SplitBounds): number {
+  return Math.max(floorPx, Math.min(savedPx, viewportPx - bounds.minThreadPx - bounds.minContentPx));
 }
 
 /** Call on divider pointerdown: switch the layout into 1:1 pointer-tracking

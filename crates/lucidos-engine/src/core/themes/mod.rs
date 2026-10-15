@@ -338,7 +338,6 @@ pub fn is_frame_colour_token(name: &str) -> bool {
 }
 
 /// Every catalog colour token, in catalog order, with whether frames define it.
-#[cfg(test)]
 fn colour_tokens() -> impl Iterator<Item = (&'static str, bool)> {
     CATALOG
         .tokens

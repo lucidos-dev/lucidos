@@ -490,8 +490,8 @@ async fn follow_up_is_persisted_before_the_ack_and_keeps_send_order() {
     let marker = unique_marker("api-send-order");
 
     // First message creates the thread. It is deliberately NOT pre-emitted (a
-    // brand-new thread has nothing to be out of order with), so resolve the
-    // thread the same way the other tests do.
+    // brand-new thread's first message records in its spawned turn), so
+    // resolve the thread the same way the other tests do.
     let resp: serde_json::Value = client
         .post(&url)
         .json(&serde_json::json!({

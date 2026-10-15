@@ -417,8 +417,10 @@ impl LucidosEngine {
                 // This call site used to do both by hand, which is why the
                 // helper it called (`SystemEvent::artifact_change`) existed at
                 // all, and why the image tool could forget the pair entirely.
+                let held = self.lock_workspace_repo().await;
                 self.artifact_manager
                     .write_and_commit(
+                        &held,
                         &self.event_bus,
                         artifact_path,
                         &body_bytes,
@@ -429,13 +431,10 @@ impl LucidosEngine {
                         },
                     )
                     .await?;
-                // Re-read rather than publish `body_bytes`: this tool is the one
-                // artifact writer that does NOT take `lock_workspace_repo`, so
-                // a concurrent writer may already have landed newer bytes, and
-                // the cache must never hold content the file does not.
                 self.user_profile
-                    .artifact_written_on_disk(self.workspace_path(), artifact_path)
+                    .artifact_written(artifact_path, &body_bytes)
                     .await;
+                drop(held);
             }
         }
 

@@ -1,4 +1,5 @@
 import { parseRepoPath } from '../store/store';
+import { workspaceDataRoot } from './dataPathPrefixes';
 
 /** The path a file-preview overlay is showing, as the user would write it.
  *
@@ -54,7 +55,7 @@ export function previewDiskPath(
     return clone?.path ? joinPath(clone.path, repo.path) : null;
   }
   if (!workspacePath || encoded.startsWith('system-knowhow/')) return null;
-  return joinPath(workspacePath, `data/${encoded}`);
+  return `${workspaceDataRoot(workspacePath)}${encoded}`;
 }
 
 /** What "copy the path" puts on the clipboard: the absolute disk path where
@@ -73,9 +74,8 @@ export function previewCopyPath(
   return disk ? { path: disk, absolute: true } : { path: previewFilePath(encoded), absolute: false };
 }
 
-/** Join an absolute root to a relative path, tolerating a trailing slash on the
- *  root: `workspace_path` comes off the wire and a caller may register a clone
- *  either way. */
+/** Join a clone's absolute root to a relative path, tolerating a trailing
+ *  slash on the root: a caller may register a clone either way. */
 function joinPath(root: string, relative: string): string {
   return `${root.replace(/\/+$/, '')}/${relative}`;
 }

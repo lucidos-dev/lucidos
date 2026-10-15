@@ -8,7 +8,7 @@ vi.mock('../../../store/actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
 }));
 
-import { ChildCompletionRow } from '../ChildCompletionRow';
+import { ChildCompletionRow, FILED_REPORT_LINE } from '../ChildCompletionRow';
 import { EventRowFoldView } from '../EventRow';
 import { focusThreadOrBootstrap } from '../../../store/actions/threads';
 
@@ -110,6 +110,15 @@ describe('ChildCompletionRow', () => {
     expect(text).toContain('2 pending in its sub-threads');
     expect(text).not.toContain('pending change');
     expect(vnodeText(ChildCompletionRow(baseProps))).not.toContain('sub-threads');
+  });
+
+  /** A filed report reuses the card and adds one line, so a reader knows no
+   *  turn of this thread answered it. */
+  it('says a filed report did not wake this thread', () => {
+    const filed = ChildCompletionRow({ ...baseProps, filed: true });
+    expect(vnodeText(findByClass(filed, 'event-row-subject'))).toBe('Child thread report filed');
+    expect(vnodeText(filed)).toContain(FILED_REPORT_LINE);
+    expect(vnodeText(ChildCompletionRow(baseProps))).not.toContain(FILED_REPORT_LINE);
   });
 
   it('title link is an accent-link button with data-thread-id pointing at the child thread', () => {

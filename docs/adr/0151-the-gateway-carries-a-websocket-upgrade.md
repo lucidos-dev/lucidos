@@ -102,3 +102,10 @@ where the engine cannot event-source it.
 **Let the client reach the engine port directly.** No gateway work at all.
 Rejected by ADR 0096: engines bind loopback, so no such path exists from a
 phone, and re-opening one would hand out a whole workspace with no credential.
+
+## Amendment: the upgrade dials the engine socket
+
+ADR 0445 moved every gateway-to-engine hop, this one included, onto the
+engine's Unix socket, after a peer-uid check. The plain-TCP dial and its
+refusal of a TLS engine are gone, because the hop no longer has a scheme. The
+splice, the stripped headers and the injected device are unchanged.

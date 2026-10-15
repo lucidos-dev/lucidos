@@ -265,6 +265,7 @@ describe('promptPlaceholder', () => {
   it('invites a side question over a pending card in side-question mode', () => {
     expect(promptPlaceholder(true, true, true)).toBe(PLACEHOLDER_SIDE_QUESTION);
   });
+
 });
 
 describe('threadHasConversation', () => {

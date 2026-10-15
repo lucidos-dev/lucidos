@@ -195,7 +195,7 @@ async fn update(
 /// bottom, and both survive.
 #[tokio::test]
 async fn clean_merge_keeps_the_user_hunk_and_takes_upstreams() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
 
@@ -231,7 +231,6 @@ async fn clean_merge_keeps_the_user_hunk_and_takes_upstreams() {
         outcome.saved_paths.is_empty(),
         "a kept edit needs no copy aside"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// The install commit is the next update's merge base, so it must hold
@@ -239,7 +238,7 @@ async fn clean_merge_keeps_the_user_hunk_and_takes_upstreams() {
 /// the merge instead is what silently drops the patch one update later.
 #[tokio::test]
 async fn install_commit_records_upstream_not_merged() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     write_data(&ws, "knowhow/notes.md", &notes_with_user_section(NOTES));
@@ -265,14 +264,13 @@ async fn install_commit_records_upstream_not_merged() {
         read_data(&ws, "knowhow/notes.md").contains("## Outlook snapshot"),
         "while the working tree keeps the merge"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// The regression this design exists for. Update two must not eat the patch
 /// that update one kept.
 #[tokio::test]
 async fn patch_carries_forward_across_two_updates() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     write_data(&ws, "knowhow/notes.md", &notes_with_user_section(NOTES));
@@ -314,7 +312,6 @@ async fn patch_carries_forward_across_two_updates() {
         on_disk.contains("## Outlook snapshot"),
         "the patch must survive a SECOND update: {on_disk}"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// Both sides rewrote the same line. Upstream wins on disk: a file carrying
@@ -322,7 +319,7 @@ async fn patch_carries_forward_across_two_updates() {
 /// version is kept as a file plus a re-appliable patch.
 #[tokio::test]
 async fn conflict_writes_upstream_and_saves_ours_aside() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
 
@@ -370,7 +367,6 @@ async fn conflict_writes_upstream_and_saves_ours_aside() {
             .any(|p| p.ends_with("v2.0.0/README.md")),
         "the folder must explain itself"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// `trigger.toml` is a re-serialized projection the engine rewrites after every
@@ -378,7 +374,7 @@ async fn conflict_writes_upstream_and_saves_ours_aside() {
 /// would report a conflict for every plugin trigger on every update.
 #[tokio::test]
 async fn trigger_projection_is_never_merged() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     let files: &[(&str, &[u8])] = &[
         ("knowhow/notes.md", NOTES.as_bytes()),
@@ -420,14 +416,13 @@ async fn trigger_projection_is_never_merged() {
         vec!["triggers/watch/trigger.toml".to_string()]
     );
     assert!(outcome.conflicted.is_empty(), "never a conflict");
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// The common path must be untouched: no merge attempted, nothing saved aside,
 /// and `data/artifacts/` left clean.
 #[tokio::test]
 async fn unmodified_file_is_plainly_replaced() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     let base = baseline(&bus, &["knowhow/notes.md"]);
@@ -451,7 +446,6 @@ async fn unmodified_file_is_plainly_replaced() {
         !data_path(&ws, "artifacts/plugin-local-changes").exists(),
         "a normal update must not create a saved-changes folder"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// The repro: the user edits files, publishes those edits upstream, then
@@ -461,7 +455,7 @@ async fn unmodified_file_is_plainly_replaced() {
 /// about a file nothing can happen to.
 #[tokio::test]
 async fn a_file_already_equal_to_the_new_version_is_not_a_local_change() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     let files: &[(&str, &[u8])] = &[
         ("knowhow/notes.md", NOTES.as_bytes()),
@@ -531,7 +525,6 @@ async fn a_file_already_equal_to_the_new_version_is_not_a_local_change() {
         published,
         "and it lands as the new version ships it, which is what it already was"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// A path the panel says nothing about is still watched. The user edited it
@@ -539,7 +532,7 @@ async fn a_file_already_equal_to_the_new_version_is_not_a_local_change() {
 /// real work. Silent in the list must not mean unguarded at confirm.
 #[tokio::test]
 async fn a_file_dropped_for_matching_upstream_is_still_drift_checked() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     let published = notes_with_user_section(NOTES);
@@ -569,14 +562,13 @@ async fn a_file_dropped_for_matching_upstream_is_still_drift_checked() {
         Some("knowhow/notes.md"),
         "an edit inside the staging window must still stop the confirm"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// The panel's keep control switched off: clean upstream everywhere, but the
 /// discarded edit is still preserved rather than deleted.
 #[tokio::test]
 async fn keep_local_changes_false_replaces_and_saves_aside() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     let ours = notes_with_user_section(NOTES);
@@ -608,13 +600,12 @@ async fn keep_local_changes_false_replaces_and_saves_aside() {
         ours,
         "and still keeps what it discarded"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// A binary file has no meaningful three-way merge whatever its size.
 #[tokio::test]
 async fn binary_file_is_replaced_not_merged() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("apps/demo/logo.bin", b"\x00\x01binary v1")]).await;
     std::fs::write(data_path(&ws, "apps/demo/logo.bin"), b"\x00\x01edited").unwrap();
@@ -643,7 +634,6 @@ async fn binary_file_is_replaced_not_merged() {
         !saved.with_extension("bin.patch").exists(),
         "a binary has no unified diff to file beside it"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// A file the user deleted comes back, and reports as its own outcome. It must
@@ -651,7 +641,7 @@ async fn binary_file_is_replaced_not_merged() {
 /// would be promising a copy that does not exist.
 #[tokio::test]
 async fn a_locally_deleted_file_is_restored_not_replaced() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     std::fs::remove_file(data_path(&ws, "knowhow/notes.md")).unwrap();
@@ -678,7 +668,6 @@ async fn a_locally_deleted_file_is_restored_not_replaced() {
         !data_path(&ws, "artifacts/plugin-local-changes").exists(),
         "and so leaves no saved-changes folder behind"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// Installing the same version twice must not write the second batch of
@@ -687,7 +676,7 @@ async fn a_locally_deleted_file_is_restored_not_replaced() {
 /// the live file.
 #[tokio::test]
 async fn a_second_save_of_one_version_never_overwrites_the_first() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
 
@@ -737,7 +726,6 @@ async fn a_second_save_of_one_version_never_overwrites_the_first() {
         second_edit,
         "the second save goes to its own folder"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// A merged file must end up with the mode the shipped file carries, on disk
@@ -749,7 +737,7 @@ async fn a_second_save_of_one_version_never_overwrites_the_first() {
 async fn a_merged_file_keeps_the_shipped_executable_bit() {
     use std::os::unix::fs::PermissionsExt;
 
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("scripts/run.sh", NOTES.as_bytes())]).await;
     write_data(&ws, "scripts/run.sh", &notes_with_user_section(NOTES));
@@ -813,7 +801,6 @@ async fn a_merged_file_keeps_the_shipped_executable_bit() {
         0o100755,
         "the install commit must record the shipped mode, not the buffer default"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// The size arm of the same rule, checked directly: building a real
@@ -836,7 +823,7 @@ fn oversized_content_is_not_mergeable() {
 /// so. This is also what proves the merge base stayed pristine.
 #[tokio::test]
 async fn badge_still_modified_after_a_clean_merge() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     write_data(&ws, "knowhow/notes.md", &notes_with_user_section(NOTES));
@@ -862,7 +849,6 @@ async fn badge_still_modified_after_a_clean_merge() {
         "a kept patch is still a local modification"
     );
     assert_eq!(status.modified_paths, vec!["knowhow/notes.md".to_string()]);
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// The staging window is an hour long. An edit inside it means the panel
@@ -870,7 +856,7 @@ async fn badge_still_modified_after_a_clean_merge() {
 /// write a merge against the old bytes.
 #[tokio::test]
 async fn confirm_refuses_when_local_content_changed_since_staging() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     write_data(&ws, "knowhow/notes.md", &notes_with_user_section(NOTES));
@@ -896,7 +882,6 @@ async fn confirm_refuses_when_local_content_changed_since_staging() {
         Some("knowhow/notes.md"),
         "the confirm must be able to see the drift"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// The patch offered upstream is derived on read, so it is always against the
@@ -904,7 +889,7 @@ async fn confirm_refuses_when_local_content_changed_since_staging() {
 /// only thing that makes it worth handing to a plugin author.
 #[tokio::test]
 async fn proposed_patch_applies_to_the_installed_version() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
     let ours = notes_with_user_section(NOTES);
@@ -919,7 +904,8 @@ async fn proposed_patch_applies_to_the_installed_version() {
 
     // Apply it to a clean checkout of the INSTALLED version and check we get
     // the user's file back.
-    let scratch = std::env::temp_dir().join(format!("lucidos_patch_{}", uuid::Uuid::new_v4()));
+    let tmp = tempfile::tempdir().unwrap();
+    let scratch = tmp.path().to_path_buf();
     std::fs::create_dir_all(scratch.join("data/knowhow")).unwrap();
     git2::Repository::init(&scratch).unwrap();
     std::fs::write(scratch.join("data/knowhow/notes.md"), NOTES).unwrap();
@@ -941,15 +927,13 @@ async fn proposed_patch_applies_to_the_installed_version() {
         ours,
         "applying the patch must reproduce the user's file"
     );
-    let _ = std::fs::remove_dir_all(&scratch);
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// An untouched plugin has nothing to propose, and a trigger projection is not
 /// a local edit anybody wrote.
 #[tokio::test]
 async fn nothing_to_propose_without_a_real_local_edit() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     let files: &[(&str, &[u8])] = &[
         ("knowhow/notes.md", NOTES.as_bytes()),
@@ -977,7 +961,6 @@ async fn nothing_to_propose_without_a_real_local_edit() {
         super::local_patch(&ws, &base).is_none(),
         "a trigger projection diff describes the serializer, not the user"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// A path reaches `modified_paths` on a mode change alone, and identical
@@ -988,7 +971,7 @@ async fn nothing_to_propose_without_a_real_local_edit() {
 async fn a_mode_only_change_proposes_no_patch() {
     use std::os::unix::fs::PermissionsExt;
 
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("scripts/run.sh", NOTES.as_bytes())]).await;
     let base = baseline(&bus, &["scripts/run.sh"]);
@@ -1007,7 +990,6 @@ async fn a_mode_only_change_proposes_no_patch() {
         super::local_patch(&ws, &base).is_none(),
         "unchanged content has nothing to propose"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// A user-added file inside a plugin's app dir that upstream now ships too.
@@ -1015,7 +997,7 @@ async fn a_mode_only_change_proposes_no_patch() {
 /// conflict. That routes to the same save-aside rule as any other conflict.
 #[tokio::test]
 async fn user_added_app_file_upstream_now_ships_is_a_conflict() {
-    let ws = fresh_workspace();
+    let (_tmp, ws) = fresh_workspace();
     let bus = MockEventBus::new();
     install_first(&ws, &bus, &[("apps/demo/index.html", b"<h1>v1</h1>\n")]).await;
     write_data(&ws, "apps/demo/extra.js", "console.log('mine')\n");
@@ -1046,5 +1028,4 @@ async fn user_added_app_file_upstream_now_ships_is_a_conflict() {
         ),
         "console.log('mine')\n"
     );
-    let _ = std::fs::remove_dir_all(&ws);
 }

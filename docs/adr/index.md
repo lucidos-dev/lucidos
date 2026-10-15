@@ -1,9 +1,9 @@
 # ADR index
 
 One line per decision, in number order. This file is **append-only** and
-merges with `merge=union` (see `.gitattributes`), so two branches adding an
-ADR at once both keep their line instead of conflicting. Union can leave the
-new lines out of order: `./scripts/check-adrs.sh --fix` restores it.
+merges through the keyed `lucidos-sorted-lines` driver (ADR 0460, see
+`.gitattributes`), so two branches adding an ADR at once both keep their line,
+in order. `./scripts/check-adrs.sh --fix` restores an order a text merge broke.
 
 Create an entry with `./scripts/adr-new.sh`, never by hand. See
 [README.md](README.md) for the format and what belongs here.
@@ -47,7 +47,7 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0037: A down dependency is reported once by the layer that knows, never inferred N times downstream (one Docker probe, `database_reachable` on `/health`, one toast instead of twenty)](0037-database-reachability-is-reported-not-inferred.md)
 - [0038: A chat link never leaves the workspace: the click handler's extractor chain is closed at the bottom, so an unclaimed href is a toast rather than an SPA-fallback reload](0038-a-chat-link-never-leaves-the-workspace.md)
 - [0039: The public mirror's `main` is a linear release history, and a parent is safe because the mirror already publishes it (the orphan rule was sufficient, never necessary)](0039-the-public-mirror-is-a-linear-release-history.md)
-- [0040: Concurrent ADRs stop conflicting: the index is a union-merged file of its own, and a number is allocated across every unmerged branch rather than read off main](0040-adr-index-is-union-merged-and-numbers-are-allocated.md)
+- [0040: Concurrent ADRs stop conflicting: the index is a union-merged file of its own, and a number is allocated across every unmerged branch rather than read off main](0040-adr-index-is-union-merged-and-numbers-are-allocated.md) *(union merge replaced by 0460)*
 - [0041: Coding-agent branches are named for their thread, not a timestamp](0041-coding-agent-branches-named-for-their-thread.md) *(the accepted allocation race superseded by 0076)*
 - [0042: A GA release is a draft until every platform tarball is attached](0042-release-is-complete-when-it-goes-public.md)
 - [0043: The parent-to-child edge is the only privileged cross-thread write, and it asserts nothing](0043-parent-to-child-privileged-write.md)
@@ -425,10 +425,68 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0416: Unhardened Lucidos-source work is never proposed; a plan-only branch never hardens; Ready means apply-ready](0416-unhardened-work-is-never-proposed.md)
 - [0417: One turn-end gate checks every turn's valid state before its response is recorded: every turn makes a read decision, forced when missing, and Lucidos-source sessions are sent back for a missing plan marker or harden. Amends 0409](0417-turn-end-gate-enforces-valid-states.md)
 - [0418: A retired model is migrated to its successor, never left to provider routing](0418-retired-models-migrate-to-a-successor.md)
-- [0419: Widget windows float over the app and stay open; the one surface outside the outside-tap rule](0419-widget-windows-stay-open.md)
+- [0419: Widget windows float over the app and stay open; the one surface outside the outside-tap rule](0419-widget-windows-stay-open.md) *(superseded by 0466)*
 - [0420: The phone's pane strip stays overflow: hidden; clip broke iOS text editing in the prompt box](0420-pane-strip-stays-overflow-hidden.md)
 - [0421: A change that already lists the thread replaces a read request: a trigger keeps them apart, and the turn-end gate decides no](0421-change-replaces-read-request.md)
 - [0422: A widget frame mounts on first sight and stays loaded two minutes off screen; the shared cap still evicts](0422-widget-frames-stay-loaded-a-while-off-screen.md)
 - [0423: The proxy asks OpenAI speech for an SSE stream, so a TTS call records its cost](0423-proxy-asks-speech-for-its-usage.md)
 - [0424: The read decision knows when work is still in flight, and a read request lists during a live event wait](0424-read-decision-knows-work-in-flight.md)
 - [0425: A loaded knowhow doc leaves the prompt after 3 finished turns that do not load it; the set is derived from events, a re-load of a loaded doc keeps it without a body, and unload_knowhow drops one](0425-loaded-knowhow-leaves-after-three-idle-turns.md)
+- [0426: The read decision leads with Gemini 3.8 Flash, then GPT-5.6 Luna, measured on real and synthetic turns](0426-read-decision-leads-with-gemini-3-8-flash.md)
+- [0427: The phone's pane strip follows one lead at a time, and only a lift commits](0427-pane-strip-follows-one-lead.md)
+- [0428: List rows carry no version or update state; the Plugins panel row's button is the one update affordance](0428-list-rows-carry-no-version-state.md)
+- [0429: No trigger fire starts once engine shutdown has begun: cron slots are refused and caught up by the next engine, queued fires wait for it, and a run cut by shutdown is not re-run](0429-no-trigger-fire-starts-during-shutdown.md)
+- [0430: An MCP server is enabled per thread, and running stays a workspace state: a running server's schemas reach only the threads that enabled it, a trigger lists the servers its fires use, and a trigger thread calls an unlisted server only with auto-approve](0430-mcp-servers-are-enabled-per-thread.md)
+- [0431: The thread drawer windows its rows behind gaps of measured height, never estimates above the viewport](0431-drawer-row-window.md)
+- [0432: Home is one place with two faces, the Home board and the Home chat; board widgets take one of three sizes, arranged by a HomeBoardArranged snapshot per layout class on the Home thread](0432-home-board-two-faces-three-sizes.md)
+- [0433: Turn-end decisions are judgment sites, with OpenRouter and OpenAI Decisions as System One rows](0433-turn-end-decisions-are-judgment-sites.md)
+- [0434: A child's clean report wakes its parent only when the child's wake decision says the parent must act; otherwise it is filed as ChildReportFiled, which starts no turn and is never re-fired. Every doubt and every unclean finish wakes. Amends 0011.](0434-sub-threads-wake-parents-only-when-needed.md)
+- [0435: The wake decision shares the read decision's OpenAI Decisions default and its fallbacks](0435-wake-decision-shares-the-read-decisions-default.md)
+- [0436: The first-paint JS set, entry plus shell plus their static imports, is budgeted at 1400 kB; lazy chunks get a 400 kB advisory; chunkSizeWarningLimit is off](0436-first-paint-budget.md)
+- [0437: Optimistic UI state is a pending intent, dropped by the server's acknowledgement at a version, never by a timer or a finally](0437-optimistic-ui-state-follows-server-acks.md)
+- [0438: Process ownership is a held flock, not a pidfile or a port probe](0438-process-ownership-is-a-held-lock.md)
+- [0439: The wake decision measured: OpenAI Decisions and Jev miss no must-wake, every chat model in its chain does](0439-wake-decision-measured-on-a-synthetic-set.md)
+- [0440: Push suppression follows the page's report that it handled the notification, not its presence](0440-push-suppression-follows-the-pages-acknowledgement.md)
+- [0441: An event that records another commits in the same transaction, through an atomic emit](0441-an-event-that-records-another-commits-with-it.md)
+- [0442: A spawn claims its thread, and an apply its change, in the same step that finds it free](0442-a-check-and-its-claim-are-one-step.md)
+- [0443: User occupancy in the Thread Queue is read at admission, from running user threads in thread_summaries plus gate reservations not yet seen running. Amends 0010: the settle subscriber is only a drain hint](0443-user-occupancy-is-read-at-admission.md)
+- [0444: A webhook delivery's ledger row commits in its event's own transaction, so no claim can strand](0444-a-webhook-delivery-is-recorded-with-its-event.md)
+- [0445: The gateway reaches an engine only over its engine socket, after the kernel names the listener's uid](0445-gateway-reaches-engines-over-a-peer-verified-socket.md)
+- [0446: The read decision knows when a sub-thread's report wakes its parent agent](0446-read-decision-knows-the-parent-acts.md)
+- [0447: A slash command reaches the coding agent verbatim, and its read moves no turn-gap bound](0447-slash-commands-reach-the-agent-verbatim.md)
+- [0448: The wake decision runs forced, only on measured models, and reads the siblings in words: no missed must-wake in three runs on every shipped backend, and no model asked where none cleared the bar](0448-wake-decision-forced-with-a-measured-lead.md)
+- [0449: A page's inputs to a thread are ordered by the engine: a client input sequence, checked under the thread append lock at admission](0449-a-pages-inputs-are-ordered-by-the-engine.md)
+- [0450: A submission consumes the compose slot once, when the engine accepts it, and clears only the content it submitted](0450-compose-slot-is-consumed-at-accept.md)
+- [0451: The spawn declares a child's wake mode: no-wake, wake or wake-when-all-done; the wake decision is the fallback for undeclared children](0451-spawn-declares-the-wake-mode.md)
+- [0452: Postgres and the agent browser's DevTools admit only the owning OS user: CDP over a pipe, a minted dev password, a socket-only packaged cluster](0452-postgres-and-devtools-admit-only-the-owning-user.md)
+- [0453: A lagged bus subscriber re-reads its state or replays the dropped rows; a fact never gets a directed channel](0453-a-lagged-subscriber-refreshes-or-replays.md)
+- [0454: Every change reports its first-paint growth against a build of its merge base; growth over 2 kB raw needs a First-paint-growth trailer; amends 0436](0454-first-paint-growth-check.md)
+- [0455: Desktop: the Home icon opens the Home chat, the Home board has its own button](0455-desktop-home-chat-and-board-get-a-button-each.md)
+- [0456: Every directory Lucidos stores data in is a storage root kept at 0700 by whoever opens it, with no process umask, and Lucidos temp files go through tempfile.](0456-storage-roots-are-owner-only.md)
+- [0457: The agent browser always runs inside Chrome's sandbox; no opt-out, no runtime probe](0457-agent-browser-always-keeps-chromes-sandbox.md)
+- [0458: An archived thread's worktree is removed an hour after it idles; dirt is committed on its own branch first, unmerged branches stay, and removal moves the tree aside before deleting it](0458-archive-removes-the-worktree-keeping-its-work.md)
+- [0459: An Ongoing tile press only selects its group; it never opens a thread](0459-ongoing-tile-press-only-selects.md)
+- [0460: Registries merge through keyed git merge drivers, not union; amends 0040](0460-registries-merge-by-key.md)
+- [0461: The Tauri dev window moves to a new build only when the user switches to the new version, together with the gateway and the engine; it no longer rebuilds on file changes](0461-dev-window-restarts-with-the-switch.md)
+- [0462: The public mirror has one door: release_tree_push pushes by explicit URL, only a scanned commit with empty or published ancestry, and a refusing push URL makes a bare push fail](0462-mirror-push-gate.md)
+- [0463: A landing lane is the only mover of main for Lucidos-source changes: Apply queues the exact branch commit, clean changes land at once as one landing merge each, and changes that would conflict resolve together as one lane batch](0463-landing-lane.md)
+- [0464: The main check: after a landing moves main, the engine runs the engine suite and every e2e suite on GitHub against a stripped copy of main, one at a time; it gates nothing, and a red one opens one fix thread; amends 0386](0464-main-check-on-github.md)
+- [0465: An integrated sub-thread runs the fast tier, proposes nothing and hands its branch up to its parent; the parent's agent merges it, and the parent's /harden reviews only what no tier reviewed while still running every suite; amends 0416 and 0315](0465-integrated-sub-threads.md)
+- [0466: The Home board is a desktop rail; widget windows, the dock and the Home long press are gone; one inline widget](0466-home-board-is-a-desktop-rail.md)
+- [0467: The Home rail's toggle sits right of the bell and slides with the rail; separator and head match the panes](0467-home-rail-toggle-sits-beside-the-bell.md)
+- [0468: The Home rail's toggle holds the window corner in both states, and the board's head drops its title](0468-home-rail-toggle-holds-the-corner.md)
+- [0469: Dynamic bars over an app: the SDK observes the app's scroll, the panel grows once](0469-dynamic-bars-over-apps.md)
+- [0470: Keep the Claude Code prompt cache warm with short waits and a keep-alive; the 1-hour TTL is rejected](0470-keep-the-prompt-cache-warm.md)
+- [0471: The packaged desktop client holds an owner lock; a second client exits without stealing focus](0471-one-desktop-client-per-user.md)
+- [0472: Trigger runs decide their own read, and the read decision knows what the turn already pushed](0472-trigger-runs-decide-their-read.md)
+- [0473: A thread spawns a top-thread, not a child, when it will not act on the result](0473-a-thread-spawns-a-top-thread-when-no-report-is-needed.md)
+- [0474: A heavy coding-agent thread continues in a successor thread that carries its branch, sits in its place, and proposes for both](0474-successor-threads.md)
+- [0475: Any thread creates a top-thread or detaches its own child with no owner authority](0475-any-thread-creates-a-top-thread.md)
+- [0476: harden runs one Claude review pass per iteration, and repeat iterations review only the fix](0476-harden-runs-one-review-pass.md)
+- [0477: OpenAI Decisions keeps one policy question for the read decision; split predicates and chat steadiness measured](0477-read-decision-predicates-and-steadiness-measured.md)
+- [0478: A Switch hands an agent's processes to the session that resumes it](0478-switch-hands-agent-processes-to-the-resumed-session.md)
+- [0479: The cache keep-alive times its beats from the TTL each Claude Code session shows; unknown beats as 5 minutes](0479-keep-alive-follows-the-observed-cache-ttl.md)
+- [0480: The landing lane tries every arrival on main first and gathers while an Apply All press is open, so a press's conflicts resolve in one lane batch](0480-apply-all-press-lands-as-one-lane-batch.md)
+- [0481: Engine database credentials stay out of subprocesses: the engine scrubs DATABASE_URL, injects a read-only LUCIDOS_DATABASE_URL to agent surfaces only, and refuses to boot a wiped schema](0481-engine-db-credentials-stay-out-of-subprocesses.md)
+- [0482: The bars over an app wait for the finger to lift](0482-bars-over-an-app-wait-for-the-finger.md)
+- [0483: A new workspace asks for its memory module in the memory choice; unset runs Classic](0483-a-new-workspace-asks-for-its-memory-module.md)

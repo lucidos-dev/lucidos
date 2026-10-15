@@ -48,6 +48,17 @@ const DISPATCHER_FILES = DISPATCHERS.map((d) => d.file).join(' or ');
  *  make this test pass WITHOUT an arm, and it should be harder to justify than
  *  writing the arm. */
 const NO_UI_STATE: Record<string, string> = {
+  TreeBackfillStarted:
+    'the record of a backfill\'s estimate and cap. The TreeBackfillProgressed frame '
+    + 'the seed announces carries what the Memory page shows',
+  TreeBackfillCapReached:
+    'the compactor announces a TreeBackfillProgressed frame with held set right after '
+    + 'it, which moves the Memory page; the notification reaches the user separately',
+  TreeBackfillCapRaised:
+    'the re-seed it causes announces a TreeBackfillProgressed frame with the new cap',
+  TreeBackfillEnded:
+    'the record of what the whole backfill spent. The progress frame before it already '
+    + 'shows the last tree built',
   DomainEvent:
     'a transport wrapper for a workspace-defined event, stored under the inner '
     + 'name. The shell holds no state keyed on one; apps subscribe through the SDK',
@@ -191,7 +202,7 @@ describe('every SystemEvent is answered or written down', () => {
   it('names every surface this change wired, so removing one is loud', () => {
     for (const name of [
       'McpServerRegistered', 'McpServerUpdated', 'McpServerRemoved',
-      'McpServerDisabledToolsChanged',
+      'McpServerStopped', 'McpServerDisabledToolsChanged',
       'WebhookCreated', 'WebhookUpdated', 'WebhookDeleted',
       'PermissionGrantsChanged',
       'PluginInstallCanceled', 'PluginUninstallCanceled',

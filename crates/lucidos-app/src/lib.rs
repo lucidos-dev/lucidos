@@ -18,17 +18,18 @@ mod bundle_location;
 /// launched app a sink that discards both, so without this the client's
 /// diagnostics do not exist.
 mod client_log;
+mod client_owner_lock;
 mod config_scalar;
 mod crash_watchdog;
 mod desktop;
+mod dev_window;
 mod device_id_store;
 mod install_preflight;
+mod launch_role;
 mod mobile;
 mod notifications;
 mod pairing;
 mod panel_preview;
-#[cfg(test)]
-mod test_support;
 mod traffic_lights;
 mod update_relay;
 mod updater;
@@ -70,6 +71,9 @@ pub(crate) const LUCIDOS_RELEASE: &str = {
 pub fn run_service() -> i32 {
     desktop::run_service()
 }
+
+pub use client_owner_lock::claim_client_owner_lock;
+pub use launch_role::{launch_role, version_line, LaunchRole};
 
 /// Hand `url` to the OS default handler.
 ///
@@ -681,7 +685,7 @@ fn startup_status(app: tauri::AppHandle) -> String {
 /// `native-notification-tapped`, and the page routes it through the same
 /// `dispatchDeepLink` the web-push tap uses.
 ///
-/// No-op in `tauri dev` and off macOS. See `notifications.rs` and
+/// No-op in the dev window and off macOS. See `notifications.rs` and
 /// `system-knowhow/notifications.md` §4.
 #[tauri::command]
 fn show_native_notification(title: String, body: String, link: serde_json::Value) {
@@ -697,7 +701,7 @@ fn show_native_notification(title: String, body: String, link: serde_json::Value
 /// into the link, and BOTH arms need it: `Some(id)` rebuilds the composite
 /// request identifier, and `None` scopes the sweep. The stashed deep link goes
 /// with the banner, so a tap on a removed one cannot route. No-op in
-/// `tauri dev` and off macOS.
+/// the dev window and off macOS.
 #[tauri::command]
 fn dismiss_native_notification(workspace: Option<String>, id: Option<String>) {
     notifications::dismiss(workspace, id);
@@ -1020,6 +1024,7 @@ pub fn run() {
             startup_status,
             restart_app,
             restart_service,
+            dev_window::follow_engine_switch,
             quit_lucidos,
             uninstall_lucidos,
             open_url_external,
@@ -1897,11 +1902,10 @@ mod tests {
     /// the extension so the file stays a readable `.json`.
     #[test]
     fn a_taken_name_gains_a_counter_before_its_extension() {
-        let dir = std::env::temp_dir().join(format!("lucidos-dl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
 
-        let write = |name: &str, body: &str| write_new_download(&dir, name, body).unwrap();
+        let write = |name: &str, body: &str| write_new_download(dir, name, body).unwrap();
         assert_eq!(write("t.json", "first"), dir.join("t.json"));
         assert_eq!(write("t.json", "second"), dir.join("t (1).json"));
         assert_eq!(write("t.json", "third"), dir.join("t (2).json"));
@@ -1919,8 +1923,6 @@ mod tests {
             std::fs::read_to_string(dir.join("t (1).json")).unwrap(),
             "second"
         );
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
@@ -1977,7 +1979,7 @@ mod acl_tests {
     /// The runtime capability `desktop::launch` registers, as a plain
     /// [`Capability`] the resolver can consume.
     fn gateway_capability(port: u16) -> Capability {
-        match desktop::gateway_capability(port).build() {
+        match desktop::gateway_capability(&desktop::gateway_url(port)).build() {
             CapabilityFile::Capability(c) => c,
             _ => panic!("gateway_capability must build exactly one capability"),
         }
@@ -2260,7 +2262,7 @@ mod acl_tests {
         // An app ACL manifest switches `has_app_acl_manifest` to true, which
         // starts ACL-checking app commands on LOCAL origins too, dev and the
         // bundled splash included. Without `allow-app-ipc` in the default
-        // capability that breaks `tauri dev` and the splash's own heartbeat.
+        // capability that breaks the dev window and the splash's own heartbeat.
         let authority = authority(None);
         for command in invoke_handler_commands() {
             if command.starts_with("__panel_") {

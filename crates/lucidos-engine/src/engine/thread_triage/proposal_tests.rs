@@ -22,6 +22,7 @@ async fn message(bus: &EventBus, thread_id: Uuid, origin: Option<MessageOrigin>)
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "reply".into(),
             user_image_hashes: vec![],
             device_id: None,

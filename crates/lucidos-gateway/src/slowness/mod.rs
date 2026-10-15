@@ -128,7 +128,7 @@ pub fn slow_sign(
             }
         },
         ProbeOutcome::Slow => (alive && past_boot).then_some(SlowSign::NoAnswer),
-        ProbeOutcome::Unreachable | ProbeOutcome::Other => None,
+        ProbeOutcome::Unreachable | ProbeOutcome::Other | ProbeOutcome::Foreign => None,
     }
 }
 

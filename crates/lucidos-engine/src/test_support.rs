@@ -8,8 +8,26 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent, BUS_CAPACITY};
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
+
+/// Overrun every subscriber's buffer, so its next `recv` is a
+/// `RecvError::Lagged`. The way to reproduce a lag without timing: emit the
+/// event under test first, flood, then hand the subscriber's first `recv` to
+/// its one-step seam.
+///
+/// One frame past capacity, so the flood alone lags a subscriber that had
+/// nothing buffered. The frame is transient and projection-free, so no
+/// subscriber does anything with the ones it still receives.
+pub fn flood_past_bus_capacity(bus: &EventBus) {
+    for _ in 0..=BUS_CAPACITY {
+        bus.broadcast_transient_system(SystemEvent::BackupProgress {
+            phase: "flood".into(),
+            progress: 0,
+            total: 0,
+        });
+    }
+}
 
 fn admin_url() -> String {
     std::env::var("TEST_DATABASE_URL")
@@ -82,6 +100,7 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             unknown_sse_dropped: 0,
             model_only_text: None,
             progress_notes: Vec::new(),
+            service_tier: None,
         })
     }
 
@@ -219,8 +238,8 @@ pub async fn aux_captures(pool: &PgPool, thread_id: Uuid, purpose: &str) -> Vec<
 }
 
 /// Connection URL for a throwaway database created by `setup_test_db`. Lets a
-/// test open its own dedicated connection to the same DB (e.g. the startup-lease
-/// tests, which contend a Postgres advisory lock across independent connections).
+/// test open its own dedicated connection to the same DB, as a restarted engine
+/// would.
 ///
 /// Swaps the database name, the path segment after the authority, and keeps
 /// any query string. A blanket `replace("/postgres", ..)` also rewrites the
@@ -301,6 +320,86 @@ pub async fn seed_thread_event(bus: &EventBus, thread_id: Uuid, event: ThreadEve
         panic!("seed {event_type} on thread {thread_id} was not persisted (emit returned None)")
     })
     .event_id
+}
+
+/// Block until this database has `n` backends waiting on a lock. That is the
+/// signal that a racing statement reached its lock, rather than merely having
+/// been spawned. Scoped to `current_database()`, so a concurrent test's
+/// disposable database cannot satisfy it.
+///
+/// Panics rather than returning on timeout: a race that never materialised
+/// means the test proved nothing, and passing quietly is how it would rot.
+pub async fn wait_until_blocked_on_locks(pool: &PgPool, n: i64) {
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("fewer than {n} backends ever blocked on a lock, so the race never happened");
+}
+
+/// Make Postgres refuse every insert of `event_type` from now on, so an emit
+/// fails at Persist exactly as a real store error would. One per database.
+pub async fn refuse_event_type(pool: &PgPool, event_type: &str) {
+    sqlx::query(&format!(
+        "CREATE FUNCTION refuse_event() RETURNS trigger AS $$ BEGIN \
+         IF NEW.event_type = '{event_type}' THEN RAISE EXCEPTION 'refused'; END IF; \
+         RETURN NEW; END $$ LANGUAGE plpgsql"
+    ))
+    .execute(pool)
+    .await
+    .expect("create the refusing function");
+    sqlx::query(
+        "CREATE TRIGGER refuse_event BEFORE INSERT ON events \
+         FOR EACH ROW EXECUTE FUNCTION refuse_event()",
+    )
+    .execute(pool)
+    .await
+    .expect("create the refusing trigger");
+}
+
+/// A new chat thread opened by a human message, so it has a
+/// `thread_summaries` row for later events to project into.
+pub async fn seed_chat_thread(bus: &EventBus, text: &str) -> Uuid {
+    let thread_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: message_received(text),
+        meta: EventMeta {
+            channel: Some(crate::engine::thread_events::EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap_or_else(|e| panic!("seed a chat thread: {e}"));
+    thread_id
+}
+
+/// A person's message, with every optional field empty.
+pub fn message_received(text: &str) -> ThreadEvent {
+    ThreadEvent::MessageReceived {
+        provider: None,
+        voice_session_id: None,
+        wake_mode: None,
+        text: text.into(),
+        user_image_hashes: vec![],
+        device_id: None,
+        image_description: None,
+        parent_thread_id: None,
+        spawning_event_id: None,
+        mode: crate::engine::thread_events::ActorMode::Human,
+        model: None,
+        reasoning_effort: None,
+        origin: None,
+    }
 }
 
 /// One of each side-question event, for the tests pinning that no agent,
@@ -442,6 +541,9 @@ pub async fn start_cc_session(
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -629,6 +731,31 @@ pub async fn seed_preference_for_device(
 ) -> Result<(), sqlx::Error> {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     crate::core::PreferenceStore::set_for_device(pool, &bus, key, value, device_id, None).await
+}
+
+/// Insert one row on a trigger's aggregate stream, back-dated to `created`.
+///
+/// A raw insert rather than an emit, because the run-history reads compare
+/// against `created`, and the bus always stamps the database's `now()`.
+pub async fn seed_trigger_event(
+    pool: &PgPool,
+    trigger_id: &str,
+    event_type: &str,
+    created: &str,
+    payload: serde_json::Value,
+) {
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, aggregate, aggregate_id, created) \
+         VALUES ($1, $2, $3, 'trigger', $4, $5::timestamptz)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(event_type)
+    .bind(payload)
+    .bind(trigger_id)
+    .bind(created)
+    .execute(pool)
+    .await
+    .expect("insert trigger event");
 }
 
 /// An `EventBus` backed by a pool that never dials, for tests whose subject is

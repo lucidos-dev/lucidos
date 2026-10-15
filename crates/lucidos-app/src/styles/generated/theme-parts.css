@@ -1,5 +1,5 @@
 /* AUTO-GENERATED. Do not edit by hand.
-   Regenerate: cargo test -p lucidos-engine --lib generate_theme_parts_files -- --ignored
+   Regenerate: ./scripts/codegen.sh
 
    Source of truth: crates/lucidos-engine/src/core/themes/theme-parts.json
    and the colour tokens of theme-tokens.json.

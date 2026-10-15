@@ -10,7 +10,8 @@
  *     to apply or a read request. Most-recent-first.
  *   - "In flight" — every Current/Saved thread whose status dot reads Running
  *     or Waiting: a running turn, its own event wait, or unfinished sub-threads.
- *     Roots most-recent-first, each sub-thread nested under its parent.
+ *     Roots newest-created-first, so a row never moves while it stays listed.
+ *     Each sub-thread nests under its parent.
  * All views bypass the channel/trigger/repo filters and the lifecycle section
  * grouping. Each group's header counts its own rows, and the Blocked
  * badge (`blockedThreadCount`) shares `threadIsBlocked`, so a count and
@@ -23,11 +24,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { blockedThreads, reviewThreads, inFlightThreads, threadIsInFlight } from './ThreadDrawer';
 import type { NestedThread } from './ThreadDrawer';
-import { filterOngoingRows, ongoingBreakdown, ongoingFilterSteps } from './family-graph';
-import { blockedThreadCount, threadIsBlocked, threadInReview, threadMap } from '../../store/store';
+import { filterOngoingRows, ongoingBreakdown, ongoingFilterSteps, ongoingGroupLists } from './family-graph';
+import { threadVisualStatus } from '../shared/threadVisualStatus';
+import { EMPTY_LANDING_LANE, blockedThreadCount, changes, landingLane, threadIsBlocked, threadInReview, threadMap } from '../../store/store';
 import type { ThreadState, ThreadMeta, ThreadStatus } from '../../store/thread-events';
 import type { ArchiveState } from '../../generated/thread-lifecycle';
 import type { CodingAgentChangeState } from '../../api/threads';
+import type { Change } from '../../api/client';
 
 type ThreadOpts = {
     section?: ArchiveState;
@@ -35,7 +38,9 @@ type ThreadOpts = {
     saved?: boolean;
     codingAgentChangeState?: CodingAgentChangeState;
     state?: ThreadMeta['state'];
+    createdAt?: string;
     updatedAt?: string;
+    lastUserAction?: string;
     liveEventWaitCount?: number;
     activeChildrenCount?: number;
     waitingChildrenCount?: number;
@@ -51,8 +56,9 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         channel: 'chat',
         initiator: 'user',
         saved: opts.saved ?? false,
-        createdAt: opts.updatedAt ?? '2026-05-01T00:00:00Z',
+        createdAt: opts.createdAt ?? opts.updatedAt ?? '2026-05-01T00:00:00Z',
         updatedAt: opts.updatedAt ?? '2026-05-01T00:00:00Z',
+        lastUserAction: opts.lastUserAction,
         status: opts.status ?? 'idle',
         summaryVersion: 0,
         messageCount: 1,
@@ -102,6 +108,8 @@ function rootIds(list: NestedThread[]): string[] {
 
 beforeEach(() => {
     threadMap.value = new Map();
+    changes.value = { status: 'loaded', data: [] };
+    landingLane.value = EMPTY_LANDING_LANE;
 });
 
 describe('blockedThreads', () => {
@@ -321,18 +329,26 @@ describe('inFlightThreads', () => {
         expect(inFlightThreads(asMap([composing, discarded, archived]))).toEqual([]);
     });
 
-    it('sorts roots most-recent-first', () => {
-        const old = makeThread('old', { status: 'running', updatedAt: '2026-05-01T00:00:00Z' });
-        const fresh = makeThread('fresh', { liveEventWaitCount: 1, updatedAt: '2026-05-04T00:00:00Z' });
-        const mid = makeThread('mid', { activeChildrenCount: 1, updatedAt: '2026-05-02T00:00:00Z' });
+    it('sorts roots newest-created-first', () => {
+        const old = makeThread('old', { status: 'running', createdAt: '2026-05-01T00:00:00Z' });
+        const fresh = makeThread('fresh', { liveEventWaitCount: 1, createdAt: '2026-05-04T00:00:00Z' });
+        const mid = makeThread('mid', { activeChildrenCount: 1, createdAt: '2026-05-02T00:00:00Z' });
         expect(rootIds(inFlightThreads(asMap([old, fresh, mid])))).toEqual(['fresh', 'mid', 'old']);
     });
 
+    it('keeps a row in place when the user acts on it', () => {
+        // A follow-up to a running thread keeps it in flight. Its row must not
+        // jump to the top and push the rows above it down.
+        const older = makeThread('older', { status: 'running', createdAt: '2026-05-01T00:00:00Z', lastUserAction: '2026-05-09T00:00:00Z' });
+        const newer = makeThread('newer', { status: 'running', createdAt: '2026-05-02T00:00:00Z', lastUserAction: '2026-05-03T00:00:00Z' });
+        expect(rootIds(inFlightThreads(asMap([older, newer])))).toEqual(['newer', 'older']);
+    });
+
     it('nests each sub-thread under its in-flight parent', () => {
-        const parent = makeThread('parent', { activeChildrenCount: 2, updatedAt: '2026-05-01T00:00:00Z' });
-        const working = makeThread('working', { status: 'running', parentThreadId: 'parent', updatedAt: '2026-05-03T00:00:00Z' });
-        const parked = makeThread('parked', { liveEventWaitCount: 1, parentThreadId: 'parent', updatedAt: '2026-05-02T00:00:00Z' });
-        const other = makeThread('other', { status: 'running', updatedAt: '2026-05-04T00:00:00Z' });
+        const parent = makeThread('parent', { activeChildrenCount: 2, createdAt: '2026-05-01T00:00:00Z' });
+        const working = makeThread('working', { status: 'running', parentThreadId: 'parent', createdAt: '2026-05-03T00:00:00Z' });
+        const parked = makeThread('parked', { liveEventWaitCount: 1, parentThreadId: 'parent', createdAt: '2026-05-02T00:00:00Z' });
+        const other = makeThread('other', { status: 'running', createdAt: '2026-05-04T00:00:00Z' });
         expect(shape(inFlightThreads(asMap([parent, working, parked, other])))).toEqual([
             ['other', 0],
             ['parent', 0],
@@ -444,6 +460,60 @@ describe('the Review breakdown', () => {
         expect(changes).toEqual(['change', 'both']);
         expect(unread).toEqual(['unread']);
         expect(rootIds(filterOngoingRows('review', rows(), 'all'))).toEqual(['change', 'both', 'unread']);
+    });
+});
+
+describe('a change the landing lane holds', () => {
+    const proposed: CodingAgentChangeState = { kind: 'proposed', requires_restart: false };
+
+    /** Thread `id` holding pending change `change-<id>`. */
+    function pendingFor(...threadIds: string[]): void {
+        changes.value = {
+            status: 'loaded',
+            data: threadIds.map(id => ({
+                id: `change-${id}`, request_id: 'req-1', thread_id: id, thread_title: null,
+                branch_name: `claude-code/${id}`, repo_root: '/tmp/repo', description: 'fix: x',
+                file_count: 1, files: ['a.ts'], requires_restart: false, hardened: true,
+                needs_hardening: false, apply_ready: true, status: 'pending',
+                created_at: '2026-05-04T00:00:00Z', resolved_at: null, pre_merge_sha: null,
+                post_merge_sha: null, commits: [], summary: null, incomplete: false,
+            } satisfies Change)),
+        };
+    }
+
+    beforeEach(() => {
+        pendingFor('batch', 'queued', 'free');
+        landingLane.value = {
+            open_batch: { batch_id: 'b-1', lane_thread_id: 'lane', members: ['change-batch'], step: 'resolving' },
+            waiting: ['change-queued'],
+            gathering: false,
+        };
+    });
+
+    it('leaves Review, since the lane decides when it lands and Apply is gone', () => {
+        const threads = ['batch', 'queued', 'free'].map(id => makeThread(id, { codingAgentChangeState: proposed }));
+        expect(ids(reviewThreads(asMap(threads)))).toEqual(['free']);
+    });
+
+    it('keeps a read request in Review, counted as unread rather than a change', () => {
+        const rows = reviewThreads(asMap([makeThread('batch', { codingAgentChangeState: proposed, readRequested: true })]))
+            .map(thread => ({ thread, depth: 0 }));
+        expect(ongoingBreakdown('review', rows)).toEqual([{ part: 'changes', count: 0 }, { part: 'unread', count: 1 }]);
+    });
+
+    it('drops the diff dot, so a thread waiting on sub-threads is in flight', () => {
+        const parent = makeThread('queued', { codingAgentChangeState: proposed, activeChildrenCount: 1 });
+        expect(threadVisualStatus(parent)).toBe('waiting');
+        expect(threadIsInFlight(parent)).toBe(true);
+        expect(threadVisualStatus(makeThread('free', { codingAgentChangeState: proposed }))).toBe('changes');
+    });
+
+    it('leaves the Review tile the moment the lane takes it', () => {
+        threadMap.value = asMap([makeThread('free', { codingAgentChangeState: proposed })]);
+        const reviewCount = () => ongoingGroupLists.value.find(g => g.group === 'review')?.rows.length;
+        expect(reviewCount()).toBe(1);
+        landingLane.value = { ...landingLane.value, waiting: [...landingLane.value.waiting, 'change-free'] };
+        expect(reviewCount()).toBe(0);
     });
 });
 

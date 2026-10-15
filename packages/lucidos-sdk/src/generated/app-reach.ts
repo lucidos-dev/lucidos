@@ -1,5 +1,5 @@
 // AUTO-GENERATED. Do not edit by hand.
-// Regenerate: cargo test -p lucidos-engine --lib generate_app_reach_file -- --ignored
+// Regenerate: ./scripts/codegen.sh
 //
 // Source of truth: ROUTE_REACH in crates/lucidos-engine/src/api/app_reach.rs
 // (ADR 0231). Only app-reachable routes appear. A route absent from this

@@ -1,6 +1,6 @@
 # 0281: Coding-agent follow-ups keep their sent order through a per-thread handoff joined before the ack
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by ADR 0449
 - **Date**: 2026-09-25
 
 ## Context

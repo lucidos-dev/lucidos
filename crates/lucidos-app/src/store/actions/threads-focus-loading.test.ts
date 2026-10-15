@@ -36,17 +36,19 @@ import { provideScrollState } from '../../components/chat/scrollStateHandle';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { threadScrollKey } from '../savedScroll';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
-import { archiveThreadCount, archivingThreadIds, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedPane, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT } from '../store';
+import { archiveThreadCount, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedPane, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT } from '../store';
 import { _resetThreadOpenMarksForTesting, takeThreadOpenStart } from '../../utils/threadOpenMarks';
 import { loadAllThreads, loadThreadEvents } from './thread-loading';
 import { focusThread, handleSaveThread, unfocusThread } from './threads';
+import { _resetRowIntentsForTesting } from '../rowIntents';
+import { _resetComposeSyncForTesting } from '../composeSync';
 
 // Mock the API module
 vi.mock('../../api/threads', () => ({
   fetchThreads: vi.fn(),
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
   fetchThreadMessages: vi.fn(),
-  saveThread: vi.fn().mockResolvedValue(undefined),
+  saveThread: vi.fn().mockResolvedValue({ summary_version: 1 }),
   archiveThread: vi.fn().mockResolvedValue({ archived: [] }),
 }));
 
@@ -61,7 +63,7 @@ vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
 vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
   API_BASE: '',
-  submitChat: vi.fn().mockResolvedValue(undefined),
+  submitChat: vi.fn().mockResolvedValue({ event_id: 'e-1' }),
   cancelChat: vi.fn(),
   stopClaudeCode: vi.fn(),
   putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
@@ -85,7 +87,7 @@ beforeEach(() => {
   drawerOpen.value = false;
   resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
-  archivingThreadIds.value = new Set();
+  _resetRowIntentsForTesting();
   focusedPane.value = 'thread';
   localStorage.removeItem('lucidos-focused-thread');
 });
@@ -891,6 +893,7 @@ describe('loadAllThreads', () => {
 describe('loadAllThreads — compose preservation', () => {
   beforeEach(() => {
     threadsLoaded.value = false;
+    _resetComposeSyncForTesting();
   });
 
   function mockComposeApiResponse(threadId: string, composeText: string, composeImages: string[] = []) {
@@ -937,330 +940,48 @@ describe('loadAllThreads — compose preservation', () => {
     (globalThis.document as any).activeElement = null;
   }
 
-  it('preserves local composeText when textarea is focused on this thread', async () => {
+  /** A local edit is a *pending intent* until a write covering it is
+   *  answered (ADR 0437). No snapshot replaces it meanwhile, focused or not.
+   *  The orderings by revision are pinned in
+   *  `store/__tests__/compose-follows-server-revision.test.ts`. */
+  it('a pending local edit holds over a snapshot, text and images alike', async () => {
+    const { updateCompose } = await import('./compose');
     const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeText: 'hello world I am typing' } }));
+    map.set('t1', makeThreadState('t1', { meta: { state: 'composing' } }));
     threadMap.value = map;
-    focusedThreadId.value = 't1';
-    focusPromptOnThread('t1');
+    unfocusPrompt();
+    updateCompose('t1', { text: 'hello world I am typing', image_hashes: ['local-img-hash'] });
 
-    // API returns stale compose_text from before the user's keystrokes
-    mockComposeApiResponse('t1', 'hello');
-
+    mockComposeApiResponse('t1', 'hello', []);
     await loadAllThreads();
 
     expect(getDraft('t1').text).toBe('hello world I am typing');
-    unfocusPrompt();
+    expect(getDraft('t1').image_hashes).toEqual(['local-img-hash']);
   });
 
-  it('preserves local composeImages when the user attached them here (locally edited)', async () => {
-    const { composeEditedAt } = await import('./compose');
+  /** Nothing pending: a newer snapshot is the engine's draft, and dropping it
+   *  because the box has focus would let the next keystroke overwrite it. */
+  it('a newer snapshot applies to a focused composer with nothing pending', async () => {
     const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeImages: ['local-img-base64'] } }));
+    map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeText: 'hello' } }));
     threadMap.value = map;
     focusedThreadId.value = 't1';
     focusPromptOnThread('t1');
-    // A real image attach goes through updateCompose → markLocallyEdited, so the
-    // draft carries a composeEditedAt stamp. Authorship (not focus) is what
-    // protects it from an empty background snapshot.
-    composeEditedAt.set('t1', Date.now());
 
-    mockComposeApiResponse('t1', '', []); // empty server snapshot (stale / pre-attach)
-
-    try {
-      await loadAllThreads();
-      expect(getDraft('t1').image_hashes).toEqual(['local-img-base64']);
-    } finally {
-      composeEditedAt.delete('t1');
-      unfocusPrompt();
-    }
-  });
-
-  it('preserves local composeText when a PUT is in flight (debounced push not yet acked)', async () => {
-    const { pendingComposePuts } = await import('./compose');
-    const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeText: 'half-typed sentence' } }));
-    threadMap.value = map;
-    pendingComposePuts.add('t1');
-    unfocusPrompt(); // textarea may have lost focus mid-PUT
-
-    mockComposeApiResponse('t1', 'half'); // server has older state
-
-    try {
-      await loadAllThreads();
-      expect(getDraft('t1').text).toBe('half-typed sentence');
-    } finally {
-      pendingComposePuts.delete('t1');
-    }
-  });
-
-  it('does refresh composeText when no local edit is in flight (cross-device sync still works)', async () => {
-    const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { state: 'composing', composeText: 'old local' } }));
-    threadMap.value = map;
-    unfocusPrompt(); // not actively typing here
-    // pendingComposePuts is empty
-
-    mockComposeApiResponse('t1', 'updated by peer');
-
+    mockComposeApiResponse('t1', 'hello from my other device');
     await loadAllThreads();
 
-    expect(getDraft('t1').text).toBe('updated by peer');
+    expect(getDraft('t1').text).toBe('hello from my other device');
+    unfocusPrompt();
   });
 
-  // iOS PWA photo-attach regression: PHPicker dismissal fires visibilitychange
-  // (which kicks off loadAllThreads) right around the same instant as the file
-  // input's change event. The change handler resolves a FileReader and calls
-  // updateCompose, which only commits the optimistic image to threadMap and
-  // schedules the PUT for 250ms later. If loadAllThreads lands inside that
-  // debounce window, the textarea isn't focused (the picker stole it) and
-  // pendingComposePuts is still empty, so upsertThread overwrites the freshly
-  // attached image with the server's stale empty array — preview never appears.
-  it('preserves locally-attached image when loadAllThreads lands inside the PUT debounce window', async () => {
-    const { updateCompose, pendingComposePuts, composeEditedAt } = await import('./compose');
-    const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: '', composeImages: [] } }));
-    threadMap.value = map;
-    focusedThreadId.value = 't1';
-    unfocusPrompt(); // PHPicker took focus away from the textarea
-
-    // User just attached an image — optimistic update committed, PUT debounced
-    updateCompose('t1', { image_hashes: ['attached-img-base64'] });
-
-    // Server's last persisted state is still empty (PUT hasn't been sent yet)
-    mockComposeApiResponse('t1', '', []);
-
-    try {
-      await loadAllThreads();
-      expect(getDraft('t1').image_hashes).toEqual(['attached-img-base64']);
-    } finally {
-      // Clean up the entries the real updateCompose put there. The 250ms timer
-      // it also scheduled will still fire after this test, but pushNow's
-      // missing-thread guard will see threadMap empty and bail without an HTTP
-      // call — so the leak is bounded to the entries below.
-      composeEditedAt.delete('t1');
-      pendingComposePuts.delete('t1');
-    }
-  });
-
-  // "Preview appears then disappears" — the user reports this on macOS Chrome
-  // and iOS Safari PWA. The previous fix covers the case where loadAllThreads
-  // lands DURING the debounce window. This test covers the harder case: the
-  // GET was sent BEFORE the optimistic write (so server's snapshot has empty
-  // images), but its RESPONSE arrives AFTER pushNow's PUT has completed and
-  // pendingComposePuts has been cleared. The guard sees no pending entry and
-  // overwrites the freshly attached image with the stale server snapshot.
-  it('preserves locally-attached image when stale loadAllThreads response lands after PUT completes', async () => {
-    const { updateCompose, pendingComposePuts, composeEditedAt } = await import('./compose');
-
-    const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: '', composeImages: [] } }));
-    threadMap.value = map;
-    focusedThreadId.value = 't1';
-    unfocusPrompt(); // textarea isn't focused (picker stole focus)
-
-    // Server's snapshot is from BEFORE the user's PUT. fetchThreads is mocked
-    // to defer until we resolve the gate, simulating a slow GET.
-    let releaseFetch: (() => void) | null = null;
-    const fetchGate = new Promise<void>((resolve) => { releaseFetch = resolve; });
-    (fetchThreads as any).mockImplementationOnce(async () => {
-      await fetchGate;
-      return {
-        saved: [],
-        active_threads: [],
-        composing: [],
-        active: [],
-        archive: [{
-          thread_id: 't1',
-          title: 'T',
-          channel: 'chat',
-          last_activity: '2026-03-15T18:00:00Z',
-          created_at: '2026-03-15T18:00:00Z',
-          message_count: 0,
-          section: 'archived',
-          status: 'idle',
-          coding_agent_change_state: { kind: 'none' },
-          coding_agent_is_external_repo: false,
-          last_revived_at: null,
-          active_children_count: 0,
-          state: 'active',
-          compose_text: '',
-          compose_images: [], // STALE — pre-PUT snapshot
-          compose_mode: null,
-        }],
-      };
-    });
-
-    try {
-      // Kick off loadAllThreads. Its HTTP is in flight.
-      const loadPromise = loadAllThreads();
-
-      // User attaches an image. updateCompose: optimistic + pending mark + 250ms timer.
-      updateCompose('t1', { image_hashes: ['attached-img-base64'] });
-      expect(pendingComposePuts.has('t1')).toBe(true);
-
-      // Wait for the 250ms debounce + pushNow's await to drain. After this,
-      // pendingComposePuts is cleared (PUT completed).
-      await new Promise((r) => setTimeout(r, 300));
-      expect(pendingComposePuts.has('t1')).toBe(false);
-
-      // NOW the slow loadAllThreads response arrives with stale empty images.
-      releaseFetch!();
-      await loadPromise;
-
-      // Bug: stale loadAllThreads overwrites composeImages with []. Preview disappears.
-      expect(getDraft('t1').image_hashes).toEqual(['attached-img-base64']);
-    } finally {
-      // updateCompose stamps composeEditedAt; clear so the next test using 't1'
-      // sees a clean slate (the 'cross-device sync still works' test would
-      // otherwise see this thread as still-locally-edited and skip the apply).
-      composeEditedAt.delete('t1');
-      pendingComposePuts.delete('t1');
-    }
-  });
-
-  // "thread draft persists when switching to compose and back" (drafts.spec.ts:65)
-  // flake. The previous two tests cover the case where the edit happens AT or
-  // AFTER the GET went out (composeEditedAt >= requestStartedAt catches it). This
-  // covers the INVERSE order: the user types the draft FIRST, then a resync
-  // loadAllThreads starts, and its slow GET — whose server snapshot was read
-  // before the debounced PUT committed — lands after the PUT settled and
-  // pendingComposePuts cleared. Now composeEditedAt is OLDER than
-  // requestStartedAt, so neither the focus, pending-PUT, nor edited-since-request
-  // guard fires; only the PUT-settle guard prevents the stale empty snapshot
-  // from blanking the restored draft.
-  it('preserves local composeText when the edit precedes a resync whose stale response lands after the PUT settles', async () => {
-    const { updateCompose, pendingComposePuts, composeEditedAt, composePutSettledAt } = await import('./compose');
-
-    const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: '' } }));
-    threadMap.value = map;
-    focusedThreadId.value = 't1';
-    unfocusPrompt(); // user clicked away (compose) and back — textarea not focused
-
-    // 1. User types the follow-up draft FIRST: optimistic local write, pending
-    //    mark, 250ms debounced PUT.
-    updateCompose('t1', { text: 'thread draft text' });
-    expect(pendingComposePuts.has('t1')).toBe(true);
-
-    // 2. A real delay so the resync's requestStartedAt is STRICTLY after the
-    //    edit — otherwise composeEditedAt >= requestStartedAt would mask the hole
-    //    via the existing guard, not the PUT-settle one under test.
-    await new Promise((r) => setTimeout(r, 20));
-
-    // 3. Resync loadAllThreads starts; its GET is gated to land late and carries
-    //    the server's pre-PUT empty snapshot.
-    let releaseFetch: (() => void) | null = null;
-    const fetchGate = new Promise<void>((resolve) => { releaseFetch = resolve; });
-    (fetchThreads as any).mockImplementationOnce(async () => {
-      await fetchGate;
-      return {
-        saved: [],
-        active_threads: [],
-        composing: [],
-        active: [],
-        archive: [{
-          thread_id: 't1',
-          title: 'T',
-          channel: 'chat',
-          last_activity: '2026-03-15T18:00:00Z',
-          created_at: '2026-03-15T18:00:00Z',
-          message_count: 0,
-          section: 'archived',
-          status: 'idle',
-          coding_agent_change_state: { kind: 'none' },
-          coding_agent_is_external_repo: false,
-          last_revived_at: null,
-          active_children_count: 0,
-          state: 'active',
-          compose_text: '', // STALE — read before the PUT committed
-          compose_images: [],
-          compose_mode: null,
-        }],
-      };
-    });
-
-    try {
-      // Kick off loadAllThreads; its HTTP is gated in flight.
-      const loadPromise = loadAllThreads();
-
-      // 4. Drain the debounce + pushNow so the PUT settles AFTER the GET started.
-      //    pendingComposePuts clears and composePutSettledAt is stamped.
-      await new Promise((r) => setTimeout(r, 300));
-      expect(pendingComposePuts.has('t1')).toBe(false);
-      expect(composePutSettledAt.get('t1') ?? 0).toBeGreaterThan(0);
-
-      // 5. The stale empty response lands now. Without the PUT-settle guard,
-      //    upsertThread blanks the draft (the drafts:65 "got ''" flake).
-      releaseFetch!();
-      await loadPromise;
-
-      expect(getDraft('t1').text).toBe('thread draft text');
-    } finally {
-      composeEditedAt.delete('t1');
-      composePutSettledAt.delete('t1');
-      pendingComposePuts.delete('t1');
-    }
-  });
-
-  // drafts.spec.ts:65 value='' — the RESIDUAL empty-clobber the composePutSettledAt
-  // guard does NOT catch. The previous test covers a resync whose GET fired BEFORE
-  // the PUT settled (composePutSettledAt >= requestStartedAt saves it). This covers
-  // a compose PUT that never actually persisted (failed / timed out under host
-  // contention — composePutSettledAt is stamped even then) followed by a resync
-  // whose GET fired AFTER that settle stamp: composePutSettledAt < requestStartedAt
-  // and composeEditedAt < requestStartedAt, so neither timing guard fires, the
-  // textarea isn't focused, no PUT is pending — and the server (which never got the
-  // text) returns an empty compose. Only the "never clear a non-empty locally-edited
-  // draft via a bulk snapshot" rule in stageDraftFromApi preserves it.
-  it('preserves a locally-edited draft when an empty resync lands AFTER the PUT settled (failed/never-committed PUT)', async () => {
-    const { updateCompose, pendingComposePuts, composeEditedAt, composePutSettledAt } = await import('./compose');
-
-    const map = new Map<string, ThreadState>();
-    map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: '' } }));
-    threadMap.value = map;
-    focusedThreadId.value = 't1';
-    unfocusPrompt(); // user clicked away (compose) and back — textarea not focused
-
-    // 1. User types the follow-up draft: optimistic local write, pending mark,
-    //    250ms debounced PUT.
-    updateCompose('t1', { text: 'thread draft text' });
-    expect(pendingComposePuts.has('t1')).toBe(true);
-
-    try {
-      // 2. Drain the debounce so the PUT settles FIRST. composePutSettledAt is
-      //    stamped and pendingComposePuts clears — exactly the post-settle state a
-      //    failed/never-committed PUT also leaves behind (the server has no text).
-      await new Promise((r) => setTimeout(r, 300));
-      expect(pendingComposePuts.has('t1')).toBe(false);
-      expect(composePutSettledAt.get('t1') ?? 0).toBeGreaterThan(0);
-
-      // 3. A resync starts NOW — its requestStartedAt is strictly AFTER the settle
-      //    stamp, so putSettledSinceRequest is false (the guard the prior test
-      //    relies on does NOT fire here). The server snapshot is empty.
-      mockComposeApiResponse('t1', '');
-      await loadAllThreads();
-
-      // Without the stageDraftFromApi rule, this empty snapshot blanks the draft
-      // (the drafts:65 "got ''" flake). With it, the locally-typed draft survives.
-      expect(getDraft('t1').text).toBe('thread draft text');
-    } finally {
-      composeEditedAt.delete('t1');
-      composePutSettledAt.delete('t1');
-      pendingComposePuts.delete('t1');
-    }
-  });
-
-  // The guard is scoped to LOCALLY-edited drafts: a server-originated draft
-  // (loaded cross-device, never edited on this device → no composeEditedAt entry)
-  // must STILL be clearable by a bulk snapshot, so a peer's clear that arrives via
-  // a resync (e.g. the SSE clear was missed while disconnected) still applies.
+  // A peer's clear that arrives via a resync (the SSE clear was missed while
+  // disconnected) applies when nothing is pending here.
   it('still clears a server-originated draft (never edited here) when the snapshot is empty', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: 'from a peer device' } }));
     threadMap.value = map;
     unfocusPrompt();
-    // No updateCompose on this device → composeEditedAt has no entry for t1.
 
     mockComposeApiResponse('t1', ''); // peer cleared it; resync carries empty
 
@@ -1269,19 +990,14 @@ describe('loadAllThreads — compose preservation', () => {
     expect(getDraft('t1').text).toBe('');
   });
 
-  // Sibling of the SSE fix: an EMPTY snapshot (the shared draft was sent/discarded
-  // elsewhere) must clear a server-originated draft EVEN when the textarea is
-  // focused here — focus alone must not preserve a draft the user never typed.
-  // The non-empty focus guard (test at "preserves local composeText when textarea
-  // is focused") is unaffected. A locally-edited draft is still protected by
-  // stageDraftFromApi's hasUnsentLocalDraft guard (the failed-PUT test above).
+  // An EMPTY snapshot (the shared draft was sent or discarded elsewhere) clears
+  // the draft even when the textarea is focused here.
   it('clears a focused server-originated draft when the resync snapshot is empty (peer sent elsewhere)', async () => {
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', { meta: { state: 'active', composeText: 'follow-up drafted on my other device' } }));
     threadMap.value = map;
     focusedThreadId.value = 't1';
     focusPromptOnThread('t1');
-    // No updateCompose here → composeEditedAt has no entry for t1 (server-originated).
 
     mockComposeApiResponse('t1', ''); // peer's send cleared compose_text server-side
 

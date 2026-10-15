@@ -31,7 +31,7 @@ tokio::task_local! {
     /// scheduling-tool guard to identify the running trigger.
     pub static ACTIVE_TRIGGER_ID: String;
     /// Current recursion depth for event-triggered chains.
-    /// Set by `handle_domain_event` before spawning; read by `emit_domain_event`
+    /// Set by `fire_matching_triggers` before spawning; read by `emit_domain_event`
     /// to propagate depth in the `DomainEvent` broadcast.
     pub static EVENT_TRIGGER_DEPTH: u32;
     /// Thread ID of the event that fired the currently executing trigger
@@ -393,6 +393,7 @@ async fn execute_llm_task(
             invocation,
             config.go_to_review,
             config.side_effect_grant.clone(),
+            config.mcp_servers.clone(),
             // `None` on either means this trigger is on the account chat
             // default for that field. That is what every trigger did before
             // the per-trigger model existed.
@@ -567,7 +568,9 @@ recipe), and your system prompt includes a `Trigger Know-how` section, items \
 listed there belong to THIS trigger and are likely relevant. Use \
 `load_knowhow` to load what you need before acting. Beyond that, the \
 workspace and system know-how lists are also available — load whatever the \
-intent calls for, same as in chat.";
+intent calls for, same as in chat.\n\n\
+Make your request_read call beside your last other tool call, before your final \
+reply. A call on its own round costs an extra model round.";
 
 /// Build extra environment variables for a script trigger fired by an event.
 /// See the `TRIGGER_EVENT_*_ENV` docs at the top of this file for the contract
@@ -957,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn origin_thread_id_propagates_into_async_scope() {
-        // Mirrors how `handle_domain_event` wraps trigger execution: when a
+        // Mirrors how `fire_matching_triggers` wraps trigger execution: when a
         // thread-scoped event fires the trigger, the originating thread must
         // be readable inside the spawned future so `execute_send_notification`
         // can deep-link the push to that thread.
@@ -1278,6 +1281,14 @@ mod tests {
             !TRIGGER_SYSTEM_ADDENDUM.contains("Execute the intent in this turn"),
             "trigger addendum should avoid imperative meta-preamble wording"
         );
+    }
+
+    /// A read decision made on its own round costs a second full model call
+    /// on providers that hide text beside a tool call (ADR 0472).
+    #[test]
+    fn trigger_system_addendum_times_the_read_decision_beside_another_call() {
+        assert!(TRIGGER_SYSTEM_ADDENDUM.contains("request_read"));
+        assert!(TRIGGER_SYSTEM_ADDENDUM.contains("beside your last other tool call"));
     }
 
     #[test]

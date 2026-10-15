@@ -14,6 +14,7 @@ import { focusThreadOrBootstrap } from '../../../store/actions/threads';
 import { threadMap } from '../../../store/store';
 import { makeThread } from '../../../store/__tests__/thread-flows-helpers';
 import type { ThreadMeta } from '../../../store/thread-events';
+import type { ThreadStatus } from '../../../generated/thread-lifecycle';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; class?: string; [k: string]: unknown }> {}
 
@@ -54,9 +55,10 @@ beforeEach(() => {
 });
 
 describe('ChildStoppedRow', () => {
-  function loadChild(isStoppedChild: boolean) {
+  function loadChild(isStoppedChild: boolean, status: ThreadStatus = 'idle') {
     const { map } = makeThread('child-uuid');
-    map.get('child-uuid')!.meta.isStoppedChild = isStoppedChild;
+    const child = map.get('child-uuid')!;
+    child.meta = { ...child.meta, isStoppedChild, status };
     threadMap.value = map;
   }
 
@@ -93,6 +95,18 @@ describe('ChildStoppedRow', () => {
     loadChild(false);
     expect(stateLabel()).toBe('No longer waiting');
   });
+
+  /** A Cancel on the child's card, then a message: the child ran again while
+   *  the parent's row read "Child thread stopped · No longer waiting". */
+  it.each<ThreadStatus>(['running', 'waiting_for_user_answer'])(
+    'says the child continued while its new turn is %s',
+    (status) => {
+      loadChild(false, status);
+      const tree = ChildStoppedRow({ childThreadId: 'child-uuid', childThreadTitle: 'Fix the ticket' });
+      expect(vnodeText(findByClass(tree, 'event-row-state'))).toBe('Continued');
+      expect(findByClass(tree, 'event-row-state')!.props['data-tone']).toBe('live');
+    },
+  );
 
   /** A child outside the loaded window has no live state to read. "Stopped"
    *  is the one thing the event itself proves. */

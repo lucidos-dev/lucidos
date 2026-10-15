@@ -1,4 +1,5 @@
-import { effect, signal, untracked } from '@preact/signals';
+import { computed, effect, signal, untracked } from '@preact/signals';
+import { clampHomeRailWidth } from '../homeRail';
 import { preferences, showToast, removeToast, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, currentModel, selectedCodingAgent, clampThreadDrawerWidth, llmConfigured, welcomeDismissed, type NotificationsFilter } from '../store';
 import type { CodingAgent } from '../../api/types';
 import type { ThreadState } from '../thread-events';
@@ -40,11 +41,12 @@ import { themeEffectsPreference } from '../../utils/themeEffects';
 import { AUTOCORRECT_STORAGE_KEY } from '@lucidos/text-entry';
 import {
   parseFlag, PREFERENCE_CATALOG, PREF_FONT_FAMILY, PREF_PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI,
+  PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER,
   PREF_PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM, PREF_PROVIDER_ENABLED_TYPESAFE, PREF_SYSTEM_ONE_CUSTOM_MODEL,
-  PREF_SYSTEM_ONE_CUSTOM_URL, PREF_THEME, PREF_UI_SCALE,
+  PREF_SYSTEM_ONE_CUSTOM_URL, PREF_SYSTEM_ONE_OPENROUTER_MODEL, PREF_THEME, PREF_UI_SCALE,
   type PreferenceKey, type PreferenceValues,
 } from '@lucidos/preference-catalog';
-import { VOICE_RESIDENT_SECTIONS } from '@lucidos/engine-constants';
+import { MEMORY_MODULE_WHILE_UNSET, VOICE_RESIDENT_SECTIONS } from '@lucidos/engine-constants';
 
 /** Re-exported so the components that already import these from the store keep
  *  one import site. The definitions live in the appearance contract, which is
@@ -375,11 +377,13 @@ let scaleMeasurementPending = false;
  *  is authored in rem. Un-remeasured, the composer stops lining up with the
  *  transcript at any scale but the one live at boot. The thread drawer's floor
  *  is what its rem-authored header row needs, so scaling up can leave a settled
- *  drawer narrower than its own header. */
+ *  drawer narrower than its own header. The Home board's rail is two board
+ *  cells at least, by the same rule. */
 function measureScaleDerivedValues(): void {
   scaleMeasurementPending = false;
   publishScrollbarGutter();
   clampThreadDrawerWidth();
+  clampHomeRailWidth();
 }
 
 /** Owe one measurement pass, on the next frame, however many callers ask.
@@ -1256,6 +1260,16 @@ export function loadPreferences(): Promise<void> {
   return load;
 }
 
+/** Whether the first preference read has answered, either way. Until it has,
+ *  a dismissal stored there is unknown, and the layout can still move: the
+ *  read applies the UI scale and font, and decides the header's backup
+ *  reminder. Computed, so a component reading it re-renders on the flip
+ *  alone, not on every refetch. */
+export const preferencesSettled = computed(() => {
+  const { status } = preferences.value;
+  return status === 'loaded' || status === 'failed';
+});
+
 async function loadPreferencesAs(mySeq: number): Promise<void> {
   // Only flip to 'loading' on the first fetch — refetches (e.g. after an SSE
   // PreferencesChanged) keep showing existing data through the network round
@@ -1407,6 +1421,14 @@ export const PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM_KEY = PREF_PROVIDER_ENABLED_SYST
 export const SYSTEM_ONE_CUSTOM_URL_KEY = PREF_SYSTEM_ONE_CUSTOM_URL.key;
 export const SYSTEM_ONE_CUSTOM_MODEL_KEY = PREF_SYSTEM_ONE_CUSTOM_MODEL.key;
 
+/** The OpenRouter and OpenAI System One rows sit under their chat providers'
+ *  own switches, so one switch parks both uses of the key. */
+export const PROVIDER_ENABLED_OPENROUTER_KEY = PREF_PROVIDER_ENABLED_OPENROUTER.key;
+export const PROVIDER_ENABLED_OPENAI_KEY = PREF_PROVIDER_ENABLED_OPENAI.key;
+
+/** The System One model OpenRouter's System One row asks. Unset asks Jev. */
+export const SYSTEM_ONE_OPENROUTER_MODEL_KEY = PREF_SYSTEM_ONE_OPENROUTER_MODEL.key;
+
 /** Whether a stored switch value reads as an explicit off.
  *
  *  Wider than `providerSwitchedOff`'s own check just above, deliberately. The
@@ -1525,7 +1547,8 @@ export type BackgroundModelKey =
   | 'model_query_classification'
   | 'model_summary_compaction'
   | 'model_command_judge'
-  | 'model_read_decision';
+  | 'model_read_decision'
+  | 'model_wake_decision';
 
 /** The reasoning half of each background *model selection*. */
 export type BackgroundReasoningKey =
@@ -1537,7 +1560,8 @@ export type BackgroundReasoningKey =
   | 'reasoning_query_classification'
   | 'reasoning_summary_compaction'
   | 'reasoning_command_judge'
-  | 'reasoning_read_decision';
+  | 'reasoning_read_decision'
+  | 'reasoning_wake_decision';
 
 /** A background row's stored *model selection*, each half `null` while unset.
  *  The engine resolves an unset half, inheritance and the configured providers
@@ -1575,8 +1599,17 @@ export async function saveModelSelection(
 /** How a turn gets its past (ADR 0362). Global. */
 export type MemoryModule = PreferenceValues<'memory_module'>;
 
+/** The workspace's own choice, `null` while it has never chosen or while
+ *  preferences have not loaded. The memory choice asks exactly then. */
+export function storedMemoryModule(): MemoryModule | null {
+  if (preferences.value.status !== 'loaded') return null;
+  return acceptedValue('memory_module', preferences.value.data.memory_module) as MemoryModule | null;
+}
+
+/** The module the workspace runs: its choice, else the one an unset
+ *  preference runs. */
 export function currentMemoryModule(): MemoryModule {
-  return currentPreference('memory_module');
+  return storedMemoryModule() ?? MEMORY_MODULE_WHILE_UNSET;
 }
 
 export function setMemoryModule(module: MemoryModule): Promise<void> {

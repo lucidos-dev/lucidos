@@ -21,6 +21,7 @@ import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, SkBlock, SkText, useSkeleton } from '../shared/Skeleton';
 import { playStripMove, snapshotStrip, type StripSnapshot } from './themeStripMotion';
 import { GlyphBadge } from '../shared/GlyphBadge';
+import { sameStripEnds, stripEnds, type StripEnds } from '../../utils/stripEnds';
 
 function modesLabel(theme: Theme): string | null {
   if (theme.modes.length !== 1) return null;
@@ -61,12 +62,6 @@ function themeFontStyle(theme: Theme): Record<string, string> {
     '--font-ui': fontStackFor(font, known),
     '--font-features-text': fontFeaturesFor(font, known).text,
   };
-}
-
-/** Which ends of the strip already show. */
-interface StripEnds {
-  atStart: boolean;
-  atEnd: boolean;
 }
 
 /** The narrowest a card may get before the strip drops a column. */
@@ -145,10 +140,6 @@ function placeFamilies(groups: ThemeFamilyGroup[], rows: number): FamilyPlacemen
   });
 }
 
-function stripEnds(el: HTMLElement): StripEnds {
-  return { atStart: el.scrollLeft <= 1, atEnd: el.scrollLeft + el.clientWidth >= el.scrollWidth - 1 };
-}
-
 /**
  * Every theme as a radio card in a strip that scrolls sideways, a page of
  * whole columns at a time. A chevron floats over each side and pages it, and
@@ -191,7 +182,7 @@ export function ThemePicker() {
   const measure = () => {
     if (!strip.current) return;
     const next = stripEnds(strip.current);
-    setEnds(prev => (prev.atStart === next.atStart && prev.atEnd === next.atEnd ? prev : next));
+    setEnds(prev => (sameStripEnds(prev, next) ? prev : next));
   };
   const fit = () => {
     if (!strip.current) return;

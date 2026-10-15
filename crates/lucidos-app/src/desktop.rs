@@ -13,7 +13,7 @@
 //!
 //! **Closing the UI does NOT stop the service.** Only `launchctl bootout`,
 //! behind "Quit and Stop Background Service", tears it down. [`launch`]
-//! short-circuits on `tauri::is_dev()`, so none of this runs in development.
+//! hands development to `crate::dev_window`, so none of this runs there.
 //!
 //! Bundle paths resolve relative to the executable, so the service, which has
 //! no `AppHandle`, reaches what the client's `resource_dir()` would. State
@@ -490,7 +490,9 @@ impl GatewayService {
         // Recorded BEFORE the wait below: launchd may still kill this process
         // during it, and a lost record leaves those workspaces stopped.
         let stopped = stop_workspace_engines(app_data);
-        let ids: Vec<String> = stopped.iter().map(|e| e.id.clone()).collect();
+        // A workspace stopped mid-respawn appears twice: owner and successor.
+        let mut ids: Vec<String> = stopped.iter().map(|e| e.id.clone()).collect();
+        ids.dedup();
         record_workspaces_to_restore(app_data, &ids);
         // The next service start must find these engines gone. One still
         // draining answers health, and the new gateway would route the window
@@ -675,11 +677,15 @@ fn stop_workspace_engines(app_data: &Path) -> Vec<SignalledEngine> {
     };
     let mut stopped = Vec::new();
     for entry in entries.flatten() {
-        let pidfile = entry.path().join(".lucidos/engine.pid");
-        if let Some(pid) = read_engine_pid(&entry.path()) {
+        // The owner, and any successor still waiting for it to exit. A stop
+        // that lands mid-respawn must reach both, or the successor boots once
+        // the owner is gone.
+        let waiting = lucidos_owner_lock::engine::waiting_pid(&entry.path())
+            .and_then(|pid| i32::try_from(pid).ok());
+        for pid in read_engine_pid(&entry.path()).into_iter().chain(waiting) {
             // SAFETY: signal 0 checks for the process's existence without
-            // delivering anything. `read_engine_pid` has already refused the
-            // pids that would broadcast.
+            // delivering anything. Both reads have already refused the pids
+            // that would broadcast.
             #[cfg(unix)]
             if unsafe { libc::kill(pid, 0) } == 0 && !pid_runs_another_program(pid) {
                 // SAFETY: a positive, live pid not known to run anything else.
@@ -693,28 +699,29 @@ fn stop_workspace_engines(app_data: &Path) -> Vec<SignalledEngine> {
                     });
                 }
             }
-            let _ = std::fs::remove_file(&pidfile);
         }
     }
     stopped
 }
 
-/// The engine pid this workspace's `.lucidos/engine.pid` names, when it names
-/// one process.
+/// The engine pid this workspace's `.lucidos/engine.pid` names, while an engine
+/// holds the workspace's owner lock, and when it names one process.
 ///
-/// **Strictly positive, and that is the load-bearing part.** `kill` reads 0 as
-/// "my whole process group", and -1 as "everything I may signal". A pidfile
-/// holding either turns a per-engine stop into a broadcast. The gateway writes
-/// a real child pid, so this only ever fires on a corrupt or hand-edited file.
-/// It is the same class as the never-kill-broadly rule in `CLAUDE.md`, and the
-/// cheapest place to hold it is where the number is parsed.
+/// **The lock comes first.** The engine writes its own pid once it owns the
+/// workspace, and leaves the file behind when it exits. Without the lock the
+/// pid names nobody, and may already be a successor waiting to take over.
+///
+/// **Strictly positive.** `kill` reads 0 as "my whole process group", and -1 as
+/// "everything I may signal". A pidfile holding either turns a per-engine stop
+/// into a broadcast. Only a corrupt or hand-edited file holds one. It is the
+/// same class as the never-kill-broadly rule in `CLAUDE.md`, and the cheapest
+/// place to hold it is where the number is parsed.
 ///
 /// Shared by the two readers of that file, so they cannot disagree on which
 /// pidfiles name an engine: [`stop_workspace_engines`], which signals it, and
 /// [`engine_pid_is_live`], which only asks whether it is there.
 fn read_engine_pid(workspace_dir: &Path) -> Option<i32> {
-    let contents = std::fs::read_to_string(workspace_dir.join(".lucidos/engine.pid")).ok()?;
-    contents.trim().parse::<i32>().ok().filter(|pid| *pid > 0)
+    lucidos_owner_lock::engine::live_pid(workspace_dir).and_then(|pid| i32::try_from(pid).ok())
 }
 
 // ── Telling the engines who asked (client role) ─────────────────────────────
@@ -1184,7 +1191,8 @@ fn resolve_engine_port(app_data: &Path) -> u16 {
         }
     }
     // First run: persist the default so the URL is stable and the user can edit it.
-    let _ = std::fs::create_dir_all(app_data.join("config"));
+    let _ = lucidos_home::ensure_storage_root(app_data)
+        .and_then(|()| std::fs::create_dir_all(app_data.join("config")));
     let _ = std::fs::write(&cfg, DEFAULT_ENGINE_PORT.to_string());
     DEFAULT_ENGINE_PORT
 }
@@ -1259,24 +1267,25 @@ const GATEWAY_PERMISSIONS: &[&str] = &[
     "updater:default",
 ];
 
-/// The ACL capability that lets the packaged window talk to the app at all.
+/// The ACL capability that lets a window on `origin` talk to the app at all.
 ///
 /// [`launch`] navigates the window off the Tauri app URL and onto the gateway,
-/// which Tauri ACL-checks as `Origin::Remote`. Without this capability EVERY
-/// command is rejected. ADR 0028 records the decision and its scoping: a
-/// resolved port rather than a wildcard, `webviews` rather than `windows`, and
-/// `local(false)`.
+/// at [`gateway_url`], which Tauri ACL-checks as `Origin::Remote`. Without this
+/// capability EVERY command is rejected. The dev window navigates the same way
+/// (`crate::dev_window`). ADR 0028 records the decision and its scoping: one
+/// resolved origin rather than a wildcard, `webviews` rather than `windows`,
+/// and `local(false)`.
 ///
 /// **Read this before widening [`GATEWAY_PERMISSIONS`].** The set includes
 /// `updater:default`, so anything answering on that port can drive a signed
 /// bundle swap and a full stack restart. The residual is accepted, and ADR 0028
 /// weighs both hardenings. The question to ask of a new entry is not whether
 /// the frontend needs it, but what it hands to whoever answers on that port.
-pub(crate) fn gateway_capability(port: u16) -> tauri::ipc::CapabilityBuilder {
+pub(crate) fn gateway_capability(origin: &str) -> tauri::ipc::CapabilityBuilder {
     GATEWAY_PERMISSIONS.iter().fold(
         tauri::ipc::CapabilityBuilder::new("gateway")
             .local(false)
-            .remote(gateway_url(port))
+            .remote(origin.to_string())
             .webviews(["main", "window-*"]),
         |capability, permission| capability.permission(*permission),
     )
@@ -1285,14 +1294,16 @@ pub(crate) fn gateway_capability(port: u16) -> tauri::ipc::CapabilityBuilder {
 // ── Client role: ensure the service is up, then point the window at it ───────
 
 /// Ensure the always-on service is running and point the main window at the
-/// gateway. No-op in development. The ensure-and-wait runs on a background
-/// thread so the window paints immediately, and the window is navigated once
-/// the gateway is healthy.
+/// gateway. The ensure-and-wait runs on a background thread so the window
+/// paints immediately, and the window is navigated once the gateway is healthy.
+/// Development has no service to ensure, and points the window at the URL its
+/// launcher names instead (`crate::dev_window`).
 pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
     if tauri::is_dev() {
         // No dock-badge thread in dev (unbundled; dev uses the browser) — drop the
         // receiver so the managed sender's `send` is a harmless no-op.
         drop(nudge_rx);
+        crate::dev_window::launch(app);
         return;
     }
 
@@ -1383,7 +1394,7 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
         // navigates on purpose: a reachable UI with a dead bridge beats
         // stranding the user on the splash with no explanation. The page's own
         // `utils/ipcHealth.ts` then reports the dead bridge to the engine log.
-        if let Err(e) = handle.add_capability(gateway_capability(port)) {
+        if let Err(e) = handle.add_capability(gateway_capability(&gateway_url(port))) {
             eprintln!(
                 "[desktop] FAILED to register the gateway ACL capability for {} — every Tauri IPC \
                  call from the window will be rejected by the ACL: {e}",
@@ -2123,6 +2134,7 @@ fn write_plist_if_changed(path: &Path, app_data: &Path, desired: &str) -> io::Re
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    lucidos_home::ensure_storage_root(app_data)?;
     std::fs::create_dir_all(app_data.join("logs"))?;
     if std::fs::read_to_string(path).ok().as_deref() == Some(desired) {
         return Ok(false);
@@ -3019,7 +3031,7 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
             }
         },
         None => {
-            // Unbundled (e.g. `tauri dev`) — nothing to trash. Not a failure.
+            // Unbundled (e.g. the dev window) — nothing to trash. Not a failure.
             eprintln!(
                 "[service] uninstall: not running from a .app bundle; skipping bundle removal"
             );
@@ -3172,6 +3184,7 @@ fn applescript_escape(s: &str) -> String {
 /// creates no workspace, and the smart root serves the picker instead.
 fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<GatewayService> {
     let bundle = bundled_resources(resources);
+    lucidos_home::ensure_storage_root(app_data)?;
 
     // The embedding model (fastembed) caches its ONNX model under
     // `FASTEMBED_CACHE_DIR` (default: `.fastembed_cache` relative to CWD). Under
@@ -4056,9 +4069,8 @@ mod tests {
         // The service's children share this stderr, and the read is byte-capped,
         // so the window can hold something that is not valid UTF-8. A strict
         // decode would refuse the whole read and turn the report off silently.
-        let dir = std::env::temp_dir().join(format!("lucidos-log-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(SERVICE_ERR_LOG);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SERVICE_ERR_LOG);
         let mut bytes = format!("{SERVICE_BOOT_MARKER} (pid 1)\n").into_bytes();
         bytes.extend_from_slice(&[0xff, 0xfe]); // a child's non-UTF-8 output
         bytes.extend_from_slice(b"\n[service] boot failed: no engine binary\n");
@@ -4076,7 +4088,6 @@ mod tests {
                 reason: Some("no engine binary".to_string())
             }
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4524,11 +4535,8 @@ mod tests {
     fn stop_embedded_postgres_is_a_noop_without_a_provisioned_cluster() {
         // No <app-data>/pgdata/PG_VERSION → must early-return without trying to
         // spawn a (here, nonexistent) pg_ctl, so this call simply does nothing.
-        let dir = std::env::temp_dir().join(format!("lucidos-nopg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        stop_embedded_postgres(Path::new("/nonexistent/resources"), &dir);
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        stop_embedded_postgres(Path::new("/nonexistent/resources"), dir.path());
     }
 
     #[test]
@@ -4536,12 +4544,11 @@ mod tests {
         // Determinism: ignore any ambient override for this test.
         std::env::remove_var("LUCIDOS_ENGINE_PORT");
 
-        let dir = std::env::temp_dir().join(format!("lucidos-port-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
 
         // First call: no file → default, and it persists the default.
-        assert_eq!(resolve_engine_port(&dir), DEFAULT_ENGINE_PORT);
+        assert_eq!(resolve_engine_port(dir), DEFAULT_ENGINE_PORT);
         let cfg = dir.join("config/engine-port");
         assert_eq!(
             std::fs::read_to_string(&cfg).unwrap().trim(),
@@ -4550,13 +4557,11 @@ mod tests {
 
         // A persisted custom value is read back verbatim.
         std::fs::write(&cfg, "6123").unwrap();
-        assert_eq!(resolve_engine_port(&dir), 6123);
+        assert_eq!(resolve_engine_port(dir), 6123);
 
         // A garbage / zero value falls back to the default.
         std::fs::write(&cfg, "nope").unwrap();
-        assert_eq!(resolve_engine_port(&dir), DEFAULT_ENGINE_PORT);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(resolve_engine_port(dir), DEFAULT_ENGINE_PORT);
     }
 
     #[cfg(target_os = "macos")]
@@ -4870,7 +4875,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_path_with_nothing_to_resolve_contributes_one_form() {
-        let tmp = crate::test_support::TempDir::new("relaunch-forms");
+        let tmp = tempfile::tempdir().unwrap();
         let exe = tmp.path().join("lucidos-app");
         std::fs::write(&exe, b"#!/bin/sh\n").expect("write a stand-in executable");
         let forms = relaunched_exe_forms(&exe);
@@ -5017,53 +5022,54 @@ mod tests {
     // ── What the next boot owes the user ─────────────────────────────────────
 
     /// A throwaway app-data dir that removes itself.
-    struct TempAppData(PathBuf);
+    struct TempAppData(tempfile::TempDir);
 
     impl TempAppData {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("the clock is after the epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("lucidos-next-boot-{tag}-{unique}"));
-            std::fs::create_dir_all(&path).expect("create the temp app-data dir");
-            Self(path)
+        fn new() -> Self {
+            Self(tempfile::tempdir().expect("create the temp app-data dir"))
         }
 
         fn path(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
 
         fn record(&self) -> Option<String> {
-            std::fs::read_to_string(next_boot_path(&self.0)).ok()
+            std::fs::read_to_string(next_boot_path(self.path())).ok()
         }
 
-        /// Lay down `workspaces/<id>/.lucidos/engine.pid` holding `pid`.
-        fn write_pidfile(&self, id: &str, pid: u32) {
-            let dir = self.0.join("workspaces").join(id).join(".lucidos");
-            std::fs::create_dir_all(&dir).expect("create the workspace dir");
-            std::fs::write(dir.join("engine.pid"), pid.to_string()).expect("write the pidfile");
+        /// Lay down `workspaces/<id>/.lucidos/engine.pid` holding `pid`, with
+        /// no owner lock behind it: what an exited engine leaves.
+        fn write_unowned_pidfile(&self, id: &str, pid: u32) {
+            let ws = self.path().join("workspaces").join(id);
+            std::fs::create_dir_all(ws.join(".lucidos")).expect("create the workspace dir");
+            std::fs::write(lucidos_owner_lock::engine::pid_path(&ws), pid.to_string())
+                .expect("write the pidfile");
+        }
+
+        /// Stand in for an engine that owns workspace `id`: hold its owner lock
+        /// and publish `pid` beside it. Drop the guard to "exit".
+        fn own_as_engine(&self, id: &str, pid: u32) -> lucidos_owner_lock::OwnerLock {
+            let ws = self.path().join("workspaces").join(id);
+            let lock =
+                lucidos_owner_lock::OwnerLock::acquire(&lucidos_owner_lock::engine::lock_path(&ws))
+                    .expect("the scratch workspace's engine lock is free");
+            self.write_unowned_pidfile(id, pid);
+            lock
         }
 
         /// Lay down `workspaces/<id>/.lucidos/ports`, the way the gateway
         /// publishes it for an engine it spawned.
         fn write_ports(&self, id: &str, contents: &str) {
-            let dir = self.0.join("workspaces").join(id).join(".lucidos");
+            let dir = self.path().join("workspaces").join(id).join(".lucidos");
             std::fs::create_dir_all(&dir).expect("create the workspace dir");
             std::fs::write(dir.join("ports"), contents).expect("write the ports file");
         }
 
         /// Lay down the durable slug-to-device-id map this client keeps.
         fn write_device_ids(&self, json: &str) {
-            let dir = self.0.join("config");
+            let dir = self.path().join("config");
             std::fs::create_dir_all(&dir).expect("create the config dir");
             std::fs::write(dir.join("device-ids.json"), json).expect("write the device map");
-        }
-    }
-
-    impl Drop for TempAppData {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -5072,7 +5078,7 @@ mod tests {
     // `next_boot_record_shape_matches_the_writer` pins the other side.
     #[test]
     fn the_restore_record_is_the_shape_the_gateway_reads() {
-        let tmp = TempAppData::new("shape");
+        let tmp = TempAppData::new();
         record_workspaces_to_restore(tmp.path(), &["myws".to_string()]);
         assert_eq!(tmp.record().as_deref(), Some(r#"{"restore":["myws"]}"#));
         assert_eq!(NEXT_BOOT_QUIT, r#"{"quit":true}"#);
@@ -5084,7 +5090,7 @@ mod tests {
     // leave its marker alone rather than record a restore over it.
     #[test]
     fn a_declared_quit_survives_the_teardown_that_follows_it() {
-        let tmp = TempAppData::new("quit");
+        let tmp = TempAppData::new();
         declare_quit_intent(tmp.path());
         record_workspaces_to_restore(tmp.path(), &["myws".to_string()]);
         assert_eq!(tmp.record().as_deref(), Some(NEXT_BOOT_QUIT));
@@ -5096,7 +5102,7 @@ mod tests {
     // next real restart's restore list.
     #[test]
     fn a_quit_intent_can_be_taken_back_when_the_stop_fails() {
-        let tmp = TempAppData::new("unquit");
+        let tmp = TempAppData::new();
         declare_quit_intent(tmp.path());
         clear_next_boot_record(tmp.path());
         assert_eq!(tmp.record(), None);
@@ -5109,7 +5115,7 @@ mod tests {
     // it must not read as a declared stop and silence the next teardown.
     #[test]
     fn a_workspace_named_quit_is_not_a_quit_intent() {
-        let tmp = TempAppData::new("named-quit");
+        let tmp = TempAppData::new();
         record_workspaces_to_restore(tmp.path(), &["quit".to_string()]);
         assert!(!quit_was_declared(&next_boot_path(tmp.path())));
         record_workspaces_to_restore(tmp.path(), &["myws".to_string()]);
@@ -5118,7 +5124,7 @@ mod tests {
 
     #[test]
     fn clearing_a_record_that_is_not_there_is_fine() {
-        let tmp = TempAppData::new("noclear");
+        let tmp = TempAppData::new();
         clear_next_boot_record(tmp.path());
         assert_eq!(tmp.record(), None);
     }
@@ -5127,7 +5133,7 @@ mod tests {
     // teardown must not resurrect workspaces this one never stopped.
     #[test]
     fn stopping_nothing_clears_any_stale_record() {
-        let tmp = TempAppData::new("empty");
+        let tmp = TempAppData::new();
         record_workspaces_to_restore(tmp.path(), &["stale".to_string()]);
         record_workspaces_to_restore(tmp.path(), &[]);
         assert_eq!(tmp.record(), None);
@@ -5138,12 +5144,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_the_engines_that_were_alive_are_recorded() {
-        let tmp = TempAppData::new("alive");
-        let mut child = spawn_stand_in_engine(tmp.path());
-        tmp.write_pidfile("live-ws", child.id());
+        let tmp = TempAppData::new();
+        let mut child = spawn_stand_in_engine();
+        let _owner = tmp.own_as_engine("live-ws", child.id());
         // A pid that cannot exist, since macOS caps pids well below this. It
         // stands in for a pidfile an engine left behind when it died.
-        tmp.write_pidfile("stale-ws", 999_999);
+        tmp.write_unowned_pidfile("stale-ws", 999_999);
 
         let stopped = stop_workspace_engines(tmp.path());
         assert_eq!(
@@ -5155,10 +5161,8 @@ mod tests {
             "the pid comes back too, so a caller can wait the engine out",
         );
         assert!(
-            !tmp.path()
-                .join("workspaces/live-ws/.lucidos/engine.pid")
-                .exists(),
-            "the pidfile is cleared either way",
+            lucidos_owner_lock::engine::pid_path(&tmp.path().join("workspaces/live-ws")).exists(),
+            "the pidfile is the engine's to write, so a stop leaves it",
         );
         let _ = child.wait();
     }
@@ -5166,27 +5170,56 @@ mod tests {
     /// A stand-in engine: `sleep`, copied under the engine binary's name so it
     /// does not read as another program. Our own child, which SIGUSR1 terminates.
     #[cfg(unix)]
-    fn spawn_stand_in_engine(dir: &Path) -> std::process::Child {
-        let exe = dir.join(ENGINE_RESOURCE_NAME);
-        std::fs::copy("/bin/sleep", &exe).expect("copy sleep under the engine's name");
-        Command::new(&exe)
-            .arg("30")
+    fn spawn_stand_in_engine() -> std::process::Child {
+        Command::new(stand_in_engine_exe())
+            .args([
+                "--ignored",
+                "--exact",
+                "desktop::tests::stand_in_engine_body",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn a stand-in engine")
     }
 
-    // A stopped workspace keeps its pidfile, and the OS reuses pids. SIGUSR1
-    // terminates a process that does not handle it. So a pid that no longer
-    // runs the engine is neither signalled nor owed a restore.
+    /// What a stand-in engine runs: a long sleep.
+    #[test]
+    #[ignore = "spawned by the stop tests as a stand-in engine"]
+    fn stand_in_engine_body() {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// The stand-in's binary, copied once per test run. macOS SIGKILLs an exec
+    /// of a file some process holds open for writing. A sibling test's fork
+    /// holds a copy of that handle until it execs. One copy is one such window.
+    /// It is this test binary, because macOS also SIGKILLs a copied Apple
+    /// platform binary such as `/bin/sleep` at exec.
+    #[cfg(unix)]
+    fn stand_in_engine_exe() -> &'static Path {
+        static EXE: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> = std::sync::OnceLock::new();
+        &EXE.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("create the stand-in dir");
+            let exe = dir.path().join(ENGINE_RESOURCE_NAME);
+            std::fs::copy(std::env::current_exe().expect("test binary"), &exe)
+                .expect("copy the test binary under the engine's name");
+            (dir, exe)
+        })
+        .1
+    }
+
+    // The lock check and the signal are two steps, and the OS reuses pids.
+    // SIGUSR1 terminates a process that does not handle it. So even a pid read
+    // under a held lock must run the engine before it is signalled.
     #[cfg(unix)]
     #[test]
     fn a_reused_pid_is_not_signalled_as_an_engine() {
-        let tmp = TempAppData::new("reused");
+        let tmp = TempAppData::new();
         let mut bystander = Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn an unrelated process");
-        tmp.write_pidfile("stopped-ws", bystander.id());
+        let _owner = tmp.own_as_engine("stopped-ws", bystander.id());
 
         assert_eq!(stop_workspace_engines(tmp.path()), Vec::new());
         std::thread::sleep(Duration::from_millis(200));
@@ -5194,14 +5227,54 @@ mod tests {
             matches!(bystander.try_wait(), Ok(None)),
             "the unrelated process must still be running",
         );
-        assert!(
-            !tmp.path()
-                .join("workspaces/stopped-ws/.lucidos/engine.pid")
-                .exists(),
-            "the stale pidfile is cleared",
-        );
         let _ = bystander.kill();
         let _ = bystander.wait();
+    }
+
+    // A stop that lands mid-respawn reaches the successor still waiting for
+    // the owner lock, not only the owner. Otherwise the successor takes the
+    // lock once the owner exits and boots after the user asked for a stop.
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_successor_is_stopped_too() {
+        let tmp = TempAppData::new();
+        let mut successor = spawn_stand_in_engine();
+        let ws = tmp.path().join("workspaces/myws");
+        std::fs::create_dir_all(ws.join(".lucidos")).unwrap();
+        let waiting = lucidos_owner_lock::OwnerLock::acquire(
+            &lucidos_owner_lock::engine::successor_lock_path(&ws),
+        )
+        .unwrap();
+        std::fs::write(
+            lucidos_owner_lock::engine::successor_pid_path(&ws),
+            successor.id().to_string(),
+        )
+        .unwrap();
+
+        let stopped = stop_workspace_engines(tmp.path());
+        drop(waiting);
+        let _ = successor.wait();
+        assert_eq!(
+            stopped,
+            vec![SignalledEngine {
+                id: "myws".to_string(),
+                pid: successor.id() as i32,
+            }],
+        );
+    }
+
+    // A pidfile no owner lock vouches for names nobody. Its engine exited, so
+    // the pid may already be a successor still waiting to own the workspace,
+    // and signalling it would stop the restart. Every stop reads through here.
+    #[test]
+    fn a_pidfile_no_engine_owns_names_no_engine() {
+        let tmp = TempAppData::new();
+        tmp.write_unowned_pidfile("waiting-ws", 4242);
+        let ws = tmp.path().join("workspaces/waiting-ws");
+        // The lock file a lock-aware engine left behind when it exited.
+        std::fs::write(lucidos_owner_lock::engine::lock_path(&ws), "").unwrap();
+        assert_eq!(read_engine_pid(&ws), None);
+        assert_eq!(stop_workspace_engines(tmp.path()), Vec::new());
     }
 
     #[cfg(target_os = "macos")]
@@ -5216,8 +5289,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn delete_path_treats_missing_as_success() {
-        let missing = std::env::temp_dir().join(format!("lucidos-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&missing);
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
         assert!(delete_path(&missing).is_ok());
     }
 
@@ -5240,15 +5313,15 @@ mod tests {
     // broadcast, so neither names an engine.
     #[test]
     fn a_pidfile_that_would_broadcast_names_no_engine() {
-        let tmp = TempAppData::new("badpid");
+        let tmp = TempAppData::new();
         let ws = tmp.path().join("workspaces/bad-ws");
-        let dir = ws.join(".lucidos");
-        std::fs::create_dir_all(&dir).expect("create the workspace dir");
+        let _owner = tmp.own_as_engine("bad-ws", 4242);
         for bad in ["0", "-1", "", "not-a-pid"] {
-            std::fs::write(dir.join("engine.pid"), bad).expect("write the pidfile");
+            std::fs::write(lucidos_owner_lock::engine::pid_path(&ws), bad)
+                .expect("write the pidfile");
             assert_eq!(read_engine_pid(&ws), None, "{bad:?}");
         }
-        tmp.write_pidfile("bad-ws", 4242);
+        tmp.write_unowned_pidfile("bad-ws", 4242);
         assert_eq!(read_engine_pid(&ws), Some(4242));
     }
 
@@ -5394,17 +5467,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_a_live_engine_this_client_knows_is_a_target() {
-        let tmp = TempAppData::new("intent-targets");
+        let tmp = TempAppData::new();
         let mut child = Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn a stand-in engine");
         tmp.write_device_ids(r#"{"live-ws":"device-7","dead-ws":"device-7"}"#);
-        tmp.write_pidfile("live-ws", child.id());
+        let _owner = tmp.own_as_engine("live-ws", child.id());
         tmp.write_ports("live-ws", PACKAGED_PORTS);
         // A pidfile an engine left behind when it died. macOS caps pids well
         // below this, so it cannot name a live process.
-        tmp.write_pidfile("dead-ws", 999_999);
+        tmp.write_unowned_pidfile("dead-ws", 999_999);
         tmp.write_ports("dead-ws", PACKAGED_PORTS);
 
         assert_eq!(
@@ -5424,12 +5497,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_empty_device_store_announces_to_nobody() {
-        let tmp = TempAppData::new("intent-nodevices");
+        let tmp = TempAppData::new();
         let mut child = Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn a stand-in engine");
-        tmp.write_pidfile("live-ws", child.id());
+        let _owner = tmp.own_as_engine("live-ws", child.id());
         tmp.write_ports("live-ws", PACKAGED_PORTS);
 
         assert!(restart_intent_targets(tmp.path()).is_empty());

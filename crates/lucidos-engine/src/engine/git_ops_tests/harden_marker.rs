@@ -1,13 +1,98 @@
 use super::common::make_test_repo;
 use super::*;
 
+async fn is_fresh(pool: &sqlx::PgPool, repo: &std::path::Path, branch: &str) -> bool {
+    full_harden_marker_state(pool, repo, branch).await == HardenMarkerState::Fresh
+}
+
+/// A full marker certifies either need. A fast one certifies only an
+/// integrated sub-thread's, so Apply and an independent proposal read it as
+/// missing.
+#[test]
+fn a_full_marker_covers_a_fast_need_and_never_the_reverse() {
+    let marker = |tier| HardenMarker::Recorded {
+        head_sha: "abc".into(),
+        fresh: true,
+        tier,
+    };
+    assert_eq!(
+        marker(HardenTier::Full).state_for(HardenTier::Full),
+        HardenMarkerState::Fresh
+    );
+    assert_eq!(
+        marker(HardenTier::Full).state_for(HardenTier::Fast),
+        HardenMarkerState::Fresh
+    );
+    assert_eq!(
+        marker(HardenTier::Fast).state_for(HardenTier::Fast),
+        HardenMarkerState::Fresh
+    );
+    assert_eq!(
+        marker(HardenTier::Fast).state_for(HardenTier::Full),
+        HardenMarkerState::Missing
+    );
+    assert_eq!(
+        HardenMarker::Missing.state_for(HardenTier::Fast),
+        HardenMarkerState::Missing
+    );
+}
+
+/// The tier column admits exactly the Rust tiers, so a write cannot carry a
+/// tier the reader does not know.
+#[test]
+fn the_tier_check_lists_the_rust_tiers() {
+    const MIGRATION: &str =
+        include_str!("../../../migrations/20261013034934_add_tier_to_hardened_branches.sql");
+    let tiers: Vec<String> = HardenTier::ALL
+        .iter()
+        .map(|t| format!("'{}'", t.as_str()))
+        .collect();
+    assert!(
+        MIGRATION.contains(&format!("tier IN ({})", tiers.join(", "))),
+        "{MIGRATION}"
+    );
+    for tier in HardenTier::ALL {
+        assert_eq!(HardenTier::parse(tier.as_str()), Some(tier));
+    }
+}
+
+/// The tier is stored with the marker and read back, and a later run
+/// replaces it. A fast marker on its own is no full marker.
+#[tokio::test]
+async fn the_marker_stores_its_tier() {
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db_name) = setup_test_db().await;
+    let (_tmp, repo_path) = make_test_repo().await;
+    let _ = git_cmd(&["checkout", "-b", "child"], &repo_path).await;
+    let head_sha = current_head_sha(&repo_path).await.unwrap();
+
+    record_hardened(&pool, &repo_path, "child", &head_sha, HardenTier::Fast)
+        .await
+        .unwrap();
+    let marker = harden_marker(&pool, &repo_path, "child").await;
+    assert_eq!(marker.tier(), Some(HardenTier::Fast));
+    assert_eq!(marker.state_for(HardenTier::Fast), HardenMarkerState::Fresh);
+    assert!(!has_full_harden_marker(&pool, &repo_path, "child").await);
+
+    record_hardened(&pool, &repo_path, "child", &head_sha, HardenTier::Full)
+        .await
+        .unwrap();
+    assert_eq!(
+        harden_marker(&pool, &repo_path, "child").await.tier(),
+        Some(HardenTier::Full)
+    );
+    assert!(has_full_harden_marker(&pool, &repo_path, "child").await);
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 #[tokio::test]
 async fn harden_marker_missing_when_no_db_row() {
     use crate::test_support::{setup_test_db, teardown_test_db};
     let (pool, db_name) = setup_test_db().await;
     let (_tmp, repo_path) = make_test_repo().await;
     assert_eq!(
-        harden_marker_state(&pool, &repo_path, "any-branch").await,
+        full_harden_marker_state(&pool, &repo_path, "any-branch").await,
         HardenMarkerState::Missing,
         "No DB row should report Missing"
     );
@@ -29,12 +114,18 @@ async fn harden_marker_with_matching_head_sha_is_fresh() {
     let _ = git_cmd(&["commit", "-m", "add test file"], &repo_path).await;
 
     let head_sha = current_head_sha(&repo_path).await.unwrap();
-    record_hardened(&pool, &repo_path, "test-branch", &head_sha)
-        .await
-        .unwrap();
+    record_hardened(
+        &pool,
+        &repo_path,
+        "test-branch",
+        &head_sha,
+        HardenTier::Full,
+    )
+    .await
+    .unwrap();
 
     assert!(
-        is_harden_marker_fresh(&pool, &repo_path, "test-branch").await,
+        is_fresh(&pool, &repo_path, "test-branch").await,
         "Marker with matching HEAD SHA should be fresh"
     );
     pool.close().await;
@@ -55,11 +146,17 @@ async fn harden_marker_becomes_stale_after_new_commit() {
     let _ = git_cmd(&["commit", "-m", "first commit"], &repo_path).await;
 
     let head_sha = current_head_sha(&repo_path).await.unwrap();
-    record_hardened(&pool, &repo_path, "test-branch", &head_sha)
-        .await
-        .unwrap();
+    record_hardened(
+        &pool,
+        &repo_path,
+        "test-branch",
+        &head_sha,
+        HardenTier::Full,
+    )
+    .await
+    .unwrap();
     assert!(
-        is_harden_marker_fresh(&pool, &repo_path, "test-branch").await,
+        is_fresh(&pool, &repo_path, "test-branch").await,
         "Should be fresh right after hardening"
     );
 
@@ -70,7 +167,7 @@ async fn harden_marker_becomes_stale_after_new_commit() {
     let _ = git_cmd(&["commit", "-m", "fix harden finding"], &repo_path).await;
 
     assert!(
-        !is_harden_marker_fresh(&pool, &repo_path, "test-branch").await,
+        !is_fresh(&pool, &repo_path, "test-branch").await,
         "Should be STALE after new commit changes HEAD"
     );
     pool.close().await;
@@ -94,17 +191,17 @@ async fn harden_marker_stays_fresh_when_branch_merged_to_main() {
     let _ = git_cmd(&["commit", "-m", "add badge"], &repo_path).await;
 
     let head_sha = current_head_sha(&repo_path).await.unwrap();
-    record_hardened(&pool, &repo_path, "feature", &head_sha)
+    record_hardened(&pool, &repo_path, "feature", &head_sha, HardenTier::Full)
         .await
         .unwrap();
-    assert!(is_harden_marker_fresh(&pool, &repo_path, "feature").await);
+    assert!(is_fresh(&pool, &repo_path, "feature").await);
 
     let _ = git_cmd(&["checkout", "main"], &repo_path).await;
     let _ = git_cmd(&["merge", "--ff-only", "feature"], &repo_path).await;
     let _ = git_cmd(&["checkout", "feature"], &repo_path).await;
 
     assert!(
-        is_harden_marker_fresh(&pool, &repo_path, "feature").await,
+        is_fresh(&pool, &repo_path, "feature").await,
         "Marker must stay fresh when branch is merged to main without HEAD changing"
     );
     pool.close().await;
@@ -127,7 +224,7 @@ async fn harden_marker_stays_fresh_when_main_advances() {
     let _ = git_cmd(&["commit", "-m", "feature work"], &repo_path).await;
 
     let head_sha = current_head_sha(&repo_path).await.unwrap();
-    record_hardened(&pool, &repo_path, "feature", &head_sha)
+    record_hardened(&pool, &repo_path, "feature", &head_sha, HardenTier::Full)
         .await
         .unwrap();
 
@@ -140,7 +237,7 @@ async fn harden_marker_stays_fresh_when_main_advances() {
     let _ = git_cmd(&["checkout", "feature"], &repo_path).await;
 
     assert!(
-        is_harden_marker_fresh(&pool, &repo_path, "feature").await,
+        is_fresh(&pool, &repo_path, "feature").await,
         "Marker must stay fresh when main advances without touching branch HEAD"
     );
     pool.close().await;
@@ -154,7 +251,7 @@ async fn harden_marker_state_distinguishes_missing_stale_fresh() {
     let (_tmp, repo_path) = make_test_repo().await;
 
     assert_eq!(
-        harden_marker_state(&pool, &repo_path, "feature").await,
+        full_harden_marker_state(&pool, &repo_path, "feature").await,
         HardenMarkerState::Missing,
         "No DB row should report Missing"
     );
@@ -167,11 +264,11 @@ async fn harden_marker_state_distinguishes_missing_stale_fresh() {
     let _ = git_cmd(&["commit", "-m", "initial feature"], &repo_path).await;
 
     let head_sha = current_head_sha(&repo_path).await.unwrap();
-    record_hardened(&pool, &repo_path, "feature", &head_sha)
+    record_hardened(&pool, &repo_path, "feature", &head_sha, HardenTier::Full)
         .await
         .unwrap();
     assert_eq!(
-        harden_marker_state(&pool, &repo_path, "feature").await,
+        full_harden_marker_state(&pool, &repo_path, "feature").await,
         HardenMarkerState::Fresh,
     );
 
@@ -181,7 +278,7 @@ async fn harden_marker_state_distinguishes_missing_stale_fresh() {
     let _ = git_cmd(&["add", "."], &repo_path).await;
     let _ = git_cmd(&["commit", "-m", "new commit after harden"], &repo_path).await;
     assert_eq!(
-        harden_marker_state(&pool, &repo_path, "feature").await,
+        full_harden_marker_state(&pool, &repo_path, "feature").await,
         HardenMarkerState::Stale,
     );
     pool.close().await;
@@ -203,14 +300,21 @@ async fn harden_marker_reports_the_recorded_sha() {
 
     let _ = git_cmd(&["checkout", "-b", "feature"], &repo_path).await;
     let hardened_sha = current_head_sha(&repo_path).await.unwrap();
-    record_hardened(&pool, &repo_path, "feature", &hardened_sha)
-        .await
-        .unwrap();
+    record_hardened(
+        &pool,
+        &repo_path,
+        "feature",
+        &hardened_sha,
+        HardenTier::Full,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         harden_marker(&pool, &repo_path, "feature").await,
         HardenMarker::Recorded {
             head_sha: hardened_sha.clone(),
-            fresh: true
+            fresh: true,
+            tier: HardenTier::Full,
         },
     );
 
@@ -223,7 +327,8 @@ async fn harden_marker_reports_the_recorded_sha() {
         harden_marker(&pool, &repo_path, "feature").await,
         HardenMarker::Recorded {
             head_sha: hardened_sha,
-            fresh: false
+            fresh: false,
+            tier: HardenTier::Full,
         },
     );
     pool.close().await;
@@ -269,11 +374,11 @@ async fn harden_marker_survives_worktree_removal() {
     let _ = git_cmd(&["commit", "-m", "work"], &wt_path).await;
 
     let head_sha = current_head_sha(&wt_path).await.unwrap();
-    record_hardened(&pool, &repo_path, branch_name, &head_sha)
+    record_hardened(&pool, &repo_path, branch_name, &head_sha, HardenTier::Full)
         .await
         .unwrap();
     assert_eq!(
-        harden_marker_state(&pool, &repo_path, branch_name).await,
+        full_harden_marker_state(&pool, &repo_path, branch_name).await,
         HardenMarkerState::Fresh,
     );
 
@@ -286,7 +391,7 @@ async fn harden_marker_survives_worktree_removal() {
     assert!(o.status.success());
 
     assert_eq!(
-        harden_marker_state(&pool, &repo_path, branch_name).await,
+        full_harden_marker_state(&pool, &repo_path, branch_name).await,
         HardenMarkerState::Fresh,
         "DB-backed marker must survive worktree removal",
     );

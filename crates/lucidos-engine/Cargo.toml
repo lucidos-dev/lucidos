@@ -34,9 +34,16 @@ chrono-tz = "0.10"
 libc = "0.2"
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-build-slot = { path = "../lucidos-build-slot" }
+lucidos-home = { path = "../lucidos-home" }
 lucidos-local-token = { path = "../lucidos-local-token" }
+lucidos-owner-lock = { path = "../lucidos-owner-lock" }
+# The engine socket the gateway reaches this engine on (ADR 0445).
+lucidos-engine-socket = { path = "../lucidos-engine-socket" }
 lucidos-frame-capability = { path = "../lucidos-frame-capability" }
 lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
+lucidos-pg-url = { path = "../lucidos-pg-url" }
+lucidos-gateway-constants = { path = "../lucidos-gateway-constants" }
+lucidos-capabilities = { path = "../lucidos-capabilities" }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
 # pg-embed removed - using Docker PostgreSQL with pgvector
 # `vendored-openssl` statically links OpenSSL into the binary for the
@@ -96,6 +103,10 @@ openssl = { version = "0.10", features = ["vendored"] }
 base64 = "0.22"
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Serves the router on the engine socket, which `axum-server` 0.7 cannot bind.
+# Both are already in the tree under `axum`.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 rustls = { version = "0.23", default-features = false }
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "builder", "smtp-transport"] }
 async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
@@ -113,6 +124,13 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 wasmtime = { version = "36", default-features = false, features = ["cranelift", "async", "cache"] }
 unicode-normalization = "0.1"
 pulldown-cmark = { version = "0.13", default-features = false }
+# Rust parser. Reads the ThreadEvent enum and its payload types out of the
+# source, so the frontend's wire types can be generated from them
+# (`engine/thread_events/ts_codegen.rs`). Only the `lucidos-codegen` bin reaches
+# it, so the linker leaves it out of the engine binary. No production type
+# carries a codegen derive.
+syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
+proc-macro2 = "1"
 
 [dev-dependencies]
 # Enables `#[tokio::test(start_paused = true)]` for time-mocked tests.
@@ -120,9 +138,3 @@ tokio = { version = "1", features = ["test-util"] }
 # WAT (WebAssembly text format) compiler — used by proxy_wasm_signer tests
 # to build minimal WASM modules at test time without an external toolchain.
 wat = "1"
-# Rust parser. Reads the ThreadEvent enum and its payload types out of the
-# source, so the frontend's wire types can be generated from them
-# (`thread_events_tests/ts_codegen.rs`). Test-only on purpose: no production
-# type carries a codegen derive.
-syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
-proc-macro2 = "1"

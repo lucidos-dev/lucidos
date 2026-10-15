@@ -6,7 +6,6 @@ use crate::memory::MemorySource;
 use chrono::Utc;
 use std::path::Path;
 use std::time::Duration;
-use uuid::Uuid;
 
 /// Standard refusal text when `git_clone` is called without a destination, or
 /// with one that lacks a recognized prefix. Per best-practices rule 8, the
@@ -237,7 +236,9 @@ impl LucidosEngine {
 
                 // Finder-style auto-suffix on collision: never overwrite an
                 // existing artifact. Resolve before the binary/text branch so
-                // every write/commit/event below uses the same final path.
+                // every write/commit/event below uses the same final path, and
+                // under the repo lock, so a concurrent import cannot take it.
+                let held = self.lock_workspace_repo().await;
                 let dest_relative = match self
                     .artifact_manager
                     .resolve_collision_free_path(&dest_relative)
@@ -264,6 +265,7 @@ impl LucidosEngine {
                     let main_commit = self
                         .artifact_manager
                         .write_and_commit(
+                            &held,
                             &self.event_bus,
                             &dest_relative,
                             &bytes,
@@ -296,6 +298,7 @@ impl LucidosEngine {
                             let commit_sha = self
                                 .artifact_manager
                                 .write_and_commit(
+                                    &held,
                                     &self.event_bus,
                                     &dest_relative,
                                     &bytes,
@@ -321,6 +324,7 @@ impl LucidosEngine {
                     let main_commit = self
                         .artifact_manager
                         .write_and_commit(
+                            &held,
                             &self.event_bus,
                             &dest_relative,
                             &content,
@@ -328,6 +332,7 @@ impl LucidosEngine {
                             WriteAnnouncement::SupersededBy("ArtifactImported"),
                         )
                         .await?;
+                    drop(held);
 
                     // Generate summary for text files
                     let summary = self
@@ -475,8 +480,13 @@ impl LucidosEngine {
                     GitCloneRoute::Artifacts(sub) => sub,
                 };
 
-                let temp_dir =
-                    std::env::temp_dir().join(format!("lucidos_clone_{}", Uuid::new_v4()));
+                // An owner-only scratch directory, removed with the clone on
+                // every return.
+                let scratch = match tempfile::Builder::new().prefix("lucidos-clone-").tempdir() {
+                    Ok(dir) => dir,
+                    Err(e) => return Ok(format!("Error: cannot create a clone directory: {e}")),
+                };
+                let temp_dir = scratch.path().join("repo");
                 log!(@git_clone, "Cloning {} to {:?}", shown_url, temp_dir);
 
                 if let Err(e) = crate::core::git_auth::shallow_clone_within(
@@ -530,11 +540,9 @@ impl LucidosEngine {
                     &mut skipped_count,
                     &mut total_bytes,
                 ) {
-                    let _ = std::fs::remove_dir_all(&temp_dir);
                     return Ok(format!("Error: {}", e));
                 }
-
-                let _ = std::fs::remove_dir_all(&temp_dir);
+                drop(scratch);
 
                 if imported_count == 0 {
                     return Ok(format!(
@@ -555,7 +563,11 @@ impl LucidosEngine {
                 let commit_msg = format!("Import {} files from {}", imported_count, shown_url);
                 let commit_sha = self
                     .artifact_manager
-                    .write_batch_and_commit(&collected_files, &commit_msg)
+                    .write_batch_and_commit(
+                        &self.lock_workspace_repo().await,
+                        &collected_files,
+                        &commit_msg,
+                    )
                     .await?;
 
                 // Emit event for the batch import
@@ -618,6 +630,8 @@ impl LucidosEngine {
         // Finder-style auto-suffix on collision: never overwrite an existing
         // artifact. Resolve once up front so the write/commit, the commit
         // message, the event, and the returned message all use the final path.
+        // Under the repo lock, so a concurrent import cannot take the same name.
+        let held = self.lock_workspace_repo().await;
         let dest_relative = self
             .artifact_manager
             .resolve_collision_free_path(dest_relative)?;
@@ -635,6 +649,7 @@ impl LucidosEngine {
             let bytes = std::fs::read(source)?;
             self.artifact_manager
                 .write_and_commit(
+                    &held,
                     &self.event_bus,
                     &dest_relative,
                     &bytes,
@@ -646,6 +661,7 @@ impl LucidosEngine {
             let content = std::fs::read_to_string(source)?;
             self.artifact_manager
                 .write_and_commit(
+                    &held,
                     &self.event_bus,
                     &dest_relative,
                     &content,
@@ -654,6 +670,7 @@ impl LucidosEngine {
                 )
                 .await?
         };
+        drop(held);
         log!(@import, "Committed: {}", &commit_sha[..commit_sha.floor_char_boundary(7)]);
 
         self.event_bus
@@ -716,7 +733,6 @@ mod tests {
     /// `walk_dir` was a nested `fn` inside `git_clone`'s match arm, which is why
     /// the bug below shipped untested. It is lifted to module level (a pure move,
     /// it captured nothing) so the recursion can be exercised directly.
-    #[allow(clippy::too_many_arguments)]
     fn walk(root: &Path, include: &[String], exclude: &[String]) -> (Vec<String>, usize) {
         let mut collected = Vec::new();
         let mut imported_files = Vec::new();

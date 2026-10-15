@@ -21,7 +21,9 @@ type Relayed =
   | { kind: 'open' }
   | { kind: 'error' };
 
-export function openBridgedEventStream(handlers: EventStreamHandlers): EventStream {
+/** The relayed stream. `types` names the event types this document listens
+ *  to, so the host relays only those (ADR 0432); `*` takes everything. */
+export function openBridgedEventStream(handlers: EventStreamHandlers, types: readonly string[]): EventStream {
   const off = onHostPush('sse', (payload) => {
     const relayed = payload as Relayed;
     if (relayed?.kind === 'frame') handlers.onFrame(relayed.data);
@@ -31,7 +33,7 @@ export function openBridgedEventStream(handlers: EventStreamHandlers): EventStre
 
   // Fire and forget. The host answers with nothing, and a failed subscribe is
   // reported by the absence of frames rather than by a rejection nobody reads.
-  void callHost('sse.open', {}).catch(() => {
+  void callHost('sse.open', { types }).catch(() => {
     handlers.onError();
   });
 

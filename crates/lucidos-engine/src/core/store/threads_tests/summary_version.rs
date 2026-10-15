@@ -168,3 +168,40 @@ async fn the_aggregate_and_the_summary_carry_the_row_version() {
     assert_eq!(summary.summary_version, 1);
     teardown_test_db(&db).await;
 }
+
+/// A write that answers its caller with a version must answer with the one its
+/// own event broadcast. A client holds an optimistic row until it sees that
+/// version (ADR 0437), so a different number would hold it too long or too
+/// briefly.
+#[tokio::test]
+async fn an_emit_returns_the_version_its_broadcast_aggregate_carried() {
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{EventMeta, ThreadEvent};
+
+    let (pool, db) = setup_test_db().await;
+    let (bus, _parent_rx) = EventBus::new(pool.clone());
+    let id = crate::test_support::seed_chat_thread(&bus, "work").await;
+    let mut events = bus.subscribe();
+
+    let emitted = bus
+        .emit(BusEvent::Thread {
+            thread_id: id,
+            event: ThreadEvent::ThreadArchived,
+            meta: EventMeta::NONE,
+        })
+        .await
+        .expect("emit")
+        .expect("persisted");
+    let broadcast = loop {
+        let event = events.recv().await.expect("broadcast");
+        if event.event_id == emitted.event_id {
+            break event;
+        }
+    };
+
+    let carried = broadcast.aggregate.map(|a| a.summary_version);
+    assert!(carried.is_some(), "a thread event carries its aggregate");
+    assert_eq!(emitted.summary_version, carried);
+    assert_eq!(emitted.summary_version, Some(version_of(&pool, id).await));
+    teardown_test_db(&db).await;
+}

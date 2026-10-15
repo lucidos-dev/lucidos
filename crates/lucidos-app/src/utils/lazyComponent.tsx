@@ -10,34 +10,28 @@ export type LazyComponent<P> = ComponentType<P> & {
    *  once the component is ready, or `false` once a failure has been handled.
    *  Never rejects. */
   preload(): Promise<boolean>;
+  /** Whether the component is in memory, so a mount renders it at once. */
+  isLoaded(): boolean;
 };
 
 /**
- * Render a code-split component lazily, fetched on first mount or `preload()`,
- * then cached. Returns `null` until the chunk arrives. Pair with a signal-gated
- * mount site (`{open.value && <Lazy />}`) so the chunk only fetches on first
- * open; mounting unconditionally would defeat the split.
+ * Load a chunk once and keep what it holds. Resolves `true` once kept, or
+ * `false` once a failure has been handled. Never rejects.
  *
  * The common failure is a stale bundle: a rebuild shipped while this tab kept
- * the old build in memory, so the lazy chunk's old hashed URL now 404s. We
+ * the old build in memory, so the chunk's old hashed URL now 404s. We
  * auto-reload to the new build (`reloadForStaleChunk`) instead of stranding the
  * user, and only fall back to a "Refresh the page" toast if the loop guard
- * trips. The `loading` flag is reset either way, so a re-mount retries.
+ * trips. The in-flight load is dropped either way, so the next ask retries.
  */
-export function lazyComponent<P>(
-  loader: () => Promise<ComponentType<P> | { default: ComponentType<P> }>,
-): LazyComponent<P> {
-  const cached = signal<ComponentType<P> | null>(null);
+function chunkLoader<T>(load: () => Promise<T>, keep: (value: T) => void, kept: () => boolean): () => Promise<boolean> {
   let loading: Promise<boolean> | null = null;
-
-  function start(): Promise<boolean> {
-    if (cached.value) return Promise.resolve(true);
+  return () => {
+    if (kept()) return Promise.resolve(true);
     if (loading) return loading;
-    loading = loader().then(
-      (mod) => {
-        cached.value = (typeof mod === 'object' && mod !== null && 'default' in mod
-          ? mod.default
-          : mod) as ComponentType<P>;
+    loading = load().then(
+      (value) => {
+        keep(value);
         return true;
       },
       (err) => {
@@ -53,12 +47,34 @@ export function lazyComponent<P>(
       },
     );
     return loading;
-  }
+  };
+}
+
+/**
+ * Render a code-split component lazily, fetched on first mount or `preload()`,
+ * then cached. Renders `placeholder`, or nothing, until the chunk arrives.
+ * Pair a component with no placeholder with a signal-gated mount site
+ * (`{open.value && <Lazy />}`), so the chunk only fetches on first open.
+ */
+export function lazyComponent<P>(
+  loader: () => Promise<ComponentType<P> | { default: ComponentType<P> }>,
+  placeholder?: ComponentType<P>,
+): LazyComponent<P> {
+  const cached = signal<ComponentType<P> | null>(null);
+  const start = chunkLoader(
+    loader,
+    (mod) => {
+      cached.value = (typeof mod === 'object' && mod !== null && 'default' in mod
+        ? mod.default
+        : mod) as ComponentType<P>;
+    },
+    () => cached.peek() !== null,
+  );
 
   function Lazy(props: P) {
     if (!cached.value) {
       void start();
-      return null;
+      return placeholder ? h(placeholder, props as never) : null;
     }
     // Use h() instead of JSX so the unconstrained P doesn't have to satisfy
     // IntrinsicAttributes. Preact resolves attribute typing at runtime.
@@ -66,7 +82,41 @@ export function lazyComponent<P>(
   }
   Lazy.displayName = 'Lazy';
   Lazy.preload = start;
+  Lazy.isLoaded = () => cached.peek() !== null;
   return Lazy as LazyComponent<P>;
+}
+
+/** A code-split module of code rather than a component. */
+export type LazyModule<M> = Pick<LazyComponent<never>, 'preload' | 'isLoaded'> & {
+  /** The loaded module. Read it only once `isLoaded()`: an open gated on
+   *  `whenLoaded` is the usual way to know. */
+  get(): M;
+};
+
+export function lazyModule<M>(loader: () => Promise<M>): LazyModule<M> {
+  let loaded: M | null = null;
+  return {
+    preload: chunkLoader(loader, (mod) => { loaded = mod; }, () => loaded !== null),
+    isLoaded: () => loaded !== null,
+    get() {
+      if (loaded === null) throw new Error('A lazy module was read before it loaded');
+      return loaded;
+    },
+  };
+}
+
+/** A chunk an open can wait on: any `LazyComponent`, or a group of them. */
+export type ChunkGate = Pick<LazyComponent<never>, 'preload' | 'isLoaded'>;
+
+/** Several lazy components that share one chunk, as one gate. The first loads
+ *  alone, and the rest only once it has, so a failed fetch reports once rather
+ *  than once per component. */
+export function chunkGroup(first: ChunkGate, ...rest: ChunkGate[]): ChunkGate {
+  return {
+    preload: async () => (await first.preload())
+      && (await Promise.all(rest.map((part) => part.preload()))).every(Boolean),
+    isLoaded: () => first.isLoaded() && rest.every((part) => part.isLoaded()),
+  };
 }
 
 /** An open waiting on a chunk. `pending` goes false once it opens or is
@@ -78,17 +128,22 @@ export interface PendingOpen {
 
 /** Run `open` once `lazy`'s chunk is in memory, so a surface never opens empty,
  *  and never after a failed load.
- *  Warm, that is the next microtask. A second press on the trigger calls
- *  `cancel` to take the open back. A press anywhere else cancels it too: the
- *  user has moved on, and a late open would land on whatever is next. */
+ *  Warm, that is at once, inside the press that asked. A second press on the
+ *  trigger calls `cancel` to take the open back. A press anywhere else cancels
+ *  it too: the user has moved on, and a late open would land on whatever is
+ *  next. An open with no trigger, such as a shortcut's, any press cancels. */
 export function whenLoaded(
-  lazy: { preload(): Promise<boolean> },
+  lazy: ChunkGate,
   open: () => void,
-  trigger: Element,
+  trigger: Element | null,
   doc: Document = document,
 ): PendingOpen {
+  if (lazy.isLoaded()) {
+    open();
+    return { pending: false, cancel() {} };
+  }
   const onPress = (e: PointerEvent) => {
-    if (!trigger.contains(e.target as Node)) handle.cancel();
+    if (!trigger?.contains(e.target as Node)) handle.cancel();
   };
   const handle = {
     pending: true,

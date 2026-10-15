@@ -2286,6 +2286,9 @@ mod tests {
                 coding_agent_kind: Default::default(),
                 coding_agent_folder: String::new(),
                 app_id: None,
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
             meta: EventMeta {
                 channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
@@ -2425,6 +2428,22 @@ mod tests {
             Path::new("/ws"),
         );
         assert_eq!(v, RequestVerdict::Benign);
+    }
+
+    /// The prompt steers scratch files to `${TMPDIR:-/tmp}` (ADR 0456). A data
+    /// write from there classifies exactly as one from `/tmp` did.
+    #[test]
+    fn a_data_write_from_the_steered_scratch_dir_classifies_like_tmp() {
+        let verdict = |from: &str| {
+            classify_coding_agent_request(
+                "command_execution",
+                &serde_json::json!({
+                    "command": format!("lucidos data write artifacts/x.png --from {from}")
+                }),
+                Path::new("/ws"),
+            )
+        };
+        assert_eq!(verdict("\"${TMPDIR:-/tmp}/x.png\""), verdict("/tmp/x.png"));
     }
 
     /// The unattended lane used to map `fallback_classify`'s `Safe` straight

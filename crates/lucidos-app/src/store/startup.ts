@@ -40,8 +40,13 @@ import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
 import { refreshChangesState, restoreRestartState } from './actions/chat-changes';
 import { openHomeOnColdStart } from './actions/coldStartHome';
+import { installDevWindowFollow } from './actions/dev-window';
 import { restoreRepoSelectionFromStorage } from './actions/repositories';
-import { openThreadAcrossWorkspaces } from './actions/cross-workspace';
+import {
+  openThreadAcrossWorkspaces,
+  openWorkspaceThreadUrl,
+  parseWorkspaceThreadUrl,
+} from './actions/cross-workspace';
 import { inlineMarkdownImage, openImagePopupFromGroup } from './imagePopup';
 import { installMarkdownImageRetry } from '../utils/markdownImageRetry';
 import { installMarkdownImageFallback } from '../utils/markdownImageFallback';
@@ -230,8 +235,8 @@ export function startClient(): () => void {
     setTimeout(() => loadAllThreads().catch(() => {}), 3000);
   });
   registerCurrentDevice();
-  // Thread focus is now reported live in the PresenceCheck pong, so the
-  // periodic POST loop is gone (see system-knowhow/notifications.md §3).
+  // Each page decides Row 1 itself when a PresenceCheck arrives, so no thread
+  // focus is posted (see system-knowhow/notifications.md §3).
   // Device-presence still pings so the engine knows which devices count
   // as candidates for the PresenceCheck broadcast.
   const stopDevicePresence = startDevicePresenceTracking();
@@ -312,7 +317,10 @@ export function startClient(): () => void {
       const href = anchor.getAttribute('href');
       if (href && /^https?:\/\//.test(href)) {
         e.preventDefault();
-        openUrl(href);  // Panel in Tauri, new tab in browser
+        // A pasted link to a Lucidos thread stays in Lucidos.
+        const threadUrl = parseWorkspaceThreadUrl(href);
+        if (threadUrl) openWorkspaceThreadUrl(threadUrl);
+        else openUrl(href);  // Panel in Tauri, new tab in browser
       }
     }
   }
@@ -686,12 +694,17 @@ export function startClient(): () => void {
   // (paneFocus.ts).
   const stopIframeFocusTracking = installContentPaneIframeFocusTracking();
 
+  // A development desktop window moves to a new build with the engine it
+  // shows, never ahead of it (ADR 0461). See actions/dev-window.ts.
+  const stopDevWindowFollow = installDevWindowFollow();
+
   return () => {
     stopped = true;
     swLiveness.stop();
     stopLiveness();
     stopBootMarks();
     stopColdStartHome();
+    stopDevWindowFollow();
     stopAppBridge();
     stopFrameCapabilityRenewal();
     clearInterval(connectionInterval);

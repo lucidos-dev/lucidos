@@ -1,5 +1,5 @@
 import type { App } from '../../store/types';
-import { openImagePopupFromGroup, showToast } from '../../store/store';
+import { openImagePopupFromGroup, showToast, workspacePath } from '../../store/store';
 import { openLocalFileOnConfirm } from '../../store/actions/artifacts';
 import { openFilePreviewModal } from '../../store/actions/filePreviewModal';
 import { openApp, openAppById } from '../../store/actions/apps';
@@ -12,6 +12,7 @@ import {
   extractLocalFileTarget,
   extractBareAppRef,
   extractDataPathTarget,
+  extractWorkspaceDiskDataPath,
   extractTriggerIdFromHref,
   extractRepoFileTargetFromHref,
   hasUrlScheme,
@@ -188,8 +189,10 @@ export function handleMarkdownLinkClick(e: MouseEvent, apps: App[], source?: str
     // list has not caught up with. That is exactly when `linkifyPaths`
     // declines to rewrite, and this fallback is all that stands between the
     // click and a full workspace reload. Runs BEFORE the OS-open branch, so
-    // an absolute /artifacts/… is never mistaken for a disk path.
-    const dataPath = extractDataPathTarget(rawHref);
+    // an absolute /artifacts/… is never mistaken for a disk path. A disk path
+    // into this workspace's data/ tree is the same file, so it previews too.
+    const dataPath = extractDataPathTarget(rawHref)
+      ?? extractWorkspaceDiskDataPath(rawHref, workspacePath.value);
     if (dataPath) {
       e.preventDefault();
       previewDataFile(dataPath, citedLines(anchorTarget, hrefLineRef(rawHref)));

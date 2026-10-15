@@ -4,16 +4,25 @@
 //! counts each in-scope thread's entries the way [`super::log::project`] makes
 //! them. A payload's stored size stands in for its entry's bytes, so the pass
 //! takes about a second on millions of events. That size carries field
-//! overhead and compression, so every figure is a range.
+//! overhead and compression, so whether an entry costs a call is a range.
 //!
-//! **Each tier is priced on its own measurement.** [`measured_for_catalog`]
-//! averages real `ContextCaptured` rows for the compactor, per model and tier.
-//! A tier with too little history uses its seed, kept beside the model's price
-//! in [`COMPACTOR_MODELS`]. A tier measured neither way is a range: see
-//! [`tier_price`].
+//! **Calls count rounds.** A line over the size limit costs a follow-up call.
+//! So the node count is scaled by the workspace's own calls per node, or by
+//! [`SEED_ROUNDS_PER_NODE`] with too little history.
+//!
+//! **Cost is calls times what one call costs.** [`measured_for_catalog`]
+//! averages real `ContextCaptured` rows for the compactor, per model and tier,
+//! cache reads and writes apart. A tier with too little history uses its seed,
+//! kept beside the model's price in [`COMPACTOR_MODELS`]. A tier measured
+//! neither way spans a range of output: see [`tier_price`]. Backfill calls are
+//! priced on Flex where the route serves it, as the compactor sends them.
 //!
 //! **A tier is priced as the tier the model runs at.** Routing snaps a tier
 //! the model cannot run onto one it can, so the estimate clamps the same way.
+//!
+//! **A turn has a price before any history.** It is [`SEED_CALLS_PER_TURN`]
+//! times one live call's price. A new workspace's backfill and daily figures
+//! are both $0, so this price is what tells it what Tree costs in use.
 //!
 //! **Time follows the compactor's lanes.** Calls run [`START_LIMIT`] at once,
 //! and a thread's leaves run one after another, so the longest thread sets a
@@ -27,31 +36,26 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::compaction_view;
-use super::compactor_models::{CompactorModel, MeasuredUsage, TierSeed, COMPACTOR_MODELS};
+use super::compactor_models::{
+    serves_flex, CompactorModel, MeasuredUsage, TierSeed, Tokens, COMPACTOR_MODELS,
+    SEED_ROUNDS_PER_NODE,
+};
 use super::limit::START_LIMIT;
 use super::log::{ENTRY_EVENT_TYPES, TURN_END_EVENT_TYPES};
 use super::shape::LEAF_WINDOW;
 use super::store::{ready_window_sql, THREAD_IN_SCOPE_SQL};
-use super::view::ViewBlocks;
 use super::workspace_log::{sql_list, WORKSPACE_LEAF_EVENT_TYPES};
-use super::{prompt, CAP_CHARS, NODE_BYTES, RAW_CONTEXT_BYTES, READY_DAYS};
+use super::{NODE_BYTES, READY_DAYS};
 use crate::engine::LucidosEngine;
 use crate::llm::model_registry::{
     provider_kind_for, resolve_route, ModelRegistry, ProviderKind, RouteEntry,
 };
 use crate::llm::reasoning::clamp_effort;
-use crate::llm::EFFORT_LADDER;
+use crate::llm::{ServiceTier, EFFORT_LADDER};
 
 /// A stored payload over this many bytes is surely an entry over
 /// [`NODE_BYTES`]: its fields and metadata never take more than the slack.
 const SURE_LONG_BYTES: i64 = NODE_BYTES as i64 + 400;
-
-/// A large payload is stored compressed. Text this repetitive shrinks by at
-/// most about this factor, so it bounds an entry's real size from above.
-const COMPRESSION: i64 = 3;
-
-const BYTES_PER_TOKEN: u64 = 4;
 
 /// Seconds one call takes, wall clock, for a model with no timed tier.
 const SECS_PER_CALL: Bounds<f64> = Bounds {
@@ -61,6 +65,15 @@ const SECS_PER_CALL: Bounds<f64> = Bounds {
 
 /// Days of activity the daily figure averages over.
 const RECENT_DAYS: u64 = 7;
+
+/// Compactor calls one live turn makes, measured on one workspace after its
+/// backfill over three days: 4,012 calls over 525 turns, 1,722 over 171 and
+/// 1,813 over 167. A workspace that never chose has never run the compactor,
+/// so this is the only figure it has.
+pub(crate) const SEED_CALLS_PER_TURN: Bounds<f64> = Bounds {
+    low: 7.6,
+    high: 10.9,
+};
 
 /// A tier's measured history counting fewer calls than this is too thin to
 /// trust: one unusually long or short call could swing the average either
@@ -97,10 +110,24 @@ pub struct TreeBackfillEstimate {
     pub complete_secs: Bounds<u64>,
     /// Calls a day once the backfill is done, from the last week's activity.
     pub daily_calls: Bounds<u64>,
+    /// Compactor calls one turn makes: [`SEED_CALLS_PER_TURN`].
+    pub turn_calls: Bounds<f64>,
     /// The cost and time of both, for each compactor model, at every reasoning
     /// tier the compactor preference accepts. A tier the model cannot run is
     /// priced as the tier routing snaps it to.
     pub costs: Vec<ModelCost>,
+}
+
+impl TreeBackfillEstimate {
+    /// The row for `model` at `effort`, as the Start dialog picks it.
+    pub(crate) fn cost_for(&self, model: &str, effort: &str) -> Option<&EffortCost> {
+        self.costs
+            .iter()
+            .find(|c| c.model == model)?
+            .by_effort
+            .iter()
+            .find(|c| c.effort == effort)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -117,12 +144,17 @@ pub struct EffortCost {
     /// [`TreeBackfillEstimate::complete_secs`] at this tier's seconds per call.
     pub complete_secs: Bounds<u64>,
     pub backfill_usd: Bounds<f64>,
-    /// The single figure the panel leads with. From measured (or
-    /// seeded) per-call tokens, not the low/high guesses that make the
-    /// range: see [`central_usd`].
+    /// The single figure the panel leads with: the midpoint of the calls at
+    /// the tier's central output. See [`priced_work`].
     pub backfill_usd_central: f64,
     pub daily_usd: Bounds<f64>,
     pub daily_usd_central: f64,
+    /// What one turn costs once the backfill is done, at the standard rate.
+    pub turn_usd: Bounds<f64>,
+    pub turn_usd_central: f64,
+    /// Where a backfill at this tier pauses for the user: see
+    /// [`super::spend::cap_for`].
+    pub cap_usd: f64,
 }
 
 /// One tree's leaves, as the estimate weighs them.
@@ -131,8 +163,6 @@ pub(crate) struct Leaves {
     pub(crate) count: u64,
     /// Leaves that surely, and that possibly, cost a call.
     pub(crate) calls: Bounds<u64>,
-    /// Input bytes of those calls' messages, low and high.
-    pub(crate) bytes: Bounds<u64>,
 }
 
 /// One tree's leaves: all of them, and those of the last [`RECENT_DAYS`].
@@ -148,7 +178,7 @@ pub(crate) struct Tree {
 impl Tree {
     /// The calls of building the whole tree.
     fn backfill(&self) -> Work {
-        tree_work(self.all, merge_count(self.all.count), self.all.count)
+        tree_work(self.all, merge_count(self.all.count))
     }
 
     /// Its leaf calls in rounds, [`LEAF_WINDOW`] at a time, which run one
@@ -168,7 +198,6 @@ impl Tree {
         tree_work(
             self.recent,
             merge_count(self.all.count) - merge_count(before),
-            self.all.count,
         )
     }
 }
@@ -182,26 +211,16 @@ pub(crate) struct Counts {
     pub(crate) built: u64,
 }
 
-/// Calls and input bytes of some amount of compactor work.
+/// The nodes some amount of compactor work builds with a model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Work {
     calls: Bounds<u64>,
-    input_bytes: Bounds<u64>,
 }
 
 impl Work {
     fn add(&mut self, other: Work) {
         self.calls.low += other.calls.low;
         self.calls.high += other.calls.high;
-        self.input_bytes.low += other.input_bytes.low;
-        self.input_bytes.high += other.input_bytes.high;
-    }
-
-    fn input_tokens(&self) -> Bounds<u64> {
-        Bounds {
-            low: self.input_bytes.low / BYTES_PER_TOKEN,
-            high: self.input_bytes.high / BYTES_PER_TOKEN,
-        }
     }
 
     /// The calls' midpoint: the one call count the central figure uses,
@@ -210,24 +229,12 @@ impl Work {
         (self.calls.low + self.calls.high) / 2
     }
 
-    /// This work less `built` calls already made, its bytes in proportion.
+    /// This work less `built` calls already made.
     fn less(self, built: u64) -> Work {
-        let keep = |calls: u64, bytes: u64| -> (u64, u64) {
-            let left = calls.saturating_sub(built);
-            let bytes = if calls == 0 {
-                0
-            } else {
-                (bytes as u128 * left as u128 / calls as u128) as u64
-            };
-            (left, bytes)
-        };
-        let (low, low_bytes) = keep(self.calls.low, self.input_bytes.low);
-        let (high, high_bytes) = keep(self.calls.high, self.input_bytes.high);
         Work {
-            calls: Bounds { low, high },
-            input_bytes: Bounds {
-                low: low_bytes,
-                high: high_bytes,
+            calls: Bounds {
+                low: self.calls.low.saturating_sub(built),
+                high: self.calls.high.saturating_sub(built),
             },
         }
     }
@@ -239,26 +246,19 @@ impl Work {
                 low: day(self.calls.low),
                 high: day(self.calls.high),
             },
-            input_bytes: Bounds {
-                low: day(self.input_bytes.low),
-                high: day(self.input_bytes.high),
+        }
+    }
+
+    /// These nodes as model calls, at `rounds` calls per node.
+    fn rounds(self, rounds: f64) -> Work {
+        let calls = |nodes: u64| (nodes as f64 * rounds).ceil() as u64;
+        Work {
+            calls: Bounds {
+                low: calls(self.calls.low),
+                high: calls(self.calls.high),
             },
         }
     }
-}
-
-/// Bytes every call sends besides its message: the system prompt and the
-/// request's frame.
-fn frame_bytes() -> u64 {
-    let request = prompt::request(&ViewBlocks::default(), &prompt::compress_step(""));
-    (prompt::COMPACT.len() + request.as_text().len()) as u64
-}
-
-/// The most context a call in a tree of `tree_len` leaves reads: every line
-/// before it at [`NODE_BYTES`], up to the compaction view's most. A small tree
-/// gets a small figure.
-fn compaction_view_bytes(tree_len: u64) -> u64 {
-    (tree_len * NODE_BYTES as u64).min(compaction_view::MAX_BYTES as u64)
 }
 
 /// The merges a full tree over `n` leaves holds (`shape::complete_addresses`
@@ -273,30 +273,13 @@ pub(crate) fn merge_count(n: u64) -> u64 {
 }
 
 /// A tree's leaf calls, and `merges` merge calls at most. At best each pair
-/// of leaves that costs no call merges for free too. `tree_len` is the whole
-/// tree's leaf count, which bounds how much context a call reads.
-fn tree_work(leaves: Leaves, merges: u64, tree_len: u64) -> Work {
-    let frame = frame_bytes();
-    let context_bytes = compaction_view_bytes(tree_len);
+/// of leaves that costs no call merges for free too.
+fn tree_work(leaves: Leaves, merges: u64) -> Work {
     let free_pairs = leaves.count.saturating_sub(leaves.calls.high) / 2;
-    let merges = Bounds {
-        low: merges.saturating_sub(free_pairs),
-        high: merges,
-    };
-    let merge_bytes = Bounds {
-        low: frame + NODE_BYTES as u64,
-        high: frame + 2 * NODE_BYTES as u64 + context_bytes,
-    };
     Work {
         calls: Bounds {
-            low: leaves.calls.low + merges.low,
-            high: leaves.calls.high + merges.high,
-        },
-        input_bytes: Bounds {
-            low: leaves.calls.low * frame + leaves.bytes.low + merges.low * merge_bytes.low,
-            high: leaves.calls.high * (frame + context_bytes)
-                + leaves.bytes.high
-                + merges.high * merge_bytes.high,
+            low: leaves.calls.low + merges.saturating_sub(free_pairs),
+            high: leaves.calls.high + merges,
         },
     }
 }
@@ -318,18 +301,25 @@ fn tier_weight(effort: &str) -> u32 {
     }
 }
 
+/// `idx_events_summary_compaction_captures`'s predicate, spelled exactly as
+/// its migration does. A compactor read opens its WHERE with it, so it reads
+/// through that index rather than scanning every event.
+macro_rules! compaction_captures_where {
+    () => {
+        "event_type = 'ContextCaptured' AND payload->>'purpose' = 'summary_compaction'"
+    };
+}
+pub(crate) use compaction_captures_where;
+
 /// Real per-call compactor usage and time, from `ContextCaptured` history:
 /// count and averages of the compactor's calls, per model in `$1` and per
 /// tier. Only timed calls count toward the time.
 ///
-/// The first two conditions are `idx_events_summary_compaction_captures`'s
-/// predicate, spelled exactly as its migration does. Change one and the read
-/// falls back to scanning every event.
-///
 /// A row with no `reasoning_effort` predates the field and ran at the
 /// preference's then-default, `low`. `avg(bigint)` is `numeric`, which sqlx
 /// cannot decode into `f64`, so each average casts to FLOAT8.
-const MEASURED_USAGE_SQL: &str = "SELECT payload->>'model', \
+const MEASURED_USAGE_SQL: &str = concat!(
+    "SELECT payload->>'model', \
        COALESCE(payload->>'reasoning_effort', 'low'), count(*), \
        avg((payload->'usage'->>'input_tokens')::bigint)::float8, \
        avg(COALESCE((payload->'usage'->>'cache_read_tokens')::bigint, 0))::float8, \
@@ -337,12 +327,10 @@ const MEASURED_USAGE_SQL: &str = "SELECT payload->>'model', \
        avg((payload->'usage'->>'output_tokens')::bigint)::float8, \
        count(payload->'duration_ms'), \
        avg((payload->>'duration_ms')::float8) \
-     FROM events \
-     WHERE event_type = 'ContextCaptured' \
-       AND payload->>'purpose' = 'summary_compaction' \
-       AND payload->>'model' = ANY($1) \
-       AND payload ? 'usage' \
-     GROUP BY 1, 2";
+     FROM events WHERE ",
+    compaction_captures_where!(),
+    " AND payload->>'model' = ANY($1) AND payload ? 'usage' GROUP BY 1, 2"
+);
 
 /// The models [`MEASURED_USAGE_SQL`] reads: the compactor's, which the
 /// estimate prices.
@@ -363,6 +351,9 @@ pub(crate) struct TierMeasure {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Measured {
     pub(crate) tiers: HashMap<(String, String), TierMeasure>,
+    /// Model calls per model-written node, once [`MIN_MEASURED_CALLS`] nodes
+    /// are built.
+    pub(crate) rounds_per_node: Option<f64>,
 }
 
 impl Measured {
@@ -374,8 +365,17 @@ impl Measured {
     }
 }
 
-/// Measured usage and time for every compactor model and tier, in one query.
-/// A tier with too few calls gets no entry, and its seed applies instead.
+/// Compactor calls recorded, and nodes a model wrote.
+const ROUNDS_SQL: &str = concat!(
+    "SELECT (SELECT count(*) FROM events WHERE ",
+    compaction_captures_where!(),
+    " AND payload ? 'usage'), \
+       (SELECT count(*) FROM summary_tree_nodes WHERE model IS NOT NULL)"
+);
+
+/// Measured usage and time for every compactor model and tier, in one query,
+/// and the calls per node. A tier with too few calls gets no entry, and its
+/// seed applies instead.
 pub(crate) async fn measured_for_catalog(pool: &PgPool) -> Result<Measured, sqlx::Error> {
     type Row = (
         String,
@@ -392,7 +392,13 @@ pub(crate) async fn measured_for_catalog(pool: &PgPool) -> Result<Measured, sqlx
         .bind(compactor_model_ids())
         .fetch_all(pool)
         .await?;
-    let mut measured = Measured::default();
+    let (calls, nodes): (i64, i64) = sqlx::query_as(ROUNDS_SQL).fetch_one(pool).await?;
+    let mut measured = Measured {
+        // A model-written node costs at least one call, whatever the rows say.
+        rounds_per_node: (nodes >= MIN_MEASURED_CALLS)
+            .then(|| (calls as f64 / nodes as f64).max(1.0)),
+        ..Measured::default()
+    };
     for (model, tier, calls, avg_input, avg_read, avg_write, avg_output, timed, avg_ms) in rows {
         let tokens = |avg: Option<f64>| avg.unwrap_or_default().round() as u64;
         let measure = TierMeasure {
@@ -532,13 +538,16 @@ pub(crate) fn estimate(
     for tree in recent_threads() {
         ready.add(tree.backfill());
     }
-    let work = gross.less(counts.built);
-    let ready = ready.less(counts.built);
-    let daily = recent.per_day();
+    let rounds = measured.rounds_per_node.unwrap_or(SEED_ROUNDS_PER_NODE);
+    let work = gross.less(counts.built).rounds(rounds);
+    let ready = ready.less(counts.built).rounds(rounds);
+    let daily = recent.per_day().rounds(rounds);
 
     // A workspace leaf reads no other workspace line, so only threads chain.
-    let complete_chain = longest_chain(counts.threads.iter());
-    let ready_chain = longest_chain(recent_threads());
+    // A node's follow-up rounds run one after another, so they lengthen it.
+    let chain_rounds = |chain: Bounds<u64>| Work { calls: chain }.rounds(rounds).calls;
+    let complete_chain = chain_rounds(longest_chain(counts.threads.iter()));
+    let ready_chain = chain_rounds(longest_chain(recent_threads()));
     let times = |secs: Bounds<f64>| {
         (
             run_secs(ready.calls, ready_chain, secs),
@@ -552,33 +561,37 @@ pub(crate) fn estimate(
         usable_secs,
         complete_secs,
         daily_calls: daily.calls,
+        turn_calls: SEED_CALLS_PER_TURN,
         costs: COMPACTOR_MODELS
             .iter()
             .map(|model| {
-                let (input_price, output_price) = model.price;
                 let route = route_for(registry, model.id, configured);
+                let backfill_tier =
+                    serves_flex(route.provider, model.id).then_some(ServiceTier::Flex);
                 let by_effort = EFFORT_LADDER
                     .iter()
                     .map(|&effort| {
                         let runs_at =
                             clamp_effort(effort, route.provider, &route.wire_id).unwrap_or(effort);
                         let price = tier_price(model, measured, runs_at);
-                        let backfill_usd =
-                            ranged_usd(input_price, output_price, price.output, &work);
-                        let daily_usd = ranged_usd(input_price, output_price, price.output, &daily);
-                        let central = |work: &Work| {
-                            central_usd(model, &price.usage, price.central_output(), work)
-                        };
+                        let (backfill_usd, backfill_usd_central) =
+                            priced_work(model, &price, backfill_tier, &work);
+                        // Live calls never ask for Flex.
+                        let (daily_usd, daily_usd_central) =
+                            priced_work(model, &price, None, &daily);
+                        let (turn_usd, turn_usd_central) = priced_turn(model, &price);
                         let (usable_secs, complete_secs) = times(price.secs);
                         EffortCost {
                             effort: effort.to_string(),
                             usable_secs,
                             complete_secs,
-                            backfill_usd_central: central(&work)
-                                .clamp(backfill_usd.low, backfill_usd.high),
-                            daily_usd_central: central(&daily).clamp(daily_usd.low, daily_usd.high),
                             backfill_usd,
+                            backfill_usd_central,
+                            cap_usd: super::spend::cap_for(backfill_usd_central),
                             daily_usd,
+                            daily_usd_central,
+                            turn_usd,
+                            turn_usd_central,
                         }
                     })
                     .collect();
@@ -600,49 +613,55 @@ fn route_for(registry: &ModelRegistry, model: &str, configured: &[ProviderKind])
         .unwrap_or_else(|_| RouteEntry::new(provider_kind_for(registry, model), model))
 }
 
-/// The low/high range: the tier's output range over the work's own call-count
-/// range. Input stays the deterministic byte-based estimate.
-fn ranged_usd(
-    input_price: f64,
-    output_price: f64,
-    output_per_call: Bounds<u64>,
+/// What `work` costs at `price` on `tier`: the low and high calls at the
+/// tier's low and high output, and the midpoint calls at its central output.
+/// Every figure is calls times one call's price, so the central figure always
+/// lies inside the range.
+fn priced_work(
+    model: &CompactorModel,
+    price: &TierPrice,
+    tier: Option<ServiceTier>,
     work: &Work,
-) -> Bounds<f64> {
-    let usd = |calls: u64, input_tokens: u64, output: u64| {
-        (input_tokens as f64 * input_price + (calls * output) as f64 * output_price) / 1_000_000.0
+) -> (Bounds<f64>, f64) {
+    let usd = |calls: u64, output: f64| calls_usd(model, price, tier, calls as f64, output);
+    let range = Bounds {
+        low: usd(work.calls.low, price.output.low as f64),
+        high: usd(work.calls.high, price.output.high as f64),
     };
-    let input = work.input_tokens();
-    Bounds {
-        low: usd(work.calls.low, input.low, output_per_call.low),
-        high: usd(work.calls.high, input.high, output_per_call.high),
-    }
+    (range, usd(work.central_calls(), price.central_output()))
 }
 
-/// The one central figure: the work's midpoint call count, times the
-/// measured (or seeded) per-call input and the tier's central output. Neither side
-/// comes from a low/high guess, so the caller clamps the result into
-/// `ranged_usd`'s own range: that range is the byte-size heuristic, a
-/// different measurement from this one, and the two are not guaranteed to
-/// agree once real usage history exists.
-///
-/// Input read from or written to the prompt cache is priced at the model's
-/// own rates. The byte range prices every token as plain input.
-fn central_usd(
+/// What one turn costs at `price`, as [`priced_work`] prices work: the seed's
+/// low and high calls at the tier's low and high output, and its midpoint at
+/// the central output. Live calls never ask for Flex.
+fn priced_turn(model: &CompactorModel, price: &TierPrice) -> (Bounds<f64>, f64) {
+    let calls = SEED_CALLS_PER_TURN;
+    let usd = |calls: f64, output: f64| calls_usd(model, price, None, calls, output);
+    let range = Bounds {
+        low: usd(calls.low, price.output.low as f64),
+        high: usd(calls.high, price.output.high as f64),
+    };
+    let central = usd((calls.low + calls.high) / 2.0, price.central_output());
+    (range, central)
+}
+
+/// What `calls` calls cost at `price` on `tier`, each writing `output` tokens.
+/// Cache reads and writes are priced at the model's own rates.
+fn calls_usd(
     model: &CompactorModel,
-    usage: &MeasuredUsage,
-    output_per_call: f64,
-    work: &Work,
+    price: &TierPrice,
+    tier: Option<ServiceTier>,
+    calls: f64,
+    output: f64,
 ) -> f64 {
-    let (input_price, output_price) = model.price;
-    let plain = usage
-        .avg_input
-        .saturating_sub(usage.avg_cache_read + usage.avg_cache_write);
-    let input_per_call = plain as f64
-        + usage.avg_cache_read as f64 * model.cache.read
-        + usage.avg_cache_write as f64 * model.cache.write;
-    let calls = work.central_calls() as f64;
-    calls * input_per_call * input_price / 1_000_000.0
-        + calls * output_per_call * output_price / 1_000_000.0
+    let usage = &price.usage;
+    let tokens = Tokens {
+        input: calls * usage.avg_input as f64,
+        cache_read: calls * usage.avg_cache_read as f64,
+        cache_write: calls * usage.avg_cache_write as f64,
+        output: calls * output,
+    };
+    model.usd(tokens, tier)
 }
 
 /// One thread's events in one window: the recent days, or before them.
@@ -660,8 +679,6 @@ struct ThreadRow {
     sure_long: i64,
     maybe_long: i64,
     long_replies: i64,
-    sure_bytes: i64,
-    maybe_bytes: i64,
 }
 
 impl ThreadRow {
@@ -680,20 +697,12 @@ impl ThreadRow {
                 low: self.sure_long as u64,
                 high: self.maybe_long as u64 + idle_turns,
             },
-            bytes: Bounds {
-                low: self.sure_bytes as u64,
-                high: self.maybe_bytes as u64,
-            },
         };
         let workspace = Leaves {
             count: turns,
             calls: Bounds {
                 low: self.long_replies as u64,
                 high: turns,
-            },
-            bytes: Bounds {
-                low: self.long_replies as u64 * NODE_BYTES as u64,
-                high: turns * (4 * NODE_BYTES + RAW_CONTEXT_BYTES) as u64,
             },
         };
         (thread, workspace)
@@ -704,8 +713,6 @@ fn add_leaves(into: &mut Leaves, more: Leaves) {
     into.count += more.count;
     into.calls.low += more.calls.low;
     into.calls.high += more.calls.high;
-    into.bytes.low += more.bytes.low;
-    into.bytes.high += more.bytes.high;
 }
 
 /// Read the counts. The three reads are independent, so they run at once.
@@ -773,22 +780,16 @@ async fn thread_rows(pool: &PgPool) -> Result<Vec<ThreadRow>, sqlx::Error> {
            count(*) FILTER (WHERE e.event_type = '{IDLED}') AS idles, \
            count(*) FILTER (WHERE {long_candidate} AND {size} > $2) AS sure_long, \
            count(*) FILTER (WHERE {long_candidate} AND {size} > $3) AS maybe_long, \
-           count(*) FILTER (WHERE {reply} AND {size} > $2) AS long_replies, \
-           COALESCE(sum(LEAST({size}, $4)) FILTER ( \
-             WHERE {long_candidate} AND {size} > $2), 0)::bigint AS sure_bytes, \
-           COALESCE(sum(LEAST({size} * $5, $4)) FILTER ( \
-             WHERE {long_candidate} AND {size} > $3), 0)::bigint AS maybe_bytes \
+           count(*) FILTER (WHERE {reply} AND {size} > $2) AS long_replies \
          FROM thread_summaries s JOIN events e ON e.thread_id = s.thread_id \
          WHERE {THREAD_IN_SCOPE_SQL} AND e.event_type IN ({}) \
          GROUP BY 1, 2, 3, 4",
-        ready_window_sql(6),
+        ready_window_sql(4),
         sql_list(&read),
     ))
     .bind(RECENT_DAYS as i32)
     .bind(SURE_LONG_BYTES as i32)
     .bind(NODE_BYTES as i32)
-    .bind(CAP_CHARS as i32)
-    .bind(COMPRESSION as i32)
     .bind(READY_DAYS)
     .fetch_all(pool)
     .await
@@ -833,16 +834,11 @@ async fn built_nodes(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(built as u64)
 }
 
-/// An artifact leaf carries the file's content, capped, so it always costs a
-/// call. It reads no context.
+/// An artifact leaf carries the file's content, so it always costs a call.
 fn artifact_leaves(n: u64) -> Leaves {
     Leaves {
         count: n,
         calls: Bounds { low: n, high: n },
-        bytes: Bounds {
-            low: n * NODE_BYTES as u64,
-            high: n * CAP_CHARS as u64,
-        },
     }
 }
 
@@ -864,10 +860,6 @@ mod tests {
             calls: Bounds {
                 low: sure,
                 high: maybe,
-            },
-            bytes: Bounds {
-                low: sure * 1_000,
-                high: maybe * 3_000,
             },
         }
     }
@@ -895,13 +887,23 @@ mod tests {
         )
     }
 
-    fn estimate_with(counts: &Counts) -> TreeBackfillEstimate {
-        estimate_measured(counts, &Measured::default())
+    /// A history of exactly one call per node, so the arithmetic tests count
+    /// nodes and calls alike.
+    fn one_round() -> Measured {
+        Measured {
+            rounds_per_node: Some(1.0),
+            ..Measured::default()
+        }
     }
 
-    /// History of `usage` for each `(model, tier)`.
+    fn estimate_with(counts: &Counts) -> TreeBackfillEstimate {
+        estimate_measured(counts, &one_round())
+    }
+
+    /// History of `usage` for each `(model, tier)`, one call per node.
     fn measured_usage(entries: &[(&str, &str, MeasuredUsage)]) -> Measured {
         Measured {
+            rounds_per_node: Some(1.0),
             tiers: entries
                 .iter()
                 .map(|(model, tier, usage)| {
@@ -916,9 +918,7 @@ mod tests {
     }
 
     fn model(id: &str) -> &'static CompactorModel {
-        COMPACTOR_MODELS
-            .iter()
-            .find(|m| m.id == id)
+        super::super::compactor_models::priced(id)
             .unwrap_or_else(|| panic!("{id} is not a compactor model"))
     }
 
@@ -927,13 +927,7 @@ mod tests {
     }
 
     fn cost_at<'a>(e: &'a TreeBackfillEstimate, model: &str, effort: &str) -> &'a EffortCost {
-        e.costs
-            .iter()
-            .find(|c| c.model == model)
-            .unwrap_or_else(|| panic!("{model} not priced"))
-            .by_effort
-            .iter()
-            .find(|c| c.effort == effort)
+        e.cost_for(model, effort)
             .unwrap_or_else(|| panic!("{model} has no {effort} row"))
     }
 
@@ -972,9 +966,9 @@ mod tests {
     /// ones cost one merge at best and three at worst.
     #[test]
     fn short_leaves_merge_free_only_in_the_low_bound() {
-        let long = tree_work(leaves(2, 2, 2), merge_count(2), 2);
+        let long = tree_work(leaves(2, 2, 2), merge_count(2));
         assert_eq!(long.calls, Bounds { low: 3, high: 3 });
-        let short = tree_work(leaves(4, 0, 0), merge_count(4), 4);
+        let short = tree_work(leaves(4, 0, 0), merge_count(4));
         assert_eq!(short.calls, Bounds { low: 1, high: 3 });
     }
 
@@ -1101,13 +1095,10 @@ mod tests {
         }
     }
 
-    /// Prices follow the route the call takes. Through OpenRouter, GPT-6.1 Sol
-    /// tops out at `high`. So `xhigh` and `max` price as `high` there, though
-    /// its first route (OpenAI) offers them.
-    #[test]
-    fn tiers_are_priced_on_the_configured_route() {
+    /// GPT-6.1 Sol's two routes: OpenAI first, then OpenRouter.
+    fn sol_on_openai_and_openrouter() -> ModelRegistry {
         use crate::llm::model_registry::ModelRouting;
-        let registry: ModelRegistry = std::sync::Arc::new(std::sync::RwLock::new(
+        std::sync::Arc::new(std::sync::RwLock::new(
             [(
                 "gpt-6.1-sol".to_string(),
                 ModelRouting {
@@ -1123,7 +1114,15 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-        ));
+        ))
+    }
+
+    /// Prices follow the route the call takes. Through OpenRouter, GPT-6.1 Sol
+    /// tops out at `high`. So `xhigh` and `max` price as `high` there, though
+    /// its first route (OpenAI) offers them.
+    #[test]
+    fn tiers_are_priced_on_the_configured_route() {
+        let registry = sol_on_openai_and_openrouter();
         let counts = Counts {
             threads: vec![old(leaves(100, 50, 80))],
             ..Counts::default()
@@ -1205,18 +1204,17 @@ mod tests {
         assert!(measured_cost > seeded_cost);
     }
 
-    /// The central figure comes from measured per-call tokens; the range
-    /// comes from the byte-size heuristic. The two methods can disagree.
-    /// A measured average far outside the heuristic must still clamp into
-    /// the displayed range, rather than draw outside it.
+    /// The central figure and its range are both calls times one call's
+    /// price, so the central figure lies inside the range whatever the
+    /// measurement says.
     #[test]
     fn a_central_figure_never_draws_outside_its_own_range() {
         let counts = Counts {
             threads: vec![old(leaves(100, 50, 80))],
             ..Counts::default()
         };
-        let flash_at = |avg: u64| {
-            measured_usage(&[(
+        for avg in [0, 1_000, 100_000_000] {
+            let measured = measured_usage(&[(
                 "gemini-3.8-flash",
                 "low",
                 MeasuredUsage {
@@ -1224,15 +1222,62 @@ mod tests {
                     avg_output: avg,
                     ..MeasuredUsage::default()
                 },
-            )])
-        };
-        let estimate_high = estimate_measured(&counts, &flash_at(100_000_000));
-        let high = cost_at(&estimate_high, "gemini-3.8-flash", "low");
-        assert_eq!(high.backfill_usd_central, high.backfill_usd.high);
+            )]);
+            let e = estimate_measured(&counts, &measured);
+            for effort in EFFORT_LADDER {
+                let c = cost_at(&e, "gemini-3.8-flash", effort);
+                let range = c.backfill_usd;
+                assert!(range.low <= c.backfill_usd_central, "{c:?}");
+                assert!(c.backfill_usd_central <= range.high, "{c:?}");
+            }
+        }
+    }
 
-        let estimate_low = estimate_measured(&counts, &flash_at(0));
-        let low = cost_at(&estimate_low, "gemini-3.8-flash", "low");
-        assert_eq!(low.backfill_usd_central, low.backfill_usd.low);
+    /// Each node costs its workspace's calls per node: a line over the limit
+    /// is asked for again. With no history, the seed applies.
+    #[test]
+    fn calls_count_each_nodes_rounds() {
+        let counts = Counts {
+            threads: vec![old(leaves(1_000, 500, 900))],
+            ..Counts::default()
+        };
+        let calls = |measured: &Measured| estimate_measured(&counts, measured).calls;
+        let single = calls(&one_round());
+        let doubled = calls(&Measured {
+            rounds_per_node: Some(2.0),
+            ..Measured::default()
+        });
+        assert_eq!(doubled.low, single.low * 2);
+        assert_eq!(doubled.high, single.high * 2);
+        let seeded = calls(&Measured::default());
+        let expected = (single.high as f64 * SEED_ROUNDS_PER_NODE).ceil() as u64;
+        assert_eq!(seeded.high, expected);
+    }
+
+    /// A backfill on a route that serves Flex is priced at the Flex rate, as
+    /// the compactor sends it. Live calls stay on the standard rate.
+    #[test]
+    fn a_backfill_on_a_flex_route_is_priced_at_the_flex_rate() {
+        let counts = Counts {
+            threads: vec![tree(leaves(1_000, 500, 900), leaves(300, 150, 270))],
+            ..Counts::default()
+        };
+        let registry = sol_on_openai_and_openrouter();
+        let on = |configured: &[ProviderKind]| {
+            let e = estimate(&counts, &one_round(), &registry, configured);
+            cost_at(&e, "gpt-6.1-sol", "low").clone()
+        };
+        let flex = on(&[ProviderKind::OpenAi]);
+        let standard = on(&[ProviderKind::OpenRouter]);
+        let share = model("gpt-6.1-sol").flex.expect("Sol has a Flex rate");
+        let expected = standard.backfill_usd_central * share;
+        assert!(
+            (flex.backfill_usd_central - expected).abs() < 1e-9,
+            "{flex:?}"
+        );
+        assert_eq!(flex.daily_usd_central, standard.daily_usd_central);
+        assert_eq!(flex.turn_usd, standard.turn_usd);
+        assert_eq!(flex.turn_usd_central, standard.turn_usd_central);
     }
 
     fn recent_thread(all: Leaves) -> Tree {
@@ -1303,6 +1348,7 @@ mod tests {
             ..Counts::default()
         };
         let measured = Measured {
+            rounds_per_node: Some(1.0),
             tiers: HashMap::from([(
                 ("gemini-3.8-flash".to_string(), "low".to_string()),
                 TierMeasure {
@@ -1426,14 +1472,53 @@ mod tests {
         assert!(at(&measured, "medium") > at(&seeded, "medium"));
     }
 
+    /// A new workspace has no history, so its backfill and daily figures are
+    /// both $0. Its turn still has a price, for every model and tier, and the
+    /// central figure lies inside the range.
     #[test]
-    fn compaction_view_bytes_is_bounded_by_the_view_and_grows_with_the_tree() {
-        assert_eq!(compaction_view_bytes(0), 0);
-        assert!(compaction_view_bytes(4) < compaction_view_bytes(4_000));
-        assert_eq!(
-            compaction_view_bytes(4_000),
-            compaction_view::MAX_BYTES as u64
-        );
+    fn a_fresh_workspace_still_prices_a_turn() {
+        let e = estimate_measured(&Counts::default(), &Measured::default());
+        assert_eq!(e.turn_calls, SEED_CALLS_PER_TURN);
+        for cost in &e.costs {
+            for row in &cost.by_effort {
+                assert_eq!(row.daily_usd_central, 0.0, "the premise: {row:?}");
+                assert!(row.turn_usd.low > 0.0, "{}: {row:?}", cost.model);
+                assert!(row.turn_usd.low <= row.turn_usd_central, "{row:?}");
+                assert!(row.turn_usd_central <= row.turn_usd.high, "{row:?}");
+            }
+        }
+    }
+
+    /// A turn is priced from the same per-call price as the backfill: the
+    /// seed's calls instead of the backfill's. Gemini 3.8 Flash has no Flex
+    /// rate, so both run at the standard rate here.
+    #[test]
+    fn a_turn_costs_the_seed_calls_at_the_backfills_price_per_call() {
+        let e = estimate_with(&Counts {
+            threads: vec![old(leaves(100, 100, 100))],
+            ..Counts::default()
+        });
+        assert_eq!(e.calls.low, e.calls.high, "the premise: one call count");
+        let calls = e.calls.low as f64;
+        for effort in EFFORT_LADDER {
+            let row = cost_at(&e, "gemini-3.8-flash", effort);
+            let per_call = |usd: f64, calls: f64| usd / calls;
+            let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+            assert!(
+                close(
+                    per_call(row.turn_usd.low, SEED_CALLS_PER_TURN.low),
+                    per_call(row.backfill_usd.low, calls)
+                ),
+                "{effort}: {row:?}"
+            );
+            assert!(
+                close(
+                    per_call(row.turn_usd.high, SEED_CALLS_PER_TURN.high),
+                    per_call(row.backfill_usd.high, calls)
+                ),
+                "{effort}: {row:?}"
+            );
+        }
     }
 
     /// One compactor call's capture, shaped as `AuxCapture` writes it.
@@ -1523,26 +1608,65 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
+    /// Calls per node divide the compaction captures by the nodes a model
+    /// wrote, once enough nodes are built.
+    #[tokio::test]
+    async fn rounds_per_node_divide_captures_by_model_written_nodes() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let thin = measured_for_catalog(&pool).await.expect("read");
+        assert_eq!(thin.rounds_per_node, None, "no nodes yet");
+        for start in 0..MIN_MEASURED_CALLS {
+            sqlx::query(
+                "INSERT INTO summary_tree_nodes (scope, start, span, text, model) \
+                 VALUES ('workspace', $1, 2, 'a merged line', 'gpt-6.1-sol')",
+            )
+            .bind(start * 2)
+            .execute(&pool)
+            .await
+            .expect("insert node");
+            for _ in 0..3 {
+                insert_compaction_capture(&pool, "gpt-6.1-sol", None, 3000, 100).await;
+            }
+        }
+        let measured = measured_for_catalog(&pool).await.expect("read");
+        assert_eq!(measured.rounds_per_node, Some(3.0));
+
+        sqlx::query("DELETE FROM events WHERE event_type = 'ContextCaptured'")
+            .execute(&pool)
+            .await
+            .expect("clear captures");
+        let floored = measured_for_catalog(&pool).await.expect("read");
+        assert_eq!(
+            floored.rounds_per_node,
+            Some(1.0),
+            "a node costs one call at least"
+        );
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
     /// The central figure prices a cache read below plain input and a cache
     /// write above it, at the model's own rates.
     #[test]
     fn the_central_figure_prices_cached_input_at_the_models_rates() {
-        let sol = COMPACTOR_MODELS
-            .iter()
-            .find(|m| m.id == "gpt-6.1-sol")
-            .unwrap();
+        let sol = model("gpt-6.1-sol");
         let work = Work {
             calls: Bounds {
                 low: 1_000,
                 high: 1_000,
             },
-            input_bytes: Bounds::default(),
         };
         let plain = MeasuredUsage {
             avg_input: 6_000,
             ..MeasuredUsage::default()
         };
-        let price = |usage: MeasuredUsage| central_usd(sol, &usage, 0.0, &work);
+        let price = |usage: MeasuredUsage| {
+            let tier = TierPrice {
+                usage,
+                output: Bounds::default(),
+                secs: SECS_PER_CALL,
+            };
+            priced_work(sol, &tier, None, &work).1
+        };
         let read = price(MeasuredUsage {
             avg_cache_read: 5_000,
             ..plain

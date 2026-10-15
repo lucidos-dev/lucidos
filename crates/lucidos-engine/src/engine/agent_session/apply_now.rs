@@ -7,11 +7,11 @@ use crate::engine::git_ops::{
     auto_commit_preserving_marker, auto_commit_safe_files_if_dirty, branch_changed_files,
     branch_head_sha, catchup_and_ff_to_main, commit_worktree_or_err, commits_in_range,
     default_local_branch, describe_branch_changes, files_have_client_update, files_require_restart,
-    git_answer_when_ok, git_cmd, git_ran_ok, has_branch_commits, push_main_in_background,
-    resolution_merged_main, worktree_current_branch,
+    git_answer, git_answer_when_ok, git_cmd, git_ran_ok, has_branch_commits, lands_plan_files_only,
+    push_main_in_background, resolution_merged_main, worktree_current_branch,
 };
-use crate::engine::thread_events::{EventChannel, MessageOrigin};
-use crate::engine::{AgentUserInput, LucidosEngine};
+use crate::engine::thread_events::{ApplyNowOutcome, EventChannel, MessageOrigin};
+use crate::engine::{AgentUserInput, InputAnswered, LucidosEngine};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,6 +176,43 @@ pub(crate) fn apply_inactivity_timeout_minutes(
     }
 }
 
+/// Send `text` to a live session as a prompt the caller waits on. The receiver
+/// is answered when the turn that reads this prompt ends.
+pub(crate) fn send_awaited_prompt(
+    msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+    text: String,
+) -> Result<tokio::sync::oneshot::Receiver<InputAnswered>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let (completion, answered) = tokio::sync::oneshot::channel();
+    msg_tx
+        .send(AgentUserInput {
+            text,
+            images: None,
+            origin_event_id: None,
+            kind: crate::engine::AgentInputKind::User,
+            completion: Some(completion),
+        })
+        .map_err(|_| "Session channel closed")?;
+    Ok(answered)
+}
+
+/// Wait until the turn that read a [`send_awaited_prompt`] prompt ends.
+///
+/// A turn already running when the prompt was sent ends first, and does not
+/// answer it (ADR 0268). A session that ends first drops the sender.
+async fn wait_for_prompt_turn(
+    answered: tokio::sync::oneshot::Receiver<InputAnswered>,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match answered.await {
+        Ok(InputAnswered::TurnEnded) => Ok(()),
+        Ok(InputAnswered::Rejected) => {
+            Err(format!("The coding agent rejected the prompt while {}", context).into())
+        }
+        Err(_) => Err(format!("Coding agent session ended while {}", context).into()),
+    }
+}
+
 /// What an Apply with nothing pending and no proposal hold answers (ADR 0400).
 pub(crate) const NOTHING_PROPOSED_REFUSAL: &str =
     "Nothing is proposed on this thread, so there is nothing to apply. A turn that \
@@ -193,11 +230,16 @@ impl LucidosEngine {
     /// 3. Refresh the pending change to the branch head
     /// 4. Try merge (clean / trivial / CC-assisted conflict resolution)
     /// 5. On success: kill CC + clean up. On failure: CC stays alive for retry.
+    ///
+    /// An apply that passes its refusals is bracketed by `ApplyNowStarted` and
+    /// `ApplyNowEnded`, which project `apply_in_flight` (ADR 0437). Returns the
+    /// thread's summary version once the call's own events landed, so the
+    /// caller can hold its "requesting" state until the row reaches it.
     pub async fn apply_now(
         self: &Arc<Self>,
         thread_id: Uuid,
         actor: Option<MessageOrigin>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
         // Thread-scoped twin of the guard in `apply_change_inner`: while a
         // conflict resolution is in flight on this thread, it owns the merge.
         // Checked before the session is claimed, because the live-session
@@ -238,7 +280,7 @@ impl LucidosEngine {
         }
 
         // Extract session metadata — if no live session, fall back to stale handling
-        let (worktree_path, branch_name, repo_root, idle_notify, msg_tx, last_event_at) = {
+        let (worktree_path, branch_name, repo_root, msg_tx, last_event_at) = {
             let mut guard = self.agent_sessions.lock().await;
             match guard.get_mut(&thread_id) {
                 // `is_live` gates the claim for the same reason
@@ -269,7 +311,6 @@ impl LucidosEngine {
                         session.worktree_path.clone().unwrap(),
                         session.branch_name.clone().unwrap(),
                         session.repo_root.clone().unwrap(),
-                        session.idle_notify.clone(),
                         session.msg_tx.clone(),
                         session.last_event_at.clone(),
                     )
@@ -285,57 +326,80 @@ impl LucidosEngine {
                     // `apply_now_no_live_session_fast_path_preserves_clean_pending_change`.
                     let pending = self.changes().pending_for_thread(thread_id).await?;
                     if !pending.is_empty() {
-                        log!(
-                            "[ApplyNow] No live session for thread {} but {} pending change(s) — applying directly without stale-recovery",
-                            thread_id,
-                            pending.len()
-                        );
-                        for change in pending {
-                            log!(
-                                "[ApplyNow] Applying pending change {} on resumed thread {}",
-                                change.id,
-                                thread_id
+                        // A task of its own, so a dropped request cannot cut
+                        // the bracket between its start and its end.
+                        let engine = self.clone_arc();
+                        let actor = actor.clone();
+                        let bracket = tokio::spawn(async move {
+                            engine
+                                .emit_apply_now_started(thread_id, actor.clone())
+                                .await?;
+                            let applying = std::panic::AssertUnwindSafe(
+                                engine.apply_pending_now(thread_id, pending, actor),
                             );
-                            // Log only: `apply_change` announces this failure
-                            // itself, and a second emit draws the same card
-                            // twice. The two errors it leaves unannounced mean
-                            // the row it was just handed no longer reads, so
-                            // the spinner is not the problem then.
-                            if let Err(e) = self.apply_change(change.id, actor.clone()).await {
-                                log!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
+                            if futures::FutureExt::catch_unwind(applying).await.is_err() {
+                                log!(
+                                    "[ApplyNow] Applying pending changes panicked for {}",
+                                    thread_id
+                                );
                             }
-                        }
-                        return Ok(());
+                            Ok(engine
+                                .emit_apply_now_ended(thread_id, ApplyNowOutcome::Finished)
+                                .await)
+                        });
+                        return bracket
+                            .await
+                            .map_err(|e| format!("Apply task for {thread_id} failed: {e}"))?;
                     }
 
                     // Nothing is pending, so nothing is Apply's to land
                     // (ADR 0400). A stale session's work is proposed by its
-                    // own recovery, never by an Apply. The terminal event
-                    // resolves the frontend's `applyingNow` spinner.
+                    // own recovery, never by an Apply.
                     let error = self.nothing_proposed_refusal(thread_id).await;
                     log!("[ApplyNow] Refused for thread {}: {}", thread_id, error);
-                    self.event_bus
-                        .emit_or_log(
-                            crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event:
-                                    crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
-                                        change_id: String::new(),
-                                        error: error.to_string(),
-                                        actor: actor.clone(),
-                                    },
-                                meta: crate::engine::thread_events::EventMeta::NONE,
+                    let refused = self
+                        .event_bus
+                        .emit(crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
+                                change_id: String::new(),
+                                error: error.to_string(),
+                                actor: actor.clone(),
                             },
-                            "[ApplyNow] ChangeApplyFailed (no live session, nothing pending)",
-                        )
+                            meta: crate::engine::thread_events::EventMeta::NONE,
+                        })
                         .await;
-                    return Ok(());
+                    return Ok(match refused {
+                        Ok(emitted) => emitted.and_then(|r| r.summary_version),
+                        Err(e) => {
+                            log!(
+                                "[ApplyNow] ChangeApplyFailed (no live session, nothing pending) emit failed: {}",
+                                e
+                            );
+                            None
+                        }
+                    });
                 }
             }
         };
 
+        // The claim is held, so this apply is now the thread's. The task
+        // announces it first, so a dropped request cannot leave the claim or
+        // the flag with no task left to release them.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let engine = self.clone_arc();
         tokio::spawn(async move {
+            let started = engine
+                .emit_apply_now_started(thread_id, actor.clone())
+                .await;
+            let refused = started.is_err();
+            // The receiver is gone only when the request was dropped, and the
+            // apply goes on without it.
+            let _ = started_tx.send(started);
+            if refused {
+                release_change_claim(&mut *engine.agent_sessions.lock().await, thread_id, &msg_tx);
+                return;
+            }
             // Use std::panic::catch_unwind via FutureExt to guarantee cleanup on panic.
             // tokio::spawn swallows panics. Without this, change_claim stays
             // stuck forever if apply_now_inner panics.
@@ -353,7 +417,6 @@ impl LucidosEngine {
                     &worktree_path,
                     &branch_name,
                     &repo_root,
-                    &idle_notify,
                     &msg_tx,
                     actor.clone(),
                 );
@@ -395,7 +458,7 @@ impl LucidosEngine {
 
             if let Err(e) = result {
                 log!("[ApplyNow] Failed for thread {}: {}", thread_id, e);
-                // Emit ChangeApplyFailed so frontend clears the "Applying..." state
+                // Tell the user why. `ApplyNowEnded` below ends the apply.
                 engine
                     .event_bus
                     .emit_or_log(
@@ -412,38 +475,73 @@ impl LucidosEngine {
                     )
                     .await;
             }
+            // Every exit reaches here, panic and timeout included, and only
+            // after the claim is released: a client that sees the apply end
+            // can start the next one.
+            engine
+                .emit_apply_now_ended(thread_id, ApplyNowOutcome::Finished)
+                .await;
         });
 
-        Ok(())
+        started_rx
+            .await
+            .map_err(|_| format!("The apply task for {thread_id} ended before it started"))?
     }
 
-    /// Wait for CC to go idle, polling every 5s for process exit.
-    /// Returns Ok when CC fires idle_notify, or Err if the process dies.
-    pub(crate) async fn wait_for_idle(
-        &self,
+    /// Apply each pending change in turn, for an Apply Now with no live
+    /// session.
+    async fn apply_pending_now(
+        self: &Arc<Self>,
         thread_id: Uuid,
-        idle_notify: &tokio::sync::Notify,
-        context: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        loop {
-            // Register waiter BEFORE entering the timeout so that a
-            // notify_waiters() call between iterations isn't lost.
-            // (notify_waiters doesn't store a permit — it only wakes
-            // futures that are already registered.)
-            let notified = idle_notify.notified();
-            match tokio::time::timeout(std::time::Duration::from_secs(5), notified).await {
-                Ok(()) => return Ok(()),
-                Err(_) => {
-                    let guard = self.agent_sessions.lock().await;
-                    if guard.get(&thread_id).map(|s| !s.is_live()).unwrap_or(true) {
-                        return Err(format!("Coding agent session ended while {}", context).into());
-                    }
-                }
+        pending: Vec<crate::core::changes::Change>,
+        actor: Option<MessageOrigin>,
+    ) {
+        log!(
+            "[ApplyNow] No live session for thread {} but {} pending change(s) — applying directly without stale-recovery",
+            thread_id,
+            pending.len()
+        );
+        for change in pending {
+            log!(
+                "[ApplyNow] Applying pending change {} on resumed thread {}",
+                change.id,
+                thread_id
+            );
+            // Log only: `apply_change` announces this failure itself, and a
+            // second emit draws the same card twice. The two errors it leaves
+            // unannounced mean the row it was just handed no longer reads.
+            if let Err(e) = self.apply_change(change.id, actor.clone()).await {
+                log!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
             }
         }
     }
 
-    /// Wait for CC to go idle, then auto-commit any changes it made.
+    /// Announce that an Apply Now began, and return the row's version after it.
+    async fn emit_apply_now_started(
+        &self,
+        thread_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        let emitted = self
+            .event_bus
+            .emit(crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::ApplyNowStarted,
+                meta: crate::engine::thread_events::EventMeta::with_actor(actor),
+            })
+            .await?;
+        Ok(emitted.and_then(|r| r.summary_version))
+    }
+
+    /// Announce that the Apply Now on this thread is over, and return the row's
+    /// version after it. A failed emit leaves the flag for the next startup's
+    /// `end_interrupted_applies`.
+    async fn emit_apply_now_ended(&self, thread_id: Uuid, outcome: ApplyNowOutcome) -> Option<i64> {
+        emit_apply_now_ended(&self.event_bus, thread_id, outcome).await
+    }
+
+    /// Wait for the turn that read the prompt behind `answered`, then
+    /// auto-commit any changes it made.
     ///
     /// Propagates `git add` / `git commit` failures via `Err`. A silent failure
     /// here would lose a real CC change — the apply-now caller treats the
@@ -451,12 +549,11 @@ impl LucidosEngine {
     /// before moving on to the next step (hardening, merge).
     pub(crate) async fn wait_and_commit(
         &self,
-        thread_id: Uuid,
-        idle_notify: &tokio::sync::Notify,
+        answered: tokio::sync::oneshot::Receiver<InputAnswered>,
         worktree_path: &Path,
         context: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.wait_for_idle(thread_id, idle_notify, context).await?;
+        wait_for_prompt_turn(answered, context).await?;
 
         crate::engine::git_ops::commit_worktree_or_err(
             worktree_path,
@@ -477,7 +574,6 @@ impl LucidosEngine {
         worktree_path: &Path,
         branch_name: &str,
         repo_root: &Path,
-        idle_notify: &tokio::sync::Notify,
         msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -497,6 +593,20 @@ impl LucidosEngine {
             let error = self.nothing_proposed_refusal(thread_id).await;
             self.refuse_apply_now(thread_id, worktree_path, error, actor)
                 .await;
+            return Ok(());
+        }
+
+        // A thread that handed off lands nothing itself: its successor's
+        // change carries the work. Before the auto-commit, so the old branch
+        // stays at the commit the successor carried.
+        if crate::engine::successor::handed_off(&self.pool, thread_id).await {
+            self.refuse_apply_now_for_hold(
+                thread_id,
+                worktree_path,
+                ProposalHold::CarriedBySuccessor,
+                actor,
+            )
+            .await;
             return Ok(());
         }
 
@@ -529,24 +639,34 @@ impl LucidosEngine {
             .await;
             return Ok(());
         }
+        // Before hardening too: an integrated sub-thread's work never lands
+        // on its own, so a full suite run here would buy nothing. A plan
+        // alone is the exception, as in the proposal hold.
+        if !lands_plan_files_only(landing.as_deref().unwrap_or_default())
+            && crate::engine::integrated::thread_is_integrated(&self.pool, thread_id).await
+        {
+            self.refuse_apply_now_for_hold(
+                thread_id,
+                worktree_path,
+                ProposalHold::IntegratedIntoParent,
+                actor,
+            )
+            .await;
+            return Ok(());
+        }
 
         // The same hardening gate as `change_ops::apply_change`. Apps own
         // their hardening, so their marker is never probed.
         let mut hardened = !kind_ctx.is_app()
             && branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await;
         if apply_must_harden(&kind_ctx, hardened, landing.as_deref()) {
-            self.request_hardening_in_session(thread_id, msg_tx).await?;
-            self.wait_and_commit(
-                thread_id,
-                idle_notify,
-                worktree_path,
-                "waiting for hardening",
-            )
-            .await?;
+            let answered = self.request_hardening_in_session(thread_id, msg_tx).await?;
+            self.wait_and_commit(answered, worktree_path, "waiting for hardening")
+                .await?;
 
             // `/harden` ran the suites this change needs. A canceled `/harden`
-            // reaches `wait_and_commit`'s idle state too, so the marker is the
-            // proof, not the wait returning Ok.
+            // ends its turn too, so the marker is the proof, not the wait
+            // returning Ok.
             if !branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await {
                 log!(
                     "[ApplyNow] Hardening session ended without writing marker for branch {} — aborting apply",
@@ -649,7 +769,20 @@ impl LucidosEngine {
                 })
                 .into_iter()
                 .next();
-            if let Some(change) = pending_change {
+            let pending_change = match pending_change {
+                Some(change) => match self.claim_pending_change(change.id).await? {
+                    Some(claim) => Some((change, claim)),
+                    None => {
+                        log!(
+                            "[ApplyNow] Change {} is being applied elsewhere or was resolved; leaving it to that path",
+                            change.id
+                        );
+                        return Ok(());
+                    }
+                },
+                None => None,
+            };
+            if let Some((change, claim)) = pending_change {
                 let already_on_main = change.files.is_empty()
                     || crate::engine::git_ops::main_history_touches_files(repo_root, &change.files)
                         .await;
@@ -660,14 +793,13 @@ impl LucidosEngine {
                         change.id
                     );
                     self.emit_change_applied(
+                        &claim,
                         thread_id,
-                        change.id,
                         false, // no-op: the work is already on main, nothing to restart now
                         false, // client_update
                         Vec::new(),
                         change.thread_title.clone(),
                         actor.clone(),
-                        None,
                         None,
                     )
                     .await;
@@ -745,12 +877,28 @@ impl LucidosEngine {
             ProposeOutcome::Unfinished => {
                 return Err("propose_change never withholds a finished turn".into());
             }
+            // Already in the landing lane: the lane answers for it below.
+            ProposeOutcome::AwaitingLanding(id) => id,
+        };
+        let Some(claim) = self.claim_pending_change(change_id).await? else {
+            log!(
+                "[ApplyNow] Change {} is being applied elsewhere or was resolved; leaving it to that path",
+                change_id
+            );
+            return Ok(());
         };
 
         // Step 5: Check main repo for uncommitted changes
         self.commit_dirty_logged("Coding agent changes", "apply_now auto-commit")
             .await;
-        if auto_commit_safe_files_if_dirty(repo_root).await {
+        // Under both of `main`'s locks, as in `apply_change`: a safe-file
+        // commit moves `main`, and a concurrent merge's ref move and tree sync
+        // land wholly before or after the check.
+        let dirty = {
+            let _main = crate::engine::git_ops::MAIN_LOCKS.lock_main().await;
+            auto_commit_safe_files_if_dirty(repo_root).await
+        };
+        if dirty {
             let msg = "Cannot merge: the repository has uncommitted changes. Commit or stash them first, then try again.";
             self.emit_apply_failed(thread_id, change_id, msg, actor.clone())
                 .await;
@@ -791,6 +939,13 @@ impl LucidosEngine {
             }
         }
 
+        // Only the landing lane moves `main` for Lucidos source (ADR 0463).
+        if crate::engine::landing_lane::takes_landing_lane(&kind_ctx, repo_root, self.repo_root()) {
+            self.apply_now_through_lane(thread_id, claim, worktree_path, branch_name, actor)
+                .await;
+            return Ok(());
+        }
+
         // Step 6: Merge main into CC worktree and ff main to the branch
         match self
             .merge_via_cc_session(
@@ -799,7 +954,6 @@ impl LucidosEngine {
                 worktree_path,
                 branch_name,
                 repo_root,
-                idle_notify,
                 msg_tx,
             )
             .await
@@ -807,8 +961,8 @@ impl LucidosEngine {
             Ok((pre_sha, post_sha)) => {
                 let client_update = files_have_client_update(&changed_files);
                 self.apply_now_success(
+                    &claim,
                     thread_id,
-                    change_id,
                     requires_restart,
                     client_update,
                     &pre_sha,
@@ -830,6 +984,61 @@ impl LucidosEngine {
         Ok(())
     }
 
+    /// The landing-lane half of Apply Now. This apply holds the idle session,
+    /// so once the lane has landed everything on the branch, the worktree
+    /// resets to `main` as after any apply. A change still queued leaves the
+    /// worktree alone. Every failure was announced by the lane.
+    async fn apply_now_through_lane(
+        self: &Arc<Self>,
+        thread_id: Uuid,
+        claim: crate::engine::change_ops::apply_claim::ApplyClaim,
+        worktree_path: &Path,
+        branch_name: &str,
+        actor: Option<MessageOrigin>,
+    ) {
+        let change_id = claim.change_id();
+        let change = match self.changes().get_by_id(change_id).await {
+            Ok(Some(change)) => change,
+            Ok(None) => {
+                log!("[ApplyNow] change {} vanished before queueing", change_id);
+                self.mark_session_idle(thread_id, worktree_path).await;
+                return;
+            }
+            Err(e) => {
+                let msg = format!("Could not read the change to queue it: {e}");
+                self.emit_apply_failed(thread_id, change_id, &msg, actor)
+                    .await;
+                self.mark_session_idle(thread_id, worktree_path).await;
+                return;
+            }
+        };
+        let repo_root = std::path::PathBuf::from(&change.repo_root);
+        let landed = match self.queue_in_landing_lane(change, claim, actor).await {
+            Ok(result) => matches!(
+                result.status,
+                crate::engine::ApplyStatus::Applied | crate::engine::ApplyStatus::Noop
+            ),
+            Err(e) => {
+                log!("[ApplyNow] landing lane refused {}: {}", change_id, e);
+                false
+            }
+        };
+        // `or_unknown(false)`: a yes authorizes the reset below.
+        let all_on_main = landed
+            && git_answer(
+                &["merge-base", "--is-ancestor", branch_name, "main"],
+                &repo_root,
+            )
+            .await
+            .or_unknown(false);
+        if all_on_main {
+            self.reset_worktree_and_idle(thread_id, worktree_path, branch_name)
+                .await;
+        } else {
+            self.mark_session_idle(thread_id, worktree_path).await;
+        }
+    }
+
     /// Merge main into a CC worktree and fast-forward main to the branch.
     /// Fast path: try ff directly. If main diverged, send CC a single prompt
     /// to merge, resolve conflicts, harden, and test — then ff again.
@@ -842,7 +1051,6 @@ impl LucidosEngine {
         worktree_path: &Path,
         branch_name: &str,
         repo_root: &Path,
-        idle_notify: &tokio::sync::Notify,
         msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         // Fast path: if branch already includes main, just ff
@@ -857,7 +1065,6 @@ impl LucidosEngine {
             worktree_path,
             branch_name,
             repo_root,
-            idle_notify,
             msg_tx,
         )
         .await
@@ -877,7 +1084,6 @@ impl LucidosEngine {
         worktree_path: &Path,
         branch_name: &str,
         repo_root: &Path,
-        idle_notify: &tokio::sync::Notify,
         msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         // Main has diverged — CC handles the merge. Files are populated by a
@@ -902,26 +1108,10 @@ impl LucidosEngine {
             .start_merge_and_get_prompt(thread_id, change_id, conflict_files, "main", None, None)
             .await;
 
-        if let Err(e) = msg_tx.send(AgentUserInput {
-            text: prompt,
-            images: None,
-            origin_event_id: None,
-            kind: crate::engine::AgentInputKind::User,
-        }) {
-            return Err(format!(
-                "Failed to send merge prompt to the coding-agent session — receiver gone: {}",
-                e
-            )
-            .into());
-        }
+        let answered = send_awaited_prompt(msg_tx, prompt)
+            .map_err(|e| format!("Failed to send merge prompt to the coding-agent session: {e}"))?;
 
-        if let Err(e) = self
-            .wait_for_idle(
-                thread_id,
-                idle_notify,
-                "merging main and resolving conflicts",
-            )
-            .await
+        if let Err(e) = wait_for_prompt_turn(answered, "merging main and resolving conflicts").await
         {
             let _ = git_cmd(&["merge", "--abort"], worktree_path).await;
             return Err(e);
@@ -997,7 +1187,6 @@ impl LucidosEngine {
                         .worktree_path
                         .clone()
                         .expect("worktree present (checked under lock)"),
-                    idle_notify: s.idle_notify.clone(),
                     msg_tx: s.msg_tx.clone(),
                     last_event_at: s.last_event_at.clone(),
                 })
@@ -1034,7 +1223,7 @@ impl LucidosEngine {
     pub(crate) fn spawn_in_place_conflict_recovery(
         self: &Arc<Self>,
         thread_id: Uuid,
-        change_id: Uuid,
+        claim: crate::engine::change_ops::apply_claim::ApplyClaim,
         session: crate::engine::change_ops::LiveSessionInfo,
         branch_name: String,
         repo_root: std::path::PathBuf,
@@ -1044,10 +1233,10 @@ impl LucidosEngine {
     ) {
         use std::sync::atomic::Ordering;
         let engine = self.clone_arc();
+        let change_id = claim.change_id();
         tokio::spawn(async move {
             let crate::engine::change_ops::LiveSessionInfo {
                 worktree_path,
-                idle_notify,
                 msg_tx,
                 last_event_at,
             } = session;
@@ -1067,7 +1256,6 @@ impl LucidosEngine {
                     &worktree_path,
                     &branch_name,
                     &repo_root,
-                    &idle_notify,
                     &msg_tx,
                 );
                 tokio::pin!(inner_fut);
@@ -1106,8 +1294,8 @@ impl LucidosEngine {
                 Ok((pre_sha, post_sha)) => {
                     engine
                         .apply_now_success(
+                            &claim,
                             thread_id,
-                            change_id,
                             requires_restart,
                             client_update,
                             &pre_sha,
@@ -1139,8 +1327,8 @@ impl LucidosEngine {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn apply_now_success(
         self: &Arc<Self>,
+        claim: &crate::engine::change_ops::apply_claim::ApplyClaim,
         thread_id: Uuid,
-        change_id: Uuid,
         requires_restart: bool,
         client_update: bool,
         pre_sha: &str,
@@ -1150,6 +1338,7 @@ impl LucidosEngine {
         branch_name: &str,
         actor: Option<MessageOrigin>,
     ) -> Vec<String> {
+        let change_id = claim.change_id();
         let commits = commits_in_range(repo_root, pre_sha, post_sha).await;
         // Title is best-effort metadata for the ChangeApplied event payload —
         // a DB lookup error shouldn't block the apply that just succeeded.
@@ -1168,15 +1357,16 @@ impl LucidosEngine {
             None
         });
         self.emit_change_applied(
+            claim,
             thread_id,
-            change_id,
             requires_restart,
             client_update,
             commits.clone(),
             thread_title,
             actor.clone(),
-            Some(pre_sha.to_string()),
-            Some(post_sha.to_string()),
+            Some(crate::engine::change_ops::AppliedMerge::new(
+                pre_sha, post_sha,
+            )),
         )
         .await;
         // Apply-time net for the "≤1 pending change per thread" invariant: now
@@ -1366,6 +1556,54 @@ impl LucidosEngine {
     }
 }
 
+async fn emit_apply_now_ended(
+    event_bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    outcome: ApplyNowOutcome,
+) -> Option<i64> {
+    match event_bus
+        .emit(crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::engine::thread_events::ThreadEvent::ApplyNowEnded { outcome },
+            meta: crate::engine::thread_events::EventMeta::NONE,
+        })
+        .await
+    {
+        Ok(emitted) => emitted.and_then(|r| r.summary_version),
+        Err(e) => {
+            log!(
+                "[ApplyNow] ApplyNowEnded emit failed for {}: {}",
+                thread_id,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// End every Apply Now a stop cut off. The apply task dies with the engine. So
+/// an apply still in flight at startup has nobody left to end it, and the
+/// thread would read as applying for good (ADR 0437). A failed read leaves the
+/// flags to the next startup.
+pub(crate) async fn end_interrupted_applies(
+    pool: &sqlx::PgPool,
+    event_bus: &crate::engine::event_bus::EventBus,
+) {
+    let interrupted = sqlx::query_scalar::<_, Uuid>(
+        "SELECT thread_id FROM thread_summaries WHERE apply_in_flight",
+    )
+    .fetch_all(pool)
+    .await;
+    match interrupted {
+        Ok(threads) => {
+            for thread_id in threads {
+                emit_apply_now_ended(event_bus, thread_id, ApplyNowOutcome::Interrupted).await;
+            }
+        }
+        Err(e) => log!("[Startup] Reading in-flight applies failed: {}", e),
+    }
+}
+
 /// `git reset --hard main` then `git clean -fd` in the session's worktree, but
 /// only while its HEAD is still on `session_branch`.
 ///
@@ -1418,12 +1656,9 @@ async fn reset_session_worktree_to_main(worktree_path: &Path, session_branch: &s
 /// could not answer: the merge session runs either way and finds the conflicts
 /// itself, so an unknown list costs only the preview.
 pub(crate) async fn probe_merge_conflicts(worktree_path: &Path) -> Vec<String> {
-    match crate::engine::git_ops::probe_merge(worktree_path, "HEAD", "main").await {
-        crate::engine::git_ops::MergeProbe::Conflicts(files) => files,
-        crate::engine::git_ops::MergeProbe::Clean | crate::engine::git_ops::MergeProbe::Unknown => {
-            Vec::new()
-        }
-    }
+    crate::engine::git_ops::probe_merge(worktree_path, "HEAD", "main")
+        .await
+        .into_conflicts()
 }
 
 #[cfg(test)]
@@ -1650,6 +1885,123 @@ mod tests {
         }
     }
 
+    /// `apply_in_flight` follows the bracket: `ApplyNowStarted` sets it and
+    /// `ApplyNowEnded` clears it. Startup ends an apply a stop cut off, and
+    /// leaves one that already ended alone (ADR 0437).
+    #[tokio::test]
+    async fn an_apply_cut_off_by_a_stop_is_ended_at_startup() {
+        use crate::engine::event_bus::{BusEvent, EventBus};
+        use crate::engine::thread_events::{EventMeta, ThreadEvent};
+
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let (bus, _parent_rx) = EventBus::new(pool.clone());
+        let in_flight = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT apply_in_flight FROM thread_summaries WHERE thread_id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let emit = |id: Uuid, event: ThreadEvent| {
+            let bus = bus.clone();
+            async move {
+                bus.emit(BusEvent::Thread {
+                    thread_id: id,
+                    event,
+                    meta: EventMeta::NONE,
+                })
+                .await
+                .unwrap();
+            }
+        };
+        let cut_off = crate::test_support::seed_chat_thread(&bus, "apply this").await;
+        let finished = crate::test_support::seed_chat_thread(&bus, "apply that").await;
+
+        emit(cut_off, ThreadEvent::ApplyNowStarted).await;
+        emit(finished, ThreadEvent::ApplyNowStarted).await;
+        assert!(in_flight(cut_off).await, "a started apply is in flight");
+        emit(
+            finished,
+            ThreadEvent::ApplyNowEnded {
+                outcome: ApplyNowOutcome::Finished,
+            },
+        )
+        .await;
+        assert!(!in_flight(finished).await, "an ended apply is not");
+
+        end_interrupted_applies(&pool, &bus).await;
+
+        assert!(
+            !in_flight(cut_off).await,
+            "startup ends the apply a stop cut off"
+        );
+        let ends: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT thread_id, payload->>'outcome' FROM events WHERE event_type = 'ApplyNowEnded' \
+             ORDER BY created",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ends,
+            vec![
+                (finished, "finished".to_string()),
+                (cut_off, "interrupted".to_string())
+            ]
+        );
+
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
+    /// Every apply that passes its refusals is bracketed, inside a task of its
+    /// own so a dropped request cannot cut it. The live task announces the end
+    /// on every exit: after `catch_unwind`, so a panic still reaches it, and
+    /// after the claim is released. The no-live task brackets its loop.
+    #[test]
+    fn every_apply_now_is_bracketed_by_its_start_and_end() {
+        let src = include_str!("apply_now.rs");
+        let production = &src[..src.find("\n#[cfg(test)]").unwrap()];
+        let body = &production[production.find("pub async fn apply_now(").unwrap()..];
+        let body = &body[..body.find("async fn emit_apply_now_started(").unwrap()];
+        let at = |needle: &str, from: usize| {
+            body[from..]
+                .find(needle)
+                .map(|i| i + from)
+                .unwrap_or_else(|| panic!("apply_now no longer contains {needle:?}"))
+        };
+
+        let fast_path = at("pending_for_thread(thread_id)", 0);
+        let fast_spawn = at("tokio::spawn(", fast_path);
+        let fast_start = at(".emit_apply_now_started(", fast_path);
+        let fast_apply = at("engine.apply_pending_now(", fast_path);
+        let fast_end = at(
+            "emit_apply_now_ended(thread_id, ApplyNowOutcome::Finished)",
+            fast_path,
+        );
+        assert!(
+            fast_spawn < fast_start && fast_start < fast_apply && fast_apply < fast_end,
+            "the no-live task brackets its loop"
+        );
+
+        let spawn = at("tokio::spawn(", at("let (started_tx, started_rx)", 0));
+        let live_start = at(".emit_apply_now_started(", spawn);
+        let unwind = at("catch_unwind(", live_start);
+        let release = at("release_change_claim(", unwind);
+        let live_end = at(
+            ".emit_apply_now_ended(thread_id, ApplyNowOutcome::Finished)",
+            unwind,
+        );
+        assert!(
+            unwind < release && release < live_end,
+            "the end follows a panic and the release"
+        );
+    }
+
     /// Apply needs a proposal (ADR 0400). With no live session and nothing
     /// pending, Apply refuses: it never recovers the stale session, which
     /// would propose the branch. The live path checks for the pending change
@@ -1660,7 +2012,7 @@ mod tests {
         let production = &src[..src.find("\n#[cfg(test)]").unwrap()];
         let start = production.find("pub async fn apply_now(").unwrap();
         let end = production
-            .find("pub(crate) async fn wait_for_idle(")
+            .find("pub(crate) async fn wait_and_commit(")
             .unwrap();
         let no_live = &production[start..end];
         assert!(!no_live.contains("end_stale_waiting_session("));

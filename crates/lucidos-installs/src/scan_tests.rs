@@ -14,21 +14,16 @@ use super::*;
 /// A throwaway `$HOME`, removed when the test ends.
 struct Fixture {
     home: PathBuf,
+    _tmp: tempfile::TempDir,
 }
 
 impl Fixture {
-    fn new(tag: &str) -> Self {
-        let home = std::env::temp_dir().join(format!(
-            "lucidos-installs-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::create_dir_all(&home).unwrap();
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
         // macOS puts the temp dir behind a symlink, so an un-canonicalised root
         // makes every `starts_with` on a resolved exe path miss.
-        let home = std::fs::canonicalize(&home).unwrap();
-        Fixture { home }
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        Fixture { home, _tmp: tmp }
     }
 
     fn roots(&self) -> ScanRoots {
@@ -87,12 +82,6 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.home).ok();
-    }
-}
-
 fn info_plist(version: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -111,7 +100,7 @@ fn kinds(inv: &Inventory) -> Vec<InstallKind> {
 
 #[test]
 fn a_lone_desktop_app_is_listed_with_its_version_and_no_conflict() {
-    let fx = Fixture::new("lone-app");
+    let fx = Fixture::new();
     fx.bundle("1.2.3");
 
     let inv = scan(&fx.roots(), &RunningProcess::default());
@@ -128,7 +117,7 @@ fn a_lone_desktop_app_is_listed_with_its_version_and_no_conflict() {
 
 #[test]
 fn all_three_vehicles_are_enumerated_together() {
-    let fx = Fixture::new("all-three");
+    let fx = Fixture::new();
     fx.bundle("1.2.3");
     fx.runtime("lucidos-0.26.2-aarch64-apple-darwin");
     fx.instance("default", 5253);
@@ -153,7 +142,7 @@ fn all_three_vehicles_are_enumerated_together() {
 
 #[test]
 fn a_reserved_directory_is_never_read_as_an_instance() {
-    let fx = Fixture::new("reserved");
+    let fx = Fixture::new();
     // The dev gateway's own dir, and a stray marker inside the shared runtime.
     fx.file(".lucidos/gateway/port", "5251\n");
     fx.file(".lucidos/runtime/port", "5252\n");
@@ -170,7 +159,7 @@ fn a_reserved_directory_is_never_read_as_an_instance() {
 
 #[test]
 fn an_instance_is_found_under_a_non_default_prefix_and_names_it() {
-    let fx = Fixture::new("prefix");
+    let fx = Fixture::new();
     let extra = fx.dir("elsewhere");
     std::fs::create_dir_all(extra.join("work")).unwrap();
     std::fs::write(extra.join("work/port"), "5300\n").unwrap();
@@ -197,7 +186,7 @@ fn an_instance_is_found_under_a_non_default_prefix_and_names_it() {
 
 #[test]
 fn a_checkout_beside_the_app_is_not_a_conflict() {
-    let fx = Fixture::new("dev-plus-dmg");
+    let fx = Fixture::new();
     fx.bundle("1.2.3");
     fx.dev_gateway();
 
@@ -215,7 +204,7 @@ fn a_checkout_beside_the_app_is_not_a_conflict() {
 
 #[test]
 fn an_instance_and_the_app_on_one_port_conflict() {
-    let fx = Fixture::new("the-trap");
+    let fx = Fixture::new();
     fx.bundle("0.36.0");
     fx.runtime("lucidos-0.26.2-aarch64-apple-darwin");
     fx.instance("default", DEFAULT_GATEWAY_PORT);
@@ -232,7 +221,7 @@ fn an_instance_and_the_app_on_one_port_conflict() {
 
 #[test]
 fn a_conflict_fingerprint_ignores_everything_but_its_own_port() {
-    let fx = Fixture::new("fingerprint");
+    let fx = Fixture::new();
     fx.bundle("0.36.0");
     fx.instance("default", DEFAULT_GATEWAY_PORT);
     let before = scan(&fx.roots(), &RunningProcess::default()).conflicts[0].fingerprint();
@@ -267,7 +256,7 @@ fn a_conflict_fingerprint_ignores_everything_but_its_own_port() {
 
 #[test]
 fn the_data_dir_separates_two_instances_off_one_runtime() {
-    let fx = Fixture::new("shared-runtime");
+    let fx = Fixture::new();
     let runtime = fx.runtime("lucidos-1.2.3-aarch64-apple-darwin");
     fx.instance("alpha", 5252);
     fx.instance("beta", 5253);
@@ -288,7 +277,7 @@ fn the_data_dir_separates_two_instances_off_one_runtime() {
 
 #[test]
 fn a_checkout_is_located_from_the_running_binary() {
-    let fx = Fixture::new("checkout");
+    let fx = Fixture::new();
     fx.dev_gateway();
     let repo = fx.checkout("lucidos", "1.2.3");
     let running = RunningProcess {
@@ -307,7 +296,7 @@ fn a_checkout_is_located_from_the_running_binary() {
 
 #[test]
 fn a_checkout_nobody_runs_is_still_reported_without_its_path() {
-    let fx = Fixture::new("orphan-checkout");
+    let fx = Fixture::new();
     fx.dev_gateway();
 
     let inv = scan(&fx.roots(), &RunningProcess::default());
@@ -324,7 +313,7 @@ fn a_checkout_nobody_runs_is_still_reported_without_its_path() {
 
 #[test]
 fn a_bundle_with_no_readable_plist_reports_no_version() {
-    let fx = Fixture::new("no-plist");
+    let fx = Fixture::new();
     fx.bundle("");
 
     let inv = scan(&fx.roots(), &RunningProcess::default());
@@ -338,7 +327,7 @@ fn a_bundle_with_no_readable_plist_reports_no_version() {
 
 #[test]
 fn bundle_short_version_reads_the_xml_form_and_refuses_anything_else() {
-    let fx = Fixture::new("plist-reader");
+    let fx = Fixture::new();
     let good = fx.file("good.plist", &info_plist("1.2.3"));
     assert_eq!(bundle_short_version(&good).as_deref(), Some("1.2.3"));
 
@@ -382,7 +371,7 @@ fn runtime_stem_version_splits_at_the_first_dash_after_the_prefix() {
 
 #[test]
 fn an_ambiguous_runtime_yields_no_version_rather_than_directory_order() {
-    let fx = Fixture::new("ambiguous-runtime");
+    let fx = Fixture::new();
     fx.dir(".lucidos/runtime/lucidos-0.26.2-aarch64-apple-darwin");
     fx.dir(".lucidos/runtime/lucidos-1.2.3-aarch64-apple-darwin");
     fx.instance("default", 5252);
@@ -394,7 +383,7 @@ fn an_ambiguous_runtime_yields_no_version_rather_than_directory_order() {
 
 #[test]
 fn one_runtime_with_no_current_link_is_unambiguous() {
-    let fx = Fixture::new("sole-runtime");
+    let fx = Fixture::new();
     fx.dir(".lucidos/runtime/lucidos-0.31.0-aarch64-apple-darwin");
     fx.instance("default", 5252);
 
@@ -405,7 +394,7 @@ fn one_runtime_with_no_current_link_is_unambiguous() {
 
 #[test]
 fn a_persisted_engine_port_overrides_the_stable_default() {
-    let fx = Fixture::new("engine-port");
+    let fx = Fixture::new();
     fx.bundle("1.2.3");
     fx.file(
         "Library/Application Support/com.lucidos.app/config/engine-port",
@@ -420,7 +409,7 @@ fn a_persisted_engine_port_overrides_the_stable_default() {
 
 #[test]
 fn an_unreadable_port_marker_leaves_the_port_unknown() {
-    let fx = Fixture::new("bad-port");
+    let fx = Fixture::new();
     fx.file(".lucidos/default/port", "not-a-port\n");
 
     let inv = scan(&fx.roots(), &RunningProcess::default());
@@ -436,7 +425,7 @@ fn an_unreadable_port_marker_leaves_the_port_unknown() {
 
 #[test]
 fn every_job_that_can_start_an_install_is_named() {
-    let fx = Fixture::new("agents");
+    let fx = Fixture::new();
     fx.bundle("1.2.3");
     fx.file("Library/LaunchAgents/com.lucidos.engine.plist", "<plist/>");
     fx.file("Library/LaunchAgents/com.lucidos.client.plist", "<plist/>");
@@ -470,7 +459,7 @@ fn every_job_that_can_start_an_install_is_named() {
 fn a_second_bundle_the_uninstaller_does_not_trash_is_a_leftover() {
     // The app's uninstall trashes the RUNNING bundle and nothing else, which is
     // why the report takes a predicate rather than a kind.
-    let fx = Fixture::new("two-bundles");
+    let fx = Fixture::new();
     let running = fx.bundle("1.2.3");
     let other = fx.dir("Applications2/Lucidos.app/Contents");
     let mut roots = fx.roots();
@@ -499,7 +488,7 @@ fn a_second_bundle_the_uninstaller_does_not_trash_is_a_leftover() {
 
 #[test]
 fn the_leftovers_report_names_what_this_uninstaller_cannot_remove() {
-    let fx = Fixture::new("leftovers");
+    let fx = Fixture::new();
     fx.bundle("1.2.3");
     fx.runtime("lucidos-0.26.2-aarch64-apple-darwin");
     fx.instance("default", DEFAULT_GATEWAY_PORT);
@@ -521,7 +510,7 @@ fn the_leftovers_report_names_what_this_uninstaller_cannot_remove() {
 
 #[test]
 fn the_leftovers_report_is_empty_when_nothing_is_left() {
-    let fx = Fixture::new("no-leftovers");
+    let fx = Fixture::new();
     fx.bundle("1.2.3");
 
     let inv = scan(&fx.roots(), &RunningProcess::default());

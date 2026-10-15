@@ -1,44 +1,28 @@
-import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, threadListFetched, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
+import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, threadListFetched, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
 import { settleDeliveredUnsentMessage } from './sendSettlement';
 import { noteImageLanded } from '../landedImages';
-import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, NO_CHANGE, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
+import { liftRowIntent, overlayRowIntent } from '../rowIntents';
+import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
 import { markThreadOpenStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
-import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../composeDrafts';
-import { setComposeSelectionFromServer } from '../composeSelections';
+import { applyDraftBatch, type ComposeDraft } from '../composeDrafts';
 import { fetchThreads, fetchThreadById, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
 import type { ThreadSummary, ThreadEventRow, ThreadEventsSnapshot } from '../../api/threads';
 import { isTransientFetchError, retryTransientRead } from '../../api/client';
 import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
-import { isComposeFocusedHere } from '../../components/chat/promptFocus';
-import { pendingComposePuts, composeEditedAt, composeSentAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft, noteComposeEpoch, noteServerComposeMode } from './compose';
+import { acceptComposeReport, parseComposeMode } from '../composeSync';
 
 /** Buffer for batched compose draft writes during loadAllThreads. Hundreds of
  *  threads through the upsertThread loop land in ONE signal write. `null`
  *  means clear the entry. The caller flushes via `applyDraftBatch`. */
 type DraftBatch = Map<string, ComposeDraft | null>;
-
-/** Per-thread timestamp of the last local archive or pin flip. Mirrors
- *  `composeEditedAt`: `upsertThread` consults it and skips overwriting
- *  `section`, `saved` and `codingAgentChangeState` when the GET went out before
- *  the flip. The pin rides with the section because a pinned thread is never
- *  archived (ADR 0312), so the two flip together.
- *  Without it, a stale GET landing after the optimistic flip overwrites
- *  section back to 'inbox'. The row then flickers into Review until the SSE
- *  event confirms the move.
- *
- *  Stays set forever, with no expiry: a legitimate fresh GET captures
- *  `requestStartedAt` after the last flip, so the guard lets it through.
- *  `handleArchiveThread` (threads.ts) stamps it per cascade member, and
- *  `handleSaveThread` for the thread it pins. */
-export const sectionMutatedAt = new Map<string, number>();
 
 function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch): ThreadState {
   stageDraftFromApi(info, batch);
@@ -68,12 +52,15 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       attentionDescendantCount: info.attention_descendant_count || 0,
       isStoppedChild: info.is_stopped_child === true,
       readRequested: info.read_requested === true,
+      applyInFlight: info.apply_in_flight === true,
       liveEventWaitCount: info.live_event_wait_count || 0,
       codingAgentChangeState: info.coding_agent_change_state,
       codingAgentIsExternalRepo: info.coding_agent_is_external_repo || false,
       lastRevivedAt: info.last_revived_at || '',
       parentThreadId: info.parent_thread_id || undefined,
       parentThreadTitle: info.parent_thread_title || undefined,
+      successor: info.successor,
+      successorOf: info.successor_of,
       triggerId: info.trigger_id || undefined,
       triggerName: info.trigger_name || undefined,
       repoId: info.cc_repo_id || undefined,
@@ -94,82 +81,41 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
   };
 }
 
-/** True when a thread-summary snapshot carries no compose draft at all: the
- *  shape the backend leaves after clearing compose fields, meaning the shared
- *  draft was sent or discarded by somebody. ONE helper, so the upsert
- *  focus-gate and `stageDraftFromApi`'s clear decision cannot drift apart. If
- *  they disagreed, a focused draft could pass the gate and be re-staged. */
-function composeSnapshotIsEmpty(info: ThreadSummary): boolean {
-  return (info.compose_text || '') === '' &&
-    (info.compose_images || []).length === 0 &&
-    (info.compose_mode ?? null) === null;
-}
-
+/** Hand a thread summary's compose fields to the compose store. It applies
+ *  them only when they are newer than what this device holds, with no local
+ *  edit pending (ADR 0437). */
 function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
-  const text = info.compose_text || '';
-  // The backend column is named `compose_images`, but the JSONB array holds
-  // hash strings.
-  const image_hashes = info.compose_images || [];
-  // The snapshot is the server stating what it holds. Record it BEFORE any
-  // guard. The guard below may keep a local draft the server no longer has,
-  // and that difference is what `serverDraft` exists to state. Callers
-  // gate this whole function on the staleness guards, so a snapshot known to
-  // predate a local write never lands here.
-  noteServerDraft(info.thread_id, text, image_hashes);
-  // The snapshot's *compose epoch*, on the same footing as the draft itself
-  // and likewise recorded before the guard below.
-  noteComposeEpoch(info.thread_id, info.compose_epoch);
-  const mode = info.compose_mode ?? null;
-  // The stored mode, same footing again. A write only carries a mode the engine
-  // is not already known to hold.
-  noteServerComposeMode(info.thread_id, mode);
-  const isEmpty = composeSnapshotIsEmpty(info);
-  // A bulk snapshot must NEVER clear a non-empty draft the user typed ON THIS
-  // DEVICE. The compose PUT is debounced and can fail or time out under host
-  // contention. `composePutSettledAt` is stamped even on failure. A later
-  // resync's GET then fires after that stamp, reads the server before our text
-  // committed, and returns an empty compose. None of the timing guards in
-  // `upsertThread` catch that post-settle stale-empty read.
-  //
-  // Gated on `hasUnsentLocalDraft`, so it protects only locally-authored,
-  // genuinely unsent work. A snapshot can still clear a server-ORIGINATED
-  // draft, or one the history shows was submitted. A peer's clear still flows
-  // through the SSE path. The kept draft is local-view only: it schedules no
-  // PUT, so it never resurrects server-side unless the user resumes editing.
-  if (isEmpty && hasUnsentLocalDraft(info.thread_id)) {
-    return;
-  }
-  // Rehydrate the per-draft dropdown selection from the DB, the authoritative
-  // store, so a reload restores the draft's picks. Placed past the local-edit
-  // guard above so it cannot clobber a locally-edited draft. An absent
-  // selection clears the local entry.
-  setComposeSelectionFromServer(info.thread_id, info.compose_selection);
-  if (batch) {
-    batch.set(info.thread_id, isEmpty ? null : { text, image_hashes, mode });
-    return;
-  }
-  if (isEmpty) clearDraft(info.thread_id);
-  else setDraft(info.thread_id, { text, image_hashes, mode });
+  acceptComposeReport(info.thread_id, {
+    revision: info.summary_version ?? null,
+    epoch: info.compose_epoch ?? null,
+    text: info.compose_text || '',
+    // The backend column is named `compose_images`, but the JSONB array holds
+    // hash strings.
+    imageHashes: info.compose_images || [],
+    mode: parseComposeMode(info.compose_mode),
+    selection: info.compose_selection ?? null,
+  }, batch);
 }
 
-/** Insert or update a thread in the map from API metadata.
- *
- *  `requestStartedAt` is the moment the originating GET went out. The
- *  compose-fields overwrite is skipped when a local edit happened AT OR AFTER
- *  it. Without that guard, a slow GET issued before the user's photo attach
- *  can land after `pushNow`'s PUT clears `pendingComposePuts`. It then
- *  overwrites the optimistic image with the server's pre-PUT snapshot.
- *
- *  The default `Number.MAX_SAFE_INTEGER` is an "infinitely fresh" sentinel for
- *  a synthetic caller that gates on no real GET, making the check always
- *  false. */
+/** Threads this page has seen deleted. A delete is final and thread ids are
+ *  never reused, so the set only grows. */
+const deletedThreadIds = new Set<string>();
+
+/** Record a delete, so a list read that went out before it cannot put the
+ *  thread back. */
+export function noteThreadDeleted(threadId: string): void {
+  deletedThreadIds.add(threadId);
+}
+
+/** Insert or update a thread in the map from API metadata. A deleted thread
+ *  is skipped (`noteThreadDeleted`). */
 export function upsertThread(
   map: Map<string, ThreadState>,
   info: ThreadSummary,
   saved: boolean,
-  requestStartedAt: number = Number.MAX_SAFE_INTEGER,
   draftBatch?: DraftBatch,
 ): void {
+  if (deletedThreadIds.has(info.thread_id)) return;
   if (!map.has(info.thread_id)) {
     map.set(info.thread_id, makeThreadState(info, saved, draftBatch));
   } else {
@@ -194,17 +140,17 @@ export function upsertThread(
     // before a live event landed carries an older version and changes none of
     // them: not the status, the counts, the waits or the flags.
     const summaryIsCurrent = applySummaryVersion(existing.meta, info.summary_version, info.status);
+    const firstSendUnsettled = info.state === 'composing'
+      && (existing.pendingUserMessages.length > 0 || (existing.unsentMessageSeqs?.size ?? 0) > 0);
     if (summaryIsCurrent) {
+      liftRowIntent(existing.meta);
       if (info.message_count) existing.meta.messageCount = info.message_count;
-      // A local archive or pin flip AT OR AFTER this GET went out makes its
-      // section, pin and change state stale, so skip them. See
-      // `sectionMutatedAt`.
-      const sectionEditedSinceRequest = (sectionMutatedAt.get(info.thread_id) ?? 0) >= requestStartedAt;
-      if (!sectionEditedSinceRequest) {
-        if (saved) existing.meta.saved = true;
-        if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
-        existing.meta.codingAgentChangeState = info.coding_agent_change_state;
-      }
+      // The summary's own flag is the server's answer. A list group without it
+      // can only say "pinned", never "not pinned".
+      if (info.saved !== undefined) existing.meta.saved = info.saved;
+      else if (saved) existing.meta.saved = true;
+      if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
+      existing.meta.codingAgentChangeState = info.coding_agent_change_state;
       existing.meta.activeChildrenCount = info.active_children_count || 0;
       existing.meta.waitingChildrenCount = info.waiting_children_count || 0;
       existing.meta.totalChildrenCount = info.total_children_count || 0;
@@ -212,6 +158,7 @@ export function upsertThread(
       existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
       existing.meta.isStoppedChild = info.is_stopped_child === true;
       existing.meta.readRequested = info.read_requested === true;
+      existing.meta.applyInFlight = info.apply_in_flight === true;
       existing.meta.liveEventWaitCount = info.live_event_wait_count || 0;
       // Absence is not emptiness: an older engine or a partial test fixture
       // omits the field, and must leave a populated list alone. Only an
@@ -224,6 +171,9 @@ export function upsertThread(
       // Absent leaves the value alone, for a partial fixture.
       if (info.parent_thread_id !== undefined) existing.meta.parentThreadId = info.parent_thread_id ?? undefined;
       if (info.parent_thread_title !== undefined) existing.meta.parentThreadTitle = info.parent_thread_title ?? undefined;
+      // A successor link never goes away, so absence leaves it alone.
+      if (info.successor) existing.meta.successor = info.successor;
+      if (info.successor_of) existing.meta.successorOf = info.successor_of;
       if (info.trigger_id) existing.meta.triggerId = info.trigger_id;
       if (info.trigger_name) existing.meta.triggerName = info.trigger_name;
       if (info.cc_repo_id) existing.meta.repoId = info.cc_repo_id;
@@ -231,60 +181,20 @@ export function upsertThread(
       if (info.coding_agent_kind) existing.meta.codingAgentKind = info.coding_agent_kind;
       if (info.coding_agent_folder) existing.meta.codingAgentFolder = info.coding_agent_folder;
       if (info.coding_agent) existing.meta.codingAgent = info.coding_agent;
+      // The engine still has the thread composing, but this device sent its
+      // first message and the engine has not recorded it yet: a pending row,
+      // or an unsent message. The row predates the send however late it was
+      // read, so its lifecycle is stale. Without this guard `ThreadPane` would
+      // swap the transcript back for the compose view. Otherwise this also
+      // rescues an SSE skeleton stuck at `composing`, which no drawer section
+      // draws.
+      if (!firstSendUnsettled) existing.meta.state = info.state;
+      // An archive, pin or discard the server has not yet reflected at this
+      // version holds over the row (ADR 0437).
+      overlayRowIntent(existing.meta);
     }
-    // Refresh compose state from the API. Without this, an SSE skeleton stuck
-    // at state='composing' stays invisible forever: `categorizeThreads` skips
-    // a composing row, so the thread surfaces in no drawer section even after
-    // the projection moved on.
-    //
-    // Four conditions skip the compose fields:
-    //   1. The user is mid-edit on this thread's textarea, and ONLY for a
-    //      NON-empty snapshot (see below).
-    //   2. A debounced or in-flight PUT covers the value the API would clobber.
-    //   3. A local edit happened AFTER this GET went out, so the response is
-    //      stale with respect to compose by definition.
-    //   4. A first send from this device is unsettled (`firstSendUnsettled`).
-    //
-    // `>=` because both timestamps come from `Date.now()`, at 1ms resolution.
-    // A request fired in the same millisecond as the edit can race ahead of
-    // the edit's PUT and would otherwise pass the guard.
-    const lastLocalChange = Math.max(composeEditedAt.get(info.thread_id) ?? 0, composeSentAt.get(info.thread_id) ?? 0);
-    const editedSinceRequest = lastLocalChange >= requestStartedAt;
-    // The engine still has the thread composing, but this device sent its
-    // first message and has no engine row for it yet: a pending row, or an
-    // unsent message. The row predates the send however late it was read, so
-    // its lifecycle and its draft (the one the message was written from) are
-    // stale.
-    const firstSendUnsettled = info.state === 'composing'
-      && (existing.pendingUserMessages.length > 0 || (existing.unsentMessageSeqs?.size ?? 0) > 0);
-    // The lifecycle marker takes the version guard of `status` above, AND the
-    // local-edit guard. A GET fired before a send lands after it, still saying
-    // `composing`, and often at the SAME version: nothing has raised it until
-    // the send's `MessageReceived` arrives. `ThreadPane` would then swap the
-    // transcript back for the compose view. `sendCompose` stamps `composeSentAt`.
-    if (summaryIsCurrent && !editedSinceRequest && !firstSendUnsettled) existing.meta.state = info.state;
-    const isFocusedThread = info.thread_id === focusedThreadId.value;
-    // An EMPTY server snapshot genuinely means the shared draft was sent or
-    // discarded by somebody, since the backend clears compose_text on those
-    // events. Focus must NOT block that clear, or a synced-from-peer draft
-    // ghosts in a focused-but-untyped textarea.
-    //
-    // Unsent locally-authored work is still protected, by the staleness guards
-    // below AND `stageDraftFromApi`'s own empty-guard. A draft whose text has
-    // since been submitted is not such work and clears. A NON-empty snapshot
-    // keeps the focus guard, so a background refresh cannot move the cursor.
-    const snapshotIsEmpty = composeSnapshotIsEmpty(info);
-    const userIsTypingHere = isFocusedThread && isComposeFocusedHere(info.thread_id) && !snapshotIsEmpty;
-    // The inverse-order hole. The edit predates this GET, so
-    // `editedSinceRequest` is false, but the debounced PUT settled at or after
-    // the GET went out. The server snapshot in this response was therefore
-    // read before the PUT committed, and is stale. `pendingComposePuts` no
-    // longer covers it, since it cleared at exactly the moment
-    // `composePutSettledAt` records.
-    const putSettledSinceRequest = (composePutSettledAt.get(info.thread_id) ?? 0) >= requestStartedAt;
-    if (!userIsTypingHere && !pendingComposePuts.has(info.thread_id) && !editedSinceRequest && !putSettledSinceRequest && !firstSendUnsettled) {
-      stageDraftFromApi(info, draftBatch);
-    }
+    // The draft the unsettled first send was written from is stale too.
+    if (existing.meta.state !== 'discarded' && !firstSendUnsettled) stageDraftFromApi(info, draftBatch);
   }
 }
 
@@ -369,9 +279,6 @@ export function reloadFacetsForApps(ids: readonly string[]): void {
 async function loadAllThreadsInner(): Promise<void> {
   const focused = focusedThreadId.value;
 
-  // Capture BEFORE the GET fires so a local edit that happens between this
-  // line and the response landing reliably wins (composeEditedAt > requestAt).
-  const requestStartedAt = Date.now();
   const response = await fetchThreads(focused || undefined);
 
   const map = threadMap.value;
@@ -380,21 +287,21 @@ async function loadAllThreadsInner(): Promise<void> {
 
   // Build/update thread states from metadata
   for (const info of response.saved) {
-    upsertThread(map, info, true, requestStartedAt, draftBatch);
+    upsertThread(map, info, true, draftBatch);
     familyExtensionIds.delete(info.thread_id);
   }
   for (const info of [...response.active_threads, ...response.archive, ...response.composing]) {
-    upsertThread(map, info, false, requestStartedAt, draftBatch);
+    upsertThread(map, info, false, draftBatch);
     familyExtensionIds.delete(info.thread_id);
   }
   // The Home entries open the home thread, so it is loaded whatever its age.
   if (response.home_thread) {
-    upsertThread(map, response.home_thread, false, requestStartedAt, draftBatch);
+    upsertThread(map, response.home_thread, false, draftBatch);
     familyExtensionIds.delete(response.home_thread.thread_id);
   }
   // Focused thread may be too old for recent list, not saved, not active
   if (response.focused_thread) {
-    upsertThread(map, response.focused_thread, false, requestStartedAt, draftBatch);
+    upsertThread(map, response.focused_thread, false, draftBatch);
     familyExtensionIds.delete(response.focused_thread.thread_id);
   }
   // Family members of the loaded set that were not already loaded. The
@@ -404,7 +311,7 @@ async function loadAllThreadsInner(): Promise<void> {
   // old. The `?? []` is the field's correct semantic default rather than a
   // value-masking fallback, and it keeps a mock that skips the field green.
   for (const info of response.family_threads ?? []) {
-    upsertThread(map, info, false, requestStartedAt, draftBatch);
+    upsertThread(map, info, false, draftBatch);
     familyExtensionIds.add(info.thread_id);
   }
 
@@ -534,7 +441,6 @@ export async function ensureThreadInMap(info: ThreadSummary): Promise<void> {
  *  `loadAllThreads` is still in flight. */
 export async function ensureThreadByIdInMap(threadId: string): Promise<boolean> {
   if (threadMap.value.has(threadId)) return true;
-  const requestStartedAt = Date.now();
   const info = await fetchThreadById(threadId);
   // null is the engine's 404, i.e. a real "no such thread" verdict. Anything
   // else threw, so the caller can tell "gone" from "could not ask" and retry
@@ -546,7 +452,7 @@ export async function ensureThreadByIdInMap(threadId: string): Promise<boolean> 
   // row cannot. Both read `thread_summaries.is_saved`. It is absent only from
   // a test mock or an older engine, where unsaved is the honest reading: the
   // Saved section is opt-in, and the next grouped load reconciles either way.
-  upsertThread(map, info, info.saved === true, requestStartedAt);
+  upsertThread(map, info, info.saved === true);
   threadMap.value = new Map(map);
   return true;
 }
@@ -1821,16 +1727,11 @@ function applyEventRows(
     // A snapshot older than the live state this device already applied
     // changes nothing (`ThreadMeta.summaryVersion`).
     const current = isSummaryCurrent(thread.meta, currentAggregate.summaryVersion);
+    if (current) liftRowIntent(thread.meta);
     applyAggregateToMeta(thread.meta, currentAggregate);
-    if (current) {
-      // Same archive race guard as the SSE path in thread-sync.ts: a replay
-      // initiated before the user's Archive click ships a pre-archive
-      // aggregate that would otherwise revert the optimistic flip.
-      if (archivingThreadIds.value.has(threadId)) {
-        thread.meta.section = 'archived';
-        thread.meta.codingAgentChangeState = NO_CHANGE;
-      }
-    }
+    // A replay started before the user's archive or pin ships the row as it
+    // was. The row intent holds over it, as on the SSE path (ADR 0437).
+    if (current) overlayRowIntent(thread.meta);
   }
 
   // Ring the per-thread bell once after the batch replay, so subscribers to
@@ -1843,14 +1744,5 @@ function applyEventRows(
   // `meta.channel` is the one `meta` field a bump subscriber would read.
   // `channel` only changes via the per-row `isChannelDefiningEvent` branch
   // above, which requires `rows.length > 0`.
-  if (rows.length > 0) {
-    bumpThreadEvents(threadId);
-    // Replay is the ONLY path that learns about a submission made while this
-    // device was asleep / disconnected, and it runs LAST: `resyncLoadedThreads`
-    // fires `loadAllThreads` (whose empty-compose snapshot has no evidence yet)
-    // before `refreshThreadEvents` brings the missed messages in. Without this
-    // reconcile, a draft submitted from another device during the gap would
-    // never be re-examined and would sit in the composer indefinitely.
-    clearSupersededDraft(threadId);
-  }
+  if (rows.length > 0) bumpThreadEvents(threadId);
 }

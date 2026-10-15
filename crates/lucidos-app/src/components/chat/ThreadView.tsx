@@ -10,6 +10,7 @@ import { replaceDocument } from '../../utils/documentNavigation';
 import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { StoppedChildNotice } from './StoppedChildNotice';
+import { ContinuedFromNotice, ContinuedInNotice } from './SuccessorNotice';
 import { sideQuestionsFor } from '../../store/sideQuestions';
 import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { ThreadTitleMenu, ThreadTitlePin } from './ThreadTitle';
@@ -40,7 +41,7 @@ import { reportThreadRenderProbe } from '../../utils/threadRenderProbe';
 import { postClientLog } from '../../utils/liveness';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { FindBar } from '../shared/FindBar';
-import { transcriptRenderRequest } from '../../store/actions/transcript-find';
+import { transcriptRenderRequest } from '../../store/actions/transcriptRenderRequest';
 
 /** Only sample a grouping fold this slow (ms) — keeps cheap incremental folds
  *  (streaming tokens) out of the perf log; we only want the expensive full
@@ -1997,11 +1998,13 @@ export function ThreadView() {
                         <div class="thread-feed" key="feed">
                             {/* Every non-turn child is boxed, as `readScrollAnchor`
                                 requires: a side question sits between turns. */}
+                            {renderFromIndex === 0 && <ContinuedFromNotice meta={eventThread.meta} />}
                             {renderExchanges(
                                 exchanges, threadId!, streamingBuffer, renderFromIndex, edge.rowsHidden,
                                 sideQuestionsFor(threadId!),
                             )}
                             <StoppedChildNotice meta={eventThread.meta} />
+                            <ContinuedInNotice meta={eventThread.meta} />
                         </div>
                     ) : (
                         <ThreadEmptyState key={threadId} reason={emptyReason(animating, historyLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />

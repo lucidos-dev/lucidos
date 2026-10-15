@@ -163,3 +163,15 @@ unchanged and still binding. It reads `run_session/completion.rs`, and the delet
 lives in `api/threads/delete.rs`, so the session teardown still holds exactly two
 removals. See ADR 0192 and
 `docs/plans/2026-09-15-deleting-a-thread.md`.
+
+## Amendment, 2026-10-12: an archived thread's tree is removed, and removal moves it aside first
+
+The rule above stands, and the worker is still the one owner. ADR 0458 changes
+what the worker does with an archived thread: it removes the tree an hour after
+the thread idles, dirty or ahead of main. It commits the dirt on the thread's
+own branch first and keeps any branch with commits ahead.
+
+`remove_worktree_and_optionally_delete_branch` no longer opens with
+`git worktree remove --force`. It renames the tree to a `reclaiming-` sibling,
+prunes git's registration, settles the branch, then deletes the directory. A
+crash therefore never leaves a half-deleted tree at the thread path.

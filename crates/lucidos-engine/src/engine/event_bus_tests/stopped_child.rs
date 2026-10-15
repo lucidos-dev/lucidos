@@ -239,6 +239,7 @@ fn input_read(started_turn: bool) -> ThreadEvent {
     ThreadEvent::CodingAgentInputRead {
         input_event_id: Uuid::new_v4(),
         started_turn,
+        verbatim: false,
     }
 }
 

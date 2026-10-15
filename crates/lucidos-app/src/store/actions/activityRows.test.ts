@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import type { ApplyEstimates, Change } from '../../api/client';
-import { NO_APPLY_ESTIMATES, threadMap, type ApplyPhaseReading } from '../store';
+import type { ApplyEstimates, Change, LandingLane } from '../../api/client';
+import { EMPTY_LANDING_LANE, IDLE_MAIN_CHECK, NO_APPLY_ESTIMATES, threadMap, type ApplyPhaseReading } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
 import type { BackgroundActivity } from '../backgroundActivity';
 import { activityRows, type ActivityRowsInput } from './activityRows';
@@ -45,8 +45,10 @@ const IDLE: ActivityRowsInput = {
   applyAllCanceling: false,
   batch: null,
   pending: [],
+  lane: EMPTY_LANDING_LANE,
+  mainCheck: IDLE_MAIN_CHECK,
   phases: new Map(),
-  applyingNow: new Map(),
+  applyingNow: new Set(),
   estimates: NO_APPLY_ESTIMATES,
   nowMs: NOW,
 };
@@ -88,7 +90,7 @@ describe('activityRows', () => {
     ]);
   });
 
-  it('names the Apply All member in flight, its phase and its position', () => {
+  it('names the Apply All member in flight, its phase and how many are done', () => {
     const pending = [change('c-1', 't-1'), change('c-2', 't-2', { needs_hardening: true })];
     const phases = new Map<string, ApplyPhaseReading>([['t-2', { phase: 'hardening', eventId: 'e-9', startedAt: null }]]);
     const rows = activityRows({
@@ -101,7 +103,7 @@ describe('activityRows', () => {
     expect(rows).toHaveLength(1);
     // The batch is the title; its member in flight, phase and all, is the body's.
     expect(rows[0].label).toBe('Applying 3 changes');
-    expect(rows[0].detail).toBe('2 of 3');
+    expect(rows[0].detail).toBe('1 done');
     expect(rows[0].body).toEqual({
       kind: 'apply-all',
       thread: {
@@ -111,7 +113,7 @@ describe('activityRows', () => {
         title: 'Collapse Menu',
         phase: 'Hardening',
       },
-      position: { index: 2, total: 3 },
+      count: { done: 1, total: 3 },
       // The member in flight owns its own span, so no member reads as an empty track.
       progress: { done: 1 / 3, working: 1 / 3 },
       timeLeft: null,
@@ -145,7 +147,7 @@ describe('activityRows', () => {
     const rows = activityRows({ ...IDLE, applyAllActive: true });
     expect(rows.map((r) => r.label)).toEqual(['Applying changes']);
     expect(rows[0].body).toEqual({
-      kind: 'apply-all', thread: null, position: null, progress: null, timeLeft: null, canceling: false,
+      kind: 'apply-all', thread: null, count: null, progress: null, timeLeft: null, canceling: false,
     });
   });
 
@@ -174,7 +176,7 @@ describe('activityRows', () => {
       pending,
       // t-2 is the batch member: its phase belongs to the Apply All row.
       phases: new Map([['t-2', { phase: 'merging', eventId: null, startedAt: null }]]),
-      applyingNow: new Map([['t-1', 'applying']]),
+      applyingNow: new Set(['t-1']),
     });
     expect(rows.map((r) => r.key)).toEqual(['apply-all', 'apply-t-1']);
     expect(rows[1].label).toBe('Merging: Card gate fix');
@@ -236,12 +238,25 @@ describe('activityRows', () => {
       ],
     });
     expect(rows.map((r) => r.label)).toEqual(['Applying 3 changes', 'Resolving merge conflict: Card gate fix']);
-    expect(rows[0].detail).toBe('2 of 3');
+    expect(rows[0].detail).toBe('0 done');
     expect(rows[0].body).toMatchObject({
       kind: 'apply-all',
       thread: { threadId: 't-2', phase: 'Hardening' },
       progress: { done: 0, working: 2 / 3 },
     });
+  });
+
+  /** ADR 0463: a member handed to the landing lane parks too. Waiting there,
+   *  it has not applied, so the count must not reach the batch's size. */
+  it('does not count members waiting in the landing lane as done', () => {
+    const rows = activityRows({
+      ...IDLE,
+      applyAllActive: true,
+      batch: { changeIds: ['c-1', 'c-2', 'c-3'], resolvedChangeIds: ['c-1'], applyingChangeIds: [], resolvingChangeIds: ['c-2', 'c-3'] },
+      pending: [change('c-2', 't-2'), change('c-3', 't-3')],
+    });
+    expect(rows[0].detail).toBe('1 done');
+    expect(rows[0].body).toMatchObject({ kind: 'apply-all', count: { done: 1, total: 3 } });
   });
 
   it('leaves a resolving batch member to the Apply All row', () => {
@@ -255,7 +270,7 @@ describe('activityRows', () => {
   });
 
   it('names an Apply Now whose change has not been proposed yet', () => {
-    const rows = activityRows({ ...IDLE, pending: [], applyingNow: new Map([['t-1', 'requesting']]) });
+    const rows = activityRows({ ...IDLE, pending: [], applyingNow: new Set(['t-1']) });
     expect(rows.map((r) => r.label)).toEqual(['Applying: Card gate fix']);
   });
 
@@ -263,8 +278,74 @@ describe('activityRows', () => {
     const rows = activityRows({
       ...IDLE,
       activities: [frontend],
-      applyingNow: new Map([['t-1', 'requesting']]),
+      applyingNow: new Set(['t-1']),
     });
     expect(rows.map((r) => r.key)).toEqual(['frontend-refresh', 'apply-t-1']);
+  });
+
+  /** The row gives the header its label only. The menu builds the body
+   *  (landingLaneRow.test.ts). */
+  describe('the landing lane row', () => {
+    const LANE: LandingLane = {
+      open_batch: { batch_id: 'b-1', lane_thread_id: 'lane-t', members: ['c-1', 'c-2'], step: 'resolving' },
+      waiting: ['c-3'],
+      gathering: false,
+    };
+    const PENDING = [change('c-1', 't-1'), change('c-2', 't-2'), change('c-3', 't-3', { thread_title: 'Fix the parser' })];
+    const RED = { state: 'red' as const, check_id: 'k-1', fix_thread_id: 'fix-t', summary: 'Failed: engine.' };
+
+    it('has no row while the lane is empty', () => {
+      expect(activityRows({ ...IDLE, pending: PENDING })).toEqual([]);
+    });
+
+    it('counts the open batch, with what waits beside it', () => {
+      const rows = activityRows({ ...IDLE, pending: PENDING, lane: LANE });
+      expect(rows).toEqual([{
+        key: 'landing-lane',
+        label: 'Landing 2 changes',
+        detail: '1 waiting',
+        queued: false,
+        body: { kind: 'landing-lane' },
+      }]);
+    });
+
+    it('names what waits with no batch open, and spins nothing', () => {
+      const [row] = activityRows({ ...IDLE, pending: PENDING, lane: { open_batch: null, waiting: ['c-3'], gathering: false } });
+      expect(row.label).toBe('1 change waiting to land');
+      expect(row.detail).toBeUndefined();
+      expect(row.queued).toBe(true);
+    });
+
+    it('gives a running check a spinning row, even with the lane empty', () => {
+      const [row] = activityRows({ ...IDLE, mainCheck: { state: 'running', check_id: 'k-1' } });
+      expect(row).toMatchObject({ key: 'landing-lane', label: 'Checking main', queued: false });
+    });
+
+    it('gives a red check a row that spins nothing', () => {
+      const [row] = activityRows({ ...IDLE, mainCheck: RED });
+      expect(row).toMatchObject({ key: 'landing-lane', label: 'Main is red', queued: true });
+    });
+
+    it('draws no row for a passed, idle or unavailable check alone', () => {
+      expect(activityRows({ ...IDLE, mainCheck: { state: 'passed', check_id: 'k-1' } })).toEqual([]);
+      expect(activityRows({ ...IDLE, mainCheck: { state: 'unavailable', summary: 'no remote' } })).toEqual([]);
+    });
+
+    /** The lane, not the apply, decides when a parked member lands. So the
+     *  lane row names it, and the Apply All row says where it stands. */
+    it('gives a member the lane holds no apply row of its own', () => {
+      const rows = activityRows({
+        ...IDLE,
+        applyAllActive: true,
+        batch: { changeIds: ['c-1', 'c-3'], resolvedChangeIds: [], applyingChangeIds: [], resolvingChangeIds: ['c-1', 'c-3'] },
+        pending: PENDING,
+        lane: LANE,
+      });
+      expect(rows.map((r) => r.key)).toEqual(['apply-all', 'landing-lane']);
+      expect(rows[0].body).toMatchObject({
+        kind: 'apply-all',
+        thread: { threadId: 't-1', phase: 'Landing in a batch' },
+      });
+    });
   });
 });

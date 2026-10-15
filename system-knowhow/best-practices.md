@@ -147,7 +147,25 @@ Fixes, in order of preference:
 1. **Inline the env var on the same line as the command**: `GWS_CONFIG_DIR=/Users/me/.config/gws-work gws calendar list`. For `cd`, chain in one call: `cd /some/dir && ./run.sh`.
 2. **Same value across all calls in the workspace?** Define an **environment variable** (next section), so every subprocess inherits it.
 
-Exception: the engine injects `CRED_*`, `OAUTH_*_ACCESS_TOKEN` and `LUCIDOS_WORKSPACE` into every subprocess, so each fresh call has them.
+Exception: the engine injects `CRED_*`, `OAUTH_*_ACCESS_TOKEN`, `LUCIDOS_WORKSPACE` and `LUCIDOS_DATABASE_URL` into every subprocess, so each fresh call has them.
+
+## The workspace database: `LUCIDOS_DATABASE_URL`
+
+A script, trigger or agent shell reaches the workspace's own database through one variable, `LUCIDOS_DATABASE_URL`. Pass it explicitly:
+
+```bash
+psql "$LUCIDOS_DATABASE_URL" -At -c "SELECT count(*) FROM thread_summaries"
+```
+
+```python
+import os, psycopg
+conn = psycopg.connect(os.environ["LUCIDOS_DATABASE_URL"])
+```
+
+- **It is read-only by default.** Every transaction opens read-only, so an accidental `DROP`, `DELETE` or `CREATE` fails with `cannot execute … in a read-only transaction`. A deliberate write opts in per transaction: `BEGIN READ WRITE; …; COMMIT;`.
+- **Never put the URL or a password on the command line.** The command is recorded in the tool call. Naming the variable keeps the password out, and tool output masks the URL's value.
+- **Bare `psql` reaches nothing.** The engine sets no `PGHOST` / `PGUSER` / `PGDATABASE` defaults and passes on no `DATABASE_URL` of its own. So an unset variable, as in `psql "$STAGING_URL"`, fails instead of landing on the workspace database.
+- **A project's own database is yours to configure.** Set its `DATABASE_URL` or `PG*` names as environment variables (next section); the engine no longer reserves them.
 
 ## Environment variables: Per-Workspace Config
 
@@ -156,7 +174,7 @@ For environment that must be the **same for every subprocess in this workspace**
 - **You (the agent) can list, set and delete them** with the grouped `env_vars` tool (`action: list | set | delete`; `set`/`delete` take `name`, `set` also `value`). The retired `set_environment_variable` name still works as an alias for `set`. The user can also edit them in Settings. Changes take effect on the **next** tool call or agent turn, with **no engine restart**.
   - Exception: the engine's *own* shell-outs read their vars at startup. For example, the Apply-time `git push` uses `GIT_SSH_COMMAND` / `GH_CONFIG_DIR`. A change reaches the engine's own git on the next restart. Tool and agent subprocesses see it immediately.
 - **Non-secret only.** Values appear in logs, the event store and tool-call payloads, by design. For API keys, tokens or passwords use a **credential** (`request_credential`). It is injected as `CRED_<NAME>` and kept out of the event log.
-- **Names** are uppercase letters, digits and underscores, not starting with a digit (e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`). Engine-owned names (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, internal `LUCIDOS_*` like `LUCIDOS_WORKSPACE`) are rejected. Engine-owned vars always win a collision.
+- **Names** are uppercase letters, digits and underscores, not starting with a digit (e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`). Engine-owned names (`CRED_*`, `OAUTH_*`, `PATH`, internal `LUCIDOS_*` like `LUCIDOS_WORKSPACE` and `LUCIDOS_DATABASE_URL`) are rejected. Engine-owned vars always win a collision.
 
 The main use is **per-workspace identity**: a `gh` config dir, a Google `gws` config dir and project id, an SSH command. Then `gh` / `git push` from agent subprocesses authenticate as the right account:
 
@@ -176,7 +194,7 @@ Setup is **partly interactive**. You can set the variables, but the user must co
 - In the credential editor (Settings → credential editor).
 - Up front, when the agent requests the credential. `request_credential` takes an optional `env_var_name` arg that pre-fills the modal's "Env var name" field. The user can still edit or clear it before saving.
 
-The name must match `[A-Z_][A-Z0-9_]*` and can't be an engine-owned name (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, `LUCIDOS_*`). It works for single-value auth types only. A `password` credential ignores it, since it splits into `_USERNAME`/`_PASSWORD`.
+The name must match `[A-Z_][A-Z0-9_]*` and can't be an engine-owned name (`CRED_*`, `OAUTH_*`, `PATH`, `LUCIDOS_*`). It works for single-value auth types only. A `password` credential ignores it, since it splits into `_USERNAME`/`_PASSWORD`.
 
 **An auth handshake script never gets the custom name.** It receives only `CRED_*` and `OAUTH_*` names, so it reads `CRED_<NAME>`. See `building-an-auth-handshake`.
 

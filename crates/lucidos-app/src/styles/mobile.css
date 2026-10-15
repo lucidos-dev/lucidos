@@ -275,7 +275,7 @@
         /* `top` comes from the shared --app-header-bottom anchor on the base
            rule; only the left edge is desktop-specific (the drawer emerges from
            the split divider rather than the viewport edge). */
-        left: calc(var(--divider-x) + var(--divider-width));
+        left: calc(var(--divider-x-in-window) + var(--divider-width));
         overflow: hidden;
     }
 
@@ -376,11 +376,10 @@
         justify-content: flex-end;
     }
 
-    /* Apps and triggers stack like every other mobile row (default column
-       layout above): the name, description, badges, and cron/event lists span
-       the full row width, with the action buttons on their own bottom-right
-       row. They were previously pinned beside the content to save vertical
-       space, but that squeezed long names/descriptions into a narrow column. */
+    /* Triggers stack like every other mobile row (default column layout
+       above): the name and cron/event lists span the full row width, with the
+       action buttons on their own bottom-right row. App rows keep their grid
+       (pages.css), since their one button fits beside the name. */
 
     .thread-row {
         flex-direction: row;
@@ -867,11 +866,11 @@
         display: flex;
         align-items: flex-start;
         gap: 0.25rem 0.75rem;
-        /* Right padding matches `.pane-header`'s `--header-padding-x` so the
-         * action icons land in the same slot as the mobile header above.
+        /* The header's own right padding, so the action icons land in the
+         * same slot as the mobile header above.
          * Symmetric 0.5rem top/bottom: just the title's own padding, with no
          * extra gap before the first message. */
-        padding: 0.5rem calc(0.625rem + var(--phone-side-inset)) 0.5rem calc(1rem + var(--phone-side-inset));
+        padding: 0.5rem calc(var(--header-padding-x) + var(--phone-side-inset)) 0.5rem calc(1rem + var(--phone-side-inset));
         /* Opaque, so content scrolling under the sticky bar is covered. On the
          * page colour at the top of the thread; once content slides under it,
          * the faint --bg-secondary band fades in. Without the band the title
@@ -1511,6 +1510,18 @@
         transform: translateZ(0);
     }
 
+    /* A pane off screen still repaints an infinite animation on every frame.
+       On an iPhone, that work shares the main thread with typing: the drawer's
+       running shimmer and spinners held keystrokes back by over a second. The
+       pane resumes them the moment it becomes current. `!important` because
+       an `animation` shorthand resets the play state, and a more specific
+       selector carrying one would otherwise keep running. */
+    .mobile-swipe-pane[data-offscreen] *,
+    .mobile-swipe-pane[data-offscreen] *::before,
+    .mobile-swipe-pane[data-offscreen] *::after {
+        animation-play-state: paused !important;
+    }
+
     /* Panes inside swipe container need full height */
     .mobile-swipe-pane > .thread-pane,
     .mobile-swipe-pane > .content-pane,
@@ -1555,6 +1566,32 @@
         flex: 1;
         min-height: 0;
         height: auto;
+        will-change: translate;
+        /* Back from away: the glide first, then the shrink, so no gap opens
+           below the app while it slides down. */
+        transition:
+            translate var(--bars-glide-duration, 0s) ease,
+            margin-bottom 0s linear var(--bars-glide-duration, 0s);
+    }
+
+    /* Dynamic bars over an app (ADR 0469). The panel glides up with the
+       header, and grows by the header's height at once. The frame resizes
+       once, not per frame, and its new bottom is in place when the glide ends.
+       A fullscreen panel covers the header, so it stays put. */
+    .mobile-swipe-pane .content-pane-body.has-app-ui .app-ui-inline[data-bars-away]:not(.app-ui-fullscreen) {
+        translate: 0 calc(-1 * var(--app-header-bottom));
+        margin-bottom: calc(-1 * var(--app-header-bottom));
+        transition: translate var(--bars-glide-duration, 0s) ease;
+    }
+
+    /* Two rules, not a list: an unknown pseudo-class drops a whole list. */
+    .mobile-swipe-pane .content-pane-body.has-app-ui .app-ui-inline[data-bars-away]:fullscreen {
+        translate: none;
+        margin-bottom: 0;
+    }
+    .mobile-swipe-pane .content-pane-body.has-app-ui .app-ui-inline[data-bars-away]:-webkit-full-screen {
+        translate: none;
+        margin-bottom: 0;
     }
 
     /* ─── Mobile threads pane (standalone swipe pane) ─── */
@@ -1658,9 +1695,11 @@
         padding-bottom: calc(var(--prompt-fade) + var(--nav-focus-reach) + var(--mobile-prompt-height, 0rem));
     }
 
+    /* The chevron follows the prompt down, but stops short by the bottom safe
+       area, so it never lands on the home indicator once the prompt is away. */
     :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .scroll-to-bottom {
         bottom: calc(0.75rem + var(--mobile-prompt-height, 0rem));
-        translate: 0 var(--mobile-prompt-offset, 0rem);
+        translate: 0 max(0rem, calc(var(--mobile-prompt-offset, 0rem) - var(--safe-area-bottom)));
     }
 
     /* The welcome floats in the middle of the free space instead of docking on

@@ -1,5 +1,5 @@
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
-import { threadMap } from '../../store/store';
+import { effectiveThreadStatus, isMidTurn, threadMap } from '../../store/store';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { eventNameChip, eventRowBody } from './EventRow';
 import type { EventRowTone } from './EventRow';
@@ -19,7 +19,12 @@ interface Props {
   subThreadPendingChanges?: SubThreadPendingChange[];
   /** Set while the report waits behind an open question (`EventRowProps`). */
   heldNote?: string;
+  /** A `ChildReportFiled`: the report reached this thread without waking it. */
+  filed?: boolean;
 }
+
+/** The line a filed report adds, so a reader knows no turn answered it. */
+export const FILED_REPORT_LINE = 'Filed without waking this thread';
 
 /** How each completion reads on the row. This is the one event row that
  *  legitimately shows a pass or a fail, because the verdict it reports is the
@@ -70,12 +75,17 @@ export function ChildCompletionRow(props: Props) {
     kind: 'child',
     state: props.status,
     role: 'child-completion',
-    subject: eventNameChip({ kind: 'chip', name: 'ChildThreadCompleted', sentenceStart: true }),
+    subject: eventNameChip({
+      kind: 'chip',
+      name: props.filed ? 'ChildReportFiled' : 'ChildThreadCompleted',
+      sentenceStart: true,
+    }),
     stateLabel: label,
     tone,
     heldNote: props.heldNote,
     facts: [
       { kind: 'node' as const, node: threadLink(props.childThreadId, props.childThreadTitle) },
+      props.filed ? { kind: 'text' as const, text: FILED_REPORT_LINE } : null,
       pending > 0
         ? { kind: 'text' as const, text: `${pending} pending change${pending === 1 ? '' : 's'}` }
         : null,
@@ -102,16 +112,16 @@ interface StoppedProps {
   childThreadTitle?: string;
 }
 
-/** What a stopped row's state says, read from the child's live meta. The event
- *  is immutable, but "Waiting for you" is a present-tense claim, so it holds
- *  only while the child is still stopped. An unloaded child has no live state,
- *  and the row then says only what the event proves. */
+/** What a stopped row's state says, read from the child's live state. The event
+ *  is immutable, but its state word is a present-tense claim. So it follows the
+ *  child: still stopped, running again, or moved on. An unloaded child has no
+ *  live state, and the row then says only what the event proves. */
 function childStoppedState(childThreadId: string): { label: string; tone: EventRowTone } {
   const child = threadMap.value.get(childThreadId);
   if (!child) return { label: 'Stopped', tone: 'halted' };
-  return child.meta.isStoppedChild
-    ? { label: 'Waiting for you', tone: 'live' }
-    : { label: 'No longer waiting', tone: 'none' };
+  if (child.meta.isStoppedChild) return { label: 'Waiting for you', tone: 'live' };
+  if (isMidTurn(effectiveThreadStatus(child))) return { label: 'Continued', tone: 'live' };
+  return { label: 'No longer waiting', tone: 'none' };
 }
 
 /** A user Stop paused one of this thread's children, as an event row

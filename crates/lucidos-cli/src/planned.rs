@@ -14,20 +14,50 @@ use crate::hardened::{git_context, run_git};
 use crate::http::client as http_client;
 use crate::workspace::{BoxError, Workspace};
 
-/// When and how a plan's build moves to a fresh thread. Both moments an agent
-/// turns to ask for approval print it: `mark --plan` and the edit gate's deny.
-/// The engine prompt names the option only, since it is paid on every request.
-pub(crate) const NEW_THREAD_HANDOFF: &str = "When this thread's context is already heavy \
-    (a long grill, many pictures) AND the plan spans several phases or layers, also offer \
-    `Implement in a new thread`, so the build starts from the plan file alone. It counts like a \
-    fork: `Approve` stays first, and `Request changes` is dropped whenever it appears. Picking it \
-    approves the plan: run `lucidos planned approve` here, then spawn the builder with \
-    `lucidos spawn-thread --to \"$LUCIDOS_WORKSPACE\" --relation child --coding-agent \
-    <claude-code|codex>` (your own backend; without the flag it starts a chat thread), and end \
-    your turn. The spawn message names the plan path and tells the \
-    builder its first step: `git merge <this branch>`, since its worktree starts from main and \
-    lacks the plan. It then runs `lucidos planned mark --plan <path>` and `lucidos planned \
-    approve` without asking again, because the user approved here.";
+/// What picking `Implement in a new thread` does. Printed only when this
+/// thread's measured context calls for the option ([`card_shape`]).
+pub(crate) const NEW_THREAD_HANDOFF: &str = "Picking `Implement in a new thread` approves the \
+    plan: run `lucidos planned approve` here, then hand the build to a successor thread with \
+    `lucidos successor spawn --narrative <file>` (`lucidos successor --help` has the format). \
+    The narrative names the plan path and says the user approved it here, so the builder builds \
+    it phase by phase without asking again. The successor's branch starts at this branch's last \
+    commit, so it already holds the plan, and the approved marker carries over. End your turn \
+    with the link it prints. If the handoff is refused for authority, run the \
+    `lucidos ask-owner-approval` it names, then retry. `Approve here` builds in this thread \
+    instead.";
+
+/// The plan-approval card's options under the floor: today's shape.
+const FLOOR_SHAPE: &str = "Offer `Approve` / `Request changes`. The option pair is a floor: if \
+    the plan offers a real fork, that fork takes the second slot and `Request changes` is \
+    dropped rather than carried as a third.";
+
+/// The card's options, as this thread's measured context decides them. The
+/// engine owns the threshold, so this never compares a number itself. An
+/// unknown size offers today's shape and says the size is unknown.
+pub(crate) fn card_shape(reading: crate::successor::ContextReading) -> String {
+    use crate::successor::ContextReading;
+    match reading {
+        ContextReading::Read {
+            offer: true,
+            input_tokens,
+        } => {
+            let size = input_tokens
+                .map(|t| format!("{}k tokens", t / 1000))
+                .unwrap_or_else(|| "large".to_string());
+            format!(
+                "This thread's context is {size}, large enough that the build belongs in a \
+                 fresh thread. So offer `Implement in a new thread (Recommended)` first and \
+                 `Approve here` second, plus a real fork of the plan if it has one. Never offer \
+                 `Request changes` beside them. {NEW_THREAD_HANDOFF}"
+            )
+        }
+        ContextReading::Read { offer: false, .. } => FLOOR_SHAPE.to_string(),
+        ContextReading::Unknown => format!(
+            "{FLOOR_SHAPE} Lucidos could not read this thread's context size, so it offers no \
+             new thread."
+        ),
+    }
+}
 
 /// Which kind of planning decision is being recorded.
 #[derive(Debug, Clone)]
@@ -117,8 +147,10 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
         // the Lucidos MCP server, and sending either after the other's tool
         // would strand a proposed plan with no way to get it approved.
         MarkKind::Plan(p) => println!(
-            "Plan recorded (awaiting approval): {} ({}). Summarize it in your message, then ask for approval with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), not in prose. The card's question is one short line that never repeats the summary. The option pair is a floor: if the plan offers a real fork, that fork takes the second slot and `Request changes` is dropped rather than carried as a third. Once approved, run `lucidos planned approve`. {}",
-            branch, p, NEW_THREAD_HANDOFF
+            "Plan recorded (awaiting approval): {} ({}). Summarize it in your message, then ask for approval with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex), not in prose. The card's question is one short line that never repeats the summary. {} Once approved, run `lucidos planned approve`.",
+            branch,
+            p,
+            card_shape(crate::successor::read_own_context(ws))
         ),
         MarkKind::Simple(r) => println!("Simple change acknowledged: {} ({})", branch, r),
         // The reminder is the only enforcement of the lane's other two

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, focusedThreadId, toasts, appSourceEpoch } from '../store';
+import { panelOverlay, focusedThreadId, toasts } from '../store';
 import type { App } from '../types';
 
 // Mock all side-effect imports that handleNavigationRequest calls
@@ -424,12 +424,6 @@ describe('app capture and refresh scoping', () => {
   it('leaves the app alone for a refresh naming another device', () => {
     handleThreadEvent(refresh(OTHER));
     expect(refreshAppUI).not.toHaveBeenCalled();
-  });
-
-  it('has an open source editor re-read on any refresh, since the files changed', () => {
-    const before = appSourceEpoch.value;
-    handleThreadEvent(refresh(OTHER));
-    expect(appSourceEpoch.value).toBe(before + 1);
   });
 
   it('reloads the app for the unscoped end-of-turn refresh', () => {

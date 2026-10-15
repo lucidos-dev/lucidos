@@ -59,6 +59,54 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### The lane batch borrows the Tier-3 merge session
+
+- **Added:** 2026-10-13
+- **Lives in:** `Driver::hand_to_resolver` in
+  `crates/lucidos-engine/src/engine/landing_lane/driver.rs`, and the
+  `engine/change_ops/apply.rs` and `run_session/completion.rs` rows of
+  `only_the_lane_and_the_app_path_move_main` in `landing_lane/lane_tests.rs`.
+- **Impermanent because:** Phase 1 of the landing lane
+  (`docs/plans/2026-10-12-landing-lane.md`) ships before its resolver. A batch
+  member goes to the existing per-change Tier-3 merge session instead. That
+  session merges the branch head rather than the snapshot, lands members one at
+  a time, and moves `main` itself. So a batch is not yet landed or failed whole.
+- **Removal / resolution condition:** Phase 2's lane thread resolves the batch
+  on the integration branch and lands it through the lane. Then delete
+  `hand_to_resolver`, swap `footprint::batch_footprint` for the integration
+  branch's `base..head`, and drop the interim rows from the scan test. Verify
+  with that test and the plan's batch tests.
+- **Status:** `removed` 2026-10-13. The lane thread resolves a batch on its
+  integration branch, and its completion lands the batch whole
+  (`landing_lane/integration.rs`). `hand_to_resolver` is gone, the batch
+  footprint reads `base..integration head`, and the scan test names only the
+  lane and the app path.
+- **Investigation:** none.
+
+### chromiumoxide is vendored for a pipe transport
+
+- **Added:** 2026-10-12
+- **Lives in:** `crates/vendor/chromiumoxide/`, wired in by `[patch.crates-io]`
+  and `exclude` in the root `Cargo.toml`. The patch is every commit after the
+  one that added the directory: `git log -p crates/vendor/chromiumoxide`. The
+  prose gate's `crates/vendor/` exemption in `scripts/lib/prose_scan.sh` exists
+  for it.
+- **Impermanent because:** chromiumoxide 0.7 reaches Chrome only over
+  `--remote-debugging-port`, and CDP has no auth. Any local user could then read
+  the agent browser's cookies and run script in its logged-in sites. The patch
+  adds `--remote-debugging-pipe`. It also deletes `no_sandbox()` and refuses
+  every switch in `SANDBOX_WEAKENING_SWITCHES`, so no caller can launch Chrome
+  outside its sandbox (ADR 0457).
+- **Removal / resolution condition:** a chromiumoxide release launches Chrome
+  over a pipe, so its changelog names a pipe transport. Move the engine to it,
+  and keep `the_agent_browser_listens_on_no_tcp_port` passing. Upstream still
+  has `no_sandbox()`, so move the switch refusal into the engine first. Keep
+  `the_agent_browser_renderers_are_sandboxed` and
+  `chrome_refuses_every_sandbox_weakening_switch` passing. Then delete the
+  vendored copy, the patch entry, the `exclude` and the prose exemption.
+- **Status:** `active`.
+- **Investigation:** none.
+
 ### Shared-fetch reload of app frames
 
 - **Added:** 2026-10-10
@@ -143,7 +191,12 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md`. Verify with a
   tree-wide search for `toastPlacement` and `data-toast-placement`, which must
   return nothing, and with the geometry test that phase adds for the winner.
-- **Status:** `active`
+- **Status:** `removed` 2026-10-12. Decision 6 of the plan above picked the
+  bottom-right corner, a cross-pane shape. The picker, the losing shapes,
+  `ToastItem.pane` and the per-pane columns are gone, so the stack is one
+  column. The tree-wide search is empty, and
+  `styles/__tests__/toast-corner-geometry.test.ts` pins the corner.
+- **Investigation:** none.
 
 ### Angle brackets kept out of `data-label`
 
@@ -211,7 +264,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   reproduce it, and a session-leak probe there found nothing piling up. So a
   touch device writes one `[Client/page-health]` line every 30 s while visible:
   main-thread lag, frame rate, animation-frame calls, DOM size, animations,
-  live listeners, intervals and observers.
+  live listeners, intervals and observers. The lines land in
+  `~/.lucidos/gateway/gateway.log`; `docs/client-logs.md` covers reading them.
 - **Removal / resolution condition:** the trend across a degraded session
   names the cause and that cause is fixed, or two months pass with no episode.
   Verify by confirming no open work reads the line. Then delete both modules,
@@ -243,7 +297,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-08-26. **Widened:** 2026-08-27, twice; 2026-08-28; 2026-08-29.
 - **Lives in:** `crates/lucidos-app/src/components/chat/deadPressProbe.ts`, its
-  install call in `src/shellStartup.ts`, and
+  cover sample in `src/components/chat/pressCover.ts`, their install calls in
+  `src/shellStartup.ts`, and
   `src/components/chat/__tests__/dead-press-probe.test.ts` and
   `src/components/chat/__tests__/dead-press-probe-ledger.test.ts`. The `PressOutcome`
   pair in `src/utils/tapGesture.ts` is part of it: the probe cannot tell a
@@ -732,8 +787,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 - **Added:** 2026-08-29
 - **Lives in:** `crates/lucidos-app/src/components/chat/deadKeystrokeProbe.ts`,
-  its install call in `src/shellStartup.ts`, its `reportDraftClobbered` caller in
-  `src/components/chat/PromptInput.tsx`, and
+  its install call in `src/shellStartup.ts`, and
   `src/components/chat/__tests__/dead-keystroke-probe.test.ts`.
   `src/components/chat/probeViewport.ts` is shared with the press probe above,
   so it goes with whichever of the two is removed last.
@@ -743,30 +797,29 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   focus, the keyboard came up, the user typed, and nothing appeared. No emulator
   reproduces it and the user cannot reproduce it on demand, so the app has to
   report the next episode itself.
-- **The three verdicts, and what each settles.** `input-never-arrived` is a
+- **The two verdicts, and what each settles.** `input-never-arrived` is a
   `beforeinput` with no `input` behind it, which puts the fault in WebKit rather
   than in our code. That is the question nine reports have not been able to
   answer. `keystroke-lost` is the edit reaching the box and not the store.
-  `draft-clobbered` is both of those working and a draft clear wiping the
-  result, which the composer now repairs rather than obeying.
+  A third, `draft-clobbered`, was removed with the second copy of the message
+  it reported on: the textarea now shows the draft, and no report replaces a
+  draft with an edit pending
+  ([`docs/plans/2026-10-12-compose-draft-follows-a-server-revision.md`](plans/2026-10-12-compose-draft-follows-a-server-revision.md)).
 - **Reading an episode.** Grep for `composer-typing` in whichever log the
   engine's stdout goes to, the same two candidates the press row names. Each
   line carries the verdict, the lengths involved, and the same viewport block a
   press line does, so the two read side by side.
 - **Removal / resolution condition:** An episode arrives carrying a verdict, and
   the fix that verdict points at ships, OR two months pass with no report. Then
-  delete the module, its install call, the `reportDraftClobbered` call in
-  `PromptInput`, and the test. Verify with a tree-wide search for
-  `deadKeystrokeProbe` and `reportDraftClobbered`, which must return nothing.
-  `resolveEmptyDraftSync` STAYS: it is a behaviour fix, not a diagnostic.
+  delete the module, its install call, and the test. Verify with a tree-wide
+  search for `deadKeystrokeProbe`, which must return nothing.
 - **Investigation:** none, same as the press probe. The plan behind it is
   [`docs/plans/2026-08-29-the-composer-never-erases-what-you-typed.md`](plans/2026-08-29-the-composer-never-erases-what-you-typed.md).
 - **Status:** `active`. The press probe's cause, iOS autocorrect
   ([ADR 0262](adr/0262-ios-autocorrect-eats-the-send-tap.md)), does not explain
   this half. Characters that never appeared are a different symptom, so its own
   removal condition stands.
-- **Not a workaround.** Every listener is passive and consumes nothing. The
-  behaviour fix ships beside it, in `resolveEmptyDraftSync`.
+- **Not a workaround.** Every listener is passive and consumes nothing.
 
 ### Composer relayout nudge, when the row stops being reachable
 
@@ -989,6 +1042,35 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
   Lucidos never deletes the old file itself, which stays the user's to remove.
 - **Status:** open
+
+### Pre-lock engine pidfile fallback
+
+- **Added:** 2026-10-12
+- **Lives in:** `crates/lucidos-owner-lock/src/lib.rs` `engine::live_pid`, the
+  arm taken when `.lucidos/engine.lock` does not exist, and its shell twins:
+  `engine_live_pid` in `scripts/lib/flock.sh` and `_service_engine_live_pid` in
+  `scripts/lib/service.sh`. Also `stop_pre_lock_build_watch` in
+  `scripts/lib/workspace.sh`, which stops a build-watch started before the
+  watch lock existed. Paired with the upgrade bullet in ADR 0438 §
+  Consequences.
+- **Impermanent because:** ADR 0438 made readers trust `engine.pid` only while
+  the engine's owner lock is held. An engine from an earlier release takes no
+  lock, so without this arm every reader would treat it as dead. The desktop
+  app's update would then leave it running on the old version, and a gateway
+  that re-exec'd would never reclaim it. The arm serves only workspaces where
+  no lock-aware engine has run yet: the first one creates the lock file.
+- **Removal / resolution condition:** The oldest release the updater and the
+  front door still upgrade from carries ADR 0438. Then no supported install
+  can run an engine that takes no lock. Check the release that first shipped
+  `lucidos-owner-lock` against that oldest version. Then:
+  - Delete the `lock.exists()` arm, so `engine::live_pid` is `live_pid` alone.
+  - Delete `a_workspace_no_lock_aware_engine_ran_in_keeps_its_pidfile`.
+  - Delete the no-lock-file arm of both shell twins, and its cases in
+    `flock_test.sh` and `service_test.sh`.
+  - Delete `stop_pre_lock_build_watch`, its call and its test in
+    `workspace_test.sh`.
+  - Drop the upgrade bullet from ADR 0438 § Consequences.
+- **Status:** active
 
 ### Legacy attached-event-wait boot sweep
 
@@ -2011,6 +2093,26 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   The listener stays as the permanent answer, and the e2e clip spec is gone.
 - **Investigation:** none.
 
+### Held-message delivery polls for the spawned session
+
+- **Added:** 2026-10-12
+- **Lives in:** `crates/lucidos-engine/src/engine/chat/held_messages.rs`
+  (`AGENT_START_GRACE`, `AGENT_POLL`): the loop at the end of
+  `deliver_held_message`, and `wait_until_agent_takes_messages`.
+- **Impermanent because:** a session joins `agent_sessions` only once its
+  subprocess registers, many seconds after the spawn starts. Nothing signals
+  that moment, so a release sleeps in 500 ms steps until the session shows up,
+  for at most 60 seconds. A race audit filed it as a sleep standing in for a
+  readiness signal.
+- **Removal / resolution condition:** the spawn inserts a "starting" placeholder
+  into `agent_sessions` under the live-session check's lock, owning the message
+  channel (the audit's "claim at entry" item). A released message can then go
+  straight into that channel. Delete both constants and both loops, and check
+  that `held_messages_tests.rs` still passes.
+- **Status:** active
+- **Investigation:** n/a (see ADR 0256, Consequences, and
+  `docs/plans/2026-10-12-markers-commit-with-what-they-record.md`)
+
 ## 2. Model-tolerance measures
 
 A **model-tolerance measure** is a crutch added *only* to compensate for current
@@ -2498,7 +2600,11 @@ condition; fix the condition rather than acting on it.
   loop calls it in `agentic_loop/run.rs`. Coding agents reach it through
   `POST /api/v1/internal/ask-user-question`, which returns `refusal`. The CLI
   hook turns that into a denied tool call (`ask_user_question_hook.rs`), and
-  the Codex MCP tool into an error result (`mcp_permission_server.rs`).
+  the Codex MCP tool into an error result (`mcp_permission_server.rs`). A
+  coding agent's refusal takes a second look once its session loop has
+  persisted the text before the card (`QuestionFlushes`, signalled from
+  `run_session/run.rs`). A hook waits for its own tool use id. The session's
+  n-th MCP ask waits for its n-th MCP question tool use.
 - **Impermanent because (tolerates):** an agent raises a question card with
   no prose, so the user gets a menu instead of an answer. These shapes were
   observed:
@@ -2782,6 +2888,28 @@ event that retires it.
   has Home. The catalog entry, the gate, `home_visible_sql`, the voice refusal
   and the Experimental section are gone. A migration deletes stored rows, and
   a write of the key is refused (`RETIRED_KEYS`).
+
+### Auto-compact trial
+
+- **Added:** 2026-10-14
+- **Lives in:**
+  - `crates/lucidos-engine/src/core/preference_catalog.rs`: the
+    `CODING_AGENT_AUTO_COMPACT_TRIAL` handle.
+  - `crates/lucidos-engine/src/engine/auto_compact_trial.rs`: the arm and
+    the window.
+  - `runtime/claude_code.rs` (`build_command_with_settings`): the env var.
+  - `engine/agent_session/run_session/run.rs`: where each Claude Code spawn
+    resolves its setting.
+  - `SessionStarted.auto_compact_window` and `auto_compact_arm`: the record.
+- **Impermanent because:** the trial decides whether Claude Code sessions
+  default to a 400k auto-compact window. Plan and decision rule:
+  `docs/plans/2026-10-13-auto-compact-trial-and-successor-threads.md`.
+- **Removal / resolution condition:** the default is decided and shipped. The
+  follow-up change then sets the window unconditionally or not at all, and
+  deletes the preference, the arm function and the two `SessionStarted`
+  fields' writer. The fields stay readable for old rows. Verify from the tree:
+  no `coding_agent_auto_compact_trial` outside this row and the plan.
+- **Status:** active.
 
 ### `self_curated_context_mode` flag (ADR 0085)
 

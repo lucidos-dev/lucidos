@@ -16,7 +16,8 @@ vi.mock('./thread-loading', async (importOriginal) => ({
 }));
 
 import { createPainter, type FindPainter } from '@lucidos/find';
-import { clearBand, markdownText, transcriptPassages, transcriptRenderRequest, transcriptTarget } from './transcript-find';
+import { clearBand, markdownText, transcriptPassages, transcriptTarget } from './transcript-find';
+import { transcriptRenderRequest } from './transcriptRenderRequest';
 import { ensureWholeThreadLoaded } from './thread-loading';
 import { collapsedExchanges, detailsExpanded, threadMap } from '../store';
 import { makeThreadState } from '../__tests__/thread-events-helpers';

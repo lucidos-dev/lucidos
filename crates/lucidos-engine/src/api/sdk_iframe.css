@@ -192,17 +192,12 @@ body {
     text-rendering: optimizeLegibility;
 }
 
-/* A minimal widget window draws the widget alone (ADR 0419). The page is
-   see-through, so the widget's own drawing is its shape, and the body takes
-   its content's width, which the SDK reports so the window fits it. */
-html[data-widget-mode="minimal"],
-html[data-widget-mode="minimal"] body {
+/* A Home board tile sets the widget's box and draws its surface (ADR 0432).
+   The page is see-through, so a transparent widget's own drawing is its shape.
+   The SDK keeps it from scrolling inside the tile. */
+html[data-widget-place="home"],
+html[data-widget-place="home"] body {
     background: transparent;
-}
-
-html[data-widget-mode="minimal"] body {
-    width: max-content;
-    max-width: 100%;
 }
 
 /* A shared row title names no size and inherits the body's. The host body is

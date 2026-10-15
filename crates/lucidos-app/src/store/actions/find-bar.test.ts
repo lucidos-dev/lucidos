@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { beforeAll, describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('./app-bridge', () => ({ askFrame: vi.fn(), tellFrame: vi.fn() }));
 vi.mock('./apps', () => ({ getVisibleAppFrame: vi.fn() }));
@@ -12,10 +12,11 @@ vi.mock('../../utils/elementVisibility', async (importOriginal) => ({
 import { askFrame, tellFrame } from './app-bridge';
 import { getVisibleAppFrame } from './apps';
 import {
-  FIND_TIMEOUT_MS, closeFind, contentFindKind, findFocusRequest, findQuery, findResult, findStatusText,
-  findSurface, focusedFindSurface, openFind, parseFindReply, rerunFindOn, resetFind, setFindQuery, stepFind,
+  closeFind, contentFindKind, findFocusRequest, findQuery, findResult, findStatusText,
+  findSurface, findTargets, focusedFindSurface, openFind, rerunFindOn, resetFind, setFindQuery, stepFind,
   takeFindRequest, toggleFocusedFind,
 } from './find-bar';
+import { FIND_TIMEOUT_MS, parseFindReply } from './find-targets';
 import { MIN_FIND_QUERY_CHARS, fileFindScope, requestFind } from './find-request';
 import {
   filePreviewEditing, filePreviewSource, findRequest, focusedPane, lineScrollTarget, panelOverlay,
@@ -50,6 +51,10 @@ async function typeQuery(query: string) {
   setFindQuery(query);
   await vi.runAllTimersAsync();
 }
+
+// The bar's targets are code-split, and it opens once they are in memory.
+// Warm them, so an open lands at once.
+beforeAll(() => findTargets.preload());
 
 describe('parseFindReply', () => {
   it('takes a well-formed count', () => {

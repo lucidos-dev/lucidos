@@ -5,16 +5,18 @@
  *
  * Background activities (builds, the model download, an Expose run) come in
  * already derived by `store/backgroundActivity.ts`. Applies are added here:
- * the Apply All batch as one row, and each single-thread apply as its own. A
- * batch member parked on a merge conflict counts as its own apply too.
- * Their rows read the pending changes and the batch, which that module never sees.
+ * the Apply All batch as one row, the *landing lane* as one row, and each
+ * single-thread apply as its own. A batch member parked on a merge conflict
+ * counts as its own apply too, unless the lane holds it: then the lane row
+ * names it. Their rows read the pending changes, the batch and the lane,
+ * which that module never sees.
  *
  * `activityRows` is pure of its arguments except for the thread titles, which
  * it reads the way the apply toasts do (`threadTitle`). `liveActivityRows`
  * feeds it from the signals.
  */
 
-import type { ApplyEstimates, Change } from '../../api/client';
+import type { ApplyEstimates, Change, LandingLane, MainCheck } from '../../api/client';
 import {
   applyAllBatch,
   applyAllCanceling,
@@ -27,6 +29,9 @@ import {
   engineBuildDetail,
   engineBuilding,
   frontendRefreshDetail,
+  landingLane,
+  lanePlace,
+  mainCheck,
   tailscaleServeRun,
   type ApplyAllBatch,
   type ApplyPhaseReading,
@@ -43,6 +48,10 @@ import {
   phaseLabel,
   threadTitle,
 } from './applyProgress';
+import { LANE_PLACE_LABEL } from './landingLane';
+
+/** The title a thread no list names yet. */
+export const UNTITLED_THREAD = 'Untitled thread';
 
 /** The thread an apply is working on, and the event its phase started at. */
 export interface ApplyThread {
@@ -59,12 +68,13 @@ export interface ApplyThread {
 export type ActivityBody =
   /** A build, the model download or an Expose run. */
   | { kind: 'background'; activity: BackgroundActivity }
-  /** The Apply All batch. `thread` and `position` are `null` until the batch
-   *  names its member in flight. */
+  /** The Apply All batch. `thread` and `count` are `null` until the batch
+   *  names its member in flight. `count.done` counts resolved members, never
+   *  one parked on a conflict or waiting in the landing lane. */
   | {
       kind: 'apply-all';
       thread: ApplyThread | null;
-      position: { index: number; total: number } | null;
+      count: { done: number; total: number } | null;
       progress: StepProgress | null;
       /** "about 20 min until all are applied", or `null` when the batch
        *  cannot say. */
@@ -72,13 +82,16 @@ export type ActivityBody =
       canceling: boolean;
     }
   /** A single-thread apply. */
-  | { kind: 'apply-thread'; thread: ApplyThread };
+  | { kind: 'apply-thread'; thread: ApplyThread }
+  /** The landing lane. The menu builds its body itself, from
+   *  `landingLaneRow.ts`, so the header mark that counts rows never loads it. */
+  | { kind: 'landing-lane' };
 
 export interface ActivityRow {
   /** Stable per job, for list keys and for which rows are unfolded. */
   key: string;
   label: string;
-  /** Right-aligned beside the label: elapsed time, bytes, "2 of 4". */
+  /** Right-aligned beside the label: elapsed time, bytes, "2 done". */
   detail?: string;
   /** The job waits its turn instead of running, so nothing should spin. */
   queued?: boolean;
@@ -94,9 +107,11 @@ export interface ActivityRowsInput {
   batch: ApplyAllBatch | null;
   /** The pending changes, or `null` while the list is not loaded. */
   pending: readonly Change[] | null;
+  lane: LandingLane;
+  mainCheck: MainCheck;
   phases: ReadonlyMap<string, ApplyPhaseReading>;
   /** `applyingNowThreadIds`: the threads with an Apply Now in flight. */
-  applyingNow: ReadonlyMap<string, unknown>;
+  applyingNow: ReadonlySet<string>;
   estimates: ApplyEstimates;
   nowMs: number;
 }
@@ -118,6 +133,8 @@ export function liveActivityRows(nowMs: number = Date.now()): ActivityRow[] {
     applyAllCanceling: applyAllCanceling.value,
     batch: applyAllBatch.value,
     pending: loaded.status === 'loaded' ? loaded.data : null,
+    lane: landingLane.value,
+    mainCheck: mainCheck.value,
     phases: applyPhases.value,
     applyingNow: applyingNowThreadIds.value,
     estimates: applyEstimates.value,
@@ -136,8 +153,38 @@ export function activityRows(input: ActivityRowsInput): ActivityRow[] {
   }));
   const batchRow = applyAllRow(input);
   if (batchRow) rows.push(batchRow);
+  const laneRow = landingLaneRow(input);
+  if (laneRow) rows.push(laneRow);
   rows.push(...singleApplyRows(input));
   return rows;
+}
+
+/** The lane's row, while a batch is open or a change waits. It reads
+ *  "Landing 3 changes" with "2 waiting" beside it. With no batch open it
+ *  names what waits, and draws the hourglass, since nothing resolves.
+ *
+ *  An empty lane still draws the row while the main check runs or main is
+ *  red, so its line has somewhere to be. A red row spins nothing: it waits
+ *  on a fix. */
+function landingLaneRow({ lane, mainCheck }: ActivityRowsInput): ActivityRow | null {
+  const row = { key: 'landing-lane', body: { kind: 'landing-lane' } } as const;
+  const waiting = lane.waiting.length;
+  if (lane.open_batch) {
+    return {
+      ...row,
+      label: `Landing ${countOf(lane.open_batch.members.length)}`,
+      detail: waiting > 0 ? `${waiting} waiting` : undefined,
+      queued: false,
+    };
+  }
+  if (waiting > 0) return { ...row, label: `${countOf(waiting)} waiting to land`, queued: true };
+  if (mainCheck.state === 'running') return { ...row, label: 'Checking main', queued: false };
+  if (mainCheck.state === 'red') return { ...row, label: 'Main is red', queued: true };
+  return null;
+}
+
+function countOf(n: number): string {
+  return `${n} change${n === 1 ? '' : 's'}`;
 }
 
 function applyAllRow(input: ActivityRowsInput): ActivityRow | null {
@@ -145,7 +192,7 @@ function applyAllRow(input: ActivityRowsInput): ActivityRow | null {
   if (!applyAllActive) return null;
   const pendingIds = pending ? new Set(pending.map((c) => c.id)) : null;
   const inFlight = batch ? batchMemberInFlight(batch, pendingIds) : null;
-  const position = inFlight ? { index: inFlight.position, total: inFlight.total } : null;
+  const count = inFlight ? { done: inFlight.resolved, total: inFlight.total } : null;
   // Every member started and not yet done is working: the one applying and
   // the parked ones alike.
   const progress = inFlight
@@ -165,8 +212,8 @@ function applyAllRow(input: ActivityRowsInput): ActivityRow | null {
   return {
     key: 'apply-all',
     label,
-    detail: position ? `${position.index} of ${position.total}` : undefined,
-    body: { kind: 'apply-all', thread, position, progress, timeLeft, canceling: applyAllCanceling },
+    detail: count ? `${count.done} done` : undefined,
+    body: { kind: 'apply-all', thread, count, progress, timeLeft, canceling: applyAllCanceling },
   };
 }
 
@@ -190,24 +237,28 @@ function singleApplyRows(input: ActivityRowsInput): ActivityRow[] {
   for (const threadId of threadIds) {
     const change = pending?.find((c) => c.thread_id === threadId);
     if (change && batchIds.has(change.id)) continue;
+    if (lanePlace(input.lane, change?.id)) continue;
     const thread = applyThread(threadId, change, input);
     rows.push({ key: `apply-${threadId}`, label: applyLabel(thread), body: { kind: 'apply-thread', thread } });
   }
   return rows;
 }
 
+/** A change the lane holds says where it stands there, since the lane, not
+ *  the apply, decides when it lands. */
 function applyThread(
   threadId: string,
   change: Change | undefined,
-  { phases, estimates, nowMs }: ActivityRowsInput,
+  { lane, phases, estimates, nowMs }: ActivityRowsInput,
 ): ApplyThread {
   const reading = applyPhaseOf(threadId, change, phases);
+  const place = lanePlace(lane, change?.id);
   return {
     threadId,
     changeId: change?.id ?? null,
     reading,
-    title: threadTitle(threadId, change) ?? 'Untitled thread',
-    phase: phaseLabel(reading, estimates, nowMs),
+    title: threadTitle(threadId, change) ?? UNTITLED_THREAD,
+    phase: place ? LANE_PLACE_LABEL[place] : phaseLabel(reading, estimates, nowMs),
   };
 }
 
@@ -216,7 +267,7 @@ function applyVerb(reading: ApplyPhaseReading | null): string {
   return reading ? APPLY_PHASE_LABEL[reading.phase] : 'Applying';
 }
 
-/** The batch as a whole, so "2 of 5" counts changes, not merge conflicts. */
+/** The batch as a whole: it counts changes, not merge conflicts. */
 function applyingCount(total: number): string {
   return `Applying ${total} change${total === 1 ? '' : 's'}`;
 }

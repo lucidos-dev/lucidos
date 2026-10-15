@@ -20,6 +20,7 @@
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"],
+      "@lucidos/app-scroll": ["../../packages/lucidos-sdk/src/appScroll.ts"],
       "@lucidos/appearance": ["../../packages/lucidos-sdk/src/appearance.ts"],
       "@lucidos/engine-constants": ["../../packages/lucidos-sdk/src/generated/engine-constants.ts"],
       "@lucidos/event-stream": ["../../packages/lucidos-sdk/src/eventStream.ts"],

@@ -182,7 +182,11 @@ impl LucidosEngine {
                     branch_name
                 );
             }
-            Ok(ProposeOutcome::Held(_) | ProposeOutcome::Unfinished) => {}
+            Ok(
+                ProposeOutcome::Held(_)
+                | ProposeOutcome::Unfinished
+                | ProposeOutcome::AwaitingLanding(_),
+            ) => {}
             Err(e) => {
                 log!(
                     "[Recovery] Failed to propose change from stale session: {}",
@@ -214,6 +218,19 @@ impl LucidosEngine {
         .bind(thread_id)
         .fetch_optional(self.pool())
         .await?;
+        let session_branch = session.as_ref().and_then(|(branch, _)| branch.as_deref());
+        if let Some(batch_id) = crate::engine::landing_lane::lane_batch_of_stale_session(
+            self.pool(),
+            self.workspace_path(),
+            thread_id,
+            session_branch,
+        )
+        .await?
+        {
+            self.end_stale_lane_thread(thread_id, batch_id, discard)
+                .await;
+            return Ok(());
+        }
 
         let (branch_name, session_kind) = match session {
             Some((Some(b), kind)) if !b.is_empty() => (b, kind),
@@ -387,6 +404,48 @@ impl LucidosEngine {
         Ok(())
     }
 
+    /// End a lane thread's stale session. Its branch and worktree are the
+    /// lane's, never a change, so nothing here proposes, resets or deletes
+    /// them. The lane hears the answer a run would give: a Stop keeps the
+    /// batch open, and a Discard fails it, so the lane removes the worktree.
+    /// For a batch already closed, either answer retires what the lane left.
+    async fn end_stale_lane_thread(&self, thread_id: Uuid, batch_id: Uuid, discard: bool) {
+        use crate::engine::landing_lane::{LaneThreadEnd, LANE_THREAD_CLOSED};
+        let end = if discard {
+            LaneThreadEnd::Failed(LANE_THREAD_CLOSED.to_string())
+        } else {
+            LaneThreadEnd::Stopped
+        };
+        log!(
+            "[Recovery] Ending stale lane thread {} of batch {}: {:?}",
+            thread_id,
+            batch_id,
+            end
+        );
+        self.report_lane_thread_end(batch_id, thread_id, end);
+        let coding_agent = self.thread_coding_agent(thread_id).await;
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
+                        has_changes: false,
+                        is_external_repo: false,
+                        requires_restart: false,
+                        cc_session_id: None,
+                        coding_agent,
+                        reason: None,
+                        worktree_path: None,
+                        worktree_head_sha: None,
+                        bg_bash_pending: false,
+                    },
+                    meta: crate::engine::thread_events::EventMeta::NONE,
+                },
+                "[Recovery] CodingAgentIdled (lane thread)",
+            )
+            .await;
+    }
+
     /// Boot floor: withdraw every *Switch to new version* resume promise this
     /// boot did not keep. Thin wrapper over
     /// [`settle_unresumed_switch_threads`], which documents the whole contract;
@@ -477,7 +536,11 @@ impl LucidosEngine {
                     branch = Some(b.to_string());
                 } else if line.is_empty() {
                     if let (Some(ref wt), Some(ref br)) = (&worktree_path, &branch) {
-                        if crate::engine::git_ops::is_coding_agent_branch(br) {
+                        // A lane thread works on its batch's integration
+                        // branch, and recovers like any coding-agent thread.
+                        if crate::engine::git_ops::is_coding_agent_branch(br)
+                            || crate::engine::git_ops::is_lane_branch(br)
+                        {
                             // A worktree outside this workspace's worktrees dir
                             // cannot be ours, so skip the marker read. That read
                             // dominates the scan in multi-workspace setups.
@@ -683,7 +746,11 @@ impl LucidosEngine {
         };
 
         for branch in &actively_running_branches {
-            if discovered_branches.contains(branch) {
+            // A lane worktree lives at its batch's own path, and the lane
+            // thread's next run recreates it there.
+            if discovered_branches.contains(branch)
+                || crate::engine::git_ops::is_lane_branch(branch)
+            {
                 continue;
             }
             // `idle_branches` can still hold this branch. The classifier emits
@@ -870,17 +937,30 @@ impl LucidosEngine {
                     // without asking git, which a busy boot can time out, then
                     // withhold the branch's work (ADR 0400).
                     log!("[Recovery] Resuming active session with pending change {} for branch {} — withdrawing it and withholding its unfinished work", pending_change.id, branch_name);
-                    if let Some(&tid) = branch_to_thread.get(&branch_name) {
-                        let origin = Some(MessageOrigin::engine(EngineReason::OrphanRecovery));
-                        if let Err(e) = crate::engine::change_ops::emit_change_withdrawn(
-                            &self.event_bus,
+                    let tid = branch_to_thread.get(&branch_name).copied();
+                    if let Some(tid) = tid {
+                        // A queued change is frozen (ADR 0463), and an
+                        // unanswered read keeps it too. The re-decide still
+                        // runs: it withholds the newer work as awaiting landing.
+                        let queued = crate::engine::landing_lane::queued_snapshot(
+                            self.pool(),
                             tid,
                             pending_change.id,
-                            origin,
                         )
                         .await
-                        {
-                            log!("[Recovery] {}", e);
+                        .map_or(true, |snapshot| snapshot.is_some());
+                        if !queued {
+                            let origin = Some(MessageOrigin::engine(EngineReason::OrphanRecovery));
+                            if let Err(e) = crate::engine::change_ops::emit_change_withdrawn(
+                                &self.event_bus,
+                                tid,
+                                pending_change.id,
+                                origin,
+                            )
+                            .await
+                            {
+                                log!("[Recovery] {}", e);
+                            }
                         }
                         if let Err(e) = self
                             .redecide_branch_work(
@@ -1035,8 +1115,8 @@ impl LucidosEngine {
 
             // Resume or manual Continue, by cause. A user switch left a
             // device-attributed teardown boundary, so auto-resume it. The resume
-            // is queued: `main.rs` emits `ContinuationRequested` once the spawn
-            // dispatcher is subscribed, and recovery runs before it. A crash left
+            // is queued: `main.rs` emits `ContinuationRequested` later in boot,
+            // after the apply recoveries that read the queue. A crash left
             // no boundary, so offer Continue instead and never auto-resume: work
             // that crashed the engine must not loop.
             if switch_was_user_initiated(self.pool(), thread_id).await {
@@ -1664,6 +1744,7 @@ const TURN_PROGRESSION_EVENT_TYPES_SQL: &str = "'SessionStarted','CodingAgentUse
 ///
 /// A branch is `running` iff its newest lifecycle event is a `SessionStarted`,
 /// or a turn-progression event landed after its newest turn-ended event.
+/// A *cache keep-alive* the stop cut off is `idle`: it had no work to resume.
 /// Everything else is `idle`. There is no third state: the caller computes
 /// `in_flight = !idle_branches.contains(branch)`, so a branch missing from both
 /// sets would be treated as in-flight.
@@ -1687,7 +1768,8 @@ pub(crate) static BRANCH_CLASSIFICATION_SQL: std::sync::LazyLock<String> =
             ORDER BY thread_id, sequence DESC \
          ) \
          SELECT sb.branch, \
-                CASE WHEN ll.event_type = 'SessionStarted' \
+                CASE WHEN COALESCE(ts.keep_alive_turn, FALSE) THEN 'idle' \
+                     WHEN ll.event_type = 'SessionStarted' \
                        OR EXISTS ( \
                            SELECT 1 FROM events e3 \
                            WHERE e3.thread_id = ll.thread_id \
@@ -1696,12 +1778,29 @@ pub(crate) static BRANCH_CLASSIFICATION_SQL: std::sync::LazyLock<String> =
                        ) \
                      THEN 'running' ELSE 'idle' END AS status \
          FROM last_lifecycle ll \
-         JOIN session_branches sb ON sb.thread_id = ll.thread_id",
+         JOIN session_branches sb ON sb.thread_id = ll.thread_id \
+         LEFT JOIN thread_summaries ts ON ts.thread_id = ll.thread_id",
             turn_ended = TURN_ENDED_EVENT_TYPES_SQL,
             mid_turn_ends = SESSION_ENDED_MID_TURN_REASONS_SQL,
             progression = TURN_PROGRESSION_EVENT_TYPES_SQL,
         )
     });
+
+/// Whether the turn on `branch` was in flight when the engine stopped, by
+/// [`BRANCH_CLASSIFICATION_SQL`]. `None` when no session ever ran on it.
+pub(crate) async fn branch_turn_in_flight(
+    pool: &sqlx::PgPool,
+    branch: &str,
+) -> Result<Option<bool>, sqlx::Error> {
+    let statuses: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT c.status FROM ({}) c WHERE c.branch = $1",
+        *BRANCH_CLASSIFICATION_SQL
+    ))
+    .bind(branch)
+    .fetch_all(pool)
+    .await?;
+    Ok((!statuses.is_empty()).then(|| statuses.iter().any(|s| s == "running")))
+}
 
 /// Threads still holding an UNKEPT resume promise: a switch-teardown abort that
 /// is the thread's newest `ResponseAborted`, with no start event after it, on a
@@ -1843,10 +1942,13 @@ macro_rules! turn_start_events {
 
 /// The start of a thread's latest turn, when that turn was interrupted: no
 /// terminator came after it, and either it did something or it was never
-/// going to run on its own. Two starts DO run on their own, so a bare one is
-/// pending rather than interrupted: a `ChildThreadCompleted` (the
-/// parent-resume refire) and a `ContinuationRequested` (the spawn
-/// dispatcher's backfill). Ordered by `sequence`, which is total.
+/// going to run on its own. A bare `ChildThreadCompleted` DOES run on its own
+/// (the parent-resume refire), so it is pending rather than interrupted.
+/// Ordered by `sequence`, which is total.
+///
+/// A bare `ContinuationRequested` is interrupted. The spawn dispatcher's
+/// orphan scan reads only `running` threads, and a request the previous
+/// process never started must not auto-resume after a crash.
 ///
 /// The terminator and activity lists are the chat sweep's own. The start list
 /// is wider than the chat sweep's: a coding-agent turn or a Continue rerun can
@@ -1871,7 +1973,7 @@ const INTERRUPTED_TURN_START_SQL: &str = concat!(
     SELECT s.id, s.event_type, s.channel FROM start s, marks m \
     WHERE s.sequence > COALESCE(m.last_terminal, 0) \
       AND (m.last_activity > s.sequence \
-           OR s.event_type NOT IN ('ChildThreadCompleted','ContinuationRequested'))"
+           OR s.event_type <> 'ChildThreadCompleted')"
 );
 
 /// The boot step that settles every thread still `running`, once recovery has
@@ -1882,10 +1984,10 @@ const INTERRUPTED_TURN_START_SQL: &str = concat!(
 /// - **An interrupted turn** gets `ResponseAborted { RecoveryAfterRestart }`,
 ///   what the chat sweep emits, so it reads "Response interrupted" with a
 ///   Continue. That includes a message the crash dropped before its first
-///   token, which otherwise sat unanswered with nothing saying why.
+///   token, and a `ContinuationRequested` the previous process never started.
 /// - **Anything else** goes straight to `idle`. An ended turn's `running` came
-///   from the event-less parent wake, and a pending start runs later in boot.
-///   An abort for either would record one that never happened.
+///   from the event-less parent wake, and a pending child completion runs
+///   later in boot. An abort for either would record one that never happened.
 ///
 /// `recovering` holds threads the coding-agent pass is about to resume.
 pub async fn settle_orphaned_running_threads(

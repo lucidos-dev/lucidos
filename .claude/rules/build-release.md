@@ -26,6 +26,12 @@ paths:
   - ".github/workflows/install-smoke.yml"
   - ".github/workflows/e2e.yml"
   - "scripts/check-e2e-workflow.sh"
+  - "scripts/lib/check_e2e_workflow_test.sh"
+  # The mirror's one-door gate (ADR 0462), described under "The mirror has one
+  # door" below. release_tree_push_test.sh matches scripts/lib/release_*.sh.
+  - "scripts/check-mirror-pushers.sh"
+  - "scripts/mirror-push-gate.sh"
+  - "scripts/lib/check_mirror_pushers_test.sh"
 ---
 
 # Build, Packaging & Installer
@@ -70,15 +76,16 @@ cd crates/lucidos-app && cargo tauri build # Desktop app
 
 Dev: native engine + Docker PostgreSQL. Production: the `.app` and the headless tarball above, each with bundled PostgreSQL.
 
-### GitHub Actions never gates a change: release checks plus on-demand e2e
+### GitHub Actions never gates a change: release checks, on-demand e2e and the main check
 
 Every workflow in `.github/workflows/` verifies a **release or delivery
-artifact**, or runs the e2e suites **when someone asks** (ADRs 0382, 0386). That is the
-complete list of what belongs there:
+artifact**, or runs the e2e suites **when someone asks** (ADRs 0382, 0386), or
+runs the engine's post-land **main check** (ADR 0464). That is the complete list
+of what belongs there:
 
 | workflow | fires on | verifies |
 |---|---|---|
-| `e2e.yml` | push to `e2e/**` by `./scripts/e2e*.sh` (GitHub is their default; `--local` stays here), plus a push to mirror `main` that only seeds the dependency cache | the selected e2e suites, sharded: Linux for API, WASM, embedder, `chromium` and `mobile`; macOS arm64 for `mobile-webkit`. No secrets, `contents: read`, and `e2e/*` branches never save a cache |
+| `e2e.yml` | push to `e2e/**` by `./scripts/e2e*.sh` (GitHub is their default; `--local` stays here) or by `./scripts/main-check.sh`, plus a push to mirror `main` that only seeds the dependency cache | the selected e2e suites, sharded: Linux for API, WASM, embedder, `chromium` and `mobile`; macOS arm64 for `mobile-webkit`. The `main-check` selection adds the engine suite on Linux, against Docker Postgres. No secrets, `contents: read`, and `e2e/*` branches never save a cache |
 | `install-smoke.yml` | push to `rc/**`, a `dmg_tag` dispatch (the RC draft gate, ADR 0036), `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, **route parity between the two front doors**, and that both front doors still parse under macOS `/bin/sh` |
 | `release-tarballs.yml` | `rc/**` push, `v*` tag push, manual | the per-triple headless tarball build, and attaching it to that tag's release (still a DRAFT at the time) |
 
@@ -116,6 +123,14 @@ inventory it is measured against.
 `e2e.yml` fits that rule because the agent asks for the run, before Apply, and
 waits for it. It never fires on its own. `./scripts/check-e2e-workflow.sh`
 enforces its limits in `/harden`.
+
+**The main check fits it too, because it gates nothing.** After a landing moves
+`main`, the engine runs `scripts/main-check.sh <sha>`: the engine suite plus
+every e2e suite, on a stripped copy of `main`. It never fires per push or
+PR, and no landing waits on it. One check runs at a time, and the next covers
+everything that landed meanwhile. A red one opens one fix thread, and `/harden`
+reads it with `lucidos main-check status` before fixing a failure that also
+fails on `main`. The coordinator is `engine::main_check`.
 
 `install-smoke.yml`'s two crons are the only non-release *triggers*, and both are
 deliberate — each verifies something **external** to the tree, which is why no
@@ -575,6 +590,44 @@ and that is a bug to fix at the source. Registered in `docs/temporary-measures.m
 (a mirror rebuild would re-derive a chain with no untagged commits, which is the
 removal condition).
 
+#### The mirror has one door: `release_tree_push` (ADR 0462)
+
+Every write to the public mirror goes through one function in
+`scripts/lib/release_tree.sh`. `release_tree_push <repo> <remote> <commit>
+<ref> [--force | --lease=<sha>]` refuses, naming the rule, unless all three
+hold:
+
+- **The ref is one a release or an e2e run owns**: `main`, `rc/*`, `e2e/*`, or
+  a `v*` tag.
+- **The commit's tree passes `release_tree_scan`.**
+- **Its ancestry is published.** The commit is the mirror's `main`, or a single
+  child of it. A parentless commit also passes, except for `main` itself once
+  it exists. A tag must name the mirror's `main`.
+
+`release_tree_delete_ref` deletes only `rc/*` and `e2e/*` branches. Both push
+by explicit URL, to the list `release_mirror_push_urls` returns: a real push
+URL on the remote, else the ones the gate saved in
+`release-tree.lucidos.pushurl`, else the fetch URL.
+
+The ancestry check reads `main` from each of those URLs. Every other mirror
+read goes through `release_mirror_ls_remote` or `release_mirror_fetch`, so a
+release reads the repository it pushes to.
+
+Both functions first run `release_mirror_gate`, which
+saves a real push URL it finds and sets `remote.lucidos.pushurl` to a refusing
+value. From then on a bare
+`git push lucidos …` fails. The value sits in the shared git config, so it
+covers every worktree. `scripts/mirror-push-gate.sh` installs it ahead of any
+push, and `/harden` Phase 4.5 runs it.
+
+`release.sh`, `release-to-lucidos.sh`, `release_abandon.sh` and
+`e2e_github.sh` all call it. Pushes to `origin` stay as they are.
+`./scripts/check-mirror-pushers.sh` fails `/harden` when any other tracked
+script pushes, or names the mirror's git URL. Fix a hit by routing the push
+through `release_tree_push`, never by widening the allowlist. Tested by
+`scripts/lib/release_tree_push_test.sh` and
+`scripts/lib/check_mirror_pushers_test.sh`.
+
 ### The source side: main gets the bump, and the tag names it (ADR 0029)
 
 The same tag name means a **different object per remote**, deliberately: the
@@ -844,7 +897,9 @@ The `sh-compat` job in `install-smoke.yml` runs the real thing on a macOS runner
 
 **TLS opt-in (`--tls-cert`/`--tls-key`, env `LUCIDOS_TLS_CERT`/`LUCIDOS_TLS_KEY`).** Both-or-neither, files must exist (fail closed). When supplied, the pairs are appended to the service/foreground env (`service_tls_env_pairs`) so the bundled gateway serves **https**, which is what gives a NON-localhost device a secure context (service worker, PWA install, web push all require one; plain http limits them to localhost). Works with `tailscale cert` / mkcert / CA certs. Engines still never see `LUCIDOS_TLS_*` (the gateway strips them: it terminates TLS, ADR 0014), and `restart_via_gateway` tolerates the scheme mismatch via `peer_scheme_order()`. Remote reachability is separate (`--bind` below, or Settings → Access → Network access; loopback-only default unchanged). Like provider creds, TLS is baked from THAT run's flags: a re-run without them reverts the service to plain http.
 
-**macOS CLT preflight (download / from-tarball paths).** `install.sh` probes `xcode-select -p` on Darwin and **warns (never dies)** when the Command Line Tools are absent: chat works, but coding agents / Apply / `run_python` shell out to git + python3, whose `/usr/bin` shims error until CLT is installed. The engine mirrors this at boot (`git_preflight` + `python_preflight` in `main.rs`, warn-only) and startup-augments its own process PATH with the common user-install bin dirs (`core::user_path::augment_process_path` — Homebrew, `/usr/local/bin`, `~/.local/bin`, npm-global; dedupe ⇒ no-op on a dev shell PATH) so bare-name tools (`claude`/`codex` fallbacks, chat bash/python shell-outs, stdio MCP servers) resolve under the launchd minimal PATH exactly as in dev. Agent children additionally get the bundled `LUCIDOS_PG_BIN_DIR` PATH-prepended (`spawn_env::agent_path_prefixes`) so the advertised bare `psql -c '…'` works inside coding-agent threads on a packaged install, mirroring what `workspace_script_env_vars` already did for chat bash/python tools.
+**macOS CLT preflight (download / from-tarball paths).** `install.sh` probes `xcode-select -p` on Darwin and **warns (never dies)** when the Command Line Tools are absent: chat works, but coding agents / Apply / `run_python` shell out to git + python3, whose `/usr/bin` shims error until CLT is installed. The engine mirrors this at boot, warn-only, in `git_preflight` and `python_preflight` (`main.rs`). It also prepends the common user-install bin dirs to its own PATH at startup: Homebrew, `/usr/local/bin`, `~/.local/bin` and npm-global (`core::user_path::augment_process_path`, a no-op on a dev shell PATH). So bare-name tools resolve under the launchd minimal PATH exactly as in dev: the `claude`/`codex` fallbacks, chat bash/python shell-outs and stdio MCP servers.
+
+Agent children also get the bundled `LUCIDOS_PG_BIN_DIR` prepended (`spawn_env::agent_path_prefixes`). So `psql "$LUCIDOS_DATABASE_URL"` works in coding-agent threads on a packaged install, as `workspace_script_env_vars` already arranged for chat bash/python tools.
 
 **Manager detection + degrade.** macOS → launchd; Linux → systemd `--user` (probed via `systemctl --user show-environment`) + best-effort `loginctl enable-linger` (announced, never hard-fails). **No supported manager** (e.g. a container) → **degrade to a foreground launch** with a clear message, never fail.
 

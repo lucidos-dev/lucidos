@@ -104,6 +104,36 @@ describe('an unread coding-agent message', () => {
     });
   });
 
+  // A long turn's own read sits pages back, so the loaded window holds none.
+  // The prompt naming the message is proof enough that reads get reported.
+  it.each([
+    ['in one load', false],
+    ['as each event arrives', true],
+  ])('queues behind a turn whose read is outside the loaded window, %s', (_, live) => {
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+    });
+    for (const [seq, event] of [
+      ev(1, message('start'), 'm1'),
+      ev(3, said('working on it')),
+      ev(4, message('also check the totals'), 'm2'),
+      ev(5, { type: 'CodingAgentPromptSent', text: 'also check the totals', input_event_id: 'm2', channel: 'claude_code' }),
+      ev(6, said('still on the first job')),
+    ]) {
+      thread.events.set(seq, event);
+      if (live) computeExchanges(thread);
+    }
+    const exchanges = computeExchanges(thread);
+    expect(texts(byMessage(exchanges, 'start'))).toEqual(['working on it', 'still on the first job']);
+    const queued = byMessage(exchanges, 'also check the totals');
+    expect(queued.awaitingRead).toBe(true);
+    expect(queued.steps).toEqual([]);
+  });
+
   it('takes the next turn when the running one ends with it unread', () => {
     const exchanges = groupIntoExchanges(new Map([
       ev(1, message('start'), 'm1'),

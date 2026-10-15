@@ -5,7 +5,6 @@
 import { fetchThreadWidgets, listReusableWidgetsApi } from '../../api/client/widgets';
 import { loadingIfFresh, toFailed } from '../types';
 import {
-  appliedThreadWidgetTickets,
   openShelfWidget,
   reusableWidgets,
   threadWidgets,
@@ -23,9 +22,9 @@ let lastTicket = 0;
  *  older read that lands late cannot put back a chip a newer one removed. */
 const newestThreadWidgetsRead = new Map<string, number>();
 
-/** Start a read of a thread's widgets and return its ticket at once. A
- *  re-read keeps the chips and cards on screen meanwhile. */
-export function rereadThreadWidgets(threadId: string): number {
+/** Start a read of a thread's widgets. A re-read keeps the chips and inline
+ *  widgets on screen meanwhile. */
+export function rereadThreadWidgets(threadId: string): void {
   const ticket = ++lastTicket;
   newestThreadWidgetsRead.set(threadId, ticket);
   setThreadWidgets(threadId, loadingIfFresh(threadWidgetsFor(threadId)));
@@ -33,9 +32,6 @@ export function rereadThreadWidgets(threadId: string): number {
     (data) => {
       if (newestThreadWidgetsRead.get(threadId) !== ticket) return;
       setThreadWidgets(threadId, { status: 'loaded', data });
-      const applied = new Map(appliedThreadWidgetTickets.value);
-      applied.set(threadId, ticket);
-      appliedThreadWidgetTickets.value = applied;
     },
     (error) => {
       if (newestThreadWidgetsRead.get(threadId) !== ticket) return;
@@ -43,7 +39,6 @@ export function rereadThreadWidgets(threadId: string): number {
       if (threadWidgetsFor(threadId).status !== 'loaded') setThreadWidgets(threadId, toFailed(error));
     },
   );
-  return ticket;
 }
 
 /** A widget event for this thread arrived over SSE, or the stream came back

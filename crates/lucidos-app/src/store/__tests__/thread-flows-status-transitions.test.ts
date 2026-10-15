@@ -3,12 +3,12 @@ import { getExchanges, getExchangesWithPending, getLabel, insertEvents, makeThre
 import { applySummaryVersion, changeReadyToReview, exchangeStatus, exchangeTimestamp, exchangeUserMessage, getCodingAgentWaitingInfo, groupIntoExchanges } from '../thread-events';
 import { displaySection } from '../../generated/thread-lifecycle';
 import { effectiveThreadStatus } from '../store';
+import { _holdArchiveForTesting, _resetRowIntentsForTesting } from '../rowIntents';
 
 beforeEach(resetSeqCounter);
 
 describe('Bug: dismissed thread keeps red status dot until SSE round-trip lands', () => {
   it('effectiveThreadStatus returns idle once dismiss is requested, even on a failed thread', async () => {
-    const { archivingThreadIds } = await import('../store');
     const { map, id } = makeThread('failed-thread');
     const thread = map.get(id)!;
     applySummaryVersion(thread.meta, thread.meta.summaryVersion, 'failed');
@@ -17,11 +17,11 @@ describe('Bug: dismissed thread keeps red status dot until SSE round-trip lands'
     expect(effectiveThreadStatus(thread)).toBe('failed');
 
     // User clicks dismiss → optimistic state added before SSE arrives.
-    archivingThreadIds.value = new Set([id]);
+    _holdArchiveForTesting([id]);
     try {
       expect(effectiveThreadStatus(thread)).toBe('idle');
     } finally {
-      archivingThreadIds.value = new Set();
+      _resetRowIntentsForTesting();
     }
   });
 });
@@ -31,7 +31,7 @@ describe('Bug: dismissed thread keeps red status dot until SSE round-trip lands'
 // ---------------------------------------------------------------------------
 describe('Bug: applying a change keeps thread in Review until CC actually runs', () => {
   it('effectiveThreadStatus does not flip to running just because Apply was clicked', async () => {
-    const { applyingNowThreadIds } = await import('../store');
+    const { applyNowRequests } = await import('../store');
     const { map, id } = makeThread('cc-with-changes');
     const thread = map.get(id)!;
     thread.meta.channel = 'claude_code';
@@ -41,7 +41,7 @@ describe('Bug: applying a change keeps thread in Review until CC actually runs',
 
     expect(effectiveThreadStatus(thread)).toBe('waiting');
 
-    applyingNowThreadIds.value = new Map([[id, 'requesting']]);
+    applyNowRequests.value = new Map([[id, null]]);
     try {
       // Status must stay 'waiting' — only CC activity events (or harden/conflict
       // boundary events that precede them) should flip the thread to running.
@@ -56,7 +56,7 @@ describe('Bug: applying a change keeps thread in Review until CC actually runs',
       );
       expect(section).toBe('current');
     } finally {
-      applyingNowThreadIds.value = new Map();
+      applyNowRequests.value = new Map();
     }
   });
 });

@@ -13,6 +13,7 @@ async fn emit_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>, tex
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -312,6 +313,7 @@ async fn coding_agent_routing_is_derived_from_the_child_row() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "coding task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -366,6 +368,7 @@ async fn the_home_thread_follows_up_a_coding_agent_thread_it_never_spawned() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "coding task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1144,6 +1147,7 @@ async fn parent_redirects_a_coding_agent_child_and_the_card_count_matches() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "task B".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1172,6 +1176,9 @@ async fn parent_redirects_a_coding_agent_child_and_the_card_count_matches() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1242,6 +1249,7 @@ async fn follow_up_marks_the_callback_pending() {
                 event: ThreadEvent::MessageReceived {
                     provider: None,
                     voice_session_id: None,
+                    wake_mode: None,
                     text: "child task".into(),
                     user_image_hashes: vec![],
                     device_id: None,
@@ -1318,6 +1326,7 @@ async fn a_coding_agent_child_ending_with_response_generated_reports_nothing() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "coding task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1346,6 +1355,9 @@ async fn a_coding_agent_child_ending_with_response_generated_reports_nothing() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1392,6 +1404,7 @@ async fn a_question_parked_coding_agent_child_acks_held() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "coding task".into(),
             user_image_hashes: vec![],
             device_id: None,

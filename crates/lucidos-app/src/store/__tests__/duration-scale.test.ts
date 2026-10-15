@@ -167,17 +167,12 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     what: "runs the image viewer's swipe cleanup if transitionend never fires",
   },
   {
-    file: '../../components/widgets/WidgetWindows.tsx',
-    expr: /scaledDurationMs\(WIDGET_WINDOW_FADE_MS\) \+ WIDGET_WINDOW_FADE_SLACK_MS/,
-    what: 'keeps a closing widget window mounted through its fade out',
-  },
-  {
     file: '../../hooks/panelStepMorph.ts',
     expr: /scaledDurationMs\(STEP_MORPH_MS\) \+ STEP_MORPH_SLACK_MS/,
     what: 'settles a step morph if its finish event never arrives',
   },
   {
-    file: '../../components/layout/Drawer.tsx',
+    file: '../../components/layout/drawerState.ts',
     expr: /scaledDurationMs\(DRAWER_SLIDE_OUT_MS\) \+ DRAWER_SLIDE_OUT_SLACK_MS/,
     what: 'closes the menu drawer if its slide-out end never arrives',
   },
@@ -185,6 +180,11 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     file: '../../components/shared/overlayExitDrawing.ts',
     expr: /scaledDurationMs\(MODAL_FADE_MS\) \+ MODAL_FADE_SLACK_MS/,
     what: "removes a closed modal's exit drawing once its fade has run",
+  },
+  {
+    file: '../../components/layout/SplitLayout.tsx',
+    expr: /scaledDurationMs\(PANE_TRANSITION_MS\) \+ 100/,
+    what: "migrates the split once the Home board's rail has slid in",
   },
   // The only entry whose transition is INLINE rather than a token. The FLIP
   // writes `transform` and `height` durations onto the element itself, so

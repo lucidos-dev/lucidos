@@ -1,4 +1,4 @@
-//! `lucidos ask-owner-approval <verb> [--thread <id>] --reason "<why>"`: ask
+//! `lucidos ask-owner-approval <verb> --thread <id> --reason "<why>"`: ask
 //! the workspace owner to let this thread press one clause-4 act once
 //! (ADR 0387).
 //!

@@ -30,7 +30,6 @@ import { generateUuid } from '../../utils/uuid';
 import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, retireUnsentExchange, type PendingUserMessage, type StoredEvent, type QueuedMessage } from '../thread-events';
 import { getDraft } from '../composeDrafts';
 import { reopenEmptyDraft, updateCompose } from './compose';
-import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { bumpThreadEvents } from '../threadActivity';
 import { getThreadModelOverride, clearThreadModelOverride } from '../threadModelSelections';
@@ -46,6 +45,7 @@ import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
+import { acceptComposeReport, parseComposeReport } from '../composeSync';
 
 /** Safety timeout (ms) for an accepted send's pending row. If SSE doesn't
  *  deliver the MessageReceived event within this window, we force-refresh
@@ -455,6 +455,7 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
     // CodingAgentSettingsChanged events.
     event_id: eventId,
     thread_id: threadId,
+    ...sendSlot.position,
     ...(options?.context ?? {}),
   };
   if (imageHashes?.length) body.image_hashes = imageHashes;
@@ -596,9 +597,9 @@ async function postSend(send: {
     void retireWelcomeAfterUse(threadMap.value.values());
     return 'sent';
   };
-  // Serialized per thread. The optimistic row is already on screen, so the
-  // wait costs the user nothing visible. It keeps the engine's record in the
-  // order they pressed send.
+  // Paced per thread. The optimistic row is already on screen, so the wait
+  // costs the user nothing visible. It keeps a quick second send from
+  // overtaking this one, which the engine would refuse (ADR 0449).
   if (sendSlot.waitForTurn) await sendSlot.waitForTurn;
   const result = await withQuietRetries(() => submitChat(body), {
     path: 'message',
@@ -608,6 +609,10 @@ async function postSend(send: {
   });
   switch (result.kind) {
     case 'done':
+      // The send consumed the thread's compose slot at accept; the report says
+      // what that left (ADR 0450).
+      if (result.value.compose) acceptComposeReport(threadId, parseComposeReport(result.value.compose));
+      return accepted();
     case 'landed':
       return accepted();
     case 'gave-up':
@@ -752,10 +757,12 @@ export function showRestoredUnsentMessage(record: UnsentMessageRecord): void {
 export async function retryUnsentMessage(eventId: string): Promise<SendOutcome | null> {
   const unsent = takeUnsentMessage(eventId);
   if (!unsent) return null;
-  const { threadId, body } = unsent;
+  const { threadId } = unsent;
   const thread = threadMap.value.get(threadId);
   if (!thread) return null;
   const sendSlot = enterSendChain(threadId);
+  // A fresh place at the tail: the engine already admitted what was sent since.
+  const body = { ...unsent.body, ...sendSlot.position };
   let outcome: SendOutcome;
   try {
     retireUnsentExchange(thread, eventId);
@@ -839,10 +846,8 @@ export function appendMessagesToCompose(threadId: string, messages: ReadonlyArra
   const existing = getDraft(threadId).text;
   const addition = texts.join('\n\n');
   const combined = existing.trim().length > 0 ? `${existing}\n\n${addition}` : addition;
+  // An append: the draft keeps its prefix, so the caret stays where it was.
   updateCompose(threadId, { text: combined });
-  // `'append'` rather than `'replace'`: the draft the user was writing keeps its
-  // prefix, so their caret still points at the character it did and stays put.
-  requestPromptOverrideSync('append');
 }
 
 /** On a user Stop of a chat thread, return un-injected queued follow-ups to the

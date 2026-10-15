@@ -135,6 +135,7 @@ describe('backgroundRowCaveat', () => {
     reachable,
     not_served: [],
     needs_vision: false,
+    asks_no_model: false,
     vision: false,
     recommended: [],
     ...more,
@@ -184,6 +185,17 @@ describe('backgroundRowCaveat', () => {
     expect(
       backgroundRowCaveat(row(true, { source: 'default', not_served: ['claude-haiku-4-5'] }), null),
     ).toBe('Moved past claude-haiku-4-5: its provider no longer serves it');
+  });
+
+  /** The wake decision asks nothing then, so its parents always wake. */
+  it('says when no measured model is reachable', () => {
+    expect(
+      backgroundRowCaveat(row(true, { source: 'chat-model', asks_no_model: true }), null),
+    ).toBe('No measured model is reachable, so every report wakes its parent');
+    expect(
+      backgroundRowCaveat(row(false, { source: 'chat-model', asks_no_model: true }), null),
+      'a model the gate never asks cannot be the problem',
+    ).toBe('No measured model is reachable, so every report wakes its parent');
   });
 
   it('says when the engine could not be asked', () => {

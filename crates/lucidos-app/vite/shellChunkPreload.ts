@@ -12,23 +12,11 @@
  */
 
 import type { Plugin } from 'vite';
-
-const SHELL_MODULE = '/src/App.tsx';
-
-type BundleChunk = { type: 'chunk'; fileName: string; moduleIds: string[]; imports: string[]; isEntry: boolean };
-type BundleEntry = BundleChunk | { type: 'asset' };
+import { bundleChunks, findShellChunk, type BundleEntry } from './shellChunk';
 
 export function shellPreloadHrefs(bundle: Record<string, BundleEntry>, base: string): string[] {
-  const chunks = Object.values(bundle).filter((o): o is BundleChunk => o.type === 'chunk');
-  // By membership, not `facadeModuleId`: Rollup leaves that null when the chunk
-  // also exports shared code to the chunks that import it.
-  const shell = chunks.find((c) => c.moduleIds.some((id) => id.endsWith(SHELL_MODULE)));
-  if (!shell) {
-    throw new Error(
-      `No shell chunk for ${SHELL_MODULE}. main.tsx must import('./App') dynamically, `
-      + 'or the entry chunk carries the whole UI again (ADR 0288).',
-    );
-  }
+  const chunks = bundleChunks(bundle);
+  const shell = findShellChunk(chunks);
   const entry = chunks.find((c) => c.isEntry);
   const loadedByEntry = new Set([entry?.fileName, ...(entry?.imports ?? [])]);
   const files = [shell.fileName, ...shell.imports.filter((f) => !loadedByEntry.has(f))];

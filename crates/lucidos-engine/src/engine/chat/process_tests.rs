@@ -31,7 +31,7 @@ fn run_build(
     app_context_section: &str,
     file_context_section: &str,
     url_context_section: &str,
-    mcp_stopped_context: &str,
+    mcp_servers_context: &str,
     setup_reminder: &str,
     thread_depth_context: &str,
     user_message: &str,
@@ -51,7 +51,7 @@ fn run_build(
         app_context_section,
         file_context_section,
         url_context_section,
-        mcp_stopped_context,
+        mcp_servers_context,
         "",
         setup_reminder,
         thread_depth_context,
@@ -98,6 +98,7 @@ fn trigger_context_has_no_preload_fields() {
         invocation: TriggerInvocation::Schedule,
         go_to_review: false,
         side_effect_grant: vec![],
+        mcp_servers: vec![],
         queue_entry_id: uuid::Uuid::new_v4(),
     };
 }
@@ -779,7 +780,7 @@ fn build_capture_sections_tags_existing_sections_with_role_and_group() {
         Some("Active context".to_string())
     );
     assert_eq!(
-        by_name("Stopped MCP Servers").group,
+        by_name("MCP Servers").group,
         Some("System notices".to_string())
     );
     assert_eq!(

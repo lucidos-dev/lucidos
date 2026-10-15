@@ -12,11 +12,13 @@
 //!   the run future is dropped instead of completed.
 
 mod completion;
-mod entry_guard;
+pub(in crate::engine::agent_session) mod entry_guard;
 mod idle_change_state;
 mod idle_snapshot;
 mod run;
 mod spawn_context;
+
+pub(crate) use spawn_context::{link_node_modules, provision_generated_files};
 
 #[cfg(test)]
 #[path = "../run_session_tests.rs"]

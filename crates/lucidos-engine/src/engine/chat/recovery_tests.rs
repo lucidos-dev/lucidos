@@ -72,6 +72,7 @@ async fn emit_orphan_turn(bus: &EventBus, thread_id: Uuid) {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "stuck request".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -108,6 +109,7 @@ async fn emit_orphan_tool_call(bus: &EventBus, thread_id: Uuid) {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "trigger a tool".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -241,8 +243,8 @@ async fn orphan_threads_query_excludes_threads_owned_by_cc_recovery() {
     // `recover_orphaned_worktrees` runs first and returns the set of
     // coding-agent threads it is resuming/settling; `main.rs` passes that set as
     // `exclude_thread_ids` so the chat orphan sweep does NOT emit a duplicate
-    // `ResponseAborted` on a thread CC recovery already owns (which — combined
-    // with the startup-lease serialization — is what stops the chat sweep from
+    // `ResponseAborted` on a thread CC recovery already owns (which, combined
+    // with the engine's owner lock serializing restarts, is what stops the chat sweep from
     // aborting an in-flight CC thread out from under its auto-resume). This pins
     // the `exclude_thread_ids` bind: an excluded orphan is filtered out, an
     // otherwise-identical control orphan is still returned.
@@ -488,6 +490,7 @@ mod switch_resume {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -720,6 +723,7 @@ mod switch_resume {
                 branch: String::new(),
                 origin: None,
                 reason: None,
+                resumed_abort_id: None,
             },
             meta: EventMeta::NONE,
         })

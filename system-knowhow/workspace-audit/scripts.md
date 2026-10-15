@@ -1,6 +1,6 @@
 ---
 name: Workspace audit: scripts
-description: The scripts audit section: CLI usage for data writes, events and API calls, and hardcoded machine paths.
+description: The scripts audit section: CLI usage for data writes, events and API calls, hardcoded machine paths, and database access through LUCIDOS_DATABASE_URL.
 ---
 
 # Workspace audit section: scripts
@@ -15,6 +15,7 @@ Append these lines to the root's scan preamble, before its receipts tail:
 
 ```bash
 scan machine-path "/(Users|home)/[^\"'[:space:]]+" $all
+scan db-defaults "(^|[^[:alnum:]_])(psql|pg_dump)([^[:alnum:]_.-]|\$)|psycopg2?\.connect\(|new (pg\.)?(Client|Pool)\(|PG(HOST|PORT|USER|PASSWORD|DATABASE)|(^|[^[:alnum:]_])DATABASE_URL" $all
 ```
 
 ## Checks
@@ -31,3 +32,35 @@ Per `system-knowhow/lucidos-cli.md`:
 Per `system-knowhow/best-practices.md`:
 
 - Script lives with its sole consumer (single-app script in `apps/<id>/scripts/`, not shared `data/scripts/`).
+
+Per `system-knowhow/best-practices.md` § "The workspace database: `LUCIDOS_DATABASE_URL`":
+
+- **Database access that leans on the engine's old `PG*` defaults.** The engine used to set `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGPORT` and `PGDATABASE` in every subprocess, and its own `DATABASE_URL` leaked into many. It sets neither now (ADR 0481). So a `psql`, `pg_dump`, `psycopg.connect()` or `pg.Client()` with no connection argument now reaches no database. Code reading `PG*` or `DATABASE_URL` for the workspace database finds nothing. Judge each `db-defaults` hit:
+  - No connection argument, or a `PG*` / `DATABASE_URL` read meant for the workspace database: severity **broken**.
+  - A write through `$LUCIDOS_DATABASE_URL` with no `BEGIN READ WRITE`: severity **broken**, since the handle is read-only by default.
+  - Skip a call that already passes `$LUCIDOS_DATABASE_URL` and only reads. Skip one aimed at another database the script configures itself, such as a project `DATABASE_URL` the user set as an environment variable (`lucidos env-vars list`).
+  - A hit on a wrapper (`def psql(`, `function psql(`): read the wrapper body. The connection argument lives there or is missing there. Calls to the wrapper are noise.
+
+  This is the ADR 0214 migration check for ADR 0481.
+
+## Remediation
+
+Fixes run only on request, as the root's § Remediation says. A fix thread gets
+the table for its finding.
+
+### Pointing database access at `LUCIDOS_DATABASE_URL`
+
+| Old | New |
+|---|---|
+| `psql -At -c "…"`, any flags | `psql "$LUCIDOS_DATABASE_URL" -At -c "…"` |
+| `pg_dump …` | `pg_dump --dbname="$LUCIDOS_DATABASE_URL" …` |
+| `psycopg.connect()` or `psycopg2.connect("")` | `psycopg.connect(os.environ["LUCIDOS_DATABASE_URL"])` |
+| `new pg.Client()` | `new pg.Client({ connectionString: process.env.LUCIDOS_DATABASE_URL })` |
+| `$DATABASE_URL`, `os.environ["DATABASE_URL"]` or a `PG*` read, meant for the workspace | the same read of `LUCIDOS_DATABASE_URL` |
+| A write: `INSERT`, `UPDATE`, `DELETE` or DDL | the same statements inside `BEGIN READ WRITE; … COMMIT;` |
+
+Three rules the rewrite has to follow:
+
+- **Name the variable, never its value.** A pasted URL puts the password in the script and in every tool call that runs it.
+- **List every write you wrapped** in the report's `## Remediation` section. The read-only default exists to catch an accident, so a human confirms each write was meant.
+- **Leave a project's own database alone.** A connection the script configures for another database is not a finding.

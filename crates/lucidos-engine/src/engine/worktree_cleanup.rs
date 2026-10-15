@@ -6,8 +6,9 @@
 //! Cargo `target/` directory persists, and disk usage grows monotonically.
 //!
 //! Cleanup runs on [`CLEANUP_INTERVAL`] (15 minutes) and applies three tiers
-//! per thread (Tier 0, Tier 1, Tier 2), plus sweeps for stranded, orphan-path
-//! and temporary worktrees. The low-disk alert runs apart, in [`DiskMonitor`].
+//! per thread (Tier 0, Tier 1, Tier 2), or the archived removal for an
+//! archived thread. It also sweeps stranded, orphan-path, temporary and
+//! `reclaiming-` worktrees. The low-disk alert runs apart, in [`DiskMonitor`].
 //!
 //! **Retention gate (the load-bearing policy).** A worktree is the user's warm
 //! working copy of a thread — reopening a thread with its worktree still on disk
@@ -18,6 +19,17 @@
 //! [`FREE_DISK_SOFT_BYTES`]. Archiving is the explicit "I'm done" signal, from
 //! the user or the thread's agent (ADR 0310).
 //!
+//! **Archived removal (ADR 0458).** An archived thread's worktree goes once
+//! idle past [`ARCHIVED_REMOVAL_GRACE`], dirty or ahead of main. Build
+//! artifacts go first, then any dirt is committed on the thread's own branch
+//! ([`SNAPSHOT_COMMIT_MESSAGE`]). A branch with commits ahead stays. Tier 0
+//! and Tier 2 do not run for an archived thread. Emits `WorktreeCleaned
+//! { tier: 2 }`.
+//!
+//! Every full removal first moves the tree to a `reclaiming-` sibling. A crash
+//! then never leaves a partial tree at the thread path, and the next pass
+//! deletes the leftover.
+//!
 //! While disk is comfortable and the thread is non-archived, the worktree is
 //! never removed. Its build artifacts stay too, unless the thread has nothing
 //! pending (Tier 1 below). The gate is `WorktreeCleanup::reclaim_pressure`; the
@@ -26,9 +38,9 @@
 //! gate: live sessions and *stranded* worktrees (broken git admin dir — removed
 //! immediately because they hold nothing recoverable).
 //!
-//! **Fan-in retention (ADR 0011, B2).** The two *full-removal* tiers (Tier 0 and
-//! Tier 2) additionally skip any thread with an outstanding parent↔child fan-in
-//! obligation — a direct child still running (`active_children_count > 0`) or a
+//! **Fan-in retention (ADR 0011, B2).** The full removals (Tier 0, Tier 2 and
+//! the archived removal) also skip a thread that owes a parent↔child fan-in.
+//! That is a direct child still running (`active_children_count > 0`), or a
 //! `ChildThreadCompleted` as its latest persisted event (a child completed but
 //! the parent hasn't processed it yet). Reclaiming such a worktree would leave
 //! the parent with nothing to resume into when it reacts to the completion (the
@@ -109,9 +121,11 @@ use sqlx::PgPool;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::engine::agent_session::SpawnsInFlight;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
-use crate::engine::git_ops::{git_cmd, has_branch_commits, worktrees_dir, SHORT_THREAD_ID_LEN};
+use crate::engine::git_ops::{
+    commit_worktree_or_err, git_cmd, has_branch_commits, worktree_current_branch,
+    worktree_dirtiness, worktree_liveness, worktrees_dir, GitAnswer, SHORT_THREAD_ID_LEN,
+};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::tools::bash_background::BackgroundBashRegistry;
 use crate::engine::types::AgentSession;
@@ -129,25 +143,22 @@ pub trait ActiveThreads: Send + Sync {
     async fn is_active(&self, thread_id: Uuid) -> bool;
 }
 
-/// Asks the engine's three in-memory sources of work in a worktree: live agent
-/// sessions, coding-agent spawns still starting, and running background tasks.
-/// All die with the engine, so memory is the whole truth, and the probe never
+/// Asks the engine's two in-memory sources of work in a worktree: the runs in
+/// `agent_sessions` (starting, live or finishing) and running background tasks.
+/// Both die with the engine, so memory is the whole truth, and the probe never
 /// waits on the database.
 pub struct EngineActiveThreads {
     sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
-    spawns_in_flight: Arc<SpawnsInFlight>,
     background_tasks: BackgroundBashRegistry,
 }
 
 impl EngineActiveThreads {
     pub(crate) fn new(
         sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
-        spawns_in_flight: Arc<SpawnsInFlight>,
         background_tasks: BackgroundBashRegistry,
     ) -> Self {
         Self {
             sessions,
-            spawns_in_flight,
             background_tasks,
         }
     }
@@ -156,19 +167,17 @@ impl EngineActiveThreads {
 #[async_trait::async_trait]
 impl ActiveThreads for EngineActiveThreads {
     async fn is_active(&self, thread_id: Uuid) -> bool {
-        if self.spawns_in_flight.contains(thread_id) {
-            return true;
-        }
-        // Presence in the map is not liveness, `AgentSession::is_live` is. A
-        // phantom left by a dropped run future would otherwise hold this
-        // `true` forever and block reclamation of a long-dead tree.
-        let session_live = self
+        // A spawn claims its entry before it sets up the worktree, and a run
+        // holds it until finalize is done with the tree. Presence alone is not
+        // enough: a phantom left by a dropped run future has let go, and would
+        // otherwise block reclamation of a long-dead tree forever.
+        let run_holds_thread = self
             .sessions
             .lock()
             .await
             .get(&thread_id)
-            .is_some_and(|s| s.is_live());
-        session_live
+            .is_some_and(crate::engine::agent_session::spawn_claim::holds_thread);
+        run_holds_thread
             || self
                 .background_tasks
                 .has_running_for_thread(thread_id)
@@ -181,6 +190,16 @@ impl ActiveThreads for EngineActiveThreads {
 /// resolve a thread's worktree without depending on the crate-private
 /// `agent_session` module.
 pub(crate) use crate::engine::agent_session::resume::deterministic_worktree_path as deterministic_worktree_for;
+use crate::engine::agent_session::resume::lookup_session_branch_for_thread;
+
+/// Idle time after which an archived thread's worktree is removed, dirty or
+/// ahead of main. Long enough that Undo or Move to Current finds the tree warm.
+/// Drops to 0 under hard disk pressure.
+pub const ARCHIVED_REMOVAL_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// The commit that keeps an archived tree's uncommitted work on its branch.
+pub(crate) const SNAPSHOT_COMMIT_MESSAGE: &str =
+    "Coding agent changes (snapshot before worktree removal)";
 
 /// Idle threshold for Tier 1 (build-artifact stripping). 24 hours.
 pub const TIER_1_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -407,6 +426,17 @@ impl WorktreeCleanup {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            // A removal cut short after moving its tree aside. The tree's
+            // commits live on its branch, so only the bytes are left.
+            if name.starts_with(RECLAIMING_PREFIX) {
+                if is_safe_subpath(&dir, &path) && remove_reclaiming_dir(&path).await {
+                    log!(
+                        "[WorktreeCleanup] removed {}, left by an interrupted removal",
+                        path.display()
+                    );
+                }
+                continue;
+            }
             let pre_size = measure_on_blocking_pool(&path, self.size_walk).await;
 
             // Orphaned temporary worktrees (`harden-`/`apply-`/`merge-`) left by
@@ -477,32 +507,18 @@ impl WorktreeCleanup {
 
                         // Each tier asks the gate before its checks, as a cheap
                         // filter, and again right before it deletes anything.
+                        // An archived thread takes the archived removal in place
+                        // of Tier 0 and Tier 2.
                         let mut gate = ReclaimGate::new(thread_id, age);
-                        if self
-                            .reclaim_pressure(&mut gate, DiskPressure::zero_info_grace)
-                            .await
-                            .is_some()
-                        {
-                            if let Some((freed, pressure)) =
-                                self.try_tier_0(&mut gate, &path, pre_size).await
-                            {
-                                total_freed_under_hard = total_freed_under_hard
-                                    .saturating_add(pressure.hard_reclaimed(Some(freed)));
-                                continue;
-                            }
-                        }
-                        if self
-                            .reclaim_pressure(&mut gate, |_| TIER_2_IDLE)
-                            .await
-                            .is_some()
-                        {
-                            if let Some((freed, pressure)) =
-                                self.try_tier_2(&mut gate, &path, pre_size).await
-                            {
-                                total_freed_under_hard = total_freed_under_hard
-                                    .saturating_add(pressure.hard_reclaimed(Some(freed)));
-                                continue;
-                            }
+                        let removed = if self.archived(&mut gate).await {
+                            self.try_archived_removal(&gate, &path, pre_size).await
+                        } else {
+                            self.try_removal_tiers(&mut gate, &path, pre_size).await
+                        };
+                        if let Some((freed, pressure)) = removed {
+                            total_freed_under_hard = total_freed_under_hard
+                                .saturating_add(pressure.hard_reclaimed(Some(freed)));
+                            continue;
                         }
                         if let Some((freed, pressure)) = self.try_tier_1(&mut gate, &path).await {
                             total_freed_under_hard = total_freed_under_hard
@@ -548,8 +564,7 @@ impl WorktreeCleanup {
     /// signal) or free disk is below the soft threshold.
     ///
     /// On top of the gate, the worktree must have been idle for `min_age`,
-    /// which some tiers derive from the same pressure reading. Under soft
-    /// pressure the archive lookup is skipped entirely.
+    /// which some tiers derive from the same pressure reading.
     async fn reclaim_pressure(
         &self,
         gate: &mut ReclaimGate,
@@ -557,17 +572,184 @@ impl WorktreeCleanup {
     ) -> Option<DiskPressure> {
         let mut pressure = self.disk_pressure();
         if !pressure.under_soft {
-            let archived = match gate.archived {
-                Some(known) => known,
-                None => *gate.archived.insert(self.is_archived(gate.thread_id).await),
-            };
-            if !archived {
+            if !self.archived(gate).await {
                 return None;
             }
             // Read again: the archive lookup may have waited on the database.
             pressure = self.disk_pressure();
         }
         (gate.age >= min_age(&pressure)).then_some(pressure)
+    }
+
+    /// [`Self::is_archived`], asked once per worktree per pass.
+    async fn archived(&self, gate: &mut ReclaimGate) -> bool {
+        match gate.archived {
+            Some(known) => known,
+            None => *gate.archived.insert(self.is_archived(gate.thread_id).await),
+        }
+    }
+
+    /// The full-removal tiers of a non-archived thread: Tier 0, then Tier 2.
+    /// Both stay behind the retention gate.
+    async fn try_removal_tiers(
+        &self,
+        gate: &mut ReclaimGate,
+        worktree: &Path,
+        pre_size: u64,
+    ) -> Option<(u64, DiskPressure)> {
+        if self
+            .reclaim_pressure(gate, DiskPressure::zero_info_grace)
+            .await
+            .is_some()
+        {
+            if let Some(removed) = self.try_tier_0(gate, worktree, pre_size).await {
+                return Some(removed);
+            }
+        }
+        self.reclaim_pressure(gate, |_| TIER_2_IDLE).await?;
+        self.try_tier_2(gate, worktree, pre_size).await
+    }
+
+    /// Archived removal: an archived thread's worktree goes once it has been
+    /// idle past [`ARCHIVED_REMOVAL_GRACE`], dirty or ahead of main. Dirt is
+    /// committed on the thread's own branch first. A branch holding commits
+    /// stays, since this is reclamation ([`BranchDisposal::WhenMerged`]).
+    async fn try_archived_removal(
+        &self,
+        gate: &ReclaimGate,
+        worktree: &Path,
+        pre_size: u64,
+    ) -> Option<(u64, DiskPressure)> {
+        let thread_id = gate.thread_id;
+        if gate.age < self.disk_pressure().archived_grace() {
+            return None;
+        }
+        let keep = |reason: String| {
+            log!(
+                "[WorktreeCleanup] keeping archived thread {}'s worktree: {}",
+                thread_id,
+                reason
+            );
+        };
+        let head = match self.check_archived_removal(thread_id, worktree).await {
+            Ok(head) => head,
+            Err(reason) => {
+                keep(reason);
+                return None;
+            }
+        };
+        // The checks above may have waited minutes on the database or git.
+        self.archived_removal_still_due(gate).await?;
+        if let Err(reason) = self.snapshot_dirt(thread_id, worktree, &head).await {
+            keep(reason);
+            return None;
+        }
+        // The snapshot strips build output and commits, which takes minutes.
+        // Undo, Move to Current or a new session may have landed meanwhile.
+        let pressure = self.archived_removal_still_due(gate).await?;
+        let outcome = remove_worktree_and_optionally_delete_branch(
+            worktree,
+            Some(pre_size),
+            BranchDisposal::WhenMerged,
+        )
+        .await?;
+        log!(
+            "[WorktreeCleanup] archived removal freed {} bytes for thread {} (branch_deleted={})",
+            outcome.freed_bytes,
+            thread_id,
+            outcome.branch_deleted
+        );
+        // Tier 2 is the event's word for "the whole tree is gone".
+        self.emit_cleaned(thread_id, 2, outcome.freed_bytes, outcome.branch_deleted)
+            .await;
+        Some((outcome.freed_bytes, pressure))
+    }
+
+    /// `Some(pressure)` while the archived removal may still go ahead: past
+    /// the grace, still archived, and nothing live in the tree.
+    async fn archived_removal_still_due(&self, gate: &ReclaimGate) -> Option<DiskPressure> {
+        let pressure = self.disk_pressure();
+        let still = gate.age >= pressure.archived_grace()
+            && self.is_archived(gate.thread_id).await
+            && !self.active_threads.is_active(gate.thread_id).await;
+        still.then_some(pressure)
+    }
+
+    /// May an archived thread's tree go? `Ok` carries the branch HEAD is on.
+    /// `Err` says why the tree stays. Every unanswered probe keeps it.
+    async fn check_archived_removal(
+        &self,
+        thread_id: Uuid,
+        worktree: &Path,
+    ) -> Result<String, String> {
+        if has_pending_fan_in(&self.pool, thread_id).await {
+            return Err("the thread still owes a child fan-in".into());
+        }
+        match self.changes.pending_for_thread(thread_id).await {
+            Ok(pending) if pending.is_empty() => {}
+            Ok(_) => return Err("a change is still pending".into()),
+            Err(e) => return Err(format!("the pending-change lookup failed: {e}")),
+        }
+        // A tree whose `.git` is gone resolves upward to the enclosing repo.
+        if !worktree_liveness(worktree).await.or_unknown(false) {
+            return Err("git does not confirm it is its own work tree".into());
+        }
+        worktree_current_branch(worktree)
+            .await
+            .ok_or_else(|| "HEAD is detached, or git could not name its branch".to_string())
+    }
+
+    /// Commit the tree's uncommitted work on `head`, which must be the
+    /// thread's own branch. Build artifacts go first, so a repo that does not
+    /// ignore them never gets them committed. `Err` says why the tree stays.
+    async fn snapshot_dirt(
+        &self,
+        thread_id: Uuid,
+        worktree: &Path,
+        head: &str,
+    ) -> Result<(), String> {
+        let dirty = || async {
+            match worktree_dirtiness(worktree).await {
+                GitAnswer::Yes => Ok(true),
+                GitAnswer::No => Ok(false),
+                GitAnswer::Unknown => Err("git status could not answer".to_string()),
+            }
+        };
+        if !dirty().await? {
+            return Ok(());
+        }
+        // Unignored build output may have been the only dirt.
+        prune_build_artifacts(worktree).await;
+        if !dirty().await? {
+            return Ok(());
+        }
+        // A snapshot on any other branch would put this thread's work there.
+        let own = lookup_session_branch_for_thread(&self.pool, thread_id).await;
+        if own.as_deref() != Some(head) {
+            return Err(format!(
+                "it has uncommitted changes on {head}, which is not the thread's own branch"
+            ));
+        }
+        // `git add -A` records a nested repository as a bare pointer, so its
+        // files would go with the tree.
+        if let Some(nested) = untracked_repositories(worktree).await?.first() {
+            return Err(format!(
+                "{nested} is a git repository of its own, which a commit would not keep"
+            ));
+        }
+        commit_worktree_or_err(worktree, SNAPSHOT_COMMIT_MESSAGE)
+            .await
+            .map_err(|e| format!("the snapshot commit failed: {e}"))?;
+        // The commit skips a dirty submodule's content, so ask git again.
+        if dirty().await? {
+            return Err("changes remain after the snapshot, such as in a submodule".into());
+        }
+        log!(
+            "[WorktreeCleanup] committed archived thread {}'s uncommitted changes on {}",
+            thread_id,
+            head
+        );
+        Ok(())
     }
 
     /// Tier 0: full removal of zero-information worktrees (clean + branch at
@@ -1035,6 +1217,10 @@ mod common;
 #[cfg(test)]
 #[path = "worktree_cleanup_tests/tiers.rs"]
 mod tiers_tests;
+
+#[cfg(test)]
+#[path = "worktree_cleanup_tests/archived.rs"]
+mod archived_tests;
 
 #[cfg(test)]
 #[path = "worktree_cleanup_tests/parsers.rs"]

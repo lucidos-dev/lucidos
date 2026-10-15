@@ -9,6 +9,7 @@ import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { activityMenuGroup, ActivityMenuGroup, type ActivityGroupProps } from '../ActivityMenuRows';
 import type { ActivityRow, ApplyThread } from '../../../store/actions/activityRows';
+import { LANE_GATHERING_LABEL, type LaneView, type MainCheckLine } from '../../../store/actions/landingLaneRow';
 import { backgroundActivities } from '../../../store/backgroundActivity';
 import {
   applyAllCanceling,
@@ -53,16 +54,39 @@ const buildRow: ActivityRow = {
 const applyAllRow: ActivityRow = {
   key: 'apply-all',
   label: 'Applying 5 changes',
-  detail: '2 of 5',
+  detail: '1 done',
   body: {
     kind: 'apply-all',
     thread: THREAD,
-    position: { index: 2, total: 5 },
+    count: { done: 1, total: 5 },
     progress: { done: 0.2, working: 0.2 },
     timeLeft: 'about 28 min until all are applied',
     canceling: false,
   },
 };
+
+const laneRow: ActivityRow = {
+  key: 'landing-lane',
+  label: 'Landing 1 change',
+  detail: '1 waiting',
+  queued: false,
+  body: { kind: 'landing-lane' },
+};
+
+const LANE: LaneView = {
+  batch: {
+    batchId: 'b-1',
+    step: 'resolving',
+    laneThread: { threadId: 'lane-t', title: 'Landing: Card gate fix' },
+    members: [{ changeId: 'c-1', threadId: 't-1', title: 'Card gate fix' }],
+  },
+  waiting: [{ changeId: 'c-3', threadId: 't-3', title: 'Fix the parser' }],
+  gathering: false,
+  canceling: false,
+  mainCheck: null,
+};
+
+const EMPTY_LANE: LaneView = { batch: null, waiting: [], gathering: false, canceling: false, mainCheck: null };
 
 const noop = () => {};
 
@@ -72,9 +96,16 @@ function props(overrides: Partial<ActivityGroupProps>): ActivityGroupProps {
     pending: 'none',
     open: new Set(),
     commits: null,
+    lane: EMPTY_LANE,
     onToggle: noop,
     onOpenThread: noop,
     onCancelApplyAll: noop,
+    onOpenLaneThread: noop,
+    onOpenLaneEntry: noop,
+    onRemoveFromLane: noop,
+    onCancelLaneBatch: noop,
+    onOpenFixThread: noop,
+    onCloseMainCheck: noop,
     onOpenPending: noop,
     ...overrides,
   };
@@ -154,12 +185,12 @@ describe('activityMenuGroup', () => {
     expect(labels).toEqual(['Cancel', 'Enable in Tailscale']);
   });
 
-  it('opens an Apply All with its position, its thread and Cancel', () => {
+  it('opens an Apply All with its count, its thread and Cancel', () => {
     const onOpenThread = vi.fn();
     const onCancelApplyAll = vi.fn();
     const el = draw(props({ rows: [applyAllRow], open: new Set(['apply-all']), onOpenThread, onCancelApplyAll }));
     const body = el.querySelector('[data-role="activity-body"]')!;
-    expect(body.textContent).toContain('Change 2 of 5 · about 28 min until all are applied');
+    expect(body.textContent).toContain('1 of 5 done · about 28 min until all are applied');
     // The finished member fills, and the member in flight owns its own span.
     expect(body.querySelector<HTMLElement>('.progress-bar-fill')?.style.width).toBe('20%');
     const working = body.querySelector<HTMLElement>('.brand-menu-activity-working');
@@ -187,7 +218,7 @@ describe('activityMenuGroup', () => {
     const bare: ActivityRow = {
       key: 'apply-all',
       label: 'Applying changes',
-      body: { kind: 'apply-all', thread: null, position: null, progress: null, timeLeft: null, canceling: false },
+      body: { kind: 'apply-all', thread: null, count: null, progress: null, timeLeft: null, canceling: false },
     };
     const el = draw(props({ rows: [bare], open: new Set(['apply-all']) }));
     expect(el.querySelector('[data-role="activity-thread-link"]')).toBeNull();
@@ -198,6 +229,116 @@ describe('activityMenuGroup', () => {
     const row: ActivityRow = { key: 'apply-t-2', label: 'Hardening: Collapse Menu', body: { kind: 'apply-thread', thread: THREAD } };
     const el = draw(props({ rows: [row], open: new Set(['apply-t-2']) }));
     expect(el.querySelector('[data-role="activity-thread-link"]')?.textContent).toContain('Collapse Menu');
+  });
+
+  it('opens the lane to its step, its members, what waits with Remove, and Cancel', () => {
+    const onOpenLaneThread = vi.fn();
+    const onOpenLaneEntry = vi.fn();
+    const onRemoveFromLane = vi.fn();
+    const onCancelLaneBatch = vi.fn();
+    const el = draw(props({
+      rows: [laneRow],
+      lane: LANE,
+      open: new Set(['landing-lane']),
+      onOpenLaneThread,
+      onOpenLaneEntry,
+      onRemoveFromLane,
+      onCancelLaneBatch,
+    }));
+    expect(el.querySelector('.brand-menu-activity-row')?.textContent).toContain('Landing 1 change');
+    const body = el.querySelector('[data-role="activity-body"]')!;
+    const links = [...body.querySelectorAll<HTMLButtonElement>('[data-role="activity-thread-link"]')];
+    expect(links.map((l) => l.textContent)).toEqual([
+      'Resolving merge conflictsLanding: Card gate fix',
+      'Landing in a batchCard gate fix',
+      'Waiting to landFix the parser',
+    ]);
+    expect(body.textContent).toContain('1 waiting for the next batch');
+    links[0].click();
+    expect(onOpenLaneThread).toHaveBeenCalledWith('lane-t');
+    links[1].click();
+    expect(onOpenLaneEntry).toHaveBeenCalledWith({ changeId: 'c-1', threadId: 't-1', title: 'Card gate fix' });
+    // Only a waiting change gets Remove: a batch member leaves with its batch.
+    const removes = [...body.querySelectorAll('button')].filter((b) => b.textContent === 'Remove');
+    expect(removes).toHaveLength(1);
+    expect(removes[0].closest('[data-role="lane-waiting"]')?.textContent).toContain('Fix the parser');
+    removes[0].click();
+    expect(onRemoveFromLane).toHaveBeenCalledWith('c-3');
+    [...body.querySelectorAll('button')].find((b) => b.textContent === 'Cancel')!.click();
+    expect(onCancelLaneBatch).toHaveBeenCalledWith('b-1');
+  });
+
+  it('names the landing step, and drops the lane\'s Cancel once pressed', () => {
+    const landing: LaneView = { ...LANE, batch: { ...LANE.batch!, step: 'landing' }, canceling: true };
+    const el = draw(props({ rows: [laneRow], lane: landing, open: new Set(['landing-lane']) }));
+    expect(el.querySelector('[data-role="activity-thread-link"]')?.textContent).toContain('Landing');
+    expect([...el.querySelectorAll('button')].some((b) => b.textContent === 'Cancel')).toBe(false);
+  });
+
+  it('offers no Cancel when only waiting changes are left', () => {
+    const waitingOnly: ActivityRow = { ...laneRow, label: '1 change waiting to land', detail: undefined, queued: true };
+    const el = draw(props({
+      rows: [waitingOnly],
+      lane: { ...EMPTY_LANE, waiting: LANE.waiting },
+      open: new Set(['landing-lane']),
+    }));
+    const labels = [...el.querySelectorAll('[data-role="activity-body"] button')].map((b) => b.textContent);
+    expect(labels).toEqual(['Waiting to landFix the parser', 'Remove']);
+  });
+
+  it('says what waits, waits for Apply All, while the lane gathers a press', () => {
+    const waitingOnly: ActivityRow = { ...laneRow, label: '1 change waiting to land', detail: undefined, queued: true };
+    const el = draw(props({
+      rows: [waitingOnly],
+      lane: { ...EMPTY_LANE, waiting: LANE.waiting, gathering: true },
+      open: new Set(['landing-lane']),
+    }));
+    const body = el.querySelector('[data-role="activity-body"]')!;
+    expect(body.textContent).toContain(LANE_GATHERING_LABEL);
+    expect(body.textContent).not.toContain('for the next batch');
+  });
+
+  /** A lane row whose body carries `mainCheck`, unfolded. */
+  function drawMainCheck(mainCheck: MainCheckLine, extra: Partial<ActivityGroupProps> = {}): HTMLDivElement {
+    return draw(props({ rows: [laneRow], lane: { ...LANE, mainCheck }, open: new Set(['landing-lane']), ...extra }));
+  }
+
+  it('says the main check passes on its own line', () => {
+    const el = drawMainCheck({ kind: 'passing' });
+    expect(el.querySelector('[data-role="main-check"]')?.textContent).toBe('Main check: passing');
+  });
+
+  it('links a running main check to its run', () => {
+    const el = drawMainCheck({ kind: 'running', runUrl: 'https://example.invalid/runs/1' });
+    const link = el.querySelector<HTMLAnchorElement>('a[data-role="main-check"]')!;
+    expect(link.textContent).toBe('Main check: running');
+    expect(link.getAttribute('href')).toBe('https://example.invalid/runs/1');
+    expect(link.getAttribute('target')).toBe('_blank');
+    const noRun = drawMainCheck({ kind: 'running', runUrl: null });
+    expect(noRun.querySelector('a[data-role="main-check"]')).toBeNull();
+  });
+
+  it('links a red main check to its fix thread, with Close', () => {
+    const onOpenFixThread = vi.fn();
+    const onCloseMainCheck = vi.fn();
+    const red: MainCheckLine = {
+      kind: 'red',
+      checkId: 'k-1',
+      summary: 'Failed: engine.',
+      fixThread: { threadId: 'fix-t', title: 'Fix main: Failed: engine.' },
+      closing: false,
+    };
+    const el = drawMainCheck(red, { onOpenFixThread, onCloseMainCheck });
+    const line = el.querySelector('[data-role="main-check"]')!;
+    const link = line.querySelector<HTMLButtonElement>('[data-role="activity-thread-link"]')!;
+    expect(link.textContent).toBe('Main red: Failed: engine.Fix main: Failed: engine.');
+    link.click();
+    expect(onOpenFixThread).toHaveBeenCalledWith('fix-t');
+    [...line.querySelectorAll('button')].find((b) => b.textContent === 'Close')!.click();
+    expect(onCloseMainCheck).toHaveBeenCalledWith('k-1');
+
+    const closing = drawMainCheck({ ...red, closing: true });
+    expect([...closing.querySelectorAll('[data-role="main-check"] button')].some((b) => b.textContent === 'Close')).toBe(false);
   });
 
   it('draws a waiting job still, and a running one spinning', () => {

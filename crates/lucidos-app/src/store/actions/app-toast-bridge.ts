@@ -1,4 +1,4 @@
-import { showToast, removeToast } from '../store';
+import { showToast, removeToast, defaultToastDurationMs } from '../store';
 import type { ToastType } from '../types';
 
 /** The `payload` of an app iframe's toast-bridge postMessage. Every field is
@@ -36,12 +36,20 @@ export function handleAppToastMessage(type: string, payload: AppToastPayload): b
     const toastType: ToastType = TOAST_TYPES.includes(payload.type as ToastType)
       ? payload.type as ToastType
       : 'info';
+    const spinning = typeof payload.spinning === 'boolean' ? payload.spinning : undefined;
+    const key = typeof payload.key === 'string' && payload.key.length > 0 ? payload.key : undefined;
     showToast(payload.message, toastType, {
       title: typeof payload.title === 'string' && payload.title.length > 0 ? payload.title : undefined,
-      key: typeof payload.key === 'string' && payload.key.length > 0 ? payload.key : undefined,
-      autoDismissMs: typeof payload.durationMs === 'number' ? payload.durationMs : undefined,
+      key,
+      // Pass the SDK's documented default explicitly (js-sdk.md § Toasts): a
+      // keyed host toast with no delay stays up, and an app's key only means
+      // "replace in place". A keyed spinner waits for the toast that replaces
+      // it. An unkeyed one has no such toast, so it keeps the timer.
+      autoDismissMs: typeof payload.durationMs === 'number'
+        ? payload.durationMs
+        : defaultToastDurationMs(toastType, Boolean(spinning && key)),
       dismissable: typeof payload.dismissable === 'boolean' ? payload.dismissable : undefined,
-      spinning: typeof payload.spinning === 'boolean' ? payload.spinning : undefined,
+      spinning,
     });
     return true;
   }

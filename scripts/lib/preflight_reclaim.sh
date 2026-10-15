@@ -58,6 +58,9 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proc_env.sh"
 # Pure helpers only, so sourcing it starts nothing.
 # shellcheck source=service.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/service.sh"
+# For `gateway_data_dir`, which names the dev gateway's data dir.
+# shellcheck source=storage_root.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/storage_root.sh"
 
 RECLAIM_TAG="[preflight-reclaim]"
 
@@ -144,7 +147,7 @@ _reclaim_sleep() { sleep "$1"; }
 # redirected by launchd (`desired_service_plist` in
 # crates/lucidos-app/src/desktop.rs).
 _reclaim_gateway_logs() {
-    printf '%s\n' "${LUCIDOS_GATEWAY_DATA:-$HOME/.lucidos/gateway}/gateway.log"
+    printf '%s\n' "$(gateway_data_dir)/gateway.log"
     printf '%s\n' "$HOME/Library/Application Support/$(service_bundle_identifier)/logs/engine-service.out.log"
 }
 

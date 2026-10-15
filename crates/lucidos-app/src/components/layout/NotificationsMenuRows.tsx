@@ -43,6 +43,7 @@ import { workspaceState, type WorkspaceState } from '../../utils/workspaceState'
 import { BellIcon } from '../shared/icons';
 import { workspaceActionRow } from './WorkspaceActionRow';
 import { GlyphBadge } from '../shared/GlyphBadge';
+import { countLabel } from './unreadCountLabel';
 
 /** The indent an unfolded action takes under a row of THIS group, whose rows
  *  are `.brand-menu-item`s leading with the bell. The switcher passes its own,
@@ -95,11 +96,6 @@ export interface NotificationsGroupProps {
 /** What this workspace's row is called before its name has resolved. */
 const OWN_FALLBACK_NAME = 'This workspace';
 
-/** Above this the count is drawn as `99+`. The bell caps at 999, and can
- *  afford to: it is a full-size badge on a roomy icon. This one rides a menu
- *  row beside a name it must not squeeze. */
-const MAX_SHOWN_COUNT = 99;
-
 /** The rows to draw, in order: this workspace first, then the peers as the
  *  gateway listed them.
  *
@@ -134,12 +130,6 @@ export function notifyRows({ peers, ownUnread, ownId, ownName }: NotificationsGr
     }
   }
   return rows;
-}
-
-/** The count, capped. Pure and exported so the cap is pinned by a test rather
- *  than by the two call sites happening to agree. */
-export function countLabel(count: number): string {
-  return count > MAX_SHOWN_COUNT ? `${MAX_SHOWN_COUNT}+` : String(count);
 }
 
 /** The alternate a right-click offers on `row`, or `null` for a row with none.

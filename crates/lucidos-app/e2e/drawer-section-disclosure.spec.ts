@@ -79,18 +79,22 @@ test.describe('Drawer section disclosure', () => {
 
         await navigateToApp(page);
         await openThreadDrawer(page);
-        const pinnedRow = page.locator(`.thread-row[data-thread-nav="${pinnedIds[1]}"]`);
+        // The section's top row: rows far below it sit past the row window.
+        const pinnedRow = page.locator('[data-flip-id="__section_saved"] ~ .drawer-section-rows .thread-row').first();
         await expect(pinnedRow).toBeVisible();
-        await expect(page.locator(`.thread-row[data-thread-nav="${archivedId}"]`)).toBeVisible();
+        // The archived row itself may sit past the row window, so the
+        // Archive header stands for it.
+        await expect(page.locator('[data-flip-id="__section_archive"]')).toBeVisible();
 
         // The gap under the moving block, open and shut. The next header must
-        // stay inside that range on every frame.
-        const nextHeaderGap = () => page.evaluate((pinnedIds) => {
-            const rect = (id: string) => document.querySelector(`[data-flip-id="${id}"]`)?.getBoundingClientRect();
-            const rows = pinnedIds.map(rect).filter((r): r is DOMRect => !!r);
-            const blockBottom = rows.length > 0 ? Math.max(...rows.map(r => r.bottom)) : rect('__section_saved')!.bottom;
-            return rect('__section_archive')!.top - blockBottom;
-        }, pinnedIds);
+        // stay inside that range on every frame. The block's bottom is its rows'
+        // box: rows past the row window are a gap, not a row.
+        const nextHeaderGap = () => page.evaluate(() => {
+            const header = document.querySelector('[data-flip-id="__section_saved"]')!;
+            const rows = header.parentElement!.querySelector('.drawer-section-rows');
+            const blockBottom = (rows ?? header).getBoundingClientRect().bottom;
+            return document.querySelector('[data-flip-id="__section_archive"]')!.getBoundingClientRect().top - blockBottom;
+        });
         const openGap = await nextHeaderGap();
 
         const collapse = await recordToggle(page, pinnedIds);

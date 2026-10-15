@@ -507,8 +507,8 @@ fn test_paths_are_excluded_by_convention() {
 
 #[test]
 fn inline_test_modules_are_cut_before_scanning() {
-    let dir = std::env::temp_dir().join(format!("lucidos-scan-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
     let path = dir.join("sample.rs");
     std::fs::write(
         &path,
@@ -521,15 +521,14 @@ fn inline_test_modules_are_cut_before_scanning() {
         tables_written(&text).is_empty(),
         "a fixture inside #[cfg(test)] must not read as a production write"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A file-level `#![cfg(test)]` never compiles outside tests, so a fixture
 /// write in it is no production write. `test_support.rs` is that file.
 #[test]
 fn a_test_only_file_has_no_production_text() {
-    let dir = std::env::temp_dir().join(format!("lucidos-scan-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
     let path = dir.join("helpers.rs");
     std::fs::write(
         &path,
@@ -537,7 +536,6 @@ fn a_test_only_file_has_no_production_text() {
     )
     .unwrap();
     assert_eq!(read_production_source(&path), "");
-    std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         read_production_source(&src_root().join("test_support.rs")),
         ""

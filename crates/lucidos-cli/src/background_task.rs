@@ -1,9 +1,10 @@
-//! `lucidos background-task run | output | stop`: a coding agent's *background
-//! tasks*, work the engine runs so it can outlive the agent's turn.
+//! `lucidos background-task run | wait | output | stop`: a coding agent's
+//! *background tasks*, work the engine runs so it can outlive one tool call.
 //!
 //! `run` hands the command to the engine, which runs it in this thread's
 //! worktree and arms an event wait on its completion. The agent then ends its
-//! turn, and the wait re-opens the thread with the result. Over
+//! turn, and the wait re-opens the thread with the result. `run --poll` arms
+//! nothing, and the agent calls `wait` until the task finishes. Over
 //! `/api/v1/threads/<id>/background-tasks`.
 //!
 //! `$LUCIDOS_THREAD_ID` names the thread and there is no `--thread` flag, so a
@@ -11,7 +12,7 @@
 
 use serde_json::json;
 
-use crate::http::{client as http_client, send_and_print};
+use crate::http::{client as http_client, client_with_timeout, send_and_print};
 use crate::workspace::{BoxError, Workspace};
 
 fn calling_thread() -> Result<String, BoxError> {
@@ -59,11 +60,22 @@ fn shell_quote(arg: &str) -> String {
     }
 }
 
+/// How long `wait` lets the engine answer. The engine caps one wait at 230 s,
+/// so this only has to outlast that and the round trip.
+const WAIT_RESPONSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(290);
+
+/// What `run` asks for, beside the command.
+pub(crate) struct RunOptions<'a> {
+    pub description: Option<&'a str>,
+    pub timeout_secs: Option<u64>,
+    /// Arm no event wait: the agent polls with `wait`.
+    pub poll: bool,
+}
+
 pub(crate) fn cmd_run(
     ws: &Workspace,
     command: &[String],
-    description: Option<&str>,
-    timeout_secs: Option<u64>,
+    options: RunOptions<'_>,
 ) -> Result<(), BoxError> {
     if command.is_empty() {
         return Err("Pass the command after `--`: \
@@ -72,20 +84,31 @@ pub(crate) fn cmd_run(
     }
     let thread_id = calling_thread()?;
     let url = tasks_url(ws, &thread_id);
-    let body = run_body(command, description, timeout_secs);
+    let body = run_body(command, &options);
     send_and_print("POST", &url, http_client()?.post(&url).json(&body))
 }
 
-fn run_body(
-    command: &[String],
-    description: Option<&str>,
-    timeout_secs: Option<u64>,
-) -> serde_json::Value {
+fn run_body(command: &[String], options: &RunOptions<'_>) -> serde_json::Value {
     json!({
         "command": shell_command_line(command),
-        "description": description,
-        "timeout_secs": timeout_secs,
+        "description": options.description,
+        "timeout_secs": options.timeout_secs,
+        "poll": options.poll,
     })
+}
+
+pub(crate) fn cmd_wait(
+    ws: &Workspace,
+    task_id: &str,
+    max_secs: Option<u64>,
+) -> Result<(), BoxError> {
+    let thread_id = calling_thread()?;
+    let url = format!("{}/{}/wait", tasks_url(ws, &thread_id), task_id);
+    let mut request = client_with_timeout(WAIT_RESPONSE_DEADLINE)?.get(&url);
+    if let Some(secs) = max_secs {
+        request = request.query(&[("max_secs", secs)]);
+    }
+    send_and_print("GET", &url, request)
 }
 
 pub(crate) fn cmd_output(ws: &Workspace, task_id: &str) -> Result<(), BoxError> {
@@ -108,12 +131,34 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    fn options(description: Option<&str>, poll: bool) -> RunOptions<'_> {
+        RunOptions {
+            description,
+            timeout_secs: None,
+            poll,
+        }
+    }
+
     /// The engine names the task on the thread's waiting row by this field.
     #[test]
     fn the_description_reaches_the_request_body() {
-        let body = run_body(&args(&["make"]), Some("the release build"), None);
+        let body = run_body(&args(&["make"]), &options(Some("the release build"), false));
         assert_eq!(body["description"], "the release build");
-        assert!(run_body(&args(&["make"]), None, None)["description"].is_null());
+        assert!(run_body(&args(&["make"]), &options(None, false))["description"].is_null());
+    }
+
+    /// `--poll` is what keeps the engine from arming a wake-up the agent
+    /// would read after it already polled the result.
+    #[test]
+    fn poll_reaches_the_request_body() {
+        assert_eq!(
+            run_body(&args(&["make"]), &options(None, true))["poll"],
+            true
+        );
+        assert_eq!(
+            run_body(&args(&["make"]), &options(None, false))["poll"],
+            false
+        );
     }
 
     #[test]

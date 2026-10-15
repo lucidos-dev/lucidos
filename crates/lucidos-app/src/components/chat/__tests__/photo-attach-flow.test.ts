@@ -80,12 +80,14 @@ describe('photo attach reaches the draft preview', () => {
   beforeEach(() => {
     // The blob endpoint is the only fetch the attach path makes; the chat
     // POST is a separate flow exercised elsewhere.
-    mockFetch = vi.fn().mockResolvedValue(
+    // A fresh Response per call: a body can be read once, and the thread
+    // start reads its own.
+    mockFetch = vi.fn(() => Promise.resolve(
       new Response(JSON.stringify({ hash: 'fake-hash-abc123', mime: 'image/jpeg', byte_size: 3 }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       }),
-    );
+    ));
     globalThis.fetch = mockFetch as unknown as typeof fetch;
     installXhrOverFetch();
     (globalThis as any).URL.createObjectURL = vi.fn().mockReturnValue('blob:fake-preview-url');

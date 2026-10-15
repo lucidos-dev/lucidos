@@ -63,6 +63,13 @@ describe('the prompt footprint page helpers', () => {
     expect(usageLine(item({ kind: 'knowhow', usage: { last_used_days_ago: null, verdict: 'not-loaded-by-name' } }))).toBe('not loaded by name');
   });
 
+  it("states an MCP server's threads, the ones that enabled it and the ones that called it", () => {
+    expect(usageLine(item({ kind: 'mcp-server', mcp_threads: { enabled: 3, called: 1 } })))
+      .toBe('enabled in 3 threads, called in 1');
+    expect(usageLine(item({ kind: 'mcp-server', mcp_threads: { enabled: 1, called: 0 } })))
+      .toBe('enabled in 1 thread, called in 0');
+  });
+
   it('lists a knowhow doc nothing read by name on the Unused tab', () => {
     const r = report();
     r.sections[1].items[0].usage = { last_used_days_ago: 80, verdict: 'not-loaded-by-name' };

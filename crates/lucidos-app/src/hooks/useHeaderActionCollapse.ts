@@ -92,6 +92,33 @@ export function computeHeaderCollapse(input: HeaderCollapseInput): HeaderCollaps
   return { collapsed: candidates[candidates.length - 1], titleEllipsized: true };
 }
 
+/** What the row's boxes measure, before it is a `HeaderCollapseInput`. */
+export interface MeasuredHeaderRow {
+  /** The row's padding-box width, which its centred box spans. */
+  clientWidth: number;
+  /** Padding the actions stop short of: the docked Home rail toggle's room. */
+  trailingPadding: number;
+  titleWidth: number;
+  iconWidth: number;
+  actionCount: number;
+  anchorWidth: number;
+  gapPx: number;
+}
+
+/** The centred box sits on the whole padding box. The actions end at the
+ *  trailing padding, so only their side gives that padding up. */
+export function measuredCollapseInput(row: MeasuredHeaderRow): HeaderCollapseInput {
+  return {
+    containerWidth: row.clientWidth - row.trailingPadding,
+    leadingWidth: Math.max(0, (row.clientWidth - row.titleWidth) / 2),
+    centreWidth: row.titleWidth,
+    actionWidths: Array.from({ length: row.actionCount }, () => row.iconWidth),
+    anchorWidth: row.anchorWidth,
+    moreWidth: row.iconWidth,
+    gapPx: row.gapPx,
+  };
+}
+
 /** Mobile's collapse count, which measures nothing: the row folds every action
  *  into the ⋯ menu at any width. The one exception is a LONE action, which keeps
  *  its own icon. The ⋯ trigger replaces it one box for one box, so the menu buys
@@ -220,16 +247,15 @@ export function useHeaderActionCollapse(
       // The box's own width, not its content's: it is a fixed span with its
       // members at the ends, so what the cluster has to clear is the box.
       const titleWidth = titleZone ? titleZone.getBoundingClientRect().width : 0;
-      const containerWidth = container.clientWidth;
-      const { collapsed: next } = computeHeaderCollapse({
-        containerWidth,
-        leadingWidth: Math.max(0, (containerWidth - titleWidth) / 2),
-        centreWidth: titleWidth,
-        actionWidths: Array.from({ length: actionCount }, () => iconWidth),
+      const { collapsed: next } = computeHeaderCollapse(measuredCollapseInput({
+        clientWidth: container.clientWidth,
+        trailingPadding: parseFloat(getComputedStyle(container).paddingRight) || 0,
+        titleWidth,
+        iconWidth,
+        actionCount,
         anchorWidth: anchor ? anchor.getBoundingClientRect().width : 0,
-        moreWidth: iconWidth,
         gapPx: gapRem * getRemPx(),
-      });
+      }));
       setCollapsed(next);
     };
     measure();

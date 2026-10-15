@@ -241,9 +241,12 @@ const REASON_PILL: Partial<Record<EngineReason['kind'], string>> = {
   missing_plan: 'plan needed',
   harden_retrigger: 'hardening needed',
   merge_conflict: 'merge conflict',
+  main_check_red: 'main is red',
   stale_session: 'stopped agent tidied up',
   orphan_recovery: 'picked up after a restart',
   archived_branch_work: 'work set aside',
+  unmerged_integrated_work: 'work set aside',
+  successor_residue: 'work set aside',
   plugin_setup: 'plugin setup',
   plugin_upstream_proposal: 'plugin change offered',
   scheduler: 'scheduled message',
@@ -1061,11 +1064,6 @@ export function InlineStep(
   },
 ) {
   const { label, className } = stepStatus(event.outcome);
-  const snap = event.contextCapture;
-  const used = snap?.usage?.input_tokens ?? snap?.estimated_total_tokens ?? event.context_tokens;
-  const window = snap?.context_window;
-  const trimmed = snap?.trimmed ?? event.trimmed;
-  const hasContext = used != null;
   // Reasoning streams into `thinkingText` while the row is still an unnamed
   // "Thinking" marker. Show its tail (latest non-empty line, truncated) as a
   // live ticker so a long reasoning pass visibly progresses. It stops at the
@@ -1078,23 +1076,6 @@ export function InlineStep(
   const detailText = event.detail || thinkingTail;
 
   const isPending = event.outcome === 'pending';
-  // Both forms go into the DOM and CSS shows exactly one, because what decides
-  // is the ROW's own width, which nothing here can read. The row is as wide as
-  // the thread pane the divider was dragged to. So a narrow desktop pane crowds
-  // the counter the way a phone does. The gate is a container query on
-  // `.inline-step` (steps.css). Measuring in JS would mean re-rendering every
-  // step row on every frame of that drag.
-  const counter = hasContext && (
-    <>
-      <span class="step-context-full">
-        {contextLabel(used!, window, event.context_messages, false)}
-      </span>
-      <span class="step-context-compact">
-        {contextLabel(used!, window, event.context_messages, true)}
-      </span>
-      {trimmed && ' · trimmed'}
-    </>
-  );
 
   return (
     <div
@@ -1155,23 +1136,50 @@ export function InlineStep(
           {stepCount(fold.count)}
         </button>
       )}
-      {/* The counter is a button only when there is a snapshot behind it. A
-          legacy row carries `context_tokens` with nothing to open, and a button
-          that opens nothing is worse than plain text. */}
-      {counter && (snap ? (
-        <button
-          type="button"
-          class={`step-context${trimmed ? ' trimmed' : ''}`}
-          data-role="step-context"
-          aria-label="Show the context sent for this call"
-          onClick={() => { contextViewer.value = { snapshot: snap, description: event.description }; }}
-        >
-          {counter}
-        </button>
-      ) : (
-        <span class={`step-context${trimmed ? ' trimmed' : ''}`}>{counter}</span>
-      ))}
+      <StepContext event={event} />
     </div>
+  );
+}
+
+/** A step row's context counter: what the model was sent for that call. */
+export function StepContext({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
+  const snap = event.contextCapture;
+  const used = snap?.usage?.input_tokens ?? snap?.estimated_total_tokens ?? event.context_tokens;
+  if (used == null) return null;
+  const window = snap?.context_window;
+  const trimmed = snap?.trimmed ?? event.trimmed;
+  // Both forms go into the DOM and CSS shows exactly one, because what decides
+  // is the ROW's own width, which nothing here can read. The row is as wide as
+  // the thread pane the divider was dragged to. So a narrow desktop pane crowds
+  // the counter the way a phone does. The gate is a container query on
+  // `.inline-step` (steps.css). Measuring in JS would mean re-rendering every
+  // step row on every frame of that drag.
+  const counter = (
+    <>
+      <span class="step-context-full">
+        {contextLabel(used, window, event.context_messages, false)}
+      </span>
+      <span class="step-context-compact">
+        {contextLabel(used, window, event.context_messages, true)}
+      </span>
+      {trimmed && ' · trimmed'}
+    </>
+  );
+  // A button only when there is a snapshot behind it. A legacy row carries
+  // `context_tokens` with nothing to open, and a button that opens nothing is
+  // worse than plain text.
+  return snap ? (
+    <button
+      type="button"
+      class={`step-context${trimmed ? ' trimmed' : ''}`}
+      data-role="step-context"
+      aria-label="Show the context sent for this call"
+      onClick={() => { contextViewer.value = { snapshot: snap, description: event.description }; }}
+    >
+      {counter}
+    </button>
+  ) : (
+    <span class={`step-context${trimmed ? ' trimmed' : ''}`}>{counter}</span>
   );
 }
 
@@ -1227,10 +1235,15 @@ export function SubAgentStepGroup(
   );
 }
 
-/** How an agent ended, as the tail line: its outcome mark and one word. It
- *  opens the agent's step detail, which holds the report it returned. */
+/** How an agent ended, as the tail line: its outcome mark, one word, and the
+ *  agent's final context. The word opens the agent's step detail, which holds
+ *  the report it returned.
+ *
+ *  The final context is the sub-agent's own last call. The `Agent` row's
+ *  counter is the PARENT's call that spawned it. */
 function SubAgentEnding({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
   const { label, className } = stepStatus(event.outcome);
+  const final = event.finalContextCapture;
   return (
     <div class={`inline-step ${className}`}>
       <button
@@ -1242,6 +1255,11 @@ function SubAgentEnding({ event }: { event: Extract<ResponseEvent, { type: 'step
         <span class="step-icon"><StepOutcomeIcon outcome={event.outcome} /></span>
         <span class="step-description">{event.outcome === 'success' ? 'Done' : label}</span>
       </button>
+      {final && (
+        <StepContext
+          event={{ type: 'step', description: event.description, outcome: event.outcome, contextCapture: final }}
+        />
+      )}
     </div>
   );
 }

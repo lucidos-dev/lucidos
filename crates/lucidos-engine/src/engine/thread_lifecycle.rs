@@ -295,6 +295,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "ThreadReadRequested" | "ThreadReadNotRequested" | "ThreadReplySeen" => {
             EventClass::Metadata
         }
+        // A child's wake decision marks its report, not its work.
+        "ParentWakeRequested" | "ParentWakeNotRequested" => EventClass::Metadata,
+        // An Apply Now's bracket marks the thread as applying, not its work.
+        "ApplyNowStarted" | "ApplyNowEnded" => EventClass::Metadata,
         // Queued-message removal is a pure marker over a prior MessageReceived.
         // It must not bump recency, status, section, or message count.
         "QueuedMessageRemoved" => EventClass::Metadata,
@@ -315,9 +319,11 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "MessageReceived" | "TriggerStarted" => EventClass::Start,
         "CodingAgentUserMessageSent" | "PromptInjected" => EventClass::Start,
         // Session lifecycle — invisible to user (no status change, no activity bump)
-        "SessionStarted" | "ContinuationStarted" | "CodingAgentSettingsChanged" => {
-            EventClass::Metadata
-        }
+        "SessionStarted"
+        | "ContinuationStarted"
+        | "CodingAgentSettingsChanged"
+        | "CodingAgentCompacted"
+        | "SuccessorThreadSpawned" => EventClass::Metadata,
         // Voice-session lifecycle. Metadata on BOTH halves, which is the
         // asymmetry against the coding-agent pair above, where the end is
         // Terminal. A live microphone is not a turn: the thread's status
@@ -365,9 +371,15 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // Command-guard checkpoint lifecycle: a pure card / audit projection,
         // so neither bumps status or activity (ADR 0002, Phase 4).
         "CommandCheckpointed" | "CommandCheckpointReverted" => EventClass::Metadata,
-        // A widget card or chip is a card projection (ADR 0402): it moves no
-        // status, and the turn that showed it already counts as activity.
+        // An inline widget or chip is a card projection (ADR 0402): it moves no
+        // status, and the turn that drew it already counts as activity.
         "WidgetShown" | "WidgetPinned" | "WidgetUnpinned" => EventClass::Metadata,
+        // A thread's enabled MCP servers change what its next request carries,
+        // not what the thread is doing (ADR 0430).
+        "ThreadMcpServerEnabled" | "ThreadMcpServerDisabled" => EventClass::Metadata,
+        // Arranging the Home board moves no status and is no activity, so an
+        // unused Home stays where it is (ADR 0432).
+        "HomeBoardArranged" => EventClass::Metadata,
         "CodingAgentTextStreamed"
         | "CodingAgentThoughtStreamed"
         | "CodingAgentToolCalled"
@@ -422,6 +434,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         | "ChangeBroughtBack"
         | "ChangeWithdrawn"
         | "ProposalWithheld"
+        | "ChangeQueued"
+        | "ChangeUnqueued"
         | "MergeResolutionStarted"
         | "MergeResolutionCleared" => EventClass::Metadata,
         // Phase 4 fan-in: parent's resume path renders this as the rich
@@ -434,6 +448,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // timeline, never a turn: the stopped child is alive, and the parent
         // stays asleep until the `ChildThreadCompleted` that settles it.
         "ChildThreadStopped" => EventClass::Metadata,
+        // A clean report its child said needs no action now. A note on the
+        // parent's timeline, never a turn: the parent reads it next turn.
+        "ChildReportFiled" => EventClass::Metadata,
         // The edge to a child was cut (ADR 0278). Bookkeeping on the former
         // parent: it wakes nothing and moves no section.
         "ChildThreadDetached" => EventClass::Metadata,
@@ -516,6 +533,10 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ThreadUnarchived",
         "ThreadReadRequested",
         "ThreadReadNotRequested",
+        "ParentWakeRequested",
+        "ParentWakeNotRequested",
+        "ApplyNowStarted",
+        "ApplyNowEnded",
         "ThreadReplySeen",
         "ThreadTriageProposed",
         "ThreadStarted",
@@ -532,6 +553,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ChangeBroughtBack",
         "ChangeWithdrawn",
         "ProposalWithheld",
+        "ChangeQueued",
+        "ChangeUnqueued",
         "ChangeApplyFailed",
         "ChangeHardened",
         "ChangeSummarized",
@@ -547,6 +570,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "FormRequestResolved",
         "McpConsentRequested",
         "CodingAgentSettingsChanged",
+        "CodingAgentCompacted",
+        "SuccessorThreadSpawned",
         "UserQuestionAsked",
         "UserQuestionAnswered",
         "CodingAgentPermissionRequest",
@@ -558,6 +583,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "WorktreeCleaned",
         // Phase 4 fan-in / resume bookkeeping.
         "ChildThreadCompleted",
+        "ChildReportFiled",
         "ChildThreadStopped",
         "ChildThreadDetached",
         "ContextDismissed",
@@ -600,11 +626,17 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "SideQuestionAnswered",
         "SideQuestionFailed",
         "SideQuestionDismissed",
-        // Widgets. Persisted so the shelf and the thread's widget cards survive
-        // a reload and show on every device (ADRs 0402, 0407).
+        // Widgets. Persisted so the shelf and an old showing's inline widget
+        // survive a reload and show on every device (ADRs 0402, 0407).
         "WidgetShown",
         "WidgetPinned",
         "WidgetUnpinned",
+        // A thread's enabled MCP servers. Persisted because the events ARE the
+        // record: the projection rebuilds from them (ADR 0430).
+        "ThreadMcpServerEnabled",
+        "ThreadMcpServerDisabled",
+        // The Home board's arrangement, synced across devices (ADR 0432).
+        "HomeBoardArranged",
     ]
 }
 
@@ -715,6 +747,8 @@ pub fn resolve_transition(
         | "CodingAgentInputRead"
         | "MissingHardeningDetected"
         | "CodingAgentSettingsChanged"
+        | "CodingAgentCompacted"
+        | "SuccessorThreadSpawned"
         | "ContinuationRequested" => match thread_type {
             ThreadType::CodingAgent => no_change,
             ThreadType::Chat => violation("coding-agent-specific event on Chat thread"),
@@ -749,6 +783,12 @@ pub fn resolve_transition(
         "ProposalWithheld" => match thread_type {
             ThreadType::CodingAgent => no_change,
             ThreadType::Chat => violation("ProposalWithheld is coding-agent-only"),
+        },
+        // The landing lane's bookkeeping. The change stays pending throughout,
+        // so the thread stays where its proposal put it.
+        "ChangeQueued" | "ChangeUnqueued" => match thread_type {
+            ThreadType::CodingAgent => no_change,
+            ThreadType::Chat => violation("the landing lane is coding-agent-only"),
         },
         // UserQuestionAsked surfaces the thread in REVIEW so the user sees the
         // question card and the action buttons. Raised by CC's
@@ -829,6 +869,10 @@ pub fn resolve_transition(
         | "ThreadArchiveRequested"
         | "ThreadReadRequested"
         | "ThreadReadNotRequested"
+        | "ParentWakeRequested"
+        | "ParentWakeNotRequested"
+        | "ApplyNowStarted"
+        | "ApplyNowEnded"
         | "ThreadReplySeen"
         | "ThreadTriageProposed"
         | "TriggerStarted"
@@ -887,6 +931,8 @@ pub fn resolve_transition(
         // Never a status write: a stopped child's note must not wake its
         // parent (ADR 0252).
         | "ChildThreadStopped"
+        // Never a status write either: a filed report wakes no one.
+        | "ChildReportFiled"
         // Never a status write either: moving a child out wakes no one.
         | "ChildThreadDetached"
         | "ContextDismissed"
@@ -963,10 +1009,14 @@ pub fn resolve_transition(
         | "SideQuestionAnswered"
         | "SideQuestionFailed"
         | "SideQuestionDismissed"
-        // A widget card or chip is display bookkeeping (ADRs 0402, 0407).
+        // An inline widget or chip is display bookkeeping (ADRs 0402, 0407).
         | "WidgetShown"
         | "WidgetPinned"
-        | "WidgetUnpinned" => no_change,
+        | "WidgetUnpinned"
+        // Enabling an MCP server moves the thread nowhere (ADR 0430).
+        | "ThreadMcpServerEnabled"
+        | "ThreadMcpServerDisabled" => no_change,
+        | "HomeBoardArranged" => no_change,
         _ => violation("Unknown event type"),
     }?;
 
@@ -2053,6 +2103,9 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         ),
     ]
 }
+
+#[path = "thread_lifecycle_codegen.rs"]
+pub(crate) mod codegen;
 
 // ── Tests ────────────────────────────────────────────────────────────
 

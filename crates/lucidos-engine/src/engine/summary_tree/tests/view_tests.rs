@@ -9,11 +9,13 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::seed;
+use super::{choose_module, seed};
 use crate::engine::event_bus::EventBus;
 use crate::engine::summary_tree::consumer::switched_to;
 use crate::engine::summary_tree::log::{EntryKind, LogEntry};
-use crate::engine::summary_tree::module::{tree_ready, MemoryModule, Surface, ViewBudgets};
+use crate::engine::summary_tree::module::{
+    tree_chosen, tree_ready, MemoryModule, Surface, ViewBudgets,
+};
 use crate::engine::summary_tree::shape::complete_addresses;
 use crate::engine::summary_tree::store::{self, StoredNode};
 use crate::engine::summary_tree::view::{
@@ -229,25 +231,13 @@ async fn an_unbuilt_thread_view_reads_its_entries_from_events() {
     teardown_test_db(&db_name).await;
 }
 
-/// I7: an untouched workspace, and a Tree one whose backfill has not
-/// completed, both run Classic. Only a ready Tree workspace takes the views.
+/// I7: a Tree workspace still runs Classic until its ready flag sets. Only a
+/// ready Tree workspace takes the views.
 #[tokio::test]
 async fn a_workspace_stays_on_classic_until_its_trees_are_ready() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
-    assert_eq!(MemoryModule::chosen(&pool).await, MemoryModule::Classic);
-    assert!(!tree_ready(&pool).await);
-
-    crate::core::PreferenceStore::set(
-        &pool,
-        &bus,
-        crate::core::prefs::MEMORY_MODULE.key(),
-        "tree",
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(MemoryModule::chosen(&pool).await, MemoryModule::Tree);
+    choose_module(&pool, &bus, "tree").await;
     assert!(
         !tree_ready(&pool).await,
         "not ready before the ready flag sets"
@@ -258,27 +248,119 @@ async fn a_workspace_stays_on_classic_until_its_trees_are_ready() {
     teardown_test_db(&db_name).await;
 }
 
-/// The compactor follows the preference: an untouched workspace boots with
-/// none, and a change of `memory_module` starts or stops it.
+/// Tree spends money, so a module the engine cannot read is Classic, whatever
+/// the default. A blip at boot then starts no backfill.
+#[tokio::test]
+async fn an_unreadable_module_is_classic() {
+    let (pool, db_name) = setup_test_db().await;
+    pool.close().await;
+    assert_eq!(MemoryModule::chosen(&pool).await, MemoryModule::Classic);
+    assert!(!tree_ready(&pool).await);
+    teardown_test_db(&db_name).await;
+}
+
+/// The global `memory_module` row, if one is stored.
+async fn stored_memory_module(pool: &PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT value FROM preferences WHERE key = $1 AND device_id IS NULL")
+        .bind(crate::core::prefs::MEMORY_MODULE.key())
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+/// The migration that keeps a used workspace on Classic when the default
+/// became Tree.
+const KEEP_CLASSIC_MIGRATION: &str = include_str!(
+    "../../../../migrations/20261012130357_keep_classic_memory_for_existing_workspaces.sql"
+);
+
+async fn run_keep_classic_migration(pool: &PgPool) {
+    sqlx::raw_sql(KEEP_CLASSIC_MIGRATION)
+        .execute(pool)
+        .await
+        .expect("the migration runs");
+}
+
+/// A new workspace, and one that only ever booted and so holds just Home,
+/// store nothing. Both run Classic until the memory choice asks the user.
+#[tokio::test]
+async fn the_keep_classic_migration_leaves_an_unused_workspace_unset() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    run_keep_classic_migration(&pool).await;
+    assert_eq!(stored_memory_module(&pool).await, None);
+
+    crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
+    run_keep_classic_migration(&pool).await;
+    assert_eq!(stored_memory_module(&pool).await, None);
+    assert_eq!(MemoryModule::stored(&pool).await.unwrap(), None);
+    teardown_test_db(&db_name).await;
+}
+
+/// A used workspace that never chose keeps Classic, so the upgrade starts no
+/// backfill. A stored choice, either one, is kept.
+#[tokio::test]
+async fn the_keep_classic_migration_pins_a_used_workspace_and_keeps_a_choice() {
+    for (stored, expected) in [
+        (None, MemoryModule::Classic),
+        (Some("tree"), MemoryModule::Tree),
+        (Some("classic"), MemoryModule::Classic),
+    ] {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        seed(
+            &bus,
+            Uuid::new_v4(),
+            EventChannel::Chat,
+            vec![json!({"type": "MessageReceived", "text": "hello", "mode": "human"})],
+        )
+        .await;
+        if let Some(value) = stored {
+            choose_module(&pool, &bus, value).await;
+        }
+        run_keep_classic_migration(&pool).await;
+        assert_eq!(
+            MemoryModule::chosen(&pool).await,
+            expected,
+            "stored {stored:?}"
+        );
+        teardown_test_db(&db_name).await;
+    }
+}
+
+/// The compactor starts at boot only on a chosen Tree. A used workspace that
+/// never chose starts none, so it spends nothing before the user answers.
+#[tokio::test]
+async fn the_compactor_does_not_start_unchosen() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed(
+        &bus,
+        Uuid::new_v4(),
+        EventChannel::Chat,
+        vec![json!({"type": "MessageReceived", "text": "hello", "mode": "human"})],
+    )
+    .await;
+    assert!(!tree_chosen(&pool).await);
+    choose_module(&pool, &bus, "tree").await;
+    assert!(tree_chosen(&pool).await);
+    teardown_test_db(&db_name).await;
+}
+
+/// The compactor follows the preference: a change of `memory_module` starts
+/// or stops it, and a reset to unset stops it.
 #[tokio::test]
 async fn the_compactor_runs_only_while_the_module_is_tree() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let mut rx = bus.subscribe();
-    assert_eq!(MemoryModule::chosen(&pool).await, MemoryModule::Classic);
     for (value, module) in [
-        ("tree", MemoryModule::Tree),
         ("classic", MemoryModule::Classic),
+        ("tree", MemoryModule::Tree),
     ] {
-        crate::core::PreferenceStore::set(
-            &pool,
-            &bus,
-            crate::core::prefs::MEMORY_MODULE.key(),
-            value,
-            None,
-        )
-        .await
-        .unwrap();
+        choose_module(&pool, &bus, value).await;
         let switched = loop {
             let emitted = rx.recv().await.expect("an event");
             if let Some(module) = switched_to(&emitted) {
@@ -287,6 +369,21 @@ async fn the_compactor_runs_only_while_the_module_is_tree() {
         };
         assert_eq!(switched, module);
     }
+    crate::core::PreferenceStore::delete(
+        &pool,
+        &bus,
+        crate::core::prefs::MEMORY_MODULE.key(),
+        None,
+    )
+    .await
+    .unwrap();
+    let switched = loop {
+        let emitted = rx.recv().await.expect("an event");
+        if let Some(module) = switched_to(&emitted) {
+            break module;
+        }
+    };
+    assert_eq!(switched, MemoryModule::Classic);
     teardown_test_db(&db_name).await;
 }
 
@@ -425,15 +522,7 @@ async fn an_unset_coding_agent_preference_adds_no_workspace_view() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     build_workspace(&pool, 20, 200).await;
-    crate::core::PreferenceStore::set(
-        &pool,
-        &bus,
-        crate::core::prefs::MEMORY_MODULE.key(),
-        "tree",
-        None,
-    )
-    .await
-    .unwrap();
+    choose_module(&pool, &bus, "tree").await;
     store::mark_ready(&pool).await.unwrap();
     assert!(tree_ready(&pool).await);
 
@@ -458,15 +547,7 @@ async fn a_positive_coding_agent_preference_adds_the_workspace_view() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     build_workspace(&pool, 20, 200).await;
-    crate::core::PreferenceStore::set(
-        &pool,
-        &bus,
-        crate::core::prefs::MEMORY_MODULE.key(),
-        "tree",
-        None,
-    )
-    .await
-    .unwrap();
+    choose_module(&pool, &bus, "tree").await;
     store::mark_ready(&pool).await.unwrap();
     crate::core::PreferenceStore::set(
         &pool,

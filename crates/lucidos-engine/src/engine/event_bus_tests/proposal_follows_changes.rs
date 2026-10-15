@@ -116,6 +116,7 @@ fn applied(change_id: Uuid) -> ThreadEvent {
         actor: None,
         pre_merge_sha: None,
         post_merge_sha: None,
+        landing_merge_sha: None,
         path: String::new(),
     }
 }

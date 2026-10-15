@@ -27,14 +27,14 @@ pub use push::{PushSubscription, PushSubscriptionStore};
 
 use crate::api::SharedEngine;
 use crate::core::{prefs, PreferenceStore};
-use crate::engine::event_bus::EventBus;
+use crate::engine::event_bus::{EventBus, LagReplay, ReplayScope};
 use crate::triggers::{
     replay_trigger_events, replay_trigger_group_events, TriggerConfig, TriggerEventRow,
     TriggerGroup, TriggerGroupEventRow, TriggerRun,
 };
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -74,12 +74,9 @@ pub(crate) fn trigger_id_to_uuid(trigger_id: &str) -> uuid::Uuid {
 /// Thread Queue's own accounting.
 pub(crate) static ACTIVE_TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// What the trigger matcher is handed for one bus event.
-///
-/// The subscriber sees two carriers, and they used to be answered in two
-/// places with two different ideas of depth. One function now decides for
-/// both, which is what makes the answer testable.
-#[derive(Debug, PartialEq)]
+/// What the trigger matcher is handed for one event: a live frame through
+/// [`trigger_dispatch`], or a stored row through [`stored_trigger_dispatch`].
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TriggerDispatch {
     pub(crate) event_type: String,
     /// The *matchable payload*: the same view the event-wait dispatcher
@@ -91,11 +88,10 @@ pub(crate) struct TriggerDispatch {
     /// The depth to dispatch at, so `MAX_EVENT_TRIGGER_DEPTH` engages.
     pub(crate) depth: u32,
     /// Which trigger's fire emitted this, so the matcher can drop it from the
-    /// matches. Always read off the frame, including for a domain event, which
-    /// reads its depth off the variant instead. See the arm's own comment.
+    /// matches.
     pub(crate) emitting_trigger_id: Option<String>,
-    /// The thread the firing event lives on. `None` for a domain event, which
-    /// belongs to no thread.
+    /// The thread the firing event lives on. `None` for a system frame or a
+    /// domain event, which belong to no thread.
     pub(crate) origin_thread_id: Option<uuid::Uuid>,
 }
 
@@ -117,8 +113,8 @@ pub(crate) struct TriggerDispatch {
 /// emitted inside a trigger fire is one link along that fire's chain.
 /// Dispatching it at zero disengaged `MAX_EVENT_TRIGGER_DEPTH` for the whole
 /// `BusEvent::Thread` carrier. A trigger subscribed to an event its own run
-/// emits then re-fired without bound. A domain event reads the depth off its
-/// own variant, the persisted value a replay reconstructs.
+/// emits then re-fired without bound. `EmittedEvent::trigger_chain_depth`
+/// answers it, the same function the stored row is written from.
 ///
 /// **The emitting trigger comes off the frame, in every arm.** The cap above
 /// only ends that chain after three fires. Naming the trigger lets the matcher
@@ -130,9 +126,9 @@ pub(crate) fn trigger_dispatch(
         is_subscribable, is_subscribable_system_event, matchable_system_payload,
         matchable_thread_payload,
     };
-    use crate::engine::event_bus::{BusEvent, SystemEvent};
+    use crate::engine::event_bus::BusEvent;
 
-    match &emitted.typed {
+    let (event_type, payload, origin_thread_id) = match &emitted.typed {
         BusEvent::Thread {
             thread_id,
             event,
@@ -141,39 +137,87 @@ pub(crate) fn trigger_dispatch(
             if !is_subscribable(event) {
                 return None;
             }
-            Some(TriggerDispatch {
-                event_type: event.event_type().to_string(),
-                payload: matchable_thread_payload(event, meta, *thread_id),
-                depth: emitted.depth,
-                emitting_trigger_id: emitted.emitting_trigger_id.clone(),
-                origin_thread_id: Some(*thread_id),
-            })
+            (
+                event.event_type().to_string(),
+                matchable_thread_payload(event, meta, *thread_id),
+                Some(*thread_id),
+            )
         }
-        // A domain event reads its depth off the variant, not off the frame.
-        // That copy is persisted, so a replay reconstructs it. Everything else
-        // about it is the arm below.
-        //
-        // The emitting trigger is the exception: it comes off the frame here
-        // too, because there is no persisted copy to read. See
-        // `docs/adr/0137-a-trigger-never-wakes-itself.md`.
-        BusEvent::System(se @ SystemEvent::DomainEvent { depth, .. }) => Some(TriggerDispatch {
-            event_type: se.stored_event_type().to_string(),
-            payload: matchable_system_payload(se),
-            depth: *depth,
-            emitting_trigger_id: emitted.emitting_trigger_id.clone(),
-            origin_thread_id: None,
-        }),
-        BusEvent::System(se) if is_subscribable_system_event(se) => Some(TriggerDispatch {
-            // The stored name and the stored payload, so a `condition` reads
-            // the same fields live and on replay.
-            event_type: se.stored_event_type().to_string(),
-            payload: matchable_system_payload(se),
-            depth: emitted.depth,
-            emitting_trigger_id: emitted.emitting_trigger_id.clone(),
-            origin_thread_id: None,
-        }),
-        BusEvent::System(_) => None,
-    }
+        // The stored name and the stored payload, so a `condition` reads the
+        // same fields live and on replay.
+        BusEvent::System(se) if is_subscribable_system_event(se) => (
+            se.stored_event_type().to_string(),
+            matchable_system_payload(se),
+            None,
+        ),
+        BusEvent::System(_) => return None,
+    };
+    Some(TriggerDispatch {
+        event_type,
+        payload,
+        depth: emitted.trigger_chain_depth(),
+        emitting_trigger_id: emitted.emitting_trigger_id.clone(),
+        origin_thread_id,
+    })
+}
+
+/// One events row, as a lag replay reads it for the trigger matcher.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct StoredTriggerCarrier {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) sequence: i64,
+    pub(crate) event_type: String,
+    pub(crate) payload: serde_json::Value,
+    pub(crate) thread_id: Option<uuid::Uuid>,
+    pub(crate) trigger_chain_depth: Option<i32>,
+    pub(crate) emitting_trigger_id: Option<String>,
+}
+
+/// [`trigger_dispatch`] for a stored row, so a lag replay hands the matcher
+/// what the live frame did. `None` when the name is not a trigger carrier.
+///
+/// The row holds every input: the stored payload is what the live matchable
+/// payload is built from, and the two provenance columns are what the frame
+/// carried. The gate is the name-level form of the live one.
+pub(crate) fn stored_trigger_dispatch(row: &StoredTriggerCarrier) -> Option<TriggerDispatch> {
+    use crate::core::event_subscription::{
+        matchable_payload, validate_subscribable_event_type, SubscriptionSurface,
+    };
+
+    validate_subscribable_event_type(&row.event_type, SubscriptionSurface::Trigger).ok()?;
+    Some(TriggerDispatch {
+        event_type: row.event_type.clone(),
+        payload: matchable_payload(&row.event_type, row.payload.clone(), row.thread_id),
+        depth: row
+            .trigger_chain_depth
+            .and_then(|d| u32::try_from(d).ok())
+            .unwrap_or(0),
+        emitting_trigger_id: row.emitting_trigger_id.clone(),
+        origin_thread_id: row.thread_id,
+    })
+}
+
+/// Fold every trigger-group lifecycle event into the registry it describes.
+/// Boot and a lagged subscriber both rebuild the registry from this.
+pub(crate) async fn load_trigger_groups(
+    pool: &PgPool,
+) -> Result<HashMap<String, TriggerGroup>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
+        "SELECT event_type, payload, created FROM events
+         WHERE aggregate = 'trigger_group'
+         ORDER BY sequence ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(replay_trigger_group_events(
+        rows.into_iter()
+            .map(|(event_type, payload, created)| TriggerGroupEventRow {
+                event_type,
+                payload,
+                created,
+            })
+            .collect(),
+    ))
 }
 
 /// Manages all triggers in Lucidos
@@ -190,8 +234,6 @@ pub struct SchedulerManager {
     /// backup-pref write. Only ever held briefly (take/store a token), never
     /// across an `.await`.
     backup_runner: BackupRunner,
-    /// Shared flag signaling task runners to stop scheduling new executions
-    shutdown_flag: Arc<AtomicBool>,
     /// In-memory trigger configs, rebuilt from events on startup and kept
     /// up-to-date via EventBus subscription. Source of truth for trigger
     /// listing — replaces DB queries to trigger_crons table.
@@ -222,7 +264,6 @@ impl SchedulerManager {
             pool,
             tracked_tasks: Arc::new(RwLock::new(HashMap::new())),
             backup_runner: Arc::new(std::sync::Mutex::new(None)),
-            shutdown_flag: Arc::new(AtomicBool::new(false)),
             trigger_configs,
             trigger_groups,
         })
@@ -297,16 +338,14 @@ impl SchedulerManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tracked_tasks = self.tracked_tasks.clone();
         let engine_health = self.engine.clone();
-        let health_shutdown = self.shutdown_flag.clone();
         let trigger_configs = self.trigger_configs.clone();
 
         let health_job = Job::new_async("*/30 * * * * *", move |_uuid, _lock| {
             let tracked = tracked_tasks.clone();
             let engine = engine_health.clone();
-            let shutdown = health_shutdown.clone();
             let configs = trigger_configs.clone();
             Box::pin(async move {
-                check_task_health_and_restart(tracked, engine, shutdown, configs).await;
+                check_task_health_and_restart(tracked, engine, configs).await;
             })
         })?;
 
@@ -343,17 +382,17 @@ impl SchedulerManager {
         // tearing-down EventBus. The work is bounded by the rows it matches.
         prune_devices(&self.pool, &self.engine.event_bus).await;
 
-        // Daily 03:10 UTC: drop expired webhook delivery claims. Ten minutes
+        // Daily 03:10 UTC: drop expired webhook delivery records. Ten minutes
         // after the device sweep so two DELETE-heavy jobs do not share a tick.
-        let pool_claims = self.pool.clone();
-        let claims_job = Job::new_async("0 10 3 * * *", move |_uuid, _lock| {
-            let pool = pool_claims.clone();
+        let pool_deliveries = self.pool.clone();
+        let deliveries_job = Job::new_async("0 10 3 * * *", move |_uuid, _lock| {
+            let pool = pool_deliveries.clone();
             Box::pin(async move {
-                prune_webhook_delivery_claims(pool).await;
+                prune_webhook_deliveries(pool).await;
             })
         })?;
-        self.scheduler.add(claims_job).await?;
-        log!("[Scheduler] Registered system task: prune_webhook_delivery_claims (daily 03:10 UTC)");
+        self.scheduler.add(deliveries_job).await?;
+        log!("[Scheduler] Registered system task: prune_webhook_deliveries (daily 03:10 UTC)");
 
         let engine_plugin_updates = self.engine.clone();
         let pool_plugin_updates = self.pool.clone();
@@ -581,49 +620,23 @@ impl SchedulerManager {
         Ok(())
     }
 
-    /// Replay trigger-group lifecycle events from the events table to rebuild
-    /// the in-memory registry.
+    /// Rebuild the trigger-group registry from its events.
     ///
     /// Unlike `replay_triggers_from_events`, a failed read degrades to no
     /// groups: they schedule nothing and prune nothing, so the panel shows
     /// flat sections and startup goes on.
     async fn replay_trigger_groups_from_events(&self) {
-        let rows = sqlx::query_as::<_, (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
-            "SELECT event_type, payload, created FROM events
-             WHERE aggregate = 'trigger_group'
-             ORDER BY sequence ASC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .unwrap_or_else(|e| {
+        let groups = load_trigger_groups(&self.pool).await.unwrap_or_else(|e| {
             log!("[Scheduler] Failed to replay trigger_group events: {}", e);
-            vec![]
+            HashMap::new()
         });
-
-        let event_rows: Vec<TriggerGroupEventRow> = rows
-            .into_iter()
-            .map(|(event_type, payload, created)| TriggerGroupEventRow {
-                event_type,
-                payload,
-                created,
-            })
-            .collect();
-
-        let count = event_rows.len();
-        let groups = replay_trigger_group_events(event_rows);
-        let total = groups.len();
-        {
-            let mut g = self.trigger_groups.write().unwrap();
-            *g = groups;
-        }
-
-        if count > 0 {
+        if !groups.is_empty() {
             log!(
-                "[Scheduler] Replayed {} trigger_group events → {} groups",
-                count,
-                total
+                "[Scheduler] Replayed trigger_group events → {} groups",
+                groups.len()
             );
         }
+        *self.trigger_groups.write().unwrap() = groups;
     }
 
     /// Migrate triggers whose prompt text is a stale placeholder like `"Run trigger ..."` or `"Run skill ..."`.
@@ -768,7 +781,6 @@ impl SchedulerManager {
             config,
             &self.tracked_tasks,
             &self.engine,
-            &self.shutdown_flag,
             &self.trigger_configs,
         )
         .await;
@@ -784,146 +796,26 @@ impl SchedulerManager {
     }
 
     /// Start a background task that subscribes to EventBus for trigger lifecycle
-    /// events AND domain events (to fire event-based triggers).
+    /// events AND domain events (to fire event-based triggers). The work per
+    /// `recv` lives in [`bus_subscriber::BusSubscriber::step`].
     fn start_trigger_event_subscriber(&self) {
-        let mut rx = self.engine.event_bus.subscribe();
-        let trigger_configs = self.trigger_configs.clone();
-        let trigger_groups = self.trigger_groups.clone();
-        let tracked_tasks = self.tracked_tasks.clone();
-        let engine = self.engine.clone();
-        let shutdown_flag = self.shutdown_flag.clone();
-        // For re-arming the backup loop when the timezone or a backup
-        // preference changes. The agent/HTTP write path is event-driven,
-        // because a tool cannot reach the scheduler directly.
-        let backup_runner = self.backup_runner.clone();
-        let pool = self.pool.clone();
-
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(emitted) => {
-                        if let crate::engine::event_bus::BusEvent::System(se) = &emitted.typed {
-                            use crate::engine::event_bus::SystemEvent;
-                            match se {
-                                SystemEvent::TriggerCreated {
-                                    trigger_id,
-                                    payload,
-                                    ..
-                                }
-                                | SystemEvent::TriggerUpdated {
-                                    trigger_id,
-                                    payload,
-                                    ..
-                                }
-                                | SystemEvent::TriggerDeleted {
-                                    trigger_id,
-                                    payload,
-                                    ..
-                                }
-                                | SystemEvent::TriggerEnabled {
-                                    trigger_id,
-                                    payload,
-                                    ..
-                                }
-                                | SystemEvent::TriggerDisabled {
-                                    trigger_id,
-                                    payload,
-                                    ..
-                                }
-                                | SystemEvent::TriggerExecuted {
-                                    trigger_id,
-                                    payload,
-                                } => {
-                                    handle_trigger_event(
-                                        se.event_type(),
-                                        trigger_id,
-                                        payload,
-                                        &trigger_configs,
-                                        &tracked_tasks,
-                                        &engine,
-                                        &shutdown_flag,
-                                    )
-                                    .await;
-                                }
-                                SystemEvent::TriggerGroupCreated {
-                                    group_id, payload, ..
-                                }
-                                | SystemEvent::TriggerGroupRenamed {
-                                    group_id, payload, ..
-                                }
-                                | SystemEvent::TriggerGroupReordered {
-                                    group_id, payload, ..
-                                }
-                                | SystemEvent::TriggerGroupDeleted {
-                                    group_id, payload, ..
-                                } => {
-                                    handle_trigger_group_event(
-                                        se.event_type(),
-                                        group_id,
-                                        payload,
-                                        &trigger_groups,
-                                    );
-                                }
-                                // Re-arm the backup loop when the user's
-                                // timezone changes, so the next fire is
-                                // resolved in the new zone.
-                                SystemEvent::TimezoneSet { .. } => {
-                                    reload_backup_schedule(
-                                        &backup_runner,
-                                        &engine,
-                                        &shutdown_flag,
-                                        &pool,
-                                    )
-                                    .await;
-                                }
-                                // Re-arm when the backup schedule or provider
-                                // changes via any write path: the agent's
-                                // `set_preference` (the tool layer cannot reach
-                                // the scheduler) or the HTTP handler. Idempotent
-                                // with the handler's own direct call.
-                                SystemEvent::PreferencesChanged { key, .. }
-                                    if key == prefs::BACKUP_SCHEDULE.key()
-                                        || key == prefs::BACKUP_PROVIDER.key() =>
-                                {
-                                    reload_backup_schedule(
-                                        &backup_runner,
-                                        &engine,
-                                        &shutdown_flag,
-                                        &pool,
-                                    )
-                                    .await;
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Every trigger carrier, decided in one place. See
-                        // `trigger_dispatch`.
-                        if let Some(dispatch) = trigger_dispatch(&emitted) {
-                            handle_domain_event(
-                                &dispatch.event_type,
-                                &dispatch.payload,
-                                dispatch.depth,
-                                dispatch.emitting_trigger_id.as_deref(),
-                                dispatch.origin_thread_id,
-                                Some(emitted.event_id),
-                                &trigger_configs,
-                                &engine,
-                            )
-                            .await;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        crate::log!("[Scheduler] EventBus subscriber lagged by {} events", n);
-                        rearm_after_lag(&trigger_configs, &tracked_tasks, &engine, &shutdown_flag)
-                            .await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        crate::log!("[Scheduler] EventBus closed, stopping trigger subscriber");
-                        break;
-                    }
-                }
-            }
-        });
+        let (mut rx, lag_replay) =
+            LagReplay::subscribe(&self.engine.event_bus, ReplayScope::Workspace, None);
+        let effects = bus_subscriber::EngineEffects {
+            engine: self.engine.clone(),
+            pool: self.pool.clone(),
+            trigger_configs: self.trigger_configs.clone(),
+            tracked_tasks: self.tracked_tasks.clone(),
+            backup_runner: self.backup_runner.clone(),
+        };
+        let mut subscriber = bus_subscriber::BusSubscriber::new(
+            effects,
+            self.engine.event_bus.clone(),
+            self.trigger_configs.clone(),
+            self.trigger_groups.clone(),
+            lag_replay,
+        );
+        tokio::spawn(async move { while subscriber.step(rx.recv().await).await.is_continue() {} });
     }
 
     /// List all trigger configs from in-memory state.
@@ -942,13 +834,7 @@ impl SchedulerManager {
     /// reload path so startup, a timezone change, and an agent/HTTP pref write
     /// all arm the loop identically (in the user's timezone).
     async fn load_backup_schedule(&mut self) {
-        reload_backup_schedule(
-            &self.backup_runner,
-            &self.engine,
-            &self.shutdown_flag,
-            &self.pool,
-        )
-        .await;
+        reload_backup_schedule(&self.backup_runner, &self.engine, &self.pool).await;
     }
 
     /// Set or clear the automatic backup schedule.
@@ -981,14 +867,7 @@ impl SchedulerManager {
                 PreferenceStore::set(&self.pool, bus, schedule_key, expr, actor.clone()).await?;
                 PreferenceStore::set(&self.pool, bus, provider_key, provider, actor).await?;
 
-                arm_backup_runner(
-                    &self.backup_runner,
-                    &self.engine,
-                    &self.shutdown_flag,
-                    expr,
-                    provider,
-                )
-                .await?;
+                arm_backup_runner(&self.backup_runner, &self.engine, expr, provider).await?;
             }
             None => {
                 // Disable schedule. The PROVIDER is still written: it is the
@@ -1011,14 +890,16 @@ impl SchedulerManager {
 
     /// Shutdown the scheduler gracefully.
     ///
-    /// 1. Signals all task runners to stop scheduling new executions
+    /// 1. Marks the engine shutting down, so no runner starts another fire
     /// 2. Waits up to 60s for in-flight task executions to complete
     /// 3. Aborts any remaining task handles
     pub async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log!("[Scheduler] Shutting down...");
 
-        // Signal all task runners to stop — they'll exit after their current execution finishes
-        self.shutdown_flag.store(true, Ordering::SeqCst);
+        // Normally already set by `begin_teardown`, so this matters only for a
+        // caller that shuts the scheduler down alone. Runners finish their
+        // current execution first.
+        self.engine.mark_shutting_down();
         // The backup loop reads the same flag, but the token wakes it now
         // instead of on its next 30-second poll.
         stop_backup_runner(&self.backup_runner);
@@ -1125,19 +1006,18 @@ fn next_backup_fire(
 ///
 /// The idiom is `task_runner::run_task_loop`'s, deliberately: short polls rather
 /// than one long sleep, because a monotonic timer does not advance across macOS
-/// system sleep. Exits on the shared shutdown flag or on `cancel`, whichever
+/// system sleep. Exits once engine shutdown begins or on `cancel`, whichever
 /// comes first.
 async fn run_backup_loop(
     engine: SharedEngine,
     schedule: cron::Schedule,
     tz: chrono_tz::Tz,
     provider_id: String,
-    shutdown_flag: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     loop {
-        if shutdown_flag.load(Ordering::Relaxed) || cancel.is_cancelled() {
+        if engine.is_shutting_down() || cancel.is_cancelled() {
             return;
         }
         let Some(next) = next_backup_fire(&schedule, tz, chrono::Utc::now()) else {
@@ -1145,7 +1025,7 @@ async fn run_backup_loop(
             return;
         };
         loop {
-            if shutdown_flag.load(Ordering::Relaxed) {
+            if engine.is_shutting_down() {
                 return;
             }
             let now = chrono::Utc::now();
@@ -1175,7 +1055,6 @@ async fn run_backup_loop(
 async fn arm_backup_runner(
     backup_runner: &BackupRunner,
     engine: &SharedEngine,
-    shutdown_flag: &Arc<AtomicBool>,
     cron_expr: &str,
     provider_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1201,7 +1080,6 @@ async fn arm_backup_runner(
         schedule,
         tz,
         provider_id.to_string(),
-        shutdown_flag.clone(),
         cancel,
     ));
     log!(
@@ -1233,7 +1111,6 @@ fn stop_backup_runner(backup_runner: &BackupRunner) {
 pub(crate) async fn reload_backup_schedule(
     backup_runner: &BackupRunner,
     engine: &SharedEngine,
-    shutdown_flag: &Arc<AtomicBool>,
     pool: &PgPool,
 ) {
     use crate::core::backup::is_schedule_active;
@@ -1276,17 +1153,14 @@ pub(crate) async fn reload_backup_schedule(
             return;
         }
     };
-    if let Err(e) = arm_backup_runner(backup_runner, engine, shutdown_flag, &cron, &provider).await
-    {
+    if let Err(e) = arm_backup_runner(backup_runner, engine, &cron, &provider).await {
         log!("[Scheduler] Failed to reload backup schedule: {}", e);
     }
 }
 
+mod bus_subscriber;
 mod task_runner;
-use task_runner::{
-    check_task_health_and_restart, handle_domain_event, handle_trigger_event, rearm_after_lag,
-    register_and_track, TrackedTask,
-};
+use task_runner::{check_task_health_and_restart, register_and_track, TrackedTask};
 
 /// Apply a trigger-group lifecycle event to the in-memory registry. Groups
 /// don't schedule anything, so this is just a write to the shared map. Called
@@ -1345,20 +1219,20 @@ use plugin_updates::{
 use webhook_ingress::{run_webhook_ingress_check, WEBHOOK_INGRESS_CRON};
 use webhook_refusal::{run_webhook_refusal_check, WEBHOOK_REFUSAL_CRON};
 
-/// Drop webhook delivery claims nothing can still be waiting on.
+/// Drop webhook delivery records nothing can still be deduping against.
 ///
-/// The ledger's horizon IS the largest window a hook may configure, so a claim
+/// The ledger's horizon IS the largest window a hook may configure, so a row
 /// this deletes cannot still be deciding a duplicate. Silent by design: the
-/// table is a nonce ledger, and expiring a claim is not a state change anyone
+/// table is a nonce ledger, and expiring a row is not a state change anyone
 /// made.
-pub(crate) async fn prune_webhook_delivery_claims(pool: PgPool) {
+pub(crate) async fn prune_webhook_deliveries(pool: PgPool) {
     match crate::core::DeliveryLedger::prune(&pool).await {
         Ok(0) => {}
         Ok(gone) => log!(
-            "[Scheduler] Pruned {} expired webhook delivery claim(s)",
+            "[Scheduler] Pruned {} expired webhook delivery record(s)",
             gone
         ),
-        Err(e) => log!("[Scheduler] prune_webhook_delivery_claims failed: {}", e),
+        Err(e) => log!("[Scheduler] prune_webhook_deliveries failed: {}", e),
     }
 }
 
@@ -1597,9 +1471,9 @@ mod tests {
     }
 
     #[test]
-    fn a_domain_event_dispatches_at_its_own_persisted_depth() {
-        // The envelope depth is the emitting task's; the variant's is the one
-        // a replay reconstructs, so the domain carrier keeps reading its own.
+    fn a_domain_event_dispatches_at_its_own_variants_depth() {
+        // The envelope depth is the emitting task's. The domain carrier reads
+        // the variant's, through the function the stored row is written from.
         let frame = emitted(
             BusEvent::System(SystemEvent::DomainEvent {
                 event_type: "BuildObserved".into(),

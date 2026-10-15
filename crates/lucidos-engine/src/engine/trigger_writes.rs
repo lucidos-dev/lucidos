@@ -434,7 +434,7 @@ mod tests {
 
         // The subscriber has to name the variants to *destructure* them off the
         // broadcast; it never builds one.
-        const ALLOWED: [&str; 2] = ["engine/trigger_writes.rs", "scheduler/mod.rs"];
+        const ALLOWED: [&str; 2] = ["engine/trigger_writes.rs", "scheduler/bus_subscriber.rs"];
 
         let mut offenders: Vec<String> = Vec::new();
         for (rel, text) in production_sources() {

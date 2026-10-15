@@ -143,7 +143,7 @@ fn client_for(transport: Transport) -> &'static reqwest::Client {
 /// `provider` is `None` when the file itself is the problem, so there is
 /// no entry to name. Modelling that as an option rather than a sentinel
 /// name keeps a real provider called "apis.json" from impersonating it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RejectedProvider {
     pub provider: Option<String>,
     pub reason: String,

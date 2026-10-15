@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.48.1"
+LUCIDOS_DEFAULT_VERSION="0.49.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -162,6 +162,14 @@ warn() { printf '%s  !%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf '\n%sERROR:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# ensure_storage_root <dir>: make <dir> owner-only (ADR 0456), so another local
+# user cannot traverse into what Lucidos stores there. A copy of
+# scripts/lib/storage_root.sh's, because a piped run fetches only the libs the
+# origin serves. crates/lucidos-home pins the two bodies equal.
+ensure_storage_root() {
+    (umask 077 && mkdir -p "$1") && chmod 700 "$1"
+}
 
 # ── helper library sourcing (download / from-tarball modes) ──────────────────
 # The directory install.sh was invoked from, if it is a real file (a checkout or
@@ -284,6 +292,7 @@ extract_tarball() {
     fi
 
     step "Extracting runtime → $runtime_dir" >&2
+    ensure_storage_root "$LUCIDOS_PREFIX" || die "Could not make $LUCIDOS_PREFIX owner-only"
     mkdir -p "$runtime_parent" || die "Could not create $runtime_parent"
 
     # Extract beside the live tree and swap, never delete then extract. This
@@ -607,6 +616,7 @@ apply_bind_config() {
     [ -n "$LUCIDOS_BIND" ] || return 0
     local path existing="" old
     path="$(service_network_toml_path "$HOME")"
+    ensure_storage_root "$(dirname "$path")" || die "Could not make $(dirname "$path") owner-only"
     if [ -f "$path" ]; then
         existing="$(cat "$path" 2>/dev/null || true)"
         old="$(service_network_toml_bind "$existing")"
@@ -707,7 +717,8 @@ record_instance_port() {
 # LUCIDOS_PG_LIB_DIR for every PG subprocess, so we only point the PG dirs.
 launch_runtime() {
     local runtime_dir="$1" data="$LUCIDOS_GATEWAY_DATA" pair
-    mkdir -p "$data" "$data/fastembed" || die "Could not create the gateway data dir $data"
+    ensure_storage_root "$data" || die "Could not make the gateway data dir $data owner-only"
+    mkdir -p "$data/fastembed" || die "Could not create the gateway data dir $data"
 
     # Record the instance port BEFORE the exec below, which never returns. The
     # service path writes the same marker AFTER its unit, deliberately; here
@@ -747,7 +758,8 @@ EOF
 register_service() {
     local runtime_dir="$1" manager="$2"
     local data="$LUCIDOS_GATEWAY_DATA" prefix="$LUCIDOS_PREFIX" slug="$LUCIDOS_INSTANCE"
-    mkdir -p "$data" "$data/fastembed" "$(service_log_dir "$data")" \
+    ensure_storage_root "$data" || die "Could not make the instance data dir $data owner-only"
+    mkdir -p "$data/fastembed" "$(service_log_dir "$data")" \
         || die "Could not create the instance data/log dirs at $data"
 
     local runtime_root gateway_bin env_block mode
@@ -765,6 +777,7 @@ register_service() {
         mode=644
     fi
 
+    stop_running_instance "$manager" "$slug" "$data" "$runtime_root"
     step "Registering instance '$slug' as a user service ($manager, port $LUCIDOS_PORT)"
     case "$manager" in
         launchd)      register_launchd "$gateway_bin" "$data" "$env_block" "$mode" "$slug" ;;
@@ -790,6 +803,34 @@ $(service_log_hint "$manager" "$data" "$slug")
         info "curl not found — skipping the post-register health check."
     fi
     print_service_running "$runtime_dir" "$manager"
+}
+
+# stop_running_instance <manager> <slug> <data> <runtime-root> — before the new
+# unit loads, stop the instance's service if it runs, then the engines and
+# embedded Postgres it spawned. A gateway stop alone, by this script or by hand,
+# leaves both running. The new gateway would adopt engines that still hold the
+# old DATABASE_URL (ADR 0452). A first install has nothing to stop.
+stop_running_instance() {
+    local manager="$1" slug="$2" data="$3" runtime_root="$4" uid label unit_name
+    case "$manager" in
+        launchd)
+            uid="$(id -u)"
+            label="$(service_launchd_label "$slug")"
+            if service_launchd_is_loaded "$uid" "$label"; then
+                service_launchd_unload "$uid" "$label" \
+                    || die "launchctl could not stop the running service ($label)${SERVICE_LAUNCHD_ERR:+: $SERVICE_LAUNCHD_ERR}"
+            fi
+            ;;
+        systemd-user)
+            unit_name="$(service_systemd_unit_name "$slug")"
+            if service_systemd_is_active "$unit_name"; then
+                service_systemd_stop "$unit_name" \
+                    || die "systemctl --user could not stop the running $unit_name. Check: systemctl --user status $unit_name"
+            fi
+            ;;
+    esac
+    step "Stopping any engines and embedded Postgres left from a previous run"
+    service_stop_embedded_runtime "$data" "$runtime_root"
 }
 
 # append_provider_creds <env-block> — append any supplied provider creds to the
@@ -1301,6 +1342,7 @@ fetch_repo() {
 PROVIDER_MODE="mock"   # mock|openai|vertex|existing
 configure_provider() {
     step "Configuring the LLM provider"
+    ensure_storage_root "$LUCIDOS_WORKSPACE" || die "Could not make $LUCIDOS_WORKSPACE owner-only"
     mkdir -p "$LUCIDOS_WORKSPACE/data"
     local env_file="$LUCIDOS_WORKSPACE/data/.env"
 

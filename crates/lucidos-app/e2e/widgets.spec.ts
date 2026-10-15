@@ -1,6 +1,6 @@
 import { test, expect, Page } from './fixtures';
 import { randomUUID } from 'crypto';
-import { apiRequest, assertHealthy, navigateToApp, clickVisibleElement, isMobileViewport } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, clickVisibleElement, isMobileViewport, hideHomeRail } from './helpers';
 import { psql } from './db-helpers';
 
 /**
@@ -29,9 +29,9 @@ async function writeFile(page: Page, path: string, body: string): Promise<void> 
   expect(resp.ok(), `PUT ${path}`).toBeTruthy();
 }
 
-/** A widget a few lines tall, well inside the card's clip. */
+/** A widget a few lines tall, well inside the inline widget's clip. */
 const SHORT_WIDGET = '<!doctype html><html><head><script src="/api/v1/sdk.js"></script></head><body><h1>Fares</h1></body></html>';
-/** A widget far taller than one phone screen, so its card clips. */
+/** A widget far taller than one phone screen, so its inline widget clips. */
 const TALL_WIDGET = '<!doctype html><html><head><script src="/api/v1/sdk.js"></script></head>'
   + '<body><h1>Fares</h1><div style="height: 3000px"></div></body></html>';
 
@@ -83,8 +83,8 @@ async function openThread(page: Page, threadId: string): Promise<void> {
 }
 
 const chip = (page: Page) => page.locator('.widget-chip:visible', { hasText: WIDGET_NAME }).first();
-const card = (page: Page) => page.locator('.chat-exchange .widget-card-inline:visible').first();
-const droppedCard = (page: Page) => page.locator('.widget-shelf-drop .widget-card:visible').first();
+const card = (page: Page) => page.locator('.chat-exchange .inline-widget:visible').first();
+const droppedCard = (page: Page) => page.locator('.widget-shelf-drop .widget-panel:visible').first();
 
 test.describe('Widgets', () => {
   let threadId: string;
@@ -95,6 +95,7 @@ test.describe('Widgets', () => {
     written = [];
     threadId = randomUUID();
     appId = `e2e-widget-${randomUUID().slice(0, 8)}`;
+    await hideHomeRail(page);
     await page.goto('/');
   });
 
@@ -105,7 +106,7 @@ test.describe('Widgets', () => {
     }
   });
 
-  test('shows the widget inline in its card, drops open from its chip, and survives a reload', async ({ page }) => {
+  test('shows the widget inline in its turn, drops open from its chip, and survives a reload', async ({ page }) => {
     await writeWidget(page, appId, threadId, SHORT_WIDGET);
     seedThreadShowingWidget(threadId, appId, { pinned: true });
     await openThread(page, threadId);
@@ -117,7 +118,7 @@ test.describe('Widgets', () => {
       'src', new RegExp(`/app/${appId}/`),
     );
     // It fits, so the card does not clip it.
-    await expect(card(page).locator('.widget-card-fade')).toHaveCount(0);
+    await expect(card(page).locator('.inline-widget-fade')).toHaveCount(0);
 
     // A chip tap drops the widget open under the title, in an app frame.
     expect(await clickVisibleElement(page, '.widget-chip', WIDGET_NAME)).toBe(true);
@@ -153,11 +154,11 @@ test.describe('Widgets', () => {
     seedThreadShowingWidget(threadId, appId, { pinned: false });
     await openThread(page, threadId);
 
-    const expand = card(page).locator('.widget-card-fade .action-btn');
+    const expand = card(page).locator('.inline-widget-fade .action-btn');
     await expect(expand).toBeVisible({ timeout: 15_000 });
     // The frame is as tall as its content, so it has nothing to scroll.
     const frame = card(page).locator('.widget-frame');
-    const clip = card(page).locator('.widget-card-clip');
+    const clip = card(page).locator('.inline-widget-clip');
     const [frameBox, clipBox] = await Promise.all([frame.boundingBox(), clip.boundingBox()]);
     expect(frameBox && clipBox).toBeTruthy();
     expect(frameBox!.height).toBeGreaterThan(clipBox!.height);
@@ -181,7 +182,7 @@ test.describe('Widgets', () => {
     const plain = page.locator('.widget-chip:visible', { hasText: 'Ferry times' }).first();
     await expect(plain.locator('.app-icon-monogram')).toHaveText('F');
     // The card's bar draws the same picture as its chip.
-    await expect(page.locator(`.widget-card-inline:visible .app-icon-image img[src*="/app/${appId}/"]`).first())
+    await expect(page.locator(`.inline-widget:visible .app-icon-image img[src*="/app/${appId}/"]`).first())
       .toBeVisible();
   });
 

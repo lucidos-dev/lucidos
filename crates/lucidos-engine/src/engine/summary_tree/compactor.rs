@@ -32,18 +32,21 @@ use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 use super::compaction_view::{self, CompactionView};
+use super::compactor_models::Tokens;
 use super::limit::{Lanes, MAX_LIMIT};
 use super::log::{self, EntryKind, LogEntry};
 use super::shape::LeafOrder;
+use super::spend::{self, Episode, StartEstimate};
 use super::store::{self, StoredNode};
 use super::view::ViewBlocks;
 use super::workspace_log::{WorkspaceLeaf, WorkspaceLog};
 use super::{prompt, shape, NodeAddr, SummaryScope, HORIZON_SECS, LIVE_DRAINS, RAW_CONTEXT_BYTES};
 use super::{BackfillProgress, NODE_BYTES, READS, READY_DAYS, RETRY, TRIES};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
-use crate::engine::thread_events::ActorMode;
+use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::engine::{AuxCapture, ContextPurpose};
 use crate::llm::provider::{LlmProvider, Message, MessageContent};
+use crate::llm::{CacheMode, ServiceTier};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -58,6 +61,10 @@ pub(crate) trait CompactorDeps: Send + Sync {
     /// An artifact's text at a commit, or `None`, logged, when it cannot be
     /// read as text.
     fn read_artifact(&self, path: &str, commit: &str) -> Option<String>;
+
+    /// What a backfill from here would cost on the compactor's model and
+    /// tier, as the Start dialog shows it.
+    async fn backfill_estimate(&self) -> Result<StartEstimate, String>;
 }
 
 pub(crate) struct CompactionModel {
@@ -71,14 +78,25 @@ pub(crate) struct CompactionModel {
     pub(crate) deadline: Duration,
     /// The provider route the calls take, which names their lane.
     pub(crate) lane: String,
+    /// The route serves this model on the Flex tier, which the backfill asks
+    /// for.
+    pub(crate) flex: bool,
 }
+
+/// Flex refusals in a row, for capacity, after which a node asks for the
+/// standard tier.
+const FLEX_TRIES: u32 = 2;
+
+/// Wait between tries to open a backfill episode whose estimate failed.
+const EPISODE_RETRY: Duration = Duration::from_secs(60);
 
 /// How one drain ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Drained {
     /// Every node the log allows is built.
     Complete,
-    /// The compactor paused mid-drain; resume re-seeds the scope.
+    /// The compactor stopped mid-drain: it paused, or the backfill reached its
+    /// cap. Resume, or the raise's re-seed, queues the scope again.
     Paused,
     /// A node failed; the scope goes back after [`RETRY`].
     Failed,
@@ -200,6 +218,22 @@ pub(crate) struct Compactor {
     /// Held from reading the backfill count to emitting it, so two workers
     /// never announce counts out of order.
     announcing: tokio::sync::Mutex<()>,
+    /// The open backfill episode: read from events at each seed, and its
+    /// spend kept current between seeds ([`spend`]).
+    episode: Mutex<Option<Episode>>,
+    /// Who switched the workspace to Tree, for the episode the next seed
+    /// opens.
+    starter: Mutex<Option<MessageOrigin>>,
+    /// Held while the episode is read, opened, closed, or announces its cap.
+    /// So two seeds never open two, a seed never revives an ended episode,
+    /// and a cap is announced once. Never held across `announce_progress`,
+    /// which can close the episode.
+    opening: tokio::sync::Mutex<()>,
+    /// When a backfill whose episode failed to open may try again.
+    episode_retry: Mutex<Option<tokio::time::Instant>>,
+    /// Nodes whose Flex calls were refused for capacity, with the count in a
+    /// row. A node at [`FLEX_TRIES`] asks for the standard tier.
+    flex_refusals: Mutex<HashMap<(SummaryScope, NodeAddr), u32>>,
 }
 
 impl Compactor {
@@ -221,6 +255,11 @@ impl Compactor {
             resumed: Notify::new(),
             waiting_for_model: AtomicBool::new(false),
             announcing: tokio::sync::Mutex::new(()),
+            episode: Mutex::default(),
+            starter: Mutex::default(),
+            opening: tokio::sync::Mutex::new(()),
+            episode_retry: Mutex::default(),
+            flex_refusals: Mutex::default(),
         })
     }
 
@@ -253,6 +292,8 @@ impl Compactor {
             .filter(|n| n.total > 0)
             .map(|n| n.done.min(n.total) * 1000 / n.total)
             .sum();
+        let episode = self.episode.lock().unwrap();
+        let episode = episode.as_ref();
         Some(BackfillProgress {
             done,
             total: backfill.total,
@@ -262,6 +303,10 @@ impl Compactor {
             waiting_for_model: self.waiting_for_model.load(Ordering::SeqCst),
             retrying: !backfill.failing.is_empty(),
             ready: backfill.ready,
+            spent_usd: episode.and_then(Episode::priced_spend),
+            cap_usd: episode.and_then(|e| e.cap_usd),
+            next_cap_usd: episode.and_then(Episode::next_cap),
+            held: episode.is_some_and(Episode::held),
             seq: q.announced,
         })
     }
@@ -303,15 +348,38 @@ impl Compactor {
                 "[SummaryTree] TreeBackfillProgressed",
             )
             .await;
-        let mut q = self.queue.lock().unwrap();
-        // A re-seed during the emit installs a new backfill, which stays.
-        if q.backfill
-            .as_ref()
-            .is_some_and(|b| b.ready && b.owed.is_empty())
-        {
-            log!("[SummaryTree] Backfill complete; every tree is built");
-            q.backfill = None;
+        let finished = {
+            let mut q = self.queue.lock().unwrap();
+            // A re-seed during the emit installs a new backfill, which stays.
+            let finished = q
+                .backfill
+                .as_ref()
+                .is_some_and(|b| b.ready && b.owed.is_empty());
+            if finished {
+                log!("[SummaryTree] Backfill complete; every tree is built");
+                q.backfill = None;
+            }
+            finished
+        };
+        if finished {
+            self.close_episode().await;
         }
+    }
+
+    /// Close the open episode, when there is one, with what it spent.
+    async fn close_episode(&self) {
+        let _one = self.opening.lock().await;
+        let Some(episode) = self.episode.lock().unwrap().take() else {
+            return;
+        };
+        self.bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::TreeBackfillEnded {
+                    spent_usd: episode.priced_spend(),
+                }),
+                "[SummaryTree] TreeBackfillEnded",
+            )
+            .await;
     }
 
     /// Record whether the compactor waits on a model, and announce a change.
@@ -366,6 +434,7 @@ impl Compactor {
         let swept = store::sweep_deleted_threads(&self.pool).await?;
         let threads = store::dirty_threads(&self.pool, READY_DAYS).await?;
         let ready = store::is_ready(&self.pool).await?;
+        self.sync_episode(!ready).await?;
         let trees = store::in_scope_thread_count(&self.pool).await? + 1;
         let mut scopes = vec![SummaryScope::Workspace];
         let mut owed: HashSet<SummaryScope> = HashSet::new();
@@ -392,6 +461,7 @@ impl Compactor {
             gate.len(),
             swept
         );
+        let owed_nothing = owed.is_empty();
         {
             let mut q = self.queue.lock().unwrap();
             // A drain running through the re-seed keeps counting its nodes,
@@ -406,7 +476,7 @@ impl Compactor {
                 ),
                 None => Default::default(),
             };
-            q.backfill = (!owed.is_empty()).then(|| Backfill {
+            q.backfill = (!owed_nothing).then(|| Backfill {
                 // A thread created between the two reads is owed but uncounted.
                 total: trees.max(scopes.len()),
                 owed,
@@ -419,9 +489,181 @@ impl Compactor {
                 mark_dirty_in(&mut q, scope, false);
             }
         }
+        if owed_nothing {
+            self.close_episode().await;
+        }
         self.wake.notify_waiters();
         self.announce_progress().await;
         Ok(())
+    }
+
+    /// Read the open episode from the events. With none open and `opening`,
+    /// open one: a backfill toward the ready flag is starting. A cap reached
+    /// with nothing announcing it, as after a restart, is announced here.
+    async fn sync_episode(&self, opening: bool) -> Result<(), BoxError> {
+        let announced = {
+            let _one = self.opening.lock().await;
+            let mut episode = spend::load(&self.pool).await?;
+            if episode.is_none() && opening && !self.is_paused() && self.open_episode().await {
+                episode = spend::load(&self.pool).await?;
+            }
+            let unannounced = episode
+                .as_mut()
+                .filter(|e| e.held() && !e.cap_announced)
+                .map(|e| {
+                    e.cap_announced = true;
+                    (e.spent_usd, e.cap_usd)
+                });
+            *self.episode.lock().unwrap() = episode;
+            match unannounced {
+                Some((spent_usd, Some(cap_usd))) => {
+                    self.emit_cap_reached(spent_usd, cap_usd).await;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if announced {
+            self.announce_progress().await;
+        }
+        Ok(())
+    }
+
+    /// Open the episode a backfill toward the ready flag still lacks, before
+    /// its next model call. Its estimate failed at seed, say for want of a
+    /// model, so the calls the model now answers would run uncapped.
+    async fn ensure_episode(&self) {
+        if self.episode.lock().unwrap().is_some() {
+            return;
+        }
+        let toward_ready = self
+            .queue
+            .lock()
+            .unwrap()
+            .backfill
+            .as_ref()
+            .is_some_and(|b| !b.ready);
+        if !toward_ready {
+            return;
+        }
+        {
+            let now = tokio::time::Instant::now();
+            let mut retry = self.episode_retry.lock().unwrap();
+            if retry.is_some_and(|at| now < at) {
+                return;
+            }
+            *retry = Some(now + EPISODE_RETRY);
+        }
+        if let Err(e) = self.sync_episode(true).await {
+            log!("[SummaryTree] Could not open the backfill episode: {}", e);
+        }
+    }
+
+    /// Emit `TreeBackfillStarted` with what the backfill is estimated to cost,
+    /// and say whether it did. A workspace with nothing to build opens none.
+    async fn open_episode(&self) -> bool {
+        let estimate = match self.deps.backfill_estimate().await {
+            Ok(estimate) => estimate,
+            Err(e) => {
+                log!(
+                    "[SummaryTree] No estimate, so this backfill runs with no cap: {}",
+                    e
+                );
+                return false;
+            }
+        };
+        if estimate.calls.high == 0 {
+            return false;
+        }
+        let cap_usd = estimate.cost.as_ref().map(|c| c.cap_usd);
+        log!(
+            "[SummaryTree] Backfill started on {} at {:?}: {}..{} calls, cap {:?} USD",
+            estimate.model,
+            estimate.effort,
+            estimate.calls.low,
+            estimate.calls.high,
+            cap_usd
+        );
+        let actor = self.starter.lock().unwrap().take();
+        self.bus
+            .emit(BusEvent::System(SystemEvent::TreeBackfillStarted {
+                estimate,
+                cap_usd,
+                actor,
+            }))
+            .await
+            .map_err(|e| log!("[SummaryTree] TreeBackfillStarted emit failed: {}", e))
+            .is_ok()
+    }
+
+    /// Callers hold `opening`, and announce progress once they release it.
+    async fn emit_cap_reached(&self, spent_usd: f64, cap_usd: f64) {
+        log!(
+            "[SummaryTree] The backfill spent {:.2} of its {:.2} USD cap; holding it",
+            spent_usd,
+            cap_usd
+        );
+        self.bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::TreeBackfillCapReached { spent_usd, cap_usd }),
+                "[SummaryTree] TreeBackfillCapReached",
+            )
+            .await;
+    }
+
+    /// Whoever switched the workspace to Tree, named on the episode a seed
+    /// opens next.
+    pub(crate) fn set_starter(&self, actor: Option<MessageOrigin>) {
+        *self.starter.lock().unwrap() = actor;
+    }
+
+    /// A raise landed in the events. Re-seeding reads it and queues the work
+    /// the hold kept back.
+    pub(crate) async fn cap_raised(&self) {
+        if let Err(e) = self.seed().await {
+            log!("[SummaryTree] Could not re-seed after a cap raise: {}", e);
+        }
+    }
+
+    /// Whether the backfill spent its cap and waits for the user.
+    fn held(&self) -> bool {
+        self.episode
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(Episode::held)
+    }
+
+    /// Whether `scope` waits on a raise: the backfill owes it and is held.
+    fn holds(&self, scope: SummaryScope) -> bool {
+        self.held() && owed_in(&self.queue.lock().unwrap(), scope)
+    }
+
+    /// Add one node's model calls, served on `tier`, to the episode's spend.
+    async fn record_spend(&self, model: &str, tier: Option<ServiceTier>, tokens: Tokens) {
+        if tokens == Tokens::default() {
+            return;
+        }
+        let announced = {
+            let _one = self.opening.lock().await;
+            let reached = {
+                let mut episode = self.episode.lock().unwrap();
+                let Some(episode) = episode.as_mut() else {
+                    return;
+                };
+                (episode.spend(model, tier, tokens)).then_some((episode.spent_usd, episode.cap_usd))
+            };
+            match reached {
+                Some((spent_usd, Some(cap_usd))) => {
+                    self.emit_cap_reached(spent_usd, cap_usd).await;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if announced {
+            self.announce_progress().await;
+        }
     }
 
     /// Mark `scope` dirty. `urgent` puts it at the front, for live events.
@@ -442,6 +684,10 @@ impl Compactor {
     /// written while the delete ran.
     pub(crate) fn forget_threads(&self, ids: &[Uuid]) {
         self.deleted_threads.lock().unwrap().extend(ids);
+        self.flex_refusals
+            .lock()
+            .unwrap()
+            .retain(|(scope, _), _| !matches!(scope, SummaryScope::Thread(id) if ids.contains(id)));
         self.mark_dirty(SummaryScope::Workspace, true);
         for id in ids {
             self.mark_dirty(SummaryScope::Thread(*id), true);
@@ -484,11 +730,16 @@ impl Compactor {
     /// A live-only worker takes the first urgent scope, wherever it sits: an
     /// owed workspace drain marked by a live event can hold the front.
     fn pop(&self, take: Take) -> Option<(SummaryScope, bool)> {
+        let held = self.held();
         let mut q = self.queue.lock().unwrap();
+        let takes = |q: &Queue, s: SummaryScope| !(held && owed_in(q, s));
         let at = match take {
-            Take::Any => 0,
+            Take::Any => q.order.iter().position(|s| takes(&q, *s))?,
             Take::UrgentOnly if q.urgent.is_empty() => return None,
-            Take::UrgentOnly => q.order.iter().position(|s| urgency(&q, *s))?,
+            Take::UrgentOnly => q
+                .order
+                .iter()
+                .position(|s| urgency(&q, *s) && takes(&q, *s))?,
         };
         let scope = q.order.remove(at)?;
         let urgent = urgency(&q, scope);
@@ -618,9 +869,15 @@ impl Compactor {
             backfill.ready = true;
         }
         log!("[SummaryTree] The workspace tree and the recent threads are built; the workspace is ready");
+        let spent_usd = self
+            .episode
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Episode::priced_spend);
         self.bus
             .emit_or_log(
-                BusEvent::System(SystemEvent::TreeBackfillCompleted { total }),
+                BusEvent::System(SystemEvent::TreeBackfillCompleted { total, spent_usd }),
                 "[SummaryTree] TreeBackfillCompleted",
             )
             .await;
@@ -934,7 +1191,7 @@ impl Compactor {
         let mut view = CompactionView::default();
 
         loop {
-            if !failed && !self.is_paused() {
+            if !failed && !self.is_paused() && !self.holds(scope) {
                 let size = |a: NodeAddr| sizes.get(&a).copied();
                 let room = MAX_LIMIT - inflight.len();
                 for addr in pending.buildable(&texts, &busy, source.leaf_order(), room) {
@@ -960,7 +1217,7 @@ impl Compactor {
                         NodeInput::Leaf(LeafInput {
                             context: LeafContext::Raw(lines),
                             ..
-                        }) => compaction_view::render(lines.iter().map(String::as_str), 0),
+                        }) => compaction_view::render_unshared(lines.iter().map(String::as_str)),
                         _ => {
                             let end = if addr.is_leaf() {
                                 addr.start.min(pending.first_unbuilt_leaf())
@@ -969,10 +1226,7 @@ impl Compactor {
                             };
                             view.advance(pending.built_prefix_end(), &size);
                             let tiles = view.tiles(end, &size);
-                            compaction_view::render(
-                                tiles.iter().map(|a| texts[a].as_str()),
-                                compaction_view::RUNGS,
-                            )
+                            compaction_view::render(tiles.iter().map(|a| texts[a].as_str()), &view)
                         }
                     };
                     busy.insert(addr);
@@ -1020,7 +1274,7 @@ impl Compactor {
         } else if failed {
             Drained::Failed
         } else if !pending.is_done() {
-            // Only a pause stops the pump with nodes left to build.
+            // Only a pause or a hold stops the pump with nodes left to build.
             Drained::Paused
         } else {
             Drained::Complete
@@ -1065,7 +1319,7 @@ impl Compactor {
             (verbatim, None)
         } else {
             let (text, model) = self
-                .write_line(&context, &step, capture_thread, urgent)
+                .write_line((scope, addr), &context, &step, capture_thread, urgent)
                 .await?;
             (text, Some(model))
         };
@@ -1079,10 +1333,12 @@ impl Compactor {
         Ok(node)
     }
 
-    /// One model-written line, under the purpose's whole-node deadline, in
-    /// the lane of the route it takes.
+    /// One model-written line for `node`, under the purpose's whole-node
+    /// deadline, in the lane of the route it takes. Backfill work asks for
+    /// Flex where the route offers it, until [`FLEX_TRIES`] refusals in a row.
     async fn write_line(
         &self,
+        node: (SummaryScope, NodeAddr),
         context: &ViewBlocks,
         step: &str,
         capture_thread: Option<Uuid>,
@@ -1093,6 +1349,9 @@ impl Compactor {
             .model()
             .await
             .map_err(NodeError::ModelUnavailable)?;
+        let tier = (!urgent && model.flex && self.flex_refused(node) < FLEX_TRIES)
+            .then_some(ServiceTier::Flex);
+        self.ensure_episode().await;
         let permit = self.lanes.lane(&model.lane).acquire(urgent).await;
         let capture = AuxCapture::for_thread_or_home(
             &self.bus,
@@ -1100,20 +1359,38 @@ impl Compactor {
             ContextPurpose::SummaryCompaction,
         );
         let request = prompt::request(context, step);
-        match fit_line(&model, request, &capture).await {
+        let mut spent = Spent::default();
+        let fitted = fit_line(&model, tier, request, &capture, &mut spent).await;
+        self.record_spend(&model.model, spent.served_tier, spent.tokens)
+            .await;
+        match fitted {
             Ok(line) => {
                 permit.succeeded();
+                self.flex_refusals.lock().unwrap().remove(&node);
                 self.set_waiting_for_model(false).await;
                 Ok((line, model.model))
             }
             Err(NodeError::Failed(e)) => {
                 if crate::llm::is_capacity_error(&e) {
                     permit.congested();
+                    if tier.is_some() {
+                        *self.flex_refusals.lock().unwrap().entry(node).or_default() += 1;
+                    }
                 }
                 Err(NodeError::Failed(e))
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// How many Flex calls in a row `node` had refused for capacity.
+    fn flex_refused(&self, node: (SummaryScope, NodeAddr)) -> u32 {
+        self.flex_refusals
+            .lock()
+            .unwrap()
+            .get(&node)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -1125,13 +1402,17 @@ enum Take {
     UrgentOnly,
 }
 
+/// Whether the running backfill owes `scope`.
+fn owed_in(q: &Queue, scope: SummaryScope) -> bool {
+    q.backfill.as_ref().is_some_and(|b| b.owed.contains(&scope))
+}
+
 /// Whether queued `scope` drains as urgent. The workspace drain the backfill
 /// still owes never does, though a live event marked it: it holds up to
 /// [`MAX_LIMIT`] calls of history, and urgent ones would starve every other
 /// call in the lane.
 fn urgency(q: &Queue, scope: SummaryScope) -> bool {
-    let backfilling = scope == SummaryScope::Workspace
-        && q.backfill.as_ref().is_some_and(|b| b.owed.contains(&scope));
+    let backfilling = scope == SummaryScope::Workspace && owed_in(q, scope);
     q.urgent.contains(&scope) && !backfilling
 }
 
@@ -1167,11 +1448,14 @@ fn enqueue(q: &mut Queue, scope: SummaryScope, urgent: bool) {
 /// a target nothing downstream relies on.
 ///
 /// The purpose's deadline covers every round. It bounds each provider call,
-/// never its record, so a round that answered in time is never lost.
+/// never its record, so a round that answered in time is never lost. Every
+/// round that answered adds to `spent`, whether or not the node then fails.
 async fn fit_line(
     model: &CompactionModel,
+    tier: Option<ServiceTier>,
     request: MessageContent,
     capture: &AuxCapture,
+    spent: &mut Spent,
 ) -> Result<String, NodeError> {
     let mut messages = vec![Message {
         role: "user".to_string(),
@@ -1184,7 +1468,10 @@ async fn fit_line(
             model.provider.as_ref(),
             messages.clone(),
             vec![],
-            crate::llm::ModelSelection::model(&model.model).with_effort(model.effort.as_deref()),
+            crate::llm::ModelSelection::model(&model.model)
+                .with_effort(model.effort.as_deref())
+                .with_service_tier(tier)
+                .with_cache_mode(CacheMode::Explicit),
             Some(prompt::COMPACT),
             None,
         );
@@ -1195,6 +1482,12 @@ async fn fit_line(
                 NodeError::from(e)
             }
         })?;
+        let count = |n: Option<u32>| f64::from(n.unwrap_or_default());
+        spent.tokens.input += count(response.input_tokens);
+        spent.tokens.cache_read += count(response.cache_read_tokens);
+        spent.tokens.cache_write += count(response.cache_creation_tokens);
+        spent.tokens.output += count(response.output_tokens);
+        spent.served_tier = response.service_tier;
         let line = response.content.unwrap_or_default().trim().to_string();
         if line.is_empty() {
             return Err(NodeError::Failed("the model returned an empty line".into()));
@@ -1216,6 +1509,14 @@ async fn fit_line(
         .into_iter()
         .min_by_key(String::len)
         .expect("at least one try"))
+}
+
+/// What one node's model calls cost: every round's tokens summed, and the
+/// tier the provider says served them.
+#[derive(Default)]
+struct Spent {
+    tokens: Tokens,
+    served_tier: Option<ServiceTier>,
 }
 
 /// The raw lines of a thread's entries before `end`, newest first until

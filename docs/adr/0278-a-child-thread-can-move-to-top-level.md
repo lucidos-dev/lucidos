@@ -3,6 +3,8 @@
 - **Status**: Accepted
 - **Date**: 2026-09-24
 - **Amends**: [0011: A blocking child's completion is durably delivered to its parent](0011-parent-child-fan-in-durability.md)
+- **Amended by**: [0475: Any thread creates a top-thread](0475-any-thread-creates-a-top-thread.md).
+  An agent's move of its own child needs no owner authority again.
 
 ## Context
 
@@ -35,6 +37,17 @@ Two callers, told apart by what the engine verified:
 - **The user** moves any thread that has a parent, from the thread menu's
   **Move to top level**, through `POST /api/v1/threads/:thread_id/detach` with
   no origin token.
+
+*Amended:* an agent's move also needs the workspace owner's authority, because
+it creates a top-thread (ADR 0168 clause 4). That is a turn the owner opened, a
+trigger firing they authorized, or an owner approval naming the child (ADR
+0387, verb `detach-child`). Before, any agent could spawn a child and move it,
+and so hold a top-thread the top-thread gate would have refused. The engine's
+move asks `api::thread_reach` after the ladder and before the emit. So the
+route, the CLI and the `threads` tool are gated in one place, and a request
+the ladder refuses spends no approval.
+
+*Superseded by ADR 0475:* the owner check above is gone. The ladder stays.
 
 ## Rationale
 

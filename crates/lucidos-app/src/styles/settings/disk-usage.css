@@ -107,7 +107,7 @@
 
 /* A worktree row grows tall (a wrapping title over a line of fields) and
    `.list-row` top-aligns its children, so pin the actions to the bottom edge,
-   the way `.app-row` / `.trigger-row` (skills.css) and the Accounts rows
+   the way `.trigger-row` (skills.css) and the Accounts rows
    (settings/accounts.css) already do. */
 .disk-usage-row .list-row-actions {
     align-self: flex-end;

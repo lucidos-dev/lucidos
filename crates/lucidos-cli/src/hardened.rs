@@ -4,13 +4,15 @@ use std::process::Command;
 use crate::http::client as http_client;
 use crate::workspace::{BoxError, Workspace};
 
-/// Hardening marker state for a branch, mirroring the engine's
-/// `HardenMarkerState`. Wire format on the HTTP API is the literal string.
+/// Hardening state for a branch, as the engine's `query_hardened` labels it:
+/// its `HardenMarkerState`, plus `NotNeeded` for a branch that lands plan
+/// files only. Wire format on the HTTP API is the literal string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HardenedState {
     Fresh,
     Stale,
     Missing,
+    NotNeeded,
 }
 
 impl HardenedState {
@@ -18,6 +20,7 @@ impl HardenedState {
         match raw.trim() {
             "FRESH" => HardenedState::Fresh,
             "STALE" => HardenedState::Stale,
+            "NOT_NEEDED" => HardenedState::NotNeeded,
             // Unknown / unreachable engine / empty body => treat like Missing
             // so transient errors don't silently mask the reminder.
             _ => HardenedState::Missing,
@@ -29,6 +32,24 @@ impl HardenedState {
             HardenedState::Fresh => "FRESH",
             HardenedState::Stale => "STALE",
             HardenedState::Missing => "MISSING",
+            HardenedState::NotNeeded => "NOT_NEEDED",
+        }
+    }
+}
+
+/// The tier of `/harden` a marker records, as `--tier` spells it. Mirrors the
+/// engine's `HardenTier`; the wire format is the lowercase name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Tier {
+    Fast,
+    Full,
+}
+
+impl Tier {
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            Tier::Fast => "fast",
+            Tier::Full => "full",
         }
     }
 }
@@ -78,7 +99,7 @@ pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, Bo
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
+pub(crate) fn cmd_mark(ws: &Workspace, tier: Tier) -> Result<(), BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, head_sha) = git_context(&cwd)?;
     let url = format!("{}/api/v1/internal/mark-hardened", ws.base_url());
@@ -86,6 +107,7 @@ pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
         "repo_root": repo_root.to_string_lossy(),
         "branch_name": branch,
         "head_sha": head_sha,
+        "tier": tier.as_wire(),
     });
     let resp = http_client()?
         .post(&url)
@@ -103,9 +125,10 @@ pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
     // `git rev-parse` printed, and slicing subprocess output by byte panics on
     // anything multi-byte.
     println!(
-        "Hardening recorded: {} {}",
+        "Hardening recorded: {} {} ({} tier)",
         branch,
-        &head_sha[..head_sha.floor_char_boundary(12)]
+        &head_sha[..head_sha.floor_char_boundary(12)],
+        tier.as_wire()
     );
     // An engine predating the report answers 204 with no body.
     let report: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
@@ -175,9 +198,18 @@ pub(crate) fn query_state(ws: &Workspace) -> Result<HardenedState, BoxError> {
 /// GET `/api/v1/internal/hardened-state` for the branch in `$PWD`. Returns the
 /// URL (for error messages), the branch, and the JSON body.
 fn fetch_marker(ws: &Workspace) -> Result<(String, String, serde_json::Value), BoxError> {
+    fetch_for_branch(ws, "hardened-state")
+}
+
+/// GET `/api/v1/internal/<route>` for the branch in `$PWD`, keyed by repo root
+/// and branch name. Returns the URL, the branch, and the JSON body.
+fn fetch_for_branch(
+    ws: &Workspace,
+    route: &str,
+) -> Result<(String, String, serde_json::Value), BoxError> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, _head_sha) = git_context(&cwd)?;
-    let url = format!("{}/api/v1/internal/hardened-state", ws.base_url());
+    let url = format!("{}/api/v1/internal/{}", ws.base_url(), route);
     let resp = http_client()?
         .get(&url)
         .query(&[
@@ -199,7 +231,7 @@ fn fetch_marker(ws: &Workspace) -> Result<(String, String, serde_json::Value), B
     Ok((url, branch, body))
 }
 
-/// Print `FRESH`, `STALE`, or `MISSING` for the current branch to stdout.
+/// Print `FRESH`, `STALE`, `MISSING` or `NOT_NEEDED` for the current branch.
 /// Transport / git-context errors go to stderr with exit 1.
 pub(crate) fn cmd_query(ws: &Workspace) -> Result<(), BoxError> {
     let state = query_state(ws)?;
@@ -217,7 +249,47 @@ pub(crate) fn cmd_sha(ws: &Workspace) -> Result<(), BoxError> {
 }
 
 fn hardened_sha(body: &serde_json::Value) -> Option<&str> {
-    body.get("head_sha")
+    non_empty_str(body, "head_sha")
+}
+
+/// Print the tier the current branch's marker recorded. No marker is an
+/// error (exit 1), so a caller cannot mistake it for a tier.
+pub(crate) fn cmd_tier(ws: &Workspace) -> Result<(), BoxError> {
+    let (_url, branch, body) = fetch_marker(ws)?;
+    let tier =
+        non_empty_str(&body, "tier").ok_or_else(|| format!("No harden marker for {}", branch))?;
+    println!("{}", tier);
+    Ok(())
+}
+
+/// Print the tier `/harden` runs on the current branch. An engine predating
+/// tiers answers without one, and every branch then ran the full tier.
+pub(crate) fn cmd_expected_tier(ws: &Workspace) -> Result<(), BoxError> {
+    let (_url, _branch, body) = fetch_marker(ws)?;
+    println!("{}", expected_tier(&body));
+    Ok(())
+}
+
+fn expected_tier(body: &serde_json::Value) -> &str {
+    non_empty_str(body, "expected_tier").unwrap_or(Tier::Full.as_wire())
+}
+
+/// Print the heads the current branch's integrated children hardened, one per
+/// line. None prints nothing.
+pub(crate) fn cmd_integrated_heads(ws: &Workspace) -> Result<(), BoxError> {
+    let (url, _branch, body) = fetch_for_branch(ws, "integrated-heads")?;
+    let heads = body
+        .get("heads")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("GET {} response missing `heads`: {}", url, body))?;
+    for head in heads.iter().filter_map(|h| h.as_str()) {
+        println!("{}", head);
+    }
+    Ok(())
+}
+
+fn non_empty_str<'a>(body: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    body.get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
 }
@@ -231,6 +303,32 @@ mod tests {
         assert_eq!(HardenedState::parse("FRESH"), HardenedState::Fresh);
         assert_eq!(HardenedState::parse("STALE"), HardenedState::Stale);
         assert_eq!(HardenedState::parse("MISSING"), HardenedState::Missing);
+        assert_eq!(HardenedState::parse("NOT_NEEDED"), HardenedState::NotNeeded);
+    }
+
+    /// Pins every label against the engine's `query_hardened`, which this
+    /// crate cannot import.
+    #[test]
+    fn every_state_spells_an_engine_label() {
+        const ENGINE: &str = include_str!("../../lucidos-engine/src/api/internal.rs");
+        let handler = ENGINE
+            .split("async fn query_hardened(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the engine has a query_hardened handler");
+        let states = [
+            HardenedState::Fresh,
+            HardenedState::Stale,
+            HardenedState::Missing,
+            HardenedState::NotNeeded,
+        ];
+        for state in states {
+            let label = format!("=> \"{}\",", state.as_str());
+            assert!(
+                handler.contains(&label),
+                "the engine never labels {state:?}"
+            );
+        }
     }
 
     #[test]
@@ -246,6 +344,33 @@ mod tests {
         // The HTTP body is JSON-extracted so trim is belt-and-braces, but
         // covers the case where someone pipes `lucidos hardened query` output.
         assert_eq!(HardenedState::parse("FRESH\n"), HardenedState::Fresh);
+    }
+
+    /// The tier the engine expects is printed as it says it. An engine that
+    /// predates tiers says nothing, and every branch then ran the full tier.
+    #[test]
+    fn expected_tier_defaults_to_full_for_an_older_engine() {
+        assert_eq!(
+            expected_tier(&serde_json::json!({ "state": "MISSING", "expected_tier": "fast" })),
+            "fast"
+        );
+        assert_eq!(
+            expected_tier(&serde_json::json!({ "state": "MISSING" })),
+            "full"
+        );
+    }
+
+    /// Pins `--tier` against the engine's `HardenTier::as_str`, which this
+    /// crate cannot import.
+    #[test]
+    fn the_tier_flag_spells_the_engine_wire_names() {
+        const ENGINE: &str =
+            include_str!("../../lucidos-engine/src/engine/git_ops/harden_marker.rs");
+        for tier in [Tier::Fast, Tier::Full] {
+            let name = format!("{tier:?}");
+            let arm = format!("Self::{name} => \"{}\"", tier.as_wire());
+            assert!(ENGINE.contains(&arm), "the engine spells {name} otherwise");
+        }
     }
 
     #[test]

@@ -1,14 +1,14 @@
 import { useRef } from 'preact/hooks';
 import { llmConfigured, recoveryProgress, searchEverywhereAnchor, searchEverywhereOpen } from '../../store/store';
 import { unfocusThread } from '../../store/actions/threads';
-import { homeThreadId, openHomeThread } from '../../store/actions/homeThread';
+import { homeThreadId } from '../../store/actions/homeThread';
+import { openHome } from '../../store/actions/homeBoardNav';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { confirmAndStartSetupInterview } from '../shared/setupInterview';
 import { focusSearchInput } from '../search/searchEverywhereActions';
 import { ComposeIcon, HelpIcon, HomeIcon, SearchIcon } from '../shared/icons';
 import { CollapsingActions, renderHeaderAction, type HeaderActionSpec } from './headerActions';
 import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
-import { useHomeWidgetsPress } from '../widgets/HomeWidgetsMenu';
 
 /** The boxes the thread row's collapse is measured against: the region, and the
  *  brand cluster centred on it. The room these actions have is half of what
@@ -29,10 +29,10 @@ const COLLAPSE_TARGETS: HeaderCollapseTargets = {
  *  into a ⋯ menu instead of crowding the mark.
  *
  *  Ordered nearest-centre first, which is the end collapse eats from: Setup
- *  interview goes first (a once-or-twice thing), then New thread. Search
- *  everywhere is the last one standing at the row's outer edge, where the
- *  pointer already is. Home is not one of these: it leads the row instead
- *  (`ThreadHeaderHomeButton`).
+ *  interview goes first (a once-or-twice thing). Search everywhere is the last
+ *  one standing at the row's outer edge, where the pointer already is. Home and
+ *  New thread are not among them: they lead the row instead
+ *  (`ThreadHeaderHomeButton`, `ThreadHeaderNewThreadButton`).
  *
  *  Exported as a pure function so the set and its order are testable without
  *  standing the header up. */
@@ -51,15 +51,6 @@ export function threadHeaderActions(): HeaderActionSpec[] {
       extraClass: 'setup-interview-btn',
     });
   }
-
-  actions.push({
-    key: 'new-thread',
-    label: 'New thread',
-    tooltip: tooltipWithShortcut('New thread', 'newThread'),
-    icon: () => <ComposeIcon />,
-    onClick: () => unfocusThread(),
-    extraClass: 'brand-compose-btn',
-  });
 
   actions.push({
     key: 'search-everywhere',
@@ -94,9 +85,23 @@ export function threadHeaderHomeAction(): HeaderActionSpec | null {
     key: 'home',
     label: 'Home',
     icon: () => <HomeIcon />,
-    onClick: openHomeThread,
+    onClick: openHome,
     extraClass: 'home-thread-btn',
   };
+}
+
+/** New thread as a header icon, beside Home at the desktop row's leading end.
+ *  Like Home it never folds: the brand cluster's reserve and the pane's floor
+ *  both count its box. The phone reaches it from the Lucidos menu. */
+export function ThreadHeaderNewThreadButton() {
+  return renderHeaderAction({
+    key: 'new-thread',
+    label: 'New thread',
+    tooltip: tooltipWithShortcut('New thread', 'newThread'),
+    icon: () => <ComposeIcon />,
+    onClick: () => unfocusThread(),
+    extraClass: 'brand-compose-btn',
+  });
 }
 
 /** Home as a header icon. On desktop it leads the thread pane's row and never
@@ -104,41 +109,7 @@ export function threadHeaderHomeAction(): HeaderActionSpec | null {
  *  On the phone it sits beside the mark (`MobileThreadHeader`). */
 export function ThreadHeaderHomeButton() {
   const home = threadHeaderHomeAction();
-  return home ? <HomeButtonWithWidgets home={home} /> : null;
-}
-
-/** A tap opens Home; a hover, a hold or a right-click lists Home's widgets,
- *  and so does a tap in Home. The list stands in for a tooltip, so the button
- *  carries none. The menu is portaled, so the button stays its row's direct
- *  child, which the header's layout rules select on. */
-function HomeButtonWithWidgets({ home }: { home: HeaderActionSpec }) {
-  const { press, hover, menu } = useHomeWidgetsPress((e) => home.onClick?.(e), { homeIcon: true });
-  return (
-    <>
-      {renderHeaderAction({
-        ...home,
-        render: (attrs) => (
-          <button
-            {...attrs}
-            type="button"
-            class={`icon-btn header-icon ${home.extraClass}`}
-            aria-label={home.label}
-            onPointerEnter={hover.onPointerEnter}
-            onPointerDown={(e) => { hover.onPointerDown(); press.onPointerDown(e); }}
-            onPointerMove={press.onPointerMove}
-            onPointerUp={press.onPointerUp}
-            onPointerLeave={(e) => { hover.onPointerLeave(); press.onPointerLeave(e); }}
-            onPointerCancel={press.onPointerCancel}
-            onContextMenu={(e) => { if (!e.altKey) press.onContextMenu(e); }}
-            onClick={press.onClick}
-          >
-            {home.icon()}
-          </button>
-        ),
-      })}
-      {menu}
-    </>
-  );
+  return home ? renderHeaderAction(home) : null;
 }
 
 /**

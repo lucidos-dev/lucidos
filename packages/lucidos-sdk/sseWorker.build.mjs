@@ -5,26 +5,23 @@
  * self-contained script the engine can serve at
  * `/<slug>/api/v1/sse-worker.js`. It cannot import anything at runtime.
  *
- * The output is CHECKED IN under `src/generated/`, unlike `dist/sdk.js`, for
- * the same reason the appearance boot bundles are: the engine `include_str!`s
- * it, so `cargo build` must not need npm to have run first.
- * `sseWorker.staleness.test.ts` rebuilds and diffs, so a source edit nobody
- * rebuilt fails the ordinary test run instead of shipping the previous worker.
+ * The output lands in `dist/`, beside `sdk.js`, and is never committed. The
+ * engine reads it at startup, like the appearance boot bundle.
  *
  * `es2020` matches `dist/sdk.js`. Nothing older can reach this script anyway:
  * a browser without `SharedWorker` never requests it and takes the direct
  * `EventSource` fallback instead. `minify` off so the artifact is reviewable.
  */
 import { build } from 'esbuild';
+import { writeIfChanged } from './writeIfChanged.mjs';
 
-/** Entry file to committed artifact. */
+/** Entry file to build output. */
 export const WORKER_BUNDLE = {
   entry: 'src/worker/sseWorker.ts',
-  out: 'src/generated/sse-worker.js',
+  out: 'dist/sse-worker.js',
 };
 
-/** Shared config, so the staleness test builds exactly what `npm run build`
- *  wrote. Any drift between the two would make the check meaningless. */
+
 export function workerBuildOptions(entry) {
   return {
     entryPoints: [entry],
@@ -47,11 +44,5 @@ export async function buildWorkerBundle(entry) {
 }
 
 export async function buildSseWorkerBundle() {
-  const { writeFile, mkdir } = await import('node:fs/promises');
-  await mkdir('src/generated', { recursive: true });
-  await writeFile(
-    WORKER_BUNDLE.out,
-    await buildWorkerBundle(WORKER_BUNDLE.entry),
-    'utf8',
-  );
+  await writeIfChanged(WORKER_BUNDLE.out, await buildWorkerBundle(WORKER_BUNDLE.entry));
 }

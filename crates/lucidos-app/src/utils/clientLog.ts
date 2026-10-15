@@ -1,5 +1,6 @@
 /** The engine-log breadcrumb channel: a fire-and-forget POST that surfaces as a
- *  `[Client/<category>]` line in engine.log.
+ *  `[Client/<category>]` line in the engine's log. Under the gateway that log is
+ *  `~/.lucidos/gateway/gateway.log`: see `docs/client-logs.md`.
  *
  *  Deliberately a LEAF module — it imports only `API` (from utils/basePath, which
  *  imports nothing). `postClientLog` used to live in utils/liveness, whose store

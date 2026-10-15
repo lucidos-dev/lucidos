@@ -1,129 +1,52 @@
-//! Direct Claude Code mode — the branch that runs CC against the current
-//! thread (no spawn). Caller MUST keep the `ThreadGuard` from
-//! `register_thread_queued` alive across the await — without it,
-//! `cancel_thread` lands on `settle_stuck_running_thread` instead of the
-//! per-thread `cancel_token` during the CC startup window (before
-//! `agent_sessions` is populated), and CC keeps running.
+//! Direct Claude Code mode: the branch that runs a coding agent against the
+//! current thread. The caller claimed the thread at its fast path, so a
+//! follow-up sent during startup queues for this run and a Stop cancels it.
+//! The caller's `ThreadGuard` stays alive across the await: the run's
+//! `chat_cancel` arm listens on its token for a request abort or a shutdown.
 
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::engine::agent_session::spawn_claim::SpawnClaim;
 use crate::engine::types::ProcessResult;
 use crate::engine::LucidosEngine;
 
 impl LucidosEngine {
-    /// Spawn / resume a CC turn for the current thread, coalescing rapid-fire
-    /// follow-ups via the leader-election helper. Returns whatever
-    /// `run_direct_agent` returns (or the queued-follower no-op `ProcessResult`
-    /// if a leader is already in flight). Caller's `_guard` MUST stay alive
-    /// across the await — `cancel_thread` lands on the per-thread token during
-    /// the startup window before `agent_sessions` is populated.
+    /// Spawn or resume a coding-agent turn for the current thread on the claim
+    /// the caller took. Returns whatever `run_direct_agent` returns.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_cc_chat_branch(
         &self,
-        thread_id: Uuid,
+        mut claim: SpawnClaim,
         request_id: Uuid,
         user_message: &str,
         user_images: Option<&[crate::api::ChatImage]>,
         repo_id: Option<&str>,
         cc_model: Option<&str>,
         reasoning_effort: Option<&str>,
-        coding_agent: Option<crate::runtime::CodingAgent>,
         conflict_change_id: Option<Uuid>,
         origin_id: Uuid,
         spawning_event_id: Option<Uuid>,
         cancel_token: &CancellationToken,
         chat_start: std::time::Instant,
-        // True when the caller knows no rapid-fire follow-up can arrive
-        // for this spawn (e.g. agent-spawned new thread via `run_thread`
-        // tool). Skips the 250ms debounce + leader-election entirely.
-        skip_coalesce: bool,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+        let thread_id = claim.thread_id;
         log!(
             "[Chat] [TIMING] pre-CC overhead: {:?}",
             chat_start.elapsed()
         );
+        // A merge-conflict turn holds the change's apply claim for its run.
+        let conflict_claim = match conflict_change_id {
+            Some(change_id) => Some(
+                self.claim_pending_change(change_id)
+                    .await?
+                    .ok_or(crate::engine::change_ops::apply_claim::APPLY_IN_PROGRESS_MESSAGE)?,
+            ),
+            None => None,
+        };
         let repo_id_str = repo_id.map(|s| s.to_string());
         let cc_model_str = cc_model.map(|s| s.to_string());
         let cc_effort_str = reasoning_effort.map(|s| s.to_string());
-
-        // Coalesce rapid-fire follow-ups arriving while no Claude Code subprocess
-        // is alive (Phase 2 made every CC exit on idle, so two messages
-        // typed within ~250ms of each other both reach this branch).
-        // The leader proceeds to spawn CC; followers queue their messages
-        // for the leader to drain into a single combined input. Phase 5's
-        // event-driven dispatcher will subsume this. See
-        // `agent_session/cc_spawn_coalesce.rs` for the helper module.
-        //
-        // Skip coalescing for: (a) conflict-resolution turns — distinct
-        // lifecycle (per-merge worktree), never user-typed in rapid
-        // succession; (b) caller-flagged `skip_coalesce` (agent-spawned
-        // new threads via `run_thread` — no user keyboard in the loop).
-        const CC_SPAWN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
-        let coalesce = conflict_change_id.is_none() && !skip_coalesce;
-        if coalesce {
-            use crate::engine::agent_session::{LeaderElection, QueuedMessage};
-            let my_msg = QueuedMessage {
-                text: user_message.to_string(),
-                images: user_images.map(|imgs| imgs.to_vec()),
-                origin_event_id: Some(origin_id),
-            };
-            match self.cc_spawn_coalesce.try_become_leader(thread_id, my_msg) {
-                LeaderElection::Queued => {
-                    // Leader will pick up our message via drain. Our
-                    // MessageReceived event is already persisted; the
-                    // response will arrive via SSE for both turns.
-                    log!(
-                        "[Chat] CC follow-up for thread {} queued behind active spawn leader",
-                        thread_id
-                    );
-                    return Ok(crate::engine::agentic_loop::terminal_result(
-                        String::new(),
-                        vec![],
-                        request_id,
-                        thread_id,
-                        false,
-                    ));
-                }
-                LeaderElection::Leader => {
-                    // Fall through to spawn CC. Drain happens just before
-                    // run_direct_agent so we capture any followups that
-                    // arrive during the brief debounce window.
-                }
-            }
-        }
-
-        // Brief debounce window: wait so any follow-ups typed within
-        // CC_SPAWN_DEBOUNCE land in our queue before we spawn. Single
-        // messages still pay this cost, but a CC spawn takes 5-10s of
-        // process startup anyway, so the overhead is in the noise. Skip
-        // when `coalesce` is false (conflict resolution / agent-spawn).
-        if coalesce {
-            tokio::time::sleep(CC_SPAWN_DEBOUNCE).await;
-        }
-
-        // Drain any queued followups and combine with our own message.
-        let queued = if coalesce {
-            self.cc_spawn_coalesce.drain_queue(thread_id)
-        } else {
-            Vec::new()
-        };
-        let coalesced_count = queued.len();
-        let coalesced_event_ids: Vec<Uuid> =
-            queued.iter().filter_map(|q| q.origin_event_id).collect();
-        let (combined_text, combined_images) = crate::engine::agent_session::combine_messages(
-            user_message,
-            user_images.map(|imgs| imgs.to_vec()),
-            queued,
-        );
-        if coalesced_count > 0 {
-            log!(
-                "[Chat] Coalesced {} follow-up(s) into leader CC spawn for thread {}",
-                coalesced_count,
-                thread_id
-            );
-        }
-        let combined_images_slice = combined_images.as_deref();
 
         // Recover the prior Claude Code session id from the event store so a follow-up
         // after the in-memory entry was removed (subprocess died, engine
@@ -141,15 +64,14 @@ impl LucidosEngine {
         // turn through this call; it's the bottom of the funnel.
         let result = self
             .run_direct_agent(
+                &mut claim,
                 request_id,
-                thread_id,
-                &combined_text,
-                combined_images_slice,
+                user_message,
+                user_images,
                 origin_id,
-                &coalesced_event_ids,
                 spawning_event_id,
                 cancel_token,
-                conflict_change_id,
+                conflict_claim.as_ref(),
                 None,
                 repo_id_str.clone(),
                 None,
@@ -157,7 +79,6 @@ impl LucidosEngine {
                 cc_model_str.clone(),
                 cc_effort_str.clone(),
                 None,
-                coding_agent,
             )
             .await;
         // Stale resume: CC process was expired and returned empty Result.
@@ -175,23 +96,23 @@ impl LucidosEngine {
                 let retry_text = crate::engine::agent_session::prepend_reconstruction(
                     &self.pool,
                     thread_id,
-                    &combined_text,
+                    user_message,
                 )
                 .await;
                 // Same as above: still inside the unified router. This
                 // is the stale-resume retry branch — fresh session with
-                // a reconstructed conversation prepended.
+                // a reconstructed conversation prepended. It runs on the same
+                // claim, so nothing takes the thread between the two runs.
                 result = self
                     .run_direct_agent(
+                        &mut claim,
                         request_id,
-                        thread_id,
                         &retry_text,
-                        combined_images_slice,
+                        user_images,
                         origin_id,
-                        &coalesced_event_ids,
                         spawning_event_id,
                         cancel_token,
-                        conflict_change_id,
+                        conflict_claim.as_ref(),
                         None,
                         repo_id_str,
                         None,
@@ -199,23 +120,8 @@ impl LucidosEngine {
                         cc_model_str,
                         cc_effort_str,
                         None,
-                        coding_agent,
                     )
                     .await;
-            }
-        }
-        // Surface any follow-ups that arrived between drain and clear (a
-        // small race window) as orphans so the caller re-routes them
-        // rather than dropping them silently. Only relevant when we
-        // participated in the coalesce map at all.
-        if coalesce {
-            let residual = self.cc_spawn_coalesce.clear(thread_id);
-            if !residual.is_empty() {
-                let mut orphans = crate::engine::agent_session::queued_to_orphans(residual);
-                match result {
-                    Ok(ref mut pr) => pr.orphaned_injections.append(&mut orphans),
-                    Err(_) => self.resubmit_orphans_of_failed_turn(thread_id, orphans),
-                }
             }
         }
         result

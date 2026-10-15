@@ -6,7 +6,7 @@
  * the compose view wiped its commands and fetched again, forever, and the
  * button sat dimmed as if it had no commands.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse } from '../../../api/client';
 
@@ -25,6 +25,10 @@ vi.mock('../../../api/client', async (importOriginal) => ({
 }));
 
 const { CodingAgentControlMenu } = await import('../CodingAgentControlMenu');
+const { controlMenuParts } = await import('../controlMenuParts');
+
+// The menus' panel parts are code-split. Warm them, so a press opens at once.
+beforeAll(() => controlMenuParts.preload());
 const { codingAgentSessionVersion } = await import('../../../store/store');
 const { composeSelections } = await import('../../../store/composeSelections');
 

@@ -13,6 +13,7 @@ import { Disclosure } from '../shared/Disclosure';
 import { Pager } from '../shared/Pager';
 import { setLoadingIfFresh, toFailed } from '../../store/types';
 import { formatTimeAgo, formatDateTime } from '../../utils/formatTime';
+import { rangeLabel } from '../../utils/rangeLabel';
 import { errorDetail } from '../../utils/errorDetail';
 import { copyToClipboard } from '../../utils/clipboard';
 import type { Loadable } from '../../store/types';
@@ -50,10 +51,10 @@ function ImportanceBar({ distribution, selected, onToggle }: {
   const hasFilter = selected.size > 0;
   const pct = (n: number) => `${((n / total) * 100).toFixed(1)}%`;
   const segments: { level: ImportanceLevel; count: number; label: string }[] = [
-    { level: 'low', count: distribution.low, label: `Low (0\u20130.3): ${distribution.low}` },
-    { level: 'medium', count: distribution.medium, label: `Medium (0.3\u20130.6): ${distribution.medium}` },
-    { level: 'high', count: distribution.high, label: `High (0.6\u20130.8): ${distribution.high}` },
-    { level: 'critical', count: distribution.critical, label: `Critical (0.8\u20131.0): ${distribution.critical}` },
+    { level: 'low', count: distribution.low, label: `Low (${rangeLabel('0', '0.3')}): ${distribution.low}` },
+    { level: 'medium', count: distribution.medium, label: `Medium (${rangeLabel('0.3', '0.6')}): ${distribution.medium}` },
+    { level: 'high', count: distribution.high, label: `High (${rangeLabel('0.6', '0.8')}): ${distribution.high}` },
+    { level: 'critical', count: distribution.critical, label: `Critical (${rangeLabel('0.8', '1.0')}): ${distribution.critical}` },
   ];
 
   return (

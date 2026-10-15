@@ -262,15 +262,27 @@ pub enum UnproposedReason {
     HardeningMissing,
     /// The turn did not finish: a Stop, a failure, an abort or a cut-off.
     TurnIncomplete,
+    /// The thread's change waits in the landing lane. Its new work is decided
+    /// again once that change lands or its batch fails.
+    AwaitingLanding,
+    /// An integrated sub-thread's hardened work. It is never proposed: the
+    /// parent's agent merges the branch.
+    IntegratedIntoParent,
+    /// The thread handed off to a successor thread, whose branch carries this
+    /// work. The successor's change proposes it.
+    CarriedBySuccessor,
 }
 
 impl UnproposedReason {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 8] = [
         Self::PlanMissing,
         Self::PlanAwaitingApproval,
         Self::OutsideBound,
         Self::HardeningMissing,
         Self::TurnIncomplete,
+        Self::AwaitingLanding,
+        Self::IntegratedIntoParent,
+        Self::CarriedBySuccessor,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -280,6 +292,9 @@ impl UnproposedReason {
             Self::OutsideBound => "outside_bound",
             Self::HardeningMissing => "hardening_missing",
             Self::TurnIncomplete => "turn_incomplete",
+            Self::AwaitingLanding => "awaiting_landing",
+            Self::IntegratedIntoParent => "integrated_into_parent",
+            Self::CarriedBySuccessor => "carried_by_successor",
         }
     }
 
@@ -295,6 +310,24 @@ impl From<ProposalHold> for UnproposedReason {
             ProposalHold::Plan(PlanHold::AwaitingApproval) => Self::PlanAwaitingApproval,
             ProposalHold::Plan(PlanHold::OutsideBound) => Self::OutsideBound,
             ProposalHold::HardeningMissing => Self::HardeningMissing,
+            ProposalHold::IntegratedIntoParent => Self::IntegratedIntoParent,
+            ProposalHold::CarriedBySuccessor => Self::CarriedBySuccessor,
         }
     }
+}
+
+/// Why a change left the landing lane without landing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnqueueReason {
+    /// The user discarded the change.
+    Discarded,
+    /// The user set the change aside.
+    SetAside,
+    /// The user removed the waiting change from the landing lane.
+    Removed,
+    /// The lane batch holding the change failed.
+    BatchFailed,
+    /// The lane could not build or publish the change's landing merge.
+    LandingFailed,
 }

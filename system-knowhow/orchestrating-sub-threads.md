@@ -1,6 +1,6 @@
 ---
 name: Orchestrating Sub-Threads
-description: How a parent thread runs several children at once, and what a spawn costs. The one rule: siblings observe each other but never direct each other. Covers which edge carries an instruction, reaching a finished child, and moving one to top level. Load before a spawn, when weighing one against inline work, when children disagree or duplicate work, or for "can a sub-thread message another sub-thread".
+description: How a parent thread runs several children at once, and what a spawn costs. The one rule: siblings observe each other but never direct each other. Covers which edge carries an instruction, child or top-thread, and reaching or moving a child. Load before a spawn, when weighing one against inline work, when children disagree or duplicate work, or for "can a sub-thread message another sub-thread".
 ---
 
 # Orchestrating Sub-Threads
@@ -23,7 +23,8 @@ rule, whether you hear a second argument: all yours to decide.
 |---|---|---|
 | Parent to its own direct child | `follow_up_child_thread` | An instruction. The only instruction-bearing edge. |
 | The home thread to any thread | `follow_up_child_thread` | An instruction, from the user's own thread. No report comes back to Home unless it spawned the thread. |
-| Child to parent | `ChildThreadCompleted`, at every terminal turn | A report. Re-opens the parent. |
+| Child to parent | `ChildThreadCompleted`, at a terminal turn that failed, or a clean one its *wake mode* says wakes the parent | A report. Re-opens the parent. |
+| Child to parent | `ChildReportFiled`, at a clean terminal turn its wake mode files (`no-wake`, or an early batch report) | A report. Re-opens nothing: the parent reads it next turn. |
 | Child to parent | `ChildThreadStopped`, when a user Stop pauses the child | A note. Re-opens nothing. |
 | Parent and child | `ChildThreadDetached`, when the child moves to top level | The edge is cut. Re-opens nothing. |
 | Any thread to any thread's events | `await_event`, the `events` query | Facts. Never an instruction. |
@@ -67,6 +68,13 @@ reading.
 
 **Do not spawn to save money on the same model, or for context hygiene.** The
 data tested both priors and neither survived.
+
+**The *home thread* is the exception: it starts a thread for work.** It
+answers a question or a quick lookup itself, and gives anything more its own
+thread. The reason is parallelism and a free Home, not cost: the user talks
+there, and should not wait behind work. A conversation that needs the user's
+answers, such as the *setup interview*, stays in Home. The cap and the rule
+against one thread per list item still hold.
 
 The figures come from 30 days and 19,254 recorded calls, in
 `data/artifacts/context-economics-investigation.md` in the Lucidos development
@@ -127,6 +135,36 @@ at $0.504 each. That is the price of one judge and one shared record, accepted
 rather than solved. Two levers, both yours: spawn fewer children, or stay
 unsubscribed and read the log on your own schedule.
 
+### Child or top-thread
+
+Ask one question before a spawn: **will this thread act on the result?** If
+not, spawn a top-thread: `relation: "top"`, or `--relation top` on the CLI. If
+so, spawn a child with the wake mode that fits (see § How a report reaches the
+parent). Why: ADR 0473.
+
+A child costs its parent even when its work is for the user. A top-thread pays
+none of it:
+
+| Child cost | When |
+|---|---|
+| A parent re-entry, $0.504 above | Every clean finish under `wake`, the default outside Home. Every failure under any mode. |
+| A filed report in your context | Every clean finish under `no-wake`. It stays in your transcript for good, and Home's never ends. |
+| One of your child slots | While it runs. |
+
+In the Lucidos development workspace, children re-opened a parent 927 times in
+30 days: 357 from chat threads, 288 from triggers, 246 from coding-agent
+threads and 36 from Home. The log cannot say which of those the parent needed.
+
+- **Work the user reads is a top-thread.** Research for them, a draft, a code
+  change they will Apply. They read the result and any failure in that thread.
+- **Home loses no control.** From Home, `follow_up_child_thread` reaches any
+  thread in its workspace, top-threads included.
+- **A top-thread needs no permission.** Any thread may create one, in any
+  turn (ADR 0475).
+- **Never use a top-thread to get round the cap** (see § Limits you will
+  actually hit). The question is whether you need the report, not whether a
+  slot is free.
+
 ## Reading another thread
 
 Observation is unrestricted, on purpose. Subscribe to any thread's events with
@@ -146,8 +184,9 @@ not argue with it. Tell your parent what you saw and carry on.
 1. **Give each child a scope that does not overlap.** Two children editing one
    file is your mistake: no lease or lock stops them both writing.
 2. **Decide what you need to see.** A child's domain events re-open you only if
-   you subscribed, but its terminal re-opens you through `ChildThreadCompleted`.
-   Four terminals do not: a mid-turn steer, a transient upstream failure the
+   you subscribed. Its terminal always reports. It re-opens you through
+   `ChildThreadCompleted` when it failed, or when its wake mode wakes you (see
+   § How a report reaches the parent). Four terminals send no card at all: a mid-turn steer, a transient upstream failure the
    engine is already resuming past, a turn ending on an event wait, and a user
    Stop. After the first three the child is still working, and reports at the
    real terminal. After a Stop it waits for the user: you get a
@@ -181,6 +220,35 @@ not argue with it. Tell your parent what you saw and carry on.
    merge and hardening already default correctly for the folder it edits. Name
    one only to ask for something else; see `system-knowhow/coding-agent-events`.
 
+## How a report reaches the parent
+
+The spawn declares the child's *wake mode*: what its clean finish does to you.
+Pass `wake_mode` to `run_thread` or `run_coding_agent`, or `--wake-mode` to
+`lucidos spawn-thread --relation child`.
+
+| Mode | Use it when | A clean report |
+|---|---|---|
+| `wake` | You need the result to continue: a pipeline step, a check you act on. | Wakes you with a `ChildThreadCompleted`. |
+| `wake-when-all-done` | You combine several results, such as a fan-out you merge. | Is filed while another child of the batch still works. The last one wakes you. |
+| `no-wake` | The user reads the result, and you may still want it next turn. If you will not, a top-thread is cheaper (see § Child or top-thread). | Is filed as a `ChildReportFiled`. Nothing re-opens. |
+
+- **Defaults.** A child of the home thread defaults to `no-wake`, since its
+  work is for the user and *Review* lists it. A child of any other thread
+  defaults to `wake`. The spawn result names the mode that applied.
+- **A failure always wakes**, under every mode: a `failure`, a `canceled` or
+  `interrupted` card, an archive, a discard, and a turn the engine cut short.
+- **A filed report is not lost.** A chat parent reads it as a
+  `[CHILD THREAD REPORT FILED]` block on its next turn. A coding-agent parent
+  reads it at the front of its next prompt.
+- **A batch** is every child of yours spawned `wake-when-all-done` and still
+  working. Two finishing at once can both wake you, so expect that.
+- **The mode lasts the child's life.** A follow-up keeps it. To hear back from
+  a `no-wake` child, spawn a new child with `wake`.
+- **A child spawned before wake modes** has none. Its turns end with a *wake
+  decision* instead: the child says, with `wake_parent` or
+  `lucidos wake-parent yes|no`, or one background call decides. Any doubt
+  wakes you.
+
 ## Reaching a child that already finished
 
 A finished child is not gone. `follow_up_child_thread` into an idle or completed
@@ -191,8 +259,9 @@ the child reported done. Expect four things:
   archive it. A family routes as one unit, so it stays listed under its parent
   as ordinary finished work. Only a real archive dims it, through the *archived
   sub-thread cue*, and archiving the parent cascades to every descendant.
-- The child reports again. `ChildThreadCompleted` fires once per completed turn,
-  so `child_thread_id` is a log entry, not a key.
+- The child reports again. A report fires once per completed turn, as a
+  `ChildThreadCompleted` or a `ChildReportFiled`, so `child_thread_id` is a log
+  entry, not a key.
 - A follow-up into a coding-agent child with a pending permission card is
   held until a human acts on the card. The result says `held`, and the card
   stays open.
@@ -217,9 +286,10 @@ Archive a child by its id with the `threads` tool's `archive` action (or
 - **A pinned thread is the user's to archive, never yours.** A pinned child,
   or your own pinned thread, is refused with `thread_pinned`. A pinned
   sub-thread of the child stays open while the rest of the family goes.
-- **Archiving frees the child's worktree.** A merged, clean worktree is
-  reclaimed about an hour after the child goes idle. A follow-up after that
-  rebuilds it from scratch.
+- **Archiving frees the child's worktree.** The worktree is removed about an
+  hour after the child goes idle, whatever it holds. Uncommitted work is
+  committed on the child's branch first, and a branch with unapplied commits
+  stays. A follow-up after that rebuilds the worktree from the branch.
 - **Your own thread** takes `thread_id: 'current'`. It is archived once this
   turn ends and settles; a new message before then keeps it open.
 
@@ -230,6 +300,8 @@ tool's `detach_child` action (or `lucidos threads detach --thread <id>`) moves
 it to top level. The user can move any nested thread with the thread menu's
 **Move to top level**. You can move only your own direct children.
 
+- **It needs no permission.** The child becomes a top-thread, which any
+  thread may create (ADR 0475).
 - **Nothing is stopped.** A turn in flight finishes, keeps its work and proposes
   its change. No tool stops a child.
 - **You get nothing more from it.** No completion card, no follow-up, and it
@@ -249,8 +321,11 @@ the edges above.
 **You are blocked and need an answer.** Two shapes work, and neither is
 preferred:
 
-- *Report and stop.* End your turn with the question in your final text. Your
-  terminal re-opens the parent, and its follow-up revives you. It uses only the
+- *Report and stop.* End your turn with the question in your final text.
+  Under `wake`, or as the last of a batch, your terminal re-opens the parent,
+  and its follow-up revives you. Under `no-wake` it does not: ask the user on
+  your own card instead. A child with no wake mode says its parent must act
+  (`wake_parent` true, or `lucidos wake-parent yes`). It uses only the
   designed edges and costs a turn boundary each way.
 - *Emit and park.* Emit a domain event naming what you need, arm `await_event`
   for the answer, then end the turn. It is faster (a measured handoff ran in
@@ -284,9 +359,9 @@ Say what is true, and do not lean on what is not.
 - **Enforced.** Anything wider than your own subtree is the workspace owner's
   to press. You may press it while carrying their standing instruction: a turn
   they opened, or a trigger firing they authorized. Creating a top-thread is
-  always in that group, because a top-thread sits under the workspace, not
-  under you. Do not tell a sibling's problem to your parent, which most threads
-  here do not have. Report what you found, and let the owner decide.
+  not in that group: any thread may create one, in any turn (ADR 0475). Do not
+  tell a sibling's problem to your parent, which most threads here do not
+  have. Report what you found, and let the owner decide.
   Without a standing instruction, a coding agent may ask for one act with
   `lucidos ask-owner-approval` (`system-knowhow/lucidos-cli.md`). The owner's
   **Allow once** on the card Lucidos writes lets your thread do that act, at

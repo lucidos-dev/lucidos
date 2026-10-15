@@ -168,7 +168,8 @@ function unresolvedMembers(batch: ApplyAllBatch, pendingIds: ReadonlySet<string>
  *  it names the first of them.
  *
  *  `position` counts the members already done or parked, then this one.
- *  `resolved` counts the done ones alone, for the progress bar. */
+ *  `resolved` counts the done ones alone. The row's count and the progress
+ *  bar read it, since a parked member has not applied. */
 export function batchMemberInFlight(
   batch: ApplyAllBatch,
   pendingIds: ReadonlySet<string> | null,
@@ -253,7 +254,8 @@ export function clearApplyPhase(threadId: string): ApplyPhaseReading | undefined
  *  is pending, and its thread is settling or resolving the conflict. A failed
  *  apply leaves the change pending on an idle thread, so its phase goes too.
  *  When the change the page last saw pending has landed, the result the stream
- *  dropped is reported. Apply Now's own threads are `reconcileApplyingNow`'s. */
+ *  dropped is reported. Apply Now's own threads read the engine's
+ *  `applyInFlight` instead. */
 export function reconcileApplyProgress(
   previousPending: readonly Change[],
   pending: readonly Change[],

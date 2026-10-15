@@ -280,7 +280,6 @@ impl CredentialStore {
     /// A single `ON CONFLICT (service_name, auth_type)` for both would turn that
     /// second case into an unhandled unique violation, because the partial index
     /// would be the constraint actually violated and it is not the arbiter.
-    #[allow(clippy::too_many_arguments)] // one arg per credential column
     async fn upsert_row(
         pool: &PgPool,
         service_name: &str,

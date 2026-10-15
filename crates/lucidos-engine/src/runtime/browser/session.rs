@@ -1,8 +1,60 @@
 use super::*;
+use chromiumoxide::browser::BrowserConfigBuilder;
+use chromiumoxide::error::CdpError;
 use chromiumoxide::BrowserConfig;
 use futures::StreamExt;
 use std::path::Path;
 use std::time::Duration;
+
+/// Why a browser launch failed, as far as the caller's retry cares.
+#[derive(Debug)]
+enum LaunchFailure {
+    /// Chrome cannot start its sandbox on this host. That never clears on its
+    /// own, so it is never retried (ADR 0457).
+    SandboxUnavailable(SandboxBlocker),
+    /// Chrome quit, timed out or closed its pipe before it answered. A stale
+    /// profile lock or a leftover Chrome is the usual cause, so cleaning up and
+    /// launching once more can help.
+    BeforeReady(String),
+    Other(String),
+}
+
+impl LaunchFailure {
+    /// Reads Chrome's stderr before the variant, because a Chrome with no
+    /// sandbox also quits before it is ready.
+    fn from_launch_error(e: CdpError) -> Self {
+        let stderr = match &e {
+            CdpError::LaunchExit(_, stderr)
+            | CdpError::LaunchTimeout(stderr)
+            | CdpError::LaunchIo(_, stderr) => stderr.as_slice(),
+            _ => &[],
+        };
+        if let Some(blocker) = SandboxBlocker::in_chrome_stderr(stderr) {
+            log!("[Browser] Chrome could not start its sandbox: {}", e);
+            return Self::SandboxUnavailable(blocker);
+        }
+        let message = format!("Failed to launch browser: {}", e);
+        match e {
+            CdpError::LaunchExit(..) | CdpError::LaunchIo(..) | CdpError::LaunchTimeout(..) => {
+                Self::BeforeReady(message)
+            }
+            _ => Self::Other(message),
+        }
+    }
+}
+
+impl std::fmt::Display for LaunchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeReady(message) | Self::Other(message) => f.write_str(message),
+            Self::SandboxUnavailable(blocker) => write!(
+                f,
+                "The agent browser did not start. Lucidos runs Chrome only inside its sandbox, and {}",
+                blocker.reason_and_fix()
+            ),
+        }
+    }
+}
 
 impl BrowserRuntime {
     pub fn new(workspace_path: PathBuf, pool: PgPool) -> Self {
@@ -77,12 +129,7 @@ impl BrowserRuntime {
                 );
                 Ok(())
             }
-            Err(e)
-                if e.contains("SingletonLock")
-                    || e.contains("File exists")
-                    || e.contains("Timeout")
-                    || e.contains("websocket") =>
-            {
+            Err(LaunchFailure::BeforeReady(e)) => {
                 // Stale state from a previous crash — clean up and retry
                 log!(
                     "[Browser] Launch failed ({}), cleaning up and retrying...",
@@ -104,22 +151,72 @@ impl BrowserRuntime {
                 );
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e.to_string()),
         }
     }
 
     /// Launch Chrome and return the Browser + handler task.
     /// When `visible` is true, Chrome opens with a GUI window the user can watch.
     /// Uses a persistent profile directory so cookies/sessions carry over.
+    ///
+    /// The vendored chromiumoxide speaks CDP over a pipe, so Chrome opens no
+    /// debugging port another local user could drive. The profile holds every
+    /// cookie, so its directory is this user's alone, on every launch.
+    ///
+    /// Chrome always runs inside its sandbox: the vendored crate cannot turn it
+    /// off. A host that cannot give Chrome one gets no browser (ADR 0457).
     async fn launch_browser(
         visible: bool,
         profile_dir: &Path,
-    ) -> Result<(Browser, JoinHandle<()>), String> {
-        std::fs::create_dir_all(profile_dir)
-            .map_err(|e| format!("Failed to create browser profile dir: {}", e))?;
+    ) -> Result<(Browser, JoinHandle<()>), LaunchFailure> {
+        Self::launch_with(Self::browser_config(visible, profile_dir), profile_dir).await
+    }
 
-        let mut builder = BrowserConfig::builder()
-            .no_sandbox()
+    async fn launch_with(
+        builder: BrowserConfigBuilder,
+        profile_dir: &Path,
+    ) -> Result<(Browser, JoinHandle<()>), LaunchFailure> {
+        use std::os::unix::fs::PermissionsExt;
+        #[cfg(target_os = "linux")]
+        // SAFETY: geteuid only reads this process's effective user id.
+        if unsafe { libc::geteuid() } == 0 {
+            return Err(LaunchFailure::SandboxUnavailable(
+                SandboxBlocker::RunningAsRoot,
+            ));
+        }
+        std::fs::create_dir_all(profile_dir)
+            .and_then(|()| {
+                std::fs::set_permissions(profile_dir, std::fs::Permissions::from_mode(0o700))
+            })
+            .map_err(|e| {
+                LaunchFailure::Other(format!("Failed to create browser profile dir: {}", e))
+            })?;
+
+        let config = builder
+            .build()
+            .map_err(|e| LaunchFailure::Other(format!("Failed to build browser config: {}", e)))?;
+
+        let (browser, mut handler) = Browser::launch(config)
+            .await
+            .map_err(LaunchFailure::from_launch_error)?;
+
+        let handler_task = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if let Err(e) = event {
+                    let err_msg = e.to_string();
+                    if !err_msg.contains("untagged enum Message") {
+                        log!("[Browser] Handler error: {}", e);
+                    }
+                }
+            }
+        });
+
+        Ok((browser, handler_task))
+    }
+
+    fn browser_config(visible: bool, profile_dir: &Path) -> BrowserConfigBuilder {
+        let builder = BrowserConfig::builder()
+            .launch_timeout(Self::CHROME_LAUNCH_TIMEOUT)
             .user_data_dir(profile_dir)
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
@@ -134,35 +231,14 @@ impl BrowserRuntime {
             });
 
         if visible {
-            builder = builder.with_head();
+            builder.with_head()
         } else {
             // Stealth headless: evade common bot detection
-            builder = builder
+            builder
                 .arg("--disable-blink-features=AutomationControlled")
                 .arg("--disable-features=AutomationControlled")
-                .arg("--disable-infobars");
+                .arg("--disable-infobars")
         }
-
-        let config = builder
-            .build()
-            .map_err(|e| format!("Failed to build browser config: {}", e))?;
-
-        let (browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| format!("Failed to launch browser: {}", e))?;
-
-        let handler_task = tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                if let Err(e) = event {
-                    let err_msg = e.to_string();
-                    if !err_msg.contains("untagged enum Message") {
-                        log!("[Browser] Handler error: {}", e);
-                    }
-                }
-            }
-        });
-
-        Ok((browser, handler_task))
     }
 
     /// Remove stale SingletonLock and other lock files from the persistent
@@ -279,6 +355,10 @@ impl BrowserRuntime {
             BrowserCheck::NotChromium
         }
     }
+
+    /// How long Chrome may take to answer on its pipe after it starts. A cold
+    /// start on a busy host can outlast chromiumoxide's default.
+    const CHROME_LAUNCH_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// Timeout for individual browser operations (page load, navigation, etc.)
     const BROWSER_OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -479,5 +559,292 @@ impl BrowserRuntime {
             Ok(result) => result.into_value::<Option<String>>().ok().flatten(),
             Err(_) => None,
         }
+    }
+}
+
+/// What keeps Chrome from starting its sandbox on this host.
+#[derive(Debug, PartialEq)]
+enum SandboxBlocker {
+    RunningAsRoot,
+    NoUsableSandbox,
+}
+
+impl SandboxBlocker {
+    /// Chrome's own words when it aborts for want of a sandbox. Its message
+    /// also suggests `--no-sandbox`, so it reaches the engine log only.
+    fn in_chrome_stderr(stderr: &[u8]) -> Option<Self> {
+        let stderr = String::from_utf8_lossy(stderr);
+        if stderr.contains("No usable sandbox") {
+            Some(Self::NoUsableSandbox)
+        } else if stderr.contains("Running as root without --no-sandbox") {
+            Some(Self::RunningAsRoot)
+        } else {
+            None
+        }
+    }
+
+    fn reason_and_fix(&self) -> &'static str {
+        match self {
+            Self::RunningAsRoot => {
+                "Chrome refuses its sandbox to the root user. Run Lucidos as a non-root user."
+            }
+            Self::NoUsableSandbox => {
+                "Chrome found no usable sandbox on this host. Install Google Chrome from its \
+                 official package, whose setuid helper provides one. Or allow unprivileged user \
+                 namespaces for the Chrome in use: on Ubuntu 23.10 and later, an AppArmor \
+                 profile granting it `userns`."
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Chrome's abort when user namespaces are restricted and no setuid helper
+    /// exists, as Chrome prints it.
+    const NO_USABLE_SANDBOX: &str = "[1:1:FATAL:zygote_host_impl_linux.cc(128)] No usable sandbox! \
+        If you are running on Ubuntu 23.10+ or another Linux distro that has disabled unprivileged \
+        user namespaces with AppArmor, see https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md. \
+        If you want to live dangerously and need an immediate workaround, you can try using --no-sandbox.";
+    const RUNNING_AS_ROOT: &str = "[1:1:ERROR:zygote_host_impl_linux.cc(100)] Running as root \
+        without --no-sandbox is not supported. See https://crbug.com/638180.";
+
+    #[test]
+    fn chrome_without_a_sandbox_is_a_sandbox_failure_never_retried() {
+        use chromiumoxide::error::BrowserStderr;
+        use std::os::unix::process::ExitStatusExt;
+        let stderr = |text: &str| BrowserStderr::new(text.as_bytes().to_vec());
+        let quit = std::process::ExitStatus::from_raw(1 << 8);
+
+        for (launch_error, blocker) in [
+            (
+                CdpError::LaunchExit(quit, stderr(NO_USABLE_SANDBOX)),
+                SandboxBlocker::NoUsableSandbox,
+            ),
+            (
+                CdpError::LaunchTimeout(stderr(RUNNING_AS_ROOT)),
+                SandboxBlocker::RunningAsRoot,
+            ),
+        ] {
+            let failure = LaunchFailure::from_launch_error(launch_error);
+            let message = failure.to_string();
+            assert!(
+                matches!(&failure, LaunchFailure::SandboxUnavailable(b) if *b == blocker),
+                "{failure:?} must be a sandbox failure, which is never retried"
+            );
+            assert!(
+                !message.contains("no-sandbox"),
+                "the fix must never be to drop the sandbox: {message}"
+            );
+        }
+        assert!(matches!(
+            LaunchFailure::from_launch_error(CdpError::LaunchExit(quit, stderr("ordinary"))),
+            LaunchFailure::BeforeReady(_)
+        ));
+    }
+
+    /// Every switch that turns the sandbox off is refused before a process
+    /// starts, so no caller can launch an unsandboxed Chrome by passing one.
+    #[test]
+    fn chrome_refuses_every_sandbox_weakening_switch() {
+        for switch in chromiumoxide::browser::SANDBOX_WEAKENING_SWITCHES {
+            let single_dash = switch.strip_prefix('-').expect("a switch starts with --");
+            for form in [
+                switch.to_string(),
+                format!("{switch}=1"),
+                single_dash.to_string(),
+                format!("{single_dash}=1"),
+            ] {
+                let config = BrowserConfig::builder()
+                    .chrome_executable("/usr/bin/true")
+                    .arg(&form)
+                    .build()
+                    .expect("a config");
+                let refused = config.launch().expect_err(&form);
+                assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{form}");
+            }
+        }
+    }
+
+    /// A cold Chrome on a busy host can need longer than chromiumoxide's
+    /// default to answer, so a slow start must still launch. The fake Chrome
+    /// answers the readiness probe on its pipe just after that default.
+    #[tokio::test]
+    async fn a_chrome_slower_than_the_library_default_still_launches() {
+        #[cfg(target_os = "linux")]
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // Linux root never launches Chrome, so no launch can be slow.
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let answers_after =
+            Duration::from_millis(chromiumoxide::browser::LAUNCH_TIMEOUT) + Duration::from_secs(2);
+        let fake_chrome = workspace.path().join("slow-chrome");
+        std::fs::write(
+            &fake_chrome,
+            format!(
+                r#"#!/usr/bin/env bash
+sleep {}
+IFS= read -r -d '' probe <&3
+[[ $probe =~ \"id\":([0-9]+) ]]
+printf '{{"id":%s,"result":{{}}}}\0' "${{BASH_REMATCH[1]}}" >&4
+exec sleep 600
+"#,
+                answers_after.as_secs()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_chrome, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let profile = workspace.path().join("browser-profile");
+
+        let (mut browser, handler_task) = BrowserRuntime::launch_with(
+            BrowserRuntime::browser_config(false, &profile).chrome_executable(&fake_chrome),
+            &profile,
+        )
+        .await
+        .expect("a slow Chrome still launches");
+
+        handler_task.abort();
+        browser.kill().await;
+    }
+
+    /// The agent browser speaks CDP over a pipe, so no other local user can
+    /// reach it through a port. Its profile is this user's alone. Needs a
+    /// Chrome on the machine, and passes as a no-op without one.
+    #[tokio::test]
+    async fn the_agent_browser_listens_on_no_tcp_port() {
+        if BrowserConfig::builder().build().is_err() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let profile = workspace.path().join("browser-profile");
+        std::fs::create_dir(&profile).expect("an older 0755 profile");
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (mut browser, handler_task) = BrowserRuntime::launch_browser(false, &profile)
+            .await
+            .expect("launch Chrome");
+        let page = browser
+            .new_page("data:text/html,<title>piped</title>")
+            .await
+            .expect("drive Chrome over the pipe");
+        assert_eq!(page.get_title().await.unwrap().as_deref(), Some("piped"));
+
+        let pid = browser
+            .get_mut_child()
+            .expect("a launched child")
+            .inner
+            .id();
+        let listening = std::process::Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN", "-Fn"])
+            .output()
+            .expect("run lsof");
+        assert!(
+            listening.stdout.is_empty(),
+            "Chrome listens on TCP: {}",
+            String::from_utf8_lossy(&listening.stdout)
+        );
+        let mode = std::fs::metadata(&profile).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the profile directory must be the user's alone"
+        );
+
+        browser.close().await.expect("close Chrome");
+        handler_task.abort();
+    }
+
+    /// A renderer runs untrusted page code, so the OS must confine every one
+    /// of them. Asks the kernel rather than reading Chrome's argv. Needs a
+    /// Chrome on the machine, and passes as a no-op without one.
+    #[tokio::test]
+    async fn the_agent_browser_renderers_are_sandboxed() {
+        if BrowserConfig::builder().build().is_err() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let (mut browser, handler_task) =
+            BrowserRuntime::launch_browser(false, &workspace.path().join("browser-profile"))
+                .await
+                .expect("launch Chrome");
+        browser
+            .new_page("data:text/html,<title>untrusted</title>")
+            .await
+            .expect("open a page");
+
+        let pid = browser
+            .get_mut_child()
+            .expect("a launched child")
+            .inner
+            .id();
+        let renderers = renderer_pids(pid);
+        assert!(!renderers.is_empty(), "Chrome started no renderer");
+        for renderer in renderers {
+            assert!(
+                runs_in_os_sandbox(pid, renderer),
+                "renderer {renderer} runs outside the OS sandbox"
+            );
+        }
+
+        browser.close().await.expect("close Chrome");
+        handler_task.abort();
+    }
+
+    /// Every live descendant of `root` whose argv says `--type=renderer`.
+    fn renderer_pids(root: u32) -> Vec<u32> {
+        let ps = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,args="])
+            .output()
+            .expect("run ps");
+        let rows: Vec<(u32, u32, String)> = String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse().ok()?;
+                let ppid = fields.next()?.parse().ok()?;
+                Some((pid, ppid, fields.collect::<Vec<_>>().join(" ")))
+            })
+            .collect();
+        let mut tree = vec![root];
+        let mut renderers = Vec::new();
+        while let Some(parent) = tree.pop() {
+            for (pid, _, args) in rows.iter().filter(|(_, ppid, _)| *ppid == parent) {
+                tree.push(*pid);
+                if args.contains("--type=renderer") {
+                    renderers.push(*pid);
+                }
+            }
+        }
+        renderers
+    }
+
+    /// macOS: the kernel's Seatbelt answer. A pid that no longer exists also
+    /// reads as sandboxed, so liveness is checked first.
+    #[cfg(target_os = "macos")]
+    fn runs_in_os_sandbox(_browser: u32, renderer: u32) -> bool {
+        extern "C" {
+            fn sandbox_check(pid: libc::pid_t, operation: *const libc::c_char, kind: i32) -> i32;
+        }
+        let pid = renderer as libc::pid_t;
+        // SAFETY: both calls only read kernel state for `pid`; a null
+        // operation asks whether the process is sandboxed at all.
+        unsafe { libc::kill(pid, 0) == 0 && sandbox_check(pid, std::ptr::null(), 0) == 1 }
+    }
+
+    /// Linux: Chrome's two layers, a seccomp-BPF filter and a PID namespace of
+    /// its own (user namespaces or the setuid helper).
+    #[cfg(target_os = "linux")]
+    fn runs_in_os_sandbox(browser: u32, renderer: u32) -> bool {
+        let status =
+            std::fs::read_to_string(format!("/proc/{renderer}/status")).unwrap_or_default();
+        let filtered = status
+            .lines()
+            .any(|line| line.split_whitespace().eq(["Seccomp:", "2"]));
+        let pid_ns = |pid: u32| std::fs::read_link(format!("/proc/{pid}/ns/pid")).ok();
+        filtered && pid_ns(renderer).is_some() && pid_ns(renderer) != pid_ns(browser)
     }
 }

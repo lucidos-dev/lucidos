@@ -41,7 +41,7 @@ test.describe('Mobile thread title menu', () => {
 
   test('the row draws no pin and no ⋯', async ({ page }) => {
     await expect(page.locator(TITLE)).toHaveCount(1);
-    await expect(page.locator('.mobile-thread-title-row .pin-thread-btn:visible')).toHaveCount(0);
+    await expect(page.locator('.mobile-thread-title-row .pin-btn:visible')).toHaveCount(0);
     await expect(page.locator('.mobile-thread-title-row button[aria-label="More thread actions"]:visible')).toHaveCount(0);
   });
 

@@ -13,6 +13,7 @@ async fn response_aborted_surfaces_chat_thread_to_inbox() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -95,6 +96,7 @@ async fn response_canceled_sets_has_response_true() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
             device_id: None,

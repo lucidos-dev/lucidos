@@ -385,7 +385,7 @@ async fn resolve_direct_providers(
     let openrouter = if_enabled(switches.openrouter, || {
         build_openrouter_provider(
             openrouter_credential,
-            std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
+            std::env::var(crate::llm::OPENROUTER_API_KEY_ENV).ok(),
             default_model,
         )
     });
@@ -595,7 +595,7 @@ pub async fn build_active_provider(
         None
     };
 
-    let openai_env_key = std::env::var("OPENAI_API_KEY").ok();
+    let openai_env_key = std::env::var(crate::llm::OPENAI_API_KEY_ENV).ok();
     // Lowest-precedence OpenAI key: auto-detected from the Codex CLI's auth file
     // (apikey login), the parallel of Vertex reading the gcloud ADC file. Read
     // fresh each build (boot + credential-subscriber hot-swap); never persisted.
@@ -1156,8 +1156,8 @@ mod tests {
     /// reported false, breaking the `Unconfigured`/`FailFast` assertions.
     fn ambient_provider_env() -> bool {
         std::env::var("ANTHROPIC_API_KEY").is_ok()
-            || std::env::var("OPENAI_API_KEY").is_ok()
-            || std::env::var("LUCIDOS_OPENROUTER_API_KEY").is_ok()
+            || std::env::var(crate::llm::OPENAI_API_KEY_ENV).is_ok()
+            || std::env::var(crate::llm::OPENROUTER_API_KEY_ENV).is_ok()
             || std::env::var("LUCIDOS_XAI_API_KEY").is_ok()
             || std::env::var("LUCIDOS_LOCAL_BASE_URL").is_ok()
             || std::env::var("LUCIDOS_LOCAL_API_KEY").is_ok()
@@ -1928,7 +1928,8 @@ mod tests {
         )
         .await;
         assert!(
-            resolved.openrouter.is_none() || std::env::var("LUCIDOS_OPENROUTER_API_KEY").is_ok(),
+            resolved.openrouter.is_none()
+                || std::env::var(crate::llm::OPENROUTER_API_KEY_ENV).is_ok(),
             "an on switch with no key must configure nothing"
         );
         teardown_test_db(&db).await;

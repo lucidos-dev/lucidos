@@ -90,6 +90,27 @@ pub(super) fn command_prefix(command: &str) -> String {
     command[..command.floor_char_boundary(COMMAND_PREFIX_BYTES)].to_string()
 }
 
+/// How a background task's owner learns that it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionDelivery {
+    /// An event wait re-opens the owning thread on its completion.
+    EventWait,
+    /// The owner polls with `lucidos background-task wait`, so no engine wait
+    /// may arm for it. A wake after the agent already read the result would
+    /// re-open the thread for nothing.
+    Poll,
+}
+
+/// What a background task is, apart from its command and where it runs.
+#[derive(Debug, Clone, Copy)]
+pub struct TaskSpec<'a> {
+    /// The watchdog budget, in seconds.
+    pub timeout_secs: u64,
+    /// The agent's name for the work, shown on the wait.
+    pub description: Option<&'a str>,
+    pub delivery: CompletionDelivery,
+}
+
 #[derive(Clone)]
 pub struct BackgroundBashRegistry {
     tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
@@ -238,6 +259,7 @@ struct BackgroundTask {
     /// Expiry ignores the flag, so the exemption cannot pin memory. See
     /// [`sweep_finished`].
     completion_claimed: bool,
+    delivery: CompletionDelivery,
     /// Thread that spawned this task. `None` for tests and engine-internal
     /// callers with no owning thread. Scopes the per-thread questions: which
     /// tasks an engine-armed event wait must cover, which a Discard kills, and
@@ -286,6 +308,7 @@ impl BackgroundTask {
             abandoned: false,
             finished_at: None,
             completion_claimed: false,
+            delivery: CompletionDelivery::EventWait,
             thread_id: None,
             timeout_secs: 600,
             kill_signal: None,
@@ -335,6 +358,8 @@ pub struct RunningTaskHandle {
     /// Without this, `stop X; run Y` inside the stop's grace re-armed a wait
     /// on X, and X's own killed completion woke the thread that stopped it.
     pub stop_requested: bool,
+    /// The owner polls for this task's result, so no engine wait arms for it.
+    pub polled: bool,
 }
 
 /// The right to stop one task, taken by [`BackgroundBashRegistry::begin_stop`]
@@ -467,6 +492,28 @@ impl BackgroundBashRegistry {
         tasks
     }
 
+    /// Test shorthand for [`Self::spawn_task`] with an event-wait delivery.
+    #[cfg(test)]
+    pub async fn spawn(
+        &self,
+        command: &str,
+        timeout_secs: u64,
+        cwd: &Path,
+        env: &[(String, String)],
+        thread_id: Option<Uuid>,
+        description: Option<&str>,
+    ) -> Result<
+        (String, tokio::sync::oneshot::Receiver<()>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let spec = TaskSpec {
+            timeout_secs,
+            description,
+            delivery: CompletionDelivery::EventWait,
+        };
+        self.spawn_task(command, cwd, env, thread_id, spec).await
+    }
+
     /// Spawn a child process. Inserts the task into the registry before
     /// returning the task_id, eliminating the spawn/poll race a follow-up
     /// `bash_output` would otherwise hit. The returned receiver fires
@@ -480,20 +527,26 @@ impl BackgroundBashRegistry {
     /// Production callers (`LucidosEngine::start_background_task`) always pass
     /// `Some(thread_id)`; tests typically pass `None`.
     ///
-    /// `description` is the agent's name for the work. A blank one counts as
-    /// none, so the wait falls back to the command rather than to nothing.
-    pub async fn spawn(
+    /// A blank `spec.description` counts as none, so the wait falls back to the
+    /// command rather than to nothing. `spec.delivery` is set in the same
+    /// locked insert that makes the task visible, so no wait can arm for a
+    /// polled task in between.
+    pub async fn spawn_task(
         &self,
         command: &str,
-        timeout_secs: u64,
         cwd: &Path,
         env: &[(String, String)],
         thread_id: Option<Uuid>,
-        description: Option<&str>,
+        spec: TaskSpec<'_>,
     ) -> Result<
         (String, tokio::sync::oneshot::Receiver<()>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        let TaskSpec {
+            timeout_secs,
+            description,
+            delivery,
+        } = spec;
         let task_id = Uuid::new_v4().to_string();
 
         // Built through `command_shell()` so the command runs under `pipefail`
@@ -547,6 +600,7 @@ impl BackgroundBashRegistry {
                     abandoned: false,
                     finished_at: None,
                     completion_claimed: false,
+                    delivery,
                     thread_id,
                     timeout_secs,
                     kill_signal: Some(kill_tx),
@@ -796,6 +850,7 @@ impl BackgroundBashRegistry {
                 command: t.command.clone(),
                 watchdog_deadline: t.started_at + chrono::Duration::seconds(t.timeout_secs as i64),
                 stop_requested: t.stop_requested(),
+                polled: t.delivery == CompletionDelivery::Poll,
             })
             .collect()
     }
@@ -2876,6 +2931,79 @@ mod tests {
 
         reg.kill(&described).await;
         reg.kill(&blank).await;
+    }
+
+    /// The engine wait planner skips a polled task by this flag, so it must
+    /// say which delivery each task was spawned with.
+    #[tokio::test]
+    async fn running_for_thread_reports_a_polled_task_as_polled() {
+        let reg = BackgroundBashRegistry::new();
+        let my_thread = Uuid::new_v4();
+        let tmp = std::path::Path::new("/tmp");
+        let spec = |delivery| TaskSpec {
+            timeout_secs: 60,
+            description: None,
+            delivery,
+        };
+        let (polled, _rx1) = reg
+            .spawn_task(
+                "sleep 30",
+                tmp,
+                &[],
+                Some(my_thread),
+                spec(CompletionDelivery::Poll),
+            )
+            .await
+            .expect("spawn");
+        let (watched, _rx2) = reg
+            .spawn_task(
+                "sleep 30",
+                tmp,
+                &[],
+                Some(my_thread),
+                spec(CompletionDelivery::EventWait),
+            )
+            .await
+            .expect("spawn");
+
+        let running = reg.running_for_thread(my_thread).await;
+        let find = |id: &str| running.iter().find(|h| h.task_id == id).expect("reported");
+        assert!(find(&polled).polled);
+        assert!(!find(&watched).polled);
+
+        reg.kill(&polled).await;
+        reg.kill(&watched).await;
+    }
+
+    /// `lucidos background-task wait` reads through the timed drain. When the
+    /// budget runs out first, the task must still be running: a wait only
+    /// reads, it never stops anything.
+    #[tokio::test]
+    async fn a_drain_whose_budget_runs_out_leaves_the_task_running() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _rx) = reg
+            .spawn(
+                "sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+                None,
+            )
+            .await
+            .expect("spawn");
+
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::from_millis(200))
+            .await
+            .expect("a running task is readable");
+        assert!(!snap.finished);
+        assert!(
+            reg.is_running(&task_id).await,
+            "the timed-out read must not stop it"
+        );
+
+        reg.kill(&task_id).await;
     }
 
     /// Tasks spawned without a thread_id (test fixtures, engine-internal

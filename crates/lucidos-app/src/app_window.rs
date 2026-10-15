@@ -631,8 +631,8 @@ fn parse_window_url(url: &str) -> Result<tauri::Url, String> {
 /// chosen by the page would be the page choosing what loads there.
 ///
 /// `landing` names a view inside the workspace, validated the same way and for
-/// the same reason. It reaches a peer's notifications rather than only the
-/// default view. It also navigates a window already on the workspace, rather
+/// the same reason. It reaches a peer's notifications or one of its threads,
+/// rather than only the default view. It also navigates a window already on the workspace, rather
 /// than merely fronting it. The caller arrives as a `Webview` (ADR 0140),
 /// because only a webview carries the URL this needs.
 #[tauri::command]
@@ -857,15 +857,15 @@ pub(crate) fn focus_calling_window(app: tauri::AppHandle, window: tauri::Window)
 /// before registering the event listener. Tauri does not replay the transition
 /// events to a listener that registers after the fact, and the cache defaults to
 /// `true`. Without the seed, a freshly loaded page that is really backgrounded
-/// keeps that default and pongs the device as active. The engine then suppresses
-/// the OS push into an invisible in-app toast.
+/// keeps that default. It renders an in-app toast nobody can see, pongs `shown`,
+/// and the engine suppresses the OS push.
 ///
 /// **It reads `window`, never `main`.** Each app window can sit on its own
 /// workspace, and the transitions it seeds ahead of are `emit_to` one label. A
 /// seed off another window therefore answers about a page that is not this one.
 /// Reading `main` is how a backgrounded second window seeded itself active from
-/// a focused first one. It then pongs `is_active: true` and its workspace's push
-/// is suppressed, the `Any`-listener symptom reached one route further back.
+/// a focused first one. It then pongs `shown` and its workspace's push is
+/// suppressed, the `Any`-listener symptom reached one route further back.
 ///
 /// Any state read that fails resolves to the SAFE direction, inactive, so an
 /// uncertain seed surfaces the banner rather than suppressing it.

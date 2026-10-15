@@ -20,12 +20,12 @@ const toastSource: string = readFileSync(resolve(here, '../Toast.tsx'), 'utf-8')
 
 /** A toast that waits to be answered, which is what `showToast` records. */
 function standing(type: ToastType): ToastItem {
-  return { id: 1, message: 'x', type, persistent: true, pane: 'thread' };
+  return { id: 1, message: 'x', type, persistent: true };
 }
 
 /** One on a timer: it is removed on its own schedule, seen or not. */
 function timed(type: ToastType): ToastItem {
-  return { id: 2, message: 'x', type, persistent: false, pane: 'thread' };
+  return { id: 2, message: 'x', type, persistent: false };
 }
 
 /**

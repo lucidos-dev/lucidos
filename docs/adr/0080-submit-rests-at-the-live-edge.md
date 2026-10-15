@@ -237,3 +237,27 @@ So a typed answer lands like a send (`followSentMessage`). It shows the answer
 and its spinner at once, then holds on the live edge until the agent's first
 row, on the one-minute deadline. The confirm plays no part. The reader asked for
 both steps: the typed answer and its spinner first, then the agent line.
+
+## Amendment: the release shows where the reply starts
+
+The hold lets go on the agent's first drawn row and rests on the edge that row
+leaves. A fast reply can draw itself whole in one commit, as ONE row. The edge
+it leaves is then the end of the reply, and the reader was carried through a
+reply they never asked to follow. The e2e spec
+`thread-scroll-belongs-to-the-reader` caught it on the mock model.
+
+So the releasing round rests on the live edge only as far as the first row's
+first line. A step row or a streamed reply's opening is about a line tall, so
+it still shows whole. A reply that arrives whole shows its first line, with the
+rest below the fold and the chevron as the way down (`releaseRestTop`). The
+reader chose this over resting above the reply, which parks the first row in
+the composer dissolve, the case this ADR was written against.
+
+A new question card and a queued turn still rest on the live edge, since
+neither ends the hold with a row.
+
+The landing's glide runs the hold before every frame, not only on growth
+rounds. A browser runs animation frames before resize observers. So a reply
+committed between the two was tracked to its end before the releasing round
+could freeze the glide. A freeze inside a running glide re-bases the tween
+(ADR 0065), so it eases on forward to the first line.

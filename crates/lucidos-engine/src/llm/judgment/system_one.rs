@@ -54,12 +54,6 @@ impl SystemOneProvider {
             client,
         })
     }
-
-    /// Whether a key rides in the `Authorization` header, without exposing it.
-    #[cfg(test)]
-    pub(crate) fn sends_a_key(&self) -> bool {
-        self.api_key.is_some()
-    }
 }
 
 /// Build the request body for one call.

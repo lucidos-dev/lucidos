@@ -118,13 +118,13 @@ Write the plan to a new file `docs/plans/YYYY-MM-DD-<slug>.md`, using the struct
 
 **Ask with your question tool, never in prose** (`AskUserQuestion` on Claude Code, `ask_user_question` on the `lucidos` MCP server on Codex). Prose is what fails: told only to "present the plan and wait", the agent writes a summary, ends the turn, and the thread sits idle until the user types "approve" by hand. In the Lucidos UI the tool renders as clickable buttons, so approval is one tap.
 
-Use exactly one question. `Approve` is always the first option. What goes in the second slot is a **floor, not a fixed shape**:
+Use exactly one question. Offer the options `lucidos planned mark` prints. `Approve` is the first option unless that output leads with `Implement in a new thread (Recommended)` (§ Implement in a new thread). What goes in the second slot is a **floor, not a fixed shape**:
 
 | Option | Meaning | When |
 |---|---|---|
-| `Approve` | Start implementing the plan as written. | Always, first. |
+| `Approve` | Start implementing the plan as written. | First, unless the new-thread option leads; then it reads `Approve here`, second. |
 | A fork of the plan (`Frontend only`, `Skip the migration`, …) | Approve a named variant. | Whenever the plan has a genuine fork: a narrower scope, one layer instead of two, a different approach. |
-| `Implement in a new thread` | Approve as written, and build in a fresh child thread. | When this thread is already heavy (a long grill, many pictures) **and** the plan spans several phases or layers. May sit beside a fork. |
+| `Implement in a new thread (Recommended)` | Approve as written, and build in a *successor thread*. | **Only when `lucidos planned mark` says so**, from this thread's measured context. It then goes FIRST, with `Approve here` second. May sit beside a fork. |
 | `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork and no new-thread option. Never alongside either. |
 
 **The plan as written is the thorough, long-term fix.** The maintainer always prefers it to a narrower patch. So write the thorough variant as the plan, and offer the narrower one as the fork, never the reverse. An unattended run still stops at the decision, as a plan or under `Decisions:`: the preference picks which variant to recommend, not whether to ask.
@@ -185,27 +185,26 @@ If `Open Questions` contains a load-bearing unresolved decision, stop and ask th
 
 A planning thread that ran a long grill carries every question, picture and
 draft into each later turn. The plan file already holds what a builder needs, so
-a fresh thread can start from it alone. Offer the option only when both hold:
-this thread is heavy, and the plan spans several phases or layers.
+a fresh thread can start from it alone.
 
-Picking it is an approval, asked once:
+**The number decides, never your judgement.** `lucidos planned mark --plan`
+reads this thread's context size from the engine and prints the card's options.
+Over the engine's threshold it prints `Implement in a new thread (Recommended)`
+first and `Approve here` second. Under it, or when the size is unknown, it
+prints the plain floor. Offer exactly what it prints.
+
+Picking `Implement in a new thread` is an approval, asked once:
 
 1. Run `lucidos planned approve` in this thread.
-2. Spawn the builder as a child, with your own coding-agent backend:
-   `lucidos spawn-thread --to "$LUCIDOS_WORKSPACE" --relation child --coding-agent <backend>`.
-   A child stays in this thread's subtree and reports back when it finishes.
-3. End your turn. This branch carries the plan only.
+2. Write a handoff narrative and run `lucidos successor spawn --narrative <file>`
+   (`lucidos successor --help` has the six sections). The narrative names the
+   plan path and says the user approved it here, so the builder builds it phase
+   by phase without asking again.
+3. End your turn with the link it prints.
 
-The builder's worktree starts from `main`, where the plan does not exist yet.
-So the spawn message must be self-contained and say:
-
-```text
-Implement docs/plans/<date>-<slug>.md. The user approved it in the planning
-thread. First run `git merge <planning branch>` to get the plan commit. Then run
-`lucidos planned mark --plan docs/plans/<date>-<slug>.md` and
-`lucidos planned approve` without asking again, and build it phase by phase.
-```
-
-Both branches then carry the same plan commit, so either Apply merges cleanly.
-The same text reaches the agent through `lucidos planned mark` and the edit
-gate, from `NEW_THREAD_HANDOFF` in `crates/lucidos-cli/src/planned.rs`.
+The successor's branch starts at this branch's last commit, so it already holds
+the plan, and the approved marker carries over. It sits in this thread's place:
+from a top-level planning thread the builder is top-level, so it never reports
+back into the heavy thread. The same text reaches the agent through
+`lucidos planned mark` and the edit gate, from `card_shape` and
+`NEW_THREAD_HANDOFF` in `crates/lucidos-cli/src/planned.rs`.

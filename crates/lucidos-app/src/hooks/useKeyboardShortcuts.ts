@@ -2,7 +2,7 @@ import { useEffect } from 'preact/hooks';
 import { unfocusThread } from '../store/actions/threads';
 import { focusPromptNow, openAgentMenu } from '../components/chat/promptFocus';
 import { searchEverywhereOpen, searchEverywhereAnchor, focusedPane, focusedThreadId, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
-import { isTextInput, isThreadTranscript } from '../utils/dom';
+import { isInteractiveTarget, isTextInput, isThreadTranscript } from '../utils/dom';
 import { dismissTopOverlay, overlayStack, topPanelOverlay } from '../store/overlayStack';
 import { nativeFullscreenElement } from '../store/appFullscreenHost';
 import { runCloseCascade } from '../store/actions/threadActions';
@@ -227,11 +227,10 @@ type ChordLike = Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKe
  *  while up, so typing must search the dropdown (its own typeahead), never
  *  leak into the prompt textarea behind the inert UI. Also false on mobile, for
  *  IME composition, when a text input already has focus, with a modifier held,
- *  or for non-printable keys. One extra carve-out: a Space press whose target is
- *  the focusable transcript region — Space is a printable key, but there it must
- *  page the transcript down (native scroll of the focused container), not insert a
- *  space into the prompt. Other printables inside the transcript still type-to-
- *  focus (start typing → compose). Pure — exported for unit testing. */
+ *  or for non-printable keys. Space keeps its native job in two places, though
+ *  it is printable. On the focusable transcript region it pages down. On a
+ *  focused control it presses that control. Other printables in either place
+ *  still type-to-focus (start typing → compose). Pure — exported for unit testing. */
 export function shouldTypeToFocusPrompt(
   e: Pick<KeyboardEvent, 'isComposing' | 'metaKey' | 'ctrlKey' | 'altKey' | 'key' | 'target'>,
   opts: { mobile: boolean; overlayOpen: boolean },
@@ -242,7 +241,7 @@ export function shouldTypeToFocusPrompt(
     && !isTextInput(e.target)
     && !e.metaKey && !e.ctrlKey && !e.altKey
     && e.key.length === 1
-    && !(e.key === ' ' && isThreadTranscript(e.target));
+    && !(e.key === ' ' && (isThreadTranscript(e.target) || isInteractiveTarget(e.target)));
 }
 
 /** Whether a Mac text field owns this keydown. There Ctrl with a bare letter

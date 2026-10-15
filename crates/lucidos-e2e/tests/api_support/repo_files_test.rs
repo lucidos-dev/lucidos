@@ -161,7 +161,8 @@ async fn get_repo_diff_with_branch() {
     let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
     let branch = format!("e2e-test/repo-diff-{}", suffix);
     let file = format!("e2e-diff-{}.txt", suffix);
-    let wt_dir = std::env::temp_dir().join(format!("e2e-wt-diff-{}", suffix));
+    let wt_tmp = tempfile::tempdir().unwrap();
+    let wt_dir = wt_tmp.path();
 
     // Use a worktree to create the branch without touching the main working tree
     git(&[
@@ -173,8 +174,8 @@ async fn get_repo_diff_with_branch() {
         "main",
     ]);
     std::fs::write(wt_dir.join(&file), "diff test content").unwrap();
-    git_in(&wt_dir, &["add", &file]);
-    git_in(&wt_dir, &["commit", "-m", "e2e diff test"]);
+    git_in(wt_dir, &["add", &file]);
+    git_in(wt_dir, &["commit", "-m", "e2e diff test"]);
 
     let resp = client
         .get(format!(
@@ -215,23 +216,23 @@ async fn get_repo_diff_with_branch() {
 /// Set up a branch in the e2e workspace with a single file whose name contains
 /// an emoji. Returns `(branch, file, wt_dir)`. Caller is responsible for
 /// teardown via `cleanup_utf8_branch`.
-fn create_utf8_branch(name_prefix: &str) -> (String, String, std::path::PathBuf) {
+fn create_utf8_branch(name_prefix: &str) -> (String, String, tempfile::TempDir) {
     let suffix = &Uuid::new_v4().as_simple().to_string()[..8];
     let branch = format!("e2e-test/utf8-{}-{}", name_prefix, suffix);
     let file = format!("e2e-7_🧮_HLL-{}.py", suffix);
-    let wt_dir = std::env::temp_dir().join(format!("e2e-wt-utf8-{}-{}", name_prefix, suffix));
+    let wt_dir = tempfile::tempdir().unwrap();
 
     git(&[
         "worktree",
         "add",
-        wt_dir.to_str().unwrap(),
+        wt_dir.path().to_str().unwrap(),
         "-b",
         &branch,
         "main",
     ]);
-    std::fs::write(wt_dir.join(&file), "utf8 test").unwrap();
-    git_in(&wt_dir, &["add", &file]);
-    git_in(&wt_dir, &["commit", "-m", "e2e utf8 test"]);
+    std::fs::write(wt_dir.path().join(&file), "utf8 test").unwrap();
+    git_in(wt_dir.path(), &["add", &file]);
+    git_in(wt_dir.path(), &["commit", "-m", "e2e utf8 test"]);
 
     (branch, file, wt_dir)
 }
@@ -292,7 +293,7 @@ async fn list_repo_files_returns_raw_utf8_paths() {
             .collect::<Vec<_>>()
     );
 
-    cleanup_utf8_branch(&branch, &wt_dir);
+    cleanup_utf8_branch(&branch, wt_dir.path());
 }
 
 #[tokio::test]
@@ -335,7 +336,7 @@ async fn get_repo_diff_returns_raw_utf8_paths() {
         paths
     );
 
-    cleanup_utf8_branch(&branch, &wt_dir);
+    cleanup_utf8_branch(&branch, wt_dir.path());
 }
 
 #[tokio::test]

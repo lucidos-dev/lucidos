@@ -202,9 +202,6 @@ source "$SCRIPT_DIR/workspace.sh"
 BUILD=1
 ENGINE_ONLY=1
 VITE_PORT=65000
-ENGINE_PIDFILE="$tmp/engine.pid"
-sleep 30 & epid=\$!
-echo "\$epid" > "\$ENGINE_PIDFILE"
 # Unrecoverable: port never frees and there's nothing to SIGKILL. Stub the
 # wait to fail fast instead of running the real ~18s graceful+grace window.
 port_is_free() { return 1; }
@@ -212,7 +209,6 @@ lsof() { echo ""; }
 wait_for_engine_shutdown() { return 1; }
 kill_stale_processes
 echo "REACHED_AFTER_KILL_STALE"
-kill -KILL "\$epid" 2>/dev/null || true
 EOF
     local out rc
     out="$(bash "$script" 2>&1)"

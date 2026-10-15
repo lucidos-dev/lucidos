@@ -72,8 +72,8 @@ export function isMobileDeviceUserAgent(ua: string | null | undefined): boolean 
  *  `tauri://localhost`; other OSes `http://tauri.localhost`), where every
  *  same-origin API URL + the service-worker registration are invalid and throw
  *  WebKit's "string did not match the expected pattern". The gateway origin is
- *  always `http(s)://localhost:<port>`, and dev Tauri loads `http://localhost:5173`
- *  (devUrl), so this is false there, in the browser, in the PWA, and after the
+ *  always `http(s)://localhost:<port>`. So is every page the dev window loads:
+ *  `build.devUrl`, then the gateway. So this is false there, in the browser, in the PWA, and after the
  *  navigation. Takes its inputs as arguments so it's testable without
  *  `window`/`location`. */
 export function isTauriPreGatewayEntryFor(opts: {
@@ -173,27 +173,33 @@ export function isIOSPwa(): boolean { return _isIOSPwa; }
 
 /** What a client can do with the system pasteboard.
  *
- *  Two abilities, not one: `writeText` is widely available and `readText` is
+ *  Three abilities, not one: `writeText` is widely available and `readText` is
  *  not, and a surface offering Paste where nothing can read is a control that
- *  fails on tap. Neither exists off a secure origin, which is exactly the
- *  plain-http LAN case. */
+ *  fails on tap. An image needs `write` and `ClipboardItem`. None exists off a
+ *  secure origin, which is exactly the plain-http LAN case. */
 export interface ClipboardAbilities {
   copy: boolean;
   paste: boolean;
+  copyImage: boolean;
 }
 
-/** Pure {@link clipboardAbilities}, so both answers are testable without a
- *  browser. Takes the clipboard rather than reading `navigator`. */
-export function clipboardAbilitiesOf(clipboard: Partial<Clipboard> | undefined): ClipboardAbilities {
+/** Pure {@link clipboardAbilities}, so every answer is testable without a
+ *  browser. Takes the clipboard and `ClipboardItem` rather than reading globals. */
+export function clipboardAbilitiesOf(
+  clipboard: Partial<Clipboard> | undefined,
+  clipboardItem?: unknown,
+): ClipboardAbilities {
   return {
     copy: typeof clipboard?.writeText === 'function',
     paste: typeof clipboard?.readText === 'function',
+    copyImage: typeof clipboard?.write === 'function' && typeof clipboardItem === 'function',
   };
 }
 
 /** Live-wired {@link clipboardAbilitiesOf} for this client. */
 export function clipboardAbilities(): ClipboardAbilities {
-  return clipboardAbilitiesOf(typeof navigator === 'undefined' ? undefined : navigator.clipboard);
+  if (typeof navigator === 'undefined') return clipboardAbilitiesOf(undefined);
+  return clipboardAbilitiesOf(navigator.clipboard, globalThis.ClipboardItem);
 }
 
 /** Pure {@link cameraIsAvailable}: can `getUserMedia` open a camera here?

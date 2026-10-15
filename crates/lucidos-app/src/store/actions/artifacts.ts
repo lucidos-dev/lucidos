@@ -356,14 +356,24 @@ export function openUrl(url: string, source?: string): void {
  *
  *  This is deliberately NOT `openUrl` / `openFilePreview`: the target lives
  *  OUTSIDE the workspace (e.g. a staged release `.dmg`), so it must not go to
- *  the in-app URL panel webview or the `/data/*` static mount. On a non-Tauri
- *  web build there is no OS bridge — best-effort open in a new tab so we never
- *  crash (browsers ignore `file://`; a real path just dead-ends, same as before
- *  this branch existed). Caller is responsible for classifying the href as a
- *  local file (see `extractLocalFileTarget`). */
-export function openLocalFile(target: string): void {
+ *  the in-app URL panel webview or the `/data/*` static mount. A browser has no
+ *  OS bridge, so it says so and navigates nowhere: a page ignores `file://`,
+ *  and a bare path resolves against the page origin, which is the gateway.
+ *  The one exception is a protocol-relative `//host/path`, which the classifier
+ *  also claims: it is a web page, so it opens in a tab.
+ *  `source` names what asked, as in `openUrlOutsideApp`. Caller is responsible
+ *  for classifying the href as a local file (see `extractLocalFileTarget`). */
+export function openLocalFile(target: string, source?: string): void {
   if (!isTauri()) {
-    window.open(target, '_blank', 'noopener');
+    if (target.startsWith('//')) {
+      window.open(target, '_blank', 'noopener');
+      return;
+    }
+    const from = source ? ` (requested by ${source})` : '';
+    showToast(
+      `${target} is on the computer running Lucidos, outside this workspace, so this browser can't open it${from}`,
+      'error',
+    );
     return;
   }
   void openExternal(target).catch((err) =>
@@ -390,7 +400,7 @@ function osOpenerMayLaunchAProgram(target: string): boolean {
  *  `openLocalFile` directly. */
 export async function openLocalFileOnConfirm(target: string, source?: string): Promise<void> {
   if (!isTauri()) {
-    openLocalFile(target);
+    openLocalFile(target, source);
     return;
   }
   const from = source ? `\n\nRequested by ${source}.` : '';

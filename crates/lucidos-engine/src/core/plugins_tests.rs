@@ -17,14 +17,10 @@ fn write_valid_plugin(root: &std::path::Path) {
     fs::write(kn.join("a.md"), "---\nname: A\n---\nhi").unwrap();
 }
 
-fn tmpdir(name: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "lucidos_plugins_test_{}_{}",
-        name,
-        uuid::Uuid::new_v4()
-    ));
-    fs::create_dir_all(&p).unwrap();
-    p
+fn tmpdir(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::Builder::new().prefix(name).tempdir().unwrap();
+    let p = tmp.path().to_path_buf();
+    (tmp, p)
 }
 
 // --- parse_manifest ---
@@ -314,25 +310,23 @@ source = "bare-string"
 
 #[test]
 fn validates_well_formed_tree() {
-    let dir = tmpdir("ok");
+    let (_tmp, dir) = tmpdir("ok");
     write_valid_plugin(&dir);
     assert!(validate_tree(&dir).is_ok());
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn rejects_missing_manifest() {
-    let dir = tmpdir("nomanifest");
+    let (_tmp, dir) = tmpdir("nomanifest");
     let kn = dir.join("knowhow");
     fs::create_dir_all(&kn).unwrap();
     fs::write(kn.join("a.md"), "x").unwrap();
     assert_eq!(validate_tree(&dir), Err(ValidationError::MissingManifest));
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn rejects_unexpected_top_level_dir() {
-    let dir = tmpdir("badtoplevel");
+    let (_tmp, dir) = tmpdir("badtoplevel");
     write_valid_plugin(&dir);
     fs::create_dir(dir.join("__MACOSX")).unwrap();
     fs::write(dir.join("__MACOSX/junk"), "").unwrap();
@@ -342,14 +336,13 @@ fn rejects_unexpected_top_level_dir() {
         }
         other => panic!("expected UnexpectedTopLevelEntry, got {:?}", other),
     }
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Themes were called looks, and a plugin built then ships `looks/`. It is
 /// refused like any unknown folder, but told which name to use instead.
 #[test]
 fn a_legacy_looks_folder_is_refused_naming_themes() {
-    let dir = tmpdir("legacylooks");
+    let (_tmp, dir) = tmpdir("legacylooks");
     write_valid_plugin(&dir);
     fs::create_dir(dir.join("looks")).unwrap();
     fs::write(dir.join("looks/harbour.json"), "{}").unwrap();
@@ -359,33 +352,30 @@ fn a_legacy_looks_folder_is_refused_naming_themes() {
         ValidationError::UnexpectedTopLevelEntry("looks".into())
     );
     assert!(err.to_string().contains("themes/"), "{err}");
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn rejects_unexpected_top_level_file() {
-    let dir = tmpdir("rootreadme");
+    let (_tmp, dir) = tmpdir("rootreadme");
     write_valid_plugin(&dir);
     fs::write(dir.join("README.md"), "hi").unwrap();
     assert!(matches!(
         validate_tree(&dir),
         Err(ValidationError::UnexpectedTopLevelEntry(_))
     ));
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn rejects_empty_tree() {
-    let dir = tmpdir("empty");
+    let (_tmp, dir) = tmpdir("empty");
     fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
     fs::create_dir_all(dir.join("knowhow")).unwrap();
     assert_eq!(validate_tree(&dir), Err(ValidationError::EmptyTree));
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn rejects_a_tree_holding_only_build_output() {
-    let dir = tmpdir("only_build_output");
+    let (_tmp, dir) = tmpdir("only_build_output");
     fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
     fs::create_dir_all(dir.join("scripts/__pycache__")).unwrap();
     fs::write(dir.join("scripts/__pycache__/run.cpython-314.pyc"), "x").unwrap();
@@ -393,13 +383,12 @@ fn rejects_a_tree_holding_only_build_output() {
     fs::create_dir_all(dir.join("apps/a/node_modules")).unwrap();
     fs::write(dir.join("apps/a/node_modules/y.js"), "x").unwrap();
     assert_eq!(validate_tree(&dir), Err(ValidationError::EmptyTree));
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn rejects_an_item_named_like_build_output() {
     for item in ["apps/dist", "triggers/build", "fonts/out"] {
-        let dir = tmpdir("item_named_build_output");
+        let (_tmp, dir) = tmpdir("item_named_build_output");
         write_valid_plugin(&dir);
         fs::create_dir_all(dir.join(item)).unwrap();
         fs::write(dir.join(item).join("index.html"), "x").unwrap();
@@ -407,13 +396,12 @@ fn rejects_an_item_named_like_build_output() {
             validate_tree(&dir),
             Err(ValidationError::ItemNamedLikeBuildOutput(item.into()))
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 }
 
 #[test]
 fn accepts_build_output_below_an_item_or_hidden() {
-    let dir = tmpdir("build_output_below_item");
+    let (_tmp, dir) = tmpdir("build_output_below_item");
     write_valid_plugin(&dir);
     fs::create_dir_all(dir.join("apps/a/dist")).unwrap();
     fs::write(dir.join("apps/a/index.html"), "x").unwrap();
@@ -422,12 +410,11 @@ fn accepts_build_output_below_an_item_or_hidden() {
     let (_, planned) = validate_tree(&dir).unwrap();
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
     assert_eq!(paths, vec!["apps/a/index.html", "knowhow/a.md"]);
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn validates_tree_with_only_auth_modules() {
-    let dir = tmpdir("authonly");
+    let (_tmp, dir) = tmpdir("authonly");
     fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
     let am = dir.join("auth-modules");
     fs::create_dir_all(&am).unwrap();
@@ -437,21 +424,24 @@ fn validates_tree_with_only_auth_modules() {
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
     assert!(paths.contains(&"auth-modules/acme.wasm"));
     assert!(paths.contains(&"auth-modules/acme.manifest.json"));
-    let _ = fs::remove_dir_all(&dir);
 }
 
-fn plugin_with_theme(name: &str, file: &str, body: &str) -> std::path::PathBuf {
-    let dir = tmpdir(name);
+fn plugin_with_theme(
+    name: &str,
+    file: &str,
+    body: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, dir) = tmpdir(name);
     fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
     let themes = dir.join("themes");
     fs::create_dir_all(&themes).unwrap();
     fs::write(themes.join(file), body).unwrap();
-    dir
+    (tmp, dir)
 }
 
 #[test]
 fn validates_tree_with_only_themes() {
-    let dir = plugin_with_theme(
+    let (_tmp, dir) = plugin_with_theme(
         "themes",
         "lagoon.json",
         r##"{"name":"Lagoon","dark":{"--accent":"#3aa3c9"}}"##,
@@ -459,7 +449,6 @@ fn validates_tree_with_only_themes() {
     let (_, planned) = validate_tree(&dir).unwrap();
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
     assert_eq!(paths, vec!["themes/lagoon.json"]);
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -478,14 +467,13 @@ fn rejects_a_theme_that_fails_validation() {
         ("Bad Id.json", r#"{"name":"Bad"}"#),
         ("notes.txt", "not a theme"),
     ] {
-        let dir = plugin_with_theme("badtheme", file, body);
+        let (_tmp, dir) = plugin_with_theme("badtheme", file, body);
         match validate_tree(&dir) {
             Err(ValidationError::InvalidTheme(path, _)) => {
                 assert_eq!(path, format!("themes/{file}"))
             }
             other => panic!("{file}: expected InvalidTheme, got {other:?}"),
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -520,20 +508,23 @@ fn rejects_a_hostile_theme_with_its_reason() {
             "parts.question-card: a protected surface, so a theme cannot style it.",
         ),
     ] {
-        let dir = plugin_with_theme("hostile", file, body);
+        let (_tmp, dir) = plugin_with_theme("hostile", file, body);
         let err = validate_tree(&dir).expect_err(file).to_string();
         assert!(
             err.contains(&format!("themes/{file} is not a valid theme")),
             "{err}"
         );
         assert!(err.contains(reason), "{file}: {err}");
-        let _ = fs::remove_dir_all(&dir);
     }
 }
 
 /// A plugin shipping `fonts/<slug>/` with the given manifest and files.
-fn plugin_with_font(name: &str, manifest: &str, files: &[(&str, &[u8])]) -> std::path::PathBuf {
-    let dir = tmpdir(name);
+fn plugin_with_font(
+    name: &str,
+    manifest: &str,
+    files: &[(&str, &[u8])],
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, dir) = tmpdir(name);
     fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
     let font = dir.join("fonts/brand");
     fs::create_dir_all(&font).unwrap();
@@ -541,14 +532,14 @@ fn plugin_with_font(name: &str, manifest: &str, files: &[(&str, &[u8])]) -> std:
     for (file, bytes) in files {
         fs::write(font.join(file), bytes).unwrap();
     }
-    dir
+    (tmp, dir)
 }
 
 const MONO_FONT: &str = r#"{"label":"Brand Mono","group":"mono","faces":[{"file":"a.woff2"}]}"#;
 
 #[test]
 fn validates_a_plugin_that_ships_a_font_and_a_theme_naming_it() {
-    let dir = plugin_with_font("font", MONO_FONT, &[("a.woff2", b"wOF2 bytes")]);
+    let (_tmp, dir) = plugin_with_font("font", MONO_FONT, &[("a.woff2", b"wOF2 bytes")]);
     fs::create_dir_all(dir.join("themes")).unwrap();
     fs::write(
         dir.join("themes/branded.json"),
@@ -559,7 +550,6 @@ fn validates_a_plugin_that_ships_a_font_and_a_theme_naming_it() {
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
     assert!(paths.contains(&"fonts/brand/font.json"), "{paths:?}");
     assert!(paths.contains(&"fonts/brand/a.woff2"), "{paths:?}");
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -575,21 +565,20 @@ fn rejects_a_font_that_fails_validation() {
             ],
         ),
     ] {
-        let dir = plugin_with_font(name, MONO_FONT, &files);
+        let (_tmp, dir) = plugin_with_font(name, MONO_FONT, &files);
         match validate_tree(&dir) {
             Err(ValidationError::InvalidFont(path, _)) => {
                 assert!(path.starts_with("fonts/brand"), "{name}: {path}")
             }
             other => panic!("{name}: expected InvalidFont, got {other:?}"),
         }
-        let _ = fs::remove_dir_all(&dir);
     }
 }
 
 /// A plugin is self-contained: it cannot lean on a font the user installed.
 #[test]
 fn rejects_a_theme_naming_a_workspace_font_the_plugin_does_not_ship() {
-    let dir = plugin_with_theme(
+    let (_tmp, dir) = plugin_with_theme(
         "foreignfont",
         "branded.json",
         r#"{"name":"Branded","fonts":{"ui":"ws-brand"}}"#,
@@ -603,7 +592,6 @@ fn rejects_a_theme_naming_a_workspace_font_the_plugin_does_not_ship() {
         }
         other => panic!("expected InvalidTheme, got {other:?}"),
     }
-    let _ = fs::remove_dir_all(&dir);
 }
 
 // --- validate_archive_entry_path (zip-slip) ---
@@ -651,7 +639,7 @@ fn rejects_empty_path() {
 
 #[test]
 fn plans_files_under_known_dirs_only() {
-    let dir = tmpdir("plan");
+    let (_tmp, dir) = tmpdir("plan");
     write_valid_plugin(&dir);
     let triggers = dir.join("triggers/morning");
     fs::create_dir_all(&triggers).unwrap();
@@ -662,12 +650,11 @@ fn plans_files_under_known_dirs_only() {
     let planned = plan_files(&dir);
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
     assert_eq!(paths, vec!["knowhow/a.md", "triggers/morning/morning.md"]);
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn plan_files_skips_build_output() {
-    let dir = tmpdir("plan_build_output");
+    let (_tmp, dir) = tmpdir("plan_build_output");
     write_valid_plugin(&dir);
     for (rel, body) in [
         ("scripts/run.py", "print(1)"),
@@ -689,29 +676,24 @@ fn plan_files_skips_build_output() {
         paths,
         vec!["apps/a/index.html", "knowhow/a.md", "scripts/run.py"]
     );
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn detects_conflicts_against_data_dir() {
-    let plugin_dir = tmpdir("plan_conflict");
+    let (_tmp, plugin_dir) = tmpdir("plan_conflict");
     write_valid_plugin(&plugin_dir);
     let planned = plan_files(&plugin_dir);
 
-    let data_dir = tmpdir("data_conflict");
+    let (_tmp, data_dir) = tmpdir("data_conflict");
     fs::create_dir_all(data_dir.join("knowhow")).unwrap();
     fs::write(data_dir.join("knowhow/a.md"), "existing").unwrap();
 
     let conflicts = detect_conflicts(&planned, &data_dir);
     assert_eq!(conflicts, vec!["knowhow/a.md"]);
 
-    let empty_data = tmpdir("data_no_conflict");
+    let (_tmp, empty_data) = tmpdir("data_no_conflict");
     let conflicts2 = detect_conflicts(&planned, &empty_data);
     assert!(conflicts2.is_empty());
-
-    let _ = fs::remove_dir_all(&plugin_dir);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&empty_data);
 }
 
 /// Install copies a plugin's files past the write-time check, so the font
@@ -719,9 +701,9 @@ fn detects_conflicts_against_data_dir() {
 #[test]
 fn refuses_a_plugin_font_that_would_pass_the_workspace_cap() {
     use crate::core::workspace_fonts::MAX_FONTS;
-    let dir = plugin_with_font("roomy", MONO_FONT, &[("a.woff2", b"wOF2 bytes")]);
+    let (_tmp, dir) = plugin_with_font("roomy", MONO_FONT, &[("a.woff2", b"wOF2 bytes")]);
     let (_, planned) = validate_tree(&dir).unwrap();
-    let data_dir = tmpdir("full_fonts");
+    let (_tmp, data_dir) = tmpdir("full_fonts");
     for i in 0..MAX_FONTS {
         let font = data_dir.join(format!("fonts/f{i:03}"));
         fs::create_dir_all(&font).unwrap();
@@ -733,8 +715,6 @@ fn refuses_a_plugin_font_that_would_pass_the_workspace_cap() {
     // Replacing a font the workspace already has needs no room.
     fs::rename(data_dir.join("fonts/f000"), data_dir.join("fonts/brand")).unwrap();
     assert!(check_font_room(&planned, &data_dir).is_ok());
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&data_dir);
 }
 
 // --- symlink safety ---
@@ -744,14 +724,14 @@ fn refuses_a_plugin_font_that_would_pass_the_workspace_cap() {
 fn plan_files_never_follows_a_symlink_out_of_the_tree() {
     use std::os::unix::fs::symlink;
     // A host secret and a host directory the plugin's symlinks would reach.
-    let outside = tmpdir("plan_symlink_outside");
+    let (_tmp, outside) = tmpdir("plan_symlink_outside");
     let secret = outside.join("id_rsa");
     fs::write(&secret, "PRIVATE KEY").unwrap();
     let outside_dir = outside.join("etc");
     fs::create_dir_all(&outside_dir).unwrap();
     fs::write(outside_dir.join("passwd"), "root:x:0:0").unwrap();
 
-    let dir = tmpdir("plan_symlink");
+    let (_tmp, dir) = tmpdir("plan_symlink");
     write_valid_plugin(&dir);
     // A file symlink and a dir symlink inside a content dir, both aimed outside.
     symlink(&secret, dir.join("knowhow/leak.md")).unwrap();
@@ -762,19 +742,16 @@ fn plan_files_never_follows_a_symlink_out_of_the_tree() {
     let planned = plan_files(&dir);
     let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
     assert_eq!(paths, vec!["knowhow/a.md"]);
-
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&outside);
 }
 
 #[cfg(unix)]
 #[test]
 fn validate_tree_rejects_a_top_level_symlink_named_as_a_content_dir() {
     use std::os::unix::fs::symlink;
-    let outside = tmpdir("validate_symlink_outside");
+    let (_tmp, outside) = tmpdir("validate_symlink_outside");
     fs::write(outside.join("x.md"), "x").unwrap();
 
-    let dir = tmpdir("validate_symlink");
+    let (_tmp, dir) = tmpdir("validate_symlink");
     fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
     // A symlink named `knowhow` (a content dir) pointing at a real directory
     // outside the tree. `is_dir()` would follow and accept it; no-follow rejects.
@@ -784,9 +761,6 @@ fn validate_tree_rejects_a_top_level_symlink_named_as_a_content_dir() {
         Err(ValidationError::UnexpectedTopLevelEntry(name)) => assert_eq!(name, "knowhow"),
         other => panic!("expected UnexpectedTopLevelEntry, got {other:?}"),
     }
-
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::remove_dir_all(&outside);
 }
 
 // --- compare_versions ---
@@ -880,9 +854,21 @@ fn validate_tree_refuses_a_widget_a_plugin_cannot_ship() {
             }),
             "origin_thread_id",
         ),
+        (
+            serde_json::json!({
+                "reusable": true, "origin_plugin_id": "browser-skills", "sizes": ["huge"],
+            }),
+            "not a widget size",
+        ),
+        (
+            serde_json::json!({
+                "reusable": true, "origin_plugin_id": "browser-skills", "sizes": [],
+            }),
+            "at least one",
+        ),
     ];
     for (extra, needle) in shapes {
-        let dir = tmpdir("widget_shape");
+        let (_tmp, dir) = tmpdir("widget_shape");
         write_valid_plugin(&dir);
         let mut manifest = serde_json::json!({"name": "Board", "kind": "widget"});
         manifest
@@ -898,20 +884,39 @@ fn validate_tree_refuses_a_widget_a_plugin_cannot_ship() {
             }
             other => panic!("expected InvalidWidget for {needle}, got {other:?}"),
         }
-        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// A plugin's app may not carry a widget's tile fields: the installer runs the
+/// same shared check as the loader and `create_app` (ADR 0432).
+#[test]
+fn validate_tree_refuses_sizes_on_an_app() {
+    let (_tmp, dir) = tmpdir("app_sizes");
+    write_valid_plugin(&dir);
+    fs::create_dir_all(dir.join("apps/tracker")).unwrap();
+    fs::write(
+        dir.join("apps/tracker/manifest.json"),
+        r#"{"name": "Tracker", "sizes": ["small"]}"#,
+    )
+    .unwrap();
+    match validate_tree(&dir) {
+        Err(ValidationError::InvalidWidget(path, reason)) => {
+            assert_eq!(path, "apps/tracker");
+            assert!(reason.contains("only a widget"), "{reason}");
+        }
+        other => panic!("expected InvalidWidget, got {other:?}"),
     }
 }
 
 #[test]
 fn validate_tree_accepts_a_reusable_widget_that_names_its_plugin() {
-    let dir = tmpdir("widget_ok");
+    let (_tmp, dir) = tmpdir("widget_ok");
     write_valid_plugin(&dir);
     fs::create_dir_all(dir.join("apps/board")).unwrap();
     fs::write(
         dir.join("apps/board/manifest.json"),
-        r#"{"name": "Board", "kind": "widget", "reusable": true, "origin_plugin_id": "browser-skills"}"#,
+        r#"{"name": "Board", "kind": "widget", "reusable": true, "origin_plugin_id": "browser-skills", "sizes": ["large", "small"], "transparent": true}"#,
     )
     .unwrap();
     validate_tree(&dir).expect("a shippable widget");
-    let _ = fs::remove_dir_all(&dir);
 }

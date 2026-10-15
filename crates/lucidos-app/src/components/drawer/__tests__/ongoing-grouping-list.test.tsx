@@ -3,7 +3,7 @@
  * The Ongoing grouping as the drawer renders it:
  * - four tiles, always, in one fixed order, whatever their counts;
  * - exactly one selected, and only its threads listed below the tiles;
- * - a press opens the group's first thread, on the phone only when it is the sole one;
+ * - a press only selects, and never opens a thread, even a group's sole one;
  * - a press on the selected In flight tile lists only running, then only waiting, then all,
  *   skipping a part with no rows;
  * - a press on the selected Review tile does the same with changes and unread;
@@ -143,13 +143,13 @@ describe('the Ongoing grouping', () => {
             expect(count('In flight')).toBe('2');
         });
 
-        it('opens the first row the filter keeps', () => {
+        it('opens no thread as the filter steps', () => {
+            focusedThreadId.value = 'quiet';
             setSelectedOngoingGroup('in-flight');
             mount();
             act(() => { tile('In flight').click(); });
-            expect(focusedThreadId.value).toBe('run');
             act(() => { tile('In flight').click(); });
-            expect(focusedThreadId.value).toBe('parked');
+            expect(focusedThreadId.value).toBe('quiet');
         });
 
         it('steps no filter while only one part has rows', () => {
@@ -189,6 +189,12 @@ describe('the Ongoing grouping', () => {
             mount();
             expect(count('Review')).toBe('3');
             expect(parts()).toEqual(['2 changes', '1 unread']);
+        });
+
+        it('sets each count apart from its word, so the counts share one column', () => {
+            mount();
+            const counts = Array.from(tile('Review').querySelectorAll('.ongoing-tile-breakdown-count')).map(c => c.textContent);
+            expect(counts).toEqual(['2', '1']);
         });
 
         it('lists only the changes, then only the unread ones, then all', () => {
@@ -258,15 +264,17 @@ describe('the Ongoing grouping', () => {
         expect(tile('Blocked').querySelector('.ongoing-tile-breakdown')).toBeNull();
     });
 
-    it('opens the group\'s first thread on a press', () => {
+    it('only selects on a press, leaving the open thread as it was', () => {
+        focusedThreadId.value = 'quiet';
         mount();
         act(() => { tile('In flight').click(); });
-        expect(focusedThreadId.value).toBe('run');
+        expect(selectedOngoingGroup.value).toBe('in-flight');
+        expect(focusedThreadId.value).toBe('quiet');
         act(() => { tile('Blocked').click(); });
-        expect(focusedThreadId.value).toBe('q');
+        expect(focusedThreadId.value).toBe('quiet');
     });
 
-    it('opens a draft from the Drafts tile', () => {
+    it('opens no thread from a group of one, the Drafts tile included', () => {
         threadMap.value = new Map([
             ...threadMap.value,
             ['draft', makeThreadState('draft', { meta: { section: 'inbox', state: 'composing', title: 'Draft', createdAt: '2026-01-05T00:00:00Z' } })],
@@ -274,39 +282,17 @@ describe('the Ongoing grouping', () => {
         patchDraft('draft', { text: 'half a thought' });
         mount();
         act(() => { tile('Drafts').click(); });
-        expect(focusedThreadId.value).toBe('draft');
-    });
-
-    it('opens the only thread of a group on the phone', () => {
-        vi.stubGlobal('innerWidth', 375);
-        vi.stubGlobal('innerHeight', 812);
-        mount();
-        act(() => { tile('In flight').click(); });
-        expect(selectedOngoingGroup.value).toBe('in-flight');
-        expect(focusedThreadId.value).toBe('run');
-    });
-
-    it('only selects on the phone before the threads load, when a sole row may not be the whole group', () => {
-        threadsLoaded.value = false;
-        vi.stubGlobal('innerWidth', 375);
-        vi.stubGlobal('innerHeight', 812);
-        mount();
-        act(() => { tile('In flight').click(); });
-        expect(selectedOngoingGroup.value).toBe('in-flight');
+        expect(rowIds()).toEqual(['draft']);
         expect(focusedThreadId.value).toBeNull();
     });
 
-    it('only selects a group of several on the phone, where opening would swipe off the list', () => {
-        threadMap.value = new Map([
-            ...threadMap.value,
-            ['run2', makeThreadState('run2', { meta: { section: 'inbox', status: 'running', title: 'Second run', createdAt: '2026-01-05T00:00:00Z' } })],
-        ]);
+    it('opens no thread from a group of one on the phone', () => {
         vi.stubGlobal('innerWidth', 375);
         vi.stubGlobal('innerHeight', 812);
         mount();
         act(() => { tile('In flight').click(); });
         expect(selectedOngoingGroup.value).toBe('in-flight');
-        expect(rowIds()).toHaveLength(2);
+        expect(rowIds()).toEqual(['run']);
         expect(focusedThreadId.value).toBeNull();
     });
 
@@ -353,12 +339,12 @@ describe('the Ongoing grouping', () => {
         act(() => { collapseHighlighted(); });
         expect(highlighted()).toBe('Blocked');
         expect(selectedOngoingGroup.value).toBe('blocked');
-        // Enter presses the highlighted tile: it selects and opens the first row.
+        // Enter presses the highlighted tile: it selects, and opens nothing.
         act(() => { moveHighlight(1); moveHighlight(1); moveHighlight(1); });
         expect(highlighted()).toBe('In flight');
         act(() => { selectHighlighted(); });
         expect(selectedOngoingGroup.value).toBe('in-flight');
-        expect(focusedThreadId.value).toBe('run');
+        expect(focusedThreadId.value).toBeNull();
         // ↓ from the last tile reaches the selected group's row.
         act(() => { moveHighlight(1); });
         expect(host.querySelector('.thread-row-highlighted')?.getAttribute('data-thread-nav')).toBe('run');

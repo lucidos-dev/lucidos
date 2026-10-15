@@ -214,7 +214,7 @@ fn conflict_session_never_proposes_change_at_idle() {
     assert!(
         idle_change_write(
             IdleSession {
-                is_conflict_session: true,
+                is_resolution_session: true,
                 ..IdleSession::default()
             },
             &Some(TerminalKind::Generated)

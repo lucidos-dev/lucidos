@@ -8,7 +8,7 @@ vi.mock('./clientLog', () => ({
   postClientLog: (...args: unknown[]) => postClientLog(...args),
 }));
 
-import { lazyComponent, whenLoaded } from './lazyComponent';
+import { chunkGroup, lazyComponent, lazyModule, whenLoaded } from './lazyComponent';
 
 /**
  * `preload()` is how a chunk loads before anything mounts it: the shell chunk
@@ -103,6 +103,18 @@ describe('whenLoaded', () => {
     expect(open).toHaveBeenCalledTimes(1);
   });
 
+  it('opens at once, inside the press, when the chunk is already in memory', async () => {
+    const { doc } = fakeDocument();
+    const lazy = lazyComponent(() => Promise.resolve(() => null));
+    expect(lazy.isLoaded()).toBe(false);
+    await lazy.preload();
+    expect(lazy.isLoaded()).toBe(true);
+    const open = vi.fn();
+    const handle = whenLoaded(lazy, open, {} as Element, doc);
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(handle.pending).toBe(false);
+  });
+
   it('never opens once cancelled, so a second press can take the open back', async () => {
     const { doc } = fakeDocument();
     const open = vi.fn();
@@ -148,5 +160,53 @@ describe('whenLoaded', () => {
     const opened = whenLoaded(lazyComponent(() => Promise.resolve(() => null)), vi.fn(), trigger, doc);
     await settle();
     expect(opened.pending).toBe(false);
+  });
+});
+
+describe('chunkGroup', () => {
+  function part(loads: boolean) {
+    let loaded = false;
+    const preload = vi.fn(async () => { loaded = loads; return loads; });
+    return { preload, isLoaded: () => loaded };
+  }
+
+  it('loads the first part alone, and the rest once it has', async () => {
+    const parts = [part(true), part(true), part(true)];
+    const group = chunkGroup(parts[0], parts[1], parts[2]);
+    expect(group.isLoaded()).toBe(false);
+    expect(await group.preload()).toBe(true);
+    expect(parts.every((p) => p.preload.mock.calls.length === 1)).toBe(true);
+    expect(group.isLoaded()).toBe(true);
+  });
+
+  it('asks nothing more after the first part fails, so one failure reports once', async () => {
+    const parts = [part(false), part(true), part(true)];
+    const group = chunkGroup(parts[0], parts[1], parts[2]);
+    expect(await group.preload()).toBe(false);
+    expect(parts[1].preload).not.toHaveBeenCalled();
+    expect(parts[2].preload).not.toHaveBeenCalled();
+    expect(group.isLoaded()).toBe(false);
+  });
+});
+
+describe('lazyModule', () => {
+  it('holds the module once loaded, and refuses a read before', async () => {
+    const mod = { answer: 42 };
+    const lazy = lazyModule(() => Promise.resolve(mod));
+    expect(lazy.isLoaded()).toBe(false);
+    expect(() => lazy.get()).toThrow(/before it loaded/);
+    await expect(lazy.preload()).resolves.toBe(true);
+    expect(lazy.isLoaded()).toBe(true);
+    expect(lazy.get()).toBe(mod);
+  });
+
+  it('shares the stale-chunk handling of a lazy component', async () => {
+    reloadForStaleChunk.mockClear();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const lazy = lazyModule(() => Promise.reject(new Error('404')));
+    await expect(lazy.preload()).resolves.toBe(false);
+    expect(reloadForStaleChunk).toHaveBeenCalledTimes(1);
+    expect(lazy.isLoaded()).toBe(false);
+    error.mockRestore();
   });
 });

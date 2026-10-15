@@ -27,6 +27,7 @@ scan hand-rolled-ui "(^|[^.[:alnum:]_])(alert|confirm|prompt)\(|window\.(alert|c
 scan attr-escape "=[[:space:]]*[\"'](\\\$\{|[\"'][[:space:]]*\+)[^}]*escapeHtml\(" $inc apps
 scan ready-signal "\"reveal\"[[:space:]]*:|lucidos\.ui\.ready\(" --include=manifest.json $inc apps
 scan app-icon "\"icon\"[[:space:]]*:" --include=manifest.json apps
+scan widget-tile "\"(sizes|transparent)\"[[:space:]]*:" --include=manifest.json apps
 scan touch-hover ":hover" $inc --include=*.css apps
 scan state-as-action "classList[[:space:]]*\.[[:space:]]*(toggle|remove|replace)\([^)]*action-btn|action-btn-(secondary|confirm|danger)" $inc apps
 ```
@@ -180,6 +181,16 @@ Per `system-knowhow/js-sdk.md`:
     `lucidos.events`, `lucidos.proxy` or `lucidos.request` before its first
     render. The user sees an empty app until the data lands. Recommend the
     opt-in. Skip an app that draws a skeleton or its own placeholder first.
+
+- **The Home board tile.** The `widget-tile` scan lists each manifest that
+  sets `sizes` or `transparent`. Read the hit with its `kind`. Owns the rule:
+  `system-knowhow/building-an-app.md` § Widgets, the Sizes and Transparent
+  paragraphs.
+  - **broken**: `sizes` is empty, names a size other than `small`, `medium`
+    or `large`, or names one twice. The widget loads with all three sizes,
+    so the sizes the author meant are ignored.
+  - **broken**: `sizes` or `transparent` on an app that is not a widget. The
+    loader ignores both.
 
 Per `system-knowhow/building-an-app.md` § App icon:
 

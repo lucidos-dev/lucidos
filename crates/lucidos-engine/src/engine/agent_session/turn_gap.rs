@@ -19,11 +19,11 @@
 //!   (see `chat/process/run.rs`, "Emit MessageReceived FIRST"), so by the time
 //!   this runs the current message is already in the events table. Excluding it
 //!   is what makes the threshold the *previous* boundary rather than the
-//!   current one. Excluding everything *after* it matters too: when two
-//!   messages race a spawn, `cc_spawn_coalesce` runs one turn anchored on the
-//!   first while the second is already persisted, and an id-only bound would
-//!   let that later message become the "previous" boundary and swallow the
-//!   entire gap. An event that lands after the origin is not lost, it simply
+//!   current one. Excluding everything *after* it matters too. A follow-up
+//!   that queues for a starting run is persisted before the spawn builds its
+//!   prompt. An id-only bound would let that later message become the
+//!   "previous" boundary and swallow the entire gap. An event that lands after
+//!   the origin is not lost, it simply
 //!   belongs to the next turn's gap.
 //! - **Lower bound (exclusive):** the most-recent turn-boundary event *before*
 //!   the current one. The boundary set is [`boundary_event_types`]: every type
@@ -35,10 +35,36 @@
 //!   by a finished child did not advance the threshold. The note fired on that
 //!   turn and then again on the next one.
 //!
-//! This is **stateless and self-clearing**: once the note rides on a turn, that
-//! turn's own origin event becomes the *previous* boundary for the next turn,
-//! so the same events fall below the threshold and never re-fire. No new event,
+//! This is **stateless and self-clearing**. Once the agent reads the prompt the
+//! note rode on, that prompt's boundary becomes the *previous* one. The same
+//! events then fall below the threshold and never re-fire. No new event,
 //! no projection column, no state to clear: the events table is the cursor.
+//!
+//! ## In-session prompts
+//!
+//! A kept-alive session takes its next prompt without a respawn, and that
+//! prompt carries the note too ([`compute_turn_gap_note_until`]). Its upper
+//! bound is the `CodingAgentPromptSent` the session writes before it forwards.
+//! An origin bound would lose every event landing between origin and that
+//! write. The lower bound still comes from the origin, so a message queued
+//! behind it cannot swallow the gap.
+//!
+//! **A boundary counts only once the agent read it.** A `CodingAgentInputRead`
+//! must name its id or its `input_event_id`. Nothing the engine writes claims
+//! delivery. So no interleaving loses a note: a prompt the agent never read,
+//! whether the send failed, the agent died or the user withdrew it, moves no
+//! bound. The next prompt or the respawn covers its window.
+//!
+//! **A verbatim read counts for nothing either.** A slash command reaches the
+//! agent exactly as typed (`input_ledger::forwards_verbatim`), so it carried no
+//! note. Its read says so, and the next framed prompt carries the whole gap.
+//!
+//! A boundary older than the workspace's first read predates read reports
+//! (ADR 0268) and counts as before. The bounds per input, and the argument,
+//! are in `docs/plans/2026-10-11-turn-gap-note-for-kept-alive-sessions.md`.
+//!
+//! Known repeat, never a loss: a note computed while an earlier prompt is
+//! forwarded but unread re-lists that prompt's gap.
 //!
 //! ## What is covered, and what is deliberately not
 //!
@@ -49,7 +75,9 @@
 //! `ChildThreadStopped` is covered for the same reason. Unlike its sibling
 //! `ChildThreadCompleted` it wakes nothing, so no turn carries it (ADR 0252).
 //! `ChildThreadDetached` too: the user moved a child out, and nothing wakes
-//! the agent to say so (ADR 0278).
+//! the agent to say so (ADR 0278). And `ChildReportFiled`, a clean report its
+//! child said needs no action now: this note is how a coding-agent parent
+//! reads it, in full, once.
 //!
 //! `BackgroundBashCompleted` is covered too, minus the ones an event wait
 //! delivered: that delivery is the prompt the re-opened turn carries. Also
@@ -131,14 +159,18 @@ const COVERED_EVENT_TYPES: &[&str] = &[
     // and without the note the agent reads a child that never reports back
     // (ADR 0278).
     "ChildThreadDetached",
+    // A child's report, filed without waking this agent. The note carries it
+    // whole, since nothing else delivers it.
+    "ChildReportFiled",
 ];
 
 /// Turn boundaries that are not turn ORIGINS, so `CC_ORIGINATING_EVENT_TYPES`
 /// does not carry them.
 ///
 /// **A boundary has to be a DELIVERY, not a request**, because it is the proof
-/// that the agent saw everything before it. `CodingAgentPromptSent` qualifies:
-/// the engine writes it once the prompt has reached the session.
+/// that the agent saw everything before it. `CodingAgentPromptSent` qualifies
+/// once the agent's read names it: the run loop writes it ahead of the forward,
+/// and that prompt carries the note ending at it (module docs).
 ///
 /// `ContinuationRequested` deliberately does NOT, and the distinction is easy
 /// to miss because it does start most resumes. It is persisted when the resume
@@ -246,6 +278,11 @@ enum GapEvent {
         child_thread_id: String,
         title: String,
     },
+    /// A child's report, filed without waking this agent: the whole
+    /// `[CHILD THREAD REPORT FILED]` block a chat parent reads.
+    ChildReportFiled {
+        block: String,
+    },
     /// An engine restart stopped the agent's last turn mid-call. See
     /// [`last_turn_cut_off_by_restart`].
     RestartCutOffLastTurn,
@@ -264,6 +301,7 @@ impl GapEvent {
             | Self::BackgroundTaskEnded { .. }
             | Self::ChildStopped { .. }
             | Self::ChildMovedOut { .. }
+            | Self::ChildReportFiled { .. }
             | Self::RestartCutOffLastTurn => None,
         }
     }
@@ -289,6 +327,7 @@ impl GapEvent {
             | Self::BackgroundTaskEnded { .. }
             | Self::ChildStopped { .. }
             | Self::ChildMovedOut { .. }
+            | Self::ChildReportFiled { .. }
             | Self::RestartCutOffLastTurn => false,
         }
     }
@@ -344,28 +383,52 @@ pub(crate) async fn compute_turn_gap_note(
     current_origin_id: Uuid,
     session_branch: Option<&str>,
 ) -> Option<TurnGapNote> {
-    // The gap's upper bound is the current origin's POSITION, not just its id.
-    // Excluding the origin by id alone leaves `MAX(sequence)` free to pick a
-    // boundary event persisted AFTER it, which really happens: when two user
-    // messages race a spawn, `cc_spawn_coalesce` runs one turn whose origin is
-    // the first message while the second is already in the events table. The
-    // later message would then become the "previous" boundary and suppress the
-    // whole gap. `None` (an origin that isn't persisted, which the module
-    // contract says cannot happen) degrades to the id-only bound rather than to
-    // an empty window, so an unresolvable origin loses no note.
-    let origin_sequence: Option<i64> =
-        sqlx::query_scalar::<_, i64>("SELECT sequence FROM events WHERE id = $1")
-            .bind(current_origin_id)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or_else(|e| {
-                log!(
-                    "[AgentSession] Failed to resolve turn-gap origin sequence for {}: {}",
-                    thread_id,
-                    e
-                );
-                None
-            });
+    compute_turn_gap_note_until(
+        pool,
+        thread_id,
+        current_origin_id,
+        current_origin_id,
+        session_branch,
+    )
+    .await
+}
+
+/// [`compute_turn_gap_note`] with its two bounds taken from different events,
+/// for a prompt to a live session (see the module docs).
+///
+/// The lower bound is the newest turn boundary before `anchor_id`. The upper
+/// bound is `until_id`, exclusive. A spawn passes its origin as both.
+pub(crate) async fn compute_turn_gap_note_until(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    anchor_id: Uuid,
+    until_id: Uuid,
+    session_branch: Option<&str>,
+) -> Option<TurnGapNote> {
+    // The bounds are POSITIONS, not just ids. Excluding the origin by id alone
+    // leaves `MAX(sequence)` free to pick a boundary event persisted AFTER it.
+    // That really happens. A follow-up that queues for a starting run is
+    // already in the events table when the spawn builds its prompt. It would
+    // become the "previous" boundary and suppress the whole gap. An unresolved
+    // sequence (an event
+    // that isn't persisted, which the module contract rules out) degrades to
+    // the id-only bound. So it loses no note.
+    let (anchor_sequence, until_sequence): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT (SELECT sequence FROM events WHERE id = $1), \
+                (SELECT sequence FROM events WHERE id = $2)",
+    )
+    .bind(anchor_id)
+    .bind(until_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| {
+        log!(
+            "[AgentSession] Failed to resolve turn-gap bounds for {}: {}",
+            thread_id,
+            e
+        );
+        (None, None)
+    });
 
     // `payload - 'stdout' - 'stderr' - 'text'`: nothing here reads those keys.
     // A `BackgroundBashCompleted` carries up to 100 KB of each stream, and a
@@ -379,26 +442,60 @@ pub(crate) async fn compute_turn_gap_note(
     // the prompt this turn carries, so a note line would say it twice, and
     // claim nobody told the agent.
     //
+    // So is a completion that landed before the previous turn's idle. The
+    // agent was still in its turn and read it there, through `background-task
+    // wait` or its own output read. A polled task always lands this way.
+    //
     // So is a killed task whose watch this thread stood down just before.
     // That is the thread's own stop (ADR 0369), and its reap usually lands
     // after the turn that issued it ended. An older stand-down is a watch the
     // agent dropped, and a later kill by somebody else is still news.
-    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as::<_, (String, serde_json::Value)>(
-        "SELECT e.event_type, e.payload - 'stdout' - 'stderr' - 'text' FROM events e \
+    //
+    // A boundary counts only once the agent read the input it carried: a
+    // `CodingAgentInputRead` names its id, or its `input_event_id`. It must
+    // not be `verbatim`: a slash command carried no note. A read carrying
+    // `assumed` is an old row, where a timer settled the input with no report
+    // from the agent, so it proves nothing either. One that went unread (a
+    // failed send, a dead agent, a withdrawal, a rejection) delivered no note,
+    // so the next prompt carries its gap. A boundary older than the
+    // workspace's first read predates read reports, and counts as before.
+    let rows: Vec<(Uuid, String, serde_json::Value)> =
+        sqlx::query_as::<_, (Uuid, String, serde_json::Value)>(&format!(
+            "SELECT e.id, e.event_type, e.payload - 'stdout' - 'stderr' - 'text' FROM events e \
          WHERE e.thread_id = $1 AND e.event_type = ANY($2) \
-           AND ($3::bigint IS NULL OR e.sequence < $3) \
+           AND ($7::bigint IS NULL OR e.sequence < $7) \
            AND e.sequence > COALESCE(( \
-             SELECT MAX(sequence) FROM events \
-             WHERE thread_id = $1 \
-               AND id <> $4 \
-               AND ($3::bigint IS NULL OR sequence < $3) \
-               AND event_type = ANY($5) \
+             SELECT b.sequence FROM events b \
+             WHERE b.thread_id = $1 \
+               AND b.id <> ALL($4) \
+               AND ($3::bigint IS NULL OR b.sequence < $3) \
+               AND b.event_type = ANY($5) \
+               AND (b.payload->'origin'->'reason'->>'kind') IS DISTINCT FROM $8 \
+               AND (COALESCE(b.created < ( \
+                     SELECT MIN(f.created) FROM events f \
+                     WHERE f.event_type = 'CodingAgentInputRead' \
+                   ), TRUE) \
+                 OR EXISTS ( \
+                   SELECT 1 FROM events r \
+                   WHERE r.thread_id = $1 AND r.event_type = 'CodingAgentInputRead' \
+                     AND r.payload->>'assumed' IS DISTINCT FROM 'true' \
+                     AND r.payload->>'verbatim' IS DISTINCT FROM 'true' \
+                     AND r.payload->>'input_event_id' \
+                       IN (b.id::text, b.payload->>'input_event_id') \
+                 )) \
+             ORDER BY b.sequence DESC LIMIT 1 \
            ), 0) \
            AND NOT (e.event_type = 'BackgroundBashCompleted' AND EXISTS ( \
              SELECT 1 FROM events d \
              WHERE d.thread_id = $1 AND d.event_type = 'EventWaitDelivered' \
                AND d.payload->>'event_id' = e.id::text \
            )) \
+           AND NOT (e.event_type = 'BackgroundBashCompleted' AND e.sequence < COALESCE(( \
+             SELECT max(i.sequence) FROM events i \
+             WHERE i.thread_id = $1 AND i.event_type = 'CodingAgentIdled' \
+               AND {not_keep_alive_idle} \
+               AND ($3::bigint IS NULL OR i.sequence < $3) \
+           ), 0)) \
            AND NOT (e.event_type = 'BackgroundBashCompleted' \
              AND e.payload->>'killed' = 'true' AND EXISTS ( \
                SELECT 1 FROM events c, jsonb_array_elements(c.payload->'on') watched \
@@ -409,34 +506,42 @@ pub(crate) async fn compute_turn_gap_note(
                  AND watched->'condition'->>'task_id' = e.payload->>'task_id' \
            )) \
          ORDER BY e.sequence ASC",
-    )
-    .bind(thread_id)
-    .bind(
-        COVERED_EVENT_TYPES
-            .iter()
-            .chain(ThreadEvent::TERMINATOR_EVENT_TYPES)
-            .copied()
-            .collect::<Vec<&str>>(),
-    )
-    .bind(origin_sequence)
-    .bind(current_origin_id)
-    .bind(boundary_event_types())
-    .bind(SELF_STOP_REAP_WINDOW_SECS)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| {
-        log!(
-            "[AgentSession] Failed to look up turn-gap events for {}: {}",
-            thread_id,
+            not_keep_alive_idle = crate::engine::thread_events::not_a_keep_alive_idle_sql("i.")
+        ))
+        .bind(thread_id)
+        .bind(
+            COVERED_EVENT_TYPES
+                .iter()
+                .chain(ThreadEvent::TERMINATOR_EVENT_TYPES)
+                .copied()
+                .collect::<Vec<&str>>(),
+        )
+        .bind(anchor_sequence)
+        .bind([anchor_id, until_id])
+        .bind(boundary_event_types())
+        .bind(SELF_STOP_REAP_WINDOW_SECS)
+        .bind(until_sequence)
+        .bind(crate::engine::thread_events::CACHE_KEEP_ALIVE_REASON_KIND)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            log!(
+                "[AgentSession] Failed to look up turn-gap events for {}: {}",
+                thread_id,
+                e
+            );
             e
-        );
-        e
-    })
-    .ok()?;
+        })
+        .ok()?;
 
-    let (terminals, covered): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(event_type, _)| {
-        ThreadEvent::TERMINATOR_EVENT_TYPES.contains(&event_type.as_str())
-    });
+    let (terminals, covered): (Vec<_>, Vec<_>) =
+        rows.into_iter().partition(|(_, event_type, _)| {
+            ThreadEvent::TERMINATOR_EVENT_TYPES.contains(&event_type.as_str())
+        });
+    let terminals: Vec<(String, serde_json::Value)> = terminals
+        .into_iter()
+        .map(|(_, event_type, payload)| (event_type, payload))
+        .collect();
 
     let mut events: Vec<GapEvent> = covered.into_iter().filter_map(parse_gap_event).collect();
     if last_turn_cut_off_by_restart(&terminals) {
@@ -492,7 +597,9 @@ fn last_turn_cut_off_by_restart(terminals: &[(String, serde_json::Value)]) -> bo
 /// Turn one `(event_type, payload)` row into a [`GapEvent`]. Missing fields
 /// degrade to empty rather than dropping the event: knowing a change was
 /// discarded matters more than knowing which one.
-fn parse_gap_event((event_type, payload): (String, serde_json::Value)) -> Option<GapEvent> {
+fn parse_gap_event(
+    (event_id, event_type, payload): (Uuid, String, serde_json::Value),
+) -> Option<GapEvent> {
     let change_id = str_field(&payload, "change_id");
     match event_type.as_str() {
         "ChangeApplied" => Some(GapEvent::Applied {
@@ -567,6 +674,17 @@ fn parse_gap_event((event_type, payload): (String, serde_json::Value)) -> Option
             title: truncate(
                 &str_field(&payload, "child_thread_title"),
                 MAX_DESCRIPTION_CHARS,
+            ),
+        }),
+        // No change statuses: the block names each change as the report left
+        // it, and the CHANGE lines above say what moved since.
+        "ChildReportFiled" => Some(GapEvent::ChildReportFiled {
+            block: crate::core::store::messages::format_child_report_filed_block(
+                &crate::core::events::EventRow {
+                    id: event_id,
+                    ..crate::core::events::EventRow::new(&event_type, payload)
+                },
+                &crate::core::store::ChangeStatuses::new(),
             ),
         }),
         // A covered type the query returned but this match doesn't know would
@@ -665,8 +783,8 @@ fn build_note(
     session_branch: Option<&str>,
 ) -> String {
     let mut note = String::from(
-        "[Note from engine: while you were idle, the user or the engine acted on your work. \
-         Reconcile what you are about to say with this:",
+        "[Note from engine: since your previous prompt, the user or the engine acted on your \
+         work. Reconcile what you are about to say with this:",
     );
 
     let mut lines = 0usize;
@@ -801,6 +919,7 @@ fn render(
             child_thread_id,
             title,
         } => vec![child_moved_out_line(child_thread_id, title)],
+        GapEvent::ChildReportFiled { block } => vec![format!("- {block}")],
         GapEvent::RestartCutOffLastTurn => vec![RESTART_CUT_OFF_LINE.to_string()],
     }
 }
@@ -925,8 +1044,8 @@ fn background_task_line(line: BackgroundTaskLine<'_>) -> String {
         format!(" with {}", line.status)
     };
     format!(
-        "- BACKGROUND TASK FINISHED: `{}` (task {}{}) ended{}{} while you were idle, and the \
-         wake never reached you. Drain it with bash_output before saying anything about it.",
+        "- BACKGROUND TASK FINISHED: `{}` (task {}{}) ended{}{}, and the wake never reached \
+         you. Drain it with bash_output before saying anything about it.",
         line.command, line.task_id, spawned, status, how,
     )
 }
@@ -940,10 +1059,13 @@ fn worktree_cleaned_line(tier: u8, freed_bytes: u64, branch_deleted: bool) -> St
             ""
         };
         format!(
-            "- WORKTREE CLEANED: the cleanup worker removed your whole worktree ({} reclaimed) \
-             after a long idle period. It has been recreated, so any untracked file you left \
-             there is gone.{}",
-            freed, branch
+            "- WORKTREE CLEANED: Lucidos removed your whole worktree ({} reclaimed), and it has \
+             been recreated. When it went because the thread was archived, uncommitted work was \
+             committed on your branch first, as \"{}\". Ignored files, such as build output, \
+             are gone.{}",
+            freed,
+            crate::engine::worktree_cleanup::SNAPSHOT_COMMIT_MESSAGE,
+            branch
         )
     } else {
         format!(

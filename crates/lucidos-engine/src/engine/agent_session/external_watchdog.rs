@@ -237,6 +237,11 @@ impl ExternalWatchdog {
             sessions
                 .iter()
                 .filter_map(|(tid, s)| {
+                    // A starting run or an apply has no process to hang. The
+                    // silence is worktree setup, the semaphore or the merge.
+                    if !s.is_running() {
+                        return None;
+                    }
                     let last_ms = s.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
                     let tif = s.tools_in_flight.load(std::sync::atomic::Ordering::Relaxed);
                     let decision = external_watchdog_decision(ExternalWatchdogInput {

@@ -197,6 +197,48 @@ fn hardened_query_round_trip() {
     );
 }
 
+/// A branch landing plan files only reads `NOT_NEEDED`, so `/harden` Phase 0
+/// stops where Apply would not harden. One code file makes it `MISSING` again.
+#[test]
+fn hardened_query_needs_nothing_for_a_plan_only_branch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path();
+    let branch = format!("cli-test-{}", unique_marker("plan-only"));
+
+    run_git(repo, &["init", "-q", "-b", "main"]);
+    run_git(repo, &["config", "user.email", "test@example.com"]);
+    run_git(repo, &["config", "user.name", "test"]);
+    std::fs::write(repo.join("a.txt"), "a").unwrap();
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-q", "-m", "first"]);
+    run_git(repo, &["checkout", "-q", "-b", &branch]);
+
+    let query = || {
+        let out = lucidos_cmd()
+            .args(["hardened", "query"])
+            .current_dir(repo)
+            .output()
+            .expect("lucidos hardened query should run");
+        assert!(
+            out.status.success(),
+            "query failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    std::fs::create_dir_all(repo.join("docs/plans")).unwrap();
+    std::fs::write(repo.join("docs/plans/a-plan.md"), "plan").unwrap();
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-q", "-m", "plan"]);
+    assert_eq!(query(), "NOT_NEEDED", "a plan-only branch needs no /harden");
+
+    std::fs::write(repo.join("b.rs"), "fn main() {}").unwrap();
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-q", "-m", "code"]);
+    assert_eq!(query(), "MISSING", "code beside the plan needs /harden");
+}
+
 /// `lucidos changes list` round-trip: the CLI GETs `/api/v1/changes` and
 /// echoes the payload verbatim. This is the command the nightly pipeline
 /// repeatedly guessed (and got "unrecognized subcommand 'list'") when looking
@@ -387,7 +429,8 @@ fn data_write_announces_the_artifact_against_a_running_workspace() {
     let marker = unique_marker("cli-data-write");
     let rel = format!("artifacts/cli-e2e/{marker}.md");
 
-    let src = std::env::temp_dir().join(format!("{marker}.md"));
+    let src_dir = tempfile::tempdir().expect("create source dir");
+    let src = src_dir.path().join(format!("{marker}.md"));
     std::fs::write(&src, b"# announced\n").expect("write source file");
 
     // The write lands a new file in the shared working tree, which a command
@@ -400,7 +443,6 @@ fn data_write_announces_the_artifact_against_a_running_workspace() {
         .arg(&src)
         .output()
         .expect("lucidos data write should run");
-    let _ = std::fs::remove_file(&src);
     assert!(
         out.status.success(),
         "data write failed: stdout={}\nstderr={}",

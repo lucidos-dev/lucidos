@@ -4,14 +4,14 @@ import { getWaitingState } from '../WaitingBanner';
 import {
   threadMap,
   focusedThreadId,
-  archivingThreadIds,
-  applyingNowThreadIds,
+  applyNowRequests,
   applyingChangeIds,
   discardingCCThreadIds,
   cancelingThreadIds,
   changes,
 } from '../../../store/store';
 import type { EventWaitSummary, ThreadState, ThreadStatus } from '../../../store/thread-events';
+import { _resetRowIntentsForTesting } from '../../../store/rowIntents';
 
 // `getWaitingState` reaches `resolveThreadActions`, whose real module pulls the
 // whole action graph (archive/apply/discard handlers). Only the close-set
@@ -118,8 +118,8 @@ function morphMode(submitting: boolean): string {
 beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
-  archivingThreadIds.value = new Set();
-  applyingNowThreadIds.value = new Map();
+  _resetRowIntentsForTesting();
+  applyNowRequests.value = new Map();
   applyingChangeIds.value = new Set();
   discardingCCThreadIds.value = new Set();
   cancelingThreadIds.value = new Set();

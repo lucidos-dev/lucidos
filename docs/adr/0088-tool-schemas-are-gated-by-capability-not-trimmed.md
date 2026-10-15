@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-18
+- **Amended by**: [0430: An MCP server is enabled per thread](0430-mcp-servers-are-enabled-per-thread.md),
+  which makes the MCP slice of part 2 also a function of the thread's enabled
+  servers. Part 4 stands.
 
 ## Context
 

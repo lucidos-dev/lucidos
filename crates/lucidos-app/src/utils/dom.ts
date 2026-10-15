@@ -26,7 +26,8 @@ export function isTextInput(el: EventTarget | Element | null): boolean {
  *  own tap/drag (button, link, form field, [role="button"], contentEditable).
  *  Exempts edge controls from the iOS navigation-swipe guard, whose touchstart
  *  preventDefault swallows the emulated click. Also keeps a control's click
- *  from opening the clickable row it sits in. */
+ *  from opening the clickable row it sits in, and keeps Space on a focused
+ *  control from typing into the prompt. */
 export function isInteractiveTarget(el: EventTarget | null): boolean {
   if (!(el instanceof Element)) return false;
   return !!el.closest('button, a, input, textarea, select, label, [role="button"], [contenteditable]');
@@ -77,6 +78,24 @@ export function viewportIsKeyboardShrunk(vvHeight: number, innerHeight: number):
  *  the 16 fallback covers SSR/JSDOM where getComputedStyle returns ''. */
 export function getRemPx(): number {
   return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+}
+
+/** The x translation of a computed `transform` value, in px. A computed
+ *  transform is `none` or a `matrix()` / `matrix3d()`, never the authored
+ *  functions, so a percentage arrives already resolved. */
+export function matrixTranslateX(transform: string): number {
+  const m = transform.match(/matrix(?:3d)?\(([^)]+)\)/);
+  if (!m) return 0;
+  const v = m[1].split(',').map((s) => parseFloat(s.trim()));
+  if (v.length === 6) return v[4];
+  if (v.length === 16) return v[12];
+  return 0;
+}
+
+/** Where an element's transform has it on screen now, mid-transition
+ *  included, as an x offset in px. */
+export function computedTranslateX(el: Element): number {
+  return matrixTranslateX(getComputedStyle(el).transform);
 }
 
 let safeAreaProbe: HTMLElement | null = null;

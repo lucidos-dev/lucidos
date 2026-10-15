@@ -1,6 +1,6 @@
 import { test, expect, type Locator, type Page } from './fixtures';
-import { assertHealthy, navigateToApp, newThread, revealSteps, sendMessage, waitForResponse } from './helpers';
-import { ensureHomeThread } from './db-helpers';
+import { assertHealthy, hideHomeRail, minThreadPane, navigateToApp, newThread, revealSteps, sendMessage, waitForResponse } from './helpers';
+import { clearAllThreads } from './db-helpers';
 
 /** The step row's context counter collapses to the bare percentage when the ROW
  *  is narrow, not when the DEVICE is a phone (`@container step-row` in
@@ -23,8 +23,7 @@ test.use({ viewport: { width: 1280, height: 800 } });
  *  the pane minus the transcript gutters, the turn inset and the scrollbar. */
 const WIDE_PANE = 860;
 /** Under it, and above the thread pane's own floor, so the clamp lets the drag
- *  land here. That floor is 418px at this 16px root with Home leading the row
- *  (`minThreadPanePx`). */
+ *  land here. The test checks the floor rather than trusting this number. */
 const NARROW_PANE = 424;
 
 async function dragDividerTo(page: Page, toX: number): Promise<void> {
@@ -62,15 +61,18 @@ async function counterOfFirstStep(page: Page): Promise<Locator> {
 test.describe('Step context counter width gate', () => {
   test('a narrow thread pane collapses the counter on a desktop viewport', async ({ page, context }) => {
     await assertHealthy(page);
-    // Home widens the pane's floor, so pin it on rather than inherit it.
-    ensureHomeThread();
+    // Home leading the row lifts the pane's floor past the gate at this
+    // window, so take it out rather than inherit it. Truncating takes Home.
+    clearAllThreads();
     await context.addInitScript(() => {
       localStorage.setItem('lucidos-split-ratio', '0.4');
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
     });
+    await hideHomeRail(page);
     await navigateToApp(page);
 
     const counter = await counterOfFirstStep(page);
+    expect(await minThreadPane(page), 'the floor sits under the narrow pane').toBeLessThan(NARROW_PANE);
     const full = counter.locator('.step-context-full');
     const compact = counter.locator('.step-context-compact');
 

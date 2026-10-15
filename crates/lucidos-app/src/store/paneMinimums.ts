@@ -1,34 +1,37 @@
 /**
  * How narrow each desktop pane is allowed to get: the thread drawer, the
- * Conversation pane, and the Canvas pane.
+ * Conversation pane, the Canvas pane, and the rail that holds the Home board.
  *
- * One module for all three because they are read TOGETHER. A divider drag is
+ * One module for all four because they are read TOGETHER. A divider drag is
  * clamped to what the panes on either side of it need, and a container too
  * narrow to hold every minimum at once has to degrade deterministically
  * (`clampSplitRatio` in components/layout/splitHelpers.ts), so a reader weighing
  * one floor is always weighing it against the others. They used to live in two
  * files, one of them a 2000-line store.
  *
- * All three are DERIVED from the root font size rather than written as px
+ * All are DERIVED from the root font size rather than written as px
  * constants, because everything they size is rem-authored: a constant is only
  * right at the one UI scale it was measured at. The drawer's floor learned that
  * first (its `260` was computed "at 16px/rem" for a header row that no longer
  * existed); the two pane floors follow, and are byte-identical to the `300` and
  * `360` they replace at a 16px root.
  *
- * The cost of deriving them is that the three no longer fit every window: they
- * sum to 1018px at 100% ui-scale, 1192 at 125%, 1367 at 150% and 1541 at 175%,
- * so from 150% on a 1280px screen `clampSplitRatio`'s empty-range branch is what
- * the user actually meets (137.5%, the step below, just fits at 1280). That
- * branch is load-bearing, not a corner. Those sums hold on every desktop client,
- * because neither derived floor varies by build (see `computeMinDrawerWidth`
- * and `computeMinThreadPaneWidth`).
+ * The cost of deriving them is that they no longer fit every window. New
+ * thread and Home lead the Conversation row. With both, the three pane floors
+ * sum to 1178px at 100% ui-scale, 1392 at 125%, 1607 at 150% and 1821 at 175%.
+ * A shown rail adds 364, 455, 546 and 637.
+ *
+ * So even without the rail, from 112.5% on a 1280px screen
+ * `clampSplitRatio`'s empty-range branch is what the user meets. That branch is load-bearing, not a corner. Those
+ * sums hold on every desktop client, because neither derived floor varies by
+ * build (see `computeMinDrawerWidth` and `computeMinThreadPaneWidth`).
  *
  * Deliberately holds no signal and imports nothing from `store.ts`: the store's
  * own module init reads `minDrawerWidth()` to clamp the persisted drawer width,
  * so an import back the other way would be a cycle resolved at boot.
  */
 import { getRemPx } from '../utils/dom';
+import { BOARD_CELL_REM, BOARD_GAP_REM, BOARD_MIN_COLUMNS, BOARD_PAD_X_REM } from '../utils/boardGeometry';
 
 /** One control at an end of the threads header's row, in rem: a button and its
  *  gap. Each end holds two. The leading end is the drawer toggle resting over
@@ -53,9 +56,10 @@ const TITLEBAR_LIGHTS_RESERVE_PX = 80;
  *  it: the drawer toggle's box. Mirrors `.thread-toggle-slot` in
  *  styles/panels/shell.css (`--header-icon-box`). */
 const THREAD_ROW_SIDE_REM = 2.25;
-/** What Home adds to that end while it is shown: its box and one gap. Mirrors
- *  the `:has(> .home-thread-btn)` reserve on `.pane-header-brand`. */
-const THREAD_ROW_HOME_REM = 2.25 + 0.25;
+/** What each control leading the row adds to that end: its box and one gap.
+ *  New thread leads it, and Home beside it. Mirrors the `:has(...)` reserves
+ *  on `.pane-header-brand`. */
+const THREAD_ROW_LEAD_CONTROL_REM = 2.25 + 0.25;
 /** The row's own leading padding, in rem. `--header-lead-inset`'s web value, and
  *  the floor UNDER the floor: whatever lead the row is sized around, an end is
  *  never narrower than the padding every build has. */
@@ -139,24 +143,56 @@ export function minDrawerWidth(): number {
  *  narrower one on both builds, because the actions fold into the ⋯ menu long
  *  before this width (`useHeaderActionCollapse`). So the symmetric lead is what
  *  governs. */
-export function computeMinThreadPaneWidth(remPx: number, leadPx: number, homeShown: boolean): number {
-  const sideRem = THREAD_ROW_SIDE_REM + (homeShown ? THREAD_ROW_HOME_REM : 0);
+export function computeMinThreadPaneWidth(remPx: number, leadPx: number, leadControls: number): number {
+  const sideRem = THREAD_ROW_SIDE_REM + leadControls * THREAD_ROW_LEAD_CONTROL_REM;
   const sidePx = Math.max(leadPx, THREAD_ROW_PAD_REM * remPx) + sideRem * remPx;
   return Math.ceil(2 * sidePx + THREAD_ROW_CLUSTER_REM * remPx);
 }
 
+/** The controls leading the Conversation header's row, each a box and a gap
+ *  the floor pays at both ends. */
+export const THREAD_ROW_LEAD_CONTROLS =
+  '.desktop-header .pane-header-brand > :is(.brand-compose-btn, .home-thread-btn)';
+
 /** Floor for the Conversation pane, at the CURRENT root font size. Reads the
  *  same lead the drawer's floor does, and by the same rule: the reserve decides
- *  how the row is LAID OUT, not how narrow the pane may get. Home leads the row
- *  once the thread list carries it, so its box counts from then. */
+ *  how the row is LAID OUT, not how narrow the pane may get. New thread leads
+ *  the row. Home joins it once the thread list carries it. Each box counts
+ *  while it shows. */
 export function minThreadPanePx(): number {
-  const homeShown = document.querySelector('.desktop-header .pane-header-brand > .home-thread-btn') !== null;
-  return computeMinThreadPaneWidth(getRemPx(), titlebarLightsReservePx(), homeShown);
+  const leadControls = document.querySelectorAll(THREAD_ROW_LEAD_CONTROLS).length;
+  return computeMinThreadPaneWidth(getRemPx(), titlebarLightsReservePx(), leadControls);
 }
 
 /** Floor for the Canvas pane. */
 export function minContentPanePx(): number {
   return Math.ceil(MIN_CONTENT_PANE_REM * getRemPx());
+}
+
+/** The divider band the rail pads its leading side by: `--divider-width` in
+ *  styles/global/base.css. */
+export const HOME_RAIL_DIVIDER_REM = 0.1875;
+
+/** Floor for the desktop rail that holds the Home board: two of the board's
+ *  cells, the gap between them, the board's side padding, the rail's divider
+ *  band, and the scrollbar gutter `.home-rail-body` reserves. Pure, so the
+ *  arithmetic is testable without a layout engine. */
+export function computeMinHomeRailWidth(remPx: number, scrollbarGutterPx: number): number {
+  const board = BOARD_MIN_COLUMNS * BOARD_CELL_REM + (BOARD_MIN_COLUMNS - 1) * BOARD_GAP_REM + 2 * BOARD_PAD_X_REM;
+  const rem = board + HOME_RAIL_DIVIDER_REM;
+  return Math.ceil(rem * remPx + scrollbarGutterPx);
+}
+
+/** The `--scrollbar-gutter-width` that `utils/scrollbarGutter.ts` publishes,
+ *  in px. A layout-less environment reads none, which is no gutter. */
+function publishedScrollbarGutterPx(): number {
+  const value = getComputedStyle(document.documentElement).getPropertyValue('--scrollbar-gutter-width');
+  return parseFloat(value) || 0;
+}
+
+/** Floor for the Home board's rail, at the CURRENT root font size. */
+export function minHomeRailPx(): number {
+  return computeMinHomeRailWidth(getRemPx(), publishedScrollbarGutterPx());
 }
 
 /** The two split-pane floors, measured together and handed to the pure clamp

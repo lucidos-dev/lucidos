@@ -49,6 +49,9 @@ pub(crate) use recovery::switch_was_user_initiated;
 // production SQL rather than a hand-copied paraphrase of it.
 #[cfg(test)]
 pub(crate) use recovery::BRANCH_CLASSIFICATION_SQL;
+// The same classifier for one branch, so the landing lane reads its lane
+// thread the way agent recovery reads every coding-agent thread.
+pub(crate) use recovery::branch_turn_in_flight;
 // The stale settle's two worktree actions, so the app-shape tests drive the
 // production pair rather than a hand-copied replay of it. Which of the two runs
 // is the whole property: a Discard removes the tree, everything else rescues it

@@ -15,20 +15,23 @@ import { describe, it, expect } from 'vitest';
 // @ts-expect-error: dev tooling, JS with no type declarations
 import * as watcher from '../../dev-build-watch.mjs';
 import {
+  BUDGET_LINE_PREFIX,
   DEV_BUILD_WATCH_ENV,
-  ENTRY_CHUNK_LINE_PREFIX,
-  entryChunkLine,
+  ENTRY_BUDGET,
+  FIRST_PAINT_BUDGET,
+  budgetLine,
   underDevBuildWatch,
-} from '../../vite/entryChunkBudget';
+} from '../../vite/chunkBudget';
 
 const {
+  BUDGET_LINE_PREFIX: WATCHER_PREFIX,
   DEV_BUILD_WATCH_ENV: WATCHER_ENV,
-  ENTRY_CHUNK_LINE_PREFIX: WATCHER_PREFIX,
   alertTransition,
+  budgetAlert,
+  budgetAlerts,
+  budgetFromLine,
   buildChildEnv,
   buildStatusRecord,
-  entryChunkAlert,
-  entryChunkFromLine,
   firstErrorLine,
 } = watcher;
 
@@ -86,6 +89,16 @@ describe('what a failure says', () => {
   });
 });
 
+/** A measurement as `budgetFromLine` reads it off the plugin's own line. */
+function measured(budget: typeof ENTRY_BUDGET, subject: string, bytes: number) {
+  return budgetFromLine(budgetLine(budget, { subject, bytes }));
+}
+
+const overEntry = measured(ENTRY_BUDGET, 'assets/index-a.js', ENTRY_BUDGET.kb * 1000 + 230);
+const withinEntry = measured(ENTRY_BUDGET, 'assets/index-a.js', ENTRY_BUDGET.kb * 800);
+const overFirstPaint = measured(FIRST_PAINT_BUDGET, '(2 chunks: a.js, b.js)', FIRST_PAINT_BUDGET.kb * 1000 + 12_340);
+const withinFirstPaint = measured(FIRST_PAINT_BUDGET, '(2 chunks: a.js, b.js)', FIRST_PAINT_BUDGET.kb * 800);
+
 describe('the status record', () => {
   const at = '2026-08-21T12:00:00.000Z';
 
@@ -97,17 +110,17 @@ describe('the status record', () => {
       at,
       error: null,
       skippedInstall: null,
-      entryChunk: null,
+      chunkBudgets: {},
     });
   });
 
-  it('keeps a served build green while recording its entry chunk overrun', () => {
+  it('keeps a served build green while recording each budget overrun', () => {
     // The overrun is reported, never a failure: `ok: false` would tell the
     // engine nothing new is being served, which is the opposite of true.
-    const entryChunk = { fileName: 'assets/index-a.js', bytes: 600_230, budgetBytes: 600_000, overBudget: true };
-    const record = buildStatusRecord({ ok: true, at, entryChunk });
+    const chunkBudgets = { entry: overEntry, 'first-paint': overFirstPaint };
+    const record = buildStatusRecord({ ok: true, at, chunkBudgets });
     expect(record.ok).toBe(true);
-    expect(record.entryChunk).toEqual(entryChunk);
+    expect(record.chunkBudgets).toEqual(chunkBudgets);
   });
 
   it('records a refused install alongside the outcome', () => {
@@ -117,11 +130,11 @@ describe('the status record', () => {
       ok: false,
       at,
       error: 'Rollup failed to resolve import "jsqr"',
-      skippedInstall: 'a Vite dev server in this checkout holds node_modules',
+      skippedInstall: 'npm ci failed (exit 1)',
     });
     expect(record.ok).toBe(false);
     expect(record.error).toContain('jsqr');
-    expect(record.skippedInstall).toContain('dev server');
+    expect(record.skippedInstall).toContain('npm ci failed');
   });
 
   it('normalises a missing error to null rather than undefined', () => {
@@ -149,33 +162,61 @@ describe('the vite build child', () => {
 
   it('shares its two names with the budget plugin', () => {
     expect(WATCHER_ENV).toBe(DEV_BUILD_WATCH_ENV);
-    expect(WATCHER_PREFIX).toBe(ENTRY_CHUNK_LINE_PREFIX);
+    expect(WATCHER_PREFIX).toBe(BUDGET_LINE_PREFIX);
   });
 });
 
-describe('reading the entry chunk measurement', () => {
+describe('reading a budget measurement', () => {
   it('parses the line the budget plugin prints', () => {
-    const line = entryChunkLine({ fileName: 'assets/index-a.js', bytes: 600_230 }, 600);
-    expect(entryChunkFromLine(line)).toEqual({
-      fileName: 'assets/index-a.js', bytes: 600_230, budgetBytes: 600_000, overBudget: true,
+    expect(overEntry).toEqual({
+      budget: ENTRY_BUDGET.name,
+      label: ENTRY_BUDGET.label,
+      subject: 'assets/index-a.js',
+      bytes: ENTRY_BUDGET.kb * 1000 + 230,
+      budgetBytes: ENTRY_BUDGET.kb * 1000,
+      overBudget: true,
     });
-    expect(entryChunkFromLine(entryChunkLine({ fileName: 'a.js', bytes: 500_000 }, 600))?.overBudget)
-      .toBe(false);
+    expect(withinEntry?.overBudget).toBe(false);
+    expect(overFirstPaint?.budget).toBe(FIRST_PAINT_BUDGET.name);
   });
 
   it('ignores every other line, and a malformed measurement', () => {
-    expect(entryChunkFromLine('dist/assets/index-a.js  600.23 kB')).toBeNull();
-    expect(entryChunkFromLine(`${WATCHER_PREFIX}{not json`)).toBeNull();
-    expect(entryChunkFromLine(`${WATCHER_PREFIX}{"fileName":"a.js"}`)).toBeNull();
+    expect(budgetFromLine('dist/assets/index-a.js  600.23 kB')).toBeNull();
+    expect(budgetFromLine(`${WATCHER_PREFIX}{not json`)).toBeNull();
+    expect(budgetFromLine(`${WATCHER_PREFIX}{"subject":"a.js","bytes":1,"budgetBytes":2}`)).toBeNull();
   });
 
-  it('names the size and the budget in the overrun alert', () => {
-    const over = { fileName: 'assets/index-a.js', bytes: 600_230, budgetBytes: 600_000, overBudget: true };
-    const alert = entryChunkAlert('broken', over);
-    expect(alert.title).toContain('over its budget');
-    expect(alert.message).toContain('600.23 kB');
-    expect(alert.message).toContain('600.00 kB');
-    expect(entryChunkAlert('recovered', { ...over, bytes: 520_000, overBudget: false }).title)
-      .toContain('back within');
+  it('names the budget, the size and the limit in the overrun alert', () => {
+    const alert = budgetAlert('broken', overFirstPaint);
+    expect(alert.title).toBe('First-paint set is over its budget');
+    expect(alert.message).toContain(`${FIRST_PAINT_BUDGET.kb + 12.34} kB`);
+    expect(alert.message).toContain(`${FIRST_PAINT_BUDGET.kb}.00 kB`);
+    expect(alert.message).toContain('(2 chunks: a.js, b.js)');
+    expect(budgetAlert('recovered', withinEntry).title).toBe('Entry chunk is back within its budget');
+  });
+});
+
+describe('announcing a budget edge', () => {
+  it('stays quiet on a first build within every budget', () => {
+    const { alerts } = budgetAlerts({}, { entry: withinEntry, 'first-paint': withinFirstPaint });
+    expect(alerts).toEqual([]);
+  });
+
+  it('speaks once for the budget that crossed, and only that one', () => {
+    const first = budgetAlerts({}, { entry: withinEntry, 'first-paint': withinFirstPaint });
+    const second = budgetAlerts(first.within, { entry: withinEntry, 'first-paint': overFirstPaint });
+    expect(second.alerts.map((a: { title: string }) => a.title)).toEqual(['First-paint set is over its budget']);
+    const third = budgetAlerts(second.within, { entry: withinEntry, 'first-paint': overFirstPaint });
+    expect(third.alerts).toEqual([]);
+    const fourth = budgetAlerts(third.within, { entry: withinEntry, 'first-paint': withinFirstPaint });
+    expect(fourth.alerts.map((a: { title: string }) => a.title)).toEqual(['First-paint set is back within its budget']);
+  });
+
+  it('keeps the last state of a budget a build did not measure', () => {
+    // A build that failed early prints no measurement. That is not a recovery.
+    const over = budgetAlerts({}, { entry: overEntry });
+    const silent = budgetAlerts(over.within, {});
+    expect(silent.alerts).toEqual([]);
+    expect(silent.within).toEqual(over.within);
   });
 });

@@ -4,6 +4,7 @@ use super::*;
 use crate::core::changes::{ChangeStatus, PendingScope};
 use crate::engine::apply_all_driver::ApplyAllOutcome;
 use crate::engine::standing_apply::{DisarmScope, StandingApply, DISARMED_BY_OWNER};
+use crate::engine::LaneRemoval;
 use crate::engine::{ApplyResult, ApplyStatus};
 use axum::http::HeaderMap;
 
@@ -133,6 +134,11 @@ pub(super) async fn list_changes(
         // keeps "thread N of M". Null while startup recovery has yet to
         // re-seed the registry, even when `apply_all_in_progress` is true.
         "apply_all_batch": state.engine.apply_all_batches.lock().await.snapshot(),
+        // The landing lane: its open lane batch with the batch's step, and the
+        // changes waiting for the next batch.
+        "landing_lane": state.engine.landing_lane_snapshot(),
+        // The main check: idle, running, passed, red or unavailable (ADR 0464).
+        "main_check": state.engine.main_check_snapshot(),
         // Threads carrying a standing apply. Keyed by THREAD, not by change: a
         // sweep arms a thread that has proposed nothing yet, and the prompt row
         // still has to render its armed state.
@@ -683,6 +689,10 @@ pub(super) async fn apply_all_changes(
                 ApplyStatus::Applied | ApplyStatus::Noop => format!(
                     "Started Apply All — first change applied. {remaining} more queued."
                 ),
+                ApplyStatus::Queued => format!(
+                    "Started Apply All. The first change waits in the landing lane, and the \
+                     remaining {remaining} apply in turn."
+                ),
             });
             Ok(Json(resp))
         }
@@ -732,6 +742,104 @@ pub(super) async fn cancel_apply_all_changes(
         "canceled_batches": canceled,
         "disarmed": disarmed,
     })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct CancelLaneBatchBody {
+    batch_id: Uuid,
+}
+
+/// POST /api/v1/changes/lane/cancel: cancel the resolving lane batch
+/// `batch_id` (ADR 0463). The batch fails whole and its lane thread stops.
+/// Every member stays pending and apply-ready, and nothing queues it again.
+pub(super) async fn cancel_lane_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CancelLaneBatchBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    // Cancel takes back every member's Apply, so it asks the gate Apply asks,
+    // member by member, before the batch fails. A batch id naming no open
+    // batch falls through to the lane's own refusal.
+    let members = state
+        .engine
+        .landing_lane_snapshot()
+        .open_batch
+        .filter(|batch| batch.batch_id == body.batch_id)
+        .map(|batch| batch.members)
+        .unwrap_or_default();
+    let mut changes = Vec::with_capacity(members.len());
+    for id in members {
+        if let Some(change) = state
+            .engine
+            .changes()
+            .get_by_id(id)
+            .await
+            .map_err(ApiError::db)?
+        {
+            changes.push(change);
+        }
+    }
+    refuse_batch_change_verb(&state, &headers, &changes, ThreadReachVerb::Apply).await?;
+    state
+        .engine
+        .cancel_lane_batch(body.batch_id, actor)
+        .await
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(serde_json::json!({ "canceled": body.batch_id })))
+}
+
+/// DELETE /api/v1/changes/:id/queue: take a change waiting in the landing
+/// lane back out (ADR 0463). It stays pending and apply-ready, and only a new
+/// Apply queues it again. A member of the open lane batch leaves only with
+/// its batch, so it answers 409 and names the batch's Cancel.
+pub(super) async fn remove_from_landing_lane(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    // Remove takes an Apply back, so it asks the gate Apply asks. It skips
+    // the thread-state gate: the source thread stays free while its change
+    // waits, and Remove touches no branch and no worktree.
+    refuse_change_verb(&state, &headers, id, ThreadReachVerb::Apply).await?;
+    let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM changes WHERE id = $1)")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::db)?;
+    if !known {
+        return queue_removal_answer(None);
+    }
+    let removal = state
+        .engine
+        .remove_from_landing_lane(id, actor)
+        .await
+        .map_err(ApiError::internal)?;
+    queue_removal_answer(Some(removal))
+}
+
+/// What Remove answers: `None` for a change id naming nothing, else what the
+/// lane decided. Pure, so every answer's status and slug are pinned.
+fn queue_removal_answer(
+    removal: Option<Result<(), LaneRemoval>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    match removal {
+        None => Err(ApiError::not_found("Change not found")),
+        Some(Ok(())) => Ok(Json(
+            serde_json::json!({ "message": "Removed from the landing lane." }),
+        )),
+        Some(Err(LaneRemoval::InBatch)) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "This change is landing in a batch. Cancel the batch to take it out.",
+        )
+        .with_reason("in_lane_batch")),
+        Some(Err(LaneRemoval::NotWaiting)) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "This change is not waiting to land.",
+        )
+        .with_reason("not_waiting_to_land")),
+    }
 }
 
 /// GET /api/v1/changes/:id — get a single change by ID
@@ -867,6 +975,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/changes/applied", get(list_applied_changes))
         .route("/changes/apply-all", post(apply_all_changes))
         .route("/changes/apply-all/cancel", post(cancel_apply_all_changes))
+        .route("/changes/lane/cancel", post(cancel_lane_batch))
         .route("/changes/discard-all", post(discard_all_changes))
         .route("/changes/for-repo/:repo_id", get(list_changes_for_repo))
         .route("/changes/:id/apply", post(apply_change))
@@ -874,6 +983,10 @@ pub(super) fn router() -> Router<AppState> {
         .route("/changes/:id/set-aside", post(set_aside_change))
         .route("/changes/:id/bring-back", post(bring_back_change))
         .route("/changes/:id/revert", post(revert_change))
+        .route(
+            "/changes/:id/queue",
+            axum::routing::delete(remove_from_landing_lane),
+        )
         .route(
             "/changes/:id/diff",
             get(super::repositories::get_change_diff),
@@ -888,6 +1001,30 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Remove answers 200 for a waiting change and 404 for an unknown id. A
+    /// batch member and a change not waiting each get a 409 with its own slug.
+    #[test]
+    fn remove_answers_each_lane_decision_with_its_own_status() {
+        let refused = |removal| queue_removal_answer(removal).expect_err("refused");
+        let body = queue_removal_answer(Some(Ok(()))).expect("removed").0;
+        assert_eq!(body["message"], "Removed from the landing lane.");
+
+        let in_batch = refused(Some(Err(LaneRemoval::InBatch)));
+        assert_eq!(in_batch.status, StatusCode::CONFLICT);
+        assert_eq!(in_batch.reason, Some("in_lane_batch"));
+        assert!(
+            in_batch.message.contains("Cancel the batch"),
+            "{}",
+            in_batch.message
+        );
+
+        let not_waiting = refused(Some(Err(LaneRemoval::NotWaiting)));
+        assert_eq!(not_waiting.status, StatusCode::CONFLICT);
+        assert_eq!(not_waiting.reason, Some("not_waiting_to_land"));
+
+        assert_eq!(refused(None).status, StatusCode::NOT_FOUND);
+    }
 
     /// The refusal names the control the Changes panel draws.
     #[test]

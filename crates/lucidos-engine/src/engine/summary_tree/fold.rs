@@ -153,9 +153,40 @@ impl Fold {
         self.parts[drop..].iter().map(|p| p.addr).collect()
     }
 
+    /// The view at `len` entries with this fold's lines left as they are.
+    /// The entries past it fold among themselves within `tail_budget`
+    /// bytes. So a view that reads this fold as its prefix never rewrites it,
+    /// however long the rest grows.
+    pub(crate) fn with_tail(
+        &self,
+        len: u64,
+        size: &impl Fn(NodeAddr) -> Option<usize>,
+        tail_budget: usize,
+    ) -> Vec<NodeAddr> {
+        let tail = Fold {
+            len: self.len,
+            ..Fold::default()
+        };
+        self.parts
+            .iter()
+            .map(|p| p.addr)
+            .chain(tail.into_tiles(len, size, tail_budget))
+            .collect()
+    }
+
     /// Entries appended so far.
     pub(crate) fn entries(&self) -> u64 {
         self.len
+    }
+
+    /// Lines this fold shows.
+    pub(crate) fn lines(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Bytes of the lines this fold shows.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 
     #[cfg(test)]

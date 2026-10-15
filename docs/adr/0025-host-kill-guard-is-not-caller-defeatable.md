@@ -63,7 +63,8 @@ reasons to refuse, never reasons to permit:
 
 The existing pidfile arm additionally scans the home recorded in the **password
 database** when it differs from `$HOME` (resolved via `dscl` / `getent`, never
-`eval`). The ancestor walk only reaches processes this one descends from, so a
+`eval`). Since ADR 0438 that arm trusts an engine pid only while the engine
+holds its `engine.lock`. It no longer scans `frontend.pid`, which is gone. The ancestor walk only reaches processes this one descends from, so a
 *sibling* workspace's engine still depends on the pidfile scan — and reassigning
 `HOME` must not disarm that either.
 
@@ -101,8 +102,8 @@ refuse whenever the candidate holds a port the caller did not allocate. Rejected
 - **Protection is deliberately not sandboxable.** A test that reassigns `HOME`
   still gets an isolated port *registry* (`LUCIDOS_PORT_REGISTRY` remains
   `$HOME`-relative), but it no longer gets an unprotected engine. A test that
-  needs a pid to be unprotected must use one that is genuinely dead — the
-  `kill -0` liveness gate on the pidfile arms still applies — or synthetic.
+  needs a pid to be unprotected must use one no engine lock vouches for: a dead
+  one, a synthetic one, or a live one with no lock held (ADR 0438).
 - **The reclaim path can now refuse where it previously acted.** If a workspace's
   engine is genuinely an ancestor of the process allocating ports, that port is
   not reclaimable. This is correct: an ancestor engine is running, not stale. The

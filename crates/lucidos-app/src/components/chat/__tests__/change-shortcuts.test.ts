@@ -24,15 +24,15 @@ import { resolveThreadActions, type TaggedAction } from '../../../store/actions/
 import { viewThreadCcDiff } from '../../../store/actions/repositories';
 import { setDraft } from '../../../store/composeDrafts';
 import {
-  applyingNowThreadIds,
+  applyNowRequests,
   discardingCCThreadIds,
-  archivingThreadIds,
   armingStandingApplyThreadIds,
   focusedThreadId,
   threadMap,
 } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import type { ThreadMeta } from '../../../store/thread-events';
+import { _holdArchiveForTesting, _resetRowIntentsForTesting } from '../../../store/rowIntents';
 
 const ID = 't1';
 
@@ -54,9 +54,9 @@ function offer(...kinds: TaggedAction['kind'][]): Record<string, Invoke> {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  applyingNowThreadIds.value = new Map();
+  applyNowRequests.value = new Map();
   discardingCCThreadIds.value = new Set();
-  archivingThreadIds.value = new Set();
+  _resetRowIntentsForTesting();
   setDraft(ID, { text: '', image_hashes: [], mode: null });
   armingStandingApplyThreadIds.value = new Set();
 });
@@ -72,7 +72,7 @@ describe('the Apply shortcut', () => {
 
   it('does nothing while that apply is already in flight', () => {
     focus({ status: 'idle' });
-    applyingNowThreadIds.value = new Map([[ID, 'requesting']]);
+    applyNowRequests.value = new Map([[ID, null]]);
     const invokes = offer('apply');
     applyFocusedThreadChange();
     expect(invokes.apply).not.toHaveBeenCalled();
@@ -80,7 +80,7 @@ describe('the Apply shortcut', () => {
 
   it('does nothing while the thread is archiving', () => {
     focus({ status: 'idle' });
-    archivingThreadIds.value = new Set([ID]);
+    _holdArchiveForTesting([ID]);
     const invokes = offer('apply');
     applyFocusedThreadChange();
     expect(invokes.apply).not.toHaveBeenCalled();

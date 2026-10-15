@@ -76,6 +76,11 @@ fi
 #     field names the release that notice shipped WITH, and the engine hides a
 #     notice until it reports that version, so rewriting it on a bump would
 #     re-show every answered notice in every workspace.
+#   crates/lucidos-engine/src/engine/release_notices_upgrade_pins_tests.rs: the tests
+#     that pin which notices a workspace owes moving from one named release to
+#     the next. Those literals are the test data, so they must not move on a
+#     bump. Only this test file is excluded: release_notices.rs holds the
+#     production code and stays scanned.
 #   *.lock, package-lock.json, node_modules — dependency versions, not ours.
 #   .github/dependabot.yml: same class, it exists to reason about THIRD-PARTY
 #     versions (the glib/gtk/tao/tauri resolution chain), so every literal in it
@@ -113,6 +118,7 @@ if git grep -nIwE '[0-9]+\.[0-9]+\.[0-9]+' -- \
     '.' \
     ':(exclude)CHANGELOG.md' \
     ':(exclude)release-notices.toml' \
+    ':(exclude)crates/lucidos-engine/src/engine/release_notices_upgrade_pins_tests.rs' \
     ':(exclude)RELEASE' \
     ':(exclude)install.sh' \
     ':(exclude)docs/plans' \

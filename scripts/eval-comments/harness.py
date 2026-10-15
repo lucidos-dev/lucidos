@@ -77,8 +77,9 @@ LAUNCH_STAGGER_SECS = 45
 STRIP_ROOTS = ("crates/", "packages/")
 # Bump when stripping changes what an arm tree contains. v2: rustfmt after stripping.
 STRIP_VERSION = 2
-# The `#[ignore]`d tests that rewrite crates/lucidos-app/src/generated/. Their
-# names follow `generate_*_file`, and the set differs by commit.
+# The `#[ignore]`d tests that rewrite the generated files on a commit that has
+# them. Their names follow `generate_*_file`, and the set differs by commit. A
+# commit with none has scripts/codegen.sh instead.
 GENERATOR_RE = re.compile(r"fn (generate_[a-z0-9_]+_file)\b")
 
 AGENT_PREAMBLE = (
@@ -547,6 +548,10 @@ def build_arms(task: dict, arms: list[str]) -> dict:
             code, out = cargo(["cargo", "test", "-p", "lucidos-engine", "--lib", gen, "--", "--include-ignored"], wt, prep_log)
             if code != 0 or re.search(r"running [1-9]\d* tests?", out) is None:
                 sys.exit(f"{task['id']}: generator {gen} failed, see {prep_log}")
+        if not generators and (wt / "scripts/codegen.sh").exists():
+            code, _ = cargo(["bash", "scripts/codegen.sh"], wt, prep_log)
+            if code != 0:
+                sys.exit(f"{task['id']}: scripts/codegen.sh failed, see {prep_log}")
         git("add", "-A", cwd=wt)
         sha = commit_like(wt, parent, git("write-tree", cwd=wt).strip())
         git("update-ref", f"refs/heads/arm-{arm}", sha, cwd=clone)

@@ -595,6 +595,8 @@ pub async fn propose_held_back_changes_on_startup_with_roots(
 ///     (ADR 0395), and the wait's delivery, expiry or cancel proposes later.
 ///   - no turn end a sweep settles ([`last_turn_end`]).
 ///   - empty / missing SessionStarted branch → can't resolve a branch.
+///   - a lane batch's integration branch → the landing lane lands it, and
+///     it is never a change (ADR 0463).
 ///   - `proposal_files_for_branch` returns `None` → no committed net diff.
 ///   - existing pending change for the branch → already rescued.
 ///
@@ -666,6 +668,14 @@ async fn propose_one_held_back_change(
         Some(b) if !b.is_empty() => b,
         _ => return Ok(false),
     };
+    if crate::engine::git_ops::is_lane_branch(&branch_name) {
+        log!(
+            "[Recovery] Skipping held-back lane branch {} for thread {}: the landing lane lands it",
+            branch_name,
+            thread_id
+        );
+        return Ok(false);
+    }
 
     // Dedup against an existing pending row keyed on the branch (covers
     // re-entrant boot, legacy per-commit emits that never made the thread

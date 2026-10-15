@@ -34,15 +34,21 @@ mod data_store;
 mod event_waits;
 mod events;
 mod frontend_preview;
-/// Manifest-generated subcommands (one per `cli = true` capability domain).
-/// AUTO-GENERATED content; wire each enum below. See
-/// `crates/lucidos-engine/src/capability_manifest/`.
-mod generated;
+/// Manifest-generated subcommands, one per `cli = true` capability domain,
+/// rendered by `build.rs` from `lucidos-capabilities`. Wire each enum below.
+/// Variant names come verbatim from the manifest's operation names, and the
+/// query vector gets one `push` per optional argument, hence the two allows.
+#[allow(clippy::enum_variant_names, clippy::vec_init_then_push)]
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/cli_commands.rs"));
+}
 mod handshake;
 mod hardened;
 mod http;
 mod knowhow;
+mod main_check;
 mod mcp_permission_server;
+mod merge_driver;
 mod notify;
 mod owner_approval;
 mod pair;
@@ -50,7 +56,9 @@ mod planned;
 mod proxy;
 mod request_read;
 mod spawn_thread;
+mod successor;
 mod threads;
+mod wake_parent;
 mod workspace;
 
 use data::WriteSource;
@@ -100,10 +108,12 @@ enum Command {
     /// (`ChangeProposed`), a trigger firing, a backup finishing
     /// (`BackupCompleted`), a workspace domain event. NOT for
     /// external state with no Lucidos event, which has nothing to deliver, and
-    /// NOT for a thread you spawned as your own child: that one already re-opens
-    /// this thread with its result when it finishes, so a wait on its
-    /// `ChildThreadCompleted` buys nothing. Await a completion only for a thread
-    /// that is not your own child, named with a `child_thread_id` condition. A
+    /// NOT for a thread you spawned as your own child: its report reaches this
+    /// thread on its own. A failure re-opens this thread, and a clean report
+    /// follows the `--wake-mode` you spawned it with. Await a
+    /// completion only for a thread that is not your own child, named with a
+    /// `child_thread_id` condition, on `ChildThreadCompleted` and
+    /// `ChildReportFiled`. A
     /// session nobody spawned emits no completion at all: watch
     /// `CodingAgentIdled` with a `thread_id` condition instead.
     ///
@@ -111,15 +121,19 @@ enum Command {
     /// rule that fires every time, create a trigger instead.
     #[command(name = "await-event")]
     AwaitEvent(AwaitEventArgs),
-    /// Run work that has to outlive your turn: a long build, a test suite, an
-    /// e2e run. The engine runs it in this thread's worktree and re-opens the
-    /// thread when it finishes, so you END YOUR TURN instead of waiting.
+    /// Run work that has to outlive one foreground call: a build, a test suite,
+    /// an e2e run. The engine runs it in this thread's worktree.
+    ///
+    /// Usually: `run --poll`, then `wait` until it finishes. Each `wait`
+    /// returns within 230 s, so the prompt cache stays warm. For an open-ended
+    /// wait, such as a run queued behind a held lock: `run` without `--poll`,
+    /// then END YOUR TURN; the thread re-opens when it finishes. Either way the
+    /// engine kills the task after an hour at most.
     ///
     /// A command you start yourself in the background dies when your turn
-    /// ends, because the engine stops every process you started. Anything that
-    /// surely fits in 10 minutes is simpler as a foreground call.
+    /// ends, because the engine stops every process you started.
     ///
-    /// All three verbs act on `$LUCIDOS_THREAD_ID`, so none can reach another
+    /// Every verb acts on `$LUCIDOS_THREAD_ID`, so none can reach another
     /// thread's tasks.
     #[command(name = "background-task")]
     BackgroundTask {
@@ -135,15 +149,17 @@ enum Command {
     /// once, the first matching call spends the approval. It expires when the
     /// thread's next turn starts.
     ///
-    /// The verbs: create-top-thread (no --thread), and archive, cancel,
-    /// continue, apply, discard, set-aside, bring-back, revert, control,
-    /// ask-side-question, dismiss-side-question (each with --thread). A card
-    /// never asks to answer another card.
+    /// The verbs, each with --thread: archive, cancel, continue, apply,
+    /// discard, set-aside, bring-back, revert, control, ask-side-question,
+    /// dismiss-side-question, spawn-successor. A card never asks to answer
+    /// another card. Creating a top-thread and moving your own child to top
+    /// level need no approval.
     #[command(name = "ask-owner-approval")]
     AskOwnerApproval {
-        /// The act, in kebab-case: create-top-thread, apply, archive, ...
+        /// The act, in kebab-case: apply, archive, cancel, ...
         verb: String,
-        /// The thread the act aims at. Omit it for create-top-thread.
+        /// The thread the act aims at. Every verb needs one; the engine
+        /// refuses a request without it.
         #[arg(long)]
         thread: Option<String>,
         /// Why you need it, in a sentence or two. The owner reads it on the
@@ -219,6 +235,19 @@ enum Command {
         /// `yes` or `no`. Required: there is no default.
         answer: request_read::ReadAnswer,
     },
+    /// Decide whether this turn's report wakes your parent thread.
+    ///
+    /// For a sub-thread: run it before your final message. `yes` when your
+    /// parent must act on the report now: it waits for this result to take a
+    /// next step, combine results, retry, or decide. `no` when the report only
+    /// informs: it is filed, and your parent reads it on its next turn. A
+    /// failure always wakes it. Skipped, Lucidos decides, and a doubt wakes.
+    /// Acts on `$LUCIDOS_THREAD_ID` and takes no thread argument.
+    #[command(name = "wake-parent")]
+    WakeParent {
+        /// `yes` or `no`. Required: there is no default.
+        answer: wake_parent::WakeAnswer,
+    },
     /// Record/query hardening state. Invoked by `/harden` Phase 5.
     Hardened {
         #[command(subcommand)]
@@ -235,6 +264,13 @@ enum Command {
     Planned {
         #[command(subcommand)]
         action: PlannedCmd,
+    },
+    /// Continue this thread in a successor thread, which carries on with a
+    /// fresh context.
+    #[command(long_about = successor::HELP)]
+    Successor {
+        #[command(subcommand)]
+        action: SuccessorCmd,
     },
     /// Start, stop, or inspect the frontend preview: a Vite dev server the
     /// engine supervises inside a coding-agent worktree, on its own port, so a
@@ -298,6 +334,19 @@ enum Command {
     /// a silent no-op in repos without the skill. Hidden; not for direct invocation.
     #[command(name = "cc-plan-gate", hide = true)]
     CcPlanGate,
+    /// Git merge driver for a path whose `.gitattributes` names
+    /// `merge=lucidos-<kind>`. Writes the merge over OURS and exits 0 (clean),
+    /// 1 (conflict) or 2 (not merged, so merge as plain text). Hidden; git runs
+    /// it through the command `scripts/merge-drivers.sh` registers.
+    #[command(name = "merge-driver", hide = true)]
+    MergeDriver {
+        kind: merge_driver::Kind,
+        base: PathBuf,
+        ours: PathBuf,
+        theirs: PathBuf,
+        #[arg(default_value_t = 7)]
+        marker_size: usize,
+    },
     /// Git post-commit hook subcommand installed in coding-agent worktrees.
     /// Refreshes the parent engine's change state so the Diff button appears
     /// as soon as committed work exists. Hidden; not for
@@ -369,6 +418,13 @@ enum Command {
     Changes {
         #[command(subcommand)]
         action: ChangesCmd,
+    },
+    /// Where the *main check* stands (ADR 0464): idle, running, passing, red
+    /// or unavailable. For a red one, `status` names what failed, the range
+    /// it covered, the run and the fix thread that owns it.
+    MainCheck {
+        #[command(subcommand)]
+        action: MainCheckCmd,
     },
     /// Read the engine-shipped system-knowhow corpus (and any user knowhow):
     /// `list` the catalog, `read <id>` one doc's full content. The authoritative
@@ -468,9 +524,9 @@ enum Command {
         action: generated::EnvVarsCmd,
     },
     /// A thread's widgets, the shelf in its title row, and reusable widgets:
-    /// `list`, `thread`, `show`, `pin`, `unpin`, `make-reusable` and
-    /// `stop-reusing`. A verb's `--thread-id` defaults to
-    /// `$LUCIDOS_THREAD_ID`, the session's own thread.
+    /// `list`, `thread`, `pin`, `unpin`, `make-reusable` and `stop-reusing`.
+    /// A verb's `--thread-id` defaults to `$LUCIDOS_THREAD_ID`, the session's
+    /// own thread.
     Widgets {
         #[command(subcommand)]
         action: generated::WidgetsCmd,
@@ -547,6 +603,17 @@ enum KnowhowCmd {
         /// Knowhow id, exactly as it appears in `list` (e.g.
         /// `system-knowhow/building-an-app` or a user knowhow id).
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MainCheckCmd {
+    /// Print the main check's state, one fact per line. Wraps
+    /// `GET /api/v1/main-check`. Exit non-zero on transport / HTTP error.
+    Status {
+        /// Print the engine's snapshot as JSON instead.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -729,7 +796,8 @@ enum ThreadsCmd {
     /// children: the engine reads the calling thread from the origin token
     /// this subprocess was spawned with. Outside a thread, it moves any
     /// thread that has a parent, as the thread menu's "Move to top level"
-    /// does.
+    /// does. It needs no other permission: any thread may create a
+    /// top-thread.
     Detach {
         /// The child's uuid. Find it with `threads list --my-children`.
         #[arg(long)]
@@ -756,8 +824,9 @@ enum ThreadsCmd {
 
 #[derive(Subcommand)]
 enum BackgroundTaskCmd {
-    /// Start a background task, then end your turn. The thread re-opens when
-    /// it finishes, with its exit status and the tail of its output.
+    /// Start a background task. Without `--poll`, end your turn: the thread
+    /// re-opens when it finishes, with its exit status and the tail of its
+    /// output. With `--poll`, keep your turn and call `wait`.
     ///
     /// One argument after `--` runs as written, so quote a pipeline or a
     /// redirect as one string. Several arguments run as exactly those words.
@@ -774,6 +843,10 @@ enum BackgroundTaskCmd {
         /// (default and maximum 3600).
         #[arg(long = "timeout-secs")]
         timeout_secs: Option<u64>,
+        /// Arm no wake-up: you poll it with `wait` until it finishes. The
+        /// usual choice; drop it only for an open-ended wait.
+        #[arg(long)]
+        poll: bool,
         /// The command to run, after `--`.
         #[arg(
             trailing_var_arg = true,
@@ -782,6 +855,16 @@ enum BackgroundTaskCmd {
             required = true
         )]
         command: Vec<String>,
+    },
+    /// Block until a task finishes, or 230 s pass, then print what `output`
+    /// prints. Re-issue it until it reports `finished`. A timed-out wait
+    /// leaves the task running.
+    Wait {
+        /// The id `run` printed.
+        task_id: String,
+        /// Return sooner than the cap. Clamped to 230.
+        #[arg(long = "max-secs")]
+        max_secs: Option<u64>,
     },
     /// Print a task's output: what arrived since your last read while it
     /// runs, and its final record once it has finished.
@@ -1130,6 +1213,20 @@ pub(crate) struct SpawnThreadArgs {
     /// fire-and-forget behavior.
     #[arg(long, value_enum)]
     pub(crate) relation: Option<CliRelation>,
+    /// Spawn an integrated sub-thread: a follow-up of your own Lucidos-source
+    /// work that folds into your branch. It runs the fast tier of `/harden`,
+    /// proposes nothing, and its report names its branch for you to
+    /// `git merge`. Needs `--relation child`, a coding-agent flag and a
+    /// Lucidos-source child, from a Lucidos-source coding-agent thread.
+    #[arg(long)]
+    pub(crate) integrated: bool,
+    /// With `--relation child`: what the child's clean finish does to the
+    /// calling thread. `wake` wakes it, `wake-when-all-done` wakes it when the
+    /// last child spawned that way finishes, and `no-wake` files the report.
+    /// Omitted, the engine picks the parent's default: `no-wake` from the home
+    /// thread, else `wake`. A failure always wakes it.
+    #[arg(long)]
+    pub(crate) wake_mode: Option<String>,
     /// Use `http://` instead of `https://`. Test-only. Hidden from --help.
     #[arg(long, hide = true)]
     pub(crate) insecure_http: bool,
@@ -1142,16 +1239,35 @@ enum HardenedCmd {
     /// parent engine's `/api/v1/internal/mark-hardened`. From a coding-agent
     /// session it also stops the thread's leftover background tasks, and
     /// prints them and every wait still live.
-    Mark,
+    Mark {
+        /// The tier of `/harden` that ran. `fast` is an integrated
+        /// sub-thread's tier, and the engine refuses it on any other branch.
+        #[arg(long, value_enum, default_value_t = hardened::Tier::Full)]
+        tier: hardened::Tier,
+    },
     /// Print the hardening state of the current branch (in $PWD): `FRESH`,
-    /// `STALE`, or `MISSING`. GETs `/api/v1/internal/hardened-state`. Used by
-    /// the `harden.md` skill (skip `/harden` iff `FRESH`) and the
-    /// `pre-push.sh` hook (allow push iff `FRESH`).
+    /// `STALE`, or `MISSING`, for the tier the branch needs. A fast marker on a
+    /// branch that needs the full run is `MISSING`. GETs
+    /// `/api/v1/internal/hardened-state`. Used by the `harden.md` skill (skip
+    /// `/harden` iff `FRESH`) and the `pre-push.sh` hook (allow push iff
+    /// `FRESH`).
     Query,
     /// Print the HEAD SHA the last `/harden` recorded for the current branch
-    /// (in $PWD), fresh or stale. Exits non-zero when there is no marker.
-    /// `/harden`'s merge-only check reads it.
+    /// (in $PWD), fresh or stale, of either tier. Exits non-zero when there
+    /// is no marker. `/harden`'s merge-only check reads it.
     Sha,
+    /// Print the tier the current branch's marker recorded: `fast` or `full`.
+    /// Exits non-zero when there is no marker.
+    Tier,
+    /// Print the tier `/harden` runs on the current branch: `fast` for an
+    /// integrated sub-thread, `full` for every other branch.
+    #[command(name = "expected-tier")]
+    ExpectedTier,
+    /// Print the heads the current branch's integrated children hardened, one
+    /// per line. `/harden` Phase 0.4 passes them to `harden-scope.sh` as
+    /// already reviewed.
+    #[command(name = "integrated-heads")]
+    IntegratedHeads,
 }
 
 #[derive(Subcommand)]
@@ -1169,6 +1285,17 @@ enum FrontendPreviewCmd {
     Stop,
     /// Print what the frontend preview is currently serving, if anything.
     Status,
+}
+
+#[derive(Subcommand)]
+enum SuccessorCmd {
+    /// Start the successor from a handoff narrative file and print its link.
+    Spawn {
+        /// The handoff narrative, a markdown file with the six sections
+        /// `lucidos successor --help` names.
+        #[arg(long)]
+        narrative: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1407,9 +1534,19 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Hardened { action } => {
             let ws = resolve_from_env()?;
             match action {
-                HardenedCmd::Mark => hardened::cmd_mark(&ws)?,
+                HardenedCmd::Mark { tier } => hardened::cmd_mark(&ws, tier)?,
                 HardenedCmd::Query => hardened::cmd_query(&ws)?,
                 HardenedCmd::Sha => hardened::cmd_sha(&ws)?,
+                HardenedCmd::Tier => hardened::cmd_tier(&ws)?,
+                HardenedCmd::ExpectedTier => hardened::cmd_expected_tier(&ws)?,
+                HardenedCmd::IntegratedHeads => hardened::cmd_integrated_heads(&ws)?,
+            }
+            Ok(0)
+        }
+        Command::Successor { action } => {
+            let ws = resolve_from_env()?;
+            match action {
+                SuccessorCmd::Spawn { narrative } => successor::cmd_spawn(&ws, &narrative)?,
             }
             Ok(0)
         }
@@ -1478,6 +1615,13 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             cc_plan_gate::run()?;
             Ok(0)
         }
+        Command::MergeDriver {
+            kind,
+            base,
+            ours,
+            theirs,
+            marker_size,
+        } => Ok(merge_driver::run(kind, &base, &ours, &theirs, marker_size)),
         Command::CodingAgentDiffHook => {
             coding_agent_diff_hook::run()?;
             Ok(0)
@@ -1583,8 +1727,20 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 BackgroundTaskCmd::Run {
                     description,
                     timeout_secs,
+                    poll,
                     command,
-                } => background_task::cmd_run(&ws, &command, description.as_deref(), timeout_secs)?,
+                } => background_task::cmd_run(
+                    &ws,
+                    &command,
+                    background_task::RunOptions {
+                        description: description.as_deref(),
+                        timeout_secs,
+                        poll,
+                    },
+                )?,
+                BackgroundTaskCmd::Wait { task_id, max_secs } => {
+                    background_task::cmd_wait(&ws, &task_id, max_secs)?
+                }
                 BackgroundTaskCmd::Output { task_id } => {
                     background_task::cmd_output(&ws, &task_id)?
                 }
@@ -1595,6 +1751,11 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::RequestRead { answer } => {
             let ws = resolve_from_env()?;
             request_read::cmd_request_read(&ws, answer)?;
+            Ok(0)
+        }
+        Command::WakeParent { answer } => {
+            let ws = resolve_from_env()?;
+            wake_parent::cmd_wake_parent(&ws, answer)?;
             Ok(0)
         }
         Command::EventWaits { action } => {
@@ -1723,6 +1884,13 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             }
             Ok(0)
         }
+        Command::MainCheck { action } => {
+            let ws = resolve_from_env()?;
+            match action {
+                MainCheckCmd::Status { json } => main_check::cmd_status(&ws, json)?,
+            }
+            Ok(0)
+        }
         Command::Knowhow { action } => {
             let ws = resolve_from_env()?;
             match action {
@@ -1784,7 +1952,6 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Widgets { mut action } => {
             let ws = resolve_from_env()?;
             if let generated::WidgetsCmd::Thread { thread_id, .. }
-            | generated::WidgetsCmd::Show { thread_id, .. }
             | generated::WidgetsCmd::Pin { thread_id, .. }
             | generated::WidgetsCmd::Unpin { thread_id, .. } = &mut action
             {

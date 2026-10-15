@@ -104,11 +104,12 @@ const APPLY_RESTART_RULE: &str = "APPLY/RESTART: After your session ends, your c
 /// `CLAUDE.md` is the repo-side fact that `.claude/hooks/pre-push.sh` enforces
 /// the marker, which binds a hand-run `claude` that never sees this text.
 const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete and committed, \
-    you MUST run `/harden`. No exceptions — even for docs-only, CSS-only, comment-only, or \
-    seemingly trivial changes. Do not rationalize skipping it (\"too small to harden\", \
-    \"nothing to test\", \"just a wording tweak\"). The skill itself decides what to check: \
-    it reviews the diff and runs the test suites for the layers you touched, auto-skipping \
-    phases when no relevant layers were touched, and iterates from Phase 1 if anything fails. \
+    you MUST run `/harden`. The one exception is a branch landing only plan files \
+    (`git_ops::is_plan_file`): Apply never hardens it, so skip `/harden` there. Every other \
+    change runs it, even a docs-only, CSS-only, comment-only, or seemingly trivial one. Do \
+    not rationalize skipping it (\"too small to harden\", \"nothing to test\", \"just a \
+    wording tweak\"). The skill decides what to check and which suites to run, and iterates \
+    until they pass. \
     The harden marker only exists if you actually invoke `/harden`, and without it the user \
     pays the wait when they click Apply. Run it ONCE, over the whole finished batch of \
     commits: hardening mid-work re-runs the same suites for nothing and says nothing about \
@@ -149,7 +150,8 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     FLOOR: `Approve` first, `Request changes` second ONLY when the plan offers no real fork. If \
     it offers one (a narrower scope, one layer instead of two), that fork takes the second slot \
     and `Request changes` is dropped, never carried alongside it as a third. \
-    `Implement in a new thread` counts as a fork. The approval itself \
+    Offer the options `lucidos planned mark` prints: on a large thread they replace this pair, \
+    led by `Implement in a new thread`. The approval itself \
     is a DECISION question, not a post-work confirmation: the edit gate is closed until they \
     answer, so approval asked in prose leaves the thread idle. Once the user \
     approves, run `lucidos planned approve` to flip the marker to gate-satisfying. Only then do \
@@ -211,16 +213,20 @@ const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run 
 /// true for the standalone CLI and false here. Claude Code also dropped its
 /// blocking `TaskOutput` wait, so the rule must not name one.
 ///
-/// The two shapes are a foreground call and a *background task*. The first
-/// names its 600000 ms ceiling, because the tool default of 120000 ms cuts a
-/// long build off. The second is `lucidos background-task run`: the engine
-/// owns the job and arms an event wait. The agent ends its turn, and no
-/// request re-reads the context while the work runs. See
-/// `docs/plans/2026-09-23-coding-agents-wait-on-background-tasks-through-event-waits.md`.
+/// Three shapes: a foreground call, a polled *background task*, and a watched
+/// one. Each foreground call names its 240000 ms ceiling, because the tool
+/// default of 120000 ms cuts a build off. The cap keeps every blocking call
+/// inside the 5-minute prompt cache, since a gap past it rewrites the whole
+/// context. `background-task wait` returns within 230 s for that reason. A wait
+/// with no end in sight takes the watched task and ends the turn: many polls
+/// would cost more calls than the one rewrite they save. See
+/// `docs/plans/2026-10-13-keep-claude-code-cache-warm-during-waits.md`.
 ///
 /// The example log path is per-worktree (`$(basename "$PWD")`), because
-/// concurrent sessions share `/tmp` and a fixed name truncates another
-/// session's log.
+/// concurrent sessions share the temp dir and a fixed name truncates another
+/// session's log. It names `${TMPDIR:-/tmp}`, not `/tmp`: on macOS `$TMPDIR` is
+/// per-user and owner-only, while `/tmp` is readable by every local user
+/// (ADR 0456).
 ///
 /// Claude Code runs with its background tasks switched off (ADR 0358). Its
 /// tool results promised a notification that the turn-end teardown never
@@ -237,20 +243,21 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
     the instant you end the turn, and nothing re-invokes you when it would have finished. Under \
     Claude Code, Lucidos switches background mode OFF: the `Bash` and `Agent` tools have no \
     `run_in_background` parameter, passing one fails, and a command that outruns its timeout is \
-    killed rather than moved to the background. Use \
-    one of two shapes. FOREGROUND, for anything that surely fits in 10 minutes: set the timeout \
-    EXPLICITLY to its maximum (Claude Code's Bash tool takes `timeout: 600000`; its 120000 ms \
-    DEFAULT silently cuts a long build off at 2 minutes). Overrunning that ceiling kills the \
-    command and throws the work away, so do not gamble on the estimate. BACKGROUND TASK, for \
-    anything longer or uncertain: `lucidos background-task run --description \"<what it is>\" -- \
-    '<cmd>'` hands the command to the engine, which runs it in your worktree and arms an event \
-    wait on its completion. The user reads the description on the thread's waiting row, so name \
-    the work in their words (\"the full e2e suite\"). When it prints `watched`, say what you are \
-    waiting for and END YOUR TURN: nothing is blocking, the thread re-opens with the exit status \
-    and the tail of the output, and waiting inside the turn would only re-read your whole context. \
-    If it prints `unwatched`, nothing will wake you: stop the task and run the command in the \
-    foreground. REDIRECT a chatty command's output to a log file (`<cmd> > /tmp/$(basename \
-    \"$PWD\").log 2>&1`) and `tail` it, so a long log never floods your context. SUBAGENTS ARE \
+    killed rather than moved to the background. KEEP EVERY BLOCKING CALL UNDER 4 MINUTES: the \
+    prompt cache lives 5 minutes, and a longer gap re-bills your whole context. Three shapes. \
+    FOREGROUND, for what surely finishes in about 3 minutes: set `timeout: 240000` EXPLICITLY \
+    (the 120000 ms DEFAULT cuts a build off at 2 minutes). Overrunning it kills the command, so \
+    do not gamble. POLLED BACKGROUND TASK, for longer work: `lucidos background-task \
+    run --poll --description \"<what it is>\" -- '<cmd>'` runs it in your worktree. Then \
+    `lucidos background-task wait <id>` (foreground, `timeout: 240000`) returns within 230 s \
+    with the new output; re-issue it until finished. WATCHED BACKGROUND TASK, for an open-ended \
+    wait such as a held lock: the same `run` without `--poll` arms an event wait. Name the work in the \
+    user's words (\"the full e2e suite\"): the waiting row shows it. On `watched`, say what you \
+    wait for and END YOUR TURN: the thread re-opens with the exit status and output tail. On \
+    `unwatched` nothing will wake you: stop it and poll instead. REDIRECT \
+    a chatty command's output to a log file \
+    (`<cmd> > \"${TMPDIR:-/tmp}/$(basename \"$PWD\").log\" 2>&1`) and `tail` it, so a long log \
+    never floods your context. SUBAGENTS ARE \
     BACKGROUND WORK TOO: a subagent dies with your process group, so its report must come back \
     inside the turn. Under Claude Code every `Agent` call blocks and hands you the report inline. \
     A fan-out still costs ONE wait: put every `Agent` call in a single assistant message and they \
@@ -283,8 +290,8 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
 /// Stated unconditionally, the pair yields a three-option card whose last button
 /// means only "I will type what I want changed". The NEVER AUTHOR AN "OTHER"
 /// OPTION paragraph below bans exactly that shape. `Implement in a new thread`
-/// counts like a fork, but only the plan rule and the CLI name it: this rule also
-/// serves external-repo sessions, which have no plan marker.
+/// replaces the pair when the thread's context is large, but only the CLI names
+/// it: this rule also serves external-repo sessions, which have no plan marker.
 ///
 /// The "WHY THE TOOL AND NOT PROSE" paragraph is what makes the two halves
 /// cohere instead of reading as a contradiction. Both describe ONE mechanism: a
@@ -348,7 +355,7 @@ const ASK_USER_QUESTION_RULE: &str =
      instead of two, a different approach), make that fork the second option and DROP `Request \
      changes`. The fork already satisfies the two-option minimum and carries a decision you can \
      act on, while a third `Request changes` beside it means only \"I will type what I want \
-     changed\", which is the escape every card already has. `Approve` stays first either way. \
+     changed\", which is the escape every card already has. `Approve` stays first beside a fork. \
      Picking a fork is still an approval: it approves that variant of the plan, and is not a \
      rejection.\n\n\
      A DANGLING ITEM IS A DECISION IN A STATEMENT'S CLOTHES. Naming something outstanding, \
@@ -544,13 +551,15 @@ const CODEX_CLI_RULE: &str = "\n\n\
     so the action is attributed to the agent, not the user.\n\
     - `lucidos spawn-thread --to <workspace> [--coding-agent claude-code|codex] --message ... \
     --title ...`: spawn a thread (always ask the user first). \
-    `--reasoning-effort low|medium|high|xhigh|max` pins its thinking level.\n\
+    `--reasoning-effort low|medium|high|xhigh|max` pins its effort. Add `--relation child` \
+    only to act on its result.\n\
     - `lucidos await-event --on <EventType> --timeout-secs <n> --reason \"...\"`: subscribe \
     this thread to a Lucidos event, then FINISH your session. It returns immediately and \
     blocks nothing. The engine re-opens this thread with a follow-up message when the event \
     lands, or tells you the deadline passed. Use it instead of a sleep-and-recheck loop \
     whenever you wait on something the engine persists (a change appearing, a trigger \
-    firing). NOT for a child you spawned: its completion already re-opens this thread. \
+    firing). NOT for a child you spawned: a failure re-opens this thread, and so does a clean \
+    report under `--wake-mode wake`, the default. `no-wake` files it for your next turn. \
     Do NOT poll for it afterwards, and do NOT keep the session alive waiting.\n\
     - `lucidos event-waits list` / `... cancel [--wait-id <id>|--all]`: read or stop this \
     thread's subscriptions. Nothing tells you when one ends, so `list` before claiming you \
@@ -708,8 +717,7 @@ const HTML_ARTIFACT_TYPE_SCALE_RULE: &str = "\n\n\
 const SHOWING_AN_IMAGE_RULE: &str = "\n\n\
     READING OR SAVING AN IMAGE DOES NOT SHOW IT TO THE USER: `Read` on a PNG is an INPUT. It \
     puts the picture in YOUR context and sends the user nothing: their step records that you \
-    read a file, never the picture. `lucidos data write artifacts/x.png --from /tmp/x.png` \
-    only stores it, and the user still sees nothing. It appears ONLY where you paste the line \
+    read a file, never the picture. `lucidos data write artifacts/x.png` only stores it, and the user still sees nothing. It appears ONLY where you paste the line \
     it prints, `![what it shows](artifacts/x.png)`. Before a card, put it ON the question card \
     (its text or an option's `preview` if your tool has one): words before a tool call arrive \
     as a short summary that drops it. Else, in the reply ending your turn. Same for a render or \
@@ -816,22 +824,87 @@ const READ_DECISION_RULE: &str = "\n\n\
     READ DECISION: End every turn with `lucidos request-read yes|no` before your final message. \
     Yes for an answer and no change (an investigation, a review), or one read later. Else no.";
 
+/// How a session continues in a *successor thread*. The procedure lives in
+/// `lucidos successor --help`. Advice from any other source to `/clear` or to
+/// write a handoff file is read the same way, without naming that source.
+const SUCCESSOR_THREAD_RULE: &str = "\n\n\
+    SUCCESSOR THREADS: When the user says \"handoff this session\", commit your work, write a \
+    handoff narrative and run `lucidos successor spawn --narrative <file>` (see its --help). In a \
+    Lucidos thread, advice to run `/clear` or write a handoff file means the same.";
+
+/// Told only to a sub-thread's session whose parent declared no wake mode. The
+/// chat agent learns the same from the `wake_parent` tool's own description.
+const WAKE_DECISION_RULE: &str = "\n\n\
+    WAKE DECISION: You are a sub-thread, and your turn's final message reports to your parent \
+    thread. Before that message, run `lucidos wake-parent yes|no`. Yes when your parent must \
+    act on it now: it waits for this result to take a next step, combine results, retry or \
+    decide. No when it only informs: the report is filed, and your parent reads it on its next \
+    turn. A failure always wakes it. Unsure, skip it: Lucidos decides.";
+
+/// The [`WAKE_DECISION_RULE`] section for a session on `thread_id`, or empty
+/// when the thread has no parent, or its spawn declared a wake mode.
+pub(super) async fn wake_decision_section(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+) -> &'static str {
+    if crate::engine::turn_end::wake_decision::WakeDuty::owes_a_decision(pool, thread_id).await {
+        WAKE_DECISION_RULE
+    } else {
+        ""
+    }
+}
+
+/// Told only to an *integrated sub-thread*'s session, naming the parent it
+/// folds into. The parent learns its half from the child's report and from the
+/// `lucidos-cli` skill.
+pub(super) async fn integrated_section(pool: &sqlx::PgPool, thread_id: uuid::Uuid) -> String {
+    let parent_title: Option<String> = sqlx::query_scalar(
+        "SELECT p.title FROM thread_summaries t \
+         JOIN thread_summaries p ON p.thread_id = t.parent_thread_id \
+         WHERE t.thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        log!("[AgentSession] parent title for {}: {}", thread_id, e);
+        None
+    })
+    .flatten();
+    integrated_rule(parent_title.as_deref())
+}
+
+/// The integrated sub-thread section, for a parent titled `parent_title`.
+fn integrated_rule(parent_title: Option<&str>) -> String {
+    let parent = match parent_title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(title) => format!("your parent thread \"{title}\""),
+        None => "your parent thread".to_string(),
+    };
+    format!(
+        "\n\nINTEGRATED SUB-THREAD: You are integrated into {parent}. Your branch folds into \
+         its branch, so Lucidos proposes nothing for yours: there is no change and no Apply. \
+         Run `/harden` before you finish, as always. It runs the fast tier: review, lint and \
+         the frontend checks, with no engine suite, and it skips merging main. Your parent's \
+         own /harden runs every suite once over the merged work. Commit everything, and do not \
+         merge main yourself. End with `lucidos wake-parent yes`: your report names your \
+         branch, and your parent's agent merges it."
+    )
+}
+
 /// Told only to a session whose turn the owner did not open (ADR 0387).
 /// Without it the agent learns from the 403, after an ordinary card's answer
 /// that grants nothing.
 const NO_STANDING_INSTRUCTION_NOTE: &str = "\n\n\
     THE OWNER DID NOT OPEN THIS TURN: another thread or an event did. So Lucidos refuses, with a \
-    403, any act in this workspace outside your own subtree. Examples are `lucidos spawn-thread \
-    --relation top`, and an Apply, archive or cancel on a thread outside your subtree. An \
-    ordinary question card cannot authorize one, even when the owner picks the option naming \
-    it. When the decision you would ask about is such an act, ask for an owner approval INSTEAD \
-    of an ordinary card. Run `lucidos ask-owner-approval create-top-thread --reason \"<why>\"` \
-    for a top-thread, or `lucidos ask-owner-approval <verb> --thread <uuid> --reason \"<why>\"` \
-    for an act on a thread (`lucidos ask-owner-approval --help` lists the verbs). Then ask your \
-    question tool with the id it prints as the only question. Lucidos shows its own owner \
-    approval card, with Allow once, in its place. A 409 from it means you hold the authority \
-    after all, for example because the owner has written to you since. Then go ahead as usual. \
-    `--relation child` stays in your subtree and needs neither.";
+    403, an act on a thread outside your own subtree, such as an Apply, archive or cancel. \
+    Spawning a thread, top-level or child, needs no authority. An ordinary question card cannot \
+    authorize such an act, even when the owner picks the option naming it. When the decision \
+    you would ask about is one, ask for an owner approval INSTEAD of an ordinary card. Run \
+    `lucidos ask-owner-approval <verb> --thread <uuid> --reason \"<why>\"` \
+    (`lucidos ask-owner-approval --help` lists the verbs). Then ask your question tool with the \
+    id it prints as the only question. Lucidos shows its own owner approval card, with Allow \
+    once, in its place. A 409 from it means you hold the authority after all, for example \
+    because the owner has written to you since. Then go ahead as usual.";
 
 /// The [`NO_STANDING_INSTRUCTION_NOTE`] section for a session on `thread_id`,
 /// or empty when its current turn carries the owner's standing instruction.
@@ -873,7 +946,7 @@ pub(super) fn append_backend_rules(
     let prompt = format!(
         "{prompt}{REASONING_NOT_VISIBLE_RULE}{SHOWING_AN_IMAGE_RULE}\
          {HTML_ARTIFACT_TYPE_SCALE_RULE}{NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}\
-         {PERMISSION_ASK_RULE}{READ_DECISION_RULE}"
+         {PERMISSION_ASK_RULE}{READ_DECISION_RULE}{SUCCESSOR_THREAD_RULE}"
     );
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
@@ -1276,9 +1349,156 @@ pub(crate) fn build_merge_prompt(
     prompt
 }
 
+/// The system prompt of a *lane thread*: the coding-agent thread that resolves
+/// a lane batch on its integration branch (ADR 0463). Its first prompt
+/// ([`build_lane_thread_prompt`]) names the members.
+pub(crate) fn lane_thread_system_prompt() -> &'static str {
+    "LANE THREAD: You resolve a lane batch. These are changes that would not merge \
+     cleanly onto main, so they land together. You work in the lane worktree, on the \
+     batch's integration branch. Nothing outside it is yours to change.\n\n\
+     RULES:\n\
+     - Merge each member exactly as your prompt lists it, one `git merge --no-ff` per \
+       member. That merge commit is the change's landing merge, so Revert later undoes \
+       exactly one change.\n\
+     - Resolve a conflict inside the merge that raised it. Read both sides, keep both \
+       intents working, `git add` each file, then `git commit --no-edit`.\n\
+     - Never rebase, never amend or squash a landing merge, and never reset the branch.\n\
+     - Never touch another worktree, least of all a source thread's.\n\
+     - When a resolution needs a judgment, ask the user with the question tool before \
+       you choose. Two changes that each add a competing mechanism is such a case.\n\
+     - After the last merge, run `/harden` once on the merged result.\n\n\
+     When everything is merged and hardened, end your turn with one short message: \
+     each conflicted file, and one sentence on how you resolved it. The engine lands \
+     the batch when your turn ends cleanly. A Stop or a failure fails the whole batch, \
+     and every member stays pending.\n\n\
+     COMMANDS: Never use /cpa. Commit with `git add` and `git commit` directly.\n\n\
+     CRITICAL: Never run `exit` as a bash command."
+}
+
+/// What a lane thread's prompt says about one member of its batch.
+pub(crate) struct LaneMemberBrief<'a> {
+    /// The member's thread title. It names the landing merge.
+    pub(crate) title: &'a str,
+    /// What the change does, from its description.
+    pub(crate) summary: &'a str,
+    pub(crate) branch: &'a str,
+    /// The exact commit the lane lands for it.
+    pub(crate) snapshot_sha: &'a str,
+}
+
+/// Longest member summary a lane prompt quotes. The thread title already says
+/// what the change is, so the summary only adds intent.
+const LANE_SUMMARY_CHARS: usize = 400;
+
+/// The first prompt of a lane thread: one landing merge per member, in lane
+/// order, then one `/harden`.
+pub(crate) fn build_lane_thread_prompt(members: &[LaneMemberBrief<'_>]) -> String {
+    let mut prompt = match members.len() {
+        1 => "This change would not merge cleanly onto main, so it lands through a lane \
+              batch. The integration branch starts at main. Merge it:\n"
+            .to_string(),
+        n => format!(
+            "These {n} changes would not merge cleanly onto main, so they land together as \
+             one lane batch. The integration branch starts at main. Merge them in this order:\n"
+        ),
+    };
+    for (i, member) in members.iter().enumerate() {
+        let message = shell_single_quote(&format!("Land: {}", member.title));
+        prompt.push_str(&format!(
+            "\n{}. {} (branch `{}`)\n   `git merge --no-ff {} -m {}`\n",
+            i + 1,
+            member.title,
+            member.branch,
+            member.snapshot_sha,
+            message
+        ));
+        let summary = member.summary.split("\n\n").next().unwrap_or("").trim();
+        if !summary.is_empty() {
+            let cut = summary.floor_char_boundary(LANE_SUMMARY_CHARS);
+            prompt.push_str(&format!("   What it does: {}\n", &summary[..cut]));
+        }
+    }
+    prompt.push_str(
+        "\nThen:\n\
+         1. Resolve each conflict inside the merge that raised it, then `git commit --no-edit`.\n\
+         2. Run `/harden` once, after the last merge. It reviews your resolutions and runs \
+            the suites the merged result needs.\n\
+         3. Ask the user with the question tool when a resolution needs a judgment.\n\
+         4. Never rebase, and never touch a source thread's worktree.\n\n\
+         End your turn when everything is merged and hardened. The batch lands then.",
+    );
+    prompt
+}
+
+/// How many of `main`'s new commits a catch-up prompt lists.
+const LANE_CATCH_UP_COMMITS: usize = 20;
+
+/// The follow-up turn a lane thread gets when `main` moved while it resolved,
+/// and the catch-up merge conflicted with its resolution. `commits` are
+/// one-line summaries of what `main` gained.
+pub(crate) fn build_lane_catch_up_prompt(main_sha: &str, commits: &[String]) -> String {
+    let mut prompt =
+        "main gained these commits while you resolved, and they conflict with the batch:\n"
+            .to_string();
+    for commit in commits.iter().take(LANE_CATCH_UP_COMMITS) {
+        prompt.push_str(&format!("- {commit}\n"));
+    }
+    if commits.len() > LANE_CATCH_UP_COMMITS {
+        prompt.push_str(&format!(
+            "- and {} more\n",
+            commits.len() - LANE_CATCH_UP_COMMITS
+        ));
+    }
+    prompt.push_str(&format!(
+        "\nMerge main with `git merge --no-ff {main_sha} -m 'Catch up with main'`, and resolve \
+         the conflicts inside that merge. Run `/harden` again if your resolution changed code. \
+         Then end your turn. The batch lands when it ends."
+    ));
+    prompt
+}
+
+/// `text` as one single-quoted shell word.
+fn shell_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule exempts exactly what Apply exempts, by naming the predicate
+    /// Apply reads. The binding below fails to compile once it is renamed.
+    #[test]
+    fn the_hardening_rule_exempts_by_the_engine_plan_file_predicate() {
+        let _: fn(&str) -> bool = crate::engine::git_ops::is_plan_file;
+        assert!(HARDENING_RULE.contains("(`git_ops::is_plan_file`)"));
+        assert!(HARDENING_RULE.contains("skip `/harden` there."));
+    }
+
+    /// An integrated sub-thread learns whom it folds into, that it runs the
+    /// fast tier and proposes nothing, and that its parent must hear now.
+    #[test]
+    fn the_integrated_section_names_the_parent_and_the_fast_tier() {
+        let rule = integrated_rule(Some("Fix the drawer"));
+        assert!(rule.contains("integrated into your parent thread \"Fix the drawer\""));
+        assert!(rule.contains("`/harden`"), "{rule}");
+        assert!(rule.contains("fast tier"), "{rule}");
+        assert!(rule.contains("proposes nothing"), "{rule}");
+        assert!(rule.contains("`lucidos wake-parent yes`"), "{rule}");
+        assert!(integrated_rule(None).contains("integrated into your parent thread."));
+        assert!(integrated_rule(Some("  ")).contains("integrated into your parent thread."));
+    }
+
+    /// Scratch files go to the per-user temp dir. `/tmp` is readable by every
+    /// local user, and on macOS `$TMPDIR` is not (ADR 0456).
+    #[test]
+    fn scratch_paths_name_the_per_user_temp_dir() {
+        assert!(BACKGROUND_PROCESS_RULE.contains("${TMPDIR:-/tmp}/"));
+        for rule in [BACKGROUND_PROCESS_RULE, SHOWING_AN_IMAGE_RULE] {
+            let rest = rule.replace("${TMPDIR:-/tmp}/", "");
+            assert!(!rest.contains("/tmp/"), "a bare /tmp scratch path: {rule}");
+        }
+    }
 
     /// A reply's file link opens the file preview modal only when the UI can
     /// resolve it. So the rule names the session's own locator, at its branch.
@@ -1301,6 +1521,69 @@ mod tests {
         for rule in [ASK_USER_QUESTION_RULE, CODEX_ASK_USER_QUESTION_RULE] {
             assert!(!rule.contains("`message`"), "{rule}");
         }
+    }
+
+    fn lane_member<'a>(title: &'a str, sha: &'a str) -> LaneMemberBrief<'a> {
+        LaneMemberBrief {
+            title,
+            summary: "Adds the thing.\n\nLonger notes nobody needs here.",
+            branch: "lucidos-claude-code-repo-lucidos-x",
+            snapshot_sha: sha,
+        }
+    }
+
+    /// One landing merge per member, in lane order, each naming its exact
+    /// snapshot and its change, then one `/harden`.
+    #[test]
+    fn lane_prompt_merges_each_member_as_its_own_landing_merge_in_order() {
+        let prompt = build_lane_thread_prompt(&[
+            lane_member("First fix", "aaa111"),
+            lane_member("Owner's tweak", "bbb222"),
+        ]);
+        let first = prompt
+            .find("git merge --no-ff aaa111 -m 'Land: First fix'")
+            .expect("the first member merges its snapshot");
+        let second = prompt
+            .find(r"git merge --no-ff bbb222 -m 'Land: Owner'\''s tweak'")
+            .expect("a quote in a title stays one shell word");
+        assert!(first < second, "lane order: {prompt}");
+        assert!(prompt.contains("These 2 changes"));
+        assert!(prompt.contains("What it does: Adds the thing."));
+        assert!(!prompt.contains("Longer notes"), "only the first paragraph");
+        assert_eq!(prompt.matches("/harden").count(), 1, "{prompt}");
+        assert!(prompt.contains("question tool"));
+        assert!(prompt.contains("Never rebase"));
+        assert!(prompt.contains("never touch a source thread's worktree"));
+    }
+
+    #[test]
+    fn lane_prompt_for_one_member_reads_singular() {
+        let prompt = build_lane_thread_prompt(&[lane_member("Only fix", "ccc333")]);
+        assert!(prompt.starts_with("This change would not merge cleanly"));
+        assert!(prompt.contains("git merge --no-ff ccc333 -m 'Land: Only fix'"));
+    }
+
+    /// The catch-up turn names what main gained and how to merge it, and
+    /// lists a bounded number of commits.
+    #[test]
+    fn lane_catch_up_prompt_names_main_and_its_new_commits() {
+        let commits: Vec<String> = (0..25).map(|n| format!("c{n} Land: change {n}")).collect();
+        let prompt = build_lane_catch_up_prompt("mainsha", &commits);
+        assert!(prompt.contains("- c0 Land: change 0"));
+        assert!(!prompt.contains("c24"), "the list is bounded");
+        assert!(prompt.contains("- and 5 more"));
+        assert!(prompt.contains("git merge --no-ff mainsha -m 'Catch up with main'"));
+        assert!(prompt.contains("end your turn"));
+    }
+
+    /// The lane thread asks rather than guesses, and never rebases.
+    #[test]
+    fn lane_system_prompt_keeps_the_landing_merges_and_asks_for_judgment() {
+        let prompt = lane_thread_system_prompt();
+        assert!(prompt.contains("question tool"));
+        assert!(prompt.contains("Never rebase"));
+        assert!(prompt.contains("/harden"));
+        assert!(prompt.contains("landing merge"));
     }
 
     /// The Lucidos-source merge prompt gates the merge on `/harden`, which picks
@@ -1646,15 +1929,20 @@ mod tests {
             for needle in [
                 "BACKGROUND PROCESSES DON'T SURVIVE A TURN",
                 "run_in_background",
-                // The two waits that work must both survive a rewrite. The
+                // The three waits that work must all survive a rewrite. The
                 // foreground call names its ceiling, or it degrades into the
-                // 120000 ms default that cuts a long build off.
+                // 120000 ms default that cuts a build off. The ceiling stays
+                // inside the 5-minute prompt cache.
                 "FOREGROUND",
-                "`timeout: 600000`",
-                // The background task is the event-wait answer: the engine owns
-                // the job and re-opens the thread, so the agent ENDS its turn
-                // rather than re-reading its context on every in-turn wait.
-                "lucidos background-task run",
+                "`timeout: 240000`",
+                "KEEP EVERY BLOCKING CALL UNDER 4 MINUTES",
+                // The polled task keeps the turn, and each wait returns inside
+                // the cache window.
+                "lucidos background-task run --poll",
+                "lucidos background-task wait <id>",
+                // The watched task is the event-wait answer for long work: the
+                // engine re-opens the thread, so the agent ENDS its turn.
+                "WATCHED BACKGROUND TASK",
                 "END YOUR TURN",
                 "`unwatched`",
                 // A long log re-read into context is the other cost, so the
@@ -1688,6 +1976,17 @@ mod tests {
                     "{label} must not ask for `{banned}`: the parameter no longer exists",
                 );
             }
+            // A 10-minute foreground wait outlives the prompt cache, and the
+            // wait the rule names returns within the engine's own cap.
+            assert!(
+                !prompt.contains("600000"),
+                "{label} still prescribes a 10-minute wait"
+            );
+            let cap = crate::engine::agent_session::background_task::AGENT_WAIT_MAX_SECS;
+            assert!(
+                prompt.contains(&format!("returns within {cap} s")),
+                "{label} must name the wait's {cap} s cap"
+            );
         }
 
         // The rule lives in the shared base, so both backends inherit it — the
@@ -1719,6 +2018,27 @@ mod tests {
                 .contains("BACKGROUND PROCESSES DON'T SURVIVE A TURN"),
             "merge-conflict prompt should omit the background-process rule",
         );
+    }
+
+    /// I12 for coding agents: an undeclared sub-thread's session learns the CLI
+    /// verb, and a parent learns what each wake mode does to its next report.
+    #[test]
+    fn coding_agents_are_told_how_a_report_reaches_the_parent() {
+        for needle in [
+            "lucidos wake-parent yes|no",
+            "report is filed",
+            "A failure always wakes it",
+        ] {
+            assert!(WAKE_DECISION_RULE.contains(needle), "missing {needle:?}");
+        }
+        for needle in [
+            "files it for your next turn",
+            "`--wake-mode wake`, the default",
+            // ADR 0473: work this thread will not act on is a top-thread.
+            "Add `--relation child` only to act on its result",
+        ] {
+            assert!(CODEX_CLI_RULE.contains(needle), "missing {needle:?}");
+        }
     }
 
     /// Byte ceiling for each assembled system prompt, measured AFTER
@@ -1785,29 +2105,45 @@ mod tests {
         // (ADR 0415), 85 bytes. Six rows had no slack and rose by it: these four
         // and both conflict_resolution rows. The embed is how an option carries
         // a sample the user must hear or try, and it rides the picture rule.
-        ("worktree", "claude-code", 27052),
-        ("worktree", "codex", 25192),
+        //
+        // EVERY Codex row rose by 103 to 119 bytes when `CODEX_CLI_RULE` said a
+        // child's clean report may be filed rather than re-open the thread. A
+        // Codex parent otherwise waits for a wake that never comes.
+        //
+        // EVERY row rose by 208 to 239 bytes for `SUCCESSOR_THREAD_RULE`. It
+        // is what turns "handoff this session", and advice to `/clear`, into
+        // a successor thread instead of a lost context.
+        //
+        // The Codex rows rose by 42 more, and two Lucidos-source rows by 3.
+        // Main grew `CODEX_CLI_RULE` and the plan rule beside the successor
+        // rule, and neither side left slack for the other.
+        //
+        // Most rows rose by up to 123 bytes for the large-thread plan card.
+        // The plan and ask rules now say it leads with `Implement in a new
+        // thread`, as `lucidos planned mark` prints it.
+        ("worktree", "claude-code", 27375),
+        ("worktree", "codex", 25646),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 19293),
-        ("external_repo", "codex", 17433),
-        ("recovery", "claude-code", 25568),
-        ("recovery", "codex", 23708),
-        ("external_repo_recovery", "claude-code", 19169),
-        ("external_repo_recovery", "codex", 17309),
-        ("app_worktree", "claude-code", 21895),
-        ("app_worktree", "codex", 20035),
-        ("app_worktree_recovery", "claude-code", 20459),
-        ("app_worktree_recovery", "codex", 18599),
+        ("external_repo", "claude-code", 19515),
+        ("external_repo", "codex", 17786),
+        ("recovery", "claude-code", 25891),
+        ("recovery", "codex", 24162),
+        ("external_repo_recovery", "claude-code", 19391),
+        ("external_repo_recovery", "codex", 17662),
+        ("app_worktree", "claude-code", 22117),
+        ("app_worktree", "codex", 20388),
+        ("app_worktree_recovery", "claude-code", 20681),
+        ("app_worktree_recovery", "codex", 18952),
         // Both conflict_resolution rows rose by about 115 bytes when
         // `SHOWING_AN_IMAGE_RULE` learned that saving a picture shows nothing
         // either. The other rows had the slack to absorb it. Both rose again,
         // by 384, for its visual-choice clause: a real picture per option.
-        ("conflict_resolution", "claude-code", 7203),
-        ("conflict_resolution", "codex", 8473),
+        ("conflict_resolution", "claude-code", 7442),
+        ("conflict_resolution", "codex", 8846),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
@@ -1907,6 +2243,26 @@ mod tests {
                 conflict_resolution_system_prompt().to_string(),
             ),
         ]
+    }
+
+    /// Every session, on both backends, learns the one handoff path, and the
+    /// rule names the CLI rather than any source of `/clear` advice.
+    #[test]
+    fn every_session_is_taught_the_successor_thread() {
+        for (flavor, prompt) in all_prompt_flavors() {
+            for (agent, label) in all_backends() {
+                let prompt = append_backend_rules(prompt.clone(), agent);
+                assert!(
+                    prompt.contains(SUCCESSOR_THREAD_RULE),
+                    "{flavor}/{label} lacks the successor rule"
+                );
+            }
+        }
+        assert!(SUCCESSOR_THREAD_RULE.contains("lucidos successor spawn"));
+        assert!(SUCCESSOR_THREAD_RULE.contains("`/clear`"));
+        // The composer's "Continue in a new thread" sends exactly this phrase.
+        let request = crate::engine::successor::HANDOFF_REQUEST;
+        assert!(SUCCESSOR_THREAD_RULE.contains(&format!("\"{request}\"")));
     }
 
     #[test]
@@ -2593,9 +2949,10 @@ mod tests {
                 // The card renders under the agent's message. A card restating
                 // the summary makes the user read the plan twice.
                 "never repeats the summary",
-                // Handing the build to a fresh thread counts like a fork. The
-                // when-and-how lives in `lucidos planned mark`'s output, not here.
-                "`Implement in a new thread` counts as a fork",
+                // The context size decides the card's shape, never the agent's
+                // judgement. `lucidos planned mark` prints the measured shape,
+                // and its when-and-how, so the rule only points there.
+                "Offer the options `lucidos planned mark` prints",
             ] {
                 assert!(
                     base.contains(needle),
@@ -3025,8 +3382,7 @@ mod tests {
 
     use crate::api::standing_instruction::tests::open_turn;
 
-    /// The case that refused a spawn the owner had picked on an ordinary card:
-    /// a thread another thread spawned. Its session must learn the approval
+    /// A thread another thread spawned. Its session must learn the approval
     /// path before it asks, not from the 403.
     #[tokio::test]
     async fn a_session_another_thread_opened_is_told_to_ask_for_an_owner_approval() {
@@ -3048,6 +3404,9 @@ mod tests {
         // Pins the CLI contract the note must teach: the command and its 409.
         assert!(section.contains("lucidos ask-owner-approval"), "{section}");
         assert!(section.contains("409"), "{section}");
+        // ADR 0475: a spawn is not among the acts it gates.
+        assert!(!section.contains("create-top-thread"), "{section}");
+        assert!(section.contains("needs no authority"), "{section}");
 
         pool.close().await;
         crate::test_support::teardown_test_db(&db_name).await;

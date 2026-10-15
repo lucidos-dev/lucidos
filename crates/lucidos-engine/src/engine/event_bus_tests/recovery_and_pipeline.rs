@@ -93,6 +93,7 @@ async fn engine_restart_continue_cycle_leaves_parent_blocking_count_at_zero() {
                 branch: "claude-code/test".into(),
                 origin: None,
                 reason: None,
+                resumed_abort_id: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),
@@ -135,6 +136,7 @@ async fn engine_restart_continue_cycle_leaves_parent_blocking_count_at_zero() {
                 actor: None,
                 pre_merge_sha: None,
                 post_merge_sha: None,
+                landing_merge_sha: None,
                 path: String::new(),
             },
             meta: EventMeta::NONE,

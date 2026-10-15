@@ -14,7 +14,8 @@ use uuid::Uuid;
 use crate::api::actor::user_actor;
 use crate::api::{ApiError, AppState};
 use crate::core::blobs::write_blob_from_base64;
-use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::core::store::{ComposeReport, ComposeReportRow, COMPOSE_REPORT_COLS};
+use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::thread_state::ThreadState;
 
@@ -82,6 +83,36 @@ pub(super) struct PutComposeBody {
     /// cannot know to send one.
     #[serde(default)]
     pub compose_epoch: Option<i64>,
+}
+
+/// A composer submission was accepted: consume the thread's compose slot and
+/// tell every device what that left (ADR 0450). `device_id` names the
+/// submitting device. Shared by `chat_submit` and the answer-question endpoint.
+pub(crate) async fn consume_and_announce_compose_slot(
+    state: &AppState,
+    thread_id: Uuid,
+    submitted_text: &str,
+    submitted_image_hashes: &[String],
+    device_id: Option<String>,
+) -> Result<Option<ComposeReport>, sqlx::Error> {
+    let report = crate::core::store::consume_compose_slot(
+        state.engine.pool(),
+        thread_id,
+        submitted_text,
+        submitted_image_hashes,
+    )
+    .await?;
+    if let Some(report) = &report {
+        state
+            .engine
+            .event_bus
+            .emit_or_log(
+                report.clone().broadcast(thread_id, device_id),
+                "[Compose] ThreadComposeChanged",
+            )
+            .await;
+    }
+    Ok(report)
 }
 
 /// Accept a compose mode in either spelling, and answer with the STORED one.
@@ -159,23 +190,35 @@ fn compose_error(state: Option<ThreadState>) -> Option<ApiError> {
 ///
 /// Idempotent on `id`: re-POSTing the same `{id, mode}` returns 200; a
 /// different `mode` returns 409 (the user's first device wins, drift would
-/// reopen the bug class this redesign closed).
+/// reopen the bug class this redesign closed). Both successes answer with the
+/// draft's *compose report*.
 pub(super) async fn post_thread(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<PostThreadBody>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<(StatusCode, Json<ComposeReport>), ApiError> {
     let mode = canonical_mode(&body.mode)?;
 
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT state, archive_state, compose_mode FROM thread_summaries WHERE thread_id = $1",
-    )
+    let row: Option<PostThreadRow> = sqlx::query_as(&format!(
+        "SELECT state, archive_state, {COMPOSE_REPORT_COLS} FROM thread_summaries WHERE thread_id = $1"
+    ))
     .bind(body.id)
     .fetch_optional(state.engine.pool())
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    if let Some((state_str, archive_state_str, existing_mode)) = row {
+    if let Some((
+        state_str,
+        archive_state_str,
+        version,
+        epoch,
+        text,
+        images,
+        stored_mode,
+        selection,
+    )) = row
+    {
+        let existing = ComposeReport::from((version, epoch, text, images, stored_mode, selection));
         let existing_state =
             ThreadState::from_db_str(&state_str).map_err(|e| ApiError::internal(e.to_string()))?;
         // Each arm fully handles its state — no spatial-ordering dependency
@@ -187,8 +230,8 @@ pub(super) async fn post_thread(
         // archived sub-case for a more specific 409 message.
         return match existing_state {
             ThreadState::Composing => {
-                if existing_mode.as_deref() == Some(mode) {
-                    Ok(StatusCode::OK)
+                if existing.mode.as_deref() == Some(mode) {
+                    Ok((StatusCode::OK, Json(existing)))
                 } else {
                     Err(ApiError::new(
                         StatusCode::CONFLICT,
@@ -225,8 +268,37 @@ pub(super) async fn post_thread(
         .emit(event)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(StatusCode::CREATED)
+    // `ThreadStarted` inserts with `ON CONFLICT DO NOTHING`, so a racing POST
+    // from another device may own the row. Read it back: the report is then
+    // whatever the row holds, in one consistent statement.
+    let row: ComposeReportRow = sqlx::query_as(&format!(
+        "SELECT {COMPOSE_REPORT_COLS} FROM thread_summaries WHERE thread_id = $1"
+    ))
+    .bind(body.id)
+    .fetch_one(state.engine.pool())
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let report = ComposeReport::from(row);
+    if report.mode.as_deref() != Some(mode) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "thread already exists with a different mode",
+        ));
+    }
+    Ok((StatusCode::CREATED, Json(report)))
 }
+
+/// `post_thread`'s lookup: the lifecycle columns, then [`COMPOSE_REPORT_COLS`].
+type PostThreadRow = (
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    JsonValue,
+    Option<String>,
+    Option<JsonValue>,
+);
 
 /// Upload a legacy inline-base64 compose batch and return its blob hashes.
 ///
@@ -269,29 +341,35 @@ fn upload_legacy_compose_images(
 /// consumed, so it was not applied. `412 Precondition Failed` is the exact HTTP
 /// semantic for a failed optimistic-concurrency check, and this endpoint's 409
 /// already means the unrelated mode lock, so the status alone tells the two
-/// apart without a bespoke error code. The body carries the current epoch so
-/// the client can adopt it and re-issue in one round trip.
+/// apart without a bespoke error code. The body carries the current *compose
+/// report*, so the client can adopt the epoch and re-issue in one round trip.
 ///
 /// Hand-built rather than returned through `ApiError`, which is a bare
-/// `{"error": msg}` and has nowhere to put the epoch.
-fn stale_compose_epoch_response(current_epoch: i64) -> Response {
+/// `{"error": msg}` and has nowhere to put the report.
+fn stale_compose_epoch_response(current: ComposeReport) -> Response {
+    #[derive(serde::Serialize)]
+    struct StaleBody {
+        error: &'static str,
+        #[serde(flatten)]
+        current: ComposeReport,
+    }
     (
         StatusCode::PRECONDITION_FAILED,
-        Json(serde_json::json!({
-            "error": "compose write is stale: the draft was consumed by a submission",
-            "compose_epoch": current_epoch,
-        })),
+        Json(StaleBody {
+            error: "compose write is stale: the draft was consumed by a submission",
+            current,
+        }),
     )
         .into_response()
 }
 
 /// PUT /api/v1/threads/:id/compose — update compose fields.
 ///
-/// One round-trip: `UPDATE ... RETURNING compose_mode, …` folds the
-/// state-machine guard, the mutation, and the SSE-payload read-back into a
-/// single query. Result: hot-path keystroke cost is one DB query plus one SSE
-/// broadcast. No event row written (per design — keystroke history isn't
-/// audit-worthy).
+/// One round-trip: `UPDATE ... RETURNING` folds the state-machine guard, the
+/// mutation, and the *compose report* read-back into a single query. The
+/// report is both the `200` body and the SSE payload. Hot-path keystroke cost
+/// is one DB query plus one SSE broadcast. No event row written (per design —
+/// keystroke history isn't audit-worthy).
 ///
 /// `mode` is COALESCE'd so text-only PUTs preserve the user's existing mode
 /// preference; explicit mode-change PUTs are rejected once the thread leaves
@@ -366,7 +444,7 @@ pub(super) async fn put_compose(
     // keystroke path because the epoch counts SUBMISSIONS, not writes: every
     // PUT between two submissions carries the same value, so only a write that
     // straddles a submission can fail it.
-    let row: Option<(Option<String>, JsonValue, Option<JsonValue>, i64)> = sqlx::query_as(
+    let row: Option<ComposeReportRow> = sqlx::query_as(&format!(
         "UPDATE thread_summaries
             SET compose_text = $2,
                 compose_images = COALESCE($3, compose_images),
@@ -382,8 +460,8 @@ pub(super) async fn put_compose(
             AND state IN ('composing', 'active')
             AND ($4::text IS NULL OR state = 'composing')
             AND ($6::bigint IS NULL OR compose_epoch = $6)
-         RETURNING compose_mode, compose_images, compose_selection, compose_epoch",
-    )
+         RETURNING {COMPOSE_REPORT_COLS}"
+    ))
     .bind(id)
     .bind(&body.text)
     .bind(images_bind.as_ref())
@@ -394,116 +472,113 @@ pub(super) async fn put_compose(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let (resolved_mode, post_compose_images, post_compose_selection, compose_epoch) = match row {
-        Some(r) => r,
-        None => {
-            // Cold path: UPDATE matched zero rows. A follow-up read tells the
-            // refusals apart, so the client gets the reason rather than a bare
-            // "not applied".
-            let lookup: Option<(String, i64)> = sqlx::query_as(
-                "SELECT state, compose_epoch FROM thread_summaries WHERE thread_id = $1",
-            )
-            .bind(id)
-            .fetch_optional(state.engine.pool())
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
-            let current_epoch = lookup.as_ref().map(|(_, e)| *e);
-            let st = lookup
-                .map(|(s, _)| ThreadState::from_db_str(&s))
-                .transpose()
-                .map_err(|e| ApiError::internal(e.to_string()))?;
-            // Answered most specific reason first, and the order is the
-            // contract. A missing or discarded row settles the request on its
-            // own. There is no draft to compose against, so neither the fence
-            // nor the mode lock applies.
-            if let Some(e) = compose_error(st) {
-                return Err(e);
-            }
-            // The fence before the mode lock, and the order is the fix. A write
-            // carrying an epoch a submission has consumed was composed against
-            // the pre-send state, where its mode was legal. The epoch is why it
-            // was not applied, and 412 is the one answer the client resyncs
-            // from silently. Asking about the mode first reported that race as
-            // an illegal mode change, and every keystroke write on a draft
-            // carries a mode. A silent 204 stays wrong for the reason it always
-            // was: the client would record the text as stored while the engine
-            // dropped it.
-            // See `docs/plans/2026-08-26-compose-mode-lock-masks-the-stale-write-fence.md`.
-            if let (Some(sent), Some(current)) = (body.compose_epoch, current_epoch) {
-                if sent != current {
-                    return Ok(stale_compose_epoch_response(current));
-                }
-            }
-            // Mode locks at first send. This write is CURRENT: it matched the
-            // epoch, or carried none. A mode here is a real divergence rather
-            // than a straggler. Archived rows carry state='active' and reach
-            // this naturally. Without it the request falls through to the 204
-            // below, which would swallow the mode change in silence.
-            if mode.is_some() && matches!(st, Some(ThreadState::Active)) {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    "mode is locked once the thread has been sent",
-                ));
-            }
-            // TOCTOU: a concurrent send between the UPDATE and the lookup may
-            // have flipped state to active, so the row now satisfies the state
-            // guard. Treat as a benign no-op: the concurrent path already wrote
-            // a more authoritative value.
-            return Ok(StatusCode::NO_CONTENT.into_response());
-        }
+    let Some(row) = row else {
+        return refuse_unapplied_compose(&state, id, body.compose_epoch, mode).await;
     };
+    let report = ComposeReport::from(row);
 
     let device_id = headers
         .get(crate::api::actor::HEADER_DEVICE_ID)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-
-    // Reads back whatever COALESCE produced — new hashes on a touched
-    // write, the existing array on a preserve write.
-    let hashes_for_event: Vec<String> = post_compose_images
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let event = BusEvent::System(SystemEvent::ThreadComposeChanged {
-        id,
-        text: body.text,
-        image_hashes: hashes_for_event,
-        mode: resolved_mode,
-        // Read back whatever COALESCE produced — the new object on a dropdown
-        // change, the existing stored object on a preserve (keystroke) write —
-        // so every SSE receiver hydrates the authoritative per-draft selection.
-        selection: post_compose_selection,
-        // Unchanged by a compose write (only a submission moves it), but
-        // carried anyway so every broadcast is a complete report of the
-        // thread's compose state and a receiver never has to merge two frames
-        // to know which epoch the text belongs to.
-        compose_epoch,
-        origin_device_id: device_id,
-    });
     state
         .engine
         .event_bus
-        .emit(event)
+        .emit(report.clone().broadcast(id, device_id))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    Ok(Json(report).into_response())
 }
+
+/// Why a compose UPDATE matched zero rows. A follow-up read tells the
+/// refusals apart, so the client gets the reason rather than a bare "not
+/// applied". Never a success: a `2xx` from the PUT means the write landed.
+async fn refuse_unapplied_compose(
+    state: &AppState,
+    id: Uuid,
+    sent_epoch: Option<i64>,
+    mode: Option<&str>,
+) -> Result<Response, ApiError> {
+    let lookup: Option<StateAndReportRow> = sqlx::query_as(&format!(
+        "SELECT state, {COMPOSE_REPORT_COLS} FROM thread_summaries WHERE thread_id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(state.engine.pool())
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (st, current) = match lookup {
+        Some((st, version, epoch, text, images, stored_mode, selection)) => (
+            Some(ThreadState::from_db_str(&st).map_err(|e| ApiError::internal(e.to_string()))?),
+            Some(ComposeReport::from((
+                version,
+                epoch,
+                text,
+                images,
+                stored_mode,
+                selection,
+            ))),
+        ),
+        None => (None, None),
+    };
+    // Answered most specific reason first, and the order is the contract. A
+    // missing or discarded row settles the request on its own. There is no
+    // draft to compose against, so neither the fence nor the mode lock applies.
+    if let Some(e) = compose_error(st) {
+        return Err(e);
+    }
+    let current: ComposeReport =
+        current.ok_or_else(|| ApiError::internal("compose row vanished"))?;
+    // The fence before the mode lock, and the order is the fix. A write
+    // carrying an epoch a submission has consumed was composed against the
+    // pre-send state, where its mode was legal. The epoch is why it was not
+    // applied, and 412 is the one answer the client resyncs from silently.
+    // Asking about the mode first reported that race as an illegal mode
+    // change. See `docs/plans/2026-08-26-compose-mode-lock-masks-the-stale-write-fence.md`.
+    if sent_epoch.is_some_and(|sent| sent != current.compose_epoch) {
+        return Ok(stale_compose_epoch_response(current));
+    }
+    // Mode locks at first send. This write is CURRENT: it matched the epoch,
+    // or carried none. A mode here is a real divergence rather than a
+    // straggler. Archived rows carry state='active' and reach this naturally.
+    if mode.is_some() && matches!(st, Some(ThreadState::Active)) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "mode is locked once the thread has been sent",
+        ));
+    }
+    // The row satisfies every guard now, so it did not exist when the UPDATE
+    // took its snapshot: the write raced the transaction creating the thread.
+    // The text was not stored, and the client must not record it as stored.
+    Err(ApiError::new(
+        StatusCode::CONFLICT,
+        "compose write raced the thread's creation and was not applied",
+    )
+    .with_reason("compose_not_applied"))
+}
+
+/// `refuse_unapplied_compose`'s lookup: `state`, then [`COMPOSE_REPORT_COLS`].
+type StateAndReportRow = (
+    String,
+    i64,
+    i64,
+    String,
+    JsonValue,
+    Option<String>,
+    Option<JsonValue>,
+);
 
 /// DELETE /api/v1/threads/:id — discard a composing thread.
 ///
 /// Idempotent on missing/already-discarded ids (204). Active threads must
-/// use archive instead (409).
+/// use archive instead (409). A discard it performs answers `200` with the
+/// `summary_version` of its `ThreadDiscarded`. The client holds the discard
+/// until the row reaches it (ADR 0437).
 pub(super) async fn delete_thread(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let lookup: Option<(String, String)> =
         sqlx::query_as("SELECT state, archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(id)
@@ -511,7 +586,7 @@ pub(super) async fn delete_thread(
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
     let Some((state_str, archive_state_str)) = lookup else {
-        return Ok(StatusCode::NO_CONTENT);
+        return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let current_state =
         ThreadState::from_db_str(&state_str).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -523,7 +598,7 @@ pub(super) async fn delete_thread(
     // state='active'.
     match current_state {
         ThreadState::Composing => {} // fall through to emit ThreadDiscarded
-        ThreadState::Discarded => return Ok(StatusCode::NO_CONTENT),
+        ThreadState::Discarded => return Ok(StatusCode::NO_CONTENT.into_response()),
         ThreadState::Active => {
             if archive_state_str == "archived" {
                 return Err(ApiError::new(
@@ -549,13 +624,14 @@ pub(super) async fn delete_thread(
             ..Default::default()
         },
     };
-    state
+    let emitted = state
         .engine
         .event_bus
         .emit(event)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
+    let summary_version = emitted.and_then(|e| e.summary_version);
+    Ok(Json(serde_json::json!({ "summary_version": summary_version })).into_response())
 }
 
 #[cfg(test)]

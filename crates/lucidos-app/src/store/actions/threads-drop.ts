@@ -8,7 +8,7 @@ import { focusedThreadId, threadMap } from '../store';
 import { forgetComposeState } from './compose';
 import { forgetUnsentMessagesOfThread } from '../unsentMessages';
 import { focusThread, unfocusThread, visibleCandidatesAround } from './threads';
-import { forgetThreadEventsFailures } from './thread-loading';
+import { forgetThreadEventsFailures, noteThreadDeleted } from './thread-loading';
 import { removeThreadNavEntries } from './thread-navigation';
 import { pruneRecents } from './entityReferences';
 
@@ -34,6 +34,7 @@ export function dropDeletedThreads(ids: readonly string[]): void {
   const next = new Map(threadMap.value);
   for (const id of gone) {
     next.delete(id);
+    noteThreadDeleted(id);
     // A thread that will never be fetched again owes the same cleanup a
     // discarded draft does: nothing may hold a pointer into it. `compose.ts`
     // owns eight private per-thread maps, so it does its own half.

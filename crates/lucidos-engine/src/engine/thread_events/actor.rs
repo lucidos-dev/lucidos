@@ -53,8 +53,18 @@ pub enum EngineReason {
     /// An archived thread's branch held work no change carried, so the
     /// engine set it aside rather than lose it (ADR 0328).
     ArchivedBranchWork,
-    /// Engine detected a merge conflict pulling main into a CC branch.
+    /// An integrated sub-thread's parent landed a change that did not carry
+    /// the sub-thread's work, so the engine set that work aside (ADR 0465).
+    UnmergedIntegratedWork,
+    /// A thread kept committing after it handed off to a successor thread.
+    /// The successor's change was resolved without that work, so the engine
+    /// set it aside.
+    SuccessorResidue,
+    /// Engine opened a merge-conflict resolution: a Tier-2 or Tier-3 merge,
+    /// or the lane thread of a lane batch.
     MergeConflict,
+    /// A red *main check* opened its *fix thread* (ADR 0464).
+    MainCheckRed,
     /// Engine detected the harden marker is missing: before an apply, or at a
     /// turn end whose proposal it held and told the agent to harden.
     MissingHardening,
@@ -110,7 +120,14 @@ pub enum EngineReason {
         watched: Vec<String>,
         wait_reason: String,
     },
+    /// A *cache keep-alive*: the engine resumed an idle Claude Code session
+    /// that waits, so its prompt cache stays warm. The turn leaves no trace.
+    CacheKeepAlive,
 }
+
+/// The serde `kind` of [`EngineReason::CacheKeepAlive`], for SQL that reads a
+/// keep-alive anchor. A test ties it to the tag.
+pub const CACHE_KEEP_ALIVE_REASON_KIND: &str = "cache_keep_alive";
 
 /// How an event wait ended, as the re-entry it caused reports it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

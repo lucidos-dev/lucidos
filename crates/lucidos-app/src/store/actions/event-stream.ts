@@ -22,7 +22,7 @@ export function setEventStream(stream: EventStream | null): void {
 /** Hand this document's `PresenceCheck` answer to the live transport.
  *
  *  Where that lands depends on the transport, and the caller must not care.
- *  Direct: POSTed straight away. Shared: sent to the worker, which ORs it with
+ *  Direct: POSTed straight away. Shared: sent to the worker, which merges it with
  *  its other ports' answers and POSTs exactly one pong for the workspace.
  *
  *  That indirection is what holds the engine's `expected_pong_count` equal to

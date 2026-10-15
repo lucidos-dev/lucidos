@@ -11,8 +11,35 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 
+/// How long a stopping engine may take before it exits regardless.
+///
+/// Its owner lock holds every successor until this process is gone, so a hung
+/// teardown must not last forever. Past the shell launcher's 15 s force-kill,
+/// which therefore still decides on that path.
+const TEARDOWN_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Run `on_expiry` once `deadline` has passed since the stop signal.
+///
+/// A plain thread rather than a tokio task, so a wedged runtime cannot hold it
+/// back. Exit code 0, because the engine was asked to stop and is stopping.
+fn arm_teardown_deadline(deadline: Duration, on_expiry: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline);
+        log!(
+            "[Shutdown] Teardown still running after {}s; exiting so a successor can own the workspace",
+            deadline.as_secs()
+        );
+        on_expiry();
+    });
+}
+
+/// How long open HTTP connections get to finish once the engine stops
+/// serving, on the TCP listeners and the engine socket alike.
+const HTTP_DRAIN: Duration = Duration::from_secs(10);
+
 async fn shutdown_signal(
     handle: axum_server::Handle,
+    socket_drain: tokio::sync::watch::Sender<bool>,
     engine: SharedEngine,
     scheduler: Arc<tokio::sync::Mutex<SchedulerManager>>,
 ) {
@@ -60,21 +87,30 @@ async fn shutdown_signal(
     }
 
     log!("\n[Shutdown] Shutting down gracefully...");
+    arm_teardown_deadline(TEARDOWN_DEADLINE, || std::process::exit(0));
 
     // Open the teardown. Two things happen here, and both must happen before
     // any cleanup event is emitted:
     //
-    // 1. The engine is marked shutting down, which stops the scheduler firing
-    //    event-triggers and stops an event-wait resolution opening a new turn.
-    //    The sweeps below emit terminator events that fan out to triggers, and
-    //    a trigger script's callback would then hit the HTTP API being torn
-    //    down. The scheduler's own shutdown flag is set far later, too late to
-    //    gate these events.
+    // 1. The engine is marked shutting down, which stops every trigger fire
+    //    from starting and stops an event-wait resolution opening a new turn.
+    //    The sweeps below emit terminator events that fan out to triggers,
+    //    and a cron slot can come due mid-teardown. Either fire's script
+    //    would then call back into the HTTP API being torn down.
     // 2. The teardown's ACTOR is decided once, for every emit inside it. A
     //    device actor means a user asked for this, and yields "You"
     //    attribution plus auto-resume on the next boot. `None` means nobody
     //    did, and yields System attribution plus a manual Continue.
     let teardown_actor = engine.begin_teardown();
+
+    // The main check's child runs in its own process group, so nothing else
+    // here stops it. Its cleanup cancels a GitHub run and deletes a branch,
+    // which takes seconds, so it starts now and runs beside the sweeps below.
+    // The next start abandons the check it was running.
+    let main_check_stopped = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.stop_main_check().await })
+    };
 
     // Emit the boundary "Switched to new version" and abort events at real
     // teardown, never at switch-request time. Nothing may show "Switched" while
@@ -105,7 +141,8 @@ async fn shutdown_signal(
     engine.shutdown_agent_sessions().await;
     engine.shutdown_active_threads().await;
 
-    handle.graceful_shutdown(Some(Duration::from_secs(10)));
+    handle.graceful_shutdown(Some(HTTP_DRAIN));
+    socket_drain.send_replace(true);
 
     // Avoid orphaning Chrome.
     engine.shutdown_browser().await;
@@ -117,6 +154,10 @@ async fn shutdown_signal(
 
     // And for the MCP server children, which nothing else on this path stops.
     shutdown_mcp_servers(&engine).await;
+
+    if let Err(e) = main_check_stopped.await {
+        log!("[Shutdown] Stopping the main check panicked: {}", e);
+    }
 
     if let Err(e) = scheduler.lock().await.shutdown().await {
         log!("[Shutdown] Error shutting down scheduler: {}", e);
@@ -500,11 +541,51 @@ async fn resolve_bind_choice(engine: &SharedEngine) -> net_config::BindChoice {
     )
 }
 
+/// Become this workspace's one engine, waiting for any predecessor to exit.
+///
+/// The owner lock is the whole mechanism. A respawn signals the old engine and
+/// spawns this one at once. So the old one may still be emitting its teardown
+/// boundary and draining its sessions. The kernel releases its lock only when
+/// its process is gone. So no migration, listener, relay or recovery here can
+/// overlap it, however slow its drain (ADR 0438).
+///
+/// Only the holder publishes `engine.pid`, which is what lets every reader trust
+/// the pid while the lock is held. While it waits, this engine names itself
+/// under the successor lock instead, so a stop that lands mid-respawn finds it.
+async fn own_workspace(
+    workspace: &std::path::Path,
+) -> std::io::Result<lucidos_owner_lock::OwnerLock> {
+    use lucidos_owner_lock::{engine, OwnerLock};
+    let workspace = workspace.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let successor = OwnerLock::acquire(&engine::successor_lock_path(&workspace))?;
+        successor.publish_pid(&engine::successor_pid_path(&workspace))?;
+        let lock_path = engine::lock_path(&workspace);
+        let lock = match OwnerLock::try_acquire(&lock_path)? {
+            Some(lock) => lock,
+            None => {
+                log!("[Startup] Another engine still owns this workspace; waiting for it to exit");
+                OwnerLock::acquire(&lock_path)?
+            }
+        };
+        // Named as the owner before the successor lock lets go, so no stop
+        // landing in between finds neither.
+        lock.publish_pid(&engine::pid_path(&workspace))?;
+        drop(successor);
+        log!("[Startup] Acquired the workspace's owner lock");
+        Ok(lock)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Before any TLS use, and before anything that might reach the network.
     lucidos_engine::net_config::install_crypto_provider();
 
     let _ = dotenvy::dotenv();
+    // Before anything spawns: no child may inherit the engine's database.
+    lucidos_engine::core::scrub_database_url_from_process_env();
 
     // macOS defaults to 256, too low for concurrent coding-agent sessions, SSE
     // streams, the DB pool and static file serving.
@@ -542,8 +623,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
 
-    std::fs::create_dir_all(&workspace_path)?;
+    lucidos_home::ensure_storage_root(&workspace_path)?;
     log!("[Startup] Using workspace: {}", workspace_path.display());
+    // Before the wait for a predecessor, which still holds its own consumer
+    // lock, so the build-watch never sees a moment with no consumer.
+    if let Some(static_dir) = std::env::var_os("LUCIDOS_STATIC_DIR") {
+        lucidos_engine::engine::register_as_build_watch_consumer(std::path::Path::new(&static_dir));
+    }
+    // Held as a `run()` local for this engine's whole life. Nothing stateful
+    // may run before it: see `own_workspace`.
+    let _owner_lock = own_workspace(&workspace_path).await?;
+    // Resolved now, while the workspace path is at hand, and bound only once
+    // the router can answer: a socket bound early would queue the gateway's
+    // requests against an engine still booting, instead of refusing them.
+    let socket_path = lucidos_engine_socket::path_for(&workspace_path).inspect_err(|e| {
+        log!("[Startup] this workspace has no engine socket: {e}");
+    })?;
     // Names the keep-awake assertion, so `pmset -g assertions` tells one
     // workspace's engine from another's.
     if let Some(name) = workspace_path.file_name().and_then(|n| n.to_str()) {
@@ -776,6 +871,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         engine.current_provider().default_model(),
     )
     .await;
+    lucidos_engine::core::PreferenceStore::replace_retired_values(engine.pool(), &engine.event_bus)
+        .await;
     // Apply stored env vars to the engine's OWN process env, so every
     // engine-internal shell-out that inherits it sees them. Runs after the
     // migration, so just-migrated vars are included. Reserved names are
@@ -945,6 +1042,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.event_bus.hold_parent_wakes();
     shared_engine.start_parent_callback_listener();
     shared_engine.start_apply_all_driver();
+    shared_engine.start_landing_lane_driver();
+    shared_engine.start_main_check_driver();
     shared_engine.start_standing_apply_resolver();
     shared_engine.start_archive_request_resolver();
     // The slot boots empty and the model is installed live once it lands, so
@@ -962,23 +1061,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // them on the boot splash.
     lucidos_engine::boot_report::report(lucidos_engine::boot_report::RECOVERING);
     boot_stages.lap("pre-recovery setup");
-
-    // Acquired BEFORE any reset or recovery below. A respawn is not atomic. The
-    // gateway spawns this engine before the previous one exits, so the sweeps
-    // would otherwise run against a DB the old engine is still mutating.
-    //
-    // The lease is a per-database advisory lock. The predecessor holds it until
-    // its process exits, so this call blocks until recovery can run against a
-    // quiescent DB. Held as a `run()` local for this engine's whole lifetime,
-    // and released for OUR successor when `run()` returns. Fail-open and
-    // bounded, so a hung predecessor cannot wedge boot. See
-    // `docs/plans/2026-07-01-engine-startup-lease-recovery-race.md`.
-    let _startup_lease = lucidos_engine::engine::startup_lease::acquire_startup_lease(
-        &database_url,
-        lucidos_engine::engine::startup_lease::DEFAULT_MAX_WAIT,
-    )
-    .await;
-    boot_stages.lap("startup lease");
 
     // A respawn sidecar means the previous engine died unexpectedly, so record
     // it in the audit timeline. Emits before recovery, so the timeline reads
@@ -1234,6 +1316,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //    that passed expires loudly on the next sweep tick.
     // 4. The abandoned-background-task sweep between steps 2 and 3, for the
     //    reason stated at its own call site below.
+    // Recovery has read the keep-alive flags, and the dispatcher below starts
+    // the beats that set them again.
+    shared_engine.event_bus.reset_keep_alive_turns().await;
     shared_engine.start_wait_reentry_consumer();
     shared_engine.start_event_wait_dispatcher();
     shared_engine.start_background_task_reaper();
@@ -1276,6 +1361,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // terminal event, and the frontend's "Applying changes" toast never clears.
     shared_engine.recover_apply_all_batches().await;
 
+    // Rebuild the landing lane's queue and resolving batch from events, and
+    // heal a landing a crash cut off. Same ordering rule as the batch recovery
+    // above: a member whose resume is queued is left to that resume.
+    shared_engine.recover_landing_lane().await;
+
+    // Rebuild the main check from events. A check this restart cut off is
+    // abandoned, and a red's fix thread that never got its prompt gets it.
+    // The driver started earlier holds every landing until this arrives.
+    shared_engine.recover_main_check();
+
     // Re-take every standing apply's verdict against current state. A thread
     // that settled while the engine was down gets its apply now, and one that
     // failed gets its report. Same ordering rule as the batch recovery above.
@@ -1287,6 +1382,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lucidos_engine::engine::pending_change_watch::spawn(shared_engine.clone());
     lucidos_engine::engine::summary_tree::spawn(shared_engine.clone());
     lucidos_engine::engine::agent_recovery::spawn_branch_work_net(shared_engine.clone());
+    lucidos_engine::engine::successor::spawn_successor_archive_net(shared_engine.clone());
 
     // Serve the last discovered Claude Code model list, and refresh it in the
     // background when it is missing or stale.
@@ -1308,12 +1404,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cleanup_wake,
     );
 
-    // The coding-agent spawn dispatcher. ContinuationRequested triggers are
-    // production-active and push onto the dispatcher's outbound channel, which
-    // `start_spawn_request_consumer` below drains. MessageReceived triggers
-    // stay in SHADOW mode, because the chat HTTP handler still owns spawning
-    // and its post-processing is not event-driven yet. See `spawn_dispatcher`
-    // and `docs/plans/2026-04-24-cc-resume-spike-q7.md`.
+    // The coding-agent spawn dispatcher. Every ContinuationRequested reaches it
+    // on the bus's directed channel, which exists from the bus's creation. Its
+    // outbound channel is what `start_spawn_request_consumer` below drains.
     let (_dispatcher_handle, spawn_request_rx) =
         lucidos_engine::engine::spawn_dispatcher::SpawnDispatcher::spawn(
             shared_engine.pool().clone(),
@@ -1324,18 +1417,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Auto-resume the coding-agent threads recovery flagged for a user-initiated
     // Switch to new version.
     //
-    // Emitted HERE, after `SpawnDispatcher::spawn()` opened its broadcast
-    // subscription synchronously, so these emits are buffered even while its
-    // startup backfill runs. Recovery itself is too early, because the
-    // dispatcher did not exist yet. The dispatcher's own orphan re-dispatch is
-    // the durable floor if an emit is lost anyway.
+    // A request emitted here waits on the bus's directed channel until the
+    // dispatcher drains it, so it cannot be lost to ordering.
     //
     // Crash-interrupted threads were NOT queued, so this never re-runs work
     // that may have crashed the engine. The returned ids are what
     // `settle_unresumed_switch_threads` must NOT touch, so they are held until
     // that floor runs at the end of boot.
     //
-    // This drains the queue, so `recover_apply_all_batches` must stay above it.
+    // This drains the queue, so `recover_apply_all_batches` and
+    // `recover_landing_lane` must stay above it.
     let mut resumed_switch_threads: std::collections::HashSet<uuid::Uuid> = shared_engine
         .resume_pending_switches()
         .await
@@ -1356,27 +1447,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // recovery above; one that bound no thread ran nothing, so it re-queues.
     shared_engine.thread_queue.recover_persisted_entries().await;
 
-    // Keep the in-memory user-initiated pool a faithful mirror of each thread's
-    // `thread_summaries.status` (ADR 0010). One subscriber reconciles the slot
-    // on every status change.
-    //
-    // Without it the slot frees only when the chat task returns, which never
-    // happens while a coding-agent thread is parked on a question. Subscribe
-    // before the API server, whose chat handler acquires user slots.
-    shared_engine.thread_queue.spawn_settle_subscriber();
+    // Admission reads user occupancy itself (ADR 0443). This subscriber only
+    // drains, and refreshes the panel, when a user thread starts or stops
+    // running, so a freed slot admits waiting work at once.
+    shared_engine.thread_queue.spawn_drain_hint_subscriber();
 
     // Chat parity of `resume_pending_switches` above: auto-resume the chat /
     // trigger threads a user-initiated Switch to new version interrupted. Same
     // cause gate as the coding-agent half (a device-attributed EngineShutdown
     // teardown abort), so a crash still falls back to the manual Continue.
     //
-    // Deliberately LATER than the coding-agent drain. A coding-agent resume
-    // only needs the spawn dispatcher subscribed. A chat resume re-enters the
-    // agentic loop directly and reads as `running` at once, so it must follow
-    // `spawn_settle_subscriber()` above. Otherwise that status change
-    // reconciles no Thread Queue slot. It must also follow
-    // `recover_orphan_tool_calls`, or the re-entered turn rebuilds an unpaired
-    // `tool_use` block.
+    // It must follow `recover_orphan_tool_calls`, or the re-entered turn
+    // rebuilds an unpaired `tool_use` block.
     resumed_switch_threads.extend(shared_engine.resume_pending_chat_switches().await);
 
     // Boot floor (ADR 0045). Every *Switch to new version* promises the
@@ -1481,9 +1563,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = addrs[0];
     let bind_label = net_config::bind_scope_label(&bind_choice);
 
+    // The gateway reaches this engine here, never on the TCP port (ADR 0445).
+    // Bound well after the owner lock, so removing a stale socket file can
+    // never unlink a live engine's. A failure stops the boot: a gateway could
+    // not reach an engine without it.
+    let socket_listener = lucidos_engine_socket::bind(&socket_path).inspect_err(|e| {
+        log!("[Startup] cannot bind the engine socket: {e}");
+    })?;
+    log!("[Startup] Engine socket at {}", socket_path.display());
+    let (socket_drain, socket_draining) = tokio::sync::watch::channel(false);
+    let socket_server = lucidos_engine::api::engine_socket::serve(
+        socket_listener,
+        app.clone(),
+        socket_draining,
+        HTTP_DRAIN,
+    );
+
     let handle = axum_server::Handle::new();
-    tokio::spawn(shutdown_signal(
+    let shutdown = tokio::spawn(shutdown_signal(
         handle.clone(),
+        socket_drain,
         shared_engine.clone(),
         scheduler,
     ));
@@ -1519,12 +1618,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             addr,
             bind_label
         );
-        futures::future::try_join_all(addrs.into_iter().map(|a| {
+        let tcp = futures::future::try_join_all(addrs.into_iter().map(|a| {
             axum_server::bind_rustls(a, tls_config.clone())
                 .handle(handle.clone())
                 .serve(app.clone().into_make_service())
-        }))
-        .await?;
+        }));
+        serve_until_shutdown(tcp, socket_server).await?;
     } else {
         log!(
             "[Startup] API server listening on {}://{}  ({})",
@@ -1532,15 +1631,153 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             addr,
             bind_label
         );
-        futures::future::try_join_all(addrs.into_iter().map(|a| {
+        let tcp = futures::future::try_join_all(addrs.into_iter().map(|a| {
             axum_server::bind(a)
                 .handle(handle.clone())
                 .serve(app.clone().into_make_service())
-        }))
-        .await?;
+        }));
+        serve_until_shutdown(tcp, socket_server).await?;
     }
 
+    // The listeners stop partway through the teardown, before Chrome, the
+    // preview and the MCP children are stopped. Returning now would drop the
+    // runtime and cancel that cleanup, orphaning them.
+    if let Err(e) = shutdown.await {
+        log!("[Shutdown] teardown task failed: {e}");
+    }
     Ok(())
+}
+
+/// Run the TCP listeners and the engine socket until both have drained. A TCP
+/// bind failure returns at once, as it did before the socket existed.
+async fn serve_until_shutdown<T, E>(
+    tcp: impl std::future::Future<Output = Result<T, E>>,
+    socket: impl std::future::Future<Output = ()>,
+) -> Result<(), E> {
+    tokio::pin!(tcp);
+    tokio::pin!(socket);
+    tokio::select! {
+        served = &mut tcp => {
+            served?;
+            socket.await;
+        }
+        () = &mut socket => {
+            tcp.await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::{arm_teardown_deadline, own_workspace};
+    use std::time::Duration;
+
+    /// A teardown that never finishes still ends the process. The expiry is
+    /// observed through a channel, so the test waits on the event itself.
+    #[test]
+    fn a_teardown_that_never_finishes_still_expires() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        arm_teardown_deadline(Duration::from_millis(1), move || tx.send(()).unwrap());
+        rx.recv().expect("the deadline fired");
+    }
+
+    /// The deadline only bounds a teardown if the stop path arms it.
+    #[test]
+    fn the_stop_signal_arms_the_teardown_deadline() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("async fn shutdown_signal(")
+            .expect("shutdown_signal exists");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("it ends")];
+        let signalled = body.find("tokio::select!").expect("it waits for a signal");
+        let armed = body
+            .find("arm_teardown_deadline(TEARDOWN_DEADLINE")
+            .expect("the stop path arms the teardown deadline");
+        let teardown = body.find("begin_teardown()").expect("it tears down");
+        assert!(
+            signalled < armed && armed < teardown,
+            "armed on the signal, before teardown"
+        );
+    }
+
+    /// The workspace root is a storage root before anything opens it. Pinned
+    /// on the source, like the owner-lock order below.
+    #[test]
+    fn the_workspace_is_a_storage_root_before_it_is_owned() {
+        let source = include_str!("main.rs");
+        let body = &source[source.find("async fn run()").expect("run() exists")..];
+        let asserted = body
+            .find("ensure_storage_root(&workspace_path)")
+            .expect("run() makes the workspace a storage root");
+        let owned = body
+            .find("own_workspace(&workspace_path)")
+            .expect("run() takes the workspace's owner lock");
+        assert!(
+            asserted < owned,
+            "the owner lock writes into the workspace first"
+        );
+    }
+
+    /// Nothing stateful may run before the workspace is owned. Pinned on the
+    /// source, because the property is an ordering inside one long function.
+    #[test]
+    fn the_owner_lock_comes_before_anything_stateful() {
+        let source = include_str!("main.rs");
+        let body = &source[source.find("async fn run()").expect("run() exists")..];
+        let owned = body
+            .find("own_workspace(&workspace_path)")
+            .expect("run() takes the workspace's owner lock");
+        for stateful in [
+            "PgPoolOptions",
+            "vertex_relay::start",
+            "boot_report::report",
+            "recover_orphaned",
+            "lucidos_engine_socket::bind",
+            "axum_server::bind",
+        ] {
+            let at = body
+                .find(stateful)
+                .unwrap_or_else(|| panic!("{stateful} moved"));
+            assert!(owned < at, "{stateful} runs before the owner lock is held");
+        }
+    }
+
+    /// The successor's half of the respawn: it owns the workspace, and names
+    /// itself, only once the predecessor has let go.
+    #[tokio::test]
+    async fn a_successor_owns_the_workspace_only_after_its_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = lucidos_owner_lock::engine::lock_path(dir.path());
+        let pid_path = lucidos_owner_lock::engine::pid_path(dir.path());
+        let predecessor = lucidos_owner_lock::OwnerLock::acquire(&lock_path).unwrap();
+        std::fs::write(&pid_path, "4242").unwrap();
+
+        let workspace = dir.path().to_path_buf();
+        let successor = tokio::spawn(async move { own_workspace(&workspace).await });
+        // A stop must find the waiting successor. Wait on that event itself.
+        while lucidos_owner_lock::engine::waiting_pid(dir.path()).is_none() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !successor.is_finished(),
+            "the successor ran while the predecessor lived"
+        );
+        assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), "4242");
+        assert_eq!(
+            lucidos_owner_lock::engine::waiting_pid(dir.path()),
+            Some(std::process::id())
+        );
+
+        drop(predecessor);
+        let lock = successor.await.unwrap().expect("the lock frees");
+        assert_eq!(
+            lucidos_owner_lock::engine::live_pid(dir.path()),
+            Some(std::process::id())
+        );
+        assert_eq!(lucidos_owner_lock::engine::waiting_pid(dir.path()), None);
+        drop(lock);
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use super::super::LucidosEngine;
+use crate::engine::thread_events::{EventMeta, McpEnablementSource};
 use crate::mcp::McpStopOutcome;
 use std::collections::HashMap;
 
@@ -13,10 +14,13 @@ fn tool_array_refreshes() -> bool {
 }
 
 impl LucidosEngine {
+    /// `thread_id` is the calling thread: `enable`, `disable`, `start` and
+    /// `setup` act on its own enabled servers (ADR 0430).
     pub(crate) async fn execute_mcp_management_tool(
         &self,
         name: &str,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "setup_mcp_server" => {
@@ -58,6 +62,7 @@ impl LucidosEngine {
 
                 self.mcp_manager
                     .setup_server(
+                        thread_id,
                         id,
                         server_name,
                         command,
@@ -74,10 +79,16 @@ impl LucidosEngine {
                 if statuses.is_empty() {
                     return Ok("No MCP servers configured.".to_string());
                 }
+                let enabled = self.mcp_manager.enabled_servers(thread_id).await;
 
                 let mut output = String::from("MCP Servers:\n");
                 for s in &statuses {
-                    let status = if s.running { "running" } else { "stopped" };
+                    let status = match (s.running, enabled.contains(&s.id)) {
+                        (true, true) => "running, enabled in this thread",
+                        (true, false) => "running",
+                        (false, true) => "stopped, enabled in this thread",
+                        (false, false) => "stopped",
+                    };
                     let approve = if s.auto_approve { ", auto-approve" } else { "" };
                     let unusable = if s.dispatchable {
                         ""
@@ -105,13 +116,16 @@ impl LucidosEngine {
                         })
                         .collect();
                     if !offered.is_empty() {
-                        // A stopped server pays nothing today, so its figure is
-                        // conditional and has to read that way. The source says
-                        // how old the list is, since a cached one can be stale.
+                        // Only a thread that enables a server pays for its
+                        // tools (ADR 0430). The source says how old the list is,
+                        // since a cached one can be stale.
                         let cost = if s.running {
-                            format!("live, ~{} tokens per request", s.tokens)
+                            format!("live, ~{} tokens in each thread that enables it", s.tokens)
                         } else {
-                            format!("last observed, ~{} tokens if started", s.tokens)
+                            format!(
+                                "last observed, ~{} tokens in each thread that enables it",
+                                s.tokens
+                            )
                         };
                         output.push_str(&format!(
                             "  Tools ({}, {}): {}\n",
@@ -141,14 +155,43 @@ impl LucidosEngine {
                 Ok(output)
             }
 
-            "start_mcp_server" => {
+            // `start` from a thread enables the server there too, so the
+            // agent's habit of starting what it needs keeps working.
+            "start_mcp_server" | "enable_mcp_server" => {
                 let id = args["id"].as_str().unwrap_or("");
                 if id.is_empty() {
                     return Ok("Error: id is required".to_string());
                 }
-                match self.mcp_manager.start_server(id).await {
+                match self
+                    .mcp_manager
+                    .enable_for_thread(thread_id, id, McpEnablementSource::Agent, EventMeta::NONE)
+                    .await
+                {
                     Ok(outcome) => Ok(outcome.describe(id, tool_array_refreshes())),
-                    Err(e) => Err(format!("Failed to start MCP server: {}", e).into()),
+                    Err(e) => Err(format!("Failed to enable MCP server: {}", e).into()),
+                }
+            }
+
+            "disable_mcp_server" => {
+                let id = args["id"].as_str().unwrap_or("");
+                if id.is_empty() {
+                    return Ok("Error: id is required".to_string());
+                }
+                match self
+                    .mcp_manager
+                    .disable_for_thread(thread_id, id, McpEnablementSource::Agent, EventMeta::NONE)
+                    .await
+                {
+                    Ok(true) => Ok(format!(
+                        "MCP server '{}' is disabled in this thread. Its tools leave this \
+                         thread's next step. The process keeps running for other threads.",
+                        id
+                    )),
+                    Ok(false) => Ok(format!(
+                        "MCP server '{}' was not enabled in this thread.",
+                        id
+                    )),
+                    Err(e) => Err(format!("Failed to disable MCP server: {}", e).into()),
                 }
             }
 
@@ -157,13 +200,20 @@ impl LucidosEngine {
                 if id.is_empty() {
                     return Ok("Error: id is required".to_string());
                 }
-                match self.mcp_manager.stop_server(id).await {
-                    Ok(McpStopOutcome::Stopped { name }) => {
-                        Ok(format!("MCP server '{}' stopped.", name))
-                    }
-                    Ok(McpStopOutcome::WasNotRunning) => {
-                        Ok(format!("MCP server '{}' is not running.", id))
-                    }
+                match self
+                    .mcp_manager
+                    .stop_everywhere(id, Some(super::agent_tool_actor(thread_id)))
+                    .await
+                {
+                    Ok(Some(McpStopOutcome::Stopped { name })) => Ok(format!(
+                        "MCP server '{}' stopped, and it is switched off in every thread.",
+                        name
+                    )),
+                    Ok(Some(McpStopOutcome::WasNotRunning)) => Ok(format!(
+                        "MCP server '{}' was not running. It is now switched off in every thread.",
+                        id
+                    )),
+                    Ok(None) => Ok(format!("MCP server '{}' not found.", id)),
                     Err(e) => Err(format!("Failed to stop MCP server: {}", e).into()),
                 }
             }
@@ -173,10 +223,11 @@ impl LucidosEngine {
                 if id.is_empty() {
                     return Ok("Error: id is required".to_string());
                 }
-                // No actor: this handler is not given the calling thread, the
-                // same as every other mutation in this file. The HTTP route
-                // stamps the device.
-                match self.mcp_manager.remove_server(id, None).await {
+                match self
+                    .mcp_manager
+                    .remove_server(id, Some(super::agent_tool_actor(thread_id)))
+                    .await
+                {
                     Ok(true) => Ok(format!("MCP server '{}' removed.", id)),
                     Ok(false) => Ok(format!("MCP server '{}' not found.", id)),
                     Err(e) => Err(format!("Failed to remove MCP server: {}", e).into()),

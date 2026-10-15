@@ -89,6 +89,7 @@ mod reply_text_tests {
             unknown_sse_dropped: 0,
             model_only_text: model_only.map(str::to_string),
             progress_notes: Vec::new(),
+            service_tier: None,
         }
     }
 

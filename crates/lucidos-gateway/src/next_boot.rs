@@ -93,39 +93,14 @@ pub fn take(app_data: &Path) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// A throwaway app-data dir that removes itself.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("the clock is after the epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("lucidos-next-boot-{tag}-{unique}"));
-            std::fs::create_dir_all(&path).expect("create the temp dir");
-            Self(path)
-        }
-
-        fn write(&self, body: &str) {
-            std::fs::write(record_path(&self.0), body).expect("write the record");
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn write_record(app_data: &Path, body: &str) {
+        std::fs::write(record_path(app_data), body).expect("write the record");
     }
 
     #[test]
     fn a_restore_record_names_the_workspaces_to_bring_back() {
-        let tmp = TempDir::new("restore");
-        tmp.write(r#"{"restore":["myws","dev"]}"#);
+        let tmp = tempfile::tempdir().unwrap();
+        write_record(tmp.path(), r#"{"restore":["myws","dev"]}"#);
         assert_eq!(take(tmp.path()), vec!["myws", "dev"]);
     }
 
@@ -133,8 +108,8 @@ mod tests {
     // not come back to life on the next launch.
     #[test]
     fn a_quit_record_restores_nothing() {
-        let tmp = TempDir::new("quit");
-        tmp.write(r#"{"quit":true}"#);
+        let tmp = tempfile::tempdir().unwrap();
+        write_record(tmp.path(), r#"{"quit":true}"#);
         assert!(take(tmp.path()).is_empty());
     }
 
@@ -142,8 +117,8 @@ mod tests {
     // so the record is gone whatever it said.
     #[test]
     fn taking_the_record_consumes_it() {
-        let tmp = TempDir::new("once");
-        tmp.write(r#"{"restore":["myws"]}"#);
+        let tmp = tempfile::tempdir().unwrap();
+        write_record(tmp.path(), r#"{"restore":["myws"]}"#);
         assert_eq!(take(tmp.path()), vec!["myws"]);
         assert!(!record_path(tmp.path()).exists(), "the record must be gone");
         assert!(
@@ -155,11 +130,11 @@ mod tests {
     // This runs on the boot path of the whole stack, so nothing here may be fatal.
     #[test]
     fn a_missing_or_unreadable_record_restores_nothing_and_is_cleared() {
-        let tmp = TempDir::new("garbage");
+        let tmp = tempfile::tempdir().unwrap();
         assert!(take(tmp.path()).is_empty(), "no record at all");
 
         for body in [r#"{ not json"#, "", r#"{"restore":"myws"}"#] {
-            tmp.write(body);
+            write_record(tmp.path(), body);
             assert!(take(tmp.path()).is_empty(), "unreadable: {body:?}");
             assert!(
                 !record_path(tmp.path()).exists(),
@@ -172,10 +147,10 @@ mod tests {
     // the format can only drift silently. This pins the exact bytes it writes.
     #[test]
     fn next_boot_record_shape_matches_the_writer() {
-        let tmp = TempDir::new("shape");
-        tmp.write("{\"restore\":[\"myws\"]}");
+        let tmp = tempfile::tempdir().unwrap();
+        write_record(tmp.path(), "{\"restore\":[\"myws\"]}");
         assert_eq!(take(tmp.path()), vec!["myws"]);
-        tmp.write("{\"quit\":true}");
+        write_record(tmp.path(), "{\"quit\":true}");
         assert!(take(tmp.path()).is_empty());
         assert_eq!(NEXT_BOOT_FILE, ".next-boot.json");
     }

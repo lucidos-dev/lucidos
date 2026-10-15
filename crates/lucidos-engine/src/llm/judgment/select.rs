@@ -8,6 +8,12 @@
 //! promise this module keeps (ADR 0363, I13 and I14 of
 //! `docs/plans/2026-10-04-tree-memory-module-and-the-home-thread.md`).
 //!
+//! **One exception, the user's choice: the wake decision** (ADRs 0433, 0435,
+//! 0472). An unset wake decision runs on [`WAKE_DECISION_DEFAULT`] while the
+//! running chat provider serves it. [`system_one_or_default_for`] asks that,
+//! and an explicit `chat` still runs chat. The read decision runs on its chat
+//! model while unset.
+//!
 //! **Two switches, and both must say yes.** Each System One provider has a
 //! master switch on Settings → Models → Providers. Under it sits one preference
 //! per site. Absent means on for the master and `chat` for a site.
@@ -25,8 +31,12 @@ use std::time::Duration;
 use sqlx::PgPool;
 
 use super::endpoint::{typesafe_api_key, SystemOneEndpoint};
-use super::SystemOneProvider;
-use crate::core::prefs::{self, Optional, Pref};
+use super::JudgmentProvider;
+use crate::core::prefs::{self, Optional, Pref, Text};
+use crate::llm::ProviderKind;
+
+/// The row an unset wake decision runs on (ADRs 0435, 0472).
+pub const WAKE_DECISION_DEFAULT: SystemOneEndpoint = SystemOneEndpoint::OpenAi;
 
 /// A call site that asks typed questions.
 ///
@@ -42,13 +52,20 @@ pub enum JudgmentSite {
     /// The Tree memory module's `find`, which walks a summary tree by asking
     /// choice questions over its lines (ADR 0362). Nothing asks it yet.
     MemoryFind,
+    /// The turn end's read decision: should the user read this reply?
+    ReadDecision,
+    /// The turn-end gate's *wake decision*: whether a child's report wakes its
+    /// parent. Every doubt wakes, so a missing answer is a wake.
+    WakeDecision,
 }
 
 impl JudgmentSite {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 5] = [
         Self::CommandGuard,
         Self::QueryClassification,
         Self::MemoryFind,
+        Self::ReadDecision,
+        Self::WakeDecision,
     ];
 
     pub const fn preference_key(self) -> &'static Pref<Optional> {
@@ -56,6 +73,33 @@ impl JudgmentSite {
             Self::CommandGuard => &prefs::JUDGMENT_COMMAND_GUARD,
             Self::QueryClassification => &prefs::JUDGMENT_QUERY_CLASSIFICATION,
             Self::MemoryFind => &prefs::JUDGMENT_MEMORY_FIND,
+            Self::ReadDecision => &prefs::JUDGMENT_READ_DECISION,
+            Self::WakeDecision => &prefs::JUDGMENT_WAKE_DECISION,
+        }
+    }
+
+    /// The chat model the site runs on while no System One row answers it.
+    pub const fn chat_model_key(self) -> &'static Pref<Text> {
+        match self {
+            Self::CommandGuard => &prefs::MODEL_COMMAND_JUDGE,
+            Self::QueryClassification => &prefs::MODEL_QUERY_CLASSIFICATION,
+            Self::MemoryFind => &prefs::MODEL_MEMORY_FIND,
+            Self::ReadDecision => &prefs::MODEL_READ_DECISION,
+            Self::WakeDecision => &prefs::MODEL_WAKE_DECISION,
+        }
+    }
+
+    /// The row an unset preference runs on, when its chat provider is served.
+    ///
+    /// Only the wake decision has one, because the user chose it (ADRs 0435,
+    /// 0472). Every other site waits for a pick.
+    pub const fn default_endpoint(self) -> Option<SystemOneEndpoint> {
+        match self {
+            Self::WakeDecision => Some(WAKE_DECISION_DEFAULT),
+            Self::ReadDecision
+            | Self::CommandGuard
+            | Self::QueryClassification
+            | Self::MemoryFind => None,
         }
     }
 
@@ -65,6 +109,8 @@ impl JudgmentSite {
             Self::CommandGuard => "command guard",
             Self::QueryClassification => "query classification",
             Self::MemoryFind => "memory find",
+            Self::ReadDecision => "read decision",
+            Self::WakeDecision => "wake decision",
         }
     }
 
@@ -73,10 +119,14 @@ impl JudgmentSite {
         static COMMAND_GUARD: AtomicBool = AtomicBool::new(false);
         static QUERY_CLASSIFICATION: AtomicBool = AtomicBool::new(false);
         static MEMORY_FIND: AtomicBool = AtomicBool::new(false);
+        static READ_DECISION: AtomicBool = AtomicBool::new(false);
+        static WAKE_DECISION: AtomicBool = AtomicBool::new(false);
         match self {
             Self::CommandGuard => &COMMAND_GUARD,
             Self::QueryClassification => &QUERY_CLASSIFICATION,
             Self::MemoryFind => &MEMORY_FIND,
+            Self::ReadDecision => &READ_DECISION,
+            Self::WakeDecision => &WAKE_DECISION,
         }
     }
 }
@@ -107,13 +157,33 @@ async fn provider_switch(pool: &PgPool, endpoint: SystemOneEndpoint) -> Option<b
 }
 
 /// The System One provider for `site`, or `None` to ask its chat model.
+///
+/// Boxed, because the rows speak two wires. [`super::for_site`] takes it as is.
+/// An unset preference is chat here, whatever the site's default.
 pub async fn system_one_for(
     pool: &PgPool,
     site: JudgmentSite,
     timeout: Duration,
-) -> Option<SystemOneProvider> {
+) -> Option<Box<dyn JudgmentProvider>> {
+    system_one_or_default_for(pool, site, timeout, &[]).await
+}
+
+/// [`system_one_for`], with an unset preference running on the site's
+/// [`JudgmentSite::default_endpoint`] while `served`, the running chat
+/// provider's configured backends, holds that row's chat provider.
+///
+/// A chat model the user pinned for the site is a choice of chat. The default
+/// never moves it, so its text never reaches the default's vendor.
+///
+/// The mock provider serves nothing, so a test engine never reaches a vendor.
+pub async fn system_one_or_default_for(
+    pool: &PgPool,
+    site: JudgmentSite,
+    timeout: Duration,
+    served: &[ProviderKind],
+) -> Option<Box<dyn JudgmentProvider>> {
     let preference = match site.preference_key().try_stored(pool).await {
-        Ok(value) => value,
+        Ok(value) => value.filter(|v| !v.trim().is_empty()),
         Err(e) => {
             log!(
                 "[Judgment] Could not read {}: {}. Running the {} on its chat model",
@@ -124,7 +194,21 @@ pub async fn system_one_for(
             return None;
         }
     };
-    let endpoint = picked_endpoint(preference.as_deref())?;
+    let picked = preference.is_some();
+    let endpoint = match preference {
+        Some(value) => picked_endpoint(Some(&value))?,
+        None => {
+            let endpoint = site.default_endpoint().filter(|endpoint| {
+                endpoint
+                    .chat_provider()
+                    .is_some_and(|k| served.contains(&k))
+            })?;
+            if !chat_model_unpinned(pool, site).await {
+                return None;
+            }
+            endpoint
+        }
+    };
 
     // Read second, so a workspace with every site on chat pays no extra query.
     // An unknown reads as OFF: the fallback is a working chat model.
@@ -135,16 +219,35 @@ pub async fn system_one_for(
     match endpoint.provider(pool, timeout).await {
         Ok(provider) => Some(provider),
         Err(reason) => {
+            let how = if picked { "picks" } else { "defaults to" };
             warn_once(
                 site,
                 format!(
-                    "[Judgment] {} picks {}, but {}. Running it on its chat model meanwhile",
+                    "[Judgment] {} {} {}, but {}. Running it on its chat model meanwhile",
                     site.preference_key().key(),
+                    how,
                     endpoint.label(),
                     reason
                 ),
             );
             None
+        }
+    }
+}
+
+/// Whether no chat model is stored for `site`. An unknown reads as pinned, so
+/// a failed read keeps the site on chat.
+async fn chat_model_unpinned(pool: &PgPool, site: JudgmentSite) -> bool {
+    match site.chat_model_key().try_stored(pool).await {
+        Ok(stored) => stored.is_none_or(|model| model.trim().is_empty()),
+        Err(e) => {
+            log!(
+                "[Judgment] Could not read {}: {}. Running the {} on its chat model",
+                site.chat_model_key().key(),
+                e,
+                site.label()
+            );
+            false
         }
     }
 }
@@ -183,7 +286,7 @@ pub async fn judgment_available(pool: &PgPool) -> bool {
 pub async fn jev_for_agent(
     pool: &PgPool,
     timeout: Duration,
-) -> Result<SystemOneProvider, &'static str> {
+) -> Result<Box<dyn JudgmentProvider>, &'static str> {
     if !provider_switch(pool, SystemOneEndpoint::Jev)
         .await
         .unwrap_or(true)

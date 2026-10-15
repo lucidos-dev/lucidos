@@ -1155,30 +1155,29 @@ mod tests {
 
     #[test]
     fn a_written_file_reads_back_as_the_rows_that_went_in() {
-        let dir = std::env::temp_dir().join(format!("lucidos-eval-{}", Uuid::new_v4().simple()));
-        let file = ResultsFile::open(&dir, "abc").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // A results dir that does not exist yet, as on a first run.
+        let file = ResultsFile::open(&dir.path().join("results"), "abc").unwrap();
         let written = vec![run_row(), thread_row(1, Arm::LEAN, "T01"), probe_row()];
         for row in &written {
             file.append(row).unwrap();
         }
         assert_eq!(file.read_all().unwrap(), written);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_corrupt_line_is_an_error_and_never_a_smaller_sample() {
-        let dir = std::env::temp_dir().join(format!("lucidos-eval-{}", Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("abc.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abc.jsonl");
         std::fs::write(&path, "{\"kind\":\"nonsense\"}\n").unwrap();
         let err = read_rows(&path).unwrap_err().to_string();
         assert!(err.contains("is not a result row"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_missing_file_reads_as_no_rows_rather_than_an_error() {
-        let path = std::env::temp_dir().join(format!("lucidos-eval-{}.jsonl", Uuid::new_v4()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.jsonl");
         assert!(read_rows(&path).unwrap().is_empty());
     }
 

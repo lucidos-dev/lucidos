@@ -1,4 +1,4 @@
-//! End-to-end API tests for widgets (ADRs 0402, 0407, 0415).
+//! End-to-end API tests for widgets (ADRs 0402, 0407, 0415, 0466).
 //!
 //! Three plan invariants an external client is placed to prove over real HTTP:
 //!
@@ -98,8 +98,24 @@ async fn remove_folders(client: &reqwest::Client, ids: &[&str]) {
     }
 }
 
+/// A reply in `thread`, for a pin to name as where its widget draws.
+async fn seed_reply(pool: &sqlx::PgPool, thread: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2::text, 'TextStreamed', $3, NOW(), $2)",
+    )
+    .bind(id)
+    .bind(thread)
+    .bind(json!({ "text": "Here are the fares." }))
+    .execute(pool)
+    .await
+    .expect("insert the reply");
+    id
+}
+
 #[tokio::test]
-async fn a_widget_shows_pins_and_unpins_without_touching_disk() {
+async fn a_widget_pins_and_unpins_without_touching_disk() {
     let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect");
     let thread = Uuid::new_v4();
@@ -130,29 +146,46 @@ async fn a_widget_shows_pins_and_unpins_without_touching_disk() {
         .expect("app JSON");
     assert_eq!(app["kind"], "widget");
 
-    let (status, body) = post(
+    // A reply embeds a widget now, so nothing shows one (ADR 0466).
+    let (status, _) = post(
         &client,
         "/widgets/show",
         json!({ "app_id": id, "thread_id": thread }),
     )
     .await;
-    assert_eq!(status, 200, "show: {body}");
-    let entries = thread_widgets(&client, thread).await;
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0]["app_id"], id.as_str());
-    assert_eq!(entries[0]["pinned"], false, "showing adds no chip");
+    assert!(
+        [404, 405].contains(&status),
+        "the show route is gone: {status}"
+    );
 
     let history_before = folder_history(&id);
     let manifest_before = std::fs::read_to_string(app_dir(&id).join("manifest.json")).unwrap();
 
+    // A pin names the reply that draws the widget, which must be in the thread.
+    let (status, _) = post(
+        &client,
+        "/widgets/pin",
+        json!({ "app_id": id, "thread_id": thread, "shown_event_id": Uuid::new_v4() }),
+    )
+    .await;
+    assert_eq!(status, 409, "a reply from nowhere is refused");
+    let reply = seed_reply(&pool, thread).await;
     let (status, body) = post(
         &client,
         "/widgets/pin",
-        json!({ "app_id": id, "thread_id": thread }),
+        json!({ "app_id": id, "thread_id": thread, "shown_event_id": reply }),
     )
     .await;
     assert_eq!(status, 200, "pin: {body}");
-    assert_eq!(thread_widgets(&client, thread).await[0]["pinned"], true);
+    let entries = thread_widgets(&client, thread).await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["app_id"], id.as_str());
+    assert_eq!(entries[0]["pinned"], true);
+    assert_eq!(
+        entries[0]["shown_event_id"],
+        reply.to_string(),
+        "Show in thread lands on the reply"
+    );
 
     let (status, body) = post(
         &client,
@@ -184,7 +217,7 @@ async fn a_widget_shows_pins_and_unpins_without_touching_disk() {
     .await
     .expect("read the widget events");
     let types: Vec<&str> = payloads.iter().map(|(t, _)| t.as_str()).collect();
-    assert_eq!(types, ["WidgetShown", "WidgetPinned", "WidgetUnpinned"]);
+    assert_eq!(types, ["WidgetPinned", "WidgetUnpinned"]);
     for (_, payload) in &payloads {
         assert_eq!(payload["app_id"], id.as_str());
         assert!(
@@ -193,12 +226,12 @@ async fn a_widget_shows_pins_and_unpins_without_touching_disk() {
         );
     }
 
-    // A second thread may not show a widget that is not reusable.
+    // A second thread may not pin a widget that is not reusable.
     let other = Uuid::new_v4();
     seed_thread(&pool, other, None, "idle").await;
     let (status, _) = post(
         &client,
-        "/widgets/show",
+        "/widgets/pin",
         json!({ "app_id": id, "thread_id": other }),
     )
     .await;
@@ -338,19 +371,19 @@ async fn built_in_instances_pin_apart_and_the_built_in_stays_read_only() {
     for (params, label) in [(&marin, "Marin"), (&cedar, "Cedar")] {
         let (status, body) = post(
             &client,
-            "/widgets/show",
+            "/widgets/pin",
             json!({ "app_id": id, "thread_id": thread, "params": params, "label": label }),
         )
         .await;
-        assert_eq!(status, 200, "show: {body}");
+        assert_eq!(status, 200, "pin: {body}");
     }
     let (status, body) = post(
         &client,
-        "/widgets/pin",
-        json!({ "app_id": id, "thread_id": thread, "params": cedar }),
+        "/widgets/unpin",
+        json!({ "app_id": id, "thread_id": thread, "params": marin }),
     )
     .await;
-    assert_eq!(status, 200, "pin: {body}");
+    assert_eq!(status, 200, "unpin: {body}");
 
     let entries = thread_widgets(&client, thread).await;
     assert_eq!(entries.len(), 2, "two instances: {entries:?}");
@@ -366,7 +399,7 @@ async fn built_in_instances_pin_apart_and_the_built_in_stays_read_only() {
     ] {
         let (status, body) = post(
             &client,
-            "/widgets/show",
+            "/widgets/pin",
             json!({ "app_id": id, "thread_id": thread, "params": bad }),
         )
         .await;
@@ -387,5 +420,135 @@ async fn built_in_instances_pin_apart_and_the_built_in_stays_read_only() {
     assert_eq!(resp.status().as_u16(), 403, "a data write to a built-in");
 
     cleanup(&pool, &[thread]).await;
+    pool.close().await;
+}
+
+async fn home_board(client: &reqwest::Client, layout: &str) -> serde_json::Value {
+    client
+        .get(format!("{}/api/v1/home-board?layout={layout}", base_url()))
+        .send()
+        .await
+        .expect("home board request failed")
+        .json()
+        .await
+        .expect("the home board is JSON")
+}
+
+/// (app id, size) per tile, keeping only this test's widgets: other tests may
+/// pin to the same Home.
+fn tile_sizes(board: &serde_json::Value, ours: &[&str]) -> Vec<(String, String)> {
+    board["tiles"]
+        .as_array()
+        .expect("tiles")
+        .iter()
+        .filter(|t| ours.contains(&t["app_id"].as_str().unwrap_or_default()))
+        .map(|t| {
+            (
+                t["app_id"].as_str().unwrap().to_string(),
+                t["size"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Prompt parity for the Home board (ADR 0432). An arrangement over HTTP
+/// reads back the same. A new pin lands at its first declared size, and an
+/// undeclared size is refused. Pin to Home on a thread's own widget makes it
+/// reusable in the same action.
+#[tokio::test]
+async fn the_home_board_arranges_over_http_and_reads_back() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect");
+    let clock = folder("clock");
+    let inbox = folder("inbox");
+    let owned = folder("owned");
+    let origin = Uuid::new_v4();
+    seed_thread(&pool, origin, None, "idle").await;
+    write_app_folder(
+        &client,
+        &clock,
+        json!({"name": "Clock", "kind": "widget", "reusable": true,
+               "sizes": ["small", "large"], "transparent": true}),
+    )
+    .await;
+    write_app_folder(
+        &client,
+        &inbox,
+        json!({"name": "Inbox", "kind": "widget", "reusable": true}),
+    )
+    .await;
+    write_app_folder(&client, &owned, widget_manifest(origin, false)).await;
+    let home = home_board(&client, "desktop").await["thread_id"]
+        .as_str()
+        .expect("the board names Home")
+        .to_string();
+
+    for id in [&clock, &inbox] {
+        let (status, body) = post(
+            &client,
+            "/widgets/pin",
+            json!({ "app_id": id, "thread_id": home }),
+        )
+        .await;
+        assert_eq!(status, 200, "pin {id}: {body}");
+    }
+    let ours = [clock.as_str(), inbox.as_str()];
+    assert_eq!(
+        tile_sizes(&home_board(&client, "desktop").await, &ours),
+        [
+            (clock.clone(), "small".into()),
+            (inbox.clone(), "medium".into())
+        ],
+        "a new pin lands at its first declared size"
+    );
+
+    let (status, arranged) = post(
+        &client,
+        "/widgets/arrange",
+        json!({ "layout": "desktop", "tiles": [
+            { "app_id": inbox, "size": "medium" },
+            { "app_id": clock, "size": "large" },
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 200, "arrange: {arranged}");
+    let expected = [
+        (inbox.clone(), "medium".into()),
+        (clock.clone(), "large".into()),
+    ];
+    assert_eq!(tile_sizes(&arranged, &ours), expected);
+    assert_eq!(
+        tile_sizes(&home_board(&client, "desktop").await, &ours),
+        expected
+    );
+
+    let (status, body) = post(
+        &client,
+        "/widgets/arrange",
+        json!({ "layout": "phone", "tiles": [{ "app_id": clock, "size": "medium" }] }),
+    )
+    .await;
+    assert_eq!(status, 409, "clock declares no medium size: {body}");
+
+    let (status, body) = post(
+        &client,
+        "/widgets/pin",
+        json!({ "app_id": owned, "thread_id": home }),
+    )
+    .await;
+    assert_eq!(status, 200, "pin to Home: {body}");
+    assert_eq!(body["made_reusable"], true, "{body}");
+
+    for id in [&clock, &inbox, &owned] {
+        post(
+            &client,
+            "/widgets/unpin",
+            json!({ "app_id": id, "thread_id": home }),
+        )
+        .await;
+    }
+    assert!(tile_sizes(&home_board(&client, "desktop").await, &ours).is_empty());
+    cleanup(&pool, &[origin]).await;
+    remove_folders(&client, &[&clock, &inbox, &owned]).await;
     pool.close().await;
 }

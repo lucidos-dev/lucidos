@@ -11,11 +11,16 @@
 //! order, tracked by a single cursor: the id of the last notice it resolved.
 //! What is visible and sits after that is owed.
 //!
+//! A notice may also name a [`NoticeCondition`]. Where it fails, the notice is
+//! invisible exactly as an unreleased one is, so nobody is told to do what
+//! their workspace already does.
+//!
 //! The modal and the What's New panel are two renderings of one list. So
 //! [`view`] returns every visible notice, plus the id of the next one owed.
 
 use crate::core::preferences::PreferenceStore;
 use crate::core::prefs;
+use crate::engine::summary_tree::module::MemoryModule;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -42,6 +47,48 @@ pub struct ReleaseNotice {
     /// The sentence the button SENDS as a new message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_prompt: Option<String>,
+    /// What must be true of the workspace for the notice to show. The engine
+    /// decides, so a client never sees it.
+    #[serde(default, skip_serializing)]
+    pub only_when: Option<NoticeCondition>,
+}
+
+/// A fact about the workspace a notice can require, named in kebab-case in
+/// the file. An unknown name fails the parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NoticeCondition {
+    /// The workspace chose the Classic memory module. One that never chose
+    /// gets the memory choice instead.
+    OnClassicMemory,
+}
+
+impl NoticeCondition {
+    fn holds(self, facts: &NoticeFacts) -> bool {
+        match self {
+            Self::OnClassicMemory => facts.memory_module == Some(MemoryModule::Classic),
+        }
+    }
+}
+
+/// The workspace facts every [`NoticeCondition`] reads, gathered once per
+/// request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NoticeFacts {
+    /// The stored choice, `None` while the workspace has never chosen.
+    pub(crate) memory_module: Option<MemoryModule>,
+}
+
+impl NoticeFacts {
+    /// An unreadable memory module reads as Classic, which shows the Tree
+    /// notice: the recoverable direction.
+    pub(crate) async fn read(pool: &PgPool) -> Self {
+        let memory_module = MemoryModule::stored(pool).await.unwrap_or_else(|e| {
+            log!("[ReleaseNotices] Failed to read the memory module: {}", e);
+            Some(MemoryModule::Classic)
+        });
+        Self { memory_module }
+    }
 }
 
 /// The file's top level: a single array of tables, `[[notice]]`.
@@ -156,9 +203,15 @@ pub(crate) fn reported_release(release: &str, dirty: bool) -> Result<Version, St
     Ok(version)
 }
 
-/// Does `notice` apply to an engine reporting `running`?
+/// Has the release an engine reports as `running` reached `notice`?
 fn applies_to(notice: &ReleaseNotice, running: &Version) -> bool {
     Version::parse(&notice.since).is_ok_and(|since| since <= *running)
+}
+
+/// Does `notice` show to this workspace: reached by the release, and its
+/// condition, if any, holding?
+fn shown(notice: &ReleaseNotice, running: &Version, facts: &NoticeFacts) -> bool {
+    applies_to(notice, running) && notice.only_when.is_none_or(|c| c.holds(facts))
 }
 
 /// Where the cursor sits in `notices`: the count of entries it has answered.
@@ -180,22 +233,28 @@ fn answered_count(notices: &[ReleaseNotice], cursor: Option<&str>) -> usize {
 fn owed<'a>(
     notices: &'a [ReleaseNotice],
     running: &Version,
+    facts: &NoticeFacts,
     cursor: Option<&str>,
 ) -> Option<&'a ReleaseNotice> {
     notices
         .iter()
         .skip(answered_count(notices, cursor))
-        .find(|n| applies_to(n, running))
+        .find(|n| shown(n, running, facts))
 }
 
 /// Both surfaces, for one workspace on one release.
-pub fn view(notices: &[ReleaseNotice], running: &Version, cursor: Option<&str>) -> NoticeView {
+pub(crate) fn view(
+    notices: &[ReleaseNotice],
+    running: &Version,
+    facts: &NoticeFacts,
+    cursor: Option<&str>,
+) -> NoticeView {
     let answered = answered_count(notices, cursor);
-    let next_id = owed(notices, running, cursor).map(|n| n.id.clone());
+    let next_id = owed(notices, running, facts, cursor).map(|n| n.id.clone());
     let visible: Vec<(usize, &ReleaseNotice)> = notices
         .iter()
         .enumerate()
-        .filter(|(_, n)| applies_to(n, running))
+        .filter(|(_, n)| shown(n, running, facts))
         .collect();
     let states = visible
         .iter()
@@ -226,6 +285,9 @@ pub fn view(notices: &[ReleaseNotice], running: &Version, cursor: Option<&str>) 
 /// A fresh workspace has nothing to audit and no settings to migrate, so it
 /// starts level and hears from the NEXT release instead. Only it is stamped:
 /// [`place_workspace`] owns the other half of that decision.
+///
+/// Conditions are ignored. A fresh workspace picks its memory module in the
+/// memory choice, and must not meet the Tree notice the day it picks Classic.
 fn fresh_workspace_stamp(notices: &[ReleaseNotice], running: &Version) -> Option<String> {
     notices
         .iter()
@@ -244,18 +306,20 @@ fn fresh_workspace_stamp(notices: &[ReleaseNotice], running: &Version) -> Option
 /// - An id at or behind the cursor is a stale client re-answering.
 /// - A queued id is a turn out of order, skipping the notices before it.
 /// - A notice this release has not reached would be skipped by the release
-///   that finally ships it.
+///   that finally ships it. A notice whose condition fails is hidden the same
+///   way.
 ///
 /// The middle two are unreachable from our own surfaces, which draw from
 /// [`view`] and disable what is not owed. The rule is here because the endpoint
 /// is reachable without them.
-pub fn advanced_cursor(
+pub(crate) fn advanced_cursor(
     notices: &[ReleaseNotice],
     running: &Version,
+    facts: &NoticeFacts,
     cursor: Option<&str>,
     id: &str,
 ) -> Option<String> {
-    owed(notices, running, cursor)
+    owed(notices, running, facts, cursor)
         .filter(|n| n.id == id)
         .map(|n| n.id.clone())
 }
@@ -344,14 +408,15 @@ async fn place_workspace(pool: &PgPool, notices: &[ReleaseNotice], running: &Ver
 /// owed and the write would rewind the cursor onto it. A transient read failure
 /// would then re-open every notice after it. A write that cannot see the
 /// current position must not guess one.
-pub async fn resolve(
+pub(crate) async fn resolve(
     pool: &PgPool,
     notices: &[ReleaseNotice],
     running: &Version,
+    facts: &NoticeFacts,
     id: &str,
 ) -> Result<bool, sqlx::Error> {
     let cursor = prefs::RELEASE_NOTICE_CURSOR.try_stored(pool).await?;
-    let Some(next) = advanced_cursor(notices, running, cursor.as_deref(), id) else {
+    let Some(next) = advanced_cursor(notices, running, facts, cursor.as_deref(), id) else {
         return Ok(false);
     };
     PreferenceStore::set_silent(pool, prefs::RELEASE_NOTICE_CURSOR.key(), &next).await?;
@@ -359,11 +424,15 @@ pub async fn resolve(
 }
 
 #[cfg(test)]
+#[path = "release_notices_upgrade_pins_tests.rs"]
+mod upgrade_pins;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
-    fn v(s: &str) -> Version {
+    pub(super) fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
     }
 
@@ -406,7 +475,9 @@ mod tests {
         let notices = vec![notice("a", "1.0.0"), notice("b", &running.to_string())];
         place_workspace(&pool, &notices, &running).await;
         assert_eq!(stored_cursor(&pool).await.as_deref(), Some("b"));
-        assert!(view(&notices, &running, Some("b")).next_id.is_none());
+        assert!(view(&notices, &running, &CLASSIC, Some("b"))
+            .next_id
+            .is_none());
         teardown_test_db(&db_name).await;
     }
 
@@ -419,7 +490,118 @@ mod tests {
             body: "Do the thing.".to_string(),
             action_label: None,
             action_prompt: None,
+            only_when: None,
         }
+    }
+
+    pub(super) const CLASSIC: NoticeFacts = NoticeFacts {
+        memory_module: Some(MemoryModule::Classic),
+    };
+    pub(super) const TREE: NoticeFacts = NoticeFacts {
+        memory_module: Some(MemoryModule::Tree),
+    };
+    const NEVER_CHOSE: NoticeFacts = NoticeFacts {
+        memory_module: None,
+    };
+
+    /// `a` and `c` for everybody, with `b` only for a Classic workspace.
+    fn b_only_on_classic() -> Vec<ReleaseNotice> {
+        let mut notices = three();
+        notices[1].only_when = Some(NoticeCondition::OnClassicMemory);
+        notices
+    }
+
+    #[test]
+    fn a_notice_whose_condition_fails_is_neither_listed_nor_owed() {
+        let view = view(&b_only_on_classic(), &v("3.0.0"), &TREE, Some("a"));
+        assert_eq!(ids(&view), ["a", "c"]);
+        assert_eq!(view.next_id.as_deref(), Some("c"));
+    }
+
+    /// A workspace that never chose runs Classic, but the memory choice asks
+    /// it. So the notice telling it that it stays on Classic is not owed.
+    #[test]
+    fn a_workspace_that_never_chose_is_not_owed_the_classic_notice() {
+        let view = view(&b_only_on_classic(), &v("3.0.0"), &NEVER_CHOSE, Some("a"));
+        assert_eq!(ids(&view), ["a", "c"]);
+        assert_eq!(view.next_id.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn a_notice_whose_condition_holds_shows_as_usual() {
+        let view = view(&b_only_on_classic(), &v("3.0.0"), &CLASSIC, Some("a"));
+        assert_eq!(ids(&view), ["a", "b", "c"]);
+        assert_eq!(view.next_id.as_deref(), Some("b"));
+    }
+
+    /// The hidden notice is skipped, never waited on, and answering past it is
+    /// the ordinary next answer.
+    #[test]
+    fn a_hidden_notice_never_blocks_the_ones_after_it() {
+        let notices = b_only_on_classic();
+        let after_a = advanced_cursor(&notices, &v("3.0.0"), &TREE, Some("a"), "c");
+        assert_eq!(after_a.as_deref(), Some("c"));
+        assert_eq!(
+            view(&notices, &v("3.0.0"), &TREE, after_a.as_deref()).next_id,
+            None
+        );
+    }
+
+    #[test]
+    fn a_hidden_notice_cannot_be_answered() {
+        let notices = b_only_on_classic();
+        assert_eq!(
+            advanced_cursor(&notices, &v("3.0.0"), &TREE, Some("a"), "b"),
+            None
+        );
+    }
+
+    /// A fresh workspace picks Classic or Tree in the memory choice. Stamping
+    /// short of a trailing Classic notice would show it the day it picks Classic.
+    #[test]
+    fn the_fresh_workspace_stamp_covers_a_conditional_notice() {
+        let mut notices = three();
+        notices[2].only_when = Some(NoticeCondition::OnClassicMemory);
+        assert_eq!(
+            fresh_workspace_stamp(&notices, &v("3.0.0")).as_deref(),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn a_condition_parses_from_its_kebab_case_name() {
+        let src = "[[notice]]\nid = \"a\"\nsince = \"1.0.0\"\ntitle = \"A\"\nbody = \"x\"\n\
+                   only_when = \"on-classic-memory\"\n";
+        let parsed = parse(src).unwrap();
+        assert_eq!(parsed[0].only_when, Some(NoticeCondition::OnClassicMemory));
+    }
+
+    /// A typo would otherwise show the notice to everybody.
+    #[test]
+    fn an_unknown_condition_is_refused() {
+        let src = "[[notice]]\nid = \"a\"\nsince = \"1.0.0\"\ntitle = \"A\"\nbody = \"x\"\n\
+                   only_when = \"on-clasic-memory\"\n";
+        assert!(parse(src).is_err());
+    }
+
+    /// The engine decides, so the response shape stays what clients read.
+    #[test]
+    fn a_condition_stays_off_the_wire() {
+        let mut notice = notice("a", "1.0.0");
+        notice.only_when = Some(NoticeCondition::OnClassicMemory);
+        let json = serde_json::to_value(&notice).unwrap();
+        assert!(json.get("only_when").is_none(), "{json}");
+    }
+
+    /// The Tree notice's whole point: a workspace already on Tree never sees it.
+    #[test]
+    fn the_shipped_tree_notice_shows_only_on_classic() {
+        let notices = parse(RELEASE_NOTICES_TOML).unwrap();
+        let tree = notices
+            .iter()
+            .find(|n| n.id == "move-to-tree-memory")
+            .unwrap();
+        assert_eq!(tree.only_when, Some(NoticeCondition::OnClassicMemory));
     }
 
     fn three() -> Vec<ReleaseNotice> {
@@ -563,14 +745,14 @@ mod tests {
     /// workspaces running the release before it.
     #[test]
     fn a_notice_newer_than_the_running_release_is_invisible() {
-        let view = view(&three(), &v("2.0.0"), None);
+        let view = view(&three(), &v("2.0.0"), &CLASSIC, None);
         assert_eq!(ids(&view), ["a", "b"]);
         assert_eq!(view.next_id.as_deref(), Some("a"));
     }
 
     #[test]
     fn the_oldest_unresolved_notice_is_the_one_owed() {
-        let view = view(&three(), &v("3.0.0"), Some("a"));
+        let view = view(&three(), &v("3.0.0"), &CLASSIC, Some("a"));
         assert_eq!(view.next_id.as_deref(), Some("b"));
         let resolved: Vec<bool> = view.notices.iter().map(|s| s.resolved).collect();
         assert_eq!(resolved, [true, false, false]);
@@ -580,7 +762,7 @@ mod tests {
     /// the reader walked past is still findable.
     #[test]
     fn answering_the_last_notice_empties_the_modal_but_not_the_panel() {
-        let view = view(&three(), &v("3.0.0"), Some("c"));
+        let view = view(&three(), &v("3.0.0"), &CLASSIC, Some("c"));
         assert_eq!(view.next_id, None);
         assert_eq!(ids(&view), ["a", "b", "c"]);
         assert!(view.notices.iter().all(|s| s.resolved));
@@ -607,7 +789,7 @@ mod tests {
             notice("b", "2.0.0"),
             with_action("c", "3.0.0", "Audit my workspace for drift."),
         ];
-        let view = view(&notices, &v("3.0.0"), None);
+        let view = view(&notices, &v("3.0.0"), &CLASSIC, None);
         assert_eq!(deferred(&view), [true, false, false]);
     }
 
@@ -617,7 +799,10 @@ mod tests {
             with_action("a", "1.0.0", "Audit my workspace for drift."),
             with_action("b", "2.0.0", "Set up backups."),
         ];
-        assert_eq!(deferred(&view(&notices, &v("2.0.0"), None)), [false, false]);
+        assert_eq!(
+            deferred(&view(&notices, &v("2.0.0"), &CLASSIC, None)),
+            [false, false]
+        );
     }
 
     /// Deferring to a notice the release has not reached would hide the button
@@ -628,7 +813,10 @@ mod tests {
             with_action("a", "1.0.0", "Audit my workspace for drift."),
             with_action("b", "2.0.0", "Audit my workspace for drift."),
         ];
-        assert_eq!(deferred(&view(&notices, &v("1.0.0"), None)), [false]);
+        assert_eq!(
+            deferred(&view(&notices, &v("1.0.0"), &CLASSIC, None)),
+            [false]
+        );
     }
 
     /// A user who upgrades every release answers each audit notice in turn, and
@@ -640,14 +828,14 @@ mod tests {
             with_action("b", "2.0.0", "Audit my workspace for drift."),
         ];
         assert_eq!(
-            deferred(&view(&notices, &v("2.0.0"), Some("a"))),
+            deferred(&view(&notices, &v("2.0.0"), &CLASSIC, Some("a"))),
             [false, false]
         );
     }
 
     #[test]
     fn a_cursor_this_build_does_not_carry_reads_as_nothing_answered() {
-        let view = view(&three(), &v("3.0.0"), Some("gone"));
+        let view = view(&three(), &v("3.0.0"), &CLASSIC, Some("gone"));
         assert_eq!(view.next_id.as_deref(), Some("a"));
     }
 
@@ -656,7 +844,10 @@ mod tests {
     fn a_fresh_workspace_is_stamped_past_the_current_release() {
         let stamp = fresh_workspace_stamp(&three(), &v("3.0.0"));
         assert_eq!(stamp.as_deref(), Some("c"));
-        assert_eq!(view(&three(), &v("3.0.0"), stamp.as_deref()).next_id, None);
+        assert_eq!(
+            view(&three(), &v("3.0.0"), &CLASSIC, stamp.as_deref()).next_id,
+            None
+        );
     }
 
     /// Its silence covers only the notices it started level with. The next
@@ -666,7 +857,7 @@ mod tests {
     fn a_fresh_workspace_still_hears_from_the_next_release() {
         let stamp = fresh_workspace_stamp(&three(), &v("2.0.0"));
         assert_eq!(stamp.as_deref(), Some("b"));
-        let view = view(&three(), &v("3.0.0"), stamp.as_deref());
+        let view = view(&three(), &v("3.0.0"), &CLASSIC, stamp.as_deref());
         assert_eq!(view.next_id.as_deref(), Some("c"));
     }
 
@@ -678,7 +869,7 @@ mod tests {
     #[test]
     fn the_first_answer_moves_a_workspace_that_has_never_answered() {
         assert_eq!(
-            advanced_cursor(&three(), &v("3.0.0"), None, "a").as_deref(),
+            advanced_cursor(&three(), &v("3.0.0"), &CLASSIC, None, "a").as_deref(),
             Some("a")
         );
     }
@@ -687,22 +878,28 @@ mod tests {
     /// answered, must not re-open what has already been walked past.
     #[test]
     fn answering_an_older_notice_never_moves_the_cursor_back() {
-        assert_eq!(advanced_cursor(&three(), &v("3.0.0"), Some("b"), "a"), None);
         assert_eq!(
-            advanced_cursor(&three(), &v("3.0.0"), Some("b"), "c").as_deref(),
+            advanced_cursor(&three(), &v("3.0.0"), &CLASSIC, Some("b"), "a"),
+            None
+        );
+        assert_eq!(
+            advanced_cursor(&three(), &v("3.0.0"), &CLASSIC, Some("b"), "c").as_deref(),
             Some("c")
         );
     }
 
     #[test]
     fn answering_the_notice_already_on_the_cursor_is_refused() {
-        assert_eq!(advanced_cursor(&three(), &v("3.0.0"), Some("b"), "b"), None);
+        assert_eq!(
+            advanced_cursor(&three(), &v("3.0.0"), &CLASSIC, Some("b"), "b"),
+            None
+        );
     }
 
     #[test]
     fn an_unknown_id_never_moves_the_cursor() {
         assert_eq!(
-            advanced_cursor(&three(), &v("3.0.0"), Some("a"), "invented"),
+            advanced_cursor(&three(), &v("3.0.0"), &CLASSIC, Some("a"), "invented"),
             None
         );
     }
@@ -712,10 +909,13 @@ mod tests {
     /// notice, and the release that ships it would then never show it.
     #[test]
     fn a_notice_this_release_has_not_reached_cannot_be_answered() {
-        assert_eq!(advanced_cursor(&three(), &v("2.0.0"), Some("a"), "c"), None);
+        assert_eq!(
+            advanced_cursor(&three(), &v("2.0.0"), &CLASSIC, Some("a"), "c"),
+            None
+        );
         // The same id, once the release reaches it and it is the one owed.
         assert_eq!(
-            advanced_cursor(&three(), &v("3.0.0"), Some("b"), "c").as_deref(),
+            advanced_cursor(&three(), &v("3.0.0"), &CLASSIC, Some("b"), "c").as_deref(),
             Some("c")
         );
     }
@@ -726,9 +926,12 @@ mod tests {
     /// given. Answering "c" while "b" is owed would mark "b" answered too.
     #[test]
     fn a_notice_whose_turn_has_not_come_cannot_be_answered() {
-        assert_eq!(advanced_cursor(&three(), &v("3.0.0"), Some("a"), "c"), None);
         assert_eq!(
-            advanced_cursor(&three(), &v("3.0.0"), Some("a"), "b").as_deref(),
+            advanced_cursor(&three(), &v("3.0.0"), &CLASSIC, Some("a"), "c"),
+            None
+        );
+        assert_eq!(
+            advanced_cursor(&three(), &v("3.0.0"), &CLASSIC, Some("a"), "b").as_deref(),
             Some("b")
         );
     }
@@ -752,7 +955,12 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         place_workspace(&pool, &three(), &v("3.0.0")).await;
         assert_eq!(stored_cursor(&pool).await.as_deref(), Some("c"));
-        let view = view(&three(), &v("3.0.0"), stored_cursor(&pool).await.as_deref());
+        let view = view(
+            &three(),
+            &v("3.0.0"),
+            &CLASSIC,
+            stored_cursor(&pool).await.as_deref(),
+        );
         assert_eq!(view.next_id, None);
         teardown_test_db(&db_name).await;
     }
@@ -767,7 +975,12 @@ mod tests {
         add_a_thread(&pool).await;
         place_workspace(&pool, &three(), &v("3.0.0")).await;
         assert_eq!(stored_cursor(&pool).await, None);
-        let view = view(&three(), &v("3.0.0"), stored_cursor(&pool).await.as_deref());
+        let view = view(
+            &three(),
+            &v("3.0.0"),
+            &CLASSIC,
+            stored_cursor(&pool).await.as_deref(),
+        );
         assert_eq!(view.next_id.as_deref(), Some("a"));
         teardown_test_db(&db_name).await;
     }
@@ -796,7 +1009,12 @@ mod tests {
             .expect("the cursor key must be writable without announcing");
         add_a_thread(&pool).await;
         place_workspace(&pool, &three(), &v("3.0.0")).await;
-        let view = view(&three(), &v("3.0.0"), stored_cursor(&pool).await.as_deref());
+        let view = view(
+            &three(),
+            &v("3.0.0"),
+            &CLASSIC,
+            stored_cursor(&pool).await.as_deref(),
+        );
         assert_eq!(view.next_id.as_deref(), Some("a"));
         teardown_test_db(&db_name).await;
     }
@@ -841,7 +1059,7 @@ mod tests {
         place_workspace(&pool, &three(), &v("3.0.0")).await;
 
         assert_eq!(stored_cursor(&pool).await, None);
-        let view = view(&three(), &v("3.0.0"), None);
+        let view = view(&three(), &v("3.0.0"), &CLASSIC, None);
         assert_eq!(view.next_id.as_deref(), Some("a"));
         teardown_test_db(&db_name).await;
     }
@@ -881,10 +1099,16 @@ mod tests {
     #[tokio::test]
     async fn answering_moves_the_cursor_and_going_back_is_refused() {
         let (pool, db_name) = setup_test_db().await;
-        assert!(resolve(&pool, &three(), &v("3.0.0"), "a").await.unwrap());
-        assert!(resolve(&pool, &three(), &v("3.0.0"), "b").await.unwrap());
+        assert!(resolve(&pool, &three(), &v("3.0.0"), &CLASSIC, "a")
+            .await
+            .unwrap());
+        assert!(resolve(&pool, &three(), &v("3.0.0"), &CLASSIC, "b")
+            .await
+            .unwrap());
         assert_eq!(stored_cursor(&pool).await.as_deref(), Some("b"));
-        assert!(!resolve(&pool, &three(), &v("3.0.0"), "a").await.unwrap());
+        assert!(!resolve(&pool, &three(), &v("3.0.0"), &CLASSIC, "a")
+            .await
+            .unwrap());
         assert_eq!(stored_cursor(&pool).await.as_deref(), Some("b"));
         teardown_test_db(&db_name).await;
     }
@@ -898,11 +1122,15 @@ mod tests {
     #[tokio::test]
     async fn a_cursor_read_that_fails_refuses_the_write() {
         let (pool, db_name) = setup_test_db().await;
-        assert!(resolve(&pool, &three(), &v("3.0.0"), "a").await.unwrap());
-        assert!(resolve(&pool, &three(), &v("3.0.0"), "b").await.unwrap());
+        assert!(resolve(&pool, &three(), &v("3.0.0"), &CLASSIC, "a")
+            .await
+            .unwrap());
+        assert!(resolve(&pool, &three(), &v("3.0.0"), &CLASSIC, "b")
+            .await
+            .unwrap());
         pool.close().await;
 
-        let refused = resolve(&pool, &three(), &v("3.0.0"), "a").await;
+        let refused = resolve(&pool, &three(), &v("3.0.0"), &CLASSIC, "a").await;
         assert!(refused.is_err(), "an unreadable cursor must not be written");
         teardown_test_db(&db_name).await;
     }

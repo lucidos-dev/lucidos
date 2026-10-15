@@ -28,4 +28,8 @@ license.workspace = true
 # of the thing this crate exists to keep single.
 
 [dependencies]
+lucidos-home = { path = "../lucidos-home" }
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

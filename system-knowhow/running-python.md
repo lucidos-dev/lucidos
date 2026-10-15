@@ -24,6 +24,13 @@ no `timeout_secs` to raise. So a script you can't confidently size belongs in
 `run_python_background` from the start. A killed run commits nothing: its
 `data/` writes were only staged, so you lose the work but never half of it.
 
+**Only `run_python` announces what it writes.** On success it commits the staged
+files and emits `ArtifactCreated` / `ArtifactUpdated` (or `DataFileWritten`
+outside `artifacts/`), so an open app showing that file re-reads it.
+`run_python_background` writes straight to `data/` and announces nothing. When a
+background script feeds an app, end it with `lucidos data write` for the file the
+app reads. See `system-knowhow/building-an-app.md` § Live data.
+
 ## The drain pattern: never poll with `time.sleep`
 
 WRONG (burns two tool calls per wait, doubles context, stalls the turn):

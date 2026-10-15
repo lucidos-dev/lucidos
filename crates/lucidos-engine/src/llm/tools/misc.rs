@@ -13,11 +13,10 @@ use serde_json::json;
 
 /// Single source of truth for the `navigate_ui` `target` enum — the top-level
 /// navigation destinations. The SDK `NavigateTarget` type is GENERATED from this
-/// list (see `packages/lucidos-sdk/src/generated/navigate-targets.ts`), so the
-/// LLM tool schema and the SDK can never drift. To change the set, edit here and
-/// regenerate:
-///   cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored
+/// list into `packages/lucidos-sdk/src/generated/navigate-targets.ts`, so the
+/// LLM tool schema and the SDK can never drift. To change the set, edit here.
 const NAVIGATE_TARGETS: &[&str] = &[
+    "home-board",
     "files",
     "apps",
     "app-store",
@@ -76,6 +75,11 @@ pub(crate) const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "environment-variables",
     "debugging",
 ];
+
+/// The `device` argument of `navigate_ui` and `capture_app`, which one
+/// resolver settles (`engine/tools/navigate.rs`).
+pub(super) const DEVICE_ARG_DESCRIPTION: &str =
+    "A Known devices id. Omit for the user's last used device.";
 
 /// Tool for navigating the Lucidos UI to a specific panel, app, or file.
 pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
@@ -138,7 +142,7 @@ pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
                 },
                 "device": {
                     "type": "string",
-                    "description": "A Known devices id. Omit for the user's last used device."
+                    "description": DEVICE_ARG_DESCRIPTION
                 }
             },
             "required": ["target"]
@@ -419,7 +423,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::AWAIT_EVENT.to_string(),
-            description: format!("Subscribe to Lucidos state instead of polling it: a thread you did not spawn finishing, a change proposed, a trigger firing, a backup finishing, a domain event. The engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a delivery.\n\nMATCHING IS WORKSPACE-WIDE, so any thread's `ChildThreadCompleted` is a real wait whoever spawned it: name it with a `child_thread_id` condition. NOT YOUR OWN CHILD'S, nor any finish of it: that already re-opens this thread, so a wait duplicates it.\n\nTHE SUBSCRIPTION IS SPENT once it delivers, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in {} minutes without a user reply the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_RECENT_SUBSCRIPTIONS, crate::engine::event_wait::RECENT_SUBSCRIPTION_WINDOW_SECS / 60),
+            description: format!("Subscribe to Lucidos state instead of polling it: a thread you did not spawn finishing, a change proposed, a trigger firing, a backup finishing, a domain event. The engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a delivery.\n\nMATCHING IS WORKSPACE-WIDE, so any thread's `ChildThreadCompleted` is a real wait whoever spawned it: name it with a `child_thread_id` condition, plus `ChildReportFiled`. NOT YOUR OWN CHILD'S: it reports here on its own, so a wait duplicates it.\n\nTHE SUBSCRIPTION IS SPENT once it delivers, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in {} minutes without a user reply the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_RECENT_SUBSCRIPTIONS, crate::engine::event_wait::RECENT_SUBSCRIPTION_WINDOW_SECS / 60),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -507,14 +511,9 @@ pub(crate) const READ_ARG: &str = "read";
 /// The *read decision* (ADR 0409, ADR 0417). Scoped to the calling thread and
 /// takes no thread id, so an agent can only decide for its own reply.
 pub(super) fn request_read_tools() -> Vec<ToolDefinition> {
-    vec![request_read_tool()]
-}
-
-/// The one `request_read` schema, also the tool the turn-end gate forces.
-pub(crate) fn request_read_tool() -> ToolDefinition {
-    ToolDefinition {
+    vec![ToolDefinition {
         name: tn::REQUEST_READ.to_string(),
-        description: "Your read decision on this turn's reply, when sure. read: true when it holds what the user asked for (a report, findings, what a trigger run found) or they will read it later: the thread waits under Review until seen. read: false for small talk, a plain \"done\", or a progress report while sub-threads or an event wait still run. Unsure, skip it: Lucidos decides. It does not notify.".to_string(),
+        description: "Your read decision on this turn's reply, when sure. read: true when it holds what the user asked for (findings, what a trigger run found) or they will read it later: Review lists it until seen. read: false for small talk, a confirmation, a ready or applied change, a kickoff, or progress while sub-threads or event waits run. Unsure, skip it: Lucidos decides. It does not notify.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -524,6 +523,28 @@ pub(crate) fn request_read_tool() -> ToolDefinition {
                 }
             },
             "required": [READ_ARG]
+        }),
+    }]
+}
+
+/// The argument `wake_parent` takes, and the wake-decision route's body field.
+pub(crate) const WAKE_ARG: &str = "wake";
+
+/// The *wake decision*, for a thread with a parent it reports to. Scoped to the
+/// calling thread and takes no thread id, like `request_read`.
+pub(crate) fn wake_parent_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: tn::WAKE_PARENT.to_string(),
+        description: "Your wake decision on this turn's report to your parent thread, when sure. wake: true when your parent must act on it now: it waits for this result to take a next step, combine results, retry, or decide something only it can. wake: false when the report only informs: the user reads your findings here, and your parent reads the report on its next turn. A failure always wakes it. Unsure, skip it: Lucidos decides, and a doubt wakes.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                (WAKE_ARG): {
+                    "type": "boolean",
+                    "description": "Whether your parent thread must act on this turn's report now."
+                }
+            },
+            "required": [WAKE_ARG]
         }),
     }
 }
@@ -631,30 +652,13 @@ mod oauth_endpoint_tests {
     }
 }
 
-/// Contract codegen for the `navigate_ui` `target` + `settings_view` enums.
-///
-/// Rust is the single source of truth (`NAVIGATE_TARGETS` /
-/// `NAVIGABLE_SETTINGS_VIEWS`); the SDK `NavigateUi` TS types are GENERATED from
-/// it into `packages/lucidos-sdk/src/generated/navigate-targets.ts`. Mirrors the
-/// thread-lifecycle contract pattern in `thread_lifecycle_tests/contract.rs`:
-/// `generated_navigate_targets_is_up_to_date` fails `cargo test` if the on-disk
-/// file is stale, and the `#[ignore]` `generate_navigate_targets_file` rewrites
-/// it. Edit the consts above, then regenerate.
-#[cfg(test)]
-mod navigate_targets_codegen {
+/// The SDK's `NavigateUi` types, rendered from `NAVIGATE_TARGETS` and
+/// `NAVIGABLE_SETTINGS_VIEWS` into
+/// `packages/lucidos-sdk/src/generated/navigate-targets.ts`. Edit the consts
+/// above, never the output.
+pub(crate) mod navigate_targets_codegen {
     use super::*;
-
-    /// Path to the generated SDK file. CARGO_MANIFEST_DIR is
-    /// `<repo>/crates/lucidos-engine`, so two `.parent()`s reach the repo root
-    /// (the SDK lives under `packages/`, not `crates/`).
-    fn generated_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("packages/lucidos-sdk/src/generated/navigate-targets.ts")
-    }
+    use crate::codegen::REGENERATE;
 
     fn push_const(out: &mut String, const_name: &str, type_name: &str, values: &[&str]) {
         out.push_str(&format!("export const {} = [\n", const_name));
@@ -668,14 +672,12 @@ mod navigate_targets_codegen {
         ));
     }
 
-    fn generate_navigate_targets_ts() -> String {
+    pub(crate) fn render() -> String {
         let mut out = String::new();
         out.push_str(
-            "// AUTO-GENERATED by crates/lucidos-engine/src/llm/tools/misc.rs — do not edit by hand.\n",
+            "// AUTO-GENERATED by crates/lucidos-engine/src/llm/tools/misc.rs. Do not edit by hand.\n",
         );
-        out.push_str(
-            "// Regenerate: cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored\n",
-        );
+        out.push_str(&format!("// Regenerate: {REGENERATE}\n"));
         out.push_str("//\n");
         out.push_str(
             "// Source of truth for the `navigate_ui` contract: the `NAVIGATE_TARGETS` and\n",
@@ -702,49 +704,26 @@ mod navigate_targets_codegen {
         out
     }
 
-    /// The tool schema's enums are built FROM the consts, so this guards only the
-    /// wiring (a refactor that hardcodes an enum again would trip it).
-    #[test]
-    fn tool_schema_enums_match_consts() {
-        let tool = get_navigate_ui_tool();
-        let props = &tool.parameters["properties"];
-        assert_eq!(
-            props["target"]["enum"],
-            serde_json::json!(NAVIGATE_TARGETS),
-            "navigate_ui target enum drifted from NAVIGATE_TARGETS"
-        );
-        assert_eq!(
-            props["settings_view"]["enum"],
-            serde_json::json!(NAVIGABLE_SETTINGS_VIEWS),
-            "navigate_ui settings_view enum drifted from NAVIGABLE_SETTINGS_VIEWS"
-        );
-    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-    #[test]
-    fn generated_navigate_targets_is_up_to_date() {
-        let generated = generate_navigate_targets_ts();
-        let path = generated_path();
-        match std::fs::read_to_string(&path) {
-            Ok(existing) => assert_eq!(
-                existing, generated,
-                "Generated navigate-targets.ts is stale. Run: \
-                 cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored"
-            ),
-            Err(_) => panic!(
-                "Generated file missing at {}. Run: \
-                 cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored",
-                path.display()
-            ),
+        /// The tool schema's enums are built FROM the consts, so this guards only the
+        /// wiring (a refactor that hardcodes an enum again would trip it).
+        #[test]
+        fn tool_schema_enums_match_consts() {
+            let tool = get_navigate_ui_tool();
+            let props = &tool.parameters["properties"];
+            assert_eq!(
+                props["target"]["enum"],
+                serde_json::json!(NAVIGATE_TARGETS),
+                "navigate_ui target enum drifted from NAVIGATE_TARGETS"
+            );
+            assert_eq!(
+                props["settings_view"]["enum"],
+                serde_json::json!(NAVIGABLE_SETTINGS_VIEWS),
+                "navigate_ui settings_view enum drifted from NAVIGABLE_SETTINGS_VIEWS"
+            );
         }
-    }
-
-    #[test]
-    #[ignore]
-    fn generate_navigate_targets_file() {
-        let generated = generate_navigate_targets_ts();
-        let path = generated_path();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, &generated).unwrap();
-        crate::log!("[ContractTest] Generated: {}", path.display());
     }
 }

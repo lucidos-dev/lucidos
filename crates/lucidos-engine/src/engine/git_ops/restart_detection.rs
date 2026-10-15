@@ -30,12 +30,22 @@ const EMBEDDED_FILES: &[&str] = &[
     "crates/lucidos-app/src/styles/global/shared-components.css",
     "crates/lucidos-app/src/styles/global/surface.css",
     "crates/lucidos-app/src/styles/global/text-input.css",
-    "crates/lucidos-app/src/styles/generated/theme-parts-frame.css",
+];
+
+/// The desktop app's compile inputs besides its Rust code. The dev window moves
+/// to a new build only at a switch (ADR 0461), so an edit to one needs a switch.
+const APP_COMPILE_INPUTS: &[&str] = &[
+    "crates/lucidos-app/tauri.conf.json",
+    "crates/lucidos-app/Info.plist",
+    "crates/lucidos-app/capabilities/",
+    "crates/lucidos-app/permissions/",
+    "crates/lucidos-app/icons/",
 ];
 
 /// Check whether any of the given file paths would require an engine restart.
 /// Rust source files (excluding tests/docs), SQL migrations, the SDK bundle
-/// sources, and every file a binary embeds all trigger a restart.
+/// sources, the desktop app's compile inputs, and every file a binary embeds
+/// all trigger a restart.
 pub(crate) fn files_require_restart(files: &[String]) -> bool {
     files.iter().any(|f| {
         let is_rust_source = f.ends_with(".rs")
@@ -54,8 +64,10 @@ pub(crate) fn files_require_restart(files: &[String]) -> bool {
         // `core::fonts` embeds the same files to serve app iframes.
         let is_vendored_font =
             f.starts_with("crates/lucidos-app/src/assets/fonts/") && f.ends_with(".woff2");
+        let is_app_compile_input = APP_COMPILE_INPUTS.iter().any(|i| f.starts_with(i));
         (is_rust_source && !is_test_or_doc)
             || is_migration
+            || is_app_compile_input
             || is_sdk_bundle_source
             || in_binary_crate
             || is_vendored_font

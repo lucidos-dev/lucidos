@@ -99,13 +99,16 @@
 }
 
 /* Above the prompt box, edge to edge with it: why the focused thread's work
-   is not ready, where Apply would otherwise be (ADR 0400). */
+   is not ready, where Apply would otherwise be (ADR 0400). The transcript
+   scrolls under the composer, so the strip stays opaque. It cannot read the
+   composer's theme part, which only the prompt box rule may read (ADR 0307). */
 .not-ready-strip {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     margin-bottom: 0.375rem;
     padding: 0.375rem 0.5rem 0.375rem 0.75rem;
+    background: var(--bg-secondary);
     border: 1px solid var(--accent-orange);
     border-radius: calc(var(--radius-control) * 0.75);
     font-size: var(--font-size-xs);
@@ -145,6 +148,62 @@
 
 .not-ready-strip-hint {
     color: var(--text-secondary);
+}
+
+/* Where the not-ready strip would be for a handed-off thread. A hand-off is
+   no warning, so it is a quiet line on the prompt's text edge. */
+.continued-here {
+    margin: 0 0 0.375rem;
+    padding-inline: var(--turn-surface-inset);
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+    color: var(--text-muted);
+}
+
+.continued-here-link {
+    padding: 0;
+    border: none;
+    background: none;
+    font-size: inherit;
+    color: inherit;
+    text-decoration: underline;
+    text-underline-offset: 0.15em;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .continued-here-link:hover {
+        color: var(--text-secondary);
+    }
+}
+
+/* Above the prompt box like the not-ready strip, and neutral: an offer to
+   continue a large thread in a successor thread, not a warning. */
+.successor-strip {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.375rem;
+    padding: 0.375rem 0.375rem 0.375rem 0.75rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.75);
+    font-size: var(--font-size-xs);
+    font-family: var(--font-ui);
+}
+
+.successor-strip-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.successor-strip .action-btn {
+    flex-shrink: 0;
 }
 
 .url-context-pill {
@@ -505,7 +564,7 @@
  *
  * WIP PREVIEW: framed, the same paint as `.icon-btn.filter-active`
  * (host-components.css). Not a blanket `.icon-btn.active`, which would also
- * frame `.pin-thread-btn.active`, whose own rule takes the accent and NO frame
+ * frame `.pin-btn.active`, whose own rule takes the accent and NO frame
  * on purpose. */
 .prompt-actions-row .icon-btn.header-icon.active[data-role="wip-preview-toggle"] {
     color: var(--accent);
@@ -520,7 +579,7 @@
     }
 }
 
-/* FOLLOW: the `.pin-thread-btn.active` shape instead, accent only and no frame.
+/* FOLLOW: the `.pin-btn.active` shape instead, accent only and no frame.
  * Following the live edge is a standing mode that is on for most of a thread's
  * life, and a filled box held down that long at the end of a row of otherwise
  * unframed icons reads as a button jammed in rather than as a mode. The accent
@@ -1655,6 +1714,12 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
    content edge, with no bottom half for the same reason the last turn drops
    its own: the transcript's bottom padding follows. */
 .stopped-child-notice {
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
+}
+
+/* A successor thread's links: "Continued from" opens the feed and "Continued
+   in" closes it, on the turns' content edge like the notice above. */
+.successor-notice {
     padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
 }
 

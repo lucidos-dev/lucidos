@@ -25,6 +25,7 @@ import { API } from '../../api/client';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { appIdForFrame, mountedAppFrames } from '../../utils/appFrame';
 import { PREVIEW_FRAME_ROLE, postToPreviewFrame } from '../../utils/previewFrameProtocol';
+import { CAPABILITY_SEGMENT } from '../../../../../packages/lucidos-sdk/src/frameCapability';
 import { postToAppFrame } from './app-bridge';
 
 /** Half the engine's TTL. Replaced by what the engine answers. */
@@ -157,6 +158,22 @@ export function currentArtifactPreviewCapability(): string | null {
  *  renewal reaches the live document over the bridge instead. */
 export function peekArtifactPreviewCapability(): string | null {
   return previewCapability.peek()?.capability ?? null;
+}
+
+/**
+ * Splice the asset pass into an artifact's URL on the `/data` mount, ahead of
+ * its `/data/artifacts/` segment.
+ *
+ * The preview's `<base href>` is built from the result. So every relative ref
+ * in the artifact carries the pass to the gateway, which the frame's cookieless
+ * requests need (ADR 0238). `null` is no gateway, where nothing needs proving.
+ * A URL off the mount comes back untouched: the pass reaches no `/api/v1`.
+ */
+export function withPreviewCapability(fileUrl: string, capability: string | null): string {
+  if (!capability) return fileUrl;
+  const at = fileUrl.indexOf('/data/artifacts/');
+  if (at === -1 || fileUrl.slice(0, at).endsWith('/api/v1')) return fileUrl;
+  return `${fileUrl.slice(0, at)}/${CAPABILITY_SEGMENT}/${capability}${fileUrl.slice(at)}`;
 }
 
 async function mintArtifactPreviewCapability(): Promise<MintedCapability> {

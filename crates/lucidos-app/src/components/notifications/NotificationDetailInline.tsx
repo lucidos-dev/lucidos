@@ -74,8 +74,8 @@ export function NotificationDetailInline() {
     });
   }
 
-  // `composeHandlers` with NO focus nudge, the shape `HeaderMark`'s setup-
-  // interview item uses. The wrapper is here for its touch/click dedup. A tap
+  // `composeHandlers` with NO focus nudge, the shape the brand menu's setup
+  // interview item uses (`BrandMenuRows`). The wrapper is here for its touch/click dedup. A tap
   // with the iOS keyboard up can blur the field and shift the viewport, moving
   // the button from under the finger. WebKit then drops the synthetic click.
   // The focus half is dropped because Discuss sends, so a raised keyboard would

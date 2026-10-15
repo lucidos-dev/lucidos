@@ -1,4 +1,5 @@
 import { request } from './_fetch';
+import type { WidgetSize } from './widgetFrame';
 
 export interface App {
   id: string;
@@ -22,6 +23,10 @@ export interface App {
   params?: Record<string, { description: string; required?: boolean }>;
   /** A built-in widget: shipped with Lucidos and read-only. Omitted otherwise. */
   built_in?: boolean;
+  /** A widget's Home board sizes, first the default. Omitted for an app. */
+  sizes?: WidgetSize[];
+  /** A widget whose Home board tile is see-through. Omitted otherwise. */
+  transparent?: boolean;
 }
 
 export const apps = {

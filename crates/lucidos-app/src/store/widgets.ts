@@ -13,11 +13,6 @@ import { widgetInstanceKey, type WidgetParams } from '../utils/widgetParams';
 
 export const threadWidgets = signal<ReadonlyMap<string, Loadable<ThreadWidget[]>>>(new Map());
 
-/** Per thread, the ticket of the widgets read whose answer is on screen. A read
- *  started later has a higher ticket. So a reader can tell "absent from a
- *  fresh read" from "absent from a stale one". */
-export const appliedThreadWidgetTickets = signal<ReadonlyMap<string, number>>(new Map());
-
 /** The widget instance a chip tap dropped open under a thread's title, if
  *  any, by its `widgetInstanceKey`. */
 export const openShelfWidget = signal<{ threadId: string; instanceKey: string } | null>(null);
@@ -43,10 +38,6 @@ export function threadWidget(threadId: string, appId: string, params?: WidgetPar
 /** A thread widget's instance key. */
 export function threadWidgetKey(widget: ThreadWidget): string {
   return widgetInstanceKey(widget.app_id, widget.params);
-}
-
-export function appliedThreadWidgetTicket(threadId: string): number {
-  return appliedThreadWidgetTickets.value.get(threadId) ?? 0;
 }
 
 export function widgetRefreshKey(appId: string): number {

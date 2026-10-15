@@ -17,6 +17,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::core::apps::WidgetSize;
 use crate::core::{App, AppManager, AppReveal};
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
@@ -74,8 +75,8 @@ impl InstanceKey {
     }
 }
 
-/// One widget instance in a thread, shown or pinned. Only a pinned one has a
-/// chip on the shelf; the transcript's card reads every shown one.
+/// One widget instance in a thread, pinned or shown by an old `WidgetShown`.
+/// Only a pinned one has a chip on the shelf; the inline widgets read them all.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ThreadWidget {
     pub app_id: String,
@@ -98,12 +99,17 @@ pub struct ThreadWidget {
     pub built_in: bool,
     /// When the frame's cover lifts, from the manifest, as for any app.
     pub reveal: AppReveal,
-    /// Pinned to the shelf, so it has a chip there. The thread's card shows
+    /// Its *widget sizes*, first the default (ADR 0432).
+    pub sizes: Vec<WidgetSize>,
+    /// Its tile is see-through, so it draws its own shape.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub transparent: bool,
+    /// Pinned to the shelf, so it has a chip there. The inline widget shows
     /// either way.
     pub pinned: bool,
-    /// The newest `WidgetShown` for this instance in this thread: where "Show
-    /// in thread" scrolls to. Absent for an instance only ever pinned, as
-    /// from an embed.
+    /// Where "Show in thread" scrolls to: the event whose reply drew the
+    /// instance when it was pinned, or an old `WidgetShown`. Absent for an
+    /// instance pinned from nowhere in the thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shown_event_id: Option<Uuid>,
 }
@@ -116,6 +122,8 @@ pub struct WidgetEventRow {
     pub app_id: String,
     pub params: Option<WidgetParams>,
     pub label: Option<String>,
+    /// A pin's reply event, where it names one.
+    pub shown_event_id: Option<Uuid>,
 }
 
 /// What the events alone say about one widget instance in a thread.
@@ -136,19 +144,19 @@ impl FoldedWidget {
 
 /// Fold a thread's widget events into its instances, ordered by first
 /// appearance. Only a pin puts an instance on the shelf and only an unpin
-/// takes it off; showing again changes neither. A pin alone adds the
+/// takes it off; an old showing changes neither. A pin alone adds the
 /// instance, since an embed records no showing. An unpin of an instance never
 /// seen is ignored. The newest label given wins.
 pub fn fold_thread_widgets(rows: &[WidgetEventRow]) -> Vec<FoldedWidget> {
     let mut widgets: Vec<FoldedWidget> = Vec::new();
     for row in rows {
-        let Some(change) = WidgetChange::from_event_type(&row.event_type) else {
+        let Some(kind) = WidgetEventKind::from_event_type(&row.event_type) else {
             continue;
         };
         let key = InstanceKey::new(&row.app_id, row.params.as_ref());
         let existing = widgets.iter_mut().find(|w| w.key() == key);
-        let widget = match (change, existing) {
-            (WidgetChange::Unpin, None) => continue,
+        let widget = match (kind, existing) {
+            (WidgetEventKind::Unpinned, None) => continue,
             (_, Some(widget)) => widget,
             (_, None) => {
                 widgets.push(FoldedWidget {
@@ -161,12 +169,17 @@ pub fn fold_thread_widgets(rows: &[WidgetEventRow]) -> Vec<FoldedWidget> {
                 widgets.last_mut().expect("just pushed")
             }
         };
-        match change {
-            WidgetChange::Show => widget.shown_event_id = Some(row.event_id),
-            WidgetChange::Pin => widget.pinned = true,
-            WidgetChange::Unpin => widget.pinned = false,
+        match kind {
+            WidgetEventKind::Shown => widget.shown_event_id = Some(row.event_id),
+            WidgetEventKind::Pinned => {
+                widget.pinned = true;
+                if row.shown_event_id.is_some() {
+                    widget.shown_event_id = row.shown_event_id;
+                }
+            }
+            WidgetEventKind::Unpinned => widget.pinned = false,
         }
-        if row.label.is_some() && change != WidgetChange::Unpin {
+        if row.label.is_some() && kind != WidgetEventKind::Unpinned {
             widget.label = row.label.clone();
         }
     }
@@ -177,9 +190,17 @@ async fn widget_event_rows(
     pool: &PgPool,
     thread_id: Uuid,
 ) -> Result<Vec<WidgetEventRow>, BoxError> {
-    type Row = (Uuid, String, Option<String>, Option<Value>, Option<String>);
+    type Row = (
+        Uuid,
+        String,
+        Option<String>,
+        Option<Value>,
+        Option<String>,
+        Option<String>,
+    );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id, event_type, payload->>'app_id', payload->'params', payload->>'label' \
+        "SELECT id, event_type, payload->>'app_id', payload->'params', payload->>'label', \
+         payload->>'shown_event_id' \
          FROM events WHERE thread_id = $1 AND event_type = ANY($2) ORDER BY sequence",
     )
     .bind(thread_id)
@@ -188,13 +209,14 @@ async fn widget_event_rows(
     .await?;
     Ok(rows
         .into_iter()
-        .filter_map(|(event_id, event_type, app_id, params, label)| {
+        .filter_map(|(event_id, event_type, app_id, params, label, shown)| {
             Some(WidgetEventRow {
                 event_id,
                 event_type,
                 app_id: app_id?,
                 params: params.and_then(|p| serde_json::from_value(p).ok()),
                 label,
+                shown_event_id: shown.and_then(|id| id.parse().ok()),
             })
         })
         .collect())
@@ -237,6 +259,8 @@ pub async fn thread_widgets(
             origin_plugin_id,
             built_in: app.built_in,
             reveal: app.reveal,
+            sizes: app.sizes,
+            transparent: app.transparent,
             pinned: widget.pinned,
             shown_event_id: widget.shown_event_id,
         });
@@ -301,7 +325,7 @@ pub fn check_widget_params(app: &App, params: Option<&WidgetParams>) -> Result<(
 fn check_widget_owner(app: &App, thread_id: Uuid) -> Result<(), WidgetCheckFailed> {
     if !app.reusable && app.origin_thread() != Some(thread_id) {
         return Err(Refused(format!(
-            "Widget '{}' belongs to another thread. Make it reusable first, then show it here.",
+            "Widget '{}' belongs to another thread. Make it reusable first, then pin or embed it here.",
             app.id
         )));
     }
@@ -309,7 +333,7 @@ fn check_widget_owner(app: &App, thread_id: Uuid) -> Result<(), WidgetCheckFaile
 }
 
 /// Whether a widget can be embedded in this thread with these params: the
-/// checks a show runs, with no thread lookup. A question card runs it on each
+/// checks a new pin runs, with no thread lookup. A question card runs it on each
 /// option's widget before it is asked (ADR 0415).
 pub fn check_widget_embed(
     app_manager: &AppManager,
@@ -322,6 +346,17 @@ pub fn check_widget_embed(
     check_widget_params(&app, params).map_err(Refused)
 }
 
+/// Whether this event happened in this thread: a pin's reply event must.
+async fn event_in_thread(pool: &PgPool, event_id: Uuid, thread_id: Uuid) -> Result<bool, BoxError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE id = $1 AND thread_id = $2)",
+    )
+    .bind(event_id)
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await?)
+}
+
 async fn thread_exists(pool: &PgPool, thread_id: Uuid) -> Result<bool, BoxError> {
     Ok(sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
@@ -331,39 +366,50 @@ async fn thread_exists(pool: &PgPool, thread_id: Uuid) -> Result<bool, BoxError>
     .await?)
 }
 
-/// A widget change in a thread that the user or an agent asked for: showing a
-/// widget there, or pinning or unpinning its chip on the shelf.
+/// A widget change in a thread that the user or an agent asked for: pinning
+/// or unpinning its chip on the shelf. A pin from a reply's inline widget
+/// names that reply's event, so "Show in thread" can land there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WidgetChange {
-    Show,
-    Pin,
+    Pin { shown_event_id: Option<Uuid> },
     Unpin,
+}
+
+/// What a stored widget event records, as the fold reads it. `Shown` is only
+/// ever an old row: nothing writes `WidgetShown` any more (ADR 0466).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WidgetEventKind {
+    Shown,
+    Pinned,
+    Unpinned,
 }
 
 /// Every `event_type` a stored widget event may carry: the current names plus
 /// the legacy ones their `serde(alias)` still reads.
-static STORED_WIDGET_EVENT_TYPES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+pub(crate) static STORED_WIDGET_EVENT_TYPES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     ThreadEvent::RESERVED_TYPE_NAMES
         .iter()
         .chain(ThreadEvent::LEGACY_TYPE_NAME_ALIASES)
         .copied()
-        .filter(|name| WidgetChange::from_event_type(name).is_some())
+        .filter(|name| WidgetEventKind::from_event_type(name).is_some())
         .collect()
 });
 
-impl WidgetChange {
-    /// The change a stored row records. Goes through `ThreadEvent`'s own
+impl WidgetEventKind {
+    /// The kind a stored row records. Goes through `ThreadEvent`'s own
     /// deserializer, so a legacy name reads as the variant it was renamed to.
     fn from_event_type(name: &str) -> Option<Self> {
         let event = ThreadEvent::from_stored(name, serde_json::json!({ "app_id": "" })).ok()?;
         match event {
-            ThreadEvent::WidgetShown { .. } => Some(Self::Show),
-            ThreadEvent::WidgetPinned { .. } => Some(Self::Pin),
-            ThreadEvent::WidgetUnpinned { .. } => Some(Self::Unpin),
+            ThreadEvent::WidgetShown { .. } => Some(Self::Shown),
+            ThreadEvent::WidgetPinned { .. } => Some(Self::Pinned),
+            ThreadEvent::WidgetUnpinned { .. } => Some(Self::Unpinned),
             _ => None,
         }
     }
+}
 
+impl WidgetChange {
     fn event(self, instance: WidgetInstance) -> ThreadEvent {
         let WidgetInstance {
             app_id,
@@ -372,15 +418,11 @@ impl WidgetChange {
         } = instance;
         let params = params.filter(|p| !p.is_empty());
         match self {
-            Self::Show => ThreadEvent::WidgetShown {
+            Self::Pin { shown_event_id } => ThreadEvent::WidgetPinned {
                 app_id,
                 params,
                 label,
-            },
-            Self::Pin => ThreadEvent::WidgetPinned {
-                app_id,
-                params,
-                label,
+                shown_event_id,
             },
             Self::Unpin => ThreadEvent::WidgetUnpinned {
                 app_id,
@@ -472,26 +514,52 @@ impl std::fmt::Display for WidgetCheckFailed {
 
 use WidgetCheckFailed::{ReadFailed, Refused};
 
-/// Whether a widget change can happen.
+/// What a checked widget change must do besides writing its event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WidgetChangePlan {
+    /// Pin to Home on another thread's own widget makes it reusable first, so
+    /// deleting that thread never silently empties a Home board tile (ADR 0432).
+    pub make_reusable: bool,
+}
+
+/// Whether a widget change can happen, and what it must do first.
 pub async fn check_widget_change(
     pool: &PgPool,
     app_manager: &AppManager,
     change: WidgetChange,
     instance: &WidgetInstance,
     thread_id: Uuid,
-) -> Result<(), WidgetCheckFailed> {
+) -> Result<WidgetChangePlan, WidgetCheckFailed> {
     let app = widget(app_manager, &instance.app_id)?;
     if !thread_exists(pool, thread_id).await.map_err(ReadFailed)? {
         return Err(Refused(format!("No thread {} exists", thread_id)));
     }
+    let pin_to_home = matches!(change, WidgetChange::Pin { .. })
+        && crate::engine::home_thread::is_home_thread(pool, thread_id)
+            .await
+            .map_err(|e| ReadFailed(e.into()))?;
     // A new instance must be one this thread may hold. One the thread already
     // holds stays pinnable, even if its widget stopped being reusable since.
-    let check_new = || -> Result<(), WidgetCheckFailed> {
-        check_widget_owner(&app, thread_id)?;
-        check_widget_params(&app, instance.params.as_ref()).map_err(Refused)
+    let check_new = || -> Result<WidgetChangePlan, WidgetCheckFailed> {
+        let make_reusable = pin_to_home && check_widget_owner(&app, thread_id).is_err();
+        if !make_reusable {
+            check_widget_owner(&app, thread_id)?;
+        }
+        check_widget_params(&app, instance.params.as_ref()).map_err(Refused)?;
+        Ok(WidgetChangePlan { make_reusable })
     };
-    if change == WidgetChange::Show {
-        return check_new();
+    if let WidgetChange::Pin {
+        shown_event_id: Some(event_id),
+    } = change
+    {
+        if !event_in_thread(pool, event_id, thread_id)
+            .await
+            .map_err(ReadFailed)?
+        {
+            return Err(Refused(format!(
+                "No event {event_id} in thread {thread_id}"
+            )));
+        }
     }
     let widgets = fold_thread_widgets(
         &widget_event_rows(pool, thread_id)
@@ -500,11 +568,17 @@ pub async fn check_widget_change(
     );
     let key = instance.key();
     let pinned = widgets.iter().find(|w| w.key() == key).map(|w| w.pinned);
-    if change == WidgetChange::Pin && pinned.is_none() {
-        check_new()?;
-    }
+    let plan = match (change, pinned) {
+        (WidgetChange::Pin { .. }, None) => check_new()?,
+        // Home held it before: a pin again still makes it reusable, or deleting
+        // its thread would empty the tile.
+        (WidgetChange::Pin { .. }, Some(false)) if pin_to_home => WidgetChangePlan {
+            make_reusable: check_widget_owner(&app, thread_id).is_err(),
+        },
+        _ => WidgetChangePlan::default(),
+    };
     match (change, pinned) {
-        (WidgetChange::Pin, Some(true)) => Err(Refused(format!(
+        (WidgetChange::Pin { .. }, Some(true)) => Err(Refused(format!(
             "Widget {} is already pinned to this thread's shelf",
             instance.describe()
         ))),
@@ -516,7 +590,7 @@ pub async fn check_widget_change(
             "Widget {} is not pinned to this thread's shelf",
             instance.describe()
         ))),
-        _ => Ok(()),
+        _ => Ok(plan),
     }
 }
 
@@ -548,6 +622,13 @@ pub async fn check_set_reusable(
             app_id, plugin
         )));
     }
+    if pinned_to_home_from_elsewhere(pool, &app).await? {
+        return Err(Refused(format!(
+            "Widget '{}' is pinned to Home. Unpin it from Home first, \
+             or deleting its thread would empty the tile.",
+            app_id
+        )));
+    }
     let origin_exists = match app.origin_thread() {
         Some(thread_id) => thread_exists(pool, thread_id).await.map_err(ReadFailed)?,
         None => false,
@@ -562,9 +643,47 @@ pub async fn check_set_reusable(
     Ok(())
 }
 
+/// Carry out a checked widget change: make the widget reusable when the plan
+/// says so, then write its event. Answers whether it made the widget reusable.
+pub async fn apply_widget_change(
+    app_manager: &AppManager,
+    event_bus: &EventBus,
+    plan: WidgetChangePlan,
+    change: WidgetChange,
+    instance: WidgetInstance,
+    thread_id: Uuid,
+    actor: Option<MessageOrigin>,
+) -> Result<bool, BoxError> {
+    // A second pin racing the first finds the widget reusable already.
+    let make_reusable = plan.make_reusable && !app_manager.get_app(&instance.app_id)?.reusable;
+    if make_reusable {
+        app_manager
+            .set_widget_reusable(event_bus, &instance.app_id, true, actor.clone())
+            .await?;
+    }
+    emit_widget_change(event_bus, change, instance, thread_id, actor).await?;
+    Ok(make_reusable)
+}
+
+/// Whether Home pins this widget while another thread owns it: then that
+/// thread's deletion would remove the widget from under its tile.
+async fn pinned_to_home_from_elsewhere(
+    pool: &PgPool,
+    app: &App,
+) -> Result<bool, WidgetCheckFailed> {
+    let home = crate::engine::home_thread::home_thread_id(pool)
+        .await
+        .map_err(|e| ReadFailed(e.into()))?;
+    let Some(home) = home.filter(|h| app.origin_thread() != Some(*h)) else {
+        return Ok(false);
+    };
+    let widgets = fold_thread_widgets(&widget_event_rows(pool, home).await.map_err(ReadFailed)?);
+    Ok(widgets.iter().any(|w| w.pinned && w.app_id == app.id))
+}
+
 /// Write the one thread event a checked widget change consists of. No file
 /// and no commit: unpinning is never destructive.
-pub async fn emit_widget_change(
+async fn emit_widget_change(
     event_bus: &EventBus,
     change: WidgetChange,
     instance: WidgetInstance,
@@ -594,6 +713,7 @@ mod tests {
             app_id: app_id.to_string(),
             params: None,
             label: None,
+            shown_event_id: None,
         }
     }
 
@@ -716,6 +836,7 @@ mod tests {
                 "<h1>w",
                 crate::core::NewAppKind::Widget {
                     origin_thread_id: origin,
+                    sizes: None,
                 },
             )
             .await
@@ -756,6 +877,7 @@ mod tests {
             ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "show my habits".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -790,9 +912,16 @@ mod tests {
             params: None,
             label: None,
         };
-        check_widget_change(&pool, &manager, WidgetChange::Show, &board, thread)
+        let pin = |shown_event_id| WidgetChange::Pin { shown_event_id };
+        check_widget_change(&pool, &manager, pin(None), &board, thread)
             .await
-            .expect("a plugin widget shows in any thread");
+            .expect("a plugin widget pins in any thread");
+        let stray =
+            check_widget_change(&pool, &manager, pin(Some(Uuid::new_v4())), &board, thread).await;
+        assert!(
+            matches!(&stray, Err(WidgetCheckFailed::Refused(r)) if r.starts_with("No event")),
+            "a pin's reply event must be in the thread, got: {stray:?}"
+        );
         let widgets = thread_widgets(&pool, &manager, thread).await.unwrap();
         assert_eq!(
             widgets[0].origin_plugin_id.as_deref(),
@@ -816,6 +945,7 @@ mod tests {
             ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "compare the fares".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -863,6 +993,21 @@ mod tests {
         assert!(widgets[0].reusable);
 
         crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[test]
+    fn a_pin_from_a_reply_names_where_show_in_thread_lands() {
+        let reply = Uuid::from_u128(40);
+        let widgets = fold_thread_widgets(&[
+            row(1, "WidgetShown", "fare-grid"),
+            WidgetEventRow {
+                shown_event_id: Some(reply),
+                ..row(2, "WidgetPinned", "fare-grid")
+            },
+            row(3, "WidgetPinned", "player"),
+        ]);
+        assert_eq!(widgets[0].shown_event_id, Some(reply));
+        assert_eq!(widgets[1].shown_event_id, None);
     }
 
     /// An embed records no showing, so its pin alone adds the instance. An
@@ -993,6 +1138,8 @@ mod tests {
                 ),
             ]),
             built_in: false,
+            sizes: WidgetSize::UNDECLARED.to_vec(),
+            transparent: false,
         }
     }
 

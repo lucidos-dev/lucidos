@@ -90,6 +90,27 @@ pub(crate) fn is_coding_agent_branch(branch: &str) -> bool {
     branch.starts_with(LUCIDOS_BRANCH_PREFIX) || branch.starts_with(LEGACY_BRANCH_PREFIX)
 }
 
+/// Prefix of a lane batch's *integration branch* (ADR 0463).
+pub(crate) const LANE_BRANCH_PREFIX: &str = "lane/";
+
+/// The integration branch a lane batch's lane thread resolves on.
+pub(crate) fn lane_branch(batch_id: Uuid) -> String {
+    format!("{LANE_BRANCH_PREFIX}{batch_id}")
+}
+
+/// The batch a lane branch belongs to. `None` for any other branch.
+pub(crate) fn lane_branch_batch(branch: &str) -> Option<Uuid> {
+    branch
+        .strip_prefix(LANE_BRANCH_PREFIX)
+        .and_then(|id| Uuid::parse_str(id).ok())
+}
+
+/// Is this a lane batch's integration branch? Orphan recovery scans these
+/// beside the coding-agent branches, since a lane thread works on one.
+pub(crate) fn is_lane_branch(branch: &str) -> bool {
+    lane_branch_batch(branch).is_some()
+}
+
 /// Kebab-case a thread name into the slug segment. Falls back to `thread` when
 /// nothing survives slugification: an emoji-only or CJK title, or a thread with
 /// neither a title nor a first message yet.
@@ -509,5 +530,16 @@ mod tests {
         assert!(!is_coding_agent_branch("feature/lucidos-integration"));
         assert!(!is_coding_agent_branch("merge-tmp/abc"));
         assert!(!is_coding_agent_branch("e2e-test/abc"));
+    }
+
+    #[test]
+    fn a_lane_branch_names_its_batch() {
+        let batch = Uuid::new_v4();
+        let branch = lane_branch(batch);
+        assert!(is_lane_branch(&branch));
+        assert_eq!(lane_branch_batch(&branch), Some(batch));
+        assert!(!is_coding_agent_branch(&branch));
+        assert!(!is_lane_branch("lane/not-a-batch"));
+        assert!(!is_lane_branch("main"));
     }
 }

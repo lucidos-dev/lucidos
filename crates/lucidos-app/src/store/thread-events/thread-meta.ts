@@ -1,7 +1,7 @@
 import { changeWork, EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS } from '../../generated/thread-lifecycle';
 import type { ChangeWork, EventChannel, ThreadStatus } from '../../generated/thread-lifecycle';
 import type { EventWaitSummary, StoredEvent, ThreadInitiator, ThreadSection, TodoItem } from './thread-event-types';
-import type { CodingAgentChangeState } from '../../api/threads';
+import type { CodingAgentChangeState, SuccessorLink } from '../../api/threads';
 
 /** Post-event projection snapshot carried on persisted SSE thread events
  *  (`data.aggregate`) and on `fetchThreadEvents` HTTP responses
@@ -52,6 +52,10 @@ export type ThreadAggregate = {
   /** Whether the thread's agent asked the user to read its latest reply,
    *  still unseen (ADR 0409). Optional only so test fixtures needn't set it. */
   readRequested?: boolean;
+  /** Whether an Apply Now is running on the thread, from its
+   *  `ApplyNowStarted` to its `ApplyNowEnded` (ADR 0437). Optional only so
+   *  test fixtures needn't set it. */
+  applyInFlight?: boolean;
   /** How many event waits this thread holds unresolved. Consumed by
    *  `resolveVisualStatus` via `count > 0`. See `ThreadMeta.liveEventWaitCount`
    *  for why the count is carried separately from `meta.liveEventWaits`. */
@@ -79,6 +83,10 @@ export type ThreadAggregate = {
   lastRevivedAt: string | null;
   parentThreadId: string | null;
   parentThreadTitle: string | null;
+  /** See `ThreadMeta.successor`. Absent until the thread hands off. */
+  successor?: SuccessorLink;
+  /** See `ThreadMeta.successorOf`. */
+  successorOf?: SuccessorLink;
   triggerId?: string;
   triggerName?: string;
   ccRepoId?: string;
@@ -157,6 +165,7 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
   if (!!meta.isStoppedChild !== !!agg.isStoppedChild) { meta.isStoppedChild = !!agg.isStoppedChild; changed = true; }
   if (!!meta.readRequested !== !!agg.readRequested) { meta.readRequested = !!agg.readRequested; changed = true; }
+  if (!!meta.applyInFlight !== !!agg.applyInFlight) { meta.applyInFlight = !!agg.applyInFlight; changed = true; }
   if (meta.liveEventWaitCount !== agg.liveEventWaitCount) { meta.liveEventWaitCount = agg.liveEventWaitCount; changed = true; }
   if (agg.liveEventWaits !== undefined && !sameWaits(meta.liveEventWaits, agg.liveEventWaits)) { meta.liveEventWaits = agg.liveEventWaits; changed = true; }
   if (!sameChangeState(meta.codingAgentChangeState, agg.codingAgentChangeState)) { meta.codingAgentChangeState = agg.codingAgentChangeState; changed = true; }
@@ -181,6 +190,9 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.parentThreadId !== nextParentId) { meta.parentThreadId = nextParentId; changed = true; }
   const nextParentTitle = agg.parentThreadTitle ?? undefined;
   if (meta.parentThreadTitle !== nextParentTitle) { meta.parentThreadTitle = nextParentTitle; changed = true; }
+  // A successor link never goes away, so absence leaves it alone.
+  if (agg.successor && !sameSuccessorLink(meta.successor, agg.successor)) { meta.successor = agg.successor; changed = true; }
+  if (agg.successorOf && !sameSuccessorLink(meta.successorOf, agg.successorOf)) { meta.successorOf = agg.successorOf; changed = true; }
   if (agg.triggerId && meta.triggerId !== agg.triggerId) { meta.triggerId = agg.triggerId; changed = true; }
   if (agg.triggerName && meta.triggerName !== agg.triggerName) { meta.triggerName = agg.triggerName; changed = true; }
   if (agg.ccRepoId && meta.repoId !== agg.ccRepoId) { meta.repoId = agg.ccRepoId; changed = true; }
@@ -266,6 +278,10 @@ export type ThreadMeta = {
    *  reply, and they have not seen it yet (ADR 0409). Lists a settled thread
    *  under Review. Absent reads as false. */
   readRequested?: boolean;
+  /** Whether the engine has an Apply Now running on this thread (ADR 0437).
+   *  The one source of "applying", beside a click still waiting for its
+   *  answer (`applyNowRequests`). Absent reads as false. */
+  applyInFlight?: boolean;
   /** How many *event waits* this thread holds unresolved, from the backend
    *  projection (`thread_summaries.live_event_wait_count`). Consumed by
    *  `resolveVisualStatus` via `count > 0` to paint the same Waiting dot
@@ -292,6 +308,10 @@ export type ThreadMeta = {
   /** Set when mode != 'human' on the initial MessageReceived. */
   parentThreadId?: string;
   parentThreadTitle?: string;
+  /** The *successor thread* this one continued in, once it handed off. */
+  successor?: SuccessorLink;
+  /** The thread this *successor thread* continues. */
+  successorOf?: SuccessorLink;
   /** Trigger that fired this thread (only for `channel === 'trigger'`). */
   triggerId?: string;
   /** Trigger name at fire-time (snapshot — falls back when the trigger is renamed/deleted). */
@@ -379,6 +399,10 @@ export type ThreadState = {
    *  client-only message row. Its failure card sits on the next seq. Written by
    *  `showUnsentExchange` (actions/chat.ts), cleared by `retireUnsentExchange`. */
   unsentMessageSeqs?: Map<string, number>;
+  /** Ids of this thread's *cache keep-alive* anchors seen so far. A keep-alive
+   *  turn's events name one as `request_event_id`, and none of them moves the
+   *  thread's recency. */
+  keepAliveAnchorIds?: Set<string>;
   streamingBuffer: string;
   eventsLoaded: boolean;
   /** True when loadThreadEvents exhausted retries. The UI shows an error
@@ -663,6 +687,11 @@ export function sameChangeState(a: CodingAgentChangeState, b: CodingAgentChangeS
     case 'unproposed': return b.kind === 'unproposed' && a.reason === b.reason;
     case 'proposed': return b.kind === 'proposed' && a.requires_restart === b.requires_restart;
   }
+}
+
+/** Whether two successor links name the same thread under the same title. */
+export function sameSuccessorLink(a: SuccessorLink | undefined, b: SuccessorLink): boolean {
+  return a?.thread_id === b.thread_id && a.title === b.title;
 }
 
 /** Whether this event type updates the thread's last_activity in the backend

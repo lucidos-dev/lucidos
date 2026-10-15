@@ -89,8 +89,7 @@ fn default_true() -> bool {
 
 /// `~/.lucidos/network.toml`. `None` only when `HOME` is unset.
 pub fn network_toml_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".lucidos/network.toml"))
+    Some(lucidos_home::path()?.join("network.toml"))
 }
 
 /// Read + parse the machine-global config. Any failure (missing file, unreadable,
@@ -489,9 +488,8 @@ mod tests {
     fn an_unreadable_config_warns_while_an_absent_one_stays_silent() {
         // Both errors come from a real read, so the split holds for what the
         // OS returns, not for an invented kind.
-        let dir = std::env::temp_dir().join(format!("lucidos-net-config-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("a writable temp directory");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let absent_path = dir.join("network.toml");
         let absent = std::fs::read_to_string(&absent_path).expect_err("nothing was written there");
@@ -505,8 +503,6 @@ mod tests {
             .expect("an unreadable config must not fall back to loopback in silence");
         assert!(warning.contains(&dir.display().to_string()), "{warning}");
         assert!(warning.contains(&unreadable.to_string()), "{warning}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

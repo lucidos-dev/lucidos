@@ -4,8 +4,8 @@ use crate::engine::agent_session::node_modules_setup::{
 use crate::engine::agent_session::prompts::{
     app_worktree_recovery_system_prompt, app_worktree_system_prompt, append_backend_rules,
     conflict_resolution_system_prompt, external_repo_recovery_system_prompt,
-    external_repo_system_prompt, file_link_rule, recovery_system_prompt,
-    standing_instruction_section, worktree_system_prompt,
+    external_repo_system_prompt, file_link_rule, lane_thread_system_prompt, recovery_system_prompt,
+    standing_instruction_section, wake_decision_section, worktree_system_prompt,
 };
 use crate::engine::agent_session::spawn::{
     resolve_branch_for_resume, BranchResolution, FreshBranch,
@@ -64,6 +64,92 @@ async fn link_node_modules_tree(src: &Path, dst: &Path, label: &str) {
     }
 }
 
+/// Copy this worktree's generated files from the codegen cache. They are build
+/// outputs, so a fresh worktree may have none or stale ones. `--cached-only`
+/// never compiles: on a miss it leaves the session to render them itself.
+/// Best-effort like the `node_modules` link: a failure is logged, not fatal.
+pub(crate) async fn provision_generated_files(wt_path: &Path) {
+    let script = wt_path.join("scripts/codegen.sh");
+    if !script.is_file() {
+        return;
+    }
+    match tokio::process::Command::new("bash")
+        .arg(&script)
+        .arg("--cached-only")
+        .current_dir(wt_path)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => log!(
+            "[AgentSession] generated files provisioned: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Ok(o) => log!(
+            "[AgentSession] codegen --cached-only failed in worktree: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => log!("[AgentSession] Failed to run codegen in worktree: {}", e),
+    }
+}
+
+/// Give a Lucidos-source worktree the main checkout's `node_modules`, so its
+/// frontend tests run. A hardlink takes 1 to 2 s, against minutes for `npm ci`.
+/// A main checkout with none installed gets `npm ci` in the worktree instead.
+async fn provision_node_modules(repo_root: &Path, wt_path: &Path) {
+    let wt_node_modules = wt_path.join("node_modules");
+    if !has_install_marker(&wt_node_modules) && !has_install_marker(&repo_root.join("node_modules"))
+    {
+        // At the workspace root, so every member installs. `npm ci` wipes
+        // node_modules itself, so a stale Vite cache here does no harm.
+        log!("[AgentSession] No node_modules in main repo to copy, running npm ci...");
+        match tokio::process::Command::new("npm")
+            .args(["ci", "--prefer-offline"])
+            .current_dir(wt_path)
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => {
+                log!("[AgentSession] node_modules installed in worktree");
+            }
+            Ok(o) => log!(
+                "[AgentSession] npm ci failed in worktree: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => log!("[AgentSession] Failed to run npm ci in worktree: {}", e),
+        }
+    }
+    link_node_modules(repo_root, wt_path).await;
+}
+
+/// Hardlink the main checkout's installed `node_modules` into a worktree.
+/// Links nothing the main checkout lacks or the worktree already has.
+///
+/// The repo is an npm workspace, so dependencies hoist to the repo root. The
+/// root tree goes first: its member symlinks are relative, and Node resolution
+/// walks up to `<wt>/node_modules`. Pointing the root link at a member once
+/// sent every worktree to a cold `npm ci` that saturated the disk
+/// (docs/plans/2026-06-27-mobile-webkit-shard-contention.md). A member tree
+/// holds only what npm could not hoist. It links independently of the root
+/// marker, so an older root-only worktree still gets it.
+///
+/// Never a symlink to the tree itself: an `npm install` in the worktree would
+/// follow it and corrupt the main checkout's real `node_modules`.
+pub(crate) async fn link_node_modules(repo_root: &Path, wt_path: &Path) {
+    let wt_node_modules = wt_path.join("node_modules");
+    let src_node_modules = repo_root.join("node_modules");
+    if !has_install_marker(&wt_node_modules) && has_install_marker(&src_node_modules) {
+        link_node_modules_tree(&src_node_modules, &wt_node_modules, "node_modules").await;
+    }
+    for (member_src, member_dst) in member_node_modules_links(repo_root, wt_path) {
+        let label = member_dst
+            .strip_prefix(wt_path)
+            .unwrap_or(member_dst.as_path())
+            .to_string_lossy()
+            .into_owned();
+        link_node_modules_tree(&member_src, &member_dst, &label).await;
+    }
+}
+
 /// Resolved worktree / branch / system-prompt context for a `run_direct_agent`
 /// spawn. Produced by [`LucidosEngine::resolve_run_worktree_context`], the
 /// "start" lifecycle stage extracted from the driver: it picks recovery vs
@@ -99,6 +185,7 @@ impl LucidosEngine {
         &self,
         recovery_worktree: Option<(PathBuf, String)>,
         conflict_change: &Option<crate::core::changes::Change>,
+        lane_duty: Option<&crate::engine::landing_lane::LaneDuty>,
         system_prompt_override: Option<String>,
         app_spawn_id: &Option<String>,
         is_app_spawn: bool,
@@ -155,6 +242,22 @@ impl LucidosEngine {
                 branch,
                 Some(wt_path),
                 true,
+                false,
+                false,
+            )
+        } else if let Some(duty) = lane_duty {
+            // Lane mode: the lane thread resolves its batch on the integration
+            // branch. The lane owns the worktree and its cleanup.
+            duty.ensure_worktree(repo_root, self.workspace_path())
+                .await
+                .map_err(|e| format!("The lane worktree could not be prepared: {e}"))?;
+            let cwd = duty.worktree.path.clone();
+            (
+                cwd.clone(),
+                lane_thread_system_prompt().to_string(),
+                duty.worktree.branch.clone(),
+                Some(cwd),
+                false,
                 false,
                 false,
             )
@@ -400,7 +503,26 @@ impl LucidosEngine {
             // unrelated in-flight `lucidos-*` branch would otherwise leak
             // that branch's commits into this thread as phantom "pending
             // changes". External repos keep the origin-or-HEAD contract.
-            let worktree_base_branch = resolve_worktree_base(repo_root, is_external_repo).await;
+            //
+            // A successor thread starts at its old thread's last commit
+            // instead, so its branch carries all of that thread's work. An
+            // unreadable base fails the spawn: branching from `main` would
+            // split the work across two branches.
+            let carried_base = match crate::engine::successor::carried_base(self.pool(), thread_id)
+                .await
+            {
+                Ok(base) => base,
+                Err(e) => {
+                    return Err(format!(
+                        "Could not read where this successor thread's branch starts: {e}. Resend the message to retry."
+                    )
+                    .into())
+                }
+            };
+            let worktree_base_branch = match carried_base.clone() {
+                Some(base) => Some(base),
+                None => resolve_worktree_base(repo_root, is_external_repo).await,
+            };
 
             // Create worktree if we're not reusing an existing one. A *stranded*
             // directory may still occupy the target path — present on disk but
@@ -436,11 +558,12 @@ impl LucidosEngine {
                     let Some(ref app_id) = app_spawn_id else {
                         return Err("Internal: is_app_spawn set without app_spawn_id".into());
                     };
-                    match crate::engine::git_ops::create_sparse_app_worktree(
+                    match crate::engine::git_ops::create_sparse_app_worktree_from(
                         repo_root,
                         app_id,
                         &branch_name,
                         &wt_path,
+                        carried_base.as_deref(),
                     )
                     .await
                     {
@@ -579,88 +702,17 @@ impl LucidosEngine {
             // needs `main` as an ancestor. See
             // docs/adr/0241-session-spawn-does-not-merge-main.md.
 
-            // Copy node_modules from main repo to worktree so frontend tests work.
-            // Much faster than `npm ci` (~1-2s hardlink vs 2-10min install).
-            //
-            // The repo is an npm WORKSPACE (root package.json `workspaces:
-            // [crates/lucidos-app, packages/lucidos-sdk]`), so deps hoist
-            // to the REPO ROOT (`<repo>/node_modules`). Provision the root tree
-            // first: its workspace-member symlinks (e.g. `lucidos-app ->
-            // ../crates/lucidos-app`) are relative and resolve inside the
-            // worktree, and Node resolution walks up to `<wt>/node_modules`.
-            // The committed lockfile nests nothing under a member today, so the
-            // root tree carries `vitest` and everything else `npm test` needs.
-            // The member loop below is the safety net for a dep npm cannot
-            // hoist, and links nothing while the lockfile stays flat.
-            // (Pointing the ROOT link at crates/lucidos-app is what silently killed the
-            // fast path after the workspace migration: the marker was never
-            // found, so every CC worktree fell back to a cold `npm ci` that
-            // saturated disk I/O and timed out the concurrent git checkout —
-            // see docs/plans/2026-06-27-mobile-webkit-shard-contention.md.)
-            // Can't symlink the tree itself: npm install in the worktree would
-            // follow it and corrupt/delete the main repo's real node_modules.
-            // Apps don't share Lucidos's node_modules — they're standalone
-            // static folders. Skip the copy.
+            // Apps don't share Lucidos's node_modules: they are standalone
+            // static folders.
             if !is_external_repo && !is_app_spawn {
-                let wt_node_modules = wt_path.join("node_modules");
-                if !has_install_marker(&wt_node_modules) {
-                    let src_node_modules = repo_root.join("node_modules");
-                    if has_install_marker(&src_node_modules) {
-                        // Fast path (~1-2s vs a 2-10min npm ci): hardlink main's
-                        // hoisted ROOT node_modules into the worktree. Any
-                        // MEMBER tree npm could not hoist is linked separately
-                        // below, independent of this root-marker gate.
-                        link_node_modules_tree(&src_node_modules, &wt_node_modules, "node_modules")
-                            .await;
-                    } else {
-                        // npm ci wipes node_modules itself, so any stale Vite
-                        // cache here is fine to leave. Run it at the WORKSPACE
-                        // ROOT so every member installs correctly — the repo is
-                        // an npm workspace, so `npm ci` inside a member is wrong.
-                        log!(
-                            "[AgentSession] No node_modules in main repo to copy, running npm ci..."
-                        );
-                        match tokio::process::Command::new("npm")
-                            .args(["ci", "--prefer-offline"])
-                            .current_dir(&wt_path)
-                            .output()
-                            .await
-                        {
-                            Ok(o) if o.status.success() => {
-                                log!("[AgentSession] node_modules installed in worktree");
-                            }
-                            Ok(o) => log!(
-                                "[AgentSession] npm ci failed in worktree: {}",
-                                String::from_utf8_lossy(&o.stderr).trim()
-                            ),
-                            Err(e) => {
-                                log!("[AgentSession] Failed to run npm ci in worktree: {}", e)
-                            }
-                        }
-                    }
-                }
+                provision_node_modules(repo_root, &wt_path).await;
 
-                // A MEMBER node_modules holds only what npm could not hoist, and
-                // is the tree the ROOT link above misses.
-                // Provision them here — independent of the root marker — so a
-                // worktree created by the old root-only provisioning (root
-                // marker present, member tree absent) still gets its member tree
-                // on the next spawn/resume. `member_node_modules_links` returns
-                // only members really installed in main AND not already
-                // installed here. So it is a no-op on the npm-ci path, on a
-                // resume that already has them, and on a flat lockfile.
-                for (member_src, member_dst) in member_node_modules_links(repo_root, &wt_path) {
-                    let label = member_dst
-                        .strip_prefix(&wt_path)
-                        .unwrap_or(member_dst.as_path())
-                        .to_string_lossy()
-                        .into_owned();
-                    link_node_modules_tree(&member_src, &member_dst, &label).await;
-                }
+                // After node_modules: the SDK bundles build with its esbuild.
+                provision_generated_files(&wt_path).await;
             }
 
             log!(
-                "[AgentSession] [TIMING] node_modules setup done: {:?}",
+                "[AgentSession] [TIMING] node_modules and generated files done: {:?}",
                 cc_start.elapsed()
             );
 
@@ -724,6 +776,15 @@ impl LucidosEngine {
             // `cleanup_failed_spawn`.
             let worktree_created = existing_worktree.is_none();
             let branch_created = worktree_created && app_branch_created.unwrap_or(!reusing_branch);
+            if branch_created && carried_base.is_some() {
+                crate::engine::successor::carry_plan_marker(
+                    self.pool(),
+                    repo_root,
+                    thread_id,
+                    &branch_name,
+                )
+                .await;
+            }
             (
                 cwd,
                 system_prompt,
@@ -734,7 +795,7 @@ impl LucidosEngine {
                 branch_created,
             )
         };
-        if conflict_change.is_none() {
+        if conflict_change.is_none() && lane_duty.is_none() {
             if let Some(ref wt_path) = worktree_path {
                 if let Err(e) = install_coding_agent_diff_hook(repo_root, wt_path).await {
                     log!(
@@ -766,6 +827,11 @@ impl LucidosEngine {
         let system_prompt = format!(
             "{system_prompt}{}",
             standing_instruction_section(&self.pool, thread_id).await
+        );
+        // Only a sub-thread reports to a parent, so only it decides a wake.
+        let system_prompt = format!(
+            "{system_prompt}{}",
+            wake_decision_section(&self.pool, thread_id).await
         );
         // ADR 0362: on the Tree memory module the session starts from the
         // workspace memory view. Only this appended prompt changes (I15).

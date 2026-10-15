@@ -12,6 +12,10 @@ import {
   toasts,
   connectionStatus,
   focusedPane,
+  servedNotifications,
+  servedUnreadNotifications,
+  pendingNotificationReads,
+  servedNotificationEpochs,
 } from '../store';
 import type { Notification, Loadable } from '../types';
 
@@ -65,6 +69,7 @@ const {
   stepViewedNotification,
   viewNotification,
   resetViewDedup,
+  _resetNotificationLoadsForTesting,
 } = await import('./notifications');
 const { getNotifications, getNotification, markNotificationRead, markAllNotificationsRead } = await import('../../api/client');
 const { revealContentPane } = await import('./pane');
@@ -104,9 +109,16 @@ function loadedRows(list: Loadable<Notification[]>): Notification[] {
   return list.data;
 }
 
+// Pending reads and loads in flight are module state, so each test starts with none.
+beforeEach(() => {
+  _resetNotificationLoadsForTesting();
+  pendingNotificationReads.value = new Map();
+  servedNotificationEpochs.value = { browse: 0, unread: 0 };
+});
+
 /** Seed the unread set (the bell badge's single source of truth) directly. */
 function seedUnread(items: Notification[]): void {
-  unreadNotifications.value = { status: 'loaded', data: items };
+  servedUnreadNotifications.value = { status: 'loaded', data: items };
 }
 
 describe('handleNotificationSSE', () => {
@@ -115,7 +127,7 @@ describe('handleNotificationSSE', () => {
     notificationsFilter.value = 'all';
     panelOverlay.value = null;
     seedUnread([]);
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [
         makeNotification('a', false),
@@ -225,7 +237,7 @@ describe('navigateAdjacentNotification', () => {
     // The loaded row IS the full notification (the list query selects identical
     // columns to the single-notification GET), so stepping must render straight
     // from memory — a per-chevron getNotification round-trip was the iOS-PWA lag.
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('a', true), makeNotification('b', true), makeNotification('c', true)],
     };
@@ -244,7 +256,7 @@ describe('navigateAdjacentNotification', () => {
   });
 
   it('marks an unread stepped-to row read in the background without a detail GET', async () => {
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('a', true), makeNotification('b', false)],
     };
@@ -261,7 +273,7 @@ describe('navigateAdjacentNotification', () => {
   });
 
   it('does NOT POST a read flip when stepping to an already-read row', async () => {
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('a', true), makeNotification('b', true)],
     };
@@ -272,7 +284,7 @@ describe('navigateAdjacentNotification', () => {
   });
 
   it('loads the next page when stepping older past the loaded boundary, then steps into it', async () => {
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('a', true), makeNotification('b', true)],
     };
@@ -295,7 +307,7 @@ describe('navigateAdjacentNotification', () => {
   });
 
   it('does not step past the last loaded item when the server has no more pages', async () => {
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('a', true), makeNotification('b', true)],
     };
@@ -308,7 +320,7 @@ describe('navigateAdjacentNotification', () => {
   });
 
   it('never fetches a page in the newer (prev) direction — the newest is always loaded', async () => {
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('a', true), makeNotification('b', true)],
     };
@@ -326,7 +338,7 @@ describe('navigateAdjacentNotification', () => {
 describe('stepViewedNotification', () => {
   beforeEach(() => {
     notificationsHasMore.value = false;
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('a', true), makeNotification('b', true)],
     };
@@ -375,7 +387,7 @@ describe('viewNotification loads the inbox list so detail chevrons work', () => 
   });
 
   it('loads the browse list on the deep-link path (list not yet loaded)', async () => {
-    notifications.value = { status: 'not-loaded' };
+    servedNotifications.value = { status: 'not-loaded' };
     (getNotification as Mock).mockResolvedValueOnce(makeNotification('x', false));
     // The list load runs while the row is still unread server-side, so it comes
     // back under either filter; here it returns the row plus an older sibling.
@@ -409,7 +421,7 @@ describe('viewNotification loads the inbox list so detail chevrons work', () => 
   });
 
   it('does NOT reload when the browse list already holds the row (in-app open)', async () => {
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('x', false), makeNotification('y', false)],
     };
@@ -433,7 +445,7 @@ describe('viewNotification opens from memory, without a detail GET', () => {
     resetViewDedup();
     panelOverlay.value = null;
     notificationsFilter.value = 'all';
-    notifications.value = { status: 'not-loaded' };
+    servedNotifications.value = { status: 'not-loaded' };
     seedUnread([]);
     (getNotifications as Mock).mockReset();
     (getNotifications as Mock).mockResolvedValue({ notifications: [], unread_count: 0, has_more: false });
@@ -447,7 +459,7 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('opens SYNCHRONOUSLY from the browse list, with no await and no fetch', () => {
-    notifications.value = {
+    servedNotifications.value = {
       status: 'loaded',
       data: [makeNotification('x', false), makeNotification('y', false)],
     };
@@ -476,7 +488,7 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   it('reveals the content pane and pushes a nav entry on the memory path too', () => {
     // Skipping either is a silent no-op on mobile / a broken panel Back
     // (.claude/rules/frontend.md), so the memory path must not shed them.
-    notifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
+    servedNotifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
 
     void viewNotification('x');
 
@@ -485,7 +497,7 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('still marks the row read on the memory path', async () => {
-    notifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
+    servedNotifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
 
     await viewNotification('x');
 
@@ -495,8 +507,8 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   it('falls back to the detail GET when NEITHER list holds the row (cold push tap)', async () => {
     // Cold start: the deep link dispatches before loadUnreadNotifications lands,
     // so there is genuinely nothing in memory to open from.
-    notifications.value = { status: 'not-loaded' };
-    unreadNotifications.value = { status: 'not-loaded' };
+    servedNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
     (getNotification as Mock).mockResolvedValueOnce(makeNotification('x', false));
 
     await viewNotification('x');
@@ -506,7 +518,7 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('falls back to the detail GET when the lists are loaded but lack the row', async () => {
-    notifications.value = { status: 'loaded', data: [makeNotification('other', true)] };
+    servedNotifications.value = { status: 'loaded', data: [makeNotification('other', true)] };
     seedUnread([]);
     (getNotification as Mock).mockResolvedValueOnce(makeNotification('x', false));
 
@@ -520,8 +532,8 @@ describe('viewNotification opens from memory, without a detail GET', () => {
     // The one case left with a real wait. The pane is revealed on the tap and
     // ContentPane fills it with the detail's own skeleton (delay-gated), rather
     // than leaving the previous view up for the whole round-trip.
-    notifications.value = { status: 'not-loaded' };
-    unreadNotifications.value = { status: 'not-loaded' };
+    servedNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
     const gate = deferred<Notification>();
     (getNotification as Mock).mockReturnValueOnce(gate.promise);
 
@@ -540,8 +552,8 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('clears the pending flag and pushes no nav entry when the fetch fails', async () => {
-    notifications.value = { status: 'not-loaded' };
-    unreadNotifications.value = { status: 'not-loaded' };
+    servedNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
     (getNotification as Mock).mockRejectedValueOnce(new Error('engine down'));
 
     await viewNotification('x');
@@ -553,7 +565,7 @@ describe('viewNotification opens from memory, without a detail GET', () => {
   });
 
   it('never flags a pending fetch on the memory path', async () => {
-    notifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
+    servedNotifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
 
     await viewNotification('x');
 
@@ -565,7 +577,7 @@ describe('viewNotification opens from memory, without a detail GET', () => {
     // prev/next walk `notifications`, so that list still has to be fetched.
     // It is fetched AFTER the panel is already up, never in front of it.
     notificationsFilter.value = 'unread';
-    notifications.value = { status: 'not-loaded' };
+    servedNotifications.value = { status: 'not-loaded' };
     seedUnread([makeNotification('u0', false)]);
     (getNotifications as Mock).mockResolvedValueOnce({
       notifications: [makeNotification('u0', false), makeNotification('u1', false)],
@@ -587,7 +599,7 @@ describe('viewNotification opens from memory, without a detail GET', () => {
 describe('the bell badge is derived from the unread set', () => {
   beforeEach(() => {
     seedUnread([]);
-    notifications.value = { status: 'not-loaded' };
+    servedNotifications.value = { status: 'not-loaded' };
     (getNotifications as Mock).mockReset();
     (markNotificationRead as Mock).mockReset();
     (markNotificationRead as Mock).mockResolvedValue({ success: true });
@@ -598,7 +610,7 @@ describe('the bell badge is derived from the unread set', () => {
     expect(unreadCount.value).toBe(3);
     seedUnread([]);
     expect(unreadCount.value).toBe(0);
-    unreadNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
     expect(unreadCount.value).toBe(0);
   });
 
@@ -643,7 +655,7 @@ describe('the app-icon badge is re-asserted, not diffed', () => {
   // Every path that (re)establishes the unread truth must re-assert the icon.
   beforeEach(() => {
     seedUnread([]);
-    notifications.value = { status: 'not-loaded' };
+    servedNotifications.value = { status: 'not-loaded' };
     (getNotifications as Mock).mockReset();
     (getNotifications as Mock).mockResolvedValue({ notifications: [], unread_count: 0, has_more: false });
     (markNotificationRead as Mock).mockReset();
@@ -691,8 +703,8 @@ describe('the app-icon badge is re-asserted, not diffed', () => {
       .mockReturnValueOnce(stale.promise)
       .mockResolvedValueOnce({ notifications: [], unread_count: 0, has_more: false });
 
-    const first = loadUnreadNotifications();   // seq N
-    const second = loadUnreadNotifications();  // seq N+1 — supersedes the first
+    const first = loadUnreadNotifications();   // older load
+    const second = loadUnreadNotifications();  // newer load: supersedes the first
     await second;
     (syncWorkspaceAppBadge as Mock).mockClear();
 
@@ -876,8 +888,8 @@ describe('unread set is resilient to out-of-order responses', () => {
       .mockReturnValueOnce(created.promise)
       .mockResolvedValueOnce({ notifications: [], unread_count: 0, has_more: false });
 
-    const createdReload = loadUnreadNotifications(); // claims seq N
-    const readReload = loadUnreadNotifications();     // claims seq N+1 (the latest)
+    const createdReload = loadUnreadNotifications(); // older load
+    const readReload = loadUnreadNotifications();     // newer load, the one that counts
     await readReload;
     expect(unreadCount.value).toBe(0);
 
@@ -889,7 +901,7 @@ describe('unread set is resilient to out-of-order responses', () => {
     expect(unreadCount.value).toBe(0);
   });
 
-  it('auto-read invalidates an in-flight created-reload so the badge never bumps (§2 Row 1)', async () => {
+  it('auto-read masks the row an in-flight created-reload brings back, so the badge never bumps (§2 Row 1)', async () => {
     // Set is loaded + empty (badge 0). A NotificationCreated SSE has just kicked
     // off a reload that WILL return the new unread row — but it is still in
     // flight when the user (looking at the source event) auto-reads it.
@@ -898,33 +910,33 @@ describe('unread set is resilient to out-of-order responses', () => {
     const created = deferred<NotifResponse>();
     (getNotifications as Mock).mockReturnValueOnce(created.promise);
 
-    const createdReload = loadUnreadNotifications(); // seq N, in-flight (will return [x])
-    markReadOptimistic('x'); // removeFromUnread invalidates the in-flight reload
+    const createdReload = loadUnreadNotifications(); // in flight, will return [x]
+    markReadOptimistic('x'); // a pending read masks x in whatever lands
     expect(unreadCount.value).toBe(0);
 
     // The created-reload lands AFTER the auto-read with the pre-read set.
     created.resolve({ notifications: [makeNotification('x', false)], unread_count: 1, has_more: false });
     await createdReload;
 
-    // It must NOT bump the badge to 1 — the auto-read superseded it.
+    // It must NOT bump the badge to 1: the pending read masks the row.
     expect(unreadCount.value).toBe(0);
   });
 
-  it('lets a local mark-all-read invalidate an older in-flight reload', async () => {
+  it('lets a local mark-all-read mask what an older in-flight reload brings back', async () => {
     seedUnread(makeUnread(5));
     expect(unreadCount.value).toBe(5);
     const stale = deferred<NotifResponse>();
     (getNotifications as Mock).mockReturnValueOnce(stale.promise);
     (markAllNotificationsRead as Mock).mockResolvedValueOnce(undefined);
 
-    const staleReload = loadUnreadNotifications(); // claims seq, held pending (would return 5)
-    await markAllRead();                            // local clear — invalidates the in-flight reload
+    const staleReload = loadUnreadNotifications(); // held pending, would return 5
+    await markAllRead();                            // every cleared row is a pending read
     expect(unreadCount.value).toBe(0);
 
     stale.resolve({ notifications: makeUnread(5), unread_count: 5, has_more: false });
     await staleReload;
 
-    // The superseded reload must not resurrect the pre-read set.
+    // The stale reload must not resurrect the pre-read set.
     expect(unreadCount.value).toBe(0);
   });
 
@@ -932,7 +944,7 @@ describe('unread set is resilient to out-of-order responses', () => {
     // Reported: on a slow engine the tap changed nothing for the whole
     // round-trip, so it read as dead until the error toasts arrived.
     seedUnread(makeUnread(2));
-    notifications.value = { status: 'loaded', data: makeUnread(2) };
+    servedNotifications.value = { status: 'loaded', data: makeUnread(2) };
     const post = deferred<void>();
     (markAllNotificationsRead as Mock).mockReturnValueOnce(post.promise);
 
@@ -947,7 +959,7 @@ describe('unread set is resilient to out-of-order responses', () => {
 
   it('a failed mark-all-read puts the rows back and says so', async () => {
     seedUnread(makeUnread(2));
-    notifications.value = { status: 'loaded', data: makeUnread(2) };
+    servedNotifications.value = { status: 'loaded', data: makeUnread(2) };
     toasts.value = [];
     (markAllNotificationsRead as Mock).mockRejectedValueOnce(new Error('request timed out'));
 
@@ -958,55 +970,204 @@ describe('unread set is resilient to out-of-order responses', () => {
     expect(toasts.value.some((t) => t.type === 'error' && /mark all as read/i.test(t.message))).toBe(true);
   });
 
-  it('a failed mark-all-read reloads instead of restoring when newer state landed', async () => {
+  it('a failed mark-all-read keeps a newer read of the same row held', async () => {
     seedUnread(makeUnread(2));
     let reject!: (e: unknown) => void;
     (markAllNotificationsRead as Mock).mockReturnValueOnce(new Promise<void>((_, r) => { reject = r; }));
-    (getNotifications as Mock).mockResolvedValue({ notifications: makeUnread(3), unread_count: 3, has_more: false });
+    (markNotificationRead as Mock).mockReturnValueOnce(new Promise(() => {}));
 
     const pending = markAllRead();
-    markReadOptimistic('elsewhere'); // a newer local mutation claims the set
+    markReadOptimistic('u0'); // a newer read of a row the mark-all also cleared
     reject(new Error('request timed out'));
     await pending;
-    await vi.waitFor(() => expect(unreadCount.value).toBe(3));
+
+    expect(loadedRows(unreadNotifications.value).map((n) => n.id)).toEqual(['u1']);
   });
 
-  it('supersedes the stale load AND reconciles when the set is NOT loaded (cold-start deep-link)', async () => {
-    // The reported badge=1 / empty-Unread-list class. Cold start: the unread set
-    // has never loaded and the startup loadUnreadNotifications is in flight — it
-    // WOULD resolve with the PRE-read row. Before it lands, the push-tapped row is
-    // opened and marked read. removeFromUnread supersedes that stale load even
-    // though the set is 'not-loaded' (no phantom), and because an idempotent read
-    // emits no NotificationRead SSE, markReadOptimistic reloads once the read
-    // settles — so the badge AND the Unread tab (one source) reach the true unread
-    // set instead of sticking 'not-loaded'/0 or surfacing the read row.
-    unreadNotifications.value = { status: 'not-loaded' };
-    (markNotificationRead as Mock).mockResolvedValue({ success: true });
+  it('a cold-start load that lands after the read never shows the read row', async () => {
+    // The reported badge=1 / empty-Unread-list class. Cold start: the startup
+    // load is in flight and WOULD return the pre-read row when the push-tapped
+    // row is opened and marked read. That load still lands, and the read row
+    // stays masked while the genuinely unread one shows.
+    servedUnreadNotifications.value = { status: 'not-loaded' };
+    (markNotificationRead as Mock).mockReturnValueOnce(new Promise(() => {}));
     const startup = deferred<NotifResponse>();
-    (getNotifications as Mock)
-      .mockReturnValueOnce(startup.promise) // #1 stale startup load (would return the pre-read set)
-      .mockResolvedValueOnce({              // #2 reconciling load: the genuine unread set
-        notifications: [makeNotification('y', false)], unread_count: 1, has_more: false,
-      });
+    (getNotifications as Mock).mockReturnValueOnce(startup.promise);
 
-    const inFlight = loadUnreadNotifications(); // seq N; set still 'not-loaded'
-    markReadOptimistic('x');                    // invalidates seq N; schedules a reconcile after the read
+    const inFlight = loadUnreadNotifications();
+    markReadOptimistic('x');
+    startup.resolve({
+      notifications: [makeNotification('x', false), makeNotification('y', false)], unread_count: 2, has_more: false,
+    });
+    await inFlight;
 
+    expect(unreadCount.value).toBe(1);
+    expect(loadedRows(unreadNotifications.value).map((n) => n.id)).toEqual(['y']);
+  });
+});
+
+// A read is a pending intent until the server acknowledges it (ADR 0437). A
+// load answered before the read POST committed still lists the row as unread,
+// however late it lands. Only a load started after the acknowledgement may
+// show the row again.
+describe('a read holds until the server has acknowledged it', () => {
+  const ids = (list: Loadable<Notification[]>) => loadedRows(list).map((n) => n.id);
+
+  beforeEach(() => {
+    seedUnread([makeNotification('x', false), makeNotification('y', false)]);
+    servedNotifications.value = { status: 'loaded', data: [makeNotification('x', false), makeNotification('y', false)] };
+    (getNotifications as Mock).mockReset();
+    (markNotificationRead as Mock).mockReset();
+    (markAllNotificationsRead as Mock).mockReset();
+  });
+
+  it('a load started after the read, but served before the POST committed, keeps the row hidden', async () => {
+    const post = deferred<{ success: boolean }>();
+    (markNotificationRead as Mock).mockReturnValueOnce(post.promise);
+    const served = deferred<NotifResponse>();
+    (getNotifications as Mock).mockReturnValueOnce(served.promise);
+
+    markReadOptimistic('x');
+    const load = loadUnreadNotifications();
+    served.resolve({ notifications: [makeNotification('x', false), makeNotification('y', false)], unread_count: 2, has_more: false });
+    await load;
+
+    expect(ids(unreadNotifications.value)).toEqual(['y']);
+  });
+
+  it('a load started before the acknowledgement stays subtracted after the POST resolves', async () => {
+    const post = deferred<{ success: boolean }>();
+    (markNotificationRead as Mock).mockReturnValueOnce(post.promise);
+    const served = deferred<NotifResponse>();
+    (getNotifications as Mock).mockReturnValueOnce(served.promise);
+
+    markReadOptimistic('x');
+    const load = loadUnreadNotifications();
+    post.resolve({ success: true });
+    await post.promise;
+    served.resolve({ notifications: [makeNotification('x', false), makeNotification('y', false)], unread_count: 2, has_more: false });
+    await load;
+
+    expect(ids(unreadNotifications.value)).toEqual(['y']);
+  });
+
+  it('a load started after the acknowledgement is the server truth again', async () => {
+    (markNotificationRead as Mock).mockResolvedValueOnce({ success: true });
+    markReadOptimistic('x');
+    await vi.waitFor(() => expect(markNotificationRead).toHaveBeenCalled());
+    await Promise.resolve();
+
+    (getNotifications as Mock).mockResolvedValueOnce({ notifications: [makeNotification('y', false)], unread_count: 1, has_more: false });
+    await loadUnreadNotifications();
+
+    expect(ids(unreadNotifications.value)).toEqual(['y']);
+  });
+
+  it('a newer browse load cannot end the hold while an older unread load is still out', async () => {
+    servedUnreadNotifications.value = { status: 'not-loaded' };
+    const startup = deferred<NotifResponse>();
+    (getNotifications as Mock).mockReturnValueOnce(startup.promise);
+    const inFlight = loadUnreadNotifications();
+    (markNotificationRead as Mock).mockResolvedValueOnce({ success: true });
+
+    markReadOptimistic('x');
+    await vi.waitFor(() => expect(markNotificationRead).toHaveBeenCalled());
+    await Promise.resolve();
+    (getNotifications as Mock).mockResolvedValueOnce({ notifications: [makeNotification('x', true)], unread_count: 0, has_more: false });
+    await loadNotifications();
     startup.resolve({ notifications: [makeNotification('x', false)], unread_count: 1, has_more: false });
-    await inFlight;                             // the stale load lands and is discarded (seq superseded)
+    await inFlight;
 
-    // The reconcile (fired from the read POST's resolution) reaches server truth:
-    // the read row 'x' is gone AND the genuinely-unread 'y' is present — proving it
-    // neither stuck at 0/not-loaded nor stranded the phantom 'x'.
-    await vi.waitFor(() => expect(unreadCount.value).toBe(1));
-    // Cast defeats TS flow-narrowing: the last direct assignment above was
-    // `{ status: 'not-loaded' }`, but the reconcile mutated it across the awaits.
-    const set = unreadNotifications.value as Loadable<Notification[]>;
-    if (set.status === 'loaded') {
-      expect(set.data.map((n) => n.id)).toEqual(['y']);
-    } else {
-      throw new Error('expected the unread set to be reconciled to loaded');
-    }
+    expect(unreadCount.value).toBe(0);
+  });
+
+  it('a superseded load that lands late still lets an acknowledged read go', async () => {
+    servedNotifications.value = { status: 'not-loaded' };
+    const older = deferred<NotifResponse>();
+    (getNotifications as Mock).mockReturnValueOnce(older.promise);
+    (markNotificationRead as Mock).mockResolvedValueOnce({ success: true });
+
+    markReadOptimistic('x');
+    const stale = loadUnreadNotifications(); // started before the acknowledgement
+    await vi.waitFor(() => expect(markNotificationRead).toHaveBeenCalled());
+    await Promise.resolve();
+    (getNotifications as Mock).mockResolvedValueOnce({ notifications: [makeNotification('y', false)], unread_count: 1, has_more: false });
+    await loadUnreadNotifications();
+    older.resolve({ notifications: [makeNotification('x', false), makeNotification('y', false)], unread_count: 2, has_more: false });
+    await stale;
+
+    expect(ids(unreadNotifications.value)).toEqual(['y']);
+    expect(pendingNotificationReads.value.size).toBe(0);
+  });
+
+  it('a failed read lets the served row show again', async () => {
+    let reject!: (e: unknown) => void;
+    (markNotificationRead as Mock).mockReturnValueOnce(new Promise((_, r) => { reject = r; }));
+
+    markReadOptimistic('x');
+    expect(ids(unreadNotifications.value)).toEqual(['y']);
+    reject(new Error('request timed out'));
+
+    await vi.waitFor(() => expect(ids(unreadNotifications.value)).toEqual(['x', 'y']));
+  });
+
+  it('the browse list keeps the row read across a load served before the commit', async () => {
+    const post = deferred<{ success: boolean }>();
+    (markNotificationRead as Mock).mockReturnValueOnce(post.promise);
+    const served = deferred<NotifResponse>();
+    (getNotifications as Mock).mockReturnValueOnce(served.promise);
+
+    markReadOptimistic('x');
+    const load = loadNotifications();
+    served.resolve({ notifications: [makeNotification('x', false), makeNotification('y', false)], unread_count: 2, has_more: false });
+    await load;
+
+    expect(loadedRows(notifications.value).find((n) => n.id === 'x')?.read).toBe(true);
+    expect(loadedRows(notifications.value).find((n) => n.id === 'y')?.read).toBe(false);
+  });
+
+  it('mark all read reloads the visible browse list, so an earlier load cannot show a row it never held', async () => {
+    activeMenuItem.value = 'notifications';
+    notificationsFilter.value = 'all';
+    panelOverlay.value = null;
+    const stale = deferred<NotifResponse>();
+    (getNotifications as Mock).mockReturnValueOnce(stale.promise);
+    const browse = loadNotifications(); // started before the commit
+    const post = deferred<void>();
+    (markAllNotificationsRead as Mock).mockReturnValueOnce(post.promise);
+
+    const marking = markAllRead();
+    (getNotifications as Mock).mockResolvedValue({
+      notifications: [makeNotification('x', true), makeNotification('y', true), makeNotification('z', true)],
+      unread_count: 0, has_more: false,
+    });
+    post.resolve();
+    await marking;
+    stale.resolve({
+      notifications: [makeNotification('x', false), makeNotification('y', false), makeNotification('z', false)],
+      unread_count: 3, has_more: false,
+    });
+    await browse;
+
+    await vi.waitFor(() => expect(loadedRows(notifications.value).find((n) => n.id === 'z')?.read).toBe(true));
+  });
+
+  it('mark all read holds every row it cleared across a load served before the commit', async () => {
+    const post = deferred<void>();
+    (markAllNotificationsRead as Mock).mockReturnValueOnce(post.promise);
+    const served = deferred<NotifResponse>();
+    (getNotifications as Mock).mockReturnValueOnce(served.promise);
+
+    const marking = markAllRead();
+    const load = loadUnreadNotifications();
+    served.resolve({ notifications: [makeNotification('x', false), makeNotification('y', false)], unread_count: 2, has_more: false });
+    await load;
+
+    expect(unreadCount.value).toBe(0);
+    (getNotifications as Mock).mockResolvedValueOnce({ notifications: [], unread_count: 0, has_more: false });
+    post.resolve();
+    await marking;
+    expect(unreadCount.value).toBe(0);
   });
 });
 
@@ -1033,7 +1194,7 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
   });
 
   it('appends the page when nothing moved under it', async () => {
-    notifications.value = { status: 'loaded', data: page(0, 3) };
+    servedNotifications.value = { status: 'loaded', data: page(0, 3) };
     (getNotifications as Mock).mockResolvedValueOnce({
       notifications: page(3, 2), unread_count: 0, has_more: false,
     });
@@ -1046,11 +1207,11 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
   });
 
   it('re-cursors from the new tail instead of appending across a reload', async () => {
-    notifications.value = { status: 'loaded', data: page(0, 4) };
+    servedNotifications.value = { status: 'loaded', data: page(0, 4) };
     // First response answers the OLD cursor. While it is out, a reload
     // truncates the list to its two newest rows.
     (getNotifications as Mock).mockImplementationOnce(async () => {
-      notifications.value = { status: 'loaded', data: page(0, 2) };
+      servedNotifications.value = { status: 'loaded', data: page(0, 2) };
       return { notifications: page(4, 2), unread_count: 0, has_more: true };
     });
     (getNotifications as Mock).mockResolvedValueOnce({
@@ -1070,7 +1231,7 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
   });
 
   it('never doubles a row the reload already carried', async () => {
-    notifications.value = { status: 'loaded', data: page(0, 2) };
+    servedNotifications.value = { status: 'loaded', data: page(0, 2) };
     (getNotifications as Mock).mockResolvedValueOnce({
       notifications: [...page(1, 1), ...page(2, 1)], unread_count: 0, has_more: false,
     });
@@ -1082,10 +1243,10 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
   });
 
   it('gives up after a bounded number of retries rather than spinning', async () => {
-    notifications.value = { status: 'loaded', data: page(0, 3) };
+    servedNotifications.value = { status: 'loaded', data: page(0, 3) };
     // Every response moves the list, so no attempt can ever settle.
     (getNotifications as Mock).mockImplementation(async () => {
-      notifications.value = { status: 'loaded', data: page(0, 3) };
+      servedNotifications.value = { status: 'loaded', data: page(0, 3) };
       return { notifications: page(3, 1), unread_count: 0, has_more: true };
     });
 
@@ -1101,7 +1262,7 @@ describe('loadMoreNotifications: a reload that lands mid-request', () => {
 describe('refreshActiveNotificationsTab', () => {
   it('keeps the list on screen and settles once the new rows land', async () => {
     notificationsFilter.value = 'all';
-    notifications.value = { status: 'loaded', data: [makeNotification('old', true)] };
+    servedNotifications.value = { status: 'loaded', data: [makeNotification('old', true)] };
     const pending = deferred<NotifResponse>();
     (getNotifications as Mock).mockReturnValueOnce(pending.promise);
 

@@ -45,6 +45,14 @@ A second token, `~/.lucidos/webhook-token`, reaches exactly
 `/api/v1/webhooks/<id>/deliver`. The gateway's hook socket presents it, and
 nothing else does.
 
+**Amended 2026-10-12.** The second token is now the *hook socket token*: file
+`~/.lucidos/hook-socket-token`, header `x-lucidos-hook-socket-token`. "Webhook
+token" now means only a webhook's own bearer token. The engine also reads or
+mints it at boot, so the order the two processes start in no longer matters.
+Nothing deletes the old file, because an older gateway sharing `~/.lucidos`
+may still use it. See
+`docs/plans/2026-10-12-the-hook-socket-token.md`.
+
 **Both header names belong to the gateway**, like `x-lucidos-device-id` before
 them (ADR 0050). The proxy strips an inbound one and re-injects its own.
 

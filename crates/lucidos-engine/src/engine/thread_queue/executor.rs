@@ -72,6 +72,7 @@ pub(crate) fn eager_sub_thread_message(
         prompt,
         parent_thread_id,
         spawning_event_id,
+        wake_mode,
         model,
         reasoning_effort,
         origin,
@@ -87,6 +88,7 @@ pub(crate) fn eager_sub_thread_message(
         None,
         *parent_thread_id,
         *spawning_event_id,
+        *wake_mode,
         MessageOrigin::mode_or(origin.as_ref(), ActorMode::Agent),
         model.as_deref(),
         reasoning_effort.as_deref(),
@@ -118,6 +120,7 @@ pub(crate) fn coding_agent_spawn_params(
         device_id,
         parent_thread_id,
         spawning_event_id,
+        wake_mode,
         repo_id,
         title,
         app_id,
@@ -137,6 +140,7 @@ pub(crate) fn coding_agent_spawn_params(
             device_id,
             parent_thread_id,
             spawning_event_id,
+            wake_mode,
             repo_id,
             caller_title: title,
             app_id,
@@ -155,6 +159,7 @@ impl ThreadQueueExecutor for EngineThreadQueueExecutor {
         // can be built from `request` before the mutable write-back below.
         let ThreadQueueRequest::SubThread {
             child_thread_id,
+            parent_thread_id,
             pre_emitted_origin,
             ..
         } = &*request
@@ -165,6 +170,7 @@ impl ThreadQueueExecutor for EngineThreadQueueExecutor {
             return; // already emitted (re-admission after a failed emit retry)
         }
         let child_thread_id = *child_thread_id;
+        let parent_thread_id = *parent_thread_id;
         let Some(engine) = self.engine.upgrade() else {
             return;
         };
@@ -203,7 +209,18 @@ impl ThreadQueueExecutor for EngineThreadQueueExecutor {
             return; // unreachable: the same variant matched above
         };
         match result {
-            Ok(Some(emit)) => *pre_emitted_origin = Some(emit.event_id),
+            Ok(Some(emit)) => {
+                *pre_emitted_origin = Some(emit.event_id);
+                // A child starts with its parent's enabled MCP servers, once
+                // its row exists to hold them (ADR 0430). A top spawn has no
+                // parent and inherits nothing.
+                if let Some(parent) = parent_thread_id {
+                    engine
+                        .mcp_manager
+                        .inherit_enabled(parent, child_thread_id)
+                        .await;
+                }
+            }
             Ok(None) => log!("[ThreadQueue] sub-thread MessageReceived emit returned no result"),
             Err(e) => log!(
                 "[ThreadQueue] sub-thread MessageReceived emit failed: {}",
@@ -388,6 +405,7 @@ impl LucidosEngine {
                 child_thread_id,
                 parent_thread_id,
                 spawning_event_id,
+                wake_mode,
                 title,
                 model,
                 reasoning_effort,
@@ -398,6 +416,7 @@ impl LucidosEngine {
                     &prompt,
                     parent_thread_id,
                     spawning_event_id,
+                    wake_mode,
                     child_thread_id,
                     pre_emitted_origin,
                     title.as_deref(),
@@ -465,7 +484,11 @@ impl LucidosEngine {
                 origin,
                 parent_thread_id,
                 spawning_event_id,
+                wake_mode,
                 app_id,
+                // The child's first message records it, read from this
+                // request's queue row (`integrated::queued_spawn_is_integrated`).
+                integrated: _,
             } => {
                 if let Some(app) = app_id {
                     match self.pending_app_spawn.lock() {
@@ -496,6 +519,7 @@ impl LucidosEngine {
                         None,
                         parent_thread_id,
                         spawning_event_id,
+                        wake_mode,
                         mode,
                         cc_model.as_deref(),
                         coding_agent,
@@ -598,6 +622,7 @@ mod tests {
             child_thread_id: Uuid::new_v4(),
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             title: None,
             model: None,
             reasoning_effort: None,
@@ -641,6 +666,7 @@ mod tests {
             child_thread_id: Uuid::new_v4(),
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             title: None,
             model: None,
             reasoning_effort: None,
@@ -687,6 +713,7 @@ mod tests {
             device_id: None,
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             repo_id: None,
             title: None,
             app_id: None,
@@ -717,6 +744,7 @@ mod tests {
             device_id: None,
             parent_thread_id: Some(spawning_thread),
             spawning_event_id: Some(tool_call),
+            wake_mode: None,
             repo_id: None,
             title: None,
             app_id: None,
@@ -750,6 +778,7 @@ mod tests {
             device_id: None,
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             repo_id: None,
             title: None,
             app_id: None,
@@ -777,6 +806,7 @@ mod tests {
             device_id: None,
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             repo_id: None,
             title: None,
             app_id: None,

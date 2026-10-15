@@ -7,6 +7,7 @@ import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
 import { WORKSPACE_ID } from './basePath';
 import { slugifyWorkspaceName } from './slug';
+import { landingHash } from './workspaceLanding';
 import { createHeadingSlugger, HEADING_ID_PREFIX } from './headingSlug';
 import { markImageUnavailable } from './markdownImageFallback';
 import { markdownImageSource, type MarkdownDocumentLocation } from './markdownImageSource';
@@ -24,7 +25,7 @@ import { markdownLinkTooltip } from './markdownLinkTooltip';
 function threadLinkHref(workspace: string | undefined, threadId: string): string {
   if (WORKSPACE_ID === null || typeof location === 'undefined') return '#';
   const slug = workspace ? slugifyWorkspaceName(workspace) : WORKSPACE_ID;
-  return `${location.origin}/${encodeURIComponent(slug)}/#thread=${threadId}`;
+  return `${location.origin}/${encodeURIComponent(slug)}/${landingHash({ thread: threadId })}`;
 }
 
 // Drops the <a> wrapper while preserving nested inline markdown. Two reasons:

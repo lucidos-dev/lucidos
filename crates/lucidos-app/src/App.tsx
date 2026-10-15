@@ -9,12 +9,9 @@ import { ConnectionBanner } from './components/layout/ConnectionBanner';
 import { IngressBanner } from './components/layout/IngressBanner';
 import { WebhookRefusalBanner } from './components/layout/WebhookRefusalBanner';
 import { SlownessBanner } from './components/layout/SlownessBanner';
-import { Drawer } from './components/layout/Drawer';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { OverlayLayer } from './components/layout/OverlayLayer';
-import { ConfirmDialog } from './components/shared/ConfirmDialog';
 import { ProgressDialog } from './components/shared/ProgressDialog';
-import { PromptDialog } from './components/shared/PromptDialog';
 import { ThreadDrawer } from './components/drawer/ThreadDrawer';
 import { DrawerDivider } from './components/layout/DrawerDivider';
 import { DropZone } from './components/files/DropZone';
@@ -26,6 +23,7 @@ import { useScrollLock } from './hooks/useScrollLock';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useWindowDragRegion } from './hooks/useWindowDragRegion';
 import { lazyComponent } from './utils/lazyComponent';
+import { prefetchWhenIdle } from './utils/idlePrefetch';
 import {
   fileSearchOpen,
   popupImage,
@@ -36,12 +34,17 @@ import {
   eventConditionPopover,
   searchEverywhereOpen,
   filePreviewModal,
+  confirmState,
+  promptState,
+  registerAskDialogChunk,
 } from './store/store';
 import { scaleModalOpen } from './components/shared/scaleModalState';
+import { DrawerChunk, drawerOpen } from './components/layout/drawerState';
 import { releaseNoticeModalOpen } from './store/releaseNotices';
+import { memoryChoiceOpen } from './store/memoryChoice';
 import { viewportIsMobile } from './utils/viewport';
 import { CameraCaptureSlot } from './components/chat/PromptInput';
-import { WidgetWindows } from './components/widgets/WidgetWindows';
+import { HomeRail } from './components/home/HomeRail';
 
 // Re-exported so it ships in the shell chunk, which `main.tsx` runs it from.
 export { startShell } from './shellStartup';
@@ -57,6 +60,10 @@ const ScaleModal = lazyComponent(() => import('./components/shared/ScaleModal').
 const SearchEverywhere = lazyComponent(() => import('./components/search/SearchEverywhere').then(m => m.SearchEverywhere));
 const FilePreviewModal = lazyComponent(() => import('./components/files/FilePreviewModal').then(m => m.FilePreviewModal));
 const ReleaseNoticeModal = lazyComponent(() => import('./components/shared/ReleaseNoticeModal').then(m => m.ReleaseNoticeModal));
+const MemoryChoice = lazyComponent(() => import('./components/settings/MemoryChoice').then(m => m.MemoryChoice));
+const ConfirmAndPromptDialogs = lazyComponent(() => import('./components/shared/ConfirmAndPromptDialogs').then(m => m.ConfirmAndPromptDialogs));
+prefetchWhenIdle(ConfirmAndPromptDialogs);
+registerAskDialogChunk(ConfirmAndPromptDialogs);
 
 // Each overlay sits in its own slot so the signal subscription is leaf-scoped:
 // a flip re-renders the slot, not all of App and its descendants.
@@ -67,6 +74,8 @@ function CheckpointDiffSlot()    { return checkpointDiffModal.value  ? <Checkpoi
 function ContextViewerSlot()     { return contextViewer.value        ? <ContextViewerModal /> : null; }
 function EventConditionSlot()    { return eventConditionPopover.value ? <EventConditionPopover /> : null; }
 function ScaleModalSlot()        { return scaleModalOpen.value       ? <ScaleModal />        : null; }
+// It stays open through its own slide-out, so the gate holds until it is gone.
+function DrawerSlot()            { return drawerOpen.value           ? <DrawerChunk />       : null; }
 // Slot-gated for a second reason beyond the leaf-scoped subscription: it keeps
 // the file preview renderers (which the content pane already lazy-loads) out of
 // the initial bundle for every user who never opens an app that previews a file.
@@ -74,6 +83,8 @@ function FilePreviewModalSlot()  { return filePreviewModal.value     ? <FilePrev
 // Most workspaces owe no release notice, so the gate keeps the modal's chunk
 // off every load that will never draw it.
 function ReleaseNoticeSlot()     { return releaseNoticeModalOpen()   ? <ReleaseNoticeModal /> : null; }
+// Asked once per workspace, so the same holds for the memory choice.
+function MemoryChoiceSlot()      { return memoryChoiceOpen()         ? <MemoryChoice />      : null; }
 
 // FileSearchModal and SearchEverywhere render a hidden shell instead of
 // unmounting when closed (avoids will-change:transform ghost pixels on iOS
@@ -84,6 +95,11 @@ effect(() => { if (fileSearchOpen.value) fileSearchEverOpen.value = true; });
 effect(() => { if (searchEverywhereOpen.value) searchEverywhereEverOpen.value = true; });
 
 function FileSearchModalSlot()   { return fileSearchEverOpen.value      ? <FileSearchModal />   : null; }
+// Latched like the two above, so after the first open they behave exactly as
+// an always-mounted dialog does, exit fade included.
+const askDialogEverOpen = signal(false);
+effect(() => { if (confirmState.value.visible || promptState.value.visible) askDialogEverOpen.value = true; });
+function ConfirmAndPromptSlot()  { return askDialogEverOpen.value       ? <ConfirmAndPromptDialogs /> : null; }
 function SearchEverywhereSlot()  { return searchEverywhereEverOpen.value ? <SearchEverywhere /> : null; }
 
 export function App() {
@@ -127,7 +143,7 @@ export function App() {
         <IngressBanner layout="desktop" />
         <WebhookRefusalBanner layout="desktop" />
         <BackupReminderBanner layout="desktop" />
-        <Drawer />
+        <DrawerSlot />
         {mobile ? (
           <MobileSwipeContainer />
         ) : (
@@ -140,6 +156,7 @@ export function App() {
             />
           </div>
         )}
+        <HomeRail />
       </div>
 
       {/* Overlays -- rendered outside the split layout.
@@ -156,9 +173,8 @@ export function App() {
         <Toast />
         <ImagePopupSlot />
         <MessageRoutePanelSlot />
-        <ConfirmDialog />
+        <ConfirmAndPromptSlot />
         <ProgressDialog />
-        <PromptDialog />
         <StepDetailModalSlot />
         <CheckpointDiffSlot />
         <ContextViewerSlot />
@@ -166,9 +182,9 @@ export function App() {
         <FilePreviewModalSlot />
         <ScaleModalSlot />
         <ReleaseNoticeSlot />
+        <MemoryChoiceSlot />
         <SearchEverywhereSlot />
         <CameraCaptureSlot />
-        <WidgetWindows />
       </OverlayLayer>
       <DropZone />
       <UiBlockingOverlay />

@@ -1,4 +1,5 @@
-import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { showToast, dismissToast, removeToast, toasts, engineVersionReady, engineVersionPending, engineRebuildWedged, engineBuilding, engineBuildDetail, frontendRefreshDetail, enginePendingCommits, engineRestarting, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { preferencesSettled } from './preferences';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import type { EngineVersionStatus, PendingCommits } from '../../api/client';
 import { confirmAndRestartEngine } from './chat-changes';
@@ -332,7 +333,7 @@ async function pollEngineVersion(): Promise<void> {
   // Switch toast on cold start: the 4s poll and startClient's post-load
   // checkEngineVersion re-run it once preferences are known. A 'failed' load
   // proceeds (fail-open surfacing is the safe default).
-  if (preferences.value.status === 'not-loaded' || preferences.value.status === 'loading') return;
+  if (!preferencesSettled.value) return;
   let status;
   try {
     status = await engineVersionStatus();

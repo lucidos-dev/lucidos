@@ -1,10 +1,12 @@
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, setAsideChanges, changeIsReady, threadMap, threadUnsettled, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, applyAllBatch, applyPhases, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed, type ApplyAllBatch, type ApplyPhase, type ApplyPhaseReading } from '../../store/store';
+import { changes, appliedChanges, setAsideChanges, changeIsReady, threadMap, threadUnsettled, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, applyAllBatch, applyPhases, landingLane, lanePlace, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed, type ApplyAllBatch, type ApplyPhase, type ApplyPhaseReading, type LanePlace } from '../../store/store';
 import { applyPhaseOf, isBatchMember } from '../../store/actions/applyProgress';
+import { LANE_PLACE_LABEL, LANE_THREAD_TIP } from '../../store/actions/landingLane';
+import { removeFromLandingLane } from '../../store/actions/laneControls';
 import { applySingleChange, discardSingleChange, setAsideSingleChange, bringBackSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, armStandingApplies, disarmStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
 import { viewChangeDiff } from '../../store/actions/repositories';
-import { focusThreadOrBootstrap } from '../../store/actions/threads';
+import { focusThread, focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatFileCount } from '../../utils/formatFileCount';
@@ -50,6 +52,8 @@ interface ChangeRowProps {
   markerClass?: string;
   /** What the action in flight is doing, or `null` when the row is idle. */
   progressLabel: string | null;
+  /** Where the change stands in the landing lane, or `null` outside it. */
+  lane: LanePlace | null;
   armed: boolean;
   onOpen: () => void;
   onDiff: () => void;
@@ -57,6 +61,8 @@ interface ChangeRowProps {
   onSetAside: () => void;
   onApply: () => void;
   onStanding: () => void;
+  onLaneThread: () => void;
+  onRemoveFromLane: () => void;
 }
 
 export const THREAD_UNSETTLED_TIP =
@@ -187,7 +193,7 @@ export function rowActionLayout(actions: ChangeRowAction[]):
  *  SkeletonProvider (`<ChangeRow />`) it draws itself as a loading placeholder
  *  via the Sk* leaves; with real props it renders normally. Props are optional
  *  only to support the skeleton call; real call sites pass them all. */
-function ChangeRow({ change, markerClass, progressLabel, armed, onOpen, onDiff, onDiscard, onSetAside, onApply, onStanding }: Partial<ChangeRowProps>) {
+function ChangeRow({ change, markerClass, progressLabel, lane, armed, onOpen, onDiff, onDiscard, onSetAside, onApply, onStanding, onLaneThread, onRemoveFromLane }: Partial<ChangeRowProps>) {
   const sk = useSkeleton();
   const layout = rowActionLayout(change ? changeRowActions(change, !!armed) : []);
   const clickable = !sk && !!change?.thread_id;
@@ -223,8 +229,9 @@ function ChangeRow({ change, markerClass, progressLabel, armed, onOpen, onDiff, 
               {change.resolving_conflict
                 ? ' · Resolving merge conflicts'
                 : change.thread_unsettled && ' · The thread has not finished'}
-              {!change.resolving_conflict && change.predicted_conflict === 'conflict'
+              {!change.resolving_conflict && !lane && change.predicted_conflict === 'conflict'
                 && ' · Likely merge conflict'}
+              {lane && ` · ${LANE_PLACE_LABEL[lane]}`}
             </>
           )}
         </SkText>
@@ -236,7 +243,21 @@ function ChangeRow({ change, markerClass, progressLabel, armed, onOpen, onDiff, 
         {/* An action in flight is progress, not a blocked action, so it takes
             the one disabled face on this row. It carries no tooltip, which is
             what the disabled ban is about. */}
-        {progressLabel ? (
+        {lane ? (
+          // The lane owns the change now. A batch member links the thread
+          // resolving it; a waiting one can be taken back out.
+          <button
+            class={`action-btn${lane === 'waiting' ? ' action-btn-danger' : ''} change-row-primary`}
+            data-tooltip={LANE_ROW_TIP[lane]}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (lane === 'waiting') onRemoveFromLane?.();
+              else onLaneThread?.();
+            }}
+          >
+            {lane === 'waiting' ? 'Remove' : 'Lane thread'}
+          </button>
+        ) : progressLabel ? (
           <SkBlock w="4.75rem" h="2rem" round>
             <button class="action-btn action-btn-confirm change-row-primary" disabled>{progressLabel}</button>
           </SkBlock>
@@ -280,6 +301,12 @@ function ChangeRow({ change, markerClass, progressLabel, armed, onOpen, onDiff, 
     </div>
   );
 }
+
+/** What the lane control on a row does. */
+const LANE_ROW_TIP: Record<LanePlace, string> = {
+  'in-batch': LANE_THREAD_TIP,
+  waiting: 'Take this change out of the landing lane. It stays pending, and Apply queues it again.',
+};
 
 function rowClass(clickable: boolean, markerClass: string | undefined): string {
   return ['list-row change-row', clickable && 'clickable', markerClass].filter(Boolean).join(' ');
@@ -526,11 +553,14 @@ export function ChangesView() {
             // session. The server refuses it too (guard_change_action). What the
             // row offers instead is the standing apply.
             const armed = !!change.thread_id && armedThreadIds.has(change.thread_id);
+            const lane = landingLane.value;
+            const laneThreadId = lane.open_batch?.lane_thread_id;
             return (
               <ChangeRow
                 change={change}
                 markerClass={markerClass}
                 progressLabel={progressLabel}
+                lane={lanePlace(lane, change.id)}
                 armed={armed}
                 onOpen={() => openChangeThread(change)}
                 onDiff={() => void viewChangeDiff(change)}
@@ -543,6 +573,8 @@ export function ChangesView() {
                     ? disarmStandingApply(change.thread_id)
                     : armStandingApply(change.thread_id, change.id));
                 }}
+                onLaneThread={() => { if (laneThreadId) focusThread(laneThreadId); }}
+                onRemoveFromLane={() => void removeFromLandingLane(change.id)}
               />
             );
           };

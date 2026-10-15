@@ -82,8 +82,13 @@ the runner half `scripts/e2e-github-shard.sh`, the workflow
   memory, interrupts mid-turn, mid-turn messages, side questions, tool use. An
   untagged test gets only `Say exactly: "X"` answered, and anything else gets
   the fake's fixed `no rule` reply. Why: ADR 0388.
-- **What gets pushed.** HEAD, stripped and scanned like a release, as a
-  parentless commit on an `e2e/<run-id>` branch of the mirror. The driver
+- **What gets pushed.** HEAD, or the commit `--commit <sha>` names, stripped
+  and scanned like a release, as a parentless commit on an `e2e/<run-id>`
+  branch of the mirror. A named commit runs no local leg, and its browser
+  specs are listed and routed from that commit, not the working tree.
+- **The main check is the one engine-driven run.** `e2e-github.sh main-check
+  --commit <sha>` adds the engine suite, and has no local fallback: an unmet
+  precondition is no verdict, exit 76 (ADR 0464). The driver
   deletes the branch afterwards, and each run sweeps finished ones over a day
   old.
 - **No secrets in the workflow, ever.** That is why the real-Claude-Code specs
@@ -159,26 +164,23 @@ it at the engine's port. They are never inherited from the caller.
 
 Rust is the source of truth. TS is generated, so never hand-edit `src/generated/`.
 
-Regenerate the contract files (the full writer list is in the `run-tests` skill):
+Generated files are build outputs. `./scripts/codegen.sh` writes every one: the
+Rust-rendered TS, CSS and JSON (`lucidos_engine::codegen::render_all`), then the
+SDK bundles in `packages/lucidos-sdk/dist/`. `npm test`, `npm run typecheck`,
+`npm run build` and every Vite run call it first, so a stale copy cannot pass a
+check. A bare `npx tsc --noEmit` does not: run `npm run typecheck` instead after
+a Rust change. `make test` renders every file in memory, so a renderer that
+refuses fails the suite.
 
-```bash
-cargo test -p lucidos-engine generate_typescript_file -- --ignored
-cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored
-cargo test -p lucidos-engine generate_thread_event_wire_file -- --ignored
-cargo test -p lucidos-engine --lib generate_title_match_fixture_file -- --ignored
-```
-
-Staleness checks run as part of `cargo test`.
-
-**When to update:** changes to `available_thread_actions()`, `display_section()`,
-the `ThreadEvent` enum, or any payload type it reaches, and to
-`engine/title_match.rs`.
+**When to regenerate:** changes to `available_thread_actions()`,
+`display_section()`, the `ThreadEvent` enum or any payload type it reaches,
+`engine/title_match.rs`, or any other source a renderer reads.
 
 ### ThreadEvent payload types (generated, ADR 0166)
 
 The **payload** shapes are generated too, into
 `src/generated/thread-event-wire.ts`, by the `syn` reader in
-`crates/lucidos-engine/src/engine/thread_events_tests/ts_codegen.rs`. It parses
+`crates/lucidos-engine/src/engine/thread_events/ts_codegen.rs`. It parses
 the `ThreadEvent` enum and its supporting types out of the engine source.
 `store/thread-events/thread-event-types.ts` re-exports them and keeps only what
 the wire does not decide (display labels, summary helpers, fingerprints).
@@ -190,29 +192,25 @@ optional, because both mean the key can be absent. `Option<T>` is `T`, never
 `T | null`.
 
 **When you add a Rust `ThreadEvent` variant or field:** regenerate. Nothing to
-hand-write. Four things fail loudly instead:
+hand-write. Two things fail loudly instead:
 
 - **A new supporting type** fails the generator until you add it to
   `TYPE_SOURCES` with the file that declares it.
-- **A carried doc comment** with an unspaced em dash or an ISO date fails the generator.
-  Rewrite the Rust line; the generated file ships and is scanned like any source.
-  Its FIRST PARAGRAPH is what gets carried, so that paragraph is bound by
-  `.claude/rules/prose.md` too. A sentence or paragraph over the limit surfaces
-  at `check-prose.sh` on the generated file, and the fix is always at the Rust
-  doc comment. Put a note a frontend reader needs in the first paragraph, or on
-  the field itself, since a later paragraph does not travel.
 - **A new persisted variant** fails `all_persisted_event_types_matches_the_enum`
   until you add it to that list in `thread_lifecycle.rs`.
-- **A stale checked-in file** fails `generated_thread_event_wire_is_up_to_date`.
+
+A Rust doc comment's FIRST PARAGRAPH is carried into the generated file as
+TSDoc. Put a note a frontend reader needs there, or on the field itself, since a
+later paragraph does not travel.
 
 Anything the wire carries but Rust does not is a row in a declared table in the
 generator, never a hand edit to the output. That covers a retired variant, a
 legacy field, and an API-layer stamp or strip.
-`src/generated/thread-event-union.test.ts` keeps the two generated files in
+`src/contract-tests/thread-event-union.test.ts` keeps the two generated files in
 agreement. Containment is one-way, because the union carries retired members the
 classification map omits.
 
-`src/generated/wire-types-have-one-spelling.test.ts` scans `src/` for a second
+`src/contract-tests/wire-types-have-one-spelling.test.ts` scans `src/` for a second
 declaration of any generated type. Re-export, never re-declare.
 
 ## WASM Signer E2E (Rust)
@@ -363,7 +361,7 @@ Two rules follow:
 | Native Tauri (non-UI) logic | `cargo test -p lucidos-app` |
 
 **That last row is the one nothing else runs for you.** `make test` runs the
-engine suite plus the eval, gateway and six library crates, never
+engine suite plus the eval, gateway and `TEST_CRATES` library crates, never
 `lucidos-app`. Clippy compiles
 the client's test targets and never executes them, so a broken assertion there
 lands on `main` green. Touch a `.rs` file under `crates/lucidos-app/src/` and

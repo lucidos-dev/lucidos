@@ -1,5 +1,7 @@
 use super::super::LucidosEngine;
 use super::app_lint::app_lint_note_on_disk;
+use super::bash_background::{CompletionDelivery, TaskSpec};
+use super::files::{data_file_event, DataFileChange};
 use super::ToolOutcome;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::llm::tools::{BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS};
@@ -11,6 +13,33 @@ pub(crate) fn requested_packages(args: &serde_json::Value) -> Vec<&str> {
         .and_then(|v| v.as_array())
         .map(|list| list.iter().filter_map(|p| p.as_str()).collect())
         .unwrap_or_default()
+}
+
+/// The events announcing one run's staged writes, given as `data/`-relative
+/// paths. Same shape as every other writer: `Artifact*` relative to
+/// `artifacts/` for a path under it, `DataFileWritten` for any other path. An
+/// app filters on these, so a second shape is a write it never sees.
+fn staged_write_events(
+    created: &[String],
+    updated: &[String],
+    commit: &str,
+    thread_id: uuid::Uuid,
+) -> Vec<SystemEvent> {
+    let created = created.iter().map(|path| (path, false));
+    let updated = updated.iter().map(|path| (path, true));
+    created
+        .chain(updated)
+        .filter_map(|(path, existed)| match path.strip_prefix("artifacts/") {
+            Some(artifact_path) => Some(SystemEvent::artifact_change(
+                existed,
+                artifact_path.to_string(),
+                commit.to_string(),
+                Some("run_python".to_string()),
+                Some(thread_id),
+            )),
+            None => data_file_event(path, DataFileChange::Written { commit }),
+        })
+        .collect()
 }
 
 impl LucidosEngine {
@@ -68,6 +97,8 @@ impl LucidosEngine {
             )?;
 
             if !created.is_empty() || !updated.is_empty() {
+                // Held from the first copy into `data/` through the commit.
+                let held = self.lock_workspace_repo().await;
                 for path in created.iter().chain(updated.iter()) {
                     let src = data_staging.join(path);
                     let dst = data_dir.join(path);
@@ -89,9 +120,10 @@ impl LucidosEngine {
                 let message = commit_message.unwrap_or("Python script output");
                 let commit_sha = self
                     .artifact_manager
-                    .commit_data_paths(&all_paths, message)
+                    .commit_data_paths(&held, &all_paths, message)
                     .await
                     .map_err(|e| format!("Git commit failed: {}", e))?;
+                drop(held);
 
                 // A script that rewrote the profile has to reach the engine's
                 // hot copy of it too, or the next chat turn renders the one
@@ -107,25 +139,8 @@ impl LucidosEngine {
                     }
                 }
 
-                for path in &created {
-                    self.event_bus
-                        .emit(BusEvent::System(SystemEvent::ArtifactCreated {
-                            artifact_path: path.clone(),
-                            commit: commit_sha.clone(),
-                            source: Some("run_python".to_string()),
-                            writer_thread_id: Some(thread_id),
-                        }))
-                        .await?;
-                }
-                for path in &updated {
-                    self.event_bus
-                        .emit(BusEvent::System(SystemEvent::ArtifactUpdated {
-                            artifact_path: path.clone(),
-                            commit: commit_sha.clone(),
-                            source: Some("run_python".to_string()),
-                            writer_thread_id: Some(thread_id),
-                        }))
-                        .await?;
+                for event in staged_write_events(&created, &updated, &commit_sha, thread_id) {
+                    self.event_bus.emit(BusEvent::System(event)).await?;
                 }
             }
         }
@@ -239,10 +254,13 @@ impl LucidosEngine {
             .start_background_task(
                 thread_id,
                 &command,
-                args.get("description").and_then(|v| v.as_str()),
-                timeout_secs,
                 self.workspace_path(),
                 &env_vars,
+                TaskSpec {
+                    timeout_secs,
+                    description: args.get("description").and_then(|v| v.as_str()),
+                    delivery: CompletionDelivery::EventWait,
+                },
             )
             .await
         {
@@ -423,10 +441,74 @@ fn build_python_background_command(
 mod tests {
     use super::{
         build_python_background_command, commit_staged_file,
-        execute_staged_and_clean_up_on_failure, sh_quote,
+        execute_staged_and_clean_up_on_failure, sh_quote, staged_write_events,
     };
     use crate::core::shell::TaskOutcome;
+    use crate::engine::event_bus::SystemEvent;
     use crate::engine::tools::bash_background::BackgroundBashRegistry;
+
+    /// A staged write announces itself the way every other writer does. An
+    /// app and the shell's open preview each match a path in one shape, so a
+    /// write in another shape is one they never see.
+    #[test]
+    fn staged_writes_announce_in_the_shape_every_other_writer_uses() {
+        let thread = uuid::Uuid::new_v4();
+        let created = vec![
+            "artifacts/fare-watch/fares.json".to_string(),
+            "apps/habit-tracker/state.json".to_string(),
+        ];
+        let updated = vec![
+            "artifacts/notes.md".to_string(),
+            "knowhow/fares.md".to_string(),
+        ];
+        let events = staged_write_events(&created, &updated, "abc123", thread);
+
+        let shapes: Vec<(String, String)> = events
+            .iter()
+            .map(|event| match event {
+                SystemEvent::ArtifactCreated { artifact_path, .. } => {
+                    ("ArtifactCreated".into(), artifact_path.clone())
+                }
+                SystemEvent::ArtifactUpdated { artifact_path, .. } => {
+                    ("ArtifactUpdated".into(), artifact_path.clone())
+                }
+                SystemEvent::DataFileWritten { path, .. } => {
+                    ("DataFileWritten".into(), path.clone())
+                }
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                ("ArtifactCreated".into(), "fare-watch/fares.json".into()),
+                (
+                    "DataFileWritten".into(),
+                    "apps/habit-tracker/state.json".into()
+                ),
+                ("ArtifactUpdated".into(), "notes.md".into()),
+                ("DataFileWritten".into(), "knowhow/fares.md".into()),
+            ]
+        );
+
+        // The writer stays named on the artifact events, as before.
+        let SystemEvent::ArtifactCreated {
+            source,
+            writer_thread_id,
+            commit,
+            ..
+        } = &events[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(source.as_deref(), Some("run_python"));
+        assert_eq!(*writer_thread_id, Some(thread));
+        assert_eq!(commit, "abc123");
+        let SystemEvent::DataFileWritten { commit, .. } = &events[1] else {
+            unreachable!()
+        };
+        assert_eq!(commit.as_deref(), Some("abc123"));
+    }
 
     /// This file with its test module cut off, through the shared reader.
     fn production_src() -> String {

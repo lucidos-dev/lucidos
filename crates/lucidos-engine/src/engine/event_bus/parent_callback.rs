@@ -4,6 +4,10 @@
 //! phase drives these methods to decrement the parent's `active_children_count`,
 //! surface the parent to inbox, and emit the typed `ChildThreadCompleted` onto
 //! the parent thread.
+//!
+//! A clean finish whose child said its parent need not act is *filed* instead:
+//! a `ChildReportFiled` lands on the parent, with no wake, no status write and
+//! no callback. See [`Delivery`].
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -11,7 +15,7 @@ use uuid::Uuid;
 use super::{BusEvent, EmittedEvent, EventBus, ParentCallback};
 use crate::engine::agent_recovery::ENGINE_RESTART_INTERRUPT_REASON;
 use crate::engine::thread_events::{
-    CancelCause, ChildCompletionStatus, EventMeta, EventWaitCancelCause, ThreadEvent,
+    CancelCause, ChildCompletionStatus, EventMeta, EventWaitCancelCause, ThreadEvent, WakeMode,
 };
 use crate::engine::thread_lifecycle::{ArchiveState, ChangeStateKind, ThreadStatus};
 
@@ -32,6 +36,17 @@ struct ChildRow {
     status: ThreadStatus,
     coding_agent_change_state: ChangeStateKind,
     parent_is_coding_agent: Option<bool>,
+    /// The child's wake decision for this turn, NULL while undecided.
+    parent_wake_requested: Option<bool>,
+    /// The child's *wake mode*, NULL when its spawn declared none.
+    wake_mode: Option<String>,
+    /// Whether another child of the same parent, spawned
+    /// `wake-when-all-done`, is still working.
+    batch_still_working: bool,
+    /// The child is in a *cache keep-alive* turn, which finishes nothing.
+    keep_alive_turn: bool,
+    /// The child handed off to a successor, which reports in its place.
+    handed_off: bool,
 }
 
 impl ChildRow {
@@ -40,16 +55,60 @@ impl ChildRow {
     fn holds_unproposed_work(&self) -> bool {
         self.is_coding_agent && self.coding_agent_change_state == ChangeStateKind::Unproposed
     }
+
+    /// The declared mode. A value the column's CHECK would refuse reads as
+    /// undeclared, which falls back to the wake decision.
+    fn wake_mode(&self) -> Option<WakeMode> {
+        self.wake_mode.as_deref().and_then(WakeMode::parse)
+    }
 }
 
-const CHILD_ROW_SQL: &str = "SELECT c.parent_thread_id, c.is_coding_agent, c.title, \
+/// [`ChildRow`]'s query. Bind the child, [`active_thread_statuses`] and the
+/// batch mode's name.
+///
+/// It runs after the child's terminal commits, so a sibling whose terminal
+/// committed first is no longer working. That is what lets the last batch child
+/// to commit always wake the parent (ADR 0451).
+///
+/// [`active_thread_statuses`]: crate::core::store::active_thread_statuses
+fn child_row_sql() -> String {
+    format!(
+        "SELECT c.parent_thread_id, c.is_coding_agent, c.title, \
             c.first_message, c.parent_callback_pending, c.is_stopped_child, \
             c.live_event_wait_count > 0 AS holds_live_wait, c.status, \
-            c.coding_agent_change_state, \
-            p.is_coding_agent AS parent_is_coding_agent \
+            c.coding_agent_change_state, c.parent_wake_requested, c.wake_mode, \
+            c.keep_alive_turn, c.successor_thread_id IS NOT NULL AS handed_off, \
+            p.is_coding_agent AS parent_is_coding_agent, \
+            {} AS batch_still_working \
      FROM thread_summaries c \
      LEFT JOIN thread_summaries p ON p.thread_id = c.parent_thread_id \
-     WHERE c.thread_id = $1";
+     WHERE c.thread_id = $1",
+        batch_still_working_sql("c", "$2", "$3")
+    )
+}
+
+/// SQL for "another child of `child`'s parent, spawned `wake-when-all-done`,
+/// is still working": the batch [`Delivery::for_report`] waits on. Bind
+/// `active_thread_statuses` to `statuses_param` and the batch mode's name to
+/// `mode_param`. The fan-in and the turn-end gate both read it, so the read
+/// decision's forecast matches the delivery. A sibling that handed off works
+/// on until its successor's row exists, since the Thread Queue may hold the
+/// spawn. From then on the successor counts as the sibling.
+pub(crate) fn batch_still_working_sql(
+    child: &str,
+    statuses_param: &str,
+    mode_param: &str,
+) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM thread_summaries s \
+                  WHERE s.parent_thread_id = {child}.parent_thread_id \
+                    AND s.thread_id <> {child}.thread_id AND s.wake_mode = {mode_param} \
+                    AND CASE WHEN s.successor_thread_id IS NULL THEN {} \
+                        ELSE NOT EXISTS (SELECT 1 FROM thread_summaries n \
+                                         WHERE n.thread_id = s.successor_thread_id) END)",
+        crate::core::store::still_working_sql("s", statuses_param)
+    )
+}
 
 /// Per-status summary caps. Success, no-changes and canceled summaries come
 /// from a real response the orchestrator may want most of. A failure summary
@@ -64,6 +123,13 @@ const INTERRUPTED_SUMMARY: &str = "An engine restart cut this child's turn befor
      finished, and nothing will resume it on its own. Its work so far is kept. To continue, \
      send it a follow-up with follow_up_child_thread. If its own work may have \
      crashed the engine, such as a heavy build or test run, ask the user before restarting it.";
+
+/// What the card says when the last working child of a `wake-when-all-done`
+/// batch ends in an abort that otherwise sends no card.
+const BATCH_ABORT_SUMMARY: &str = "This child's turn was aborted before it finished, \
+     with no report of its own, and nothing will resume it. It was the last child of your \
+     wake-when-all-done batch still working, so this card wakes you to combine what the \
+     batch filed. Send it a follow-up with follow_up_child_thread if you need its part.";
 
 /// Whether `event` is a restart abort that nobody promised to resume: a crash,
 /// or a teardown the user did not ask for. The user's own switch resumes the
@@ -136,8 +202,51 @@ impl ChildSettle {
 /// and deliver after it commits.
 pub(crate) struct OwedChildCard(ChildCompletion);
 
-/// One `ChildThreadCompleted` owed to a parent, ready to deliver. The terminal
-/// fan-in, a settle, and the end of a child's last event wait each build one.
+/// Whether a child's report wakes its parent or is filed for its next turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// A `ChildThreadCompleted` that starts a parent turn.
+    Wake,
+    /// A `ChildReportFiled` the parent reads on its next turn. It starts no
+    /// turn, moves no status, and no boot sweep re-fires it.
+    File,
+}
+
+impl Delivery {
+    /// How one report is delivered (ADR 0451). Only a clean finish can file.
+    ///
+    /// - A recorded yes wakes under every mode. For a declared child only the
+    ///   engine records one: a turn it cut short, or an empty reply.
+    /// - A declared mode decides the rest. `WakeWhenAllDone` files while
+    ///   another child of its batch still works.
+    /// - With no mode, the wake decision does: a recorded no files, and an
+    ///   undecided turn wakes.
+    pub(crate) fn for_report(
+        status: ChildCompletionStatus,
+        wake_mode: Option<WakeMode>,
+        parent_wake_requested: Option<bool>,
+        batch_still_working: bool,
+    ) -> Self {
+        let clean = matches!(
+            status,
+            ChildCompletionStatus::Success | ChildCompletionStatus::NoChanges
+        );
+        if !clean || parent_wake_requested == Some(true) {
+            return Self::Wake;
+        }
+        match wake_mode {
+            Some(WakeMode::Wake) => Self::Wake,
+            Some(WakeMode::NoWake) => Self::File,
+            Some(WakeMode::WakeWhenAllDone) if batch_still_working => Self::File,
+            Some(WakeMode::WakeWhenAllDone) => Self::Wake,
+            None if parent_wake_requested == Some(false) => Self::File,
+            None => Self::Wake,
+        }
+    }
+}
+
+/// One report owed to a parent, ready to deliver. The terminal fan-in, a
+/// settle, and the end of a child's last event wait each build one.
 struct ChildCompletion {
     child_thread_id: Uuid,
     parent_id: Uuid,
@@ -146,6 +255,7 @@ struct ChildCompletion {
     status: ChildCompletionStatus,
     summary: String,
     terminal_event_id: Option<Uuid>,
+    delivery: Delivery,
 }
 
 /// What a wake changed on the parent's row, so a caller that then fails to
@@ -307,7 +417,16 @@ impl EventBus {
             return;
         }
 
-        let Some(ChildRow {
+        let Some(row) = self.load_child_row(child_thread_id).await else {
+            return;
+        };
+        // A keep-alive turn's terminal reports nothing: the child still waits.
+        // A child that handed off reports nothing either: its successor does.
+        if row.keep_alive_turn || row.handed_off {
+            return;
+        }
+        let wake_mode = row.wake_mode();
+        let ChildRow {
             parent_thread_id: Some(parent_id),
             is_coding_agent,
             title,
@@ -316,8 +435,10 @@ impl EventBus {
             is_stopped_child,
             holds_live_wait,
             parent_is_coding_agent,
+            parent_wake_requested,
+            batch_still_working,
             ..
-        }) = self.load_child_row(child_thread_id).await
+        } = row
         else {
             return;
         };
@@ -479,6 +600,26 @@ impl EventBus {
         }
 
         if !should_callback {
+            // An abort the user sees as an error sends no card. In a batch that
+            // silence would strand its siblings' filed reports. So the last
+            // batch child still working reports the abort as a failure.
+            if should_decrement
+                && matches!(event, ThreadEvent::ResponseAborted { .. })
+                && wake_mode == Some(WakeMode::WakeWhenAllDone)
+                && !batch_still_working
+            {
+                self.deliver_child_completion(ChildCompletion {
+                    child_thread_id,
+                    parent_id,
+                    parent_is_coding_agent,
+                    label: child_label(title, first_msg),
+                    status: ChildCompletionStatus::Failure,
+                    summary: BATCH_ABORT_SUMMARY.to_string(),
+                    terminal_event_id,
+                    delivery: Delivery::Wake,
+                })
+                .await;
+            }
             return;
         }
 
@@ -554,6 +695,12 @@ impl EventBus {
             status,
             summary: cap_summary(summary, cap),
             terminal_event_id,
+            delivery: Delivery::for_report(
+                status,
+                wake_mode,
+                parent_wake_requested,
+                batch_still_working,
+            ),
         })
         .await;
     }
@@ -561,8 +708,10 @@ impl EventBus {
     /// Read [`ChildRow`] for `child_thread_id`. `None` when the row is gone, or
     /// when the read failed, which is logged.
     async fn load_child_row(&self, child_thread_id: Uuid) -> Option<ChildRow> {
-        sqlx::query_as::<_, ChildRow>(CHILD_ROW_SQL)
+        sqlx::query_as::<_, ChildRow>(&child_row_sql())
             .bind(child_thread_id)
+            .bind(crate::core::store::active_thread_statuses())
+            .bind(WakeMode::WakeWhenAllDone.as_str())
             .fetch_optional(&self.pool)
             .await
             .unwrap_or_else(|e| {
@@ -653,6 +802,7 @@ impl EventBus {
             status,
             coding_agent_change_state,
             parent_is_coding_agent,
+            ..
         } = row
         else {
             return;
@@ -683,6 +833,8 @@ impl EventBus {
             },
             summary: cap_summary(summary, SUCCESS_SUMMARY_CAP),
             terminal_event_id: None,
+            // Its turn ended holding a wait, so it decided nothing to file on.
+            delivery: Delivery::Wake,
         })
         .await;
     }
@@ -754,6 +906,7 @@ impl EventBus {
             status: ChildCompletionStatus::Canceled,
             summary: settled_by.summary().to_string(),
             terminal_event_id: None,
+            delivery: Delivery::Wake,
         }))
     }
 
@@ -767,8 +920,13 @@ impl EventBus {
         self.deliver_child_completion(card.0).await;
     }
 
-    /// Wake the parent and deliver one `ChildThreadCompleted` to it.
+    /// Deliver one report to the parent: wake it with a
+    /// `ChildThreadCompleted`, or file a `ChildReportFiled`.
     async fn deliver_child_completion(&self, card: ChildCompletion) {
+        if card.delivery == Delivery::File {
+            self.file_child_report(card).await;
+            return;
+        }
         let ChildCompletion {
             child_thread_id,
             parent_id,
@@ -777,54 +935,17 @@ impl EventBus {
             status,
             summary,
             terminal_event_id,
+            ..
         } = card;
         // Held for the rest of the function: every path below that gives up on
         // driving a turn hands it to `undo_parent_wake`, so the parent is not
         // left reading "Requesting" against nothing.
         let wake = self.update_parent_after_child_terminal(parent_id).await;
-
-        // Look up which proposed changes the child left in `pending` state.
-        // CC chats that ended with `has_changes: true` typically have one;
-        // chat children and `no_changes` idles have zero. Failures are
-        // reported with `pending_change_ids = []` regardless because the
-        // worktree state isn't reviewable.
-        let pending_change_ids: Vec<String> = if matches!(status, ChildCompletionStatus::Failure) {
-            Vec::new()
-        } else {
-            match self
-                .changes_projection
-                .pending_for_thread(child_thread_id)
-                .await
-            {
-                Ok(v) => v.into_iter().map(|c| c.id.to_string()).collect(),
-                Err(e) => {
-                    crate::log!(
-                        "[EventBus] notify_parent_if_child: pending_for_thread({}): {} — \
-                         emitting ChildThreadCompleted with no pending_change_ids",
-                        child_thread_id,
-                        e
-                    );
-                    Vec::new()
-                }
-            }
-        };
-
-        // Changes held below the child, whatever its own status: they are other
-        // threads' work, and an orchestrator's children hold all of it.
-        let sub_thread_pending_changes =
-            match crate::core::changes::sub_thread_pending_changes(&self.pool, child_thread_id)
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    crate::log!(
-                        "[FanOut] sub_thread_pending_changes({}): {}; the card lists none",
-                        child_thread_id,
-                        e
-                    );
-                    Vec::new()
-                }
-            };
+        let (pending_change_ids, sub_thread_pending_changes) =
+            self.reported_changes(child_thread_id, status).await;
+        let integrated_branch = self
+            .reported_integrated_branch(child_thread_id, status)
+            .await;
 
         // Emit the typed source-of-truth event onto the parent thread. The
         // `parent_callback_pending` marker is cleared by THIS emit's projection
@@ -842,6 +963,7 @@ impl EventBus {
             summary,
             pending_change_ids,
             sub_thread_pending_changes,
+            integrated_branch,
         };
         // Box::pin here because `emit_or_log → emit → notify_parent_if_child`
         // is the recursion the compiler flags — the emitted ChildThreadCompleted
@@ -941,6 +1063,117 @@ impl EventBus {
         ) {
             Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
         }
+    }
+
+    /// File a clean report on the parent without waking it: no status write,
+    /// no inbox move and no callback. The emit's own projection settles the
+    /// child's marker. A failed emit leaves the marker set, so the child's
+    /// next terminal tries again.
+    async fn file_child_report(&self, card: ChildCompletion) {
+        let ChildCompletion {
+            child_thread_id,
+            parent_id,
+            label,
+            status,
+            summary,
+            ..
+        } = card;
+        let (pending_change_ids, sub_thread_pending_changes) =
+            self.reported_changes(child_thread_id, status).await;
+        let integrated_branch = self
+            .reported_integrated_branch(child_thread_id, status)
+            .await;
+        crate::log!(
+            "[FanOut] Child {} said its parent {} need not act: filing its report",
+            child_thread_id,
+            parent_id
+        );
+        // Box::pin for the same recursion `deliver_child_completion` breaks.
+        Box::pin(self.emit_or_log(
+            BusEvent::Thread {
+                thread_id: parent_id,
+                event: ThreadEvent::ChildReportFiled {
+                    child_thread_id,
+                    child_thread_title: Some(label),
+                    status,
+                    summary,
+                    pending_change_ids,
+                    sub_thread_pending_changes,
+                    integrated_branch,
+                },
+                meta: EventMeta::NONE,
+            },
+            "[FanOut] ChildReportFiled",
+        ))
+        .await;
+    }
+
+    /// The branch an integrated child hands up with a successful report, for
+    /// its parent's agent to merge. Any other finish hands nothing up.
+    async fn reported_integrated_branch(
+        &self,
+        child_thread_id: Uuid,
+        status: ChildCompletionStatus,
+    ) -> Option<crate::engine::thread_events::IntegratedBranch> {
+        if status != ChildCompletionStatus::Success {
+            return None;
+        }
+        crate::engine::integrated::handed_up_branch(&self.pool, child_thread_id).await
+    }
+
+    /// The changes a report names: those the child left pending on its own
+    /// branch, and those held below it.
+    async fn reported_changes(
+        &self,
+        child_thread_id: Uuid,
+        status: ChildCompletionStatus,
+    ) -> (
+        Vec<String>,
+        Vec<crate::engine::thread_events::SubThreadPendingChange>,
+    ) {
+        // Look up which proposed changes the child left in `pending` state.
+        // CC chats that ended with `has_changes: true` typically have one;
+        // chat children and `no_changes` idles have zero. Failures are
+        // reported with `pending_change_ids = []` regardless because the
+        // worktree state isn't reviewable.
+        let pending_change_ids: Vec<String> = if matches!(status, ChildCompletionStatus::Failure) {
+            Vec::new()
+        } else {
+            match self
+                .changes_projection
+                .pending_for_thread(child_thread_id)
+                .await
+            {
+                Ok(v) => v.into_iter().map(|c| c.id.to_string()).collect(),
+                Err(e) => {
+                    crate::log!(
+                        "[FanOut] pending_for_thread({}): {}; the report lists no \
+                         pending_change_ids",
+                        child_thread_id,
+                        e
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        // Changes held below the child, whatever its own status: they are other
+        // threads' work, and an orchestrator's children hold all of it.
+        let sub_thread_pending_changes =
+            match crate::core::changes::sub_thread_pending_changes(&self.pool, child_thread_id)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::log!(
+                        "[FanOut] sub_thread_pending_changes({}): {}; the report lists none",
+                        child_thread_id,
+                        e
+                    );
+                    Vec::new()
+                }
+            };
+        (pending_change_ids, sub_thread_pending_changes)
     }
 
     /// Announce a terminal the fan-in withheld, because the auto-resume it was
@@ -1174,9 +1407,10 @@ impl EventBus {
         // thread's last word — scoped to `aggregate = 'thread'` to match
         // `lookup_last_activity` and never let a same-id non-thread event suppress
         // a real fan-in. See the selection rationale above. A later
-        // `ChildThreadStopped` or `ChildThreadDetached` is not a reaction: it
-        // wakes nothing, so a card it follows is still unprocessed (ADR 0252,
-        // ADR 0278). Nor is a side question, which no agent reads (ADR 0320).
+        // `ChildThreadStopped`, `ChildThreadDetached` or `ChildReportFiled` is
+        // not a reaction: it wakes nothing, so a card it follows is still
+        // unprocessed (ADR 0252, ADR 0278). A filed report is never selected
+        // itself, since only a `ChildThreadCompleted` is. Nor is a side question, which no agent reads (ADR 0320).
         // No card was written after its child moved out, since the emit
         // refuses one, so every card this finds was earned.
         //
@@ -1201,10 +1435,11 @@ impl EventBus {
                  WHERE later.aggregate = 'thread' \
                    AND later.aggregate_id = e.aggregate_id \
                    AND later.sequence > e.sequence \
-                   AND later.event_type NOT IN ('ChildThreadStopped', 'ChildThreadDetached') \
                    AND later.event_type <> ALL($1) \
+                   AND later.event_type <> ALL($2) \
                )",
         )
+        .bind(crate::engine::thread_events::ThreadEvent::PARENT_NOTE_EVENT_TYPES)
         .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
         .fetch_all(&self.pool)
         .await

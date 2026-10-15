@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # e2e_github.sh: the driver half of e2e GitHub mode (ADR 0382).
 #
-# The driver strips HEAD with release_tree, scans it, and commits it with no
-# parent. It pushes that commit to an e2e/<run-id> branch of the mirror, where
-# .github/workflows/e2e.yml runs the shards. It then waits, downloads each
-# shard's output, and reports it through the tally a local run uses.
+# The driver strips HEAD, or the commit a caller names, with release_tree. It
+# scans the result and commits it with no parent. It pushes that commit to an
+# e2e/<run-id> branch of the mirror, where .github/workflows/e2e.yml runs the
+# shards. It then waits, downloads each shard's output, and reports it through
+# the tally a local run uses.
 #
 # Two rules bind every change here:
-#   - Nothing reaches the mirror unless release_tree_scan passed on the exact
-#     tree being pushed, and the commit has no parent (ADR 0039).
+#   - Nothing reaches the mirror except through release_tree_push, which scans
+#     the exact tree being pushed. The commit has no parent (ADR 0039, 0462).
 #   - Only refs under e2e/ are ever deleted.
 #
 # Sourced by scripts/e2e-github.sh. Tested by scripts/lib/e2e_github_test.sh.
@@ -24,6 +25,10 @@ E2E_GITHUB_SWEEP_AGE_SECS=86400
 # A run that never produced a verdict: a refused push, a workflow that never
 # started, a cancelled run, a shard with no output. Distinct from 71, 72, 75.
 E2E_GITHUB_NO_VERDICT_EXIT=76
+# What the main check runs: the engine suite, then every e2e suite. Only the
+# main check asks for the engine suite (ADR 0386's limits, as amended).
+# shellcheck disable=SC2034 # read by scripts/e2e-github.sh after it sources this
+E2E_GITHUB_MAIN_CHECK_SUITES=(engine api wasm embedder browser)
 
 e2e_github_now() { date +%s; }
 
@@ -135,13 +140,16 @@ e2e_github_branch_started() {
         "${stamp:0:15}"
 }
 
-# e2e_github_unavailable_reason <repo>: print why GitHub mode cannot test
-# <repo> honestly, or nothing when it can.
+# e2e_github_unavailable_reason <repo> [<commit>]: print why GitHub mode cannot
+# test <repo> honestly, or nothing when it can. A named commit is tested as it
+# was committed, so uncommitted changes beside it do not matter.
 e2e_github_unavailable_reason() {
-    local repo="$1"
+    local repo="$1" commit="${2:-}"
     if [ ! -f "$repo/scripts/lib/release_tree.sh" ]; then
         echo "this checkout has no scripts/lib/release_tree.sh, which the public mirror does not ship"
-    elif [ -n "$(git -C "$repo" status --porcelain)" ]; then
+    elif [ -n "$commit" ] && ! git -C "$repo" rev-parse --verify --quiet "$commit^{commit}" >/dev/null; then
+        echo "'$commit' names no commit in this repository"
+    elif [ -z "$commit" ] && [ -n "$(git -C "$repo" status --porcelain)" ]; then
         echo "the tree has uncommitted changes, and GitHub mode tests the committed HEAD"
     elif ! git -C "$repo" remote get-url "$E2E_GITHUB_REMOTE" >/dev/null 2>&1; then
         echo "there is no '$E2E_GITHUB_REMOTE' remote for $E2E_GITHUB_REPO"
@@ -150,23 +158,74 @@ e2e_github_unavailable_reason() {
     fi
 }
 
-# e2e_github_preflight <repo>: refuse what GitHub mode cannot test honestly.
+# e2e_github_preflight <repo> [<commit>]: refuse what GitHub mode cannot test
+# honestly.
 e2e_github_preflight() {
     local reason
-    reason="$(e2e_github_unavailable_reason "$1")"
+    reason="$(e2e_github_unavailable_reason "$1" "${2:-}")"
     [ -n "$reason" ] || return 0
     echo "ERROR: GitHub mode cannot run: $reason." >&2
     echo "       Fix that, or run the suite with --local." >&2
     return 1
 }
 
-# e2e_github_build_commit <repo> <request-file> <run-id>: print the commit to
-# push. Fails, having pushed nothing, when the scan refuses the tree.
+# The browser specs, relative to the repository root.
+E2E_GITHUB_SPEC_DIR="crates/lucidos-app/e2e"
+
+# e2e_github_split_specs <repo> <commit> [<spec>...]: route each browser spec.
+# Prints "local <name>" for a spec with a @real-claude-code test and "remote
+# <name>" for any other. With no <spec>, every spec. A <commit> reads the specs
+# from that commit, the tree GitHub tests. An empty one reads the working
+# tree. Fails naming a spec that is not there. Needs scripts/lib/e2e.sh.
+e2e_github_split_specs() {
+    local repo="$1" commit="$2" name path spec names=()
+    shift 2
+    if [ "$#" -gt 0 ]; then
+        names=("$@")
+    elif [ -n "$commit" ]; then
+        while IFS= read -r name; do
+            case "$name" in *.spec.ts) names+=("$name") ;; esac
+        done <<EOF
+$(git -C "$repo" ls-tree --name-only "$commit:$E2E_GITHUB_SPEC_DIR" 2>/dev/null || true)
+EOF
+    else
+        for path in "$repo/$E2E_GITHUB_SPEC_DIR"/*.spec.ts; do
+            [ -f "$path" ] && names+=("$(basename "$path")")
+        done
+    fi
+    for name in ${names[@]+"${names[@]}"}; do
+        path="$E2E_GITHUB_SPEC_DIR/$name"
+        if [ -n "$commit" ]; then
+            git -C "$repo" cat-file -e "$commit:$path" 2>/dev/null \
+                || { echo "e2e-github.sh: no spec named $name in $commit" >&2; return 1; }
+            # Read whole before the check: grep -q stops at the first match, and
+            # a git still writing into that pipe dies of SIGPIPE.
+            spec="$(git -C "$repo" show "$commit:$path")" \
+                || { echo "e2e-github.sh: could not read $name from $commit" >&2; return 1; }
+            if e2e_spec_needs_real_claude_code - <<<"$spec"; then
+                echo "local $name"
+            else
+                echo "remote $name"
+            fi
+        else
+            [ -f "$repo/$path" ] || { echo "e2e-github.sh: no spec named $name" >&2; return 1; }
+            if e2e_spec_needs_real_claude_code "$repo/$path"; then
+                echo "local $name"
+            else
+                echo "remote $name"
+            fi
+        fi
+    done
+}
+
+# e2e_github_build_commit <repo> <request-file> <run-id> [<commit>]: print the
+# commit to push, built from <commit> (default HEAD). Fails, having pushed
+# nothing, when the scan refuses the tree.
 e2e_github_build_commit() {
-    local repo="$1" request="$2" run_id="$3"
+    local repo="$1" request="$2" run_id="$3" source="${4:-HEAD}"
     local tree blob index full_tree=""
 
-    tree="$(release_tree_build "$repo" HEAD)" || return 1
+    tree="$(release_tree_build "$repo" "$source")" || return 1
     blob="$(git -C "$repo" hash-object -w "$request")" || return 1
     index="$(mktemp "${TMPDIR:-/tmp}/lucidos-e2e-index.XXXXXX")" || return 1
     if GIT_INDEX_FILE="$index" git -C "$repo" read-tree "$tree" \
@@ -190,14 +249,14 @@ e2e_github_push() {
     local out
     # GitHub answers every new branch with a pull-request hint; show it only
     # when the push failed.
-    out="$(git -C "$repo" push --quiet "$E2E_GITHUB_REMOTE" "$commit:refs/heads/$branch" 2>&1)" \
+    out="$(release_tree_push "$repo" "$E2E_GITHUB_REMOTE" "$commit" "refs/heads/$branch" 2>&1)" \
         || { printf '%s\n' "$out" >&2; return 1; }
 }
 
 e2e_github_delete_branch() {
     local repo="$1" branch="$2"
     e2e_github_is_run_branch "$branch" || { echo "ERROR: refusing to delete '$branch'" >&2; return 1; }
-    git -C "$repo" push --quiet "$E2E_GITHUB_REMOTE" --delete "refs/heads/$branch"
+    release_tree_delete_ref "$repo" "$E2E_GITHUB_REMOTE" "refs/heads/$branch"
 }
 
 # e2e_github_unfinished_runs <branch>: how many of the branch's runs have not
@@ -223,7 +282,7 @@ e2e_github_sweep() {
         echo "[e2e-github] sweeping finished e2e run branch $branch"
         e2e_github_delete_branch "$repo" "$branch" || true
     done <<EOF
-$(git -C "$repo" ls-remote "$E2E_GITHUB_REMOTE" "refs/heads/$E2E_GITHUB_BRANCH_PREFIX*" 2>/dev/null)
+$(release_mirror_ls_remote "$repo" "$E2E_GITHUB_REMOTE" "refs/heads/$E2E_GITHUB_BRANCH_PREFIX*" 2>/dev/null)
 EOF
 }
 
@@ -275,8 +334,13 @@ print("run %s: %d queued, %d running, %d/%d jobs done, %d failed" % (
 
 # e2e_github_wait <run-id>: block until the run completes, printing progress
 # whenever it changes. Prints the conclusion on the last line of stdout.
+# Gives up after E2E_GITHUB_RUN_WAIT_SECS (default 6 hours) with the no-verdict
+# exit. The default sits above the longest chain of timeout-minutes in e2e.yml,
+# with room for queueing. A gh that keeps failing must still end the wait.
 e2e_github_wait() {
-    local run_id="$1" poll="${E2E_GITHUB_POLL_SECS:-30}" json status line last=""
+    local run_id="$1" poll="${E2E_GITHUB_POLL_SECS:-30}" limit="${E2E_GITHUB_RUN_WAIT_SECS:-21600}"
+    local json status line last="" deadline
+    deadline=$(($(e2e_github_now) + limit))
     echo "[e2e-github] watching https://github.com/$E2E_GITHUB_REPO/actions/runs/$run_id" >&2
     while :; do
         if json="$(gh run view "$run_id" --repo "$E2E_GITHUB_REPO" --json status,conclusion,jobs 2>/dev/null)"; then
@@ -288,12 +352,32 @@ e2e_github_wait() {
                 return 0
             fi
         fi
+        if [ "$(e2e_github_now)" -ge "$deadline" ]; then
+            echo "ERROR: run $run_id did not complete within ${limit}s, so it produced no verdict." >&2
+            return "$E2E_GITHUB_NO_VERDICT_EXIT"
+        fi
         sleep "$poll"
     done
 }
 
 e2e_github_cancel() {
     gh run cancel "$1" --repo "$E2E_GITHUB_REPO" >/dev/null 2>&1 || true
+}
+
+# e2e_github_stop_run <repo> <branch> <unfinished-run-id> <pushed>: on the way
+# out, cancel a run that has not finished and delete the branch once pushed.
+# It often runs after a SIGTERM that took the reader of stderr too, so it
+# ignores SIGPIPE: a broken pipe must not stop it before either call.
+e2e_github_stop_run() {
+    local repo="$1" branch="$2" run_db_id="$3" pushed="$4"
+    trap '' PIPE
+    if [ -n "$run_db_id" ]; then
+        echo "[e2e-github] cancelling run $run_db_id" >&2
+        e2e_github_cancel "$run_db_id"
+    fi
+    if [ -n "$pushed" ]; then
+        e2e_github_delete_branch "$repo" "$branch" || echo "[e2e-github] could not delete $branch; the next run's sweep will" >&2
+    fi
 }
 
 e2e_github_download() {
@@ -306,23 +390,40 @@ e2e_github_download() {
 #
 # The plan artifact lists one line per shard: "<id> <suite> <project> <shard>
 # <total>". Each shard uploads e2e-out-<id>/<id>.log and <id>.rc. A shard the
-# plan names but whose output is missing has no verdict, and so fails the run.
+# plan names but whose output is missing has no verdict. So does a shard whose
+# build the memory gate refused, since it tested nothing.
 
 # e2e_github_shard_rc <dir> <id>: the shard's exit code, or the no-verdict code.
+# Needs HOST_MEMORY_BUILD_REFUSED_EXIT, which scripts/lib/e2e.sh sources.
 e2e_github_shard_rc() {
     local rc_file="$1/e2e-out-$2/$2.rc" rc
     rc="$(cat "$rc_file" 2>/dev/null)"
     case "$rc" in
         '' | *[!0-9]*) echo "$E2E_GITHUB_NO_VERDICT_EXIT" ;;
+        "$HOST_MEMORY_BUILD_REFUSED_EXIT")
+            echo "ERROR: the $2 shard's build never started (exit $rc), so it tested nothing." >&2
+            echo "$E2E_GITHUB_NO_VERDICT_EXIT"
+            ;;
         *) echo "$rc" ;;
     esac
 }
 
 e2e_github_shard_log() { printf '%s\n' "$1/e2e-out-$2/$2.log"; }
 
+# e2e_github_worse_rc <so-far> <rc>: the exit code a run reports so far. The
+# first failure wins, and any failure outranks no verdict.
+e2e_github_worse_rc() {
+    if [ "$1" -eq 0 ] || { [ "$1" -eq "$E2E_GITHUB_NO_VERDICT_EXIT" ] && [ "$2" -ne 0 ]; }; then
+        echo "$2"
+    else
+        echo "$1"
+    fi
+}
+
 # e2e_github_report <dir>: print every phase in e2e.sh order and return the
-# first failing phase's exit code. Needs report_playwright_totals and
-# report_project_exit_codes from scripts/lib/e2e.sh.
+# first failing phase's exit code, or no verdict when no phase failed outright.
+# Needs report_playwright_totals and report_project_exit_codes from
+# scripts/lib/e2e.sh.
 e2e_github_report() {
     local dir="$1" entries="$1/e2e-plan/entries"
     local overall=0 suite project id rc log phase_rc project_rcs=() combined
@@ -332,7 +433,7 @@ e2e_github_report() {
         return "$E2E_GITHUB_NO_VERDICT_EXIT"
     fi
 
-    for suite in api wasm embedder; do
+    for suite in engine api wasm embedder; do
         while read -r id s _; do
             [ "$s" = "$suite" ] || continue
             echo ""
@@ -341,7 +442,7 @@ e2e_github_report() {
             cat "$log" 2>/dev/null || echo "ERROR: no output from the $suite shard"
             rc="$(e2e_github_shard_rc "$dir" "$id")"
             echo "── $suite exit code: $rc ──"
-            [ "$overall" -ne 0 ] || overall="$rc"
+            overall="$(e2e_github_worse_rc "$overall" "$rc")"
         done <"$entries"
     done
 
@@ -356,13 +457,13 @@ e2e_github_report() {
             log="$(e2e_github_shard_log "$dir" "$id")"
             cat "$log" 2>/dev/null >>"$combined"
             rc="$(e2e_github_shard_rc "$dir" "$id")"
-            [ "$phase_rc" -ne 0 ] || phase_rc="$rc"
+            phase_rc="$(e2e_github_worse_rc "$phase_rc" "$rc")"
         done <"$entries"
         cat "$combined"
         report_playwright_totals "$project" "$combined" || { [ "$phase_rc" -ne 0 ] || phase_rc=1; }
         rm -f "$combined"
         project_rcs+=("$project:$phase_rc")
-        [ "$overall" -ne 0 ] || overall="$phase_rc"
+        overall="$(e2e_github_worse_rc "$overall" "$phase_rc")"
     done
 
     if [ "${#project_rcs[@]}" -gt 0 ]; then

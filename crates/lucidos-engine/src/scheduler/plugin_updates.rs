@@ -440,7 +440,7 @@ fn build_update_notification(candidates: &[MarketplacePlugin]) -> (String, Strin
 /// Where the update notification's tap lands: the Plugins panel's Installed tab.
 /// A single candidate also scrolls to and pulses its row; the `id` is the plugin
 /// id, matched against each row's `data-plugin-id`. Several candidates focus no
-/// row, since each one already carries its update chip.
+/// row, since each one's button already reads Update.
 fn build_update_navigation(candidates: &[MarketplacePlugin]) -> NavigateUi {
     let focus = match candidates {
         [only] => Some(only.id.clone()),

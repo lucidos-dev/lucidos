@@ -4,7 +4,7 @@
  * Under Folders the row already is the thread's place, so the item would
  * point at itself.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { ThreadDrawer } from '../ThreadDrawer';
@@ -15,6 +15,11 @@ import {
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { _resetComposeDraftsForTesting } from '../../../store/composeDrafts';
 import type { ThreadSearchResult } from '../../../api/threads';
+import { ThreadOverflowItemsChunk } from '../../shared/ThreadOverflowMenu';
+import { clearNavFocus } from '../../shared/focusMarker';
+
+// The menu's rows are code-split. Warm them, so a click opens it at once.
+beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 vi.mock('../../../store/actions/thread-loading', () => ({
     loadThreadEvents: vi.fn(),
@@ -72,7 +77,10 @@ afterEach(() => {
     host.remove();
     document.querySelectorAll('.thread-overflow-menu').forEach(el => el.remove());
     setDrawerGrouping('folders');
+    clearNavFocus();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    delete (HTMLElement.prototype as Partial<HTMLElement>).scrollTo;
 });
 
 describe('Show in Folders on a drawer row', () => {
@@ -85,6 +93,20 @@ describe('Show in Folders on a drawer row', () => {
         act(() => { items[0].click(); });
 
         expect(drawerGrouping.value).toBe('folders');
+    });
+
+    it('marks the row it lands on with the navigation focus marker', () => {
+        // jsdom lays nothing out, and a reveal waits for a list with a height.
+        vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(800);
+        HTMLElement.prototype.scrollTo = () => {};
+        setDrawerGrouping('ongoing');
+        mount();
+        const items = openRowMenu('q');
+
+        act(() => { items[0].click(); });
+
+        const row = host.querySelector('.thread-drawer-tree [data-thread-nav="q"]');
+        expect(row?.classList.contains('nav-focus-stuck')).toBe(true);
     });
 
     it('is absent on a search hit, even with Ongoing as the grouping behind the search', () => {

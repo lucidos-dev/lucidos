@@ -283,7 +283,13 @@ pub fn db_url() -> String {
             &db_slug
         }
     );
-    format!("postgres://lucidos:lucidos@localhost:{}/{}", db_port(), db)
+    let password = lucidos_local_token::read_named(lucidos_local_token::SHARED_PG_PASSWORD_FILE)
+        .expect("the shared cluster's password file, which setup_postgres mints");
+    format!(
+        "postgres://lucidos:{password}@localhost:{}/{}",
+        db_port(),
+        db
+    )
 }
 
 /// The shared cluster's host port. `shared_pg_psql` in
@@ -674,7 +680,8 @@ pub async fn poll_thread_summary_by_marker(
 /// throwaway worktree. The worktree is removed afterwards and the branch kept,
 /// the shape a coding-agent branch has once cleanup reclaimed its tree.
 pub fn commit_on_new_branch(branch: &str, file: &str, contents: &str) {
-    let wt_dir = std::env::temp_dir().join(format!("e2e-wt-{}", branch.replace('/', "-")));
+    let wt_tmp = tempfile::tempdir().unwrap();
+    let wt_dir = wt_tmp.path();
     git(&[
         "worktree",
         "add",
@@ -686,8 +693,8 @@ pub fn commit_on_new_branch(branch: &str, file: &str, contents: &str) {
     let path = wt_dir.join(file);
     std::fs::create_dir_all(path.parent().expect("a file has a parent")).unwrap();
     std::fs::write(path, contents).unwrap();
-    git_in(&wt_dir, &["add", file]);
-    git_in(&wt_dir, &["commit", "-m", &format!("e2e: {file}")]);
+    git_in(wt_dir, &["add", file]);
+    git_in(wt_dir, &["commit", "-m", &format!("e2e: {file}")]);
     git(&["worktree", "remove", "--force", wt_dir.to_str().unwrap()]);
 }
 

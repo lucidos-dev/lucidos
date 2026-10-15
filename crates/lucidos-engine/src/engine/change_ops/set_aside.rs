@@ -23,6 +23,11 @@ impl LucidosEngine {
         change_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Held across the read and the emit, so an apply cannot start between.
+        let _claim = self
+            .apply_claims
+            .try_claim(change_id)
+            .ok_or(super::apply_claim::APPLY_IN_PROGRESS_MESSAGE)?;
         let change = self
             .changes()
             .get_by_id(change_id)
@@ -57,6 +62,11 @@ impl LucidosEngine {
         self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
             change_id,
             crate::engine::apply_all_driver::WITHDRAWN_MEMBER_REASON.to_string(),
+        ));
+        // A queued change leaves the landing lane with `ChangeUnqueued`.
+        self.notify_landing_lane(crate::engine::landing_lane::LaneMsg::Withdrawn(
+            change_id,
+            crate::engine::thread_events::UnqueueReason::SetAside,
         ));
         self.broadcast_changes_updated().await;
         Ok(())

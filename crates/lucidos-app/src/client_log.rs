@@ -10,7 +10,6 @@
 //! somewhere useful, and it shares the packaged app-data dir, which is not its
 //! to write into.
 
-use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 
@@ -42,7 +41,10 @@ pub(crate) fn install() {
     if tauri::is_dev() {
         return;
     }
-    if is_service_role(std::env::args_os()) {
+    // The service's plist owns its sink, and `parse_service_boots` reads that
+    // file back to tell a crash loop from a slow boot. `main` routes the service
+    // before `crate::run`; this is the belt for that ordering.
+    if crate::launch_role(std::env::args_os()) == crate::LaunchRole::Service {
         return;
     }
     if let Err(e) = redirect_to_app_data() {
@@ -59,21 +61,11 @@ pub(crate) fn install() {
     );
 }
 
-/// Is this process the service rather than the client?
-///
-/// The service's plist owns its sink, and `parse_service_boots` reads that file
-/// back to tell a crash loop from a slow boot. Redirecting it here would empty
-/// the file the report is built from. `main` routes `--service` before
-/// [`crate::run`], and this is the belt for that ordering.
-fn is_service_role(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
-    args.into_iter()
-        .skip(1)
-        .any(|a| a == OsStr::new("--service"))
-}
-
 /// Open the log, rotating an oversized one first, and take over both streams.
 fn redirect_to_app_data() -> io::Result<()> {
-    let logs = desktop::app_data_dir_from_env()?.join("logs");
+    let app_data = desktop::app_data_dir_from_env()?;
+    lucidos_home::ensure_storage_root(&app_data)?;
+    let logs = app_data.join("logs");
     std::fs::create_dir_all(&logs)?;
     let log = logs.join(CLIENT_LOG);
     rotate_if_large(&log, &logs.join(CLIENT_LOG_PREVIOUS), CLIENT_LOG_MAX_BYTES)?;
@@ -154,38 +146,6 @@ fn redirect_std_streams(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
-    use std::ffi::OsString;
-
-    fn args(words: &[&str]) -> Vec<OsString> {
-        std::iter::once(OsString::from(
-            "/Applications/Lucidos.app/Contents/MacOS/lucidos-app",
-        ))
-        .chain(words.iter().map(OsString::from))
-        .collect()
-    }
-
-    // The service reads its own error log back to report a crash loop. A
-    // redirect here would empty the file that report is built from.
-    #[test]
-    fn the_service_role_keeps_the_sink_its_plist_gave_it() {
-        assert!(is_service_role(args(&["--service"])));
-        assert!(is_service_role(args(&["--other", "--service"])));
-    }
-
-    #[test]
-    fn every_other_launch_is_a_client_and_gets_the_log() {
-        assert!(!is_service_role(args(&[])));
-        assert!(!is_service_role(args(&["--login"])));
-    }
-
-    // argv[0] is the executable, and a bundle could live under a directory
-    // called `--service`. Skipping it is what keeps that from silencing a real
-    // client.
-    #[test]
-    fn the_executable_path_is_never_read_as_a_flag() {
-        assert!(!is_service_role(vec![OsString::from("--service")]));
-    }
 
     #[test]
     fn rotation_starts_above_the_cap_and_not_at_it() {
@@ -196,7 +156,7 @@ mod tests {
 
     #[test]
     fn an_oversized_log_is_rotated_to_one_generation() {
-        let tmp = TempDir::new("client-log-rotate");
+        let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join(CLIENT_LOG);
         let previous = tmp.path().join(CLIENT_LOG_PREVIOUS);
 
@@ -210,7 +170,7 @@ mod tests {
     // otherwise leave a directory of them.
     #[test]
     fn a_second_rotation_replaces_the_kept_generation() {
-        let tmp = TempDir::new("client-log-second");
+        let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join(CLIENT_LOG);
         let previous = tmp.path().join(CLIENT_LOG_PREVIOUS);
 
@@ -229,7 +189,7 @@ mod tests {
 
     #[test]
     fn a_log_under_the_cap_is_left_alone() {
-        let tmp = TempDir::new("client-log-small");
+        let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join(CLIENT_LOG);
         std::fs::write(&log, b"small").expect("write the log");
         rotate_if_large(&log, &tmp.path().join(CLIENT_LOG_PREVIOUS), 1024).expect("no rotation");
@@ -239,7 +199,7 @@ mod tests {
     // The first launch has no log yet, which is not a failure to report.
     #[test]
     fn a_missing_log_is_the_first_launch() {
-        let tmp = TempDir::new("client-log-absent");
+        let tmp = tempfile::tempdir().unwrap();
         rotate_if_large(
             &tmp.path().join(CLIENT_LOG),
             &tmp.path().join(CLIENT_LOG_PREVIOUS),
@@ -254,7 +214,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_redirect_sends_every_stream_to_one_file_in_order() {
-        let tmp = TempDir::new("client-log-redirect");
+        let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(CLIENT_LOG);
         // SAFETY: `dup` takes one descriptor and no pointers. fd 1 is open for
         // the life of the process, and the copies are closed below.
@@ -285,7 +245,7 @@ mod tests {
     fn the_log_is_created_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = TempDir::new("client-log-mode");
+        let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(CLIENT_LOG);
         // SAFETY: `dup` takes one descriptor and no pointers, and fd 1 is open.
         let scratch = unsafe { libc::dup(1) };

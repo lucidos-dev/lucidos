@@ -14,7 +14,7 @@ exit, any warning, any clippy lint = FAIL.
 
 ## Commands
 
-Run all five from the repo root. If any one fails, the skill FAILED. Do
+Run all six from the repo root. If any one fails, the skill FAILED. Do
 not stop at the first failure — collect them all, fix at the source, and
 re-run until every phase is clean.
 
@@ -67,6 +67,24 @@ re-run until every phase is clean.
      || echo "[clean-build] no eslint config — skipping"
    ```
    Skip cleanly when no config exists; this is not a failure.
+
+6. **First-paint growth** (ADR 0454):
+   ```sh
+   # on a branch: this change against its merge base with main
+   node crates/lucidos-app/first-paint-growth.mjs check
+   # on main, for the nightly: what each change of the last day added
+   node crates/lucidos-app/first-paint-growth.mjs report --hours 24
+   ```
+   `check` builds the merge base and this tree, and compares their first-paint
+   sets through `vite/chunkBudget.ts`, the same measurement phase 4 judges.
+   Growth over 2 kB raw fails unless a commit of the change carries a
+   `First-paint-growth: <why>` trailer. A missing or unbuildable merge base
+   fails too: merge main and run again.
+
+   `report` always exits 0. Its lines are information, not a verdict, and
+   go into the summary as they are: the net growth, the set against its
+   budget, the biggest adders with their reasons, and the shrinks. A
+   "Not measured" line names a change it could not build, so report it.
 
 ## Reading exit codes honestly — beware piped output
 
@@ -146,16 +164,17 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-10-10. The audit
-found one new silencer: a `too_many_arguments` on the saved-capture test
-helper in `tools/app_capture_tests.rs`, whose doc comment did not justify
-it. Every caller passed the same last three arguments, so that run pinned
-them and removed the attribute.
+The currently-accepted categories, re-counted on 2026-10-12. The audit
+found six `too_many_arguments` silencers that silenced nothing. Each sat on a
+function with seven or fewer parameters, `self` included, and clippy's
+default threshold fires only above seven. That run removed all six:
+`core/credentials.rs` `upsert_row`, `chat/process/run.rs` `fail_turn`, the
+`walk` test helper in `tools/import.rs`, and three in
+`scheduler/task_runner.rs`. The check below now catches that form.
 
-The Rust counts are unchanged. `@ts-expect-error` grew with the test suite,
-and it reached one file outside test code: the Vite plugin
-`vite/sourceCommitStamp.ts` (see its entry below). The ten
-`eslint-disable` sites were unchanged.
+`@ts-expect-error` grew with the test suite, and a fourth Vitest-only helper
+joined: `__tests__/staticImportGraph.ts`. The ten `eslint-disable` sites were
+unchanged.
 
 **The first grep and the bare-allow audit both print one false hit.** It is
 `git_ops_tests/branch_queries.rs`, where `#[allow(dead_code)]` sits inside
@@ -167,7 +186,7 @@ silencers from the gateway's slowness watcher, which the first grep above
 had missed. The cfg_attr grep now covers that form.
 Anything not on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 86 sites across 54 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 82 sites across 55 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -175,15 +194,15 @@ Anything not on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 86 shares an attribute with `format_in_format_args`, which is
+  One of the 82 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 85 across 53 files. Both numbers here count the shared attribute.
-- **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
-  (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
-  scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
+  reports 81 across 54 files. Both numbers here count the shared attribute.
+- **`#[allow(dead_code)]`**, 3 sites, all test scaffolding
+  (`thread_lifecycle_tests/scenario_tests.rs`,
   `change_ops_engine_origin_stamping_tests.rs`, `tools/plugins/mod.rs`).
-  One-line comment required at each site. The count was 5 until 2026-08-28,
-  when the second `spawn_dispatcher.rs` site turned out to be gone.
+  One-line comment required at each site. The spawn dispatcher's
+  `SpawnTrigger` enum held a fourth until it was deleted with the
+  dispatcher's shadow mode.
 - **`#[allow(clippy::large_enum_variant)]`**, 1 site: `BusEvent` in
   `engine/event_bus/mod.rs`. The variant size is dominated by the inner
   event payload; boxing every variant to flatten the enum would hurt
@@ -199,8 +218,8 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 905 sites across 313 files, all but one of
-  them test-only code: 295 `*.test.ts`, fourteen `*.test.tsx`
+  `@types/node` in project**, 931 sites across 322 files, all but one of
+  them test-only code: 303 `*.test.ts`, fourteen `*.test.tsx`
   (`components/changes/__tests__/bulk-row-layout.test.tsx`,
   `components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/typed-answer-spins-on-its-card.test.tsx`,
@@ -214,10 +233,11 @@ Anything not on this list is fair game to remove and re-fix:
   `components/shared/__tests__/apps-glyph-single-source.test.tsx`,
   `components/shared/__tests__/overlay-exit-fade.test.tsx`,
   `components/shared/__tests__/system-attention-badge.test.tsx` and
-  `styles/__tests__/brand-mark-tokens.test.tsx`), and three
+  `styles/__tests__/brand-mark-tokens.test.tsx`), and four
   Vitest-only helpers. `styles/__tests__/css-rule-helpers.ts`,
-  `components/shared/__tests__/loading-guard-scan.ts` and
-  `components/search/__tests__/renderedSearchAnchors.ts` carry three each.
+  `components/shared/__tests__/loading-guard-scan.ts`,
+  `components/search/__tests__/renderedSearchAnchors.ts` and
+  `__tests__/staticImportGraph.ts` carry three each.
   The one file outside test code is `vite/sourceCommitStamp.ts`, with three
   sites. It is a Vite plugin, so it runs in Node at build time, and `tsc`
   reaches it only because its test imports it. No browser code imports it.
@@ -273,6 +293,37 @@ for f in $(git ls-files '*.rs'); do awk -v F="$f" '
     } }' "$f"; done
 ```
 
+A comment above an allow does not prove the lint fires there. The repo has no
+`clippy.toml`, so `too_many_arguments` fires only on eight or more parameters,
+`self` included. This prints every such allow on a function with seven or
+fewer. It must print nothing, and each line it prints is an attribute to
+delete:
+
+```sh
+python3 - <<'EOF'
+import re, subprocess
+for f in subprocess.check_output(['git', 'ls-files', '*.rs']).decode().split():
+    src = open(f).read()
+    for m in re.finditer(r'#\[allow\([^)]*too_many_arguments[^)]*\)\]', src):
+        sig = re.search(r'\bfn\s+\w+\s*(<[^{(]*?>)?\s*\(', src[m.end():])
+        i, depth, params, cur = m.end() + sig.end(), 1, 0, ''
+        while depth:
+            c = src[i]
+            if c in '([{' or (c == '<' and src[i - 1] != ' '):
+                depth += 1
+            elif c in ')]}' or (c == '>' and src[i - 1] != '-'):
+                depth -= 1
+            if depth == 1 and c == ',':
+                params, cur = params + bool(re.sub(r'//.*', '', cur).strip()), ''
+            elif depth:
+                cur += c
+            i += 1
+        params += bool(re.sub(r'//.*', '', cur).strip())
+        if params <= 7:
+            print(f"{f}:{src[:m.start()].count(chr(10)) + 1}: {params} params")
+EOF
+```
+
 ### Known exceptions
 
 Where "When to give up" (below) sends an unfixable finding. Kept inside
@@ -315,7 +366,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   **`src/worker/` is the hole in that transitive coverage**, found on the
   2026-08-29 run. `src/index.ts` never imports it, so phase 3 never reaches
   it. `sseWorker.build.mjs` bundles it with esbuild into
-  `src/generated/sse-worker.js`, which the engine `include_str!`s and serves,
+  `dist/sse-worker.js`, which the engine serves,
   and esbuild type checks nothing. So it is shipping code that no phase reads.
   It had one real error, `SharedWorkerGlobalScope` undeclared, which that run
   fixed by adding `WebWorker` to the SDK's `lib`. The SDK typecheck does reach
@@ -359,16 +410,47 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   The entry chunk is the data layer and startup. The UI is the shell chunk,
   loaded beside it under the boot splash.
 
-  `entryChunkBudget` (`crates/lucidos-app/vite/entryChunkBudget.ts`) FAILS a
-  single-shot `vite build` whose entry chunk passes `chunkSizeWarningLimit`,
-  naming the measured size. Past 90 % of the budget it WARNS, naming the
-  headroom left, and this phase counts that warning. So the phase goes red
-  while there is still room, which is the point.
+  **The shell chunk is budgeted as part of the first-paint set** (ADR 0436):
+  the entry, the shell, and every chunk either imports statically. Before
+  that it met only Rollup's generic advisory. On 2026-10-12 it measured
+  639.84 kB. The header's "Open in new tab" took one helper from the preview
+  frame bridge, which pulled in the bridge's two raw iframe scripts. That
+  helper moved to `store/actions/frame-capability.ts`, and `startShell` now
+  loads the composer's press probe as its own chunk, which took it to
+  591.15 kB.
 
-  When either fires, move the next thing the first frame does not need out of
-  the entry. Never raise the number. The usual cause is a static import from
-  the data layer into UI code, which pulls that code and its imports back in.
-  Two fixes cover most cases:
+  The same day the set measured 1285.30 kB, past its soft line. These
+  on-demand surfaces moved behind dynamic imports, which took it to
+  1233.39 kB even after the widget dock landed (since removed):
+
+  - the brand menu's rows (`BrandMenuRows.tsx`);
+  - the thread menu's rows (`ThreadOverflowItems.tsx`);
+  - both composer control menus, behind a look-alike `ControlMenuTrigger`;
+  - the find bar's matcher and targets (`find-targets.ts`);
+  - the microphone list and the widget menus' rows (`itemsChunk`);
+  - the menu drawer, and the confirm and prompt dialogs.
+
+  `__tests__/shell-chunk-leaves-lazy-modules-out.test.ts` keeps every one of
+  them out.
+
+  `chunkBudget` (`crates/lucidos-app/vite/chunkBudget.ts`) judges each chunk
+  against the number for its class. Vite's own `chunkSizeWarningLimit` is
+  off, because one number cannot tell the classes apart.
+
+  | Class | Budget | Past 90 % | Past the budget |
+  |---|---|---|---|
+  | Entry chunk | 600 kB | warns | single-shot build FAILS |
+  | First-paint set | 1400 kB | warns | single-shot build FAILS |
+  | Each lazy chunk | 400 kB | nothing | warns |
+
+  Every message names the measured size, and a soft-line warning names the
+  headroom left. This phase counts each warning, so it goes red while there
+  is still room, which is the point.
+
+  When the entry budget fires, move the next thing the first frame does not
+  need out of the entry. Never raise the number. The usual cause is a static
+  import from the data layer into UI code, which pulls that code and its
+  imports back in. Two fixes cover most cases:
 
   - **The store needs one export of a UI module.** Move that export into its
     own small module, as `utils/dataPathPrefixes.ts` and `store/savedScroll.ts`
@@ -377,21 +459,36 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   - **A listener only a drawn UI can need.** Install it from `startShell`
     (`src/shellStartup.ts`), not from client startup or `main.tsx`.
 
+  When the first-paint budget fires, only a dynamic import helps. Code moved
+  into a chunk the shell imports statically still loads before first paint,
+  so it still counts. Trim until the set sits at least 25 kB under the soft
+  line, about a day of growth, or the next nightly goes red again.
+
+  - **Move what the first frame does not draw behind `import()`**, with an
+    idle prefetch. Its opener waits through `whenLoaded`, so it never opens
+    empty: `OverflowMenu`'s `itemsChunk` and `controlMenuParts.ts` show how.
+  - **Keep what a cold open can draw at once.** That means the permission and
+    question cards and the thread filter panel (ADR 0288). It also covers
+    anything whose open state survives a reload.
+  - **Keep anything a restart needs.** The progress dialog is the engine
+    restart's surface, and a chunk fetch can fail mid-restart.
+
   How to find them:
 
   - **Attribute built bytes, not source bytes.** Run a sourcemap build into a
-    scratch outDir and decode the entry map's `mappings`, charging each
+    scratch outDir and decode the chunk map's `mappings`, charging each
     segment to its source. Never edit `build.sourcemap` in the config.
-  - **Over the budget that build fails before it writes.** Make the guard
+  - **Over a budget that build fails before it writes.** Make both budgets
     report by naming your own process as Vite's parent, the way the
     build-watch does:
 
     ```sh
     cd crates/lucidos-app && node -e "require('node:child_process').spawnSync(process.execPath, ['../../node_modules/vite/bin/vite.js', 'build', '--sourcemap', '--outDir', '/tmp/entry-attr', '--emptyOutDir'], { stdio: 'inherit', env: { ...process.env, LUCIDOS_DEV_BUILD_WATCH: String(process.pid) } })"
     ```
-  - **Find why a module is in the entry.** Rollup's `getModuleInfo` gives
-    each module's importers. A dominator tree over the static graph inside the
-    entry gives what a cut would actually free. Walk the graph through
+  - **Find why a module is in the entry or the shell.** Rollup's
+    `getModuleInfo` gives each module's importers. A dominator tree over the
+    static graph from `main.tsx` and `App.tsx` gives what a cut would actually
+    free. Those figures are unminified: the built chunk is about half. Walk the graph through
     re-export barrels such as `api/client.ts`. A barrel renders no code, so it
     is missing from the chunk's module list, and skipping it hides real edges.
   - **Ask the two regression questions.** Does any module sit in two chunks?
@@ -430,11 +527,15 @@ warning or returned non-zero).
 
 For each phase, report:
 
-- Phase name (`cargo build`, `make lint`, `tsc`, `vite build`, `eslint`).
+- Phase name (`cargo build`, `make lint`, `tsc`, `vite build`, `eslint`,
+  `first-paint growth`).
 - Exit code.
 - Number of warnings emitted (must be 0).
 - Number of errors (must be 0).
 - For `eslint`: SKIPPED if no config was present.
+- For `first-paint growth`: the growth line `check` printed, or on main the
+  lines `report` printed, verbatim. The morning notice lists the biggest
+  adders from them.
 
 If FAILED, list every warning with `file:line` and the lint name so the
 next iteration can target them directly.

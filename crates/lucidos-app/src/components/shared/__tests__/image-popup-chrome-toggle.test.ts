@@ -15,6 +15,7 @@ const css = readFileSync(resolve(here, '../../../styles/components.css'), 'utf-8
 /** Every control the tap hides. */
 const CHROME = [
   'image-popup-close',
+  'image-popup-copy',
   'floating-mobile-close',
   'image-popup-nav',
   'image-popup-counter',

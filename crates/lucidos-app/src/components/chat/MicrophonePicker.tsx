@@ -11,7 +11,6 @@
  * playback is riding.
  */
 import { useEffect } from 'preact/hooks';
-import { OverflowMenu, type OverflowMenuOpener } from '../shared/OverflowMenu';
 import {
   microphones,
   nameMicrophones,
@@ -26,7 +25,7 @@ import { voiceCall } from '../../store/voiceCall';
 
 /** Mounted only while the menu is open, which is what makes the device read and
  *  the hardware listener cost nothing the rest of the time. */
-function MicrophoneList({ run }: { run: (fn: () => void) => (e: MouseEvent) => void }) {
+export function MicrophoneList({ run }: { run: (fn: () => void) => (e: MouseEvent) => void }) {
   useEffect(() => {
     void refreshMicrophones();
     return watchMicrophones();
@@ -92,22 +91,5 @@ function MicrophoneList({ run }: { run: (fn: () => void) => (e: MouseEvent) => v
         <div class="thread-overflow-note">The call you are on keeps the microphone it opened.</div>
       )}
     </>
-  );
-}
-
-export function MicrophonePicker({
-  openRef,
-}: {
-  /** Host-opened mode. The call control's long press is the only way in, so
-   *  this menu draws no trigger of its own. */
-  openRef: { current: OverflowMenuOpener | null };
-}) {
-  return (
-    <OverflowMenu
-      ariaLabel="Choose a microphone"
-      stopPropagation
-      hostOpener={{ ref: openRef, trigger: false }}
-      items={({ run }) => <MicrophoneList run={run} />}
-    />
   );
 }

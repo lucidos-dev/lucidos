@@ -87,8 +87,7 @@ fn default_true() -> bool {
 
 /// `~/.lucidos/updates.toml`. `None` only when `HOME` is unset.
 pub fn updates_toml_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".lucidos/updates.toml"))
+    Some(lucidos_home::path()?.join("updates.toml"))
 }
 
 /// Read and parse the preference at `path`. Any failure yields the defaults.
@@ -139,12 +138,13 @@ pub fn render_updates_toml(cfg: &UpdatesToml) -> String {
     )
 }
 
-/// Write the preference atomically (temp plus rename), creating `~/.lucidos`.
+/// Write the preference atomically (temp plus rename). Its directory is the
+/// Lucidos home, so it is asserted as a storage root first.
 pub fn write_updates_toml(path: Option<&Path>, cfg: &UpdatesToml) -> std::io::Result<()> {
     let path =
         path.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        lucidos_home::ensure_storage_root(parent)?;
     }
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, render_updates_toml(cfg))?;
@@ -371,12 +371,11 @@ pub struct Deployment {
 impl Deployment {
     /// Resolve from the environment at gateway startup.
     pub fn from_env(packaged: bool, exe: Option<PathBuf>, app_data: PathBuf) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
         Deployment {
             packaged,
             exe,
             app_data,
-            default_prefix: home.map(|h| h.join(".lucidos")),
+            default_prefix: lucidos_home::path(),
             config_path: updates_toml_path(),
         }
     }

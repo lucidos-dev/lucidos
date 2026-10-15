@@ -10,6 +10,9 @@
 - **Amended by**: [0387: An owner approval authorizes one act](0387-an-owner-approval-authorizes-one-act.md).
   The owner's Allow on an engine-worded card lets a thread press one clause-4
   act. Clause 5's two shapes are unchanged.
+- **Amended by**: [0475: Any thread creates a top-thread](0475-any-thread-creates-a-top-thread.md).
+  Creating a top-thread, and an agent's detach of its own child, leave clause
+  4. Any thread does either with no owner authority.
 
 ## Context
 
@@ -68,6 +71,12 @@ Six clauses. The first two are vocabulary the rest depends on.
    cancelling, and creating a top-thread. None is thread-scoped, because the
    root is not a thread. Each needs evidence of the person, not a place in the
    tree.
+   *Amended:* an agent moving its own child to top level (ADR 0278) is
+   creating a top-thread too. Its target sits in the caller's subtree, but its
+   result sits in none, so clause 3 never covers it. A user's device moving a
+   thread is unaffected.
+   *Superseded by ADR 0475:* creating a top-thread and an agent's detach left
+   this list. Any thread does either on its own.
 5. **A thread may press one only while carrying a standing instruction from the
    owner.** Two shapes qualify, and no third. A turn the owner opened, where
    their words in that turn are the press. A *trigger* firing the owner

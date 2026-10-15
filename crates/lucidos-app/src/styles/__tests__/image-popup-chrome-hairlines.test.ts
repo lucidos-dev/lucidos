@@ -36,7 +36,7 @@ const ROOT_SIZES: number[] = [];
 for (let scale = 75; scale <= 200; scale += 12.5) ROOT_SIZES.push((16 * scale) / 100);
 
 /** The classes whose ring the popup draws in white over the image. */
-const RINGED = ['image-popup-close', 'image-popup-nav', 'image-popup-zoom', 'floating-mobile-close'];
+const RINGED = ['image-popup-close', 'image-popup-copy', 'image-popup-nav', 'image-popup-zoom', 'floating-mobile-close'];
 
 /** The widest ring, which is what the boxes have to stay whole against. A
  *  narrower one only subtracts a whole px from a whole total. */
@@ -63,7 +63,8 @@ function px(value: string, root: number): number {
   throw new Error(`cannot resolve "${value}" to px`);
 }
 
-const closeRule = block(componentsCss, '.image-popup-close {');
+/** Close and Copy share one box, so one rule sizes both. */
+const closeRule = block(componentsCss, '.image-popup-close,\n.image-popup-copy {');
 const zoomRule = block(componentsCss, '.image-popup-zoom {');
 const zoomBtnRule = block(componentsCss, '.image-popup-zoom-btn {');
 const zoomLevelRule = block(componentsCss, '.image-popup-zoom-level {');

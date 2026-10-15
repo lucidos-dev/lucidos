@@ -118,6 +118,10 @@ _E2E_LOCK_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 # For `proc_env_has_entry`, which decides the `browser` kind.
 # shellcheck source=proc_env.sh
 source "$_E2E_LOCK_LIB_DIR/proc_env.sh"
+# For `engine_pids_to_signal`, which names the e2e engine only while it owns its
+# lock and still runs lucidos-engine.
+# shellcheck source=flock.sh
+source "$_E2E_LOCK_LIB_DIR/flock.sh"
 
 # Resolve the lock file path. $E2E_LOCK_DIR_OVERRIDE is for tests; otherwise
 # falls back to ~/workspaces/e2e-test/.lucidos/.
@@ -361,18 +365,12 @@ EOF
         echo "agent $pid"
     done
 
-    # e2e-test workspace engine — keyed on its dedicated pidfile, liveness-gated.
+    # e2e-test workspace engine, named by its pidfile only while it holds the
+    # workspace's engine lock (ADR 0438).
     local engine_pid
-    engine_pid="$(cat "$(_e2e_workspace_dir)/.lucidos/engine.pid" 2>/dev/null)"
-    case "$engine_pid" in
-        ''|*[!0-9]*) : ;;
-        *)
-            if [ "$engine_pid" -gt 1 ] && [ "$engine_pid" != "$self" ] \
-               && kill -0 "$engine_pid" 2>/dev/null; then
-                echo "engine $engine_pid"
-            fi
-            ;;
-    esac
+    for engine_pid in $(engine_pids_to_signal "$(_e2e_workspace_dir)"); do
+        if [ "$engine_pid" != "$self" ]; then echo "engine $engine_pid"; fi
+    done
 }
 
 # Deliberate, logged sweep of the "KIND PID" lines from _e2e_list_orphans (read

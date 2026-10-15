@@ -138,9 +138,9 @@ describe('isTauriPreGatewayEntryFor', () => {
     ).toBe(false);
   });
 
-  it('is false in dev Tauri (devUrl http://localhost:5173)', () => {
+  it('is false in the dev window (an http localhost origin)', () => {
     // Same origin shape as the gateway — an http localhost origin, not the asset
-    // host — so the guard must not suppress the app in `tauri dev`.
+    // host — so the guard must not suppress the app in the dev window.
     expect(
       isTauriPreGatewayEntryFor({ isTauri: true, protocol: 'http:', hostname: 'localhost' }),
     ).toBe(false);

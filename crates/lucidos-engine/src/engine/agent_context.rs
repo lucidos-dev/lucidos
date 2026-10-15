@@ -453,6 +453,7 @@ mod tests {
             images: None,
             origin_event_id,
             kind,
+            completion: None,
         };
         assert_eq!(
             input(Some(origin), AgentInputKind::User).user_origin(),

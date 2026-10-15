@@ -1,6 +1,6 @@
-import { useRef, useCallback, useEffect, useLayoutEffect } from 'preact/hooks';
-import { mobileView, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, appPseudoFullscreen } from '../../store/store';
-import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
+import { useRef, useEffect, useLayoutEffect } from 'preact/hooks';
+import { mobileView, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, appPseudoFullscreen, type MobileView } from '../../store/store';
+import { swipeToNeighbourPane } from '../../store/actions/pane';
 import { MOBILE_PANE_CONFIGS } from './MobileAppHeader';
 import { EdgeSwipeZones } from './EdgeSwipeZones';
 import {
@@ -8,8 +8,9 @@ import {
   opensSoftwareKeyboard,
   getRemPx,
   viewportIsKeyboardShrunk,
+  computedTranslateX,
 } from '../../utils/dom';
-import { SwipeTouch } from '@lucidos/pane-swipe';
+import { PaneDrag, attachPaneDragTouches, isFrameInside, type PaneTrack, type TouchPoint } from './paneDrag';
 import { subscribeFrameSwipes } from '../../store/actions/frame-swipe-bridge';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import {
@@ -23,7 +24,7 @@ import { reportNavigation } from '../../utils/navigationMarks';
 import { useFocusedFieldVisible } from '../../hooks/useFocusedFieldVisible';
 
 // Rubber band factor at edges (0 = no movement, 1 = full movement)
-const RUBBER_BAND = 0.3;
+export const RUBBER_BAND = 0.3;
 
 /** Width of the LEFT screen-edge strip treated as a potential iOS *back*
  *  navigation swipe and suppressed, in REM. It must cover the whole
@@ -53,7 +54,7 @@ export const EDGE_NAV_GUARD_RIGHT_REM = 1.25;
  *
  *  A standalone iOS PWA exposes NO CSS/touch-action opt-out for this gesture,
  *  and WebKit's edge recognizer commits before our in-app 8px horizontal lock
- *  (SwipeTouch), so preventing the default in onTouchMove runs too late. The
+ *  (SwipeTouch), so preventing the default on a touchmove runs too late. The
  *  only reliable suppression is preventDefault on the touchstart itself. Scoped
  *  to the screen-edge strips (sized to the `.edge-swipe-*` zones) and to
  *  non-interactive, non-text-input targets so taps on edge controls and
@@ -97,6 +98,14 @@ export function shouldStartPaneSwipe(args: {
 }): boolean {
   const { textInputFocused, targetScrollable, appFullscreen } = args;
   return !textInputFocused && !targetScrollable && !appFullscreen;
+}
+
+/** Whether `pane` is off screen, which pauses every animation inside it
+ *  (mobile.css). It follows the signal, not the track. A pane revealed by a
+ *  finger drag stays paused until the release makes it current, and then it
+ *  animates through the slide. */
+export function isOffscreenPane(pane: MobileView, current: MobileView): boolean {
+  return pane !== current;
 }
 
 /** Pure decision: does focus on `el` mean the mobile keyboard is up over the
@@ -257,11 +266,115 @@ function isHorizontallyScrollable(el: Element | null): boolean {
   return false;
 }
 
-/** Convert a pane index to a CSS percentage translateX value.
- *  Uses the track's own width (300% of container = 3 × paneWidth).
- *  Pane 0 → 0%, Pane 1 → −33.333%, Pane 2 → −66.667%. */
-function paneTransform(index: number): string {
-  return `translateX(${-index * 100 / PANE_COUNT}%)`;
+/** The strip's offset for a pane. Px once the container has a width, and
+ *  the track's own percentage before (300% of the container, so pane 1 is
+ *  -33.333%). */
+function paneTransform(index: number, paneWidth: number): string {
+  return paneWidth > 0 ? `translateX(${-index * paneWidth}px)` : `translateX(${-index * 100 / PANE_COUNT}%)`;
+}
+
+/** A held offset, rubber-banded past either end of the strip. */
+export function rubberBanded(offset: number, paneWidth: number): number {
+  const minOffset = -(PANE_COUNT - 1) * paneWidth;
+  if (offset > 0) return offset * RUBBER_BAND;
+  if (offset < minOffset) return minOffset + (offset - minOffset) * RUBBER_BAND;
+  return offset;
+}
+
+/** The strip as a `PaneTrack`: the only code that writes its transform and
+ *  transition. A drag holds it with the transition off. Otherwise it rests on,
+ *  or slides to, the visible pane with the transition on. */
+export function stripTrack(
+  containerRef: { current: HTMLElement | null },
+  trackRef: { current: HTMLElement | null },
+  isHeld: () => boolean,
+): PaneTrack {
+  // Read once at the grab: a resize ends the drag, so the width holds.
+  let base = 0;
+  let heldWidth = 0;
+  const paneWidth = () => containerRef.current?.offsetWidth ?? 0;
+  return {
+    paneWidth,
+    grab() {
+      const track = trackRef.current;
+      if (!track) return;
+      // Where it is on screen, so a drag that locks mid-slide catches it there.
+      base = computedTranslateX(track);
+      heldWidth = paneWidth();
+      track.style.transition = 'none';
+    },
+    follow(dx) {
+      const track = trackRef.current;
+      if (!track) return;
+      track.style.transition = 'none';
+      track.style.transform = `translateX(${rubberBanded(base + dx, heldWidth)}px)`;
+    },
+    navigate: swipeToNeighbourPane,
+    rest(animate) {
+      const container = containerRef.current;
+      const track = trackRef.current;
+      if (!container || !track) return;
+      // The strip is `overflow: hidden` (ADR 0420), so a focus() may have
+      // scrolled it. Resting puts the panes back on their transform.
+      container.scrollLeft = 0;
+      track.style.transform = paneTransform(PANE_INDEX[mobileView.value], container.offsetWidth);
+      if (animate) {
+        track.style.transition = '';
+        return;
+      }
+      track.style.transition = 'none';
+      // Flush, so the snap lands before the next frame turns the transition
+      // back on. Without it, that frame's style pass animates the snap.
+      void track.offsetWidth;
+      requestAnimationFrame(() => {
+        if (!isHeld() && trackRef.current) trackRef.current.style.transition = '';
+      });
+    },
+  };
+}
+
+/** May a pane swipe start for this touch on the strip? Also suppresses
+ *  iOS's native back/forward swipe at the screen edges, for every new touch.
+ *
+ *  The suppression must happen on touchstart, because WebKit's edge
+ *  recognizer commits before our 8px horizontal lock. It reads the touch that
+ *  started, never an older one. So a thumb resting on an edge swipe zone
+ *  does not cancel every other touch's scroll. Scrollable children,
+ *  interactive controls and focused text inputs are exempt, so their own
+ *  gestures and taps survive (see shouldSuppressEdgeNavigation). */
+function gateStripTouch(e: TouchEvent, touch: TouchPoint): boolean {
+  const target = e.target as Element;
+  const textInputFocused = opensSoftwareKeyboard(document.activeElement);
+  // Don't hijack touches on horizontally-scrollable children (e.g., code blocks)
+  // or range sliders (knob drag is horizontal and must not trigger pane swipe).
+  const targetScrollable = isHorizontallyScrollable(target) || !!target.closest('input[type="range"]');
+
+  if (!targetScrollable && shouldSuppressEdgeNavigation({
+    clientX: touch.clientX,
+    viewportWidth: window.innerWidth,
+    // Read per touch, never captured at mount: the guards track the rem zones
+    // through a UI-scale change the user makes with the app open.
+    remPx: getRemPx(),
+    targetIsInteractive: isInteractiveTarget(target),
+    textInputFocused,
+  })) {
+    e.preventDefault();
+  }
+
+  // Must come AFTER the suppression above: a pseudo-fullscreen app cancels
+  // OUR swipe, but WebKit's native one still has to be preventDefault'd or
+  // suppressing ours just hands the gesture over. See shouldStartPaneSwipe.
+  return shouldStartPaneSwipe({
+    textInputFocused,
+    targetScrollable,
+    appFullscreen: appPseudoFullscreen.value,
+  });
+}
+
+/** A natively fullscreen app counts too. A host touch can never reach the
+ *  container then, but a frame drag can. */
+function appIsFullscreen(): boolean {
+  return appPseudoFullscreen.value || nativeFullscreenElement() !== null;
 }
 
 /** Mobile-only swipeable container with three full-screen views.
@@ -278,41 +391,38 @@ function paneTransform(index: number): string {
  *  2. useLayoutEffect (not useEffect) derives CSS transform from signal
  *     before the browser paints — header/dots and pane move in the same frame.
  *  3. transitionend handler reconciles transform as a safety net.
- *  4. SwipeTouch is pure (no DOM state) — only returns deltas. */
+ *  4. PaneDrag decides who leads the strip (paneDrag.ts); `stripTrack` is
+ *     the only writer of its transform. */
 export function MobileSwipeContainer() {
   const containerRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
-  const touch = useRef(new SwipeTouch());
   const mountedRef = useRef(false);
+  const dragRef = useRef<PaneDrag | null>(null);
+  if (dragRef.current === null) {
+    dragRef.current = new PaneDrag(stripTrack(containerRef, trackRef, () => dragRef.current?.holding ?? false), {
+      // A frame has already locked its drag horizontal, so the host's only
+      // gates are its own. Only a frame inside the strip may lead it, which
+      // keeps out any frame laid over or beside the panes.
+      frameMayLead: (source) => shouldStartPaneSwipe({
+        textInputFocused: opensSoftwareKeyboard(document.activeElement),
+        targetScrollable: false,
+        appFullscreen: appIsFullscreen(),
+      }) && isFrameInside(containerRef.current, source),
+      mayCommit: () => !appIsFullscreen(),
+    });
+  }
+  const drag = dragRef.current;
 
   // The other half of the `--app-height` write below. Shrinking the shell for
   // the keyboard is what puts a focused field behind it. So the reveal that
   // scrolls it back mounts with the shell that shrinks.
   useFocusedFieldVisible();
 
-  // Must be useLayoutEffect — see component JSDoc.
+  // Must be useLayoutEffect — see component JSDoc. A navigation from anywhere
+  // ends a drag, and the strip slides to the new pane. The first render snaps.
   useLayoutEffect(() => {
-    const track = trackRef.current;
-    if (!track) return;
-
-    const container = containerRef.current;
-    const paneWidth = container?.offsetWidth ?? 0;
-    const index = PANE_INDEX[mobileView.value];
-
-    if (!mountedRef.current) {
-      // First render: position without animation.
-      mountedRef.current = true;
-      track.style.transition = 'none';
-    } else {
-      // Subsequent renders: re-enable CSS transition for smooth animation.
-      track.style.transition = '';
-    }
-
-    if (paneWidth > 0) {
-      track.style.transform = `translateX(${-index * paneWidth}px)`;
-    } else {
-      track.style.transform = paneTransform(index);
-    }
+    drag.interrupt(mountedRef.current);
+    mountedRef.current = true;
     // The pane half of the navigation mark. This effect already runs on exactly
     // the transition being measured, before paint, so the rAF lands on the frame
     // the user sees. Same shape as `thread-render` in ThreadView.
@@ -321,17 +431,17 @@ export function MobileSwipeContainer() {
 
   // Safety net: after every CSS transition on the track ends, verify the
   // transform matches the mobileView signal. If something caused them to
-  // disagree (resize during animation, interrupted transition, browser quirk),
-  // this corrects it without a visible jump.
+  // disagree (interrupted transition, browser quirk), this corrects it without
+  // a visible jump. A held strip is the drag's to write.
   useEffect(() => {
     const track = trackRef.current;
     const container = containerRef.current;
     if (!track || !container) return;
     const onTransitionEnd = (e: TransitionEvent) => {
-      if (e.target !== track || e.propertyName !== 'transform') return;
+      if (e.target !== track || e.propertyName !== 'transform' || drag.holding) return;
       const paneWidth = container.offsetWidth;
       if (paneWidth <= 0) return;
-      const correctValue = `translateX(${-PANE_INDEX[mobileView.value] * paneWidth}px)`;
+      const correctValue = paneTransform(PANE_INDEX[mobileView.value], paneWidth);
       if (track.style.transform !== correctValue) {
         track.style.transform = correctValue;
       }
@@ -348,191 +458,41 @@ export function MobileSwipeContainer() {
     if (!container) return;
     let lastPaneWidth = 0;
     const observer = new ResizeObserver(() => {
-      const track = trackRef.current;
-      if (!track) return;
       const paneWidth = container.offsetWidth;
       if (paneWidth === 0 || paneWidth === lastPaneWidth) return;
       lastPaneWidth = paneWidth;
-      track.style.transition = 'none';
-      track.style.transform = `translateX(${-PANE_INDEX[mobileView.value] * paneWidth}px)`;
-      requestAnimationFrame(() => {
-        if (trackRef.current) trackRef.current.style.transition = '';
-      });
+      drag.interrupt(false);
     });
     observer.observe(container);
     return () => observer.disconnect();
   }, []);
 
-  // Suppress swipe track transition when exiting pseudo-fullscreen.
-  // The CSS override (transform: none !important) drops, which would
+  // Entering or leaving pseudo-fullscreen ends a drag. Leaving snaps: the CSS
+  // override (transform: none !important) drops, which would otherwise
   // animate the track back to its pane position.
-  const wasPseudoFullscreen = useRef(false);
+  const wasPseudoFullscreen = useRef(appPseudoFullscreen.value);
   useLayoutEffect(() => {
-    const isPseudo = appPseudoFullscreen.value;
-    if (wasPseudoFullscreen.current && !isPseudo) {
-      const track = trackRef.current;
-      if (track) {
-        track.style.transition = 'none';
-        requestAnimationFrame(() => { if (trackRef.current) trackRef.current.style.transition = ''; });
-      }
-    }
-    wasPseudoFullscreen.current = isPseudo;
+    if (wasPseudoFullscreen.current !== appPseudoFullscreen.value) drag.interrupt(false);
+    wasPseudoFullscreen.current = appPseudoFullscreen.value;
   }, [appPseudoFullscreen.value]);
 
-  // ── Drag and release, shared by host touches and frame drags ───────────
-
-  /** Follow a live sideways drag `dx` px from where it locked. */
-  const dragTrack = useCallback((dx: number) => {
-    const container = containerRef.current;
-    const track = trackRef.current;
-    if (!container || !track) return;
-
-    const paneWidth = container.offsetWidth;
-    const baseOffset = -PANE_INDEX[mobileView.value] * paneWidth;
-    let offset = baseOffset + dx;
-
-    // Rubber band at edges
-    const minOffset = -(PANE_COUNT - 1) * paneWidth;
-    if (offset > 0) {
-      offset = offset * RUBBER_BAND;
-    } else if (offset < minOffset) {
-      offset = minOffset + (offset - minOffset) * RUBBER_BAND;
-    }
-
-    track.style.transform = `translateX(${offset}px)`;
-  }, []);
-
-  /** End a drag: move `paneDelta` panes, or snap back to the current one. */
-  const releaseTrack = useCallback((paneDelta: number) => {
-    const container = containerRef.current;
-    const track = trackRef.current;
-    if (!container || !track) return;
-
-    const target = resolveSwipePane(paneDelta);
-    if (target) {
-      // Pane change: navigateToPane updates the signal, useLayoutEffect
-      // handles the transform + transition re-enable before paint.
-      navigateToPane(target);
-    } else {
-      // Snap back: signal unchanged, handle transform directly.
-      track.style.transition = '';
-      track.style.transform = `translateX(${-PANE_INDEX[mobileView.value] * container.offsetWidth}px)`;
-    }
-  }, []);
-
-  // ── Touch event handlers ───────────────────────────────────────────────
-
-  const touchTargetScrollable = useRef(false);
-  /** The frame drag being followed, if any. See the frame-swipe effect below. */
-  const frameDrag = useRef<{ source: MessageEventSource | null; following: boolean } | null>(null);
-
-  const onTouchStart = useCallback((e: TouchEvent) => {
-    const t = e.touches[0];
-    const target = e.target as Element;
-    frameDrag.current = null;
-
-    const textInputFocused = opensSoftwareKeyboard(document.activeElement);
-    // Don't hijack touches on horizontally-scrollable children (e.g., code blocks)
-    // or range sliders (knob drag is horizontal and must not trigger pane swipe).
-    touchTargetScrollable.current = isHorizontallyScrollable(target) ||
-      !!target.closest('input[type="range"]');
-
-    // Suppress iOS's native back/forward navigation swipe at the screen edges.
-    // Must happen here on touchstart — the listener is registered { passive:
-    // false } for this — because WebKit's edge recognizer commits before our
-    // 8px horizontal lock, so onTouchMove's preventDefault is too late. Exempts
-    // scrollable children, interactive controls, and focused text inputs so
-    // their own gestures/taps survive (see shouldSuppressEdgeNavigation).
-    if (t && !touchTargetScrollable.current && shouldSuppressEdgeNavigation({
-      clientX: t.clientX,
-      viewportWidth: window.innerWidth,
-      // Read per touch, never captured at mount: the guards track the rem zones
-      // through a UI-scale change the user makes with the app open.
-      remPx: getRemPx(),
-      targetIsInteractive: isInteractiveTarget(target),
-      textInputFocused,
-    })) {
-      e.preventDefault();
-    }
-
-    // Must come AFTER the suppression above: a pseudo-fullscreen app cancels
-    // OUR swipe, but WebKit's native one still has to be preventDefault'd or
-    // suppressing ours just hands the gesture over. See shouldStartPaneSwipe.
-    if (!shouldStartPaneSwipe({
-      textInputFocused,
-      targetScrollable: touchTargetScrollable.current,
-      appFullscreen: appPseudoFullscreen.value,
-    })) return;
-
-    touch.current.start(t.clientX, t.clientY);
-    const track = trackRef.current;
-    if (track) track.style.transition = 'none';
-  }, []);
-
-  const onTouchMove = useCallback((e: TouchEvent) => {
-    if (touchTargetScrollable.current) return;
-
-    const t = e.touches[0];
-    const dx = touch.current.move(t.clientX, t.clientY);
-    if (dx === null) return;
-
-    e.preventDefault();
-    dragTrack(dx);
-  }, [dragTrack]);
-
-  const onTouchEnd = useCallback(() => {
-    if (touchTargetScrollable.current) return;
-    const paneWidth = containerRef.current?.offsetWidth ?? 0;
-    releaseTrack(touch.current.end(paneWidth));
-  }, [releaseTrack]);
-
+  // Host touches on the strip. A row re-rendered mid-drag takes the rest of
+  // its touch with it, so the drag follows the touch onto that row too.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    // touchstart is non-passive: onTouchStart calls preventDefault() at the
-    // screen edges to suppress iOS's native back/forward navigation swipe.
-    el.addEventListener('touchstart', onTouchStart, { passive: false });
-    el.addEventListener('touchmove', onTouchMove, { passive: false });
-    el.addEventListener('touchend', onTouchEnd, { passive: true });
-    el.addEventListener('touchcancel', onTouchEnd, { passive: true });
-    return () => {
-      el.removeEventListener('touchstart', onTouchStart);
-      el.removeEventListener('touchmove', onTouchMove);
-      el.removeEventListener('touchend', onTouchEnd);
-      el.removeEventListener('touchcancel', onTouchEnd);
-    };
-  }, [onTouchStart, onTouchMove, onTouchEnd]);
+    return attachPaneDragTouches(el, drag, { gate: gateStripTouch });
+  }, []);
 
   // A drag inside an app frame or the HTML artifact preview. A frame captures
   // its touches, so code inside it tracks them and posts the drag up
-  // (`frame-swipe-bridge.ts`). The frame has already locked the drag
-  // horizontal, so the host's only gates are its own.
-  //
-  // A natively fullscreen app counts as fullscreen here too. A host touch can
-  // never reach the container then, but a frame drag can.
-  //
-  // A frame that went away mid-drag never sends its release. A drag from a
-  // different frame is therefore gated afresh, and a host touch clears it.
-  useEffect(() => {
-    return subscribeFrameSwipes((source, message) => {
-      const drag = frameDrag.current;
-      if (message.kind === 'release') {
-        if (drag?.following) releaseTrack(message.paneDelta);
-        frameDrag.current = null;
-        return;
-      }
-      if (drag?.source !== source) {
-        const following = shouldStartPaneSwipe({
-          textInputFocused: opensSoftwareKeyboard(document.activeElement),
-          targetScrollable: false,
-          appFullscreen: appPseudoFullscreen.value || nativeFullscreenElement() !== null,
-        });
-        frameDrag.current = { source, following };
-        if (following && trackRef.current) trackRef.current.style.transition = 'none';
-      }
-      if (frameDrag.current?.following) dragTrack(message.dx);
-    });
-  }, [dragTrack, releaseTrack]);
+  // (`frame-swipe-bridge.ts`). A frame whose document goes away announces it,
+  // since its release never comes.
+  useEffect(() => subscribeFrameSwipes((source, message) => {
+    if (message.kind === 'drag') drag.frameDrag(source, message.dx);
+    else if (message.kind === 'release') drag.frameRelease(source, message.paneDelta);
+    else drag.frameGone(source);
+  }), []);
 
   // ── Keyboard-active: block accidental taps on other elements ─────────
 
@@ -857,7 +817,7 @@ export function MobileSwipeContainer() {
           {MOBILE_VIEWS.map((v) => {
             const { Pane } = MOBILE_PANE_CONFIGS[v];
             return (
-              <div key={v} class="mobile-swipe-pane">
+              <div key={v} class="mobile-swipe-pane" data-offscreen={isOffscreenPane(v, mobileView.value) ? '' : undefined}>
                 <Pane />
                 {/* Rendered inside each pane (not the swipe container) so they
                     share a stacking context with the prompt-area, allowing

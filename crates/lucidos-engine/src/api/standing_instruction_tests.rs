@@ -23,6 +23,7 @@ pub(crate) async fn open_turn(
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "work".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -245,6 +246,7 @@ async fn resume_turn(bus: &EventBus, thread_id: Uuid, origin: Option<MessageOrig
             branch: String::new(),
             origin,
             reason: Some(crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into()),
+            resumed_abort_id: None,
         },
         meta: EventMeta::NONE,
     })

@@ -10,11 +10,9 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use lucidos_engine::llm::model_registry::{self, ProviderKind};
-use lucidos_engine::llm::provider_build::{build_active_provider, ProviderBuildOutcome};
 use serde::{Deserialize, Serialize};
 
-use crate::judge::{judge_context, provider_override, resolve_provider, route_to};
+use crate::candidate::{candidate, percentile, pinned_provider, provider_for};
 use crate::Fallible;
 
 /// One labelled command.
@@ -50,37 +48,11 @@ struct Classified<'a> {
     output_tokens: u32,
 }
 
-/// A candidate: a model id and the tier it runs at, written `model@tier`.
-struct Candidate<'a> {
-    spec: &'a str,
-    model: &'a str,
-    effort: Option<&'a str>,
-}
-
-fn candidate(spec: &str) -> Candidate<'_> {
-    match spec.split_once('@') {
-        Some((model, effort)) => Candidate {
-            spec,
-            model,
-            effort: Some(effort),
-        },
-        None => Candidate {
-            spec,
-            model: spec,
-            effort: None,
-        },
-    }
-}
-
 /// Run every candidate over the set, append each answer to `out` as JSON
 /// lines, and print the table.
 pub async fn run(set: &Path, candidates: &[String], out: &Path) -> Fallible<()> {
     let set: LabelledSet = toml::from_str(&std::fs::read_to_string(set)?)?;
-    let pinned = provider_override(
-        std::env::var(crate::judge::JUDGE_PROVIDER_VAR)
-            .ok()
-            .as_deref(),
-    )?;
+    let pinned = pinned_provider()?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -92,19 +64,7 @@ pub async fn run(set: &Path, candidates: &[String], out: &Path) -> Fallible<()> 
     println!("|---|---|---|---|---|---|---|---|---|---|");
     for spec in candidates {
         let candidate = candidate(spec);
-        let registry = model_registry::empty();
-        if let Some(provider) = pinned {
-            route_to(&registry, candidate.model, provider)?;
-        }
-        let context = judge_context(candidate.model, &registry);
-        let provider = match build_active_provider(None, &context).await? {
-            ProviderBuildOutcome::Install { llm, .. } => llm,
-            ProviderBuildOutcome::FailFast => return Err("no provider is configured here".into()),
-        };
-        let configured = provider.configured_providers().unwrap_or_default();
-        let served_by: ProviderKind =
-            resolve_provider(&registry, candidate.model, pinned, &configured)?;
-        eprintln!("[eval] {} on {}", candidate.spec, served_by.as_str());
+        let provider = provider_for(&candidate, pinned).await?;
         let mut rows = Vec::new();
         for item in &set.command {
             let started = Instant::now();
@@ -175,12 +135,6 @@ fn summary_row(spec: &str, rows: &[(Classified<'_>, Duration)]) -> String {
         .map(|(_, d)| d.as_millis())
         .collect();
     latencies.sort_unstable();
-    let percentile = |p: f64| {
-        latencies
-            .get(((latencies.len() as f64 - 1.0) * p).round() as usize)
-            .copied()
-            .unwrap_or(0)
-    };
     let tokens_in: u32 = answered.iter().map(|r| r.input_tokens).sum();
     let tokens_out: u32 = answered.iter().map(|r| r.output_tokens).sum();
     let mean = |total: u32| total.checked_div(answered.len() as u32).unwrap_or(0);
@@ -190,8 +144,8 @@ fn summary_row(spec: &str, rows: &[(Classified<'_>, Duration)]) -> String {
         answered.len(),
         rows.len(),
         answered.len(),
-        percentile(0.5),
-        percentile(0.95),
+        percentile(&latencies, 0.5),
+        percentile(&latencies, 0.95),
         mean(tokens_in),
         mean(tokens_out),
     )
@@ -231,12 +185,5 @@ mod tests {
         for lane in ["safe", "reversible", "irreversible"] {
             assert!(set.command.iter().any(|c| c.lane == lane), "{lane}");
         }
-    }
-
-    #[test]
-    fn a_candidate_names_its_tier_after_the_at() {
-        let c = candidate("claude-haiku-5-5@none");
-        assert_eq!((c.model, c.effort), ("claude-haiku-5-5", Some("none")));
-        assert_eq!(candidate("gemini-3-flash-preview").effort, None);
     }
 }

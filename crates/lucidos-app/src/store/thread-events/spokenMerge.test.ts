@@ -4,10 +4,7 @@ import { MERGE_GAP_SECS, isOneUtterance, joinSpoken } from './spokenMerge';
 
 /** The merge rule has two implementations, and a reader must never meet a
  *  bubble the model did not see as one message. The Rust side owns the rule and
- *  generates these cases; this replays them.
- *
- *  Regenerate after changing either side:
- *  `cargo test -p lucidos-engine --lib -- --ignored generate_spoken_merge_fixture_file` */
+ *  generates these cases (`./scripts/codegen.sh`); this replays them. */
 type MergeCase = {
   name: string;
   first: string;

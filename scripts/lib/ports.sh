@@ -15,9 +15,21 @@
 # offset is persisted in the registry.
 #
 # Exports: API_PORT, VITE_PORT, PG_PORT.
+#
+# The whole allocation is one critical section under an exclusive flock on
+# <registry>.lock: lookup, next offset, the walk and the save. So two launches
+# can never claim one offset (ADR 0438).
 
-LUCIDOS_PORT_REGISTRY="$HOME/.lucidos/port-registry"
+# shellcheck source=scripts/lib/flock.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/flock.sh"
+
+# shellcheck source=scripts/lib/storage_root.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/storage_root.sh"
+
+LUCIDOS_PORT_REGISTRY="$(lucidos_home_dir)/port-registry"
 LUCIDOS_PORT_WALK_LIMIT=1000
+# The descriptor allocate_ports holds the registry lock on.
+PORT_REGISTRY_LOCK_FD=7
 
 # ── ports_file_set ──────────────────────────────────────────────────────
 # Set KEY=VALUE lines in a workspace's ports file, preserving every other line.
@@ -155,8 +167,8 @@ _ensure_passwd_home() {
 }
 
 # Return 0 (true) if `pid` belongs to a live Lucidos host process we must
-# never signal — the engine that spawned us, the matching frontend, or any
-# other workspace's recorded engine/frontend.
+# never signal: the engine that spawned us, its build-watch, or any other
+# workspace's engine.
 #
 # FOUR arms. The first two read caller-owned state and a caller can switch
 # them off; the last two cannot, which is the whole point.
@@ -165,10 +177,11 @@ _ensure_passwd_home() {
 #     these from the engine (api/actor.rs host_protection_env_vars). Even when
 #     a test script invokes ports.sh for a different workspace (e.g. e2e-test),
 #     they still identify the dev-workspace engine that is running the test.
-#  2. A pidfile scan across every workspace under the user's home, covering the
+#  2. A scan of every workspace's engine under the user's home, covering the
 #     case where the env vars are absent (manual dev script invocation, no CC
-#     chain) but sibling workspaces are alive. `kill -0` gates each match so a
-#     stale pidfile naming a recycled PID can't protect an unrelated process.
+#     chain) but sibling workspaces are alive. A pid counts only while its
+#     engine.lock is held, so a stale pidfile naming a recycled PID can't
+#     protect an unrelated process.
 #  3. ANCESTOR — this process and everything it descends from. A process cannot
 #     unset its own parentage, so no caller can defeat this one.
 #  4. pid <= 1 — init/the kernel are never ours to signal (mirrors the same
@@ -201,16 +214,13 @@ is_protected_host_pid() {
     esac
 
     _ensure_passwd_home
-    local root pidfile other_pid
+    local root pidfile ws
     for root in "${HOME:-}" "$_LUCIDOS_PASSWD_HOME"; do
         [ -n "$root" ] || continue
-        for pidfile in "$root"/workspaces/*/.lucidos/engine.pid "$root"/workspaces/*/.lucidos/frontend.pid; do
-            [ -f "$pidfile" ] || continue
-            other_pid="$(cat "$pidfile" 2>/dev/null)"
-            [ -z "$other_pid" ] && continue
-            if [ "$pid" = "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
-                return 0
-            fi
+        for pidfile in "$root"/workspaces/*/.lucidos/engine.pid; do
+            [ "$(cat "$pidfile" 2>/dev/null)" = "$pid" ] || continue
+            ws="${pidfile%/.lucidos/engine.pid}"
+            [ "$(engine_live_pid "$ws")" = "$pid" ] && return 0
         done
     done
     return 1
@@ -258,65 +268,27 @@ registry_next_offset() {
     awk -F'\t' 'BEGIN{m=-1} {if($2+0>m) m=$2+0} END{print m+1}' "$LUCIDOS_PORT_REGISTRY"
 }
 
-# Acquire the registry lock via atomic mkdir (portable; macOS has no
-# flock). The PID inside <lockdir>/owner lets a later caller reclaim a
-# lock held by a dead process.
-_acquire_registry_lock() {
-    local lockdir="$LUCIDOS_PORT_REGISTRY.lockd"
-    local owner_file="$lockdir/owner"
-    local tries=0
-    while ! mkdir "$lockdir" 2>/dev/null; do
-        if [ -f "$owner_file" ]; then
-            local owner_pid
-            owner_pid=$(cat "$owner_file" 2>/dev/null)
-            if [ -n "$owner_pid" ] && ! kill -0 "$owner_pid" 2>/dev/null; then
-                rm -f "$owner_file"
-                rmdir "$lockdir" 2>/dev/null || true
-                continue
-            fi
-        fi
-        tries=$((tries+1))
-        # 500 × 20ms = 10s budget. Save is sub-ms; this only matters
-        # under heavy boot-time contention.
-        if [ "$tries" -gt 500 ]; then
-            echo "ports.sh: gave up waiting for registry lock at $lockdir" >&2
-            return 1
-        fi
-        sleep 0.02
-    done
-    echo "$$" > "$owner_file"
-    return 0
+# The workspace other than `workspace` that owns `offset` in the registry, or
+# nothing.
+registry_offset_owner() { # <offset> <workspace>
+    if [ -f "$LUCIDOS_PORT_REGISTRY" ]; then
+        awk -F'\t' -v o="$1" -v ws="$2" '$2 == o && $1 != ws { print $1; exit }' "$LUCIDOS_PORT_REGISTRY"
+    fi
 }
 
-_release_registry_lock() {
-    local lockdir="$LUCIDOS_PORT_REGISTRY.lockd"
-    rm -f "$lockdir/owner"
-    rmdir "$lockdir" 2>/dev/null || true
-}
-
-# Register a workspace's offset, replacing any prior entry. Atomic against
-# concurrent writers; a unique tempfile under the lock means even a partial
-# overlap can't clobber.
+# Register a workspace's offset, replacing any prior entry. The caller holds the
+# registry lock (allocate_ports), and the rename means a reader never sees a
+# partial file.
 registry_save() {
     local workspace="$1"
     local offset="$2"
-    mkdir -p "$(dirname "$LUCIDOS_PORT_REGISTRY")"
-
-    _acquire_registry_lock || return 1
-    # Critical section in a subshell so its EXIT trap releases the lock
-    # without clobbering any EXIT trap the caller installed.
-    (
-        trap '_release_registry_lock' EXIT
-        local tmp
-        tmp=$(mktemp "$LUCIDOS_PORT_REGISTRY.tmp.XXXXXX") || exit 1
-        if [ -f "$LUCIDOS_PORT_REGISTRY" ]; then
-            awk -F'\t' -v ws="$workspace" '$1 != ws' "$LUCIDOS_PORT_REGISTRY" > "$tmp"
-        else
-            : > "$tmp"
-        fi
-        printf '%s\t%s\n' "$workspace" "$offset" >> "$tmp"
-        mv "$tmp" "$LUCIDOS_PORT_REGISTRY"
-    )
+    local tmp
+    tmp=$(mktemp "$LUCIDOS_PORT_REGISTRY.tmp.XXXXXX") || return 1
+    if [ -f "$LUCIDOS_PORT_REGISTRY" ]; then
+        awk -F'\t' -v ws="$workspace" '$1 != ws' "$LUCIDOS_PORT_REGISTRY" > "$tmp"
+    fi
+    printf '%s\t%s\n' "$workspace" "$offset" >> "$tmp"
+    mv "$tmp" "$LUCIDOS_PORT_REGISTRY"
 }
 
 # Validate a vite-port override: must be a positive integer ≥ 5173 so the
@@ -368,9 +340,7 @@ LUCIDOS_HEALTH_PROBE_TIMEOUT_S=2
 # Ask the engine on `port` which workspace it serves.
 #
 # `GET /api/v1/health` carries `workspace_path`, so the engine itself settles
-# who owns a port. A pidfile cannot. `engine.pid` names whatever the gateway
-# spawned last, and a spawn that dies at once leaves a dead pid there while the
-# healthy engine keeps serving. See
+# which workspace a port serves. A pid names a process, not a workspace. See
 # docs/plans/2026-09-18-a-launch-never-tears-down-a-healthy-engine.md.
 #
 # Answers out of band, the way `_port_is_ours_or_free` passes `OCCUPIER_PID`,
@@ -457,9 +427,9 @@ _try_reclaim_stale_lucidos_on_port() {
     esac
 
     # An engine that answers health is not stale, which is this function's whole
-    # premise. The arms above cannot see that: a dead pid in engine.pid leaves a
-    # live engine looking orphaned, and the SIGUSR1 below then tore down every
-    # in-flight thread in the workspace. See
+    # premise. The arms above scan only `~/workspaces`, so an engine elsewhere
+    # looks orphaned to them, and the SIGUSR1 below would tear down every
+    # in-flight thread in its workspace. See
     # docs/plans/2026-09-18-a-launch-never-tears-down-a-healthy-engine.md.
     #
     # Asked twice unless the connection was REFUSED, the one answer that settles
@@ -506,10 +476,10 @@ _try_reclaim_stale_lucidos_on_port() {
     return 1
 }
 
-# True if a port is either free or held by a process we own (engine pidfile or
-# frontend pidfile of this workspace). Lets a restart reuse the same ports —
-# port_is_free alone would walk past our own engine. On false, OCCUPIER_PID is
-# set to the foreign process's pid (empty if we couldn't read one).
+# True if a port is either free or held by this workspace's own engine. Lets a
+# restart reuse the same ports: port_is_free alone would walk past our own
+# engine. On false, OCCUPIER_PID is set to the foreign process's pid (empty if
+# we couldn't read one).
 _port_is_ours_or_free() {
     local port="$1"
     local workspace="$2"
@@ -519,20 +489,15 @@ _port_is_ours_or_free() {
 
     OCCUPIER_PID=$(lsof -ti :"$port" -sTCP:LISTEN 2>/dev/null | head -1)
     if [ -n "$OCCUPIER_PID" ]; then
-        local engine_pid_file="$workspace/.lucidos/engine.pid"
-        local frontend_pid_file="$workspace/.lucidos/frontend.pid"
-        if [ -f "$engine_pid_file" ] && [ "$OCCUPIER_PID" = "$(cat "$engine_pid_file" 2>/dev/null)" ]; then
-            OCCUPIER_PID=""
-            return 0
-        fi
-        if [ -f "$frontend_pid_file" ] && [ "$OCCUPIER_PID" = "$(cat "$frontend_pid_file" 2>/dev/null)" ]; then
+        # _allocate_ports_locked looks the engine up once for the whole walk.
+        local own="${ALLOCATING_ENGINE_PID-$(engine_live_pid "$workspace")}"
+        if [ -n "$own" ] && [ "$OCCUPIER_PID" = "$own" ]; then
             OCCUPIER_PID=""
             return 0
         fi
 
-        # The pidfile is a hint; the engine is the authority. Ask the port which
-        # workspace it serves, so a stale engine.pid cannot make our own live
-        # engine look foreign. This also covers the pid `head -1` did not pick.
+        # Ask the port which workspace it serves. That also covers the pid
+        # `head -1` did not pick, and an engine still draining.
         if engine_on_port_serves_workspace "$port" "$workspace"; then
             OCCUPIER_PID=""
             return 0
@@ -546,29 +511,6 @@ _port_is_ours_or_free() {
         fi
     fi
 
-    return 1
-}
-
-# True if a PG port is either free or held by this workspace's own Docker
-# container (`lucidos-pg-$PG_NAME`). PG_NAME is a global set by
-# resolve_workspace before allocate_ports runs. On false, OCCUPIER_PID is
-# set to the listener pid (the Docker proxy) for the walk-forward log line.
-_pg_port_is_ours_or_free() {
-    local port="$1"
-    OCCUPIER_PID=""
-
-    port_is_free "$port" && return 0
-
-    # Check if the port is held by our own PG container.
-    if [ -n "${PG_NAME:-}" ]; then
-        local container
-        container=$(docker ps --filter "publish=$port" --format "{{.Names}}" 2>/dev/null | head -1)
-        if [ -n "$container" ] && [ "$container" = "lucidos-pg-$PG_NAME" ]; then
-            return 0
-        fi
-    fi
-
-    OCCUPIER_PID=$(lsof -ti :"$port" -sTCP:LISTEN 2>/dev/null | head -1)
     return 1
 }
 
@@ -587,9 +529,8 @@ _finalize_ports() {
     PG_PORT=$(( 5432 + offset ))
     export API_PORT VITE_PORT PG_PORT
 
-    # Propagate registry_save failures (lock-acquire timeout, mktemp). A
-    # silent miss here means future restarts can't find the offset and
-    # walk to a fresh one — the exact port-drift the lock prevents.
+    # A silent miss here would leave future restarts unable to find the offset,
+    # so they would walk to a fresh one.
     registry_save "$workspace" "$offset" || return 1
 
     # Both keys record the user-facing engine port (== post-swap VITE_PORT).
@@ -605,9 +546,23 @@ _finalize_ports() {
 
 # Allocate ports for a workspace. See the file header for precedence + collision
 # rules. Sets and exports API_PORT, VITE_PORT, PG_PORT.
+#
+# Holds the registry lock across the whole allocation, health probes and
+# reclaims included. A concurrent launch waits, and flock_open says so.
 allocate_ports() {
-    local workspace="$1"
+    local workspace="$1" rc=0
     mkdir -p "$workspace/.lucidos"
+    ensure_storage_root "$(dirname "$LUCIDOS_PORT_REGISTRY")"
+    flock_open "$PORT_REGISTRY_LOCK_FD" "$LUCIDOS_PORT_REGISTRY.lock" ex || return 1
+    _allocate_ports_locked "$workspace" || rc=$?
+    flock_close "$PORT_REGISTRY_LOCK_FD"
+    return "$rc"
+}
+
+_allocate_ports_locked() {
+    local workspace="$1"
+    local ALLOCATING_ENGINE_PID
+    ALLOCATING_ENGINE_PID="$(engine_live_pid "$workspace")"
 
     # Resolve the *desired* starting offset.
     local source="default"
@@ -668,9 +623,9 @@ allocate_ports() {
                 vite_is_ours=1
             fi
             # Kill unprotected (orphaned) listeners on both ports: our own
-            # leftover engine/Vite from a dead session. Live host pids recorded in
-            # any workspace's engine/frontend pidfile are skipped, and so is the
-            # user-facing port when the engine answering there is ours.
+            # leftover engine/Vite from a dead session. Protected host pids are
+            # skipped, and so is the user-facing port when the engine answering
+            # there is ours.
             local cp occ
             for cp in "$pvite" "$papi"; do
                 if [ "$cp" = "$pvite" ] && [ -n "$vite_is_ours" ]; then
@@ -705,7 +660,7 @@ allocate_ports() {
     # NOT gated here: a PG-port collision (e.g. a sibling workspace's sticky
     # Docker container squatting our nominal 5432+offset slot) must never drift
     # the user-facing vite/api ports off their lucidos.toml pin. PG resolves its
-    # own free port in setup_postgres (`_start_postgres_container`), independent
+    # own free port in setup_postgres (`_ensure_shared_postgres_container`), independent
     # of this offset, and an existing container's actual published port is reused
     # over the nominal one — so an established workspace keeps its vite port even
     # when its PG slot is taken.
@@ -714,15 +669,24 @@ allocate_ports() {
         local cand_vite=$(( 5173 + offset ))
         local cand_api=$(( 3000 + offset ))
 
-        if _port_is_ours_or_free "$cand_vite" "$workspace" \
+        # An offset another workspace registered is theirs even while their
+        # engine is down, so the walk never lands on it. The starting offset is
+        # exempt: a duplicate an older allocator left must not move a workspace
+        # off its own registered offset while its engine runs there.
+        local owner=""
+        [ "$steps" -eq 0 ] || owner="$(registry_offset_owner "$offset" "$workspace")"
+        if [ -n "$owner" ]; then
+            echo "[ports] offset $offset belongs to $owner, walking forward" >&2
+        elif _port_is_ours_or_free "$cand_vite" "$workspace" \
             && _port_is_ours_or_free "$cand_api" "$workspace"; then
             break
+        else
+            # OCCUPIER_PID is set by the failing check so we can name the
+            # squatter without re-running lsof.
+            local cmd=""
+            [ -n "$OCCUPIER_PID" ] && cmd=$(ps -p "$OCCUPIER_PID" -o comm= 2>/dev/null | tr -d ' ' || true)
+            echo "[ports] port $cand_vite/$cand_api occupied${cmd:+ by $cmd (pid $OCCUPIER_PID)}, walking forward" >&2
         fi
-        # OCCUPIER_PID is set by the failing check so we can name the
-        # squatter without re-running lsof.
-        local cmd=""
-        [ -n "$OCCUPIER_PID" ] && cmd=$(ps -p "$OCCUPIER_PID" -o comm= 2>/dev/null | tr -d ' ' || true)
-        echo "[ports] port $cand_vite/$cand_api occupied${cmd:+ by $cmd (pid $OCCUPIER_PID)}, walking forward" >&2
 
         offset=$(( offset + 1 ))
         steps=$(( steps + 1 ))

@@ -1,10 +1,16 @@
 import { useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { credentials } from '../../store/store';
+import { configuredProviders, credentials, preferences } from '../../store/store';
 import { submitNewCredential, deleteCredential } from '../../store/actions/credentials';
 import type { SwitchableProvider } from '../../store/actions/preferences';
 import { findProviderCredential } from './providerCredential';
 import { ProviderBlock } from './ProviderBlock';
+import { SystemOneUsageRow } from './SystemOneProviderFrame';
+import {
+  SYSTEM_ONE_ENDPOINTS,
+  systemOneConsumers,
+  type SystemOneProviderId,
+} from './judgmentBackend';
 
 /** Shared block for a provider that authenticates with a single API key stored
  *  as an `api_key` credential (OpenAI, OpenRouter, xAI). The secret is
@@ -12,7 +18,7 @@ import { ProviderBlock } from './ProviderBlock';
  *  rows; the enclosing "Providers" `settings-section` is owned by
  *  `SettingsView`. Providers with extra knobs (Anthropic's auth kind, Local's
  *  base URL) keep their own components. */
-export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, note }: {
+export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, note, systemOne, children }: {
   /** Credential service name the engine reads. It doubles as the provider id,
    *  which is what the enable switch and `/health` are keyed on. */
   service: SwitchableProvider;
@@ -25,6 +31,11 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
    *  read once, and the Providers page is otherwise a stack of such
    *  paragraphs with the actual fields lost between them. */
   note: ComponentChildren;
+  /** The System One row that reuses this provider's key, if any. Its block
+   *  then says which judgments run on it. */
+  systemOne?: SystemOneProviderId;
+  /** Rows of that System One use, under the key rows. */
+  children?: ComponentChildren;
 }) {
   const credLoadable = credentials.value;
   const existing = findProviderCredential(credLoadable, service);
@@ -84,6 +95,24 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
           {existing ? 'Update' : 'Save'}
         </button>
       </div>
+      {children}
+      {systemOne && (
+        <SystemOneUsageRow
+          anchor={`models:${systemOne}-usage`}
+          inUseBy={systemOneConsumers(
+            systemOne,
+            preferences.value,
+            !!existing,
+            configuredProviders.value,
+          )}
+          empty={`No judgment yet. ${systemOneRowLabel(systemOne)} is offered in each judgment's model control.`}
+        />
+      )}
     </ProviderBlock>
   );
+}
+
+/** The picker label of a provider's System One row. */
+function systemOneRowLabel(provider: SystemOneProviderId): string {
+  return SYSTEM_ONE_ENDPOINTS.find((e) => e.provider === provider)?.choice.label ?? provider;
 }

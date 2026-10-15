@@ -34,11 +34,9 @@
 //! and this consumer pays one indexed lookup per CC turn.
 
 use std::sync::Arc;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
+use tokio::sync::broadcast::error::RecvError;
 
-use super::event_bus::{BusEvent, EmittedEvent, EventBus};
+use super::event_bus::{BusEvent, EmittedEvent, EventBus, LagReplay, ReplayScope};
 use super::thread_events::ThreadEvent;
 use super::thread_lifecycle::ThreadStatus;
 use super::tools::todo::settle_open_todos;
@@ -158,60 +156,72 @@ async fn turn_in_flight(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sq
     })
 }
 
+/// The event types the settle runs on: every chat terminator, and a canceled
+/// subscription. `handle_event` decides which of them settle.
+fn settle_event_types() -> Vec<&'static str> {
+    ThreadEvent::TERMINATOR_EVENT_TYPES
+        .iter()
+        .copied()
+        .chain(["EventWaitCanceled"])
+        .collect()
+}
+
 /// Spawn the todo settle consumer as a background task.
 /// Returns a `JoinHandle` so the caller can observe panics if needed.
 pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
-    let rx = engine.event_bus.subscribe();
+    let (mut rx, mut replay) = LagReplay::subscribe(
+        &engine.event_bus,
+        ReplayScope::Workspace,
+        Some(settle_event_types()),
+    );
     tokio::spawn(async move {
-        let stream = BroadcastStream::new(rx);
-        tokio::pin!(stream);
-
-        // Loop body must survive both lag and unrelated stream hiccups.
-        // `while let Some(Ok(_))` would exit the loop on `Some(Err(Lagged))`,
-        // silently killing the consumer for the rest of the engine's lifetime.
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(emitted) => {
-                    // Read at TERMINATOR time, which is the instant the
-                    // question is about, and from the in-memory registry, so
-                    // it cannot race the turn tail's arming the way an events
-                    // query does.
-                    //
-                    // `seq.is_some()` mirrors `handle_event`'s own first guard,
-                    // and keeping the two in sync is the point: without it this
-                    // takes the registry lock and scans every background task
-                    // for each event of the per-token streaming firehose, whose
-                    // broadcasts are transient and which `handle_event` drops on
-                    // its first line without ever reading this value.
-                    let holds_background_work = match &emitted.typed {
-                        BusEvent::Thread { thread_id, .. } if emitted.seq.is_some() => {
-                            engine
-                                .bash_background
-                                .has_running_for_thread(*thread_id)
-                                .await
-                        }
-                        _ => false,
-                    };
-                    handle_event(
-                        &engine.event_bus,
-                        engine.pool(),
-                        &emitted,
-                        holds_background_work,
-                    )
-                    .await;
-                }
-                Err(BroadcastStreamRecvError::Lagged(n)) => {
-                    crate::log!(
-                        @Todo,
-                        "Broadcast lagged by {} events: the open-todo settle may have been missed for those terminators; continuing",
-                        n
-                    );
-                }
-            }
-        }
-
+        let registry = &engine.bash_background;
+        let holds_background_work = move |thread_id| registry.has_running_for_thread(thread_id);
+        while settle_after(
+            rx.recv().await,
+            &mut replay,
+            &engine.event_bus,
+            engine.pool(),
+            holds_background_work,
+        )
+        .await
+        {}
         crate::log!(@Todo, "Todo consumer stream ended");
     })
+}
+
+/// Settle on one read of the bus. Returns `false` once the bus closes.
+///
+/// `holds_background_work` reads the in-memory registry when the frame is
+/// handled. So it cannot race the turn tail's arming, as an events query can.
+pub(crate) async fn settle_after<F, Fut>(
+    received: Result<EmittedEvent, RecvError>,
+    replay: &mut LagReplay,
+    bus: &EventBus,
+    pool: &sqlx::PgPool,
+    holds_background_work: F,
+) -> bool
+where
+    F: Fn(Uuid) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    // A lag hands back the terminators it dropped, so each still settles as
+    // of its own sequence.
+    let Some(frames) = replay.read(received, pool).await else {
+        return false;
+    };
+    for emitted in frames {
+        // Only a persisted thread frame can settle, so only that pays for the
+        // registry read.
+        let holds = match &emitted.typed {
+            BusEvent::Thread { thread_id, .. } if emitted.seq.is_some() => {
+                holds_background_work(*thread_id).await
+            }
+            _ => false,
+        };
+        handle_event(bus, pool, &emitted, holds).await;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -710,6 +720,7 @@ mod tests {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "hi".to_string(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -910,5 +921,52 @@ mod tests {
         assert_nothing_settles(&bus, &pool, &mut rx, thread_id).await;
 
         teardown_test_db(&db).await;
+    }
+
+    /// A terminator lost to a broadcast lag must still settle the list.
+    /// Otherwise its open items read as in progress for good.
+    #[tokio::test]
+    async fn a_terminator_lost_to_a_lag_still_settles_the_list() {
+        use crate::engine::event_bus::{LagReplay, ReplayScope};
+        use crate::test_support::flood_past_bus_capacity;
+
+        let (bus, _setup_rx, pool, db) = setup().await;
+        let (mut rx, mut replay) =
+            LagReplay::subscribe(&bus, ReplayScope::Workspace, Some(settle_event_types()));
+        let thread_id = Uuid::new_v4();
+
+        seed_in_progress_list(&bus, &pool, thread_id).await;
+        emit_response_generated(&bus, thread_id).await;
+        flood_past_bus_capacity(&bus);
+        let mut watch = bus.subscribe();
+
+        let open = settle_after(rx.recv().await, &mut replay, &bus, &pool, |_| async {
+            false
+        })
+        .await;
+        assert!(open, "a lag must not end the consumer");
+        let settled = next_todo_items(&mut watch, thread_id).await;
+        assert_eq!(
+            settled[0].status,
+            TodoStatus::Abandoned,
+            "the dropped terminator settles the list on replay, got {:?}",
+            settled[0].status,
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// The replay list gates live frames too, so the canceled subscription
+    /// `handle_event` settles on must be in it.
+    #[test]
+    fn the_settle_list_names_the_canceled_subscription() {
+        let cancel = ThreadEvent::EventWaitCanceled {
+            wait_id: Uuid::new_v4(),
+            cause: EventWaitCancelCause::UserStop,
+            on: watching(),
+            reason: String::new(),
+        };
+        assert!(settle_event_types().contains(&cancel.event_type()));
     }
 }

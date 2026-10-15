@@ -90,14 +90,14 @@ thread spawn that was never wanted.
   which is what keeps that exclusion deliberate. The tool spawns read the
   ambient scope through `build_tool_env_vars`, the one helper named for that
   case, because a tool IS the fire.
-- The marker is broadcast-only. It describes the emitting task, not the event,
-  so it is absent from the stored row and from every replay path.
+- ~~The marker is broadcast-only.~~ Amended: the row records it now, so a lag
+  replay suppresses the same wake. See the second amendment below.
 
 ## Alternatives considered
 
-- **Persist the marker on the event row**, the way a `DomainEvent` persists its
-  depth. Rejected: a self-wake chain is live by definition, so a replay has
-  nothing to suppress. It would be a migration plus a column nothing reads.
+- **Persist the marker on the event row.** First rejected: a self-wake chain is
+  live by definition, so a replay has nothing to suppress. Reversed by the
+  second amendment below, once a lagged scheduler began replaying rows.
 - **Leave it to the depth cap.** Rejected: that is the status quo. It costs
   three fires per cycle, and the cycle repeats on every cron tick. Three fires
   of an opus intent trigger is a bill nobody meant to pay.
@@ -175,3 +175,28 @@ Fail-open is unchanged. A caller with no valid token yields no marker and
 suppresses nobody.
 
 Plan: `docs/plans/2026-08-26-a-trigger-never-wakes-itself.md`.
+
+## Amendment, 2026-10-12: the row records the marker and the depth
+
+The rejected alternative above rested on one premise: a replay has nothing to
+suppress. A lagged scheduler made it false. A `RecvError::Lagged` drops frames,
+and the scheduler now replays the missed rows to the trigger matcher, so an
+`on_event` trigger still fires for them.
+
+That replay had neither input. The marker was broadcast-only. A domain event's
+depth was `skip_serializing`, so the claim that it persisted had been wrong, and
+no other depth reached the row either. A replay would dispatch at depth 0 with
+no marker. Under a sustained flood the scheduler lags again and again, and each
+replay would reset a chain's depth. The cap would never engage, which is the
+silent under-count ADR 0138 names as the wrong direction.
+
+**So `events` records both, as `trigger_chain_depth` and
+`emitting_trigger_id`.** `EventBus::persist` writes the values the broadcast
+already carries, by the same depth rule `trigger_dispatch` applies. A replayed
+row then decides exactly as its live frame did. A replay offers only the rows
+that never reached the scheduler live, so a frame is decided once.
+
+Fail-open is unchanged. A `NULL` reads as depth 0 and no marker, which is how
+every row written before this amendment reads.
+
+Plan: `docs/plans/2026-10-12-the-scheduler-replays-what-a-lag-dropped.md`.

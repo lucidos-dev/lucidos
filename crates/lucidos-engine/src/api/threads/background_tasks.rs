@@ -1,10 +1,10 @@
 //! `/api/v1/threads/:thread_id/background-tasks`, a coding agent's *background
-//! tasks* (`lucidos background-task run | output | stop`).
+//! tasks* (`lucidos background-task run | wait | output | stop`).
 //!
 //! The engine runs the job and arms the event wait that re-opens the thread;
 //! see `engine::agent_session::background_task`.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::parse_thread_id;
 use crate::api::AppState;
 use crate::engine::agent_session::background_task::BackgroundTaskStart;
+use crate::engine::tools::bash_background::CompletionDelivery;
 
 type HandlerResult = Result<Json<serde_json::Value>, (StatusCode, String)>;
 
@@ -54,6 +55,9 @@ pub(in crate::api) struct StartRequest {
     /// What the task is, in the user's words. The thread's waiting row shows it.
     description: Option<String>,
     timeout_secs: Option<u64>,
+    /// Arm no event wait: the agent polls with `lucidos background-task wait`.
+    #[serde(default)]
+    poll: bool,
 }
 
 /// POST /api/v1/threads/:thread_id/background-tasks
@@ -72,6 +76,11 @@ pub(in crate::api) async fn start_background_task(
             &req.command,
             req.description.as_deref(),
             req.timeout_secs,
+            if req.poll {
+                CompletionDelivery::Poll
+            } else {
+                CompletionDelivery::EventWait
+            },
         )
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -112,6 +121,20 @@ fn start_response(started: BackgroundTaskStart) -> serde_json::Value {
                  foreground instead."
             ),
         }),
+        BackgroundTaskStart::Polled {
+            task_id,
+            timeout_secs,
+        } => serde_json::json!({
+            "status": "polled",
+            "task_id": task_id,
+            "timeout_secs": timeout_secs,
+            "message": format!(
+                "Started background task {task_id} in this thread's worktree. It is killed \
+                 if still running after {timeout_secs}s. Nothing re-opens this thread when it \
+                 finishes, so keep your turn: run `lucidos background-task wait {task_id}` \
+                 in the foreground, and re-issue it until it reports finished."
+            ),
+        }),
         BackgroundTaskStart::Finished { task_id, output } => serde_json::json!({
             "status": "finished",
             "task_id": task_id,
@@ -141,6 +164,43 @@ pub(in crate::api) async fn background_task_output(
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, e))?;
     Ok(Json(output_json(&output)))
+}
+
+#[derive(Deserialize)]
+pub(in crate::api) struct WaitQuery {
+    max_secs: Option<u64>,
+}
+
+/// GET /api/v1/threads/:thread_id/background-tasks/:task_id/wait
+///
+/// Blocks until the task finishes or the capped wait runs out, then answers
+/// what `output` answers. A still-running answer also says to wait again.
+pub(in crate::api) async fn wait_for_background_task(
+    State(state): State<AppState>,
+    Path((thread_id, task_id)): Path<(String, String)>,
+    Query(query): Query<WaitQuery>,
+    headers: HeaderMap,
+) -> HandlerResult {
+    let thread_id = parse_thread_id(&thread_id)?;
+    require_own_thread_agent(&headers, thread_id)?;
+    let output = state
+        .engine
+        .background_task_wait_for_agent(thread_id, &task_id, query.max_secs)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    Ok(Json(wait_response(&task_id, output_json(&output))))
+}
+
+/// A finished task's record passes through as `output` prints it. A running
+/// one gains the next step, since the agent must call again.
+fn wait_response(task_id: &str, mut output: serde_json::Value) -> serde_json::Value {
+    if output["finished"] == serde_json::Value::Bool(false) {
+        output["message"] = serde_json::Value::String(format!(
+            "Still running. Re-issue `lucidos background-task wait {task_id}` in the \
+             foreground."
+        ));
+    }
+    output
 }
 
 /// POST /api/v1/threads/:thread_id/background-tasks/:task_id/stop

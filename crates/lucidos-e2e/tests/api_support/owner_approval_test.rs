@@ -24,7 +24,7 @@ async fn insert_owner_approval_card(pool: &sqlx::PgPool, thread_id: Uuid, tool_u
             { "id": "opt-0", "label": "Allow once" },
             { "id": "opt-1", "label": "Don't allow" },
         ],
-        "owner_approval": { "verb": "create-top-thread" },
+        "owner_approval": { "verb": "apply", "target_thread_id": thread_id },
         "channel": "claude_code",
     });
     sqlx::query(
@@ -54,7 +54,11 @@ async fn an_owner_approval_request_needs_a_thread_token() {
     let resp = user_client()
         .await
         .post(format!("{}/api/v1/owner-approvals", base_url()))
-        .json(&serde_json::json!({ "verb": "create-top-thread", "reason": "why" }))
+        .json(&serde_json::json!({
+            "verb": "apply",
+            "target_thread_id": Uuid::new_v4(),
+            "reason": "why",
+        }))
         .send()
         .await
         .expect("request failed");

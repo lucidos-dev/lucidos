@@ -51,6 +51,9 @@ export function backgroundRowCaveat(
   error: string | null,
 ): string | null {
   if (error) return `Could not read the default model: ${error}`;
+  if (resolved?.asks_no_model) {
+    return 'No measured model is reachable, so every report wakes its parent';
+  }
   if (resolved && !resolved.reachable) {
     return resolved.not_served.includes(resolved.model)
       ? 'Its provider no longer serves this model. Pick another'

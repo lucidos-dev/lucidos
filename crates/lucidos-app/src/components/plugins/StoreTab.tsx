@@ -18,7 +18,7 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { refreshPluginCatalog, rescanPluginCatalogAndSettle } from '../../store/actions/plugin-marketplaces';
 import { installMarketplacePlugin } from '../../store/actions/plugin-install';
 import { loadInstalledPlugins, openPluginDetail } from '../../store/actions/plugins';
-import { categoryLabel, PluginActions, PluginIcon, PluginMeta, PluginTitle } from './pluginCard';
+import { categoryLabel, PluginIcon, PluginRowAction, PluginRowNote } from './pluginCard';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
 import { applyNavFocus } from '../shared/focusMarker';
@@ -107,8 +107,8 @@ const ORPHAN_MARKETPLACE_PREFIX = 'installed:';
 /** An installed plugin whose marketplace is no longer registered won't appear in
  *  the marketplace catalog scan — synthesize a catalog row for it so it still
  *  lists (and stays uninstallable) under both All and Installed. It carries no
- *  marketplace metadata (no description / categories), so it renders with just
- *  its name, "Installed vX" badge, content chips, file count, and Uninstall. */
+ *  marketplace metadata (no description / categories), so its row shows just
+ *  its name and "Installed vX" badge; its detail page carries Uninstall. */
 function orphanRow(p: InstalledPlugin): MarketplacePlugin {
   return {
     marketplace_id: `${ORPHAN_MARKETPLACE_PREFIX}${p.id}`,
@@ -535,13 +535,15 @@ export function PluginStoreRow({ plugin, installingSource, stageInstall }: Parti
         <PluginIcon plugin={plugin} />
       </div>
       <div class="list-row-info">
-        <PluginTitle plugin={plugin} nameClass="title list-row-name" />
+        <div class="app-store-plugin-title-row">
+          <SkText class="title list-row-name" w="9rem">{plugin?.name}</SkText>
+        </div>
         {(sk || plugin?.description) && (
           <SkText class="app-store-plugin-description" as="div" w="18rem">{plugin?.description}</SkText>
         )}
-        <PluginMeta plugin={plugin} />
+        <PluginRowNote plugin={plugin} />
       </div>
-      <PluginActions
+      <PluginRowAction
         plugin={plugin}
         busy={!!plugin && installingSource === plugin.source}
         onInstall={stageInstall}

@@ -53,19 +53,71 @@ impl EventMeta {
     /// Merge typed metadata fields into a JSON payload object.
     pub fn apply(&self, obj: &mut serde_json::Map<String, Value>) {
         if let Some(id) = &self.request_event_id {
-            obj.insert("request_event_id".into(), Value::String(id.to_string()));
+            obj.insert(REQUEST_EVENT_ID_KEY.into(), Value::String(id.to_string()));
         }
         if let Some(ch) = &self.channel {
             obj.insert(
-                "channel".into(),
+                CHANNEL_KEY.into(),
                 serde_json::to_value(ch).expect("EventChannel serialization"),
             );
         }
         if let Some(actor) = &self.actor {
             obj.insert(
-                "actor".into(),
+                ACTOR_KEY.into(),
                 serde_json::to_value(actor).expect("MessageOrigin serialization"),
             );
         }
+    }
+
+    /// The metadata [`Self::apply`] merged into a stored payload. `event_id` is
+    /// the row's own key, so it stays `None`. A field that does not parse
+    /// reads as absent.
+    pub fn from_payload(payload: &Value) -> Self {
+        let field = |key: &str| payload.get(key).cloned();
+        EventMeta {
+            request_event_id: field(REQUEST_EVENT_ID_KEY)
+                .and_then(|v| serde_json::from_value(v).ok()),
+            channel: field(CHANNEL_KEY).and_then(|v| serde_json::from_value(v).ok()),
+            event_id: None,
+            actor: field(ACTOR_KEY).and_then(|v| serde_json::from_value(v).ok()),
+        }
+    }
+}
+
+const REQUEST_EVENT_ID_KEY: &str = "request_event_id";
+const CHANNEL_KEY: &str = "channel";
+const ACTOR_KEY: &str = "actor";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::thread_events::ThreadEvent;
+
+    #[test]
+    fn a_stored_payload_gives_back_the_meta_it_was_written_with() {
+        let meta = EventMeta {
+            request_event_id: Some(uuid::Uuid::new_v4()),
+            channel: Some(EventChannel::ClaudeCode),
+            event_id: None,
+            actor: Some(MessageOrigin::Device {
+                device_id: "test-device".into(),
+            }),
+        };
+        let payload = ThreadEvent::ThreadArchived.to_payload(&meta);
+
+        let read = EventMeta::from_payload(&payload);
+        assert_eq!(read.request_event_id, meta.request_event_id);
+        assert_eq!(read.channel, meta.channel);
+        assert_eq!(read.actor, meta.actor);
+        assert_eq!(read.event_id, None);
+    }
+
+    #[test]
+    fn a_payload_with_no_meta_reads_as_none() {
+        let payload = ThreadEvent::ThreadArchived.to_payload(&EventMeta::NONE);
+        let read = EventMeta::from_payload(&payload);
+        assert_eq!(read.request_event_id, None);
+        assert_eq!(read.channel, None);
+        assert_eq!(read.actor, None);
     }
 }

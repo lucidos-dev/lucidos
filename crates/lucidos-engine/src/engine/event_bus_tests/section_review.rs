@@ -15,6 +15,7 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do something".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -48,6 +49,7 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -94,6 +96,7 @@ async fn test_section_inbox_on_child_complete() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "parent task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -119,6 +122,7 @@ async fn test_section_inbox_on_child_complete() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -219,6 +223,7 @@ async fn test_section_marked_read() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "hello".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -463,6 +468,7 @@ async fn trigger_followup_response_goes_to_review() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "Can you elaborate on the report?".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -553,6 +559,7 @@ async fn engine_message_received_does_not_promote_trigger_thread_to_review() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "## Triggering Event\n\n```json\n{\"date\":\"2026-05-11\"}\n```".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -611,6 +618,7 @@ fn message_received_destructures_parent_thread_id() {
     let event = ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,
+        wake_mode: None,
         text: "fan-out message".into(),
         user_image_hashes: vec![],
         device_id: None,
@@ -660,6 +668,7 @@ fn message_received_destructures_parent_thread_id() {
     let event_no_parent = ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,
+        wake_mode: None,
         text: "follow-up".into(),
         user_image_hashes: vec![],
         device_id: None,

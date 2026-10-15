@@ -16,6 +16,7 @@ async fn test_fan_out_parent_callback() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do three things".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -42,6 +43,7 @@ async fn test_fan_out_parent_callback() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: format!("task {}", i + 1),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -284,6 +286,7 @@ async fn test_fan_out_chat_children_all_report_back() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "research crypto sectors".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -310,6 +313,7 @@ async fn test_fan_out_chat_children_all_report_back() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: format!("research sector {}", i + 1),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -408,6 +412,7 @@ async fn test_top_relation_thread_does_not_callback_or_increment_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "kick off some research".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -433,6 +438,7 @@ async fn test_top_relation_thread_does_not_callback_or_increment_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do the research independently".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -515,6 +521,7 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "research something".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -540,6 +547,7 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -570,6 +578,9 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -641,6 +652,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "research something".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -666,6 +678,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -696,6 +709,9 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -801,6 +817,7 @@ async fn refire_reinjects_unprocessed_child_completion_after_restart() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -907,6 +924,7 @@ async fn refire_skips_parent_that_already_resumed() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1027,6 +1045,7 @@ async fn test_child_thread_completed_projection_clears_pending_in_tx() {
             summary: "done".into(),
             pending_change_ids: vec![],
             sub_thread_pending_changes: vec![],
+            integrated_branch: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1088,6 +1107,66 @@ async fn fresh_coding_agent_child_reports_its_first_completion() {
         "and the parent's count must come back down",
     )
     .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A cache keep-alive turn on a child finishes nothing, so its terminal and
+/// idle send the parent no card and no wake (I7).
+#[tokio::test]
+async fn a_childs_cache_keep_alive_turn_reports_nothing_to_the_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+    while callback_rx.try_recv().is_ok() {}
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "baseline"
+    );
+
+    bus.mark_keep_alive_turn(child_id, true).await;
+    let anchor = ThreadEvent::PromptInjected {
+        text: "keep warm".into(),
+        mode: ActorMode::Engine,
+        origin: Some(crate::engine::thread_events::MessageOrigin::engine(
+            crate::engine::thread_events::EngineReason::CacheKeepAlive,
+        )),
+        injected_message_id: None,
+        delivered_event_id: None,
+    };
+    for event in [
+        anchor,
+        ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            reason: Some(crate::engine::thread_events::KEEP_ALIVE_IDLE_REASON.to_string()),
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+        },
+    ] {
+        bus.emit(BusEvent::Thread {
+            thread_id: child_id,
+            event,
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "a keep-alive turn adds no completion card"
+    );
+    assert!(callback_rx.try_recv().is_err(), "and wakes no parent");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -2063,6 +2142,7 @@ async fn spawn_cc_grandchild_with_change(bus: &EventBus, parent_id: Uuid) -> (Uu
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "a milestone".into(),
             user_image_hashes: vec![],
             device_id: None,

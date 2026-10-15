@@ -2,13 +2,18 @@
 /** The thread filter, thread search and menu drawer shortcuts.
  *
  *  Plan: `docs/plans/2026-10-02-shortcut-coverage-and-search-landing.md`. */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach } from 'vitest';
 import { mobileView, threadDrawerOpen, splitRatio, focusedPane, threadSearchQuery } from '../store';
 import { threadFilterPanelOpen, closeThreadFilterPanel, openThreadFilterPanel } from '../threadFilterPanel';
 import { threadSearchOpen, openThreadSearch } from '../threadSearch';
 import { drawerOpen, drawerClosing, drawerAnchor, openDrawer } from '../../components/layout/drawerState';
 import { toggleMenuDrawer } from '../../components/layout/ContentNav';
 import { toggleThreadFilter, startThreadSearch } from './pane';
+import { DrawerChunk } from '../../components/layout/drawerState';
+
+// The drawer is code-split and opens once it is in memory. Warm it, so an
+// open lands at once.
+beforeAll(() => DrawerChunk.preload());
 
 function setViewport(px: number): void {
   Object.defineProperty(window, 'innerWidth', { value: px, configurable: true, writable: true });

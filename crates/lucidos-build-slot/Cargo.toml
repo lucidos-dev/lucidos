@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 fs2 = "0.4"
+lucidos-home = { path = "../lucidos-home" }
 
 [dev-dependencies]
 tempfile = "3"

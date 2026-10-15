@@ -104,7 +104,7 @@ Four required fields, seven optional. Unknown extra fields are accepted and roun
 - **Release unreadable**: if Lucidos cannot read its own release, it refuses any plugin that declares `engine`, since nothing can vouch for it. A plugin without `engine` still installs.
 - **Not declared**: the plugin installs and updates on any release, exactly as before. Nothing is refused, disabled or asked. Lucidos only shows the gap:
   - The confirmation panel carries a quiet note under the source: "This plugin doesn't say which Lucidos version it needs."
-  - The Plugins panel row carries a muted "No version requirement" chip, with the same sentence as its tooltip.
+  - Until it is installed, the plugin detail page carries a muted "No version requirement" chip, with the same sentence as its tooltip.
 
 **Always declare `engine`.** Without it, an older release installs the plugin, and it breaks at run time with no clear message. For example, an app that calls `lucidos.request` needs 0.39.0 or later, the first release that ships it. Declared, the same install is refused up front, with a sentence that tells the user to update Lucidos. Your floor is the release that first shipped the newest platform feature your plugin uses.
 
@@ -162,6 +162,7 @@ my-plugin/
 | `media/README.md` | markdown | 256 KB |
 | everything together | | 64 MB |
 
+- **Screenshots and videos show made-up demo data only, never the user's real data.** Media goes public with the plugin. So it shows no real thread titles, costs, names, scores, messages or files. "Authoring loop" step 2 has the procedure.
 - **Paths start with `media/`.** Lucidos drops a path outside it, a symlink, a missing file, a wrong format and a file over its limit. It also drops an entry past a count limit, or one that takes the total over 64 MB.
 - **A media problem never blocks.** The scan lists the plugin and install goes ahead. The plugin detail page names each dropped file and the limit it broke, so the author sees it in their own Plugins panel.
 - **No `icon`?** The Plugins panel falls back to the app icon of the plugin's single app (widgets do not count), then to a *monogram tile*.
@@ -180,28 +181,31 @@ A plugin may ship *reusable widgets* (ADR 0414). Such a widget's plugin owns it,
   "icon": "assets/icon.svg",
   "kind": "widget",
   "reusable": true,
-  "origin_plugin_id": "habit-tracker"
+  "origin_plugin_id": "habit-tracker",
+  "sizes": ["medium", "small"]
 }
 ```
 
 - **`"reusable": true`** and **`"origin_plugin_id"` equal to the plugin's `id`**, with **no `origin_thread_id`**. Any other widget folder fails validation: the scan names the folder in the catalog's errors, and install refuses with `apps/<id>/ is not a widget a plugin can ship`.
-- **Any thread may show it**, and the agent sees it with the other reusable widgets.
+- **Any thread may embed or pin it**, and the agent sees it with the other reusable widgets.
 - **It offers no "Stop reusing"**, and `widgets(action="stop_reusing")` refuses it. Uninstall removes it with the rest of the plugin, and an update replaces it. Deleting a thread never touches it.
 - **Make one from a thread's widget** by copying its folder into the plugin's `apps/` and rewriting the manifest as above: drop `origin_thread_id`, add `origin_plugin_id`, set `reusable`.
+- **Narrow its Home board sizes** with `"sizes"`, default first, only if it cannot draw all three (none declared means all three, starting medium). Set `"transparent": true` for one that draws its own shape (`system-knowhow/building-an-app.md` § Widgets). A bad `sizes` fails validation like a bad origin. The user pins it to Home from the board's Add, and it runs no code until the plugin is installed: Add lists only installed widgets.
+- **A plugin widget brings work in.** It reads the user's own data through `lucidos.*`, and a tap leads into a thread or an app with `lucidos.ui.navigate`. It never frames another product's interface so the user works there instead: that would be a room, not a ramp (`docs/philosophy.md`).
 
 ## Install confirmation panel
 
 `install_plugin` (and `update_plugin`) never write directly to `data/`. The engine fetches and validates into a staged temp dir, and checks the manifest's `engine` requirement. A plugin this release cannot take is refused there, and no panel opens. Otherwise the engine opens a confirmation panel in the same content pane as a credential request. The panel shows:
 
-- The plugin name + version + description from the manifest
+- The plugin name + version + description from the manifest, under **Update plugin** when the plugin is already installed and **Install plugin** otherwise. The staged payload carries `is_update`, read from the plugin's install record rather than from overwritten files
 - The `source` (git URL or archive path) and `source_type` (git / archive)
 - When the manifest has no `engine`, the note "This plugin doesn't say which Lucidos version it needs." The staged payload carries `engine_requirement` (as authored, or `null` when undeclared)
 - Every `data/`-relative path the install will write (overwrites called out separately in yellow)
 - The `setup` field rendered as markdown, if present
 
-The user clicks **Confirm** or **Cancel**. Until they click, no bytes hit `data/`.
+The user clicks **Install** (or **Update**) or **Cancel**. Until they click, no bytes hit `data/`.
 
-- **Confirm** writes the files and **commits them to the workspace git repo in one commit**, `"Install plugin: <id> v<version>"`. It emits `PluginInstalled`, and reloads WASM signers if any `auth-modules/` file changed. The plugin's files are then version-controlled like `write_file`/`edit_file` writes: with history, recoverable on a hard reset, and visible to git-based backups.
+- **Install** or **Update** writes the files and **commits them to the workspace git repo in one commit**, `"Install plugin: <id> v<version>"`. It emits `PluginInstalled`, and reloads WASM signers if any `auth-modules/` file changed. The plugin's files are then version-controlled like `write_file`/`edit_file` writes: with history, recoverable on a hard reset, and visible to git-based backups.
 - **Cancel** drops the staging and emits `PluginInstallCanceled`.
 
 Uninstall is symmetric: confirming it deletes the recorded files and commits the deletion (`"Uninstall plugin: <id> v<version>"`) before emitting `PluginUninstalled`.
@@ -237,7 +241,9 @@ Users find and install plugins, and the *apps* they ship, in the **Plugins panel
 - **Checked**, it lists every plugin on disk, *whatever it ships*. It reads the `PluginInstalled` projection via `GET /api/v1/plugins/installed`, so it works offline and still lists a plugin whose marketplace was removed.
 - **Unchecked**, it widens to the full catalog: installed plus available from registered marketplaces.
 
-The installed view is the home for plugins that ship **no app** (knowhow-, trigger-, script- or auth-module-only bundles). Each row shows the plugin's content kinds, its shipped files (each links to a preview) and an **Uninstall** button. When a registered marketplace offers a newer version, the row also shows an **Update available** chip and an **Update** button. The match is by plugin *id* (not `app_id`), so it works for app-less plugins too. Clicking stages the same confirmation panel as any install. A plugin's *app* still lives in the separate **Apps** panel, with its own **Update** shortcut, but the plugin itself is managed here.
+The installed view is the home for plugins that ship **no app** (knowhow-, trigger-, script- or auth-module-only bundles). Each row shows the plugin's name, description and one button. An installed plugin with nothing to open says **Installed** instead. Its detail page holds the version, the **Modified** badge, the content kinds, file count and **Uninstall**.
+
+When a registered marketplace offers a newer version, the row's button reads **Update**. The match is by plugin *id* (not `app_id`), so it works for app-less plugins too. Clicking stages the same confirmation panel as any install. A plugin's *app* still lives in the separate **Apps** panel, but the plugin itself, updates included, is managed here.
 
 A **marketplace** is a git repository (or GitHub tree URL) registered at `data/config/plugin-marketplaces.json`, added and removed under **Settings → Marketplaces**. A scan clones each one, finds valid `manifest.toml` plugin roots, and compares each version against installed `PluginInstalled` events. The catalog shows each plugin as a card, read from the last scan (see "A scan never runs on a page open" below). `Install`/`Update` stage the same confirmation panel described above. The catalog never writes plugin files directly.
 
@@ -250,35 +256,36 @@ Each card leads with the plugin icon: its *plugin media* icon, its single app's 
 - `media/README.md`, rendered as markdown;
 - a muted note naming each media file the engine left out, and why.
 
-The page carries the card's own buttons. It shows media only: no plugin code runs there. The README renders through the chat sanitizer. Lucidos drops its images, inline styles and form controls, since each would fetch from a host the author picked or draw over the page. List pictures as `screenshots` instead. Its web links open in a new tab, and a relative link shows as plain text.
+The page carries the card's button, **Uninstall**, and the chips the card leaves out. A modified plugin also gets a note counting the changed files, with **Send changes to author**. It shows media only: no plugin code runs there.
 
-Each card has a primary button that progresses **Install → Setup → Open**, plus an **Uninstall** button once the plugin is on disk:
+The README renders through the chat sanitizer. Lucidos drops its images, inline styles and form controls, since each would fetch from a host the author picked or draw over the page. List pictures as `screenshots` instead. Its web links open in a new tab, and a relative link shows as plain text.
+
+Each card has one button, which progresses **Install → Setup → Open**. The detail page adds an **Uninstall** button once the plugin is on disk:
 
 - **Install** (or **Update** for an out-of-date install): stages the confirmation panel. A plugin whose `engine` requirement this release misses still lists. Its button is disabled, and a warning chip gives the reason ("Needs Lucidos 0.46.1 or later"). The catalog row carries `engine_requirement` (as authored), `engine_compatible` and `engine_incompatible_reason`. They are filled each time the catalog is served, so an engine upgrade counts at once.
-  - A plugin with no `engine` keeps a live button and shows a muted "No version requirement" chip instead. Its row has no `engine_requirement`.
+  - A plugin with no `engine` keeps a live button, and its detail page shows a muted "No version requirement" chip until it is installed. Its row has no `engine_requirement`.
   - An installed plugin whose marketplace is gone reads the same field from `GET /api/v1/plugins/installed`, which reports the installed version's requirement.
   - The two chips never show together, because an incompatible plugin always declares `engine`.
 - **Setup**: shown after install while the setup thread is still running or waiting on the user. Clicking opens that thread. Driven by `setup_thread_id` + `setup_complete` on the catalog row. Plugins with no `setup` field skip past this. The engine resolves `setup_complete` from what it can observe about the thread:
   - **present** (has a `thread_summaries` row): done once its lifecycle status is neither `running` nor `waiting_for_user_answer`.
   - **pending** (no row yet but a live `thread_queue` entry, the brief window before the agent's first event): not done, so the card keeps showing Setup without flicker.
   - **gone** (no row and no queue entry: a lost spawn, deleted thread, or stale catalog id): treated as done. The card falls through to Open/Installed rather than offering a Setup button that would 404.
-- **Open**: shown once setup is finished (or the plugin had none). It launches the plugin's primary app (`data/apps/<id>/`). Plugins that ship no app show a disabled **Installed** instead.
-- **Uninstall**: stages the uninstall confirmation panel (the same one the `uninstall_plugin` LLM tool produces). The card re-fetches the catalog on every mount, so the Setup→Open transition shows when the user returns from setup.
+- **Open**: shown once setup is finished (or the plugin had none). It launches the plugin's primary app (`data/apps/<id>/`). Plugins that ship no app show the word **Installed** instead.
+- **Uninstall** (detail page only): stages the uninstall confirmation panel (the same one the `uninstall_plugin` LLM tool produces). The card re-fetches the catalog on every mount, so the Setup→Open transition shows when the user returns from setup.
 
-**Plugin uninstall is the single removal authority for a plugin's app.** The Apps panel's **Delete** button would `rm -rf` only `apps/<id>/`, leaving the plugin registered and its sibling `triggers/`/`knowhow/`/`scripts/` orphaned. So `DELETE /api/v1/app?id=...` returns **409** with `{ error, plugin_id, plugin_name }` when the app belongs to an installed plugin. That mirrors the `delete_file` guard, which refuses raw deletes of plugin-owned files. The UI catches the 409 and routes the user to the plugin **Uninstall** panel, which removes the whole plugin tree and emits `PluginUninstalled`. Standalone apps (no `PluginInstalled` record) keep deleting directly.
+**Plugin uninstall is the single removal authority for a plugin's app.** **Delete** in an app row's ⋯ menu on the Apps panel would `rm -rf` only `apps/<id>/`, leaving the plugin registered and its sibling `triggers/`/`knowhow/`/`scripts/` orphaned. So `DELETE /api/v1/app?id=...` returns **409** with `{ error, plugin_id, plugin_name }` when the app belongs to an installed plugin. That mirrors the `delete_file` guard, which refuses raw deletes of plugin-owned files. The UI catches the 409 and routes the user to the plugin **Uninstall** panel, which removes the whole plugin tree and emits `PluginUninstalled`. Standalone apps (no `PluginInstalled` record) keep deleting directly.
 
 Installed marketplace plugins are **not** auto-updated: the engine notifies, and the user decides. It scans registered marketplaces at startup, after a marketplace is registered or renamed, and every five minutes. A newer version of an installed plugin produces one deduplicated `NotificationCreated` ("Plugin update(s) available") and installs nothing. Its tap opens the Plugins panel's installed list, with the **Installed only** filter on:
 
 - **One update**: the list scrolls to and pulse-highlights that plugin, carried as the navigate `id`.
-- **Several updates**: no row is highlighted, since each pending row already shows its update chip.
+- **Several updates**: no row is highlighted, since each pending row's button already reads **Update**.
 
-The user applies an update from any of three places, and each stages the same confirmation panel as any install:
+The user applies an update from either of two places, and each stages the same confirmation panel as any install:
 
 - the plugin row's **Update** button, which works for *any* plugin, app or not;
-- the catalog card, with **Installed only** unchecked;
-- for a plugin that ships an app, the app row's **Update** button on the Apps panel.
+- the catalog card, with **Installed only** unchecked.
 
-**No notification for an update this release cannot install.** When the running release misses a version's `engine` requirement, nothing is sent. The Plugins panel still shows it, with Update disabled and the reason beside it. On the Apps panel, the app row swaps its Update button and "Update available" chip for the reason. Once Lucidos meets the requirement, that version counts as new and the notification fires.
+**No notification for an update this release cannot install.** When the running release misses a version's `engine` requirement, nothing is sent. The Plugins panel still shows it, with Update disabled and the reason beside it. Once Lucidos meets the requirement, that version counts as new and the notification fires.
 
 A `.lucidos/plugin-update-notice.json` marker tracks what the user was told. The re-scan re-notifies only for a *new* update (a fresh plugin or a bumped version), not every cycle.
 
@@ -632,7 +639,21 @@ Pick this for ad-hoc sharing (Slack, email), pre-publication testing, and plugin
    - triggers obey the intent-vs-procedure rule (`system-knowhow/triggers.md`).
 2. **Add the plugin media.** The Plugins panel shows it before anyone installs, so treat it as part of the plugin:
    - **Icon**: write `media/icon.svg`, a simple shape on the app's own colours. With no icon, the panel shows the single app's icon or a *monogram tile*.
-   - **Screenshots**: take them yourself. Show each view worth showing, then call `capture_app` with `save_as_artifact` (`plugin-shots/board.png`), and copy the file into `media/`. The file is sharp, at the device's pixel ratio, in the format the extension names. Phone-width views read best in the detail page's strip. The capture comes from the turn's last used device, so ask the user to open the app on their phone first. Prefer `.png`, and use `.jpg` for a view over the 4 MB limit.
+   - **Screenshots**: take them yourself. Never ask the user to open the app or to capture anything.
+     - **Pick the device.** Use the phone from Known devices, because phone-width views read best in the detail page's strip. If Lucidos is not visible on the phone, use any device where it is visible. Ask the user only when no device is visible at all.
+     - **Stage demo data first.** Screenshots and videos go public, so they show made-up demo data only. Never show real thread titles, costs, names, scores, messages or files.
+       1. Back up each live file the capture touches, to a scratch folder outside `data/`.
+       2. Write demo data into those files.
+       3. Capture the views (the steps below).
+       4. Restore each file byte for byte from its backup, and compare the two with `cmp`.
+       5. Open each view again and verify that it shows the live data.
+
+       If you cannot stage a view with demo data, leave that shot out and tell the user why.
+     - **Tell the user first.** Each capture takes over the screen on their device for a moment. Do one capture at a time, and never capture from two threads at once.
+     - **Capture each view.** Call `navigate_ui(target="app", app_id=..., device=<id>)` to open the view. Then call `capture_app(app_id=..., device=<id>, save_as_artifact="plugin-shots/board.png")`. Pass `fragment` to `navigate_ui` when the app routes by hash. Do this again for each view worth showing.
+     - **If the capture finds no app**, the device does not show this thread, so it got a toast instead of the view. Capture on the turn's last used device instead, which shows this thread.
+     - **Copy the files into `media/`.** Each file is sharp, at the device's pixel ratio, in the format the extension names. Prefer `.png`, and use `.jpg` for a view over the 4 MB limit.
+   - **Videos**: the same demo data rule and procedure apply.
    - **README**: write `media/README.md` for the person deciding to install: what it does, what it needs, what to try first. Keep it to text and links, since the detail page shows no images from it.
    - **Manifest**: list each file under `icon`, `screenshots` and `videos`, within the limits in "Plugin media".
    - **Widgets**: copy each reusable widget the user chose into `apps/<id>/`, and rewrite its manifest as "Shipping widgets" says.
@@ -711,7 +732,7 @@ What this means for plugin authors:
 
 ## Local modifications (the "Modified" badge)
 
-A plugin's shipped content lives under `data/` like any other artifact. So the user, the Lucidos Agent or a coding-agent thread can edit it after install. When that happens the Plugins list shows a **Modified** badge on the plugin's row. An update merges those changes into the new version where it can (see "An update keeps your changes" below).
+A plugin's shipped content lives under `data/` like any other artifact. So the user, the Lucidos Agent or a coding-agent thread can edit it after install. When that happens the plugin's detail page shows a **Modified** badge. An update merges those changes into the new version where it can (see "An update keeps your changes" below).
 
 This state is **derived on read, never stored**: there is no "PluginModified" event. The engine diffs the plugin's on-disk content against the install commit (`payload.data.manifest.commit`). It returns `modified` + `modified_paths` on the installed summary and catalog row (`registry::plugin_modification_status`). Being a pure function of git plus disk, it **self-heals**: revert an edit and the badge clears. An update re-stamps the baseline, so the badge clears there too, unless the update kept a patch. A kept patch is still a local change, so the badge correctly stays on.
 
@@ -752,7 +773,7 @@ Installing one version twice is allowed, so a second save of the same version la
 
 ### Proposing your patch upstream
 
-Whenever the Modified badge is up, the Plugins row offers **Propose upstream**. The install receipt offers it too, right after an update that kept a patch. `POST /api/v1/plugins/propose-upstream` with `{ "id": "<plugin-id>" }` does three things and stops:
+Whenever the Modified badge is up, the plugin detail page offers **Send changes to author**. The install receipt offers it too, right after an update that kept a patch. `POST /api/v1/plugins/propose-upstream` with `{ "id": "<plugin-id>" }` does three things and stops:
 
 1. Derives the diff from the install commit to the working tree, over the plugin's edited paths. Since the install commit is pristine, this is a patch against the version you are actually on.
 2. Writes it to `data/artifacts/plugin-local-changes/<plugin-id>/proposed-v<version>.patch`, commits it, and emits `ArtifactCreated`.

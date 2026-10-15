@@ -1,28 +1,10 @@
 import { OverflowMenu, type HostOpener, type TriggerFace } from './OverflowMenu';
-import type { ComponentChildren } from 'preact';
-import { CopyIcon, DownloadIcon, ArchiveIcon, CheckIcon, EditIcon, CurrentIcon, LocateIcon, MoveToTopIcon, PinIcon, SearchIcon, SetAsideIcon, SparkleIcon, StandingApplyIcon, TrashIcon } from './icons';
-import { canRenameThread, canSuggestThreadName, promptRenameThread, suggestThreadName } from '../../store/actions/threadRename';
-import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
-import { exportThread } from '../../utils/exportThread';
-import { resolveChangeMenuActions, threadIsPinnable } from '../../store/actions/threadActions';
-import type { Action } from '../../generated/thread-lifecycle';
-import { focusThread, handleArchiveThread, handleSaveThread, handleUnarchiveThread, handleUnsaveThread } from '../../store/actions/threads';
-import { handleDeleteThread } from '../../store/actions/threads-delete';
-import { canMoveToTopLevel, handleDetachThread } from '../../store/actions/threads-detach';
-import { exitItems } from '../../store/actions/threadBlockers';
-import { SUB_THREAD_STATE, moreSubThreads } from '../../store/actions/blockerCopy';
-import { threadMap, standingApplyThreadIds } from '../../store/store';
-import { threadDisplayTitle } from '../../utils/threadTitle';
+import { lazyComponent } from '../../utils/lazyComponent';
+import { prefetchWhenIdle } from '../../utils/idlePrefetch';
 
-/** Blocking sub-threads the menu lists by name before it counts the rest. */
-export const LISTED_SUB_THREADS = 3;
-
-const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentChildren>> = {
-  apply: () => <CheckIcon />,
-  apply_when_settled: (armed) => <StandingApplyIcon armed={armed} />,
-  set_aside: () => <SetAsideIcon />,
-  discard: () => <TrashIcon />,
-};
+/** The menu's rows, fetched once the boot splash lifts (ADR 0288). */
+export const ThreadOverflowItemsChunk = lazyComponent(() => import('./ThreadOverflowItems').then((m) => m.ThreadOverflowItems));
+prefetchWhenIdle(ThreadOverflowItemsChunk);
 
 /** Per-thread overflow (⋯) menu for a STARTED thread: Show in Folders and a
  *  Pin/Unpin toggle first, then Copy thread reference / Copy thread title / Download thread, then the
@@ -64,10 +46,15 @@ const CHANGE_ACTION_ICON: Partial<Record<Action, (armed: boolean) => ComponentCh
  *  **Find in thread** joins it in the thread titles only
  *  (`onFindInThread`): it searches the open transcript.
  *
- *  **Rename… and Suggest name follow, on a sent thread.** This menu is the only
- *  place to rename, because the title is display-only. A draft is titled by
- *  its compose text, so a rename there would change nothing on screen. The
- *  home thread offers Rename… alone: only the user names it (ADR 0362).
+ *  **Rename… follows, on a sent thread.** This menu is the only place to
+ *  rename, because the title is display-only. A draft is titled by its compose
+ *  text, so a rename there would change nothing on screen. The dialog carries
+ *  the Suggest link, except on the home thread: only the user names it (ADR 0362).
+ *
+ *  **Add widget… follows Rename… on a sent thread**, except Home, whose board
+ *  has its own Add (ADR 0466). It steps the menu into the reusable widgets,
+ *  the board's picker, and a pick pins one to this thread's shelf. Escape or
+ *  its Back row steps out.
  *
  *  **Pin/Unpin shows on every open.** The mobile title row draws no pin, and a
  *  drawer row's pin is mouse-only (`tabindex=-1`), so the menu must carry it.
@@ -94,157 +81,13 @@ export function ThreadOverflowMenu({ threadId, title, onShowInFolders, onFindInT
       extraClass={extraClass}
       tabIndex={tabIndex}
       {...opening}
-      items={({ run }) => {
-        // These selectors read threadMap/changes signals; OverflowMenu invokes
-        // `items` only while open, so a closed menu subscribes to neither.
-        const liveThread = threadMap.value.get(threadId);
-        const saved = liveThread?.meta.saved ?? false;
-        const pinnable = !!liveThread && threadIsPinnable(liveThread.meta);
-        const renamable = canRenameThread(liveThread);
-        const changeActions = resolveChangeMenuActions(threadId);
-        const standingApplyArmed = standingApplyThreadIds.value.has(threadId);
-        const movable = canMoveToTopLevel(threadId);
-        const exits = exitItems(threadId);
-        return (
-          <>
-            {(onShowInFolders || onFindInThread) && (
-              <>
-                {onShowInFolders && (
-                  <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(onShowInFolders)}>
-                    <LocateIcon />
-                    Show in Folders
-                  </button>
-                )}
-                {onFindInThread && (
-                  <button type="button" class="thread-overflow-item find-in-thread" role="menuitem" onClick={run(onFindInThread)}>
-                    <SearchIcon />
-                    Find in thread
-                  </button>
-                )}
-                <div class="thread-overflow-divider" role="separator" />
-              </>
-            )}
-            {pinnable && (
-              <>
-                <button type="button" class="thread-overflow-item" role="menuitem"
-                  onClick={run(() => { if (saved) void handleUnsaveThread(threadId); else void handleSaveThread(threadId); })}>
-                  <PinIcon filled={saved} />
-                  {saved ? 'Unpin thread' : 'Pin thread'}
-                </button>
-                <div class="thread-overflow-divider" role="separator" />
-              </>
-            )}
-            {renamable && (
-              <>
-                <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void promptRenameThread(threadId); })}>
-                  <EditIcon />
-                  Rename…
-                </button>
-                {canSuggestThreadName(liveThread) && (
-                  <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void suggestThreadName(threadId); })}>
-                    <SparkleIcon />
-                    Suggest name
-                  </button>
-                )}
-                <div class="thread-overflow-divider" role="separator" />
-              </>
-            )}
-            <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => copyThreadRef(threadId, title))}>
-              <CopyIcon />
-              Copy thread reference
-            </button>
-            <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => copyThreadTitle(title))}>
-              <CopyIcon />
-              Copy thread title
-            </button>
-            <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void exportThread(threadId, title); })}>
-              <DownloadIcon />
-              Download thread
-            </button>
-            {changeActions.length > 0 && <div class="thread-overflow-divider" role="separator" />}
-            {changeActions.map((action) => {
-              const toggle = action.kind === 'apply_when_settled';
-              return (
-                <button key={action.kind} type="button"
-                  role={toggle ? 'menuitemcheckbox' : 'menuitem'}
-                  aria-checked={toggle ? standingApplyArmed : undefined}
-                  class={action.kind === 'discard' ? 'thread-overflow-item thread-overflow-item-danger' : 'thread-overflow-item'}
-                  data-tooltip={action.tooltip}
-                  onClick={run(() => { void action.invoke(); })}>
-                  {CHANGE_ACTION_ICON[action.kind]?.(standingApplyArmed)}
-                  {action.label}
-                  {toggle && standingApplyArmed && (
-                    <span class="thread-overflow-check thread-overflow-check-end" aria-hidden="true">✓</span>
-                  )}
-                </button>
-              );
-            })}
-            {(movable || exits.archive || exits.unarchive || exits.delete) && <div class="thread-overflow-divider" role="separator" />}
-            {movable && (
-              <button type="button" class="thread-overflow-item" role="menuitem"
-                onClick={run(() => { void handleDetachThread(threadId); })}>
-                <MoveToTopIcon />
-                Move to top level
-              </button>
-            )}
-            {exits.archive === 'enabled' && (
-              <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void handleArchiveThread(threadId); })}>
-                <ArchiveIcon />
-                Archive
-              </button>
-            )}
-            {exits.archive === 'blocked' && <BlockedExit icon={<ArchiveIcon />} label="Archive" reason={exits.reason} />}
-            {exits.unarchive && (
-              <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void handleUnarchiveThread(threadId); })}>
-                <CurrentIcon />
-                Move to Current
-              </button>
-            )}
-            {exits.delete === 'enabled' && (
-              <button type="button" class="thread-overflow-item thread-overflow-item-danger" role="menuitem"
-                onClick={run(() => { void handleDeleteThread(threadId); })}>
-                <TrashIcon />
-                Delete thread
-              </button>
-            )}
-            {exits.delete === 'blocked' && <BlockedExit icon={<TrashIcon />} label="Delete thread" danger reason={exits.reason} />}
-            {exits.reason && <div class="thread-overflow-note" aria-hidden="true">{exits.reason}</div>}
-            {exits.subThreads.slice(0, LISTED_SUB_THREADS).map(({ thread: subThread, blocker }) => (
-              <button key={subThread.meta.id} type="button" class="thread-overflow-item" role="menuitem"
-                onClick={run(() => { focusThread(subThread.meta.id); })}>
-                <LocateIcon />
-                <span class="thread-overflow-sub-thread">
-                  <span class="thread-overflow-sub-thread-title">{threadDisplayTitle(subThread)}</span>
-                  <span class="thread-overflow-sub-thread-state">{SUB_THREAD_STATE[blocker]}</span>
-                </span>
-              </button>
-            ))}
-            {exits.subThreads.length > LISTED_SUB_THREADS && (
-              <div class="thread-overflow-note">{moreSubThreads(exits.subThreads.length - LISTED_SUB_THREADS)}</div>
-            )}
-          </>
-        );
-      }}
+      itemsChunk={ThreadOverflowItemsChunk}
+      // OverflowMenu invokes `items` only while open, so a closed menu
+      // subscribes to none of the signals the rows read.
+      items={({ run }) => (
+        <ThreadOverflowItemsChunk threadId={threadId} title={title} run={run}
+          onShowInFolders={onShowInFolders} onFindInThread={onFindInThread} />
+      )}
     />
-  );
-}
-
-/** An exit the blocker holds back. `aria-disabled` rather than `disabled`, so it
- *  stays in the roving focus order. The note under the exits draws the reason
- *  once. Each exit also holds it as visually hidden text, so a screen reader
- *  reads it with the item. */
-function BlockedExit({ icon, label, reason, danger }: {
-  icon: ComponentChildren;
-  label: string;
-  reason: string | null;
-  danger?: boolean;
-}) {
-  return (
-    <button type="button" role="menuitem" aria-disabled="true"
-      class={danger ? 'thread-overflow-item thread-overflow-item-blocked thread-overflow-item-danger' : 'thread-overflow-item thread-overflow-item-blocked'}>
-      {icon}
-      {label}
-      {reason && <span class="visually-hidden">{` ${reason}`}</span>}
-    </button>
   );
 }

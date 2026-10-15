@@ -18,8 +18,8 @@
 //!
 //! # Two credentials, because a scope must be a secret
 //!
-//! [`LOCAL_TOKEN_FILE`] carries full authority. [`WEBHOOK_TOKEN_FILE`] carries
-//! one route: the engine's webhook delivery. Two files rather than one token
+//! [`LOCAL_TOKEN_FILE`] carries full authority. [`HOOK_SOCKET_TOKEN_FILE`]
+//! carries one route: the engine's webhook delivery. Two files rather than one token
 //! plus a scope field, because a scope the caller states is not a scope. The
 //! bearer would state the widest one.
 //!
@@ -28,54 +28,66 @@
 //! inbound `x-lucidos-*` before doing so. Handing that hop the full-authority
 //! token would put it one forwarding bug away from the whole engine API.
 //!
-//! Both are mode 0600 and both live beside `network.toml`. The gateway mints
-//! both. The **engine mints the full-authority one too**, when it boots with no
-//! gateway to do it (`api::local_auth::EngineAuth::resolve`). Its own
-//! build-watch and release scripts have no other credential to present (ADR
-//! 0169). The webhook token stays the gateway's alone: only its hook socket
-//! hands that one out.
+//! Both are mode 0600 and both live beside `network.toml`. The gateway and
+//! the engine each read or mint both, whichever boots first
+//! (`api::local_auth::EngineAuth::resolve`). For the local token, the engine's
+//! own build-watch and release scripts have no other credential (ADR 0169).
+//! For the hook socket token, an engine that cached "absent" at boot would
+//! refuse every delivery from a gateway that started later. Only the gateway's
+//! hook socket ever presents that one.
+
+//! # Where the gateway sends them
 //!
-//! A reader that finds the webhook token missing is on a machine with no
-//! gateway, which is a supported launch rather than an error.
+//! Only to an engine's engine socket, and only once the kernel names the
+//! listener as this user (`lucidos-engine-socket`, ADR 0445). A loopback TCP
+//! port proves nothing about its owner: another local user can bind one an
+//! engine left free, and would receive whatever the gateway sent next.
 
 use std::path::{Path, PathBuf};
 
 /// Header carrying the full-authority token.
 pub const HEADER_LOCAL_TOKEN: &str = "x-lucidos-local-token";
 
-/// Header carrying the webhook-delivery token.
+/// Header carrying the hook socket token.
 ///
 /// A separate name, not a scope claimed inside the local token's header. A
 /// scope the caller names is not a scope: whoever holds a credential would
 /// simply name the widest one. Which header the secret arrives in is the
 /// engine's own reading, and the two secrets differ.
-pub const HEADER_WEBHOOK_TOKEN: &str = "x-lucidos-webhook-token";
+pub const HEADER_HOOK_SOCKET_TOKEN: &str = "x-lucidos-hook-socket-token";
 
 /// The full-authority credential's file name.
 pub const LOCAL_TOKEN_FILE: &str = "local-token";
 
-/// The webhook-delivery credential's file name.
+/// The hook socket token's file name: the credential for webhook delivery.
 ///
 /// Distinct from [`LOCAL_TOKEN_FILE`] so the hook socket can prove exactly one
 /// thing. It is handed to whatever `tailscale funnel` exposes, which is the one
 /// Lucidos surface a user may point at the open internet (ADR 0097). A process
 /// holding it must not be able to restart a workspace.
-pub const WEBHOOK_TOKEN_FILE: &str = "webhook-token";
+pub const HOOK_SOCKET_TOKEN_FILE: &str = "hook-socket-token";
+
+/// The file holding the password of the shared dev cluster.
+///
+/// Docker Desktop cannot hand a Unix socket from its VM to the host. So the dev
+/// cluster listens on loopback TCP, which every local user can reach, and a
+/// minted secret keeps them out. The dev scripts mint the same file under the
+/// same lock (`scripts/lib/pg_secret.sh`).
+pub const SHARED_PG_PASSWORD_FILE: &str = "pg-shared-password";
 
 /// Bytes of entropy behind a token. 32 bytes is 256 bits, far past what a
 /// guessing attack could reach through an HTTP endpoint.
-const TOKEN_BYTES: usize = 32;
+pub const TOKEN_BYTES: usize = 32;
 
-/// Passes `ensure_at` will make before giving up. Each one is displaced only
-/// by another writer settling the same file, so two is already generous.
-const MINT_ATTEMPTS: u32 = 3;
+/// Suffix of the lock file every minter of `<name>` holds: `.<name>.lock`,
+/// beside the token. `scripts/lib/pg_secret.sh` takes the same lock.
+pub const MINT_LOCK_SUFFIX: &str = "lock";
 
 /// `~/.lucidos/<name>`. `None` only when `HOME` is unset.
 ///
 /// Machine-global and outside every git tree, alongside `network.toml`.
 pub fn path_for(name: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".lucidos").join(name))
+    Some(lucidos_home::path()?.join(name))
 }
 
 /// `~/.lucidos/local-token`. `None` only when `HOME` is unset.
@@ -105,9 +117,10 @@ pub fn read() -> Option<String> {
 ///
 /// **First writer wins.** The gateway is no longer the only caller: an engine
 /// launched with no gateway mints its own, so two of them starting together
-/// race for the same path. The mint creates the file exclusively and re-reads
-/// on a collision, so both end up holding the value that actually landed. A
-/// read-then-write would leave the loser trusting a token no caller can present.
+/// race for the same path. Every minter holds the mint lock across its read,
+/// mint and publish, so the second one reads what the first published. The
+/// publish is a rename of a whole temp file, so a lock-free reader never sees
+/// a partial token either.
 pub fn ensure_named(name: &str) -> std::io::Result<String> {
     let path = path_for(name)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
@@ -117,78 +130,63 @@ pub fn ensure_named(name: &str) -> std::io::Result<String> {
 /// [`ensure_named`] at an explicit path, so the mint is testable without
 /// writing into the machine's own `~/.lucidos`.
 fn ensure_at(path: &Path) -> std::io::Result<String> {
+    ensure_with(path, || {})
+}
+
+/// [`ensure_at`], with `before_publish` run between the temp write and the
+/// rename. The seam a test pauses on to replay a rival's interleaving.
+fn ensure_with(path: &Path, before_publish: impl FnOnce()) -> std::io::Result<String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        lucidos_home::ensure_storage_root(parent)?;
     }
-    // Each pass either settles on a token or is displaced by another writer,
-    // and a displaced pass reads that writer's value next time round. Bounded
-    // so a pathological interleaving ends in an error rather than a spin.
-    for _ in 0..MINT_ATTEMPTS {
-        match read_settled(path)? {
-            OnDisk::Settled(token) => return Ok(token),
-            // A truncated write left no secret any caller could present, so
-            // clearing it loses nothing. ONLY this case clears. Unlinking an
-            // absent-looking file destroys a token another process just
-            // minted, and that race is what the exclusive create below wins.
-            OnDisk::Blank => {
-                if let Err(e) = std::fs::remove_file(path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Err(e);
-                    }
-                }
-            }
-            OnDisk::Absent => {}
-        }
-        let minted = mint_hex(TOKEN_BYTES)?;
-        match write_owner_only(path, &minted, Exclusive::Yes) {
-            Ok(()) => return Ok(minted),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
+    let mint_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sibling(path, MINT_LOCK_SUFFIX)?)?;
+    mint_lock.lock()?;
+    if let Some(token) = read_published(path)? {
+        return Ok(token);
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Interrupted,
-        "another writer kept replacing the token file",
-    ))
+    let minted = mint_hex(TOKEN_BYTES)?;
+    let staged = sibling(path, &format!("{}.tmp", std::process::id()))?;
+    write_owner_only(&staged, &minted)?;
+    before_publish();
+    std::fs::rename(&staged, path)?;
+    Ok(minted)
 }
 
-/// What the token path holds right now.
+/// `.<name>.<suffix>` beside `path`. Beside it, because a rename cannot cross
+/// filesystems. The mint lock is one such file: never delete it, or two
+/// minters would lock two different files.
+fn sibling(path: &Path, suffix: &str) -> std::io::Result<PathBuf> {
+    let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "token path has no name")
+    })?;
+    Ok(path.with_file_name(format!(".{name}.{suffix}")))
+}
+
+/// The token at `path`, or `None` when nothing is published yet.
 ///
-/// `Blank` and `Absent` are separate because only one of them may be unlinked.
-/// Collapsing them is what let a concurrent mint delete a valid token.
-enum OnDisk {
-    Settled(String),
-    /// Present but empty, which a truncated write leaves behind.
-    Blank,
-    Absent,
-}
-
-/// Read the token path, without deciding what to do about it.
+/// Called under the mint lock, where no writer is ever part-way through. So a
+/// blank file is debris from an earlier release, whose mint wrote in place
+/// and could be interrupted. It reads as nothing published, and is replaced.
 ///
 /// A read error other than "no such file" is returned rather than reported as
 /// absent. An unreadable file is NOT an empty one: treating a `chmod 000` token
 /// as missing would mint over a secret other processes still present.
-fn read_settled(path: &Path) -> std::io::Result<OnDisk> {
+fn read_published(path: &Path) -> std::io::Result<Option<String>> {
     let existing = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OnDisk::Absent),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     let token = existing.trim().to_string();
     if token.is_empty() {
-        return Ok(OnDisk::Blank);
+        return Ok(None);
     }
     enforce_owner_only(path)?;
-    Ok(OnDisk::Settled(token))
-}
-
-/// Whether a write refuses to overwrite an existing file.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Exclusive {
-    /// Fail with `AlreadyExists` rather than replace. The mint's race-winner.
-    Yes,
-    /// Truncate and replace. What a caller holding the authoritative value does.
-    No,
+    Ok(Some(token))
 }
 
 /// Mint or read the full-authority token. See [`ensure_named`].
@@ -216,23 +214,13 @@ pub fn mint_hex(bytes: usize) -> std::io::Result<String> {
 /// Create the file with mode 0600 *at creation*, never create-then-chmod. The
 /// second shape leaves a window where the secret is world-readable.
 ///
-/// One writer for both modes, because that creation-time mode is the invariant
-/// the module header calls security-critical. A second copy is a second place
-/// to keep it right.
-///
-/// [`Exclusive::Yes`] answers `AlreadyExists` instead of replacing.
-pub fn write_owner_only(path: &Path, contents: &str, exclusive: Exclusive) -> std::io::Result<()> {
+/// Replaces what is there. Shared with the gateway's paired-device store,
+/// because that creation-time mode is the invariant the module header calls
+/// security-critical. A second copy is a second place to keep it right.
+pub fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true);
-    match exclusive {
-        Exclusive::Yes => {
-            opts.create_new(true);
-        }
-        Exclusive::No => {
-            opts.create(true).truncate(true);
-        }
-    }
+    opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -240,7 +228,7 @@ pub fn write_owner_only(path: &Path, contents: &str, exclusive: Exclusive) -> st
     }
     let mut file = opts.open(path)?;
     file.write_all(contents.as_bytes())?;
-    file.flush()
+    file.sync_all()
 }
 
 /// Force mode 0600 on an existing file.
@@ -306,24 +294,23 @@ mod tests {
     #[test]
     fn a_token_file_is_created_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("lucidos-token-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("local-token");
-        write_owner_only(&path, "abc", Exclusive::No).unwrap();
+        write_owner_only(&path, "abc").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "a world-readable token is a leaked token");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn the_two_credentials_are_two_files_and_two_headers() {
         // The whole scope mechanism. One file, or one header carrying a scope
         // field, would let the hook socket's credential name full authority.
-        assert_ne!(LOCAL_TOKEN_FILE, WEBHOOK_TOKEN_FILE);
-        assert_ne!(HEADER_LOCAL_TOKEN, HEADER_WEBHOOK_TOKEN);
+        assert_ne!(LOCAL_TOKEN_FILE, HOOK_SOCKET_TOKEN_FILE);
+        assert_ne!(HEADER_LOCAL_TOKEN, HEADER_HOOK_SOCKET_TOKEN);
         // Both are `x-lucidos-*`, which is the prefix the gateway's hook socket
         // strips from every inbound delivery.
-        assert!(HEADER_WEBHOOK_TOKEN.starts_with("x-lucidos-"));
+        assert!(HEADER_HOOK_SOCKET_TOKEN.starts_with("x-lucidos-"));
     }
 
     #[test]
@@ -333,26 +320,19 @@ mod tests {
         let Some(local) = path_for(LOCAL_TOKEN_FILE) else {
             return;
         };
-        let hook = path_for(WEBHOOK_TOKEN_FILE).expect("HOME was readable a line ago");
+        let hook = path_for(HOOK_SOCKET_TOKEN_FILE).expect("HOME was readable a line ago");
         assert_ne!(local, hook);
         assert_eq!(local, path().expect("the same lookup"));
         assert!(local.ends_with(".lucidos/local-token"), "{local:?}");
-        assert!(hook.ends_with(".lucidos/webhook-token"), "{hook:?}");
-    }
-
-    /// A directory nobody else in this process is using, removed on drop.
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lucidos-token-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        assert!(hook.ends_with(".lucidos/hook-socket-token"), "{hook:?}");
     }
 
     /// The engine mints when no gateway has, and finds the gateway's value
     /// when one did. Both halves of the phase 2b decision, in one test.
     #[test]
     fn a_mint_creates_once_and_then_reads_what_is_there() {
-        let dir = scratch("ensure");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("local-token");
         let minted = ensure_at(&path).expect("a writable scratch directory");
         assert_eq!(minted.len(), TOKEN_BYTES * 2);
@@ -361,55 +341,55 @@ mod tests {
             minted,
             "a second call must not replace a token callers already hold"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The race two gateway-less engines can lose. The loser must end up with
     /// the value that landed, never with the one it minted and threw away.
     #[test]
     fn a_writer_that_loses_the_race_reads_the_winners_token() {
-        let dir = scratch("race");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("local-token");
-        write_owner_only(&path, "the-winner", Exclusive::No).unwrap();
+        write_owner_only(&path, "the-winner").unwrap();
         assert_eq!(ensure_at(&path).unwrap(), "the-winner");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Absent and blank are DIFFERENT answers, which is the whole fix.
-    ///
-    /// `ensure_at` unlinks on `Blank` and never on `Absent`, so collapsing the
-    /// two puts an unlink on the path a rival's fresh token sits in. The race
-    /// itself resists a unit test: the window between one minter's `create_new`
-    /// and another's read is microseconds, and a threaded version passed with
-    /// the bug deliberately re-introduced. So pin the decision instead, and
-    /// keep `remove_file` reachable from one arm only.
+    /// Two minters, the first paused after staging its token and before it
+    /// publishes. The second starts then, and must end up with the first's
+    /// token rather than mint its own. Synchronised by channels and the mint
+    /// lock, never by a sleep.
     #[test]
-    fn an_absent_token_is_not_a_blank_one() {
-        let dir = scratch("ondisk");
+    fn a_second_minter_adopts_the_token_the_first_publishes() {
+        use std::sync::mpsc;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("local-token");
-        assert!(matches!(read_settled(&path).unwrap(), OnDisk::Absent));
-        write_owner_only(&path, "   \n", Exclusive::No).unwrap();
-        assert!(matches!(read_settled(&path).unwrap(), OnDisk::Blank));
-        write_owner_only(&path, "a-real-token", Exclusive::No).unwrap();
-        assert!(matches!(read_settled(&path).unwrap(), OnDisk::Settled(t) if t == "a-real-token"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// The exclusive create is what decides the winner, so it must refuse to
-    /// replace. A minter reaching it with a rival's token on disk backs off.
-    #[test]
-    fn an_exclusive_write_refuses_to_replace() {
-        let dir = scratch("exclusive");
-        let path = dir.join("local-token");
-        write_owner_only(&path, "the-winner", Exclusive::No).unwrap();
-        let clash = write_owner_only(&path, "the-loser", Exclusive::Yes);
-        assert_eq!(
-            clash.unwrap_err().kind(),
-            std::io::ErrorKind::AlreadyExists,
-            "an exclusive write must not overwrite a token already there"
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "the-winner");
-        std::fs::remove_dir_all(&dir).unwrap();
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let first = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                ensure_with(&path, || {
+                    staged_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+            })
+        };
+        staged_rx.recv().unwrap();
+        let second = {
+            let path = path.clone();
+            std::thread::spawn(move || ensure_at(&path))
+        };
+        resume_tx.send(()).unwrap();
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(second, first, "both minters must trust the published token");
+        let names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".lock"))
+            .collect();
+        assert_eq!(names, ["local-token"], "every staging file is gone");
     }
 
     /// A token this process cannot read is still a token other processes are
@@ -418,9 +398,10 @@ mod tests {
     #[test]
     fn an_unreadable_token_file_is_an_error_not_an_empty_slot() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = scratch("unreadable");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("local-token");
-        write_owner_only(&path, "still-in-use", Exclusive::No).unwrap();
+        write_owner_only(&path, "still-in-use").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let outcome = ensure_at(&path);
         // Restore before asserting, so a failure still leaves a removable dir.
@@ -434,45 +415,57 @@ mod tests {
             "still-in-use",
             "the unreadable token must survive"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A truncated write leaves a blank file. Treat it as absent so the next
-    /// boot recovers, rather than publishing an empty secret nobody can send.
+    /// An earlier release minted in place and could be interrupted, leaving
+    /// a blank file. Under the mint lock no writer is part-way through, so the
+    /// blank file is debris and a fresh token replaces it.
     #[test]
-    fn a_blank_token_file_is_minted_over() {
-        let dir = scratch("blank");
+    fn a_blank_file_from_an_earlier_mint_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("local-token");
-        write_owner_only(&path, "   \n", Exclusive::No).unwrap();
+        write_owner_only(&path, "   \n").unwrap();
         let minted = ensure_at(&path).unwrap();
         assert_eq!(minted.len(), TOKEN_BYTES * 2);
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), minted);
     }
 
     #[cfg(unix)]
     #[test]
     fn a_minted_token_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = scratch("mode");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("local-token");
         ensure_at(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "a world-readable token is a leaked token");
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn minting_makes_the_home_a_storage_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_at(&dir.join("local-token")).unwrap();
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, lucidos_home::STORAGE_ROOT_MODE);
     }
 
     #[cfg(unix)]
     #[test]
     fn a_loosened_token_file_is_repaired() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("lucidos-token-fix-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("local-token");
-        write_owner_only(&path, "abc", Exclusive::No).unwrap();
+        write_owner_only(&path, "abc").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         enforce_owner_only(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

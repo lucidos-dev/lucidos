@@ -41,8 +41,9 @@ A surface that only opens on demand, and cannot be in the first frame, gets an
 **idle prefetch**. `dismissBootSplash` starts it, and the surface's opener
 waits for `preload()`, so it never opens empty.
 
-`entryChunkBudget` (`vite/entryChunkBudget.ts`) fails every single-shot build
-whose entry chunk passes `chunkSizeWarningLimit`.
+The entry chunk budget fails every single-shot build whose entry chunk passes
+600 kB. ADR 0436 moved it into `vite/chunkBudget.ts`, beside a budget for the
+whole first-paint set, and took it off `chunkSizeWarningLimit`.
 
 ## Rationale
 

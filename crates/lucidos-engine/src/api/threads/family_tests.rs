@@ -96,6 +96,7 @@ async fn spawn_idle_parent(bus: &EventBus) -> Uuid {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do something".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -190,6 +191,7 @@ async fn spawn_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid, bring_to_id
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -220,6 +222,9 @@ async fn spawn_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid, bring_to_id
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })
@@ -271,6 +276,7 @@ async fn spawn_cc_child(
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "cc task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -299,6 +305,9 @@ async fn spawn_cc_child(
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })
@@ -358,6 +367,7 @@ async fn spawn_idle_chat_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid) -
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "delegated task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -825,6 +835,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "cc task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -853,6 +864,9 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })
@@ -949,6 +963,7 @@ async fn archive_rejects_when_fresh_cc_child_is_running_without_idle() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fresh cc child".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -977,6 +992,9 @@ async fn archive_rejects_when_fresh_cc_child_is_running_without_idle() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })

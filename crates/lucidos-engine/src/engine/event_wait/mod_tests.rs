@@ -2,7 +2,7 @@ use super::register::ARMING_LOOKBACK_SECS;
 use super::*;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::MessageOrigin;
-use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
+use crate::test_support::{refuse_event_type, seed_thread_event, setup_test_db, teardown_test_db};
 use serde_json::json;
 
 fn sub(event_type: &str, condition: Option<Value>) -> EventSubscription {
@@ -389,6 +389,7 @@ async fn seed_completion_card(
             summary: "all green".into(),
             pending_change_ids: vec![],
             sub_thread_pending_changes: vec![],
+            integrated_branch: None,
         },
     )
     .await;
@@ -656,6 +657,9 @@ async fn seed_coding_agent_idle(
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
     )
     .await;
@@ -1964,6 +1968,7 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "start the work".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -2409,6 +2414,7 @@ fn an_agent_message() -> ThreadEvent {
     ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,
+        wake_mode: None,
         text: "[CHILD THREAD COMPLETED]".into(),
         user_image_hashes: vec![],
         device_id: None,
@@ -2985,13 +2991,10 @@ async fn a_canceled_wait_does_not_come_back_on_the_next_boot() {
 
 // ── a failed emit must not strand the wait ───────────────────────────
 
-/// The failure mode a bare `Err` hides. `take` has already removed the wait, so
-/// dropping the error would leave it gone from the live set (nothing can match
-/// or expire it) while its `EventWaitStarted` is still unresolved in the store.
-/// The two arms exist so the caller can tell "nothing was written, re-arm it"
-/// from "the resolution landed, do NOT re-arm or it delivers twice".
+/// The anchor is refused. The resolution must not land without it, so the wait
+/// is still live: a rebuild finds it, and the dispatcher re-arms it.
 #[tokio::test]
-async fn a_resolution_that_never_persisted_is_reported_as_still_live() {
+async fn a_refused_anchor_leaves_the_wait_live() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
@@ -3000,20 +3003,32 @@ async fn a_resolution_that_never_persisted_is_reported_as_still_live() {
     let waits = LiveWaits::new();
     rebuild_live_waits(&pool, &waits).await.unwrap();
     let wait = waits.take(wait_id).await.unwrap();
+    refuse_event_type(&pool, "PromptInjected").await;
 
-    // Close the pool under the bus: every emit now fails, starting with the
-    // resolution itself.
-    pool.close().await;
-    let err = emit_delivery(&bus, &wait, Uuid::new_v4(), "ChangeProposed", &json!({}), 0)
+    emit_delivery(&bus, &wait, Uuid::new_v4(), "ChangeProposed", &json!({}), 0)
         .await
-        .expect_err("a closed pool cannot persist the resolution");
-    assert!(
-        matches!(err, ResolutionEmitError::Unresolved(_)),
-        "nothing was written, so the wait is still live: {err:?}"
-    );
-    // The wording is what a maintainer reads in the log; keep it honest.
-    assert!(err.to_string().contains("resolution was not persisted"));
+        .expect_err("a refused anchor fails the delivery");
 
+    let resolutions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 \
+           AND event_type = 'EventWaitDelivered'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        resolutions, 0,
+        "a resolution must not land without its anchor"
+    );
+    let rebuilt = LiveWaits::new();
+    rebuild_live_waits(&pool, &rebuilt).await.unwrap();
+    assert!(
+        rebuilt.take(wait_id).await.is_some(),
+        "the wait is still live"
+    );
+
+    pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
@@ -3030,13 +3045,9 @@ async fn a_cancel_that_never_persisted_is_reported_as_still_live() {
     let wait = waits.take(wait_id).await.unwrap();
 
     pool.close().await;
-    let err = emit_cancel(&bus, &wait, EventWaitCancelCause::UserStop, None)
+    emit_cancel(&bus, &wait, EventWaitCancelCause::UserStop, None)
         .await
         .expect_err("a closed pool cannot persist the cancel");
-    assert!(
-        matches!(err, ResolutionEmitError::Unresolved(_)),
-        "a cancel that did not land leaves the wait live too: {err:?}"
-    );
 
     teardown_test_db(&db_name).await;
 }

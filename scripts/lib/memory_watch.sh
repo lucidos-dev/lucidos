@@ -28,6 +28,8 @@
 # For WORKTREES_SUBPATH, which the installer refuses to run from.
 # shellcheck source=scripts/lib/workspace_constants.sh
 source "$(dirname "${BASH_SOURCE[0]}")/workspace_constants.sh"
+# shellcheck source=scripts/lib/storage_root.sh
+source "$(dirname "${BASH_SOURCE[0]}")/storage_root.sh"
 
 # The longest command line kept in a record. A coding agent's argv carries a
 # system prompt of about 22 KB, which would bury the log.
@@ -75,7 +77,13 @@ _mw_now() {
 # ── knobs ───────────────────────────────────────────────────────────────
 
 _mw_dir() {
-    printf '%s' "${MEMORY_WATCH_DIR:-$HOME/.lucidos/memory-watch}"
+    printf '%s' "${MEMORY_WATCH_DIR:-$(lucidos_home_dir)/memory-watch}"
+}
+
+# The default dir sits in the Lucidos home, a storage root that must exist
+# owner-only before anything is created inside it.
+_mw_ensure_home() {
+    [ -n "${MEMORY_WATCH_DIR:-}" ] || ensure_storage_root "$(lucidos_home_dir)"
 }
 
 _mw_log_pct() {
@@ -209,6 +217,7 @@ memory_watch_once() {
     local dir log rows ram log_t kill_pct kill_t seen seen_new
     local pid bytes info ppid pgid uid lstart cmd key
     dir="$(_mw_dir)"
+    _mw_ensure_home 2>/dev/null || return 0
     mkdir -p "$dir" 2>/dev/null || return 0
     log="$dir/memory-watch.log"
     seen="$dir/seen"
@@ -327,6 +336,7 @@ memory_watch_install() {
     esac
     plist="$agents/$MEMORY_WATCH_LABEL.plist"
     uid="$(id -u)"
+    _mw_ensure_home || return 1
     mkdir -p "$agents" "$(_mw_dir)" || return 1
     _mw_launchctl bootout "gui/$uid/$MEMORY_WATCH_LABEL" >/dev/null 2>&1 || true
     # bootout can return before launchd has let go of the service, and a

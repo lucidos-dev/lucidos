@@ -140,7 +140,8 @@ restarts into the real provider.
 None of this runs in development — `scripts/tauri-dev.sh` still uses Docker
 Postgres + a natively-built engine, and the client launcher/updater
 short-circuit on `tauri::is_dev()` (the service role is only ever started by
-launchd in a packaged build).
+launchd in a packaged build). In dev the launcher hands the window to
+`dev_window.rs` instead, which follows a switch to a new version (ADR 0461).
 
 ## Building locally (unsigned)
 
@@ -665,6 +666,16 @@ the same executable and is always up. Retrying cannot produce a second client,
 since `open -a` without `-n` activates a running app. Every refusal and the
 final give-up go to the client log (ADR 0186).
 
+**One packaged client per user, even on a direct exec.** LaunchServices keeps a
+Finder, Dock or `open` launch to one client, but running
+`Contents/MacOS/lucidos-app` directly bypasses it. So `main` takes the client's
+owner lock, `<app-data>/client.lock`, before any Tauri init
+(`client_owner_lock.rs`). A second client prints the holder's pid to stderr and
+exits 0, without moving focus. The fd is close-on-exec, and the updater's
+spawn-first fallback releases the lock first, so no relaunch is refused.
+
+`--version` / `-V` print one line and exit before the lock. Why: ADR 0471.
+
 **The install narrates itself, phase by phase.** All of that takes long enough —
 a ~100 MB download, a signature check, a bundle swap, a service restart — that a
 silent `await` reads as a frozen app, which is exactly how it behaved while the
@@ -796,11 +807,11 @@ class of difference caused:
   version is installed. Both agents are probed concurrently and the probe is
   bounded (5s, `kill_on_drop`); any failure is logged and reported as an
   absent `version`, never as a placeholder or a failed request.
-- **Bare `psql` works in coding-agent sessions.** `spawn_env::apply_lucidos_env`
+- **`psql` resolves in coding-agent sessions.** `spawn_env::apply_lucidos_env`
   prepends `LUCIDOS_PG_BIN_DIR` (the bundled relocatable PG's `bin/`) to the
   subprocess PATH, matching what `workspace_script_env_vars` already did for
-  chat/scheduled scripts — the advertised `psql -c '…'` contract holds in
-  packaged CC/Codex threads.
+  chat/scheduled scripts. So `psql "$LUCIDOS_DATABASE_URL"` works in packaged
+  CC/Codex threads (ADR 0481).
 - **Access shows only reachable URLs.** The "Local network" row derives
   from the configured gateway bind (`GET /api/v1/network-config`): loopback
   (the packaged default) shows guidance linking the Network access section

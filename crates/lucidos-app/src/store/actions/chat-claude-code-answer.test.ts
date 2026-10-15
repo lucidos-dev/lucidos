@@ -32,7 +32,10 @@ vi.mock('../../utils/threadOpenMarks', () => ({ markThreadRerenderStart, clearTh
 vi.mock('../../utils/renderPhaseTimers', () => ({ currentPerfBaseline: () => ({ start: 0, md: 0, link: 0 }) }));
 vi.mock('./thread-sync', () => ({}));
 vi.mock('./threads', () => ({}));
-vi.mock('./sendChain', () => ({ inSendChain: (_threadId: string, send: () => Promise<unknown>) => send() }));
+const position = { input_chain: 'page-chain', input_seq: 7 };
+vi.mock('./sendChain', () => ({
+  inSendChain: (_threadId: string, send: (p: typeof position) => Promise<unknown>) => send(position),
+}));
 
 const { answerThreadQuestion, answerFailureMessage, retryUnsentPick } = await import('./chat-claude-code');
 const { pendingAnswers, unsentPicks } = await import('../pendingDecisions');
@@ -164,6 +167,16 @@ describe('a tapped answer that gets no answer', () => {
     expect(clearThreadAnswering).not.toHaveBeenCalled();
   });
 
+  it('carries an event id and its input position, the same on every quiet retry', async () => {
+    apiAnswerThreadQuestion
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValueOnce(true);
+    expect(await answerSettled()).toBe('sent');
+    const [first, retry] = apiAnswerThreadQuestion.mock.calls.map(call => (call as unknown[])[3]);
+    expect(first).toEqual({ event_id: expect.any(String), ...position });
+    expect(retry).toEqual(first);
+  });
+
   it('stays answering while it retries', async () => {
     apiAnswerThreadQuestion.mockRejectedValue(new TypeError('Load failed'));
     const outcome = answerThreadQuestion('t1', 'tool-use-1', pick);
@@ -204,7 +217,7 @@ describe('a tapped answer that gets no answer', () => {
     const retried = retryUnsentPick('tool-use-1');
     expect(pendingAnswers.map.value.get('tool-use-1')).toEqual(pick);
     expect(unsentPicks.map.value.has('tool-use-1')).toBe(false);
-    expect(apiAnswerThreadQuestion).toHaveBeenCalledWith('t1', 'tool-use-1', pick);
+    expect(apiAnswerThreadQuestion).toHaveBeenCalledWith('t1', 'tool-use-1', pick, expect.objectContaining(position));
     answer(true);
     expect(await retried).toBe('sent');
   });

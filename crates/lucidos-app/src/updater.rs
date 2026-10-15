@@ -562,6 +562,10 @@ fn installed_bundle_fault() -> Option<String> {
 /// Fails open when the bundle or a device cannot be read. The plugin then
 /// reports its own error, which is no worse than today.
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "names the directory the updater plugin stages into; creates nothing"
+)]
 fn update_blocker() -> Option<String> {
     use crate::bundle_location;
 
@@ -805,6 +809,8 @@ pub(crate) async fn run_app_update(
         Ok(()) => crate::exit_after_relaunch_scheduled(&narrator.app),
         Err(e) => {
             eprintln!("[updater] no LaunchServices relaunch ({e}); respawning directly");
+            // `restart` spawns the new client before this one exits.
+            crate::client_owner_lock::release_client_owner_lock();
             narrator.app.restart()
         }
     }
@@ -986,11 +992,6 @@ mod tests {
 
     // ── The post-install bundle check ────────────────────────────────────────
 
-    /// The bundle cases below are built on disk, so they need somewhere
-    /// throwaway that is not this machine's real install.
-    #[cfg(target_os = "macos")]
-    use crate::test_support::TempDir;
-
     /// Lay down `<root>/Lucidos.app/Contents/MacOS/lucidos-app` with `mode`, and
     /// return the bundle root.
     #[cfg(target_os = "macos")]
@@ -1010,7 +1011,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_bundle_with_an_executable_main_binary_is_runnable() {
-        let tmp = TempDir::new("runnable");
+        let tmp = tempfile::tempdir().unwrap();
         let bundle = write_bundle(tmp.path(), 0o755);
         assert_eq!(installed_bundle_verdict(&bundle), BundleVerdict::Runnable);
     }
@@ -1021,7 +1022,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_vanished_bundle_is_reported_as_missing() {
-        let tmp = TempDir::new("vanished");
+        let tmp = tempfile::tempdir().unwrap();
         let bundle = tmp.path().join("Lucidos.app");
         assert_eq!(
             installed_bundle_verdict(&bundle),
@@ -1035,7 +1036,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_bundle_directory_without_its_main_binary_is_not_runnable() {
-        let tmp = TempDir::new("hollow");
+        let tmp = tempfile::tempdir().unwrap();
         let bundle = tmp.path().join("Lucidos.app");
         std::fs::create_dir_all(bundle.join("Contents/Resources")).expect("create a hollow bundle");
         assert_eq!(
@@ -1050,7 +1051,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_directory_standing_in_for_the_main_binary_is_not_runnable() {
-        let tmp = TempDir::new("dir-exe");
+        let tmp = tempfile::tempdir().unwrap();
         let bundle = tmp.path().join("Lucidos.app");
         std::fs::create_dir_all(bundle.join(BUNDLE_MAIN_EXECUTABLE)).expect("create the stand-in");
         assert_eq!(
@@ -1064,7 +1065,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_main_binary_with_no_execute_bit_is_not_runnable() {
-        let tmp = TempDir::new("no-x");
+        let tmp = tempfile::tempdir().unwrap();
         let bundle = write_bundle(tmp.path(), 0o644);
         assert_eq!(
             installed_bundle_verdict(&bundle),
@@ -1095,7 +1096,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_verdict_follows_the_bundle_wherever_it_lives() {
-        let tmp = TempDir::new("elsewhere");
+        let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("Users/someone/Applications");
         std::fs::create_dir_all(&nested).expect("create a non-/Applications location");
         let bundle = write_bundle(&nested, 0o755);

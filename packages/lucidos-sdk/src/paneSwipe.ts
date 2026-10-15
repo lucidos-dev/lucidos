@@ -192,6 +192,39 @@ export function pageScrollsSideways(doc: PageNode, overflowXOf: (el: Element) =>
   return [doc.documentElement, doc.body].every((el) => !el || !/^(hidden|clip)$/.test(overflowXOf(el)));
 }
 
+/** How a touch continues: its moves, its lift and its cancel. */
+export interface TouchTail {
+  move: (e: Event) => void;
+  end: (e: Event) => void;
+  cancel: (e: Event) => void;
+}
+
+/**
+ * Follow the rest of a touch on the node it began on, for when that node
+ * leaves the DOM mid-drag. Every event of a touch fires on that node. Detached,
+ * it has no ancestors, so nothing reaches `surface` and the drag never ends.
+ * An app that re-renders its list under the finger does exactly that.
+ *
+ * While the node stays attached its events reach `surface`, which handles
+ * them, so these listeners skip them. Returns the cleanup.
+ */
+export function followStrandedTouch(start: Event, surface: EventTarget, tail: TouchTail): () => void {
+  const node = start.target as Partial<EventTarget> | null;
+  if (!node || node === surface || typeof node.addEventListener !== 'function') return () => {};
+  const stranded = (fn: (e: Event) => void) => (e: Event) => {
+    if (e.isTrusted && !e.composedPath().includes(surface)) fn(e);
+  };
+  const listeners: Array<[string, (e: Event) => void, AddEventListenerOptions]> = [
+    ['touchmove', stranded(tail.move), { passive: false }],
+    ['touchend', stranded(tail.end), { passive: true }],
+    ['touchcancel', stranded(tail.cancel), { passive: true }],
+  ];
+  for (const [type, fn, options] of listeners) node.addEventListener!(type, fn, options);
+  return () => {
+    for (const [type, fn, options] of listeners) node.removeEventListener!(type, fn, options);
+  };
+}
+
 function onlyTouch(e: Event): Touch | null {
   const touches = (e as TouchEvent).touches;
   return touches && touches.length === 1 ? touches[0] : null;
@@ -212,19 +245,27 @@ export function trackPaneSwipe(
   env: PaneSwipeEnv,
 ): () => void {
   const touch = new SwipeTouch();
+  let unfollow = () => {};
+
+  const finish = () => {
+    touch.cancel();
+    unfollow();
+    unfollow = () => {};
+  };
 
   const abandon = () => {
     if (touch.isHorizontal) handlers.onRelease(0);
-    touch.cancel();
+    finish();
   };
 
   const onStart = (e: Event) => {
-    // A drag whose touchend never arrived (its node left the DOM) ends here.
+    // A drag still live here never got its touchend, so it snaps back.
     abandon();
     const t = onlyTouch(e);
     if (!t || e.defaultPrevented || env.textFieldFocused()) return;
     if (env.pageScrollsSideways() || horizontalDragClaimed(e.target as DragNode | null, env.styleOf)) return;
     touch.start(...screenPoint(t));
+    unfollow = followStrandedTouch(e, surface, { move: onMove, end: onEnd, cancel: abandon });
   };
 
   const onMove = (e: Event) => {
@@ -248,7 +289,7 @@ export function trackPaneSwipe(
 
   const onEnd = () => {
     if (touch.isHorizontal) handlers.onRelease(touch.end(env.paneWidth()));
-    touch.cancel();
+    finish();
   };
 
   // Only the user's own events drive a drag. The HTML preview runs untrusted
@@ -267,6 +308,7 @@ export function trackPaneSwipe(
   for (const [type, fn, options] of listeners) surface.addEventListener(type, fn, options);
   return () => {
     for (const [type, fn, options] of listeners) surface.removeEventListener(type, fn, options);
+    finish();
   };
 }
 

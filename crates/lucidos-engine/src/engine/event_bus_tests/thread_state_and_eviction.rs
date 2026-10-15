@@ -292,6 +292,7 @@ async fn message_received_overrides_stale_compose_source_on_composing_to_active(
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "send via lucidos".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -350,6 +351,7 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "first message".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -437,6 +439,7 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "previous question".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -490,6 +493,7 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
             summary: "child finished".into(),
             pending_change_ids: vec![],
             sub_thread_pending_changes: vec![],
+            integrated_branch: None,
         },
         meta: EventMeta {
             event_id: Some(ctc_id),
@@ -588,6 +592,7 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do thing".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -611,6 +616,7 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -717,6 +723,7 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do a thing".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -821,6 +828,7 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "live".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -922,6 +930,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "fix the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -947,6 +956,9 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
                 coding_agent_kind: Default::default(),
                 coding_agent_folder: String::new(),
                 app_id: None,
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
             meta: cc_meta(),
         })
@@ -1169,6 +1181,9 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
                 coding_agent_kind: Default::default(),
                 coding_agent_folder: String::new(),
                 app_id: None,
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
             meta: cc_meta(),
         })
@@ -1387,6 +1402,9 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         coding_agent_kind: Default::default(),
         coding_agent_folder: String::new(),
         app_id: None,
+        integrated: false,
+        auto_compact_window: None,
+        auto_compact_arm: None,
     };
     // Recovery's proposal: engine-origin, and incomplete because the turn
     // never ended cleanly. A branch holds one pending change, so each gets
@@ -1598,6 +1616,7 @@ async fn only_a_user_switch_teardown_settles_a_thread_at_paused() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -1686,6 +1705,7 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "summarize the log".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1753,6 +1773,7 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "try again".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1789,79 +1810,6 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
         status_of(thread_id).await,
         "idle",
         "a real user Stop on a fresh turn must still settle the thread to idle"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// Sending a message clears ALL compose fields — including `compose_selection`.
-/// The MessageReceived / SessionStarted / ThreadDiscarded projection arms wipe
-/// the per-thread compose draft so a stale draft can't linger; `compose_selection`
-/// (the per-draft dropdown picks, added alongside text/images/mode) must be wiped
-/// in lockstep, or a sent thread retains a ghost selection in the DB that a reload
-/// would rehydrate. Regression guard for the frontend "peer-sent follow-up
-/// preserved as a draft" fix's backend half.
-#[tokio::test]
-async fn message_received_clears_compose_selection() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = Uuid::new_v4();
-
-    // Composing thread with a stored per-draft selection (as a compose PUT would
-    // leave it).
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::ThreadStarted {
-            mode: "lucidos".into(),
-            actor: None,
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE thread_summaries \
-         SET compose_text = 'half-typed', compose_selection = '{\"scope\":{\"kind\":\"lucidos\"}}'::jsonb \
-         WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::MessageReceived {
-            provider: None,
-            voice_session_id: None,
-            text: "the actual message".into(),
-            user_image_hashes: vec![],
-            device_id: None,
-            image_description: None,
-            parent_thread_id: None,
-            spawning_event_id: None,
-            mode: ActorMode::Human,
-            model: None,
-            reasoning_effort: None,
-            origin: None,
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    let (compose_text, compose_selection): (String, Option<serde_json::Value>) = sqlx::query_as(
-        "SELECT compose_text, compose_selection FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(compose_text, "", "compose_text must be cleared on send");
-    assert_eq!(
-        compose_selection, None,
-        "compose_selection must be cleared on send, in lockstep with the other compose fields"
     );
 
     pool.close().await;
@@ -1974,145 +1922,84 @@ async fn read_compose(pool: &PgPool, thread_id: Uuid) -> (String, Option<serde_j
     .unwrap()
 }
 
-/// Typed text answering a question IS a submitted draft, but it never becomes a
-/// `MessageReceived` (chat/process/run.rs reroutes it), so the send arm's clear
-/// never runs for it. Without this the draft stays in `thread_summaries` and
-/// re-syncs to every device whenever the submitting client's compose PUT doesn't
-/// land — a resurrected ghost draft.
+/// A submission consumes the compose slot when the engine ACCEPTS it (ADR
+/// 0450), so no event the send emits afterwards may touch the draft. A
+/// coding-agent send emits `MessageReceived` and then `SessionStarted` after
+/// the ack, and a draft stored in between is the user's next message. A
+/// question answer is consumed by its endpoint the same way.
 #[tokio::test]
-async fn free_text_answer_clears_the_draft_it_submitted() {
+async fn a_draft_written_after_the_accept_survives_the_sends_later_events() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id =
-        seed_thread_awaiting_answer(&bus, &pool, "night has passed by, any progress?\n").await;
-
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::UserQuestionAnswered {
-            tool_use_id: "tu-1".into(),
-            // The client trims before submitting; the stored draft may not be.
-            answer: AnswerKind::FreeText {
-                text: "night has passed by, any progress?".into(),
-                image_hashes: vec![],
-            },
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    let (compose_text, compose_selection) = read_compose(&pool, thread_id).await;
-    assert_eq!(
-        compose_text, "",
-        "a free-text answer must clear the draft it submitted, trimming aside"
-    );
-    assert_eq!(
-        compose_selection, None,
-        "compose_selection must clear in lockstep with the text it belonged to"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// The clear must also be ANNOUNCED. This path emits no `MessageReceived`, and
-/// the submitting client's own compose PUT (which normally broadcasts the empty
-/// state) may never land — so without this side effect, peers holding the same
-/// draft keep showing it until their next thread-summary snapshot. A thread
-/// event won't do: delivery can lag arbitrarily behind the transaction, so the
-/// frontend only accepts a compose REPORT as evidence of the server's current
-/// state (`serverDraft` in `store/actions/compose.ts`).
-#[tokio::test]
-async fn free_text_answer_broadcasts_the_cleared_compose_state() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id =
-        seed_thread_awaiting_answer(&bus, &pool, "night has passed by, any progress?").await;
-    let mut rx = bus.subscribe();
-
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::UserQuestionAnswered {
-            tool_use_id: "tu-1".into(),
-            answer: AnswerKind::FreeText {
-                text: "night has passed by, any progress?".into(),
-                image_hashes: vec![],
-            },
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    let mut broadcast: Option<(String, Vec<String>, Option<String>)> = None;
-    while let Ok(emitted) = rx.try_recv() {
-        if let BusEvent::System(SystemEvent::ThreadComposeChanged {
-            id,
-            text,
-            image_hashes,
-            origin_device_id,
-            ..
-        }) = &emitted.typed
-        {
-            if *id == thread_id {
-                broadcast = Some((text.clone(), image_hashes.clone(), origin_device_id.clone()));
-            }
-        }
-    }
-    let (text, image_hashes, origin_device_id) =
-        broadcast.expect("clearing the answered draft must broadcast ThreadComposeChanged");
-    assert_eq!(text, "", "the broadcast reports the cleared state");
-    assert!(image_hashes.is_empty(), "images clear with the text");
-    assert_eq!(
-        origin_device_id, None,
-        "the server's own report belongs to no device — nobody may suppress it as their echo"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// The ordinary send path owes the same announcement. `sendCompose` cancels its
-/// compose PUT and relies on this projection's clear, so without the broadcast a
-/// peer mirroring the draft keeps showing it until its next summary reload.
-#[tokio::test]
-async fn sending_a_draft_broadcasts_the_cleared_compose_state() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = Uuid::new_v4();
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::ThreadStarted {
-            mode: "lucidos".into(),
-            actor: None,
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-    sqlx::query("UPDATE thread_summaries SET compose_text = 'the draft' WHERE thread_id = $1")
+    let thread_id = seed_thread_awaiting_answer(&bus, &pool, "the next message").await;
+    // The accept already consumed the slot once.
+    sqlx::query("UPDATE thread_summaries SET compose_epoch = 1 WHERE thread_id = $1")
         .bind(thread_id)
         .execute(&pool)
         .await
         .unwrap();
     let mut rx = bus.subscribe();
 
-    emit_thread_message(&bus, thread_id, None, "the draft").await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAnswered {
+            tool_use_id: "tu-1".into(),
+            answer: AnswerKind::FreeText {
+                text: "the next message".into(),
+                image_hashes: vec![],
+            },
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    emit_thread_message(&bus, thread_id, None, "the sent message").await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: "test-session".into(),
+            branch: String::new(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
 
-    let mut announced = false;
+    let (compose_text, compose_selection) = read_compose(&pool, thread_id).await;
+    assert_eq!(
+        compose_text, "the next message",
+        "the draft typed after the accept survives"
+    );
+    assert!(compose_selection.is_some(), "and so do its picks");
+    let epoch: i64 =
+        sqlx::query_scalar("SELECT compose_epoch FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        epoch, 1,
+        "one submission moves the epoch once, at its accept"
+    );
     while let Ok(emitted) = rx.try_recv() {
-        if let BusEvent::System(SystemEvent::ThreadComposeChanged { id, text, .. }) = &emitted.typed
-        {
-            if *id == thread_id {
-                assert_eq!(text, "", "the broadcast reports the cleared state");
-                announced = true;
-            }
+        if let BusEvent::System(SystemEvent::ThreadComposeChanged { id, .. }) = &emitted.typed {
+            assert_ne!(
+                *id, thread_id,
+                "nothing changed the draft, so nothing announces it"
+            );
         }
     }
-    assert!(
-        announced,
-        "sending a thread's draft must announce that the server no longer holds it"
-    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -2135,112 +2022,6 @@ async fn a_message_that_creates_the_thread_broadcasts_no_compose_change() {
             assert_ne!(*id, thread_id, "the thread was created by this message");
         }
     }
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// A send on an existing thread announces even when the engine held NO draft,
-/// because the *compose epoch* moved. This is the reported bug's exact shape:
-/// the client's draft PUT was still in flight, so the engine had nothing to
-/// clear, and the write landed after the message and rewrote the draft the send
-/// had just consumed. The device needs the new epoch to fence its next write,
-/// and the announcement is how it gets it without a round trip.
-#[tokio::test]
-async fn sending_without_a_stored_draft_still_announces_the_new_epoch() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = Uuid::new_v4();
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::ThreadStarted {
-            mode: "lucidos".into(),
-            actor: None,
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-    let mut rx = bus.subscribe();
-
-    emit_thread_message(&bus, thread_id, None, "typed and sent inside the debounce").await;
-
-    let mut announced_epoch = None;
-    while let Ok(emitted) = rx.try_recv() {
-        if let BusEvent::System(SystemEvent::ThreadComposeChanged {
-            id, compose_epoch, ..
-        }) = &emitted.typed
-        {
-            if *id == thread_id {
-                announced_epoch = Some(*compose_epoch);
-            }
-        }
-    }
-    assert_eq!(
-        announced_epoch,
-        Some(1),
-        "the submission consumed the compose slot, so the epoch advanced and peers must hear it"
-    );
-
-    let stored: (i64,) =
-        sqlx::query_as("SELECT compose_epoch FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        stored.0, 1,
-        "the stored epoch is what later writes fence on"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// An answer whose text has NOT reached storage yet still advances the epoch.
-///
-/// This is the answer-path form of the reported bug. The answering device's
-/// compose PUT is still in flight, so `compose_text` holds the older value and
-/// the content match finds nothing to clear. Without a bump, that stalled write
-/// lands after the answer and resurrects the submitted text as a live draft. The
-/// unrelated text a peer may be writing must survive either way, so the CLEAR
-/// stays conditional while the fence does not.
-#[tokio::test]
-async fn an_answer_advances_the_epoch_even_when_it_cleared_no_stored_draft() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id =
-        seed_thread_awaiting_answer(&bus, &pool, "a different half-typed thought").await;
-
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::UserQuestionAnswered {
-            tool_use_id: "tu-1".into(),
-            answer: AnswerKind::FreeText {
-                text: "the answer, typed and sent inside the debounce".into(),
-                image_hashes: vec![],
-            },
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    let row: (String, i64) = sqlx::query_as(
-        "SELECT compose_text, compose_epoch FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        row.0, "a different half-typed thought",
-        "an answer that was not the stored draft must leave that draft alone"
-    );
-    assert_eq!(
-        row.1, 1,
-        "but it must still fence the write that carried the answer text"
-    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -2278,6 +2059,7 @@ async fn a_chat_continue_leaves_the_compose_epoch_alone() {
             branch: String::new(),
             origin: None,
             reason: Some(crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON.into()),
+            resumed_abort_id: None,
         },
         meta: EventMeta::NONE,
     })
@@ -2293,198 +2075,6 @@ async fn a_chat_continue_leaves_the_compose_epoch_alone() {
     .unwrap();
     assert_eq!(row.0, "half a follow-up", "a Continue consumes no draft");
     assert_eq!(row.1, 0, "and therefore moves no epoch");
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// The mirror of the above: no clear, no announcement. An answer that matched
-/// no stored draft must not tell peers their compose is empty.
-#[tokio::test]
-async fn answer_that_clears_nothing_broadcasts_nothing() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id =
-        seed_thread_awaiting_answer(&bus, &pool, "a different half-typed thought").await;
-    let mut rx = bus.subscribe();
-
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::UserQuestionAnswered {
-            tool_use_id: "tu-1".into(),
-            answer: AnswerKind::FreeText {
-                text: "yes, go ahead".into(),
-                image_hashes: vec![],
-            },
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    while let Ok(emitted) = rx.try_recv() {
-        if let BusEvent::System(SystemEvent::ThreadComposeChanged { id, .. }) = &emitted.typed {
-            assert_ne!(
-                *id, thread_id,
-                "an answer that cleared no draft must not announce an empty compose"
-            );
-        }
-    }
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// The clear is scoped to the draft that was actually submitted. A peer holding
-/// a DIFFERENT in-progress draft must keep it — unlike a send (which replaces
-/// the composer's contents by definition), answering a question says nothing
-/// about text the user is still writing elsewhere.
-#[tokio::test]
-async fn answer_leaves_a_different_stored_draft_alone() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id =
-        seed_thread_awaiting_answer(&bus, &pool, "a different half-typed thought").await;
-
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::UserQuestionAnswered {
-            tool_use_id: "tu-1".into(),
-            answer: AnswerKind::FreeText {
-                text: "yes, go ahead".into(),
-                image_hashes: vec![],
-            },
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    let (compose_text, _) = read_compose(&pool, thread_id).await;
-    assert_eq!(
-        compose_text, "a different half-typed thought",
-        "an answer that submitted other text must not wipe an unrelated draft"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// An answer carries no image hashes — the composer refuses to submit one with
-/// attachments — so a stored draft that HAS images is not the thing that was
-/// submitted, even when its text matches. Wiping it would destroy a peer's
-/// attachments; the client's supersede rule matches on text AND hashes for the
-/// same reason.
-#[tokio::test]
-async fn answer_leaves_an_image_bearing_draft_alone() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = seed_thread_awaiting_answer(&bus, &pool, "look at this").await;
-    sqlx::query(
-        "UPDATE thread_summaries SET compose_images = '[\"hash-a\"]'::jsonb WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::UserQuestionAnswered {
-            tool_use_id: "tu-1".into(),
-            answer: AnswerKind::FreeText {
-                text: "look at this".into(),
-                image_hashes: vec![],
-            },
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    let (compose_text, _) = read_compose(&pool, thread_id).await;
-    let compose_images: serde_json::Value =
-        sqlx::query_scalar("SELECT compose_images FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        compose_text, "look at this",
-        "a text-only answer must not consume a draft carrying attachments"
-    );
-    assert_eq!(
-        compose_images,
-        serde_json::json!(["hash-a"]),
-        "the peer's attachments must survive"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// A click-only answer submits no composer text at all, so it clears nothing —
-/// the draft is still the user's unsent work.
-#[tokio::test]
-async fn option_only_answer_clears_no_draft() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = seed_thread_awaiting_answer(&bus, &pool, "still writing this").await;
-
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::UserQuestionAnswered {
-            tool_use_id: "tu-1".into(),
-            answer: AnswerKind::MultiSelected {
-                option_ids: vec!["opt-a".into()],
-                text: None,
-                image_hashes: vec![],
-            },
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    let (compose_text, _) = read_compose(&pool, thread_id).await;
-    assert_eq!(
-        compose_text, "still writing this",
-        "an options-only answer submits no composer text and must clear nothing"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// A multi-select answer folds the prompt textarea's text in alongside the
-/// toggled options — that text came from the composer, so the matching draft
-/// clears just like the free-text case.
-#[tokio::test]
-async fn multi_select_answer_clears_the_draft_it_folded_in() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = seed_thread_awaiting_answer(&bus, &pool, "and also check the logs").await;
-
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::UserQuestionAnswered {
-            tool_use_id: "tu-1".into(),
-            answer: AnswerKind::MultiSelected {
-                option_ids: vec!["opt-a".into()],
-                text: Some("and also check the logs".into()),
-                image_hashes: vec![],
-            },
-        },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    let (compose_text, _) = read_compose(&pool, thread_id).await;
-    assert_eq!(
-        compose_text, "",
-        "typed text folded into a multi-select answer is a submitted draft"
-    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;

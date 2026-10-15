@@ -27,22 +27,21 @@ cron.
 | `run_coding_agent` LLM tool (agent-driven coding-agent thread; `coding_agent` preserves Claude Code vs Codex) | `coding-agent` | background, via `submit` |
 | Agent/Engine-mode `POST /api/v1/chat/stream` that starts a NEW thread (cross-workspace task POSTs, `lucidos spawn-thread`) | `sub-thread` or `coding-agent`, by `use_coding_agent`; `coding_agent` preserves Claude Code vs Codex for coding-agent rows | background, via `submit` |
 | User-initiated chat / user-typed coding-agent threads (a person typing, any workspace; follow-ups on existing threads; child→parent callbacks) | `user-chat` | user, via `acquire_user_slot` |
-| Waking a thread parked on an *event wait* (a matching event arrived, or the wait timed out) | `user-chat` | user, `acquire_user_slot` |
+| Waking a thread parked on an *event wait* (a matching event arrived, or the wait timed out) | none | not gated; a user thread counts while it runs |
 
 Not gated at all: engine recovery resumes, and mid-flight injections into an
 already-running thread (they feed an existing response, not a new one).
 
 **A parked thread occupies ZERO slots.** A thread that called `await_event` has
-ended its turn: no tokio task, no response in flight. `reconcile_user_slot`
-reads its `waiting_for_event` status and releases the slot. This is what makes
+ended its turn: no tokio task, no response in flight. Its status is
+`waiting_for_event`, not `running`, so admission does not count it. This is what makes
 the primitive safe. If parked threads held slots, they could fill the pool while
 the work that would emit their events queued behind them: a deadlock.
 
-The wake is admitted as `user-chat`, like a child-thread callback. It resumes
-work already admitted once, and a woken thread the user watches must not wait
-behind a saturated per-trigger cap. It is prioritized but still counted (ADR
-0008). So a parked *trigger* thread's wake bypasses that trigger's cap, which is
-correct: the fire was admitted when it started.
+The wake is not gated. It resumes work already admitted once, so it never
+waits for a slot, and a parked *trigger* thread's wake bypasses that trigger's
+cap: the fire was admitted when it started. A woken user-initiated thread is
+`running` again, so admission counts it until it parks or ends (ADR 0443).
 
 **Two mechanics, one pool:**
 
@@ -51,24 +50,28 @@ correct: the fire was admitted when it started.
   projection, so a restart re-queues work that never ran.
 - **User-initiated work** goes through `ThreadQueue::acquire_user_slot`. The chat
   handler runs it itself. The queue only **gates the start** (back-pressure at
-  true pool-max) and counts it. These slots are **in-memory only** and are not
-  persisted as rows (see § Persistence & restart). The panel API merges them in,
-  and a transient `ThreadQueueChanged` refreshes the panel when only user-slot
-  state moves.
+  true pool-max). Nothing is persisted as a row (see § Persistence & restart).
+  The panel API merges user occupants in, and a transient `ThreadQueueChanged`
+  refreshes the panel when only user state moves.
 
-  The user half of the pool **mirrors `thread_summaries.status`**, the
-  authoritative "is this thread running?" that the thread list reads. After the
-  gate seeds the slot, one bus subscriber reconciles it on every status-changing
-  event (`ThreadQueue::reconcile_user_slot`):
-  - A user-initiated thread that is `running` occupies exactly one slot.
-  - The slot is removed when the thread parks on the user
-    (`waiting_for_user_answer`), idles, completes, errors, or is canceled or
-    aborted.
-  - The slot is re-added when the thread resumes (the user answers a question or
-    resolves a permission prompt), is continued, or auto-resumes after a restart.
+  **User occupancy is read at each admission** from `thread_summaries.status`,
+  the authoritative "is this thread running?" that the thread list reads
+  (ADR 0443). It counts:
+  - every user-initiated thread that is `running`, once,
+  - a `running` thread an agent started, while a user message to it holds a
+    gate reservation, and
+  - each gate reservation whose thread has not started a turn yet. A
+    reservation covers the moment between the gate admitting a message and the
+    thread turning `running`.
 
-  Reconcile reads the committed status (events are observed post-commit). So the
-  pool can't drift, and the panel's "Running" set always matches thread status.
+  So a thread that parks on the user (`waiting_for_user_answer`), idles,
+  completes, errors, or is canceled or aborted counts nothing. A thread that
+  resumes, is continued, or auto-resumes after a restart counts again. A
+  follow-up to a thread that is already `running` never waits for its own slot.
+
+  One bus subscriber drains the queue when a user thread starts or stops, so a
+  freed slot is taken at once. It is a hint only: if it falls behind, it drains
+  anyway, and admission never depends on it.
 
 ## Capacity policy
 
@@ -173,6 +176,15 @@ other: they coalesce to one entry per trigger (see *Cron coalescing* above).
   runs at the fire's depth, whether admitted at once, drained after a wait, or
   re-fired after a restart. Rows written before the field carry 0, which is what
   they meant.
+- **The child's *wake mode*** for every spawn kind with a parent, already
+  resolved. A spawn that waited still applies the mode it declared. Entries
+  queued before the field carry none, so the child falls back to the wake
+  decision.
+
+**Shutdown holds trigger fires.** Once the engine begins shutting down, no
+`cron` or `event-trigger` entry is admitted, at submit, at drain or by **Run
+now**. The API its run would call back into is closing. The entry stays
+`queued` for the next engine. Spawn kinds still admit.
 
 On engine restart:
 
@@ -192,9 +204,10 @@ On engine restart:
   hands off does not take that slot: it already ran, so a sibling row that never
   ran still gets its turn.
 
-**User-initiated** slots are in-memory only: NOT persisted and NOT re-fired. A
-dead response is gone on restart (the person re-sends if they want), and the
-pool count resets to its live background occupancy.
+**User-initiated** work is NOT persisted and NOT re-fired. A dead response is
+gone on restart (the person re-sends if they want). Only gate reservations live
+in memory. A user thread a restart left `running` still counts, because
+admission reads `thread_summaries` (ADR 0443).
 
 The queue also keeps an in-memory binding from a thread to its chain depth. It
 keeps a coding-agent session's events on the chain, since they come from tasks
@@ -248,7 +261,8 @@ Every other Thread Queue notification taps through to the **Thread Queue** panel
 ## HTTP API
 
 - `GET /api/v1/thread-queue` → `{ entries, policy }`. `entries` are background
-  rows (FIFO) plus the in-memory user-initiated occupants (`kind: "user-chat"`);
+  rows (FIFO) plus the user-initiated occupants (`kind: "user-chat"`): running
+  user threads, gate reservations and waiters;
   `status` is `queued` or `admitted`. This endpoint and the `list_thread_queue`
   LLM tool read the SAME merged view (`ThreadQueue::snapshot`), so the panel and
   the tool always agree on who occupies the pool.

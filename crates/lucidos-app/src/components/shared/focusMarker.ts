@@ -2,7 +2,9 @@
  *
  *  Shared by every host navigation that lands on a specific inner element in a
  *  scroll container: a chat event or change (`scrollState.ts`), a settings
- *  item (`SettingsView.tsx`), a plugin row (`StoreTab.tsx`). A persistent
+ *  item (`SettingsView.tsx`), a plugin row (`StoreTab.tsx`), a trigger row
+ *  (`TriggersView.tsx`), and the drawer row Show in Folders lands on
+ *  (`revealThreadInFolders`). A persistent
  *  BACKGROUND HIGHLIGHT appears on the landed element and sticks until the user
  *  takes ANY action (a new marker (supersede), an explicit scroll/dismiss, a
  *  scroll gesture, a keypress, or a click), at which point it dissolves, though

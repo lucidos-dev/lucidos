@@ -1,7 +1,8 @@
 use super::agent_session::CodingAgentKind;
 use super::event_bus::SystemEvent;
 use super::git_ops::{
-    any_iframe_bundled_file_changed, git_cmd, git_ran_ok, harden_marker_state, HardenMarkerState,
+    any_iframe_bundled_file_changed, full_harden_marker_state, git_cmd, git_ran_ok,
+    HardenMarkerState,
 };
 use super::thread_events::{MessageOrigin, UnproposedReason};
 use super::LucidosEngine;
@@ -11,7 +12,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 mod apply;
+pub(crate) mod apply_claim;
 mod discard;
+#[cfg(test)]
+pub(crate) use discard::{revert_on_main, RevertTarget};
 mod proposal_hold;
 mod propose;
 mod set_aside;
@@ -20,10 +24,12 @@ pub(crate) use proposal_hold::{
 };
 #[cfg(test)]
 pub(crate) use propose::{
-    branch_moved_since_last_idle, withhold_unfinished_work, withhold_unready, HoldOutcome,
-    OpenChangeAfterHold,
+    branch_moved_since_last_idle, withhold_for_landing, withhold_unfinished_work, withhold_unready,
+    HoldOutcome, OpenChangeAfterHold,
 };
-pub(crate) use propose::{emit_change_withdrawn, emit_proposal_withheld, ProposeOutcome};
+pub(crate) use propose::{
+    emit_change_withdrawn, emit_proposal_withheld, ProposeOutcome, LANE_BRANCH_IS_NOT_A_CHANGE,
+};
 #[cfg(test)]
 pub(crate) use set_aside::withdraw_for_redecision;
 pub(crate) use set_aside::SET_ASIDE_APPLY_REFUSAL;
@@ -31,6 +37,8 @@ pub(crate) use set_aside::SET_ASIDE_APPLY_REFUSAL;
 #[path = "../change_ops_emitters.rs"]
 mod emitters;
 pub(crate) use emitters::APPLIED_IN_BROADCAST;
+#[cfg(test)]
+pub(crate) use emitters::CHANGE_APPLIED_ONCE_INDEX;
 
 // Test-only re-exports — `change_ops_tests.rs` reaches these via `use super::*`.
 // Non-test callers in the child modules import them directly.
@@ -42,7 +50,6 @@ pub(crate) use super::{ApplyResult, ApplyStatus};
 /// Information about a live agent session, sufficient for in-place merge.
 pub(crate) struct LiveSessionInfo {
     pub worktree_path: PathBuf,
-    pub idle_notify: Arc<tokio::sync::Notify>,
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
     /// Last-activity clock for the session (epoch millis), used by the async
     /// in-place conflict-merge task as its liveness source — the same signal
@@ -90,20 +97,59 @@ pub(crate) trait CodingAgentChangeOps: Send + Sync {
         actor: Option<MessageOrigin>,
     );
     async fn live_session_info(&self, thread_id: Uuid) -> Option<LiveSessionInfo>;
-    fn spawn_merge_session(&self, thread_id: Uuid, change_id: Uuid, description: &str);
+    /// The merge session holds `claim` for its whole run, so no second apply
+    /// of the change starts beside it.
+    fn spawn_merge_session(
+        &self,
+        thread_id: Uuid,
+        claim: apply_claim::ApplyClaim,
+        description: &str,
+    );
     async fn lookup_session_id_for_resume(&self, thread_id: Uuid) -> Option<String>;
     /// Resume an in-progress merge session via this agent.
     /// `resume_token` is opaque to the engine; each implementor decides what it
     /// means (Claude Code: the `session_id` to pass to `claude --resume`).
+    // The merge needs both claims, the worktree, the branch, the prompt's
+    // description and the resume token; a struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
     async fn run_merge_session_tier2(
         &self,
         thread_id: Uuid,
-        change_id: Uuid,
+        claim: &apply_claim::ApplyClaim,
+        // The apply's hold on the thread, which the merge session takes over.
+        thread_hold: crate::engine::agent_session::spawn_claim::SpawnClaim,
         wt_path: &Path,
         branch_name: &str,
         description: &str,
         resume_token: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Where an apply left `main`, for `ChangeApplied` and a later Revert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedMerge {
+    pub pre: String,
+    pub post: String,
+    /// Set when the landing lane landed the change as its own merge commit.
+    pub landing: Option<String>,
+}
+
+impl AppliedMerge {
+    pub(crate) fn new(pre: &str, post: &str) -> Self {
+        Self {
+            pre: pre.to_string(),
+            post: post.to_string(),
+            landing: None,
+        }
+    }
+
+    /// A landing merge: `main` moved from its first parent to the merge.
+    pub(crate) fn landing(first_parent: &str, merge: &str) -> Self {
+        Self {
+            landing: Some(merge.to_string()),
+            ..Self::new(first_parent, merge)
+        }
+    }
 }
 
 /// Resolved coding-agent-kind context for a change's owning thread. Read
@@ -337,7 +383,7 @@ impl super::LucidosEngine {
             .get(&thread_id)
             .filter(|s| s.is_live())
             .and_then(|s| s.conflict)
-            .map(crate::engine::types::ConflictBinding::change_id)
+            .and_then(crate::engine::types::ConflictBinding::change_id)
     }
 
     /// Record that this thread's live session is carrying `change_id`'s
@@ -370,7 +416,7 @@ pub(crate) fn bind_in_place_conflict_resolution(
     }
 }
 
-/// True iff the branch counts as hardened for Apply purposes. Marker existence
+/// True iff the branch counts as hardened for Apply purposes. A full marker
 /// (Fresh or Stale) means CC ran `/harden` at least once and is trusted; if
 /// the marker was consumed by a prior apply (Missing), fall back to the DB
 /// `hardened` flag on the open change row, pending or set aside.
@@ -380,7 +426,7 @@ pub(crate) async fn branch_is_hardened(
     repo_root: &Path,
     branch_name: &str,
 ) -> bool {
-    match harden_marker_state(pool, repo_root, branch_name).await {
+    match full_harden_marker_state(pool, repo_root, branch_name).await {
         HardenMarkerState::Fresh | HardenMarkerState::Stale => true,
         HardenMarkerState::Missing => match changes.get_open_by_branch(branch_name).await {
             Ok(Some(c)) => c.hardened,
@@ -581,26 +627,7 @@ pub(crate) async fn revert_with_shas(
                 .into())
             }
         };
-        match git_cmd(
-            &[
-                "revert",
-                post_sha,
-                "-m",
-                &parent_num.to_string(),
-                "--no-edit",
-            ],
-            repo_root,
-        )
-        .await
-        {
-            Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                let _ = git_cmd(&["revert", "--abort"], repo_root).await;
-                Err(format!("Revert failed (conflicts): {}", stderr).into())
-            }
-            Err(e) => Err(format!("Revert error: {}", e).into()),
-        }
+        revert_merge(repo_root, post_sha, parent_num).await
     } else {
         // `git revert pre..post` refuses a range holding a merge commit, and
         // the `/harden` merge of main (ADR 0345) often sits inside it. So
@@ -624,6 +651,38 @@ pub(crate) async fn revert_with_shas(
             }
             Err(e) => Err(format!("Revert error: {}", e).into()),
         }
+    }
+}
+
+/// Revert exactly one landing merge: the change it landed, and nothing that
+/// landed beside it. Its first parent is `main` before the landing.
+pub(crate) async fn revert_landing_merge(
+    repo_root: &Path,
+    landing_merge_sha: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    revert_merge(repo_root, landing_merge_sha, 1).await
+}
+
+/// `git revert -m <parent_num>` of one merge commit, aborted on a conflict.
+async fn revert_merge(
+    repo_root: &Path,
+    merge_sha: &str,
+    parent_num: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let parent = parent_num.to_string();
+    match git_cmd(
+        &["revert", merge_sha, "-m", &parent, "--no-edit"],
+        repo_root,
+    )
+    .await
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let _ = git_cmd(&["revert", "--abort"], repo_root).await;
+            Err(format!("Revert failed (conflicts): {}", stderr).into())
+        }
+        Err(e) => Err(format!("Revert error: {}", e).into()),
     }
 }
 

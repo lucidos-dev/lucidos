@@ -113,3 +113,17 @@ navigation.
 **A yield guard, so a tween stands down for a competing scroll.** Rejected for
 the chevrons, because an explicit tap must always reach its target. The
 stand-downs that do exist are narrow and named at their call sites.
+
+## Amendment: the start is re-based, never re-read
+
+The start is still read from `scrollTop` once, on the first frame, and never
+again. It can be re-based without a read. An anchor write shifts it by its own
+delta (`_shiftTweenStart`). A submit's landing that freezes mid-glide solves it
+so the next frame eases on from the last written position toward the frozen
+target (`_continueTweenTo`). The position stays continuous and the reader never
+steps back. The velocity can change at that frame, a cost taken knowingly.
+
+A landing's target function also runs its hold before each frame (ADR 0080).
+The hold can end the tween, or start another for a side question. So a step
+whose target read ended its own tween stops there (`_endedTweens`), and one
+tween still runs at a time.

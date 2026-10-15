@@ -154,10 +154,14 @@ Run the suites for the layers you touched.
 |---|---|
 | Rust (`.rs`, `Cargo.toml`, `.sql`) | `make test` (engine tests against a disposable Postgres) |
 | HTTP API surface | also `./scripts/e2e-api.sh` |
-| TypeScript / frontend | `cd crates/lucidos-app && npx tsc --noEmit && npm test` |
+| TypeScript / frontend | `cd crates/lucidos-app && npm run typecheck && npm test` |
 | UI behaviour / flows | `./scripts/e2e-browser.sh` |
 | Everything, end to end | `./scripts/e2e.sh` (API + browser + WASM + embedder) |
 | Docs / CSS only | no tests needed |
+
+Generated files (`src/generated/`, the SDK's `dist/`) are build outputs.
+`./scripts/codegen.sh` writes them; the launchers, Vite and the npm scripts
+above run it for you.
 
 > Don't run bare `cargo test -p lucidos-engine`. The integration tests need a
 > real Postgres, and `make test` (`./scripts/test-engine.sh`) provisions one.

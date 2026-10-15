@@ -1054,6 +1054,7 @@ fn an_agent_archive_names_what_it_left_open() {
         ArchiveOutcome {
             archived: vec![target, child],
             skipped: vec![pinned_skip.clone()],
+            ..ArchiveOutcome::default()
         },
     )
     .expect("the target was archived");
@@ -1067,6 +1068,7 @@ fn an_agent_archive_names_what_it_left_open() {
         ArchiveOutcome {
             archived: vec![],
             skipped: vec![pinned_skip],
+            ..ArchiveOutcome::default()
         },
     )
     .expect("an already archived target is not an error");
@@ -1080,6 +1082,7 @@ fn an_agent_archive_names_what_it_left_open() {
             skipped: vec![serde_json::json!({
                 "thread_id": target, "reason": "not_archivable", "message": "changed"
             })],
+            ..ArchiveOutcome::default()
         },
     )
     .expect_err("a target left open is an error");

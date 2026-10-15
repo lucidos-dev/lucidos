@@ -39,7 +39,7 @@ from that carried value.** Three carriers, one per kind of boundary:
 - **The HMAC-signed agent-origin token**, for a subprocess's HTTP emit.
 
 **A spawn does not consume a hop.** Work a fire hands off runs at the fire's own
-depth. A hop is a trigger fire, counted once in `handle_domain_event`.
+depth. A hop is a trigger fire, counted once in `fire_matching_triggers`.
 
 **The ceiling moves to `CapacityPolicy::max_event_trigger_depth`, default 5**,
 and a fire the cap stops now raises a notification.

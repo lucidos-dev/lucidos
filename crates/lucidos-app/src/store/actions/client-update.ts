@@ -1,4 +1,5 @@
-import { updateAvailable, showToast, removeToast, dismissToast, preferences } from '../store';
+import { updateAvailable, showToast, removeToast, dismissToast } from '../store';
+import { preferencesSettled } from './preferences';
 import {
   getServedBuildId,
   refreshClient,
@@ -85,7 +86,7 @@ export async function syncClientUpdateFromBuild(): Promise<void> {
   // already-dismissed toast on cold start; startClient re-runs this right after
   // loadPreferences, and resume / PreferencesChanged re-derive thereafter. A
   // 'failed' load proceeds (fail-open surfacing is the safe default).
-  if (preferences.value.status === 'not-loaded' || preferences.value.status === 'loading') return;
+  if (!preferencesSettled.value) return;
   const served = await getServedBuildId();
   if (served === null) return; // couldn't determine — leave badge + toast unchanged
   const stale = served !== CLIENT_BUILD_ID;

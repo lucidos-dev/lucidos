@@ -266,8 +266,9 @@ pub struct Change {
     /// commit list. `None` for a single-commit change and until it lands.
     pub summary: Option<String>,
     /// `true` when nobody saw the work finish: the archive net's set-aside
-    /// rows, and rows from before ADR 0400. Bring back withdraws such a row
-    /// instead of making it pending.
+    /// rows, set-aside integrated work whose last turn did not finish, and
+    /// rows from before ADR 0400. Bring back withdraws such a row instead of
+    /// making it pending.
     pub incomplete: bool,
 }
 

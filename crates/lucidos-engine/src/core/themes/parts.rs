@@ -258,6 +258,9 @@ pub fn check_shape(label: &str, value: &serde_json::Value) -> ThemeResult<()> {
     Ok(())
 }
 
+#[path = "parts_codegen.rs"]
+pub(crate) mod codegen;
+
 #[cfg(test)]
 #[path = "parts_tests.rs"]
 mod tests;

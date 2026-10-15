@@ -2,6 +2,7 @@ import { effect } from '@preact/signals';
 import { focusedThreadId, threadsLoaded } from '../store';
 import { homeThreadId } from './homeThread';
 import { focusThread } from './threads';
+import { landNextHomeOnBoard } from '../homeBoard';
 
 /** Which thread a cold start opens, or `null` to leave the focus alone.
  *
@@ -33,7 +34,11 @@ export function openHomeOnColdStart(storedFocus: boolean): () => void {
     });
     // Bookkeeping, not a navigation: the cold start already shows the thread
     // pane, and a reveal would swipe a phone that opened somewhere else.
-    if (target) focusThread(target, { revealPane: false });
+    if (target) {
+      // A phone lands on Home's board face (ADR 0432).
+      landNextHomeOnBoard();
+      focusThread(target, { revealPane: false });
+    }
   });
   return stop;
 }

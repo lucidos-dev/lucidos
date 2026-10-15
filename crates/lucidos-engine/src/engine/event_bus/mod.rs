@@ -145,26 +145,51 @@ pub struct EmittedEvent {
     /// running. Resolved by [`emit_depth`] from the emitting task's scope and
     /// the Thread Queue's per-thread registration, whichever is deeper.
     ///
-    /// Broadcast-only, and never persisted: it describes the work, not the
-    /// event. The scheduler dispatches a thread event at this depth. That is
-    /// what makes the depth cap engage for a chain across triggers, where A's
-    /// fire wakes B and B's fire wakes A. It reaches a chain routed through
-    /// spawned work too, unlike `emitting_trigger_id` below. A domain event
-    /// carries the same number on its own variant, and the scheduler reads it
-    /// from there. That field is `skip_serializing` too, so the stored row
-    /// carries no depth and a replay cannot reconstruct one.
+    /// The scheduler dispatches a thread event at this depth. That is what
+    /// makes the depth cap engage for a chain across triggers, where A's fire
+    /// wakes B and B's fire wakes A. It reaches a chain routed through spawned
+    /// work too, unlike `emitting_trigger_id` below. A domain event carries its
+    /// own depth on the variant instead: see [`Self::trigger_chain_depth`].
+    ///
+    /// The stored row records the dispatch depth in `trigger_chain_depth`, so a
+    /// lagged scheduler's replay dispatches at the depth the live frame had.
     pub depth: u32,
     /// Which trigger's fire emitted this, if any. Read from
     /// `scheduler::user_tasks::current_trigger_id`, or stated outright by a
     /// caller of [`EventBus::emit_as_trigger`].
     ///
-    /// Broadcast-only and never persisted: it describes the emitting task, not
-    /// the event, so it is absent from the stored row and from every replay
-    /// path. The scheduler drops this trigger from the matches, so a trigger is
-    /// never woken by an event its own fire emitted. Absent means no
-    /// suppression, which is the direction to fail in: an extra wake, never a
+    /// The scheduler drops this trigger from the matches, so a trigger is never
+    /// woken by an event its own fire emitted. The stored row records it in
+    /// `emitting_trigger_id`, so a replay suppresses the same wake. Absent means
+    /// no suppression, which is the direction to fail in: an extra wake, never a
     /// missing one. See `docs/adr/0137-a-trigger-never-wakes-itself.md`.
     pub emitting_trigger_id: Option<String>,
+}
+
+/// The depth the trigger matcher dispatches `event` at, given the depth of the
+/// frame that carries it.
+///
+/// A domain event reads its own variant's depth, set when it was built. Every
+/// other event reads the frame's. `persist` stores the same answer, so a replay
+/// dispatches at the live depth.
+pub(crate) fn trigger_chain_depth(event: &BusEvent, frame_depth: u32) -> u32 {
+    match event {
+        BusEvent::System(se) => system_trigger_chain_depth(se, frame_depth),
+        BusEvent::Thread { .. } => thread_trigger_chain_depth(frame_depth),
+    }
+}
+
+/// [`trigger_chain_depth`] for a thread event.
+fn thread_trigger_chain_depth(frame_depth: u32) -> u32 {
+    frame_depth
+}
+
+/// [`trigger_chain_depth`] for a system event.
+fn system_trigger_chain_depth(event: &SystemEvent, frame_depth: u32) -> u32 {
+    match event {
+        SystemEvent::DomainEvent { depth, .. } => *depth,
+        _ => frame_depth,
+    }
 }
 
 /// The chain depth an event belongs to, resolved from both carriers.
@@ -182,6 +207,29 @@ fn emit_depth(event: &BusEvent) -> u32 {
         BusEvent::Thread { thread_id, .. } => thread_emit_depth(*thread_id),
         BusEvent::System(_) => current_event_trigger_depth(),
     }
+}
+
+/// The events row one append writes.
+struct NewEventRow<'a> {
+    id: Uuid,
+    aggregate: &'a str,
+    aggregate_id: &'a str,
+    event_type: &'a str,
+    payload: &'a serde_json::Value,
+    /// What the broadcast carries to the trigger matcher, so a replay of the
+    /// row dispatches the same way: the depth and the emitting trigger.
+    trigger_chain_depth: u32,
+    emitting_trigger_id: Option<&'a str>,
+}
+
+/// A system event whose row has committed and whose broadcast has not gone out.
+struct CommittedSystemEvent {
+    event_id: Uuid,
+    seq: i64,
+    event: SystemEvent,
+    depth: u32,
+    emitting_trigger_id: Option<String>,
+    ticket: AppendTicket,
 }
 
 /// [`emit_depth`] for a caller that has the thread id but no `BusEvent` yet.
@@ -240,12 +288,29 @@ mod parent_wake_hold;
 use parent_wake_hold::ParentWakeHold;
 
 mod parent_callback;
-pub(crate) use parent_callback::ChildSettle;
+pub(crate) use parent_callback::{batch_still_working_sql, ChildSettle, Delivery};
 
 mod append_horizon;
 pub(crate) use append_horizon::committed_event_horizon;
+use append_horizon::Append;
+
+mod append_ticket;
+
+#[cfg(test)]
+mod test_rows;
+use append_ticket::{AppendTicket, AppendTickets};
+
+mod lag_replay;
+use lag_replay::UnbroadcastRows;
+pub(crate) use lag_replay::{LagReplay, ReplayScope, ReplayWindow};
 
 impl EmittedEvent {
+    /// The depth the trigger matcher dispatches this frame at. See
+    /// [`trigger_chain_depth`].
+    pub(crate) fn trigger_chain_depth(&self) -> u32 {
+        trigger_chain_depth(&self.typed, self.depth)
+    }
+
     /// Convert to SSE-compatible JSON string.
     /// Thread events use `{ "type": "ThreadEvent", "data": { thread_id, seq?, event } }`.
     /// System events serialize directly via serde `#[serde(tag = "type", content = "data")]`.
@@ -310,6 +375,38 @@ pub struct EmitResult {
     pub event_id: Uuid,
     /// Auto-assigned DB sequence number.
     pub seq: i64,
+    /// The thread's `summary_version` right after this event's projection,
+    /// read from the aggregate this emit broadcast. `None` for a system event,
+    /// which has no thread row. A write that answers with it lets the client
+    /// hold its optimistic state until that version arrives (ADR 0437).
+    pub summary_version: Option<i64>,
+}
+
+/// Whether a failed [`EventBus::emit`] lost at the unique index `index`.
+///
+/// An index such as `events_owner_approval_spent_unique` is a claim: the emit
+/// that loses it is a refused caller, not a broken store.
+pub(crate) fn violates_unique_index(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+    index: &str,
+) -> bool {
+    error
+        .downcast_ref::<sqlx::Error>()
+        .and_then(sqlx::Error::as_database_error)
+        .and_then(|db| db.constraint())
+        == Some(index)
+}
+
+/// A thread event that [`EventBus::append_thread_events`] has persisted and
+/// projected inside its transaction, waiting for the commit to publish it.
+struct StagedThreadEvent {
+    event_id: Uuid,
+    seq: i64,
+    event: ThreadEvent,
+    meta: EventMeta,
+    aggregate: Option<crate::core::store::ThreadAggregate>,
+    ancestor_aggregates: Vec<crate::core::store::ThreadAggregate>,
+    side_effects: Vec<BusEvent>,
 }
 
 /// Wake-up signal the child→parent fan-in fires when a child thread reaches
@@ -339,6 +436,19 @@ pub struct ParentCallback {
     pub parent_is_coding_agent: bool,
 }
 
+/// A spawn command the bus sends after commit, on a directed channel the spawn
+/// dispatcher drains. A broadcast lag cannot drop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnRequest {
+    /// Re-enter an interrupted coding-agent session with `--resume`, sending
+    /// the continuation text in place of a new user message.
+    Continue {
+        thread_id: Uuid,
+        /// The `ContinuationRequested` event id: the idempotency key.
+        event_id: Uuid,
+    },
+}
+
 /// Trait for emitting domain events. Extracted from `EventBus` to allow
 /// mock implementations in tests.
 #[async_trait]
@@ -350,11 +460,11 @@ pub trait EventBusEmitter: Send + Sync {
 }
 
 /// Channel capacity for the event broadcast.
-const BUS_CAPACITY: usize = 4096;
+pub(crate) const BUS_CAPACITY: usize = 4096;
 
 /// Advisory-lock class for [`EventBus::lock_thread_append`]. The two-key form
 /// keeps it apart from the one-key locks elsewhere in the engine.
-const THREAD_APPEND_LOCK_CLASS: i32 = 0x6170_6e64;
+pub const THREAD_APPEND_LOCK_CLASS: i32 = 0x6170_6e64;
 
 /// Single entry point for every domain event. Carries two distinct contracts:
 ///
@@ -367,16 +477,17 @@ const THREAD_APPEND_LOCK_CLASS: i32 = 0x6170_6e64;
 /// The transaction opens with [`EventBus::begin_append`], before any phase. Its
 /// in-flight append lock is what makes a committed horizon readable (ADR 0364).
 ///
+/// An *atomic emit* ([`EventBus::emit_atomically`]) runs phases 1 to 4 once per
+/// event inside one transaction, then PostCommit for all of them.
+///
 /// 0. **Serialize** — take the thread append lock, the transaction's second
 ///    lock after the in-flight append lock. A thread's events therefore commit
 ///    in sequence order, which every `sequence > after` catch-up relies on
 ///    (ADR 0360).
 /// 1. **Validate** — pre-INSERT checks (e.g. `request_event_id` existence) that
 ///    read the same tx snapshot the upcoming Persist will use. May short-circuit
-///    with `Err` before any events row is written, or with `Ok(None)` for the
-///    `ChangeApplied` single-fire guard, which `FOR UPDATE`-locks the change row
-///    and drops a duplicate apply so one change can't emit two `ChangeApplied`
-///    events.
+///    with `Err` before any events row is written, or with `Ok(None)` for an
+///    event a guard drops (a stale reply sighting, a moved child's card).
 /// 2. **Persist** — INSERT into the `events` table. Assigns the bigserial
 ///    sequence that drives every downstream consumer's ordering.
 /// 3. **Project** — update derived state (`thread_summaries` and friends) in
@@ -389,17 +500,17 @@ const THREAD_APPEND_LOCK_CLASS: i32 = 0x6170_6e64;
 ///    this event's post-state — no race with a concurrent emit committing
 ///    between the projection update and the broadcast.
 /// 5. **PostCommit** — commit the tx, then fan out: broadcast on `event_tx` to
-///    `subscribe()` consumers, rebroadcast each affected ancestor's aggregate,
+///    `subscribe()` consumers, send a `ContinuationRequested` on
+///    `spawn_request_tx`, rebroadcast each affected ancestor's aggregate,
 ///    wake the parent agent session via `parent_callback_tx`, and replay
 ///    Project's side-effects via recursive `emit()` calls.
 ///
-/// New code added inside `emit()` must declare which phase it belongs to by
-/// placing it under the matching banner. Phases 0–4 share one transaction —
-/// they cannot be moved out without breaking validate-reads-projection or the
-/// CaptureAggregate read-your-write guarantee. The system-event arm and
-/// transient arms are simplified variants of the thread persisted arm and run
-/// the relevant subset (no Serialize or Validate for system events, no
-/// CaptureAggregate for transient events).
+/// The banners live in `append_thread_events`. New code there declares its
+/// phase by sitting under the matching banner. Phases 0 to 4 share one
+/// transaction, which validate-reads-projection and the CaptureAggregate
+/// read-your-write guarantee both need. `append_system_event` and the
+/// transient arms run a subset: no Serialize or Validate for system events,
+/// and no CaptureAggregate for transient events.
 ///
 /// # Post-commit subscriber contract
 ///
@@ -409,12 +520,19 @@ const THREAD_APPEND_LOCK_CLASS: i32 = 0x6170_6e64;
 ///   get a [`broadcast::Receiver<EmittedEvent>`]. Every subscriber observes
 ///   every event after `tx.commit()`. No ordering between subscribers is
 ///   guaranteed. Channel capacity is [`BUS_CAPACITY`]; slow subscribers receive
-///   `RecvError::Lagged` and must reconcile via a full state refresh.
+///   `RecvError::Lagged`, and a lag must never drop work. A subscriber that
+///   mirrors state re-reads it. One that acts per event subscribes through
+///   [`LagReplay::subscribe`] and replays the rows it missed, as the scheduler
+///   does for trigger fires.
 /// - **Parent callbacks** — directed (not broadcast). The child→parent fan-in
 ///   sent on `parent_callback_tx` wakes the parent agent session's runtime
 ///   when a child thread reaches a terminal event. The lone consumer is the
 ///   `ParentCallback` receiver returned from [`EventBus::new`]; the channel is
 ///   unbounded.
+/// - **Spawn requests** — directed, unbounded. Every committed
+///   `ContinuationRequested` sends a [`SpawnRequest`] to the one consumer that
+///   took [`EventBus::take_spawn_requests`]. The channel exists from `new`, so
+///   a request emitted before the consumer starts waits for it.
 ///
 /// The bus does not run projections in subscribers. Projections are part of
 /// the write (Phase 3) and must observe read-your-write against the same tx as
@@ -433,6 +551,11 @@ pub struct EventBus {
     /// PostCommit via `notify_parent_if_child` when a child thread reaches a
     /// terminal event so the parent agent session wakes its run-loop.
     parent_callback_tx: mpsc::UnboundedSender<ParentCallback>,
+    spawn_request_tx: mpsc::UnboundedSender<SpawnRequest>,
+    /// The receiving end of `spawn_request_tx`, until the spawn dispatcher
+    /// takes it. Shared so every clone of the bus hands out the same one.
+    spawn_request_rx:
+        std::sync::Arc<std::sync::Mutex<Option<mpsc::UnboundedReceiver<SpawnRequest>>>>,
     changes_projection: crate::core::changes_projection::ChangesProjection,
     /// Children the engine is about to auto-resume, so `notify_parent_if_child`
     /// withholds their completion card. See [`AutoResumeHolds`].
@@ -440,12 +563,21 @@ pub struct EventBus {
     /// Parent wakes queued during boot recovery and teardown. See
     /// [`ParentWakeHold`].
     parent_wake_hold: ParentWakeHold,
+    /// Rows written without a broadcast. A [`LagReplay`] skips them, because
+    /// no live subscriber saw them and none was meant to.
+    unbroadcast: UnbroadcastRows,
+    /// Every persisted append in flight. A [`LagReplay`] opens from them.
+    append_tickets: AppendTickets,
+    /// Threads running a *cache keep-alive* turn, whose output the projection
+    /// skips. See [`projection::keep_alive`].
+    keep_alive_turns: projection::keep_alive::KeepAliveTurns,
 }
 
 impl EventBus {
     pub fn new(pool: PgPool) -> (Self, mpsc::UnboundedReceiver<ParentCallback>) {
         let (event_tx, _) = broadcast::channel(BUS_CAPACITY);
         let (parent_callback_tx, parent_callback_rx) = mpsc::unbounded_channel();
+        let (spawn_request_tx, spawn_request_rx) = mpsc::unbounded_channel();
         let changes_projection =
             crate::core::changes_projection::ChangesProjection::new(pool.clone());
         (
@@ -453,9 +585,16 @@ impl EventBus {
                 pool,
                 event_tx,
                 parent_callback_tx,
+                spawn_request_tx,
+                spawn_request_rx: std::sync::Arc::new(std::sync::Mutex::new(Some(
+                    spawn_request_rx,
+                ))),
                 changes_projection,
                 auto_resume_holds: AutoResumeHolds::default(),
                 parent_wake_hold: ParentWakeHold::default(),
+                unbroadcast: UnbroadcastRows::default(),
+                append_tickets: AppendTickets::default(),
+                keep_alive_turns: Default::default(),
             },
             parent_callback_rx,
         )
@@ -495,6 +634,21 @@ impl EventBus {
             }
         }
         count
+    }
+
+    /// The receiver every committed `ContinuationRequested` is sent to. `None`
+    /// once taken: the spawn dispatcher is its one consumer.
+    pub(crate) fn take_spawn_requests(&self) -> Option<mpsc::UnboundedReceiver<SpawnRequest>> {
+        self.spawn_request_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn send_spawn_request(&self, request: SpawnRequest) {
+        if let Err(e) = self.spawn_request_tx.send(request) {
+            crate::log!("[EventBus] Spawn request has no consumer: {:?}", e.0);
+        }
     }
 
     pub fn changes_projection(&self) -> &crate::core::changes_projection::ChangesProjection {
@@ -615,12 +769,14 @@ impl EventBus {
 
     /// Take `thread_id`'s *thread append lock*, held until the transaction
     /// ends. Every append of a row carrying a `thread_id` takes it, so a
-    /// thread's events commit in sequence order (ADR 0360).
+    /// thread's events commit in sequence order (ADR 0360). *Admission* takes
+    /// it too, so an input's place and the thread's appends share one order
+    /// (ADR 0449).
     ///
     /// **Only the in-flight append lock may come before it.** A waiter then
     /// holds just its own in-flight key, which only a horizon read waits on, so
     /// it cannot close a deadlock cycle (ADR 0364).
-    async fn lock_thread_append(
+    pub(crate) async fn lock_thread_append(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         thread_id: Uuid,
     ) -> Result<(), sqlx::Error> {
@@ -637,28 +793,33 @@ impl EventBus {
     /// `created` is `clock_timestamp()`, not the transaction start: a thread
     /// event's transaction may have waited for its append lock, and its stamp
     /// must not precede the event it queued behind.
+    ///
+    /// Depth 0 and no emitting trigger are stored as `NULL`, which is how
+    /// every older row reads.
     async fn persist(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        event_id: Uuid,
-        aggregate: &str,
-        aggregate_id: &str,
-        event_type: &str,
-        payload: &serde_json::Value,
+        ticket: &AppendTicket,
+        row: NewEventRow<'_>,
     ) -> Result<i64, sqlx::Error> {
         let seq: i64 = sqlx::query_scalar(
-            r#"INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id)
+            r#"INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id,
+                                   trigger_chain_depth, emitting_trigger_id)
                VALUES ($1, $2, $3, $4, $5, clock_timestamp(),
-                       CASE WHEN $2 = 'thread' THEN $3::uuid ELSE NULL END)
+                       CASE WHEN $2 = 'thread' THEN $3::uuid ELSE NULL END,
+                       NULLIF($6, 0), $7)
                RETURNING sequence"#,
         )
-        .bind(event_id)
-        .bind(aggregate)
-        .bind(aggregate_id)
-        .bind(event_type)
-        .bind(payload)
+        .bind(row.id)
+        .bind(row.aggregate)
+        .bind(row.aggregate_id)
+        .bind(row.event_type)
+        .bind(row.payload)
+        .bind(i32::try_from(row.trigger_chain_depth).unwrap_or(i32::MAX))
+        .bind(row.emitting_trigger_id)
         .fetch_one(&mut **tx)
         .await?;
+        ticket.learned(seq);
 
         Ok(seq)
     }
@@ -712,7 +873,7 @@ impl EventBus {
             created,
             broadcast,
         } = replay;
-        let mut tx = self.begin_append().await?;
+        let Append { mut tx, ticket } = self.begin_append().await?;
         if let Some(thread_id) = thread_id {
             Self::lock_thread_append(&mut tx, thread_id).await?;
         }
@@ -731,6 +892,9 @@ impl EventBus {
         .bind(created)
         .fetch_optional(&mut *tx)
         .await?;
+        if let Some(seq) = seq {
+            ticket.learned(seq);
+        }
         tx.commit().await?;
 
         // Broadcast on the bus so subscribers observe the replay. Only emit
@@ -750,25 +914,31 @@ impl EventBus {
         // scan a moment later rather than never, and the scan is what covers
         // this path anyway: a backfill runs at startup, where the wait cache is
         // still being rebuilt.
+        if let (Some(seq_val), false) = (seq, broadcast) {
+            self.unbroadcast.record(seq_val);
+        }
         if let (Some(seq_val), true) = (seq, broadcast) {
-            let _ = self.event_tx.send(EmittedEvent {
-                event_id,
-                seq: Some(seq_val),
-                created: Utc::now(),
-                typed: BusEvent::System(SystemEvent::DomainEvent {
-                    event_type: event_type.to_string(),
-                    payload: payload.clone(),
+            ticket.send(
+                &self.event_tx,
+                EmittedEvent {
+                    event_id,
+                    seq: Some(seq_val),
+                    created: Utc::now(),
+                    typed: BusEvent::System(SystemEvent::DomainEvent {
+                        event_type: event_type.to_string(),
+                        payload: payload.clone(),
+                        depth: 0,
+                        transient: false,
+                        actor: None,
+                    }),
+                    aggregate: None,
+                    // A backfill is not a link in anyone's trigger chain, and the
+                    // variant above says the same thing. No trigger owns it either,
+                    // so it wakes every subscriber it matches.
                     depth: 0,
-                    transient: false,
-                    actor: None,
-                }),
-                aggregate: None,
-                // A backfill is not a link in anyone's trigger chain, and the
-                // variant above says the same thing. No trigger owns it either,
-                // so it wakes every subscriber it matches.
-                depth: 0,
-                emitting_trigger_id: None,
-            });
+                    emitting_trigger_id: None,
+                },
+            );
         }
 
         Ok(seq)
@@ -841,307 +1011,48 @@ impl EventBus {
         // and not something a later hop happens to be running under. Every
         // branch below stamps the same value onto its broadcast.
         let depth = emit_depth(&event);
-        match &event {
+        let event = match event {
             BusEvent::Thread {
                 thread_id,
                 event: te,
                 meta,
-            } => {
-                if te.is_persisted() {
-                    let event_id = meta.event_id.unwrap_or_else(Uuid::new_v4);
-                    let mut tx = self.begin_append().await?;
-
-                    // === Phase: Serialize ===
-                    // Right after the in-flight lock and before any other
-                    // statement: Validate's row locks must never be held by a
-                    // transaction waiting here.
-                    Self::lock_thread_append(&mut tx, *thread_id).await?;
-
-                    // === Phase: Validate ===
-                    // Pre-INSERT checks that read the same tx snapshot the upcoming
-                    // Persist will use. May short-circuit with Err before any events
-                    // row is written, or with Ok(None) for the ChangeApplied
-                    // single-fire guard (a recognized duplicate is dropped, not an
-                    // error). See the EventBus struct doc-comment for the full phase
-                    // contract.
-                    //
-                    // Validate request_event_id exists in the DB. Orphaned references
-                    // cause stuck threads when the frontend can't group events into
-                    // exchanges. Log loudly so callers fix their origin_id handling.
-                    if let Some(ref req_id) = meta.request_event_id {
-                        let exists: bool =
-                            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE id = $1)")
-                                .bind(req_id)
-                                .fetch_one(&mut *tx)
-                                .await
-                                .unwrap_or(false);
-                        if !exists {
-                            crate::log!(
-                                "[EventBus] WARNING: request_event_id {} does not exist in events table \
-                                 (event_type={}, thread_id={}). This causes orphaned event references.",
-                                req_id, te.event_type(), thread_id
-                            );
-                        }
-                    }
-
-                    // Single-fire guard for ChangeApplied: claim the change row
-                    // (`FOR UPDATE`) and suppress the emit if a ChangeApplied was
-                    // already recorded for this change_id. Every apply path funnels
-                    // its ChangeApplied through this one chokepoint, so the guard
-                    // makes the event idempotent across concurrent double-fires
-                    // (the ~0.6s race), HTTP/Apply-All retries, conflict-recovery
-                    // cleanup, and post-restart recovery re-emits (the 4-minute-gap
-                    // case) — fixing two "Change applied" timeline entries for one
-                    // change. The lock is held until this tx commits and Phase
-                    // Project's `write_applied` flips the row to `applied`, so a
-                    // racing emit blocks, then reads `applied` and is suppressed.
-                    // Legitimate single emits (recovery no-ops, rows with no
-                    // aggregate) run while the row is still pending or absent and
-                    // therefore `Proceed`, emitting exactly once.
-                    if let ThreadEvent::ChangeApplied { change_id, .. } = te {
-                        use crate::core::changes_projection::{
-                            ChangeApplyDedup, ChangesProjection,
-                        };
-                        if ChangesProjection::change_apply_dedup(&mut tx, change_id).await?
-                            == ChangeApplyDedup::Suppress
-                        {
-                            tx.rollback().await?;
-                            crate::log!(
-                                "[EventBus] ChangeApplied suppressed for {} — already applied \
-                                 (duplicate apply path)",
-                                change_id
-                            );
-                            return Ok(None);
-                        }
-                    }
-
-                    // A sighting counts only for the request the client saw
-                    // (ADR 0409). The thread append lock above orders it against
-                    // a new `ThreadReadRequested`. So this read drops a duplicate,
-                    // and a sighting older than a newer request.
-                    if let ThreadEvent::ThreadReplySeen { seen_version } = te {
-                        let row: Option<(bool, i64)> = sqlx::query_as(
-                            "SELECT read_requested, summary_version FROM thread_summaries \
-                             WHERE thread_id = $1",
-                        )
-                        .bind(thread_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                        if row != Some((true, *seen_version)) {
-                            tx.rollback().await?;
-                            crate::log!(
-                                "[EventBus] ThreadReplySeen dropped for {}: the request it \
-                                 saw is gone or newer",
-                                thread_id
-                            );
-                            return Ok(None);
-                        }
-                    }
-
-                    // A thread waiting on the user is never archived, and the
-                    // home thread is never archived, whoever emits the archive
-                    // (ADR 0259, ADR 0362).
-                    if matches!(te, ThreadEvent::ThreadArchived) {
-                        Self::check_archive_allowed(&mut tx, thread_id).await?;
-                    }
-
-                    // Nothing titles the home thread automatically, whoever
-                    // emits the title. A rename by hand is `ThreadTitleRenamed`
-                    // and lands (ADR 0362).
-                    if matches!(te, ThreadEvent::ThreadTitleGenerated { .. }) {
-                        Self::check_title_generated_allowed(&mut tx, thread_id).await?;
-                    }
-
-                    // A card for a child moved to top level is dropped, not
-                    // delivered (ADR 0278). The fan-in read the edge before this
-                    // transaction began, so a detach can land in between. A
-                    // move whose edge is already gone is dropped the same way,
-                    // so the former parent records each move once.
-                    let dropped_child = match te {
-                        ThreadEvent::ChildThreadCompleted {
-                            child_thread_id, ..
-                        }
-                        | ThreadEvent::ChildThreadStopped {
-                            child_thread_id, ..
-                        } => Self::child_was_moved_out(&mut tx, *thread_id, *child_thread_id)
-                            .await?
-                            .then_some(*child_thread_id),
-                        ThreadEvent::ChildThreadDetached {
-                            child_thread_id, ..
-                        } => (!Self::lock_edge_for_detach(&mut tx, *thread_id, *child_thread_id)
-                            .await?)
-                            .then_some(*child_thread_id),
-                        _ => None,
-                    };
-                    if let Some(child_thread_id) = dropped_child {
-                        tx.rollback().await?;
-                        crate::log!(
-                            "[EventBus] {} suppressed on {}: child {} is not its child",
-                            te.event_type(),
-                            thread_id,
-                            child_thread_id
-                        );
-                        return Ok(None);
-                    }
-
-                    // === Phase: Persist ===
-                    // INSERT into the events table. Assigns the bigserial sequence
-                    // that drives ordering for every downstream consumer (SSE
-                    // catch-up, history queries, projection backfills).
-                    let seq = self
-                        .persist(
-                            &mut tx,
-                            event_id,
-                            "thread",
-                            &thread_id.to_string(),
-                            te.event_type(),
-                            &te.to_payload(meta),
-                        )
-                        .await?;
-                    // === Phase: Project ===
-                    // Update derived state (`thread_summaries` and friends) in the
-                    // same tx, so the next Validate (on a concurrent emit) and the
-                    // upcoming CaptureAggregate phase observe read-your-write.
-                    // Cascades through parent rollup (`propagate_blocking_change`)
-                    // internally; returns side-effect events to fire in PostCommit
-                    // and the list of ancestor thread_ids whose
-                    // `blocking_descendant_count` changed.
-                    let (side_effects, affected_ancestors) = self
-                        .update_thread_projection(&mut tx, *thread_id, te, meta)
-                        .await?;
-                    // === Phase: CaptureAggregate ===
-                    // In-tx read-your-write fetches of the emitting thread's
-                    // aggregate plus each affected ancestor's aggregate. Captured
-                    // here (still inside the tx) so the snapshots cannot race
-                    // with a concurrent emit committing between the projection
-                    // update and a post-commit fetch — every subscriber sees an
-                    // aggregate that matches exactly this event's post-state.
-                    // A failed fetch logs and broadcasts without aggregate
-                    // (frontend tolerates absence with a warning, but it
-                    // indicates a backend bug).
-                    let aggregate = match crate::core::store::fetch_thread_aggregate(
-                        &mut *tx, *thread_id,
-                    )
-                    .await
-                    {
-                        Ok(agg) => agg,
-                        Err(e) => {
-                            crate::log!(
-                                "[EventBus] Failed to fetch ThreadAggregate for {}: {}",
-                                thread_id,
-                                e
-                            );
-                            None
-                        }
-                    };
-                    // Ancestor aggregates fetched inside the same tx so each
-                    // rebroadcast sees the post-projection state (read-your-write)
-                    // with the bumped `blocking_descendant_count`. Empty when the
-                    // event didn't flip `is_blocking` (the common case) —
-                    // propagation's early-exit on delta==0 keeps this off the
-                    // hot path.
-                    let mut ancestor_aggregates: Vec<crate::core::store::ThreadAggregate> =
-                        Vec::with_capacity(affected_ancestors.len());
-                    for ancestor_id in &affected_ancestors {
-                        match crate::core::store::fetch_thread_aggregate(&mut *tx, *ancestor_id)
-                            .await
-                        {
-                            Ok(Some(agg)) => ancestor_aggregates.push(agg),
-                            Ok(None) => {}
-                            Err(e) => {
-                                crate::log!(
-                                    "[EventBus] Failed to fetch ancestor ThreadAggregate for {}: {}",
-                                    ancestor_id,
-                                    e
-                                );
-                            }
-                        }
-                    }
-
-                    // === Phase: PostCommit ===
-                    // Commit the tx, then fan out to external consumers: broadcast
-                    // the EmittedEvent (with its CaptureAggregate snapshot) to all
-                    // `bus.subscribe()` consumers, rebroadcast each affected
-                    // ancestor's aggregate, wake the parent agent session via the
-                    // `parent_callback_tx` mpsc, and replay any side-effect events
-                    // from Project via recursive `emit()` calls (each gets its own
-                    // tx). Anything after `tx.commit()` runs at-most-once on a
-                    // panic — the events row is durable but downstream fan-out
-                    // (broadcast, mpsc, side-effects) is fire-and-forget.
-                    tx.commit().await?;
-                    let broadcast_created = Utc::now();
-
-                    // Capture what notify_parent_if_child needs before event is moved
-                    let notify_thread_id = *thread_id;
-                    let notify_event = te.clone();
-                    let notify_actor = meta.actor.clone();
-
-                    let _ = self.event_tx.send(EmittedEvent {
-                        event_id,
-                        seq: Some(seq),
-                        created: broadcast_created,
-                        typed: event,
-                        aggregate,
-                        depth,
-                        emitting_trigger_id,
-                    });
-                    // Rebroadcast each affected ancestor's aggregate so the
-                    // frontend's `meta.blockingDescendantCount` stays live —
-                    // without this, the thread menu's blocked Archive
-                    // wouldn't update in real time. We piggyback on the
-                    // already-emitted ChildrenCountChanged transient: same
-                    // shape, same channel, just carrying a different aggregate
-                    // snapshot. Active/total counts are read off the same row
-                    // we just fetched, so consumers that overlay on `thread.meta`
-                    // see a self-consistent update.
-                    for ancestor_agg in ancestor_aggregates {
-                        let ancestor_id = match Uuid::parse_str(&ancestor_agg.thread_id) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                crate::log!(
-                                    "[EventBus] Unparseable ancestor thread_id {:?}: {} — skipping rebroadcast",
-                                    ancestor_agg.thread_id,
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-                        let active = ancestor_agg.active_children_count;
-                        let total = ancestor_agg.total_children_count;
-                        self.send_children_count_event(
-                            ancestor_id,
-                            active,
-                            total,
-                            Some(ancestor_agg),
-                        );
-                    }
-                    // Run after broadcast so a panic here can't skip SSE delivery
-                    self.notify_parent_if_child(
-                        notify_thread_id,
-                        Some(event_id),
-                        &notify_event,
-                        notify_actor.as_ref(),
-                    )
-                    .await;
-                    // If a child was just created, notify the parent with updated counts
-                    if let ThreadEvent::MessageReceived {
-                        parent_thread_id: Some(pid),
-                        ..
-                    } = &notify_event
-                    {
-                        self.broadcast_children_count(*pid).await;
-                    }
-                    // Side-effect events run in their own transactions, after the
-                    // main commit. Section changes are NOT among them — the
-                    // per-event aggregate already carries the post-projection
-                    // section to subscribers, no follow-up broadcast required.
-                    for effect in side_effects {
-                        if let Err(e) = Box::pin(self.emit(effect)).await {
-                            crate::log!("[EventBus] Side-effect emit failed: {}", e);
-                        }
-                    }
-                    Ok(Some(EmitResult { event_id, seq }))
-                } else {
+            } if te.is_persisted() => {
+                let appended = self
+                    .append_thread_events(thread_id, vec![(te, meta)], depth, emitting_trigger_id)
+                    .await?;
+                return Ok(appended.and_then(|results| results.into_iter().next()));
+            }
+            BusEvent::System(se) if se.is_persisted() => {
+                let append = self.begin_append().await?;
+                let appended = self
+                    .append_system_event(append, Uuid::new_v4(), se, depth, emitting_trigger_id)
+                    .await?;
+                return Ok(Some(appended));
+            }
+            event => event,
+        };
+        match &event {
+            BusEvent::Thread { .. } => {
+                let _ = self.event_tx.send(EmittedEvent {
+                    event_id: Uuid::new_v4(),
+                    seq: None,
+                    created: Utc::now(),
+                    typed: event,
+                    aggregate: None,
+                    depth,
+                    emitting_trigger_id,
+                });
+                Ok(None)
+            }
+            BusEvent::System(se) => {
+                // Transient system events still drive projections (e.g.
+                // device_presence). The events table is intentionally
+                // skipped — these are high-churn and not interesting to
+                // replay. Skip the SSE broadcast when the projection
+                // reports no real change (e.g. DeviceVisible heartbeats
+                // every 30s from the frontend).
+                let should_broadcast = self.update_transient_system_projection(se).await?;
+                if should_broadcast {
                     let _ = self.event_tx.send(EmittedEvent {
                         event_id: Uuid::new_v4(),
                         seq: None,
@@ -1151,60 +1062,430 @@ impl EventBus {
                         depth,
                         emitting_trigger_id,
                     });
-                    Ok(None)
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Append a webhook delivery's domain event and record the delivery in the
+    /// same transaction (ADR 0444). A resend inside its window rolls back and
+    /// reports the event the first delivery emitted. No trigger emitted it: a
+    /// delivery arrives from outside, so it wakes every subscriber.
+    pub(crate) async fn append_webhook_delivery(
+        &self,
+        event: SystemEvent,
+        delivery: &crate::core::webhook_deliveries::DeliveryKey,
+    ) -> Result<
+        crate::core::webhook_deliveries::DeliveryOutcome,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        use crate::core::webhook_deliveries::{DeliveryLedger, DeliveryOutcome};
+        // Read before the first `.await`, as `emit` does.
+        let depth = current_event_trigger_depth();
+        let event_id = Uuid::new_v4();
+        let mut append = self.begin_append().await?;
+        if let Some(first) = DeliveryLedger::record(&mut append.tx, delivery, event_id).await? {
+            append.tx.rollback().await?;
+            return Ok(DeliveryOutcome::Duplicate(first));
+        }
+        let emitted = self
+            .append_system_event(append, event_id, event, depth, None)
+            .await?;
+        Ok(DeliveryOutcome::Emitted(emitted.event_id))
+    }
+
+    /// Persist and project a system event on `tx`, commit, then broadcast it.
+    async fn append_system_event(
+        &self,
+        append: Append,
+        event_id: Uuid,
+        event: SystemEvent,
+        depth: u32,
+        emitting_trigger_id: Option<String>,
+    ) -> Result<EmitResult, Box<dyn std::error::Error + Send + Sync>> {
+        let committed = self
+            .commit_system_event(append, event_id, event, depth, emitting_trigger_id)
+            .await?;
+        Ok(self.publish_system_event(committed))
+    }
+
+    /// The first half of [`Self::append_system_event`]: persist, project and
+    /// commit. A test parks between the halves to open a subscription there.
+    async fn commit_system_event(
+        &self,
+        append: Append,
+        event_id: Uuid,
+        event: SystemEvent,
+        depth: u32,
+        emitting_trigger_id: Option<String>,
+    ) -> Result<CommittedSystemEvent, Box<dyn std::error::Error + Send + Sync>> {
+        let Append { mut tx, ticket } = append;
+        let seq = self
+            .persist(
+                &mut tx,
+                &ticket,
+                NewEventRow {
+                    id: event_id,
+                    aggregate: event.aggregate(),
+                    aggregate_id: &event.aggregate_id(),
+                    event_type: event.stored_event_type(),
+                    payload: &event.to_payload(),
+                    trigger_chain_depth: system_trigger_chain_depth(&event, depth),
+                    emitting_trigger_id: emitting_trigger_id.as_deref(),
+                },
+            )
+            .await?;
+        self.update_system_projection(&mut tx, event_id, &event)
+            .await?;
+        tx.commit().await?;
+        Ok(CommittedSystemEvent {
+            event_id,
+            seq,
+            event,
+            depth,
+            emitting_trigger_id,
+            ticket,
+        })
+    }
+
+    /// The second half of [`Self::append_system_event`]: broadcast the row.
+    fn publish_system_event(&self, committed: CommittedSystemEvent) -> EmitResult {
+        let CommittedSystemEvent {
+            event_id,
+            seq,
+            event,
+            depth,
+            emitting_trigger_id,
+            ticket,
+        } = committed;
+        ticket.send(
+            &self.event_tx,
+            EmittedEvent {
+                event_id,
+                seq: Some(seq),
+                created: Utc::now(),
+                typed: BusEvent::System(event),
+                aggregate: None,
+                depth,
+                emitting_trigger_id,
+            },
+        );
+        EmitResult {
+            event_id,
+            seq,
+            summary_version: None,
+        }
+    }
+
+    /// Emit `events` on one thread as one *atomic emit*: one transaction, all
+    /// or none, broadcast in order after the commit.
+    ///
+    /// Use it when one event records that another happened. As two emits, a
+    /// failure between them leaves the first standing alone. `Ok(None)` means
+    /// a Validate guard suppressed one event, which drops them all.
+    pub async fn emit_atomically(
+        &self,
+        thread_id: Uuid,
+        events: Vec<(ThreadEvent, EventMeta)>,
+    ) -> Result<Option<Vec<EmitResult>>, Box<dyn std::error::Error + Send + Sync>> {
+        // Read before the first `.await`, as `emit` does.
+        let emitting_trigger_id = current_trigger_id();
+        if let Some((transient, _)) = events.iter().find(|(te, _)| !te.is_persisted()) {
+            return Err(format!(
+                "{} is transient, so it cannot join an atomic emit",
+                transient.event_type()
+            )
+            .into());
+        }
+        self.append_thread_events(
+            thread_id,
+            events,
+            thread_emit_depth(thread_id),
+            emitting_trigger_id,
+        )
+        .await
+    }
+
+    /// Append persisted `events` to `thread_id` in one transaction, then
+    /// publish each. Every persisted thread event runs this pipeline. The
+    /// [`EventBus`] doc holds the phase contract.
+    async fn append_thread_events(
+        &self,
+        thread_id: Uuid,
+        events: Vec<(ThreadEvent, EventMeta)>,
+        depth: u32,
+        emitting_trigger_id: Option<String>,
+    ) -> Result<Option<Vec<EmitResult>>, Box<dyn std::error::Error + Send + Sync>> {
+        let Append { mut tx, ticket } = self.begin_append().await?;
+
+        // === Phase: Serialize ===
+        // Right after the in-flight lock and before any other statement:
+        // Validate's row locks must never be held by a transaction waiting here.
+        Self::lock_thread_append(&mut tx, thread_id).await?;
+
+        let mut staged = Vec::with_capacity(events.len());
+        for (te, meta) in events {
+            let event_id = meta.event_id.unwrap_or_else(Uuid::new_v4);
+
+            // === Phase: Validate ===
+            // Pre-INSERT checks on the snapshot Persist will use. `Err` refuses
+            // the event, and `Ok(None)` drops a recognised duplicate. Either
+            // one drops the whole atomic emit.
+            //
+            // A `request_event_id` must exist. The frontend cannot group an
+            // orphaned reference into an exchange, so log it loudly.
+            if let Some(ref req_id) = meta.request_event_id {
+                let exists: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE id = $1)")
+                        .bind(req_id)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .unwrap_or(false);
+                if !exists {
+                    crate::log!(
+                        "[EventBus] WARNING: request_event_id {} does not exist in events table \
+                         (event_type={}, thread_id={}). This causes orphaned event references.",
+                        req_id,
+                        te.event_type(),
+                        thread_id
+                    );
                 }
             }
-            BusEvent::System(se) => {
-                if se.is_persisted() {
-                    let event_id = Uuid::new_v4();
-                    let stored_event_type = se.stored_event_type();
-                    let mut tx = self.begin_append().await?;
-                    let seq = self
-                        .persist(
-                            &mut tx,
-                            event_id,
-                            se.aggregate(),
-                            &se.aggregate_id(),
-                            stored_event_type,
-                            &se.to_payload(),
-                        )
-                        .await?;
-                    self.update_system_projection(&mut tx, event_id, se).await?;
-                    tx.commit().await?;
 
-                    let _ = self.event_tx.send(EmittedEvent {
-                        event_id,
-                        seq: Some(seq),
-                        created: Utc::now(),
-                        typed: event,
-                        aggregate: None,
-                        depth,
-                        emitting_trigger_id,
-                    });
-                    Ok(Some(EmitResult { event_id, seq }))
-                } else {
-                    // Transient system events still drive projections (e.g.
-                    // device_presence). The events table is intentionally
-                    // skipped — these are high-churn and not interesting to
-                    // replay. Skip the SSE broadcast when the projection
-                    // reports no real change (e.g. DeviceVisible heartbeats
-                    // every 30s from the frontend).
-                    let should_broadcast = self.update_transient_system_projection(se).await?;
-                    if should_broadcast {
-                        let _ = self.event_tx.send(EmittedEvent {
-                            event_id: Uuid::new_v4(),
-                            seq: None,
-                            created: Utc::now(),
-                            typed: event,
-                            aggregate: None,
-                            depth,
-                            emitting_trigger_id,
-                        });
+            // A sighting counts only for the request the client saw
+            // (ADR 0409). The thread append lock above orders it against
+            // a new `ThreadReadRequested`. So this read drops a duplicate,
+            // and a sighting older than a newer request.
+            if let ThreadEvent::ThreadReplySeen { seen_version } = &te {
+                let row: Option<(bool, i64)> = sqlx::query_as(
+                    "SELECT read_requested, summary_version FROM thread_summaries \
+                     WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if row != Some((true, *seen_version)) {
+                    tx.rollback().await?;
+                    crate::log!(
+                        "[EventBus] ThreadReplySeen dropped for {}: the request it \
+                         saw is gone or newer",
+                        thread_id
+                    );
+                    return Ok(None);
+                }
+            }
+
+            // A thread waiting on the user is never archived, and the
+            // home thread is never archived, whoever emits the archive
+            // (ADR 0259, ADR 0362).
+            if matches!(te, ThreadEvent::ThreadArchived) {
+                Self::check_archive_allowed(&mut tx, &thread_id).await?;
+            }
+
+            // Nothing titles the home thread automatically, whoever
+            // emits the title. A rename by hand is `ThreadTitleRenamed`
+            // and lands (ADR 0362).
+            if matches!(te, ThreadEvent::ThreadTitleGenerated { .. }) {
+                Self::check_title_generated_allowed(&mut tx, &thread_id).await?;
+            }
+
+            // A card for a child moved to top level is dropped, not
+            // delivered (ADR 0278). The fan-in read the edge before this
+            // transaction began, so a detach can land in between. A
+            // move whose edge is already gone is dropped the same way,
+            // so the former parent records each move once.
+            let dropped_child = match &te {
+                ThreadEvent::ChildThreadCompleted {
+                    child_thread_id, ..
+                }
+                | ThreadEvent::ChildReportFiled {
+                    child_thread_id, ..
+                }
+                | ThreadEvent::ChildThreadStopped {
+                    child_thread_id, ..
+                } => Self::child_was_moved_out(&mut tx, thread_id, *child_thread_id)
+                    .await?
+                    .then_some(*child_thread_id),
+                ThreadEvent::ChildThreadDetached {
+                    child_thread_id, ..
+                } => (!Self::lock_edge_for_detach(&mut tx, thread_id, *child_thread_id).await?)
+                    .then_some(*child_thread_id),
+                _ => None,
+            };
+            if let Some(child_thread_id) = dropped_child {
+                tx.rollback().await?;
+                crate::log!(
+                    "[EventBus] {} suppressed on {}: child {} is not its child",
+                    te.event_type(),
+                    thread_id,
+                    child_thread_id
+                );
+                return Ok(None);
+            }
+
+            // === Phase: Persist ===
+            // INSERT into the events table. Assigns the bigserial sequence
+            // that drives ordering for every downstream consumer (SSE
+            // catch-up, history queries, projection backfills).
+            let seq = self
+                .persist(
+                    &mut tx,
+                    &ticket,
+                    NewEventRow {
+                        id: event_id,
+                        aggregate: "thread",
+                        aggregate_id: &thread_id.to_string(),
+                        event_type: te.event_type(),
+                        payload: &te.to_payload(&meta),
+                        trigger_chain_depth: thread_trigger_chain_depth(depth),
+                        emitting_trigger_id: emitting_trigger_id.as_deref(),
+                    },
+                )
+                .await?;
+
+            // === Phase: Project ===
+            // Update derived state in the same tx, so a later Validate and
+            // CaptureAggregate read their own write. Returns the side-effect
+            // events for PostCommit, and the ancestors whose
+            // `blocking_descendant_count` changed.
+            let (side_effects, affected_ancestors) = self
+                .update_thread_projection(&mut tx, thread_id, &te, &meta)
+                .await?;
+
+            // === Phase: CaptureAggregate ===
+            // Snapshot this thread and each affected ancestor inside the tx, so
+            // a subscriber sees exactly this event's post-state. A later event
+            // in the same atomic emit is not projected yet. A failed fetch
+            // logs and broadcasts without the aggregate.
+            let aggregate =
+                match crate::core::store::fetch_thread_aggregate(&mut *tx, thread_id).await {
+                    Ok(agg) => agg,
+                    Err(e) => {
+                        crate::log!(
+                            "[EventBus] Failed to fetch ThreadAggregate for {}: {}",
+                            thread_id,
+                            e
+                        );
+                        None
                     }
-                    Ok(None)
+                };
+            let mut ancestor_aggregates = Vec::with_capacity(affected_ancestors.len());
+            for ancestor_id in &affected_ancestors {
+                match crate::core::store::fetch_thread_aggregate(&mut *tx, *ancestor_id).await {
+                    Ok(Some(agg)) => ancestor_aggregates.push(agg),
+                    Ok(None) => {}
+                    Err(e) => {
+                        crate::log!(
+                            "[EventBus] Failed to fetch ancestor ThreadAggregate for {}: {}",
+                            ancestor_id,
+                            e
+                        );
+                    }
+                }
+            }
+            staged.push(StagedThreadEvent {
+                event_id,
+                seq,
+                event: te,
+                meta,
+                aggregate,
+                ancestor_aggregates,
+                side_effects,
+            });
+        }
+
+        // === Phase: PostCommit ===
+        // Commit, then fan out. Every broadcast goes first, in sequence order,
+        // each followed by its spawn request if it has one. Then each event's ancestor rebroadcasts, parent
+        // wake and side effects follow, the side effects in their own
+        // transactions. The rows are durable by now, so a panic here loses
+        // only the fan-out.
+        tx.commit().await?;
+        let broadcast_created = Utc::now();
+        let results = staged
+            .iter()
+            .map(|s| EmitResult {
+                event_id: s.event_id,
+                seq: s.seq,
+                summary_version: s.aggregate.as_ref().map(|a| a.summary_version),
+            })
+            .collect();
+        let mut fan_outs = Vec::with_capacity(staged.len());
+        for s in staged {
+            fan_outs.push((
+                s.event_id,
+                s.event.clone(),
+                s.meta.actor.clone(),
+                s.ancestor_aggregates,
+                s.side_effects,
+            ));
+            let continuation = matches!(s.event, ThreadEvent::ContinuationRequested { .. });
+            ticket.send(
+                &self.event_tx,
+                EmittedEvent {
+                    event_id: s.event_id,
+                    seq: Some(s.seq),
+                    created: broadcast_created,
+                    typed: BusEvent::Thread {
+                        thread_id,
+                        event: s.event,
+                        meta: s.meta,
+                    },
+                    aggregate: s.aggregate,
+                    depth,
+                    emitting_trigger_id: emitting_trigger_id.clone(),
+                },
+            );
+            // After its broadcast, so no subscriber sees the resume's own
+            // events ahead of the request that started it.
+            if continuation {
+                self.send_spawn_request(SpawnRequest::Continue {
+                    thread_id,
+                    event_id: s.event_id,
+                });
+            }
+        }
+        for (event_id, event, actor, ancestor_aggregates, side_effects) in fan_outs {
+            // Keeps the frontend's `meta.blockingDescendantCount` live, so the
+            // thread menu's blocked Archive updates in real time. It rides the
+            // `ChildrenCountChanged` transient with the ancestor's snapshot.
+            for ancestor_agg in ancestor_aggregates {
+                let ancestor_id = match Uuid::parse_str(&ancestor_agg.thread_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        crate::log!(
+                            "[EventBus] Unparseable ancestor thread_id {:?}: {}, skipping rebroadcast",
+                            ancestor_agg.thread_id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let active = ancestor_agg.active_children_count;
+                let total = ancestor_agg.total_children_count;
+                self.send_children_count_event(ancestor_id, active, total, Some(ancestor_agg));
+            }
+            // After the broadcast, so a panic here cannot skip SSE delivery.
+            self.notify_parent_if_child(thread_id, Some(event_id), &event, actor.as_ref())
+                .await;
+            // A new child: tell the parent its updated counts.
+            if let ThreadEvent::MessageReceived {
+                parent_thread_id: Some(pid),
+                ..
+            } = &event
+            {
+                self.broadcast_children_count(*pid).await;
+            }
+            // The aggregate already carries the section, so section changes
+            // are never side effects.
+            for effect in side_effects {
+                if let Err(e) = Box::pin(self.emit(effect)).await {
+                    crate::log!("[EventBus] Side-effect emit failed: {}", e);
                 }
             }
         }
+        Ok(Some(results))
     }
 
     /// Project transient system events that maintain external state (without

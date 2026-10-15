@@ -1,6 +1,6 @@
 ---
 name: Workspace audit: triggers
-description: The triggers audit section: procedure in intent, stale run.knowhow, subscriptions on retired event names, slugs, orphaned trigger knowhow, notification taps.
+description: The triggers audit section: procedure in intent, stale run.knowhow, subscriptions on retired event names, slugs, orphaned trigger knowhow, notification taps, MCP servers a trigger uses but does not list.
 ---
 
 # Workspace audit section: triggers
@@ -14,7 +14,7 @@ the report. This file carries its scan, its checks and its fixes.
 Append these lines to the root's scan preamble, before its receipts tail:
 
 ```bash
-scan tap-strings "\"tap\"[[:space:]]*:[[:space:]]*\"(modal|none|open_app|open_thread)\"|tap:[[:space:]]*'(modal|none|open_app|open_thread)'|kind:[[:space:]]*'none'" $all
+scan tap-strings "[\\\"']*tap[\\\"']*[[:space:]]*:[[:space:]]*[\\\"']+(modal|none|open_app|open_thread)[\\\"']|kind[\\\"']*[[:space:]]*:[[:space:]]*[\\\"']+none[\\\"']|--tap[=[:space:]\\\"',]+(none|open[-_]app|open[-_]thread)" $all
 ```
 
 ## Checks
@@ -56,15 +56,28 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
 - **Notification routing: `tap` opt-ins for CTA-shaped triggers.** Take each trigger whose `run.intent` mentions `send_notification`, plus each `NotificationCreated` event traceable to a trigger. Look the body's shape up in the table under `system-knowhow/triggers.md` § "Notification routing". Report each trigger whose `app_id`, `tap` or `event_id` disagrees with its row, quoting the row as the fix. Severity: **drift**, since the default works and the opt-in only tightens UX. Skip a trigger that already sets `tap` to a non-default value.
 
+- **An MCP server a trigger uses but does not list.** A trigger's fires may call only the MCP servers in its `mcp_servers` (`system-knowhow/triggers.md` § "MCP servers the fires use: `mcp_servers`"). A trigger that used one before that rule, or whose fire enabled one mid-turn, now has those calls refused. Find each pair over the last 30 days:
+
+  ```bash
+  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "SELECT ts.trigger_id, coalesce(e.payload->>'server_id', split_part(e.payload->>'name', '__', 2)) AS server_id, count(DISTINCT e.thread_id) FROM events e JOIN thread_summaries ts ON ts.thread_id = e.thread_id WHERE ts.trigger_id IS NOT NULL AND e.created >= now() - interval '30 days' AND ((e.event_type = 'ToolCalled' AND e.payload->>'name' LIKE 'mcp\_\_%') OR (e.event_type = 'ThreadMcpServerEnabled' AND e.payload->>'by' = 'agent')) GROUP BY 1, 2"
+  ```
+
+  Compare each row with that live trigger's `mcp_servers` from `lucidos triggers list`. Report every server it used but does not list, with the fires that used it. Severity: **smell**, since each fire now fails that call loud, with a notification. This is the ADR 0214 migration check for ADR 0430.
+
+- **A trigger script that reaches the workspace database through libpq defaults.** The `scripts` section owns the check and its fix (`system-knowhow/workspace-audit/scripts.md`, the `db-defaults` scan). Its scan covers `data/triggers/**/scripts/**` too. Report those hits once, under the trigger. Severity: **broken**, since each fire now fails to connect.
+
 - **Old-form `tap` strings.** The field was a four-string union and is now a discriminated union object. The engine rejects the strings with `400 Bad Request` at write time. Grep every code-bearing surface in the root's § "What to walk": trigger scripts, app code (`ui/`, `*.html`, inline `<script>`), shared scripts, and fenced `python` / `bash` / `js` / `ts` blocks in knowhow. Skip `data/artifacts/` and `data/postgres/`, which hold no code that calls the API.
 
-  Match each form in both quote styles: the key-quoted `"tap":` spelling (Python, shell, JSON bodies) and the bare `tap:` spelling (JS, TS):
+  Match each form whatever its quotes. The key is bare (`tap:` in JS, TS) or quoted (`"tap":` or `'tap':` in Python, shell, JSON bodies). The value takes either quote, and JSON inside a string escapes both (`\"tap\": \"modal\"`):
 
   - `tap: 'modal'`
   - `tap: 'none'`
   - `tap: 'open_app'`
   - `tap: 'open_thread'`
   - `{ kind: 'none' }`, the retired object form
+  - `lucidos notify --tap none`, `--tap open-app` or `--tap open-thread`, bare or in an argv list. The CLI now takes only `modal` and `navigate`.
+
+  A `kind: 'none'` hit outside a notification `tap` is some other field, not this finding.
 
   Surface path, line and the matched form. Severity: **broken**, because the next fire 400s. The one exception is the retired `{ kind: 'none' }` object. The engine coerces it to `{ kind: 'modal' }`, so it is **stale**: it runs, but still spreads by copy. Canonical `Tap` type: `system-knowhow/js-sdk.md` § `lucidos.notifications`.
 
@@ -77,6 +90,10 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 Fixes run only on request, as the root's § Remediation says. A fix thread gets
 the table for its finding.
 
+### Listing an MCP server a trigger uses
+
+Add the server to the trigger's `mcp_servers` with `update_trigger`. The field is a full replacement, so send the existing list plus the new id. It is reversible, so it may join "Do all suggested fixes". A server the fire enabled once and never called is not worth listing: report it, and leave the choice to the user.
+
 ### Rewriting an old-form `tap`
 
 Hand a fix thread this mapping:
@@ -88,6 +105,8 @@ Hand a fix thread this mapping:
 | `tap: 'open_app'`, with a sibling `app_id: 'X'` | `tap: { kind: 'navigate', to: { target: 'app', app_id: 'X' } }` |
 | `tap: 'open_thread'`, with a sibling `thread_id: 'T'` and optional `event_id: 'E'` | `tap: { kind: 'navigate', to: { target: 'thread', id: 'T', event_id: 'E' } }` |
 | `{ kind: 'none' }` | `{ kind: 'modal' }` |
+| `--tap none` | drop the flag, since `modal` is the default |
+| `--tap open-app` or `--tap open-thread` | `--tap navigate`, keeping the call's `--app-id` or `--thread-id` |
 
 Three rules the rewrite has to follow:
 

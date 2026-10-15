@@ -99,7 +99,7 @@
 /* ===== Inline Form (panel pane forms) ===== */
 
 .inline-form {
-    padding: 1rem;
+    padding: var(--space-lg);
     overflow-y: auto;
     height: 100%;
 }
@@ -325,12 +325,15 @@
 
 /* Shared by the install and uninstall panels and both receipts. One column,
    with the confirm panels' actions in the header, above lists that start
-   folded. */
+   folded. Centred on the Plugins view's own text column: that view is
+   capped at --content-max-width and insets its rows by the --space-lg gutter,
+   which .inline-form's padding already supplies here. */
 .plugin-install-panel {
     display: flex;
     flex-direction: column;
     gap: var(--space-md);
-    max-width: 50rem;
+    max-width: calc(var(--content-max-width) - 2 * var(--space-lg));
+    margin-inline: auto;
 }
 
 /* Actions sit top right at every width. The text keeps at least its
@@ -567,7 +570,7 @@
     display: flex;
     align-items: stretch;
     gap: var(--space-sm);
-    margin: 0 var(--space-lg) var(--space-md);
+    margin: var(--space-md) var(--space-lg) var(--space-lg);
 }
 
 .plugins-filter-bar .segmented-control {
@@ -620,8 +623,8 @@
     flex: 1;
 }
 
-/* An app or widget row leads with its app icon. The lead takes the row's
-   width, so the actions still wrap under it on a narrow pane. */
+/* A widget row leads with its app icon. The lead takes the row's width, so
+   the actions still wrap under it on a narrow pane. */
 .app-row-lead {
     --app-icon-size: 2.25rem;
     --app-icon-radius: calc(var(--radius-control) * 1.2);
@@ -633,19 +636,6 @@
 
 .app-row-lead > .app-icon {
     margin-top: 0.125rem;
-}
-
-/* Installed-app marketplace + update labels */
-.app-row-title-line {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.375rem;
-    min-width: 0;
-}
-
-.app-row-title-line .list-row-name {
-    min-width: 0;
 }
 
 /* ===== Store tab (plugin catalog) + Marketplaces settings ===== */
@@ -775,19 +765,21 @@
     pointer-events: none;
 }
 
-/* A plugin card's buttons sit top right, beside the title line only, as on the
-   install panel header (.plugin-install-header). The description and meta
-   below span the full card width. The info wrapper dissolves into the grid so
-   its children can take their own areas. On a narrow list the buttons move to
-   a line above the name. `.list-row` in the selector outranks the mobile
-   `.list-row` stacking rules, which would otherwise set this grid's gap. */
-.app-store-plugins {
-    container-type: inline-size;
-}
+/* A plugin card or an apps panel row: its one button sits top right, beside
+   the title line only, at every width. The description and note below span
+   the full card width. The info wrapper dissolves into the grid so its
+   children can take their own areas. `.list-row` in the selector outranks the
+   mobile `.list-row` stacking rules, which would otherwise set this grid's gap.
 
+   Icon, title and button share one top edge, as in a three-line list item.
+   The title line has a fixed height, and the button centres on it without
+   growing it. So the title sits in the same place whatever the button is: a
+   pin, an Install, or the word Installed. */
+.list-row.app-row,
 .list-row.app-store-plugin-row {
     --app-icon-size: 2.5rem;
     --app-icon-radius: calc(var(--radius-control) * 1.2);
+    --app-row-title-line: 1.25rem;
     position: relative;
     display: grid;
     grid-template-columns: auto minmax(0, 1fr) auto;
@@ -795,46 +787,50 @@
         "icon title actions"
         "icon description description"
         "icon meta meta";
-    align-items: center;
+    align-items: start;
     gap: 0 var(--space-md);
     padding-top: var(--space-lg);
     padding-bottom: var(--space-lg);
 }
 
-/* The plugin icon leads the row, as an app icon leads an apps panel row. */
-.app-store-plugin-icon {
+.app-store-plugin-icon,
+.app-row-icon {
     grid-area: icon;
     align-self: start;
     display: flex;
 }
 
-.app-store-plugin-row .list-row-info {
+.app-store-plugin-row .list-row-info,
+.app-row .list-row-info {
     display: contents;
 }
 
-.app-store-plugin-row .list-row-actions {
+/* A control taller than the line overflows it evenly, so it stays centred. */
+.app-store-plugin-row .list-row-actions,
+.app-row .list-row-actions {
     grid-area: actions;
-    align-self: center;
+    align-self: start;
     justify-self: end;
+    height: var(--app-row-title-line);
+    flex-wrap: nowrap;
+    align-items: center;
 }
 
-@container (max-width: 30rem) {
-    .list-row.app-store-plugin-row {
-        grid-template-columns: auto minmax(0, 1fr);
-        grid-template-areas:
-            "actions actions"
-            "icon title"
-            "icon description"
-            "icon meta";
-    }
-
-    .app-store-plugin-row .list-row-actions {
-        margin-bottom: var(--space-sm);
-    }
+/* An app row's pin and ⋯ stay one pair, spaced as on a thread row. */
+.app-row .list-row-actions {
+    gap: var(--space-xs);
 }
 
-/* A hairline between cards, inset to the gutter so it lines up with the text. */
-.app-store-plugin-row + .app-store-plugin-row::before {
+/* A long press opens the row's menu, as on a thread row, so iOS must not draw
+   its own callout over it. AppCard.tsx renders no anchor. */
+.app-row {
+    -webkit-touch-callout: none;
+}
+
+/* A hairline between cards, inset to the gutter so it lines up with the text.
+   A plugin row takes one above the first card too, closing off the filters. */
+.app-store-plugin-row::before,
+.app-row + .app-row::before {
     content: '';
     position: absolute;
     top: 0;
@@ -866,7 +862,8 @@
     margin: var(--space-xs);
 }
 
-.app-store-plugin-title-row {
+.app-store-plugin-title-row,
+.app-row-title-line {
     grid-area: title;
     display: flex;
     align-items: center;
@@ -875,9 +872,17 @@
     min-width: 0;
 }
 
-.app-store-plugin-title-row .list-row-name {
+.app-store-plugin-title-row .list-row-name,
+.app-row-title-line .list-row-name {
     min-width: 0;
     margin-bottom: 0;
+    line-height: var(--app-row-title-line);
+}
+
+/* Where a row has no button to press, a quiet word says it is installed. */
+.app-store-plugin-installed {
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
 }
 
 /* Status and Modified badges: a soft tint, no outline, so they label the card
@@ -914,17 +919,19 @@
     cursor: default;
 }
 
-.app-store-plugin-description {
+.app-store-plugin-description,
+.app-row-description {
     grid-area: description;
-    margin-top: var(--space-sm);
+    margin-top: var(--space-xs);
     color: var(--text-secondary);
     font-size: var(--font-size-xs);
     line-height: 1.55;
     overflow-wrap: anywhere;
 }
 
-/* The list shows two lines. The plugin detail page holds the whole text. */
-.app-store-plugin-row .app-store-plugin-description {
+/* A list shows two lines. The plugin detail page and the app hold the rest. */
+.app-store-plugin-row .app-store-plugin-description,
+.app-row-description {
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
@@ -947,13 +954,20 @@
     gap: var(--space-xl);
 }
 
+/* The head row, then the description and chips at the column's full width. */
+.plugin-detail-intro {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+}
+
 .plugin-detail-head {
     --app-icon-size: 3.5rem;
     --app-icon-radius: calc(var(--radius-control) * 1.6);
     display: grid;
     grid-template-columns: auto minmax(0, 1fr) auto;
     grid-template-areas: "icon heading actions";
-    align-items: start;
+    align-items: center;
     gap: var(--space-lg);
 }
 
@@ -971,8 +985,12 @@
     grid-area: actions;
 }
 
-.plugin-detail-head .app-store-plugin-meta {
-    margin-top: var(--space-sm);
+.plugin-detail-intro .app-store-plugin-meta {
+    margin-top: 0;
+}
+
+.plugin-detail-intro .app-store-plugin-meta:empty {
+    display: none;
 }
 
 .title.plugin-detail-name {
@@ -980,12 +998,35 @@
     font-size: var(--font-size-xl);
 }
 
-.plugin-detail-description {
+.plugin-detail-source {
     margin-top: var(--space-xs);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+.plugin-detail-description {
+    max-width: 46rem;
     color: var(--text-secondary);
     font-size: var(--font-size-xs);
     line-height: 1.55;
     overflow-wrap: anywhere;
+}
+
+.plugin-detail-modified {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-sm) var(--space-md);
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-control);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+}
+
+.plugin-detail-modified > span {
+    flex: 1 1 14rem;
 }
 
 @container (max-width: 30rem) {
@@ -1090,7 +1131,7 @@
 .app-store-filter-pills {
     scroll-padding-inline: var(--space-lg);
     padding: calc(var(--focus-ring-width) + var(--pill-bar-hit-slop, 0rem)) var(--space-lg)
-        calc(var(--space-sm) + var(--pill-bar-hit-slop, 0rem));
+        calc(var(--space-lg) + var(--pill-bar-hit-slop, 0rem));
     margin: calc(-1 * var(--pill-bar-hit-slop, 0rem)) 0;
     -webkit-mask: linear-gradient(to right, transparent, #000 var(--space-lg),
         #000 calc(100% - var(--space-lg)), transparent);

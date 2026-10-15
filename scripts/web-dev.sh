@@ -81,7 +81,7 @@ resolve_workspace
 # docs/plans/2026-09-18-engine-build-only-needs-no-ports.md.
 if [ -n "$ENGINE_BUILD_ONLY" ]; then
     build_or_find_engine
-    build_sdk
+    generate_build_outputs
     exit 0
 fi
 
@@ -90,7 +90,7 @@ detect_tls
 setup_postgres
 kill_stale_processes
 build_or_find_engine
-build_sdk
+generate_build_outputs
 swap_ports
 
 # Gateway model by default (ADR 0014): the standalone lucidos-gateway binary
@@ -100,7 +100,6 @@ swap_ports
 if [ -n "${LUCIDOS_NO_GATEWAY:-}" ]; then
     start_engine
 else
-    seed_gateway_registry
     start_gateway
 fi
 
@@ -130,14 +129,14 @@ elif [ -t 1 ]; then
 else
     # Spawned by restart API — keep web-dev.sh alive while the engine is
     # alive so the spawned process isn't orphaned. Prefer waiting on the
-    # supervisor (our direct child, survives engine restarts); fall back
-    # to polling the pidfile when start_engine reused an existing engine
-    # and didn't spawn a fresh supervisor.
+    # supervisor (our direct child, survives engine restarts); otherwise wait
+    # for whichever engine owns the workspace to exit, on its lock. Only when
+    # the lock file exists: opening it creates it, which would hide an engine
+    # from before the lock from every reader.
     if [ -n "${ENGINE_SUPERVISOR_PID:-}" ]; then
         wait "$ENGINE_SUPERVISOR_PID"
-    else
-        while [ -s "$ENGINE_PIDFILE" ] && kill -0 "$(cat "$ENGINE_PIDFILE")" 2>/dev/null; do
-            sleep 5
-        done
+    elif [ -e "$(engine_lock_path "$WORKSPACE")" ] \
+        && flock_open 6 "$(engine_lock_path "$WORKSPACE")" sh; then
+        flock_close 6
     fi
 fi

@@ -26,5 +26,5 @@
 @import './global/protected-surface.css';
 /* Theme parts (ADR 0307): the colour tokens typed with @property, and the
    protected, reduce and opt-out resets, generated from the part catalog. The
-   engine serves app frames their own copy, theme-parts-frame.css. */
+   engine renders app frames their own copy at runtime. */
 @import './generated/theme-parts.css';

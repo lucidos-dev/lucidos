@@ -8,7 +8,8 @@
 //! Who is asking comes from the verified origin token, never from the body:
 //!
 //! - **A token-bearing caller** (an agent, or the CLI inside an agent session)
-//!   moves only its own direct children.
+//!   moves only its own direct children. It needs no other authority (ADR
+//!   0475).
 //! - **A caller with no token** is the user's device or the local API. It moves
 //!   any thread that has a parent, as the Archive button archives any thread.
 

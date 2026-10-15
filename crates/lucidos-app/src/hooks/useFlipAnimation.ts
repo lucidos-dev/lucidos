@@ -15,6 +15,31 @@ const MAX_MS = 450;
 // fast, so fading from the start leaves it half gone by the first frames.
 const LINGER: Keyframe = { opacity: '1', offset: 0.5 };
 
+/** Set on a gap: an element in place of unrendered rows, such as the
+ *  drawer's row window gap. Its value is the last row it stands for, so a
+ *  disclosure measures a block down to its true bottom edge. */
+export const FLIP_GAP_END_ATTR = 'data-flip-gap-end';
+
+/** An element's viewport box. */
+function box(el: Element): Rect {
+    const r = el.getBoundingClientRect();
+    return { top: r.top, left: r.left, width: r.width, height: r.height };
+}
+
+/** Each gap's box, keyed by the last row it stands for. */
+function gapBoxes(container: HTMLElement): Map<string, Rect> {
+    const boxes = new Map<string, Rect>();
+    for (const gap of container.querySelectorAll<HTMLElement>(`[${FLIP_GAP_END_ATTR}]`)) {
+        boxes.set(gap.getAttribute(FLIP_GAP_END_ATTR)!, box(gap));
+    }
+    return boxes;
+}
+
+/** The boxes of the gaps that end inside `ids`. */
+function gapsIn(ids: readonly string[], gaps: ReadonlyMap<string, Rect>): Rect[] {
+    return ids.map(id => gaps.get(id)).filter((r): r is Rect => !!r);
+}
+
 /** A section's rows in render order, its header first. */
 export interface FlipSection { name: string; ids: string[] }
 
@@ -326,12 +351,11 @@ export function useFlipTransitions(
     const hidingLineLefts = new Map<string, number | null>();
     // How far a running batch has each row moved off its layout box.
     const lifts = new Map<string, number>();
+    // Gaps for unrendered rows, as they stood before the commit.
+    let oldGaps: ReadonlyMap<string, Rect> = new Map();
     const container = containerRef.current;
     if (container && hasChanges) {
-        const box = (el: HTMLElement): Rect => {
-            const r = el.getBoundingClientRect();
-            return { top: r.top, left: r.left, width: r.width, height: r.height };
-        };
+        oldGaps = gapBoxes(container);
         for (const [id, copy] of disclosing ? standIns.current : []) {
             seen.set(id, { rect: box(copy), opacity: Number(getComputedStyle(copy).opacity) });
         }
@@ -351,7 +375,7 @@ export function useFlipTransitions(
         for (const run of hideRuns) {
             const rects = run.ids.map(id => oldRects.get(id)).filter((r): r is Rect => !!r);
             if (rects.length === 0) continue;
-            const geometry = blockGeometry(rects, run.anchor ? oldRects.get(run.anchor) : undefined);
+            const geometry = blockGeometry([...rects, ...gapsIn(run.ids, oldGaps)], run.anchor ? oldRects.get(run.anchor) : undefined);
             for (const id of run.ids) {
                 const rect = oldRects.get(id);
                 const row = hidingRows.get(id);
@@ -466,13 +490,14 @@ export function useFlipTransitions(
             const waiting = entries.filter(e => e.real && e.rect.top >= geometry.rollEnd).map(e => e.real!);
             return { run, rows, waiting, ...geometry, drift: anchorDrift(run.anchor), reveal, rowLeft };
         };
+        const gaps = gapBoxes(el);
         const blocks = [
             ...revealRuns.map(run => {
                 const reals = run.ids.map(id => rowById.get(id)).filter((r): r is HTMLElement => !!r);
                 if (reals.length === 0) return null;
                 const rects = reals.map(real => real.getBoundingClientRect());
                 const anchorRect = run.anchor ? rowById.get(run.anchor)?.getBoundingClientRect() : undefined;
-                const geometry = blockGeometry(rects, anchorRect);
+                const geometry = blockGeometry([...rects, ...gapsIn(run.ids, gaps)], anchorRect);
                 const closing = reals[closingIndex(rects, geometry)];
                 return disclosureBlock(
                     run,
@@ -490,7 +515,7 @@ export function useFlipTransitions(
                 return disclosureBlock(
                     run,
                     ids.map((id, i) => ({ id, ghost: ghosts.get(id), rect: rects[i] })),
-                    blockGeometry(rects, run.anchor ? oldRects.get(run.anchor) : undefined), false,
+                    blockGeometry([...rects, ...gapsIn(run.ids, oldGaps)], run.anchor ? oldRects.get(run.anchor) : undefined), false,
                     run.anchor ? hidingLineLefts.get(run.anchor) ?? null : null,
                 );
             }),

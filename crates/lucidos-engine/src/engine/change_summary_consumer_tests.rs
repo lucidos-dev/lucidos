@@ -200,3 +200,52 @@ fn the_backfill_picks_only_changes_that_still_need_a_summary() {
     ];
     assert_eq!(backfill_targets(changes.iter()), vec![(thread, wanted.id)]);
 }
+
+/// A proposal lost to a broadcast lag must still reach the summarizer, or the
+/// change never gets its line.
+#[tokio::test]
+async fn a_proposal_lost_to_a_lag_still_reaches_the_summarizer() {
+    use crate::engine::event_bus::{LagReplay, ReplayScope};
+    use crate::test_support::{flood_past_bus_capacity, start_cc_session};
+
+    let (pool, db) = setup_test_db().await;
+    let (bus, _callbacks) = EventBus::new(pool.clone());
+    let (mut rx, mut replay) = LagReplay::subscribe(
+        &bus,
+        ReplayScope::Workspace,
+        Some(PROPOSAL_EVENT_TYPES.to_vec()),
+    );
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/lagged", None).await;
+    let change_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeProposed {
+            change_id: change_id.to_string(),
+            description: Some(TWO_COMMITS.into()),
+            files: vec!["src/main.rs".into()],
+            requires_restart: false,
+            origin: None,
+            commit_sha: None,
+            branch_name: "claude-code/lagged".into(),
+            repo_root: "/tmp".into(),
+            hardened: false,
+            incomplete: false,
+            set_aside: false,
+            path: String::new(),
+            diff: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    flood_past_bus_capacity(&bus);
+
+    let proposals = proposals_after(rx.recv().await, &mut replay, &pool)
+        .await
+        .expect("a lag must not end the consumer");
+    assert_eq!(proposals, vec![(thread_id, change_id)]);
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}

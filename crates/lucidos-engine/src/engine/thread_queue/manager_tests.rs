@@ -6,7 +6,7 @@
 use super::*;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Executor whose `execute` parks until the test releases a permit —
 /// `release_one()` lets exactly one execution finish, so tests control slot
@@ -145,7 +145,7 @@ fn spawn_user_slot(queue: Arc<ThreadQueue>, thread_id: Uuid) -> oneshot::Sender<
     let (release_tx, release_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let _guard = queue
-            .acquire_user_slot(Some(thread_id), "user message".to_string())
+            .acquire_user_slot(thread_id, "user message".to_string())
             .await;
         let _ = release_rx.await; // hold the slot until the test releases it
                                   // _guard drops here → slot released + drain.
@@ -159,7 +159,7 @@ async fn user_status(queue: &ThreadQueue, thread_id: Uuid) -> Option<&'static st
         .user_entries()
         .await
         .into_iter()
-        .find(|e| e.thread_id == Some(thread_id))
+        .find(|e| e.thread_id == thread_id)
         .map(|e| e.status)
 }
 
@@ -182,6 +182,7 @@ fn test_trigger_config(id: &str) -> crate::triggers::TriggerConfig {
         go_to_review: false,
         group_id: None,
         side_effect_grant: vec![],
+        mcp_servers: vec![],
         plugin_id: None,
         model: None,
         reasoning_effort: None,
@@ -209,6 +210,7 @@ fn sub_thread_request(child_thread_id: Uuid) -> ThreadQueueRequest {
         child_thread_id,
         parent_thread_id: None,
         spawning_event_id: None,
+        wake_mode: None,
         title: None,
         model: None,
         reasoning_effort: None,
@@ -236,6 +238,9 @@ struct Fixture {
     queue: Arc<ThreadQueue>,
     executor: Arc<GatedExecutor>,
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>>,
+    /// The engine's shutdown signal, as the queue holds it. Flip it to begin a
+    /// teardown.
+    shutting_down: Arc<AtomicBool>,
     /// Where the overflow guard's `TriggerDisabled` would project the on-disk
     /// trigger definition. Held so it outlives every queue built from it.
     workspace: tempfile::TempDir,
@@ -247,7 +252,15 @@ async fn fixture(max_total: usize) -> Fixture {
     let trigger_configs: Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>> =
         Arc::new(std::sync::RwLock::new(HashMap::new()));
     let workspace = tempfile::tempdir().expect("temp workspace");
-    let (queue, executor) = gated_queue(&pool, &bus, &trigger_configs, workspace.path(), max_total);
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let (queue, executor) = gated_queue(
+        &pool,
+        &bus,
+        &trigger_configs,
+        workspace.path(),
+        max_total,
+        shutting_down.clone(),
+    );
     Fixture {
         pool,
         db,
@@ -255,6 +268,7 @@ async fn fixture(max_total: usize) -> Fixture {
         queue,
         executor,
         trigger_configs,
+        shutting_down,
         workspace,
     }
 }
@@ -367,6 +381,7 @@ fn gated_queue(
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>>,
     workspace: &std::path::Path,
     max_total: usize,
+    shutting_down: Arc<AtomicBool>,
 ) -> (Arc<ThreadQueue>, Arc<GatedExecutor>) {
     let executor = GatedExecutor::new();
     let queue = queue_with_executor(
@@ -376,6 +391,7 @@ fn gated_queue(
         workspace,
         max_total,
         executor.clone(),
+        shutting_down,
     );
     (queue, executor)
 }
@@ -390,6 +406,7 @@ fn queue_with_executor(
     workspace: &std::path::Path,
     max_total: usize,
     executor: Arc<dyn ThreadQueueExecutor>,
+    shutting_down: Arc<AtomicBool>,
 ) -> Arc<ThreadQueue> {
     let queue = Arc::new(ThreadQueue::new(
         pool.clone(),
@@ -398,13 +415,15 @@ fn queue_with_executor(
         workspace.to_path_buf(),
         Arc::new(tokio::sync::Mutex::new(())),
         test_policy(max_total),
+        shutting_down,
     ));
     queue.set_executor(executor);
     queue
 }
 
 /// A fresh manager over the same database, standing in for the next engine
-/// process. The old process's in-flight executions died with it.
+/// process. The old process's in-flight executions died with it, and the new
+/// process is not shutting down.
 fn restarted_queue(f: &Fixture, max_total: usize) -> (Arc<ThreadQueue>, Arc<GatedExecutor>) {
     gated_queue(
         &f.pool,
@@ -412,6 +431,7 @@ fn restarted_queue(f: &Fixture, max_total: usize) -> (Arc<ThreadQueue>, Arc<Gate
         &f.trigger_configs,
         f.workspace.path(),
         max_total,
+        Arc::default(),
     )
 }
 
@@ -474,6 +494,18 @@ where
     .expect("condition not reached within 10s");
 }
 
+/// Wait until the executor has run exactly `expected`, in order. Admission
+/// returns once `execute` is spawned, not once it runs, so reading
+/// `executed_ids` straight after an admission races the spawned task.
+async fn wait_for_executed(executor: &Arc<GatedExecutor>, expected: Vec<Uuid>) {
+    wait_until(|| {
+        let executor = executor.clone();
+        let expected = expected.clone();
+        async move { executor.executed_ids() == expected }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn submit_within_capacity_admits_executes_and_completes() {
     let f = fixture(2).await;
@@ -484,12 +516,12 @@ async fn submit_within_capacity_admits_executes_and_completes() {
         .await;
     assert!(outcome.admitted, "first submit must admit under capacity");
     assert_eq!(outcome.position, 0);
+    wait_for_executed(&f.executor, vec![outcome.entry_id]).await;
     // Persisted active-session record: row exists with status 'admitted'.
     assert_eq!(
         row_status(&f.pool, outcome.entry_id).await.as_deref(),
         Some("admitted")
     );
-    assert_eq!(f.executor.executed_ids(), vec![outcome.entry_id]);
     // prepare ran inline before submit returned.
     assert_eq!(f.executor.prepared.load(Ordering::SeqCst), 1);
 
@@ -537,24 +569,17 @@ async fn submit_over_capacity_queues_then_drains_in_fifo_order() {
         Some("queued")
     );
 
-    // A finishes → B (and only B) admits, FIFO.
+    // A finishes → B (and only B) admits and executes, FIFO.
     f.executor.release_one();
-    let pool = f.pool.clone();
-    let b_id = b.entry_id;
-    wait_until(|| {
-        let pool = pool.clone();
-        async move { row_status(&pool, b_id).await.as_deref() == Some("admitted") }
-    })
-    .await;
+    wait_for_executed(&f.executor, vec![a.entry_id, b.entry_id]).await;
+    assert_eq!(
+        row_status(&f.pool, b.entry_id).await.as_deref(),
+        Some("admitted")
+    );
     assert_eq!(
         row_status(&f.pool, c.entry_id).await.as_deref(),
         Some("queued"),
         "C must wait its turn"
-    );
-    assert_eq!(
-        f.executor.executed_ids(),
-        vec![a.entry_id, b.entry_id],
-        "execution order must be FIFO"
     );
 
     f.pool.close().await;
@@ -615,12 +640,12 @@ async fn run_now_force_admits_ignoring_caps() {
         .run_now(b.entry_id, None)
         .await
         .expect("queued entry must be runnable now");
+    wait_for_executed(&f.executor, vec![a.entry_id, b.entry_id]).await;
     assert_eq!(
         row_status(&f.pool, b.entry_id).await.as_deref(),
         Some("admitted"),
         "run-now bypasses the capacity check"
     );
-    assert_eq!(f.executor.executed_ids(), vec![a.entry_id, b.entry_id]);
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
@@ -815,11 +840,7 @@ async fn recover_collapses_duplicate_cron_rows_to_one() {
     // A drain re-fires exactly the single surviving cron entry (execution is
     // spawned, so poll rather than assert synchronously).
     queue2.drain().await;
-    wait_until(|| {
-        let ex = executor2.clone();
-        async move { ex.executed_ids() == vec![admitted_id] }
-    })
-    .await;
+    wait_for_executed(&executor2, vec![admitted_id]).await;
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
@@ -859,7 +880,8 @@ async fn drain_skips_paused_triggers_and_drops_deleted_ones() {
         Some("queued")
     );
 
-    // Resume → drain admits it.
+    // Resume → drain admits it. The blocker's own drain may still be running
+    // and win the entry, emitting its admission after this drain returns.
     f.trigger_configs
         .write()
         .unwrap()
@@ -867,10 +889,13 @@ async fn drain_skips_paused_triggers_and_drops_deleted_ones() {
         .unwrap()
         .paused = false;
     f.queue.drain().await;
-    assert_eq!(
-        row_status(&f.pool, fire.entry_id).await.as_deref(),
-        Some("admitted")
-    );
+    let pool = f.pool.clone();
+    let fire_id = fire.entry_id;
+    wait_until(|| {
+        let pool = pool.clone();
+        async move { row_status(&pool, fire_id).await.as_deref() == Some("admitted") }
+    })
+    .await;
 
     // A queued fire whose trigger was deleted gets dropped at drain time.
     let orphan = f
@@ -919,11 +944,11 @@ async fn recover_requeues_admitted_trigger_entries_after_restart() {
     );
     // …and a drain re-fires it.
     queue2.drain().await;
+    wait_for_executed(&executor2, vec![a.entry_id]).await;
     assert_eq!(
         row_status(&f.pool, a.entry_id).await.as_deref(),
         Some("admitted")
     );
-    assert_eq!(executor2.executed_ids(), vec![a.entry_id]);
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
@@ -1025,11 +1050,7 @@ async fn a_handed_off_cron_fire_leaves_its_queued_sibling_alone() {
         "the sibling that never ran survives the handoff"
     );
     queue2.drain().await;
-    wait_until(|| {
-        let ex = executor2.clone();
-        async move { ex.executed_ids() == vec![waiting] }
-    })
-    .await;
+    wait_for_executed(&executor2, vec![waiting]).await;
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
@@ -1061,11 +1082,7 @@ async fn recover_requeues_an_admitted_cron_fire_whose_thread_never_existed() {
         "no thread materialized, so the fire is re-queued"
     );
     queue2.drain().await;
-    wait_until(|| {
-        let ex = executor2.clone();
-        async move { ex.executed_ids() == vec![entry_id] }
-    })
-    .await;
+    wait_for_executed(&executor2, vec![entry_id]).await;
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
@@ -1369,7 +1386,7 @@ async fn a_cancelled_waiter_releases_its_reserved_slot() {
     let acquiring = f.queue.clone();
     let waiter = tokio::spawn(async move {
         let _guard = acquiring
-            .acquire_user_slot(Some(tid), "user message".to_string())
+            .acquire_user_slot(tid, "user message".to_string())
             .await;
         // Never reached: this task is aborted while its request is queued.
         std::future::pending::<()>().await;
@@ -1507,9 +1524,78 @@ async fn user_waiter_preempts_background_above_the_floor() {
     teardown_test_db(&f.db).await;
 }
 
-// ---- Release-on-settle (the phantom "RUNNING" rows leak) ----
+// ---- I12: occupancy is read at admission, not mirrored by a subscriber ----
 
-/// Minimal `CodingAgentIdled` for the settle-classifier test.
+/// Wait for the next `ThreadQueueChanged`, which the gate emits once its
+/// reservation or waiter is in place. The timeout only bounds a failure.
+async fn next_queue_change(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::engine::event_bus::EmittedEvent>,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Ok(e)
+                    if matches!(
+                        e.typed,
+                        BusEvent::System(SystemEvent::ThreadQueueChanged {})
+                    ) =>
+                {
+                    return;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("bus closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("no ThreadQueueChanged");
+}
+
+/// A user thread parks, then resumes: `running` again in `thread_summaries`,
+/// with no gate behind it. No subscriber sees either event, which is the worst
+/// a broadcast lag can do. Admission must still count the thread.
+#[tokio::test]
+async fn admission_counts_a_running_user_thread_no_subscriber_saw() {
+    let f = fixture(1).await;
+    let resumed = Uuid::new_v4();
+    emit_message_received(&f.bus, resumed).await;
+    for event in [user_question_asked(), user_question_answered()] {
+        f.bus
+            .emit(BusEvent::Thread {
+                thread_id: resumed,
+                event,
+                meta: crate::engine::thread_events::EventMeta::NONE,
+            })
+            .await
+            .expect("park/resume emit");
+    }
+
+    let bg = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .await;
+    assert!(
+        !bg.admitted,
+        "the resumed user thread fills the pool of 1, so background queues"
+    );
+
+    let mut changes = f.bus.subscribe();
+    let other = Uuid::new_v4();
+    let _release = spawn_user_slot(f.queue.clone(), other);
+    next_queue_change(&mut changes).await;
+    assert_eq!(
+        user_status(&f.queue, other).await,
+        Some("queued"),
+        "a new user message waits behind the resumed thread"
+    );
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+// ---- A user thread counts exactly while it is running ----
+
+/// Minimal `CodingAgentIdled` for the drain-hint classifier test.
 fn cc_idled() -> crate::engine::thread_events::ThreadEvent {
     crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
         has_changes: false,
@@ -1525,7 +1611,7 @@ fn cc_idled() -> crate::engine::thread_events::ThreadEvent {
 }
 
 /// Minimal `UserQuestionAsked` — the thread parks on the user
-/// (`waiting_for_user_answer`), so reconcile removes its slot.
+/// (`waiting_for_user_answer`), so it stops counting.
 fn user_question_asked() -> crate::engine::thread_events::ThreadEvent {
     crate::engine::thread_events::ThreadEvent::UserQuestionAsked {
         tool_use_id: "tu-1".to_string(),
@@ -1539,7 +1625,7 @@ fn user_question_asked() -> crate::engine::thread_events::ThreadEvent {
 }
 
 /// Minimal `UserQuestionAnswered` — the user resolved the prompt, so the thread
-/// goes back to `running` and reconcile must re-add its slot.
+/// goes back to `running` and counts again.
 fn user_question_answered() -> crate::engine::thread_events::ThreadEvent {
     crate::engine::thread_events::ThreadEvent::UserQuestionAnswered {
         tool_use_id: "tu-1".to_string(),
@@ -1550,14 +1636,23 @@ fn user_question_answered() -> crate::engine::thread_events::ThreadEvent {
     }
 }
 
-/// Create the `thread_summaries` row (chat thread) so a later settle event's
-/// projection resolves its section transition cleanly.
+fn response_generated() -> crate::engine::thread_events::ThreadEvent {
+    crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+        text: String::new(),
+        images: vec![],
+        model: None,
+        reasoning_effort: None,
+    }
+}
+
+/// A user `MessageReceived` on a chat thread: the row is created, `running`.
 async fn emit_message_received(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: crate::engine::thread_events::ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "hello".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1578,295 +1673,296 @@ async fn emit_message_received(bus: &EventBus, thread_id: Uuid) {
     .expect("MessageReceived emit");
 }
 
-/// Acquire a user slot, then emit `settle_event` through the bus and assert the
-/// settle subscriber reconciles the slot away (the thread left `running`) —
-/// even though the chat task still holds its `UserSlotGuard` (the parked-CC
-/// shape: the task never returns).
-async fn assert_settle_releases(settle_event: crate::engine::thread_events::ThreadEvent) {
-    let f = fixture(2).await;
-    f.queue.spawn_settle_subscriber();
-    let tid = Uuid::new_v4();
-    emit_message_received(&f.bus, tid).await;
-
-    let _release = spawn_user_slot(f.queue.clone(), tid);
-    let q = f.queue.clone();
-    wait_until(|| {
-        let q = q.clone();
-        async move { user_status(&q, tid).await == Some("admitted") }
+async fn emit_on(
+    bus: &EventBus,
+    thread_id: Uuid,
+    event: crate::engine::thread_events::ThreadEvent,
+) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event,
+        meta: crate::engine::thread_events::EventMeta::NONE,
     })
-    .await;
-
-    f.bus
-        .emit(BusEvent::Thread {
-            thread_id: tid,
-            event: settle_event,
-            meta: crate::engine::thread_events::EventMeta::NONE,
-        })
-        .await
-        .expect("settle event emit");
-
-    // The subscriber releases asynchronously after the broadcast.
-    wait_until(|| {
-        let q = q.clone();
-        async move { user_status(&q, tid).await.is_none() }
-    })
-    .await;
-
-    f.pool.close().await;
-    teardown_test_db(&f.db).await;
+    .await
+    .expect("thread event emit");
 }
 
+/// Acquire a user slot in a detached task. The first receiver resolves once
+/// the gate admits; dropping the returned sender releases the slot.
+fn spawn_admitted_user_slot(
+    queue: Arc<ThreadQueue>,
+    thread_id: Uuid,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (admitted_tx, admitted_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _guard = queue
+            .acquire_user_slot(thread_id, "user message".to_string())
+            .await;
+        let _ = admitted_tx.send(());
+        let _ = release_rx.await;
+    });
+    (admitted_rx, release_tx)
+}
+
+async fn admitted(rx: oneshot::Receiver<()>) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+        .await
+        .expect("the gate did not admit")
+        .expect("the gate task died");
+}
+
+/// A user thread stops counting the moment it leaves `running`, whatever the
+/// cause, while the chat task still holds its guard: the parked coding-agent
+/// shape, where the task never returns.
 #[tokio::test]
-async fn settle_releases_user_slot_on_response_completion() {
-    assert_settle_releases(
-        crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-            text: String::new(),
-            images: vec![],
-            model: None,
-            reasoning_effort: None,
+async fn a_user_thread_that_leaves_running_stops_counting() {
+    for leave in [
+        response_generated(),
+        crate::engine::thread_events::ThreadEvent::ResponseFailed {
+            error: "boom".to_string(),
         },
-    )
-    .await;
-}
+        user_question_asked(),
+    ] {
+        let f = fixture(2).await;
+        let tid = Uuid::new_v4();
+        emit_message_received(&f.bus, tid).await;
+        let (admitted_rx, _release) = spawn_admitted_user_slot(f.queue.clone(), tid);
+        admitted(admitted_rx).await;
+        assert_eq!(user_status(&f.queue, tid).await, Some("admitted"));
 
-#[tokio::test]
-async fn settle_releases_user_slot_on_response_failure() {
-    assert_settle_releases(crate::engine::thread_events::ThreadEvent::ResponseFailed {
-        error: "boom".to_string(),
-    })
-    .await;
-}
+        emit_on(&f.bus, tid, leave).await;
+        assert_eq!(user_status(&f.queue, tid).await, None);
 
-#[tokio::test]
-async fn settle_releases_user_slot_when_parked_on_user_question() {
-    assert_settle_releases(user_question_asked()).await;
-}
-
-/// The reported bug: a user-initiated thread parks on a question (slot removed,
-/// drops out of the Running set), the user answers, and the thread keeps running
-/// — but the panel showed "Nothing running" because the slot was never restored.
-/// reconcile must re-add the slot the moment the thread is `running` again.
-#[tokio::test]
-async fn reconcile_re_adds_user_slot_after_question_answered() {
-    let f = fixture(2).await;
-    f.queue.spawn_settle_subscriber();
-    let tid = Uuid::new_v4();
-    emit_message_received(&f.bus, tid).await;
-
-    let _release = spawn_user_slot(f.queue.clone(), tid);
-    let q = f.queue.clone();
-    wait_until(|| {
-        let q = q.clone();
-        async move { user_status(&q, tid).await == Some("admitted") }
-    })
-    .await;
-
-    // Park: the thread asks the user a question → drops out of the Running set.
-    f.bus
-        .emit(BusEvent::Thread {
-            thread_id: tid,
-            event: user_question_asked(),
-            meta: crate::engine::thread_events::EventMeta::NONE,
-        })
-        .await
-        .expect("UserQuestionAsked emit");
-    wait_until(|| {
-        let q = q.clone();
-        async move { user_status(&q, tid).await.is_none() }
-    })
-    .await;
-
-    // Resume: the user answers → status flips back to running → reconcile
-    // re-adds the slot and the thread shows as running again.
-    f.bus
-        .emit(BusEvent::Thread {
-            thread_id: tid,
-            event: user_question_answered(),
-            meta: crate::engine::thread_events::EventMeta::NONE,
-        })
-        .await
-        .expect("UserQuestionAnswered emit");
-    wait_until(|| {
-        let q = q.clone();
-        async move { user_status(&q, tid).await == Some("admitted") }
-    })
-    .await;
-
-    f.pool.close().await;
-    teardown_test_db(&f.db).await;
-}
-
-/// The guard's backstop has to survive the park/resume round trip above.
-/// `reconcile_user_slot` used to RE-FILE the resumed slot under a fresh `Uuid`,
-/// so the gate's `UserSlotGuard` (which matches its own `entry_id`) could never
-/// release it again. Pair that with a settle missed on broadcast lag and the
-/// slot leaked for the life of the process; enough leaks and every chat POST
-/// blocks on the pool. The resume now re-files under the parked key.
-///
-/// The fix is deliberately NOT a release-by-thread fallback: after a second
-/// gate for the same thread that would drop the NEWER request's slot and admit
-/// queued work above the pool limit.
-#[tokio::test]
-async fn a_dropped_guard_still_releases_a_slot_that_survived_a_park_resume() {
-    let f = fixture(2).await;
-    f.queue.spawn_settle_subscriber();
-    let tid = Uuid::new_v4();
-    emit_message_received(&f.bus, tid).await;
-
-    let release = spawn_user_slot(f.queue.clone(), tid);
-    let q = f.queue.clone();
-    wait_until(|| {
-        let q = q.clone();
-        async move { user_status(&q, tid).await == Some("admitted") }
-    })
-    .await;
-
-    for event in [user_question_asked(), user_question_answered()] {
-        let expect_admitted = matches!(
-            event,
-            crate::engine::thread_events::ThreadEvent::UserQuestionAnswered { .. }
-        );
-        f.bus
-            .emit(BusEvent::Thread {
-                thread_id: tid,
-                event,
-                meta: crate::engine::thread_events::EventMeta::NONE,
-            })
-            .await
-            .expect("park/resume emit");
-        wait_until(|| {
-            let q = q.clone();
-            async move { (user_status(&q, tid).await == Some("admitted")) == expect_admitted }
-        })
-        .await;
+        f.pool.close().await;
+        teardown_test_db(&f.db).await;
     }
+}
 
-    // The chat task ends. Its guard must still find the re-filed slot.
-    drop(release);
-    wait_until(|| {
-        let q = q.clone();
-        async move { user_status(&q, tid).await.is_none() }
-    })
-    .await;
+/// The resume family ADR 0010 fixed: a thread parks, the user answers, and it
+/// runs again. It counts again because `thread_summaries` says `running`.
+#[tokio::test]
+async fn a_resumed_user_thread_counts_again() {
+    let f = fixture(2).await;
+    let tid = Uuid::new_v4();
+    emit_message_received(&f.bus, tid).await;
+    let (admitted_rx, _release) = spawn_admitted_user_slot(f.queue.clone(), tid);
+    admitted(admitted_rx).await;
+
+    emit_on(&f.bus, tid, user_question_asked()).await;
+    assert_eq!(user_status(&f.queue, tid).await, None);
+    emit_on(&f.bus, tid, user_question_answered()).await;
+    assert_eq!(user_status(&f.queue, tid).await, Some("admitted"));
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
 }
 
+/// A reservation counts until its thread starts. A thread can start AND park
+/// before any admission looks, so it is never observed `running`. Its turn
+/// start is in the log, so the reservation is seen and the parked thread holds
+/// nothing, guard or no guard.
 #[tokio::test]
-async fn reconcile_frees_the_pool_when_thread_leaves_running_under_a_held_guard() {
+async fn a_thread_that_starts_and_parks_unobserved_holds_no_slot() {
     let f = fixture(1).await;
     let tid = Uuid::new_v4();
-    emit_message_received(&f.bus, tid).await; // status='running', initiator='user'
-                                              // The guard stays held by the detached task for the whole test, exactly
-                                              // the parked-CC shape where the chat task can't release on its own.
-    let _release = spawn_user_slot(f.queue.clone(), tid);
-    let q = f.queue.clone();
-    wait_until(|| {
-        let q = q.clone();
-        async move { user_status(&q, tid).await == Some("admitted") }
-    })
-    .await;
+    let (admitted_rx, _release) = spawn_admitted_user_slot(f.queue.clone(), tid);
+    admitted(admitted_rx).await;
+    assert_eq!(
+        user_status(&f.queue, tid).await,
+        Some("admitted"),
+        "the reservation holds the slot until the thread starts"
+    );
 
-    // Pool of 1 is saturated by the user slot → a background spawn queues.
+    emit_message_received(&f.bus, tid).await;
+    emit_on(&f.bus, tid, user_question_asked()).await;
+
     let bg = f
         .queue
         .submit(sub_thread_request(Uuid::new_v4()), None, None)
         .await;
-    assert!(!bg.admitted, "pool of 1 is saturated by the user slot");
-
-    // The thread leaves `running` (response completed). reconcile clears the
-    // slot even though the guard is still held, and the freed slot drains the
-    // queued background spawn.
-    f.bus
-        .emit(BusEvent::Thread {
-            thread_id: tid,
-            event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-                text: String::new(),
-                images: vec![],
-                model: None,
-                reasoning_effort: None,
-            },
-            meta: crate::engine::thread_events::EventMeta::NONE,
-        })
-        .await
-        .expect("ResponseGenerated emit");
-    f.queue.reconcile_user_slot(tid).await;
-    assert_eq!(
-        user_status(&f.queue, tid).await,
-        None,
-        "reconcile clears the slot under a held guard once the thread leaves running"
+    assert!(
+        bg.admitted,
+        "the parked thread holds no slot, so background takes the only one"
     );
-
-    // The freed slot drained the queued background spawn.
-    let pool = f.pool.clone();
-    let bg_id = bg.entry_id;
-    wait_until(|| {
-        let pool = pool.clone();
-        async move { row_status(&pool, bg_id).await.as_deref() == Some("admitted") }
-    })
-    .await;
+    assert_eq!(user_status(&f.queue, tid).await, None);
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
 }
 
-/// reconcile adds a slot for a running user thread, is idempotent, and removes
-/// it when the thread is no longer running — driving the pool purely from
-/// `thread_summaries.status`, with no settle subscriber in the loop.
+/// A follow-up whose message already set its thread `running` does not wait
+/// for the slot its own thread holds.
 #[tokio::test]
-async fn reconcile_converges_pool_to_thread_status() {
-    let f = fixture(2).await;
+async fn a_follow_up_on_a_running_thread_does_not_wait_for_its_own_slot() {
+    let f = fixture(1).await;
     let tid = Uuid::new_v4();
-
-    // No row yet → not running → reconcile leaves the pool empty.
-    f.queue.reconcile_user_slot(tid).await;
-    assert_eq!(user_status(&f.queue, tid).await, None);
-
-    // A running user thread → reconcile adds exactly one slot.
     emit_message_received(&f.bus, tid).await;
-    f.queue.reconcile_user_slot(tid).await;
-    assert_eq!(user_status(&f.queue, tid).await, Some("admitted"));
 
-    // Idempotent: reconciling again while still running does not double-add.
-    f.queue.reconcile_user_slot(tid).await;
-    let count = f
+    let (admitted_rx, _release) = spawn_admitted_user_slot(f.queue.clone(), tid);
+    admitted(admitted_rx).await;
+    let own = f
         .queue
         .user_entries()
         .await
         .into_iter()
-        .filter(|e| e.thread_id == Some(tid))
+        .filter(|e| e.thread_id == tid)
         .count();
+    assert_eq!(own, 1, "the thread counts once, not once per request");
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// A freed slot drains on the next admission read, under a held guard and with
+/// no subscriber in the loop.
+#[tokio::test]
+async fn a_drain_admits_into_a_slot_a_user_thread_freed() {
+    let f = fixture(1).await;
+    let tid = Uuid::new_v4();
+    emit_message_received(&f.bus, tid).await;
+    let (admitted_rx, _release) = spawn_admitted_user_slot(f.queue.clone(), tid);
+    admitted(admitted_rx).await;
+
+    let bg = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .await;
+    assert!(!bg.admitted, "pool of 1 is saturated by the user thread");
+
+    emit_on(&f.bus, tid, response_generated()).await;
+    f.queue.drain().await;
     assert_eq!(
-        count, 1,
-        "reconcile must not double-add a running user thread"
+        row_status(&f.pool, bg.entry_id).await.as_deref(),
+        Some("admitted")
     );
 
-    // Thread leaves running → reconcile removes the slot.
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// I12: a lagged drain hint still drains. The thread's terminal went out
+/// before the subscriber existed, and the broadcast then overflowed. The lag
+/// arm drains, and the waiting user message takes the freed slot.
+#[tokio::test]
+async fn a_lagged_drain_hint_still_drains() {
+    use crate::engine::event_bus::BUS_CAPACITY;
+
+    let f = fixture(1).await;
+    let busy = Uuid::new_v4();
+    emit_message_received(&f.bus, busy).await;
+
+    let waiting = Uuid::new_v4();
+    let mut changes = f.bus.subscribe();
+    let (admitted_rx, _release) = spawn_admitted_user_slot(f.queue.clone(), waiting);
+    next_queue_change(&mut changes).await;
+    assert_eq!(user_status(&f.queue, waiting).await, Some("queued"));
+
+    emit_on(&f.bus, busy, response_generated()).await;
+    let lagging = f.bus.subscribe();
+    for _ in 0..=BUS_CAPACITY {
+        f.bus
+            .broadcast_transient_system(SystemEvent::ThreadQueueChanged {});
+    }
+    tokio::spawn(f.queue.clone().run_drain_hints(lagging));
+    admitted(admitted_rx).await;
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// A user follow-up into a thread an agent started. The row keeps
+/// `initiator = 'system'`, so only the live admission makes the thread count:
+/// while it runs, and not once it settles.
+#[tokio::test]
+async fn a_follow_up_into_an_agent_started_thread_counts_while_it_runs() {
+    use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
+
+    let message = |mode| ThreadEvent::MessageReceived {
+        provider: None,
+        voice_session_id: None,
+        wake_mode: None,
+        text: "hi".into(),
+        user_image_hashes: vec![],
+        device_id: None,
+        image_description: None,
+        parent_thread_id: None,
+        spawning_event_id: None,
+        mode,
+        model: None,
+        reasoning_effort: None,
+        origin: None,
+    };
+    let chat = || EventMeta {
+        channel: Some(EventChannel::Chat),
+        ..EventMeta::NONE
+    };
+
+    let f = fixture(1).await;
+    let tid = Uuid::new_v4();
     f.bus
         .emit(BusEvent::Thread {
             thread_id: tid,
-            event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-                text: String::new(),
-                images: vec![],
-                model: None,
-                reasoning_effort: None,
-            },
-            meta: crate::engine::thread_events::EventMeta::NONE,
+            event: message(ActorMode::Agent),
+            meta: chat(),
         })
         .await
-        .expect("ResponseGenerated emit");
-    f.queue.reconcile_user_slot(tid).await;
+        .expect("agent message");
+    emit_on(&f.bus, tid, response_generated()).await;
+
+    let (admitted_rx, _release) = spawn_admitted_user_slot(f.queue.clone(), tid);
+    admitted(admitted_rx).await;
+    f.bus
+        .emit(BusEvent::Thread {
+            thread_id: tid,
+            event: message(ActorMode::Human),
+            meta: chat(),
+        })
+        .await
+        .expect("user follow-up");
+
+    let bg = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .await;
+    assert!(
+        !bg.admitted,
+        "the resumed agent thread fills the pool while the user's turn runs"
+    );
+
+    emit_on(&f.bus, tid, response_generated()).await;
+    f.queue.drain().await;
+    assert_eq!(
+        row_status(&f.pool, bg.entry_id).await.as_deref(),
+        Some("admitted"),
+        "once the turn settles, the thread holds nothing"
+    );
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// Only `running` user threads in `thread_summaries` count.
+#[tokio::test]
+async fn occupancy_follows_thread_status() {
+    let f = fixture(2).await;
+    let tid = Uuid::new_v4();
+    assert_eq!(user_status(&f.queue, tid).await, None, "no row, no slot");
+
+    emit_message_received(&f.bus, tid).await;
+    assert_eq!(user_status(&f.queue, tid).await, Some("admitted"));
+
+    emit_on(&f.bus, tid, response_generated()).await;
     assert_eq!(user_status(&f.queue, tid).await, None);
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
 }
 
-/// reconcile never adds a slot for a background (non-user) running thread — only
-/// `initiator = 'user'` threads occupy the user-half of the pool.
+/// A background (non-user) running thread never counts as user occupancy:
+/// the `thread_queue` projection counts it.
 #[tokio::test]
-async fn reconcile_ignores_background_thread() {
+async fn occupancy_ignores_a_background_thread() {
     let f = fixture(2).await;
     let tid = Uuid::new_v4();
     // An agent-driven MessageReceived → initiator='system', status='running'.
@@ -1876,6 +1972,7 @@ async fn reconcile_ignores_background_thread() {
             event: crate::engine::thread_events::ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "spawned".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -1895,7 +1992,6 @@ async fn reconcile_ignores_background_thread() {
         .await
         .expect("agent MessageReceived emit");
 
-    f.queue.reconcile_user_slot(tid).await;
     assert_eq!(
         user_status(&f.queue, tid).await,
         None,
@@ -1915,15 +2011,10 @@ async fn snapshot_merges_background_rows_and_user_entries() {
         .submit(sub_thread_request(Uuid::new_v4()), None, None)
         .await;
     assert!(bg.admitted);
-    // User-initiated slot → in-memory only, no row.
+    // User-initiated reservation → in-memory only, no row.
     let tid = Uuid::new_v4();
-    let _release = spawn_user_slot(f.queue.clone(), tid);
-    let q = f.queue.clone();
-    wait_until(|| {
-        let q = q.clone();
-        async move { user_status(&q, tid).await == Some("admitted") }
-    })
-    .await;
+    let (admitted_rx, _release) = spawn_admitted_user_slot(f.queue.clone(), tid);
+    admitted(admitted_rx).await;
 
     // The single merged view both the panel API and the LLM tool read.
     let snap = f.queue.snapshot().await.expect("snapshot");
@@ -1947,33 +2038,25 @@ async fn snapshot_merges_background_rows_and_user_entries() {
 }
 
 #[test]
-fn affects_user_running_selects_status_transitions() {
+fn moves_user_occupancy_selects_status_transitions() {
     use crate::engine::thread_events::ThreadEvent;
     use crate::runtime::CodingAgent;
 
-    // Status transitions reconcile must observe: parks, resumes (no gate),
-    // continuations, and terminals.
-    assert!(affects_user_running(&user_question_asked())); // park
-    assert!(affects_user_running(&user_question_answered())); // resume (no gate)
-    assert!(affects_user_running(&cc_idled())); // terminal
-    assert!(affects_user_running(&ThreadEvent::ResponseGenerated {
-        text: String::new(),
-        images: vec![],
-        model: None,
-        reasoning_effort: None,
-    }));
-    assert!(affects_user_running(&ThreadEvent::ResponseFailed {
+    // Parks, resumes, continuations, terminals, and turn starts.
+    assert!(moves_user_occupancy(&user_question_asked()));
+    assert!(moves_user_occupancy(&user_question_answered()));
+    assert!(moves_user_occupancy(&cc_idled()));
+    assert!(moves_user_occupancy(&response_generated()));
+    assert!(moves_user_occupancy(&ThreadEvent::ResponseFailed {
         error: "x".into()
     }));
-    assert!(affects_user_running(&ThreadEvent::ContinuationRequested {
+    assert!(moves_user_occupancy(&ThreadEvent::ContinuationRequested {
         reason: String::new()
     }));
-
-    // Gate-covered starts: the gate owns the add, so reconcile must NOT fire on
-    // these (a reconcile add would race the gate's unconditional add).
-    assert!(!affects_user_running(&ThreadEvent::MessageReceived {
+    assert!(moves_user_occupancy(&ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,
+        wake_mode: None,
         text: "hi".into(),
         user_image_hashes: vec![],
         device_id: None,
@@ -1987,10 +2070,10 @@ fn affects_user_running_selects_status_transitions() {
     }));
 
     // Per-token streaming / neutral: never move status.
-    assert!(!affects_user_running(&ThreadEvent::TextStreamed {
+    assert!(!moves_user_occupancy(&ThreadEvent::TextStreamed {
         text: "hi".into()
     }));
-    assert!(!affects_user_running(&ThreadEvent::CodingAgentToolCalled {
+    assert!(!moves_user_occupancy(&ThreadEvent::CodingAgentToolCalled {
         name: "Bash".into(),
         args: serde_json::json!({}),
         description: String::new(),
@@ -1999,15 +2082,16 @@ fn affects_user_running_selects_status_transitions() {
         parent_tool_use_id: None,
         api_call_id: None,
     }));
-    assert!(!affects_user_running(&ThreadEvent::ThreadSaved));
+    assert!(!moves_user_occupancy(&ThreadEvent::ThreadSaved));
 
     // An input read moves status only when it started a turn.
     let read = |started_turn| ThreadEvent::CodingAgentInputRead {
         input_event_id: Uuid::new_v4(),
         started_turn,
+        verbatim: false,
     };
-    assert!(affects_user_running(&read(true)));
-    assert!(!affects_user_running(&read(false)));
+    assert!(moves_user_occupancy(&read(true)));
+    assert!(!moves_user_occupancy(&read(false)));
 }
 
 // ---- Event-trigger chain depth ----
@@ -2029,7 +2113,15 @@ async fn a_fires_spawned_work_runs_at_the_fires_own_depth() {
     let configs = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let workspace = tempfile::tempdir().expect("temp workspace");
     let (probe, mut entered) = DepthProbeExecutor::new();
-    let queue = queue_with_executor(&pool, &bus, &configs, workspace.path(), 4, probe.clone());
+    let queue = queue_with_executor(
+        &pool,
+        &bus,
+        &configs,
+        workspace.path(),
+        4,
+        probe.clone(),
+        Arc::default(),
+    );
 
     // Submitted from inside the fire, exactly as the `run_thread` tool does.
     let outcome = EVENT_TRIGGER_DEPTH
@@ -2074,7 +2166,15 @@ async fn a_queued_spawn_keeps_its_depth_when_the_drainer_admits_it() {
     let workspace = tempfile::tempdir().expect("temp workspace");
     let (probe, mut entered) = DepthProbeExecutor::new();
     // One slot, so the second submit has to wait for the drainer.
-    let queue = queue_with_executor(&pool, &bus, &configs, workspace.path(), 1, probe.clone());
+    let queue = queue_with_executor(
+        &pool,
+        &bus,
+        &configs,
+        workspace.path(),
+        1,
+        probe.clone(),
+        Arc::default(),
+    );
 
     let first = EVENT_TRIGGER_DEPTH
         .scope(
@@ -2128,7 +2228,15 @@ async fn an_admitted_spawns_thread_carries_the_chain_depth_until_it_completes() 
     let configs = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let workspace = tempfile::tempdir().expect("temp workspace");
     let (probe, mut entered) = DepthProbeExecutor::new();
-    let queue = queue_with_executor(&pool, &bus, &configs, workspace.path(), 4, probe.clone());
+    let queue = queue_with_executor(
+        &pool,
+        &bus,
+        &configs,
+        workspace.path(),
+        4,
+        probe.clone(),
+        Arc::default(),
+    );
 
     let child = Uuid::new_v4();
     let outcome = EVENT_TRIGGER_DEPTH
@@ -2194,6 +2302,7 @@ async fn a_re_queued_entry_re_fires_at_the_depth_it_was_submitted_with() {
         f.workspace.path(),
         4,
         probe.clone(),
+        Arc::default(),
     );
     restarted.recover_persisted_entries().await;
     restarted.drain().await;
@@ -2554,6 +2663,7 @@ async fn an_entry_whose_work_panics_releases_its_hold() {
         workspace.path(),
         4,
         Arc::new(PanickingExecutor),
+        Arc::default(),
     );
     let entry = queue.submit(cron_request("trig-panic"), None, None).await;
     assert!(entry.admitted);
@@ -2564,4 +2674,147 @@ async fn an_entry_whose_work_panics_releases_its_hold() {
 
     pool.close().await;
     teardown_test_db(&db).await;
+}
+
+// ── Shutdown holds trigger fires for the next engine ────────────────────────
+//
+// A teardown stops coding-agent sessions, which frees their pool slots and
+// drains the queue. A trigger fire admitted then starts on an engine whose API
+// is closing, so its script's `lucidos` callback is refused and the run fails.
+
+#[tokio::test]
+async fn a_trigger_fire_queued_before_shutdown_waits_for_the_next_engine() {
+    let f = fixture(1).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    let blocker = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .await;
+    let fire = f.queue.submit(cron_request("trig-a"), None, None).await;
+    assert!(blocker.admitted);
+    assert!(!fire.admitted, "the pool is full, so the fire queues");
+
+    // The teardown begins, then frees the blocker's slot.
+    f.shutting_down.store(true, Ordering::SeqCst);
+    f.executor.release_one();
+    blocker.completion.await.expect("blocker completes");
+    f.queue.drain().await;
+    // The completion handle resolves before `ThreadQueueCompleted` deletes the
+    // row. A next engine that recovers it first would run the blocker again.
+    let pool = f.pool.clone();
+    let blocker_id = blocker.entry_id;
+    wait_until(|| {
+        let pool = pool.clone();
+        async move { row_status(&pool, blocker_id).await.is_none() }
+    })
+    .await;
+
+    assert_eq!(
+        f.executor.executed_ids(),
+        vec![blocker.entry_id],
+        "a trigger fire must not start on an engine that is shutting down"
+    );
+    assert_eq!(
+        row_status(&f.pool, fire.entry_id).await.as_deref(),
+        Some("queued"),
+        "the fire stays queued for the next engine"
+    );
+
+    // The next engine recovers the row and runs it.
+    let (next, next_executor) = restarted_queue(&f, 1);
+    next.recover_persisted_entries().await;
+    next.drain().await;
+    wait_for_executed(&next_executor, vec![fire.entry_id]).await;
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn a_trigger_fire_submitted_during_shutdown_is_queued_not_started() {
+    let f = fixture(4).await;
+    for id in ["trig-cron", "trig-event"] {
+        f.trigger_configs
+            .write()
+            .unwrap()
+            .insert(id.to_string(), test_trigger_config(id));
+    }
+    f.shutting_down.store(true, Ordering::SeqCst);
+
+    let cron = f.queue.submit(cron_request("trig-cron"), None, None).await;
+    let event = f
+        .queue
+        .submit(event_trigger_request("trig-event"), None, None)
+        .await;
+
+    for (kind, outcome) in [("cron", &cron), ("event-trigger", &event)] {
+        assert!(!outcome.admitted, "a {kind} fire must not admit");
+        assert_eq!(
+            row_status(&f.pool, outcome.entry_id).await.as_deref(),
+            Some("queued"),
+            "the {kind} fire is kept for the next engine"
+        );
+    }
+    assert!(f.executor.executed_ids().is_empty());
+
+    // A held cron fire still coalesces a second fire of the same trigger.
+    // So a catch-up of the same slot cannot double it.
+    let again = f.queue.submit(cron_request("trig-cron"), None, None).await;
+    assert!(again.coalesced);
+    assert_eq!(cron_row_count(&f.pool, "trig-cron").await, 1);
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn a_spawn_still_admits_during_shutdown() {
+    let f = fixture(4).await;
+    f.shutting_down.store(true, Ordering::SeqCst);
+
+    let spawn = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .await;
+    assert!(
+        spawn.admitted,
+        "only trigger fires are held; spawn kinds keep their own rules"
+    );
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn run_now_does_not_start_a_held_trigger_fire() {
+    let f = fixture(1).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+    let blocker = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .await;
+    let fire = f.queue.submit(cron_request("trig-a"), None, None).await;
+    assert!(blocker.admitted);
+    assert!(!fire.admitted);
+
+    f.shutting_down.store(true, Ordering::SeqCst);
+    assert!(
+        f.queue.run_now(fire.entry_id, None).await.is_err(),
+        "Run now must not start a trigger fire on an engine that is leaving"
+    );
+    assert_eq!(f.executor.executed_ids(), vec![blocker.entry_id]);
+    assert_eq!(
+        row_status(&f.pool, fire.entry_id).await.as_deref(),
+        Some("queued")
+    );
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
 }

@@ -1,12 +1,13 @@
 import { EVENT_CLASSIFICATION } from '../../generated/thread-lifecycle';
 import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
-import { findQuestionAnswer, isAgentReplyText, modeToInitiator } from './exchange';
+import { findQuestionAnswer, isAgentReplyText, modeToInitiator, parentToolUseIdOf } from './exchange';
 import { isOneUtterance, joinSpoken } from './spokenMerge';
 import { SIDE_QUESTION_TYPES, WIDGET_SHELF_CHANGE_TYPES, isFormRequest, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange, TypedAnswer } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
+import { KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON } from '@lucidos/engine-constants';
 import type { PendingUserMessage, ThreadAggregate, ThreadState } from './thread-meta';
 
 // ---------------------------------------------------------------------------
@@ -549,6 +550,8 @@ export const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   // (ADR 0278). Notes that hold no turn: see `isTurnlessBoundary`.
   'ChildThreadStopped',
   'ChildThreadDetached',
+  // A child's report filed without waking this thread. A note too.
+  'ChildReportFiled',
   // A caller's utterance the talker answered alone. A reader sorts a
   // transcript by who is talking. Which turn was running underneath comes
   // second, so the caller opens a boundary either way.
@@ -631,6 +634,7 @@ export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHand
   ['EventWaitCanceled', 'own-arm'],
   ['ChildThreadStopped', 'own-arm'],
   ['ChildThreadDetached', 'own-arm'],
+  ['ChildReportFiled', 'own-arm'],
 ]);
 
 /** Does this boundary take the running turn? `previous` held it.
@@ -723,9 +727,15 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // A side question is a card beside the thread (`store/sideQuestions.ts`),
   // never a step of a turn (ADR 0320).
   ...SIDE_QUESTION_TYPES,
-  // A pin or an unpin is shelf bookkeeping (ADR 0407). The widget card its
-  // `WidgetShown` drew stays as it is.
+  // A pin or an unpin is shelf bookkeeping (ADR 0407). The inline widget it
+  // names stays as it is.
   ...WIDGET_SHELF_CHANGE_TYPES,
+  // Arranging the Home board draws nothing in Home's chat (ADR 0432).
+  'HomeBoardArranged',
+  // An Apply Now's bracket only marks the row as applying (ADR 0437). What the
+  // apply did is told by its change events.
+  'ApplyNowStarted',
+  'ApplyNowEnded',
 ]);
 
 /** True for a `ContextCaptured` recording an *auxiliary model call* rather
@@ -744,6 +754,35 @@ export function isAuxiliaryCapture(event: { type: string }): boolean {
   if (event.type !== 'ContextCaptured') return false;
   const purpose = (event as { purpose?: string }).purpose;
   return purpose !== undefined && purpose !== 'turn';
+}
+
+/** A *cache keep-alive* anchor: the engine resumed a waiting session only to
+ *  keep its prompt cache warm. The turn leaves no trace, so nothing of it
+ *  renders and the thread keeps showing Waiting. */
+export function isCacheKeepAliveAnchor(event: StoredEvent): boolean {
+  return event.type === 'PromptInjected'
+    && event.origin?.kind === 'engine'
+    && event.origin.reason.kind === 'cache_keep_alive';
+}
+
+/** Cards that end a keep-alive turn, as the engine's projection reads them.
+ *  The nudge asks for no tool call. An agent that asks anyway leaves the
+ *  thread waiting on the card, so the card and the turn after it must show. */
+const KEEP_ALIVE_VISIBLE_CARDS: ReadonlySet<string> = new Set(KEEP_ALIVE_ENDING_EVENT_TYPES);
+
+/** The idle a keep-alive turn ends with. */
+export function isCacheKeepAliveIdle(event: StoredEvent): boolean {
+  return event.type === 'CodingAgentIdled' && event.reason === KEEP_ALIVE_IDLE_REASON;
+}
+
+/** Whether `event` belongs to one of the thread's keep-alive turns. */
+function isKeepAliveTurnEvent(thread: ThreadState, event: StoredEvent): boolean {
+  if (isCacheKeepAliveAnchor(event) || isCacheKeepAliveIdle(event)) return true;
+  const req = requestEventIdOf(event);
+  if (req === undefined || !thread.keepAliveAnchorIds?.has(req)) return false;
+  if (!KEEP_ALIVE_VISIBLE_CARDS.has(event.type)) return true;
+  thread.keepAliveAnchorIds.delete(req);
+  return false;
 }
 
 /** True if the thread contains at least one event that could contribute to
@@ -1104,6 +1143,15 @@ function onCodingAgentChannel(event: { type: string }): boolean {
   return (event as { channel?: string }).channel === 'claude_code';
 }
 
+/** Does `event` prove the engine reports when the agent reads a message? A read
+ *  does. So does a prompt naming the input it forwards, since only an engine
+ *  that already reports reads stamps that name. The prompt matters because it
+ *  lands beside the message, while a long turn's last read can sit pages back. */
+function provesReadsReported(event: StoredEvent): boolean {
+  return event.type === 'CodingAgentInputRead'
+    || (event.type === 'CodingAgentPromptSent' && !!event.input_event_id);
+}
+
 /** Is `event` a message the coding agent has yet to read, sent while `turn`
  *  is still running or while others wait? Such a message waits in the queue
  *  (`Exchange.awaitingRead`). `othersWait` defaults to the fold's own queue. */
@@ -1177,9 +1225,9 @@ function handOverTheTurn(
   next: Exchange,
   touched: Set<Exchange> | null,
 ): void {
-  // Nothing else lands in `previous`, so a `Thinking` marker left pending
-  // there can never resolve on its own events. Record the handoff so rendering
-  // finalizes it. See `Exchange.continuationMoved`.
+  // From here only events routed back by tool id land in `previous`. A
+  // `Thinking` marker left pending there can never resolve on its own events.
+  // Record the handoff so rendering finalizes it. See `Exchange.continuationMoved`.
   previous.continuationMoved = true;
   touched?.add(previous);
   for (const [reqId, exchange] of state.reqIdRedirect.entries()) {
@@ -1277,8 +1325,8 @@ interface GroupFoldState {
   exchanges: Exchange[];
   current: Exchange | null;
   // tool_use_id to the exchange owning the matching CodingAgentToolCalled step.
-  // Queried when a CodingAgentToolResult lands, so it can be re-routed to the
-  // call's exchange even if a permission-request boundary intervened.
+  // Queried when a CodingAgentToolResult or a sub-agent's event lands, so it
+  // can be re-routed to its call's exchange across an intervening boundary.
   toolCallOwners: Map<string, Exchange>;
   // Chat ToolCalled.event_id to owner exchange, the primary routing path for
   // chat ToolResults. Required because an `ask_user_question` call is followed
@@ -1315,10 +1363,11 @@ interface GroupFoldState {
   /** Coding-agent messages the agent has not read yet, oldest first. See
    *  `Exchange.awaitingRead`. */
   unreadMessages: Exchange[];
-  /** Does the loaded history hold a `CodingAgentInputRead` anywhere? History
-   *  from before read events has none, and there a message takes the turn when
-   *  sent, since nothing would ever say the agent read it. Read across the
-   *  whole window, because a page can start after the running turn's read. */
+  /** Does the loaded history prove the engine reports reads
+   *  (`provesReadsReported`)? History from before read events has no proof.
+   *  There a message takes the turn when sent, since nothing would ever say
+   *  the agent read it. Read across the whole window, because a page can
+   *  start after the running turn's read. */
   readsReported: boolean;
   /** request_id to the tool call a permission card is holding: the exchange
    *  owning the call step, plus that step's `seq`. Written when the request is
@@ -1347,6 +1396,9 @@ interface GroupFoldState {
    *  (abort-before-terminal direction), which the incremental path detects,
    *  falling back to a full rebuild. */
   abortReqIds: Set<string>;
+  /** Ids of the *cache keep-alive* anchors folded so far. Every event of such
+   *  a turn names one as its `request_event_id`, and none of it renders. */
+  keepAliveAnchors: Set<string>;
   /** request_event_id of the most recent request-id-routed chat event, i.e. the
    *  active chat turn's req_id. The divider redirect bootstrap reads it to
    *  target the divider directly. It cannot trust `previousCurrent`, which can
@@ -1386,6 +1438,7 @@ function newFoldState(paged: boolean): GroupFoldState {
     reqIdRedirect: new Map(),
     resolvedReqIds: new Set(),
     abortReqIds: new Set(),
+    keepAliveAnchors: new Set(),
   };
 }
 
@@ -1695,9 +1748,9 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>, paged: boole
       // event): its sorted position is in the middle, not the end.
       return rebuildIncrementalCache(events, paged);
     }
-    if (event.type === 'CodingAgentInputRead' && !cache.fold.readsReported) {
-      // The first read proves the agent reports them, which changes how the
-      // messages already folded should have queued (`readsReported`).
+    if (provesReadsReported(event) && !cache.fold.readsReported) {
+      // The first proof changes how the messages already folded should have
+      // queued (`readsReported`).
       return rebuildIncrementalCache(events, paged);
     }
     const reqId = rerunReqIdOf(event);
@@ -1763,7 +1816,7 @@ function foldSorted(sorted: SequencedEvent[], paged: boolean): GroupFoldState {
   }
 
   const state = newFoldState(paged);
-  state.readsReported = sorted.some(({ event }) => event.type === 'CodingAgentInputRead');
+  state.readsReported = sorted.some(({ event }) => provesReadsReported(event));
   for (const { seq, event } of sorted) {
     foldEvent(state, seq, event, legacySupersededAbortSeqs.has(seq), null);
   }
@@ -2021,6 +2074,18 @@ function foldEvent(
     }
     if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
     if (isAuxiliaryCapture(event)) return;
+    if (isCacheKeepAliveAnchor(event)) {
+      if (event._eventId) state.keepAliveAnchors.add(event._eventId);
+      return;
+    }
+    if (isCacheKeepAliveIdle(event)) return;
+    const keepAliveReq = requestEventIdOf(event);
+    if (keepAliveReq !== undefined && state.keepAliveAnchors.has(keepAliveReq)) {
+      // A card makes the turn real, as the engine's projection does, so the
+      // card and everything after it render.
+      if (!KEEP_ALIVE_VISIBLE_CARDS.has(event.type)) return;
+      state.keepAliveAnchors.delete(keepAliveReq);
+    }
     // The prompt handing a waiting message to a running agent is no step of
     // the running turn, though it carries that turn's anchor. Filed there, it
     // opens a Thinking row that nothing closes. The read's own turn draws one.
@@ -2134,14 +2199,21 @@ function foldEvent(
         return;
       }
     }
-    // Re-route ToolResult by tool_use_id when a permission boundary stranded
-    // it from its call's exchange. Legacy events (no id) fall through.
-    if (event.type === 'CodingAgentToolResult') {
-      const id = toolUseIdOf(event);
-      const callOwner = id ? toolCallOwners.get(id) : undefined;
+    // Re-route a coding-agent event a boundary stranded from its call's
+    // exchange: a result to its call's, and a sub-agent's event to its `Agent`
+    // call's. A permission card is one such boundary, and a follow-up sent
+    // while a sub-agent runs is another. Legacy events (no id) fall through.
+    {
+      const resultOf = event.type === 'CodingAgentToolResult' ? toolUseIdOf(event) : undefined;
+      const parent = parentToolUseIdOf(event);
+      const callOwner = (resultOf ? toolCallOwners.get(resultOf) : undefined)
+        ?? (parent ? toolCallOwners.get(parent) : undefined);
       if (callOwner && callOwner !== current) {
-        callOwner.steps.push({ seq, event });
+        appendStep(callOwner, seq, event);
         touched?.add(callOwner);
+        // A sub-agent's own `Agent` call owns the steps of the agent it spawns.
+        const id = event.type === 'CodingAgentToolCalled' ? toolUseIdOf(event) : undefined;
+        if (id) toolCallOwners.set(id, callOwner);
         return;
       }
     }
@@ -2321,9 +2393,9 @@ function foldEvent(
       // `own-arm` in `BOUNDARY_CONTINUATION_HANDOFF`. It continues nothing, so
       // there is no continuation to redirect and no handoff to record.
       //
-      // A `ChildThreadStopped` or `ChildThreadDetached` is handled the same
-      // way: it wakes nothing, so a turn the parent is running keeps writing
-      // where it was.
+      // A `ChildThreadStopped`, `ChildThreadDetached` or `ChildReportFiled` is
+      // handled the same way: it wakes nothing, so a turn the parent is running
+      // keeps writing where it was.
       // An unsent message never reached the engine, so no agent reads it and it
       // takes no turn either.
       if (isTurnlessBoundary(event) || event._unsent) {
@@ -2700,9 +2772,15 @@ export function handleEvent(
     // A side question lands beside a streaming reply and is no part of it.
     if (!isSideQuestionEvent(event)) thread.streamingBuffer = '';
     // Update updatedAt only for events that the backend updates last_activity for.
-    // Must stay in sync with update_thread_projection() in event_bus.rs.
+    // Must stay in sync with update_thread_projection() in event_bus.rs, which
+    // skips a cache keep-alive turn.
     // Tick-only write — does not mark metaChanged (see `applyAggregateToMeta`).
-    if (created && updatesLastActivity(event.type)) thread.meta.updatedAt = created;
+    if (isCacheKeepAliveAnchor(stored) && eventId) {
+      (thread.keepAliveAnchorIds ??= new Set()).add(eventId);
+    }
+    if (created && updatesLastActivity(event.type) && !isKeepAliveTurnEvent(thread, stored)) {
+      thread.meta.updatedAt = created;
+    }
     // The caller's words landed, so the row promising them has done its job.
     // Here rather than on the call's own clock: the engine holds a transcript
     // across the talker's decision, so `user_turn_ended` can precede this row

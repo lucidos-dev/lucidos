@@ -89,6 +89,15 @@ describe('startClient external-link delegation', () => {
     expect(body).toContain('openUrl(href)');
   });
 
+  // A pasted link to a Lucidos thread opened the external browser on desktop.
+  // The parser answers first, and `cross-workspace.test.ts` covers its routing.
+  it('keeps a workspace thread URL inside Lucidos before falling back to openUrl', () => {
+    const parse = body.indexOf('parseWorkspaceThreadUrl(href)');
+    expect(parse).toBeGreaterThan(-1);
+    expect(body).toContain('openWorkspaceThreadUrl(');
+    expect(parse).toBeLessThan(body.indexOf('openUrl(href)'));
+  });
+
   it('never opens an external URL itself, so the platform routing has one home', () => {
     expect(body).not.toContain('window.open(');
   });
@@ -254,6 +263,7 @@ describe('startShell runs when the shell chunk resolves', () => {
   // first paint.
   const SHELL_INSTALLS = [
     'installDeadPressProbe()',
+    'installPressCoverWatch()',
     'installDeadKeystrokeProbe()',
     'installToastPressProbe()',
     'installAppKeybindingsSync()',

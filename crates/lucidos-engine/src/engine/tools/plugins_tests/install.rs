@@ -77,7 +77,7 @@ description = "test"
 
 #[tokio::test]
 async fn install_without_source_succeeds_and_omits_from_in_summary() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_sourceless_fixture(&archive_dir);
@@ -118,8 +118,6 @@ async fn install_without_source_succeeds_and_omits_from_in_summary() {
         }
         other => panic!("expected PluginInstalled, got {:?}", other),
     }
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 // --- Confirm-flow: prepare_install_request + cancel_pending_install_with_bus ---
@@ -137,7 +135,7 @@ fn parse_sentinel_payload(s: &str) -> serde_json::Value {
 
 #[test]
 fn prepare_install_request_returns_sentinel_and_registers_pending() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "preview-body");
@@ -177,8 +175,6 @@ fn prepare_install_request_returns_sentinel_and_registers_pending() {
 
     // Critically: nothing in data/ yet — the panel hasn't been confirmed.
     assert!(!scratch.join("data/knowhow/fixture.md").exists());
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// Theme Studio's shape: a plugin declaring the first release it works on.
@@ -211,7 +207,7 @@ fn stage_with_engine(
 
 #[test]
 fn an_unmet_engine_requirement_refuses_staging_and_writes_nothing() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let pending = fresh_pending_map();
 
     let result = stage_with_engine(
@@ -228,13 +224,11 @@ fn an_unmet_engine_requirement_refuses_staging_and_writes_nothing() {
     );
     assert!(pending.lock().unwrap().is_empty(), "no confirm panel");
     assert!(!scratch.join("data/knowhow").exists(), "nothing in data/");
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
 fn an_invalid_engine_requirement_refuses_staging_with_the_value_quoted() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let pending = fresh_pending_map();
 
     let result = stage_with_engine(&scratch, &pending, r#""newest""#, &running());
@@ -243,13 +237,11 @@ fn an_invalid_engine_requirement_refuses_staging_with_the_value_quoted() {
     assert!(result.contains(r#"engine = "newest""#), "{result}");
     assert!(pending.lock().unwrap().is_empty());
     assert!(!scratch.join("data/knowhow").exists());
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
 fn a_met_engine_requirement_stages_as_usual() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let pending = fresh_pending_map();
 
     let result = stage_with_engine(
@@ -268,15 +260,13 @@ fn a_met_engine_requirement_stages_as_usual() {
         parse_sentinel_payload(&result)["engine_requirement"],
         ">=0.46.1"
     );
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// No `engine` stages exactly as before. The payload says so with a null
 /// `engine_requirement`, which the confirmation panel shows as a quiet note.
 #[test]
 fn a_plugin_with_no_engine_stages_with_a_null_engine_requirement() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let pending = fresh_pending_map();
     let archive = build_fixture_archive(&scratch, "body");
 
@@ -297,13 +287,11 @@ fn a_plugin_with_no_engine_stages_with_a_null_engine_requirement() {
     let payload = parse_sentinel_payload(&result);
     assert!(payload["manifest"].get("engine").is_none());
     assert!(payload["engine_requirement"].is_null(), "{payload}");
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
 fn an_unreadable_release_refuses_only_a_plugin_that_declares_engine() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let pending = fresh_pending_map();
     let unreadable = Err("RELEASE is not semver".to_string());
 
@@ -324,13 +312,11 @@ fn an_unreadable_release_refuses_only_a_plugin_that_declares_engine() {
         staged.starts_with(PLUGIN_INSTALL_REQUEST_PREFIX),
         "got: {staged}"
     );
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
 fn prepare_install_request_lists_overwrites_when_files_already_exist() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "v1");
@@ -359,13 +345,59 @@ fn prepare_install_request_lists_overwrites_when_files_already_exist() {
         std::fs::read_to_string(scratch.join("data/knowhow/fixture.md")).unwrap(),
         "existing"
     );
+}
 
-    let _ = std::fs::remove_dir_all(&scratch);
+/// Files already on disk do not make an install an update: only the plugin's
+/// own install record does, with or without a merge baseline.
+#[test]
+fn a_collision_with_unrelated_files_stages_a_fresh_install() {
+    let (_tmp, scratch) = fresh_workspace();
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive = build_fixture_archive(&archive_dir, "v1");
+    std::fs::create_dir_all(scratch.join("data/knowhow")).unwrap();
+    std::fs::write(scratch.join("data/knowhow/fixture.md"), "existing").unwrap();
+
+    let result = prepare_install_request(
+        &scratch,
+        &fresh_pending_map(),
+        archive.to_str().unwrap(),
+        &Ok(Default::default()),
+        &GitCredentials::none(),
+        &running(),
+    );
+    let payload = parse_sentinel_payload(&result);
+    assert_eq!(payload["overwrites"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["is_update"], false);
+}
+
+#[test]
+fn an_installed_plugin_stages_an_update_even_with_its_files_gone() {
+    let (_tmp, scratch) = fresh_workspace();
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive = build_fixture_archive(&archive_dir, "v1");
+    let installed = InstalledPlugins {
+        ids: ["fixture-plugin".to_string()].into(),
+        baselines: Default::default(),
+    };
+
+    let result = prepare_install_request(
+        &scratch,
+        &fresh_pending_map(),
+        archive.to_str().unwrap(),
+        &Ok(installed),
+        &GitCredentials::none(),
+        &running(),
+    );
+    let payload = parse_sentinel_payload(&result);
+    assert!(payload["overwrites"].as_array().unwrap().is_empty());
+    assert_eq!(payload["is_update"], true);
 }
 
 #[test]
 fn unreadable_baselines_refuse_a_staging_that_would_overwrite_files() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "v2");
@@ -392,13 +424,11 @@ fn unreadable_baselines_refuse_a_staging_that_would_overwrite_files() {
         std::fs::read_to_string(scratch.join("data/knowhow/fixture.md")).unwrap(),
         "my local edit"
     );
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
 fn unreadable_baselines_still_stage_a_fresh_install() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "v1");
@@ -419,13 +449,11 @@ fn unreadable_baselines_still_stage_a_fresh_install() {
         result
     );
     assert_eq!(pending.lock().unwrap().len(), 1);
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[test]
 fn prepare_install_request_returns_error_string_on_invalid_source() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let pending = fresh_pending_map();
 
     let result = prepare_install_request(
@@ -447,13 +475,11 @@ fn prepare_install_request_returns_error_string_on_invalid_source() {
         pending.lock().unwrap().is_empty(),
         "failed prepare must not register a pending entry"
     );
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[tokio::test]
 async fn cancel_pending_install_emits_event_and_drops_staging() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "to-cancel");
@@ -514,8 +540,6 @@ async fn cancel_pending_install_emits_event_and_drops_staging() {
         }
         other => panic!("expected PluginInstallCanceled, got {:?}", other),
     }
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 #[tokio::test]
@@ -541,7 +565,7 @@ name = "With Setup"
 description = "Plugin that needs post-install wiring"
 setup = "Create a daily trigger that loads `knowhow/with-setup/run.md`. Suggested cron: `0 0 4 * * *`."
 "#;
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_archive(
@@ -566,8 +590,6 @@ setup = "Create a daily trigger that loads `knowhow/with-setup/run.md`. Suggeste
         write.summary, "Installed With Setup v0.1.0 (1 files).",
         "a manifest with setup must not widen the summary beyond the one line"
     );
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 // ---- Pure setup-change detection (drives confirm's spawn gate) --------
@@ -1026,7 +1048,7 @@ async fn latest_install_round_trips_id_version_source_and_files() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
 
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "v1");
@@ -1066,7 +1088,6 @@ async fn latest_install_round_trips_id_version_source_and_files() {
         "files list must round-trip from PluginInstalled payload"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -1097,7 +1118,7 @@ async fn e2e_install_from_local_archive() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
 
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "v1-from-archive");
@@ -1133,7 +1154,6 @@ async fn e2e_install_from_local_archive() {
     assert!(files.contains(&"knowhow/fixture.md"));
     assert!(files.contains(&"triggers/fixture/fixture.md"));
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -1148,7 +1168,7 @@ async fn e2e_install_from_local_git_source_records_source_url() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
 
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let repos_dir = scratch.join("repos");
     std::fs::create_dir_all(&repos_dir).unwrap();
     let (bare, _work) = make_local_git_plugin(
@@ -1181,7 +1201,6 @@ async fn e2e_install_from_local_git_source_records_source_url() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["data"]["source_type"], "git");
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -1197,7 +1216,7 @@ async fn e2e_check_plugin_updates_returns_real_data_after_install() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
 
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let repos_dir = scratch.join("repos");
     std::fs::create_dir_all(&repos_dir).unwrap();
     let (bare, _work) = make_local_git_plugin(
@@ -1231,7 +1250,6 @@ async fn e2e_check_plugin_updates_returns_real_data_after_install() {
     assert_eq!(entry["changed"], false);
     assert_eq!(entry["source"], source_url);
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -1242,7 +1260,7 @@ async fn e2e_check_plugin_updates_returns_real_data_after_install() {
 async fn e2e_engine_requirement_follows_the_manifest_on_installed_and_check_updates() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let repos_dir = scratch.join("repos");
     std::fs::create_dir_all(&repos_dir).unwrap();
     let (bare, work) = make_local_git_plugin(&repos_dir, "floorless", "floorless", "0.1.0", "b");
@@ -1278,7 +1296,6 @@ async fn e2e_engine_requirement_follows_the_manifest_on_installed_and_check_upda
     let installed = installed_plugin_summaries(&pool, &scratch).await.unwrap();
     assert_eq!(installed[0].engine_requirement.as_deref(), Some(">=0.1.0"));
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -1294,7 +1311,7 @@ async fn e2e_update_plugin_re_fetches_when_version_bumps() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
 
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let repos_dir = scratch.join("repos");
     std::fs::create_dir_all(&repos_dir).unwrap();
     let (bare, work) = make_local_git_plugin(
@@ -1356,7 +1373,6 @@ async fn e2e_update_plugin_re_fetches_when_version_bumps() {
         "no-op update must not emit a third PluginInstalled"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -1383,7 +1399,7 @@ source = "https://github.com/x/git-track"
 /// prove the whole install lands in a SINGLE commit.
 #[tokio::test]
 async fn install_commits_written_files_so_working_tree_is_clean() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_archive(
@@ -1460,6 +1476,4 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
                 .contains(&"knowhow/git-track.md".to_string()),
         "fixture must span apps/ and knowhow/ to prove a single multi-dir commit"
     );
-
-    let _ = std::fs::remove_dir_all(&scratch);
 }

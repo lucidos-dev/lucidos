@@ -5,7 +5,7 @@
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
 };
-use crate::llm::ModelSelection;
+use crate::llm::{CacheMode, ModelSelection};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -23,10 +23,11 @@ impl OpenAiProvider {
     /// - `{"type": "function_call", "id": "...", "call_id": "...", "name": "...", "arguments": "..."}`
     /// - `{"type": "function_call_output", "call_id": "...", "output": "..."}`
     ///
-    /// `breakpoints` is [`super::takes_cache_breakpoints`] for the model.
+    /// `breakpoints` is how many marks the request may carry, or `None` for
+    /// a model that takes none ([`super::takes_cache_breakpoints`]).
     fn convert_messages_responses(
         messages: &[Message],
-        breakpoints: bool,
+        breakpoints: Option<usize>,
     ) -> Vec<serde_json::Value> {
         let mut input: Vec<serde_json::Value> = Vec::new();
         let mut marked = 0;
@@ -41,7 +42,7 @@ impl OpenAiProvider {
                 }
                 MessageContent::Blocks(blocks) => {
                     let mut text_parts: Vec<String> = Vec::new();
-                    let marked_text = breakpoints
+                    let marked_text = breakpoints.is_some()
                         && msg.role == "user"
                         && blocks
                             .iter()
@@ -49,7 +50,11 @@ impl OpenAiProvider {
                     if marked_text {
                         input.push(serde_json::json!({
                             "role": msg.role,
-                            "content": marked_parts(blocks, &mut marked),
+                            "content": marked_parts(
+                                blocks,
+                                &mut marked,
+                                breakpoints.unwrap_or_default(),
+                            ),
                         }));
                         continue;
                     }
@@ -166,16 +171,22 @@ impl OpenAiProvider {
         serde_json::json!({ "type": "function", "name": tool })
     }
 
+    /// `model` is the one sent, already resolved. The rest of the request's
+    /// options come from `selection`.
     fn build_responses_body(
         &self,
         model: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
         system_prompt: Option<&str>,
-        reasoning_effort: Option<&str>,
+        selection: &ModelSelection<'_>,
     ) -> serde_json::Value {
-        let input =
-            Self::convert_messages_responses(messages, super::takes_cache_breakpoints(model));
+        let breakpoints =
+            super::takes_cache_breakpoints(model).then_some(match selection.cache_mode {
+                CacheMode::Implicit => MAX_BREAKPOINTS,
+                CacheMode::Explicit => MAX_EXPLICIT_BREAKPOINTS,
+            });
+        let input = Self::convert_messages_responses(messages, breakpoints);
 
         let mut body = serde_json::json!({
             "model": model,
@@ -208,8 +219,16 @@ impl OpenAiProvider {
         // once, in `llm::reasoning`, and enforced by `RoutingProvider`'s clamp;
         // a second per-model rule here is what let the picker and the wire
         // disagree (see `llm/reasoning.rs`).
-        if let Some(effort) = reasoning_effort {
+        if let Some(effort) = selection.reasoning_effort {
             body["reasoning"] = serde_json::json!({ "effort": effort });
+        }
+
+        if breakpoints.is_some() && selection.cache_mode == CacheMode::Explicit {
+            body["prompt_cache_options"] = serde_json::json!({ "mode": "explicit" });
+        }
+
+        if let Some(tier) = selection.service_tier {
+            body["service_tier"] = serde_json::Value::String(tier.as_wire().to_string());
         }
 
         body
@@ -439,9 +458,7 @@ impl OpenAiProvider {
         on_token: Option<TokenCallback>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let model = selection.model.unwrap_or(&self.model);
-        let reasoning_effort = selection.reasoning_effort;
-        let mut body =
-            self.build_responses_body(model, messages, tools, system_prompt, reasoning_effort);
+        let mut body = self.build_responses_body(model, messages, tools, system_prompt, &selection);
         if let Some(tool) = selection.forced_tool {
             body["tool_choice"] = Self::forced_tool_choice_responses(tool);
         }
@@ -544,6 +561,10 @@ impl OpenAiProvider {
 /// message.
 pub(crate) const MAX_BREAKPOINTS: usize = 3;
 
+/// Breakpoints a request in explicit mode may carry: all four writes, since
+/// nothing writes at the end.
+pub(crate) const MAX_EXPLICIT_BREAKPOINTS: usize = 4;
+
 /// A user message holding memory view blocks, as typed text parts. Each
 /// memory view block takes a breakpoint, so a later request that marks the
 /// same place reads the cache up to there. A read needs a breakpoint in the
@@ -552,7 +573,11 @@ pub(crate) const MAX_BREAKPOINTS: usize = 3;
 /// The parts read as the joined string would, with a newline between two
 /// parts only where the first does not already end in one. Only text
 /// travels, as images do not on this wire.
-fn marked_parts(blocks: &[ContentBlock], breakpoints: &mut usize) -> Vec<serde_json::Value> {
+fn marked_parts(
+    blocks: &[ContentBlock],
+    breakpoints: &mut usize,
+    limit: usize,
+) -> Vec<serde_json::Value> {
     let texts: Vec<(&str, bool)> = blocks
         .iter()
         .filter_map(|block| match block {
@@ -574,7 +599,7 @@ fn marked_parts(blocks: &[ContentBlock], breakpoints: &mut usize) -> Vec<serde_j
                 text.push('\n');
             }
             let mut part = serde_json::json!({"type": "input_text", "text": text});
-            if marked && *breakpoints < MAX_BREAKPOINTS {
+            if marked && *breakpoints < limit {
                 *breakpoints += 1;
                 part["prompt_cache_breakpoint"] = serde_json::json!({"mode": "explicit"});
             }
@@ -617,7 +642,7 @@ mod tests {
                 text("c\n</chat>\n"),
                 text("the task"),
             ])],
-            true,
+            Some(MAX_BREAKPOINTS),
         );
         let parts = input[0]["content"].as_array().expect("typed parts");
         assert_eq!(parts.len(), 3);
@@ -632,8 +657,10 @@ mod tests {
     /// keeps its one joined string.
     #[test]
     fn a_message_with_no_memory_view_block_stays_one_string() {
-        let input =
-            OpenAiProvider::convert_messages_responses(&[user(vec![text("a"), text("b")])], true);
+        let input = OpenAiProvider::convert_messages_responses(
+            &[user(vec![text("a"), text("b")])],
+            Some(MAX_BREAKPOINTS),
+        );
         assert_eq!(input[0]["content"], "a\nb");
     }
 
@@ -647,7 +674,7 @@ mod tests {
         assert!(super::super::takes_cache_breakpoints("gpt-6.1-sol"));
         let input = OpenAiProvider::convert_messages_responses(
             &[user(vec![view("<chat>\na\n"), text("the task")])],
-            false,
+            None,
         );
         assert_eq!(input[0]["content"], "<chat>\na\n\nthe task");
     }
@@ -657,7 +684,8 @@ mod tests {
     #[test]
     fn a_request_carries_at_most_three_breakpoints() {
         let blocks = (0..5).map(|i| view(&format!("block {i}\n"))).collect();
-        let input = OpenAiProvider::convert_messages_responses(&[user(blocks)], true);
+        let input =
+            OpenAiProvider::convert_messages_responses(&[user(blocks)], Some(MAX_BREAKPOINTS));
         let marked = input[0]["content"]
             .as_array()
             .unwrap()
@@ -679,9 +707,104 @@ mod tests {
             content: MessageContent::Text("hi".to_string()),
         }];
 
-        let body = provider.build_responses_body("gpt-5.5", &messages, &[], None, None);
+        let body = provider.build_responses_body(
+            "gpt-5.5",
+            &messages,
+            &[],
+            None,
+            &ModelSelection::default(),
+        );
 
         assert_eq!(body["store"], false);
+    }
+
+    /// Explicit mode turns off the write at the end and frees its slot for a
+    /// fourth mark. A turn keeps implicit mode, since its next request reads
+    /// what that end write stored.
+    #[test]
+    fn explicit_mode_writes_only_at_the_marks() {
+        let provider = OpenAiProvider::new("k".to_string(), "gpt-6.1-sol".to_string()).unwrap();
+        let blocks: Vec<ContentBlock> = (0..6).map(|i| view(&format!("block {i}\n"))).collect();
+        let messages = [user(blocks)];
+        let marks = |body: &serde_json::Value| {
+            body["input"][0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p.get("prompt_cache_breakpoint").is_some())
+                .count()
+        };
+
+        let turn = provider.build_responses_body(
+            "gpt-6.1-sol",
+            &messages,
+            &[],
+            None,
+            &ModelSelection::default(),
+        );
+        assert!(turn.get("prompt_cache_options").is_none());
+        assert_eq!(marks(&turn), MAX_BREAKPOINTS);
+
+        let explicit = ModelSelection::default().with_cache_mode(CacheMode::Explicit);
+        let body = provider.build_responses_body("gpt-6.1-sol", &messages, &[], None, &explicit);
+        assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(marks(&body), MAX_EXPLICIT_BREAKPOINTS);
+
+        let old = provider.build_responses_body("gpt-5.5", &messages, &[], None, &explicit);
+        assert!(
+            old.get("prompt_cache_options").is_none(),
+            "a model before GPT-5.6 refuses cache options"
+        );
+    }
+
+    /// Flex goes on the body only when the selection asks for it, so every
+    /// other call keeps OpenAI's standard tier.
+    #[test]
+    fn responses_body_asks_for_flex_only_when_selected() {
+        let provider = OpenAiProvider::new("k".to_string(), "gpt-6.1-sol".to_string()).unwrap();
+        let standard = provider.build_responses_body(
+            "gpt-6.1-sol",
+            &[],
+            &[],
+            None,
+            &ModelSelection::default(),
+        );
+        assert!(standard.get("service_tier").is_none());
+        let flex = ModelSelection::default().with_service_tier(Some(crate::llm::ServiceTier::Flex));
+        let body = provider.build_responses_body("gpt-6.1-sol", &[], &[], None, &flex);
+        assert_eq!(body["service_tier"], "flex");
+    }
+
+    /// The completed response names the tier that served it, which the
+    /// capture records so the call is priced at that tier's rate.
+    #[test]
+    fn the_served_tier_is_read_from_the_completed_response() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut item_id_map = std::collections::HashMap::new();
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_responses_chunk(
+            "response.completed",
+            r#"{"response":{"status":"completed","service_tier":"flex","usage":{"input_tokens":10,"output_tokens":2}}}"#,
+            &mut content,
+            &mut tools,
+            &mut item_id_map,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(meta.service_tier, Some(crate::llm::ServiceTier::Flex));
+
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_responses_chunk(
+            "response.completed",
+            r#"{"response":{"status":"completed","service_tier":"default","usage":{"input_tokens":10,"output_tokens":2}}}"#,
+            &mut content,
+            &mut tools,
+            &mut item_id_map,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(meta.service_tier, None, "the standard tier records nothing");
     }
 
     /// The Responses API names the function at the top level, unlike Chat
@@ -703,7 +826,8 @@ mod tests {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-5.5".to_string()).unwrap();
         for model in ["gpt-5.6-sol", "gpt-5.5-pro", "gpt-5.4"] {
             for effort in crate::llm::reasoning::EFFORT_LADDER {
-                let body = provider.build_responses_body(model, &[], &[], None, Some(effort));
+                let selection = ModelSelection::default().with_effort(Some(effort));
+                let body = provider.build_responses_body(model, &[], &[], None, &selection);
                 assert_eq!(
                     body["reasoning"]["effort"], *effort,
                     "{model} rewrote {effort}"

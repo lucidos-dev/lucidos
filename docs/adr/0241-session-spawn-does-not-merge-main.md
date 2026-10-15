@@ -3,6 +3,8 @@
 - **Status**: Accepted, amended by
   [0345](0345-harden-merges-main-before-it-reviews.md): `/harden` now merges
   `main` at its start, as an agent step. The engine still never does.
+  Amended by [0463](0463-landing-lane.md): for Lucidos source, the landing lane
+  merges onto `main` only, never into a thread's branch.
 - **Date**: 2026-09-21
 
 ## Context
@@ -15,7 +17,7 @@ It was added in `3e28061ec` for a concrete incident. A broad-stop bug in
 `populate.sh` was fixed on `main`, and it kept recurring because resumed
 worktrees still ran the pre-fix copy of the script.
 
-`main` moves in exactly one place, `ff_main_to`, reached only from Apply. Apply
+`main` moves in exactly one place, `ff_main_to_locked`, reached only from Apply. Apply
 notifies no other worktree. So the spawn-time merge was pull-side compensation
 for an event it had no connection to. It ran at whatever moment the engine next
 happened to spawn a process.

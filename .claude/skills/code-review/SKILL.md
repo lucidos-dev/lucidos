@@ -43,9 +43,8 @@ The arg picks the recipe. Default to **medium** when no arg is passed.
 | high | **recall-biased** | 3 correctness + 4 cleanup-class + altitude (7) | 6 | 1-vote (recall-biased) | no | 10 |
 | xhigh / max | **recall** — a missed bug ships; err toward surfacing | 5 correctness + 3 cleanup + 1 altitude (9) | 8 | 1-vote | yes | 15 |
 
-`/harden` calls this at **medium** (precision): fewer findings, very low
-false-positive rate, complementary to harden Phase 2's broader bug-detection
-agent.
+`/harden` calls this at **high**. It is the one Claude review of each iteration,
+beside Codex, so a missed bug costs more than a false positive (ADR 0476).
 
 ## Phase 0 — Gather the diff
 
@@ -64,6 +63,10 @@ N candidate findings** (N = candidates/angle) with `file`, `line`, a one-line
 NOT let one angle's conclusions suppress another's; if two angles flag the same
 line for different reasons, record both.
 
+Read `docs/code-review-priors.md` before you flag anything. It lists patterns
+past reviews flagged and dismissed with evidence. Re-flag a listed pattern only
+with new evidence that its guard or contract changed.
+
 ### Correctness angles
 
 **Angle A — line-by-line diff scan.** Read every hunk in the diff, line by
@@ -72,13 +75,18 @@ of a touched function are in scope (the change re-exposes or fails to fix them).
 For every line ask: what input, state, timing, or platform makes this line
 wrong? Look for inverted/wrong conditions, off-by-one, null/undefined deref,
 missing `await`, falsy-zero checks, wrong-variable copy-paste, error swallowed
-in catch, unescaped regex metachars.
+in catch, unescaped regex metachars. Also look for security holes the diff
+opens: injection, auth bypass, data exposure.
 
 **Angle B — removed-behavior auditor.** For every line the diff DELETES or
 replaces, name the invariant or behavior it enforced, then search the new code
 for where that invariant is re-established. If you can't find it, that's a
 candidate: a removed guard, a dropped error path, a narrowed validation, a
 deleted test that was covering a real case.
+
+The same angle checks recent history. Run `git log --oneline -10 <file>` for
+each touched file. Flag a change that reverts, contradicts or undermines a
+recent fix or intentional refactor, and name the commit it undoes.
 
 **Angle C — cross-file tracer.** For each function the diff changes, find its
 callers (Grep for the symbol) and check whether the change breaks any call
@@ -152,6 +160,27 @@ The definition, carve-out (legitimate attribution), and approved placeholders
 live in `.claude/rules/no-private-data.md` — flag against that rule and name the
 placeholder to use.
 
+**Compliance.** Flag a clear violation of `CLAUDE.md` or a `.claude/rules/`
+file, and quote the rule it breaks. Skip general best practice no rule states,
+and anything a lint suppression already silences. Three violations need a
+look on every diff, because no script sees them:
+
+- **Glossary and knowhow drift.** A new, renamed or retired term without its
+  glossary entry (`.claude/rules/glossary.md`). A `system-knowhow/` file whose
+  meaning the diff made stale, though its names still resolve.
+- **An untracked temporary measure.** Apply the inclusion test in
+  `.claude/rules/temporary-measures.md`. A `remove after X` or `workaround
+  until` comment, a new flag or kill-switch, a sunset shim, and a bare `TODO`,
+  `FIXME`, `HACK` or `XXX` each need a row in `docs/temporary-measures.md`.
+  Rewording a marker into a plain comment does not escape it. Skip the rule's
+  OUT list: permanent back-compat, site-local suppressions, ADR-recorded
+  decisions and open-ended debt.
+- **A defending comment.** This is an added or changed comment that argues a
+  shortcut is acceptable, such as "fine for now". See `.claude/rules/prose.md`
+  § What a comment is for. A stated invariant is not one.
+
+Flag only lines the diff adds or changes, never an untouched comment.
+
 **Buried user-reaching finding.** Flag a diff that records a security,
 data-exposure, or user-visible-correctness finding and then buries it. Burying
 means a non-goal, known limitation, follow-up, deferred item, or release gate in
@@ -165,7 +194,8 @@ harmless out-of-scope note, is not this.
 Cleanup and altitude candidates use the same `file`/`line`/`summary` shape; in
 `failure_scenario`, state the concrete cost (what is duplicated, wasted, or
 harder to maintain) instead of a crash. **Correctness bugs always outrank
-cleanup and altitude findings** when the output cap forces a cut.
+cleanup and altitude findings** when the output cap forces a cut, and
+compliance findings rank between the two.
 
 Pass every candidate with a nameable failure scenario through to Phase 2 —
 finders that silently drop half-believed candidates bypass the verify step and
@@ -222,12 +252,22 @@ Each finding is an object, ranked most-severe first, capped at `max findings`:
   "file": "path/to/file.ext",
   "line": 123,
   "summary": "one-sentence statement of the bug",
-  "failure_scenario": "concrete inputs/state → wrong output/crash"
+  "failure_scenario": "concrete inputs/state → wrong output/crash",
+  "category": "correctness"
 }
 ```
 
+`category` is the angle class: `correctness`, `compliance` or `cleanup`.
+Altitude, motion and prose findings count as `cleanup`, and private-data and
+buried findings as `compliance`. The caller decides what to fix by it.
+
 Route the findings by what your runtime offers:
 
+- **You run as a subagent for `/harden` Phase 1:** do NOT call
+  `ReportFindings`, since its result would stay in your own context. End with
+  a final report listing each surviving finding with all five fields, ranked
+  most-severe first, or the single line `No findings.`. The caller reads that
+  report and tells the reader in prose.
 - **You have a `ReportFindings` tool (Claude Code):** call it **exactly once**
   with the findings array — ranked most-severe first, and an **empty array when
   nothing survives verification**. It renders the findings structurally instead

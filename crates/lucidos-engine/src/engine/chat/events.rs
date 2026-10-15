@@ -2,7 +2,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::core::blobs::write_blob_from_base64;
-use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
+use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection, WakeMode};
 
 /// Bad-base64 / unsupported-mime entries are dropped + logged; the event
 /// still emits with the surviving hashes, matching the migration's
@@ -46,6 +46,7 @@ pub(crate) fn make_message_received(
     device_id: Option<&str>,
     parent_thread_id: Option<Uuid>,
     spawning_event_id: Option<Uuid>,
+    wake_mode: Option<WakeMode>,
     mode: ActorMode,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
@@ -62,6 +63,7 @@ pub(crate) fn make_message_received(
         device_id,
         parent_thread_id,
         spawning_event_id,
+        wake_mode,
         mode,
         model,
         reasoning_effort,
@@ -83,6 +85,7 @@ pub(super) fn make_message_received_with_origin(
     device_id: Option<&str>,
     parent_thread_id: Option<Uuid>,
     spawning_event_id: Option<Uuid>,
+    wake_mode: Option<WakeMode>,
     mode: ActorMode,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
@@ -101,6 +104,7 @@ pub(super) fn make_message_received_with_origin(
         image_description: None,
         parent_thread_id,
         spawning_event_id,
+        wake_mode,
         mode,
         model: model.map(|s| s.to_string()),
         reasoning_effort: reasoning_effort.map(|s| s.to_string()),
@@ -164,8 +168,9 @@ pub(super) fn chat_message_is_pre_emittable(
     mode: ActorMode,
     use_coding_agent: Option<bool>,
     thread_exists: bool,
+    input_ahead: bool,
 ) -> bool {
-    mode == ActorMode::Human && use_coding_agent != Some(true) && thread_exists
+    mode == ActorMode::Human && use_coding_agent != Some(true) && thread_exists && !input_ahead
 }
 
 impl crate::engine::LucidosEngine {
@@ -173,40 +178,36 @@ impl crate::engine::LucidosEngine {
     /// the handler acks, and report it back so the spawned turn does not emit a
     /// second one.
     ///
-    /// This is what makes a `200` from `POST /chat/stream` mean "your message is
-    /// in the thread, with its sequence assigned". The handler otherwise spawns
-    /// the work and returns immediately, and the spawned task waits for a Thread
-    /// Queue slot before it emits, so the gap between the ack and the write is
-    /// unbounded at pool-max. A client that serializes its sends still could not
-    /// rely on the ack for ordering across that gap: the second request's task
-    /// could win the race and take the lower sequence, which is unrecoverable
-    /// because `created` is stamped at emit time and the request carries no
-    /// client-side ordering data. See
+    /// The ack already means the input holds its place in the thread's input
+    /// order (*admission*, ADR 0449). Recording here adds that the message is
+    /// in the thread too, so the client's own read finds it at once. See
     /// `docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`.
     ///
-    /// Returns `None` when this request must NOT be pre-emitted, and the caller
-    /// then behaves exactly as before:
+    /// Returns `None` when this request must NOT be pre-emitted, and the
+    /// spawned turn records it instead, in the order admission gave it:
     ///
+    /// - **An input ahead of it.** Recording now would put it before an input
+    ///   admitted first.
     /// - **Not a person typing** (`mode != Human`). Agent and engine callers
     ///   have their own boundary events and their own ordering.
     /// - **A coding-agent dispatch.** That path deliberately emits its
     ///   `MessageReceived` *after* a Codex redirect interrupt reaches a
     ///   boundary, so the interrupted turn's terminal sequences first; emitting
     ///   here would reorder the exchange.
-    /// - **A thread that does not exist yet.** Its first message has nothing to
-    ///   be out of order with, and the starter event stays behind whatever the
-    ///   slow path emits for a new thread.
+    /// - **A thread that does not exist yet.** The starter event stays behind
+    ///   whatever the slow path emits for a new thread.
     /// - **A thread with an open question.** A typed reply there is rerouted to
     ///   `UserQuestionAnswered` and never becomes a `MessageReceived`, so
     ///   emitting one would be a spurious extra event.
-    /// - **A failed emit.** Logged, then treated as no pre-emission, so a
-    ///   transient hiccup costs the ordering guarantee for one message rather
-    ///   than the message itself.
+    /// - **A failed emit.** Logged. The input keeps its place in the order, so
+    ///   the spawned turn records it without losing it or its order.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn pre_emit_chat_message_received(
         &self,
         thread_id: Option<Uuid>,
         thread_exists: bool,
+        // An input admitted before this one is still unrecorded.
+        input_ahead: bool,
         mode: ActorMode,
         use_coding_agent: Option<bool>,
         user_message: &str,
@@ -223,7 +224,7 @@ impl crate::engine::LucidosEngine {
         voice_session_id: Option<Uuid>,
     ) -> Option<crate::engine::PreEmittedOrigin> {
         let thread_id = thread_id?;
-        if !chat_message_is_pre_emittable(mode, use_coding_agent, thread_exists) {
+        if !chat_message_is_pre_emittable(mode, use_coding_agent, thread_exists, input_ahead) {
             return None;
         }
         // An open question turns the next typed message into its answer.
@@ -271,6 +272,7 @@ impl crate::engine::LucidosEngine {
                     device_id,
                     // A human message never carries spawn linkage
                     // (`validate_mode_and_spawn` rejects it).
+                    None,
                     None,
                     None,
                     mode,
@@ -440,6 +442,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
             ActorMode::Human,
             None,
             None,
@@ -458,6 +461,7 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
+            None,
             None,
             None,
             None,
@@ -486,6 +490,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
             ActorMode::Human,
             None,
             None,
@@ -507,6 +512,7 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
+            None,
             None,
             None,
             None,
@@ -539,6 +545,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
             ActorMode::Engine,
             None,
             None,
@@ -560,6 +567,7 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
+            None,
             None,
             None,
             None,
@@ -590,6 +598,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
             ActorMode::Human,
             None,
             None,
@@ -612,6 +621,7 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
+            None,
             None,
             None,
             None,
@@ -645,6 +655,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
             ActorMode::Agent,
             None,
             None,
@@ -667,6 +678,7 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
+            None,
             None,
             None,
             None,
@@ -696,6 +708,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
             ActorMode::Engine,
             None,
             None,
@@ -714,6 +727,7 @@ mod origin_invariants {
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
+            None,
             None,
             None,
             None,
@@ -745,6 +759,7 @@ mod origin_invariants {
             None,
             Some(parent_id),
             spawn_id,
+            None,
             ActorMode::Agent,
             None,
             None,
@@ -795,6 +810,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
             ActorMode::Agent,
             None,
             None,
@@ -814,6 +830,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
             ActorMode::Human,
             None,
             None,
@@ -825,6 +842,7 @@ mod origin_invariants {
         let res2 = make_message_received_with_origin(
             std::path::Path::new(""),
             "hi",
+            None,
             None,
             None,
             None,
@@ -854,6 +872,7 @@ mod origin_invariants {
             Some("dev-1"),
             None,
             None,
+            None,
             ActorMode::Human,
             None,
             None,
@@ -866,6 +885,7 @@ mod origin_invariants {
             "what have I got running",
             None,
             Some("dev-1"),
+            None,
             None,
             None,
             ActorMode::Human,
@@ -921,22 +941,28 @@ mod pre_emit_eligibility {
     /// pre-emitting buy an ordering guarantee.
     #[test]
     fn human_chat_follow_up_is_pre_emittable() {
-        assert!(chat_message_is_pre_emittable(ActorMode::Human, None, true));
+        assert!(chat_message_is_pre_emittable(
+            ActorMode::Human,
+            None,
+            true,
+            false
+        ));
         assert!(chat_message_is_pre_emittable(
             ActorMode::Human,
             Some(false),
-            true
+            true,
+            false
         ));
     }
 
-    /// A brand-new thread's first message has nothing to be out of order with,
-    /// and pre-emitting would put `MessageReceived` ahead of whatever the slow
-    /// path emits for a new thread.
+    /// Pre-emitting a brand-new thread's first message would put
+    /// `MessageReceived` ahead of whatever the slow path emits for a new thread.
     #[test]
     fn first_message_on_a_new_thread_is_not_pre_emittable() {
         assert!(!chat_message_is_pre_emittable(
             ActorMode::Human,
             None,
+            false,
             false
         ));
     }
@@ -949,6 +975,20 @@ mod pre_emit_eligibility {
         assert!(!chat_message_is_pre_emittable(
             ActorMode::Human,
             Some(true),
+            true,
+            false
+        ));
+    }
+
+    /// An input with one still ahead of it in the thread's input order must
+    /// record after it, in the spawned turn. Recording it at the ack would put
+    /// it ahead of an input admitted first (ADR 0449).
+    #[test]
+    fn an_input_with_one_ahead_is_not_pre_emittable() {
+        assert!(!chat_message_is_pre_emittable(
+            ActorMode::Human,
+            None,
+            true,
             true
         ));
     }
@@ -957,11 +997,17 @@ mod pre_emit_eligibility {
     /// own ordering; the API boundary must not speak for them.
     #[test]
     fn non_human_modes_are_not_pre_emittable() {
-        assert!(!chat_message_is_pre_emittable(ActorMode::Agent, None, true));
+        assert!(!chat_message_is_pre_emittable(
+            ActorMode::Agent,
+            None,
+            true,
+            false
+        ));
         assert!(!chat_message_is_pre_emittable(
             ActorMode::Engine,
             None,
-            true
+            true,
+            false
         ));
     }
 }

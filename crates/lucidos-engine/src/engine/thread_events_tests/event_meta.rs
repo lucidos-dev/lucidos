@@ -82,6 +82,7 @@ fn indexable_text_returns_content_for_chat_events() {
     let msg = ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,
+        wake_mode: None,
         text: "hello".into(),
         user_image_hashes: vec![],
         device_id: None,
@@ -248,6 +249,9 @@ fn indexable_text_returns_none_for_non_chat_events() {
         coding_agent_kind: Default::default(),
         coding_agent_folder: String::new(),
         app_id: None,
+        integrated: false,
+        auto_compact_window: None,
+        auto_compact_arm: None,
     }
     .indexable_text()
     .is_none());

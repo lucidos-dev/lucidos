@@ -71,8 +71,7 @@ fn move_into_root(name: &str, source: &Path, target_root: &Path) -> Result<PathB
 }
 
 fn data_store_root() -> Result<PathBuf, BoxError> {
-    let home = std::env::var("HOME").map_err(|_| "HOME env var not set")?;
-    Ok(Path::new(&home).join(".lucidos").join("data"))
+    Ok(lucidos_home::ensure()?.join("data"))
 }
 
 fn expand_tilde(path: &str) -> PathBuf {

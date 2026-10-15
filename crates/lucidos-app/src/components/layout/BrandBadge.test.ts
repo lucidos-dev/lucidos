@@ -1,13 +1,13 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { brandBadgeState, brandBadgeLabel, BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
+import { brandBadgeState, brandBadgeLabel, brandTooltipRows, BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
 import { GlyphBadge } from '../shared/GlyphBadge';
 import { vnodeToText } from '../chat/__tests__/vnodeToText';
 import { crossWorkspaceUnreadTotal, peerWorkspaces } from '../../store/actions/app-badge';
 import type { ActivityRow } from '../../store/actions/activityRows';
+import { connectionNotice } from '../../utils/connectionNotice';
 import type { Notification } from '../../store/types';
 import {
-  unreadNotifications,
   restartRequired,
   engineVersionReady,
   engineVersionPending,
@@ -20,6 +20,7 @@ import {
   applyAllInProgress,
   engineRestarting,
   mobileView,
+  servedUnreadNotifications,
 } from '../../store/store';
 vi.mock('../shared/GlyphBadge', () => import('../shared/__tests__/glyphBadgeStub'));
 
@@ -36,11 +37,11 @@ describe('brandBadgeState / brandBadgeLabel', () => {
   const apply: ActivityRow = {
     key: 'apply-all',
     label: 'Applying 4 changes',
-    detail: '1 of 4',
+    detail: '0 done',
     body: {
       kind: 'apply-all',
       thread: { threadId: 't-1', changeId: 'c-1', reading: null, title: 'Card gate fix', phase: 'Applying changes' },
-      position: { index: 1, total: 4 },
+      count: { done: 0, total: 4 },
       progress: { done: 0, working: 0.25 },
       timeLeft: null,
       canceling: false,
@@ -131,6 +132,60 @@ describe('brandBadgeState / brandBadgeLabel', () => {
     engineVersionPending.value = true;
     expect(brandBadgeState(1)).toBe('busy');
     expect(brandBadgeLabel([build])).toBe('Building new version');
+  });
+});
+
+describe('brandTooltipRows', () => {
+  const conflict = (threadId: string): ActivityRow => ({
+    key: `apply-${threadId}`,
+    label: `Resolving merge conflict: ${threadId}`,
+    body: {
+      kind: 'apply-thread',
+      thread: {
+        threadId,
+        changeId: null,
+        reading: { phase: 'resolving-conflict', eventId: null, startedAt: null },
+        title: threadId,
+        phase: 'Resolving merge conflict',
+      },
+    },
+  });
+  const batch: ActivityRow = {
+    key: 'apply-all',
+    label: 'Applying 14 changes',
+    detail: '1 done',
+    body: { kind: 'apply-all', thread: null, count: { done: 1, total: 14 }, progress: null, timeLeft: null, canceling: false },
+  };
+
+  beforeEach(() => {
+    engineVersionReady.value = false;
+    engineVersionPending.value = false;
+    updateAvailable.value = false;
+  });
+
+  it('is empty when there is nothing to report, so the name stands alone', () => {
+    expect(brandTooltipRows(0, [], null)).toEqual([]);
+  });
+
+  /** The menu names each thread, so the tooltip counts them instead of
+   *  listing every title. */
+  it('collapses single-thread applies to one count per phase', () => {
+    expect(brandTooltipRows(4, [batch, conflict('a'), conflict('b'), conflict('c')], null)).toEqual([
+      { label: 'Unread', value: '4' },
+      { label: 'Applying 14 changes', value: '1 done' },
+      { label: 'Merge conflicts', value: '3' },
+    ]);
+  });
+
+  it('names the connection only while it is degraded, first, with what happens next', () => {
+    const notice = connectionNotice('disconnected', 'test', 'short')!;
+    expect(brandTooltipRows(1, [], notice)[0]).toEqual({ label: notice.title, value: notice.detail });
+  });
+
+  it('carries the version notices while no job runs', () => {
+    updateAvailable.value = true;
+    expect(brandTooltipRows(0, [], null)).toEqual([{ label: 'Client update', value: 'available' }]);
+    expect(brandTooltipRows(0, [batch], null)).toEqual([{ label: 'Applying 14 changes', value: '1 done' }]);
   });
 });
 
@@ -238,7 +293,7 @@ describe('BrandBadge', () => {
  *  unread, which on a dev workspace is most of the time. */
 describe('UnreadBrandBadge', () => {
   beforeEach(() => {
-    unreadNotifications.value = { status: 'loaded', data: [] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
     peerWorkspaces.value = [];
   });
 
@@ -263,7 +318,7 @@ describe('UnreadBrandBadge', () => {
   });
 
   it('shows the same total the app icon carries', () => {
-    unreadNotifications.value = { status: 'loaded', data: notes(2) };
+    servedUnreadNotifications.value = { status: 'loaded', data: notes(2) };
     expect(unread()).toBeDefined();
     // The computed is the single source both surfaces read, so asserting the
     // rendered number IS asserting the icon's.
@@ -273,7 +328,7 @@ describe('UnreadBrandBadge', () => {
   it('coexists with the engine state badge rather than replacing it', () => {
     // The reported failure this pins: a rebuild that shows no spinner because a
     // notification happens to be unread.
-    unreadNotifications.value = { status: 'loaded', data: notes(3) };
+    servedUnreadNotifications.value = { status: 'loaded', data: notes(3) };
     engineBuilding.value = true;
     expect(findByClass(BrandBadge(), 'brand-badge-spinner'),
       'the spinner must survive an unread count').toHaveLength(1);
@@ -284,7 +339,7 @@ describe('UnreadBrandBadge', () => {
     // Both would be dead. The badge is `pointer-events: none`, so `useTooltip`
     // (which walks UP from the hovered element) can never resolve it, and the
     // hover lands on the mark instead. The MARK speaks the count.
-    unreadNotifications.value = { status: 'loaded', data: notes(3) };
+    servedUnreadNotifications.value = { status: 'loaded', data: notes(3) };
     const el = unread() as VNode<Record<string, unknown>> | undefined;
     expect(el?.props['aria-hidden']).toBe('true');
     expect(el?.props['data-tooltip']).toBeUndefined();
@@ -300,7 +355,7 @@ describe('UnreadBrandBadge', () => {
   it('caps at the same number the menu rows do', () => {
     // One shared `countLabel`, so the mark and the rows cannot start eliding at
     // different counts.
-    unreadNotifications.value = { status: 'loaded', data: notes(100) };
+    servedUnreadNotifications.value = { status: 'loaded', data: notes(100) };
     expect(vnodeToText(UnreadBrandBadge())).toContain('99+');
   });
 });

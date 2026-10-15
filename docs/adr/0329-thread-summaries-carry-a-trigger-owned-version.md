@@ -47,6 +47,9 @@ than the one it holds, through `applySummaryVersion`, the only writer of
   casts and `Object.assign`. Tests set status through `applySummaryVersion`.
 - The optimistic overlays (`answeringThreadIds`, pending messages) stay: they
   cover the moment before any event exists, which no version can.
+- Amended by ADR 0437: an optimistic row change (archive, pin, unpin) now
+  ends on a version too. The write returns the version its event produced,
+  and the client holds the change until the row reaches it.
 
 ## Alternatives considered
 

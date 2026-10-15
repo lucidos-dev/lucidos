@@ -1,5 +1,7 @@
+import { ENTRY_KINDS } from '@lucidos/engine-constants';
 import type { RecallLine } from '../../api/types';
 import { formatShortDateWithYear, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
+import { rangeLabel } from '../../utils/rangeLabel';
 
 /** How many entries a line covers, read from the `start+span` end of its id.
  *  `null` for an id that names no node, such as the pending line. */
@@ -22,6 +24,33 @@ export function entriesLabel(count: number): string {
   return `${count.toLocaleString()} ${count === 1 ? 'entry' : 'entries'}`;
 }
 
+export type EntryKind = typeof ENTRY_KINDS[number];
+
+/** Who wrote a line of each kind: a prompt names its sender, and a response
+ *  is always the agent's. */
+export const ENTRY_KIND_LABELS: Record<EntryKind, string> = {
+  'prompt (human)': 'Human',
+  'prompt (agent)': 'Agent',
+  'prompt (engine)': 'Engine',
+  response: 'Agent',
+  call: 'Call',
+  result: 'Result',
+  report: 'Report',
+  turn: 'Turn',
+  artifact: 'Artifact',
+};
+
+const ENTRY_KIND_PREFIX = new RegExp(
+  `^(${ENTRY_KINDS.map((k) => k.replace(/[()]/g, '\\$&')).join('|')}):\\s*`,
+);
+
+/** The entry kind a line starts with, `kind: text`, and the text after it. */
+export function entryKindOf(text: string): { kind: EntryKind | null; text: string } {
+  const match = ENTRY_KIND_PREFIX.exec(text);
+  if (!match) return { kind: null, text };
+  return { kind: match[1] as EntryKind, text: text.slice(match[0].length) };
+}
+
 /** Whether a zoom of `id` came back as the line's source rather than finer
  *  lines. A leaf opens into one line under its own id: the exact message,
  *  or the artifact text. */
@@ -34,9 +63,9 @@ export function dateRangeLabel(from: string, to: string): string {
   const start = new Date(from);
   const end = new Date(to);
   if (!isSameDayInUserTz(start, end)) {
-    return `${formatShortDateWithYear(start)} – ${formatShortDateWithYear(end)}`;
+    return rangeLabel(formatShortDateWithYear(start), formatShortDateWithYear(end));
   }
   const day = formatShortDateWithYear(start);
   const [first, last] = [formatShortTime(start), formatShortTime(end)];
-  return first === last ? `${day}, ${first}` : `${day}, ${first} – ${last}`;
+  return `${day}, ${first === last ? first : rangeLabel(first, last)}`;
 }

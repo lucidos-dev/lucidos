@@ -221,6 +221,19 @@ pub(crate) async fn create_sparse_app_worktree(
     branch_name: &str,
     wt_path: &Path,
 ) -> Result<bool, String> {
+    create_sparse_app_worktree_from(workspace_root, app_id, branch_name, wt_path, None).await
+}
+
+/// [`create_sparse_app_worktree`], with a fresh branch starting at `base`
+/// rather than the default branch. A successor thread passes its old
+/// thread's last commit.
+pub(crate) async fn create_sparse_app_worktree_from(
+    workspace_root: &Path,
+    app_id: &str,
+    branch_name: &str,
+    wt_path: &Path,
+    base: Option<&str>,
+) -> Result<bool, String> {
     let wt_str = wt_path
         .to_str()
         .ok_or_else(|| format!("non-utf8 worktree path: {}", wt_path.display()))?;
@@ -242,7 +255,10 @@ pub(crate) async fn create_sparse_app_worktree(
         )
         .await?
     } else {
-        let base = default_local_branch(workspace_root).await;
+        let base = match base {
+            Some(base) => base.to_string(),
+            None => default_local_branch(workspace_root).await,
+        };
         worktree_add_pruning_stale(
             workspace_root,
             &[
@@ -455,6 +471,14 @@ async fn worktree_add_pruning_stale(
 /// no repo lock that would cover them.
 pub(super) static WORKTREE_ADMIN_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Clear registrations whose working tree is gone, under
+/// [`WORKTREE_ADMIN_MUTEX`]. A removal that moved a tree aside calls this, so
+/// its branch is no longer checked out anywhere.
+pub(crate) async fn prune_worktrees(repo_root: &Path) {
+    let _guard = WORKTREE_ADMIN_MUTEX.lock().await;
+    prune_worktrees_locked(repo_root).await;
+}
 
 /// Clear registrations whose working tree is gone. The caller holds
 /// [`WORKTREE_ADMIN_MUTEX`] for the sweep.
@@ -970,7 +994,13 @@ pub(crate) async fn add_paths_to_worktree_exclude(wt_path: &Path, paths: &[&str]
         .await
     {
         Ok(mut f) => {
-            if let Err(e) = f.write_all(payload.as_bytes()).await {
+            // A tokio write only queues the bytes on the blocking pool. The
+            // flush waits for them, so the caller's next `git status` sees them.
+            let written = match f.write_all(payload.as_bytes()).await {
+                Ok(()) => f.flush().await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = written {
                 log!("[Git] Failed to write {}: {}", exclude_file.display(), e);
             }
         }

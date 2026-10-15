@@ -15,6 +15,7 @@ async fn spawn(bus: &EventBus, parent: Option<Uuid>) -> Uuid {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "work".into(),
             user_image_hashes: vec![],
             device_id: None,

@@ -1,6 +1,6 @@
 # 0419: Widget windows float over the app and stay open; the one surface outside the outside-tap rule
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0466](0466-home-board-is-a-desktop-rail.md)
 - **Date**: 2026-10-10
 
 ## Context
@@ -143,3 +143,36 @@ Plan: `docs/plans/2026-10-11-docked-widgets-pack-under-the-header.md`.
   on any shelf, it opens a new one below.
 
 This replaces "hung under the thread's title row" in the amendment above.
+
+## Amendment, 2026-10-12: the dock is a band in the layout
+
+The maintainer called the packed shelves "a complete miss": docked widgets
+were "supposed to take the space below header permanently with a fixed size,
+not still be a weird floating window". They then picked a seamless strip from
+rendered options, and asked for a toggle beside Home.
+Plan: `docs/plans/2026-10-12-widget-dock-band-under-the-header.md`.
+
+- **The *widget dock* is a band in the layout**, between the header (and its
+  banners) and the panes, like an app-shell banner. The panes get shorter by
+  its height, and nothing hides under it. On a desktop it is a flow sibling
+  that publishes `--app-widget-dock-height`, a term of `--app-header-bottom`.
+  On a phone it sits inside the fixed header, so it hides with the header on
+  scroll and covers no title.
+- **Fixed height, natural widths.** A widget never grows the band. Docked
+  widgets sit edge to edge in open order, each at the width it reports. The
+  SDK now sends it in docked mode as in minimal. Once they overflow, chevrons
+  page the strip.
+- **A header button beside Home shows and hides the dock.** A hidden dock
+  takes no room and keeps its widgets loaded. The choice persists per device.
+- **A docked widget's controls sit inside its top right corner**, and show on
+  hover or after a tap. The band clips anything outside a tile, so this
+  replaces "or under it … when docked" in the controls amendment above.
+- **Docking or undocking reloads the widget.** The dock renders its frames in
+  the shell, and moving an iframe in the DOM reloads it. Minimal and window
+  still share one tree and never reload on a switch between them.
+
+Rejected: keeping the frames in the overlay layer and drawing them over a
+reserved strip. It avoids the reload, but the phone's header moves on scroll,
+and every frame would have to track it.
+
+This replaces the "docked windows pack under the header" amendment above.

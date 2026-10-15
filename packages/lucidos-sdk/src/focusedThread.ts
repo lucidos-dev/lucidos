@@ -2,7 +2,7 @@
  * The thread the user has open in the host, for `lucidos.ui.focusedThread` and
  * `lucidos.ui.onFocusedThreadChange`.
  *
- * The host owns the answer. A widget window floats over whatever thread the
+ * The host owns the answer. A Home board tile sits beside whatever thread the
  * user is in, so the frame's own origin thread says nothing about it.
  */
 

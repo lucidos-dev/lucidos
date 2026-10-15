@@ -5,15 +5,44 @@
 //! the chat loop before `ResponseGenerated`, and the session runner around
 //! `CodingAgentIdled`. Each requirement says how it is enforced: a forced
 //! decision the engine makes, or a session re-entry that sends a coding agent
-//! back to do the work.
+//! back to do the work. The forced decisions are the read decision and, for a
+//! thread that reports to a parent, the wake decision.
 //!
 //! The re-entry rules are the *proposal hold*'s, which owns when Lucidos-source
 //! work lacks a plan marker or a harden, and what the agent is told. This
 //! module owns only that a hold sends the agent back, and how often.
 
 mod read_decision;
+pub(crate) mod wake_decision;
+
+pub use read_decision::{
+    decide_read_for_eval, read_decision_chat_judge, AnsweredQuestion, EvalReadDecision, InFlight,
+    OpeningSource, PushedNotification, TurnRead,
+};
+pub(crate) use wake_decision::TurnFinish;
+pub use wake_decision::{
+    decide_wake_for_eval, wake_decision_chat_judge, EvalWakeDecision, ParentView,
+};
 
 use crate::engine::change_ops::ProposalHold;
+use crate::llm::judgment::{system_one_or_default_for, JudgmentProvider, JudgmentSite};
+
+impl crate::engine::LucidosEngine {
+    /// The System One row a turn-end decision runs on, or `None` for its chat
+    /// model. Only the wake decision has a default row, and both share one
+    /// fallback (ADRs 0435, 0472).
+    async fn turn_end_system_one(
+        &self,
+        site: JudgmentSite,
+        timeout: std::time::Duration,
+    ) -> Option<Box<dyn JudgmentProvider>> {
+        let served = self
+            .current_provider()
+            .configured_providers()
+            .unwrap_or_default();
+        system_one_or_default_for(&self.pool, site, timeout, &served).await
+    }
+}
 
 /// One rule a turn must meet before it ends, in the order the gate checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,10 +114,13 @@ pub(crate) struct ReentryLedger {
 }
 
 impl ReentryLedger {
-    fn slot(&mut self, hold: ProposalHold) -> &mut Option<String> {
+    /// The key a hold's re-entry is bounded by, or `None` for a hold that
+    /// sends nobody back.
+    fn slot(&mut self, hold: ProposalHold) -> Option<&mut Option<String>> {
         match hold {
-            ProposalHold::Plan(_) => &mut self.plan,
-            ProposalHold::HardeningMissing => &mut self.hardening,
+            ProposalHold::Plan(_) => Some(&mut self.plan),
+            ProposalHold::HardeningMissing => Some(&mut self.hardening),
+            ProposalHold::IntegratedIntoParent | ProposalHold::CarriedBySuccessor => None,
         }
     }
 
@@ -104,7 +136,7 @@ impl ReentryLedger {
             let TurnEndRequirement::Reentry(hold) = requirement else {
                 return None;
             };
-            let slot = self.slot(hold);
+            let slot = self.slot(hold)?;
             (slot.as_deref() != Some(head.as_str())).then(|| {
                 *slot = Some(head.clone());
                 hold

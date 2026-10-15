@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-24
+- **Amended by**: [0444: A webhook delivery is recorded with its event](0444-a-webhook-delivery-is-recorded-with-its-event.md), which writes the ledger row in the event's transaction and retires the 503, the release and the claim token
 
 ## Context
 

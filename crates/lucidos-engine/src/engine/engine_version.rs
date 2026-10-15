@@ -700,14 +700,22 @@ fn stash_first_restart_actor(
 ///   teardown falls back to a system actor. One *Switch to new version* then
 ///   produces two verdicts, decided by when a thread became in-flight.
 ///
-/// A free function over the two slots, like [`stash_first_restart_actor`] above,
+/// A teardown that promises an auto-resume also sets `handover`. The agents'
+/// processes then outlive it, for the sessions that resume them (ADR 0478).
+///
+/// A free function over the slots, like [`stash_first_restart_actor`] above,
 /// so the rule is testable without standing up an engine.
 fn open_teardown(
     restart_slot: &mut Option<crate::engine::thread_events::MessageOrigin>,
     teardown_slot: &mut Option<crate::engine::thread_events::MessageOrigin>,
+    handover: &crate::runtime::agent_run_marker::TeardownHandover,
 ) -> Option<crate::engine::thread_events::MessageOrigin> {
     let actor = restart_slot.take();
     *teardown_slot = actor.clone();
+    if crate::engine::thread_events::AbortCause::EngineShutdown.promises_auto_resume(actor.as_ref())
+    {
+        handover.hand_over();
+    }
     actor
 }
 
@@ -769,6 +777,7 @@ impl LucidosEngine {
         open_teardown(
             &mut self.restart_actor.lock().unwrap(),
             &mut self.teardown_actor.lock().unwrap(),
+            &self.teardown_handover,
         )
     }
 
@@ -797,11 +806,9 @@ impl LucidosEngine {
 
     /// Emit `ContinuationRequested` for every thread recovery queued for
     /// auto-resume after a user-initiated switch, so the spawn dispatcher boots
-    /// a `--resume`. Called by `main.rs` AFTER `SpawnDispatcher::spawn()`, which
-    /// opens the broadcast subscription synchronously before it returns. These
-    /// emits are therefore buffered by the receiver even while the dispatcher's
-    /// startup backfill is still running. Engine-attributed (`actor: None`),
-    /// because the resume is a recovery consequence, not a device click.
+    /// a `--resume`. Each request waits on the bus's directed channel until the
+    /// dispatcher drains it. Engine-attributed (`actor: None`), because the
+    /// resume is a recovery consequence, not a device click.
     ///
     /// Returns the thread ids whose resume this boot has taken responsibility
     /// for, which `settle_unresumed_switch_threads` must EXCLUDE. The dispatcher
@@ -2476,19 +2483,10 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         cmd
     }
 
-    fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-build-output-{name}-{}",
-            std::process::id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[tokio::test]
     async fn both_streams_are_captured_in_order_and_copied_to_the_log() {
-        let dir = scratch_dir("order");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let log = dir.join("engine.log");
         let (status, output) = run_capturing_output(
             shell("echo first; echo second >&2; echo third; exit 3"),
@@ -2505,14 +2503,14 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             std::fs::read_to_string(&log).unwrap(),
             "first\nsecond\nthird\n"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn a_log_that_cannot_be_written_never_fails_the_build() {
         // The incident class. Handed the log as its stdout, the build died on
         // its first `echo` and said nothing. Through the pipe it cannot.
-        let dir = scratch_dir("unwritable");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let log = dir.join("engine.log");
         std::fs::write(&log, "").unwrap();
         let mut perms = std::fs::metadata(&log).unwrap().permissions();
@@ -2528,14 +2526,14 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         .expect("the build must run");
         assert!(status.success(), "{status}");
         assert_eq!(output.last_line().as_deref(), Some("done"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn a_process_left_holding_the_pipe_does_not_hang_the_build() {
         // A daemon the build started inherits the write end, so end-of-file
         // may never come. The grace bounds the wait.
-        let dir = scratch_dir("lingering");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let started = std::time::Instant::now();
         let (status, output) = run_capturing_output(
             shell("sleep 5 & echo done"),
@@ -2552,12 +2550,12 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             "waited {:?} for a pipe a daemon held open",
             started.elapsed()
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn the_output_keeps_a_bounded_head_and_tail() {
-        let dir = scratch_dir("caps");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let mut output = BuildOutput::new(&dir.join("engine.log"));
         output.push(b"error: the first line wins\n");
         let filler = vec![b'x'; 1024];
@@ -2569,7 +2567,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         assert!(output.head_text().starts_with("error: the first line wins"));
         assert!(output.tail.len() <= 2 * BUILD_OUTPUT_TAIL_CAP);
         assert_eq!(output.last_line().as_deref(), Some("the last line"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── The restart-actor stash ──────────────────────────────────────────────
@@ -2646,7 +2643,7 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         let mut restart = device("the-click");
         let mut teardown = None;
 
-        let returned = open_teardown(&mut restart, &mut teardown);
+        let returned = open_teardown(&mut restart, &mut teardown, &Default::default());
 
         assert_eq!(
             device_id_of(&returned),
@@ -2674,8 +2671,30 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         let mut restart = None;
         let mut teardown = None;
 
-        assert!(open_teardown(&mut restart, &mut teardown).is_none());
+        assert!(open_teardown(&mut restart, &mut teardown, &Default::default()).is_none());
         assert!(teardown.is_none());
+    }
+
+    #[test]
+    fn only_a_teardown_that_promises_a_resume_hands_the_agents_processes_over() {
+        // A Switch auto-resumes its threads, so their agents' processes (an
+        // early `/harden` suite run) must outlive it (ADR 0478). Any other
+        // teardown ends the work, so ADR 0391's sweep still reaps.
+        let api = MessageOrigin::Api {
+            user_agent: None,
+            mode: crate::engine::thread_events::ActorMode::Human,
+            source_thread_id: None,
+        };
+        for (actor, hands_over) in [
+            (device("the-click"), true),
+            (None, false),
+            (Some(api), false),
+        ] {
+            let mut restart = actor.clone();
+            let handover = crate::runtime::agent_run_marker::TeardownHandover::default();
+            open_teardown(&mut restart, &mut None, &handover);
+            assert_eq!(handover.is_handed_over(), hands_over, "actor {actor:?}");
+        }
     }
 
     #[test]
@@ -2725,8 +2744,8 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     /// millisecond into `SkippedLocked`, leaving no build running at all.
     #[tokio::test]
     async fn build_lock_wait_rides_out_a_holder_that_is_about_to_release() {
-        let dir = std::env::temp_dir().join(format!("lucidos-lockwait-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(".lucidos-engine-build.lock");
 
         let held = eventually_acquire(&path);
@@ -2740,8 +2759,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
                 .is_some(),
             "a lock released partway through the wait must be acquired, not read as a peer build"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The other direction, so the wait cannot paper over a genuine peer build.
@@ -2749,8 +2766,8 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     /// `SkippedLocked` rather than a second concurrent cargo.
     #[tokio::test]
     async fn build_lock_wait_gives_up_on_a_holder_that_never_releases() {
-        let dir = std::env::temp_dir().join(format!("lucidos-lockheld-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(".lucidos-engine-build.lock");
 
         let _held = eventually_acquire(&path);
@@ -2760,8 +2777,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
                 .is_none(),
             "a lock held for the whole wait must still report the peer build"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A restart must take the GRANDCHILD down with the script.
@@ -2770,8 +2785,8 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     /// `target/`. Modelled with a shell that backgrounds a `sleep` and waits.
     #[tokio::test]
     async fn dropping_the_build_group_guard_kills_the_grandchild() {
-        let dir = std::env::temp_dir().join(format!("lucidos-buildgroup-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let pid_file = dir.join("grandchild.pid");
 
         let mut cmd = tokio::process::Command::new("sh");
@@ -2803,15 +2818,14 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             eventually(|| !pid_is_alive(grandchild)),
             "the group kill must reach the grandchild; kill_on_drop alone leaves it running"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The queued probe reads the group while the build runs. It must never
     /// read it once the leader is reaped and its pid can be recycled.
     #[tokio::test]
     async fn the_build_group_is_published_while_it_runs_and_cleared_once_reaped() {
-        let dir = scratch_dir("published-group");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let log = dir.join("engine.log");
         let published = AtomicU32::new(0);
         let mut cmd = shell("sleep 0.5");
@@ -2830,7 +2844,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             0,
             "a reaped build does not"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2956,8 +2969,8 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     /// mirrors the cross-process case that serializes rebuilds.
     #[test]
     fn build_lock_admits_a_single_holder_and_releases_on_drop() {
-        let dir = std::env::temp_dir().join(format!("lucidos-buildlock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(".lucidos-engine-build.lock");
 
         let held = eventually_acquire(&path);
@@ -2970,8 +2983,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             eventually(|| try_lock_file(&path).is_some()),
             "the lock must become acquirable again after release"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The lock must not live under `target/`. `flock` binds to an inode, so a
@@ -3025,8 +3036,8 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     /// hatch behind a phantom spinner.
     #[test]
     fn lock_held_at_reports_held_only_while_genuinely_locked() {
-        let dir = std::env::temp_dir().join(format!("lucidos-heldprobe-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join(".lucidos-engine-build.lock");
 
         // Free lock reads as not held, so the escape hatch stays available.
@@ -3048,8 +3059,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             eventually(|| !lock_held_at(&path)),
             "a released lock must read as NOT held again"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3079,12 +3088,8 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     /// current, and a move by engine source makes it stale.
     #[tokio::test]
     async fn no_restart_between_passes_a_css_move_and_stops_a_rust_move() {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-source-state-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
@@ -3111,8 +3116,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
         commit_file("crates/lucidos-engine/src/lib.rs");
         assert_eq!(no_restart_between(&built, "HEAD", &dir).await, Some(false));
         assert_eq!(no_restart_between("0123456789ab", "HEAD", &dir).await, None);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3280,13 +3283,8 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     /// `None` (so an unresolvable id can't be mistaken for "provably older").
     #[tokio::test]
     async fn commit_is_strict_ancestor_reads_history_direction() {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-ancestry-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
@@ -3341,8 +3339,6 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             None,
             "an unknown object is indeterminate, never 'provably older'"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The two halves of the group indexing have to agree: `slot()` is what
@@ -3558,13 +3554,8 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
     /// unresolvable range is UNKNOWN.
     #[tokio::test]
     async fn pending_commits_leave_out_what_the_served_client_carries() {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-pending-commits-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
@@ -3714,7 +3705,5 @@ ERROR: pinned port for workspace '/Users/me/workspaces/dev' is occupied: vite 51
             None,
             "a range git cannot resolve says nothing about what is pending"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

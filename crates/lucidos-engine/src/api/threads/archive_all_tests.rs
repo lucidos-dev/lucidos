@@ -16,6 +16,7 @@ async fn spawn_under(bus: &EventBus, pool: &sqlx::PgPool, parent: Option<Uuid>) 
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "work".into(),
             user_image_hashes: vec![],
             device_id: None,

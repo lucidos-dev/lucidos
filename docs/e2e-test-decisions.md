@@ -305,9 +305,9 @@ single green local `e2e-browser.sh` as full proof.
 `drafts.spec.ts:65` ("thread draft persists when switching to compose and back")
 was the longest-running mobile-webkit flake (six sessions of compose-draft clobber
 fixes — see `docs/plans/2026-06-27-mobile-webkit-shard-contention.md` and
-`docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md`). After all four inbound
-draft-clear paths were guarded (`stageDraftFromApi`, `applyRemoteCompose`, the
-`MessageReceived` echo — all gated on `hasUnsentLocalDraft`), it still surfaced once
+`docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md`). The inbound
+draft-clear paths were all guarded by then, by a local-authorship check that the
+compose revision has since replaced. It still surfaced once
 on the 2026-06-28 nightly as a **retry-recovered flake** — but with a *different
 shape* than the value='' clobber: the restore assertion **timed out** (the textarea
 hadn't hydrated within 5s, then recovered on the fresh-context retry).

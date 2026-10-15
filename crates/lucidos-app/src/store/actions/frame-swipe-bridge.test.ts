@@ -4,7 +4,7 @@ import { APP_SWIPE_END_MESSAGE_TYPE, APP_SWIPE_MESSAGE_TYPE } from '@lucidos/pan
 const isKnownAppFrame = vi.fn();
 vi.mock('../../utils/appFrame', () => ({ isKnownAppFrame }));
 
-const { forwardPreviewSwipe, parseAppSwipeMessage, subscribeFrameSwipes } = await import('./frame-swipe-bridge');
+const { announceFrameGone, forwardPreviewSwipe, parseAppSwipeMessage, subscribeFrameSwipes } = await import('./frame-swipe-bridge');
 
 const APP = { name: 'the app frame' };
 const message = (data: unknown, source: unknown = APP) => ({ data, source }) as unknown as MessageEvent;
@@ -73,5 +73,30 @@ describe('subscribeFrameSwipes', () => {
     expect(remove).toHaveBeenCalledWith('message', onMessage);
     add.mockRestore();
     remove.mockRestore();
+  });
+
+  it('tells every subscriber when a frame goes away, until cleanup', () => {
+    const FRAME = {} as Window;
+    const first: unknown[] = [];
+    const second: unknown[] = [];
+    const stopFirst = subscribeFrameSwipes((source, m) => { first.push({ source, m }); });
+    const stopSecond = subscribeFrameSwipes((source, m) => { second.push({ source, m }); });
+
+    announceFrameGone(FRAME);
+    stopFirst();
+    announceFrameGone(FRAME);
+    stopSecond();
+    announceFrameGone(FRAME);
+
+    expect(first).toEqual([{ source: FRAME, m: { kind: 'gone' } }]);
+    expect(second).toEqual([{ source: FRAME, m: { kind: 'gone' } }, { source: FRAME, m: { kind: 'gone' } }]);
+  });
+
+  it('announces nothing for a frame with no window', () => {
+    const seen: unknown[] = [];
+    const stop = subscribeFrameSwipes((source, m) => { seen.push({ source, m }); });
+    announceFrameGone(null);
+    stop();
+    expect(seen).toEqual([]);
   });
 });

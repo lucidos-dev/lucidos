@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   computeHeaderCollapse,
   iconsRowWidth,
+  measuredCollapseInput,
   mobileCollapseCount,
   type HeaderCollapseInput,
 } from './useHeaderActionCollapse';
@@ -286,6 +287,23 @@ describe('computeHeaderCollapse', () => {
 });
 
 // Mobile's whole decision, which reads no box at all.
+describe('measuredCollapseInput', () => {
+  // A row whose two actions and bell just fit beside a 320px centred title:
+  // (570 - 320) / 2 leaves 125px, and the cluster plus its two gaps is 124.
+  const row = { clientWidth: 570, titleWidth: 320, iconWidth: ICON, actionCount: 2, anchorWidth: ICON, gapPx: GAP };
+
+  it('keeps every action riding when nothing holds the trailing padding', () => {
+    expect(computeHeaderCollapse(measuredCollapseInput({ ...row, trailingPadding: 0 })).collapsed).toBe(0);
+  });
+
+  it('folds sooner while the docked Home rail toggle holds the trailing padding', () => {
+    const docked = measuredCollapseInput({ ...row, trailingPadding: ICON + GAP });
+    // The centred box still sits on the whole row, so only the actions give way.
+    expect(docked.leadingWidth).toBe((570 - 320) / 2);
+    expect(computeHeaderCollapse(docked).collapsed).toBe(2);
+  });
+});
+
 describe('mobileCollapseCount', () => {
   it('folds a set of two or more, whatever the width', () => {
     expect(mobileCollapseCount(2)).toBe(2);

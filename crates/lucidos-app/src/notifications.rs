@@ -5,8 +5,8 @@
 //! which Apple has dismantled — it no longer delivers on recent macOS (26
 //! "Tahoe"). `UNUserNotification` is the supported API, but it **requires the
 //! process to run inside a signed `.app` bundle**: `currentNotificationCenter()`
-//! throws for an unbundled binary. A `tauri dev` build is an unbundled
-//! `cargo run` binary, so native banners are inert in dev — `tauri::is_dev()`
+//! throws for an unbundled binary. The dev window is an unbundled
+//! `cargo build` binary, so native banners are inert in dev — `tauri::is_dev()`
 //! short-circuits both [`setup`] and [`show`]. Browser / PWA clients still get
 //! the web push on the same engine branch, so dev keeps a working notification
 //! channel. A packaged build (`cargo tauri build`) is a real bundle and
@@ -387,7 +387,7 @@ mod imp {
     }
 
     /// Wire the delegate + request authorization once, at app startup. No-op in
-    /// dev: `tauri dev` runs an unbundled binary, where
+    /// dev: the dev window runs an unbundled binary, where
     /// `currentNotificationCenter()` throws an Objective-C exception (which would
     /// abort the process), so we never touch UN there.
     pub fn setup(app: &AppHandle) {

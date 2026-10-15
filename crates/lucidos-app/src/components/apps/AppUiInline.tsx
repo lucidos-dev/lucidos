@@ -83,15 +83,15 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
 
   // Keep `appFullscreenHost` (where the host's overlay layer renders) in step
   // with the DOM: while this panel is the natively fullscreen element, the
-  // overlays have to be portaled INSIDE it, because a fullscreen element is
-  // painted alone. `syncAppFullscreenHost` re-derives that from the document
+  // overlays have to move INSIDE it, because a fullscreen element is painted
+  // alone. `syncAppFullscreenHost` re-derives that from the document
   // rather than from anything captured here, so a replaced panel cannot leave a
   // stale answer behind (see store/appFullscreenHost.ts).
   //
   // No dep array: it re-asserts on every render as well as on the fullscreen
   // event, so a remount is covered by the render that caused it. It only ever
-  // writes a CHANGED value, so a render that changes nothing does not churn the
-  // overlay layer's portal target. Same isActiveLayout gate as above.
+  // writes a CHANGED value, so a render that changes nothing does not move the
+  // overlay layer. Same isActiveLayout gate as above.
   useLayoutEffect(() => {
     if (isActiveLayout) syncAppFullscreenHost();
   });
@@ -99,8 +99,8 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
   // The listeners and the on-unmount clear are keyed separately from the sync
   // above: they must NOT be torn down and rebuilt on every render, and the clear
   // must fire when this panel actually goes away rather than between two renders
-  // that both have a fullscreen app (which would unmount and remount the whole
-  // overlay layer, and any open modal with it).
+  // that both have a fullscreen app. The clear runs before Preact removes the
+  // panel, and it is what moves the overlay layer home first (OverlayLayer).
   useLayoutEffect(() => {
     if (!isActiveLayout) return;
     document.addEventListener('fullscreenchange', syncAppFullscreenHost);
@@ -147,12 +147,12 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
       {frameSrc && (
         <ContentAppFrame key={`${refreshKey}:${splitFrameSrc(frameSrc).doc}`} src={frameSrc} reveal={reveal} />
       )}
-      {/* Where the host's overlay layer renders while this panel is natively
-          fullscreen (OverlayLayer portals into it, found by this marker). Always
-          mounted, always empty: it has no vnode children, so the portal is the
-          only writer, and `display: contents` keeps it out of the flex column
-          and out of hit testing. Last child, so the overlays follow the iframe
-          in paint order. */}
+      {/* Where the host's overlay layer sits while this panel is natively
+          fullscreen (OverlayLayer moves its node in, found by this marker).
+          Always mounted, never given vnode children, so Preact never diffs what
+          the layer puts there, and `display: contents` keeps it out of the flex
+          column and out of hit testing. Last child, so the overlays follow the
+          iframe in paint order. */}
       <div class="app-overlay-layer" data-overlay-layer="" />
     </div>
   );

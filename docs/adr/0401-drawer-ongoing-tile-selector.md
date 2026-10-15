@@ -50,7 +50,7 @@ says so.
 - A press also opens the group's first thread, the selected tile included. The
   user asked for it later. On the phone it opens only a sole thread: its drawer
   is its own pane, and opening one of several would swipe the reader off the
-  list.
+  list. ADR 0459 drops this: a press now only selects.
 - The In flight running/waiting split moved from its header into its tile.
 - "Nothing ongoing" is gone. Each group has its own empty state.
 

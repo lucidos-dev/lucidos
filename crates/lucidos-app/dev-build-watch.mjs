@@ -16,16 +16,17 @@
 // the entire class of stale-CSS wedges is gone, with no watchdog, no age-based
 // recycle, and no staleness guard needed.
 //
-// Lifecycle: workspace.sh:start_frontend_built launches this as the
-// checkout-level build-watch singleton (this process's PID is the
-// `.build-watch/pid`), waits for the initial build to produce dist/index.html,
-// and SIGTERMs it on teardown. A change mid-build is coalesced and rebuilt after.
+// Lifecycle: workspace.sh:start_frontend_built launches this through
+// scripts/lib/build_watch_exec.pl, which hands it `.build-watch/watch.lock` to
+// hold for its whole life and publishes its PID as `.build-watch/pid`. The
+// launcher waits for the initial build to produce dist/index.html, and the
+// teardown SIGTERMs it. A change mid-build is coalesced and rebuilt after.
 //
 // # Three things this does besides building
 //
 // **It installs what the manifest declares.** A coding agent's Apply can land a
 // new `package-lock.json` that the checkout never installed: `ensure_npm_deps`
-// refuses to install while a frontend is running, by design. Every build after
+// refuses to install while this watcher runs, by design. Every build after
 // that fails to resolve the new import, and `dist/` stops publishing for every
 // workspace. So each build first reconciles `node_modules` with the lockfile.
 //
@@ -36,11 +37,11 @@
 //
 // Both, and why: `docs/plans/2026-08-21-a-wedged-frontend-build-heals-itself-and-shouts.md`.
 //
-// **It serves an entry chunk over its budget, and says so.** Every other build
-// fails on that (`vite/entryChunkBudget.ts`). Here it would strand every later
+// **It serves a build over a chunk budget, and says so.** Every other build
+// fails on that (`vite/chunkBudget.ts`). Here it would strand every later
 // Apply, so the child is told it runs under the watcher, and the overrun lands
-// in the status file and one notification instead. See
-// `docs/plans/2026-10-03-entry-chunk-headroom-and-watcher-report-only.md`.
+// in the status file and one notification per budget instead (ADR 0353,
+// ADR 0436).
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, watch } from 'node:fs';
@@ -55,10 +56,10 @@ const STATE_DIR = resolve(APP_DIR, '.build-watch');
 const STATUS_FILE = resolve(STATE_DIR, 'status.json');
 const DEBOUNCE_MS = 200; // coalesce git-merge bursts (Apply touches many files at once)
 
-// Both mirror `vite/entryChunkBudget.ts`, which this JS cannot import.
+// Both mirror `vite/chunkBudget.ts`, which this JS cannot import.
 // `dev-build-watch.test.ts` fails when they drift apart.
 export const DEV_BUILD_WATCH_ENV = 'LUCIDOS_DEV_BUILD_WATCH';
-export const ENTRY_CHUNK_LINE_PREFIX = 'lucidos-entry-chunk ';
+export const BUDGET_LINE_PREFIX = 'lucidos-chunk-budget ';
 
 /** Build output kept for the status file and the alert. Enough for a Rollup
  *  resolve error with its stack, small enough to hold for every build.
@@ -136,13 +137,13 @@ export function firstErrorLine(output) {
  * Written on success too. The engine reads this to explain an Apply that did
  * not land, and a stale failure from an hour ago would be a lie.
  */
-export function buildStatusRecord({ ok, at, error, skippedInstall, entryChunk }) {
+export function buildStatusRecord({ ok, at, error, skippedInstall, chunkBudgets }) {
   return {
     ok,
     at,
     error: ok ? null : (error ?? null),
     skippedInstall: skippedInstall ?? null,
-    entryChunk: entryChunk ?? null,
+    chunkBudgets: chunkBudgets ?? {},
   };
 }
 
@@ -158,36 +159,55 @@ export function buildChildEnv(baseEnv, watcherPid) {
 }
 
 /**
- * The entry chunk measurement on one line of build output, or `null`.
+ * One budget's measurement on one line of build output, or `null`.
  *
  * `overBudget` is decided here rather than trusted from the line, so the status
  * file cannot disagree with its own two numbers.
  */
-export function entryChunkFromLine(line) {
-  if (!line.startsWith(ENTRY_CHUNK_LINE_PREFIX)) return null;
+export function budgetFromLine(line) {
+  if (!line.startsWith(BUDGET_LINE_PREFIX)) return null;
   try {
-    const { fileName, bytes, budgetBytes } = JSON.parse(line.slice(ENTRY_CHUNK_LINE_PREFIX.length));
-    if (typeof fileName !== 'string' || !Number.isFinite(bytes) || !Number.isFinite(budgetBytes)) return null;
-    return { fileName, bytes, budgetBytes, overBudget: bytes > budgetBytes };
+    const { budget, label, subject, bytes, budgetBytes } = JSON.parse(line.slice(BUDGET_LINE_PREFIX.length));
+    if (typeof budget !== 'string' || typeof label !== 'string' || typeof subject !== 'string') return null;
+    if (!Number.isFinite(bytes) || !Number.isFinite(budgetBytes)) return null;
+    return { budget, label, subject, bytes, budgetBytes, overBudget: bytes > budgetBytes };
   } catch {
     return null;
   }
 }
 
-/** The notification for an entry chunk crossing its budget, either way. */
-export function entryChunkAlert(transition, entryChunk) {
+/** The notification for one budget crossing its line, either way. */
+export function budgetAlert(transition, measured) {
   const kb = (bytes) => `${(bytes / 1000).toFixed(2)} kB`;
   if (transition === 'broken') {
     return {
-      title: 'Entry chunk is over its budget',
-      message: `${entryChunk.fileName} is ${kb(entryChunk.bytes)}, over ${kb(entryChunk.budgetBytes)}. `
-        + 'This checkout still serves it, but every other build now fails. See ADR 0288.',
+      title: `${measured.label} is over its budget`,
+      message: `${measured.subject} is ${kb(measured.bytes)}, over ${kb(measured.budgetBytes)}. `
+        + 'This checkout still serves it, but every other build now fails. See ADR 0436.',
     };
   }
   return {
-    title: 'Entry chunk is back within its budget',
-    message: `${entryChunk.fileName} is ${kb(entryChunk.bytes)}, within ${kb(entryChunk.budgetBytes)}.`,
+    title: `${measured.label} is back within its budget`,
+    message: `${measured.subject} is ${kb(measured.bytes)}, within ${kb(measured.budgetBytes)}.`,
   };
+}
+
+/**
+ * The alerts one build's measurements raise, and each budget's state after it.
+ *
+ * `within` maps a budget name to whether its last measurement was within. Each
+ * budget follows `alertTransition` on its own. A budget this build did not
+ * measure keeps its state, since a build that failed early is no recovery.
+ */
+export function budgetAlerts(within, chunkBudgets) {
+  const next = { ...within };
+  const alerts = [];
+  for (const measured of Object.values(chunkBudgets)) {
+    const transition = alertTransition(within[measured.budget] ?? null, !measured.overBudget);
+    next[measured.budget] = !measured.overBudget;
+    if (transition) alerts.push(budgetAlert(transition, measured));
+  }
+  return { alerts, within: next };
 }
 
 // ── the watcher ─────────────────────────────────────────────────────────────
@@ -205,16 +225,6 @@ function depsState(arg) {
     return out.stdout.trim();
   } catch {
     return null;
-  }
-}
-
-/** True when a Vite dev server in this checkout holds `node_modules`. The probe
- *  exits 0 for a conflict, and excludes this watcher's own pid. */
-function devServerRunning() {
-  try {
-    return spawnSync('bash', [DEPS_STATE, 'dev-server-running']).status === 0;
-  } catch {
-    return false;
   }
 }
 
@@ -240,13 +250,6 @@ function ensureDeps() {
     have = null;
   }
   if (have === want) return null;
-
-  if (devServerRunning()) {
-    // The case `ensure_npm_deps` refuses for: wiping node_modules under a live
-    // Vite server corrupts it. Say so instead, and build anyway. The build may
-    // well fail, and then the alert carries both facts.
-    return 'dependencies changed, but a Vite dev server in this checkout holds node_modules';
-  }
 
   const root = depsState('install-root');
   if (root === null) return null;
@@ -290,16 +293,16 @@ let pending = false;
 let child = null;
 /** `null` until this process has completed a build. See `alertTransition`. */
 let lastOk = null;
-/** `null` until a build has measured the entry chunk. The same edge rule. */
-let lastWithinBudget = null;
+/** Per budget, whether its last measurement was within. See `budgetAlerts`. */
+let budgetsWithin = {};
 
-function recordOutcome(ok, error, skippedInstall, entryChunk) {
+function recordOutcome(ok, error, skippedInstall, chunkBudgets) {
   try {
     mkdirSync(STATE_DIR, { recursive: true });
     writeFileSync(
       STATUS_FILE,
       `${JSON.stringify(
-        buildStatusRecord({ ok, at: new Date().toISOString(), error, skippedInstall, entryChunk }),
+        buildStatusRecord({ ok, at: new Date().toISOString(), error, skippedInstall, chunkBudgets }),
         null,
         2,
       )}\n`,
@@ -318,14 +321,14 @@ function recordOutcome(ok, error, skippedInstall, entryChunk) {
     raiseAlert({ title: 'Frontend build is green again', message: 'The checkout is publishing again.' });
   }
 
-  if (!entryChunk) return;
-  if (entryChunk.overBudget) {
-    log(`ENTRY CHUNK OVER BUDGET: ${entryChunk.fileName} is ${entryChunk.bytes} bytes, `
-      + `budget ${entryChunk.budgetBytes}. Served anyway; every other build fails on it.`);
+  for (const measured of Object.values(chunkBudgets)) {
+    if (!measured.overBudget) continue;
+    log(`${measured.label.toUpperCase()} OVER BUDGET: ${measured.subject} is ${measured.bytes} bytes, `
+      + `budget ${measured.budgetBytes}. Served anyway; every other build fails on it.`);
   }
-  const budgetTransition = alertTransition(lastWithinBudget, !entryChunk.overBudget);
-  lastWithinBudget = !entryChunk.overBudget;
-  if (budgetTransition) raiseAlert(entryChunkAlert(budgetTransition, entryChunk));
+  const { alerts, within } = budgetAlerts(budgetsWithin, chunkBudgets);
+  budgetsWithin = within;
+  for (const alert of alerts) raiseAlert(alert);
 }
 
 /** Vite's CLI, run by this Node directly, so the child's parent is this process. */
@@ -347,7 +350,7 @@ function runBuild() {
   } catch (err) {
     building = false;
     log(`vite build FAILED: cannot resolve vite (${err.message})`);
-    recordOutcome(false, `cannot resolve vite: ${err.message}`, skippedInstall, null);
+    recordOutcome(false, `cannot resolve vite: ${err.message}`, skippedInstall, {});
     return;
   }
 
@@ -363,7 +366,11 @@ function runBuild() {
   });
   let tail = '';
   let partialLine = '';
-  let entryChunk = null;
+  const chunkBudgets = {};
+  const measure = (line) => {
+    const measured = budgetFromLine(line);
+    if (measured) chunkBudgets[measured.budget] = measured;
+  };
   const keep = (chunk) => {
     process.stdout.write(chunk);
     tail = (tail + chunk.toString()).slice(-ERROR_TAIL_BYTES);
@@ -373,7 +380,7 @@ function runBuild() {
     keep(chunk);
     const lines = (partialLine + chunk.toString()).split('\n');
     partialLine = lines.pop() ?? '';
-    for (const line of lines) entryChunk = entryChunkFromLine(line) ?? entryChunk;
+    for (const line of lines) measure(line);
   };
   child.stdout.on('data', keepStdout);
   child.stderr.on('data', keep);
@@ -381,11 +388,11 @@ function runBuild() {
   child.on('exit', (code) => {
     child = null;
     building = false;
-    entryChunk = entryChunkFromLine(partialLine) ?? entryChunk;
+    measure(partialLine);
     const ms = Date.now() - started;
     const ok = code === 0;
     log(`vite build ${ok ? 'ok' : `FAILED (exit ${code})`} in ${ms}ms`);
-    recordOutcome(ok, ok ? null : firstErrorLine(tail), skippedInstall, entryChunk);
+    recordOutcome(ok, ok ? null : firstErrorLine(tail), skippedInstall, chunkBudgets);
     if (pending) { pending = false; runBuild(); }
   });
 }

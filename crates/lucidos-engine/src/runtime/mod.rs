@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 pub use agent_runtime::{
     AccountPin, AgentEvent, AgentInput, AgentPermissionRequest, AgentRuntime, CodingAgent,
-    ControlReach, ControlRequest, InputWithdrawal, ReplayedInput, RunningAgent, SpawnArgs,
-    TakesEffect, WithdrawRequest,
+    ControlReach, ControlRequest, InputWithdrawal, RunningAgent, SpawnArgs, TakesEffect,
+    WithdrawRequest,
 };
 pub use browser::{BrowserLogins, BrowserRuntime, HeadlessBlocklist};
 // The three CC wire names are re-exported beside Codex's so every consumer

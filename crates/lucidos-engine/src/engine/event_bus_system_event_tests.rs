@@ -62,31 +62,36 @@ fn domain_event_to_payload_with_api_actor_keeps_mode_and_user_agent() {
 
 #[test]
 fn presence_check_serializes_with_type_tag() {
-    // Wire shape consumed by the SDK SSE handler — see
-    // crates/lucidos-app/src/store/actions/presence-pong.ts. PresenceCheck is
-    // now a pure pong trigger: it carries no toast content (that moved to
-    // NotificationToastRequested, emitted only on the push-suppressed branch
-    // so a toast and an OS push can't both fire — see notifications.md §3-§4).
+    // Wire shape consumed by the page's PresenceCheck handler
+    // (crates/lucidos-app/src/store/actions/presence-pong.ts). It carries the
+    // toast, so a page can act on it before it answers (notifications.md §3).
+    let nid = Uuid::nil();
+    let tid = Uuid::nil();
     let e = SystemEvent::PresenceCheck {
-        notification_id: Uuid::nil(),
+        notification_id: nid,
+        title: "Claude is asking".to_string(),
+        body: "Pick one".to_string(),
+        thread_id: Some(tid),
         event_id: None,
+        app_id: None,
+        tap: Tap::Modal,
         deadline_ms: 250,
         sent_at_ms: 1_700_000_000_000,
         actor: None,
     };
     let json = serde_json::to_value(&e).unwrap();
     assert_eq!(json["type"], "PresenceCheck");
+    assert_eq!(json["data"]["notification_id"], nid.to_string());
+    assert_eq!(json["data"]["title"], "Claude is asking");
+    assert_eq!(json["data"]["body"], "Pick one");
+    assert_eq!(json["data"]["thread_id"], tid.to_string());
     assert_eq!(json["data"]["deadline_ms"], 250);
     assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
-    // No toast content rides on PresenceCheck anymore.
-    assert!(json["data"].get("title").is_none());
-    assert!(json["data"].get("body").is_none());
-    assert!(json["data"].get("thread_id").is_none());
-    assert!(json["data"].get("app_id").is_none());
-    assert!(json["data"].get("tap").is_none());
-    // Optional fields stay omitted when None so the wire shape mirrors
-    // the spec snippet exactly.
+    // Tap::Modal is the serde default: present and shaped {"kind":"modal"}.
+    assert_eq!(json["data"]["tap"], serde_json::json!({"kind": "modal"}));
+    // None optionals stay omitted.
     assert!(json["data"].get("event_id").is_none());
+    assert!(json["data"].get("app_id").is_none());
     assert!(json["data"].get("actor").is_none());
 }
 
@@ -95,7 +100,12 @@ fn presence_check_is_transient_not_persisted() {
     // Spec §3 — PresenceCheck is broadcast, never written to events.
     let e = SystemEvent::PresenceCheck {
         notification_id: Uuid::nil(),
+        title: String::new(),
+        body: String::new(),
+        thread_id: None,
         event_id: None,
+        app_id: None,
+        tap: Tap::Modal,
         deadline_ms: 250,
         sent_at_ms: 0,
         actor: None,
@@ -106,63 +116,11 @@ fn presence_check_is_transient_not_persisted() {
 }
 
 #[test]
-fn notification_toast_requested_serializes_with_type_tag() {
-    // §4 in-app toast trigger — emitted after the engine decides to suppress
-    // the OS push. Wire shape consumed by the SDK handler (in-app-
-    // notification-toast.ts). Carries the toast content so the page renders
-    // without a re-fetch; `sent_at_ms` drives the page-side freshness gate.
-    let nid = Uuid::nil();
-    let tid = Uuid::nil();
-    let e = SystemEvent::NotificationToastRequested {
-        notification_id: nid,
-        title: "Claude is asking".to_string(),
-        body: "Pick one".to_string(),
-        thread_id: Some(tid),
-        event_id: None,
-        app_id: None,
-        tap: Tap::Modal,
-        sent_at_ms: 1_700_000_000_000,
-    };
-    let json = serde_json::to_value(&e).unwrap();
-    assert_eq!(json["type"], "NotificationToastRequested");
-    assert_eq!(json["data"]["notification_id"], nid.to_string());
-    assert_eq!(json["data"]["title"], "Claude is asking");
-    assert_eq!(json["data"]["body"], "Pick one");
-    assert_eq!(json["data"]["thread_id"], tid.to_string());
-    assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
-    // Tap::Modal is the serde default — present and shaped {"kind":"modal"}.
-    assert_eq!(json["data"]["tap"], serde_json::json!({"kind": "modal"}));
-    // None optionals stay omitted.
-    assert!(json["data"].get("event_id").is_none());
-    assert!(json["data"].get("app_id").is_none());
-}
-
-#[test]
-fn notification_toast_requested_is_transient_on_notification_aggregate() {
-    // Transient UI signal — broadcast to SSE, never written to events. Lives
-    // on the `notification` aggregate alongside NotificationCreated/Read.
-    let e = SystemEvent::NotificationToastRequested {
-        notification_id: Uuid::nil(),
-        title: String::new(),
-        body: String::new(),
-        thread_id: None,
-        event_id: None,
-        app_id: None,
-        tap: Tap::Modal,
-        sent_at_ms: 0,
-    };
-    assert!(!e.is_persisted());
-    assert_eq!(e.aggregate(), "notification");
-    assert_eq!(e.event_type(), "NotificationToastRequested");
-    assert_eq!(e.aggregate_id(), Uuid::nil().to_string());
-}
-
-#[test]
 fn native_push_requested_serializes_with_type_tag() {
     // §4 native desktop surface trigger — emitted on the push-ALLOWED branch
-    // so a connected Tauri app shows a native macOS banner. Same wire shape as
-    // NotificationToastRequested (the SDK reuses the decode), consumed by the
-    // native-push handler. `sent_at_ms` drives the page-side freshness gate.
+    // so a connected Tauri app shows a native macOS banner. Carries the same
+    // toast content as PresenceCheck, consumed by the native-push handler.
+    // `sent_at_ms` drives the page-side freshness gate.
     let nid = Uuid::nil();
     let tid = Uuid::nil();
     let e = SystemEvent::NativePushRequested {
@@ -189,10 +147,8 @@ fn native_push_requested_serializes_with_type_tag() {
 
 #[test]
 fn native_push_requested_is_transient_on_notification_aggregate() {
-    // Transient UI signal — broadcast to SSE, never written to events. Lives on
-    // the `notification` aggregate alongside NotificationToastRequested (its
-    // mutually-exclusive complement: toast on push-suppressed, native on
-    // push-allowed).
+    // Transient UI signal: broadcast to SSE, never written to events. Lives on
+    // the `notification` aggregate alongside NotificationCreated and Read.
     let e = SystemEvent::NativePushRequested {
         notification_id: Uuid::nil(),
         title: String::new(),
@@ -493,4 +449,31 @@ fn the_name_keyed_predicate_agrees_with_the_event_keyed_one() {
     assert!(!SystemEvent::is_persisted_type_name("BackupProgress"));
     assert!(!SystemEvent::is_persisted_type_name("Toast"));
     assert!(!SystemEvent::is_persisted_type_name("NotAnEventAtAll"));
+}
+
+/// A lag replay reads an artifact write back from its row, so the stored
+/// payload must give back the event that wrote it.
+#[test]
+fn a_default_shaped_row_gives_back_its_event() {
+    let written = SystemEvent::ArtifactCreated {
+        artifact_path: "notes.md".into(),
+        commit: "abc123".into(),
+        source: Some("chat".into()),
+        writer_thread_id: Some(uuid::Uuid::new_v4()),
+    };
+    let read = SystemEvent::from_stored(written.to_payload()).expect("round trip");
+    assert_eq!(
+        serde_json::to_value(&read).unwrap(),
+        serde_json::to_value(&written).unwrap()
+    );
+}
+
+/// A trigger row stores its raw payload, so it does not read back as typed.
+#[test]
+fn a_bespoke_row_is_refused_rather_than_misread() {
+    let trigger = SystemEvent::TriggerExecuted {
+        trigger_id: "t-1".into(),
+        payload: serde_json::json!({"name": "nightly"}),
+    };
+    assert!(SystemEvent::from_stored(trigger.to_payload()).is_err());
 }

@@ -130,6 +130,16 @@ impl DiskPressure {
         }
     }
 
+    /// Archived-removal grace: [`ARCHIVED_REMOVAL_GRACE`], or zero under hard
+    /// pressure. Liveness, not idle age, protects a tree then.
+    pub(crate) fn archived_grace(&self) -> Duration {
+        if self.under_hard {
+            Duration::ZERO
+        } else {
+            ARCHIVED_REMOVAL_GRACE
+        }
+    }
+
     /// The part of `freed` that counts toward the "Lucidos reclaimed disk
     /// space" report, which covers only reclamation under hard pressure.
     pub(crate) fn hard_reclaimed(&self, freed: Option<u64>) -> u64 {
@@ -265,6 +275,31 @@ pub(crate) async fn is_finished_worktree(
     !has_branch_commits(&repo_root, &branch).await
 }
 
+/// The untracked directories in `worktree` that are git repositories of their
+/// own, such as a clone the agent made there. `Err` when git cannot answer.
+///
+/// With every untracked file listed, git still stops at a nested repository
+/// and reports it as one `?? dir/` record, however deep it sits.
+pub(crate) async fn untracked_repositories(worktree: &Path) -> Result<Vec<String>, String> {
+    let out = git_cmd(
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+        worktree,
+    )
+    .await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter_map(|record| record.strip_prefix("?? "))
+        .filter(|path| path.ends_with('/') && worktree.join(path).join(".git").exists())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Whether the user pinned the thread. An unknown thread is not pinned.
 pub(crate) async fn thread_is_saved(pool: &PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
     let row: Option<(bool,)> =
@@ -315,17 +350,18 @@ pub(crate) async fn has_pending_fan_in(pool: &PgPool, thread_id: Uuid) -> bool {
     }
     // (b) a completed-but-unprocessed child completion is the thread's last
     // persisted word (no resume emitted a later event). A sibling's
-    // `ChildThreadStopped` or `ChildThreadDetached` note wakes nothing, so
-    // it cannot have processed the card, and it must not hide it. Nor can a
-    // side question, which no agent reads.
+    // `ChildThreadStopped`, `ChildThreadDetached` or `ChildReportFiled` note
+    // wakes nothing, so it cannot have processed the card, and it must not
+    // hide it. Nor can a side question, which no agent reads.
     match sqlx::query_scalar::<_, String>(
         "SELECT event_type FROM events \
          WHERE aggregate = 'thread' AND aggregate_id = $1::text \
-           AND event_type NOT IN ('ChildThreadStopped', 'ChildThreadDetached') \
            AND event_type <> ALL($2) \
+           AND event_type <> ALL($3) \
          ORDER BY sequence DESC LIMIT 1",
     )
     .bind(thread_id)
+    .bind(crate::engine::thread_events::ThreadEvent::PARENT_NOTE_EVENT_TYPES)
     .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
     .fetch_optional(pool)
     .await
@@ -464,17 +500,20 @@ pub(crate) async fn is_worktree_dirty(worktree: &Path) -> bool {
 pub(crate) enum BranchDisposal {
     /// Delete the branch only when it holds no unique commits.
     WhenMerged,
-    /// Delete the branch whatever it holds. Only a thread delete passes this.
-    /// The owner asked for the thread and its work to be gone, and the
-    /// confirmation said unapplied branch work goes with it. Once the thread's
-    /// events are removed, nothing can resolve this branch back to a thread.
+    /// Delete the branch whatever it holds. Two callers pass this. A thread
+    /// delete does: the owner asked for the thread and its work to be gone,
+    /// and the confirmation said unapplied branch work goes with it. Once the
+    /// thread's events are removed, nothing can resolve this branch back to a
+    /// thread. The landing lane does for a closed batch's integration branch,
+    /// which is its own.
     Always,
 }
 
 /// Outcome of [`remove_worktree_and_optionally_delete_branch`].
 pub(crate) struct RemoveWorktreeOutcome {
     /// Bytes reclaimed from the on-disk worktree (best-effort directory size
-    /// captured before removal).
+    /// captured before removal). Zero when the moved-aside tree could not be
+    /// deleted yet.
     pub freed_bytes: u64,
     /// True iff the branch was deleted.
     pub branch_deleted: bool,
@@ -568,22 +607,73 @@ async fn holds_tracked_files(worktree: &Path, sub: &str) -> bool {
     .or_unknown(true)
 }
 
+/// Name prefix of a worktree a removal has moved aside and not yet deleted.
+/// Whatever carries it is garbage: the worker deletes it on its next pass.
+pub(crate) const RECLAIMING_PREFIX: &str = "reclaiming-";
+
+/// Move `worktree` aside to a `reclaiming-` sibling, then drop git's
+/// registration of the old path. Returns the new path.
+///
+/// The rename is atomic on one volume. So a crash leaves the whole tree at its
+/// path or a `reclaiming-` directory, never a half-deleted tree. Such a tree
+/// reads as dirty, and a later snapshot would commit its deletions.
+pub(crate) async fn move_worktree_aside(worktree: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let name = worktree.file_name()?.to_string_lossy();
+    let aside = worktree.with_file_name(format!("{RECLAIMING_PREFIX}{name}"));
+    // A crashed earlier removal of the same tree left this behind.
+    if aside.exists() && !remove_reclaiming_dir(&aside).await {
+        return None;
+    }
+    if let Err(e) = tokio::fs::rename(worktree, &aside).await {
+        log!(
+            "[WorktreeCleanup] could not move {} aside: {}",
+            worktree.display(),
+            e
+        );
+        return None;
+    }
+    crate::engine::git_ops::prune_worktrees(repo_root).await;
+    Some(aside)
+}
+
+/// Delete a directory [`move_worktree_aside`] produced. True once it is gone,
+/// including when a concurrent remover got there first.
+pub(crate) async fn remove_reclaiming_dir(dir: &Path) -> bool {
+    match tokio::fs::remove_dir_all(dir).await {
+        Ok(()) => true,
+        Err(_) if !dir.exists() => true,
+        Err(e) => {
+            log!(
+                "[WorktreeCleanup] remove_dir_all failed for {}: {}; the next pass retries",
+                dir.display(),
+                e
+            );
+            false
+        }
+    }
+}
+
 /// Remove a worktree directory, and delete its branch per `disposal`.
 ///
-/// It opens with `git worktree remove --force`, so a caller gates it on
-/// [`is_worktree_dirty`] first. Two callers skip the gate, both because the
-/// user confirmed a destructive action naming this tree: the disk-usage
-/// endpoint's Tier 3, and a thread delete. Add a caller and you add the gate
-/// with it. `rg is_worktree_dirty` lists the current set.
+/// It deletes the tree whatever it holds, so a caller gates it on
+/// [`is_worktree_dirty`] first, or commits the dirt. Three callers skip the
+/// gate. The disk-usage endpoint's Tier 3 and a thread delete do, because the
+/// user confirmed a destructive action naming this tree. The landing lane does
+/// for the lane worktree of a closed batch, which holds nobody's work: the
+/// batch landed, or failed whole. Add a caller and you add the gate with it.
+/// `rg is_worktree_dirty` lists the current set.
+///
+/// The tree is moved aside before anything is deleted ([`move_worktree_aside`]),
+/// so a crash midway never leaves a partial tree at `worktree`.
 ///
 /// `pre_size` lets the Tier 2 worker pass the directory size it already
 /// surveyed at the top of `run_once`, avoiding a second walk of the same
 /// tree (worktrees can be tens of GB). Callers without a precomputed size
 /// pass `None` and the helper measures.
 ///
-/// Returns `None` when the repo root cannot be resolved from the worktree
-/// (e.g. the worktree was already removed manually). The caller decides
-/// whether absence is a hard error.
+/// Returns `None`, with the tree untouched, when the repo root cannot be
+/// resolved or the tree cannot be moved aside. The caller decides whether that
+/// is a hard error.
 pub(crate) async fn remove_worktree_and_optionally_delete_branch(
     worktree: &Path,
     pre_size: Option<u64>,
@@ -608,44 +698,7 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
         None => directory_size_bytes(worktree).await,
     };
 
-    // Use `git worktree remove --force` so git's bookkeeping (the
-    // `worktrees/<name>` admin dir under `.git/`) is cleaned up too. If
-    // git doesn't know about the path (e.g. it was moved/copied), fall
-    // back to `remove_dir_all` so we still reclaim the bytes.
-    let removed_via_git = match git_cmd(
-        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
-        &repo_root,
-    )
-    .await
-    {
-        Ok(o) if o.status.success() => true,
-        Ok(o) => {
-            log!(
-                "[WorktreeCleanup] git worktree remove failed for {}: {}",
-                worktree.display(),
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            false
-        }
-        Err(e) => {
-            log!(
-                "[WorktreeCleanup] git worktree remove errored for {}: {}",
-                worktree.display(),
-                e
-            );
-            false
-        }
-    };
-    if !removed_via_git && worktree.exists() {
-        if let Err(e) = tokio::fs::remove_dir_all(worktree).await {
-            log!(
-                "[WorktreeCleanup] remove_dir_all failed for {}: {}",
-                worktree.display(),
-                e
-            );
-            return None;
-        }
-    }
+    let aside = move_worktree_aside(worktree, &repo_root).await?;
 
     // Branch deletion (Phase 10.3). `WhenMerged` is the reclamation rule, and
     // `has_branch_commits` returns true on error, so a branch is kept whenever
@@ -696,8 +749,16 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
         }
     }
 
+    // A failure leaves a `reclaiming-` directory, which the worker retries.
+    // Bytes still on disk are not reported as freed.
+    let freed_bytes = if remove_reclaiming_dir(&aside).await {
+        total_size
+    } else {
+        0
+    };
+
     Some(RemoveWorktreeOutcome {
-        freed_bytes: total_size,
+        freed_bytes,
         branch_deleted,
         branch,
         repo_root,

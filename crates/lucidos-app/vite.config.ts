@@ -6,11 +6,15 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { previewAuthGate, previewGatewayFromEnv, previewProxy } from './vite/frontendPreviewGateway';
 import { askGatewaySession } from './vite/gatewaySession';
-import { entryChunkBudget, underDevBuildWatch } from './vite/entryChunkBudget';
+import { chunkBudget, underDevBuildWatch } from './vite/chunkBudget';
 import { shellChunkPreload } from './vite/shellChunkPreload';
 import { inlineBootScript } from './vite/inlineBootScript';
 import { layoutMediaPlugin } from './vite/layoutMediaPlugin';
 import { readHeadCommit, sourceCommitStamp } from './vite/sourceCommitStamp';
+import { ensureGenerated } from './vite/ensureGenerated';
+
+// First, before any plugin or module reads a generated file.
+ensureGenerated(resolve(__dirname, '../..'));
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
 
@@ -166,8 +170,8 @@ function stampServiceWorker(): Plugin {
  * That is a runtime constraint, not a source one. The same program is served to
  * every app iframe by the engine, and until this plugin the two documents
  * carried two hand-copied copies of it. Both now come from
- * `packages/lucidos-sdk/src/boot/`, built by that package into a committed
- * bundle, and this plugin substitutes the shell's build into a marker comment.
+ * `packages/lucidos-sdk/src/boot/`, built by that package into `dist/`, and
+ * this plugin substitutes the shell's build into a marker comment.
  *
  * `transformIndexHtml` runs in `serve` as well as `build`, so the dev server
  * gets it too. Reading the bundle per transform (rather than once at config
@@ -177,7 +181,7 @@ const APPEARANCE_BOOT_MARKER = '<!-- lucidos:appearance-boot -->';
 
 function inlineAppearanceBoot(): Plugin {
   const bundlePath = resolve(
-    __dirname, '../../packages/lucidos-sdk/src/generated/appearance-boot.host.js',
+    __dirname, '../../packages/lucidos-sdk/dist/appearance-boot.host.js',
   );
   return {
     name: 'lucidos-appearance-boot',
@@ -193,7 +197,7 @@ function inlineAppearanceBoot(): Plugin {
       }
       if (!fs.existsSync(bundlePath)) {
         throw new Error(
-          `${bundlePath} is missing. Run: cd packages/lucidos-sdk && npm run build`,
+          `${bundlePath} is missing. Run: ./scripts/codegen.sh`,
         );
       }
       return inlineBootScript(html, APPEARANCE_BOOT_MARKER, fs.readFileSync(bundlePath, 'utf-8'));
@@ -291,7 +295,7 @@ export default defineConfig({
       ? [previewAuthGate(previewGateway, (cookie) => askGatewaySession(previewGateway, cookie))]
       : []),
     buildIdVirtualModule(), suppressMergeReload(), inlineAppearanceBoot(), syncPublicDir(),
-    stampServiceWorker(), preact(), entryChunkBudget(underDevBuildWatch(process.env, process.ppid)),
+    stampServiceWorker(), preact(), chunkBudget(underDevBuildWatch(process.env, process.ppid)),
     shellChunkPreload(),
     sourceCommitStamp(!!process.env.LUCIDOS_ATOMIC_DIST, () => readHeadCommit(__dirname), resolve(__dirname, 'dist')),
     atomicDistPublish(),
@@ -302,17 +306,17 @@ export default defineConfig({
     // stream, API client. The UI is the shell chunk, which loads beside it
     // under the boot splash, and views load on demand (ADR 0288).
     //
-    // 600 is a CEILING, not a budget to spend. `entryChunkBudget` fails the
-    // build when the entry chunk passes it. Then move the next thing the first
-    // frame does not need behind a dynamic import, rather than raising it.
-    chunkSizeWarningLimit: 600,
+    // Off, not raised. Vite holds every chunk to this one number, so it cannot
+    // tell the first-paint chunks from the lazy ones. `chunkBudget` judges each
+    // chunk against the number for its class instead (ADR 0436).
+    chunkSizeWarningLimit: Infinity,
     rollupOptions: {
       output: {
         // Split third-party code out of the always-loaded entry chunk. The
         // markdown and highlight libs get their own buckets, being heavy and
         // pulled in only by the chat paths. Everything else under node_modules
         // lands in a shared `vendor` chunk. Without this the framework rides in
-        // the entry chunk and pushes it past Rollup's advisory.
+        // the entry chunk and pushes it past its budget.
         manualChunks(id) {
           if (id.includes('node_modules')) {
             // Each name below is a dependency only ONE lazy chunk imports.
@@ -388,6 +392,10 @@ export default defineConfig({
       // barrel, for the same reason as the six above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/pane-swipe': resolve(__dirname, '../../packages/lucidos-sdk/src/paneSwipe.ts'),
+      // The app's scroll report, which moves the mobile bars over an app
+      // (ADR 0469). Reached WITHOUT the barrel, like the pane swipe above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/app-scroll': resolve(__dirname, '../../packages/lucidos-sdk/src/appScroll.ts'),
       // The widget height protocol (ADR 0402): the channel the host marks a
       // widget frame on and the message the frame answers with. Reached
       // WITHOUT the barrel, like the pane swipe above.

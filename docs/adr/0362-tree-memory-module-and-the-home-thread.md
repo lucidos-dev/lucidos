@@ -77,7 +77,8 @@ already allows. The two widest Always-allow grants stay on screen only.
 hand. Nothing titles it automatically: no generated title, no suggested name.
 A thread that never ends has no single topic, so a model naming it from one
 exchange gets it wrong. The bus refuses `ThreadTitleGenerated` on it, the
-title paths skip it before any model call, and its menu hides Suggest name.
+title paths skip it before any model call, and its Rename dialog offers no
+Suggest link.
 Plan: `docs/plans/2026-10-05-home-thread-never-auto-titled.md`.
 
 This supersedes ADR 0208. Calls run only on Home, and Home is never named
@@ -553,3 +554,27 @@ would have hidden the menu, the mark's only way in. Here every widget still
 has its card in Home's transcript. Home draws no shelf, so the hold is how a
 pinned widget opens from anywhere ([ADR 0419](0419-widget-windows-stay-open.md)
 § Amendment). The desktop tooltip names the right-click.
+
+## Amendment, 2026-10-12: Tree is the default
+
+The gate in the Decision is met. The Phase 5 benchmark
+(`docs/plans/2026-10-05-classic-vs-tree-benchmark-verdict.md`) scored Tree at
+least as well as Classic on all five axes, at about 14% more dollars. So
+`memory_module` now defaults to `tree`, and a new workspace starts on it.
+
+A workspace used before the flip stays on Classic. A migration stores
+`classic` for a workspace with history and no stored value. Read through the
+new default, such a workspace would start a paid backfill at upgrade and skip
+the confirm Settings shows. A release notice asks those users to move to Tree
+from Settings, where the confirm shows the cost. It carries no action button,
+since an agent writing the preference would skip that confirm too.
+
+Moving every workspace at upgrade was weighed and rejected for the same
+reason: the backfill spends the user's money, and nobody would have agreed to
+it. Plan: `docs/plans/2026-10-12-tree-memory-is-the-default.md`.
+
+## Amendment, 2026-10-14: a new workspace asks
+
+[ADR 0483](0483-a-new-workspace-asks-for-its-memory-module.md) replaces the
+2026-10-12 default. `memory_module` has no default: unset runs Classic, and the
+memory choice asks the user, with what Tree costs a month.

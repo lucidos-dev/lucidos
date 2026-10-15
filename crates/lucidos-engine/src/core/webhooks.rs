@@ -187,7 +187,7 @@ pub struct DedupeConfig {
     /// the key is a digest of the body instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
-    /// How long a claim holds a key. `0` switches deduping off, which is also
+    /// How long a delivery's key dedupes a resend. `0` switches deduping off, which is also
     /// how `update` clears the setting.
     #[serde(default = "default_window_secs")]
     pub window_secs: i64,
@@ -201,7 +201,7 @@ fn default_window_secs() -> i64 {
 ///
 /// A digest either way, so the ledger stores one fixed-length value rather than
 /// whatever a public caller put in a header. The two sources are prefixed
-/// apart, so a body can never key the same claim as a header value.
+/// apart, so a body can never key the same row as a header value.
 ///
 /// Falling back is safe because this key authenticates nothing. It decides only
 /// whether this delivery has been seen, and that decision runs after

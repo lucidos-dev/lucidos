@@ -31,6 +31,7 @@ async fn message(bus: &EventBus, thread_id: Uuid) {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do the thing".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -130,6 +131,7 @@ async fn apply(bus: &EventBus, thread_id: Uuid) {
             actor: None,
             pre_merge_sha: None,
             post_merge_sha: None,
+            landing_merge_sha: None,
             path: String::new(),
         },
         EventChannel::ClaudeCode,
@@ -451,6 +453,7 @@ async fn a_child_that_stops_blocking_wakes_its_parent() {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "a sub-task".into(),
             user_image_hashes: vec![],
             device_id: None,

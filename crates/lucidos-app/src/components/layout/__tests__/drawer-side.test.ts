@@ -14,10 +14,15 @@
  * it. The `.drawer-right` CSS is scoped to the mobile breakpoint for the same
  * reason, belt and braces.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   drawerSide, drawerSideFor, openDrawer, forceCloseDrawer,
 } from '../drawerState';
+import { DrawerChunk } from '../drawerState';
+
+// The drawer is code-split and opens once it is in memory. Warm it, so an
+// open lands at once.
+beforeAll(() => DrawerChunk.preload());
 
 /** Minimal stand-in for the hamburger element: openDrawer only measures it. */
 function anchorAt(left: number, width = 28): HTMLElement {

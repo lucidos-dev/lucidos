@@ -1,3 +1,4 @@
+import type { WidgetSize } from '../generated/thread-event-wire';
 import { errorDetail } from '../utils/errorDetail';
 import type { PluginLocalChangesResult } from '../api/client/apps';
 import type { WebhookIngress, WebhookRefusals } from '../api/client/webhooks';
@@ -243,6 +244,10 @@ type ResponseEventKind =
       /** The steps this `Agent` call's sub-agent took, in clock order. They
        *  render folded under this row (`nestSubAgentSteps`). */
       children?: Extract<ResponseEvent, { type: 'step' }>[];
+      /** The last snapshot this `Agent` call's sub-agent captured. Its final
+       *  call writes the report and makes no tool call, so no child row holds
+       *  that figure. */
+      finalContextCapture?: ContextCapture;
       detail?: string;
       /** Legacy fields — see Step.context_tokens above. */
       context_tokens?: number;
@@ -811,7 +816,13 @@ export interface App {
   params?: Record<string, AppParam>;
   /** A *built-in widget*: shipped with Lucidos and read-only (ADR 0415). */
   built_in?: boolean;
+  /** A widget's *widget sizes*, first the default (ADR 0432). Absent for an app. */
+  sizes?: WidgetSize[];
+  /** A widget whose Home board tile is see-through, so it draws its own shape. */
+  transparent?: boolean;
 }
+
+export type { WidgetSize };
 
 /** One name a widget takes in its params (`engine::core::AppParam`). */
 export interface AppParam {
@@ -928,6 +939,9 @@ export interface PromptState {
   okLabel?: string;
   cancelLabel?: string;
   multiline?: boolean;
+  /** Offers a Suggest link that fills the field with what this returns. It
+   *  settles its own errors and returns null when there is nothing to fill. */
+  suggest?: () => Promise<string | null>;
   resolve?: (value: string | null) => void;
 }
 
@@ -979,15 +993,6 @@ export interface ToastItem {
    *  the user can't dismiss the toast while the dim restart overlay is still
    *  blocking the UI behind it. Defaults to true (close button shown). */
   dismissable?: boolean;
-  /** Desktop pane this toast is centered over, FROZEN to whichever pane was
-   *  focused when the toast first appeared (drawer counts as 'thread'). It never
-   *  changes afterwards — a later focus switch must not make the toast jump
-   *  panes. Set once in `showToast`; a keyed in-place update keeps the original.
-   *  Selects which `.toast-column` the toast is rendered into (`toastColumns.ts`),
-   *  so it stacks with its own pane's toasts and never displaces the other
-   *  pane's. Ignored while only one pane is on screen: mobile, and a collapsed
-   *  split, both merge every toast into one column. */
-  pane?: 'thread' | 'content';
   /** true = this toast waits to be answered, with no auto-dismiss timer.
    *
    *  Decided in `showToast`, which is the one place that knows: the rule mixes
@@ -1152,7 +1157,7 @@ export interface MarketplaceCatalog {
 
 /** Plugin install awaiting user confirmation in the install panel. Mirrors
  *  the JSON payload built by `engine::tools::plugins::prepare_install_request`.
- *  The user clicks Confirm/Cancel; the panel POSTs to
+ *  The user clicks Install (or Update) or Cancel; the panel POSTs to
  *  `/api/v1/plugins/install/:install_id/{confirm|cancel}` to resolve. */
 export interface PluginInstallRequest {
   install_id: string;
@@ -1167,6 +1172,10 @@ export interface PluginInstallRequest {
   /** Subset of `files` that already exist under `data/` and would be
    *  overwritten. Highlight separately from the rest. */
   overwrites: string[];
+  /** True when this plugin is already installed, so confirming updates it.
+   *  Read from its install record, never from `overwrites`. Absent on a
+   *  request staged before the engine sent it. */
+  is_update?: boolean;
   /** Optional post-install instruction text from the manifest. Render as
    *  markdown so the LLM-shippable instructions wrap nicely. */
   setup?: string | null;

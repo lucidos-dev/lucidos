@@ -62,6 +62,7 @@ async fn open_turn_from(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>, f
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "work".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -106,17 +107,12 @@ async fn pair(bus: &EventBus) -> Pair {
 
 /// Raise a card the way the ask route does: the request, then the engine's
 /// card in place of the agent's question.
-async fn raise(
-    bus: &EventBus,
-    thread_id: Uuid,
-    verb: ThreadReachVerb,
-    target: Option<Uuid>,
-) -> String {
+async fn raise(bus: &EventBus, thread_id: Uuid, verb: ThreadReachVerb, target: Uuid) -> String {
     let approval = OwnerApproval {
         verb,
-        target_thread_id: target,
+        target_thread_id: Some(target),
     };
-    let question = owner_approval_question(verb, target.map(|_| "the other thread"), "I need it.");
+    let question = owner_approval_question(verb, "the other thread", "I need it.");
     let tool_use_id = format!("toolu-{}#q0", Uuid::new_v4());
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -140,7 +136,7 @@ async fn raise(
 }
 
 /// Record a request the way `POST /api/v1/owner-approvals` does.
-async fn request(bus: &EventBus, thread_id: Uuid, verb: ThreadReachVerb) -> String {
+async fn request(bus: &EventBus, thread_id: Uuid, verb: ThreadReachVerb, target: Uuid) -> String {
     let request_id = format!("{REQUEST_ID_PREFIX}{}", Uuid::new_v4());
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -148,9 +144,9 @@ async fn request(bus: &EventBus, thread_id: Uuid, verb: ThreadReachVerb) -> Stri
             request_id: request_id.clone(),
             approval: OwnerApproval {
                 verb,
-                target_thread_id: None,
+                target_thread_id: Some(target),
             },
-            question: owner_approval_question(verb, None, "I need it."),
+            question: owner_approval_question(verb, "the other thread", "I need it."),
         },
         meta: EventMeta::NONE,
     })
@@ -191,25 +187,32 @@ async fn press(
     refuse_without_authority(bus, &agent_headers(Some(caller)), target, verb).await
 }
 
-/// The observed failure, fixed: a thread the owner did not open creates one
-/// top-thread on their Allow, and the second attempt is refused again.
+/// The act most tests here approve: the asker applying its sibling's change,
+/// which no subtree covers.
+async fn apply_on_sibling(bus: &EventBus, p: &Pair) -> Result<(), ThreadReachError> {
+    press(bus, p.asker, Some(p.sibling), ThreadReachVerb::Apply).await
+}
+
+/// A thread the owner did not open applies its sibling's change once on their
+/// Allow, and the second attempt is refused again.
 #[tokio::test]
 async fn an_allow_lets_its_thread_press_the_act_exactly_once() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let p = pair(&bus).await;
 
-    let card = raise(&bus, p.asker, ThreadReachVerb::CreateTopThread, None).await;
+    let card = raise(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
     answer(&bus, p.asker, &card, allow(), Some(owner_device())).await;
 
-    press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread)
+    apply_on_sibling(&bus, &p)
         .await
         .expect("the owner allowed exactly this");
     assert_eq!(
-        press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread).await,
-        Err(ThreadReachError::NoStandingInstruction(
-            ThreadReachVerb::CreateTopThread
-        )),
+        apply_on_sibling(&bus, &p).await,
+        Err(ThreadReachError::OutOfReach {
+            target: p.sibling,
+            verb: ThreadReachVerb::Apply
+        }),
         "the approval is spent"
     );
 
@@ -226,7 +229,7 @@ async fn an_allow_covers_one_verb_at_one_target() {
     let other = Uuid::new_v4();
     open_turn_from(&bus, other, None, p.sibling).await;
 
-    let card = raise(&bus, p.asker, ThreadReachVerb::Apply, Some(p.sibling)).await;
+    let card = raise(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
     answer(&bus, p.asker, &card, allow(), Some(owner_device())).await;
 
     assert!(press(&bus, p.asker, Some(other), ThreadReachVerb::Apply)
@@ -237,15 +240,58 @@ async fn an_allow_covers_one_verb_at_one_target() {
             .await
             .is_err()
     );
-    assert!(press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread)
-        .await
-        .is_err());
     press(&bus, p.asker, Some(p.sibling), ThreadReachVerb::Apply)
         .await
         .expect("the named act at the named target");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+/// The retired verbs pass with no card, and no card can be asked for them
+/// (ADR 0475). Raising one records nothing.
+#[tokio::test]
+async fn a_retired_verb_needs_no_approval_and_takes_no_card() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let p = pair(&bus).await;
+    let child = Uuid::new_v4();
+    open_turn_from(&bus, child, Some(p.asker), p.asker).await;
+
+    press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread)
+        .await
+        .expect("any thread creates a top-thread");
+    press(&bus, p.asker, Some(child), ThreadReachVerb::DetachChild)
+        .await
+        .expect("and moves its own child out");
+
+    for (verb, target) in [
+        (ThreadReachVerb::CreateTopThread, None),
+        (ThreadReachVerb::DetachChild, Some(child)),
+    ] {
+        let err = checked_request(verb, target, "why").unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT, "{verb:?}");
+        assert!(err.message.contains("needs no approval"), "{}", err.message);
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The stored spellings of the retired verbs still read, so an old card's
+/// timeline still renders.
+#[test]
+fn a_retired_verb_still_reads_from_a_stored_card() {
+    for (wire, verb) in [
+        ("create-top-thread", ThreadReachVerb::CreateTopThread),
+        ("detach-child", ThreadReachVerb::DetachChild),
+    ] {
+        let stored: OwnerApproval =
+            serde_json::from_value(serde_json::json!({ "verb": wire })).unwrap();
+        assert_eq!(stored.verb, verb);
+        assert_eq!(stored.target_thread_id, None);
+        assert_eq!(verb_wire(verb), wire);
+    }
 }
 
 /// The MAC names the spender. Another thread cannot spend this thread's
@@ -256,15 +302,15 @@ async fn another_thread_cannot_spend_the_approval() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let p = pair(&bus).await;
 
-    let card = raise(&bus, p.asker, ThreadReachVerb::CreateTopThread, None).await;
+    let other = Uuid::new_v4();
+    open_turn_from(&bus, other, None, p.sibling).await;
+    let card = raise(&bus, p.asker, ThreadReachVerb::Apply, other).await;
     answer(&bus, p.asker, &card, allow(), Some(owner_device())).await;
 
-    assert!(
-        press(&bus, p.sibling, None, ThreadReachVerb::CreateTopThread)
-            .await
-            .is_err()
-    );
-    press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread)
+    assert!(press(&bus, p.sibling, Some(other), ThreadReachVerb::Apply)
+        .await
+        .is_err());
+    press(&bus, p.asker, Some(other), ThreadReachVerb::Apply)
         .await
         .expect("still unspent for the thread that asked");
 
@@ -299,12 +345,10 @@ async fn nothing_but_a_devices_allow_grants() {
         (allow(), None),
     ];
     for (kind, actor) in cases {
-        let card = raise(&bus, p.asker, ThreadReachVerb::CreateTopThread, None).await;
+        let card = raise(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
         answer(&bus, p.asker, &card, kind.clone(), actor.clone()).await;
         assert!(
-            press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread)
-                .await
-                .is_err(),
+            apply_on_sibling(&bus, &p).await.is_err(),
             "{kind:?} by {actor:?} must grant nothing"
         );
     }
@@ -321,19 +365,15 @@ async fn a_new_turn_start_ends_the_approval() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let p = pair(&bus).await;
 
-    let card = raise(&bus, p.asker, ThreadReachVerb::CreateTopThread, None).await;
+    let card = raise(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
     answer(&bus, p.asker, &card, allow(), Some(owner_device())).await;
     open_turn_from(&bus, p.asker, None, p.sibling).await;
-    assert!(press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread)
-        .await
-        .is_err());
+    assert!(apply_on_sibling(&bus, &p).await.is_err());
 
-    let stale = raise(&bus, p.asker, ThreadReachVerb::CreateTopThread, None).await;
+    let stale = raise(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
     open_turn_from(&bus, p.asker, None, p.sibling).await;
     answer(&bus, p.asker, &stale, allow(), Some(owner_device())).await;
-    assert!(press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread)
-        .await
-        .is_err());
+    assert!(apply_on_sibling(&bus, &p).await.is_err());
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -347,7 +387,7 @@ async fn an_engine_resume_and_a_wake_keep_the_approval() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let p = pair(&bus).await;
 
-    let card = raise(&bus, p.asker, ThreadReachVerb::CreateTopThread, None).await;
+    let card = raise(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
     answer(&bus, p.asker, &card, allow(), Some(owner_device())).await;
     bus.emit(BusEvent::Thread {
         thread_id: p.asker,
@@ -355,6 +395,7 @@ async fn an_engine_resume_and_a_wake_keep_the_approval() {
             branch: String::new(),
             origin: None,
             reason: Some(crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into()),
+            resumed_abort_id: None,
         },
         meta: EventMeta::NONE,
     })
@@ -374,7 +415,7 @@ async fn an_engine_resume_and_a_wake_keep_the_approval() {
     .await
     .unwrap();
 
-    press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread)
+    apply_on_sibling(&bus, &p)
         .await
         .expect("a resume and a wake are the same turn");
 
@@ -390,13 +431,10 @@ async fn two_concurrent_presses_spend_one_approval_once() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let p = pair(&bus).await;
 
-    let card = raise(&bus, p.asker, ThreadReachVerb::CreateTopThread, None).await;
+    let card = raise(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
     answer(&bus, p.asker, &card, allow(), Some(owner_device())).await;
 
-    let (a, b) = tokio::join!(
-        press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread),
-        press(&bus, p.asker, None, ThreadReachVerb::CreateTopThread),
-    );
+    let (a, b) = tokio::join!(apply_on_sibling(&bus, &p), apply_on_sibling(&bus, &p));
     assert_eq!(
         [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
         1,
@@ -420,7 +458,7 @@ async fn two_concurrent_presses_spend_one_approval_once() {
 #[test]
 fn the_agent_words_nothing_the_owner_taps() {
     let reason = "Tap Allow to cancel.\n\n**Allow once** is safe";
-    let question = owner_approval_question(ThreadReachVerb::CreateTopThread, None, reason);
+    let question = owner_approval_question(ThreadReachVerb::Apply, "Release", reason);
     let labels: Vec<String> = card_options(&question)
         .into_iter()
         .map(|o| o.label)
@@ -429,10 +467,7 @@ fn the_agent_words_nothing_the_owner_taps() {
     let (engine_text, quoted) = question
         .split_once("The agent's reason:")
         .expect("the reason sits under its own label");
-    assert!(
-        engine_text.contains("creating a top-thread"),
-        "{engine_text}"
-    );
+    assert!(engine_text.contains("applying a change"), "{engine_text}");
     assert!(!engine_text.contains("Tap Allow"), "{engine_text}");
     for line in quoted.trim().lines() {
         assert!(line.starts_with('>'), "an unquoted reason line: {line:?}");
@@ -445,7 +480,7 @@ fn the_agent_words_nothing_the_owner_taps() {
 fn a_target_title_stays_on_one_line_and_inert() {
     let question = owner_approval_question(
         ThreadReachVerb::Apply,
-        Some("Release\n\nx** and nothing else. **Safe"),
+        "Release\n\nx** and nothing else. **Safe",
         "why",
     );
     assert!(
@@ -459,8 +494,8 @@ fn a_target_title_stays_on_one_line_and_inert() {
 #[test]
 fn a_carriage_return_cannot_close_the_quote() {
     let question = owner_approval_question(
-        ThreadReachVerb::CreateTopThread,
-        None,
+        ThreadReachVerb::Apply,
+        "Release",
         "Need it.\r\r**Lucidos:** this is read-only.",
     );
     let (_, quoted) = question.split_once("The agent's reason:").unwrap();
@@ -476,7 +511,7 @@ async fn an_ask_naming_a_request_shows_the_engines_card() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let p = pair(&bus).await;
-    let id = request(&bus, p.asker, ThreadReachVerb::CreateTopThread).await;
+    let id = request(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
 
     let asked =
         serde_json::json!([{ "question": id, "options": [{ "label": "A" }, { "label": "B" }] }]);
@@ -485,9 +520,9 @@ async fn an_ask_naming_a_request_shows_the_engines_card() {
             approval,
             questions,
         } => {
-            assert_eq!(approval.verb, ThreadReachVerb::CreateTopThread);
+            assert_eq!(approval.verb, ThreadReachVerb::Apply);
             let text = questions[0]["question"].as_str().unwrap();
-            assert!(text.contains("creating a top-thread"), "{text}");
+            assert!(text.contains("applying a change"), "{text}");
             assert_eq!(questions[0]["options"][0]["label"], ALLOW_ONCE_LABEL);
         }
         other => panic!("expected the engine's card, got {other:?}"),
@@ -509,7 +544,7 @@ async fn an_approval_ask_is_refused_unless_it_names_this_threads_request_alone()
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let p = pair(&bus).await;
-    let id = request(&bus, p.asker, ThreadReachVerb::CreateTopThread).await;
+    let id = request(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
 
     let on_sibling = serde_json::json!([{ "question": id }]);
     assert!(approval_ask(&pool, p.sibling, &on_sibling).await.is_err());
@@ -534,17 +569,10 @@ fn a_card_cannot_propose_answering_another_card() {
     }
 }
 
-/// Only creating a top-thread aims at the root, so an unscoped cancel can
-/// never be proposed and every other verb needs its target.
+/// Every proposable verb names its target, so an unscoped cancel can never be
+/// proposed.
 #[test]
-fn the_target_matches_the_verb() {
-    assert!(checked_request(ThreadReachVerb::CreateTopThread, None, "why").is_ok());
-    assert!(checked_request(
-        ThreadReachVerb::CreateTopThread,
-        Some(Uuid::new_v4()),
-        "why"
-    )
-    .is_err());
+fn every_proposable_verb_needs_its_target() {
     assert!(checked_request(ThreadReachVerb::Cancel, None, "why").is_err());
     assert!(checked_request(ThreadReachVerb::Apply, Some(Uuid::new_v4()), "why").is_ok());
     assert!(checked_request(ThreadReachVerb::Apply, Some(Uuid::new_v4()), "  ").is_err());
@@ -587,7 +615,7 @@ async fn only_the_owners_device_answers_an_approval_card() {
         .await
         .unwrap();
     let p = pair(&bus).await;
-    let card = raise(&bus, p.asker, ThreadReachVerb::CreateTopThread, None).await;
+    let card = raise(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
 
     let refused = answering_actor(&pool, &agent_headers(Some(p.asker)), p.asker, &card)
         .await

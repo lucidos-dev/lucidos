@@ -19,9 +19,11 @@ use uuid::Uuid;
 
 use super::compactor::{CompactionModel, CompactorDeps};
 use super::prompt::flatten;
+use super::spend::StartEstimate;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 use crate::llm::provider::{LlmProvider, LlmResponse, Message};
+use crate::llm::ServiceTier;
 
 /// A thread event from its wire JSON, so a fixture names only the fields it
 /// cares about.
@@ -67,6 +69,20 @@ pub(super) async fn seed_artifact(bus: &EventBus, path: &str, commit: &str, writ
     .expect("seed artifact");
 }
 
+/// Store `memory_module`. A fresh test database stores none, so it runs
+/// Classic.
+pub(super) async fn choose_module(pool: &PgPool, bus: &EventBus, value: &str) {
+    crate::core::PreferenceStore::set(
+        pool,
+        bus,
+        crate::core::prefs::MEMORY_MODULE.key(),
+        value,
+        None,
+    )
+    .await
+    .unwrap();
+}
+
 /// Push every event past the compactor's horizon.
 pub(super) async fn age_events(pool: &PgPool) {
     sqlx::query("UPDATE events SET created = created - interval '1 hour'")
@@ -81,11 +97,18 @@ pub(super) async fn age_events(pool: &PgPool) {
 /// A step containing `POISON` always fails. One containing `OVERSHOOT` gets a
 /// line over the limit first, to drive the size loop. After `fail_after`
 /// calls, every call fails, which is how a test stops the compactor mid-build.
+/// With `refuse_flex`, a Flex call fails as OpenAI's capacity refusal does.
+/// A call that asked for a tier is answered as served on it.
 pub(super) struct EchoProvider {
     pub(super) calls: AtomicUsize,
     pub(super) fail_after: Option<usize>,
+    pub(super) refuse_flex: bool,
     /// The model and effort each call named.
     pub(super) selections: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
+    /// The service tier each call asked for.
+    pub(super) tiers: std::sync::Mutex<Vec<Option<ServiceTier>>>,
+    /// The cache mode each call asked for.
+    pub(super) cache_modes: std::sync::Mutex<Vec<crate::llm::CacheMode>>,
 }
 
 impl EchoProvider {
@@ -93,15 +116,17 @@ impl EchoProvider {
         Self {
             calls: AtomicUsize::new(0),
             fail_after: None,
+            refuse_flex: false,
             selections: std::sync::Mutex::default(),
+            tiers: std::sync::Mutex::default(),
+            cache_modes: std::sync::Mutex::default(),
         }
     }
 
     pub(super) fn failing_after(calls: usize) -> Self {
         Self {
-            calls: AtomicUsize::new(0),
             fail_after: Some(calls),
-            selections: std::sync::Mutex::default(),
+            ..Self::new()
         }
     }
 }
@@ -121,7 +146,12 @@ impl LlmProvider for EchoProvider {
             selection.model.map(str::to_string),
             selection.reasoning_effort.map(str::to_string),
         ));
+        self.tiers.lock().unwrap().push(selection.service_tier);
+        self.cache_modes.lock().unwrap().push(selection.cache_mode);
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.refuse_flex && selection.service_tier == Some(ServiceTier::Flex) {
+            return Err("429 Resource Unavailable: no Flex capacity".into());
+        }
         if self.fail_after.is_some_and(|limit| n >= limit) {
             return Err("the model is down".into());
         }
@@ -142,7 +172,10 @@ impl LlmProvider for EchoProvider {
                 flatten(&step).chars().take(60).collect::<String>()
             )
         };
-        Ok(line_response(line))
+        Ok(LlmResponse {
+            service_tier: selection.service_tier,
+            ..line_response(line)
+        })
     }
 
     fn default_model(&self) -> &str {
@@ -166,6 +199,7 @@ pub(super) fn line_response(line: String) -> LlmResponse {
         unknown_sse_dropped: 0,
         model_only_text: None,
         progress_notes: Vec::new(),
+        service_tier: None,
     }
 }
 
@@ -176,10 +210,15 @@ pub(super) const COMPACTOR_EFFORT: &str = "low";
 /// The lane [`TestDeps`] calls through.
 pub(super) const TEST_LANE: &str = "test/compactor-model";
 
-/// Engine stand-ins: a model, and artifacts held in a map.
+/// What a deps with no estimate answers, so its backfill opens no episode.
+pub(super) const NO_ESTIMATE: &str = "this test sets no estimate";
+
+/// Engine stand-ins: a model, artifacts held in a map, and the estimate a
+/// backfill opens its episode with.
 pub(super) struct TestDeps {
     pub(super) provider: Option<Arc<EchoProvider>>,
     pub(super) artifacts: Vec<(String, String)>,
+    pub(super) estimate: Option<StartEstimate>,
 }
 
 #[async_trait::async_trait]
@@ -192,6 +231,7 @@ impl CompactorDeps for TestDeps {
             effort: Some(COMPACTOR_EFFORT.to_string()),
             deadline: Duration::from_secs(5),
             lane: TEST_LANE.to_string(),
+            flex: false,
         })
     }
 
@@ -200,6 +240,10 @@ impl CompactorDeps for TestDeps {
             .iter()
             .find(|(p, _)| p == path)
             .map(|(_, c)| c.clone())
+    }
+
+    async fn backfill_estimate(&self) -> Result<StartEstimate, String> {
+        self.estimate.clone().ok_or_else(|| NO_ESTIMATE.to_string())
     }
 }
 
@@ -215,6 +259,7 @@ pub(super) fn deps_with(provider: Arc<EchoProvider>) -> Arc<TestDeps> {
             "notes/plan.md".to_string(),
             format!("# Plan\n{}", "A line of the plan. ".repeat(40)),
         )],
+        estimate: None,
     })
 }
 

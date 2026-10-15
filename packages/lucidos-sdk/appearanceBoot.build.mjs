@@ -7,13 +7,11 @@
  * That is a runtime constraint, not a source one: both come from
  * `src/boot/appearanceBoot.ts` and differ only in their entry file.
  *
- * The output is CHECKED IN under `src/generated/`, unlike `dist/sdk.js`. The
- * engine `include_str!`s the iframe bundle, so `cargo build` would otherwise
- * need npm to have run first, and unlike the SDK bundle a boot script has no
- * usable "not built yet" fallback: a missing one is a flash on every cold load.
- * `appearanceBoot.staleness.test.ts` rebuilds and diffs, so a source edit that
- * nobody rebuilt fails the ordinary test run rather than silently shipping the
- * previous script.
+ * The output lands in `dist/`, beside `sdk.js`, and is never committed. The
+ * engine reads the iframe bundle at startup, and Vite inlines the host bundle.
+ * Every consumer builds the SDK first, through `scripts/codegen.sh`. A boot
+ * script has no usable "not built yet" fallback, so a missing one is an error
+ * at engine startup, never a silent stub.
  *
  * `es2015` because these run before anything else on whatever the device
  * brought, including an old iOS WKWebView, and there is no bundle to fall back
@@ -22,15 +20,15 @@
  * first-paint flash.
  */
 import { build } from 'esbuild';
+import { writeIfChanged } from './writeIfChanged.mjs';
 
-/** Entry file to committed artifact. */
+/** Entry file to build output. */
 export const BOOT_BUNDLES = [
-  { entry: 'src/boot/host.ts', out: 'src/generated/appearance-boot.host.js' },
-  { entry: 'src/boot/iframe.ts', out: 'src/generated/appearance-boot.iframe.js' },
+  { entry: 'src/boot/host.ts', out: 'dist/appearance-boot.host.js' },
+  { entry: 'src/boot/iframe.ts', out: 'dist/appearance-boot.iframe.js' },
 ];
 
-/** Shared config, so the staleness test builds exactly what `npm run build`
- *  wrote. Any drift between the two would make the check meaningless. */
+
 export function bootBuildOptions(entry) {
   return {
     entryPoints: [entry],
@@ -53,9 +51,7 @@ export async function buildBootBundle(entry) {
 }
 
 export async function buildAllBootBundles() {
-  const { writeFile, mkdir } = await import('node:fs/promises');
-  await mkdir('src/generated', { recursive: true });
   for (const { entry, out } of BOOT_BUNDLES) {
-    await writeFile(out, await buildBootBundle(entry), 'utf8');
+    await writeIfChanged(out, await buildBootBundle(entry));
   }
 }

@@ -1,4 +1,4 @@
-import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, setAsideChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, applyAllBatch, applyAllCanceling, applyEstimates, standingApplyThreadIds, armingStandingApplyThreadIds, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, enginePendingCommits, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, setAsideChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyAllInProgress, applyAllBatch, applyAllCanceling, applyEstimates, standingApplyThreadIds, armingStandingApplyThreadIds, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, enginePendingCommits, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
 import { restartConfirmCopy } from '../restartConfirmCopy';
 import { loadedOr, toFailed } from '../types';
@@ -9,10 +9,10 @@ import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
 import { isNewerVersion } from '../../utils/version';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
-import { focusThread } from './threads';
 import { reconcileApplyProgress } from './applyProgress';
+import { setLandingLaneFromServer } from './landingLane';
+import { setMainCheckFromServer } from './mainCheck';
 import type { Change } from '../../api/client';
-import { changeHeadline } from '../changeHeadline';
 
 /** Key of the restart FAILURE toast, and of nothing else now.
  *
@@ -359,51 +359,6 @@ export function restoreRestartState(): void {
   }
 }
 
-/** Reconcile the optimistic Apply Now state (`applyingNowThreadIds`) against
- *  backend truth fetched on resume / reconnect / startup.
- *
- *  The per-thread state is normally cleared by the live ChangeApplied /
- *  ChangeApplyFailed SSE event. An iOS PWA suspend or an SSE reconnect gap can
- *  miss it. The menu row then sticks on "Applying", and the WaitingBanner on a
- *  disabled "Apply...", even though the change already applied. This
- *  mirrors the `apply_all_in_progress` rehydration.
- *
- *  A thread is still genuinely applying iff its change is still pending (the row
- *  flips to `applied` only on success, staying pending through harden / merge /
- *  conflict resolution) OR the thread is mid-turn (CC is running the apply, or
- *  hasn't proposed the change yet). Anything else means the apply resolved while
- *  we weren't listening — drop the optimistic state and resolve the toast:
- *  "Applied" when the change landed in the applied list, otherwise dismiss it.
- *  `pending` is the complete unbounded list, so absence is authoritative. */
-function reconcileApplyingNow(pending: Change[], applied: Change[]): void {
-  const tracked = applyingNowThreadIds.value;
-  if (tracked.size === 0) return;
-  const pendingThreadIds = new Set(
-    pending.map((c) => c.thread_id).filter((id): id is string => !!id),
-  );
-  const next = new Map(tracked);
-  let changed = false;
-  for (const threadId of tracked.keys()) {
-    if (pendingThreadIds.has(threadId)) continue; // change still pending → applying
-    const thread = threadMap.value.get(threadId);
-    if (thread && isMidTurn(effectiveThreadStatus(thread))) continue; // CC running the apply
-    next.delete(threadId);
-    changed = true;
-    const key = `applying-${threadId}`;
-    const appliedChange = applied.find((c) => c.thread_id === threadId);
-    if (appliedChange) {
-      showToast(changeToastMessage('Applied', threadId, changeHeadline(appliedChange)), 'success', {
-        key,
-        onClick: () => focusThread(threadId),
-        autoDismissMs: TOAST_AUTO_DISMISS_MS,
-      });
-    } else {
-      dismissToast(key);
-    }
-  }
-  if (changed) applyingNowThreadIds.value = next;
-}
-
 /** Fetch changes from backend and update all related signals.
  *  On a transient wake failure — a TimeoutError (10s client timeout) OR a
  *  transport-layer TypeError (Safari "Load failed" on a stale HTTP/2 connection)
@@ -455,7 +410,7 @@ export function refreshChangesState(): Promise<void> {
       // so without this the Apply All row leaves the Lucidos menu on reload
       // while the batch is still running. The batch's members and progress
       // rehydrate beside the flag, so the row keeps naming the thread in
-      // flight as "thread N of M".
+      // flight and how many members are done.
       const batch = state.apply_all_batch;
       applyAllBatch.value = batch
         ? {
@@ -469,17 +424,18 @@ export function refreshChangesState(): Promise<void> {
       // next batch reading "Canceling".
       if (!state.apply_all_in_progress) applyAllCanceling.value = false;
       applyAllInProgress.value = state.apply_all_in_progress ?? false;
+      // The lane's frames are not replayed either, so a reload reads the lane
+      // from here.
+      setLandingLaneFromServer(state.landing_lane);
+      setMainCheckFromServer(state.main_check);
       // Same rehydration for the standing applies: the StandingApply* SSE
       // events are not replayed, so a reload would otherwise draw an armed
       // thread as unarmed and offer to arm it again.
       standingApplyThreadIds.value = new Set(state.standing_apply_thread_ids ?? []);
       if (state.apply_estimates) applyEstimates.value = state.apply_estimates;
-      // Same rehydration for the per-thread Apply Now state: its menu row and
-      // the WaitingBanner "Apply..." clear only on the live
-      // ChangeApplied/ChangeApplyFailed SSE event, so a missed event (iOS PWA
-      // suspend, an SSE reconnect gap) strands them even though the apply
-      // finished. Reconcile against the freshly-fetched backend truth.
-      reconcileApplyingNow(state.pending, applied);
+      // An apply's progress phases clear only on the live SSE result, so a
+      // missed event (iOS PWA suspend, an SSE reconnect gap) strands them.
+      // Reconcile them against the freshly fetched backend truth.
       reconcileApplyProgress(previousPending, state.pending, applied);
       // The update badge is NOT lit from the applied-changes list here. It shares
       // the toast's single honest source of truth — the build-id check

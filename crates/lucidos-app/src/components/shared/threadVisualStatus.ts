@@ -5,10 +5,9 @@
  */
 
 import type { ThreadMeta, ThreadStatus, ThreadState } from '../../store/thread-events';
-import { changeReadyToReview } from '../../store/thread-events';
-import { effectiveThreadStatus } from '../../store/store';
+import { changeAwaitsApply, effectiveThreadStatus } from '../../store/store';
 
-/** 'changes' = diff glyph (CC has pending changes). 'read-request' = static
+/** 'changes' = diff glyph (a pending change awaits Apply). 'read-request' = static
  *  dot (its agent asked the user to read the reply, ADR 0409). 'question' =
  *  "?" badge (CC paused on AskUserQuestion). 'waiting' = pulsing dot. It shows
  *  only when the thread has no state of its own to surface: own state wins,
@@ -72,7 +71,7 @@ export function resolveVisualStatus(
 /** The meta facts `visualStatusFor` reads. */
 type VisualStatusFacts = Pick<
   ThreadMeta,
-  'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentChangeState' | 'liveEventWaitCount' | 'readRequested'
+  'id' | 'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentChangeState' | 'liveEventWaitCount' | 'readRequested'
 >;
 
 /** `resolveVisualStatus` fed from a thread's meta, for a surface holding a
@@ -84,7 +83,7 @@ export function visualStatusFor(status: ThreadStatus, meta: VisualStatusFacts | 
   return resolveVisualStatus(
     status,
     meta.activeChildrenCount + (meta.waitingChildrenCount ?? 0) > 0,
-    changeReadyToReview(meta),
+    changeAwaitsApply(meta),
     meta.liveEventWaitCount > 0,
     meta.readRequested === true,
   );

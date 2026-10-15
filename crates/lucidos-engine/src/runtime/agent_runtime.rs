@@ -181,14 +181,17 @@ pub enum AgentEvent {
         /// session's own work, and always `None` from Codex.
         parent_tool_use_id: Option<String>,
     },
-    /// The agent took the oldest forwarded inputs it had not taken yet.
+    /// The agent took the forwarded input whose [`AgentInput::uuid`] is `input`.
     ///
-    /// Claude Code reports it by replaying the input (`--replay-user-messages`).
-    /// The replay comes mid-turn when it folds the input in at a tool result,
-    /// and at the next turn's start otherwise. Inputs queued behind a busy turn
-    /// share one replay, which carries what they said. Codex reports one input
-    /// when the driver starts the turn that carries it, and carries `None`.
-    InputRead(Option<ReplayedInput>),
+    /// Claude Code reports it by replaying the input under that uuid
+    /// (`--replay-user-messages`): mid-turn when it folds the input in at a tool
+    /// result, and at the next turn's start otherwise. A local command such as
+    /// `/cost` replays too. Codex reports it when the driver starts the turn
+    /// that carries the input.
+    InputRead { input: uuid::Uuid },
+    /// The agent will never take the forwarded input `input`: Codex rejected or
+    /// failed the turn that carried it. The turn's `Result` carries the error.
+    InputRejected { input: uuid::Uuid },
     /// Turn-complete marker. The agent is now idle.
     /// `error` is `Some` when the agent reported the turn ended in failure
     /// (CC's `subtype: "error_during_execution"` etc., `is_error: true`) —
@@ -210,12 +213,27 @@ pub enum AgentEvent {
         output_tokens: u32,
         cache_read_tokens: u32,
         cache_creation_tokens: u32,
+        /// The 1-hour part of `cache_creation_tokens`. `None` when the usage
+        /// block did not split the write by lifetime, and always from Codex.
+        cache_creation_1h_tokens: Option<u32>,
         /// The `Agent` call whose sub-agent this came from. `None` for the
         /// session's own work, and always `None` from Codex.
         parent_tool_use_id: Option<String>,
         /// Which API call this was: Claude Code's `message.id`. `None` from
         /// Codex, and for a Claude Code frame that carries no id.
         api_call_id: Option<String>,
+        /// How long the call streamed, from its `message_start`. The capture
+        /// lands when the call ends, so this dates when it began. `None` from
+        /// Codex and for a sub-agent's call.
+        duration_ms: Option<u64>,
+    },
+    /// Claude Code compacted the session's context (its `compact_boundary`
+    /// message). `trigger` is Claude Code's own word, `auto` or `manual`.
+    /// Codex never sends it.
+    Compacted {
+        trigger: String,
+        pre_tokens: Option<u64>,
+        post_tokens: Option<u64>,
     },
     /// Claude Code's driver read the last output line and flushed any call
     /// left open. Only `Exited` can follow, once the process group is torn
@@ -234,17 +252,6 @@ pub enum AgentEvent {
     /// `ContinuationRequested`) instead of surfacing a red-dot abort. A clean
     /// exit, an EOF close, or an engine-initiated cancel all report `false`.
     Exited { killed_by_signal: bool },
-}
-
-/// What one Claude Code replay carried, which may be several inputs.
-///
-/// Claude Code joins queued plain-text inputs into one text with newlines. Once
-/// an image is among them it keeps every input's blocks apart instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplayedInput {
-    /// The text blocks, in order.
-    pub texts: Vec<String>,
-    pub images: usize,
 }
 
 /// User input sent to a running agent.
@@ -432,6 +439,13 @@ pub struct SpawnArgs<'a> {
     /// `engine::repo_directory_grants::resolve`. Each becomes one
     /// `--add-dir`. Claude Code only: Codex does not read those settings.
     pub additional_directories: &'a [PathBuf],
+    /// The auto-compact trial's setting for this spawn, from
+    /// `engine::auto_compact_trial::resolve`. `None` when the trial is off.
+    /// Claude Code only: Codex compacts on its own terms and ignores it.
+    pub auto_compact: Option<crate::engine::auto_compact_trial::AutoCompactSetting>,
+    /// The agent run marker the spawn stamps, and what the driver's end does
+    /// with the processes carrying it (ADR 0391, 0478).
+    pub(crate) agent_run: super::agent_run_marker::AgentRun,
 }
 
 /// An in-band permission request raised by the agent's own protocol — the

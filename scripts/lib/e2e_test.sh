@@ -19,6 +19,8 @@ mkdir -p "$E2E_WORKSPACE/.lucidos/worktrees"
 
 # shellcheck source=e2e.sh
 source "$SCRIPT_DIR/e2e.sh"
+# shellcheck source=scripts/lib/flock_test_support.sh
+source "$SCRIPT_DIR/flock_test_support.sh"
 
 # ── prune_orphan_worktree_dirs ────────────────────────────────────────
 test_prune_removes_empty_dir() {
@@ -556,7 +558,7 @@ test_no_sourced_lib_leaks_a_loop_variable() {
     # nightly's blank exit code. This one holds the whole CLASS: e2e-browser.sh
     # drives an indexed loop and calls deep into these libs, so ANY of them
     # leaking a loop variable can corrupt the caller's iteration. Static, because
-    # the dangerous functions (start_engine, _start_postgres_container) spawn
+    # the dangerous functions (start_engine, _ensure_shared_postgres_container) spawn
     # engines and Docker containers — not something to boot for an assertion —
     # and because the failure we want to prevent is a NEW leak being added, which
     # a scan catches and a fixture never would.
@@ -664,34 +666,36 @@ test_ensure_workspace_running_builds_the_frontend_before_the_engine() {
     # At boot the engine snapshots the dist/ it finds and serves that copy
     # (api/frontend_snapshot.rs). A build landing after start_engine is never
     # served, so every spec grades the PREVIOUS build and says nothing about it.
-    # Stubs only, in a subshell: the two steps announce themselves and nothing
-    # is booted. The health curl answers no, so the start branch is the one run.
+    # The engine BUILD still comes first: it writes the generated files the
+    # frontend build reads. Stubs only, in a subshell: the steps announce
+    # themselves and nothing is booted. The health curl answers no, so the
+    # start branch is the one run.
     local order
     order="$(
         e2e_workspace_env() { VITE_PORT=65000; PROTO=http; }
         swap_ports() { :; }
         setup_postgres() { :; }
-        build_e2e_engine_once() { :; }
+        build_e2e_engine_once() { echo "build"; }
         ensure_frontend_built() { echo "frontend"; }
         attach_e2e_gateway() { echo "gateway"; }
         start_engine() { echo "engine"; }
         curl() { if [[ "$*" == *health* ]]; then return 1; fi; echo "<!DOCTYPE html>"; }
-        ensure_workspace_running 2>/dev/null | grep -E '^(frontend|gateway|engine)$' | tr '\n' ' '
+        ensure_workspace_running 2>/dev/null | grep -E '^(build|frontend|gateway|engine)$' | tr '\n' ' '
     )"
 
-    if [ "$order" = "frontend gateway engine " ]; then
-        pass "the build and the gateway identity land before the boot"
+    if [ "$order" = "build frontend gateway engine " ]; then
+        pass "the generated files, the build and the gateway identity land before the boot"
     else
-        fail "order was '$order': the engine boots on a stale dist/ or an inherited gateway"
+        fail "order was '$order': the frontend builds without its generated files, or the engine boots on a stale dist/"
     fi
 }
 
 # ── the sandbox contract itself ───────────────────────────────────────
 # Every test above aims at $E2E_WORKSPACE, which this file pins to a sandbox
 # BEFORE sourcing e2e.sh. That pin is load-bearing well beyond worktree pruning:
-# `e2e_workspace_env` exports E2E_WORKSPACE as $WORKSPACE, which resolves
-# $ENGINE_PIDFILE, which `stop_e2e_engine` sends SIGUSR1 to — the one signal the
-# engine does NOT ignore. A hard `E2E_WORKSPACE=...` in e2e.sh silently clobbered
+# `e2e_workspace_env` exports E2E_WORKSPACE as $WORKSPACE, which names the
+# engine `stop_e2e_engine` sends SIGUSR1 to — the one signal the engine does NOT
+# ignore. A hard `E2E_WORKSPACE=...` in e2e.sh silently clobbered
 # the pin, pointing this whole file (and any future test that reaches a stop or
 # cleanup path) at the real ~/workspaces/e2e-test. Assert the pin survives the
 # source, so the escape can't come back unnoticed.
@@ -1267,14 +1271,11 @@ test_tree_reset_keeps_only_lucidos() {
 
 test_tree_reset_refuses_a_running_engine() {
     echo "test: reset_e2e_workspace_tree refuses while the engine is running"
-    local E2E_WORKSPACE rc=0 live
+    local E2E_WORKSPACE rc=0
     E2E_WORKSPACE="$(new_fresh_ws)"
-    sleep 30 &
-    live=$!
-    echo "$live" > "$E2E_WORKSPACE/.lucidos/engine.pid"
+    start_lock_holder "$SANDBOX" "$E2E_WORKSPACE/.lucidos/engine.lock" ex "$E2E_WORKSPACE/.lucidos/engine.pid"
     reset_e2e_workspace_tree > "$SANDBOX/fresh-live.out" 2>&1 || rc=$?
-    kill "$live" 2>/dev/null
-    wait "$live" 2>/dev/null
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
     if [ "$rc" -ne 0 ]; then pass "it refuses"; else fail "it reset the tree under a live engine"; fi
     if [ -f "$E2E_WORKSPACE/data/apps/old-app/index.html" ]; then pass "nothing was removed"; else fail "it removed files before refusing"; fi
 }

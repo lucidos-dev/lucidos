@@ -19,9 +19,8 @@
  * two more copies of the same values in the store and the SDK. They drifted by
  * construction and were held together by source-scanning guards. esbuild
  * removes the premise: one source, two dependency-free IIFEs, built by
- * `npm run build` into `../generated/` and checked in (see the staleness test,
- * and `api/sdk_prefs.rs` for why a committed artifact rather than a build-time
- * dependency).
+ * `npm run build` into the SDK's `dist/`, which the shell inlines and the
+ * engine serves (`api/sdk_prefs.rs`).
  *
  * Keep this file free of anything the two documents do not share. The shell's
  * boot-splash gradient and its theme telemetry live in `host.ts`, because they

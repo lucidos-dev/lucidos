@@ -29,7 +29,8 @@ import {
   _resetImageUploadRunsForTesting,
 } from './imageUploads';
 import { ApiError, uploadThreadBlob, type UploadObserver } from '../../api/client';
-import { awaitThreadStarted, isThreadStartPending, noteServerDraft } from './compose';
+import { awaitThreadStarted, isThreadStartPending } from './compose';
+import { _recordServerComposeForTesting as noteServerDraft } from '../composeSync';
 import {
   createMemoryPendingUploadBackend,
   ownedPendingUploadRecords,

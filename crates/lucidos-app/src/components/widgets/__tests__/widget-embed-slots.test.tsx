@@ -20,7 +20,7 @@ const { renderMarkdown, renderMarkdownInline } = await import('../../../utils/re
 const { COPY_ID_NONCE, WIDGET_EMBED_SLOT_ATTR } = await import('../../../utils/markedConfig');
 const { ReplyHtml } = await import('../useWidgetEmbedSlots');
 const { appsById: widgetApps } = await import('../../../store/appsById');
-const { WIDGET_UNAVAILABLE_TEXT } = await import('../WidgetEmbedFrame');
+const { WIDGET_UNAVAILABLE_TEXT } = await import('../InlineWidget');
 
 const EMBED = '![Marin](app:lucidos-sound-player?params={"clip": "voices/marin.mp3"})';
 const player = {
@@ -110,7 +110,7 @@ describe('ReplyHtml', () => {
     const md = '![a](app:lucidos-sound-player?params={"clip":"a","speed":2}) ![b](app:lucidos-sound-player) '
       + '![c](app:mine?params={"clip":"a"})';
     act(() => { render(<ReplyHtml html={renderMarkdown(md)} final threadId="t" />, host); });
-    expect(host.querySelectorAll('.widget-embed-unavailable')).toHaveLength(3);
+    expect(host.querySelectorAll('.inline-widget-gone')).toHaveLength(3);
     expect(frames()).toHaveLength(0);
   });
 
@@ -119,7 +119,7 @@ describe('ReplyHtml', () => {
     act(() => {
       render(<ReplyHtml html={renderMarkdown('![x](app:player?params=[1]) ![y](app:gone)')} final threadId="t" />, host);
     });
-    const notes = host.querySelectorAll('.widget-embed-unavailable');
+    const notes = host.querySelectorAll('.inline-widget-gone');
     expect(notes).toHaveLength(2);
     for (const note of notes) expect(note.textContent).toBe(WIDGET_UNAVAILABLE_TEXT);
   });

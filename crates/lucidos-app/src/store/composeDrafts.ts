@@ -1,8 +1,7 @@
-/** Per-thread compose drafts (text, image hashes, mode), kept OUT of
- *  `threadMap` so per-keystroke writes don't re-render every component
- *  subscribed to threadMap. Cross-device sync goes through `compose.ts`
- *  (debounced PUT + SSE-driven `applyRemoteCompose`); both write here
- *  instead of into `ThreadMeta`. */
+/** Per-thread compose drafts (text, image hashes, mode): the draft each
+ *  composer shows. Kept OUT of `threadMap` so per-keystroke writes don't
+ *  re-render every component subscribed to threadMap. Local edits write here
+ *  through `compose.ts`, and the engine's reports through `composeSync.ts`. */
 
 import { signal } from '@preact/signals';
 import type { ComposeChannelMode } from './thread-events';

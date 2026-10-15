@@ -140,6 +140,10 @@ pub struct LlmResponse {
     /// `None` when the reply names none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
+    /// The service tier the reply says served the call, when not the
+    /// standard one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
     /// Total characters of thinking text. High value with empty content
     /// distinguishes "thought hard then gave up" from "said nothing".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +227,46 @@ pub struct ModelSelection<'a> {
     /// own `tool_choice` form. On Claude a forced call runs without thinking,
     /// and a model that cannot turn thinking off is refused before sending.
     pub forced_tool: Option<&'a str>,
+    /// A cheaper, slower tier to ask for. Only a backend that offers it sends
+    /// it; every other backend serves the call at its standard tier.
+    pub service_tier: Option<ServiceTier>,
+    /// Where the prompt cache writes. Only OpenAI's Responses wire reads it.
+    pub cache_mode: CacheMode,
+}
+
+/// Where a request writes the prompt cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheMode {
+    /// At its memory view marks, and at the end of the latest message. The
+    /// next request of a growing conversation reads that end.
+    #[default]
+    Implicit,
+    /// At its memory view marks only. For a request whose tail no later
+    /// request shares: the tail is then billed as plain input, not as a write.
+    Explicit,
+}
+
+/// A provider's processing tier other than its standard one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTier {
+    /// OpenAI's Flex processing: half the price, slower, and refused with a
+    /// 429 when OpenAI has no capacity for it.
+    Flex,
+}
+
+impl ServiceTier {
+    /// The tier a provider's `service_tier` value names, `None` for its
+    /// standard tier or one this enum does not know.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        (value == "flex").then_some(Self::Flex)
+    }
+
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Flex => "flex",
+        }
+    }
 }
 
 impl<'a> ModelSelection<'a> {
@@ -246,6 +290,16 @@ impl<'a> ModelSelection<'a> {
 
     pub fn with_forced_tool(mut self, forced_tool: Option<&'a str>) -> Self {
         self.forced_tool = forced_tool;
+        self
+    }
+
+    pub fn with_service_tier(mut self, service_tier: Option<ServiceTier>) -> Self {
+        self.service_tier = service_tier;
+        self
+    }
+
+    pub fn with_cache_mode(mut self, cache_mode: CacheMode) -> Self {
+        self.cache_mode = cache_mode;
         self
     }
 }
@@ -298,7 +352,7 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,

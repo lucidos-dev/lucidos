@@ -100,7 +100,9 @@ describe('the workspace tree', () => {
     await click(line('w/0+8'));
     expect(api.getRecallZoom).toHaveBeenCalledWith('w/0+8');
     expect(line('w/0+8').getAttribute('aria-expanded')).toBe('true');
-    expect(line('w/0+8').querySelector('.tree-line-date')?.textContent).toContain('–');
+    const date = line('w/0+8').querySelector('.tree-line-date')?.textContent ?? '';
+    expect(date).toContain(' to ');
+    expect(date).not.toMatch(/[\u2013\u2014]/);
     const children = host.querySelector('.tree-line-children')!;
     expect(children.textContent).toContain('text of w/0+4');
     expect(children.textContent).toContain('text of w/4+4');
@@ -139,6 +141,24 @@ describe('the workspace tree', () => {
     await click(line('w/0+8'));
     expect(api.getRecallZoom).toHaveBeenCalledTimes(1);
   });
+});
+
+it('draws a line\'s entry kind as a label and keeps the rest as its text', async () => {
+  api.getSummaryTree.mockResolvedValue({
+    entries: 2,
+    lines: [
+      { id: 'w/0+1', text: 'prompt (human): reset the badge at midnight' },
+      { id: 'w/1+1', text: 'a line with no key' },
+    ],
+  });
+  await mount();
+  const [keyed, plain] = host.querySelectorAll('button.tree-line');
+  const label = keyed.querySelector('.tree-line-kind');
+  expect(label?.textContent).toBe('Human');
+  expect(label?.getAttribute('data-kind')).toBe('prompt (human)');
+  expect(keyed.querySelector('.tree-line-text')?.textContent).toBe('reset the badge at midnight');
+  expect(plain.querySelector('.tree-line-kind')).toBeNull();
+  expect(plain.querySelector('.tree-line-text')?.textContent).toBe('a line with no key');
 });
 
 it('says when nothing is summarised yet', async () => {

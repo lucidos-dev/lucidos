@@ -29,6 +29,7 @@ import {
   extractAppTargetFromHref,
   extractNavTargetFromHref,
   extractLocalFileTarget,
+  extractWorkspaceDiskDataPath,
   extractTriggerIdFromHref,
   extractRepoFileTargetFromHref,
   extractSettingsViewFromHref,
@@ -41,7 +42,7 @@ import { openThreadAcrossWorkspaces } from '../../store/actions/cross-workspace'
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { openRepoFileLink } from '../../store/actions/repoFileLink';
 import { encodeRepoPath, type RepoLocator } from '../../store/repoPath';
-import { showToast } from '../../store/store';
+import { showToast, workspacePath } from '../../store/store';
 import { HEADING_ID_PREFIX } from '../../utils/headingSlug';
 import { scrollBehavior } from '../../utils/motion';
 
@@ -63,6 +64,9 @@ export interface PreviewLinkContext {
   hostPath: string;
   /** This bundle's workspace slug, or null when not served behind the gateway. */
   workspaceId: string | null;
+  /** The workspace's root on disk, from `/health`, or empty until that loads.
+   *  A link that spells a data file by disk path resolves against it. */
+  workspacePath: string;
   /** The previewed document's effective base URI, supplied ONLY when the
    *  artifact declares its own `<base href>` (see `documentDeclaresBase`). In
    *  that case relative links resolve there rather than against `artifactPath`. */
@@ -233,10 +237,14 @@ export function classifyPreviewLink(
   if (navTarget) return { kind: 'nav', target: navTarget };
   // A bare leading `/` is skipped for a repo preview: there it names a
   // checkout-root path (the catch-all below), never a real filesystem
-  // location. A `file://` URL is unambiguous in either context and still
-  // goes to the OS opener.
-  const localFile = ctx.repoLocator && href.startsWith('/') ? null : extractLocalFileTarget(href);
-  if (localFile) return { kind: 'local-file', target: localFile };
+  // location. A `file://` URL is unambiguous in either context. One into this
+  // workspace's data/ tree previews in-app; any other goes to the OS opener.
+  if (!(ctx.repoLocator && href.startsWith('/'))) {
+    const dataPath = extractWorkspaceDiskDataPath(href, ctx.workspacePath);
+    if (dataPath) return { kind: 'file', path: dataPath };
+    const localFile = extractLocalFileTarget(href);
+    if (localFile) return { kind: 'local-file', target: localFile };
+  }
 
   // A file in a registered repository clone. `repo:` is a scheme, so without
   // this arm the guard below hands it back to the browser and the link
@@ -335,6 +343,7 @@ export function previewLinkContext(
     hostOrigin: page?.origin ?? '',
     hostPath: page?.pathname ?? '/',
     workspaceId: WORKSPACE_ID,
+    workspacePath: workspacePath.value,
     documentBase,
     repoLocator,
   };

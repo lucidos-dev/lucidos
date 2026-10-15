@@ -130,6 +130,10 @@ pub struct TriggerConfig {
     /// irreversible side-effect — the command guard fails the trigger if its
     /// intent tries to. Only consulted when the `command_guard` preference is on.
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// The MCP server ids this trigger's fires use (ADR 0430). A fire enables
+    /// each in its thread before round 1, and only these servers' tools run
+    /// silently in it. Any other MCP call in the fire is refused.
+    pub mcp_servers: Vec<String>,
     /// **Plugin provenance** (ADR 0019): the id of the *plugin* that
     /// auto-registered this trigger at install, or `None` for a user-created
     /// trigger. Plugin uninstall removes exactly the triggers carrying its id;
@@ -395,6 +399,29 @@ pub(crate) fn parse_side_effect_grant(field: Option<&Value>) -> Vec<SideEffectCa
     out
 }
 
+/// A submitted or stored list of MCP server ids: trimmed, blanks dropped, and
+/// each id kept once, in its first position. Shared by the HTTP handlers, the
+/// triggers LLM tool and the event readers, so none of them can disagree.
+pub fn normalize_mcp_servers<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in ids.into_iter().map(str::trim).filter(|id| !id.is_empty()) {
+        if !out.iter().any(|seen| seen == id) {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
+/// Parse a payload's `mcp_servers` field. Absent, null or not an array reads
+/// as no servers. A non-string entry is skipped, so one bad row can never
+/// wedge the in-memory config.
+pub(crate) fn parse_mcp_servers(field: Option<&Value>) -> Vec<String> {
+    let Some(arr) = field.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    normalize_mcp_servers(arr.iter().filter_map(|v| v.as_str()))
+}
+
 impl TriggerConfig {
     /// Build a TriggerConfig from a TriggerCreated event payload.
     pub fn from_created_payload(payload: &Value) -> Result<Self, String> {
@@ -464,6 +491,7 @@ impl TriggerConfig {
             .map(String::from)
             .unwrap_or_else(|| slugify_trigger_name_with_fallback(&name, &id));
         let side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
+        let mcp_servers = parse_mcp_servers(payload.get("mcp_servers"));
         // Plugin provenance (ADR 0019) — present only on plugin-auto-registered
         // triggers; absent on user-created ones (→ None, never plugin-managed).
         let plugin_id = payload
@@ -496,6 +524,7 @@ impl TriggerConfig {
             go_to_review,
             group_id,
             side_effect_grant,
+            mcp_servers,
             plugin_id,
             model,
             reasoning_effort,
@@ -691,6 +720,11 @@ impl TriggerConfig {
         // HTTP layer always sends the whole array on a change, mirroring `on`.
         if payload.get("side_effect_grant").is_some() {
             self.side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
+        }
+        // mcp_servers: full replacement when present, like `on`; `[]` or null
+        // clears it, and absent leaves it as-is.
+        if payload.get("mcp_servers").is_some() {
+            self.mcp_servers = parse_mcp_servers(payload.get("mcp_servers"));
         }
         // model / reasoning_effort: explicit null clears back to the account
         // chat default, a string sets, absent leaves as-is. The same triple

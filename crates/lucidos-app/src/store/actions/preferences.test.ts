@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts, llmConfigured } from '../store';
-import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule } from './preferences';
+import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
 import { motionPreference } from '../../utils/motion';
+import { MEMORY_MODULE_WHILE_UNSET } from '@lucidos/engine-constants';
 import { SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS } from '@lucidos/appearance';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
 import type { ThreadState } from '../thread-events';
+import type { Loadable } from '../types';
 
 const platformMocks = vi.hoisted(() => ({ isTauri: false, isIOSPwa: false, isIOS: false }));
 vi.mock('../../utils/platform', () => ({
@@ -1790,17 +1792,29 @@ describe('a stored background selection', () => {
 describe('the memory module', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('reads Classic while unset, unloaded or unknown', () => {
-    preferences.value = { status: 'not-loaded' };
-    expect(currentMemoryModule()).toBe('classic');
-    preferences.value = { status: 'loaded', data: {} };
-    expect(currentMemoryModule()).toBe('classic');
-    preferences.value = { status: 'loaded', data: { memory_module: 'bogus' } };
+  /** Unset is "never chosen", and runs what the engine runs while unset. */
+  it('runs Classic, with no choice, while unset, unloaded or unknown', () => {
+    const states: Loadable<Record<string, string>>[] = [
+      { status: 'not-loaded' },
+      { status: 'loaded', data: {} },
+      { status: 'loaded', data: { memory_module: 'bogus' } },
+    ];
+    for (const value of states) {
+      preferences.value = value;
+      expect(storedMemoryModule()).toBeNull();
+      expect(currentMemoryModule()).toBe(MEMORY_MODULE_WHILE_UNSET);
+    }
+  });
+
+  it('reads Classic once set', () => {
+    preferences.value = { status: 'loaded', data: { memory_module: 'classic' } };
+    expect(storedMemoryModule()).toBe('classic');
     expect(currentMemoryModule()).toBe('classic');
   });
 
   it('reads Tree once set', () => {
     preferences.value = { status: 'loaded', data: { memory_module: 'tree' } };
+    expect(storedMemoryModule()).toBe('tree');
     expect(currentMemoryModule()).toBe('tree');
   });
 

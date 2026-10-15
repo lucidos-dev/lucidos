@@ -54,10 +54,15 @@ test.describe('Drawer scroll position across a reload', () => {
         await expect(rows.first()).toBeVisible();
 
         // Page older threads in by scrolling to the bottom until enough landed.
-        await expect.poll(async () => {
-            await list.evaluate(el => { el.scrollTop = el.scrollHeight; });
-            return rows.count();
-        }, { timeout: 30_000 }).toBeGreaterThanOrEqual(LOADED_BEFORE_PARKING);
+        // The row window mounts only the rows near the viewport, so count
+        // every row seen on the way down rather than the rows mounted now.
+        await expect.poll(() => list.evaluate((el) => {
+            el.scrollTop = el.scrollHeight;
+            const w = window as unknown as { __rowsSeen?: Set<string> };
+            w.__rowsSeen ??= new Set();
+            for (const row of el.querySelectorAll<HTMLElement>('.thread-row[data-thread-nav]')) w.__rowsSeen.add(row.dataset.threadNav!);
+            return w.__rowsSeen.size;
+        }), { timeout: 30_000 }).toBeGreaterThanOrEqual(LOADED_BEFORE_PARKING);
 
         // Park the list deep in the loaded rows, with a real wheel so the
         // scroll memory records it.

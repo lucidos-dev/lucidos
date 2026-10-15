@@ -78,6 +78,7 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
   const overwriteSet = new Set(req.overwrites);
   const newFiles = req.files.filter((f) => !overwriteSet.has(f));
   const replacedOutright = plainOverwrites(req.overwrites, localChanges);
+  const isUpdate = req.is_update === true;
 
   // The action fns resolve the panel themselves (into a receipt on success,
   // closed on failure), so busy normally never resets visibly. Reset in a
@@ -117,7 +118,7 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
         onClick={handleConfirm}
         disabled={busy}
       >
-        {req.overwrites.length > 0 ? 'Install and replace' : 'Install'}
+        {isUpdate ? 'Update' : 'Install'}
       </button>
     </div>
   );
@@ -126,7 +127,7 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
     <div class="inline-form protected-surface">
       <div class="plugin-install-panel">
         {pluginPanelHeader({
-          status: 'Install plugin',
+          status: isUpdate ? 'Update plugin' : 'Install plugin',
           name: req.plugin_name,
           version: req.plugin_version,
           description,

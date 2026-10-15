@@ -649,6 +649,52 @@ else
 fi
 rm -rf "$HINT_DIR"
 
+# ── stop_running_instance: a re-run stops the old stack before it registers ──
+echo ""
+echo "test: a re-run over a running instance stops its service, engines and Postgres"
+# The gateway's own stop leaves its engines and embedded Postgres running, and
+# the new gateway would adopt engines holding the old DATABASE_URL (ADR 0452).
+# Extracted, with the service.sh wrappers stubbed to record what ran.
+STOP_DIR="$(mktemp -d)"
+sed -n '/^stop_running_instance()/,/^}/p' "$INSTALL" > "$STOP_DIR/stop.sh"
+cat > "$STOP_DIR/stubs.sh" <<'STUBS'
+step() { :; }
+die() { echo "die: $*"; exit 1; }
+service_launchd_label() { echo "label-$1"; }
+service_systemd_unit_name() { echo "unit-$1"; }
+service_launchd_is_loaded() { [ "$RUNNING" = 1 ]; }
+service_launchd_unload() { echo "unload $2"; [ "$STOP_OK" = 1 ]; }
+service_systemd_is_active() { [ "$RUNNING" = 1 ]; }
+service_systemd_stop() { echo "stop $1"; [ "$STOP_OK" = 1 ]; }
+service_stop_embedded_runtime() { echo "runtime $1 $2"; }
+STUBS
+stop_case() {
+    (cd "$STOP_DIR" && RUNNING="$2" STOP_OK="$3" bash -c \
+        '. ./stubs.sh; . ./stop.sh; stop_running_instance "$0" demo /d /r' "$1" 2>&1 | tr '\n' ';')
+}
+if ! grep -q '^stop_running_instance()' "$STOP_DIR/stop.sh"; then
+    fail "could not extract stop_running_instance from install.sh (shape changed)"
+else
+    expect_stop() {
+        if [ "$1" = "$2" ]; then pass "$3"; else fail "$3: got '$1'"; fi
+    }
+    expect_stop "$(stop_case systemd-user 1 1)" "stop unit-demo;runtime /d /r;" \
+        "systemd: stops the unit, then the runtime"
+    expect_stop "$(stop_case launchd 1 1)" "unload label-demo;runtime /d /r;" \
+        "launchd: unloads the agent, then the runtime"
+    expect_stop "$(stop_case systemd-user 0 1)" "runtime /d /r;" \
+        "a service stopped by hand still has its engines and Postgres stopped"
+    expect_stop "$(stop_case launchd 0 1)" "runtime /d /r;" \
+        "an unloaded agent still has its engines and Postgres stopped"
+    got="$(stop_case launchd 1 0)"
+    case "$got" in
+        *runtime*) fail "the runtime stopped under a gateway that would not stop: $got" ;;
+        *die:*) pass "a service that will not stop fails the install before the runtime" ;;
+        *) fail "a failed unload was not fatal: $got" ;;
+    esac
+fi
+rm -rf "$STOP_DIR"
+
 # ── INTEGRATION: the FETCHED UNINSTALLER gets the same soft-404 treatment ─────
 echo ""
 echo "test: a fetched uninstaller that is HTML is refused and never exec'd"

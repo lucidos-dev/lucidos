@@ -44,7 +44,7 @@ resolve_workspace_path 2>/dev/null || {
 }
 
 # Stop engine for this workspace if running
-if [ -f "$WORKSPACE/.lucidos/engine.pid" ] && kill -0 "$(cat "$WORKSPACE/.lucidos/engine.pid")" 2>/dev/null; then
+if [ -n "$(engine_live_pid "$WORKSPACE")" ]; then
     echo "Stopping running engine for $WORKSPACE..."
     "$SCRIPT_DIR/stop.sh" -w "$WORKSPACE"
     sleep 2

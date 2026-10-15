@@ -17,6 +17,8 @@ import type { NavigateUi } from '@lucidos/sdk';
  *  after this build — `validateTap` doesn't constrain the target value. */
 export function navigateTapLabel(to: NavigateUi): string {
   switch (to.target) {
+    case 'home-board':
+      return 'Open Home board';
     case 'changes':
       return 'View changes';
     case 'files':

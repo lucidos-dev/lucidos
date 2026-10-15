@@ -8,6 +8,7 @@
 //! manifest tool (built from `crate::capability_manifest`); the flat names stay
 //! wired as back-compat aliases in `execute_tool`.
 
+use crate::engine::thread_events::WakeMode;
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
@@ -37,11 +38,21 @@ fn coding_agent_effort_vocabulary() -> Vec<&'static str> {
         .collect()
 }
 
+/// The `wake_mode` argument both spawn tools take: what a child's clean finish
+/// does to the spawning thread (ADR 0451).
+fn wake_mode_property() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": WakeMode::ALL.map(WakeMode::as_str),
+        "description": "relation='child' only. Default 'no-wake' from the home thread, else 'wake' (FAN-OUT)."
+    })
+}
+
 pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::RUN_THREAD.to_string(),
-            description: "Start a new Lucidos thread for a non-code subtask (research, analysis, drafting). For code, use run_coding_agent. It runs its own agentic loop with full tool access, and with the default relation=\"child\" resumes THIS thread with its result, so you never poll. Spawn several in parallel and each reports back independently. Review what comes back before acting on it, and re-spawn if it is incomplete.".to_string(),
+            description: "Start a new Lucidos thread for a non-code subtask (research, analysis, drafting). For code, use run_coding_agent. It runs its own agentic loop with full tool access, and with the default relation=\"child\" reports back to THIS thread, so you never poll. Spawn several in parallel and each reports back independently. Review what comes back before acting on it, and re-spawn if it is incomplete.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -56,8 +67,9 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     "relation": {
                         "type": "string",
                         "enum": ["child", "top"],
-                        "description": "'child' (default): this thread resumes with the result. 'top': fire-and-forget, for work the user will read rather than you. ('sub' is an alias.)"
+                        "description": "'child' (default): it reports to this thread. 'top': no report, cheaper when you will not act on the result. ('sub' is an alias.)"
                     },
+                    "wake_mode": wake_mode_property(),
                     "model": {
                         "type": "string",
                         "description": "Chat model id, e.g. 'claude-sonnet-5'. Omit for the account default; a mechanical subtask wants a cheaper one and less thinking."
@@ -133,8 +145,9 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     "relation": {
                         "type": "string",
                         "enum": ["child", "top"],
-                        "description": "'child' (default): this thread resumes when the session ends. 'top': fire-and-forget, and the only form a cross-workspace spawn accepts. ('sub' is an alias.)"
-                    }
+                        "description": "'child' (default): it reports to this thread when its session ends. 'top': no report, cheaper when you will not act on the result; the only form a cross-workspace spawn accepts. ('sub' is an alias.)"
+                    },
+                    "wake_mode": wake_mode_property()
                 },
                 "required": ["prompt"]
             }),
@@ -171,7 +184,8 @@ const FOLLOW_UP_CHILD_THREAD_DESCRIPTION: &str = concat!(
     "way, hand it something a sibling learned, or tell a stalled one to continue. The ",
     "child cap never refuses it, so reviving a child beats spawning another. ",
     "Refer to the child by TITLE in anything the user reads. Returns at once, ",
-    "even when held, so issue it and end your turn.\n\n",
+    "even when held, so issue it and end your turn. A no-wake child's ",
+    "clean report never wakes you.\n\n",
     "By default the message QUEUES: a mid-turn child reads it at its next natural break, ",
     "which inside a long tool call can be many minutes, and nothing in flight is thrown away. ",
     "urgent: true stops the child's current turn instead. On a CODEX child urgent changes ",
@@ -205,6 +219,43 @@ mod tests {
             coding_agent["enum"],
             serde_json::json!(["claude-code", "codex"])
         );
+    }
+
+    /// Both spawn tools take the wake mode, with exactly the engine's values.
+    #[test]
+    fn both_spawn_tools_declare_the_wake_mode() {
+        let tools = spawn_tools();
+        for name in [tn::RUN_THREAD, tn::RUN_CODING_AGENT] {
+            let tool = tools.iter().find(|t| t.name == name).expect(name);
+            let wake_mode = &tool.parameters["properties"]["wake_mode"];
+            assert_eq!(
+                wake_mode["enum"],
+                serde_json::json!(WakeMode::ALL.map(WakeMode::as_str)),
+                "{name}"
+            );
+            let described = wake_mode["description"].as_str().unwrap();
+            assert!(
+                described.contains("'no-wake' from the home thread"),
+                "{name}"
+            );
+        }
+    }
+
+    /// ADR 0473: both spawn tools advise a top-thread for a result the caller
+    /// will not act on.
+    #[test]
+    fn both_spawn_tools_advise_top_when_no_report_is_needed() {
+        let tools = spawn_tools();
+        for name in [tn::RUN_THREAD, tn::RUN_CODING_AGENT] {
+            let tool = tools.iter().find(|t| t.name == name).expect(name);
+            let described = tool.parameters["properties"]["relation"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(
+                described.contains("you will not act on the result"),
+                "{name}: {described}"
+            );
+        }
     }
 
     /// The tool exposes NO caller-thread argument. The caller is

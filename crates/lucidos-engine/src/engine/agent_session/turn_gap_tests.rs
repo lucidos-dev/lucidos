@@ -1,4 +1,4 @@
-use super::compute_turn_gap_note;
+use super::{compute_turn_gap_note, compute_turn_gap_note_until};
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
     ActorMode, ChildCompletionStatus, EventChannel, EventMeta, ThreadEvent,
@@ -38,6 +38,7 @@ async fn emit_message_received(bus: &EventBus, thread_id: Uuid, text: &str) -> U
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -54,6 +55,31 @@ async fn emit_message_received(bus: &EventBus, thread_id: Uuid, text: &str) -> U
 }
 
 async fn emit_engine_prompt(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid {
+    emit_delivery(bus, thread_id, text, None).await
+}
+
+/// The agent's report that it read the input `input_event_id` carried.
+async fn emit_read(bus: &EventBus, thread_id: Uuid, input_event_id: Uuid) {
+    emit(
+        bus,
+        thread_id,
+        ThreadEvent::CodingAgentInputRead {
+            input_event_id,
+            started_turn: false,
+            verbatim: false,
+        },
+    )
+    .await;
+}
+
+/// The `CodingAgentPromptSent` a live session writes as it forwards the input
+/// `input_event_id` carried.
+async fn emit_delivery(
+    bus: &EventBus,
+    thread_id: Uuid,
+    text: &str,
+    input_event_id: Option<Uuid>,
+) -> Uuid {
     emit(
         bus,
         thread_id,
@@ -61,6 +87,7 @@ async fn emit_engine_prompt(bus: &EventBus, thread_id: Uuid, text: &str) -> Uuid
             text: text.into(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             origin: None,
+            input_event_id,
         },
     )
     .await
@@ -103,6 +130,7 @@ async fn emit_change_applied(
             actor: None,
             pre_merge_sha: None,
             post_merge_sha: post_merge_sha.map(|s| s.to_string()),
+            landing_merge_sha: None,
             path: String::new(),
         },
     )
@@ -387,6 +415,7 @@ async fn multiple_events_listed_oldest_first_and_capped() {
             actor: None,
             pre_merge_sha: None,
             post_merge_sha: Some("deadbeef".into()),
+            landing_merge_sha: None,
             path: String::new(),
         },
     )
@@ -476,6 +505,7 @@ async fn child_completion_origin_advances_boundary() {
             summary: "child did the thing".into(),
             pending_change_ids: vec![],
             sub_thread_pending_changes: vec![],
+            integrated_branch: None,
         },
     )
     .await;
@@ -619,9 +649,8 @@ async fn other_branch_says_current_work_untouched() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// 10b. Two messages racing one spawn: `cc_spawn_coalesce` runs a single turn
-///      whose origin is the FIRST message, while the second is already
-///      persisted. Bounding the gap by the origin's id alone let `MAX(sequence)`
+/// 10b. Two messages racing one spawn: the run's origin is the FIRST message,
+///      and the second queues for the starting run, already persisted. Bounding the gap by the origin's id alone let `MAX(sequence)`
 ///      pick that later message as the "previous" boundary and swallow the whole
 ///      gap, so the user who typed twice after a Discard was told nothing.
 #[tokio::test]
@@ -819,6 +848,376 @@ async fn a_stopped_child_reaches_the_resumed_parent_as_alive() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+fn filed(child_thread_id: Uuid, summary: &str) -> ThreadEvent {
+    ThreadEvent::ChildReportFiled {
+        child_thread_id,
+        child_thread_title: Some("Check the venue".into()),
+        status: crate::engine::thread_events::ChildCompletionStatus::Success,
+        summary: summary.into(),
+        pending_change_ids: vec![],
+        sub_thread_pending_changes: vec![],
+        integrated_branch: None,
+    }
+}
+
+/// I6: a coding-agent parent reads each report filed since its previous turn
+/// at the front of its next prompt, whole, and exactly once.
+#[tokio::test]
+async fn each_filed_report_reaches_the_next_turn_once() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    emit_message_received(&bus, thread_id, "turn 1").await;
+
+    emit(&bus, thread_id, filed(child_id, "First finding.")).await;
+    let second_turn = emit_message_received(&bus, thread_id, "turn 2").await;
+    let note = compute_turn_gap_note(&pool, thread_id, second_turn, Some(BRANCH))
+        .await
+        .expect("a filed report must reach the next turn")
+        .note;
+    for needle in [
+        "[CHILD THREAD REPORT FILED]",
+        "First finding.",
+        "did not wake you",
+    ] {
+        assert!(note.contains(needle), "missing {needle:?}: {note}");
+    }
+
+    emit(&bus, thread_id, filed(child_id, "Second finding.")).await;
+    let third_turn = emit_message_received(&bus, thread_id, "turn 3").await;
+    let note = compute_turn_gap_note(&pool, thread_id, third_turn, Some(BRANCH))
+        .await
+        .expect("the second report must reach the turn after it")
+        .note;
+    assert!(note.contains("Second finding."), "{note}");
+    assert!(
+        !note.contains("First finding."),
+        "a report the previous turn carried must not repeat: {note}"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// An event landing between a follow-up's origin and its delivery rides that
+/// follow-up. Bounded at the origin, it would sit above this note and below
+/// the next one, whose lower bound is the delivery's `CodingAgentPromptSent`.
+#[tokio::test]
+async fn an_event_landing_before_the_delivery_rides_that_follow_up_once() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    emit_message_received(&bus, thread_id, "turn 1").await;
+
+    let follow_up = emit_message_received(&bus, thread_id, "follow-up").await;
+    emit(&bus, thread_id, filed(child_id, "Landed in the window.")).await;
+    let delivered = emit_engine_prompt(&bus, thread_id, "follow-up").await;
+    let note = compute_turn_gap_note_until(&pool, thread_id, follow_up, delivered, Some(BRANCH))
+        .await
+        .expect("the window event must ride the follow-up")
+        .note;
+    assert!(note.contains("Landed in the window."), "{note}");
+
+    let next = emit_message_received(&bus, thread_id, "next").await;
+    let next_delivered = emit_engine_prompt(&bus, thread_id, "next").await;
+    assert!(
+        compute_turn_gap_note_until(&pool, thread_id, next, next_delivered, Some(BRANCH))
+            .await
+            .is_none(),
+        "the follow-up carried it, so the next prompt must not"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A follow-up the user takes back before the agent reads it never delivers
+/// its note, and never gets a read. Its origin and its delivery therefore do
+/// not count as boundaries, so the next prompt carries the gap instead.
+#[tokio::test]
+async fn a_withdrawn_follow_up_leaves_its_gap_to_the_next_prompt() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    let turn1 = emit_message_received(&bus, thread_id, "turn 1").await;
+    emit_read(&bus, thread_id, turn1).await;
+    emit(&bus, thread_id, filed(child_id, "Filed mid-turn.")).await;
+
+    let withdrawn = emit_message_received(&bus, thread_id, "never read").await;
+    emit_delivery(&bus, thread_id, "never read", Some(withdrawn)).await;
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::QueuedMessageRemoved {
+            removed_message_id: withdrawn,
+        },
+    )
+    .await;
+
+    let next = emit_message_received(&bus, thread_id, "next").await;
+    let delivered = emit_delivery(&bus, thread_id, "next", Some(next)).await;
+    let note = compute_turn_gap_note_until(&pool, thread_id, next, delivered, Some(BRANCH))
+        .await
+        .expect("the withdrawn follow-up's gap must ride the next prompt")
+        .note;
+    assert!(note.contains("Filed mid-turn."), "{note}");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The failed-send case: the session wrote a follow-up's delivery, and the
+/// agent never read it, whether the send failed or the agent died first. No
+/// boundary counts until a read, so the next prompt and a respawn carry it.
+#[tokio::test]
+async fn a_delivery_the_agent_never_read_moves_no_bound() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    let turn1 = emit_message_received(&bus, thread_id, "turn 1").await;
+    emit_read(&bus, thread_id, turn1).await;
+    emit(&bus, thread_id, filed(child_id, "Filed mid-turn.")).await;
+
+    let lost = emit_message_received(&bus, thread_id, "lost in the send").await;
+    emit_delivery(&bus, thread_id, "lost in the send", Some(lost)).await;
+
+    let next = emit_message_received(&bus, thread_id, "next").await;
+    let delivered = emit_delivery(&bus, thread_id, "next", Some(next)).await;
+    let note = compute_turn_gap_note_until(&pool, thread_id, next, delivered, Some(BRANCH))
+        .await
+        .expect("an unread delivery must not hide the report")
+        .note;
+    assert!(note.contains("Filed mid-turn."), "{note}");
+    let respawned = compute_turn_gap_note(&pool, thread_id, next, Some(BRANCH))
+        .await
+        .expect("a respawn must carry it too")
+        .note;
+    assert!(respawned.contains("Filed mid-turn."), "{respawned}");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The other half: once the agent read a follow-up, its delivery is the
+/// boundary, so the note it carried does not repeat.
+#[tokio::test]
+async fn a_delivery_the_agent_read_moves_the_bound() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    let turn1 = emit_message_received(&bus, thread_id, "turn 1").await;
+    emit_read(&bus, thread_id, turn1).await;
+    emit(&bus, thread_id, filed(child_id, "Filed mid-turn.")).await;
+
+    let follow_up = emit_message_received(&bus, thread_id, "follow-up").await;
+    emit_delivery(&bus, thread_id, "follow-up", Some(follow_up)).await;
+    emit_read(&bus, thread_id, follow_up).await;
+
+    let next = emit_message_received(&bus, thread_id, "next").await;
+    let delivered = emit_delivery(&bus, thread_id, "next", Some(next)).await;
+    assert!(
+        compute_turn_gap_note_until(&pool, thread_id, next, delivered, Some(BRANCH))
+            .await
+            .is_none(),
+        "the read follow-up carried the report, so the next prompt must not"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// An old row's read carrying `assumed`: a timer settled the input with no
+/// report from the agent. Nothing writes one now, but history keeps them, and
+/// such a read proves no delivery, so it moves no bound.
+#[tokio::test]
+async fn an_assumed_read_moves_no_bound() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    let turn1 = emit_message_received(&bus, thread_id, "turn 1").await;
+    emit_read(&bus, thread_id, turn1).await;
+    emit(&bus, thread_id, filed(child_id, "Filed mid-turn.")).await;
+
+    let settled = emit_message_received(&bus, thread_id, "settled unread").await;
+    emit_delivery(&bus, thread_id, "settled unread", Some(settled)).await;
+    // Seeded raw: the event no longer has the field, and the bus writes only
+    // what it has. The old row must still decode.
+    let old_read = serde_json::json!({ "input_event_id": settled, "assumed": true });
+    assert!(matches!(
+        ThreadEvent::from_stored("CodingAgentInputRead", old_read.clone()),
+        Ok(ThreadEvent::CodingAgentInputRead { input_event_id, .. }) if input_event_id == settled
+    ));
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+             VALUES ($1, 'CodingAgentInputRead', $2, $3, 'thread', $3::text)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(old_read)
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("seed an old assumed read");
+
+    let next = emit_message_received(&bus, thread_id, "next").await;
+    let note = compute_turn_gap_note(&pool, thread_id, next, Some(BRANCH))
+        .await
+        .expect("an assumed read must not hide the report")
+        .note;
+    assert!(note.contains("Filed mid-turn."), "{note}");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A slash command goes to the agent verbatim, with no note in front. Its read
+/// proves no delivery, so the next prompt carries the gap from before the
+/// command as well as after it.
+#[tokio::test]
+async fn a_verbatim_read_moves_no_bound() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    let turn1 = emit_message_received(&bus, thread_id, "turn 1").await;
+    emit_read(&bus, thread_id, turn1).await;
+    emit(
+        &bus,
+        thread_id,
+        filed(Uuid::new_v4(), "Before the command."),
+    )
+    .await;
+
+    let command = emit_message_received(&bus, thread_id, "/cost").await;
+    emit_delivery(&bus, thread_id, "/cost", Some(command)).await;
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::CodingAgentInputRead {
+            input_event_id: command,
+            started_turn: false,
+            verbatim: true,
+        },
+    )
+    .await;
+    emit(&bus, thread_id, filed(Uuid::new_v4(), "After the command.")).await;
+
+    let next = emit_message_received(&bus, thread_id, "next").await;
+    let delivered = emit_delivery(&bus, thread_id, "next", Some(next)).await;
+    let note = compute_turn_gap_note_until(&pool, thread_id, next, delivered, Some(BRANCH))
+        .await
+        .expect("a verbatim command must not hide the gap")
+        .note;
+    assert!(note.contains("Before the command."), "{note}");
+    assert!(note.contains("After the command."), "{note}");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A boundary older than the workspace's first read predates read reports
+/// (ADR 0268), so it counts unread. Otherwise a thread idle since then would
+/// get its whole history on its next note.
+#[tokio::test]
+async fn a_boundary_older_than_the_first_read_still_counts() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    emit_message_received(&bus, thread_id, "turn 1").await;
+    emit(&bus, thread_id, filed(child_id, "Long since read.")).await;
+    emit_message_received(&bus, thread_id, "turn 2").await;
+
+    // Reads start later, on another thread.
+    let other = Uuid::new_v4();
+    start_cc_session(&bus, other, "claude-code/other", None).await;
+    let elsewhere = emit_message_received(&bus, other, "elsewhere").await;
+    emit_read(&bus, other, elsewhere).await;
+
+    let next = emit_message_received(&bus, thread_id, "turn 3").await;
+    assert!(
+        compute_turn_gap_note(&pool, thread_id, next, Some(BRANCH))
+            .await
+            .is_none(),
+        "turn 2 predates reads, so it still bounds the gap"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A follow-up queued behind another is persisted before the first one's
+/// delivery. The lower bound comes from the first one's origin, so the queued
+/// message cannot become its previous boundary and swallow the gap.
+#[tokio::test]
+async fn a_queued_follow_up_does_not_swallow_the_gap_of_the_one_before() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    emit_message_received(&bus, thread_id, "turn 1").await;
+    emit(&bus, thread_id, filed(child_id, "Filed mid-turn.")).await;
+
+    let first = emit_message_received(&bus, thread_id, "first").await;
+    emit_message_received(&bus, thread_id, "queued second").await;
+    let first_delivered = emit_engine_prompt(&bus, thread_id, "first").await;
+    let note = compute_turn_gap_note_until(&pool, thread_id, first, first_delivered, Some(BRANCH))
+        .await
+        .expect("the queued message must not hide the report")
+        .note;
+    assert!(note.contains("Filed mid-turn."), "{note}");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// An engine prompt with no origin, such as auto-harden, still writes a
+/// `CodingAgentPromptSent`, which the ledger names as its input. So it
+/// carries the gap itself, and its read makes it the next boundary.
+#[tokio::test]
+async fn an_origin_less_engine_prompt_carries_the_gap_once() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+    let turn1 = emit_message_received(&bus, thread_id, "turn 1").await;
+    emit_read(&bus, thread_id, turn1).await;
+    emit(&bus, thread_id, filed(child_id, "Filed before harden.")).await;
+
+    let harden = emit_engine_prompt(&bus, thread_id, "run /harden").await;
+    let note = compute_turn_gap_note_until(&pool, thread_id, harden, harden, Some(BRANCH))
+        .await
+        .expect("the engine prompt must carry the report")
+        .note;
+    assert!(note.contains("Filed before harden."), "{note}");
+    emit_read(&bus, thread_id, harden).await;
+
+    let next = emit_message_received(&bus, thread_id, "next").await;
+    assert!(
+        compute_turn_gap_note(&pool, thread_id, next, Some(BRANCH))
+            .await
+            .is_none(),
+        "the engine prompt carried it, so the next turn must not"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 /// ADR 0278: a child moved to top level wakes nothing either, so the resumed
 /// parent reads here that it must stop waiting for it.
 #[tokio::test]
@@ -941,7 +1340,8 @@ async fn tier_2_clean_explains_the_reset() {
         .unwrap();
     assert!(note.note.contains("512 MB"), "{}", note.note);
     assert!(
-        note.note.contains("untracked file you left there is gone"),
+        note.note
+            .contains(crate::engine::worktree_cleanup::SNAPSHOT_COMMIT_MESSAGE),
         "{}",
         note.note
     );
@@ -1086,6 +1486,43 @@ async fn a_background_completion_nobody_delivered_reaches_the_resumed_agent() {
         !note.contains("./scripts/e2e.sh` (task task-los) ended"),
         "an abandoned task has no verdict to report: {note}"
     );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A completion that landed while the agent's turn still ran reached it in
+/// that turn: a polled task's `background-task wait` read it. The next turn's
+/// note must not call it a lost wake. One landing after the idle still counts.
+#[tokio::test]
+async fn a_completion_read_inside_the_turn_is_not_repeated() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "run the suite").await;
+    emit(
+        &bus,
+        thread_id,
+        completion("task-polled", "cargo test --lib", Some(0), false),
+    )
+    .await;
+    emit_idled(&bus, thread_id).await;
+    emit(
+        &bus,
+        thread_id,
+        completion("task-after", "./scripts/e2e.sh", Some(0), false),
+    )
+    .await;
+    let next = emit_message_received(&bus, thread_id, "and now?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, next, Some(BRANCH))
+        .await
+        .expect("the completion after the idle is still news")
+        .note;
+    assert!(!note.contains("task-polled"), "{note}");
+    assert!(note.contains("task task-after"), "{note}");
 
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;
@@ -1352,6 +1789,7 @@ async fn a_large_apply_does_not_bury_the_background_task_line() {
             actor: None,
             pre_merge_sha: None,
             post_merge_sha: Some("deadbeef".into()),
+            landing_merge_sha: None,
             path: String::new(),
         },
     )
@@ -1410,6 +1848,7 @@ async fn a_gap_full_of_applies_does_not_bury_the_background_task_line() {
                 actor: None,
                 pre_merge_sha: None,
                 post_merge_sha: Some("deadbeef".into()),
+                landing_merge_sha: None,
                 path: String::new(),
             },
         )

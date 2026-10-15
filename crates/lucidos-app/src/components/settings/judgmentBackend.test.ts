@@ -1,4 +1,5 @@
 import { FLAG_OFF_VALUES, FLAG_ON_VALUES } from '@lucidos/preference-catalog';
+import { WAKE_DECISION_DEFAULT_ENDPOINT } from '@lucidos/engine-constants';
 import { describe, it, expect } from 'vitest';
 import {
   CHAT,
@@ -13,6 +14,7 @@ import {
   judgmentSelectionCaveat,
   offeredEndpoints,
   pickedEndpoint,
+  sitePick,
   systemOneConfigured,
   systemOneConsumers,
   systemOneSwitchedOff,
@@ -55,6 +57,8 @@ describe('pickedEndpoint', () => {
     expect(pickedEndpoint('  JEV  ')?.id).toBe('jev');
     expect(pickedEndpoint('clef')?.id).toBe('clef');
     expect(pickedEndpoint('Clef-Flash')?.id).toBe('clef-flash');
+    expect(pickedEndpoint('openrouter')?.id).toBe('openrouter');
+    expect(pickedEndpoint('OpenAI')?.id).toBe('openai');
     expect(pickedEndpoint('custom')?.id).toBe('custom');
   });
 
@@ -74,10 +78,12 @@ describe('pickedEndpoint', () => {
 describe('JUDGMENT_PREFERENCE_KEY', () => {
   /** The keys the engine declares. A typo here writes a preference nothing
    *  reads, which looks exactly like a control that does nothing. */
-  it('names the two engine preference keys', () => {
+  it('names the four engine preference keys', () => {
     expect(JUDGMENT_PREFERENCE_KEY['command-guard']).toBe('judgment_command_guard');
     expect(JUDGMENT_PREFERENCE_KEY['query-classification'])
       .toBe('judgment_query_classification');
+    expect(JUDGMENT_PREFERENCE_KEY['read-decision']).toBe('judgment_read_decision');
+    expect(JUDGMENT_PREFERENCE_KEY['wake-decision']).toBe('judgment_wake_decision');
   });
 
   it('pairs each site with its own model and reasoning keys', () => {
@@ -86,21 +92,25 @@ describe('JUDGMENT_PREFERENCE_KEY', () => {
     expect(JUDGMENT_MODEL_KEY['query-classification']).toBe('model_query_classification');
     expect(JUDGMENT_REASONING_KEY['query-classification'])
       .toBe('reasoning_query_classification');
+    expect(JUDGMENT_MODEL_KEY['read-decision']).toBe('model_read_decision');
+    expect(JUDGMENT_REASONING_KEY['read-decision']).toBe('reasoning_read_decision');
+    expect(JUDGMENT_MODEL_KEY['wake-decision']).toBe('model_wake_decision');
+    expect(JUDGMENT_REASONING_KEY['wake-decision']).toBe('reasoning_wake_decision');
   });
 });
 
 describe('systemOneConfigured', () => {
   it('sees a stored key for TypeSafe and Cloudflare', () => {
-    expect(systemOneConfigured('typesafe', loaded([cred('typesafe')]), NO_PREFS)).toBe(true);
-    expect(systemOneConfigured('cloudflare-workers-ai', loaded([cred('cloudflare-workers-ai')]), NO_PREFS))
+    expect(systemOneConfigured('typesafe', loaded([cred('typesafe')]), NO_PREFS, null)).toBe(true);
+    expect(systemOneConfigured('cloudflare-workers-ai', loaded([cred('cloudflare-workers-ai')]), NO_PREFS, null))
       .toBe(true);
-    expect(systemOneConfigured('cloudflare-workers-ai', loaded([cred('typesafe')]), NO_PREFS))
+    expect(systemOneConfigured('cloudflare-workers-ai', loaded([cred('typesafe')]), NO_PREFS, null))
       .toBe(false);
   });
 
   it('is false while credentials load, or for an oauth_client row of the same name', () => {
-    expect(systemOneConfigured('typesafe', { status: 'loading' }, NO_PREFS)).toBe(false);
-    expect(systemOneConfigured('typesafe', loaded([cred('typesafe', 'oauth_client')]), NO_PREFS))
+    expect(systemOneConfigured('typesafe', { status: 'loading' }, NO_PREFS, null)).toBe(false);
+    expect(systemOneConfigured('typesafe', loaded([cred('typesafe', 'oauth_client')]), NO_PREFS, null))
       .toBe(false);
   });
 
@@ -109,11 +119,31 @@ describe('systemOneConfigured', () => {
   it('reads the custom endpoint as set up by its URL and model, no key needed', () => {
     const url = 'http://localhost:8000/v1/systemone';
     const both = loaded({ system_one_custom_url: url, system_one_custom_model: 'kev' });
-    expect(systemOneConfigured('system-one-custom', loaded([]), both)).toBe(true);
-    expect(systemOneConfigured('system-one-custom', loaded([]), loaded({ system_one_custom_url: url })))
+    expect(systemOneConfigured('system-one-custom', loaded([]), both, null)).toBe(true);
+    expect(systemOneConfigured('system-one-custom', loaded([]), loaded({ system_one_custom_url: url }), null))
       .toBe(false);
-    expect(systemOneConfigured('system-one-custom', loaded([cred('system-one-custom')]), NO_PREFS))
+    expect(systemOneConfigured('system-one-custom', loaded([cred('system-one-custom')]), NO_PREFS, null))
       .toBe(false);
+  });
+});
+
+describe('systemOneConfigured for a chat provider row', () => {
+  /** The engine resolves OpenAI from a stored key, OPENAI_API_KEY or a Codex
+   *  login, and only `/health` sees the last two. */
+  it('reads OpenRouter and OpenAI as set up once /health lists their chat provider', () => {
+    expect(systemOneConfigured('openai', loaded([]), NO_PREFS, ['openai'])).toBe(true);
+    expect(systemOneConfigured('openrouter', loaded([]), NO_PREFS, ['openrouter'])).toBe(true);
+    expect(systemOneConfigured('openai', loaded([]), NO_PREFS, ['openrouter'])).toBe(false);
+    expect(systemOneConfigured('openai', loaded([]), NO_PREFS, null)).toBe(false);
+  });
+
+  it('still reads a stored key before /health answers', () => {
+    expect(systemOneConfigured('openrouter', loaded([cred('openrouter')]), NO_PREFS, null)).toBe(true);
+  });
+
+  /** Only a row that reuses a chat provider's key reads `/health`. */
+  it('never reads TypeSafe as set up from a chat provider', () => {
+    expect(systemOneConfigured('typesafe', loaded([]), NO_PREFS, ['openai', 'openrouter'])).toBe(false);
   });
 });
 
@@ -143,6 +173,46 @@ describe('systemOneSwitchedOff', () => {
     expect(stored('cloudflare-workers-ai', 'provider_enabled_cloudflare_workers_ai', 'false')).toBe(true);
     expect(stored('system-one-custom', 'provider_enabled_system_one_custom', 'false')).toBe(true);
     expect(stored('cloudflare-workers-ai', 'provider_enabled_typesafe', 'false')).toBe(false);
+    expect(stored('openrouter', 'provider_enabled_openrouter', 'false')).toBe(true);
+    expect(stored('openai', 'provider_enabled_openai', 'false')).toBe(true);
+  });
+});
+
+describe('sitePick', () => {
+  /** ADRs 0435 and 0472: the engine runs an unset wake decision on OpenAI Decisions
+   *  while OpenAI is served. The field must show what runs. */
+  describe.each(['wake-decision'] as const)('%s', (site) => {
+    const backend = JUDGMENT_PREFERENCE_KEY[site];
+    const model = JUDGMENT_MODEL_KEY[site];
+
+    it('shows OpenAI Decisions while OpenAI is served and unset', () => {
+      expect(sitePick(site, NO_PREFS, ['openai'])?.id).toBe(WAKE_DECISION_DEFAULT_ENDPOINT);
+      expect(sitePick(site, loaded({ [backend]: '  ' }), ['openai'])?.id)
+        .toBe(WAKE_DECISION_DEFAULT_ENDPOINT);
+    });
+
+    it('shows chat when OpenAI is not served, switched off, or chat was picked', () => {
+      expect(sitePick(site, NO_PREFS, ['vertex'])).toBeNull();
+      expect(sitePick(site, NO_PREFS, null)).toBeNull();
+      expect(sitePick(site, loaded({ provider_enabled_openai: 'false' }), ['openai'])).toBeNull();
+      expect(sitePick(site, loaded({ [backend]: 'chat' }), ['openai'])).toBeNull();
+    });
+
+    /** A pinned chat model may be a local one kept for privacy: the default
+     *  must never send its turns to a vendor. */
+    it('keeps a pinned chat model on chat', () => {
+      expect(sitePick(site, loaded({ [model]: 'local-model' }), ['openai'])).toBeNull();
+    });
+
+    it('lets a stored pick decide', () => {
+      expect(sitePick(site, loaded({ [backend]: 'jev' }), ['openai'])?.id).toBe('jev');
+    });
+  });
+
+  it('gives no other site a default, the read decision included', () => {
+    expect(sitePick('read-decision', NO_PREFS, ['openai', 'openrouter'])).toBeNull();
+    expect(sitePick('command-guard', NO_PREFS, ['openai', 'openrouter'])).toBeNull();
+    expect(sitePick('query-classification', NO_PREFS, ['openai', 'openrouter'])).toBeNull();
   });
 });
 
@@ -150,18 +220,31 @@ describe('systemOneConsumers', () => {
   /** The tool has no preference of its own: a stored key IS its condition
    *  (ADR 0223). So it is listed where no site has moved at all. */
   it('lists the judge tool for TypeSafe on a key alone, ahead of any site', () => {
-    expect(systemOneConsumers('typesafe', NO_PREFS, true)).toEqual(['The agent’s judge tool']);
-    expect(systemOneConsumers('typesafe', NO_PREFS, false)).toEqual([]);
+    expect(systemOneConsumers('typesafe', NO_PREFS, true, null)).toEqual(['The agent’s judge tool']);
+    expect(systemOneConsumers('typesafe', NO_PREFS, false, null)).toEqual([]);
   });
 
   it('never lists the judge tool for another provider', () => {
-    expect(systemOneConsumers('cloudflare-workers-ai', NO_PREFS, true)).toEqual([]);
+    expect(systemOneConsumers('cloudflare-workers-ai', NO_PREFS, true, null)).toEqual([]);
+    expect(systemOneConsumers('openai', NO_PREFS, true, null)).toEqual([]);
+  });
+
+  it('names the wake decision on OpenAI by default while OpenAI is served', () => {
+    expect(systemOneConsumers('openai', NO_PREFS, true, ['openai']))
+      .toEqual(['Wake decision']);
+    expect(systemOneConsumers('openai', NO_PREFS, true, null)).toEqual([]);
+  });
+
+  it('names the read decision on the provider it picked', () => {
+    const prefs = loaded({ judgment_read_decision: 'openai' });
+    expect(systemOneConsumers('openai', prefs, true, null)).toEqual(['Read decision']);
+    expect(systemOneConsumers('typesafe', prefs, false, null)).toEqual([]);
   });
 
   it('names each site picked on that provider, and only those', () => {
     const prefs = loaded({ judgment_command_guard: 'clef-flash', judgment_query_classification: 'jev' });
-    expect(systemOneConsumers('cloudflare-workers-ai', prefs, true)).toEqual(['Command guard']);
-    expect(systemOneConsumers('typesafe', prefs, true))
+    expect(systemOneConsumers('cloudflare-workers-ai', prefs, true, null)).toEqual(['Command guard']);
+    expect(systemOneConsumers('typesafe', prefs, true, null))
       .toEqual(['The agent’s judge tool', 'Query classification']);
   });
 });
@@ -186,7 +269,7 @@ describe('offeredEndpoints', () => {
 
   it('offers no row of a switched-off provider', () => {
     expect(ids({ picked: null, configured: () => true, switchedOff: (p) => p === 'typesafe' }))
-      .toEqual(['clef', 'clef-flash', 'custom']);
+      .toEqual(['openrouter', 'clef', 'clef-flash', 'openai', 'custom']);
   });
 
   /** The engine reads `TYPESAFE_API_KEY`, which this page cannot see. Without

@@ -178,8 +178,7 @@ pub enum ContextMode {
 /// ADR 0362's memory module, the other dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MemoryModule {
-    /// The history summariser, memory recall and memory search. The engine's
-    /// default, so a Classic arm seeds no row for it.
+    /// The history summariser, memory recall and memory search.
     Classic,
     /// Summary trees and memory views in place of history and recall.
     Tree,
@@ -199,8 +198,8 @@ impl MemoryModule {
 ///
 /// Its name is its identity in every result row, workspace and database. A
 /// Classic arm keeps the name it had before the memory module became a
-/// dimension. Its rows, its database and its seeded preferences therefore stay
-/// byte-identical (ADR 0362 I2). A Tree arm adds `-tree`.
+/// dimension, so its result rows and database keep their names (ADR 0362 I2).
+/// A Tree arm adds `-tree`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -237,10 +236,11 @@ impl Arm {
 
     /// The preference rows this arm seeds, in order.
     ///
-    /// A control arm writes no mode row rather than writing `false`, and a
-    /// Classic arm writes no module row. An absent key and the default mean
-    /// the same thing to the engine. An absent one keeps the digest exclusion
-    /// honest: each row of difference between two arms exists in one arm only.
+    /// A control arm writes no mode row rather than writing `false`, and an
+    /// arm on the module an unset preference runs writes no module row. An
+    /// absent key and that module mean the same thing to the engine. An
+    /// absent one keeps the digest exclusion honest: each row of difference
+    /// between two arms exists in one arm only.
     ///
     /// Plural, because the schedule rides beside the mode. An arm that carries
     /// the flag and not the two numbers would run at the engine's defaults
@@ -257,11 +257,9 @@ impl Arm {
                 (SWEEP_EVERY_ROUNDS_KEY, sweep.sweep_every_rounds.to_string()),
             ],
         };
-        if self.memory == MemoryModule::Tree {
-            rows.push((
-                MEMORY_MODULE_PREFERENCE_KEY,
-                MemoryModule::Tree.as_pref().to_string(),
-            ));
+        let module = self.memory.as_pref();
+        if module != prefs::MEMORY_MODULE_WHILE_UNSET {
+            rows.push((MEMORY_MODULE_PREFERENCE_KEY, module.to_string()));
         }
         rows
     }
@@ -376,34 +374,54 @@ mod tests {
         ]
     }
 
-    /// I2: the Classic arms seed exactly what they seeded before the memory
-    /// module was a dimension.
-    #[test]
-    fn only_the_lean_arm_seeds_preference_rows() {
-        assert!(Arm::CONTROL
-            .preference_rows(SweepPins::default())
-            .is_empty());
-        assert_eq!(Arm::LEAN.preference_rows(SweepPins::default()), lean_rows());
+    /// The module an arm's rows give the engine: its own row, or the one an
+    /// unset preference runs when it writes none.
+    fn seeded_module(arm: Arm) -> String {
+        arm.preference_rows(SweepPins::default())
+            .into_iter()
+            .find(|(key, _)| *key == MEMORY_MODULE_PREFERENCE_KEY)
+            .map_or_else(
+                || prefs::MEMORY_MODULE_WHILE_UNSET.to_string(),
+                |(_, value)| value,
+            )
     }
 
-    /// A Tree arm is its Classic twin plus one row, so the two differ by the
-    /// module and nothing else.
+    /// Each arm runs the module its name says, whichever one runs while unset.
     #[test]
-    fn a_tree_arm_adds_the_module_row_to_its_classic_twin() {
-        let module = (MEMORY_MODULE_PREFERENCE_KEY, "tree".to_string());
-        assert_eq!(
-            Arm::CONTROL_TREE.preference_rows(SweepPins::default()),
-            vec![module.clone()]
-        );
-        let mut lean_tree = lean_rows();
-        lean_tree.push(module);
-        assert_eq!(
-            Arm::LEAN_TREE.preference_rows(SweepPins::default()),
-            lean_tree
-        );
+    fn every_arm_seeds_the_module_it_names() {
+        for arm in Arm::ALL {
+            assert_eq!(seeded_module(arm), arm.memory.as_pref(), "{arm}");
+        }
     }
 
-    /// The value the Tree arm seeds is one the engine's catalog accepts, read
+    /// Twins differ by the module row and nothing else, and the lean arms add
+    /// the same mode rows to it.
+    #[test]
+    fn twin_arms_differ_by_the_module_row_alone() {
+        let without_module = |arm: Arm| -> Vec<(&'static str, String)> {
+            arm.preference_rows(SweepPins::default())
+                .into_iter()
+                .filter(|(key, _)| *key != MEMORY_MODULE_PREFERENCE_KEY)
+                .collect()
+        };
+        assert!(without_module(Arm::CONTROL).is_empty());
+        assert!(without_module(Arm::CONTROL_TREE).is_empty());
+        assert_eq!(without_module(Arm::LEAN), lean_rows());
+        assert_eq!(without_module(Arm::LEAN_TREE), lean_rows());
+        for (classic, tree) in [
+            (Arm::CONTROL, Arm::CONTROL_TREE),
+            (Arm::LEAN, Arm::LEAN_TREE),
+        ] {
+            let rows = |arm: Arm| arm.preference_rows(SweepPins::default()).len();
+            assert_eq!(
+                rows(classic).abs_diff(rows(tree)),
+                1,
+                "{classic} and {tree}"
+            );
+        }
+    }
+
+    /// Both values an arm may seed are ones the engine's catalog accepts, read
     /// from the catalog rather than restated.
     #[test]
     fn both_module_values_are_ones_the_catalog_accepts() {

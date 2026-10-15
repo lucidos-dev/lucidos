@@ -699,6 +699,49 @@ fn build_session_messages_projects_child_thread_stopped_as_alive() {
     }
 }
 
+/// I6: a filed report reaches a chat parent on its next turn. It carries the
+/// waking card's block and a note that it woke nothing. Its change
+/// counts as reported, so the block names what became of it.
+#[test]
+fn build_session_messages_projects_a_filed_report_with_its_note() {
+    use chrono::Utc;
+    let child_id = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+    let events = vec![EventRow {
+        id: Uuid::new_v4(),
+        event_type: "ChildReportFiled".into(),
+        payload: json!({
+            "child_thread_id": child_id.to_string(),
+            "child_thread_title": "Check the venue",
+            "status": "success",
+            "summary": "It opens at nine.",
+            "pending_change_ids": [change_id.to_string()],
+        }),
+        created: Utc::now(),
+        thread_id: None,
+        sequence: Some(1),
+    }];
+    assert_eq!(super::build::reported_change_ids(&events), vec![change_id]);
+    let msgs = build_session_messages(&events);
+    let report = msgs
+        .iter()
+        .find(|m| m.content.contains("[CHILD THREAD REPORT FILED]"))
+        .expect("filed report message");
+    assert_eq!(report.role, "user");
+    for needle in [
+        child_id.to_string(),
+        "completed (success)".to_string(),
+        "It opens at nine.".to_string(),
+        super::build::REPORT_FILED_NOTE.trim().to_string(),
+    ] {
+        assert!(
+            report.content.contains(&needle),
+            "missing {needle:?} in:\n{}",
+            report.content
+        );
+    }
+}
+
 /// ADR 0278: a child moved to top level reaches a chat parent as a
 /// `[CHILD THREAD MOVED OUT]` block, so the parent stops waiting for it rather
 /// than respawning it.
@@ -930,6 +973,41 @@ fn child_completed_block_lists_sub_thread_changes_apart_from_its_own() {
         &ChangeStatuses::new(),
     );
     assert!(!plain.contains("sub-threads"), "got:\n{plain}");
+}
+
+/// An integrated child's report names its branch and head, and tells the
+/// parent to merge it. A report without one reads as before.
+#[test]
+fn child_completed_block_names_the_branch_an_integrated_child_hands_up() {
+    let block = format_child_thread_completed_block(
+        &child_report_row(json!({
+            "child_thread_id": Uuid::new_v4().to_string(),
+            "status": "success",
+            "summary": "fixed the follow-up",
+            "integrated_branch": {
+                "branch_name": "claude-code/follow-up",
+                "head_sha": "0123abcd",
+            },
+        })),
+        &ChangeStatuses::new(),
+    );
+    assert!(
+        block.contains("Integrated branch: claude-code/follow-up at 0123abcd."),
+        "got:\n{block}"
+    );
+    assert!(
+        block.contains("`git merge claude-code/follow-up`"),
+        "got:\n{block}"
+    );
+    let plain = format_child_thread_completed_block(
+        &child_report_row(json!({
+            "child_thread_id": Uuid::new_v4().to_string(),
+            "status": "success",
+            "summary": "done",
+        })),
+        &ChangeStatuses::new(),
+    );
+    assert!(!plain.contains("Integrated branch"), "got:\n{plain}");
 }
 
 fn child_report_row(payload: serde_json::Value) -> EventRow {

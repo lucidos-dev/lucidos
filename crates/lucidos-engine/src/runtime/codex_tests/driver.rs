@@ -131,7 +131,7 @@ async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
 
     assert!(matches!(
         next_event(&mut s.agent).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     assert!(matches!(
         next_event(&mut s.agent).await,
@@ -213,7 +213,7 @@ async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
     // Turn 2: duplicate thread.started is suppressed → Message, Usage, Result.
     assert!(matches!(
         next_event(&mut s.agent).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     assert!(matches!(
         next_event(&mut s.agent).await,
@@ -260,7 +260,7 @@ async fn a_resumed_session_runs_the_engine_continuation_as_an_input() {
 
     assert!(matches!(
         next_event(&mut s.agent).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     let mut saw_result = false;
     for _ in 0..4 {
@@ -339,7 +339,7 @@ async fn child_death_without_terminal_synthesizes_failed_result() {
 
     assert!(matches!(
         next_event(&mut s.agent).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     assert!(matches!(
         next_event(&mut s.agent).await,
@@ -377,7 +377,7 @@ async fn abandoned_tool_call_is_closed_at_synthesized_turn_end() {
 
     assert!(matches!(
         next_event(&mut s.agent).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     assert!(matches!(
         next_event(&mut s.agent).await,
@@ -471,7 +471,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
     }
     assert!(matches!(
         recv(&mut events_rx).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     assert!(matches!(
         recv(&mut events_rx).await,
@@ -508,7 +508,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
     // stub blocks again, so its ToolUse is the signal the turn is running.
     assert!(matches!(
         recv(&mut events_rx).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     assert!(matches!(
         recv(&mut events_rx).await,
@@ -580,7 +580,7 @@ async fn a_line_split_around_a_queued_input_still_arrives_whole() {
 
     assert!(matches!(
         next_event(&mut s.agent).await,
-        AgentEvent::InputRead(None)
+        AgentEvent::InputRead { .. }
     ));
     let init = next_event(&mut s.agent).await;
     assert!(
@@ -589,4 +589,89 @@ async fn a_line_split_around_a_queued_input_still_arrives_whole() {
     );
 
     s.cancel.cancel();
+}
+
+/// A child that exits before it prints anything never took its prompt, so the
+/// driver reports no read for it. The read is the turn gap's proof of
+/// delivery: reporting it early would let a lost prompt hide its note. It names
+/// the input as rejected before the `Result` instead, so nothing stays owed.
+#[tokio::test]
+async fn a_turn_that_never_starts_rejects_its_input() {
+    let mut s = stub_driver_running("exit 1\n", None);
+    let ping = uuid::Uuid::new_v4();
+    s.agent
+        .input_tx
+        .send(AgentInput {
+            text: "ping".into(),
+            images: vec![],
+            uuid: ping,
+        })
+        .expect("send input");
+    assert_eq!(rejected_before_the_result(&mut s.agent).await, ping);
+    s.cancel.cancel();
+}
+
+/// A codex binary that cannot start rejects its input the same way.
+#[tokio::test]
+async fn a_turn_that_cannot_spawn_rejects_its_input() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = CodexConfig {
+        codex_bin: tmp.path().join("no-such-codex").into_os_string(),
+        worktree_path: tmp.path().to_path_buf(),
+        system_prompt: Some("SYSPROMPT".into()),
+        model: None,
+        reasoning_effort: None,
+        sandbox_writable_roots: Vec::new(),
+        env_removed: Vec::new(),
+        env: Vec::new(),
+    };
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    tokio::spawn(driver_task(
+        config,
+        None,
+        events_tx,
+        input_rx,
+        control_rx,
+        cancel.clone(),
+    ));
+    let mut agent = RunningAgent {
+        kind: CodingAgent::Codex,
+        events_rx,
+        input_tx,
+        control_tx,
+        permission_rx: None,
+        withdraw_tx: None,
+    };
+    let ping = uuid::Uuid::new_v4();
+    agent
+        .input_tx
+        .send(AgentInput {
+            text: "ping".into(),
+            images: vec![],
+            uuid: ping,
+        })
+        .expect("send input");
+    assert_eq!(rejected_before_the_result(&mut agent).await, ping);
+    cancel.cancel();
+}
+
+/// The input a turn rejected, which must come before its failed `Result` and
+/// with no read.
+async fn rejected_before_the_result(agent: &mut RunningAgent) -> uuid::Uuid {
+    let mut rejected = None;
+    loop {
+        match next_event(agent).await {
+            AgentEvent::InputRead { .. } => panic!("no output, so no read"),
+            AgentEvent::InputRejected { input } => rejected = Some(input),
+            AgentEvent::Result { error, .. } => {
+                assert!(error.is_some(), "the turn failed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    rejected.expect("the rejected input is named before the Result")
 }

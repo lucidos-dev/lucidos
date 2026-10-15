@@ -38,7 +38,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::agent_run_marker::reap_marked_groups;
 use super::agent_runtime::{
     AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
 };
@@ -235,9 +234,9 @@ impl AgentRuntime for CodexRuntime {
             sandbox_writable_roots(args.worktree_path, args.workspace_path).await;
 
         // Bake the Lucidos env contract once; each per-turn child re-applies it.
-        let (env, env_removed, run_marker) = {
+        let (env, env_removed) = {
             let mut probe = tokio::process::Command::new("true");
-            let run_marker = apply_lucidos_env(&mut probe, &args, cli_dir, "Codex");
+            apply_lucidos_env(&mut probe, &args, cli_dir, "Codex");
             let mut env = Vec::new();
             let mut env_removed = Vec::new();
             for (k, v) in probe.as_std().get_envs() {
@@ -246,8 +245,9 @@ impl AgentRuntime for CodexRuntime {
                     None => env_removed.push(k.to_owned()),
                 }
             }
-            (env, env_removed, run_marker)
+            (env, env_removed)
         };
+        let agent_run = args.agent_run.clone();
 
         // A user-configured `codex` path must point at a real executable —
         // fail the spawn naming the setting rather than silently probing past
@@ -292,7 +292,7 @@ impl AgentRuntime for CodexRuntime {
                         cancel,
                     )
                     .await;
-                    reap_marked_groups(run_marker, GROUP_TEARDOWN_GRACE).await;
+                    agent_run.finish(GROUP_TEARDOWN_GRACE).await;
                 });
                 Some(permission_rx)
             }
@@ -307,7 +307,7 @@ impl AgentRuntime for CodexRuntime {
                         cancel,
                     )
                     .await;
-                    reap_marked_groups(run_marker, GROUP_TEARDOWN_GRACE).await;
+                    agent_run.finish(GROUP_TEARDOWN_GRACE).await;
                 });
                 // The exec protocol has no approval channel — the OS sandbox
                 // is the only guard (ADR 0004 §4; ADR 0005 keeps this as the
@@ -811,7 +811,6 @@ async fn driver_task(
             }
         }
         let input = queue.pop_front().expect("queue non-empty");
-        let _ = events_tx.send(AgentEvent::InputRead(None));
 
         let outcome = run_turn(
             &config,
@@ -852,6 +851,32 @@ fn apply_idle_control(
         ControlRequest::Interrupt => {}
         ControlRequest::SetModel { model: m } => *model = Some(m),
         ControlRequest::SetReasoningEffort { effort: e } => *effort = Some(e),
+    }
+}
+
+/// What one turn forwards from the child's stdout. The first line is the
+/// input's read: codex has taken its prompt off stdin by then, and a read is
+/// the turn gap's proof of delivery. Every line goes through here, so no
+/// output can precede the read.
+struct TurnOutput<'a> {
+    events_tx: &'a mpsc::UnboundedSender<AgentEvent>,
+    input: uuid::Uuid,
+    read_reported: bool,
+}
+
+impl TurnOutput<'_> {
+    /// Forward one stdout line's events. `false` once the consumer is gone.
+    fn forward(&mut self, tracker: &mut TurnTracker, line: &[u8], elapsed_ms: u64) -> bool {
+        if !self.read_reported {
+            self.read_reported = true;
+            let _ = self
+                .events_tx
+                .send(AgentEvent::InputRead { input: self.input });
+        }
+        tracker
+            .map_line(parse_codex_line(&String::from_utf8_lossy(line)), elapsed_ms)
+            .into_iter()
+            .all(|ev| self.events_tx.send(ev).is_ok())
     }
 }
 
@@ -902,6 +927,7 @@ async fn run_turn(
         Ok(c) => c,
         Err(e) => {
             log!("[Codex] failed to spawn codex CLI: {}", e);
+            let _ = events_tx.send(AgentEvent::InputRejected { input: input.uuid });
             let _ = events_tx.send(AgentEvent::Result {
                 text: String::new(),
                 duration_ms: 0,
@@ -923,23 +949,23 @@ async fn run_turn(
     let mut line_buf: Vec<u8> = Vec::new();
     let mut interrupted = false;
     let mut shutdown = false;
+    let mut output = TurnOutput {
+        events_tx,
+        input: input.uuid,
+        read_reported: false,
+    };
     'turn: loop {
         tokio::select! {
             read_result = stdout_reader.read_until(b'\n', &mut line_buf) => {
                 match read_result {
                     Ok(0) => break 'turn,
                     Ok(_) => {
-                        let events = tracker.map_line(
-                            parse_codex_line(&String::from_utf8_lossy(&line_buf)),
-                            turn_start.elapsed().as_millis() as u64,
-                        );
+                        let alive = output.forward(tracker, &line_buf, turn_start.elapsed().as_millis() as u64);
                         line_buf.clear();
-                        for ev in events {
-                            if events_tx.send(ev).is_err() {
-                                // Consumer dropped — abandon the process.
-                                shutdown = true;
-                                break 'turn;
-                            }
+                        if !alive {
+                            // Consumer dropped — abandon the process.
+                            shutdown = true;
+                            break 'turn;
                         }
                     }
                     Err(e) => {
@@ -1001,12 +1027,7 @@ async fn run_turn(
         // a last line that EOF ended without a newline. Forward it before
         // draining.
         if !line_buf.is_empty() {
-            for ev in tracker.map_line(
-                parse_codex_line(&String::from_utf8_lossy(&line_buf)),
-                turn_start.elapsed().as_millis() as u64,
-            ) {
-                let _ = events_tx.send(ev);
-            }
+            output.forward(tracker, &line_buf, turn_start.elapsed().as_millis() as u64);
             line_buf.clear();
         }
         // Drain whatever the OS still buffers, then wait.
@@ -1020,14 +1041,8 @@ async fn run_turn(
             {
                 Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                 Ok(Ok(_)) => {
-                    let events = tracker.map_line(
-                        parse_codex_line(&String::from_utf8_lossy(&line_buf)),
-                        turn_start.elapsed().as_millis() as u64,
-                    );
+                    output.forward(tracker, &line_buf, turn_start.elapsed().as_millis() as u64);
                     line_buf.clear();
-                    for ev in events {
-                        let _ = events_tx.send(ev);
-                    }
                 }
             }
         }
@@ -1054,6 +1069,10 @@ async fn run_turn(
 
     if shutdown {
         return TurnOutcome::Shutdown;
+    }
+    if !output.read_reported {
+        // Named before the `Result`, so the idle that follows owes nothing.
+        let _ = events_tx.send(AgentEvent::InputRejected { input: input.uuid });
     }
     if interrupted {
         // The engine's interrupt arm waits for a Result to close the turn as

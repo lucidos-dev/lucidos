@@ -11,6 +11,9 @@ pub(crate) enum ProposeOutcome {
     Held(ProposalHold),
     /// The turn did not finish, so its work stays unproposed (ADR 0400).
     Unfinished,
+    /// The thread's change waits in the landing lane under this id. It is
+    /// frozen, so the turn's work stays unproposed until it lands or fails.
+    AwaitingLanding(Uuid),
 }
 
 /// What withholding a turn end's work did with the branch's open change.
@@ -110,6 +113,40 @@ pub(crate) async fn branch_moved_since_last_idle(
     }
 }
 
+/// The change the thread has waiting in the landing lane, if any. Its work is
+/// then withheld as `awaiting_landing`, and the change is neither withdrawn nor
+/// re-proposed: the lane lands exactly the snapshot it queued (ADR 0463). The
+/// withheld card is drawn only when the branch moved past that snapshot.
+///
+/// An unanswered read is an error. Proposing then could withdraw a queued
+/// change, so the turn end proposes nothing and the next one asks again.
+pub(crate) async fn withhold_for_landing(
+    pool: &sqlx::PgPool,
+    bus: &EventBus,
+    input: &ProposeChangeInput<'_>,
+) -> Result<Option<Uuid>, Box<dyn std::error::Error + Send + Sync>> {
+    let queued = crate::engine::landing_lane::queued_changes(pool, input.thread_id)
+        .await
+        .map_err(|e| format!("could not read the landing lane for this thread: {e}"))?;
+    let Some(member) = queued.into_iter().next() else {
+        return Ok(None);
+    };
+    let head =
+        crate::engine::git_ops::branch_head_sha(Path::new(input.repo_root), input.branch_name)
+            .await;
+    if head.as_deref() != Some(member.snapshot_sha.as_str()) {
+        emit_proposal_withheld(
+            bus,
+            input.thread_id,
+            input.branch_name,
+            input.files,
+            UnproposedReason::AwaitingLanding,
+        )
+        .await;
+    }
+    Ok(Some(member.change_id))
+}
+
 /// What the proposal hold did with a turn end's work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HoldOutcome {
@@ -201,6 +238,20 @@ pub(crate) async fn emit_proposal_withheld(
     .await;
 }
 
+/// A lane batch's integration branch lands through the landing lane, whole,
+/// and is never anybody's change (ADR 0463).
+pub(crate) const LANE_BRANCH_IS_NOT_A_CHANGE: &str =
+    "A lane batch's integration branch lands through the landing lane, never as a change.";
+
+fn refuse_lane_branch(
+    input: &ProposeChangeInput<'_>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if crate::engine::git_ops::is_lane_branch(input.branch_name) {
+        return Err(LANE_BRANCH_IS_NOT_A_CHANGE.into());
+    }
+    Ok(())
+}
+
 impl LucidosEngine {
     /// What a turn end does with its branch work (ADR 0400). A finished turn
     /// proposes it; an unfinished one never does, and says so.
@@ -209,8 +260,12 @@ impl LucidosEngine {
         input: ProposeChangeInput<'_>,
         finished: bool,
     ) -> Result<ProposeOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        refuse_lane_branch(&input)?;
         if finished {
             return self.propose_change(input).await;
+        }
+        if let Some(queued) = withhold_for_landing(&self.pool, &self.event_bus, &input).await? {
+            return Ok(ProposeOutcome::AwaitingLanding(queued));
         }
         let moved = branch_moved_since_last_idle(
             &self.pool,
@@ -232,6 +287,10 @@ impl LucidosEngine {
         &self,
         input: ProposeChangeInput<'_>,
     ) -> Result<ProposeOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        refuse_lane_branch(&input)?;
+        if let Some(queued) = withhold_for_landing(&self.pool, &self.event_bus, &input).await? {
+            return Ok(ProposeOutcome::AwaitingLanding(queued));
+        }
         match withhold_unready(&self.pool, &self.event_bus, &input).await? {
             HoldOutcome::Clear => {}
             // Nothing new since it was proposed, so the open change stands.
@@ -471,7 +530,7 @@ impl LucidosEngine {
         }
 
         let hardened =
-            crate::engine::git_ops::is_harden_marker_present(&self.pool, repo_root, branch_name)
+            crate::engine::git_ops::has_full_harden_marker(&self.pool, repo_root, branch_name)
                 .await;
         let fallback = crate::engine::agent_session::change_description_fallback(
             &self.pool,
@@ -519,7 +578,8 @@ impl LucidosEngine {
 
     /// Emit the harden boundary event then queue AUTO_HARDEN_MESSAGE on a live
     /// agent session. Emit-before-send guarantees the panel sits above any
-    /// CodingAgentTextStreamed events CC produces in response.
+    /// CodingAgentTextStreamed events CC produces in response. The receiver is
+    /// answered when the turn that reads the message ends.
     ///
     /// The boundary event is stamped engine-origin internally (see
     /// `emit_missing_hardening_detected`), so callers don't pass an actor.
@@ -527,19 +587,15 @@ impl LucidosEngine {
         &self,
         thread_id: Uuid,
         msg_tx: &tokio::sync::mpsc::UnboundedSender<crate::engine::AgentUserInput>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<crate::engine::InputAnswered>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         self.emit_missing_hardening_detected(thread_id).await;
-        msg_tx
-            .send(crate::engine::AgentUserInput {
-                text: crate::engine::claude_code::AUTO_HARDEN_MESSAGE.to_string(),
-                images: None,
-                origin_event_id: None,
-                kind: crate::engine::AgentInputKind::User,
-            })
-            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                "Session channel closed".into()
-            })?;
-        Ok(())
+        crate::engine::agent_session::send_awaited_prompt(
+            msg_tx,
+            crate::engine::claude_code::AUTO_HARDEN_MESSAGE.to_string(),
+        )
     }
 
     /// Start the hardening run for work held for `hardening_missing`, which
@@ -593,6 +649,9 @@ impl LucidosEngine {
         let origin = MessageOrigin::engine(match hold {
             ProposalHold::Plan(_) => EngineReason::MissingPlan,
             ProposalHold::HardeningMissing => EngineReason::MissingHardening,
+            // Handed-up or carried work is finished: nothing to send the
+            // agent back for.
+            ProposalHold::IntegratedIntoParent | ProposalHold::CarriedBySuccessor => return Ok(()),
         });
         let text = hold.agent_nudge();
         let anchor = self
@@ -626,6 +685,7 @@ impl LucidosEngine {
                 images: None,
                 origin_event_id: anchor.map(|a| a.event_id),
                 kind: crate::engine::AgentInputKind::ReentryFromEngine,
+                completion: None,
             })
             .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
                 "Session channel closed".into()
@@ -671,6 +731,27 @@ pub(crate) fn should_reconcile_emptied_change(
 #[cfg(test)]
 mod tests {
     use super::should_reconcile_emptied_change;
+
+    /// A lane thread's integration branch is never proposed: not by its own
+    /// turn end, an Apply Now on it, or a recovery sweep.
+    #[test]
+    fn a_lane_branch_is_never_proposed() {
+        let input = |branch| super::ProposeChangeInput {
+            thread_id: uuid::Uuid::new_v4(),
+            branch_name: branch,
+            repo_root: "/repo",
+            description: "",
+            files: &[],
+            requires_restart: false,
+            channel: crate::engine::thread_events::EventChannel::ClaudeCode,
+            hardened: true,
+            origin: None,
+        };
+        let lane = crate::engine::git_ops::lane_branch(uuid::Uuid::new_v4());
+        let refused = super::refuse_lane_branch(&input(&lane));
+        assert!(refused.is_err_and(|e| e.to_string() == super::LANE_BRANCH_IS_NOT_A_CHANGE));
+        assert!(super::refuse_lane_branch(&input("lucidos-claude-code-repo-lucidos-x")).is_ok());
+    }
 
     fn files(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|p| p.to_string()).collect()

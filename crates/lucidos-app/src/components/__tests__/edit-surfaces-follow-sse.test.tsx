@@ -10,11 +10,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 
-vi.mock('../../api/client', async () => {
-  const actual = await vi.importActual<Record<string, unknown>>('../../api/client');
-  return { ...actual, readAppSourceApi: vi.fn(async () => ({ files: [] })) };
-});
-
 import { AppUiEditModal } from '../apps/AppUiEditModal';
 import { TriggerGroupHeader } from '../triggers/TriggerGroupHeader';
 import { appsList, panelOverlay, collapsedTriggerSectionIds } from '../../store/store';

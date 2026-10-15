@@ -2,25 +2,32 @@
 //! `docs/plans/2026-10-10-turn-end-gate-enforces-valid-states.md`.
 
 use super::read_decision::{
-    chat_turn_read, coding_agent_turn_read, read_decision_prompt, record_forced_decision,
-    ForcedReadDecision, InFlight, OpeningSource, TurnRead, READ_DECISION_SYSTEM_PROMPT,
+    chat_turn_read, coding_agent_turn_read, decision_from, read_decision_chat_judge,
+    read_decision_prompt, record_forced_decision, wake_settles_first, AnsweredQuestion,
+    ForcedReadDecision, InFlight, OpeningSource, PushedNotification, TurnRead, PUSH_MESSAGE_BYTES,
+    READ_DECISION_INSTRUCTIONS, READ_QUESTION_ID, READ_THRESHOLD,
 };
+use super::wake_decision::{record_wake_decision, OwedReport, WakeDecision};
 use super::*;
-use crate::engine::aux_purpose::AuxCall;
 use crate::engine::change_ops::PlanHold;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::model_call::AuxCapture;
 use crate::engine::read_request::ReadDecision;
 use crate::engine::thread_events::{
-    ActorMode, EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    ActorMode, AnswerKind, ChildCompletionStatus, EngineReason, EventChannel, EventMeta,
+    MessageOrigin, QuestionOption, ThreadEvent,
 };
 use crate::engine::ContextPurpose;
+use crate::llm::judgment::{
+    Answer, Answers, ChatJudgmentProvider, Judgment, JudgmentProvider, NoulAnswer, Question,
+};
 use crate::llm::mock::{MockProvider, MOCK_MODEL, MOCK_READ_YES_SENTINEL};
 use crate::runtime::agent_runtime::CodingAgent;
 use crate::test_support::{
     aux_captures, setup_test_db, start_cc_session, teardown_test_db, ScriptedProvider,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 fn session(head: &str, held: Option<ProposalHold>) -> SessionFacts {
@@ -124,6 +131,15 @@ fn work_with_no_hold_is_left_alone() {
     assert!(ledger.take_due(&idle(session("a1", None))).is_none());
 }
 
+/// An integrated sub-thread's handed-up work is its finished state, so its
+/// turn end sends the agent nowhere.
+#[test]
+fn integrated_work_sends_the_agent_nowhere() {
+    let mut ledger = ReentryLedger::default();
+    let held = idle(session("a1", Some(ProposalHold::IntegratedIntoParent)));
+    assert!(ledger.take_due(&held).is_none());
+}
+
 // ---- the forced read decision ----
 
 async fn emit(bus: &EventBus, thread_id: Uuid, channel: EventChannel, event: ThreadEvent) {
@@ -143,6 +159,7 @@ fn message(text: &str) -> ThreadEvent {
     ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,
+        wake_mode: None,
         text: text.into(),
         user_image_hashes: vec![],
         device_id: None,
@@ -169,8 +186,23 @@ fn idled_event() -> ThreadEvent {
     serde_json::from_value(serde_json::json!({ "type": "CodingAgentIdled", "data": {} })).unwrap()
 }
 
-fn forced<'a>(call: &'a AuxCall, capture: &'a AuxCapture) -> ForcedReadDecision<'a> {
-    ForcedReadDecision { call, capture }
+/// A deadline no offline test reaches.
+const TEST_DEADLINE: Duration = Duration::from_secs(30);
+
+fn forced<'a>(
+    provider: &'a dyn JudgmentProvider,
+    capture: &'a AuxCapture,
+) -> ForcedReadDecision<'a> {
+    ForcedReadDecision {
+        provider,
+        deadline: TEST_DEADLINE,
+        capture,
+    }
+}
+
+/// The read decision's chat backend over `provider`.
+fn chat_judge(provider: impl crate::llm::LlmProvider + 'static) -> ChatJudgmentProvider {
+    read_decision_chat_judge(Arc::new(provider), None)
 }
 
 fn turn(message: &str, reply: &str) -> TurnRead {
@@ -239,12 +271,9 @@ async fn the_forced_call_answers_no_or_yes_and_records_its_cost() {
     let thread_id = Uuid::new_v4();
     emit(&bus, thread_id, EventChannel::Chat, message("hello")).await;
 
-    let call = AuxCall::over(
-        Arc::new(MockProvider::new(MOCK_MODEL.to_string())),
-        ContextPurpose::ReadDecision,
-    );
+    let judge = chat_judge(MockProvider::new(MOCK_MODEL.to_string()));
     let capture = AuxCapture::new(&bus, thread_id, ContextPurpose::ReadDecision);
-    let decide = forced(&call, &capture);
+    let decide = forced(&judge, &capture);
     assert_eq!(
         decide
             .decide(&turn("thanks", "You're welcome."))
@@ -263,7 +292,7 @@ async fn the_forced_call_answers_no_or_yes_and_records_its_cost() {
     assert_eq!(
         aux_captures(&pool, thread_id, "read_decision").await.len(),
         2,
-        "every forced call records what it cost"
+        "every call records what it cost"
     );
 
     teardown_test_db(&db).await;
@@ -271,13 +300,10 @@ async fn the_forced_call_answers_no_or_yes_and_records_its_cost() {
 
 #[tokio::test]
 async fn an_empty_reply_is_a_no_without_a_call() {
-    let call = AuxCall::over(
-        Arc::new(ScriptedProvider::new("m", vec![])),
-        ContextPurpose::ReadDecision,
-    );
+    let judge = chat_judge(ScriptedProvider::new("m", vec![]));
     let capture = AuxCapture::discarding(ContextPurpose::ReadDecision);
     assert_eq!(
-        forced(&call, &capture)
+        forced(&judge, &capture)
             .decide(&turn("go", "  "))
             .await
             .unwrap(),
@@ -285,10 +311,83 @@ async fn an_empty_reply_is_a_no_without_a_call() {
     );
 }
 
-/// A call that fails or answers in text records a read request in the
-/// engine's name. The reply then waits in Review rather than hiding.
+/// A model that answers in text gave no answer, and a missing answer asks to
+/// be read (I4).
 #[tokio::test]
-async fn a_failed_forced_call_records_a_read_request_from_the_engine() {
+async fn a_text_answer_is_no_answer_and_asks_to_be_read() {
+    let judge = chat_judge(ScriptedProvider::new("m", vec!["I think yes."]));
+    let capture = AuxCapture::discarding(ContextPurpose::ReadDecision);
+    assert_eq!(
+        forced(&judge, &capture)
+            .decide(&turn("report please", "Here it is."))
+            .await
+            .unwrap(),
+        ReadDecision::Requested
+    );
+}
+
+/// The threshold reads the probability of yes. A tie reads, and a missing
+/// answer reads (I4).
+#[test]
+fn the_threshold_reads_a_tie_and_a_missing_answer_as_a_read() {
+    let answered = |p: f64| {
+        Answers::new(
+            [(
+                READ_QUESTION_ID.to_string(),
+                Answer::Noul(NoulAnswer { noul: p }),
+            )]
+            .into_iter()
+            .collect(),
+        )
+    };
+    assert_eq!(
+        decision_from(&answered(READ_THRESHOLD)),
+        ReadDecision::Requested
+    );
+    assert_eq!(decision_from(&answered(0.9)), ReadDecision::Requested);
+    assert_eq!(decision_from(&answered(0.1)), ReadDecision::NotRequested);
+    assert_eq!(decision_from(&Answers::default()), ReadDecision::Requested);
+}
+
+/// What the read decision asks any backend: one yes/no question, over the
+/// turn as text. Nothing else rides on the call (I10).
+#[tokio::test]
+async fn the_decision_asks_one_question_over_the_turn() {
+    type Asked = (serde_json::Value, Vec<(String, Question)>);
+    struct Recording(std::sync::Mutex<Vec<Asked>>);
+
+    #[async_trait::async_trait]
+    impl JudgmentProvider for Recording {
+        async fn ask(
+            &self,
+            state: serde_json::Value,
+            questions: Vec<(String, Question)>,
+            _: crate::llm::metered::CallToken,
+        ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().push((state, questions));
+            Ok(Judgment::default())
+        }
+    }
+
+    let recording = Recording(Default::default());
+    let capture = AuxCapture::discarding(ContextPurpose::ReadDecision);
+    let read = turn("research it", "Findings: three causes.");
+    forced(&recording, &capture).decide(&read).await.unwrap();
+    let asked = recording.0.lock().unwrap();
+    let (state, questions) = &asked[0];
+    assert_eq!(state.as_str(), Some(read_decision_prompt(&read).as_str()));
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0].0, READ_QUESTION_ID);
+    assert!(
+        matches!(&questions[0].1, Question::Noul { instructions, criteria: Some(_) }
+        if instructions == READ_DECISION_INSTRUCTIONS)
+    );
+}
+
+/// A call that fails records a read request in the engine's name. The reply
+/// then waits in Review rather than hiding.
+#[tokio::test]
+async fn a_failed_call_records_a_read_request_from_the_engine() {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -300,15 +399,8 @@ async fn a_failed_forced_call_records_a_read_request_from_the_engine() {
     )
     .await;
 
-    let call = AuxCall::over(
-        Arc::new(ScriptedProvider::new("m", vec!["I think yes."])),
-        ContextPurpose::ReadDecision,
-    );
-    let capture = AuxCapture::discarding(ContextPurpose::ReadDecision);
-    let outcome = forced(&call, &capture)
-        .decide(&turn("report please", "Here it is."))
-        .await;
-    assert!(outcome.is_err(), "a text answer is no decision");
+    let outcome: Result<ReadDecision, Box<dyn std::error::Error + Send + Sync>> =
+        Err("the System One call and its chat fallback both failed".into());
     assert_eq!(
         record_forced_decision(&bus, thread_id, outcome).await,
         ReadDecision::Requested
@@ -418,6 +510,7 @@ async fn a_coding_agent_turn_opened_by_an_agent_prompt_says_so() {
     // An engine retrigger names the engine only in its origin.
     emit(&bus, thread_id, cc, idled_event()).await;
     let retrigger = ThreadEvent::CodingAgentPromptSent {
+        input_event_id: None,
         text: "Resolve the merge conflict.".into(),
         coding_agent: CodingAgent::ClaudeCode,
         origin: Some(MessageOrigin::engine(EngineReason::MergeConflict)),
@@ -468,12 +561,9 @@ async fn a_turn_holding_a_change_decides_no_without_a_call() {
     let turn = coding_agent_turn_read(&pool, thread_id).await.unwrap();
     assert!(turn.change_replaces_read_request);
 
-    let call = AuxCall::over(
-        Arc::new(ScriptedProvider::new("m", vec![])),
-        ContextPurpose::ReadDecision,
-    );
+    let judge = chat_judge(ScriptedProvider::new("m", vec![]));
     let capture = AuxCapture::new(&bus, thread_id, ContextPurpose::ReadDecision);
-    let outcome = forced(&call, &capture).decide(&turn).await;
+    let outcome = forced(&judge, &capture).decide(&turn).await;
     assert_eq!(
         record_forced_decision(&bus, thread_id, outcome).await,
         ReadDecision::NotRequested
@@ -537,15 +627,327 @@ fn a_turn_ending_in_flight_says_what_it_waits_on_and_the_end_does_not() {
     assert!(!read_decision_prompt(&end).contains("Closing note"));
 
     // The note means nothing unless the system prompt says what it implies.
-    assert!(READ_DECISION_SYSTEM_PROMPT.contains(
+    assert!(READ_DECISION_INSTRUCTIONS.contains(
         "When a closing note says the thread's work is still in flight, a progress report"
     ));
+}
+
+// ---- a report the parent agent acts on (ADR 0446) ----
+
+const PARENT_NOTE: &str = "the parent agent acts on it now.";
+
+/// The archive sub-thread that landed in Review: a parent agent asked for a
+/// run, the reply reported it, and the report woke the parent. The forced call
+/// must learn that the parent acts on it (I2).
+fn archive_report() -> TurnRead {
+    TurnRead {
+        source: OpeningSource::AgentOrEngine,
+        report_wakes_parent: true,
+        ..turn(
+            "Run the archive script, then report the summary line.",
+            "Exit 0. 248 present, 0 missing, 0 unknown.",
+        )
+    }
+}
+
+#[test]
+fn a_report_that_wakes_the_parent_agent_says_so() {
+    let prompt = read_decision_prompt(&archive_report());
+    assert!(prompt.ends_with(PARENT_NOTE), "{prompt}");
+
+    // Both notes show, the in-flight one first.
+    let in_flight = TurnRead {
+        in_flight: InFlight {
+            sub_threads: 1,
+            event_waits: 0,
+        },
+        ..archive_report()
+    };
+    let both = read_decision_prompt(&in_flight);
+    assert!(both.contains("It waits on 1 sub-thread.\n\n"), "{both}");
+    assert!(both.ends_with(PARENT_NOTE), "{both}");
+
+    // The note means nothing unless the system prompt says what it implies.
+    assert!(READ_DECISION_INSTRUCTIONS
+        .contains("When a closing note says the parent agent acts on this reply now"));
+}
+
+/// A filed report, and a turn the user opened or resumed, read as before.
+#[test]
+fn only_an_agent_opened_turn_waking_its_parent_carries_the_note() {
+    let filed = TurnRead {
+        report_wakes_parent: false,
+        ..archive_report()
+    };
+    let users_own = TurnRead {
+        source: OpeningSource::UserMessage,
+        ..archive_report()
+    };
+    let resumed = TurnRead {
+        answered: Some(AnsweredQuestion {
+            question: "Archive the retakes too?".into(),
+            answer: "Yes".into(),
+        }),
+        ..archive_report()
+    };
+    for quiet in [filed, users_own, resumed] {
+        let prompt = read_decision_prompt(&quiet);
+        assert!(!prompt.contains(PARENT_NOTE), "{prompt}");
+    }
+}
+
+/// The read prompt claims a wake exactly when the fan-in delivers one (I4).
+/// The test records the wake decision as the gate does, and builds the read
+/// prompt from it. Then the child's reply reaches the parent.
+#[tokio::test]
+async fn the_parent_note_matches_what_the_fan_in_delivers() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let chat = EventChannel::Chat;
+    let clean = TurnFinish::Finished(ChildCompletionStatus::Success);
+    let report = "Exit 0. 248 present, 0 missing, 0 unknown.";
+    for (decision, delivered) in [
+        (WakeDecision::NotRequested, "ChildReportFiled"),
+        (WakeDecision::Requested, "ChildThreadCompleted"),
+    ] {
+        let (parent, child, opener) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        emit(&bus, parent, chat, message("archive the take")).await;
+        bus.emit(BusEvent::Thread {
+            thread_id: child,
+            event: child_message("Run the archive script and report.", parent),
+            meta: EventMeta {
+                channel: Some(chat),
+                event_id: Some(opener),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+        let owed = OwedReport::of_thread(&pool, child).await.unwrap();
+        record_wake_decision(&bus, child, decision, None)
+            .await
+            .unwrap();
+        let turn = TurnRead {
+            report_wakes_parent: owed.wakes_parent(clean, Some(decision)),
+            ..chat_turn_read(&pool, child, opener, report).await
+        };
+        let noted = read_decision_prompt(&turn).ends_with(PARENT_NOTE);
+
+        emit(&bus, child, chat, reply(report)).await;
+        let cards: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate = 'thread' AND aggregate_id = $1 \
+               AND event_type = $2",
+        )
+        .bind(parent.to_string())
+        .bind(delivered)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cards, 1, "{decision:?} delivers a {delivered}");
+        assert_eq!(noted, decision == WakeDecision::Requested, "{decision:?}");
+    }
+
+    teardown_test_db(&db).await;
+}
+
+/// The wake decision runs first only where the read decision reads it, so
+/// every other turn still makes both calls at once (I7). An agent's own read
+/// decision is kept, and no call reads the wake for it (I1).
+#[test]
+fn the_wake_decision_settles_first_only_for_a_forced_read_on_an_agent_turn() {
+    let agent_turn = archive_report();
+    assert!(wake_settles_first(false, &agent_turn));
+    assert!(!wake_settles_first(true, &agent_turn));
+    let users_own = TurnRead {
+        source: OpeningSource::UserMessage,
+        ..archive_report()
+    };
+    assert!(!wake_settles_first(false, &users_own));
+}
+
+// ---- a question answered inside the turn ----
+
+fn asked(tool_use_id: &str, question: &str, options: &[(&str, &str)]) -> ThreadEvent {
+    ThreadEvent::UserQuestionAsked {
+        tool_use_id: tool_use_id.into(),
+        cc_session_id: String::new(),
+        question: question.into(),
+        options: options
+            .iter()
+            .map(|(id, label)| QuestionOption {
+                id: (*id).into(),
+                label: (*label).into(),
+                description: None,
+                preview: None,
+                widget: None,
+            })
+            .collect(),
+        worktree_path: None,
+        multi_select: false,
+        owner_approval: None,
+    }
+}
+
+fn answered(tool_use_id: &str, answer: AnswerKind) -> ThreadEvent {
+    ThreadEvent::UserQuestionAnswered {
+        tool_use_id: tool_use_id.into(),
+        answer,
+    }
+}
+
+fn typed(text: &str) -> AnswerKind {
+    AnswerKind::FreeText {
+        text: text.into(),
+        image_hashes: vec![],
+    }
+}
+
+/// The trigger run that landed in Review: it asked the user a question, the
+/// answer resumed the same turn, and the reply only confirmed that answer.
+/// The forced call saw the run's instruction and the reply, never the answer.
+#[test]
+fn an_answer_inside_the_turn_reaches_the_forced_call_between_opener_and_reply() {
+    let watch = TurnRead {
+        source: OpeningSource::TriggerRun,
+        answered: Some(AnsweredQuestion {
+            question: "What do you want done with the tester's question?".into(),
+            answer: "They were happy with my answer, it seems".into(),
+        }),
+        ..turn(
+            "Catch me up on what my testers said in the channel.",
+            "Yes, they were happy with it. I closed the board item.",
+        )
+    };
+    let prompt = read_decision_prompt(&watch);
+    let opener = prompt.find("Catch me up").unwrap();
+    let question = prompt
+        .find("The agent then asked the user:\nWhat do you want done")
+        .unwrap();
+    let answer = prompt
+        .find("The user answered:\nThey were happy with my answer, it seems")
+        .unwrap();
+    let reply = prompt
+        .find("The agent's reply:\nYes, they were happy")
+        .unwrap();
+    assert!(
+        opener < question && question < answer && answer < reply,
+        "{prompt}"
+    );
+
+    // The answer means nothing unless the system prompt says what it implies.
+    assert!(READ_DECISION_INSTRUCTIONS.contains("The user answered"));
+}
+
+/// A chat turn reads the latest answer after its opener, never one from an
+/// earlier turn, and a cancelled card is no answer.
+#[tokio::test]
+async fn a_chat_turn_reads_the_answer_after_its_opener_only() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let chat = EventChannel::Chat;
+    let thread_id = Uuid::new_v4();
+
+    emit(&bus, thread_id, chat, asked("q-old", "Earlier?", &[])).await;
+    emit(
+        &bus,
+        thread_id,
+        chat,
+        answered("q-old", typed("from before")),
+    )
+    .await;
+    let opener = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: message("triage the channel"),
+        meta: EventMeta {
+            channel: Some(chat),
+            event_id: Some(opener),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    let unasked = chat_turn_read(&pool, thread_id, opener, "Nothing new.").await;
+    assert_eq!(
+        unasked.answered, None,
+        "an earlier turn's answer never shows"
+    );
+
+    let options = [("opt-0", "Park it"), ("opt-1", "Drop it")];
+    emit(&bus, thread_id, chat, asked("q-1", "What now?", &options)).await;
+    let picked = AnswerKind::Selected {
+        option_id: "opt-1".into(),
+    };
+    emit(&bus, thread_id, chat, answered("q-1", picked)).await;
+    emit(&bus, thread_id, chat, asked("q-2", "Anything else?", &[])).await;
+    emit(&bus, thread_id, chat, answered("q-2", AnswerKind::Canceled)).await;
+
+    let turn = chat_turn_read(&pool, thread_id, opener, "Dropped.").await;
+    assert_eq!(turn.message, "triage the channel");
+    assert_eq!(
+        turn.answered,
+        Some(AnsweredQuestion {
+            question: "What now?".into(),
+            answer: "Drop it".into(),
+        })
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// A coding-agent turn reads the answer given since its last idle.
+#[tokio::test]
+async fn a_coding_agent_turn_reads_the_answer_since_its_last_idle() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let cc = EventChannel::ClaudeCode;
+    let thread_id = Uuid::new_v4();
+    emit(&bus, thread_id, cc, message("fix the build")).await;
+    start_cc_session(&bus, thread_id, "claude-code/test", None).await;
+    emit(&bus, thread_id, cc, asked("q-1", "Which fix?", &[])).await;
+    emit(
+        &bus,
+        thread_id,
+        cc,
+        answered("q-1", typed("the narrow one")),
+    )
+    .await;
+    emit(&bus, thread_id, cc, reply("Done, the narrow fix.")).await;
+
+    let turn = coding_agent_turn_read(&pool, thread_id).await.unwrap();
+    assert_eq!(turn.message, "fix the build");
+    assert_eq!(
+        turn.answered,
+        Some(AnsweredQuestion {
+            question: "Which fix?".into(),
+            answer: "the narrow one".into(),
+        })
+    );
+
+    emit(&bus, thread_id, cc, idled_event()).await;
+    let follow_up = ThreadEvent::PromptInjected {
+        text: "now the docs".into(),
+        mode: ActorMode::Human,
+        origin: None,
+        injected_message_id: None,
+        delivered_event_id: None,
+    };
+    emit(&bus, thread_id, cc, follow_up).await;
+    emit(&bus, thread_id, cc, reply("Docs updated.")).await;
+    let next = coding_agent_turn_read(&pool, thread_id).await.unwrap();
+    assert_eq!(
+        next.answered, None,
+        "the previous turn's answer never shows"
+    );
+
+    teardown_test_db(&db).await;
 }
 
 fn child_message(text: &str, parent: Uuid) -> ThreadEvent {
     ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,
+        wake_mode: None,
         text: text.into(),
         user_image_hashes: vec![],
         device_id: None,
@@ -627,6 +1029,143 @@ async fn both_turn_readers_see_a_running_sub_thread_and_a_live_wait() {
             event_waits: 1,
         }
     );
+
+    teardown_test_db(&db).await;
+}
+
+// ---- a notification the turn already sent ----
+
+fn pushed(title: &str, message: &str) -> PushedNotification {
+    PushedNotification {
+        title: title.into(),
+        message: message.into(),
+    }
+}
+
+/// A turn that pushed its news and ended undecided: the forced call must
+/// learn what the push already said (I5).
+#[test]
+fn a_turn_that_pushed_says_what_the_user_already_got() {
+    let run = TurnRead {
+        source: OpeningSource::TriggerRun,
+        pushed: vec![pushed(
+            "Inbox: 2 need you",
+            "Landlord moves the inspection.",
+        )],
+        ..turn("Triage my inbox.", "Two messages need you. I sent a push.")
+    };
+    let prompt = read_decision_prompt(&run);
+    assert!(
+        prompt.ends_with(
+            "Closing note: before this reply, the turn sent the user this notification, \
+             so they have already seen it.\n\
+             Title: Inbox: 2 need you\n\
+             Message: Landlord moves the inspection."
+        ),
+        "{prompt}"
+    );
+
+    let two = TurnRead {
+        pushed: vec![pushed("One", "first"), pushed("Two", "second")],
+        ..run.clone()
+    };
+    let prompt = read_decision_prompt(&two);
+    assert!(
+        prompt.contains("sent the user these 2 notifications"),
+        "{prompt}"
+    );
+    assert!(prompt.ends_with("Title: Two\nMessage: second"), "{prompt}");
+
+    let quiet = TurnRead {
+        pushed: vec![],
+        ..run
+    };
+    assert!(!read_decision_prompt(&quiet).contains("Closing note"));
+
+    // The note means nothing unless the question says what it implies.
+    assert!(READ_DECISION_INSTRUCTIONS
+        .contains("When a closing note says the turn already sent the user a notification"));
+}
+
+/// A long push reaches the call cut in the middle, like the reply.
+#[test]
+fn a_long_push_is_cut_to_its_budget() {
+    let long = "x".repeat(10_000);
+    let run = TurnRead {
+        pushed: vec![pushed("Long", &long)],
+        ..turn("Run.", "Done.")
+    };
+    let kept = read_decision_prompt(&run).matches('x').count();
+    assert!(kept <= PUSH_MESSAGE_BYTES, "{kept} bytes of the push kept");
+    assert!(
+        kept > PUSH_MESSAGE_BYTES / 2,
+        "both ends of the push survive"
+    );
+}
+
+async fn emit_with_id(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) -> Uuid {
+    let id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event,
+        meta: EventMeta {
+            channel: Some(EventChannel::Trigger),
+            event_id: Some(id),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    id
+}
+
+/// Emit a `send_notification` call and its result.
+async fn send_notification(bus: &EventBus, thread_id: Uuid, title: &str, success: bool) {
+    let called = emit_with_id(
+        bus,
+        thread_id,
+        ThreadEvent::ToolCalled {
+            name: crate::llm::tool_names::SEND_NOTIFICATION.into(),
+            args: serde_json::json!({ "title": title, "message": format!("{title} body") }),
+            description: String::new(),
+        },
+    )
+    .await;
+    emit_with_id(
+        bus,
+        thread_id,
+        ThreadEvent::ToolResult {
+            name: crate::llm::tool_names::SEND_NOTIFICATION.into(),
+            result: if success {
+                "Notification sent."
+            } else {
+                "No device."
+            }
+            .into(),
+            images: vec![],
+            success,
+            tool_called_event_id: Some(called),
+        },
+    )
+    .await;
+}
+
+/// The push note counts only what this turn delivered: never a push from an
+/// earlier turn, a failed one, or one on another thread (I4).
+#[tokio::test]
+async fn a_chat_turn_reads_only_the_pushes_it_delivered() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let run = Uuid::new_v4();
+
+    send_notification(&bus, run, "earlier turn", true).await;
+    let opener = emit_with_id(&bus, run, message("triage the inbox")).await;
+    send_notification(&bus, run, "failed", false).await;
+    send_notification(&bus, Uuid::new_v4(), "another thread", true).await;
+    send_notification(&bus, run, "delivered", true).await;
+
+    let turn = chat_turn_read(&pool, run, opener, "One message needs you.").await;
+    assert_eq!(turn.pushed, vec![pushed("delivered", "delivered body")]);
 
     teardown_test_db(&db).await;
 }

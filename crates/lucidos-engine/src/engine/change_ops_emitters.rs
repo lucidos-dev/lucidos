@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::core::AppKind;
+use crate::engine::change_ops::AppliedMerge;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::git_ops::{consume_harden_marker, consume_plan_marker, git_cmd};
 use crate::engine::thread_events::{
@@ -44,6 +45,8 @@ async fn changes_updated_payload(
     pool: &sqlx::PgPool,
     proj: &crate::core::changes_projection::ChangesProjection,
     apply_estimates: crate::engine::apply_estimate::ApplyEstimates,
+    landing_lane: crate::engine::landing_lane::LaneSnapshot,
+    main_check: crate::engine::MainCheckSnapshot,
 ) -> Option<SystemEvent> {
     let (pending_r, set_aside_r, applied_r, restart_r) = tokio::join!(
         crate::core::changes::list_pending_for_readers(
@@ -101,6 +104,8 @@ async fn changes_updated_payload(
         applied,
         restart_required,
         apply_estimates,
+        landing_lane,
+        main_check,
     })
 }
 
@@ -120,7 +125,14 @@ impl LucidosEngine {
                 return;
             }
         };
-        let Some(event) = changes_updated_payload(self.pool(), self.changes(), estimates).await
+        let Some(event) = changes_updated_payload(
+            self.pool(),
+            self.changes(),
+            estimates,
+            self.landing_lane_snapshot(),
+            self.main_check_snapshot(),
+        )
+        .await
         else {
             return;
         };
@@ -225,16 +237,20 @@ impl LucidosEngine {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn emit_change_applied(
         &self,
+        claim: &crate::engine::change_ops::apply_claim::ApplyClaim,
         thread_id: Uuid,
-        change_id: Uuid,
         requires_restart: bool,
         client_update: bool,
         commits: Vec<String>,
         thread_title: Option<String>,
         actor: Option<MessageOrigin>,
-        pre_merge_sha: Option<String>,
-        post_merge_sha: Option<String>,
+        merge: Option<AppliedMerge>,
     ) {
+        let change_id = claim.change_id();
+        let (pre_merge_sha, post_merge_sha, landing_merge_sha) = match merge {
+            Some(m) => (Some(m.pre), Some(m.post), m.landing),
+            None => (None, None, None),
+        };
         let thread_title = match thread_title {
             Some(t) => Some(t),
             None => sqlx::query_scalar::<_, Option<String>>(
@@ -248,12 +264,9 @@ impl LucidosEngine {
             .flatten(),
         };
         // `emit` rather than `emit_or_log` because the post-apply refresh below
-        // MUST see whether this emit was accepted. The bus runs a single-fire
-        // guard for `ChangeApplied` (`FOR UPDATE` on the change row) and returns
-        // `Ok(None)` for a recognized duplicate — the double-fire race, an
-        // Apply-All retry, the conflict-recovery cleanup, a post-restart re-emit.
-        // Firing the refresh on the DUPLICATE would supersede the frontend
-        // refresh the ACCEPTED emit just started, and join its rebuild for nothing.
+        // runs only when the event persisted. A second `ChangeApplied` for one
+        // change cannot happen: every emit holds the change's apply claim, and
+        // every apply reads the row under it (ADR 0442).
         let accepted = match self
             .event_bus
             .emit(BusEvent::Thread {
@@ -267,6 +280,7 @@ impl LucidosEngine {
                     actor,
                     pre_merge_sha,
                     post_merge_sha,
+                    landing_merge_sha,
                     path: String::new(),
                 },
                 meta: EventMeta::NONE,
@@ -274,6 +288,13 @@ impl LucidosEngine {
             .await
         {
             Ok(res) => res.is_some(),
+            Err(e) if e.to_string().contains(CHANGE_APPLIED_ONCE_INDEX) => {
+                log!(
+                    "[Changes] ChangeApplied for {} refused: another engine on this database already recorded it",
+                    change_id
+                );
+                false
+            }
             Err(e) => {
                 // Same message shape `emit_or_log` produced, so the existing
                 // `[EventBus] [Changes] ChangeApplied emit failed: …` stays greppable.
@@ -285,11 +306,6 @@ impl LucidosEngine {
         // members advance the registry and (if more remain) trigger the
         // next apply. Non-blocking — the channel send hands off to the
         // driver task, never holds a lock.
-        //
-        // Deliberately NOT gated on `accepted`, unlike the refresh below: batch
-        // member status is first-write-wins, so a duplicate `Applied` is already
-        // idempotent here — while withholding it on a suppressed duplicate could
-        // strand a batch whose only signal was that duplicate.
         self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Applied(
             change_id,
         ));
@@ -797,6 +813,10 @@ fn post_apply_refresh(
     }
 }
 
+/// The unique index that refuses a second `ChangeApplied` for one change
+/// (migration `20261012130519_change_applied_once_per_change.sql`).
+pub(crate) const CHANGE_APPLIED_ONCE_INDEX: &str = "events_change_applied_once";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +848,9 @@ mod tests {
                 coding_agent_kind: Default::default(),
                 coding_agent_folder: String::new(),
                 app_id: None,
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),
@@ -868,9 +891,15 @@ mod tests {
             .expect("put the thread mid-turn");
 
         let proj = ChangesProjection::new(pool.clone());
-        let event = changes_updated_payload(&pool, &proj, Default::default())
-            .await
-            .expect("every read answered");
+        let event = changes_updated_payload(
+            &pool,
+            &proj,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("every read answered");
         match event {
             SystemEvent::ChangesUpdated { pending, .. } => {
                 assert_eq!(pending.len(), 1, "one pending change, got {:?}", pending);

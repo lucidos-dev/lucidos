@@ -15,9 +15,10 @@ import { describe, expect, it } from 'vitest';
 import { Fragment } from 'preact';
 import type { ComponentChildren, VNode } from 'preact';
 import { FollowLiveEdgeIcon } from '../../shared/icons';
-import { CodingAgentControlMenu } from '../CodingAgentControlMenu';
-import { LucidosControlMenu } from '../LucidosControlMenu';
-import { followLiveEdgeAction, PromptRowControls, promptRowToggles } from '../PromptRowControls';
+import {
+  followLiveEdgeAction, LazyCodingAgentControlMenu as CodingAgentControlMenu,
+  LazyLucidosControlMenu as LucidosControlMenu, PromptRowControls, promptRowToggles,
+} from '../PromptRowControls';
 import { callIsOffered } from '../../../voice/callOffer';
 import type { ThreadState } from '../../../store/thread-events/thread-meta';
 

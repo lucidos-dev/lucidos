@@ -19,12 +19,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
+use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
-use super::event_bus::{BusEvent, EventBus};
+use super::event_bus::{BusEvent, EmittedEvent, EventBus, LagReplay, ReplayScope};
 use super::thread_events::{EventMeta, ThreadEvent};
 use super::LucidosEngine;
 use crate::core::changes_projection::ChangesProjection;
@@ -36,6 +34,10 @@ const SYSTEM_PROMPT: &str = "You summarize one code change for the person decidi
      the latest fix or cleanup. Use plain words in sentence case. No conventional-commit \
      prefix such as 'feat:' or 'fix(engine):', no quotes, no trailing period. Return only \
      the line.";
+
+/// The event types a proposal arrives as. [`proposal`] decides which need a
+/// summary.
+pub(crate) const PROPOSAL_EVENT_TYPES: [&str; 1] = ["ChangeProposed"];
 
 /// The longest summary kept. A reply past this is an explanation, not a line.
 const MAX_SUMMARY_CHARS: usize = 100;
@@ -56,50 +58,56 @@ type InFlight = Arc<Mutex<HashSet<Uuid>>>;
 pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
     // Subscribe before the backfill reads, so nothing proposed in between is
     // missed by both.
-    let rx = engine.event_bus.subscribe();
+    let (mut rx, mut replay) = LagReplay::subscribe(
+        &engine.event_bus,
+        ReplayScope::Workspace,
+        Some(PROPOSAL_EVENT_TYPES.to_vec()),
+    );
     let in_flight: InFlight = Arc::default();
     tokio::spawn(backfill(engine.clone(), in_flight.clone()));
     tokio::spawn(async move {
-        let stream = BroadcastStream::new(rx);
-        tokio::pin!(stream);
-        // `while let Some(Ok(_))` would end the loop on a lag and silently stop
-        // summarizing for the rest of the engine's life.
-        while let Some(result) = stream.next().await {
-            let emitted = match result {
-                Ok(e) => e,
-                Err(BroadcastStreamRecvError::Lagged(n)) => {
-                    log!(
-                        "[ChangeSummary] Broadcast lagged by {} events, their summaries are skipped",
-                        n
-                    );
-                    continue;
-                }
-            };
-            if emitted.seq.is_none() {
-                continue;
+        while let Some(proposals) =
+            proposals_after(rx.recv().await, &mut replay, engine.pool()).await
+        {
+            for (thread_id, change_id) in proposals {
+                let (engine, in_flight) = (engine.clone(), in_flight.clone());
+                tokio::spawn(async move {
+                    summarize_guarded(&engine, &in_flight, thread_id, change_id).await
+                });
             }
-            let BusEvent::Thread {
-                thread_id,
-                event:
-                    ThreadEvent::ChangeProposed {
-                        change_id,
-                        commit_sha: None,
-                        ..
-                    },
-                ..
-            } = &emitted.typed
-            else {
-                continue;
-            };
-            let Ok(change_id) = Uuid::parse_str(change_id) else {
-                continue;
-            };
-            let (engine, in_flight, thread_id) = (engine.clone(), in_flight.clone(), *thread_id);
-            tokio::spawn(async move {
-                summarize_guarded(&engine, &in_flight, thread_id, change_id).await
-            });
         }
     })
+}
+
+/// The `(thread, change)` proposals one read of the bus hands the summarizer.
+/// `None` once the bus closes.
+pub(crate) async fn proposals_after(
+    received: Result<EmittedEvent, RecvError>,
+    replay: &mut LagReplay,
+    pool: &sqlx::PgPool,
+) -> Option<Vec<(Uuid, Uuid)>> {
+    let frames = replay.read(received, pool).await?;
+    Some(frames.iter().filter_map(proposal).collect())
+}
+
+/// The change a stored aggregate proposal names. A commit-scoped proposal has
+/// one commit, so it needs no summary.
+fn proposal(emitted: &EmittedEvent) -> Option<(Uuid, Uuid)> {
+    emitted.seq?;
+    let BusEvent::Thread {
+        thread_id,
+        event:
+            ThreadEvent::ChangeProposed {
+                change_id,
+                commit_sha: None,
+                ..
+            },
+        ..
+    } = &emitted.typed
+    else {
+        return None;
+    };
+    Some((*thread_id, Uuid::parse_str(change_id).ok()?))
 }
 
 /// Summarize the changes the Changes panel lists that still lack a summary:

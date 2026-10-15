@@ -756,13 +756,8 @@ mod tests {
 
     #[test]
     fn a_persisted_bar_height_round_trips_through_a_real_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-traffic-lights-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(BAR_HEIGHT_FILE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(BAR_HEIGHT_FILE);
 
         // Absent is normal, and says nothing.
         assert_eq!(crate::config_scalar::read(&path), None);
@@ -772,8 +767,6 @@ mod tests {
         let read = crate::config_scalar::read(&path);
         assert_eq!(read.as_deref(), Some("72"));
         assert_eq!(bar_height_or_default(read.as_deref()), 72.0);
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Held by every test that writes the two placement globals. Cargo runs

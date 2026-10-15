@@ -87,6 +87,9 @@ pub(crate) fn title_rank(title: &str, query: &str) -> TitleRank {
     TitleRank { level, coverage }
 }
 
+#[path = "title_match_codegen.rs"]
+pub(crate) mod codegen;
+
 #[cfg(test)]
 #[path = "title_match_tests.rs"]
 mod tests;

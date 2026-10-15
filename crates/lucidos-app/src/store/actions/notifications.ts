@@ -1,6 +1,11 @@
+import { batch } from '@preact/signals';
 import {
   notifications,
   unreadNotifications,
+  servedNotifications,
+  servedUnreadNotifications,
+  pendingNotificationReads,
+  servedNotificationEpochs,
   showToast,
   removeToast,
   connectionStatus,
@@ -15,6 +20,7 @@ import {
   type NotificationsFilter,
 } from '../store';
 import { toFailed, setLoadingIfFresh, type Notification } from '../types';
+import { readIsPending, type PendingRead } from '../notificationReads';
 import { savePreference } from './preferences';
 import { syncWorkspaceAppBadge } from './app-badge';
 import { revealContentPane } from './pane';
@@ -44,64 +50,100 @@ const MAX_PAGE_RETRIES = 3;
  *  realistic unread count. */
 const UNREAD_LOAD_LIMIT = 100;
 
-/** Monotonic guard over `unreadNotifications` — the single source of truth the
- *  bell badge projects (the `unreadCount` computed is just its length). An async
- *  load applies its result only if no newer operation has claimed since it
- *  started, and every local optimistic mutation (`markReadOptimistic` /
- *  `navigateToNotification` / `markAllRead`) invalidates any in-flight load
- *  before it writes. This is the guard the old per-`unreadCount`-number version
- *  had, except it now protects the notifications THEMSELVES rather than a
- *  separately-fetched count — so the badge can never disagree with the unread
- *  set, and an out-of-order load can't resurrect a stale one. It still covers
- *  the in-app auto-read sequence (notifications.md §4 Row 1): looking at a
- *  source event fires NotificationCreated then NotificationRead back-to-back;
- *  the optimistic mark-read invalidates the created-reload, so the later state
- *  wins regardless of response order. */
-let unreadSeq = 0;
-function claimUnreadSeq(): number {
-  return ++unreadSeq;
-}
-function isCurrentUnread(seq: number): boolean {
-  return seq === unreadSeq;
-}
-/** Invalidate any in-flight unread load ahead of a local optimistic mutation. */
-function invalidateUnreadLoad(): void {
-  unreadSeq++;
+/** Every load takes the next epoch when it starts. A read acknowledged at
+ *  epoch E is reflected by any load whose epoch is above E, and by no other. */
+let loadEpoch = 0;
+
+/** The newest load of each list. An older one landing later is discarded,
+ *  so an out-of-order response can never put back a list a newer load
+ *  replaced. */
+let latestUnreadLoad = 0;
+let latestBrowseLoad = 0;
+
+/** The epochs of the loads still out, per list. A read stays pending while
+ *  any of them started before its acknowledgement, since that load will
+ *  serve the row unread. */
+const loadsInFlight = { browse: new Set<number>(), unread: new Set<number>() };
+
+/** Forget the loads a test left hanging, so they owe no reads in the next. */
+export function _resetNotificationLoadsForTesting(): void {
+  loadsInFlight.browse.clear();
+  loadsInFlight.unread.clear();
 }
 
-/** Drop one notification from the unread set — the badge falls with it. No-op
- *  on the set's contents if it isn't loaded or the row isn't in it (idempotent).
- *  Returns whether the set was loaded, so the caller knows the local drop was
- *  authoritative (loaded → the badge already reflects reality) vs. deferred (not
- *  loaded → the caller must reconcile against the server; see markReadOptimistic).
- *
- *  Invalidates any in-flight load FIRST — before BOTH the loaded-check and the
- *  membership check. Two paths need this:
- *   - §4 Row 1 auto-read: the created-reload is in flight when the row is marked
- *     read, so the row isn't in the (loaded) set yet.
- *   - Cold-start push deep-link: the startup `loadUnreadNotifications` is still in
- *     flight and the set is 'not-loaded' when the deep-linked row is marked read.
- *  In either case a load that lands a beat later would re-add the just-read
- *  notification and strand the badge at a phantom count — and if the healing
- *  NotificationRead SSE is dropped (flaky iOS-PWA link) the phantom sticks. The
- *  earlier version invalidated AFTER the 'not-loaded' early return, so the
- *  cold-start case slipped through — that is the reported badge=1 / empty-list
- *  divergence. Superseding here (the seq bump) makes the stale load a no-op —
- *  but on the not-loaded path it leaves NO load standing, so markReadOptimistic
- *  issues a replacement once the read settles (an idempotent read emits no SSE
- *  to reload from). */
-function removeFromUnread(id: string): boolean {
-  invalidateUnreadLoad();
-  const set = unreadNotifications.value;
-  if (set.status === 'loaded' && set.data.some((n) => n.id === id)) {
-    unreadNotifications.value = { status: 'loaded', data: set.data.filter((n) => n.id !== id) };
-  }
+function beginLoad(list: keyof typeof loadsInFlight): number {
+  const epoch = ++loadEpoch;
+  loadsInFlight[list].add(epoch);
+  return epoch;
+}
+
+/** Names each request that holds reads, so it settles only its own. */
+let lastReadOwner = 0;
+
+function updatePendingReads(update: (reads: Map<string, PendingRead>) => void): void {
+  const next = new Map(pendingNotificationReads.value);
+  update(next);
+  pendingNotificationReads.value = next;
+}
+
+/** Hide these rows as read until the server acknowledges it (ADR 0437). The
+ *  unread set and the badge fall at once, with no load cancelled: whatever a
+ *  load in flight brings back is masked the same way. Returns the owner that
+ *  settles the hold. */
+function holdReads(ids: readonly string[]): number {
+  const owner = ++lastReadOwner;
+  updatePendingReads((reads) => { for (const id of ids) reads.set(id, { owner, ackedAt: null }); });
   // Re-assert the app-icon badge even when nothing moved locally. A tap on a
   // push whose row this device never held (frozen page, dropped SSE) drops
-  // nothing and leaves the count at 0 — but the icon still carries the count
-  // the push wrote, so only an unconditional write reconciles it with the bell.
+  // nothing, but the icon still carries the count the push wrote.
   syncWorkspaceAppBadge();
-  return set.status === 'loaded';
+  return owner;
+}
+
+/** The server committed `owner`'s reads: only loads started before now still
+ *  owe them a mask. */
+function acknowledgeReads(ids: readonly string[], owner: number): void {
+  const ackedAt = loadEpoch;
+  updatePendingReads((reads) => {
+    for (const id of ids) if (reads.get(id)?.owner === owner) reads.set(id, { owner, ackedAt });
+  });
+}
+
+/** The server refused `owner`'s reads, so the served rows show again, unless
+ *  a later request on the same row holds it now. */
+function abandonReads(ids: readonly string[], owner: number): void {
+  updatePendingReads((reads) => {
+    for (const id of ids) if (reads.get(id)?.owner === owner) reads.delete(id);
+  });
+  syncWorkspaceAppBadge();
+}
+
+/** Forget each acknowledged read that every loaded list already reflects.
+ *  Every load runs it as it ends, since a load that lost the race or failed
+ *  also stops owing its reads. */
+function pruneReads(): void {
+  const epochs = servedNotificationEpochs.value;
+  const owes = (
+    inFlight: ReadonlySet<number>,
+    list: typeof servedNotifications.value,
+    epoch: number,
+    ack: number,
+  ) => [...inFlight].some((started) => started <= ack)
+    || (list.status === 'loaded' && readIsPending(ack, epoch));
+  const settled = [...pendingNotificationReads.value].filter(([, { ackedAt }]) =>
+    ackedAt !== null
+    && !owes(loadsInFlight.browse, servedNotifications.value, epochs.browse, ackedAt)
+    && !owes(loadsInFlight.unread, servedUnreadNotifications.value, epochs.unread, ackedAt));
+  if (settled.length > 0) updatePendingReads((reads) => { for (const [id] of settled) reads.delete(id); });
+}
+
+/** Record what a load served, with the epoch it started at. */
+function serveBrowse(list: typeof servedNotifications.value, epoch: number): void {
+  batch(() => {
+    servedNotifications.value = list;
+    servedNotificationEpochs.value = { ...servedNotificationEpochs.value, browse: epoch };
+    pruneReads();
+  });
 }
 
 /** True when the inbox browse list is loaded AND already holds this row — i.e.
@@ -154,33 +196,25 @@ function openNotificationDetail(notification: Notification): void {
   pushNavState();
 }
 
-/** Flip a single row to read in the inbox browse list (display only — the badge
- *  is driven by the unread set, not this list). No-op if absent / already read. */
-function markBrowseRowRead(id: string): void {
-  const browse = notifications.value;
-  if (browse.status !== 'loaded') return;
-  const row = browse.data.find((n) => n.id === id);
-  if (!row || row.read) return;
-  notifications.value = {
-    status: 'loaded',
-    data: browse.data.map((n) => (n.id === id ? { ...n, read: true } : n)),
-  };
-}
-
 /** Load the first page of notifications using the current filter. This populates
  *  the inbox browse list only; the bell badge derives from the unread set
  *  (`loadUnreadNotifications`), so opening the inbox never reaches for a count. */
 export async function loadNotifications(): Promise<void> {
-  setLoadingIfFresh(notifications);
+  const epoch = beginLoad('browse');
+  latestBrowseLoad = epoch;
+  setLoadingIfFresh(servedNotifications);
   try {
     const data = await getNotifications({
       limit: PAGE_SIZE,
       filter: notificationsFilter.value,
-    });
-    notifications.value = { status: 'loaded', data: data.notifications || [] };
+    }).finally(() => loadsInFlight.browse.delete(epoch));
+    if (epoch !== latestBrowseLoad) return;
+    serveBrowse({ status: 'loaded', data: data.notifications || [] }, epoch);
     notificationsHasMore.value = data.has_more;
   } catch (error) {
-    notifications.value = toFailed(error);
+    if (epoch === latestBrowseLoad) servedNotifications.value = toFailed(error);
+  } finally {
+    pruneReads();
   }
 }
 
@@ -202,17 +236,18 @@ export async function loadMoreNotifications(): Promise<void> {
     // scroll: the sentinel's observer is rebuilt only when `hasMore` changes,
     // and it never left the viewport, so nothing re-asks.
     for (let attempt = 0; attempt < MAX_PAGE_RETRIES; attempt++) {
-      const base = notifications.value;
+      const base = servedNotifications.value;
       if (base.status !== 'loaded' || base.data.length === 0) return;
       const tail = base.data[base.data.length - 1];
 
+      const epoch = beginLoad('browse');
       const data = await getNotifications({
         limit: PAGE_SIZE,
         before: new Date(tail.created_at).getTime() / 1000,
         filter: notificationsFilter.value,
-      });
+      }).finally(() => loadsInFlight.browse.delete(epoch));
 
-      const after = notifications.value;
+      const after = servedNotifications.value;
       if (after.status !== 'loaded') return;
       // Moved under us: this page answers a cursor that no longer ends the
       // list, so throw it away and ask again from the new tail.
@@ -221,7 +256,11 @@ export async function loadMoreNotifications(): Promise<void> {
       // Dedupe anyway: a reload can have carried some of these rows already.
       const seen = new Set(after.data.map(n => n.id));
       const fresh = (data.notifications || []).filter(n => !seen.has(n.id));
-      notifications.value = { status: 'loaded', data: [...after.data, ...fresh] };
+      // The page is only as fresh as the older of the two loads it joins.
+      serveBrowse(
+        { status: 'loaded', data: [...after.data, ...fresh] },
+        Math.min(epoch, servedNotificationEpochs.value.browse),
+      );
       notificationsHasMore.value = data.has_more;
       return;
     }
@@ -229,6 +268,7 @@ export async function loadMoreNotifications(): Promise<void> {
     showToast(`Failed to load more notifications: ${errorDetail(error)}`, 'error');
   } finally {
     notificationsLoadingMore.value = false;
+    pruneReads();
   }
 }
 
@@ -281,11 +321,17 @@ const unreadLoadFailures = createFailureCounter(UNREAD_LOAD_TOAST_THRESHOLD, () 
  *  REACHABLE (see the catch below for why an outage is the dot's to report, not
  *  this one's). A landed load retracts the toast. */
 export async function loadUnreadNotifications(): Promise<void> {
-  const seq = claimUnreadSeq();
+  const epoch = beginLoad('unread');
+  latestUnreadLoad = epoch;
   try {
-    const data = await getNotifications({ limit: UNREAD_LOAD_LIMIT, filter: 'unread' });
-    if (isCurrentUnread(seq)) {
-      unreadNotifications.value = { status: 'loaded', data: data.notifications || [] };
+    const data = await getNotifications({ limit: UNREAD_LOAD_LIMIT, filter: 'unread' })
+      .finally(() => loadsInFlight.unread.delete(epoch));
+    if (epoch === latestUnreadLoad) {
+      batch(() => {
+        servedUnreadNotifications.value = { status: 'loaded', data: data.notifications || [] };
+        servedNotificationEpochs.value = { ...servedNotificationEpochs.value, unread: epoch };
+        pruneReads();
+      });
       // Server truth just landed — re-assert the app-icon badge from it, even
       // when the count is unchanged. This is the resume path: a notification
       // read on another device leaves 0 → 0 here, which notifies no subscriber,
@@ -322,6 +368,8 @@ export async function loadUnreadNotifications(): Promise<void> {
     // the moment the dot is green.
     if (connectionStatus.value !== 'connected') return;
     unreadLoadFailures.recordFailure();
+  } finally {
+    pruneReads();
   }
 }
 
@@ -334,7 +382,7 @@ export async function loadUnreadNotifications(): Promise<void> {
  *  reload while a detail is open would drop the currently-viewed row and break
  *  prev/next navigation. */
 export function handleNotificationSSE(): void {
-  void loadUnreadNotifications();
+  reloadNotificationLists();
   // Under the Tauri desktop app, wake the native unread-indicator loop so the
   // menu-bar tray title (and the dock badge, when a window is open) reflects this
   // change instantly. This handler runs on Created/Read/AllRead, all broadcast
@@ -342,6 +390,12 @@ export function handleNotificationSSE(): void {
   // drop), and it covers reads from another device (their SSE arrives here too).
   // No-op off Tauri; the recompute reads the fresh aggregate.
   if (isTauri()) nudgeDockBadge();
+}
+
+/** Reload the unread set, and the "All" browse list when it is the visible
+ *  tab with no detail open (see `handleNotificationSSE` for why). */
+function reloadNotificationLists(): void {
+  void loadUnreadNotifications();
   if (
     activeMenuItem.value === 'notifications' &&
     !viewingNotification.value &&
@@ -361,29 +415,20 @@ export function resetViewDedup(): void {
   _lastViewedId = null;
 }
 
-/** Mark a notification read on tap: optimistic local cache update + best-effort
- *  API call. Idempotent — safe to call on already-read rows. Dropping the row
- *  from the unread set makes the badge fall immediately; the server's
- *  NotificationRead broadcast triggers a confirming reload.
- *
- *  Cold-start reconcile: when the unread set hadn't loaded yet, `removeFromUnread`
- *  couldn't drop the row locally AND superseded the in-flight startup load — so
- *  there is no load left to establish the true set. An already-read (idempotent)
- *  read emits no NotificationRead SSE either, so nothing else would reconcile it,
- *  leaving the badge wrong (missing genuinely-unread rows) and the Unread tab
- *  stuck loading. Issue a replacement load once the read has settled server-side
- *  (after the POST, so it can't re-read the pre-read set). When the set WAS
- *  loaded the local drop + the NotificationRead SSE already cover it — no extra
- *  fetch. A failed POST skips the reconcile (engine unreachable); reconnect
- *  (connection.ts) reloads the unread set then. */
+/** Mark a notification read on tap. The row leaves the unread set and the
+ *  badge at once. It stays out until a load started after the server's
+ *  acknowledgement replaces it (ADR 0437). Idempotent, so safe on read rows.
+ *  A refused POST shows the row again and says so. */
 export function markReadOptimistic(id: string): void {
-  markBrowseRowRead(id);
-  const setWasLoaded = removeFromUnread(id);
+  const owner = holdReads([id]);
   markNotificationRead(id)
-    .then(() => {
-      if (!setWasLoaded) void loadUnreadNotifications();
-    })
-    .catch(() => { /* row stays unread; user sees it next visit */ });
+    .then(() => acknowledgeReads([id], owner))
+    .catch((error) => {
+      abandonReads([id], owner);
+      showToast(`Could not mark notification ${id} read: ${errorDetail(error)}`, 'error', {
+        key: `notification-read-failed-${id}`,
+      });
+    });
 }
 
 export async function viewNotification(id: string): Promise<void> {
@@ -436,7 +481,7 @@ export async function viewNotification(id: string): Promise<void> {
     // doesn't already hold this row. Load BEFORE marking read: the just-pushed
     // row is still unread server-side, so it's returned under either filter
     // ('all' or 'unread'); the subsequent mark-read only flips the loaded row
-    // in place (markBrowseRowRead never removes it), so currentIndex stays
+    // in place (a pending read never removes it), so currentIndex stays
     // valid and the chevrons can walk the inbox. In-app opens from the panel
     // already have the list loaded with this row, so they skip the fetch.
     if (!browseListHas(id)) await loadNotifications();
@@ -536,7 +581,7 @@ export function stepViewedNotification(direction: -1 | 1): boolean {
  *  view-dedup guard so the same notification can be reopened immediately, and
  *  refreshes the "All" browse list when it's the active panel so a now-read row
  *  shows its read state. The "Unread" tab renders `unreadNotifications`, from
- *  which the read row was already dropped optimistically (removeFromUnread), so
+ *  which the read row was already dropped optimistically (a pending read), so
  *  it needs no reload. */
 export function onNotificationDetailClosed(): void {
   resetViewDedup();
@@ -549,33 +594,21 @@ export function onNotificationDetailClosed(): void {
  *  the POST can take tens of seconds, and applying after it made the tap look
  *  dead for that whole wait.
  *
- *  A failure puts back what this call cleared, unless something newer has
- *  written the set since. Then the snapshot is stale, so it reloads instead. */
+ *  Each cleared row is a pending read, so a load served before the commit
+ *  cannot bring it back. Once acknowledged, the lists reload: the server also
+ *  marked rows that arrived after the tap, or that a load in flight serves. A failure shows the served rows
+ *  again and says so. */
 export async function markAllRead(): Promise<void> {
-  const browseBefore = notifications.value;
-  const unreadBefore = unreadNotifications.value;
-
-  const browseAfter: typeof browseBefore = browseBefore.status === 'loaded'
-    ? { status: 'loaded', data: browseBefore.data.map((n) => ({ ...n, read: true })) }
-    : browseBefore;
-  notifications.value = browseAfter;
-  // Invalidate any in-flight load first so a stale reload can't resurrect the count.
-  const seq = claimUnreadSeq();
-  unreadNotifications.value = { status: 'loaded', data: [] };
-  // Explicit re-assert: the set may already have been empty here (nothing to
-  // mark read on this device), which moves no count and notifies nobody.
-  syncWorkspaceAppBadge();
-
+  const unreadRows = (list: typeof notifications.value) =>
+    list.status === 'loaded' ? list.data.filter((n) => !n.read).map((n) => n.id) : [];
+  const ids = [...new Set([...unreadRows(unreadNotifications.value), ...unreadRows(notifications.value)])];
+  const owner = holdReads(ids);
   try {
     await markAllNotificationsRead();
+    acknowledgeReads(ids, owner);
+    reloadNotificationLists();
   } catch (error) {
-    if (notifications.value === browseAfter) notifications.value = browseBefore;
-    if (isCurrentUnread(seq)) {
-      unreadNotifications.value = unreadBefore;
-      syncWorkspaceAppBadge();
-    } else {
-      void loadUnreadNotifications();
-    }
+    abandonReads(ids, owner);
     showToast('Failed to mark all as read: ' + errorDetail(error), 'error');
   }
 }

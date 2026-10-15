@@ -10,7 +10,6 @@ use sqlx::PgPool;
 use super::push_test_log;
 
 use super::notification_plain_text::plain_text_body;
-use crate::api::presence_pong::PresencePong;
 use crate::api::SharedEngine;
 
 /// Spec §3: the engine waits this long for pongs before deciding push.
@@ -20,15 +19,10 @@ use crate::api::SharedEngine;
 /// that band fires an OS push on top of a toast the page already rendered.
 ///
 /// The wait only blocks fan-out when a candidate fails to pong. The short
-/// circuit in [`run_presence_check`] wakes once every expected device has
-/// answered, so a longer deadline costs latency only when a `device_presence`
-/// row is stale.
+/// circuit in [`run_presence_check`] wakes at the first pong that suppresses
+/// the push, or once every expected device has answered. So a longer deadline
+/// costs latency only when a `device_presence` row is stale.
 pub const DEADLINE_MS: u32 = 2000;
-
-/// Spec §2 Step A: push_allowed iff no pong reports active.
-pub fn decide_push_allowed(pongs: &[PresencePong]) -> bool {
-    !pongs.iter().any(|p| p.is_active)
-}
 
 /// Spec §2 Step A / §3: how many pongs to wait for, and (via `> 0`) whether to
 /// run the PresenceCheck at all. The max of the two signals, because each
@@ -36,7 +30,7 @@ pub fn decide_push_allowed(pongs: &[PresencePong]) -> bool {
 ///
 /// - Open SSE streams are the robust signal. iOS suspends the heartbeat on a
 ///   foregrounded PWA, so an active page's `device_presence` row goes stale
-///   while its EventSource stays open and would pong `is_active`.
+///   while its EventSource stays open and would pong `shown`.
 /// - Fresh heartbeat rows cover the inverse: a page that heartbeated recently
 ///   but whose SSE connection just dropped.
 ///
@@ -299,15 +293,14 @@ fn spawn_carrying_chain_depth(work: impl std::future::Future<Output = ()> + Send
 /// Fan out the OS surface for a notification per the §2 matrix in
 /// `system-knowhow/notifications.md`. The PresenceCheck pong protocol (§3) is
 /// the authoritative decision input:
-/// - `push_allowed = false`, so an active device pong'd in: emit
-///   `NotificationToastRequested` and active pages show the in-app toast.
+/// - `push_allowed = false`: a page already handled the notification in the
+///   app (toast, auto-read or toasts off) and said so. Nothing more to send.
 /// - `push_allowed = true`: emit `NativePushRequested` for a connected Tauri
 ///   desktop app, and fan the web push out to every browser subscription.
 ///
-/// The two emits sit on opposite branches of one decision, so a device can
-/// never get both a toast and a push. The decision runs whenever ANY client is
-/// reachable, so a desktop-only workspace with no web-push subscription still
-/// gets toasts and native banners.
+/// The decision runs whenever ANY client is reachable, so a desktop-only
+/// workspace with no web-push subscription still gets toasts and native
+/// banners.
 ///
 /// Non-fatal throughout: one bad subscription must not sink the fan-out.
 #[allow(clippy::too_many_arguments)]
@@ -372,8 +365,15 @@ async fn fan_out_os_surface(
         run_presence_check(
             &engine.event_bus,
             &engine.presence_tracker,
-            nid,
-            link_event_id,
+            ToastContent {
+                notification_id: nid,
+                title,
+                body,
+                thread_id: link_thread_id,
+                event_id: link_event_id,
+                app_id,
+                tap: tap.clone(),
+            },
             expected_pongs,
         )
         .await
@@ -383,36 +383,14 @@ async fn fan_out_os_surface(
     };
 
     if !push_allowed {
-        // An active device pong'd in, so the OS push is suppressed (§2 Step A)
-        // and active pages render the in-app toast instead (§4). This is the
-        // only place the toast is triggered. `notification_id` is always Some
-        // here: `push_allowed` only goes false through the arm above, which
-        // requires it.
-        if let Some(nid) = notification_id {
-            emit_toast_requested(
-                &engine.event_bus,
-                nid,
-                title,
-                body,
-                link_thread_id,
-                link_event_id,
-                app_id,
-                tap,
-            )
-            .await;
-        }
-        log!(
-            "[Push] Suppressed OS push (PresenceCheck: an active device pinged in); \
-             requested in-app toast instead"
-        );
+        log!("[Push] Suppressed OS push (PresenceCheck: a page handled it in the app)");
         return;
     }
 
     // Native desktop surface (§1, §4). A connected Tauri app cannot receive
     // the web push below, because its WKWebView has no service-worker push.
-    // Browser clients ignore this frame; only a non-active Tauri client acts
-    // on it. It rides the branch opposite `emit_toast_requested`, so a device
-    // never gets both a native banner and an in-app toast.
+    // Browser clients ignore this frame. A Tauri page shows the banner, or
+    // the in-app toast if its window came forward since it answered.
     if let Some(nid) = notification_id {
         emit_native_push_requested(
             &engine.event_bus,
@@ -531,28 +509,44 @@ fn schedule_mac_chromium_wakes(
     }
 }
 
+/// What a page needs to put a notification on screen as an in-app toast.
+struct ToastContent<'a> {
+    notification_id: uuid::Uuid,
+    title: &'a str,
+    body: &'a str,
+    thread_id: Option<uuid::Uuid>,
+    event_id: Option<uuid::Uuid>,
+    app_id: Option<&'a str>,
+    tap: crate::scheduler::notifications::Tap,
+}
+
 /// Broadcast a PresenceCheck and wait up to `DEADLINE_MS` for every candidate
 /// device to pong. Returns the `push_allowed` decision per §2 Step A: true iff
-/// no pong reports `is_active`. Drains the tracker slot either way.
+/// no pong reports that the page handled the notification. The tracker closes
+/// the slot as it decides.
 ///
-/// The PresenceCheck carries no toast content. [`emit_toast_requested`] fires
-/// AFTER this decision resolves, so the toast and the OS push can never both
-/// happen (notifications.md §3-§4). `event_id` rides along only so the pong
-/// can report `event_in_viewport`.
+/// The check carries the toast. A page shows it, auto-reads, or holds it for
+/// the badge BEFORE it answers. So the push is suppressed only on a page's
+/// word that the reader already has the notification (notifications.md §3-§4).
 async fn run_presence_check(
     event_bus: &crate::engine::event_bus::EventBus,
     presence_tracker: &crate::api::presence_pong::PresenceTracker,
-    notification_id: uuid::Uuid,
-    event_id: Option<uuid::Uuid>,
+    toast: ToastContent<'_>,
     expected_pongs: usize,
 ) -> bool {
+    let notification_id = toast.notification_id;
     let sent_at_ms = crate::engine::now_epoch_millis();
     let notify = presence_tracker.expect(notification_id, expected_pongs);
     if let Err(e) = event_bus
         .emit(crate::engine::event_bus::BusEvent::System(
             crate::engine::event_bus::SystemEvent::PresenceCheck {
                 notification_id,
-                event_id,
+                title: toast.title.to_string(),
+                body: toast.body.to_string(),
+                thread_id: toast.thread_id,
+                event_id: toast.event_id,
+                app_id: toast.app_id.map(str::to_string),
+                tap: toast.tap,
                 deadline_ms: DEADLINE_MS,
                 sent_at_ms,
                 actor: None,
@@ -560,11 +554,10 @@ async fn run_presence_check(
         ))
         .await
     {
-        // No page knows to pong, so no informed decision is possible. Drain
-        // the slot and send the push, the safer side.
+        // No page knows to pong, so no informed decision is possible. With no
+        // pongs the decision sends the push, the safer side.
         log!("[Push] Failed to broadcast PresenceCheck: {}", e);
-        let _ = presence_tracker.collect(notification_id);
-        return true;
+        return presence_tracker.decide(notification_id);
     }
 
     let _ = tokio::time::timeout(
@@ -573,49 +566,7 @@ async fn run_presence_check(
     )
     .await;
 
-    let pongs = presence_tracker.collect(notification_id);
-    decide_push_allowed(&pongs)
-}
-
-/// Broadcast a [`SystemEvent::NotificationToastRequested`] so active pages
-/// render the in-app toast for a notification whose OS push was suppressed.
-///
-/// Broadcast SSE: hidden pages ignore it via the §4 row matrix. Non-fatal, and
-/// the worst case is the bell badge bumping without the toast. See
-/// `system-knowhow/notifications.md` §4.
-#[allow(clippy::too_many_arguments)]
-async fn emit_toast_requested(
-    event_bus: &crate::engine::event_bus::EventBus,
-    notification_id: uuid::Uuid,
-    title: &str,
-    body: &str,
-    thread_id: Option<uuid::Uuid>,
-    event_id: Option<uuid::Uuid>,
-    app_id: Option<&str>,
-    tap: crate::scheduler::notifications::Tap,
-) {
-    let sent_at_ms = crate::engine::now_epoch_millis();
-    if let Err(e) = event_bus
-        .emit(crate::engine::event_bus::BusEvent::System(
-            crate::engine::event_bus::SystemEvent::NotificationToastRequested {
-                notification_id,
-                title: title.to_string(),
-                body: body.to_string(),
-                thread_id,
-                event_id,
-                app_id: app_id.map(|s| s.to_string()),
-                tap,
-                sent_at_ms,
-            },
-        ))
-        .await
-    {
-        log!(
-            "[Push] Failed to broadcast NotificationToastRequested for {}: {}",
-            notification_id,
-            e
-        );
-    }
+    presence_tracker.decide(notification_id)
 }
 
 /// Broadcast a [`SystemEvent::NativePushRequested`] so a connected Tauri
@@ -623,8 +574,8 @@ async fn emit_toast_requested(
 ///
 /// The desktop counterpart of the web-push fan-out. A Tauri app's WKWebView
 /// cannot subscribe to Web Push, so the engine reaches it over the already-open
-/// SSE stream. Browser pages ignore the frame, and a Tauri page shows the
-/// banner only when it is not active (§4 row matrix).
+/// SSE stream. Browser pages ignore the frame. A Tauri page shows the banner
+/// when it is not active, and the in-app toast when it is (§4 row matrix).
 ///
 /// Non-fatal, and the worst case is the desktop user seeing only the bell
 /// badge. See `system-knowhow/notifications.md` §1, §4.

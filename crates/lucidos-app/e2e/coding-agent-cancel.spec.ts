@@ -177,8 +177,8 @@ test.describe('Claude Code cancel and stop', () => {
     // CC thread stops the agent, and the `CodingAgentIdled` that stop emits
     // resolves to `to_inbox` for a coding-agent thread (thread_lifecycle.rs), so
     // the column races back to 'inbox' whenever that event lands after
-    // `ThreadArchived`. The frontend already guards the same race via
-    // `archivingThreadIds`.
+    // `ThreadArchived`. The frontend already guards the same race with its row
+    // intent (`store/rowIntents.ts`).
     await expect.poll(
       () => psql(
         `SELECT COUNT(*) FROM events WHERE aggregate_id = '${threadId}' ` +

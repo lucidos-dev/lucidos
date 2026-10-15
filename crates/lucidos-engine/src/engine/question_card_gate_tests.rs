@@ -1016,7 +1016,7 @@ async fn the_query_reads_what_each_agent_writes() {
         "the refusal names the message"
     );
     assert!(
-        refuse_coding_agent_card(&pool, c, "toolu_chat", &json!([]))
+        refuse_coding_agent_card(&pool, c, "toolu_chat", &json!([]), std::future::ready(()))
             .await
             .is_some(),
         "both looks agree"
@@ -1696,4 +1696,119 @@ async fn the_query_reads_a_claude_code_progress_note() {
     );
 
     teardown_test_db(&db).await;
+}
+
+/// Invariant I11: a coding agent's second look runs only once the session loop
+/// has persisted the text written before the card. The hook arrives first, the
+/// first look refuses, and the gate waits for the loop's signal rather than a
+/// clock. The text lands, the signal fires, and the card passes.
+#[tokio::test]
+async fn the_second_look_waits_for_the_loop_to_persist_the_text() {
+    let (pool, db) = setup_test_db().await;
+    let t = Uuid::new_v4();
+    insert(
+        &pool,
+        t,
+        "MessageReceived",
+        json!({ "text": "why did the build fail?", "mode": "human" }),
+    )
+    .await;
+    cc_tool(&pool, t, "Bash").await;
+
+    let (parked_tx, parked) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let gate = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            refuse_coding_agent_card(&pool, t, "toolu_card", &json!([]), async move {
+                let _ = parked_tx.send(());
+                let _ = released.await;
+            })
+            .await
+        }
+    });
+
+    parked
+        .await
+        .expect("the first look refused, and the gate waits for the loop's signal");
+    assert!(!gate.is_finished(), "no second look before the signal");
+
+    cc_text(&pool, t, "The linker ran out of memory.").await;
+    release.send(()).expect("the gate still waits");
+    assert_eq!(
+        gate.await.expect("gate task"),
+        None,
+        "the second look reads the text the user read"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// A hook carries the agent's own tool use id, so it waits for that one. An
+/// MCP ask carries an id the stream never sees, so the session's n-th ask
+/// waits for its n-th MCP question tool use. Every ask takes its ordinal,
+/// waiting or not, so an earlier card never answers a later one.
+#[tokio::test]
+async fn a_card_waits_for_its_own_question_tool_use() {
+    use crate::runtime::{
+        CC_NATIVE_ASK_USER_QUESTION_TOOL as NATIVE, CODEX_ASK_USER_QUESTION_TOOL as MCP,
+    };
+    let flushes = std::sync::Arc::new(QuestionFlushes::default());
+    let wait = |ask: CardAsk| {
+        let flushes = flushes.clone();
+        tokio::spawn(async move { flushes.wait_for(ask).await })
+    };
+    let question = |q: &str| json!({ "question": q });
+
+    let hook = wait(flushes.ask("toolu_b"));
+    flushes.flushed(
+        "toolu_a",
+        NATIVE,
+        &json!({ "questions": [{ "question": "A?" }] }),
+    );
+    tokio::task::yield_now().await;
+    assert!(
+        !hook.is_finished(),
+        "another tool use's flush does not answer it"
+    );
+    flushes.flushed(
+        "toolu_b",
+        NATIVE,
+        &json!({ "questions": [{ "question": "B?" }] }),
+    );
+    hook.await.expect("hook gate");
+
+    // The first MCP card passed its first look and never waited.
+    assert_eq!(flushes.ask("codex-q-1"), CardAsk::McpAsk(1));
+    flushes.flushed("item_1", MCP, &question("Ship it?"));
+    // The second arrives before the loop flushed its tool use.
+    let second = wait(flushes.ask("codex-q-2"));
+    tokio::task::yield_now().await;
+    assert!(
+        !second.is_finished(),
+        "the first card's flush does not answer the second"
+    );
+    flushes.flushed("item_2", MCP, &question(""));
+    tokio::task::yield_now().await;
+    assert!(
+        !second.is_finished(),
+        "a call the tool refuses unsent takes no ordinal"
+    );
+    flushes.flushed("item_3", MCP, &question("Ship it now?"));
+    second.await.expect("its own flush releases it");
+
+    let last = wait(flushes.ask("codex-q-3"));
+    flushes.loop_ended();
+    last.await.expect("an ended loop releases every waiter");
+}
+
+/// The MCP ask tool mints the ids [`QuestionFlushes::ask`] counts as MCP
+/// asks. This pins the wire contract between the CLI and the engine.
+#[test]
+fn the_mcp_ask_tool_mints_the_prefix_the_gate_counts() {
+    let cli = include_str!("../../../lucidos-cli/src/mcp_permission_server.rs");
+    assert!(
+        cli.contains(&format!("format!(\"{MCP_ASK_ID_PREFIX}{{}}\"")),
+        "the CLI's question id must start with {MCP_ASK_ID_PREFIX:?}"
+    );
 }

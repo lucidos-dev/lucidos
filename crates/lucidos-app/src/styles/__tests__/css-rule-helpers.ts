@@ -1,7 +1,7 @@
 /**
  * Shared reader for the CSS source scans. Several suites pin a geometry
  * contract by asserting on the declarations a rule actually carries (the
- * below-header anchor, the per-pane toast columns, the transcript fades), and
+ * below-header anchor, the toast corner, the transcript fades), and
  * each had grown its own byte-identical copy of the two string functions.
  *
  * Two readers here, and picking the wrong one is the trap this header exists
@@ -33,8 +33,9 @@ import { fileURLToPath } from 'node:url';
 /** Repo root, from `crates/lucidos-app/src/styles/__tests__/`. */
 export const REPO_ROOT: string = resolve(dirname(fileURLToPath(import.meta.url)), '../../../../..');
 
-/** Stylesheets the engine embeds and serves to app frames, relative to the
- *  repo root. Add a new one here in the same change that adds the
+/** Stylesheets the engine serves to app frames, relative to the repo root.
+ *  The generated frame sheet holds the same rules the engine renders at
+ *  runtime. Add a new one here in the same change that adds the
  *  `include_str!`. */
 export const ENGINE_SERVED_CSS = [
   'crates/lucidos-engine/src/api/sdk_iframe.css',

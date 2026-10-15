@@ -1,6 +1,6 @@
 # 0315: After a hardened branch gains commits, /harden reviews only what no hardening has reviewed
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [0465](0465-integrated-sub-threads.md)
 - **Date**: 2026-09-28
 - **Amends**: [0295: After a merge, /harden reviews only the resolution and the overlap](0295-merge-only-hardening.md)
 

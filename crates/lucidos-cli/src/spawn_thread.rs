@@ -10,6 +10,9 @@
 //! `mode` defaults to "agent" since this CLI is invoked from coding-agent subprocesses;
 //! override with --mode for engine-mode helpers.
 //!
+//! `--integrated` (with `--relation child`) spawns an *integrated sub-thread*:
+//! a Lucidos-source coding-agent child that folds into the caller's branch.
+//!
 //! `--relation child` emits `parent_thread_id` + `spawning_event_id` instead
 //! of `caller_*` fields, for same-workspace parent-with-callback spawns. The
 //! target workspace basename must match `$LUCIDOS_WORKSPACE` basename in
@@ -39,7 +42,7 @@
 use std::path::PathBuf;
 
 use crate::workspace::{read_ports, BoxError};
-use crate::{CliRelation, SpawnThreadArgs};
+use crate::{CliMode, CliRelation, SpawnThreadArgs};
 
 /// Reasoning levels `--reasoning-effort` accepts, ascending.
 ///
@@ -116,6 +119,15 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         );
     }
 
+    if args.integrated {
+        check_integrated_spawn(
+            args.relation,
+            use_coding_agent,
+            args.folder.is_some(),
+            args.mode,
+        )?;
+    }
+
     if let Some(effort) = args.reasoning_effort.as_deref() {
         check_effort_fits_model(
             selected_coding_agent,
@@ -149,6 +161,10 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     // Resolve relation: explicit `--relation` wins; otherwise default to `top`
     // so existing cross-workspace recipes keep their fire-and-forget behavior.
     let relation = args.relation.unwrap_or(CliRelation::Top);
+
+    if args.wake_mode.is_some() && !matches!(relation, CliRelation::Child) {
+        return Err("--wake-mode needs --relation child: a top thread never reports back".into());
+    }
 
     if matches!(relation, CliRelation::Child) {
         let caller_basename = caller_workspace.as_deref().unwrap_or("");
@@ -227,6 +243,9 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     if let Some(ref f) = args.folder {
         obj.insert("folder".into(), f.clone().into());
     }
+    if args.integrated {
+        obj.insert("integrated".into(), true.into());
+    }
 
     match relation {
         CliRelation::Child => {
@@ -235,6 +254,10 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
             }
             if let Some(e) = caller_event_id {
                 obj.insert("spawning_event_id".into(), e.into());
+            }
+            // Sent as written: the engine validates it and lists the modes.
+            if let Some(ref mode) = args.wake_mode {
+                obj.insert("wake_mode".into(), mode.clone().into());
             }
         }
         CliRelation::Top => {
@@ -289,6 +312,46 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     // its response so the user can click through to the spawned thread.
     let label = link_label(args.title.as_deref(), &args.message);
     println!("[{}](thread:{}/{})", label, target_basename, thread_id);
+    Ok(())
+}
+
+/// Refuse an `--integrated` spawn the CLI can already tell is unfit. The
+/// engine judges the rest: that the child is Lucidos source and that the
+/// caller is a Lucidos-source coding-agent thread.
+fn check_integrated_spawn(
+    relation: Option<CliRelation>,
+    coding_agent: bool,
+    folder: bool,
+    mode: CliMode,
+) -> Result<(), BoxError> {
+    if !matches!(relation, Some(CliRelation::Child)) {
+        return Err(
+            "--integrated needs --relation child: the child folds into your own branch, \
+                    so it must be your child thread."
+                .into(),
+        );
+    }
+    if !coding_agent {
+        return Err(
+            "--integrated needs --coding-agent, --codex or --cc: only a coding-agent \
+                    child has a branch to merge."
+                .into(),
+        );
+    }
+    if folder {
+        return Err(
+            "--integrated needs a Lucidos-source child, and --folder targets an app. \
+                    Drop --folder."
+                .into(),
+        );
+    }
+    if matches!(mode, CliMode::Human) {
+        return Err(
+            "--integrated does not work with --mode human: a human-mode spawn starts \
+                    at once and would start independent. Drop --mode human."
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -447,10 +510,13 @@ fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_effort_fits_model, effort_rows, inline_images, link_label, models_offering,
-        require_input, workspaces_root, CC_MENU, CODEX_MENU, EFFORT_LEVELS, NOTHING_TO_SEND,
+        check_effort_fits_model, check_integrated_spawn, effort_rows, inline_images, link_label,
+        models_offering, require_input, workspaces_root, CC_MENU, CODEX_MENU, EFFORT_LEVELS,
+        NOTHING_TO_SEND,
     };
     use crate::CliCodingAgent;
+    use crate::CliMode;
+    use crate::CliRelation;
     use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -466,6 +532,35 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// `--integrated` needs an explicit child relation, a coding-agent child
+    /// and a queued spawn, and never an app folder. Each refusal names the
+    /// flag to fix, in one clean sentence.
+    #[test]
+    fn an_integrated_spawn_needs_a_coding_agent_child_relation() {
+        let child = Some(CliRelation::Child);
+        assert!(check_integrated_spawn(child, true, false, CliMode::Agent).is_ok());
+        assert!(check_integrated_spawn(child, true, false, CliMode::Engine).is_ok());
+        for (relation, coding_agent, folder, mode, names) in [
+            (None, true, false, CliMode::Agent, "--relation child"),
+            (
+                Some(CliRelation::Top),
+                true,
+                false,
+                CliMode::Agent,
+                "--relation child",
+            ),
+            (child, false, false, CliMode::Agent, "--coding-agent"),
+            (child, true, true, CliMode::Agent, "--folder"),
+            (child, true, false, CliMode::Human, "--mode human"),
+        ] {
+            let refusal = check_integrated_spawn(relation, coding_agent, folder, mode)
+                .expect_err("refused")
+                .to_string();
+            assert!(refusal.contains(names), "{refusal}");
+            assert!(!refusal.contains("  "), "a run of spaces in: {refusal:?}");
+        }
     }
 
     /// The flag must accept exactly what both backends offer.

@@ -2,6 +2,7 @@
 
 - **Status** — Accepted
 - **Date** — 2026-06-26
+- **Amended by**: [0428: List rows carry no version or update state](0428-list-rows-carry-no-version-state.md), which drops the chip and Update affordance from the Apps panel row
 
 ## Context
 

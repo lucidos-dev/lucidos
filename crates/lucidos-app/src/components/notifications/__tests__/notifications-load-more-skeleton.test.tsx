@@ -11,7 +11,7 @@ vi.mock('../../../api/client', async (importOriginal) => ({
 }));
 
 import { NotificationsView } from '../NotificationsView';
-import { notifications, notificationsFilter, notificationsHasMore, notificationsLoadingMore } from '../../../store/store';
+import { notificationsFilter, notificationsHasMore, notificationsLoadingMore, servedNotifications } from '../../../store/store';
 import { SPINNER_DELAY_MS } from '../../../hooks/useDelayedLoading';
 
 let host: HTMLDivElement;
@@ -20,7 +20,7 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   vi.stubGlobal('IntersectionObserver', class { observe() {} disconnect() {} unobserve() {} });
   notificationsFilter.value = 'all';
-  notifications.value = {
+  servedNotifications.value = {
     status: 'loaded',
     data: [{ id: 'n1', title: 'Build finished', message: 'All green', read: true, created_at: new Date().toISOString() }],
   };
@@ -34,7 +34,7 @@ beforeEach(() => {
 afterEach(() => {
   render(null, host);
   host.remove();
-  notifications.value = { status: 'not-loaded' };
+  servedNotifications.value = { status: 'not-loaded' };
   notificationsHasMore.value = false;
   notificationsLoadingMore.value = false;
   vi.unstubAllGlobals();

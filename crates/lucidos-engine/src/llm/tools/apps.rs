@@ -19,7 +19,7 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                     },
                     "name": {
                         "type": "string",
-                        "description": "Display name."
+                        "description": "Display name in words: no emoji or other pictograph."
                     },
                     "description": {
                         "type": "string",
@@ -32,7 +32,12 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                     "kind": {
                         "type": "string",
                         "enum": ["app", "widget"],
-                        "description": "'widget': a small answer shown inline in this thread. Default 'app'."
+                        "description": "'widget': a small answer inline in this thread. Default 'app'."
+                    },
+                    "sizes": {
+                        "type": "array",
+                        "items": { "enum": crate::core::apps::WidgetSize::ALL.map(|s| s.as_str()) },
+                        "description": "Widget only: Home board sizes, default first."
                     },
                     "icon_svg": {
                         "type": "string",
@@ -111,6 +116,10 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                             "Also save a sharp screenshot file here, under data/artifacts/. Ends in {}.",
                             crate::engine::thread_events::CaptureFormat::extensions()
                         )
+                    },
+                    "device": {
+                        "type": "string",
+                        "description": super::misc::DEVICE_ARG_DESCRIPTION
                     }
                 },
                 "required": ["app_id"]

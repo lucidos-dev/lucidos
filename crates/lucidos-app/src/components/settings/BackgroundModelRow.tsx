@@ -14,6 +14,7 @@ import type { BackgroundRows } from './useBackgroundModels';
  *  models first. */
 export function BackgroundModelRow({
   label,
+  fieldLabel,
   anchor,
   nested,
   modelKey,
@@ -21,6 +22,7 @@ export function BackgroundModelRow({
   background,
 }: {
   label: string;
+  fieldLabel?: string;
   anchor?: string;
   nested?: boolean;
   modelKey: BackgroundModelKey;
@@ -36,6 +38,7 @@ export function BackgroundModelRow({
   return (
     <ModelSelectionRow
       label={label}
+      fieldLabel={fieldLabel}
       anchor={anchor}
       nested={nested}
       detail={caveat && <span class="error-text">{caveat}</span>}

@@ -41,7 +41,8 @@ async function recordToggle(
 ): Promise<ToggleFrame[]> {
     return page.evaluate(async ({ parentId, childIds, siblingId }) => {
         const wrap = (id: string) => document.querySelector<HTMLElement>(`[data-flip-id="${id}"]`);
-        const ghostSelector = '.drawer-section > .flip-disclosure-mask > *';
+        // A family's mask joins its rows, inside the section's windowed rows.
+        const ghostSelector = '.drawer-section-rows > .flip-disclosure-mask > *';
         document.querySelector<HTMLElement>(`.thread-row[data-thread-nav="${parentId}"] .family-disclosure`)!.click();
         const frames: ToggleFrame[] = [];
         const start = performance.now();

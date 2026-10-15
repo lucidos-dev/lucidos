@@ -9,17 +9,16 @@ vi.mock('../store', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../store')>()),
   showPrompt: vi.fn(async () => null),
   showToast: vi.fn(),
-  removeToast: vi.fn(),
 }));
 
 import { renameThread, suggestTitle } from '../../api/threads';
-import { removeToast, showPrompt, showToast, threadMap } from '../store';
+import { showPrompt, showToast, threadMap } from '../store';
 import { makeThreadState } from './threads-test-helpers';
-import { normalizeRename, promptRenameThread, suggestThreadName } from './threadRename';
+import { normalizeRename, promptRenameThread } from './threadRename';
 
 const ID = 't1';
 
-/** The options of the last toast raised, for reading its action. */
+/** The arguments of the last toast raised. */
 function lastToast() {
   const calls = vi.mocked(showToast).mock.calls;
   return calls[calls.length - 1];
@@ -93,58 +92,38 @@ describe('promptRenameThread', () => {
   });
 });
 
-describe('suggestThreadName', () => {
-  it('offers the suggestion without renaming', async () => {
-    await suggestThreadName(ID);
+/** The `suggest` option the rename dialog was opened with. */
+async function suggestOption() {
+  await promptRenameThread(ID);
+  return vi.mocked(showPrompt).mock.calls[0][1]?.suggest;
+}
+
+describe('the rename dialog\'s Suggest link', () => {
+  it('returns the suggestion for the field, without renaming', async () => {
+    const suggest = await suggestOption();
+    expect(await suggest!()).toBe('A suggested name');
     expect(renameThread).not.toHaveBeenCalled();
-    const [message, , opts] = lastToast();
-    expect(message).toContain('A suggested name');
-    expect(opts?.action?.label).toBe('Use it');
+    expect(showToast).not.toHaveBeenCalled();
   });
 
-  it('renames to exactly the suggestion when the user takes it, and clears the offer', async () => {
-    await suggestThreadName(ID);
-    lastToast()[2]!.action!.onClick();
-    await vi.waitFor(() => expect(renameThread).toHaveBeenCalledWith(ID, 'A suggested name'));
-    expect(removeToast).toHaveBeenCalledWith(lastToast()[2]!.key);
-  });
-
-  it('shows a spinning toast while it waits, updated in place by the result', async () => {
-    await suggestThreadName(ID);
-    const calls = vi.mocked(showToast).mock.calls;
-    expect(calls[0][2]?.spinning).toBe(true);
-    expect(calls[0][2]?.key).toBeTruthy();
-    expect(lastToast()[2]?.key).toBe(calls[0][2]?.key);
-  });
-
-  it('says so when the suggestion is the current title, with nothing to take', async () => {
+  it('fills nothing and says so when the suggestion is the current title', async () => {
     vi.mocked(suggestTitle).mockResolvedValueOnce('Old title');
-    await suggestThreadName(ID);
-    expect(lastToast()[2]?.action).toBeUndefined();
-    // A keyed toast waits to be answered unless it names a delay.
-    expect(lastToast()[2]?.autoDismissMs).toBeGreaterThan(0);
-    expect(renameThread).not.toHaveBeenCalled();
+    const suggest = await suggestOption();
+    expect(await suggest!()).toBe(null);
+    expect(lastToast()[2]?.title).toBe('No better name');
   });
 
-  it('does nothing for a draft', async () => {
-    threadMap.value = new Map([[ID, makeThreadState(ID, { meta: { state: 'composing' } })]]);
-    await suggestThreadName(ID);
-    expect(suggestTitle).not.toHaveBeenCalled();
-    expect(showToast).not.toHaveBeenCalled();
-  });
-
-  it('does nothing for the home thread, which only the user names', async () => {
-    threadMap.value = new Map([[ID, makeThreadState(ID, { meta: { home: true } })]]);
-    await suggestThreadName(ID);
-    expect(suggestTitle).not.toHaveBeenCalled();
-    expect(showToast).not.toHaveBeenCalled();
-  });
-
-  it('shows an error toast naming the thread when the suggestion fails', async () => {
+  it('fills nothing and shows an error naming the thread when the suggestion fails', async () => {
     vi.mocked(suggestTitle).mockRejectedValueOnce(new Error('no provider'));
-    await suggestThreadName(ID);
+    const suggest = await suggestOption();
+    expect(await suggest!()).toBe(null);
     const [message, type] = lastToast();
     expect(type).toBe('error');
     expect(message).toContain('Old title');
+  });
+
+  it('is not offered on the home thread, which only the user names', async () => {
+    threadMap.value = new Map([[ID, makeThreadState(ID, { meta: { home: true } })]]);
+    expect(await suggestOption()).toBeUndefined();
   });
 });

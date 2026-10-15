@@ -152,6 +152,15 @@ if (typeof (globalThis as any).Element !== 'undefined'
   && typeof (globalThis as any).Element.prototype.scrollIntoView !== 'function') {
   (globalThis as any).Element.prototype.scrollIntoView = () => {};
 }
+// jsdom has no `ResizeObserver` either, for the same reason: no layout, so
+// nothing ever resizes. The drawer's row window observes every row it renders.
+if (typeof (globalThis as any).ResizeObserver === 'undefined') {
+  (globalThis as any).ResizeObserver = class {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  };
+}
 if (typeof globalThis.requestAnimationFrame === 'undefined') {
   (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { cb(0); return 0; };
   (globalThis as any).cancelAnimationFrame = () => {};

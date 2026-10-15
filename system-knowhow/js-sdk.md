@@ -44,7 +44,7 @@ What each piece does (include only what you need):
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme-mode`, `--bg-primary` and `--font-ui` on `<html>` (plus `--user-ui-scale` when set) *before* any later stylesheet evaluates. The engine resolves this device's theme mode, theme, font and scale and serves them inside the script, so the frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` and adds nothing to your document. It also carries the device's Autocorrect switch, so `sdk.js` knows it before any field takes focus. It sets `data-motion` (§ Reduced motion), `data-theme-effects` (§ Theme parts) and `data-font-bold` (§ Theme variables). This removes the flash of default theme before `applyPreferences()`. **Place it as early in `<head>` as possible: before `sdk-iframe.css`, any other `<link rel="stylesheet">`, and any inline `<style>` that reads theme vars.** The inline `--bg-primary` makes `background: var(--bg-primary, …)` paint even when stylesheets load asynchronously (JS-injected, dynamic `import()`, Vite dev mode). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). With these classes your controls render like the host shell. The body is set to `--font-size-sm`, the chat prose step. Inputs and buttons get `--font-ui` at `--font-size-md`, the host's step for labels and controls. The root font-size is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Without these defaults, unsized text would read two steps larger than body. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance that survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API, plus iframe-only side effects that need no call from you. **Link interceptor:** `target="_blank"` links resolve in-frame, and external `http(s)://` links go through `lucidos.ui.openExternal()`. **Shortcut forwarder:** host shortcuts (focus/hide a pane, narrow/widen, new thread, search, Escape) keep working while the app has focus. Apply and the voice call never run from an app, since an app's script could send their chords. A chord bound to a host shortcut has its browser default cancelled, so ⌘P opens file search, not print. Your handlers still get that key, marked `defaultPrevented`. Only modifier chords, Escape and the F-keys are forwarded. Plain typing stays in the app, and so does Ctrl plus a bare letter in a Mac text field. **Per-app scroll memory** across an app switch or reload. **Pull to refresh** (§ Pull to refresh). **Pane swipe** (§ Pane swipe). The Lucidos **tooltip** on any `data-tooltip` element (§ Tooltips, under lucidos.ui). The device's **Autocorrect switch** plus a key-code guard on text fields (§ Text fields and autocorrect). | App doesn't use `lucidos.*` |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API, plus iframe-only side effects that need no call from you. **Link interceptor:** `target="_blank"` links resolve in-frame, and external `http(s)://` links go through `lucidos.ui.openExternal()`. **Shortcut forwarder:** host shortcuts (focus/hide a pane, narrow/widen, new thread, search, Escape) keep working while the app has focus. Apply and the voice call never run from an app, since an app's script could send their chords. A chord bound to a host shortcut has its browser default cancelled, so ⌘P opens file search, not print. Your handlers still get that key, marked `defaultPrevented`. Only modifier chords, Escape and the F-keys are forwarded. Plain typing stays in the app, and so does Ctrl plus a bare letter in a Mac text field. **Per-app scroll memory** across an app switch or reload. **Pull to refresh** (§ Pull to refresh). **Pane swipe** (§ Pane swipe). **Dynamic bars** (§ Dynamic bars). The Lucidos **tooltip** on any `data-tooltip` element (§ Tooltips, under lucidos.ui). The device's **Autocorrect switch** plus a key-code guard on text fields (§ Text fields and autocorrect). | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme mode/theme/font/scale (resolving `system` to the live OS light/dark) and sets `data-theme-mode`, `data-font-bold` and CSS vars on `<html>`. Pairs with `sdk-iframe.css`. | **Don't skip if you include `sdk-iframe.css`**: without it the app ignores a light or system setting and stays dark. Skip only when opting out of Lucidos theming entirely. |
 | `lucidos.ui.watchPreferences()` | Re-applies preferences live: on SSE `PreferencesChanged`, when the active theme's file or plugin changes, and under `system` when the OS appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform. Inside the host shell the app also repaints with the shell, mid-drag included (§ lucidos.ui) | Static apps that have opted out of Lucidos theming |
 
@@ -267,6 +267,8 @@ the touch.
 code from you.** On the phone layout, `sdk.js` watches for a mostly sideways
 drag and posts it to Lucidos. Lucidos moves the panes as it does over a thread.
 It ignores the drag on the desktop layout and while your app is fullscreen.
+Your app may re-render the element under the finger mid-drag. The swipe still
+follows the touch to its end.
 
 Vertical scrolling stays native. Once a drag has locked sideways, `sdk.js`
 cancels its `touchmove` events so the page does not drift under the swipe. It
@@ -281,6 +283,22 @@ stays out of the way of a drag that is not a pane swipe:
 - call `preventDefault()` on the `touchstart` or `touchmove`;
 - give the element a `touch-action` that keeps the sideways pan, such as
   `touch-action: pan-y` on a carousel or `none` on a canvas.
+
+### Dynamic bars
+
+**On a phone, the Lucidos header glides away after the reader scrolls down your
+app, with no code from you.** It moves once the finger lifts, never during the
+drag. It glides back after a scroll up, near the top, or on a pane swipe. This
+follows the user's *dynamic bars* setting, and with it off the header stays put.
+
+`sdk.js` only watches the scroll and the touches, and posts them to Lucidos.
+Every listener is passive, so your app scrolls exactly as before. It sees the
+page's own scroll and any element that scrolls vertically inside it.
+
+While the header is away, your app's panel moves up into its room and grows
+by its height. Your page gets one `resize` as the header leaves, and one as it
+returns. An element fixed to the bottom of your page slides with the panel as
+the header comes back.
 
 ### One sound at a time
 
@@ -755,6 +773,8 @@ const events = await lucidos.events.query({
 // Read the outcome of child threads the workspace has spawned. This is an
 // ENGINE event, not one your app emitted, and it comes back from the same
 // call: `thread_id` is the PARENT thread, and the payload carries the child.
+// A clean report its child's wake mode files lands as `ChildReportFiled`
+// instead, with the same payload, so query both.
 const completions = await lucidos.events.query({
   event_type: 'ChildThreadCompleted',
   limit: 20
@@ -1047,8 +1067,8 @@ app runs in. The whole reachable set, with the methods each opens:
 | `/themes/resolve` | POST |
 
 Most of those have a namespace of their own, which is the better way to call
-them. The engine writes the exact list to
-`packages/lucidos-sdk/src/generated/app-reach.ts`, so it cannot drift.
+them. The SDK's copy of the list is generated from `ROUTE_REACH` in
+`crates/lucidos-engine/src/api/app_reach.rs`, so it cannot drift.
 
 Denied, and why:
 
@@ -1195,6 +1215,8 @@ interface Trigger {
   // Side-effect grant: irreversible categories this trigger may perform
   // unattended. Omitted when empty (= no grant).
   side_effect_grant?: SideEffectCategory[];
+  // MCP server ids its fires use. Only these run unattended in its threads.
+  mcp_servers?: string[];
   // Chat model this trigger's intent fires on, and its thinking budget. Both
   // omitted when the trigger follows the account default (Settings → Models →
   // Chat & triggers). Intent triggers only: a script trigger runs no LLM.
@@ -1214,6 +1236,8 @@ interface CreateTrigger {
   /** Side-effect grant: irreversible categories this trigger may perform
    *  unattended. Omit / `[]` = none granted (the safe default). */
   side_effect_grant?: SideEffectCategory[];
+  /** MCP server ids its fires use. A fire refuses a call to any other server. */
+  mcp_servers?: string[];
   /** Pin the intent to a chat model and a thinking budget
    *  (`none|low|medium|high|xhigh|max`). Omit either for the account default. */
   model?: string | null;
@@ -1236,6 +1260,8 @@ interface UpdateTrigger {
   group_id?: string | null;
   /** Full replacement for the side-effect grant; pass `[]` to clear all. */
   side_effect_grant?: SideEffectCategory[];
+  /** Full replacement for the MCP server ids; pass `[]` to clear them. */
+  mcp_servers?: string[];
   /** Pin the intent's model / thinking budget / backend (string), clear it
    *  back to the default (null), or leave it unchanged (absent). Changing the
    *  model drops a backend pin it cannot use. */
@@ -1355,7 +1381,7 @@ console.log(me.name, me.icon ?? '(no icon)');
 lucidos.params(): Record<string, unknown>
 ```
 
-A *widget*'s params for the place it shows (ADR 0415): the JSON object given to `widgets(action="show")`, a *widget embed*, or a pin. It returns `{}` when the widget was given none, or when the value is not a JSON object.
+A *widget*'s params for the place it shows (ADR 0415): the JSON object given to a *widget embed* or a pin. It returns `{}` when the widget was given none, or when the value is not a JSON object.
 
 The host writes the object into the frame URL under the one query key `params`. So a param name never collides with a host name. The widget's `manifest.json` declares the names it takes (`system-knowhow/building-an-app.md` § Widgets). Params are visible in the URL, so never pass a credential. Params over 2 KB are refused.
 
@@ -1364,6 +1390,38 @@ The host writes the object into the frame URL under the one query key `params`. 
 ```js
 const { clip } = lucidos.params();
 if (!clip) document.body.textContent = 'No clip given';
+```
+
+## lucidos.widget: Where a Widget Shows
+
+```ts
+lucidos.widget.size(): 'small' | 'medium' | 'large' | null
+lucidos.widget.onSize(callback: (size) => void): () => void
+lucidos.widget.place(): 'home' | 'inline' | 'shelf' | 'option' | null
+lucidos.widget.visible(): boolean
+lucidos.widget.onVisibility(callback: (visible: boolean) => void): () => void
+```
+
+What the host told a *widget* about the place it shows in (ADR 0432). The SDK also stamps two attributes on `<html>`, so most widgets adapt in CSS alone:
+
+- **`data-widget-place`**: `home` on the *Home board*, `inline` in a thread (a reply's embed included), `shelf` or `option`. Absent in the Canvas, where a widget opens as an app.
+- **`data-widget-size`**: the tile's *widget size* on the Home board, `small`, `medium` or `large`. Absent anywhere else, where `size()` is `null`.
+
+On the Home board the tile sets the box and the frame fills it. Draw for the size you are told, with no scroll inside. Content past the tile is clipped under a fade. The tile's menu offers Open in Canvas, which opens the widget full size. A widget whose manifest declares no sizes takes all three (`system-knowhow/building-an-app.md` § Widgets).
+
+`visible()` turns false while a hidden board keeps the frame loaded, just before it unloads. Stop timers then, and read again when it turns true.
+
+### Example
+
+```css
+html[data-widget-size="small"] .detail { display: none; }
+html[data-widget-size="large"] .chart { height: 60%; }
+```
+
+```js
+lucidos.widget.onVisibility((visible) => {
+  if (visible) render(); else clearInterval(tick);
+});
 ```
 
 ## lucidos.preferences: User Settings
@@ -1497,14 +1555,12 @@ lucidos.notifications.markAllRead(): Promise<void>
 
 `NavigateTarget` and `SettingsViewTarget` are **generated from the engine's
 `navigate_ui` tool** (the `NAVIGATE_TARGETS` / `NAVIGABLE_SETTINGS_VIEWS` consts in
-`crates/lucidos-engine/src/llm/tools/misc.rs`) into
-`packages/lucidos-sdk/src/generated/navigate-targets.ts`, so the SDK and the LLM
-tool schema cannot drift. To change the set, edit those Rust consts and run
-`cargo test -p lucidos-engine --lib generate_navigate_targets_file -- --ignored`.
+`crates/lucidos-engine/src/llm/tools/misc.rs`), so the SDK and the LLM tool
+schema cannot drift. To change the set, edit those Rust consts.
 
 ```ts
 type NavigateTarget =
-  | 'files' | 'apps' | 'app-store' | 'plugins' | 'triggers' | 'thread-queue' | 'changes' | 'notifications'
+  | 'home-board' | 'files' | 'apps' | 'app-store' | 'plugins' | 'triggers' | 'thread-queue' | 'changes' | 'notifications'
   | 'settings' | 'app' | 'file' | 'trigger' | 'thread'
   | 'new-app' | 'new-trigger' | 'new-chat' | 'url';
 
@@ -1693,7 +1749,10 @@ type UnproposedReason =
   | 'plan_awaiting_approval'
   | 'outside_bound'
   | 'hardening_missing'
-  | 'turn_incomplete';
+  | 'turn_incomplete'
+  | 'awaiting_landing'
+  | 'integrated_into_parent'
+  | 'carried_by_successor';
 
 type CodingAgentChangeState =
   | { kind: 'none' }
@@ -1754,6 +1813,8 @@ interface ThreadSummary {
   last_revived_at: string | null;
   parent_thread_id?: string | null;
   parent_thread_title?: string | null;
+  successor?: { thread_id: string; title: string | null };    // the successor thread it continued in
+  successor_of?: { thread_id: string; title: string | null }; // the thread this successor continues
   trigger_id?: string | null;
   trigger_name?: string | null;
   cc_repo_id?: string | null;
@@ -1902,7 +1963,7 @@ fuse lifts the cover before `load`, so a slow page still says it is loading.
 
 ### Sizing a widget to its content
 
-A *widget* shows inline in its thread as a *widget card*, so its frame fits
+A *widget* shows inline in its thread as an *inline widget*, so its frame fits
 what it draws instead of filling a pane. Nothing to call: when the host marks a
 frame as a widget, the SDK measures `document.body` and reports its height on
 every resize. Design the widget to fit one phone screen, with the answer on its
@@ -1922,39 +1983,6 @@ top screen.
 - The same widget opened full size in the Canvas pane reports nothing, so
   there it is an ordinary app.
 
-### Drawing for a widget window
-
-A *widget window* floats a widget over the app in one of three *widget window
-modes*. The SDK stamps the mode on `<html>` as `data-widget-mode`: `minimal`,
-`window` or `docked`. Every other place leaves the attribute off, so style a
-compact form under it and keep your normal layout as the default.
-
-```css
-/* Minimal: the total only, no controls. */
-html[data-widget-mode="minimal"] .controls,
-html[data-widget-mode="minimal"] .list { display: none; }
-```
-
-- **Minimal** is the widget alone, in the shape it draws. The page is
-  see-through and the body takes its content's width, which the SDK reports
-  with the height. So keep a minimal form small, and give it a background of
-  its own where it needs one. The window stops at 24 rem wide, and longer
-  text wraps there.
-- **Window** keeps the size the user set, and your page scrolls inside it.
-  A "Show more" never resizes the window.
-- **Docked** hangs under the header at the window's own width, beside the
-  other docked windows (on a phone, under the thread's title row). Its
-  height follows your content, up to half the screen.
-- **The window owns its controls.** It draws a mode button, a ⋯ menu and
-  Close in a pill above your widget. Near the top of the screen, or docked,
-  the pill goes under it. It never covers your widget, so draw edge to edge.
-- **A drag on your widget moves the window.** A mouse or pen drag that starts
-  on no control moves a minimal or window-mode window. The SDK does it for
-  you. A control is a link, button, form field, `label`, `summary`, an ARIA
-  widget role, `contenteditable`, or anything with `cursor: pointer`. To keep
-  a drag for yourself, call `preventDefault()` on its `pointerdown`. A plain
-  click is never a drag, and a finger drag still scrolls.
-
 ### Reading the thread the user has open
 
 `lucidos.ui.focusedThread()` gives the id of the *focused thread*: the thread
@@ -1973,9 +2001,9 @@ lucidos.ui.onFocusedThreadChange(show);
 show(await lucidos.ui.focusedThread());
 ```
 
-- **The host decides, not your app.** A widget window floats over whatever
-  thread the user is in. So the value is that thread, not the thread the
-  widget came from.
+- **The host decides, not your app.** A widget on the Home board sits beside
+  whatever thread the user is in. So the value is that thread, not the thread
+  the widget came from.
 - **`null` means the empty compose view.** No thread is open there.
 - **A draft and Home are threads.** A draft the user is typing gives its id.
 - **The Canvas pane does not change it.** A panel or an app beside the thread
@@ -1983,8 +2011,8 @@ show(await lucidos.ui.focusedThread());
   is still open.
 - **No host, no answer.** In its own tab your app has no thread pane, so
   `focusedThread()` rejects. The subscription is never called there.
-- **Every frame hears every change.** The Canvas app, each widget card and
-  each widget window get the same calls.
+- **Every frame hears every change.** The Canvas app, each inline widget and
+  each Home board tile get the same calls.
 
 ### Navigation targets
 
@@ -1996,6 +2024,7 @@ show(await lucidos.ui.focusedThread());
 | `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()`, the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row. The plugin-update notification uses this, so a tap on one update lands on its plugin. |
 | `app-store` | (none) | Open the Plugins panel's Store (marketplace) tab. |
+| `home-board` | (none) | Show the *Home board*: its rail on desktop, shown if it was hidden, and Home's board face on a phone. |
 | `file` | `file_path`, `line` (optional), `line_end` (optional) | Open a file in the preview pane, optionally at a line. See the two accepted path forms and the line params below. |
 | _other panels_ | (none) | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
 
@@ -2256,8 +2285,9 @@ interface ToastOptions {
   /** A bold line over the message. Only the title is bold; without one the
    *  toast is its message alone. A non-string title throws a TypeError. */
   title?: string;
-  /** Auto-dismiss after this many ms. Omit for the host default: errors and
-   *  warnings stay until dismissed; success/info auto-close. */
+  /** Auto-dismiss after this many ms. Omit for the host default: errors,
+   *  warnings and keyed spinning toasts stay until dismissed or replaced;
+   *  success/info auto-close, with or without a key. */
   durationMs?: number;
   /** false = never show the close (X) button, and a tap on the toast never
    *  closes it. A toast that leaves on its own timer and has no button shows
@@ -2551,9 +2581,32 @@ Subscribe to server-sent events for live updates.
 lucidos.sse.connect(): void
 lucidos.sse.disconnect(): void
 lucidos.sse.on(eventType: string, callback: (data: unknown, raw: SseEvent) => void): () => void
+lucidos.sse.onOpen(callback: () => void): () => void
 ```
 
 `on()` returns an unsubscribe function. Subscribe by inner event name: the SDK unwraps the wire format.
+
+### Hearing the stream open: `onOpen`
+
+**The stream does not replay what landed while it was down.** A network drop, an engine restart or a phone that slept all leave a gap, and nothing tells an `on()` listener what it missed. `onOpen(callback)` is where an app catches up: read the data again there.
+
+- **It runs on the first open and on every reopen.** One `render` passed to it covers first load and every reconnect.
+- **If the stream is already open, it runs once at once** (on the next microtask). The SDK may have opened the stream before your code ran, and you still get your first call.
+- **So do not also call `render()` on load.** That reads everything twice at startup. Reading on the open also means the stream is live before the first read, so no change slips between the two.
+- **It connects the stream.** No separate `connect()` call is needed.
+- **It is a method of its own, not an `on()` type,** so no event can fire it, whatever its name.
+- **It returns an unsubscribe function.** A callback unsubscribed before its first call never runs.
+
+It works the same in an app frame, a widget, and an app in its own tab. The host relays each open of its own stream to the frame.
+
+```js
+lucidos.sse.onOpen(render);
+lucidos.sse.on('ArtifactUpdated', (data) => {
+  if (data.artifact_path === 'habits/data.json') render();
+});
+```
+
+The full pattern, with the file events, the resume listeners and your own writes, is `system-knowhow/building-an-app.md` § Live data.
 
 ### One stream per workspace
 
@@ -2565,6 +2618,7 @@ There is nothing to configure. For an app author:
 
 - **A frame is identical either way.** A relayed frame carries the same payload a private connection would, so your handler does not change.
 - **`disconnect()` detaches this document only.** It never takes the stream from another app or from the shell.
+- **A frame hears only the types it listens to.** The SDK tells the host which types have an `on()` listener, and the host relays only those. A streaming reply is thousands of frames, so this keeps a page of live widgets cheap. An `on('*')` listener takes every frame, and `on('ThreadEvent')` every thread event.
 
 Where `SharedWorker` is missing (Chromium on Android, and Android WebView), a document that is not an app frame opens a private `EventSource`. Same events, same order, one connection per document.
 
@@ -2654,15 +2708,42 @@ import { lucidos } from '@lucidos/sdk';
 // Apply user theme/font/scale
 await lucidos.ui.applyPreferences();
 
-// Connect SSE for live updates
-lucidos.sse.connect();
+const PATH = 'artifacts/my-app/data.json';
+const ARTIFACT = 'my-app/data.json';   // artifact_path is relative to artifacts/
+let shown = null;
 
-// Load data
-const raw = await lucidos.data.read('artifacts/my-app/data.json');
-const state = JSON.parse(raw);
+// One render for every place the data can change. It updates in place.
+async function render() {
+  let text;
+  try {
+    text = await lucidos.data.read(PATH);
+  } catch (err) {
+    if (err.httpCode !== 404) throw err;
+    text = '';   // deleted, or not written yet: draw the empty state
+  }
+  if (text === shown) return;   // the echo of your own write, or nothing new
+  shown = text;
+  const state = text ? JSON.parse(text) : null;
+  // Update the existing elements, keeping scroll position and selection.
+}
 
-// Listen for relevant events
-lucidos.sse.on('MyAppDataUpdated', (data) => {
-  // Re-render with new data
+// The first load, and every reconnect. Do not also call render() on load.
+lucidos.sse.onOpen(render);
+
+// Whoever writes the file: the agent, a trigger, a script, another device.
+for (const type of ['ArtifactCreated', 'ArtifactUpdated', 'ArtifactDeleted']) {
+  lucidos.sse.on(type, (data) => {
+    if (data.artifact_path === ARTIFACT) render();
+  });
+}
+
+// A resumed phone PWA whose stream stalled while it slept.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') render();
+});
+addEventListener('pageshow', (event) => {
+  if (event.persisted) render();
 });
 ```
+
+The full pattern is `system-knowhow/building-an-app.md` § Live data. It covers the events per path, the writes that announce nothing, a deleted file, and your own writes.

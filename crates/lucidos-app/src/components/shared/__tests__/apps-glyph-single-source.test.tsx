@@ -30,7 +30,7 @@ const APP_SURFACES = [
   '../../apps/ReusableWidgetsSection.tsx',
   '../../layout/Drawer.tsx',
   '../../widgets/WidgetShelf.tsx',
-  '../../widgets/WidgetCard.tsx',
+  '../../widgets/InlineWidget.tsx',
   '../../search/SearchEverywhere.tsx',
   '../../layout/ContentNav.tsx',
   '../../chat/MessageRoutePanel.tsx',

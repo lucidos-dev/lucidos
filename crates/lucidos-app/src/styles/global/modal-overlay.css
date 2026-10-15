@@ -92,8 +92,8 @@
    Driven by `data-overlay-open` on <html>, ref-counted in `Overlay.tsx`.
 
    `[data-overlay-layer]` is the third exemption, and it exists because the
-   overlay layer does NOT always render outside `.app-shell`: while an app is
-   natively fullscreen, `OverlayLayer` portals the whole group into the
+   overlay layer does NOT always sit outside `.app-shell`: while an app is
+   natively fullscreen, `OverlayLayer` moves the whole group into the
    fullscreen app panel (the only place the browser will paint it), which is
    deep inside `.app-shell` and therefore inherits the inert. The exemption puts
    the layer back where it started, and no further: everything under it is host
@@ -107,11 +107,13 @@
     pointer-events: auto;
 }
 
-/* The overlay layer's mount inside a natively fullscreen app panel (rendered by
-   AppUiInline, filled by OverlayLayer). It generates no box of its own: its
-   children are the same position:fixed scrims and toast container that sit at
-   the app root when nothing is fullscreen, so the mount must not become a flex
-   item of the app panel or a hit target over the app. */
+/* The overlay layer (the one node OverlayLayer portals into), its home at the
+   app root, and its mount inside a natively fullscreen app panel (rendered by
+   AppUiInline). None generates a box: the layer's children are position:fixed
+   scrims and the toast container, so no wrapper may become a flex item of the
+   app panel or a hit target over the app. */
+.overlay-layer,
+.overlay-layer-home,
 .app-overlay-layer {
     display: contents;
 }

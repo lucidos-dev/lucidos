@@ -525,7 +525,6 @@ pub fn is_named_colour(name: &str) -> bool {
 
 /// Every CSS named colour, for the generated TypeScript twin of the part
 /// grammar.
-#[cfg(test)]
 pub fn named_colours() -> impl Iterator<Item = &'static str> {
     NAMED_COLOURS.split_whitespace().step_by(2)
 }

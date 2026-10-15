@@ -1,6 +1,6 @@
 # 0011 — A blocking child's completion is durably delivered to its parent: the persisted `ChildThreadCompleted` is the source of truth, the in-memory wake is a cache rebuilt on boot
 
-- **Status:** Accepted
+- **Status:** Accepted (amended by [0434](0434-sub-threads-wake-parents-only-when-needed.md): a clean report the child declines to wake on is filed as `ChildReportFiled`, which this durability never re-fires)
 - **Date:** 2026-06-16
 
 ## Context

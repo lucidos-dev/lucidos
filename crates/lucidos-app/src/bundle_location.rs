@@ -179,7 +179,6 @@ pub fn same_device(a: &Path, b: &Path) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
 
     const TRANSLOCATED: &str =
         "/private/var/folders/ab/xyz/T/AppTranslocation/1F2E3D4C-0000-4000-8000-000000000000/d/Lucidos.app";
@@ -270,7 +269,7 @@ mod tests {
 
     #[test]
     fn two_paths_in_one_directory_share_a_device() {
-        let tmp = TempDir::new("same-device");
+        let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a");
         std::fs::create_dir_all(&a).expect("create a");
         assert_eq!(same_device(&a, tmp.path()), Some(true));
@@ -278,13 +277,14 @@ mod tests {
 
     #[test]
     fn a_missing_path_has_no_device_answer() {
-        let tmp = TempDir::new("no-device");
+        let tmp = tempfile::tempdir().unwrap();
         assert_eq!(same_device(&tmp.path().join("missing"), tmp.path()), None);
     }
 
     #[test]
     fn the_temp_dir_is_on_a_writable_volume() {
-        assert_eq!(is_read_only_volume(&std::env::temp_dir()), Some(false));
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(is_read_only_volume(tmp.path()), Some(false));
     }
 
     #[test]
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn a_bundle_in_a_folder_this_user_owns_is_writable_in_place() {
-        let tmp = TempDir::new("writable");
+        let tmp = tempfile::tempdir().unwrap();
         let bundle = tmp.path().join("Lucidos.app");
         std::fs::create_dir_all(&bundle).expect("create the bundle");
         assert!(writable_in_place(&bundle));
@@ -319,7 +319,7 @@ mod tests {
     fn a_bundle_in_a_read_only_folder_is_not_writable_in_place() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = TempDir::new("read-only-parent");
+        let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("Applications");
         let bundle = parent.join("Lucidos.app");
         std::fs::create_dir_all(&bundle).expect("create the bundle");
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn a_missing_bundle_is_not_writable_in_place() {
-        let tmp = TempDir::new("missing-bundle");
+        let tmp = tempfile::tempdir().unwrap();
         assert!(!writable_in_place(&tmp.path().join("Lucidos.app")));
     }
 }

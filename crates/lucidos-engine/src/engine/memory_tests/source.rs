@@ -50,7 +50,7 @@ fn trigger_channel_events_not_indexed() {
 
 #[test]
 fn canonicalize_artifact_path_strips_prefix() {
-    // python.rs emits data-relative paths — under artifacts/ they look like this.
+    // Event rows python.rs stored before it stripped the prefix look like this.
     assert_eq!(
         LucidosEngine::canonicalize_artifact_path("artifacts/output.csv"),
         "output.csv"
@@ -64,8 +64,8 @@ fn canonicalize_artifact_path_strips_prefix() {
 
 #[test]
 fn canonicalize_artifact_path_passes_through_already_canonical() {
-    // files.rs / import.rs / email.rs strip the prefix at the emit site, so
-    // the consumer must accept already-canonical paths unchanged.
+    // Every writer strips the prefix at the emit site now, so the consumer
+    // must accept already-canonical paths unchanged.
     assert_eq!(
         LucidosEngine::canonicalize_artifact_path("notes.md"),
         "notes.md"
@@ -78,7 +78,7 @@ fn canonicalize_artifact_path_passes_through_already_canonical() {
 
 #[test]
 fn canonicalize_artifact_path_leaves_non_artifact_paths_alone() {
-    // A python tool writing under data/apps/ emits the data-relative path.
+    // An old python.rs row for a write under data/apps/ carries this path.
     // The caller's read then looks under data/artifacts/apps/
     // and fails, which is the desired behavior (apps aren't memory-indexed,
     // matching what walk_artifact_history reports).

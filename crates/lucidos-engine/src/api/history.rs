@@ -383,9 +383,11 @@ pub(super) async fn restart_engine(
 /// `LUCIDOS_WORKSPACE_ID`. Fall back to launchd (packaged, no gateway) or
 /// `web-dev.sh --engine-only` (legacy `LUCIDOS_NO_GATEWAY` dev).
 ///
-/// `Ok` means the teardown is under way, not merely requested: the gateway
-/// signals the engine inside the call it answers, and launchctl / `web-dev.sh`
-/// have been spawned. Every `Err` leaves this process running.
+/// `Ok` means the teardown is under way, not merely requested. The gateway
+/// signals the engine inside the call it answers. When it moves to a newer
+/// binary first, its new image signals it a moment later (ADR 0461). launchctl and
+/// `web-dev.sh` have been spawned by then. Every `Err` leaves this process
+/// running.
 async fn respawn_this_engine(
     state: &AppState,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {

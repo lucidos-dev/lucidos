@@ -1,6 +1,6 @@
 import { useRef, useEffect, useLayoutEffect, useState } from 'preact/hooks';
 import { popupImage, scaledDurationMs } from '../../store/store';
-import { CloseIcon, ChevronLeftIcon, ChevronRightIcon } from './icons';
+import { CloseIcon, ChevronLeftIcon, ChevronRightIcon, CopyIcon } from './icons';
 import { Overlay } from './Overlay';
 import {
   fingerDistance,
@@ -19,8 +19,10 @@ import {
   type PinchInitial,
   type ImageLayout,
 } from '../../utils/pinchGesture';
-import { isTextInput } from '../../utils/dom';
+import { computedTranslateX, isTextInput } from '../../utils/dom';
 import { SwipeTouch } from '@lucidos/pane-swipe';
+import { copyImageToClipboard } from '../../utils/clipboard';
+import { clipboardAbilities } from '../../utils/platform';
 
 // How far past the fitted view a gesture zooms, raised per image so full size
 // always fits under it (see `zoomRange` below).
@@ -100,17 +102,6 @@ function step(delta: -1 | 1) {
   if (!s || s.images.length <= 1) return;
   const next = (s.index + delta + s.images.length) % s.images.length;
   popupImage.value = { images: s.images, index: next };
-}
-
-function parseTranslateX(el: HTMLElement): number {
-  const t = getComputedStyle(el).transform;
-  if (!t || t === 'none') return 0;
-  const m = t.match(/matrix(?:3d)?\(([^)]+)\)/);
-  if (!m) return 0;
-  const v = m[1].split(',').map(s => parseFloat(s.trim()));
-  if (v.length === 6) return v[4];
-  if (v.length === 16) return v[12];
-  return 0;
 }
 
 export function ImagePopup() {
@@ -404,7 +395,7 @@ export function ImagePopup() {
       const cur = popupImage.value;
       if (!cur || cur.index === pending.to) return;
       const w = strip.offsetWidth;
-      const tBefore = parseTranslateX(strip);
+      const tBefore = computedTranslateX(strip);
       const len = cur.images.length;
       const delta = shortestDelta(pending.to, pending.from, len);
       popupImage.value = { images: cur.images, index: pending.to };
@@ -478,7 +469,7 @@ export function ImagePopup() {
         flushPendingCommit();
         dragRef.current.active = false;
         dragStartRef.current = null;
-        const cur = parseTranslateX(strip);
+        const cur = computedTranslateX(strip);
         strip.style.transition = 'none';
         strip.style.transform = `translate3d(${cur}px, 0, 0)`;
         // Captured fresh rather than through ensureLayout: the strip may be
@@ -510,7 +501,7 @@ export function ImagePopup() {
       const s = popupImage.value;
       if (!s || s.images.length <= 1) { releaseGesture(); return; }
       const w = strip.offsetWidth;
-      const offset = parseTranslateX(strip);
+      const offset = computedTranslateX(strip);
       strip.style.transition = 'none';
       strip.style.transform = `translate3d(${offset}px, 0, 0)`;
       dragStartRef.current = { offset, w };
@@ -554,7 +545,17 @@ export function ImagePopup() {
 
     function handleTouchEnd(e: TouchEvent) {
       const wasHorizontal = swipe.isHorizontal;
-      const result = swipe.end(window.innerWidth || 1);
+      settleTouch(e, swipe.end(window.innerWidth || 1), wasHorizontal);
+    }
+
+    // A touch the browser took over never commits: a swipe springs back.
+    function handleTouchCancel(e: TouchEvent) {
+      const wasHorizontal = swipe.isHorizontal;
+      swipe.cancel();
+      settleTouch(e, 0, wasHorizontal);
+    }
+
+    function settleTouch(e: TouchEvent, result: number, wasHorizontal: boolean) {
       const drag = dragStartRef.current;
 
       if (e.touches.length === 0) layoutRef.current = null;
@@ -691,7 +692,7 @@ export function ImagePopup() {
     strip.addEventListener('touchstart', handleTouchStart, { passive: false });
     strip.addEventListener('touchmove', handleTouchMove, { passive: false });
     strip.addEventListener('touchend', handleTouchEnd, { passive: false });
-    strip.addEventListener('touchcancel', handleTouchEnd, { passive: false });
+    strip.addEventListener('touchcancel', handleTouchCancel, { passive: false });
     strip.addEventListener('pointerdown', onPointerDown);
     strip.addEventListener('pointermove', onPointerMove);
     strip.addEventListener('pointerup', onPointerUp);
@@ -705,7 +706,7 @@ export function ImagePopup() {
       strip.removeEventListener('touchstart', handleTouchStart);
       strip.removeEventListener('touchmove', handleTouchMove);
       strip.removeEventListener('touchend', handleTouchEnd);
-      strip.removeEventListener('touchcancel', handleTouchEnd);
+      strip.removeEventListener('touchcancel', handleTouchCancel);
       strip.removeEventListener('pointerdown', onPointerDown);
       strip.removeEventListener('pointermove', onPointerMove);
       strip.removeEventListener('pointerup', onPointerUp);
@@ -789,6 +790,16 @@ export function ImagePopup() {
         <button class="floating-mobile-close" onClick={close} aria-label="Close">
           <CloseIcon />
         </button>
+        {clipboardAbilities().copyImage && (
+          <button
+            class="image-popup-copy icon-btn"
+            onClick={() => copyImageToClipboard(state.images[state.index])}
+            aria-label="Copy image"
+            data-tooltip="Copy image"
+          >
+            <CopyIcon />
+          </button>
+        )}
         {hasNav && (
           <>
             <button

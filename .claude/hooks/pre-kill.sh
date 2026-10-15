@@ -11,7 +11,7 @@
 # Env vars come from the spawning subprocess (set by the engine via
 # api::actor::host_protection_env_vars):
 #   LUCIDOS_HOST_PID       — engine process id (always set)
-#   LUCIDOS_FRONTEND_PID   — sibling Vite pid (web-dev only; may be unset)
+#   LUCIDOS_FRONTEND_PID   — the checkout's build-watch pid (web-dev only; may be unset)
 #   LUCIDOS_API_PORT       — engine port (re-exported from the engine's env)
 
 # jq reads from stdin directly — no need for an intermediate `cat`.

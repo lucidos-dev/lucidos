@@ -1,5 +1,6 @@
 //! `capture_app` / `refresh_app`: which device answers, what the agent is told,
-//! and where a saved capture goes.
+//! and where a saved capture goes. The device is the one the agent named, else
+//! the turn's last used device, settled by the same `recipient` as `navigate_ui`.
 //!
 //! Every connected page receives a thread event, so the device actor stamped
 //! here IS the routing decision, as for `navigate_ui` (`navigate.rs`). A page
@@ -7,7 +8,7 @@
 //! `device-scope.ts`). The engine also refuses an answer from any other device. So
 //! a page with no app frame cannot win the race with a quick error.
 
-use super::navigate::{device_actor, device_label, device_presence};
+use super::navigate::{device_presence, recipient, Recipient};
 use crate::core::{ArtifactManager, WriteAnnouncement};
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{CaptureFormat, EventMeta, ThreadEvent};
@@ -27,8 +28,8 @@ pub(crate) const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A capture waiting for its answer.
 pub struct PendingCapture {
-    /// The device that must answer. `None` when the turn has no last used
-    /// device, and then any page may.
+    /// The device that must answer. `None` when the agent named none and the
+    /// turn has no last used device, and then any page may.
     target: Option<String>,
     tx: oneshot::Sender<CaptureResult>,
 }
@@ -129,6 +130,7 @@ async fn save_capture(
     // the error never claims nothing was saved.
     artifacts
         .write_and_commit(
+            &crate::engine::git_ops::lock_workspace_repo().await,
             bus,
             path,
             &bytes,
@@ -159,7 +161,7 @@ async fn save_capture(
 }
 
 /// The `capture_app` and `refresh_app` tools. `last_used` is the turn's last
-/// used device, the one `navigate_ui` also sends to.
+/// used device, the target when `args` names no `device`.
 // One argument per collaborator; a bundle struct would only rename them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn app_ui_tool_impl(
@@ -182,7 +184,12 @@ pub(crate) async fn app_ui_tool_impl(
         Ok(save) => save,
         Err(e) => return format!("Error: {e}"),
     };
-    let meta = || EventMeta::with_actor(last_used.map(device_actor));
+    let who = match recipient(pool, args, last_used).await {
+        Ok(who) => who,
+        Err(e) => return e,
+    };
+    let device = who.device_id();
+    let meta = || EventMeta::with_actor(who.actor());
 
     if refresh {
         bus.emit_or_log(
@@ -213,11 +220,11 @@ pub(crate) async fn app_ui_tool_impl(
     pending.lock().unwrap().insert(
         request_id.clone(),
         PendingCapture {
-            target: last_used.map(str::to_string),
+            target: device.map(str::to_string),
             tx,
         },
     );
-    log!("[AppCapture] capture thread={thread_id} app={app_id} device={last_used:?}");
+    log!("[AppCapture] capture thread={thread_id} app={app_id} device={device:?}");
     let emitted = bus
         .emit(BusEvent::Thread {
             thread_id,
@@ -236,8 +243,8 @@ pub(crate) async fn app_ui_tool_impl(
 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(capture)) if capture.screenshot.is_empty() => {
-            let out = match last_used {
-                Some(device) => answered_error(&device_label(pool, device).await, capture.dom),
+            let out = match who.described() {
+                Some(device) => answered_error(&device, capture.dom),
                 None => capture.dom,
             };
             match &save {
@@ -268,7 +275,7 @@ pub(crate) async fn app_ui_tool_impl(
         Ok(Err(_)) => "Error: Capture failed: the frontend channel was dropped.".to_string(),
         Err(_) => {
             pending.lock().unwrap().remove(&request_id);
-            timed_out(pool, last_used, timeout).await
+            timed_out(pool, &who, timeout).await
         }
     }
 }
@@ -276,37 +283,32 @@ pub(crate) async fn app_ui_tool_impl(
 /// An error the target device sent back, prefixed with that device's name, so
 /// the agent knows which screen it is about. A DOM-only capture is not an
 /// error and passes through unchanged.
-fn answered_error(label: &str, dom: String) -> String {
+fn answered_error(device: &str, dom: String) -> String {
     match dom.strip_prefix("Error: ") {
-        Some(reason) => {
-            format!("Error from \"{label}\", the user's last used device in this turn: {reason}")
-        }
+        Some(reason) => format!("Error from {device}: {reason}"),
         None => dom,
     }
 }
 
 /// Nobody answered. Name who was asked, and whether Lucidos looks open there.
-async fn timed_out(pool: &PgPool, last_used: Option<&str>, timeout: Duration) -> String {
+async fn timed_out(pool: &PgPool, who: &Recipient, timeout: Duration) -> String {
     let secs = timeout.as_secs();
-    let Some(device) = last_used else {
+    let (Some(device), Some(described)) = (who.device_id(), who.described()) else {
         return format!(
             "Error: Capture timed out ({secs}s). No device answered. This turn has no last \
              used device, so the request went to every connected device and none could \
              capture the app UI."
         );
     };
-    let label = device_label(pool, device).await;
-    let mut out = format!(
-        "Error: Capture timed out ({secs}s). \"{label}\", the user's last used device in this \
-         turn, did not answer."
-    );
+    let mut out = format!("Error: Capture timed out ({secs}s). {described} did not answer.");
     if let Some(seen) = device_presence(pool, device)
         .await
         .filter(|seen| !seen.visible_now)
     {
         out.push_str(&format!(
             " Lucidos is not seen visible on it now (last seen {}), so it is likely closed \
-             or suspended there. Ask the user to open Lucidos on that device.",
+             or suspended there. Pass a device where Lucidos is visible now, and ask the \
+             user to open Lucidos only when no device is.",
             crate::engine::agent_context::format_age(seen.seen_secs_ago)
         ));
     }

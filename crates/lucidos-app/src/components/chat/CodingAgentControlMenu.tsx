@@ -1,16 +1,14 @@
-import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { Fragment } from 'preact';
 import { useSignal, useSignalEffect, signal, untracked } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import { showToast, codingAgentSessionVersion, codingAgentPendingModel, codingAgentPendingReasoningEffort, scopeToRepoId, engineRestarting } from '../../store/store';
-import { resolveScope, resolveCodingAgent, getComposeSelectionOverride } from '../../store/composeSelections';
+import { resolveScope, getComposeSelectionOverride } from '../../store/composeSelections';
 import { updateComposeSelection } from '../../store/actions/compose';
 import { sendCodingAgentControl, sessionRecorded, type ControlSendResult } from '../../store/actions/chat-claude-code';
 import { controlPickToast } from './controlPickToast';
 import { sendMessage } from '../../store/actions/chat';
 import { fetchCodingAgentCommands, type CodingAgentCommandDef, type CodingAgentCommandOption, type CodingAgentCommandsResponse, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import type { CodingAgent } from '../../api/types';
-import { ClaudeIcon, CodexIcon } from '../shared/icons';
 import { isTextInput, keepFocusOnPress } from '../../utils/dom';
 import { hasCoarsePointer, viewportIsMobile } from '../../utils/viewport';
 import { errorDetail } from '../../utils/errorDetail';
@@ -22,17 +20,16 @@ import { useFocusWhenPlaced } from '../../hooks/useFocusWhenPlaced';
 import {
   decodePair, pairLabelOf, type ModelChoice, type ModelRow, type TierChoice,
 } from '../../store/modelSelection';
-import { ControlFilter, ControlOptionList, type ControlOption } from '../shared/ControlOptionList';
-import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
+import type { ControlOption } from '../shared/ControlOptionList';
 import { keyboardHolder, returnKeyboard } from '../shared/keyboardHandoff';
-import { FrontendPreviewSection } from './FrontendPreviewSection';
+import { ControlFilter, ControlOptionList, FrontendPreviewSection, ModelSelectionPicker, controlMenuParts } from './controlMenuParts';
+import { codingAgentMenuOpenRequest, takeControlMenuPress } from './controlMenuRequests';
+import { CodingAgentIcon, ControlMenuTrigger, codingAgentMenuLabel, menuCodingAgent } from './ControlMenuTrigger';
+import { usePendingOpen } from '../../hooks/usePendingOpen';
 import { loadFrontendPreview } from '../../store/actions/frontend-preview';
 import { failedIfFresh, loadedOr, setLoadingIfFresh, type Loadable } from '../../store/types';
 import { displayModelName } from '../../store/thread-events/exchange';
 
-// Signal for PromptInput to request opening the menu with a filter
-// Set to a string (the filter text) to open, consumed by the component
-export const codingAgentMenuOpenRequest = signal<string | null>(null);
 
 /** Whether the open menu moves focus into itself. Under a finger with no
  *  keyboard up it leaves focus in the prompt: moving it would drop focus from
@@ -132,6 +129,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   // Only the newest `loadCommands` may apply its response. A scope or backend
   // switch fires a second fetch, and the first can land after it.
   const loadSeqRef = useRef(0);
+  const pendingOpen = usePendingOpen();
   const open = useSignal(false);
   const activeCommand = useSignal<string | null>(null);
   const sending = useSignal(false);
@@ -151,7 +149,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   // route to pending). On an active thread they live in the global pending
   // signals (reconciled per-thread by loadCommands).
   const inCompose = !threadId;
-  const resolvedCodingAgent = codingAgent ?? (threadId ? 'claude-code' : resolveCodingAgent(composeThreadId));
+  const resolvedCodingAgent = menuCodingAgent(codingAgent, threadId, composeThreadId);
   const isClaudeCode = resolvedCodingAgent === 'claude-code';
   // null here = "no pick" → display falls through to the backend's current value.
   const draftOverride = inCompose ? getComposeSelectionOverride(composeThreadId) : null;
@@ -161,7 +159,6 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   const pendingReasoningEffort: CodingAgentReasoningEffort | null = draftOverride
     ? (draftOverride.ccReasoningEffort ?? null)
     : codingAgentPendingReasoningEffort.value;
-  const menuLabel = isClaudeCode ? 'Claude Code' : 'Codex';
   const effectiveBuiltinCommands = isClaudeCode ? builtinCommands.value : [];
   const effectiveSkillCommands = isClaudeCode ? skillCommands.value : [];
   const effectiveModel = pendingModel ?? currentModel.value;
@@ -315,18 +312,24 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
    *  typed "/" opened it, so the typing continues in the filter. */
   function openMenu(filterText = '', typed = false) {
     if (!hasAnyCommands(controlCommands.value, effectiveBuiltinCommands, effectiveSkillCommands)) return;
-    openedByTypingRef.current = typed;
-    keyboardHolderRef.current = keyboardHolder();
-    open.value = true;
-    filter.value = filterText;
-    highlightIndex.value = 0;
-    // Reset retry counter — each manual open gets fresh retries
-    retryCountRef.current = 0;
-    loadCommands();
-    // Read the preview slot on open rather than at startup: it is dev-only and
-    // one slot per workspace, so the menu opening is both the cheapest and the
-    // freshest moment to learn what is running. SSE keeps it live from there.
-    if (threadId) void loadFrontendPreview();
+    const trigger = menuRef.current;
+    if (!trigger) return;
+    // Read at the press: the holder is whatever had the keyboard then.
+    const holder = keyboardHolder();
+    pendingOpen.open(controlMenuParts, () => {
+      openedByTypingRef.current = typed;
+      keyboardHolderRef.current = holder;
+      open.value = true;
+      filter.value = filterText;
+      highlightIndex.value = 0;
+      // Reset retry counter — each manual open gets fresh retries
+      retryCountRef.current = 0;
+      loadCommands();
+      // Read the preview slot on open rather than at startup: it is dev-only and
+      // one slot per workspace, so the menu opening is both the cheapest and the
+      // freshest moment to learn what is running. SSE keeps it live from there.
+      if (threadId) void loadFrontendPreview();
+    }, trigger);
   }
 
   useEffect(() => {
@@ -340,6 +343,12 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   // Blur before unmount so useHideOnScroll's focusout handler fires while
   // the element is still connected, properly resetting keyboardOpen.
   useEffect(() => close, []);
+
+  // A press that landed on the placeholder before this code arrived. With no
+  // commands yet it opens nothing, exactly as a press on this button would.
+  useEffect(() => {
+    if (takeControlMenuPress('coding-agent')) openMenu();
+  }, []);
 
   // Re-fetch commands when a Claude Code session starts/resumes (SSE-driven).
   // useSignalEffect required — see comment below re: Preact signal optimization.
@@ -672,20 +681,19 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
 
   return (
     <div class="control-menu" data-row-item ref={menuRef}>
-      {/* Never disabled — openMenu() guards against empty commands instead.
+      {/* Never disabled: openMenu() guards against empty commands instead.
           disabled={...} caused intermittent UX issues during Claude Code session startup races. */}
-      <button
-        class={`icon-btn header-icon commands-btn${hasAnyCommands(controlCommands.value, effectiveBuiltinCommands, effectiveSkillCommands) ? ' commands-btn-active' : ''}`}
-        data-tooltip={tooltipWithShortcut(`${menuLabel} controls`, 'openAgentMenu')}
-        aria-label={`${menuLabel} controls`}
-        onMouseDown={keepFocusOnPress}
+      <ControlMenuTrigger
+        label={codingAgentMenuLabel(resolvedCodingAgent)}
+        extraClass={hasAnyCommands(controlCommands.value, effectiveBuiltinCommands, effectiveSkillCommands) ? 'commands-btn-active' : undefined}
         onClick={() => {
           if (open.value) { close(); return; }
+          if (pendingOpen.takeBack()) return;
           openMenu();
         }}
       >
-        {isClaudeCode ? <ClaudeIcon /> : <CodexIcon />}
-      </button>
+        <CodingAgentIcon agent={resolvedCodingAgent} />
+      </ControlMenuTrigger>
       <Overlay
         open={open.value}
         onClose={close}

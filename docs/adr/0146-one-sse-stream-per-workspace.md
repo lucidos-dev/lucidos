@@ -119,3 +119,14 @@ counts as active reaches the same consistency now.
 diff to one concern. Rejected because the two land in the same function: Phase 3
 was already rewriting the pong path, so the marginal cost was a predicate and
 its tests.
+
+## Amendment: the holder merges outcomes, not a boolean
+
+ADR 0440 changed what a pong says. A document no longer reports whether it is
+active. It acts on the check first and reports what it did: `shown`,
+`auto_read`, `silenced` or `not_shown`. So the holder keeps the strongest
+outcome instead of ORing `is_active`. One document that showed the toast still
+speaks for the connection, and the connection still owes exactly one pong.
+
+The presence rule above is unchanged. A fullscreen app is still not an active
+shell, so its document shows nothing and reports `not_shown`.

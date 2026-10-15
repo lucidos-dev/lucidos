@@ -1,5 +1,5 @@
 // AUTO-GENERATED. Do not edit by hand.
-// Regenerate: cargo test -p lucidos-engine --lib generate_preference_catalog_file -- --ignored
+// Regenerate: ./scripts/codegen.sh
 //
 // Source of truth: CATALOG in crates/lucidos-engine/src/core/preference_catalog.rs.
 // `fallback` is the value an unset preference resolves to, after any
@@ -74,7 +74,7 @@ export const PREF_IMAGE_MODEL = {
   key: "image_model",
   scope: "global",
   type: "enum",
-  values: ["auto", "imagen-4", "gpt-image-1", "gpt-image-1.5", "gpt-image-2"],
+  values: ["auto", "imagen-4", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2"],
   fallback: "auto",
 } as const;
 
@@ -170,6 +170,21 @@ export const PREF_REASONING_READ_DECISION = {
   fallback: "none",
 } as const;
 
+export const PREF_MODEL_WAKE_DECISION = {
+  key: "model_wake_decision",
+  scope: "global",
+  type: "text",
+  fallback: "gemini-3-flash-preview",
+} as const;
+
+export const PREF_REASONING_WAKE_DECISION = {
+  key: "reasoning_wake_decision",
+  scope: "global",
+  type: "enum",
+  values: ["none", "low", "medium", "high", "xhigh", "max"],
+  fallback: "none",
+} as const;
+
 export const PREF_MODEL_MEMORY = {
   key: "model_memory",
   scope: "global",
@@ -225,7 +240,7 @@ export const PREF_MODEL_VOICE_TRANSCRIBER = {
   key: "model_voice_transcriber",
   scope: "global",
   type: "text",
-  fallback: "gpt-4o-mini-transcribe",
+  fallback: "gpt-transcribe",
 } as const;
 
 export const PREF_VOICE_TALKER_VOICE = {
@@ -374,7 +389,7 @@ export const PREF_MEMORY_MODULE = {
   scope: "global",
   type: "enum",
   values: ["classic", "tree"],
-  fallback: "classic",
+  fallback: null,
 } as const;
 
 export const PREF_WORKSPACE_VIEW_BYTES_HOME = {
@@ -457,6 +472,14 @@ export const PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE = {
   type: "enum",
   values: ["accept-edits", "auto"],
   fallback: "accept-edits",
+} as const;
+
+export const PREF_CODING_AGENT_AUTO_COMPACT_TRIAL = {
+  key: "coding_agent_auto_compact_trial",
+  scope: "global",
+  type: "enum",
+  values: ["off", "ab", "on"],
+  fallback: "off",
 } as const;
 
 export const PREF_THEME_MODE = {
@@ -602,6 +625,20 @@ export const PREF_JUDGMENT_MEMORY_FIND = {
   fallback: null,
 } as const;
 
+export const PREF_JUDGMENT_READ_DECISION = {
+  key: "judgment_read_decision",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
+export const PREF_JUDGMENT_WAKE_DECISION = {
+  key: "judgment_wake_decision",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
 export const PREF_MAX_TOOL_CALLS = {
   key: "max_tool_calls",
   scope: "global",
@@ -737,6 +774,13 @@ export const PREF_SYSTEM_ONE_CUSTOM_MODEL = {
   fallback: null,
 } as const;
 
+export const PREF_SYSTEM_ONE_OPENROUTER_MODEL = {
+  key: "system_one_openrouter_model",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
 export const PREFERENCE_CATALOG = {
   "language": PREF_LANGUAGE,
   "timezone": PREF_TIMEZONE,
@@ -758,6 +802,8 @@ export const PREFERENCE_CATALOG = {
   "reasoning_memory_find": PREF_REASONING_MEMORY_FIND,
   "model_read_decision": PREF_MODEL_READ_DECISION,
   "reasoning_read_decision": PREF_REASONING_READ_DECISION,
+  "model_wake_decision": PREF_MODEL_WAKE_DECISION,
+  "reasoning_wake_decision": PREF_REASONING_WAKE_DECISION,
   "model_memory": PREF_MODEL_MEMORY,
   "reasoning_memory": PREF_REASONING_MEMORY,
   "model_query_classification": PREF_MODEL_QUERY_CLASSIFICATION,
@@ -795,6 +841,7 @@ export const PREFERENCE_CATALOG = {
   "coding_agent_claude_path": PREF_CODING_AGENT_CLAUDE_PATH,
   "coding_agent_codex_path": PREF_CODING_AGENT_CODEX_PATH,
   "coding_agent_claude_permission_mode": PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
+  "coding_agent_auto_compact_trial": PREF_CODING_AGENT_AUTO_COMPACT_TRIAL,
   "theme-mode": PREF_THEME_MODE,
   "font-family": PREF_FONT_FAMILY,
   "ui-scale": PREF_UI_SCALE,
@@ -814,6 +861,8 @@ export const PREFERENCE_CATALOG = {
   "judgment_command_guard": PREF_JUDGMENT_COMMAND_GUARD,
   "judgment_query_classification": PREF_JUDGMENT_QUERY_CLASSIFICATION,
   "judgment_memory_find": PREF_JUDGMENT_MEMORY_FIND,
+  "judgment_read_decision": PREF_JUDGMENT_READ_DECISION,
+  "judgment_wake_decision": PREF_JUDGMENT_WAKE_DECISION,
   "max_tool_calls": PREF_MAX_TOOL_CALLS,
   "capture_context": PREF_CAPTURE_CONTEXT,
   "keybindings": PREF_KEYBINDINGS,
@@ -833,6 +882,7 @@ export const PREFERENCE_CATALOG = {
   "local_base_url": PREF_LOCAL_BASE_URL,
   "system_one_custom_url": PREF_SYSTEM_ONE_CUSTOM_URL,
   "system_one_custom_model": PREF_SYSTEM_ONE_CUSTOM_MODEL,
+  "system_one_openrouter_model": PREF_SYSTEM_ONE_OPENROUTER_MODEL,
 } as const;
 
 export type PreferenceKey = keyof typeof PREFERENCE_CATALOG;

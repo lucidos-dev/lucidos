@@ -21,7 +21,6 @@ vi.mock('../../../store/store', () => ({ focusedThreadId: focusedId }));
 
 import {
   installDeadKeystrokeProbe,
-  reportDraftClobbered,
   _resetDeadKeystrokeProbeForTesting,
 } from '../deadKeystrokeProbe';
 
@@ -114,30 +113,6 @@ describe('a keystroke that reaches the box and not the store', () => {
     el.value = '';
     vi.advanceTimersByTime(10);
     expect(verdicts()).toEqual([]);
-  });
-});
-
-describe('a clear that ran under the user’s fingers', () => {
-  // The composer repairs it, keeping the characters and handing them to the
-  // draft (`resolveEmptyDraftSync`). The line is the only trace the repair
-  // leaves, and the fault is the clear, not the repair.
-  it('records the repair on the same channel, with the thread’s status', () => {
-    reportDraftClobbered({ charCount: 24, threadStatus: 'running' });
-    expect(verdicts()).toEqual(['draft-clobbered']);
-    expect(lines()[0]).toMatchObject({ charCount: 24, threadStatus: 'running' });
-  });
-
-  it('carries the viewport block, so it reads beside a press episode', () => {
-    reportDraftClobbered({ charCount: 3, threadStatus: 'idle' });
-    expect(lines()[0].viewport).toMatchObject({ keyboardActive: false });
-  });
-
-  // A clear can only be repaired on the device the user is typing on, and the
-  // composer calls this directly rather than through a listener.
-  it('is not gated on mobile, unlike the listeners', () => {
-    isMobile.mockReturnValue(false);
-    reportDraftClobbered({ charCount: 1, threadStatus: 'idle' });
-    expect(verdicts()).toEqual(['draft-clobbered']);
   });
 });
 

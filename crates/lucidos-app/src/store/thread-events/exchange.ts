@@ -2,6 +2,7 @@ import { MODELS, REASONING_LEVELS } from '../models';
 import { chatModels } from '../store';
 import { ENGINE_LABEL, RESPONSE_CANCELED_SUMMARY, continuationStartedSummary, responseAbortedSummary } from './thread-event-types';
 import { CC_ACTIVITY_EVENTS } from './thread-meta';
+import { parseMcpToolName } from '../../utils/mcpToolName';
 import type { ActorMode, SequencedEvent, StoredEvent, ThreadEvent, ThreadInitiator } from './thread-event-types';
 
 /** A typed answer to a question card that the engine has not confirmed. It is
@@ -631,10 +632,7 @@ function codexFileChangeLabel(args: unknown): string {
  *  (Codex rebuilds its `mcp_tool_call` item into the same shape), so the server
  *  prefix is noise in a step row. Twin of Rust `mcp_tool_suffix`. */
 function mcpToolSuffix(name: string): string | undefined {
-  if (!name.startsWith('mcp__')) return undefined;
-  const rest = name.slice('mcp__'.length);
-  const sep = rest.indexOf('__');
-  return sep === -1 ? undefined : rest.slice(sep + 2);
+  return parseMcpToolName(name)?.tool;
 }
 
 /** Full primary-arg value for an engine tool call — used as a hover tooltip when
@@ -838,6 +836,8 @@ export function describeEngineTool(name: string, args: unknown): string {
     case 'mcp': {
       const a = str('action');
       if (a === 'setup') return str('name') ? `Setup MCP: ${str('name')}` : 'Setup MCP server';
+      if (a === 'enable') return str('id') ? `Enable MCP: ${str('id')}` : 'Enable MCP server';
+      if (a === 'disable') return str('id') ? `Disable MCP: ${str('id')}` : 'Disable MCP server';
       if (a === 'start') return 'Start MCP server';
       if (a === 'stop') return 'Stop MCP server';
       if (a === 'remove') return 'Remove MCP server';
@@ -888,11 +888,13 @@ export function describeEngineTool(name: string, args: unknown): string {
     case 'enable_push_notifications': return 'Enable push notifications';
     case 'setup_mcp_server': return str('name') ? `Setup MCP: ${str('name')}` : 'Setup MCP server';
     case 'list_mcp_servers': return 'List MCP servers';
-    // start/stop/remove address an already-registered server by `id` (only
+    // enable/disable/start/stop/remove address an already-registered server by `id` (only
     // `setup` takes a `name`). Both the `mcp` domain in `capability_manifest`
     // and the executor in `engine/tools/mcp.rs` read `id`.
     case 'start_mcp_server': return str('id') ? `Start MCP: ${str('id')}` : 'Start MCP server';
     case 'stop_mcp_server': return str('id') ? `Stop MCP: ${str('id')}` : 'Stop MCP server';
+    case 'enable_mcp_server': return str('id') ? `Enable MCP: ${str('id')}` : 'Enable MCP server';
+    case 'disable_mcp_server': return str('id') ? `Disable MCP: ${str('id')}` : 'Disable MCP server';
     case 'remove_mcp_server': return str('id') ? `Remove MCP: ${str('id')}` : 'Remove MCP server';
     case 'list_apps': return 'List apps';
     case 'list_triggers': return 'List triggers';

@@ -10,6 +10,7 @@ import { APP_FRAME_READY_EVENT } from '../../store/actions/app-ready-bridge';
 import type { AppReveal } from '../../store/types';
 import { appFrameLoading, appFrameRevealed, revealFuseMs } from './appFrameReveal';
 import { frameLoaded, frameUnmounted, trackFrameLoad } from './appFrameSharedLoads';
+import { announceFrameGone } from '../../store/actions/frame-swipe-bridge';
 
 /** The load cover's CSS opacity transition at 1x (var(--duration-normal)).
  *  The cover lingers for this, scaled by the Animation speed slider, plus
@@ -97,6 +98,14 @@ export function AppFrame({ src, reveal, onRevealed, onLoad, onUnmount }: AppFram
     const onReady = () => setReady(true);
     iframe.addEventListener(APP_FRAME_READY_EVENT, onReady);
     return () => iframe.removeEventListener(APP_FRAME_READY_EVENT, onReady);
+  }, [generation]);
+
+  // Each element is its own window, and it goes away on a reload as well as an
+  // unmount. A pane drag it leads then springs back, since its release never
+  // comes. Read the window now: the cleanup runs after the ref is gone.
+  useLayoutEffect(() => {
+    const frameWindow = iframeRef.current?.contentWindow ?? null;
+    return () => announceFrameGone(frameWindow);
   }, [generation]);
 
   useEffect(() => {

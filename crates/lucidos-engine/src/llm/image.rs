@@ -423,7 +423,9 @@ pub async fn build_image_provider(
     };
 
     match model {
-        "gpt-image-1" | "gpt-image-1.5" | "gpt-image-2" => match openai_api_key {
+        // The catalog enum limits what is stored, so the prefix names exactly
+        // the OpenAI ids it offers.
+        openai if openai.starts_with("gpt-image-") => match openai_api_key {
             Some(key) => {
                 crate::log!("[Image] Using OpenAI {}", model);
                 build_openai(key, model)
@@ -459,8 +461,9 @@ pub async fn build_image_provider(
                 crate::log!("[Image] Auto-selected Vertex AI Imagen 4");
                 build_imagen()
             } else if let Some(key) = openai_api_key {
-                crate::log!("[Image] Auto-selected OpenAI gpt-image-1");
-                build_openai(key, "gpt-image-1")
+                let openai = crate::core::preference_catalog::OPENAI_IMAGE_MODEL;
+                crate::log!("[Image] Auto-selected OpenAI {}", openai);
+                build_openai(key, openai)
             } else {
                 crate::log!(
                     "[Image] No image provider available (no Vertex or OpenAI credentials)"
@@ -517,7 +520,7 @@ mod tests {
     fn image_provider_constructors_return_result() {
         type BoxErr = Box<dyn std::error::Error + Send + Sync>;
         let openai: Result<OpenAiImageProvider, BoxErr> =
-            OpenAiImageProvider::new("sk-test".into(), "gpt-image-1".into());
+            OpenAiImageProvider::new("sk-test".into(), "gpt-image-2".into());
         assert!(openai.is_ok());
 
         let token_cache: TokenCache = Arc::new(std::sync::Mutex::new(None));
@@ -605,16 +608,58 @@ mod tests {
             "Vertex AI Imagen 4"
         );
 
-        // Auto with no Vertex → falls back to OpenAI gpt-image-1.
+        // Auto with no Vertex falls back to OpenAI. OpenAI shuts gpt-image-1
+        // down, so this pins the current model by name.
         let p2 = build_image_provider(&pool, Some("sk-test"), "", &location, &token_cache).await;
         assert_eq!(
             p2.expect("provider should be built").name(),
-            "OpenAI gpt-image-1"
+            "OpenAI gpt-image-2.5-flare"
         );
 
         // Auto with no credentials at all → None.
         let p3 = build_image_provider(&pool, None, "", &location, &token_cache).await;
         assert!(p3.is_none(), "no credentials → no provider");
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Every OpenAI id the picker offers reaches OpenAI under that id. An id
+    /// the provider match misses would read as auto and run another model.
+    #[tokio::test]
+    async fn every_offered_openai_model_builds_under_its_own_id() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let location = crate::llm::vertex::location_handle("us-central1".into());
+        let token_cache: Option<TokenCache> = Some(Arc::new(std::sync::Mutex::new(None)));
+        let crate::core::preference_catalog::PrefValue::Enum(offered) =
+            crate::core::prefs::IMAGE_MODEL.spec.value
+        else {
+            panic!("image_model is an enum");
+        };
+
+        let openai: Vec<&str> = offered
+            .iter()
+            .copied()
+            .filter(|id| id.starts_with("gpt-image-"))
+            .collect();
+        assert!(openai.len() >= 2, "the picker offers {:?}", offered);
+        for id in openai {
+            crate::test_support::seed_preference(&pool, crate::core::prefs::IMAGE_MODEL.key(), id)
+                .await
+                .unwrap();
+            let provider = build_image_provider(
+                &pool,
+                Some("sk-test"),
+                "test-project",
+                &location,
+                &token_cache,
+            )
+            .await;
+            assert_eq!(
+                provider.expect("provider should be built").name(),
+                format!("OpenAI {id}")
+            );
+        }
 
         pool.close().await;
         crate::test_support::teardown_test_db(&db_name).await;

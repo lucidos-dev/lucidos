@@ -12,6 +12,7 @@ import {
   renewEveryOpenFrame,
   resetArtifactPreviewCapability,
   stopFrameCapabilityRenewal,
+  withPreviewCapability,
 } from './frame-capability';
 
 function mountAppFrame(src: string): HTMLIFrameElement {
@@ -204,5 +205,24 @@ describe('the artifact preview pass', () => {
 
     expect(await renewEveryOpenFrame()).toBe(60_000);
     expect(seen).toEqual([]);
+  });
+});
+
+describe('withPreviewCapability', () => {
+  it('splices the pass in ahead of the data segment', () => {
+    expect(withPreviewCapability('/myws/data/artifacts/r/a.html?rev=2', 'tok'))
+      .toBe('/myws/~cap/tok/data/artifacts/r/a.html?rev=2');
+    expect(withPreviewCapability('/data/artifacts/a.html', 'tok')).toBe('/~cap/tok/data/artifacts/a.html');
+  });
+
+  it('leaves the URL alone with no pass, or off the artifacts tree of the mount', () => {
+    expect(withPreviewCapability('/myws/data/artifacts/a.html', null)).toBe('/myws/data/artifacts/a.html');
+    for (const url of [
+      '/myws/api/v1/data/system-knowhow/x.html',
+      '/myws/api/v1/data/artifacts/x.html',
+      '/myws/data/knowhow/x.html',
+    ]) {
+      expect(withPreviewCapability(url, 'tok')).toBe(url);
+    }
   });
 });

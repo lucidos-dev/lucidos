@@ -337,8 +337,8 @@ pub(crate) fn change_applied_concurrently(
 /// Callers should retry with a fresh session.
 pub(crate) const STALE_RESUME_ERROR: &str = "CC_STALE_RESUME";
 
-/// Error `run_direct_agent`'s spawn guard returns when a **live** session
-/// already owns the thread — the caller lost the race and owns nothing.
+/// Error a spawn reports when its claim found a **live** session on the
+/// thread (`claim_thread_for_spawn` returned `None`). The caller owns nothing.
 ///
 /// User-facing prose (it surfaces on a rejected send), but engine callers must
 /// branch on it, so it is a shared constant rather than a duplicated literal.
@@ -349,16 +349,6 @@ pub(crate) const STALE_RESUME_ERROR: &str = "CC_STALE_RESUME";
 /// `agent_recovery::continue_recovery`.
 pub(crate) const AGENT_ALREADY_RUNNING_ERROR: &str =
     "A coding agent is already running for this thread. Cancel it first or wait for it to finish.";
-
-/// Error the per-thread spawn debounce returns when another spawn started on
-/// this thread within [`SPAWN_DEBOUNCE`]. The same lost race as
-/// [`AGENT_ALREADY_RUNNING_ERROR`], possibly caught before the winner
-/// registered its session. See `agent_recovery::continue_recovery`.
-pub(crate) const DUPLICATE_SPAWN_ERROR: &str =
-    "A coding-agent session was just started, so this duplicate request was ignored.";
-
-/// How long after a spawn on a thread `run_direct_agent` refuses another one.
-pub(crate) const SPAWN_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Marker file written to each CC worktree identifying the owning workspace.
 pub(crate) const WORKTREE_WORKSPACE_MARKER: &str = ".lucidos-workspace";
@@ -442,6 +432,8 @@ pub(crate) struct SpawnAgentThreadParams {
     pub device_id: Option<String>,
     pub parent_thread_id: Option<Uuid>,
     pub spawning_event_id: Option<Uuid>,
+    /// The child's wake mode, beside its parent link. `None` for a top spawn.
+    pub wake_mode: Option<crate::engine::thread_events::WakeMode>,
     pub repo_id: Option<String>,
     pub caller_title: Option<String>,
     /// When `Some`, spawn an **app coding-agent thread** instead of a
@@ -654,8 +646,16 @@ pub(crate) fn claim_for_discard(
 /// Discard is deleting. The holder finishes on its own, and the stop can follow.
 /// `decide_in_place_merge_claim` refuses the other direction.
 pub(crate) fn stop_refusal(session: &crate::engine::AgentSession) -> Option<&'static str> {
+    if matches!(session.phase, crate::engine::SessionPhase::Applying) {
+        return Some(THREAD_APPLYING_MESSAGE);
+    }
     session.change_claim.map(claim_refusal_message)
 }
+
+/// A Stop, Discard or Archive while an apply resets the thread's worktree. No
+/// loop listens to the entry, so a recorded stop would be lost.
+pub(crate) const THREAD_APPLYING_MESSAGE: &str =
+    "An apply is merging this thread's work. Try again when it finishes.";
 
 /// Which terminal event [`settle_stuck_running_thread`] emits, i.e. what ended
 /// the turn it is settling. The caller knows. The helper must not guess: both

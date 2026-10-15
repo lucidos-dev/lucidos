@@ -36,18 +36,17 @@ mod source;
 use merge::{LocalChangeOutcome, MergePlan, ResolvedChange};
 use registry::{
     check_plugin_updates_impl, fetch_remote_manifest, latest_install, not_installed_error,
-    project_baselines, resolve_plugin_query, PluginBaseline,
+    project_installed_plugins, resolve_plugin_query, InstalledPlugins, PluginBaseline,
 };
 use source::{
     copy_atomic, credentials_for_source, detect_source, fetch_source, git_file_mode, write_atomic,
     write_atomic_like, SourceType,
 };
 
-/// Every installed plugin's merge baseline, keyed by plugin id, or why they
-/// could not be read. Resolved before the blocking fetch and handed into it,
-/// since the staged plugin's id is only known once its manifest parses inside
-/// that task.
-type PluginBaselines = Result<std::collections::BTreeMap<String, PluginBaseline>, String>;
+/// Every installed plugin and its merge baseline, or why they could not be
+/// read. Resolved before the blocking fetch and handed into it, since the
+/// staged plugin's id is only known once its manifest parses inside that task.
+type InstalledPluginsRead = Result<InstalledPlugins, String>;
 
 // Named by other modules via the `plugins::` path (`engine::tools::files`
 // routes plugin-owned deletes here), so it stays a re-export.
@@ -254,11 +253,11 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
     let workspace = engine.workspace_path.clone();
     let pending = engine.pending_installs.clone();
     let source = source_str.to_string();
-    // Read every plugin's merge baseline up front. The staged plugin's id
-    // appears only when the fetched manifest parses, inside the blocking task.
-    // So it cannot look up its own baseline from in there.
-    let baselines = project_baselines(&engine.pool).await.map_err(|e| {
-        log!(@Plugins, "read merge baselines failed: {}", e);
+    // Read every installed plugin up front. The staged plugin's id appears
+    // only when the fetched manifest parses, inside the blocking task. So it
+    // cannot look up its own install record from in there.
+    let installed = project_installed_plugins(&engine.pool).await.map_err(|e| {
+        log!(@Plugins, "read installed plugins failed: {}", e);
         e.to_string()
     });
     // The staging body is synchronous, so its credentials are resolved here.
@@ -269,7 +268,7 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
             &workspace,
             &pending,
             &source,
-            &baselines,
+            &installed,
             &credentials,
             &running,
         )
@@ -335,7 +334,7 @@ pub(crate) fn prepare_install_request(
     workspace_path: &Path,
     pending_installs: &std::sync::Arc<PendingInstallsMap>,
     source_str: &str,
-    baselines: &PluginBaselines,
+    installed: &InstalledPluginsRead,
     credentials: &GitCredentials,
     running: &Result<semver::Version, String>,
 ) -> String {
@@ -373,13 +372,18 @@ pub(crate) fn prepare_install_request(
     // pending entry that decides whether confirm spawns a setup thread.
     let setup = normalize_setup(manifest.setup.as_deref());
 
+    let is_update = installed
+        .as_ref()
+        .is_ok_and(|installed| installed.ids.contains(&manifest.id));
+
     // An update over a plugin the user has edited: work out per file whether
     // their edit merges, conflicts, or is simply lost, so the panel can say so
     // before they confirm. A fresh install has no baseline and no plan.
-    // Unreadable baselines refuse any staging that would overwrite a file: the
-    // panel could not name the user's edits, and confirm would not save them.
-    let merge = match baselines {
-        Ok(baselines) => match baselines.get(&manifest.id) {
+    // Unreadable install records refuse any staging that would overwrite a
+    // file: the panel could not name the user's edits, and confirm would not
+    // save them.
+    let merge = match installed {
+        Ok(installed) => match installed.baselines.get(&manifest.id) {
             Some(baseline) => merge::plan_local_changes(workspace_path, baseline, &planned),
             None => MergePlan::default(),
         },
@@ -404,6 +408,7 @@ pub(crate) fn prepare_install_request(
             .map(|p| p.data_relative.clone())
             .collect::<Vec<_>>(),
         "overwrites": overwrites,
+        "is_update": is_update,
         "local_changes": merge.preview_json(),
         "setup": setup,
         "plugin_id": manifest.id,
@@ -1467,6 +1472,7 @@ fn build_upstream_patch_thread_request(
         child_thread_id: thread_id,
         parent_thread_id: None,
         spawning_event_id: None,
+        wake_mode: None,
         title: Some(format!("Propose {plugin_name} patch upstream")),
         model: None,
         reasoning_effort: None,
@@ -1590,6 +1596,7 @@ fn build_setup_thread_request(
         child_thread_id: thread_id,
         parent_thread_id: None,
         spawning_event_id: None,
+        wake_mode: None,
         title: Some(title),
         model: None,
         reasoning_effort: None,

@@ -6,20 +6,20 @@ import { signal } from '@preact/signals';
 export const APP_PANEL_SELECTOR = '[data-role="app-ui-panel"]';
 export const OVERLAY_MOUNT_SELECTOR = '[data-overlay-layer]';
 
-/** Where the host's overlay layer renders while an app is NATIVELY fullscreen:
+/** Where the host's overlay layer sits while an app is NATIVELY fullscreen:
  *  an empty mount element inside the fullscreen app panel, or null.
  *
  *  A natively fullscreen element is painted alone: the browser renders that
  *  element's subtree and nothing else, whatever its z-index. So the host's own
  *  overlays (the `previewFile` modal, confirm, prompt, toast, the search
  *  palette) cannot be seen over a fullscreen app from where they are mounted, at
- *  the app root. `OverlayLayer` portals the whole group into this element, which
+ *  the app root. `OverlayLayer` moves the whole group into this element, which
  *  is the only place the browser will paint them.
  *
  *  The mount is a dedicated empty element rather than the panel itself because
  *  the panel's children are Preact's (the iframe, the pseudo-fullscreen chrome),
- *  and a portal filling a container another component also fills asks two diffs
- *  to agree about DOM they each think they own.
+ *  and a node moved into a container Preact also fills asks its diff to step
+ *  around DOM it does not own.
  *
  *  Pseudo-fullscreen (`.app-ui-fullscreen`, the CSS fallback) deliberately does
  *  NOT set this. That panel is painted in the normal layer, so it is a pure
@@ -64,7 +64,7 @@ export function resolveOverlayMount(
 
 /** Re-derive `appFullscreenHost` from the DOM. Called by `AppUiInline` on every
  *  render and on every fullscreen change, and by the app-message bridge right
- *  before it decides whether it can show a modal, so the decision and the portal
+ *  before it decides whether it can show a modal, so the decision and the move
  *  that acts on it are reading the same instant. */
 export function syncAppFullscreenHost(): void {
   const mount = resolveOverlayMount();

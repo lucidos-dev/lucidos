@@ -93,7 +93,7 @@ pub(super) async fn spend_owner_approval(
     {
         Ok(_) => true,
         Err(e) => {
-            let why = if e.to_string().contains(SPENT_UNIQUE_INDEX) {
+            let why = if crate::engine::event_bus::violates_unique_index(&*e, SPENT_UNIQUE_INDEX) {
                 "another call spent it first".to_string()
             } else {
                 e.to_string()
@@ -161,16 +161,12 @@ async fn live_owner_approval(
 /// The card's question, in the engine's words. The agent's reason is quoted
 /// line by line, so no blank line can close the quote and pose as engine text.
 /// A lone `\r` counts as a line break here, as it does in the card's renderer.
-/// `target_title` is `None` for a verb aimed at the root.
-fn owner_approval_question(
-    verb: ThreadReachVerb,
-    target_title: Option<&str>,
-    reason: &str,
-) -> String {
-    let act = match target_title {
-        Some(title) => format!("{} on \u{201c}{}\u{201d}", verb.act(), one_line(title)),
-        None => verb.act().to_string(),
-    };
+fn owner_approval_question(verb: ThreadReachVerb, target_title: &str, reason: &str) -> String {
+    let act = format!(
+        "{} on \u{201c}{}\u{201d}",
+        verb.act(),
+        one_line(target_title)
+    );
     let quoted: String = reason
         .split(['\n', '\r'])
         .map(|line| format!("> {line}\n"))
@@ -293,7 +289,7 @@ pub(in crate::api) struct RequestOwnerApprovalBody {
 /// calling thread, and return the id the agent asks `AskUserQuestion` with.
 ///
 /// Only a coding agent inside its own thread may call it, and the request
-/// lands on the thread its token names. Body: `{verb, target_thread_id?,
+/// lands on the thread its token names. Body: `{verb, target_thread_id,
 /// reason}`.
 pub(in crate::api) async fn request_owner_approval(
     State(state): State<AppState>,
@@ -301,12 +297,9 @@ pub(in crate::api) async fn request_owner_approval(
     Json(body): Json<RequestOwnerApprovalBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let caller = calling_agent_thread(&headers)?;
-    let reason = checked_request(body.verb, body.target_thread_id, &body.reason)?;
-    let target_title = match body.target_thread_id {
-        Some(target) => Some(thread_title(&state.pool, target).await?),
-        None => None,
-    };
-    if authority_held(&state.pool, Some(caller), None, body.target_thread_id)
+    let (target, reason) = checked_request(body.verb, body.target_thread_id, &body.reason)?;
+    let target_title = thread_title(&state.pool, target).await?;
+    if authority_held(&state.pool, Some(caller), None, Some(target), body.verb)
         .await
         .map_err(ApiError::from)?
         .is_some()
@@ -322,7 +315,7 @@ pub(in crate::api) async fn request_owner_approval(
     }
 
     let request_id = format!("{REQUEST_ID_PREFIX}{}", Uuid::new_v4());
-    let question = owner_approval_question(body.verb, target_title.as_deref(), reason);
+    let question = owner_approval_question(body.verb, &target_title, reason);
     state
         .engine
         .event_bus
@@ -332,7 +325,7 @@ pub(in crate::api) async fn request_owner_approval(
                 request_id: request_id.clone(),
                 approval: OwnerApproval {
                     verb: body.verb,
-                    target_thread_id: body.target_thread_id,
+                    target_thread_id: Some(target),
                 },
                 question,
             },
@@ -364,44 +357,46 @@ fn calling_agent_thread(headers: &HeaderMap) -> Result<Uuid, ApiError> {
     }
 }
 
-/// Check the request's shape, and return the reason trimmed and capped.
+/// Check the request's shape, and return its target with the reason trimmed
+/// and capped.
 fn checked_request(
     verb: ThreadReachVerb,
     target: Option<Uuid>,
     reason: &str,
-) -> Result<&str, ApiError> {
+) -> Result<(Uuid, &str), ApiError> {
     let bad = |msg: String| ApiError::new(StatusCode::BAD_REQUEST, msg);
+    if !verb.needs_authority() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "{} needs no approval (ADR 0475). Do it without a card.",
+                verb.act()
+            ),
+        ));
+    }
     if !verb.proposable() {
         return Err(bad(format!(
             "A card cannot propose {}: that is the owner's own answer, on screen.",
             verb.act()
         )));
     }
-    match (verb.aims_at_root(), target) {
-        (true, Some(_)) => {
-            return Err(bad(format!(
-                "{} aims at the workspace root, so it takes no --thread.",
-                verb.act()
-            )))
-        }
-        (false, None) => {
-            return Err(bad(format!(
-                "Name the thread {} aims at, with --thread <id>.",
-                verb.act()
-            )))
-        }
-        _ => {}
-    }
+    let Some(target) = target else {
+        return Err(bad(format!(
+            "Name the thread {} aims at, with --thread <id>.",
+            verb.act()
+        )));
+    };
     let reason = reason.trim();
     if reason.is_empty() {
         return Err(bad(
             "Give a reason with --reason. The owner reads it on the card.".to_string(),
         ));
     }
-    Ok(match reason.char_indices().nth(REASON_MAX_CHARS) {
+    let reason = match reason.char_indices().nth(REASON_MAX_CHARS) {
         Some((end, _)) => &reason[..end],
         None => reason,
-    })
+    };
+    Ok((target, reason))
 }
 
 /// The target's title, or a 404 naming the id when no such thread exists.

@@ -1,13 +1,11 @@
 import { signal } from '@preact/signals';
-import { PHONE_LAYOUT_QUERY, isPhoneLayout } from './layoutMedia';
+import { PHONE_LAYOUT_QUERY, hasCoarsePointer, viewportGetsPhoneLayout } from './layoutMedia';
+
+export { hasCoarsePointer };
 
 /** Whether the viewport gets the phone layout (`@media (--phone-layout)` in
  *  CSS, utils/layoutMedia.ts). Non-reactive: does not subscribe the caller. */
-export const isMobile = (): boolean => isPhoneLayout({
-  width: window.innerWidth,
-  height: window.innerHeight,
-  coarsePointer: hasCoarsePointer(),
-});
+export const isMobile = (): boolean => viewportGetsPhoneLayout();
 
 /** True when the device exposes touch input. Inclusive OR so any touch
  *  indicator counts — used by the body `.is-touch` class which controls
@@ -15,12 +13,6 @@ export const isMobile = (): boolean => isPhoneLayout({
  *  staying visible on a desktop Chrome with a stale ontouchstart shim). */
 export const isTouchDevice = (): boolean =>
   'ontouchstart' in window || navigator.maxTouchPoints > 0;
-
-/** True when the primary pointer is a finger. Unlike `isMobile()` this holds
- *  on an iPad wider than the breakpoint, and unlike `isTouchDevice()` it stays
- *  false on a touchscreen laptop driven by its trackpad. */
-export const hasCoarsePointer = (): boolean =>
-  window.matchMedia?.('(pointer: coarse)').matches ?? false;
 
 /** True when the device is mobile-sized OR confirmed touch-capable. The
  *  scroll-lock helper keys off this — iOS Safari ignores overflow:hidden on
@@ -80,7 +72,7 @@ window.matchMedia?.(PHONE_LAYOUT_QUERY).addEventListener?.('change', syncViewpor
  *  Backed by `components/chat/scrollState.ts`, through the scroll state
  *  handle, so consumers (notification routing, audit logging) can pull from
  *  `utils/viewport` without reaching into chat internals. See
- *  `system-knowhow/notifications.md` §3 — used to compute
- *  `event_in_viewport` in the PresenceCheck pong.
+ *  `system-knowhow/notifications.md` §4: Row 1 auto-reads a notification
+ *  whose source event this reports on screen.
  */
 export { isEventInViewport as isInViewport, isReplyEndInViewport, lastExchangeOf } from '../components/chat/scrollStateHandle';

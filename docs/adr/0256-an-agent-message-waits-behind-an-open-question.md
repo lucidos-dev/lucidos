@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-23
+- **Amended by**: [0441: An event that records another commits with it](0441-an-event-that-records-another-commits-with-it.md)
 
 ## Context
 
@@ -33,9 +34,9 @@ Any answer except Cancel releases every held message, oldest first, and so does
 an Allow or Deny on the card. So do the user's next message and Continue. A
 Cancel keeps them held.
 
-Each release emits `HeldMessageReleased` and then the ordinary `MessageReceived`,
-and forwards the message to the agent. A unique index allows one release per
-held message. The rule is `message_is_held` in `engine/chat/held_messages.rs`.
+Each release emits `HeldMessageReleased` and the ordinary `MessageReceived` as
+one atomic emit (ADR 0441), then forwards the message to the agent. A unique
+index allows one release per held message. The rule is `message_is_held` in `engine/chat/held_messages.rs`.
 
 The release is guaranteed to reach the agent. The session keeps its subprocess
 until the agent reports the message read, per ADR 0268. The transcript shows
@@ -55,9 +56,10 @@ parent's message must not restart the child the user just stopped.
 Without this rule a newer agent message would overtake an older held one and
 restart the child. With it, send order is kept and the Cancel is respected.
 
-**Emit the release before delivering.** A crash between the two leaves a message
-that is visible but undelivered, which is loud. The reverse order can deliver a
-message twice, which is silent.
+**The release and its `MessageReceived` commit together.** Either the message is
+still held or it is received, never neither (ADR 0441). The forward to the agent
+comes after the commit. A crash there is the ordinary message path, which
+Continue recovers.
 
 **Codex waits for the turn to end.** A Codex agent interrupts a running turn for
 any new input. So a release waits for the turn the answer resumed to finish.
@@ -75,9 +77,14 @@ lost.
   One on an overtaken question supersedes it, per ADR 0082.
 - An agent message on an overtaken question still supersedes it. Nothing is
   parked on a dead card, so there is nothing to wait for.
-- A release that a restart interrupts leaves the message held and visible. The
-  user's next message or Continue releases it. No boot sweep delivers it,
-  because a restart must not start work on its own.
+- A release that a restart or a store error interrupts leaves the message held
+  and visible, at the head of the queue. The user's next message or Continue
+  releases it. No boot sweep delivers it, because a restart must not start work
+  on its own.
+- A release that lands while no agent session is up waits for the session to
+  register by polling (`AGENT_START_GRACE`, `AGENT_POLL`). The spawn
+  placeholder from the "claim at entry" work will make the session visible at
+  once, which retires that poll.
 - Held messages on an archived or discarded thread are never delivered.
 - The Lucidos Agent lane is unchanged. It already queues these messages.
 - A pending permission card holds agent messages too. An agent message used to

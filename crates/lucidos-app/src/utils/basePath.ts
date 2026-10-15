@@ -126,6 +126,11 @@ export const SCOPE_PATH: string = `${BASE_PATH}/`;
  *  hyphen) — the same shape the picker's `slugifyWorkspaceName` produces. */
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
+/** Is `segment` a workspace slug the gateway would serve? */
+export function isWorkspaceSlug(segment: string): boolean {
+  return SLUG_RE.test(segment);
+}
+
 /** Pure predicate (testable without the DOM): does this served context let the
  *  app build valid workspace URLs? The picker (`/~`, slug null) and a legacy
  *  direct-engine root (`''`, slug null) are always valid. A workspace context is
@@ -134,7 +139,7 @@ const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
  *  malformed one is exactly what yields the WebKit "string did not match the
  *  expected pattern" failures across every fetch + SW registration. */
 export function baseContextValidFor(workspaceId: string | null): boolean {
-  return workspaceId === null || SLUG_RE.test(workspaceId);
+  return workspaceId === null || isWorkspaceSlug(workspaceId);
 }
 
 /** True when THIS bundle's served base-path context can build valid workspace

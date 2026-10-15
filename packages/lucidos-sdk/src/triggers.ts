@@ -43,6 +43,9 @@ export interface Trigger {
   /** Side-effect grant — irreversible categories this trigger may perform
    *  unattended. Omitted when empty (= no grant). */
   side_effect_grant?: SideEffectCategory[];
+  /** MCP server ids this trigger's fires use. Only these servers' tools run
+   *  unattended in its threads. Omitted when empty. */
+  mcp_servers?: string[];
   /** Chat model this trigger's intent fires on. Omitted when the trigger uses
    *  the account default (Settings → Models → Chat & triggers). Intent
    *  triggers only: a script trigger runs no LLM. */
@@ -67,6 +70,9 @@ export interface CreateTrigger {
   /** Side-effect grant — irreversible categories this trigger may perform
    *  unattended. Omit / `[]` = none granted (the safe default). */
   side_effect_grant?: SideEffectCategory[];
+  /** MCP server ids this trigger's fires use. A fire refuses a call to any
+   *  other server. Omit / `[]` = none. */
+  mcp_servers?: string[];
   /** Chat model this trigger's intent fires on. Omit / null = the account
    *  default. Not validated against the model registry, so a wrong id fails at
    *  fire time rather than at save time. */
@@ -95,6 +101,8 @@ export interface UpdateTrigger {
   /** Full replacement for the side-effect grant. Send the complete new set;
    *  pass `[]` to clear all grants. */
   side_effect_grant?: SideEffectCategory[];
+  /** Full replacement for the MCP server ids; pass `[]` to clear them. */
+  mcp_servers?: string[];
   /** Pin the trigger's intent to a chat model (string) or clear it back to the
    *  account default (null). Absent leaves it unchanged. */
   model?: string | null;

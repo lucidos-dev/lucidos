@@ -37,7 +37,7 @@ fn huge() -> Vec<u8> {
 /// or the install commit, and an oversize screenshot is dropped, not fatal.
 #[tokio::test]
 async fn install_keeps_media_outside_the_workspace_content() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     crate::core::ensure_workspace_gitignore_entries(&scratch).unwrap();
     let huge = huge();
     let write = install(
@@ -82,13 +82,12 @@ async fn install_keeps_media_outside_the_workspace_content() {
         untracked.is_empty(),
         "media must be gitignored: {untracked:?}"
     );
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// Invariant I11: an update swaps the copy whole and uninstall deletes it.
 #[tokio::test]
 async fn update_replaces_media_and_uninstall_removes_it() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install(
         &scratch,
         MANIFEST,
@@ -130,13 +129,12 @@ async fn update_replaces_media_and_uninstall_removes_it() {
         .await
         .expect("uninstall");
     assert!(!copy.exists());
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// Invariant I10: installed media does not depend on the marketplace's cache.
 #[tokio::test]
 async fn installed_media_outlives_the_marketplace() {
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install(
         &scratch,
         MANIFEST,
@@ -159,5 +157,4 @@ async fn installed_media_outlives_the_marketplace() {
     assert!(!cached.exists(), "the removed marketplace's cache goes");
     let copy = installed_dir(&scratch, "media-plugin");
     assert!(listed_file(&copy, "media/icon.svg").is_some());
-    let _ = std::fs::remove_dir_all(&scratch);
 }

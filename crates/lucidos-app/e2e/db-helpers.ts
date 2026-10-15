@@ -1,6 +1,7 @@
 import { execSync } from 'child_process';
-import { mkdirSync, writeFileSync, rmSync, realpathSync } from 'fs';
-import { resolve } from 'path';
+import { mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from 'fs';
+import { homedir } from 'os';
+import { join, resolve } from 'path';
 import { randomUUID } from 'crypto';
 import { E2E_WORKSPACE } from './address';
 
@@ -97,12 +98,20 @@ export function resetWelcomePreference(): void {
   ].join(';\n'));
 }
 
-/** Run SQL via stdin to avoid shell escaping issues with JSON payloads. */
+/** The shared cluster's minted password (`shared_pg_password`,
+ *  scripts/lib/pg_secret.sh). The file name is pinned by the gateway's
+ *  `value_pins_tests`. */
+function sharedPgPassword(): string {
+  return readFileSync(join(homedir(), '.lucidos', 'pg-shared-password'), 'utf-8').trim();
+}
+
+/** Run SQL via stdin to avoid shell escaping issues with JSON payloads. The
+ *  password goes in the child's environment, never its argv. */
 export function psql(sql: string): string {
   const dbPort = getDbPort();
   return execSync(
-    `psql "postgres://lucidos:lucidos@localhost:${dbPort}/${getDbName()}" -t`,
-    { encoding: 'utf-8', input: sql },
+    `psql "postgres://lucidos@localhost:${dbPort}/${getDbName()}" -t`,
+    { encoding: 'utf-8', input: sql, env: { ...process.env, PGPASSWORD: sharedPgPassword() } },
   ).trim();
 }
 

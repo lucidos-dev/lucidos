@@ -30,12 +30,16 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, hasUrlScheme, browserHandlesHref, type RepoFileHrefTarget } from '../../../utils/linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractWorkspaceDiskDataPath, extractTriggerIdFromHref, extractSettingsViewFromHref, extractRepoFileTargetFromHref, hasUrlScheme, browserHandlesHref, type RepoFileHrefTarget } from '../../../utils/linkifyPaths';
 import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const routerSource = readFileSync(resolve(here, '../../shared/markdownLinkClick.ts'), 'utf-8');
+
+/** The workspace root the mirror resolves disk paths against, standing in for
+ *  the `workspacePath` signal the real handler reads. */
+const WORKSPACE = '/Users/me/workspaces/dev';
 
 const APPS: App[] = [
   { id: 'work-tracker', name: 'Lucidos Work', description: 'x', reveal: 'on-load', kind: 'app', reusable: false },
@@ -174,7 +178,7 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
       const a = apps.find(x => x.id === bareRef || x.name === bareRef);
       if (a) { e.preventDefault(); cb.openApp(a); return; }
     }
-    const dataPath = extractDataPathTarget(href);
+    const dataPath = extractDataPathTarget(href) ?? extractWorkspaceDiskDataPath(href, WORKSPACE);
     if (dataPath) {
       e.preventDefault();
       cb.openArtifact(dataPath);
@@ -651,6 +655,20 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(true);
   });
 
+  // The reported bug: a coding agent linked its artifacts by DISK path. On the
+  // iOS PWA the OS-open branch has no OS to hand it to, so the tap landed on
+  // the gateway. A disk path into this workspace's data/ tree is a data path.
+  it.each([
+    `${WORKSPACE}/data/artifacts/marketing/phone-100.png`,
+    `file://${WORKSPACE}/data/artifacts/marketing/phone-100.png`,
+  ])('DISK PATH: %s inside the workspace previews in-app, never OS-opens', (href) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openArtifact).toHaveBeenCalledWith('artifacts/marketing/phone-100.png');
+    expect(cb.osOpen).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+  });
+
   // ---------------------------------------------------------------------------
   // The reported bug: `lucidos data write` lands an artifact and prints
   // `[name](artifacts/<path>)` for the agent to paste. The artifacts cache is
@@ -838,7 +856,7 @@ describe('chat link click — handler structure pin', () => {
     expect(body).toMatch(sequence);
   });
 
-  it('handleMarkdownLinkClick uses all seven href extractors in the fallback branch', () => {
+  it('handleMarkdownLinkClick uses all eight href extractors in the fallback branch', () => {
     expect(routerSource).toMatch(/import[\s\S]*?extractAppTargetFromHref[\s\S]*?extractNavTargetFromHref[\s\S]*?extractLocalFileTarget[\s\S]*?extractBareAppRef[\s\S]*?extractDataPathTarget[\s\S]*?extractTriggerIdFromHref[\s\S]*?extractRepoFileTargetFromHref[\s\S]*?from '..\/..\/utils\/linkifyPaths'/);
     expect(routerSource).toMatch(/extractAppTargetFromHref\(rawHref\)/);
     expect(routerSource).toMatch(/extractTriggerIdFromHref\(rawHref\)/);
@@ -846,6 +864,7 @@ describe('chat link click — handler structure pin', () => {
     expect(routerSource).toMatch(/extractNavTargetFromHref\(rawHref\)/);
     expect(routerSource).toMatch(/extractBareAppRef\(rawHref\)/);
     expect(routerSource).toMatch(/extractDataPathTarget\(rawHref\)/);
+    expect(routerSource).toMatch(/extractWorkspaceDiskDataPath\(rawHref, workspacePath\.value\)/);
     expect(routerSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
   });
 
@@ -894,6 +913,9 @@ describe('chat link click — handler structure pin', () => {
     const navIdx = routerSource.indexOf('extractNavTargetFromHref(rawHref)');
     const bareIdx = routerSource.indexOf('extractBareAppRef(rawHref)');
     const dataIdx = routerSource.indexOf('extractDataPathTarget(rawHref)');
+    // A disk path into the workspace's data/ tree is a data path. The OS-open
+    // branch must not read it as a file outside the workspace.
+    const diskIdx = routerSource.indexOf('extractWorkspaceDiskDataPath(rawHref');
     const fileIdx = routerSource.indexOf('extractLocalFileTarget(rawHref)');
     expect(appIdx).toBeGreaterThanOrEqual(0);
     expect(trigIdx).toBeGreaterThan(appIdx);
@@ -901,7 +923,8 @@ describe('chat link click — handler structure pin', () => {
     expect(navIdx).toBeGreaterThan(repoIdx);
     expect(bareIdx).toBeGreaterThan(navIdx);
     expect(dataIdx).toBeGreaterThan(bareIdx);
-    expect(fileIdx).toBeGreaterThan(dataIdx);
+    expect(diskIdx).toBeGreaterThan(dataIdx);
+    expect(fileIdx).toBeGreaterThan(diskIdx);
   });
 
   it('the terminal guard is LAST and swallows every scheme-less href', () => {

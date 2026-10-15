@@ -389,6 +389,7 @@ impl LucidosEngine {
             None,
             None,
             None,
+            None,
             thread_events::ActorMode::Agent,
             None,
             None,

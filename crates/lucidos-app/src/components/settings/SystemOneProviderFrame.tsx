@@ -1,6 +1,6 @@
 import { useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { credentials, preferences } from '../../store/store';
+import { configuredProviders, credentials, preferences } from '../../store/store';
 import { setSystemOneEnabled } from '../../store/actions/preferences';
 import { findProviderCredential } from './providerCredential';
 import { ProviderBlockFrame } from './ProviderBlockFrame';
@@ -52,7 +52,12 @@ export function SystemOneProviderFrame(props: {
     prefsLoadable.status === 'loaded',
   );
   const state = systemOneProviderState({
-    configured: systemOneConfigured(props.provider, credLoadable, prefsLoadable),
+    configured: systemOneConfigured(
+      props.provider,
+      credLoadable,
+      prefsLoadable,
+      configuredProviders.value,
+    ),
     switchedOff: systemOneSwitchedOff(prefsLoadable, props.provider),
   });
   // The local disclosure that lets a first key be typed. A provider nobody has
@@ -71,7 +76,12 @@ export function SystemOneProviderFrame(props: {
   }
 
   const keyStored = !!findProviderCredential(credLoadable, spec.credentialService);
-  const inUseBy = systemOneConsumers(props.provider, prefsLoadable, keyStored);
+  const inUseBy = systemOneConsumers(
+    props.provider,
+    prefsLoadable,
+    keyStored,
+    configuredProviders.value,
+  );
 
   return (
     <ProviderBlockFrame
@@ -95,16 +105,29 @@ export function SystemOneProviderFrame(props: {
           while the provider is off, though the preferences it reads outlive
           the switch. And it never asserts from an unloaded read, because
           `open` needs `loaded`. */}
-      <div class="settings-row settings-row-child" data-search-anchor={`${spec.anchor}-usage`}>
-        <span class="settings-row-label">
-          In use by
-          <span class="list-row-details list-row-details-prose">
-            {inUseBy.length === 0
-              ? 'Nothing yet. Every judgment still runs on its chat model.'
-              : inUseBy.join(', ')}
-          </span>
-        </span>
-      </div>
+      <SystemOneUsageRow
+        anchor={`${spec.anchor}-usage`}
+        inUseBy={inUseBy}
+        empty="Nothing yet. Every judgment still runs on its chat model."
+      />
     </ProviderBlockFrame>
+  );
+}
+
+/** The "In use by" row under a provider that answers judgments. */
+export function SystemOneUsageRow(props: {
+  anchor?: string;
+  inUseBy: readonly string[];
+  empty: string;
+}) {
+  return (
+    <div class="settings-row settings-row-child" data-search-anchor={props.anchor}>
+      <span class="settings-row-label">
+        In use by
+        <span class="list-row-details list-row-details-prose">
+          {props.inUseBy.length === 0 ? props.empty : props.inUseBy.join(', ')}
+        </span>
+      </span>
+    </div>
   );
 }

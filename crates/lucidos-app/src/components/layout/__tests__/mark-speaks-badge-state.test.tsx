@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { render } from 'preact';
-import { BrandMenuButton } from '../HeaderMark';
+import { BrandMenuButton, MENU_NAME } from '../HeaderMark';
 import { engineBuilding } from '../../../store/store';
 
 describe('the mark speaks the state badge', () => {
@@ -23,7 +23,8 @@ describe('the mark speaks the state badge', () => {
     render(<BrandMenuButton placement="brand" />, host);
     const mark = host.querySelector('[data-role="brand-menu-toggle"]')!;
     expect(mark.getAttribute('aria-label')).toContain('Building new version');
-    expect(mark.getAttribute('data-tooltip')).toContain('Building new version');
+    expect(mark.getAttribute('data-tooltip-title')).toBe(MENU_NAME);
+    expect(mark.getAttribute('data-tooltip-rows')).toContain('Building new version');
     expect(host.querySelector('.brand-badge')?.getAttribute('data-tooltip')).toBeNull();
   });
 });

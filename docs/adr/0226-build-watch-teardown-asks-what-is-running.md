@@ -1,7 +1,15 @@
 # 0226: The build-watch teardown asks what is running, not what a marker file says
 
-- **Status**: Accepted
+- **Status**: Superseded by
+  [ADR 0438](0438-process-ownership-is-a-held-lock.md)
 - **Date**: 2026-09-19
+
+The incident and the principle survive. What 0438 replaces is the mechanism.
+Every engine serving a checkout's `dist/` holds a shared *consumer lock* for its
+whole life, and the teardown takes that lock exclusively without waiting. So
+the process-table vote, its unknown handling and the marker scan are all gone:
+the kernel answers "does anything still serve this checkout" in one call, and
+no consumer can register between that answer and the kill.
 
 ## Context
 

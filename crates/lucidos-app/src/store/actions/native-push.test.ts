@@ -5,10 +5,6 @@ vi.mock('../../utils/platform', () => ({
   isTauri: () => isTauri(),
 }));
 
-const isPageActive = vi.fn(() => false);
-vi.mock('../../utils/pageActive', () => ({
-  isPageActive: () => isPageActive(),
-}));
 
 // The gateway slug this page is served under. A getter (not a plain value) so a
 // test can move the page between workspaces: `native-push.ts` reads
@@ -48,12 +44,12 @@ vi.mock('../../utils/tauri', () => ({
 }));
 
 const dispatchDeepLink = vi.fn();
-// A budget only this suite uses. Read back as NATIVE_PUSH_STALE_AFTER_MS, it
-// proves the banner gate takes the toast's budget rather than its own.
-const testStaleBudgetMs = vi.hoisted(() => 1234);
+// What the page does with the notification in the app. `not_shown` means the
+// shell is not in front, which is what a banner is for.
+const presentInAppNotification = vi.fn((_input: unknown) => 'not_shown');
 vi.mock('./in-app-notification-toast', () => ({
   dispatchDeepLink: (...args: unknown[]) => dispatchDeepLink(...args),
-  TOAST_REQUEST_STALE_AFTER_MS: testStaleBudgetMs,
+  presentInAppNotification: (input: unknown) => presentInAppNotification(input),
 }));
 
 // Breadcrumb telemetry — assert nothing, just keep it from hitting the network.
@@ -92,7 +88,7 @@ const flush = () => new Promise((r) => setTimeout(r, 0));
 describe('NativePushRequested → native desktop banner', () => {
   beforeEach(() => {
     isTauri.mockReturnValue(true);
-    isPageActive.mockReturnValue(false);
+    presentInAppNotification.mockReset().mockReturnValue('not_shown');
     showNativeNotification.mockClear();
   });
 
@@ -129,16 +125,22 @@ describe('NativePushRequested → native desktop banner', () => {
   });
 
   it('drops a stale frame (late SSE-queue flush) past the freshness budget', async () => {
-    expect(NATIVE_PUSH_STALE_AFTER_MS).toBe(testStaleBudgetMs);
     emit({ sent_at_ms: Date.now() - NATIVE_PUSH_STALE_AFTER_MS - 1 });
     await flush();
     expect(showNativeNotification).not.toHaveBeenCalled();
   });
 
-  it('no-ops when the page is active (OS surface is for non-active devices)', async () => {
-    isPageActive.mockReturnValue(true);
-    emit();
+  it('gives a window that came forward the in-app outcome instead of a banner', async () => {
+    // The page answered the check from behind other windows, then the reader
+    // brought it forward. The frame still surfaces, in the app this time.
+    presentInAppNotification.mockReturnValue('shown');
+    emit({ notification_id: 'n-front', thread_id: 't-1', event_id: 'e-1', tap: { kind: 'modal' } });
     await flush();
+    expect(presentInAppNotification).toHaveBeenCalledWith({
+      title: 'Claude is asking',
+      body: 'Pick one',
+      target: { notification: 'n-front', thread: 't-1', event: 'e-1', tap: { kind: 'modal' } },
+    });
     expect(showNativeNotification).not.toHaveBeenCalled();
   });
 
@@ -206,8 +208,8 @@ describe('setupNativePushTapRouting → drain → dispatchDeepLink', () => {
     expect(dispatchDeepLink).toHaveBeenCalledTimes(2);
   });
 
-  // A native banner only ever shows while the page is INACTIVE
-  // (handleNativePushRequested gates on isPageActive), so a banner tap ALWAYS
+  // A native banner only ever shows while the shell is not in front
+  // (handleNativePushRequested), so a banner tap ALWAYS
   // lands on a backgrounded/hidden — often JS-throttled — WKWebView.
   // show_main_window then just SHOWS the existing window (no reload), so the
   // startup cold drain never re-runs and the warm app.emit can be dropped on the
@@ -295,7 +297,7 @@ function emitDismiss(overrides: Partial<NativePushDismissRequestedPayload> = {})
 describe('NativePushDismissRequested → remove native desktop banner', () => {
   beforeEach(() => {
     isTauri.mockReturnValue(true);
-    isPageActive.mockReturnValue(false);
+    presentInAppNotification.mockClear();
     dismissNativeNotification.mockClear();
   });
 
@@ -334,10 +336,10 @@ describe('NativePushDismissRequested → remove native desktop banner', () => {
     expect(dismissNativeNotification).not.toHaveBeenCalled();
   });
 
-  it('dismisses regardless of page-active state (no isPageActive gate)', async () => {
-    isPageActive.mockReturnValue(true);
+  it('dismisses without asking whether the window is in front', async () => {
     emitDismiss({ notification_id: 'n-9' });
     await flush();
+    expect(presentInAppNotification).not.toHaveBeenCalled();
     expect(dismissNativeNotification).toHaveBeenCalledWith({
       workspace: 'myws',
       notificationId: 'n-9',

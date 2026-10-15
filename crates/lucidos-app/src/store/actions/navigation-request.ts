@@ -12,6 +12,7 @@ import { holdFocusedPaneWhileTyping, releaseTypingHold, revealContentPane } from
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { openEncodedRepoFilePreview } from './repositories';
 import { openRepoFileLink } from './repoFileLink';
+import { revealHomeBoard } from './homeBoardNav';
 import { fileFindScope, requestFind } from './find-request';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { isMobile } from '../../utils/viewport';
@@ -117,6 +118,8 @@ export function describeNavTarget(nav: {
       return 'your installed plugins';
     case 'thread-queue':
       return 'the Thread Queue';
+    case 'home-board':
+      return 'the Home board';
     case 'files':
     case 'apps':
     case 'triggers':
@@ -155,6 +158,9 @@ export function handleNavigationRequest(nav: {
 }): Promise<unknown> | void {
   const navAppId = nav.app_id;
   switch (nav.target) {
+    case 'home-board':
+      revealHomeBoard();
+      break;
     case 'files':
     case 'apps':
     case 'triggers':

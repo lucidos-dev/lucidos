@@ -14,7 +14,7 @@ import { RetryIcon } from '../shared/icons';
 import { Disclosure } from '../shared/Disclosure';
 import { unsentMessages } from '../../store/unsentMessages';
 import { sendFailureDetail, type SendFailure } from '../../store/actions/sendRetry';
-import { WidgetEmbedFrame } from '../widgets/WidgetEmbedFrame';
+import { OptionWidgetFrame } from '../widgets/OptionWidgetFrame';
 
 /** Local name for the wire `AnswerKind`. Aliased rather than restated, because
  *  this card renders every kind the engine can persist. A second copy of the
@@ -140,7 +140,7 @@ function OptionSlot({ option, state, children }: {
   return (
     <div class={state ? `question-option-boxed ${state}` : 'question-option-boxed'} data-option-id={option.id}>
       {children}
-      <WidgetEmbedFrame embed={option.widget} place="option" />
+      <OptionWidgetFrame embed={option.widget} />
     </div>
   );
 }

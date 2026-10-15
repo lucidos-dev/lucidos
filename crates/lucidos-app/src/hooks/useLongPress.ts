@@ -1,3 +1,4 @@
+import { LONG_PRESS_DELAY_MS, PRESS_MOVE_TOLERANCE_PX } from '@lucidos/widget-frame';
 import { useEffect, useRef } from 'preact/hooks';
 import type { ViewportPoint } from './useAnchoredPopover';
 
@@ -17,13 +18,12 @@ export interface LongPressHandlers {
 export interface LongPressOptions {
   /** Hold duration before the long-press fires. */
   delayMs?: number;
-  /** Pointer travel (px) that cancels a pending hold — a drag, not a press. */
+  /** Pointer travel (px) that cancels a pending hold: a drag, not a press. */
   moveTolerancePx?: number;
 }
 
-/** Where a still press stops being a tap, app-wide. */
-export const LONG_PRESS_DELAY_MS = 450;
-const DEFAULT_MOVE_TOLERANCE_PX = 10;
+export { LONG_PRESS_DELAY_MS };
+const DEFAULT_MOVE_TOLERANCE_PX = PRESS_MOVE_TOLERANCE_PX;
 // Upper bound for swallowing the `click` the browser pairs with the gesture's
 // pointerup. Keyed to pointerup (not to fire time) so an arbitrarily long hold
 // can never leave the suppressor armed against a later, unrelated click.

@@ -88,14 +88,23 @@ fn claimed_target_rejection(
 pub(crate) type ArchiveRejection = (StatusCode, axum::Json<serde_json::Value>);
 
 /// What one cascade archived, and the members it left open.
+#[derive(Default)]
 pub(crate) struct ArchiveOutcome {
     pub(crate) archived: Vec<Uuid>,
     pub(crate) skipped: Vec<serde_json::Value>,
+    /// Each archived member's `summary_version` as its `ThreadArchived`
+    /// broadcast it. The client holds its optimistic archive until the row
+    /// reaches this version (ADR 0437).
+    pub(crate) summary_versions: HashMap<Uuid, i64>,
 }
 
 impl ArchiveOutcome {
     fn into_body(self) -> axum::Json<serde_json::Value> {
-        axum::Json(serde_json::json!({ "archived": self.archived, "skipped": self.skipped }))
+        axum::Json(serde_json::json!({
+            "archived": self.archived,
+            "skipped": self.skipped,
+            "summary_versions": self.summary_versions,
+        }))
     }
 }
 
@@ -469,16 +478,23 @@ pub(crate) async fn archive_family(
             .await
             .map_err(internal_json)?;
         for change in pending {
+            // An apply already running for this change announces it instead.
+            let Some(claim) = engine
+                .claim_pending_change(change.id)
+                .await
+                .map_err(internal_json)?
+            else {
+                continue;
+            };
             engine
                 .emit_change_applied(
+                    &claim,
                     *tid,
-                    change.id,
                     false,
                     false,
                     Vec::new(),
                     change.thread_title.clone(),
                     actor.clone(),
-                    None,
                     None,
                 )
                 .await;
@@ -490,6 +506,7 @@ pub(crate) async fn archive_family(
     }
 
     let mut archived = Vec::with_capacity(to_archive.len());
+    let mut summary_versions = HashMap::with_capacity(to_archive.len());
     let mut skipped: Vec<serde_json::Value> = left_pinned
         .iter()
         .map(|tid| skipped_member(*tid, THREAD_PINNED, &pinned_message(*tid)))
@@ -578,7 +595,12 @@ pub(crate) async fn archive_family(
             })
             .await;
         match emitted {
-            Ok(_) => archived.push(*tid),
+            Ok(result) => {
+                archived.push(*tid);
+                if let Some(version) = result.and_then(|r| r.summary_version) {
+                    summary_versions.insert(*tid, version);
+                }
+            }
             // The bus refused: the member parked after the lock dropped.
             Err(e) if e.downcast_ref::<LifecycleViolation>().is_some() => {
                 log!("[API] archive_thread: {} not archived: {}", tid, e);
@@ -610,7 +632,11 @@ pub(crate) async fn archive_family(
             .await;
     }
 
-    Ok(ArchiveOutcome { archived, skipped })
+    Ok(ArchiveOutcome {
+        archived,
+        skipped,
+        summary_versions,
+    })
 }
 
 #[cfg(test)]

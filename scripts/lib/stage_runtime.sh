@@ -108,14 +108,33 @@ stage_runtime_needs_macos_sysroot() {
 
 # ── build steps (network / toolchain — not offline-testable) ─────────────────
 
-# stage_runtime_build_frontend <repo-root> <app-dir> — build the bundled frontend
-# (Vite dist/) and the JS SDK bundle. Mirrors build-dmg.sh's step 1.
+# stage_runtime_build_frontend <repo-root> <app-dir> — write the generated files
+# and the SDK bundles (scripts/codegen.sh), then build the bundled frontend (Vite
+# dist/). Runs AFTER stage_runtime_build_binaries: a codegen cache miss renders
+# with the release lucidos-codegen that build left beside the engine.
 stage_runtime_build_frontend() {
-    local repo_root="$1" app_dir="$2"
+    local repo_root="$1" app_dir="$2" codegen_bin="$1/target/release/lucidos-codegen"
+    [ -x "$codegen_bin" ] || { echo "ERROR: $codegen_bin not found: build the release binaries first" >&2; return 1; }
     ( cd "$repo_root" && npm ci ) || return 1   # strict: install exactly from the committed package-lock.json
-    ( cd "$repo_root/packages/lucidos-sdk" && npm run build ) || return 1   # /api/v1/sdk.js for app UIs
+    "$repo_root/scripts/codegen.sh" --bin "$codegen_bin" || return 1   # also /api/v1/sdk.js for app UIs
+    stage_runtime_assert_sdk_built "$repo_root/packages/lucidos-sdk/dist" || return 1
     ( cd "$app_dir" && npm run build ) || return 1
     [ -f "$app_dir/dist/index.html" ] || { echo "ERROR: frontend build did not produce $app_dir/dist/index.html" >&2; return 1; }
+}
+
+# The SDK files the engine reads at runtime from its staged SDK dir. A packaged
+# build missing one serves app frames no boot script, so staging fails closed.
+# `served_sdk_files_are_staged` in api/sdk.rs pins this list to the engine's.
+STAGE_RUNTIME_SERVED_SDK_FILES=(sdk.js appearance-boot.iframe.js sse-worker.js)
+
+# stage_runtime_assert_sdk_built <sdk-dist> — fail naming every served SDK file
+# that is missing from <sdk-dist>.
+stage_runtime_assert_sdk_built() {
+    local dist="$1" name rc=0
+    for name in "${STAGE_RUNTIME_SERVED_SDK_FILES[@]}"; do
+        [ -s "$dist/$name" ] || { echo "ERROR: the SDK build did not produce $dist/$name" >&2; rc=1; }
+    done
+    return "$rc"
 }
 
 # stage_runtime_build_binaries <repo-root> <pkg…> — release-build the given cargo

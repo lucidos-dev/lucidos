@@ -7,10 +7,11 @@ use crate::core::event_subscription::EventSubscription;
 use crate::runtime::CodingAgent;
 
 use super::{
-    AbortCause, ActorMode, AnswerKind, CancelCause, CaptureFormat, ChildCompletionStatus,
-    EventWaitCancelCause, FormRequestOutcome, MessageOrigin, OwnerApproval, QuestionOption,
-    RecalledMemory, SessionEndReason, TodoItem, TriggerInvocation, UnproposedReason,
-    VoiceSessionEndReason,
+    AbortCause, ActorMode, AnswerKind, ApplyNowOutcome, ArrangedTile, CancelCause, CaptureFormat,
+    ChildCompletionStatus, EventWaitCancelCause, FormRequestOutcome, LayoutClass,
+    McpEnablementSource, MessageOrigin, OwnerApproval, QuestionOption, RecalledMemory,
+    SessionEndReason, TodoItem, TriggerInvocation, UnproposedReason, UnqueueReason,
+    VoiceSessionEndReason, WakeMode,
 };
 
 /// Replay default for events persisted before the `agent` field existed —
@@ -98,6 +99,11 @@ pub enum ThreadEvent {
         /// `mode != Human`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawning_event_id: Option<uuid::Uuid>,
+        /// The child's *wake mode*, set only beside `parent_thread_id` on a
+        /// child's spawning message. Absent on a spawn from before wake modes,
+        /// whose turns fall back to the wake decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_mode: Option<WakeMode>,
         /// Semantic mode of the actor that emitted this message. Required for
         /// new emissions (enforced at the API layer). The serde default exists
         /// only to replay old DB rows persisted before the `mode` field existed.
@@ -443,6 +449,12 @@ pub enum ThreadEvent {
         /// rerun path (which carries its own engine note instead).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// The `ResponseAborted` a chat or trigger Continue resumes. A unique
+        /// index lets one `ContinuationStarted` claim each abort, so a double
+        /// Continue spawns one rerun. `None` on the coding-agent path, the
+        /// answer-driven fallback and legacy rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed_abort_id: Option<uuid::Uuid>,
     },
     SessionStarted {
         session_id: String,
@@ -476,6 +488,21 @@ pub enum ThreadEvent {
         /// which are all Claude Code.
         #[serde(default = "default_coding_agent_claude_code")]
         coding_agent: CodingAgent,
+        /// The thread is an *integrated sub-thread*: it folds into its
+        /// parent's branch, runs the fast tier of `/harden` and proposes
+        /// nothing. Locked in at the first session like the fields above.
+        /// Absent on every row written before integrated spawns existed,
+        /// which reads as independent.
+        #[serde(default, skip_serializing_if = "is_false")]
+        integrated: bool,
+        /// The auto-compact window this session's process got, in tokens.
+        /// Absent when the trial is off, under `control`, and on Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_compact_window: Option<u64>,
+        /// The auto-compact trial arm this session ran in. Absent when the
+        /// trial is off and on Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_compact_arm: Option<crate::engine::auto_compact_trial::AutoCompactArm>,
     },
     SessionEnded {
         /// Why the session ended. Always serialized, because the frontend reads
@@ -487,6 +514,27 @@ pub enum ThreadEvent {
         /// reader must tolerate any string here.
         #[serde(default = "default_session_ended_reason")]
         reason: SessionEndReason,
+    },
+    /// This thread handed off to a *successor thread*, which carries on with
+    /// a fresh context. Lands on the OLD thread. The successor's branch starts
+    /// at `base_sha`, this thread's last commit at the handoff.
+    SuccessorThreadSpawned {
+        successor_thread_id: uuid::Uuid,
+        base_sha: String,
+    },
+    /// The coding agent compacted its own context mid-session: Claude Code's
+    /// `compact_boundary`. The context counter drops at this step.
+    CodingAgentCompacted {
+        /// Claude Code's word for what started it: `auto` or `manual`.
+        trigger: String,
+        /// The context size Claude Code measured before compacting, in tokens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+        /// The context size after compacting, when Claude Code reports it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_tokens: Option<u64>,
+        #[serde(default = "default_coding_agent_claude_code")]
+        coding_agent: CodingAgent,
     },
     #[serde(alias = "ClaudeCodeTextStreamed")]
     CodingAgentTextStreamed {
@@ -563,7 +611,8 @@ pub enum ThreadEvent {
         #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
         coding_agent: CodingAgent,
     },
-    /// Automated prompt sent to a coding agent (e.g., conflict resolution, hardening).
+    /// A prompt forwarded to a coding agent: an automated one (conflict
+    /// resolution, hardening) or a user follow-up to a live session.
     /// Persisted for audit trail but not rendered in the chat UI.
     #[serde(alias = "ClaudeCodePromptSent")]
     CodingAgentPromptSent {
@@ -577,18 +626,31 @@ pub enum ThreadEvent {
         /// that already carry their origin elsewhere in the chain.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
+        /// The event that carried the forwarded input, as on
+        /// `CodingAgentInputRead`: the `MessageReceived` of a user follow-up.
+        /// `None` for an engine prompt with no starter event. The turn gap
+        /// counts this event as a boundary only once a `CodingAgentInputRead`
+        /// names that input, or this event itself for an engine prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_event_id: Option<uuid::Uuid>,
     },
     /// The coding agent read an input the engine forwarded to it. Until then
     /// the input is owed, and the session keeps its subprocess (ADR 0268).
     CodingAgentInputRead {
         /// The event that carried the input: the `MessageReceived` for a
-        /// message, the `ChildThreadCompleted` for a child wake.
+        /// message, the `ChildThreadCompleted` for a child wake, the
+        /// `CodingAgentPromptSent` for an engine prompt with no starter event.
         input_event_id: uuid::Uuid,
         /// The read opened a turn on a session whose last turn had already
         /// ended, as when a queued message outlives a Stop. Such a read is a
         /// start event: the thread runs again (ADR 0268).
         #[serde(default, skip_serializing_if = "is_false")]
         started_turn: bool,
+        /// The input went to the agent exactly as typed, a slash command with
+        /// nothing in front. It carried no turn-gap note, so the turn gap does
+        /// not count it.
+        #[serde(default, skip_serializing_if = "is_false")]
+        verbatim: bool,
     },
     /// Emitted when the engine detects that a coding-agent session ended without
     /// running the required hardening. A recovery hardening session is spawned
@@ -707,6 +769,16 @@ pub enum ThreadEvent {
     /// unseen request (ADR 0409). The actor names the agent thread, and is
     /// absent when the turn-end gate forced the decision.
     ThreadReadNotRequested,
+    /// The yes half of a child's *wake decision*: its parent must act on this
+    /// turn's report, so the report wakes it. Sets `parent_wake_requested`
+    /// TRUE until the child's next turn starts. The actor names the child's
+    /// agent, and is absent when the turn-end gate decided.
+    ParentWakeRequested,
+    /// The no half of a child's *wake decision*: its parent need not act now.
+    /// A clean finish then files the report on the parent as a
+    /// `ChildReportFiled`, which wakes nothing. Sets `parent_wake_requested`
+    /// FALSE until the child's next turn starts.
+    ParentWakeNotRequested,
     /// The user saw the reply a read request pointed at: its end stayed on
     /// screen for the seen dwell. Clears `read_requested`. Recorded only while
     /// the thread's summary still reads `seen_version`, so a duplicate or a
@@ -850,18 +922,21 @@ pub enum ThreadEvent {
         repo_root: String,
         /// `true` if the originating commit landed on a hardened HEAD; surfaced
         /// in the projection so the apply UI can short-circuit re-hardening.
-        /// Stamped from `is_harden_marker_present` at end-of-turn aggregate
+        /// Stamped from `has_full_harden_marker` at end-of-turn aggregate
         /// emit; engine-internal recovery emits resolve it the same way.
         #[serde(default, skip_serializing_if = "is_false")]
         hardened: bool,
         /// `true` when nobody saw the work finish: the archive net's
-        /// set-aside proposals. A pending change is never incomplete
-        /// (ADR 0400), and older rows marked so are withdrawn at boot.
+        /// set-aside proposals, and unmerged integrated work whose last turn
+        /// did not finish. A pending change is never incomplete (ADR 0400),
+        /// and older rows marked so are withdrawn at boot.
         #[serde(default, skip_serializing_if = "is_false")]
         incomplete: bool,
         /// `true` when the engine proposes the change straight into set-aside:
-        /// work found on an archived thread's branch (ADR 0328). It leaves
-        /// the thread where it is instead of surfacing it for review.
+        /// work found on an archived thread's branch (ADR 0328), or an
+        /// integrated sub-thread's work its parent's change landed without
+        /// (ADR 0465). It leaves the thread where it is instead of surfacing
+        /// it for review.
         #[serde(default, skip_serializing_if = "is_false")]
         set_aside: bool,
         // Legacy fields — kept for backward compat with old DB rows
@@ -900,6 +975,11 @@ pub enum ThreadEvent {
         /// SHA of `main` after the merge.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         post_merge_sha: Option<String>,
+        /// The *landing merge* the landing lane made for this change alone.
+        /// Revert undoes exactly this commit. `None` for an app change, and
+        /// for every apply made before the lane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        landing_merge_sha: Option<String>,
         // Legacy
         #[serde(default, skip_serializing_if = "is_empty_str")]
         path: String,
@@ -936,6 +1016,19 @@ pub enum ThreadEvent {
         files: Vec<String>,
         reason: UnproposedReason,
     },
+    /// Apply put the change in the *landing lane*. The lane lands exactly
+    /// `snapshot_sha`, the branch commit Apply read, whatever the branch does
+    /// next.
+    ChangeQueued {
+        change_id: String,
+        snapshot_sha: String,
+    },
+    /// The change left the landing lane without landing. It stays where its
+    /// status puts it, and nothing queues it again until Apply is pressed.
+    ChangeUnqueued {
+        change_id: String,
+        reason: UnqueueReason,
+    },
     ChangeReverted {
         #[serde(default, skip_serializing_if = "is_empty_str")]
         change_id: String,
@@ -952,6 +1045,16 @@ pub enum ThreadEvent {
         error: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
+    },
+    /// An Apply Now passed its refusals and began. Sets `apply_in_flight` TRUE
+    /// until the apply's own `ApplyNowEnded`, so every client reads one answer
+    /// to "is this thread applying" (ADR 0437). The actor is whoever clicked.
+    ApplyNowStarted,
+    /// The Apply Now that `ApplyNowStarted` began is over, whatever happened.
+    /// Sets `apply_in_flight` FALSE. The apply task emits it on every exit, and
+    /// engine startup emits it as `interrupted` for an apply a stop cut off.
+    ApplyNowEnded {
+        outcome: ApplyNowOutcome,
     },
 
     // Merge conflict resolution
@@ -1274,9 +1377,10 @@ pub enum ThreadEvent {
     /// `tool_name` is the bare MCP tool, and `arguments_summary` is the
     /// pretty-printed (truncated) args.
     /// Persisted so the card survives reload. Replaces the legacy transient
-    /// `McpConsentPromptRequested` + `showConfirm` modal. Auto-approved silently
-    /// (no event) in non-interactive trigger threads and when the server's
-    /// `auto_approve` flag is set.
+    /// `McpConsentPromptRequested` + `showConfirm` modal. Never raised when
+    /// the server's `auto_approve` flag is set, nor in a trigger thread: there
+    /// a call runs only on a server the trigger lists, and is refused
+    /// otherwise (ADR 0430).
     McpPermissionRequested {
         request_id: String,
         tool_use_id: String,
@@ -1383,6 +1487,30 @@ pub enum ThreadEvent {
         /// changes while the orchestrator holds none.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sub_thread_pending_changes: Vec<super::SubThreadPendingChange>,
+        /// The branch an integrated child hands up, for its parent's agent to
+        /// merge. Absent for an independent child, and for an integrated one
+        /// whose work is not hardened yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        integrated_branch: Option<super::IntegratedBranch>,
+    },
+
+    /// A child thread's clean report, filed on the **parent** without waking
+    /// it: the child's *wake decision* said the parent need not act now.
+    /// Same payload as `ChildThreadCompleted`, emitted by the same fan-in in
+    /// its place. It starts no turn and moves no status. The parent reads it
+    /// on its next turn. Only a `success` or `no_changes` finish is ever filed.
+    ChildReportFiled {
+        child_thread_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_thread_title: Option<String>,
+        status: ChildCompletionStatus,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_change_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sub_thread_pending_changes: Vec<super::SubThreadPendingChange>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        integrated_branch: Option<super::IntegratedBranch>,
     },
 
     /// A user Stop ended a child thread's turn, and the child is now a
@@ -1725,8 +1853,8 @@ pub enum ThreadEvent {
         side_question_id: uuid::Uuid,
     },
     /// A widget instance was shown at this point in the thread (ADRs 0402,
-    /// 0407, 0415). Draws its inline card here and adds no chip to the
-    /// thread's widget shelf. The widget's files stay in its app folder.
+    /// 0407, 0415). Nothing writes it any more: a reply embeds the widget
+    /// instead (ADR 0466). An old row still draws as an inline widget here.
     WidgetShown {
         app_id: String,
         /// The instance's *widget params*. Absent means none.
@@ -1746,9 +1874,13 @@ pub enum ThreadEvent {
         params: Option<BTreeMap<String, Value>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// The event whose reply draws the widget, so "Show in thread" can
+        /// land there. Absent when the pin came from nowhere in the thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shown_event_id: Option<uuid::Uuid>,
     },
     /// A widget instance was unpinned: its chip left this thread's widget
-    /// shelf. The thread's card stays, and no file changes.
+    /// shelf. The inline widget stays, and no file changes.
     #[serde(alias = "WidgetHidden")]
     WidgetUnpinned {
         app_id: String,
@@ -1756,6 +1888,27 @@ pub enum ThreadEvent {
         params: Option<BTreeMap<String, Value>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+    },
+    /// This thread switched an MCP server on for itself, so its requests now
+    /// carry the server's tools (ADR 0430). Projected into
+    /// `thread_summaries.enabled_mcp_servers`.
+    ThreadMcpServerEnabled {
+        server_id: String,
+        by: McpEnablementSource,
+    },
+    /// This thread switched an MCP server off for itself. The process keeps
+    /// running for the threads that still use it.
+    ThreadMcpServerDisabled {
+        server_id: String,
+        by: McpEnablementSource,
+    },
+    /// The Home board of one layout class was arranged: its tiles in order,
+    /// each with its size and whether it is hidden (ADR 0432). Written on the
+    /// home thread only. The newest one per layout wins, whole. The tiles stay
+    /// Home's pins, so an entry for an unpinned instance is ignored.
+    HomeBoardArranged {
+        layout: LayoutClass,
+        tiles: Vec<ArrangedTile>,
     },
 
     // ---- Transient — never persisted ----

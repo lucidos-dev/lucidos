@@ -13,14 +13,6 @@
     align-self: flex-end;
 }
 
-/* On desktop an app row's actions sit level with its app icon and text
- * block. A phone row stacks, with its actions bottom-right. */
-@media (--desktop-layout) {
-    .app-row .list-row-actions {
-        align-self: center;
-    }
-}
-
 /* Gated on the ROW's own width, not the viewport's. The two differ constantly on
    a desktop: the row is only as wide as the content pane the split divider was
    dropped at, and that width is the whole question here. Named, so the query
@@ -65,11 +57,11 @@
     }
 }
 
-/* Change rows carry up to four actions (Thread, Diff, Discard, Apply) — too
+/* Change rows carry up to four actions (Thread, Diff, Discard, Apply), too
  * wide to sit beside the description without squeezing it into a narrow,
- * heavily-wrapped column. Stack like apps/triggers do on mobile: the
- * description (and details/label) span the full row width, with the actions
- * on their own bottom-right row below. */
+ * heavily-wrapped column. Stack like triggers do on mobile: the description
+ * (and details/label) span the full row width, with the actions on their own
+ * bottom-right row below. */
 .change-row {
     flex-direction: column;
     align-items: flex-start;

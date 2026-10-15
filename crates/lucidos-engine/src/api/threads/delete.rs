@@ -330,7 +330,6 @@ async fn remove_owned_widgets(
     if owned.is_empty() {
         return 0;
     }
-    let _repo_guard = state.engine.lock_workspace_repo().await;
     match state
         .app_manager
         .delete_widgets(&state.engine.event_bus, &owned, Some(actor.clone()))
@@ -415,6 +414,10 @@ async fn delete_family_rows(
         .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM standing_applies WHERE thread_id = ANY($1)")
+        .bind(ids)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM thread_input_chains WHERE thread_id = ANY($1)")
         .bind(ids)
         .execute(&mut **tx)
         .await?;

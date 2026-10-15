@@ -15,6 +15,13 @@ export type CodingAgentChangeState =
   | { kind: 'unproposed'; reason: UnproposedReason | null }
   | { kind: 'proposed'; requires_restart: boolean };
 
+/** One end of a *successor thread* link. The summary and the aggregate carry
+ *  the same object, so its keys stay snake_case in both. */
+export interface SuccessorLink {
+  thread_id: string;
+  title: string | null;
+}
+
 export interface ThreadSummary {
   thread_id: string;
   title: string;
@@ -64,6 +71,9 @@ export interface ThreadSummary {
   is_stopped_child?: boolean;
   /** The *read request* (ADR 0409). Absent on an engine that predates it. */
   read_requested?: boolean;
+  /** Whether an Apply Now is running (ADR 0437). Absent on an engine that
+   *  predates it. */
+  apply_in_flight?: boolean;
   /** How many event waits this thread holds unresolved. Consumed by
    *  `resolveVisualStatus` via `count > 0` to paint the Waiting status dot: a
    *  thread watching for an event is not finished, and this is what says so on
@@ -94,6 +104,10 @@ export interface ThreadSummary {
   parent_thread_id?: string | null;
   /** Cached title of the parent thread — null when no parent or no title yet. */
   parent_thread_title?: string | null;
+  /** The *successor thread* this one continued in. Absent until it hands off. */
+  successor?: SuccessorLink;
+  /** The thread this *successor thread* continues. */
+  successor_of?: SuccessorLink;
   /** Trigger that fired this thread (only for `channel === 'trigger'`). */
   trigger_id?: string | null;
   /** Trigger name at fire-time (snapshot — falls back when the trigger is renamed/deleted). */
@@ -200,12 +214,24 @@ async function postThreadAction(path: string, body: Record<string, unknown>): Pr
     return res;
 }
 
-export async function saveThread(threadId: string): Promise<void> {
-    await postThreadAction('save', { thread_id: threadId });
+/** What a pin or unpin answers: the row's `summary_version` once the write
+ *  landed (ADR 0437). Absent from an engine that predates it. */
+export interface RowWriteAck {
+  summary_version?: number;
 }
 
-export async function unsaveThread(threadId: string): Promise<void> {
-    await postThreadAction('unsave', { thread_id: threadId });
+/** An older engine answers a pin with an empty body. */
+async function rowWriteAck(res: Response): Promise<RowWriteAck> {
+    const body = await res.text();
+    return body ? JSON.parse(body) as RowWriteAck : {};
+}
+
+export async function saveThread(threadId: string): Promise<RowWriteAck> {
+    return rowWriteAck(await postThreadAction('save', { thread_id: threadId }));
+}
+
+export async function unsaveThread(threadId: string): Promise<RowWriteAck> {
+    return rowWriteAck(await postThreadAction('unsave', { thread_id: threadId }));
 }
 
 /** A cascade member the archive left unarchived, and why. `reason` is
@@ -224,10 +250,12 @@ export interface ArchiveSkippedMember {
  *  surfaces as ApiError with the engine's structured reason
  *  ("parent_not_archivable" | "descendants_blocking" |
  *  "apply_in_progress" | "discard_in_progress", each with `message`).
- *  `skipped` is optional because an older engine does not send it. */
+ *  `summary_versions` gives each archived member's version once its
+ *  `ThreadArchived` landed (ADR 0437). `skipped` and `summary_versions` are
+ *  optional because an older engine does not send them. */
 export async function archiveThread(
   threadId: string,
-): Promise<{ archived: string[]; skipped?: ArchiveSkippedMember[] }> {
+): Promise<{ archived: string[]; skipped?: ArchiveSkippedMember[]; summary_versions?: Record<string, number> }> {
     const res = await postThreadAction('archive', { thread_id: threadId });
     return res.json();
 }

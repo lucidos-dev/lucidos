@@ -1,8 +1,9 @@
 import { useRef, useCallback, useEffect, useLayoutEffect } from 'preact/hooks';
-import { splitRatio, threadDrawerOpen, threadDrawerWidth, focusedPane, SPLIT_RATIO_KEY } from '../../store/store';
+import { splitRatio, threadDrawerOpen, threadDrawerWidth, focusedPane, SPLIT_RATIO_KEY, scaledDurationMs } from '../../store/store';
+import { homeRailShown } from '../../store/homeRail';
 import { focusPane, toggleSplitFromDivider } from '../../store/actions/pane';
 import { homeThreadId } from '../../store/actions/homeThread';
-import { setSplitRatio, clampSplitRatio, migratedSplitRatio, beginPaneResize, endPaneResize } from './splitHelpers';
+import { setSplitRatio, clampSplitRatio, migratedSplitRatio, beginPaneResize, endPaneResize, PANE_TRANSITION_MS } from './splitHelpers';
 import { splitBounds } from '../../store/paneMinimums';
 import { startDividerDrag } from './dividerDrag';
 import { createDblClickGate } from '../../utils/dblClickGate';
@@ -56,6 +57,21 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
     });
     return () => cancelAnimationFrame(frame);
   }, [homeShown]);
+
+  // Showing the Home board's rail takes its width from the split, as a
+  // narrower window would. So it migrates too, once the shell's padding has
+  // finished sliding and the split has its final width.
+  const railShown = homeRailShown.value;
+  useEffect(() => {
+    if (!railShown) return;
+    const timer = setTimeout(() => {
+      const container = containerRef.current;
+      if (!container) return;
+      const next = migratedSplitRatio(splitRatio.value, container.getBoundingClientRect().width, splitBounds());
+      if (next !== null) setSplitRatio(next);
+    }, scaledDurationMs(PANE_TRANSITION_MS) + 100);
+    return () => clearTimeout(timer);
+  }, [railShown]);
 
   const onDividerDown = useCallback((e: PointerEvent) => {
     dividerDblGate.record();

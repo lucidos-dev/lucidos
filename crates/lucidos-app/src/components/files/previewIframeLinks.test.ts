@@ -62,6 +62,7 @@ const ctx = (over: Partial<Parameters<typeof classifyPreviewLink>[1]> = {}) => (
   hostOrigin: 'https://localhost:5251',
   hostPath: '/myws/',
   workspaceId: 'myws' as string | null,
+  workspacePath: '/Users/me/workspaces/myws',
   ...over,
 });
 
@@ -217,6 +218,13 @@ describe('classifyPreviewLink', () => {
     // the file branch below it. Before that widening, `/artifacts/report.pdf`
     // was handed to the OS opener as a disk path that does not exist.
     expect(classifyPreviewLink(href, ctx())).toEqual({ kind: 'file', path });
+  });
+
+  it.each([
+    '/Users/me/workspaces/myws/data/artifacts/report.pdf',
+    'file:///Users/me/workspaces/myws/data/artifacts/report.pdf',
+  ])('previews a disk path into this workspace (%s) instead of OS-opening it', (href) => {
+    expect(classifyPreviewLink(href, ctx())).toEqual({ kind: 'file', path: 'artifacts/report.pdf' });
   });
 
   it('resolves a sibling file against the previewed artifact folder', () => {

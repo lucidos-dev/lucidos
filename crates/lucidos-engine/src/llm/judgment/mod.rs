@@ -9,7 +9,8 @@
 //! instead of in prompt text.
 //!
 //! The question types come from TypeSafe's System One API, which
-//! [`system_one`] speaks for every endpoint that shares it. [`chat`] answers
+//! [`system_one`] speaks for every endpoint that shares it.
+//! [`openai_decisions`] speaks OpenAI's Decisions API, and [`chat`] answers
 //! the same types on a chat model. Its third primitive, **Score**, is
 //! deliberately absent: no call site asks one.
 //!
@@ -28,13 +29,18 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub mod chat;
 pub mod endpoint;
 mod fallback;
+pub mod openai_decisions;
 pub mod select;
 pub mod system_one;
 
 pub use chat::ChatJudgmentProvider;
 pub use endpoint::{SystemOneEndpoint, TYPESAFE_API_KEY_ENV, TYPESAFE_CREDENTIAL_SERVICE};
 pub use fallback::for_site;
-pub use select::{jev_for_agent, judgment_available, system_one_for, JudgmentSite};
+pub use openai_decisions::{OpenAiDecisionsProvider, OPENAI_DECISIONS_MODEL};
+pub use select::{
+    jev_for_agent, judgment_available, system_one_for, system_one_or_default_for, JudgmentSite,
+    WAKE_DECISION_DEFAULT,
+};
 pub use system_one::{SystemOneProvider, JEV_DEFAULT_MODEL, TYPESAFE_API_BASE_URL};
 
 /// One question, in the shape the wire wants.
@@ -254,6 +260,20 @@ pub trait JudgmentProvider: Send + Sync {
         questions: Vec<(String, Question)>,
         call: crate::llm::metered::CallToken,
     ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// A boxed provider is a provider, so a site's pick, which is boxed because the
+/// rows speak different wires, composes with [`for_site`].
+#[async_trait]
+impl<P: JudgmentProvider + ?Sized> JudgmentProvider for Box<P> {
+    async fn ask(
+        &self,
+        state: serde_json::Value,
+        questions: Vec<(String, Question)>,
+        call: crate::llm::metered::CallToken,
+    ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
+        (**self).ask(state, questions, call).await
+    }
 }
 
 #[cfg(test)]

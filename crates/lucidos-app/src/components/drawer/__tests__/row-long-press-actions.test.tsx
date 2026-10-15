@@ -11,7 +11,7 @@
  * has to survive that composition. And the trigger's absence is what publishes
  * the opener the hold calls.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { ThreadRow, ComposingThreadRow } from '../ThreadDrawer';
 import { threadMap } from '../../../store/store';
@@ -33,6 +33,10 @@ vi.mock('../../../store/actions/thread-loading', () => ({
 
 import { focusThread } from '../../../store/actions/threads';
 import { loadThreadEvents } from '../../../store/actions/thread-loading';
+import { ThreadOverflowItemsChunk } from '../../shared/ThreadOverflowMenu';
+
+// The menu's rows are code-split. Warm them, so a click opens it at once.
+beforeAll(() => ThreadOverflowItemsChunk.preload());
 
 const THREAD_ID = 'row-1';
 
@@ -158,7 +162,7 @@ describe('the mobile row drops its ⋯', () => {
 
   it('keeps the pin, the row\'s one remaining control', () => {
     mount(true);
-    expect(host.querySelector('.pin-thread-btn')).not.toBeNull();
+    expect(host.querySelector('.pin-btn')).not.toBeNull();
   });
 });
 
@@ -230,7 +234,7 @@ describe('the mobile gesture', () => {
 
   it('leaves a press that began on the pin to the pin', async () => {
     mount(true);
-    const pin = host.querySelector<HTMLElement>('.pin-thread-btn');
+    const pin = host.querySelector<HTMLElement>('.pin-btn');
     expect(pin, 'no pin button rendered').not.toBeNull();
     await hold(pin as HTMLElement);
     expect(openMenu()).toBeNull();

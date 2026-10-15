@@ -262,10 +262,11 @@ describe('on the overlay build the leading control only steps sideways', () => {
       .toBe(true);
     // The leading term names the inset the toggle is actually placed with,
     // rather than restating 0.5rem or 80px.
-    expect(reserve).toContain('calc(var(--header-lead-inset) + var(--header-icon-box))');
+    // The toggle plus New thread, which always leads the row.
+    expect(reserve).toContain('calc(var(--header-lead-inset) + 2 * var(--header-icon-box) + 0.25rem)');
     // …and the trailing one is still the actions at their widest.
     expect(reserve).toContain('var(--brand-trail-end)');
-    expect(desktopRule(':root').props.get('--brand-trail-end')).toContain('3 * var(--header-icon-box)');
+    expect(desktopRule(':root').props.get('--brand-trail-end')).toContain('2 * var(--header-icon-box)');
   });
 
   it('the cluster\'s floor IS its natural width, so the chevrons hug the mark', () => {

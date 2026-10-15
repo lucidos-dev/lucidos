@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use super::PreEmittedOrigin;
 use crate::api::ChatImage;
-use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::event_bus::EventBus;
 use crate::engine::thread_events::{
     ActorMode, AnswerKind, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
@@ -244,20 +244,29 @@ async fn has_unreleased_held_messages(
         .await
 }
 
-/// Release the oldest unreleased held message on `thread_id` and return it for
-/// delivery, or `None` when nothing is held.
+/// A held message whose release and delivering `MessageReceived` have
+/// committed together.
+pub(crate) struct ReleasedMessage {
+    pub(crate) held: HeldMessage,
+    /// The `MessageReceived` row that delivers it.
+    pub(crate) message_id: Uuid,
+}
+
+/// Release the oldest unreleased held message on `thread_id` and record its
+/// delivery, or return `None` when nothing is held.
 ///
-/// One at a time, so a crash mid-release strands at most the message it was
-/// on. The unique index refuses a release that lost a race; the loop then moves
-/// to the next message, so no message is delivered twice. A refused message
-/// that is still unreleased on the re-read was not a lost race, so it stays
-/// held and the loop ends.
+/// The release and its `MessageReceived` are one atomic emit, so the message is
+/// either still held or received, never neither (ADR 0441). One at a time, so a
+/// crash mid-release strands at most the message it was on. The unique index
+/// refuses a release that lost a race; the loop then moves to the next message,
+/// so no message is delivered twice. A refused message that is still unreleased
+/// on the re-read was not a lost race, so it stays held and the loop ends.
 pub(crate) async fn claim_next_held_message(
     bus: &EventBus,
     pool: &sqlx::PgPool,
     workspace: &Path,
     thread_id: Uuid,
-) -> Option<HeldMessage> {
+) -> Option<ReleasedMessage> {
     let mut refused: Option<Uuid> = None;
     loop {
         let oldest = match unreleased_held_messages(pool, workspace, thread_id).await {
@@ -279,26 +288,52 @@ pub(crate) async fn claim_next_held_message(
             );
             return None;
         }
+        let claude_code = || EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        };
+        let received = super::make_message_received(
+            workspace,
+            &oldest.text,
+            oldest.images.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            ActorMode::Agent,
+            None,
+            None,
+            None,
+            oldest.origin.clone(),
+            None,
+        );
         let released = bus
-            .emit(BusEvent::Thread {
+            .emit_atomically(
                 thread_id,
-                event: ThreadEvent::HeldMessageReleased {
-                    held_message_id: oldest.id,
-                },
-                meta: EventMeta {
-                    channel: Some(EventChannel::ClaudeCode),
-                    ..EventMeta::NONE
-                },
-            })
+                vec![
+                    (
+                        ThreadEvent::HeldMessageReleased {
+                            held_message_id: oldest.id,
+                        },
+                        claude_code(),
+                    ),
+                    (received, claude_code()),
+                ],
+            )
             .await;
         match released {
-            Ok(_) => return Some(oldest),
-            Err(e) => {
+            Ok(Some(results)) => {
+                return Some(ReleasedMessage {
+                    message_id: results[1].event_id,
+                    held: oldest,
+                })
+            }
+            outcome => {
                 crate::log!(
-                    "[HeldMessages] release of {} on thread {} refused: {}",
+                    "[HeldMessages] release of {} on thread {} refused: {:?}",
                     oldest.id,
                     thread_id,
-                    e
+                    outcome.err()
                 );
                 refused = Some(oldest.id);
             }
@@ -338,7 +373,9 @@ pub(crate) fn held_message_event(
     }
 }
 
-/// How long a release waits for a coding agent to come up after a resume.
+/// How long a release waits for a coding agent to come up after a resume. A
+/// temporary measure: see "Held-message delivery polls for the spawned
+/// session" in `docs/temporary-measures.md`.
 const AGENT_START_GRACE: Duration = Duration::from_secs(60);
 const AGENT_POLL: Duration = Duration::from_millis(500);
 
@@ -367,52 +404,19 @@ impl LucidosEngine {
         })
     }
 
-    /// Deliver one released message as the ordinary `MessageReceived` it was
-    /// held back from. Emitting it here, rather than in the router, is what
-    /// keeps the router from holding it a second time.
+    /// Forward one released message to the agent. Its `MessageReceived` is
+    /// already recorded, which is what keeps the router from holding it a
+    /// second time.
     ///
     /// With a live agent the router queues it at once. Without one, the router
     /// would start a session and run its whole turn first. So that turn runs in
     /// the background, and this returns once the session is up. The next
     /// message then queues behind it rather than waiting a turn out.
-    async fn deliver_held_message(self: &Arc<Self>, thread_id: Uuid, message: HeldMessage) {
-        let received = super::make_message_received(
-            &self.workspace_path,
-            &message.text,
-            message.images.as_deref(),
-            None,
-            None,
-            None,
-            ActorMode::Agent,
-            None,
-            None,
-            None,
-            message.origin.clone(),
-            None,
-        );
-        let emitted = self
-            .event_bus
-            .emit(BusEvent::Thread {
-                thread_id,
-                event: received,
-                meta: EventMeta {
-                    channel: Some(EventChannel::ClaudeCode),
-                    ..EventMeta::NONE
-                },
-            })
-            .await;
-        let message_id = match emitted {
-            Ok(Some(result)) => result.event_id,
-            Ok(None) | Err(_) => {
-                crate::log!(
-                    "[HeldMessages] could not record released message {} on thread {}: {:?}",
-                    message.id,
-                    thread_id,
-                    emitted.err()
-                );
-                return;
-            }
-        };
+    async fn deliver_held_message(self: &Arc<Self>, thread_id: Uuid, released: ReleasedMessage) {
+        let ReleasedMessage {
+            held: message,
+            message_id,
+        } = released;
         let held_id = message.id;
         let agent_is_live = self.agent_is_live(thread_id).await;
         let engine = self.clone();
@@ -430,6 +434,7 @@ impl LucidosEngine {
                     Some(true),
                     None,
                     Some(thread_id),
+                    None,
                     None,
                     None,
                     None,

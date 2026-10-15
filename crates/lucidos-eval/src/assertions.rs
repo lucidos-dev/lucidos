@@ -495,28 +495,17 @@ mod tests {
         }
     }
 
-    struct TempTree(PathBuf);
+    struct TempTree(tempfile::TempDir);
 
     impl TempTree {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "lucidos-eval-{label}-{}",
-                uuid::Uuid::new_v4().simple()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            TempTree(path)
+        fn new() -> Self {
+            TempTree(tempfile::tempdir().unwrap())
         }
 
         fn write(&self, relative: &str, contents: &str) {
-            let path = self.0.join(relative);
+            let path = self.0.path().join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, contents).unwrap();
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -560,18 +549,18 @@ mod tests {
 
     #[test]
     fn the_column_cap_fails_on_a_wider_table() {
-        let tree = TempTree::new("columns");
+        let tree = TempTree::new();
         tree.write("r.md", "| a | b | c | d | e |\n|-|-|-|-|-|\n");
         let assertion = Assertion::MarkdownTableMaxColumns {
             path: "r.md".into(),
             max: 4,
         };
-        assert!(!assertion.evaluate(&ctx(&tree.0, "")).unwrap());
+        assert!(!assertion.evaluate(&ctx(tree.0.path(), "")).unwrap());
     }
 
     #[test]
     fn all_composes_a_contains_and_a_does_not_contain() {
-        let tree = TempTree::new("all");
+        let tree = TempTree::new();
         tree.write("r.md", "Build Health report: 37.5% failed\n");
         let assertion = Assertion::All {
             of: vec![
@@ -585,27 +574,27 @@ mod tests {
                 },
             ],
         };
-        assert!(assertion.evaluate(&ctx(&tree.0, "")).unwrap());
+        assert!(assertion.evaluate(&ctx(tree.0.path(), "")).unwrap());
     }
 
     #[test]
     fn a_missing_file_is_false_and_not_an_error() {
-        let tree = TempTree::new("missing");
+        let tree = TempTree::new();
         let assertion = Assertion::FileExists {
             path: "nope.md".into(),
         };
-        assert!(!assertion.evaluate(&ctx(&tree.0, "")).unwrap());
+        assert!(!assertion.evaluate(&ctx(tree.0.path(), "")).unwrap());
     }
 
     #[test]
     fn ends_with_ignores_a_trailing_blank_line() {
-        let tree = TempTree::new("endswith");
+        let tree = TempTree::new();
         tree.write("w.md", "body\nprepared-by: sub\n\n");
         let assertion = Assertion::FileEndsWith {
             path: "w.md".into(),
             literal: "prepared-by: sub".into(),
         };
-        assert!(assertion.evaluate(&ctx(&tree.0, "")).unwrap());
+        assert!(assertion.evaluate(&ctx(tree.0.path(), "")).unwrap());
     }
 
     fn memory_calls() -> [ToolCall; 3] {
@@ -729,7 +718,7 @@ mod tests {
 
     #[test]
     fn any_passes_when_one_of_two_homes_carries_the_fact() {
-        let tree = TempTree::new("any");
+        let tree = TempTree::new();
         tree.write(
             "knowhow/collection.md",
             "never notify between 22:00 and 07:00\n",
@@ -746,12 +735,12 @@ mod tests {
                 },
             ],
         };
-        assert!(assertion.evaluate(&ctx(&tree.0, "")).unwrap());
+        assert!(assertion.evaluate(&ctx(tree.0.path(), "")).unwrap());
     }
 
     #[test]
     fn any_fails_when_no_home_carries_it() {
-        let tree = TempTree::new("any-empty");
+        let tree = TempTree::new();
         tree.write("knowhow/collection.md", "collect the data\n");
         let assertion = Assertion::Any {
             of: vec![Assertion::FileMatches {
@@ -759,7 +748,7 @@ mod tests {
                 regex: "22:00".into(),
             }],
         };
-        assert!(!assertion.evaluate(&ctx(&tree.0, "")).unwrap());
+        assert!(!assertion.evaluate(&ctx(tree.0.path(), "")).unwrap());
     }
 
     #[test]

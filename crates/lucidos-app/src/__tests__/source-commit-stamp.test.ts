@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 import { SOURCE_COMMIT_FILE } from '@lucidos/engine-constants';
-import { readHeadCommit, sourceCommitStamp } from '../../vite/sourceCommitStamp';
+import { readHeadCommit, sourceCommitFile, sourceCommitStamp } from '../../vite/sourceCommitStamp';
 
 /**
  * The build stamps `dist/` with the commit it was built from. The engine reads
@@ -71,6 +71,12 @@ describe('sourceCommitStamp', () => {
     head = 'b'.repeat(40);
     plugin.writeBundle({ dir: out });
     expect(fs.readFileSync(join(out, SOURCE_COMMIT_FILE), 'utf8')).toBe(`${SHA}\n`);
+  });
+});
+
+describe('sourceCommitFile', () => {
+  it('reads the same name the generated constants export', () => {
+    expect(sourceCommitFile()).toBe(SOURCE_COMMIT_FILE);
   });
 });
 

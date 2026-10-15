@@ -9,10 +9,9 @@
 //! - the stylesheets and files `api/fonts.rs` serves to app frames;
 //! - `GET /api/v1/fonts`.
 //!
-//! Adding a font is one entry here plus its files, then the regenerate command
-//! the staleness test prints. Every font is vendored or already on the device,
-//! so none makes a third-party request and a theme may name any of them (ADR
-//! 0303).
+//! Adding a font is one entry here plus its files, then `./scripts/codegen.sh`.
+//! Every font is vendored or already on the device, so none makes a third-party
+//! request and a theme may name any of them (ADR 0303).
 //!
 //! A workspace can add its own fonts beside these (`core::workspace_fonts`,
 //! ADR 0308). Only the `font-family` preference, themes and `GET /api/v1/fonts`
@@ -645,6 +644,9 @@ pub fn catalog_json(workspace: &WorkspaceFonts) -> serde_json::Value {
         "fallback": FALLBACK_FONT,
     })
 }
+
+#[path = "fonts_codegen.rs"]
+pub(crate) mod codegen;
 
 #[cfg(test)]
 #[path = "fonts_tests.rs"]

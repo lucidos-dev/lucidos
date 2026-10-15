@@ -52,8 +52,14 @@ PROSE_ADVICE='Cut it, or move the content to a doc, an ADR or a plan and link th
 # Deliberately narrow. `.sql`, `.css` and `.sh` are out until someone measures
 # them, because a limit picked without a distribution behind it is a guess, and
 # a guessed limit is what makes a gate feel arbitrary.
+#
+# `crates/vendor/` is third-party source carried for a patch. We did not write
+# its prose, and rewording it would fork upstream for nothing. It leaves with
+# the temporary measure that vendors it (docs/temporary-measures.md,
+# "chromiumoxide is vendored for a pipe transport").
 prose_kind() {
     case "$1" in
+        crates/vendor/* | */crates/vendor/*) printf '\n' ;;
         *.md) printf 'md\n' ;;
         *.rs | *.ts | *.tsx | *.js | *.jsx) printf 'src\n' ;;
         *) printf '\n' ;;

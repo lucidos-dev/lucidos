@@ -53,6 +53,7 @@ impl Stores {
             ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "lint it".into(),
                 user_image_hashes: vec![],
                 device_id: None,

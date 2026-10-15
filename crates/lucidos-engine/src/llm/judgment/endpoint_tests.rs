@@ -71,3 +71,34 @@ fn a_scope_naming_no_account_yields_nothing() {
         assert_eq!(workers_ai_url(scope, "clef"), None, "{scope:?}");
     }
 }
+
+/// OpenRouter and OpenAI are chat providers too. Their rows read the key and
+/// the switch the chat provider reads, so one switch parks both uses.
+#[test]
+fn openrouter_and_openai_share_their_chat_providers_switch_and_key() {
+    use crate::llm::ProviderKind;
+    assert_eq!(
+        SystemOneEndpoint::OpenRouter.switch_key().key(),
+        prefs::PROVIDER_ENABLED_OPENROUTER.key()
+    );
+    assert_eq!(
+        SystemOneEndpoint::OpenAi.switch_key().key(),
+        prefs::PROVIDER_ENABLED_OPENAI.key()
+    );
+    assert_eq!(
+        SystemOneEndpoint::OpenRouter.credential_service(),
+        ProviderKind::OpenRouter.as_str()
+    );
+    assert_eq!(
+        SystemOneEndpoint::OpenAi.credential_service(),
+        ProviderKind::OpenAi.as_str()
+    );
+}
+
+#[test]
+fn the_openrouter_url_is_system_one_under_its_chat_root() {
+    assert_eq!(
+        openrouter_system_one_url(),
+        "https://openrouter.ai/api/v1/systemone"
+    );
+}

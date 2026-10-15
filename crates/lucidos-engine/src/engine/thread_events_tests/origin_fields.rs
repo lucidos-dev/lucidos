@@ -8,6 +8,7 @@ fn continuation_started_event_can_carry_engine_origin() {
             reason: EngineReason::ContinuationStarted,
         }),
         reason: None,
+        resumed_abort_id: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "ContinuationStarted");
@@ -119,6 +120,7 @@ fn change_proposed_event_can_carry_orphan_recovery_origin() {
 #[test]
 fn coding_agent_prompt_sent_can_carry_orphan_recovery_origin() {
     let event = ThreadEvent::CodingAgentPromptSent {
+        input_event_id: None,
         text: "resume after restart".into(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         origin: Some(MessageOrigin::Engine {
@@ -134,6 +136,7 @@ fn coding_agent_prompt_sent_can_carry_orphan_recovery_origin() {
 #[test]
 fn coding_agent_prompt_sent_can_carry_harden_retrigger_origin() {
     let event = ThreadEvent::CodingAgentPromptSent {
+        input_event_id: None,
         text: "Run /harden now.".into(),
         coding_agent: crate::runtime::CodingAgent::ClaudeCode,
         origin: Some(MessageOrigin::Engine {

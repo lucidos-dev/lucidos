@@ -71,7 +71,7 @@ engine build, which is the intended failure mode.
 2. Add or edit the entry in `core/fonts.rs`. The served name carries the
    upstream version, because the bytes go out as `immutable` for a year: new
    bytes at an old URL would leave every warm client on the old glyphs.
-3. Run `cargo test -p lucidos-engine --lib generate_font_catalog_files -- --ignored`,
-   then rebuild the SDK boot scripts (`cd packages/lucidos-sdk && npm run build`).
+3. Run `./scripts/codegen.sh`, which regenerates the font catalog and rebuilds
+   the SDK boot scripts.
 4. Name the new id in `system-knowhow/preferences.md` and `system-knowhow/js-sdk.md`
    (a unit test fails otherwise).

@@ -2,14 +2,17 @@ import { signal } from '@preact/signals';
 import { showToast, workspaceName } from '../store';
 import { fetchWorkspaces } from '../../api/client';
 import { listWorkspaces, locateWorkspace } from '../../api/client/control';
-import { GATEWAY_PORT, WORKSPACE_ID } from '../../utils/basePath';
+import { GATEWAY_PORT, WORKSPACE_ID, isWorkspaceSlug } from '../../utils/basePath';
 import { slugifyWorkspaceName } from '../../utils/slug';
 import { isTauri } from '../../utils/platform';
+import { showWorkspaceInNativeWindow } from '../../utils/tauri';
 import { openUrl } from './artifacts';
 import { focusThreadOrBootstrap } from './threads';
 import { errorDetail } from '../../utils/errorDetail';
 import { openNewTab } from '../../utils/newTab';
-import { workspaceTabName } from '../../utils/workspaceWindow';
+import { replaceDocument } from '../../utils/documentNavigation';
+import { isCanonicalThreadId, landingHash } from '../../utils/workspaceLanding';
+import { separateViewIsAvailable, workspaceTabName } from '../../utils/workspaceWindow';
 
 /** Hash-channel deep link to a thread. Hash (not `?thread=`) is deliberate:
  *  `startClient` strips `?thread=` unconditionally to defuse stale SW deep-
@@ -21,10 +24,20 @@ export const THREAD_HASH_RE = /^#thread=([0-9a-f-]+)$/;
  *
  *  `tabKey` is the SLUG behind the gateway, which is what a workspace row keys
  *  its own tab on. So a thread link and a row reach one tab between them. On a
- *  dedicated port there is no slug, so the workspace name is the key. */
+ *  dedicated port there is no slug, so the workspace name is the key.
+ *
+ *  `gatewaySlug` is set only when THIS page's gateway serves the workspace.
+ *  Only then can the packaged shell open it in a native window, because the
+ *  shell composes a window URL on the calling window's own origin. */
 interface WorkspaceReach {
   base: string;
   tabKey: string;
+  gatewaySlug: string | null;
+}
+
+/** The reach for `slug` behind the gateway this page is served by. */
+function reachOnThisGateway(slug: string): WorkspaceReach {
+  return { base: `${location.origin}/${encodeURIComponent(slug)}`, tabKey: slug, gatewaySlug: slug };
 }
 
 /** Base URL (no trailing slash) for reaching a target workspace's engine from the
@@ -71,18 +84,14 @@ async function resolveWorkspaceBaseUrl(
       // (and lazy-start) the peer from the slugified name (exact when name ===
       // slug, the common case); a passive fetch gives up rather than guess.
       if (!opts.lazyStart) return null;
-      const guess = slugifyWorkspaceName(workspace);
-      return { base: `${location.origin}/${encodeURIComponent(guess)}`, tabKey: guess };
+      return reachOnThisGateway(slugifyWorkspaceName(workspace));
     }
     const entry =
       list.find(w => w.name === workspace) ??
       list.find(w => w.id === slugifyWorkspaceName(workspace));
     if (!entry) return null; // not registered with the gateway
     if (!opts.lazyStart && entry.health !== 'healthy') return null; // don't boot a stopped peer for a title
-    return {
-      base: `${location.origin}/${encodeURIComponent(entry.id)}`,
-      tabKey: entry.id,
-    };
+    return reachOnThisGateway(entry.id);
   }
   const { workspaces } = await fetchWorkspaces();
   const entry = workspaces.find(w => w.name === workspace);
@@ -90,6 +99,7 @@ async function resolveWorkspaceBaseUrl(
   return {
     base: `${location.protocol}//${location.hostname}:${entry.port}`,
     tabKey: workspace,
+    gatewaySlug: null,
   };
 }
 
@@ -163,6 +173,7 @@ async function reachPeerInstall(workspace: string): Promise<WorkspaceReach | nul
     // Keyed on the peer's port too: two installs may both serve a slug, and
     // one tab name between them would re-point the wrong workspace's tab.
     tabKey: `${found.gateway_port}-${found.slug}`,
+    gatewaySlug: null,
   };
 }
 
@@ -176,7 +187,13 @@ async function reachPeerInstall(workspace: string): Promise<WorkspaceReach | nul
  *  The tab is NAMED, so the user's existing tab for that workspace is reused
  *  rather than duplicated. `openNewTab` owns the naming and the `noopener`
  *  reasoning. Going through it also reports a blocked pop-up, which a raw
- *  `window.open` here left as a dead click. */
+ *  `window.open` here left as a dead click.
+ *
+ *  An installed app has no tabs, so a hop on this origin replaces the page. iOS
+ *  loads such a `window.open` in the same view and PUSHES, which leaves a stale
+ *  Lucidos page one stray back swipe away (`utils/documentNavigation.ts`).
+ *  Another origin is outside the app, so it keeps `window.open`, which hands it
+ *  to the browser rather than stranding the app there. */
 export async function openThreadInWorkspace(workspace: string, threadId: string): Promise<void> {
   let reach: WorkspaceReach | null;
   try {
@@ -184,21 +201,84 @@ export async function openThreadInWorkspace(workspace: string, threadId: string)
       (await resolveWorkspaceBaseUrl(workspace, { lazyStart: true })) ??
       (await reachPeerInstall(workspace));
   } catch (e) {
-    showToast(`Failed to open thread in workspace '${workspace}': ${errorDetail(e)}`, 'error');
+    toastOpenThreadFailed(workspace, e);
     return;
   }
   // `reachPeerInstall` has already said why, and said it more precisely than
   // a shared message here could.
   if (reach === null) return;
+  await openThreadAt(reach, threadId, workspace);
+}
 
-  const url = `${reach.base}/#thread=${threadId}`;
+function toastOpenThreadFailed(workspace: string, err: unknown): void {
+  showToast(`Failed to open thread in workspace '${workspace}': ${errorDetail(err)}`, 'error');
+}
+
+/** Show `threadId` in the workspace `reach` points at. `workspace` names it in
+ *  a failure toast.
+ *
+ *  The packaged desktop client opens a workspace on its own gateway in a native
+ *  window, landed on the thread. That keeps the user in Lucidos: `openUrl` there
+ *  is the OS browser unless the in-app browser is on. Another install's gateway
+ *  is a different origin, which the shell does not compose URLs for, so it keeps
+ *  `openUrl`. */
+async function openThreadAt(reach: WorkspaceReach, threadId: string, workspace: string): Promise<void> {
+  const landing = { thread: threadId };
+  if (isTauri() && reach.gatewaySlug !== null) {
+    try {
+      await showWorkspaceInNativeWindow(reach.gatewaySlug, landing);
+    } catch (e) {
+      toastOpenThreadFailed(workspace, e);
+    }
+    return;
+  }
+  const url = `${reach.base}/${landingHash(landing)}`;
   if (isTauri()) {
     openUrl(url);
+    return;
+  }
+  if (!separateViewIsAvailable() && new URL(url).origin === location.origin) {
+    replaceDocument(url);
     return;
   }
   if (!openNewTab(url, workspaceTabName(reach.tabKey))) {
     showToast(`Your browser blocked the tab for '${workspace}'. Allow pop-ups for this site.`, 'error');
   }
+}
+
+/** A *workspace thread URL*, read back into the workspace and the thread. */
+export interface WorkspaceThreadUrl {
+  slug: string;
+  threadId: string;
+}
+
+/** Read `href` as a workspace thread URL on THIS page's origin
+ *  (`<origin>/<slug>/#thread=<uuid>`), or `null` for any other URL.
+ *
+ *  Strict on purpose: a null keeps a link on its ordinary route. So a link that
+ *  only resembles one (another origin, a deeper path, a query) opens as a page. */
+export function parseWorkspaceThreadUrl(href: string): WorkspaceThreadUrl | null {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  if (url.origin !== location.origin || url.search !== '') return null;
+  const slug = /^\/([^/]+)\/?$/.exec(url.pathname)?.[1];
+  const threadId = THREAD_HASH_RE.exec(url.hash)?.[1];
+  if (!slug || !threadId || !isWorkspaceSlug(slug) || !isCanonicalThreadId(threadId)) return null;
+  return { slug, threadId };
+}
+
+/** Open a workspace thread URL inside Lucidos: in place when it names this
+ *  workspace, else in that workspace's own window or tab. */
+export function openWorkspaceThreadUrl({ slug, threadId }: WorkspaceThreadUrl): void {
+  if (slug === WORKSPACE_ID) {
+    focusThreadOrBootstrap(threadId);
+    return;
+  }
+  openThreadAt(reachOnThisGateway(slug), threadId, slug).catch((e) => toastOpenThreadFailed(slug, e));
 }
 
 /** Route a thread link to the engine that owns it: a same-workspace link

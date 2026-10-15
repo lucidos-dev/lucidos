@@ -331,8 +331,10 @@ impl TurnTracker {
                         output_tokens: clamp(output_tokens),
                         cache_read_tokens: cached,
                         cache_creation_tokens: 0,
+                        cache_creation_1h_tokens: None,
                         parent_tool_use_id: None,
                         api_call_id: None,
+                        duration_ms: None,
                     });
                 }
                 events.push(AgentEvent::Result {

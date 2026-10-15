@@ -82,3 +82,10 @@ the browser gate. It refuses an app-iframe `Referer`, which is right for a
 destructive control plane and wrong for the engine: apps call the engine API
 through the SDK from inside an iframe, and the Phase 1 plan keeps them working.
 The engine's own shipped policy was already the correct one.
+
+## Amendment: the gateway no longer uses the engine's port
+
+The consequence above, "the gateway proxies and health-probes over http", held
+until ADR 0445. The gateway now reaches every engine over its engine socket, a
+Unix socket whose owner the kernel names, and never dials the TCP port. That
+port stays loopback, and stays the CLI's and a local browser's way in.

@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// A device's name, the way Settings → Devices shows it.
-pub(super) async fn device_label(pool: &PgPool, device_id: &str) -> String {
+async fn device_label(pool: &PgPool, device_id: &str) -> String {
     crate::core::DeviceStore::friendly_name(pool, device_id).await
 }
 
@@ -25,25 +25,52 @@ pub(crate) fn device_actor(device_id: &str) -> MessageOrigin {
     }
 }
 
-/// Where a navigate went, and why there. The result text is built from this.
-enum Recipient {
+/// Which device a navigate or a capture goes to, and why there. The result
+/// text is built from this.
+pub(super) enum Recipient {
     /// The agent named the device.
-    Chosen(String),
+    Chosen { id: String, label: String },
     /// The last used device, the default.
-    LastUsed(String),
+    LastUsed { id: String, label: String },
     /// No device in this turn: every page showing the thread handles it.
     EveryDevice,
 }
 
-/// Settle the `device` argument into who receives the navigate.
+impl Recipient {
+    pub(super) fn device_id(&self) -> Option<&str> {
+        match self {
+            Recipient::Chosen { id, .. } | Recipient::LastUsed { id, .. } => Some(id),
+            Recipient::EveryDevice => None,
+        }
+    }
+
+    /// The device as the event actor, which is what routes the request.
+    pub(super) fn actor(&self) -> Option<MessageOrigin> {
+        self.device_id().map(device_actor)
+    }
+
+    /// The device's name and how it was picked, for the agent to relay.
+    pub(super) fn described(&self) -> Option<String> {
+        match self {
+            Recipient::Chosen { label, .. } => Some(format!("\"{label}\", the device you named")),
+            Recipient::LastUsed { label, .. } => Some(format!(
+                "\"{label}\", the user's last used device in this turn"
+            )),
+            Recipient::EveryDevice => None,
+        }
+    }
+}
+
+/// Settle the `device` argument of `navigate_ui` or `capture_app` into who
+/// receives the request.
 ///
 /// An explicit id must be a registered device. An unknown one would be
 /// dropped by every page with nobody told, so it is refused here instead.
-async fn recipient(
+pub(super) async fn recipient(
     pool: &PgPool,
     args: &serde_json::Value,
     last_used: Option<&str>,
-) -> Result<(Recipient, Option<MessageOrigin>), String> {
+) -> Result<Recipient, String> {
     // A blank string is a model filling every optional field, so it reads as
     // omitted rather than costing a retry.
     let chosen = match args.get("device") {
@@ -64,16 +91,15 @@ async fn recipient(
         }
     }
     let Some(id) = chosen.or(last_used) else {
-        return Ok((Recipient::EveryDevice, None));
+        return Ok(Recipient::EveryDevice);
     };
     let label = device_label(pool, id).await;
-    let actor = device_actor(id);
-    let who = if chosen.is_some() {
-        Recipient::Chosen(label)
+    let id = id.to_string();
+    Ok(if chosen.is_some() {
+        Recipient::Chosen { id, label }
     } else {
-        Recipient::LastUsed(label)
-    };
-    Ok((who, Some(actor)))
+        Recipient::LastUsed { id, label }
+    })
 }
 
 /// Emit one `NavigationRequested` scoped to `actor`. The one emitter of that
@@ -128,18 +154,15 @@ pub(crate) async fn navigate_ui_impl(
         .await
         .map_err(|e| format!("Error: {e}"))?;
 
-    let (who, actor) = recipient(pool, args, last_used).await?;
-    let device_id = match &actor {
-        Some(MessageOrigin::Device { device_id, .. }) => Some(device_id.clone()),
-        _ => None,
-    };
+    let who = recipient(pool, args, last_used).await?;
+    let device_id = who.device_id();
     log!("[Navigate] navigate_ui thread={thread_id} target={target} device={device_id:?}");
-    emit_navigation(bus, &payload, thread_id, actor)
+    emit_navigation(bus, &payload, thread_id, who.actor())
         .await
         .map_err(|e| format!("Error: {e}"))?;
 
     let mut out = sent_line(&describe_target(target, &payload), &who);
-    if let Some(id) = &device_id {
+    if let Some(id) = device_id {
         out.push_str(&presence_note(
             device_presence(pool, id).await.as_ref(),
             &payload,
@@ -159,13 +182,10 @@ pub(crate) async fn navigate_ui_impl(
 /// not opened. The agent relays this, so it must name a place the user can
 /// look, and must not promise the screen changed.
 fn sent_line(what: &str, who: &Recipient) -> String {
-    let to = match who {
-        Recipient::Chosen(label) => format!("to \"{label}\", the device you named"),
-        Recipient::LastUsed(label) => {
-            format!("to \"{label}\", the user's last used device in this turn")
-        }
-        Recipient::EveryDevice => "to every device showing this thread. This turn has no last \
-                                   used device, so no single device was chosen"
+    let to = match who.described() {
+        Some(device) => format!("to {device}"),
+        None => "to every device showing this thread. This turn has no last used device, so \
+                 no single device was chosen"
             .to_string(),
     };
     format!(

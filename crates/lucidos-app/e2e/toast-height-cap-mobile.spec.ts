@@ -17,11 +17,9 @@
  * viewport.
  *
  * The toast is SPLICED into the live page rather than raised through the
- * notification path. Rendering a real in-app notification toast needs the
- * engine's push-suppression decision (`NotificationToastRequested`, which only
- * fires when a device pongs in), and that path already has unit coverage; what
- * is under test here is the box, which resolves identically however it got
- * mounted. Same technique, and the same reason, as the `.question-body` probe
+ * notification path. A real in-app notification toast rides the engine's
+ * `PresenceCheck`, and that path already has unit coverage. What is under
+ * test here is the box, which resolves identically however it got mounted. Same technique, and the same reason, as the `.question-body` probe
  * in `prompt-transcript-alignment.spec.ts`.
  */
 import { test, expect } from './fixtures';

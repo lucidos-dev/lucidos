@@ -249,6 +249,9 @@ for the architecture.
 # Build engine first if no binary exists
 ./scripts/web-dev.sh -w ~/workspaces/dev -b
 
+# Write the generated files (the launchers and Vite run it for you)
+./scripts/codegen.sh
+
 # Other scripts
 ./scripts/stop.sh -w ~/workspaces/dev   # Graceful shutdown
 ./scripts/restart.sh -w <ws>   # Stop and start

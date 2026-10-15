@@ -8,7 +8,7 @@ import { SearchIcon } from '../shared/icons';
 import { SearchField } from '../shared/SearchField';
 import { ThreadBackButton, ThreadForwardButton } from '../shared/ThreadNav';
 import { openUrl } from '../../store/actions/artifacts';
-import { navigateToPane, resolveSwipePane, focusPane } from '../../store/actions/pane';
+import { swipeToNeighbourPane, focusPane } from '../../store/actions/pane';
 import { focusPromptNow } from '../chat/promptFocus';
 import { MobileAppHeader } from './MobileAppHeader';
 import { BackupReminderBanner } from './BackupReminderBanner';
@@ -16,11 +16,11 @@ import { ConnectionBanner } from './ConnectionBanner';
 import { IngressBanner } from './IngressBanner';
 import { WebhookRefusalBanner } from './WebhookRefusalBanner';
 import { SlownessBanner } from './SlownessBanner';
-import { SwipeTouch } from '@lucidos/pane-swipe';
+import { PaneDrag, attachPaneDragTouches, type PaneTrack } from './paneDrag';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { ContentRefreshButton } from './RefreshIndicator';
-import { ThreadHeaderActions, ThreadHeaderHomeButton } from './ThreadHeaderActions';
+import { ThreadHeaderActions, ThreadHeaderHomeButton, ThreadHeaderNewThreadButton } from './ThreadHeaderActions';
 import { BrandMenuButton } from './HeaderMark';
 import { WorkspaceNameLabel } from './WorkspaceNameLabel';
 import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
@@ -150,47 +150,30 @@ function onHeaderDblClick(e: MouseEvent) {
   resolveHeaderDblClick({ region, ratio });
 }
 
+/** The header swipe's track draws nothing: the pane transition animates via
+ *  CSS when mobileView changes. */
+const HEADER_TRACK: PaneTrack = {
+  paneWidth: () => window.innerWidth,
+  grab: () => {},
+  follow: () => {},
+  navigate: swipeToNeighbourPane,
+  rest: () => {},
+};
+
 /** On mobile, let horizontal swipes on the header navigate between panes.
  *  The header sits above the app iframe (which captures touch events) and
  *  outside iOS Safari's edge gesture zone, making it the most reliable
- *  swipe target on mobile. No visual track feedback — the pane transition
- *  animates via CSS when mobileView changes. */
+ *  swipe target on mobile. The strip's touch rules apply: only a lift
+ *  commits, and a second finger never hijacks a locked swipe. */
 function useHeaderPaneSwipe(ref: { current: HTMLElement | null }): void {
-  const touch = useRef(new SwipeTouch());
-
-  const onTouchStart = useCallback((e: TouchEvent) => {
-    if (!isMobile()) return;
-    if (isTextInput(e.target as Element)) return;
-    const t = e.touches[0];
-    touch.current.start(t.clientX, t.clientY);
-  }, []);
-
-  const onTouchMove = useCallback((e: TouchEvent) => {
-    const t = e.touches[0];
-    if (touch.current.move(t.clientX, t.clientY) !== null) {
-      e.preventDefault();
-    }
-  }, []);
-
-  const onTouchEnd = useCallback(() => {
-    const target = resolveSwipePane(touch.current.end(window.innerWidth));
-    if (target) navigateToPane(target);
-  }, []);
-
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    el.addEventListener('touchstart', onTouchStart, { passive: true });
-    el.addEventListener('touchmove', onTouchMove, { passive: false });
-    el.addEventListener('touchend', onTouchEnd, { passive: true });
-    el.addEventListener('touchcancel', onTouchEnd, { passive: true });
-    return () => {
-      el.removeEventListener('touchstart', onTouchStart);
-      el.removeEventListener('touchmove', onTouchMove);
-      el.removeEventListener('touchend', onTouchEnd);
-      el.removeEventListener('touchcancel', onTouchEnd);
-    };
-  }, [onTouchStart, onTouchMove, onTouchEnd]);
+    const drag = new PaneDrag(HEADER_TRACK, { frameMayLead: () => false, mayCommit: () => true });
+    return attachPaneDragTouches(el, drag, {
+      gate: (e) => isMobile() && !isTextInput(e.target as Element),
+    });
+  }, []);
 }
 
 export function AppHeader() {
@@ -283,9 +266,10 @@ export function AppHeader() {
             {/* Focus on click, not pointerdown, so a window drag never shifts
                 focus — see ThreadsHeader. */}
             <span class="pane-header-brand" onClick={onThreadHeaderClick}>
-              {/* Home leads the row, past the drawer toggle while the drawer
-                  is shut (shell.css). */}
+              {/* Home and New thread lead the row, past the drawer toggle
+                  while the drawer is shut (shell.css). */}
               <ThreadHeaderHomeButton />
+              <ThreadHeaderNewThreadButton />
               {/* The Lucidos mark, absolutely centred on the pane: brand,
                   connection light and menu in one control, the same one both
                   mobile headers carry. It replaced a `[Lucidos * workspace]`

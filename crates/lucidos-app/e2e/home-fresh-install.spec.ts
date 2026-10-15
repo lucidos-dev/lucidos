@@ -33,11 +33,17 @@ test.describe('A fresh install starts in Home', () => {
     await expect
       .poll(() => page.evaluate(() => localStorage.getItem('lucidos-focused-thread')), { timeout: 10_000 })
       .toBe(home);
-    await expect(page.locator('.home-welcome-title .thread-title-menu:visible')).toHaveText('Home');
+    if (isMobileViewport(page)) {
+      // A phone's cold start lands on Home's board face, which holds the
+      // welcome (ADR 0432).
+      await expect(page.locator('.home-pane[data-home-face="board"]')).toBeVisible();
+    } else {
+      await expect(page.locator('.home-welcome-title .thread-title-menu:visible')).toHaveText('Home');
+      await expect(page.locator('.thread-pane.compose-empty:visible')).toHaveCount(1);
+    }
     const welcome = page.locator('.welcome-message:visible');
     await expect(welcome).toHaveCount(1);
     await expect(welcome.getByText('Hi, there!')).toBeVisible();
-    await expect(page.locator('.thread-pane.compose-empty:visible')).toHaveCount(1);
   });
 
   test('runs the setup interview in Home', async ({ page }) => {

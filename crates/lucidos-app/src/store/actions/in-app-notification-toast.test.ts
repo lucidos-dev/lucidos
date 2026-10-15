@@ -67,7 +67,7 @@ describe('§4 in-app surface matrix', () => {
     );
   });
 
-  test('s4_row4_hidden_classifies_as_hidden_regardless_of_focus_or_viewport', async () => {
+  test('s4_row4_hidden_classifies_as_shell_not_active_regardless_of_focus_or_viewport', async () => {
     // Even when focused on the source thread and the event is "in viewport"
     // (hidden tab could still report bbox), an inactive page never gets a
     // toast and never auto-marks-read.
@@ -75,7 +75,7 @@ describe('§4 in-app surface matrix', () => {
     isInViewportMock.mockReturnValue(true);
     focusedThreadIdSignal.value = 't-1';
     const { classifyInAppRow } = await importModule();
-    expect(classifyInAppRow(target({ thread: 't-1', event: 'e-1' }))).toBe('row4_hidden');
+    expect(classifyInAppRow(target({ thread: 't-1', event: 'e-1' }))).toBe('shell_not_active');
   });
 
   test('s4_null_event_id_with_focused_thread_falls_through_to_toast', async () => {
@@ -108,5 +108,35 @@ describe('§4 in-app surface matrix', () => {
     expect(classifyInAppRow(target({ thread: null, event: 'e-1' }))).toBe(
       'row2_or_3_toast_and_badge',
     );
+  });
+});
+
+describe('isShellActive', () => {
+  // Only the SHELL can show a toast. An app filling the screen means the user
+  // is looking at the app, so the OS surface wins. That also makes a fullscreen
+  // app agree with a popped-out app window, which has always taken the push
+  // and looks identical to the user.
+
+  test('an ordinary visible shell is active', async () => {
+    const { isShellActive } = await importModule();
+    expect(isShellActive(true, false, false)).toBe(true);
+  });
+
+  test('a hidden shell is inactive whatever the fullscreen state', async () => {
+    const { isShellActive } = await importModule();
+    expect(isShellActive(false, false, false)).toBe(false);
+    expect(isShellActive(false, true, false)).toBe(false);
+  });
+
+  test('native fullscreen makes the shell inactive', async () => {
+    const { isShellActive } = await importModule();
+    expect(isShellActive(true, true, false)).toBe(false);
+  });
+
+  test('pseudo-fullscreen makes the shell inactive too', async () => {
+    // The iOS path is a CSS overlay rather than the Fullscreen API, so it sets
+    // a different signal. Both mean the same thing to the user.
+    const { isShellActive } = await importModule();
+    expect(isShellActive(true, false, true)).toBe(false);
   });
 });

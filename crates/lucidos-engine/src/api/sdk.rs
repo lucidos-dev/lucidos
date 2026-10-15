@@ -48,12 +48,6 @@ const TEXT_INPUT_CSS: &str = include_str!("../../../lucidos-app/src/styles/globa
 /// widget draws instead of a table. Iframe-only, since the host draws none.
 const SHAPES_CSS: &str = include_str!("sdk_iframe_shapes.css");
 
-/// The theme part rules for app frames, generated from the part catalog: the
-/// `@property` rules for the frame colour tokens, the protected reset, the
-/// `theme-effects` reduce rule and the app opt-out (ADR 0307).
-const THEME_PARTS_CSS: &str =
-    include_str!("../../../lucidos-app/src/styles/generated/theme-parts-frame.css");
-
 /// The theme-part rules that tint app CONTROLS (`.lucidos-select-trigger` /
 /// `.text-input` / bare `input`/`select`/`button` border-color + box-shadow).
 /// Concatenated LAST. It names `.lucidos-select-trigger` and `.text-input`
@@ -64,13 +58,19 @@ const CONTROL_THEME_PARTS_CSS: &str = include_str!("sdk_iframe_control_theme_par
 
 /// The served `/api/v1/sdk-iframe.css` body: iframe tokens and defaults, the
 /// shared component layers, the widget shapes, then the theme part rules.
-/// Concatenated once and cached. `CONTROL_THEME_PARTS_CSS` must stay last — see its own comment.
+/// Concatenated once and cached. `CONTROL_THEME_PARTS_CSS` must stay last; see
+/// its own comment.
+///
+/// The theme part rules come from the part catalog: the `@property` rules for
+/// the frame colour tokens, the protected reset, the `theme-effects` reduce
+/// rule and the app opt-out (ADR 0307).
 fn sdk_iframe_css() -> &'static str {
     static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CSS.get_or_init(|| {
+        let theme_parts_css = crate::core::themes::parts::codegen::frame_css();
         format!(
             "{SDK_IFRAME_BASE_CSS}\n{SHARED_COMPONENTS_CSS}\n{SURFACE_CSS}\n{TEXT_INPUT_CSS}\n\
-             {SHAPES_CSS}\n{THEME_PARTS_CSS}\n{CONTROL_THEME_PARTS_CSS}"
+             {SHAPES_CSS}\n{theme_parts_css}\n{CONTROL_THEME_PARTS_CSS}"
         )
     })
 }
@@ -80,19 +80,6 @@ fn sdk_iframe_css() -> &'static str {
 /// Must run before any app script creates an `AudioContext`, so apps include
 /// it via `<script src="/api/v1/sdk-iframe-audio.js"></script>` early in `<head>`.
 pub(super) const SDK_IFRAME_AUDIO_JS: &str = include_str!("sdk_iframe_audio.js");
-
-/// The shared SSE worker: one `EventSource` per workspace, per browser profile.
-///
-/// A `SharedWorker` is keyed by its resolved script URL. This route sits under
-/// the workspace's `/<slug>` prefix, so two workspaces get two workers and
-/// neither can see the other's frames.
-///
-/// `include_str!` of a CHECKED-IN esbuild artifact, like the appearance boot
-/// bundle beside it, so `cargo build` needs no prior npm run.
-/// `sseWorker.staleness.test.ts` fails if the committed bundle drifts from its
-/// TypeScript source.
-const SSE_WORKER_JS: &str =
-    include_str!("../../../../packages/lucidos-sdk/src/generated/sse-worker.js");
 
 /// GET /api/v1/sdk-iframe.css — serve the iframe stylesheet (iframe tokens/
 /// defaults + the shared component layer).
@@ -104,23 +91,32 @@ pub(super) async fn serve_sdk_iframe_css() -> Response {
         .into_response()
 }
 
-/// GET /api/v1/sse-worker.js: serve the shared SSE worker.
+/// GET /api/v1/sse-worker.js: serve the shared SSE worker, one `EventSource`
+/// per workspace, per browser profile.
+///
+/// A `SharedWorker` is keyed by its resolved script URL. This route sits under
+/// the workspace's `/<slug>` prefix, so two workspaces get two workers and
+/// neither can see the other's frames.
 ///
 /// `no-cache` so a revalidation happens per load. A stale worker keeps relaying
 /// frames correctly while quietly running the previous pong aggregation, which
 /// is the failure hardest to notice.
 pub(super) async fn serve_sse_worker_js() -> Response {
-    (
-        [
-            (
-                header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            ),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        SSE_WORKER_JS,
-    )
-        .into_response()
+    static WORKER: BuiltSdkFile = BuiltSdkFile::new(SSE_WORKER_FILE);
+    match WORKER.read() {
+        Some(js) => (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    "application/javascript; charset=utf-8",
+                ),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            js,
+        )
+            .into_response(),
+        None => WORKER.missing(),
+    }
 }
 
 /// GET /api/v1/sdk-iframe-audio.js — serve the audio unlock shim.
@@ -136,28 +132,83 @@ pub(super) async fn serve_sdk_iframe_audio_js() -> Response {
 }
 
 fn find_sdk_bundle() -> String {
+    read_sdk_dist(SDK_JS_FILE).unwrap_or_else(|| {
+        // A minimal stub that logs a warning, so app pages still load.
+        r#"(function(){
+  console.warn('[Lucidos SDK] Built SDK bundle not found. Run: ./scripts/codegen.sh');
+  window.lucidos = window.lucidos || {};
+})();"#
+            .to_string()
+    })
+}
+
+/// The files of the built SDK the engine serves. Release staging fails closed
+/// without one (`STAGE_RUNTIME_SERVED_SDK_FILES` in scripts/lib/stage_runtime.sh).
+const SDK_JS_FILE: &str = "sdk.js";
+pub(super) const APPEARANCE_BOOT_FILE: &str = "appearance-boot.iframe.js";
+const SSE_WORKER_FILE: &str = "sse-worker.js";
+
+/// One script the SDK build writes into `packages/lucidos-sdk/dist/`, beside
+/// `sdk.js`, which the engine serves as built.
+///
+/// A debug build reads it from disk on every request, so a rebuild needs no
+/// restart. A release build reads it once.
+pub(super) struct BuiltSdkFile {
+    name: &'static str,
+    cached: std::sync::OnceLock<Option<String>>,
+}
+
+impl BuiltSdkFile {
+    pub(super) const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            cached: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(super) fn read(&self) -> Option<String> {
+        if cfg!(debug_assertions) {
+            return read_sdk_dist(self.name);
+        }
+        self.cached.get_or_init(|| read_sdk_dist(self.name)).clone()
+    }
+
+    /// The answer when the file is not built. A boot script has no usable
+    /// stand-in, so this is an error the engine log names, never a stub.
+    pub(super) fn missing(&self) -> Response {
+        crate::log!(
+            "[SDK] {} is not built, so it cannot be served. Run: ./scripts/codegen.sh",
+            self.name
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{} is not built. Run: ./scripts/codegen.sh\n", self.name),
+        )
+            .into_response()
+    }
+}
+
+/// Read one file of the built SDK: from `LUCIDOS_SDK_DIR` in a packaged build,
+/// else from the checkout's `packages/lucidos-sdk/dist/`.
+fn read_sdk_dist(name: &str) -> Option<String> {
     // Packaged desktop bundle: the launcher sets LUCIDOS_SDK_DIR to the staged
-    // SDK resource dir (which contains sdk.js). Checked first so the bundle
-    // doesn't depend on cwd / exe-relative layout. No-op when unset (dev/docker).
+    // SDK resource dir. Checked first so the bundle doesn't depend on cwd /
+    // exe-relative layout. No-op when unset (dev/docker).
     if let Some(dir) = std::env::var_os("LUCIDOS_SDK_DIR") {
-        let path = std::path::Path::new(&dir).join("sdk.js");
+        let path = std::path::Path::new(&dir).join(name);
         match std::fs::read_to_string(&path) {
-            Ok(content) => return content,
-            // LUCIDOS_SDK_DIR is set (packaged) but the bundle is missing /
-            // unreadable — a real staging defect. Log a SERVER-side error so it
-            // isn't invisible (apps would otherwise silently lose
-            // `window.lucidos.*` with only a browser-console warning from the
-            // stub below). We still fall through to the stub so app pages load.
+            Ok(content) => return Some(content),
+            // LUCIDOS_SDK_DIR is set (packaged) but the file is missing or
+            // unreadable: a real staging defect. Log it SERVER-side so it is
+            // never invisible, then try the checkout layouts below.
             Err(e) => crate::log!(
-                "[SDK] LUCIDOS_SDK_DIR is set but {} is unreadable: {} — serving the SDK stub; \
-                 apps will lose window.lucidos.*",
-                path.display(),
-                e
+                "[SDK] LUCIDOS_SDK_DIR is set but {} is unreadable: {e}",
+                path.display()
             ),
         }
     }
 
-    const SDK_REL: &str = "packages/lucidos-sdk/dist/sdk.js";
+    let rel = format!("packages/lucidos-sdk/dist/{name}");
 
     // Dev, resolved from the CHECKOUT rather than from a fixed number of `..`
     // hops above the binary. `paths::repo_root` walks `current_exe()`'s ancestors
@@ -169,41 +220,26 @@ fn find_sdk_bundle() -> String {
     // WORKSPACE dir, so the cwd-relative reads never hit in the normal dev topology
     // and this is the branch that actually serves the bundle.
     if let Ok(root) = crate::paths::repo_root() {
-        if let Ok(content) = std::fs::read_to_string(root.join(SDK_REL)) {
-            return content;
+        if let Ok(content) = std::fs::read_to_string(root.join(&rel)) {
+            return Some(content);
         }
     }
 
     // cwd-relative (a directly-launched engine runs with cwd = the checkout) and
     // exe-relative, kept as fallbacks for layouts `repo_root` can't resolve.
-    let search_paths = [
-        SDK_REL,
-        "../packages/lucidos-sdk/dist/sdk.js",
-        "../../packages/lucidos-sdk/dist/sdk.js",
-    ];
-
-    for path in &search_paths {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            return content;
-        }
-    }
-
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            for path in &search_paths {
-                let full_path = exe_dir.join(path);
-                if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    return content;
-                }
-            }
-        }
-    }
-
-    // Fallback: minimal SDK stub that logs a warning
-    r#"(function(){
-  console.warn('[Lucidos SDK] Built SDK bundle not found. Run: cd packages/lucidos-sdk && npm run build');
-  window.lucidos = window.lucidos || {};
-})();"#.to_string()
+    let search_paths = [rel.clone(), format!("../{rel}"), format!("../../{rel}")];
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+    search_paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(
+            exe_dir
+                .iter()
+                .flat_map(|dir| search_paths.iter().map(move |p| dir.join(p))),
+        )
+        .find_map(|path| std::fs::read_to_string(path).ok())
 }
 
 /// POST /api/v1/ui/navigate — emit a NavigationRequested event via EventBus.
@@ -298,6 +334,42 @@ pub(super) fn router() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    /// A boot script has no usable stand-in, so an unbuilt one is an error the
+    /// caller sees, never a stub that quietly paints the defaults.
+    #[test]
+    fn a_script_that_is_not_built_is_a_503() {
+        let file = super::BuiltSdkFile::new("not-built.js");
+        assert!(file.read().is_none());
+        assert_eq!(
+            file.missing().status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// The release scripts cannot read these names, so a pin holds the copy.
+    #[test]
+    fn served_sdk_files_are_staged() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/lib/stage_runtime.sh"),
+        )
+        .expect("stage_runtime.sh exists");
+        let list = script
+            .lines()
+            .find(|l| l.starts_with("STAGE_RUNTIME_SERVED_SDK_FILES=("))
+            .expect("stage_runtime.sh lists the served SDK files");
+        for name in [
+            super::SDK_JS_FILE,
+            super::APPEARANCE_BOOT_FILE,
+            super::SSE_WORKER_FILE,
+        ] {
+            assert!(
+                list.split(['(', ' ', ')']).any(|w| w == name),
+                "release staging does not check {name}: {list}"
+            );
+        }
+    }
+
     use super::*;
 
     /// An app that loads this stylesheet gets typed colour tokens and every

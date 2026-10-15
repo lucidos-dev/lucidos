@@ -1,10 +1,12 @@
 /** The shared cap on mounted widget frames (ADR 0415).
  *
- *  Each widget frame is a renderer process of its own (ADR 0227). Widget
- *  cards, option widgets and reply embeds mount once they come on screen, and
- *  stay a while after they scroll off. This one budget caps how many are
- *  mounted at once. Past it, the frame furthest from view unmounts first and
- *  draws again when it next comes on screen. Frames in view are never evicted. */
+ *  Each widget frame costs renderer memory. Chrome may give it a process of
+ *  its own (ADR 0227); WebKit keeps every frame in the page's one content
+ *  process. Inline widgets, option widgets and Home board tiles
+ *  mount once they come on screen, and stay a while after they scroll off.
+ *  This one budget caps how many are mounted at once. Past it, the frame
+ *  furthest from view unmounts first and draws again when it next comes on
+ *  screen. Frames in view are never evicted. */
 
 /** How many widget frames may be mounted at once, across every placement. */
 export const MAX_MOUNTED_WIDGET_FRAMES = 8;

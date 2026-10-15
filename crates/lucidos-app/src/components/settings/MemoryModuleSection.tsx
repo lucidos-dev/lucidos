@@ -6,6 +6,7 @@ import {
   currentMemoryModule,
   setMemoryModule,
   storedBackgroundSelection,
+  storedMemoryModule,
   type MemoryModule,
 } from '../../store/actions/preferences';
 import { loadTreeBackfill, treeBackfillStarted } from '../../store/actions/treeBackfill';
@@ -31,7 +32,7 @@ const SUMMARY_COMPACTION_ANCHOR = 'models:summary-compaction';
 
 /** Heads Settings → System → Memory: how a turn gets its past (ADR 0362).
  *
- *  Classic is written at once. Tree costs money, so the first time its button
+ *  Classic is written at once, even while unset. Tree costs money, so the first time its button
  *  only opens the confirm modal: the estimate and the compactor model, and the
  *  Start button that writes `memory_module`. Once a backfill has started,
  *  Tree is written at once too, and the compactor resumes it. */
@@ -65,7 +66,8 @@ export function MemoryModuleSection() {
       return;
     }
     setConfirming(false);
-    if (chosen !== 'classic') void setMemoryModule('classic');
+    // Unset runs Classic, but pressing it is still the workspace's answer.
+    if (storedMemoryModule() !== 'classic') void setMemoryModule('classic');
   }
 
   async function startTree() {
@@ -111,7 +113,9 @@ export function MemoryModuleSection() {
         />
       )}
       <Disclosure open={chosen === 'tree'}>
-        {chosen === 'tree' && <TreeBackfillStatus onPickModel={openCompactionModel} />}
+        {chosen === 'tree' && (
+          <TreeBackfillStatus onPickModel={openCompactionModel} onSwitchToClassic={() => void setMemoryModule('classic')} />
+        )}
         <div class="settings-row-note" data-role="memory-compaction-link">
           {compactor ? `${displayModelName(compactor)} writes` : 'A background model writes'}{' '}
           Tree's summaries. Change it under{' '}

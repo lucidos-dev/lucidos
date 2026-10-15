@@ -3,7 +3,7 @@ import type { Notification } from '../types';
 
 // The toast module reaches the navigation dispatcher through `resolveDeepLink`,
 // so the whole navigate graph loads with it. None of it runs here: these keep
-// the import inert, exactly as `__tests__/notification-toast-requested.test.ts`
+// the import inert, exactly as `__tests__/presence-check-toast.test.ts`
 // does for the arrival matrix.
 vi.mock('./threads', () => ({
   focusThread: vi.fn(),
@@ -28,12 +28,12 @@ vi.mock('./menu', () => ({ switchMenuItem: vi.fn() }));
 vi.mock('../../api/client', () => ({ API_BASE: 'http://test', API: 'http://test/api/v1' }));
 vi.mock('./devices', () => ({ getDeviceId: () => 'dev-test' }));
 
-import { dismissToast, focusedThreadId, showToast, toasts, unreadNotifications } from '../store';
+import { dismissToast, focusedThreadId, showToast, toasts, servedUnreadNotifications } from '../store';
 import {
   _resetToastLifetimeForTesting,
   dropAllNotificationToasts,
   dropNotificationToast,
-  handleNotificationToastRequested,
+  presentInAppNotification,
   installNotificationToastLifetime,
   notificationToastKey,
   toastsToDrop,
@@ -42,7 +42,7 @@ import {
 const OVERFLOW_KEY = 'notifications-overflow';
 
 function unreadSet(...ids: string[]): void {
-  unreadNotifications.value = {
+  servedUnreadNotifications.value = {
     status: 'loaded',
     data: ids.map((id) => ({
       id,
@@ -54,17 +54,12 @@ function unreadSet(...ids: string[]): void {
   };
 }
 
-/** Land a toast the way the engine's push-suppressed branch does. */
+/** Land a toast the way an active page acts on a PresenceCheck. */
 function arrive(id: string): void {
-  handleNotificationToastRequested({
-    notification_id: id,
+  presentInAppNotification({
     title: 'Claude is asking',
     body: 'Pick one',
-    thread_id: 't-other',
-    event_id: null,
-    app_id: null,
-    tap: null,
-    sent_at_ms: Date.now(),
+    target: { notification: id, thread: 't-other', event: null, tap: null },
   });
 }
 
@@ -79,7 +74,7 @@ function overflow() {
 beforeEach(() => {
   toasts.value = [];
   focusedThreadId.value = null;
-  unreadNotifications.value = { status: 'not-loaded' };
+  servedUnreadNotifications.value = { status: 'not-loaded' };
   _resetToastLifetimeForTesting();
   Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
   Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => true });
@@ -180,7 +175,7 @@ describe('a read the unread set cannot report', () => {
 
 describe('a toast the page never held as unread', () => {
   it('survives a set that lands without it', () => {
-    // The toast rides `NotificationToastRequested` while the unread reload
+    // The toast rides `PresenceCheck` while the unread reload
     // `NotificationCreated` kicked off is still in flight. Bare absence is
     // therefore not a read, and dropping on it would hide a fresh notification.
     arrive('n-1');
@@ -203,10 +198,10 @@ describe('a set that is not loaded', () => {
     unreadSet('n-1');
     arrive('n-1');
 
-    unreadNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
     expect(toastFor('n-1')).toBeTruthy();
 
-    unreadNotifications.value = { status: 'loading' };
+    servedUnreadNotifications.value = { status: 'loading' };
     expect(toastFor('n-1')).toBeTruthy();
 
     // The baseline survived, so the read that follows is still a transition.

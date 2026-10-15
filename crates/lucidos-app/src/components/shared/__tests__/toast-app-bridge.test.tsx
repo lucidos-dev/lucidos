@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { ToastList } from '../Toast';
-import { toasts, engineRestarting, dismissToast, showToast } from '../../../store/store';
+import { toasts, engineRestarting, dismissToast, showToast, TOAST_AUTO_DISMISS_MS } from '../../../store/store';
 import { handleAppToastMessage } from '../../../store/actions/app-toast-bridge';
 import { markSwUpdateDismissed } from '../../../hooks/sw-update';
 
@@ -134,6 +134,55 @@ describe('app toast bridge: dismissToast', () => {
     showToast('New version available', 'info', { key: 'update-available' });
     dismissToast('update-available');
     expect(markSwUpdateDismissed).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('app toast bridge: lifetime', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  // The documented default (js-sdk.md § Toasts): success and info close on their
+  // own whether or not the app keyed them. A keyed host toast stays up, so the
+  // bridge must not inherit that rule. Regression: a keyed "Saved" never closed.
+  it('closes a keyed success toast on the host timer', () => {
+    toastMsg({ message: 'Saved', type: 'success', key: 'save' });
+    vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('closes an unkeyed info toast on the host timer', () => {
+    toastMsg({ message: 'Synced', type: 'info' });
+    vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('keeps errors, warnings and spinners up until dismissed or replaced', () => {
+    toastMsg({ message: 'Failed', type: 'error', key: 'a' });
+    toastMsg({ message: 'Careful', type: 'warning' });
+    toastMsg({ message: 'Reindexing…', type: 'info', key: 'reindex', spinning: true });
+    vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS * 10);
+    expect(toasts.value.length).toBe(3);
+  });
+
+  // No key means nothing can replace or dismiss it, and with no X either it
+  // would never leave.
+  it('closes an unkeyed spinner on the host timer', () => {
+    toastMsg({ message: 'Working…', type: 'info', spinning: true, dismissable: false });
+    vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('closes a spinner once its outcome replaces it', () => {
+    toastMsg({ message: 'Reindexing…', type: 'info', key: 'reindex', spinning: true });
+    toastMsg({ message: 'Reindexed', type: 'success', key: 'reindex' });
+    vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('honours an explicit durationMs', () => {
+    toastMsg({ message: 'Failed', type: 'error', key: 'a', durationMs: 1000 });
+    vi.advanceTimersByTime(1000);
+    expect(toasts.value).toEqual([]);
   });
 });
 

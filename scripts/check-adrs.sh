@@ -11,15 +11,15 @@
 # MERGE rather than through this branch's own edits. Catching a collision at
 # any hardening before Apply is the entire point.
 #
-# It exists because docs/adr/index.md carries `merge=union` (see
-# .gitattributes), which is what stops two branches appending an ADR line from
-# conflicting. Union keeps both lines but neither orders nor deduplicates them,
-# so this is the half that covers what union does not:
+# docs/adr/index.md merges through the keyed `lucidos-sorted-lines` driver
+# (ADR 0460), which keeps concurrent lines sorted and one per number. A clone
+# without the driver registered merges it as text. This is the half that holds
+# either way:
 #
 #   - two ADR files claiming the same number (silent: git merges them clean,
 #     because the filenames differ)
 #   - an ADR file with no index line, or an index line with no file
-#   - the index out of numeric order (the ordinary result of a union merge)
+#   - the index out of numeric order (a hand edit, or a text merge)
 #   - an ADR missing a required section, or whose heading number disagrees
 #     with its filename
 #
@@ -194,8 +194,9 @@ fi
         echo
     fi
     if grep -q 'out of order' "$PROBLEMS"; then
-        echo "Out-of-order entries are the ordinary result of a union merge of"
-        echo "$ADR_INDEX. Run ./scripts/check-adrs.sh --fix to restore the order."
+        echo "Out-of-order entries come from a hand edit or a merge of $ADR_INDEX"
+        echo "without its driver (./scripts/merge-drivers.sh). Run"
+        echo "./scripts/check-adrs.sh --fix to restore the order."
         echo
     fi
 } >&2

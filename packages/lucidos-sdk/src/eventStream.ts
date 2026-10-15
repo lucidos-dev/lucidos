@@ -15,12 +15,21 @@
  * `document`.
  */
 
+import type { PRESENCE_OUTCOMES_BY_STRENGTH } from './generated/engine-constants';
+
+/** How long a dropped stream waits before it opens again. The shell, the
+ *  shared worker and an app's own stream all retry on this one schedule. */
+export const EVENT_STREAM_RETRY_MS = 3000;
+
+/** What a document already did with a `PresenceCheck` when it answered.
+ *  Every value but `not_shown` means the reader has the notification in the
+ *  app, so the engine suppresses the OS push. */
+export type PresenceOutcome = (typeof PRESENCE_OUTCOMES_BY_STRENGTH)[number];
+
 /** One document's answer to a `PresenceCheck`, before aggregation. */
 export interface PongAnswer {
   device_id: string;
-  is_active: boolean;
-  focused_thread_id: string | null;
-  event_in_viewport: boolean;
+  outcome: PresenceOutcome;
 }
 
 export interface EventStreamHandlers {
@@ -44,7 +53,7 @@ export interface EventStream {
   readonly ownsReconnect: boolean;
   /** Hand this document's answer to a `PresenceCheck` to the transport.
    *
-   *  Direct: POSTs it straight away. Shared: sends it to the worker, which ORs
+   *  Direct: POSTs it straight away. Shared: sends it to the worker, which merges
    *  it with its other ports' answers and POSTs exactly one pong. Keeping the
    *  submit behind the transport is what holds the engine's
    *  `expected_pong_count` equal to its open-connection count. */

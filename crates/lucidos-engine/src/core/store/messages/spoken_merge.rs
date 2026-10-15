@@ -8,12 +8,8 @@
 //! and in `store/thread-events/spokenMerge.ts` for the transcript.
 //!
 //! **One rule, two languages, proven identical.** The cases below are
-//! generated into a fixture the TypeScript side replays, so the two cannot
-//! drift. Regenerate with:
-//!
-//! ```text
-//! cargo test -p lucidos-engine --lib -- --ignored generate_spoken_merge_fixture_file
-//! ```
+//! generated into a fixture the TypeScript side replays (`./scripts/codegen.sh`),
+//! so the two cannot drift.
 
 /// How far apart two spoken rows may be and still be one thing said.
 ///
@@ -70,7 +66,6 @@ pub(crate) fn join_spoken(first: &str, second: &str) -> String {
 }
 
 /// One generated case: the inputs, and what both languages must answer.
-#[cfg(test)]
 #[derive(serde::Serialize)]
 struct MergeCase {
     pub name: &'static str,
@@ -82,8 +77,7 @@ struct MergeCase {
     pub joined: String,
 }
 
-/// Every case the fixture pins. Add one here and regenerate.
-#[cfg(test)]
+/// Every case the fixture pins.
 fn cases() -> Vec<MergeCase> {
     const INPUTS: &[(&str, &str, &str, f64, bool)] = &[
         ("a comma clause attaches", "Status", ", please", 0.4, true),
@@ -162,8 +156,7 @@ fn cases() -> Vec<MergeCase> {
 ///
 /// Pretty-printed with a trailing newline, matching every other generated file
 /// in `crates/lucidos-app/src/generated/`.
-#[cfg(test)]
-fn generate_fixture() -> String {
+pub(crate) fn render_fixture() -> String {
     let mut json = serde_json::to_string_pretty(&serde_json::json!({
         "merge_gap_secs": MERGE_GAP_SECS,
         "cases": cases(),
@@ -173,44 +166,9 @@ fn generate_fixture() -> String {
     json
 }
 
-/// Where the fixture lives, beside the other generated contract files.
-#[cfg(test)]
-fn fixture_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the crate has a parent directory")
-        .join("lucidos-app/src/generated/spoken-merge-fixture.json")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn spoken_merge_fixture_is_up_to_date() {
-        let generated = generate_fixture();
-        let path = fixture_path();
-        let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| {
-            panic!(
-                "The spoken-merge fixture does not exist at {}. Run: cargo test -p lucidos-engine --lib -- --ignored generate_spoken_merge_fixture_file",
-                path.display()
-            )
-        });
-        assert_eq!(
-            existing, generated,
-            "The spoken-merge fixture is stale. Run: cargo test -p lucidos-engine --lib -- --ignored generate_spoken_merge_fixture_file"
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn generate_spoken_merge_fixture_file() {
-        let path = fixture_path();
-        std::fs::create_dir_all(path.parent().expect("the fixture has a directory"))
-            .expect("the generated directory is writable");
-        std::fs::write(&path, generate_fixture()).expect("the fixture is writable");
-        crate::log!("[ContractTest] Generated: {}", path.display());
-    }
 
     #[test]
     fn a_clitic_needs_no_space() {

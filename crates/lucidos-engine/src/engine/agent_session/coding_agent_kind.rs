@@ -498,7 +498,8 @@ mod tests {
 
     #[test]
     fn classify_refuses_inside_lucidos_state() {
-        let ws = std::env::temp_dir().join("classify_test_ws_state");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let target = ws.join(".lucidos/worktrees/thread-foo");
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
@@ -513,7 +514,8 @@ mod tests {
 
     #[test]
     fn classify_returns_app_for_canonical_app_folder() {
-        let ws = std::env::temp_dir().join("classify_test_ws_app");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let target = ws.join("data/apps/habit-tracker");
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
@@ -536,7 +538,8 @@ mod tests {
 
     #[test]
     fn classify_refuses_app_subpath() {
-        let ws = std::env::temp_dir().join("classify_test_ws_appsub");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let target = ws.join("data/apps/habit-tracker/ui");
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
@@ -551,7 +554,8 @@ mod tests {
 
     #[test]
     fn classify_refuses_non_app_data_subtree() {
-        let ws = std::env::temp_dir().join("classify_test_ws_data_knowhow");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let target = ws.join("data/knowhow");
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos-source");
@@ -566,7 +570,8 @@ mod tests {
 
     #[test]
     fn classify_returns_lucidos_for_repo_root() {
-        let ws = std::env::temp_dir().join("classify_test_ws_lucidos");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let lucidos_root = ws.join("lucidos");
         let _ = std::fs::create_dir_all(&lucidos_root);
         let res = classify_resolved_folder(&lucidos_root, &ws, Some(&lucidos_root), |_| None);
@@ -583,7 +588,8 @@ mod tests {
 
     #[test]
     fn classify_returns_external_when_registry_matches() {
-        let ws = std::env::temp_dir().join("classify_test_ws_external");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let lucidos_root = ws.join("lucidos");
         let _ = std::fs::create_dir_all(&lucidos_root);
         let ext = ws.join("acme");
@@ -607,7 +613,8 @@ mod tests {
 
     #[test]
     fn classify_refuses_unrecognised_path() {
-        let ws = std::env::temp_dir().join("classify_test_ws_unknown");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let target = ws.join("scratch");
         let _ = std::fs::create_dir_all(&target);
         let lucidos_root = ws.join("lucidos");
@@ -626,7 +633,8 @@ mod tests {
     fn classify_app_without_lucidos_source() {
         // Packaged: no source checkout, yet an app folder must still classify so
         // app coding-agent spawns work (the regression this fix targets).
-        let ws = std::env::temp_dir().join("classify_test_ws_app_no_src");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let target = ws.join("data/apps/habit-tracker");
         let _ = std::fs::create_dir_all(&target);
         let res = classify_resolved_folder(&target, &ws, None, |_| None);
@@ -648,7 +656,8 @@ mod tests {
     #[test]
     fn classify_external_without_lucidos_source() {
         // Packaged: a registered external repo must still classify with no source.
-        let ws = std::env::temp_dir().join("classify_test_ws_ext_no_src");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let ext = ws.join("acme");
         let _ = std::fs::create_dir_all(&ext);
         let ext_ref = ext.clone();
@@ -672,7 +681,8 @@ mod tests {
     fn classify_would_be_source_falls_through_without_lucidos_source() {
         // Packaged: a path that WOULD be the Lucidos source on a dev build must
         // NOT be silently classified — with no source it's UnrecognisedPath.
-        let ws = std::env::temp_dir().join("classify_test_ws_src_falls_through");
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
         let would_be_source = ws.join("lucidos");
         let _ = std::fs::create_dir_all(&would_be_source);
         let res = classify_resolved_folder(&would_be_source, &ws, None, |_| None);

@@ -1,6 +1,10 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { closeDrawer } from '../layout/Drawer';
-import { drawerOpen, drawerClosing, openDrawer } from '../layout/drawerState';
+import { beforeAll, describe, it, expect, beforeEach } from 'vitest';
+import { closeDrawer, drawerOpen, drawerClosing, openDrawer } from '../layout/drawerState';
+import { DrawerChunk } from '../layout/drawerState';
+
+// The drawer is code-split and opens once it is in memory. Warm it, so an
+// open lands at once.
+beforeAll(() => DrawerChunk.preload());
 
 /** Simulate the burger click handler logic from AppHeader */
 function burgerClick() {

@@ -4,9 +4,9 @@ import { proposePluginUpstreamAction } from '../../store/actions/plugin-install'
 /** Offer the user's local patch to the plugin's author.
  *
  *  Shown wherever a kept local patch is visible: on the install receipt right
- *  after an update that merged one, and on the Plugins row whenever the
- *  Modified badge is up. The receipt is timely but scrolls away; the row is
- *  where the offer stays reachable.
+ *  after an update that merged one, and on the plugin detail page whenever the
+ *  Modified badge is up. The receipt is timely but scrolls away; the detail
+ *  page is where the offer stays reachable.
  *
  *  The click only asks the engine for a patch and a thread. Everything about
  *  forks and pull requests happens in that thread. */
@@ -17,7 +17,7 @@ export function ProposeUpstreamButton(
   return (
     <button
       type="button"
-      class="action-btn"
+      class="action-btn action-btn-secondary"
       disabled={busy}
       onClick={async () => {
         setBusy(true);
@@ -28,7 +28,7 @@ export function ProposeUpstreamButton(
         }
       }}
     >
-      Propose upstream
+      Send changes to author
     </button>
   );
 }

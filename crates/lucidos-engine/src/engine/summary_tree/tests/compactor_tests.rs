@@ -15,11 +15,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    age_events, deps, deps_with, line_response, seed, seed_artifact, EchoProvider, TestDeps,
-    COMPACTOR_EFFORT, COMPACTOR_MODEL, TEST_LANE,
+    age_events, choose_module, deps, deps_with, line_response, seed, seed_artifact, EchoProvider,
+    TestDeps, COMPACTOR_EFFORT, COMPACTOR_MODEL, NO_ESTIMATE, TEST_LANE,
 };
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::summary_tree::compactor::{CompactionModel, Compactor, CompactorDeps, Drained};
+use crate::engine::summary_tree::spend::StartEstimate;
 use crate::engine::summary_tree::store::{self, StoredNode};
 use crate::engine::summary_tree::workspace_log::WorkspaceLog;
 use crate::engine::summary_tree::{
@@ -233,6 +234,24 @@ async fn dropping_every_node_and_rebuilding_lands_on_the_same_tree() {
     run_to_rest(&compactor(&pool, &bus, deps(EchoProvider::new()))).await;
     assert_eq!(snapshot(&pool).await, first);
 
+    teardown_test_db(&db_name).await;
+}
+
+/// A new workspace that chooses Tree holds nothing but the home thread boot
+/// makes, so it is ready without a model call.
+#[tokio::test]
+async fn a_new_workspace_is_ready_without_a_model_call() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .expect("create the home thread");
+    let model = Arc::new(EchoProvider::new());
+
+    run_to_rest(&compactor(&pool, &bus, deps_with(model.clone()))).await;
+
+    assert!(store::is_ready(&pool).await.unwrap());
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     teardown_test_db(&db_name).await;
 }
 
@@ -468,6 +487,7 @@ async fn an_overlong_line_is_asked_again_and_every_call_is_recorded() {
     let deps = Arc::new(TestDeps {
         provider: Some(provider.clone()),
         artifacts: vec![],
+        estimate: None,
     });
     run_to_rest(&compactor(&pool, &bus, deps)).await;
 
@@ -518,6 +538,7 @@ async fn an_artifact_only_build_records_every_call_on_the_home_thread() {
     let deps = Arc::new(TestDeps {
         provider: Some(Arc::new(EchoProvider::new())),
         artifacts,
+        estimate: None,
     });
     run_to_rest(&compactor(&pool, &bus, deps)).await;
 
@@ -570,6 +591,7 @@ async fn an_artifact_leaf_records_on_its_writer_thread() {
             ("notes/plan.md".to_string(), notes.clone()),
             ("notes/later.md".to_string(), notes),
         ],
+        estimate: None,
     });
     run_to_rest(&compactor(&pool, &bus, deps)).await;
 
@@ -618,6 +640,7 @@ async fn without_a_model_only_free_nodes_are_built() {
     let none = Arc::new(TestDeps {
         provider: None,
         artifacts: Vec::new(),
+        estimate: None,
     });
     let c = compactor(&pool, &bus, none);
     c.seed().await.unwrap();
@@ -922,7 +945,7 @@ async fn the_backfill_counts_every_tree_and_completes_once() {
     assert!(matches!(
         &frames[frames.len() - 2..],
         [
-            SystemEvent::TreeBackfillCompleted { total: 4 },
+            SystemEvent::TreeBackfillCompleted { total: 4, .. },
             SystemEvent::TreeBackfillProgressed { .. }
         ]
     ));
@@ -1016,6 +1039,7 @@ async fn a_classic_workspace_with_nodes_reads_as_started() {
     let (bus, _rx) = EventBus::new(pool.clone());
     seed_workspace(&pool, &bus).await;
     run_to_rest(&compactor(&pool, &bus, deps(EchoProvider::new()))).await;
+    choose_module(&pool, &bus, "classic").await;
 
     assert_eq!(
         tree_backfill(&pool, &Runtime::default()).await.unwrap(),
@@ -1075,11 +1099,16 @@ impl CompactorDeps for SwitchableDeps {
             effort: None,
             deadline: std::time::Duration::from_secs(5),
             lane: TEST_LANE.to_string(),
+            flex: false,
         })
     }
 
     fn read_artifact(&self, _path: &str, _commit: &str) -> Option<String> {
         None
+    }
+
+    async fn backfill_estimate(&self) -> Result<StartEstimate, String> {
+        Err(NO_ESTIMATE.to_string())
     }
 }
 
@@ -1141,6 +1170,7 @@ async fn the_backfill_read_follows_the_module_and_the_ready_flag() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let runtime = Runtime::default();
+    choose_module(&pool, &bus, "classic").await;
 
     assert_eq!(
         tree_backfill(&pool, &runtime).await.unwrap(),
@@ -1154,15 +1184,7 @@ async fn the_backfill_read_follows_the_module_and_the_ready_flag() {
     );
     super::super::consumer::clear_ready_flag(&pool, &bus).await;
 
-    crate::core::PreferenceStore::set(
-        &pool,
-        &bus,
-        crate::core::prefs::MEMORY_MODULE.key(),
-        "tree",
-        None,
-    )
-    .await
-    .unwrap();
+    choose_module(&pool, &bus, "tree").await;
     assert_eq!(
         tree_backfill(&pool, &runtime).await.unwrap(),
         TreeBackfill::Running {
@@ -1190,6 +1212,10 @@ fn the_progress_frame_carries_the_rest_shape() {
         waiting_for_model: true,
         retrying: false,
         ready: false,
+        spent_usd: Some(1.25),
+        cap_usd: Some(3.0),
+        next_cap_usd: Some(4.0),
+        held: false,
         seq: 7,
     };
     let rest = serde_json::to_value(TreeBackfill::Running { progress }).unwrap();
@@ -1256,11 +1282,16 @@ impl CompactorDeps for ProviderDeps {
             effort: None,
             deadline: Duration::from_secs(30),
             lane: TEST_LANE.to_string(),
+            flex: false,
         })
     }
 
     fn read_artifact(&self, path: &str, _commit: &str) -> Option<String> {
         (path == "notes/plan.md").then(|| "A line of the plan. ".repeat(40))
+    }
+
+    async fn backfill_estimate(&self) -> Result<StartEstimate, String> {
+        Err(NO_ESTIMATE.to_string())
     }
 }
 
@@ -1371,15 +1402,7 @@ async fn the_workspace_is_ready_before_an_old_thread_is_built() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let fixture = seed_workspace(&pool, &bus).await;
     make_old(&pool, fixture.coding).await;
-    crate::core::PreferenceStore::set(
-        &pool,
-        &bus,
-        crate::core::prefs::MEMORY_MODULE.key(),
-        "tree",
-        None,
-    )
-    .await
-    .unwrap();
+    choose_module(&pool, &bus, "tree").await;
     let c = compactor(&pool, &bus, deps(EchoProvider::new()));
     let runtime = Runtime::default();
     runtime.set(c.clone());
@@ -1996,5 +2019,491 @@ async fn an_outgrown_merge_over_an_agent_prompt_is_rebuilt() {
     );
     assert_complete(&pool, scope, len).await;
 
+    teardown_test_db(&db_name).await;
+}
+
+// ── The backfill episode and its spending cap ─────────────────────────
+
+/// A model the catalog prices, so the compactor counts what it spends.
+const PRICED_MODEL: &str = "gpt-6.1-sol";
+
+/// What one [`EchoProvider`] call costs on [`PRICED_MODEL`] on `tier`, from
+/// the token counts [`line_response`] reports.
+fn priced_call_usd(tier: Option<crate::llm::ServiceTier>) -> f64 {
+    let answer = line_response(String::new());
+    let tokens = crate::engine::summary_tree::compactor_models::Tokens {
+        input: f64::from(answer.input_tokens.unwrap_or_default()),
+        output: f64::from(answer.output_tokens.unwrap_or_default()),
+        ..Default::default()
+    };
+    crate::engine::summary_tree::compactor_models::priced(PRICED_MODEL)
+        .expect("priced")
+        .usd(tokens, tier)
+}
+
+/// The priced model, with an estimate whose central figure is a dollar and
+/// whose cap is `cap_usd`. `flex` says the route serves it on Flex.
+struct PricedDeps {
+    provider: Arc<EchoProvider>,
+    cap_usd: f64,
+    flex: bool,
+}
+
+#[async_trait::async_trait]
+impl CompactorDeps for PricedDeps {
+    async fn model(&self) -> Result<CompactionModel, String> {
+        Ok(CompactionModel {
+            provider: self.provider.clone(),
+            model: PRICED_MODEL.to_string(),
+            effort: Some(COMPACTOR_EFFORT.to_string()),
+            deadline: Duration::from_secs(5),
+            lane: TEST_LANE.to_string(),
+            flex: self.flex,
+        })
+    }
+
+    fn read_artifact(&self, _path: &str, _commit: &str) -> Option<String> {
+        None
+    }
+
+    async fn backfill_estimate(&self) -> Result<StartEstimate, String> {
+        use crate::engine::summary_tree::{Bounds, EffortCost};
+        Ok(StartEstimate {
+            model: PRICED_MODEL.to_string(),
+            effort: Some(COMPACTOR_EFFORT.to_string()),
+            calls: Bounds { low: 1, high: 50 },
+            cost: Some(EffortCost {
+                effort: COMPACTOR_EFFORT.to_string(),
+                usable_secs: Bounds::default(),
+                complete_secs: Bounds::default(),
+                backfill_usd: Bounds {
+                    low: 0.5,
+                    high: 2.0,
+                },
+                backfill_usd_central: 1.0,
+                daily_usd: Bounds::default(),
+                daily_usd_central: 0.0,
+                turn_usd: Bounds::default(),
+                turn_usd_central: 0.0,
+                cap_usd: self.cap_usd,
+            }),
+        })
+    }
+}
+
+fn priced(provider: &Arc<EchoProvider>, cap_usd: f64) -> Arc<PricedDeps> {
+    Arc::new(PricedDeps {
+        provider: provider.clone(),
+        cap_usd,
+        flex: false,
+    })
+}
+
+/// [`priced`] on a route that serves the model on Flex.
+fn priced_on_flex(provider: &Arc<EchoProvider>, cap_usd: f64) -> Arc<PricedDeps> {
+    Arc::new(PricedDeps {
+        provider: provider.clone(),
+        cap_usd,
+        flex: true,
+    })
+}
+
+async fn count_events(pool: &PgPool, event_type: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn newest_data(pool: &PgPool, event_type: &str) -> serde_json::Value {
+    sqlx::query_scalar(
+        "SELECT payload->'data' FROM events WHERE event_type = $1 ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(event_type)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A backfill records its estimate and cap once, however often it re-seeds,
+/// and closes the episode with every call's price once every tree is built.
+#[tokio::test]
+async fn a_backfill_opens_one_episode_and_closes_it_with_what_it_spent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let provider = Arc::new(EchoProvider::new());
+    let c = compactor(&pool, &bus, priced(&provider, 100.0));
+
+    c.seed().await.unwrap();
+    run_to_rest(&c).await;
+    c.seed().await.unwrap();
+
+    assert_eq!(count_events(&pool, "TreeBackfillStarted").await, 1);
+    let started = newest_data(&pool, "TreeBackfillStarted").await;
+    assert_eq!(started["cap_usd"], 100.0);
+    assert_eq!(started["estimate"]["model"], PRICED_MODEL);
+    assert_eq!(count_events(&pool, "TreeBackfillEnded").await, 1);
+    let calls = provider.calls.load(Ordering::SeqCst) as f64;
+    assert!(calls > 0.0);
+    let spent = newest_data(&pool, "TreeBackfillEnded").await["spent_usd"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (spent - calls * priced_call_usd(None)).abs() < 1e-9,
+        "spent {spent} for {calls} calls"
+    );
+    teardown_test_db(&db_name).await;
+}
+
+/// No estimate, as for a workspace whose estimate read failed, opens no
+/// episode, and the backfill runs uncapped.
+#[tokio::test]
+async fn a_backfill_with_no_estimate_runs_uncapped() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    run_to_rest(&compactor(&pool, &bus, deps(EchoProvider::new()))).await;
+    assert_eq!(count_events(&pool, "TreeBackfillStarted").await, 0);
+    assert_every_scope_complete(&pool, &fixture).await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Spending the cap holds the work the backfill owes, announced once. A
+/// raise lets it finish.
+#[tokio::test]
+async fn a_backfill_holds_at_its_cap_until_a_raise() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    let provider = Arc::new(EchoProvider::new());
+    let c = compactor(&pool, &bus, priced(&provider, priced_call_usd(None) / 2.0));
+
+    run_to_rest(&c).await;
+    let progress = c
+        .backfill_progress()
+        .expect("the backfill is held, not done");
+    assert!(progress.held, "{progress:?}");
+    assert!(progress.spent_usd.unwrap() >= progress.cap_usd.unwrap());
+    assert!(progress.next_cap_usd.unwrap() > progress.spent_usd.unwrap());
+    assert!(!store::is_ready(&pool).await.unwrap());
+    assert_eq!(count_events(&pool, "TreeBackfillCapReached").await, 1);
+    let held_calls = provider.calls.load(Ordering::SeqCst);
+    drain_to_rest(&c).await;
+    assert_eq!(provider.calls.load(Ordering::SeqCst), held_calls);
+
+    bus.emit(BusEvent::System(SystemEvent::TreeBackfillCapRaised {
+        cap_usd: 100.0,
+        actor: None,
+    }))
+    .await
+    .unwrap();
+    c.cap_raised().await;
+    drain_to_rest(&c).await;
+    assert_every_scope_complete(&pool, &fixture).await;
+    assert!(store::is_ready(&pool).await.unwrap());
+    assert_eq!(count_events(&pool, "TreeBackfillEnded").await, 1);
+    teardown_test_db(&db_name).await;
+}
+
+/// A restart reads the hold back from the events: a new compactor builds
+/// nothing the backfill owes, and does not announce the cap again.
+#[tokio::test]
+async fn a_restart_keeps_a_held_backfill_held() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let first = Arc::new(EchoProvider::new());
+    run_to_rest(&compactor(
+        &pool,
+        &bus,
+        priced(&first, priced_call_usd(None) / 2.0),
+    ))
+    .await;
+    assert_eq!(count_events(&pool, "TreeBackfillCapReached").await, 1);
+
+    let second = Arc::new(EchoProvider::new());
+    let restarted = compactor(&pool, &bus, priced(&second, priced_call_usd(None) / 2.0));
+    run_to_rest(&restarted).await;
+    assert_eq!(second.calls.load(Ordering::SeqCst), 0);
+    assert!(restarted.backfill_progress().unwrap().held);
+    assert_eq!(count_events(&pool, "TreeBackfillCapReached").await, 1);
+    assert_eq!(count_events(&pool, "TreeBackfillStarted").await, 1);
+    teardown_test_db(&db_name).await;
+}
+
+/// A thread the held backfill does not owe, such as one started after it,
+/// still gets its tree: the hold stops the backfill, not live work.
+#[tokio::test]
+async fn live_work_goes_on_while_the_backfill_is_held() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let provider = Arc::new(EchoProvider::new());
+    let c = compactor(&pool, &bus, priced(&provider, priced_call_usd(None) / 2.0));
+    run_to_rest(&c).await;
+    assert!(c.backfill_progress().unwrap().held);
+
+    let fresh = Uuid::new_v4();
+    seed(
+        &bus,
+        fresh,
+        EventChannel::Chat,
+        vec![
+            json!({"type": "MessageReceived", "mode": "human",
+                   "text": format!("a new question {}", "with detail. ".repeat(60))}),
+            json!({"type": "ResponseGenerated", "text": "answered"}),
+        ],
+    )
+    .await;
+    age_events(&pool).await;
+    let before = provider.calls.load(Ordering::SeqCst);
+    c.mark_dirty(SummaryScope::Thread(fresh), true);
+    drain_to_rest(&c).await;
+    assert!(provider.calls.load(Ordering::SeqCst) > before);
+    assert_complete(
+        &pool,
+        SummaryScope::Thread(fresh),
+        thread_len(&pool, fresh).await,
+    )
+    .await;
+    teardown_test_db(&db_name).await;
+}
+
+// ── Flex for backfill calls ───────────────────────────────────────────
+
+/// Backfill calls ask for Flex where the route offers it, and their spend is
+/// priced at the Flex rate.
+#[tokio::test]
+async fn backfill_calls_ask_for_flex_and_cost_the_flex_rate() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let provider = Arc::new(EchoProvider::new());
+    run_to_rest(&compactor(&pool, &bus, priced_on_flex(&provider, 100.0))).await;
+
+    let tiers = provider.tiers.lock().unwrap().clone();
+    assert!(!tiers.is_empty());
+    assert!(
+        tiers
+            .iter()
+            .all(|t| *t == Some(crate::llm::ServiceTier::Flex)),
+        "{tiers:?}"
+    );
+    let calls = provider.calls.load(Ordering::SeqCst) as f64;
+    let spent = newest_data(&pool, "TreeBackfillEnded").await["spent_usd"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        (spent - calls * priced_call_usd(Some(crate::llm::ServiceTier::Flex))).abs() < 1e-9,
+        "{spent} for {calls} calls"
+    );
+    let flex_captures: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE event_type = 'ContextCaptured' \
+         AND payload->'usage'->>'service_tier' = 'flex'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        flex_captures as f64, calls,
+        "every capture records its tier"
+    );
+    teardown_test_db(&db_name).await;
+}
+
+/// Every compactor call writes the cache only at its marks: its tail is its
+/// own, so a write there would be billed and never read.
+#[tokio::test]
+async fn compactor_calls_write_the_cache_only_at_their_marks() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let provider = Arc::new(EchoProvider::new());
+    run_to_rest(&compactor(&pool, &bus, deps_with(provider.clone()))).await;
+    let modes = provider.cache_modes.lock().unwrap().clone();
+    assert!(!modes.is_empty());
+    assert!(
+        modes.iter().all(|m| *m == crate::llm::CacheMode::Explicit),
+        "{modes:?}"
+    );
+    teardown_test_db(&db_name).await;
+}
+
+/// A live event's drain never asks for Flex: its turn should not wait on a
+/// slower tier.
+#[tokio::test]
+async fn live_calls_stay_on_the_standard_tier() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    let provider = Arc::new(EchoProvider::new());
+    let c = compactor(&pool, &bus, priced_on_flex(&provider, 100.0));
+    run_to_rest(&c).await;
+    provider.tiers.lock().unwrap().clear();
+
+    seed(
+        &bus,
+        fixture.chat,
+        EventChannel::Chat,
+        vec![json!({"type": "MessageReceived", "mode": "human",
+                    "text": format!("live {}", "and long. ".repeat(80))})],
+    )
+    .await;
+    age_events(&pool).await;
+    c.mark_dirty(SummaryScope::Thread(fixture.chat), true);
+    drain_to_rest(&c).await;
+    let tiers = provider.tiers.lock().unwrap().clone();
+    assert!(!tiers.is_empty(), "the live entry cost a call");
+    assert!(tiers.iter().all(Option::is_none), "{tiers:?}");
+    teardown_test_db(&db_name).await;
+}
+
+/// Two Flex refusals in a row move a node to the standard tier, so a Flex
+/// shortage slows the backfill and never stalls it.
+#[tokio::test]
+async fn a_node_refused_flex_twice_runs_on_the_standard_tier() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    let provider = Arc::new(EchoProvider {
+        refuse_flex: true,
+        ..EchoProvider::new()
+    });
+    let c = compactor(&pool, &bus, priced_on_flex(&provider, 100.0));
+    c.seed().await.unwrap();
+    for _ in 0..3 {
+        c.drain_queue().await;
+        for scope in [
+            SummaryScope::Workspace,
+            SummaryScope::Thread(fixture.chat),
+            SummaryScope::Thread(fixture.coding),
+            SummaryScope::Thread(fixture.home),
+        ] {
+            c.mark_dirty(scope, false);
+        }
+    }
+    drain_to_rest(&c).await;
+    assert_every_scope_complete(&pool, &fixture).await;
+    let tiers = provider.tiers.lock().unwrap().clone();
+    assert!(tiers.contains(&Some(crate::llm::ServiceTier::Flex)));
+    assert!(tiers.contains(&None), "{tiers:?}");
+    teardown_test_db(&db_name).await;
+}
+
+// ── Episode edges found in review ─────────────────────────────────────
+
+/// [`PricedDeps`] whose first estimate fails, as one does before any model
+/// is configured.
+struct LateEstimateDeps {
+    priced: PricedDeps,
+    failed_once: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl CompactorDeps for LateEstimateDeps {
+    async fn model(&self) -> Result<CompactionModel, String> {
+        self.priced.model().await
+    }
+
+    fn read_artifact(&self, path: &str, commit: &str) -> Option<String> {
+        self.priced.read_artifact(path, commit)
+    }
+
+    async fn backfill_estimate(&self) -> Result<StartEstimate, String> {
+        if !self.failed_once.swap(true, Ordering::SeqCst) {
+            return Err("no background model yet".to_string());
+        }
+        self.priced.backfill_estimate().await
+    }
+}
+
+/// A backfill whose estimate failed at seed opens its episode before its
+/// first model call, so the calls the model then answers are capped.
+#[tokio::test]
+async fn an_episode_that_failed_to_open_at_seed_opens_before_the_first_call() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let provider = Arc::new(EchoProvider::new());
+    let deps = Arc::new(LateEstimateDeps {
+        priced: PricedDeps {
+            provider: provider.clone(),
+            cap_usd: priced_call_usd(None) / 2.0,
+            flex: false,
+        },
+        failed_once: AtomicBool::new(false),
+    });
+    let c = compactor(&pool, &bus, deps);
+    c.seed().await.unwrap();
+    assert_eq!(count_events(&pool, "TreeBackfillStarted").await, 0);
+
+    drain_to_rest(&c).await;
+    assert_eq!(count_events(&pool, "TreeBackfillStarted").await, 1);
+    assert!(
+        c.backfill_progress().unwrap().held,
+        "the late episode caps it"
+    );
+    teardown_test_db(&db_name).await;
+}
+
+/// A model the catalog does not price adds nothing to the spend, so the
+/// backfill shows no spend rather than a misleading zero.
+#[tokio::test]
+async fn an_unpriced_episode_shows_no_spend() {
+    use crate::engine::summary_tree::Bounds;
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let deps = Arc::new(TestDeps {
+        provider: Some(Arc::new(EchoProvider::new())),
+        artifacts: Vec::new(),
+        estimate: Some(StartEstimate {
+            model: COMPACTOR_MODEL.to_string(),
+            effort: None,
+            calls: Bounds { low: 1, high: 10 },
+            cost: None,
+        }),
+    });
+    let c = compactor(&pool, &bus, deps);
+    c.seed().await.unwrap();
+    assert_eq!(c.backfill_progress().unwrap().spent_usd, None);
+    drain_to_rest(&c).await;
+    let ended = newest_data(&pool, "TreeBackfillEnded").await;
+    assert!(ended.get("spent_usd").is_none(), "{ended}");
+    teardown_test_db(&db_name).await;
+}
+
+/// A seed that finds nothing owed closes an episode still open, as one is
+/// when a re-seed ran between the last drain and its announcement.
+#[tokio::test]
+async fn a_seed_with_nothing_owed_closes_the_open_episode() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let provider = Arc::new(EchoProvider::new());
+    let c = compactor(&pool, &bus, priced(&provider, 100.0));
+    run_to_rest(&c).await;
+    assert_eq!(count_events(&pool, "TreeBackfillEnded").await, 1);
+    // The captures the build left are newer than the horizon.
+    age_events(&pool).await;
+    run_to_rest(&c).await;
+
+    let stray = PricedDeps {
+        provider: provider.clone(),
+        cap_usd: 100.0,
+        flex: false,
+    };
+    bus.emit(BusEvent::System(SystemEvent::TreeBackfillStarted {
+        estimate: stray.backfill_estimate().await.unwrap(),
+        cap_usd: Some(100.0),
+        actor: None,
+    }))
+    .await
+    .unwrap();
+    c.seed().await.unwrap();
+    assert_eq!(count_events(&pool, "TreeBackfillEnded").await, 2);
+    assert_eq!(c.backfill_progress(), None);
     teardown_test_db(&db_name).await;
 }

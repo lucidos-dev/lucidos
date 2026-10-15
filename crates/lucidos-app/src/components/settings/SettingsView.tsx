@@ -172,8 +172,8 @@ const MAX_TOOL_CALLS_OPTIONS = [...new Set([...MAX_TOOL_CALLS_PRESETS, MAX_TOOL_
 const IMAGE_MODEL_LABELS: Record<ImageModel, string> = {
   auto: 'Auto',
   'imagen-4': 'Imagen 4',
-  'gpt-image-1': 'GPT Image 1',
-  'gpt-image-1.5': 'GPT Image 1.5',
+  'gpt-image-2.5-flare': 'GPT Image 2.5 Flare',
+  'gpt-image-2.5-sunburst': 'GPT Image 2.5 Sunburst',
   'gpt-image-2': 'GPT Image 2',
 };
 
@@ -1269,11 +1269,21 @@ export function SettingsView() {
             reasoningKey="reasoning_conversation_summary"
             background={background}
           />
-          <BackgroundModelRow
+          {/* The System One rows are among its models, as for query
+              classification. */}
+          <JudgmentModelRow
+            site="read-decision"
             label="Read decision"
             anchor="models:read-decision"
-            modelKey="model_read_decision"
-            reasoningKey="reasoning_read_decision"
+            background={background}
+          />
+          {/* Under the read decision, its sibling at a child's turn end. The
+              System One rows are among its models. */}
+          <JudgmentModelRow
+            site="wake-decision"
+            label="Wake decision"
+            anchor="models:wake-decision"
+            nested
             background={background}
           />
           {/* The compactor runs only under Tree, so the row shows only then. */}

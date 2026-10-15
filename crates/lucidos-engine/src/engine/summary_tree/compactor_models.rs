@@ -15,6 +15,7 @@ use crate::llm::model_registry::{
     default_effort, resolve_route, ModelRegistry, ProviderKind, Unconfigured,
 };
 use crate::llm::reasoning::clamp_effort;
+use crate::llm::ServiceTier;
 
 /// One measured compactor model.
 pub(crate) struct CompactorModel {
@@ -23,6 +24,9 @@ pub(crate) struct CompactorModel {
     pub(crate) price: (f64, f64),
     /// What a cached input token costs, as a share of the input price.
     pub(crate) cache: CacheRates,
+    /// Every rate on the Flex tier, as a share of the standard rate. `None`
+    /// for a model no route serves on Flex.
+    pub(crate) flex: Option<f64>,
     /// One compactor call at each tier the comparison measured, in ladder
     /// order. The estimate prices a tier with too little history of its own on
     /// these. Figures and their derivations:
@@ -53,6 +57,32 @@ pub(crate) struct MeasuredUsage {
     pub(crate) avg_output: u64,
 }
 
+/// Model calls per node a workspace with no history of its own is priced at.
+/// A line over the size limit costs a follow-up round. Measured over two
+/// workspaces' backfills: 1.04 and 1.12 calls per model-written node.
+pub(crate) const SEED_ROUNDS_PER_NODE: f64 = 1.08;
+
+/// A seed measured from a backfill, with its cached input.
+const fn cached(
+    effort: &'static str,
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
+    output: u64,
+    secs: f64,
+) -> TierSeed {
+    TierSeed {
+        effort,
+        usage: MeasuredUsage {
+            avg_input: input,
+            avg_cache_read: cache_read,
+            avg_cache_write: cache_write,
+            avg_output: output,
+        },
+        secs_per_call: Some(secs),
+    }
+}
+
 /// A seed with no cached input: the comparison sent none.
 const fn uncached(effort: &'static str, input: u64, output: u64, secs: Option<f64>) -> TierSeed {
     TierSeed {
@@ -74,6 +104,44 @@ pub(crate) struct CacheRates {
     pub(crate) write: f64,
 }
 
+/// Tokens of some compactor calls, summed. `input` counts every input token,
+/// cached or not, as the capture records it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Tokens {
+    pub(crate) input: f64,
+    pub(crate) cache_read: f64,
+    pub(crate) cache_write: f64,
+    pub(crate) output: f64,
+}
+
+impl CompactorModel {
+    /// What `tokens` cost at this model's list price on `tier`. The estimate
+    /// and the backfill's spend both price through here. A tier the catalog
+    /// has no rate for prices at the standard rate.
+    pub(crate) fn usd(&self, tokens: Tokens, tier: Option<ServiceTier>) -> f64 {
+        let (input_price, output_price) = self.price;
+        let plain = (tokens.input - tokens.cache_read - tokens.cache_write).max(0.0);
+        let input =
+            plain + tokens.cache_read * self.cache.read + tokens.cache_write * self.cache.write;
+        let share = match tier {
+            Some(ServiceTier::Flex) => self.flex.unwrap_or(1.0),
+            None => 1.0,
+        };
+        share * (input * input_price + tokens.output * output_price) / 1_000_000.0
+    }
+}
+
+/// The priced row for `model`, if the catalog measured it.
+pub(crate) fn priced(model: &str) -> Option<&'static CompactorModel> {
+    COMPACTOR_MODELS.iter().find(|m| m.id == model)
+}
+
+/// Whether a route through `provider` serves `model` on the Flex tier: OpenAI
+/// does, for a model the catalog has a Flex rate for.
+pub(crate) fn serves_flex(provider: ProviderKind, model: &str) -> bool {
+    provider == ProviderKind::OpenAi && priced(model).is_some_and(|m| m.flex.is_some())
+}
+
 pub(crate) const COMPACTOR_MODELS: &[CompactorModel] = &[
     CompactorModel {
         id: "gpt-6.1-sol",
@@ -84,7 +152,11 @@ pub(crate) const COMPACTOR_MODELS: &[CompactorModel] = &[
             read: 0.05,
             write: 1.25,
         },
-        seeds: &[uncached("low", 2_909, 109, Some(6.1))],
+        // https://developers.openai.com/api/docs/pricing, the Flex table.
+        flex: Some(0.5),
+        // One workspace's whole backfill at low, 138,000 calls, before the
+        // compactor asked for explicit cache mode.
+        seeds: &[cached("low", 7_315, 4_905, 2_407, 116, 3.7)],
     },
     CompactorModel {
         id: "gemini-3.8-flash",
@@ -98,6 +170,7 @@ pub(crate) const COMPACTOR_MODELS: &[CompactorModel] = &[
             read: 0.1,
             write: 1.0,
         },
+        flex: None,
         // Medium's output assumes low's calls per node and input: the
         // comparison reports only its dollars per node.
         seeds: &[
@@ -116,6 +189,7 @@ pub(crate) const COMPACTOR_MODELS: &[CompactorModel] = &[
             read: 0.05,
             write: 1.25,
         },
+        flex: None,
         // The comparison timed no medium run.
         seeds: &[
             uncached("low", 4_383, 181, Some(2.2)),
@@ -225,6 +299,9 @@ pub(crate) struct CompactorRoute {
     /// The tier the route runs, snapped as routing snaps it. The capture
     /// records this, so the estimate finds history under the tier that ran.
     pub(crate) effort: Option<String>,
+    /// The route serves `model` on the Flex tier: OpenAI does, for a model the
+    /// catalog has a Flex rate for.
+    pub(crate) flex: bool,
 }
 
 /// The route `model`'s calls take at `effort`. When no configured provider
@@ -250,6 +327,7 @@ pub(crate) fn compactor_route(
         effort: effort
             .and_then(|e| clamp_effort(e, route.provider, &route.wire_id))
             .map(str::to_string),
+        flex: serves_flex(route.provider, model),
     })
 }
 

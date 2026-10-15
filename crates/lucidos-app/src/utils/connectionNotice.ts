@@ -56,14 +56,14 @@ function connectionTarget(workspace: string | null): string {
  *
  *  The mark carries the state as colour and motion, and this is its readable
  *  half, read by three surfaces: the toggle's accessible name, the desktop hover
- *  tooltip, and the sentence the menu's own notice leads with (see
- *  `connectionNotice`, which sentence-cases exactly this). One table, so what a
- *  screen reader is told and what the panel says cannot drift into two
+ *  tooltip while degraded, and the sentence the menu's own notice leads with
+ *  (see `connectionNotice`, which sentence-cases exactly this). One table, so
+ *  what a screen reader is told and what the panel says cannot drift into two
  *  different claims about one state.
  *
- *  On the tooltip the workspace matters as much as the state: the name beside
- *  the mark hides itself when the pane is narrow, so this is what answers
- *  "connected to what?" at any width.
+ *  The workspace matters as much as the state: the name beside the mark hides
+ *  itself when the pane is narrow, so this answers "connected to what?" at any
+ *  width.
  *
  *  Each state brings its own verb rather than sharing one, and the degraded one
  *  is deliberately weak. "Disconnected from" reads as a link the engine dropped,

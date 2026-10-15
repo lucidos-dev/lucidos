@@ -751,6 +751,7 @@ pub(crate) async fn parse_claude_stream(
         // model-only.
         model_only_text: None,
         progress_notes,
+        service_tier: None,
     })
 }
 
@@ -2251,7 +2252,7 @@ mod tests {
                 role: "user".into(),
                 content: MessageContent::Text("hi".into()),
             }],
-            vec![crate::llm::tools::request_read_tool()],
+            vec![crate::llm::judgment::chat::answer_tool(&[])],
             model,
             None,
             effort,
@@ -2260,7 +2261,7 @@ mod tests {
             },
             "Anthropic",
         );
-        req.force_tool(crate::llm::tool_names::REQUEST_READ, model)?;
+        req.force_tool(crate::llm::judgment::chat::ANSWER_TOOL, model)?;
         Ok(serde_json::to_value(&req).unwrap())
     }
 
@@ -2272,7 +2273,7 @@ mod tests {
             let json = forced_request(model, Some("high")).unwrap();
             assert_eq!(
                 json["tool_choice"],
-                serde_json::json!({ "type": "tool", "name": "request_read" }),
+                serde_json::json!({ "type": "tool", "name": crate::llm::judgment::chat::ANSWER_TOOL }),
                 "{model}"
             );
             assert!(json.get("thinking").is_none(), "{model}: {json}");
@@ -2307,7 +2308,7 @@ mod tests {
                 role: "user".into(),
                 content: MessageContent::Text("hi".into()),
             }],
-            vec![crate::llm::tools::request_read_tool()],
+            vec![crate::llm::judgment::chat::answer_tool(&[])],
             "claude-opus-4-8",
             None,
             None,

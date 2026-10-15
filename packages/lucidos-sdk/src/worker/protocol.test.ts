@@ -1,20 +1,14 @@
 /**
  * Pong aggregation is what keeps the engine's `expected_pong_count` honest once
  * many documents sit behind one connection. The engine waits for one pong per
- * open SSE stream, so the worker owes it exactly one, ORed across its ports.
+ * open SSE stream, so the worker owes it exactly one, merged across its ports.
  */
 import { describe, it, expect } from 'vitest';
 import { aggregatePongAnswers, PONG_COLLECT_MS } from './protocol';
 import type { PongAnswer } from '../eventStream';
 
 function answer(over: Partial<PongAnswer> = {}): PongAnswer {
-  return {
-    device_id: 'dev-1',
-    is_active: false,
-    focused_thread_id: null,
-    event_in_viewport: false,
-    ...over,
-  };
+  return { device_id: 'dev-1', outcome: 'not_shown', ...over };
 }
 
 describe('aggregatePongAnswers', () => {
@@ -23,49 +17,31 @@ describe('aggregatePongAnswers', () => {
   });
 
   it('passes a lone answer through unchanged', () => {
-    const only = answer({ is_active: true, focused_thread_id: 't-1' });
+    const only = answer({ outcome: 'auto_read' });
     expect(aggregatePongAnswers([only])).toEqual(only);
   });
 
-  it('ORs is_active, so one visible tab keeps the device active', () => {
+  it('lets one document that showed the toast speak for the connection', () => {
+    // A hidden tab answering after the visible one must not outvote it, or
+    // the engine pushes on top of a toast already on screen.
     const merged = aggregatePongAnswers([
-      answer({ is_active: false }),
-      answer({ is_active: true }),
-      answer({ is_active: false }),
+      answer({ outcome: 'not_shown' }),
+      answer({ outcome: 'shown' }),
+      answer({ outcome: 'not_shown' }),
     ]);
-    expect(merged?.is_active).toBe(true);
+    expect(merged?.outcome).toBe('shown');
   });
 
-  it('reports inactive only when every document is', () => {
+  it('keeps the strongest of the handled outcomes', () => {
+    expect(aggregatePongAnswers([answer({ outcome: 'silenced' }), answer({ outcome: 'auto_read' })])?.outcome)
+      .toBe('auto_read');
+    expect(aggregatePongAnswers([answer({ outcome: 'auto_read' }), answer({ outcome: 'shown' })])?.outcome)
+      .toBe('shown');
+  });
+
+  it('reports not_shown only when every document is', () => {
     const merged = aggregatePongAnswers([answer(), answer(), answer()]);
-    expect(merged?.is_active).toBe(false);
-  });
-
-  it('ORs event_in_viewport, so one tab reading the event auto-reads it', () => {
-    const merged = aggregatePongAnswers([
-      answer({ event_in_viewport: false }),
-      answer({ event_in_viewport: true }),
-    ]);
-    expect(merged?.event_in_viewport).toBe(true);
-  });
-
-  it('prefers an ACTIVE document\'s focused thread over a hidden one\'s', () => {
-    // The engine reads focused_thread_id to decide whether the user is looking
-    // at the source thread. A hidden tab's answer says nothing about that, so
-    // it must not win over a visible tab's.
-    const merged = aggregatePongAnswers([
-      answer({ is_active: false, focused_thread_id: 'hidden-thread' }),
-      answer({ is_active: true, focused_thread_id: 'visible-thread' }),
-    ]);
-    expect(merged?.focused_thread_id).toBe('visible-thread');
-  });
-
-  it('falls back to a hidden document\'s focused thread when none is active', () => {
-    const merged = aggregatePongAnswers([
-      answer({ is_active: false, focused_thread_id: null }),
-      answer({ is_active: false, focused_thread_id: 'hidden-thread' }),
-    ]);
-    expect(merged?.focused_thread_id).toBe('hidden-thread');
+    expect(merged?.outcome).toBe('not_shown');
   });
 
   it('carries the device id, which every document of a workspace shares', () => {

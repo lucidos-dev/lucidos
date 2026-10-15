@@ -25,8 +25,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Isolate test runs from any real e2e workspace lock AND workspace. Pinning
 # E2E_WORKSPACE to the sandbox is load-bearing: the real `_e2e_list_orphans`
-# reads <E2E_WORKSPACE>/.lucidos/engine.pid, so without this the test could
-# detect — and SIGUSR1 — a real running e2e engine.
+# reads the engine of <E2E_WORKSPACE>, so without this the test could detect,
+# and SIGUSR1, a real running e2e engine.
 TMPROOT="$(mktemp -d -t lucidos-e2e-lock-test.XXXXXX)"
 export E2E_LOCK_DIR_OVERRIDE="$TMPROOT/lock-dir"
 # Test 9 runs a real entry script, which would otherwise hand off to GitHub.
@@ -176,6 +176,8 @@ reset_emit_sandbox() {
 }
 
 source "$PROJECT_DIR/scripts/lib/e2e_lock.sh"
+# shellcheck source=scripts/lib/flock_test_support.sh
+source "$PROJECT_DIR/scripts/lib/flock_test_support.sh"
 
 # ── neutralize the real process scan ────────────────────────────────────
 # Override the ps seam so the real `_e2e_list_orphans` runs against synthetic
@@ -467,7 +469,7 @@ echo "Test 6: orphan scan matches Playwright + engine pidfile, ignores user Safa
 reset_lock_dir
 spawn_sleeper; wk=$SLEEPER_PID       # Playwright WebKit child
 spawn_sleeper; sf=$SLEEPER_PID       # user's own Safari
-spawn_sleeper; eng=$SLEEPER_PID      # e2e workspace engine (via pidfile)
+spawn_sleeper; stale=$SLEEPER_PID    # a live pid in a pidfile no engine lock vouches for
 spawn_sleeper; cc=$SLEEPER_PID       # a Claude Code session that only MENTIONS the path
 # The cc row is the 2026-08-03 regression. Tokens are matched against argv[0], so
 # a process whose argv merely QUOTES the browsers-cache path is not a browser.
@@ -480,8 +482,24 @@ $cc /Users/x/.local/bin/claude --append-system-prompt THREAD HISTORY: the leak l
 SYNTHETIC_ENV="$wk PATH=/usr/bin LUCIDOS_E2E_RUN_ID=scan-run
 $sf PATH=/usr/bin LUCIDOS_E2E_RUN_ID=scan-run
 $cc PATH=/usr/bin LUCIDOS_E2E_RUN_ID=scan-run"
-echo "$eng" > "$E2E_WORKSPACE/.lucidos/engine.pid"
+mkdir -p "$E2E_WORKSPACE/.lucidos"
+: > "$E2E_WORKSPACE/.lucidos/engine.lock"
+echo "$stale" > "$E2E_WORKSPACE/.lucidos/engine.pid"
+if _e2e_list_orphans scan-run | grep -q "^engine "; then
+    fail "an engine pidfile with no lock held was swept"
+else
+    pass "a pidfile whose engine lock nobody holds names no engine"
+fi
+# The e2e workspace engine, which holds its lock and published its pid.
+start_lock_holder "$TMPROOT" "$E2E_WORKSPACE/.lucidos/engine.lock" ex "$E2E_WORKSPACE/.lucidos/engine.pid"
+eng=$HOLDER_PID
+# The holder is perl. Only its own argv[0] is stubbed, as an engine's.
+# shellcheck disable=SC2329 # called by engine_pids_to_signal
+ps() {
+    if [ "$*" = "-o command= -p $eng" ]; then echo "/x/lucidos-engine"; else command ps "$@"; fi
+}
 scan_out="$(_e2e_list_orphans scan-run)"
+unset -f ps
 SYNTHETIC_PS=""; SYNTHETIC_ENV=""
 if printf '%s\n' "$scan_out" | grep -qx "browser $wk"; then
     pass "Playwright WebKit child detected as a browser orphan"
@@ -504,7 +522,7 @@ else
     pass "process that only mentions the browsers path correctly ignored"
 fi
 rm -f "$E2E_WORKSPACE/.lucidos/engine.pid"
-kill -KILL "$wk" "$sf" "$eng" "$cc" 2>/dev/null; wait 2>/dev/null
+kill -KILL "$wk" "$sf" "$eng" "$cc" "$stale" 2>/dev/null; wait 2>/dev/null
 
 # ── 6b. A whitespace browsers path disarms the scan, loudly ──────────────
 # argv[0] is read up to the first space, so a PLAYWRIGHT_BROWSERS_PATH with a

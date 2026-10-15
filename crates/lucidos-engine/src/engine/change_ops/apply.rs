@@ -1,14 +1,22 @@
+use super::apply_claim::{ApplyClaim, APPLY_IN_PROGRESS_MESSAGE};
 use super::*;
 use crate::engine::agent_session::InPlaceMergeStart;
 use crate::engine::git_ops::{
     auto_commit_safe_files_if_dirty, bounded_fix_refusal_for, branch_changed_files_checked,
-    branch_head_sha, catchup_and_ff_to_main, commit_worktree_or_err, commits_in_range, ff_main_to,
-    files_have_client_update, find_branch_merge_in_main, find_worktree_for_branch, git_ran_ok,
-    has_branch_commits, is_harden_marker_present, push_main_in_background,
-    recover_no_commits_branch, worktree_add, worktree_dirty_files, worktrees_dir, BoundedFixInputs,
-    NoCommitsRecovery, PlanMarkerState, WorktreeLookup, MERGE_MUTEX,
+    branch_head_sha, catchup_and_ff_to_main, commit_worktree_or_err, commits_in_range,
+    ff_main_to_branch, files_have_client_update, find_branch_merge_in_main,
+    find_worktree_for_branch, git_ran_ok, has_branch_commits, has_full_harden_marker,
+    push_main_in_background, recover_no_commits_branch, worktree_add, worktree_dirty_files,
+    worktrees_dir, BoundedFixInputs, NoCommitsRecovery, PlanMarkerState, WorktreeLookup,
+    MAIN_LOCKS, MERGE_MUTEX,
 };
+use crate::engine::landing_lane::{queued_snapshot, takes_landing_lane, Submission};
 use crate::engine::{ApplyResult, ApplyStatus};
+
+/// A Tier-2 apply that found a coding agent starting on the thread. Resetting
+/// the worktree under it would lose the agent's first turn.
+const THREAD_AGENT_STARTING_MESSAGE: &str =
+    "A coding agent is starting on this thread. Apply again once it reaches a stopping point.";
 
 /// Pick the worktree the hardening session runs in, given what git said about
 /// `branch_name`.
@@ -183,11 +191,12 @@ impl LucidosEngine {
     async fn finalize_change_as_noop(
         &self,
         change: &crate::core::changes::Change,
-        change_id: Uuid,
+        claim: &ApplyClaim,
         repo_root: &Path,
         actor: Option<MessageOrigin>,
         result_message: &'static str,
     ) -> ApplyResult {
+        let change_id = claim.change_id();
         if let Err(e) = git_ran_ok(&["branch", "-D", &change.branch_name], repo_root).await {
             log!(
                 "[Changes] Could not delete branch {} while resolving change {} as a no-op: {}",
@@ -197,14 +206,13 @@ impl LucidosEngine {
             );
         }
         self.emit_change_applied(
+            claim,
             change.thread_id.unwrap_or(change_id),
-            change_id,
             false,
             false,
             Vec::new(),
             change.thread_title.clone(),
             actor,
-            None,
             None,
         )
         .await;
@@ -223,27 +231,27 @@ impl LucidosEngine {
     async fn finish_merged_apply(
         &self,
         change: &crate::core::changes::Change,
-        change_id: Uuid,
+        claim: &ApplyClaim,
         actor: Option<MessageOrigin>,
         kind_ctx: &ApplyKindContext,
         effective_requires_restart: bool,
         merged: MergedShas,
     ) -> ApplyResult {
+        let change_id = claim.change_id();
         let MergedShas {
             pre_sha,
             post_sha,
             commits,
         } = merged;
         self.emit_change_applied(
+            claim,
             change.thread_id.unwrap_or(change_id),
-            change_id,
             effective_requires_restart,
             files_have_client_update(&change.files),
             commits.clone(),
             change.thread_title.clone(),
             actor.clone(),
-            Some(pre_sha.clone()),
-            Some(post_sha.clone()),
+            Some(AppliedMerge::new(&pre_sha, &post_sha)),
         )
         .await;
         self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref())
@@ -276,21 +284,18 @@ impl LucidosEngine {
     /// **"≤1 pending change per thread" reconcile** — discard any other pending
     /// change the thread still holds on a stale branch, so a pre-existing orphan
     /// can't keep blocking Archive. Gated on the change ACTUALLY merging
-    /// (`ApplyStatus::Applied` — not `Noop`/`Hardening`/`Conflict`, which also
-    /// return `Ok`); that gate is load-bearing, since reconciling on
-    /// `Noop`/`Hardening`/`Conflict` would discard a *newer* sibling (data loss)
-    /// or drop siblings before the merge lands. See
-    /// docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
+    /// (`ApplyStatus::Applied`, not the other statuses, which also return
+    /// `Ok`). That gate is load-bearing: reconciling on any other status would
+    /// discard a *newer* sibling (data loss) or drop siblings before the merge
+    /// lands. See docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md.
     ///
-    /// This single point covers every `apply_change` caller (HTTP handler, the
-    /// no-live `apply_now` fast/stale paths, the Apply-All driver, the
-    /// post-hardening auto-apply re-entry) whose merge finishes *before* the
-    /// return. Two paths finish after it and reconcile themselves, for the same
-    /// reason: their result is `Conflict` at return time, so this gate can never
-    /// see the eventual `Applied`. The live in-place merge reconciles in
-    /// `apply_now_success`; the detached Tier-2 merge reconciles in its spawned
-    /// task, re-reading the change row and gating on `ChangeStatus::Applied` so the
-    /// data-loss trap above still holds.
+    /// This single point covers every `apply_change` caller whose merge
+    /// finishes *before* the return. Three paths finish after it and reconcile
+    /// themselves, because their result at return time is `Conflict` or
+    /// `Queued`. The live in-place merge reconciles in `apply_now_success`. The
+    /// detached Tier-2 merge reconciles in its spawned task, gating on
+    /// `ChangeStatus::Applied`. The landing lane reconciles once a change lands
+    /// (`settle_source_after_lane`).
     ///
     /// The *other* apply-time follow-up — kicking the background engine rebuild
     /// (or re-snapshotting the served `dist/`) — deliberately does NOT live here:
@@ -334,6 +339,16 @@ impl LucidosEngine {
         change_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<ApplyResult, Box<dyn std::error::Error + Send + Sync>> {
+        // Claimed before the row is read, so the read and every act below sit
+        // inside one claim. The apply that holds it announces the outcome.
+        let Some(claim) = self.apply_claims.try_claim(change_id) else {
+            return Ok(ApplyResult {
+                status: ApplyStatus::Conflict,
+                change_id,
+                message: APPLY_IN_PROGRESS_MESSAGE.to_string(),
+                ..ApplyResult::default()
+            });
+        };
         let change = self
             .changes()
             .get_by_id(change_id)
@@ -430,7 +445,7 @@ impl LucidosEngine {
                     return Ok(self
                         .finish_merged_apply(
                             &change,
-                            change_id,
+                            &claim,
                             actor,
                             &kind_ctx,
                             effective_requires_restart,
@@ -488,15 +503,11 @@ impl LucidosEngine {
         // resolving it", and the change really does apply on its own when the
         // resolver's completion (`finalize_direct_agent`) lands its terminal.
         //
-        // Deliberately NOT covered: the Tier-2 / Tier-3 startup window, where
-        // the spawned task has opened the pairing but its session is not
-        // registered yet, so no resolver is named. `main` cannot move there.
-        // Reaching a resolution at all means `catchup_and_ff_to_main` already
-        // failed on this branch, and in that window nothing has merged yet, so
-        // a second apply's ff fails identically. Closing the window would mean
-        // an in-memory claim spanning a spawn, which is the wedging shape
-        // ADR 0060 rejects. Tier 1 has no such window: it binds the session
-        // before it opens the pairing.
+        // The apply claim above closes the Tier-2 / Tier-3 startup window, where
+        // the pairing is open but no resolver is named yet. The merge session
+        // holds the claim for its whole run (ADR 0442).
+        // This guard still covers a resolver that went idle holding its pairing
+        // while it waits for a continuation, when nothing holds the claim.
         if let Some(tid) = change.thread_id {
             if self.merge_ownership_for_change(tid, change_id).await
                 == MergeOwnership::ResolverOwnsIt
@@ -596,7 +607,7 @@ impl LucidosEngine {
         // a row proposed before that hold existed. `apply_must_harden` skips
         // apps, which own their hardening, and a branch that lands only plans.
         let marker_hardened = !kind_ctx.is_app()
-            && is_harden_marker_present(&self.pool, &plan_repo_root, &change.branch_name).await;
+            && has_full_harden_marker(&self.pool, &plan_repo_root, &change.branch_name).await;
         if marker_hardened && !change.hardened {
             log!(
                 "[Changes] Marker found but DB not set — marking change {} as hardened",
@@ -629,7 +640,7 @@ impl LucidosEngine {
                     .request_hardening_in_session(thread_id, &session.msg_tx)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         log!(
                             "[Changes] Reusing existing session on thread {} for hardening",
                             thread_id
@@ -739,7 +750,7 @@ impl LucidosEngine {
                     return Ok(self
                         .finalize_change_as_noop(
                             &change,
-                            change_id,
+                            &claim,
                             &repo_root,
                             actor.clone(),
                             "Change applied (no commits to merge).",
@@ -755,7 +766,7 @@ impl LucidosEngine {
                     return Ok(self
                         .finalize_change_as_noop(
                             &change,
-                            change_id,
+                            &claim,
                             &repo_root,
                             actor.clone(),
                             "Change already present on main — marked applied.",
@@ -784,25 +795,14 @@ impl LucidosEngine {
         // Auto-commit safe files (docs) if they're the only dirty files, then
         // reject if the workspace tree still has genuine uncommitted changes.
         //
-        // MERGE_MUTEX is held alongside WORKSPACE_REPO_MUTEX here: a concurrent
-        // apply's merge advances `refs/heads/main` via `ff_main_to`'s
-        // `update-ref` and only afterwards resets the working tree via
-        // `checkout -f main`. Between those two git calls the tree transiently
-        // looks dirty (`main` moved, the working tree hasn't caught up). Without
-        // MERGE_MUTEX this gate would observe that mid-merge window and reject a
-        // perfectly valid concurrent apply with a spurious "uncommitted changes"
-        // error (regression caught by app_coding_agent_concurrent_apply). Taking
-        // MERGE_MUTEX guarantees the gate only ever sees a settled tree — the
-        // other apply's merge has either not started or finished its checkout.
-        // Lock order is always MERGE_MUTEX → WORKSPACE_REPO_MUTEX, here and in
-        // `ff_main_to`; data writes take only the second, so this can't deadlock.
-        //
-        // Both guards drop at the end of this block so neither is held across a
-        // tier's Claude Code subprocess await — those merges happen in separate
-        // worktrees and would otherwise block every data API write for minutes.
+        // Both of `main`'s locks, since a safe-file commit moves `main`. They
+        // keep a concurrent merge's ref move and tree sync wholly before or
+        // after this check. Between them the tree looks dirty, and the gate
+        // would refuse a valid apply (app_coding_agent_concurrent_apply).
+        // They drop at the end of this block, so no tier holds them across a
+        // coding-agent subprocess, which would stall every data write.
         {
-            let _merge_guard = MERGE_MUTEX.lock().await;
-            let _repo_guard = self.lock_workspace_repo().await;
+            let _main = MAIN_LOCKS.lock_main().await;
             if auto_commit_safe_files_if_dirty(&repo_root).await {
                 let msg = "Cannot merge: the repository has uncommitted changes. Commit or stash them first, then try again.";
                 self.emit_apply_failed(
@@ -814,6 +814,12 @@ impl LucidosEngine {
                 .await;
                 return Err(msg.into());
             }
+        }
+
+        // Only the landing lane moves `main` for Lucidos source (ADR 0463).
+        // Everything below is the app path.
+        if takes_landing_lane(&kind_ctx, &repo_root, self.repo_root()) {
+            return self.queue_in_landing_lane(change, claim, actor).await;
         }
 
         // Tier 1: If a live agent session exists for this thread, merge main
@@ -876,8 +882,8 @@ impl LucidosEngine {
                         // app threads) internally — no sibling emit needed here.
                         let commits = self
                             .apply_now_success(
+                                &claim,
                                 thread_id,
-                                change_id,
                                 effective_requires_restart,
                                 files_have_client_update(&change.files),
                                 &pre_sha,
@@ -908,7 +914,7 @@ impl LucidosEngine {
                     );
                     self.spawn_in_place_conflict_recovery(
                         thread_id,
-                        change_id,
+                        claim,
                         session,
                         change.branch_name.clone(),
                         repo_root.clone(),
@@ -972,6 +978,28 @@ impl LucidosEngine {
                 return Err(msg.into());
             }
             if let WorktreeLookup::Found(wt_path) = lookup {
+                // Held from here until the merge is done with the worktree: no
+                // spawn or wake starts a turn in it while it is reset (ADR 0442).
+                let thread_hold = match self.hold_thread_for_worktree_reset(thread_id).await {
+                    Ok(Some(hold)) => hold,
+                    // Announced, so a spinner clears and Apply All moves on.
+                    Ok(None) => {
+                        self.emit_apply_failed(
+                            thread_id,
+                            change_id,
+                            THREAD_AGENT_STARTING_MESSAGE,
+                            actor.clone(),
+                        )
+                        .await;
+                        return Err(THREAD_AGENT_STARTING_MESSAGE.into());
+                    }
+                    Err(e) => {
+                        let msg = format!("Could not hold the thread for the apply: {e}");
+                        self.emit_apply_failed(thread_id, change_id, &msg, actor.clone())
+                            .await;
+                        return Err(msg.into());
+                    }
+                };
                 // A commit that does not land fails the apply before `main`
                 // moves. Merging anyway publishes only the committed part, and
                 // the reset below then refuses the dirty tree after the fact.
@@ -1019,7 +1047,7 @@ impl LucidosEngine {
                         return Ok(self
                             .finish_merged_apply(
                                 &change,
-                                change_id,
+                                &claim,
                                 actor,
                                 &kind_ctx,
                                 effective_requires_restart,
@@ -1079,8 +1107,8 @@ impl LucidosEngine {
                 // resolves its spinner on the events, and the Apply-All driver
                 // is fed by the same events.
                 // No apply-level liveness timeout here, unlike Tier 1's
-                // `spawn_in_place_conflict_recovery`. That one waits on
-                // `idle_notify` for a session it does not own, so a silent
+                // `spawn_in_place_conflict_recovery`. That one waits on its
+                // prompt's turn in a session it does not own, so a silent
                 // agent would hang it forever. This task OWNS the session
                 // through `run_direct_agent`, which carries the in-loop and
                 // external watchdogs — a second timer on top would just race
@@ -1097,7 +1125,8 @@ impl LucidosEngine {
                     match CodingAgentChangeOps::run_merge_session_tier2(
                         engine.as_ref(),
                         thread_id,
-                        change_id,
+                        &claim,
+                        thread_hold,
                         &merge_wt,
                         &branch_name,
                         &description,
@@ -1154,7 +1183,7 @@ impl LucidosEngine {
                             if let Err(e) = engine
                                 .apply_change_tier3(
                                     &tier3_change,
-                                    change_id,
+                                    claim,
                                     task_actor,
                                     &tier3_kind_ctx,
                                     &tier3_repo_root,
@@ -1184,13 +1213,99 @@ impl LucidosEngine {
 
         self.apply_change_tier3(
             &change,
-            change_id,
+            claim,
             actor,
             &kind_ctx,
             &repo_root,
             effective_requires_restart,
         )
         .await
+    }
+
+    /// Hand a Lucidos-source change to the landing lane and return its answer.
+    /// A failure to read the snapshot is announced here, like every refusal
+    /// above it.
+    pub(crate) async fn queue_in_landing_lane(
+        &self,
+        change: crate::core::changes::Change,
+        claim: ApplyClaim,
+        actor: Option<MessageOrigin>,
+    ) -> Result<ApplyResult, Box<dyn std::error::Error + Send + Sync>> {
+        let thread_id = change.thread_id.unwrap_or(change.id);
+        let snapshot_sha = match self.landing_snapshot(&change).await {
+            Ok(sha) => sha,
+            Err(msg) => {
+                self.emit_apply_failed(thread_id, change.id, &msg, actor)
+                    .await;
+                return Err(msg.into());
+            }
+        };
+        self.submit_to_landing_lane(Submission {
+            change,
+            claim,
+            actor,
+            snapshot_sha,
+        })
+        .await
+        .map_err(Into::into)
+    }
+
+    /// The commit the lane lands for `change`. A change already queued keeps
+    /// its snapshot: a queued change is frozen. Otherwise uncommitted work in
+    /// its worktree is committed first, as Tier 2 does, unless a run holds the
+    /// thread. That run's uncommitted files are its own work in progress.
+    async fn landing_snapshot(
+        &self,
+        change: &crate::core::changes::Change,
+    ) -> Result<String, String> {
+        let thread_id = change.thread_id.unwrap_or(change.id);
+        match queued_snapshot(self.pool(), thread_id, change.id).await {
+            Ok(Some(sha)) => return Ok(sha),
+            Ok(None) => {}
+            Err(e) => {
+                return Err(format!(
+                    "Could not read whether the change is already queued: {e}. Try Apply again."
+                ))
+            }
+        }
+        let repo_root = Path::new(&change.repo_root);
+        match find_worktree_for_branch(repo_root, &change.branch_name).await {
+            WorktreeLookup::Unknown => {
+                return Err(format!(
+                    "Could not determine which worktree holds branch {} (git worktree list gave \
+                     no answer). Refusing to queue it without committing its work. Try Apply again.",
+                    change.branch_name
+                ))
+            }
+            WorktreeLookup::NotFound => {}
+            WorktreeLookup::Found(worktree) => {
+                let hold = match change.thread_id {
+                    Some(tid) => self
+                        .hold_thread_for_worktree_reset(tid)
+                        .await
+                        .map_err(|e| format!("Could not hold the thread for the apply: {e}"))?,
+                    None => None,
+                };
+                if hold.is_some() {
+                    commit_worktree_or_err(&worktree, "Coding agent changes (pre-landing auto-commit)")
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "Could not commit the uncommitted work in {} before queueing it: {e}",
+                                worktree.display()
+                            )
+                        })?;
+                }
+            }
+        }
+        branch_head_sha(repo_root, &change.branch_name)
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "Could not read the head of branch {}. Try Apply again.",
+                    change.branch_name
+                )
+            })
     }
 
     /// Tier 3: no live session and no worktree for the branch — fast-forward
@@ -1205,23 +1320,22 @@ impl LucidosEngine {
     async fn apply_change_tier3(
         self: &Arc<Self>,
         change: &crate::core::changes::Change,
-        change_id: Uuid,
+        claim: ApplyClaim,
         actor: Option<MessageOrigin>,
         kind_ctx: &ApplyKindContext,
         repo_root: &std::path::Path,
         effective_requires_restart: bool,
     ) -> Result<ApplyResult, Box<dyn std::error::Error + Send + Sync>> {
+        let change_id = claim.change_id();
         // Tier 3: No worktree — try ff directly, spawn CC in temp worktree if needed
 
         // Fast path: branch may already be a descendant of main
         {
             let _merge_guard = MERGE_MUTEX.lock().await;
-            let main_sha = branch_head_sha(repo_root, "main").await.unwrap_or_default();
-            let branch_sha = branch_head_sha(repo_root, &change.branch_name)
-                .await
-                .unwrap_or_default();
-
-            if let Ok(shas) = ff_main_to(repo_root, &branch_sha, &main_sha).await {
+            let held = self.lock_workspace_repo().await;
+            let fast_forward = ff_main_to_branch(&held, repo_root, &change.branch_name).await;
+            drop(held);
+            if let Ok(shas) = fast_forward {
                 log!(
                     "[Changes] Fast path succeeded for {} (Tier 3)",
                     change.branch_name
@@ -1240,7 +1354,7 @@ impl LucidosEngine {
                 return Ok(self
                     .finish_merged_apply(
                         change,
-                        change_id,
+                        &claim,
                         actor,
                         kind_ctx,
                         effective_requires_restart,
@@ -1283,7 +1397,7 @@ impl LucidosEngine {
                     return Ok(self
                         .finish_merged_apply(
                             change,
-                            change_id,
+                            &claim,
                             actor,
                             kind_ctx,
                             effective_requires_restart,
@@ -1364,7 +1478,7 @@ impl LucidosEngine {
         CodingAgentChangeOps::spawn_merge_session(
             self.as_ref(),
             thread_id,
-            change_id,
+            claim,
             &change.description,
         );
         Ok(ApplyResult::conflict(

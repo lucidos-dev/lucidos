@@ -250,6 +250,11 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   // create the group Escape cancelled. Reset when the field reopens.
   const groupDraftSettledRef = useRef(false);
 
+  // A create is not idempotent: every POST mints a new trigger. The ref guards
+  // a second submit in the same render window; the state twin disables Save.
+  const savingRef = useRef(false);
+  const [saving, setSaving] = useState(false);
+
   const intentRef = useRef<HTMLTextAreaElement>(null);
   const resizeIntent = () => { if (intentRef.current) resizeTextarea(intentRef.current); };
   // runType included in deps because the textarea is unmounted/remounted when switching to script.
@@ -305,6 +310,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
 
   async function handleSubmit(e: Event) {
     e.preventDefault();
+    if (savingRef.current) return;
 
     const run = buildRun();
     if (!run) return;
@@ -354,16 +360,23 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
     // apply only to the intent path. `submitTrigger` gates all five on
     // `run.type`, so a script trigger can't persist state left over from an
     // intent → script switch.
-    await submitTrigger({
-      name, run, cronExpressions: finalCrons, triggerId: editingId,
-      on, showEvent, goToReview,
-      groupId: groupId || null,
-      sideEffectGrant,
-      // '' is the Default option; null is how it reaches the engine.
-      model: model || null,
-      reasoningEffort: triggerEffort || null,
-      provider: triggerProvider || null,
-    });
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      await submitTrigger({
+        name, run, cronExpressions: finalCrons, triggerId: editingId,
+        on, showEvent, goToReview,
+        groupId: groupId || null,
+        sideEffectGrant,
+        // '' is the Default option; null is how it reaches the engine.
+        model: model || null,
+        reasoningEffort: triggerEffort || null,
+        provider: triggerProvider || null,
+      });
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   }
 
   function clearSubError(index: number) {
@@ -815,7 +828,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
             >
               Cancel
             </button>
-            <button type="submit" class="btn-save">
+            <button type="submit" class="btn-save" disabled={saving}>
               Save
             </button>
           </div>

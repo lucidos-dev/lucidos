@@ -295,6 +295,22 @@ fn an_unparseable_registry_seeds_nothing_and_leaves_the_door_open() {
     );
 }
 
+/// A blank registry is damage, not an empty machine. The launcher once
+/// truncated the file in place, and reading the gap as "no workspaces" would
+/// close the door on every workspace it names.
+#[test]
+fn a_blank_registry_seeds_nothing_and_leaves_the_door_open() {
+    let m = Machine::new();
+    m.with_global(GrantFile::AgentCommands, GRANTED);
+    let dev = m.with_workspace("dev");
+    m.write_registry_raw("  \n");
+
+    m.migrate(&dev);
+
+    assert!(!grants::grants_dir(&dev).join(WORKSPACE_STAMP).exists());
+    assert!(!m.record().exists(), "the next boot must try again");
+}
+
 /// The record is the machine-wide gate. Present means the seed has run, so a
 /// second call touches nothing even where a workspace was somehow missed.
 #[test]

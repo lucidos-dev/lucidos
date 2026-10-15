@@ -483,6 +483,114 @@ test.describe('A notification clears once its event card has been seen', () => {
   });
 });
 
+/** An agent's `send_notification` taps to its own thread, and the reader is in
+ *  that thread when it lands. Being there is not seeing it: its surface is the
+ *  toast, or the bell badge with toasts off. A read would take the toast down
+ *  with the row, so the row has to stay unread. */
+test.describe('A notification that lands where the reader already is', () => {
+  let seeded: string[] = [];
+
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+    clearNotifications();
+  });
+
+  test.afterEach(async ({ page }) => {
+    await putNotificationToasts(page, 'true');
+    for (const threadId of seeded) {
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+    seeded = [];
+  });
+
+  function seedThreads(count: number): string[] {
+    for (let i = 0; i < count; i++) seeded.push(seedShortChatThread().threadId);
+    return [...seeded];
+  }
+
+  async function openThread(page: Page, threadId: string): Promise<void> {
+    await openThreadDrawer(page);
+    await clickThreadRow(page, threadId);
+    await ensureMobileView(page, 'thread');
+    await waitForExchangeCount(page, 1, 15_000);
+  }
+
+  /** The global switch, written as an agent or another device would. */
+  async function putNotificationToasts(page: Page, value: 'true' | 'false'): Promise<void> {
+    const res = await apiRequest(page).put('/api/v1/preferences?key=notification_toasts', { data: { value } });
+    expect(res.ok(), `notification_toasts=${value}`).toBe(true);
+  }
+
+  /** Flip the switch under an open page, which picks it up live with no
+   *  reload: it mirrors each served value into localStorage. */
+  async function switchNotificationToastsLive(page: Page, value: 'true' | 'false'): Promise<void> {
+    await putNotificationToasts(page, value);
+    await page.waitForFunction(
+      (v) => localStorage.getItem('lucidos-notification-toasts') === v,
+      value,
+      { timeout: 10_000 },
+    );
+  }
+
+  /** Post what `send_notification` posts from inside `threadId`, and wait for
+   *  the page to hold the row. Without that a "still unread" is vacuous. */
+  async function notifyFromThread(page: Page, threadId: string, title: string): Promise<void> {
+    const landed = page.waitForResponse(async (res) =>
+      res.url().includes('/api/v1/notifications') && res.url().includes('filter=unread')
+        && (await res.text()).includes(title));
+    await postNotification(page, {
+      title,
+      message: 'sent from the thread the reader has open',
+      thread_id: threadId,
+      tap: { kind: 'navigate', to: { target: 'thread', id: threadId } },
+    });
+    await landed;
+  }
+
+  function readState(title: string): string {
+    return psql(`SELECT read FROM notifications WHERE title = '${title}'`);
+  }
+
+  test('the toast shows and stays, and the row stays unread', async ({ page }) => {
+    const [here] = seedThreads(1);
+    await navigateToApp(page);
+    await openThread(page, here);
+    await waitForEventStream(page);
+
+    await notifyFromThread(page, here, 'Landed here');
+    const toast = page.locator('.toast-container .toast', { hasText: 'Landed here' });
+    await expect(toast).toHaveCount(1, { timeout: 10_000 });
+
+    // Wait-then-check past SEEN_DWELL_MS, the dwell after which a visit reads
+    // a row. The toast and the row must both outlast it.
+    await page.waitForTimeout(2_000);
+    await expect(toast).toHaveCount(1);
+    expect(readState('Landed here')).toBe('f');
+  });
+
+  test('with toasts switched off live, nothing pops and the row stays unread until a later visit', async ({ page }) => {
+    const [here, elsewhere] = seedThreads(2);
+    await navigateToApp(page);
+    await openThread(page, here);
+    await waitForEventStream(page);
+    await switchNotificationToastsLive(page, 'false');
+
+    await notifyFromThread(page, here, 'Quiet here');
+    await page.waitForTimeout(2_000);
+    await expect(page.locator('.toast-container .toast', { hasText: 'Quiet here' })).toHaveCount(0);
+    expect(readState('Quiet here')).toBe('f');
+
+    // A later visit does read it. That is the rule still armed for this row,
+    // which is what makes the "still unread" above mean something.
+    await openThread(page, elsewhere);
+    await openThread(page, here);
+    await expect.poll(() => readState('Quiet here'), { timeout: 10_000 }).toBe('t');
+  });
+});
+
 test.describe('Declarative Web Push payload', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);

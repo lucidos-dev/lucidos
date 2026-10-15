@@ -36,6 +36,61 @@ fn a_task_that_finished_before_any_wait_comes_back_inline() {
     assert_eq!(settle_start("mine", &[], false), Settled::AlreadyFinished);
 }
 
+/// One `wait` must return inside the prompt cache's 5-minute life, whatever
+/// the caller asks. A shorter ask is honoured.
+#[test]
+fn a_wait_is_capped_whatever_the_caller_asks() {
+    assert_eq!(agent_wait_secs(None), AGENT_WAIT_MAX_SECS);
+    assert_eq!(agent_wait_secs(Some(100_000)), AGENT_WAIT_MAX_SECS);
+    assert_eq!(agent_wait_secs(Some(5)), 5);
+    // A pin on the cache arithmetic, not a restated value: 300 s minus the
+    // next request's own generation time.
+    const { assert!(AGENT_WAIT_MAX_SECS <= 230) };
+}
+
+/// The CLI help, the CLI's own response deadline and the knowhow all state
+/// the cap, and none can import it. A pin, so a changed cap fails here rather
+/// than leaving them telling agents the old number.
+#[test]
+fn every_copy_of_the_wait_cap_states_the_engine_constant() {
+    let cap = AGENT_WAIT_MAX_SECS;
+    let copies = [
+        (
+            "crates/lucidos-cli/src/main.rs",
+            include_str!("../../../../lucidos-cli/src/main.rs"),
+        ),
+        (
+            "system-knowhow/lucidos-cli.md",
+            include_str!("../../../../../system-knowhow/lucidos-cli.md"),
+        ),
+        (
+            ".claude/skills/run-e2e/SKILL.md",
+            include_str!("../../../../../.claude/skills/run-e2e/SKILL.md"),
+        ),
+        (
+            ".claude/skills/run-tests/SKILL.md",
+            include_str!("../../../../../.claude/skills/run-tests/SKILL.md"),
+        ),
+    ];
+    for (path, text) in copies {
+        assert!(
+            text.contains(&format!("{cap} s")),
+            "{path} must state the {cap} s cap"
+        );
+    }
+    let cli = include_str!("../../../../lucidos-cli/src/background_task.rs");
+    let deadline: u64 = cli
+        .split("WAIT_RESPONSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|n| n.parse().ok())
+        .expect("the CLI's wait deadline");
+    assert!(
+        deadline > cap,
+        "the CLI must wait longer than the engine's cap"
+    );
+}
+
 /// A coding agent's shell holds none of the workspace's secrets. A task it
 /// starts through the engine must not either, or the route hands them over:
 /// the chat tool's env carries every `CRED_*` and `OAUTH_*` value.
@@ -141,4 +196,127 @@ fn every_user_discard_kills_the_threads_background_tasks() {
             "{entry} must kill the thread's background tasks"
         );
     }
+}
+
+/// An archive lost to a broadcast lag must still kill the thread's task, or it
+/// runs on to its own watchdog.
+#[tokio::test]
+async fn an_archive_lost_to_a_lag_still_kills_the_threads_task() {
+    use crate::engine::event_bus::EventBus;
+    use crate::engine::thread_events::ThreadEvent;
+    use crate::test_support::{
+        flood_past_bus_capacity, seed_chat_thread, seed_thread_event, setup_test_db,
+        teardown_test_db,
+    };
+
+    let (pool, db) = setup_test_db().await;
+    let (bus, _callbacks) = EventBus::new(pool.clone());
+    let registry = BackgroundBashRegistry::new();
+    let thread_id = seed_chat_thread(&bus, "run the suite").await;
+    seed_thread_event(
+        &bus,
+        thread_id,
+        ThreadEvent::ResponseGenerated {
+            text: "started".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await;
+    let (task_id, _rx) = registry
+        .spawn(
+            "sleep 30",
+            60,
+            std::path::Path::new("/tmp"),
+            &[],
+            Some(thread_id),
+            None,
+        )
+        .await
+        .expect("spawn");
+    let (mut rx, mut replay) = LagReplay::subscribe(
+        &bus,
+        ReplayScope::Workspace,
+        Some(WORK_ENDING_EVENT_TYPES.to_vec()),
+    );
+
+    seed_thread_event(&bus, thread_id, ThreadEvent::ThreadArchived).await;
+    flood_past_bus_capacity(&bus);
+
+    assert!(reap_ended_work(rx.recv().await, &mut replay, &registry, &pool).await);
+    // A second kill finds nothing left to signal only if the reaper sent the
+    // stop. Otherwise it stops the task here, so the test leaves no process.
+    assert_eq!(
+        registry.kill_for_thread(thread_id).await,
+        0,
+        "the archived thread's task {task_id} must already be stopped"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// An unattended trigger thread is archived by its terminator, with no
+/// `ThreadArchived`, while its background task may still run. The live path
+/// leaves that task alone, so a lag must too.
+#[tokio::test]
+async fn a_lag_leaves_a_task_running_on_a_thread_archived_without_an_archive_event() {
+    use crate::engine::event_bus::EventBus;
+    use crate::test_support::{
+        flood_past_bus_capacity, seed_chat_thread, setup_test_db, teardown_test_db,
+    };
+
+    let (pool, db) = setup_test_db().await;
+    let (bus, _callbacks) = EventBus::new(pool.clone());
+    let registry = BackgroundBashRegistry::new();
+    let thread_id = seed_chat_thread(&bus, "nightly sync").await;
+    sqlx::query("UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    registry
+        .spawn(
+            "sleep 30",
+            60,
+            std::path::Path::new("/tmp"),
+            &[],
+            Some(thread_id),
+            None,
+        )
+        .await
+        .expect("spawn");
+    let (mut rx, mut replay) = LagReplay::subscribe(
+        &bus,
+        ReplayScope::Workspace,
+        Some(WORK_ENDING_EVENT_TYPES.to_vec()),
+    );
+    flood_past_bus_capacity(&bus);
+
+    assert!(reap_ended_work(rx.recv().await, &mut replay, &registry, &pool).await);
+    assert_eq!(
+        registry.kill_for_thread(thread_id).await,
+        1,
+        "the task must still be running, so this cleanup is what stops it"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// The replay list gates live frames too, so an event the reaper acts on but
+/// the list omits would never reach it.
+#[test]
+fn the_reaper_replays_every_event_that_ends_a_threads_work() {
+    use crate::engine::thread_events::ThreadEvent;
+    let ending = [
+        ThreadEvent::ThreadArchived,
+        ThreadEvent::ThreadDiscarded { actor: None },
+    ];
+    for event in &ending {
+        assert!(ends_the_threads_work(event));
+        assert!(WORK_ENDING_EVENT_TYPES.contains(&event.event_type()));
+    }
+    assert_eq!(WORK_ENDING_EVENT_TYPES.len(), ending.len());
 }

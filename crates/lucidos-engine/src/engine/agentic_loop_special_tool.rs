@@ -10,7 +10,7 @@ use super::{build_intent_tools, derive_call_key};
 use crate::engine::context::trim_context_if_needed;
 use crate::engine::event_bus::BusEvent;
 use crate::engine::http::workspace_client::cross_workspace_http_client;
-use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
+use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent, WakeMode};
 use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
 use crate::llm::{ContentBlock, Message, MessageContent};
@@ -20,8 +20,8 @@ use crate::triggers::{normalize_route_setting, validate_trigger_reasoning_effort
 /// thread that issued the spawn. Drives both the spawn linkage (parent /
 /// spawning event ids) and the result-text branch.
 ///
-/// `Child` (default) preserves today's callback semantics: the spawning
-/// thread's `notify_parent_if_child` fires when the spawned thread reaches
+/// `Child` (default) carries the child's resolved *wake mode*, and keeps the
+/// callback: the spawning thread's `notify_parent_if_child` fires when the spawned thread reaches
 /// a terminal event, and `active_children_count` is incremented while the
 /// spawned thread is in flight. The wire string is `"child"`; `"sub"` is
 /// accepted as a back-compat alias from before the glossary settled on
@@ -33,7 +33,7 @@ use crate::triggers::{normalize_route_setting, validate_trigger_reasoning_effort
 /// thread to resume on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Relation {
-    Child,
+    Child(WakeMode),
     Top,
 }
 
@@ -47,17 +47,27 @@ struct SpawnSource {
     tool_called_event_id: Option<Uuid>,
 }
 
-/// Parse the optional `relation` argument from a tool call. Defaults to
-/// [`Relation::Child`] when absent so existing prompts keep working unchanged.
-/// Accepts `"child"` (canonical) and `"sub"` (back-compat alias from the
-/// pre-glossary wire name). Returns `Err` for unknown values or non-string
-/// types so the LLM sees the contract violation instead of silently getting
-/// `Child`.
-pub(crate) fn parse_relation(args: &serde_json::Value) -> Result<Relation, String> {
+/// Parse the optional `relation` and `wake_mode` arguments from a spawn tool
+/// call. The relation defaults to [`Relation::Child`] when absent, and accepts
+/// `"child"` (canonical) and `"sub"` (back-compat alias from the pre-glossary
+/// wire name). A child's wake mode is the declared one, else the default for a
+/// parent that is or is not the home thread. Unknown values, non-string types
+/// and a wake mode on a top spawn are errors. So the LLM sees the contract
+/// violation instead of silently getting a default.
+pub(crate) fn parse_relation(
+    args: &serde_json::Value,
+    parent_is_home: bool,
+) -> Result<Relation, String> {
+    let declared = WakeMode::from_arg(optional_string_arg(args, "wake_mode")?)?;
+    let child = || Relation::Child(WakeMode::for_spawn(declared, parent_is_home));
     match args.get("relation") {
-        None | Some(serde_json::Value::Null) => Ok(Relation::Child),
+        None | Some(serde_json::Value::Null) => Ok(child()),
         Some(serde_json::Value::String(s)) => match s.as_str() {
-            "child" | "sub" => Ok(Relation::Child),
+            "child" | "sub" => Ok(child()),
+            "top" if declared.is_some() => Err(
+                "wake_mode applies to relation \"child\" only: a top thread never reports back"
+                    .to_string(),
+            ),
             "top" => Ok(Relation::Top),
             other => Err(format!(
                 "relation must be \"child\" or \"top\", got {:?}",
@@ -183,6 +193,27 @@ fn mcp_arguments_summary(tool_args: &serde_json::Value) -> String {
     }
 }
 
+/// What a child's report does to this conversation under its wake mode, as
+/// the spawn result states it. The parent reads this to know whether to wait.
+fn child_report_contract(mode: WakeMode) -> &'static str {
+    match mode {
+        WakeMode::Wake => {
+            "Its wake_mode is \"wake\": when it finishes, this conversation \
+             automatically resumes with its results, so you don't need to check on it."
+        }
+        WakeMode::WakeWhenAllDone => {
+            "Its wake_mode is \"wake-when-all-done\": its clean report is filed while \
+             another child you spawned that way is still working, and the last one to \
+             finish resumes this conversation. A failure resumes it at once."
+        }
+        WakeMode::NoWake => {
+            "Its wake_mode is \"no-wake\": a clean finish does NOT resume this \
+             conversation, since the user reads the result in that thread. Its report \
+             is filed for your next turn, and a failure still resumes this conversation."
+        }
+    }
+}
+
 fn coding_agent_label(agent: crate::runtime::CodingAgent) -> &'static str {
     match agent {
         crate::runtime::CodingAgent::ClaudeCode => "Claude Code",
@@ -208,8 +239,17 @@ impl Relation {
         tool_called_event_id: Option<Uuid>,
     ) -> (Option<Uuid>, Option<Uuid>) {
         match self {
-            Self::Child => (Some(spawning_thread_id), tool_called_event_id),
+            Self::Child(_) => (Some(spawning_thread_id), tool_called_event_id),
             Self::Top => (None, None),
+        }
+    }
+
+    /// The child's wake mode, which rides beside the linkage. `None` for a
+    /// top spawn, which reports to nobody.
+    pub(crate) fn wake_mode(self) -> Option<WakeMode> {
+        match self {
+            Self::Child(mode) => Some(mode),
+            Self::Top => None,
         }
     }
 
@@ -221,12 +261,11 @@ impl Relation {
     /// renderer in `renderMarkdown.ts`).
     pub(crate) fn run_thread_success_text(self, child_thread_id: Uuid, workspace: &str) -> String {
         match self {
-            Self::Child => format!(
-                "Thread started in workspace '{ws}' (thread_id: {tid}). When the child \
-                 thread finishes, this conversation will automatically resume with its \
-                 results — you don't need to check on it. Continue with other work or \
-                 tell the user you've delegated this subtask in the {ws} workspace: \
-                 [Open thread]({link})",
+            Self::Child(mode) => format!(
+                "Thread started in workspace '{ws}' (thread_id: {tid}). {contract} \
+                 Continue with other work or tell the user you've delegated this \
+                 subtask in the {ws} workspace: [Open thread]({link})",
+                contract = child_report_contract(mode),
                 ws = workspace,
                 tid = child_thread_id,
                 link = crate::core::store::thread_link(workspace, child_thread_id),
@@ -256,10 +295,7 @@ impl Relation {
              thread_id will be {thread_id}."
         );
         match self {
-            Self::Child => format!(
-                "{base} When it eventually finishes, this conversation will \
-                 automatically resume with its results — you don't need to check on it."
-            ),
+            Self::Child(mode) => format!("{base} {}", child_report_contract(mode)),
             Self::Top => format!(
                 "{base} It runs independently and will NOT report back to this \
                  conversation."
@@ -275,10 +311,11 @@ impl Relation {
     ) -> String {
         let label = coding_agent_label(coding_agent);
         match self {
-            Self::Child => format!(
+            Self::Child(mode) => format!(
                 "{label} session started in workspace '{ws}' (thread_id: {tid}). \
-                 Tell the user you've started a new {label} thread in the {ws} \
-                 workspace and include this link: [Open thread]({link})",
+                 {contract} Tell the user you've started a new {label} thread in the \
+                 {ws} workspace and include this link: [Open thread]({link})",
+                contract = child_report_contract(mode),
                 label = label,
                 ws = workspace,
                 tid = cc_thread_id,
@@ -321,10 +358,10 @@ impl LucidosEngine {
         // Outer batch id `ask_user_question` keys its per-question wait
         // registry sub_ids on (see `synth_question_id`).
         tool_use_id: &str,
-        // Per-turn event meta — carries the channel (`Some(Trigger)` for a
-        // scheduled trigger, `None` for chat) so the MCP permission gate can
-        // auto-approve silently in unattended trigger threads, and the actor for
-        // the permission card. Cloned onto any emitted event.
+        // Per-turn event meta, cloned onto any emitted event. Its channel is
+        // `Some(Trigger)` for a scheduled trigger and `None` for chat. That
+        // picks the MCP gate's trigger rule over its card. Its actor goes on
+        // the permission card.
         meta: &EventMeta,
         // Cancel token for the response — lets a blocking MCP permission card
         // resolve as canceled when the user clicks Stop, instead of dangling.
@@ -357,7 +394,9 @@ impl LucidosEngine {
             if prompt.is_empty() {
                 Some("Error: prompt is required".to_string())
             } else {
-                let relation = match parse_relation(tool_args) {
+                let parent_is_home =
+                    crate::engine::home_thread::spawner_is_home(&self.pool, thread_id).await;
+                let relation = match parse_relation(tool_args, parent_is_home) {
                     Ok(r) => r,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
@@ -606,6 +645,7 @@ impl LucidosEngine {
                     device_id: device_id.map(str::to_string),
                     parent_thread_id,
                     spawning_event_id,
+                    wake_mode: relation.wake_mode(),
                     repo_id,
                     title: caller_title.map(str::to_string),
                     app_id: spawn_app_id,
@@ -631,7 +671,9 @@ impl LucidosEngine {
             if prompt.is_empty() {
                 Some("Error: prompt is required".to_string())
             } else {
-                let relation = match parse_relation(tool_args) {
+                let parent_is_home =
+                    crate::engine::home_thread::spawner_is_home(&self.pool, thread_id).await;
+                let relation = match parse_relation(tool_args, parent_is_home) {
                     Ok(r) => r,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
@@ -699,6 +741,7 @@ impl LucidosEngine {
                                     child_thread_id,
                                     parent_thread_id,
                                     spawning_event_id,
+                                    wake_mode: relation.wake_mode(),
                                     title: caller_title.map(str::to_string),
                                     model,
                                     reasoning_effort,
@@ -725,7 +768,9 @@ impl LucidosEngine {
         } else if let Some((server_id, mcp_tool_name)) =
             crate::mcp::McpManager::parse_mcp_tool_name(tool_name)
         {
-            use crate::engine::mcp_permission::{mcp_gate, McpAsk, McpGate};
+            use crate::engine::mcp_permission::{
+                mcp_gate, unlisted_trigger_refusal, McpAsk, McpGate,
+            };
 
             let (auto_approve, server_name) = {
                 let statuses = self.mcp_manager.list_servers().await.unwrap_or_default();
@@ -738,36 +783,66 @@ impl LucidosEngine {
                 )
             };
 
-            // Pre-authorization gate: the server's `auto_approve` flag or a
-            // non-interactive trigger thread proceeds with no card; otherwise
-            // ask the user (in-thread `McpPermissionRequested` card), which also
-            // honors a prior session / `mcp-allowed-tools` grant.
-            if let McpGate::Ask = mcp_gate(auto_approve, meta.channel) {
-                let args_summary = mcp_arguments_summary(tool_args);
+            // A thread may call only the servers it enabled. Asked before the
+            // gate, so no card asks the user to allow a call that cannot run.
+            if let Some(refusal) = self
+                .mcp_manager
+                .not_enabled_refusal(thread_id, &server_id, tool_name)
+                .await
+            {
+                return Some(format!("Error: {refusal}"));
+            }
 
-                if let McpAsk::Refuse(refusal) = self
-                    .ask_mcp_permission(
-                        &server_id,
-                        &server_name,
-                        &mcp_tool_name,
-                        tool_name,
-                        tool_args,
-                        &args_summary,
+            // Pre-authorization gate (ADR 0430). The server's `auto_approve`
+            // flag proceeds anywhere. A trigger thread proceeds only on a
+            // server its trigger lists, and is refused otherwise. A chat
+            // thread asks the user (in-thread `McpPermissionRequested` card),
+            // which also honors a prior session / `mcp-allowed-tools` grant.
+            let firing_trigger = if meta.channel == Some(EventChannel::Trigger) {
+                self.trigger_of_thread(thread_id).await
+            } else {
+                None
+            };
+            let listed_by_trigger = firing_trigger
+                .as_ref()
+                .is_some_and(|t| t.mcp_servers.contains(&server_id));
+            match mcp_gate(auto_approve, meta.channel, listed_by_trigger) {
+                McpGate::Proceed => {}
+                McpGate::Refuse => {
+                    self.notify_unlisted_trigger_mcp_call(
                         thread_id,
-                        tool_use_id,
-                        meta,
-                        cancel_token,
+                        firing_trigger.as_ref(),
+                        &server_name,
                     )
-                    .await
-                {
-                    return Some(refusal);
+                    .await;
+                    return Some(unlisted_trigger_refusal(tool_name, &server_id));
+                }
+                McpGate::Ask => {
+                    let args_summary = mcp_arguments_summary(tool_args);
+                    if let McpAsk::Refuse(refusal) = self
+                        .ask_mcp_permission(
+                            &server_id,
+                            &server_name,
+                            &mcp_tool_name,
+                            tool_name,
+                            tool_args,
+                            &args_summary,
+                            thread_id,
+                            tool_use_id,
+                            meta,
+                            cancel_token,
+                        )
+                        .await
+                    {
+                        return Some(refusal);
+                    }
                 }
             }
 
             Some(
                 match self
                     .mcp_manager
-                    .call_tool(&server_id, &mcp_tool_name, tool_args.clone())
+                    .call_tool(thread_id, &server_id, &mcp_tool_name, tool_args.clone())
                     .await
                 {
                     Ok((result, _, _)) => result,
@@ -802,7 +877,7 @@ impl LucidosEngine {
         tool_args: &serde_json::Value,
         source: SpawnSource,
     ) -> String {
-        if matches!(relation, Relation::Child) {
+        if matches!(relation, Relation::Child(_)) {
             return format!(
                 "Error: cross-workspace run_coding_agent (workspace=\"{}\") requires \
                  relation=\"top\" — child-thread auto-resume callbacks across \
@@ -1553,7 +1628,7 @@ mod tests {
         let spawning_thread = Uuid::new_v4();
         let tool_call = Uuid::new_v4();
         assert_eq!(
-            Relation::Child.spawn_linkage(spawning_thread, Some(tool_call)),
+            Relation::Child(WakeMode::Wake).spawn_linkage(spawning_thread, Some(tool_call)),
             (Some(spawning_thread), Some(tool_call))
         );
     }
@@ -1600,7 +1675,7 @@ mod tests {
         let tool_call = Uuid::new_v4();
         let workspace = std::path::Path::new("/tmp/lucidos-test-ws");
         let (parent_thread_id, spawning_event_id) =
-            Relation::Child.spawn_linkage(spawning_thread, Some(tool_call));
+            Relation::Child(WakeMode::Wake).spawn_linkage(spawning_thread, Some(tool_call));
 
         // `explicit_origin: None` takes the legacy-synthesis branch.
         let synthesized = crate::engine::chat::make_message_received(
@@ -1610,6 +1685,7 @@ mod tests {
             None,
             parent_thread_id,
             spawning_event_id,
+            None,
             ActorMode::Agent,
             None,
             None,
@@ -1624,6 +1700,7 @@ mod tests {
             None,
             parent_thread_id,
             spawning_event_id,
+            None,
             ActorMode::Agent,
             None,
             None,

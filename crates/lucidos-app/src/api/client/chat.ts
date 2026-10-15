@@ -6,6 +6,7 @@ import type { AnswerKind, AllowScope } from '../../store/thread-events';
 import type { Loadable } from '../../store/types';
 import type { ChatRequestBody, CodingAgent } from '../types';
 import { SIDE_QUESTION_TIMEOUT_MS, type TAKES_EFFECT_VALUES } from '@lucidos/engine-constants';
+import type { ComposeReportWire } from '../../store/composeReport';
 
 // --- Health ---
 export interface HealthInfo {
@@ -86,7 +87,14 @@ export async function getWorkspaceLabel(): Promise<string | null> {
  *  harmless, because the engine acks a repeat once. */
 export const SUBMIT_CHAT_TIMEOUT_MS = 20_000;
 
-export async function submitChat(body: ChatRequestBody): Promise<{ event_id: string }> {
+/** The chat ack. `compose` is the *compose report* the send left when it
+ *  consumed the thread's compose slot (ADR 0450), absent when it consumed none. */
+export interface ChatSubmitAck {
+  event_id: string;
+  compose?: ComposeReportWire;
+}
+
+export async function submitChat(body: ChatRequestBody): Promise<ChatSubmitAck> {
   const res = await mutatingFetch(`${API}/chat/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -129,9 +137,12 @@ export async function removeQueuedMessage(threadId: string, messageId: string): 
   await throwIfNotOk(res);
 }
 
-export async function applyNow(threadId: string): Promise<void> {
+/** Start an Apply Now. Answers with the thread's summary version once the
+ *  apply's start landed (ADR 0437). Absent from an engine that predates it. */
+export async function applyNow(threadId: string): Promise<{ summary_version?: number | null }> {
   const res = await mutatingFetch(`${API}/claude-code/apply-now?thread_id=${encodeURIComponent(threadId)}`, { method: 'POST' });
   await throwIfNotOk(res);
+  return res.json();
 }
 
 /** Resume an interrupted thread — chat/trigger threads route through
@@ -329,13 +340,23 @@ export async function discardCCChanges(threadId: string): Promise<void> {
   await throwIfNotOk(res);
 }
 
+/** The answer's own event id and its place in this page's inputs to the
+ *  thread. The engine records the answer under that id, and refuses one a
+ *  later input from this page overtook (ADR 0449). */
+export interface AnswerPlacement {
+  event_id: string;
+  input_chain: string;
+  input_seq: number;
+}
+
 /** Answer a pending question card on a thread. The backend emits
  *  UserQuestionAnswered and dispatches the agent-specific resume side
  *  effects: for CC threads it respawns the subprocess with --resume + a
  *  matching tool_result; for chat threads it wakes the in-process
  *  `ask_user_question` tool which returns the answer as a tool_result on
- *  the same turn. Returns true on success; false for 409 (stale/duplicate)
- *  so the UI can re-sync from events.
+ *  the same turn. Returns true on success; false for 409 (stale, duplicate,
+ *  or overtaken by a later input from this page) so the UI can re-sync from
+ *  events.
  *
  *  One attempt. The store action retries it with every other send
  *  (`withQuietRetries`). An answer that lands twice writes once and 409s the
@@ -345,11 +366,12 @@ export async function answerThreadQuestion(
   threadId: string,
   toolUseId: string,
   answer: AnswerKind,
+  placement: AnswerPlacement,
 ): Promise<boolean> {
   const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/answer-question`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tool_use_id: toolUseId, answer }),
+    body: JSON.stringify({ tool_use_id: toolUseId, answer, ...placement }),
     signal: AbortSignal.timeout(SUBMIT_CHAT_TIMEOUT_MS),
   });
   if (res.ok) return true;

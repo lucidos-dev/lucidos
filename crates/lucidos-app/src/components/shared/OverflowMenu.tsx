@@ -5,6 +5,8 @@ import { useAnchoredPosition, pointAnchor, type AnchorAlign, type AnchorBox, typ
 import { useLongPress } from '../../hooks/useLongPress';
 import { viewportIsMobile } from '../../utils/viewport';
 import { MoreIcon } from './icons';
+import type { ChunkGate } from '../../utils/lazyComponent';
+import { usePendingOpen } from '../../hooks/usePendingOpen';
 
 /** What counts as a row for roving focus and for the keyboard-open focus. */
 const MENU_ITEM_ROLES = '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]';
@@ -37,28 +39,13 @@ export interface OverflowMenuContext {
  *  menu belongs to. `at` opens it at the pointer instead of below `anchor`. */
 export type OverflowMenuOpener = (anchor: HTMLElement, at?: ViewportPoint) => void;
 
-/** A mouse resting on the host this long opens the menu as a peek. */
-export const HOVER_OPEN_DELAY_MS = 300;
-/** A peek outlives the pointer leaving by this long, so the pointer can cross
- *  the gap between the host and the menu. */
-export const PEEK_CLOSE_DELAY_MS = 250;
-
-/** The host element's handlers for opening on hover. */
-export interface HoverOpening {
-  onPointerEnter(e: PointerEvent): void;
-  onPointerLeave(): void;
-  onPointerDown(): void;
-}
-
 /** Hands opening to a host. `trigger` says whether the ⋯ is drawn as well.
  *  `align` places a menu the host opened against its anchor, and defaults to
- *  the anchor's leading edge. `hoverRef` asks for hover opening too: the menu
- *  publishes the host element's handlers there. */
+ *  the anchor's leading edge. */
 export interface HostOpener {
   ref: { current: OverflowMenuOpener | null };
   trigger: boolean;
   align?: AnchorAlign;
-  hoverRef?: { current: HoverOpening | null };
 }
 
 /** The host's own content drawn as the menu button in place of the ⋯, such as
@@ -77,13 +64,11 @@ type MenuOpening =
   | { face: TriggerFace; hostOpener?: never };
 
 /** An open popover: the element it belongs to, and the box it is placed
- *  against. The two differ only for a menu opened at the pointer. A `peek` was
- *  opened by hover, and closes once the pointer leaves both host and menu. */
+ *  against. The two differ only for a menu opened at the pointer. */
 interface Placement {
   anchor: HTMLElement;
   box: AnchorBox;
   align: AnchorAlign;
-  peek: boolean;
 }
 
 /** Generic ⋯ overflow menu: a trigger button and an anchored menu popover, with
@@ -100,10 +85,6 @@ interface Placement {
  *  hit. The ⋯ can only be hidden through `hostOpener` or a `face`, so a menu
  *  nothing can open is unrepresentable.
  *
- *  **A host can also open it on hover, as a peek.** The Home icon does: a mouse
- *  resting on it lists Home's widgets. A peek closes once the pointer leaves
- *  both the host and the menu, and a press on the host ends it.
- *
  *  **`face` draws the host's content as the trigger.** The thread title is its
  *  own menu button on both title rows. It is a toggle, so it stays the
  *  overlay's anchor, and the menu opens against it, aligned to its leading edge.
@@ -119,11 +100,14 @@ interface Placement {
  *  menu then subscribes to no hot signals. That keeps the drawer's per-row
  *  render budget across the many rows that each mount one of these.
  *
+ *  **`itemsChunk` holds the open until a lazy body is in memory.** A menu
+ *  whose items live in their own chunk never opens empty (ADR 0436).
+ *
  *  `stopPropagation` guards a host whose container has its own click handler
  *  (the drawer row's focus-thread `onClick`) — toggling the menu or running an
  *  item must not also fire it.
  */
-export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAttrs, onOpen, tabIndex, hostOpener, face, items }: MenuOpening & {
+export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAttrs, onOpen, tabIndex, hostOpener, face, items, itemsChunk }: MenuOpening & {
   ariaLabel: string;
   stopPropagation?: boolean;
   extraClass?: string;
@@ -145,6 +129,8 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   tabIndex?: number;
   /** The menu's items. Invoked only while the menu is open. */
   items: (ctx: OverflowMenuContext) => ComponentChildren;
+  /** The chunk `items` renders from, when it is code-split. */
+  itemsChunk?: ChunkGate;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -163,6 +149,12 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   const open = menu !== null;
   const pos = useAnchoredPosition(menu?.box ?? null, menuRef, undefined, menu?.align);
 
+  const pendingOpen = usePendingOpen();
+  const openWhenReady = (place: () => void, from: Element) => {
+    if (itemsChunk) pendingOpen.open(itemsChunk, place, from);
+    else place();
+  };
+
   // Right-align to the ⋯ trigger. It sits at the far right of its row. A
   // left-start panel would run off-screen, and the clamp would then strand it
   // near the left edge.
@@ -170,24 +162,10 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   // A host's anchor is a whole row, not a button at its end. Right-aligning to
   // it puts the panel back in the corner the long press exists to leave, so it
   // aligns to the row's leading edge instead, unless the host asks otherwise.
-  const placeAt = (anchor: HTMLElement, peek = false): Placement =>
-    ({ anchor, box: anchor, align: drawsDots && anchor === triggerRef.current ? 'end' : hostOpener?.align ?? 'start', peek });
-
-  // One timer serves both hover delays: the open while closed, the close while
-  // peeking. A peek is never keyboard-opened, so it has no focus to restore.
-  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const clearHoverTimer = () => {
-    if (hoverTimer.current !== null) { clearTimeout(hoverTimer.current); hoverTimer.current = null; }
-  };
-  useEffect(() => clearHoverTimer, []);
-  const peeking = menu?.peek ?? false;
-  const closePeekSoon = () => {
-    clearHoverTimer();
-    if (peeking) hoverTimer.current = setTimeout(() => { hoverTimer.current = null; setMenu(null); }, PEEK_CLOSE_DELAY_MS);
-  };
+  const placeAt = (anchor: HTMLElement): Placement =>
+    ({ anchor, box: anchor, align: drawsDots && anchor === triggerRef.current ? 'end' : hostOpener?.align ?? 'start' });
 
   const close = () => {
-    clearHoverTimer();
     setMenu(null);
     // A keyboard-opened menu owns DOM focus (an item inside the portal); hand it
     // back to the opener so the drawer's ↑/↓/Enter list-nav (or the header) is
@@ -201,14 +179,18 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   const toggle = (e: MouseEvent) => {
     if (stopPropagation) e.stopPropagation();
     if (open) { close(); return; }
+    if (pendingOpen.takeBack()) return;
     const trigger = triggerRef.current;
     if (!trigger) return;
-    onOpen?.();
     // detail === 0 ⇒ keyboard activation or the shortcut's synthetic click.
     const keyboard = e.detail === 0;
-    setOpenedViaKeyboard(keyboard);
-    lastFocusedRef.current = keyboard ? (document.activeElement as HTMLElement | null) : null;
-    setMenu(placeAt(trigger));
+    const focused = document.activeElement as HTMLElement | null;
+    openWhenReady(() => {
+      onOpen?.();
+      setOpenedViaKeyboard(keyboard);
+      lastFocusedRef.current = keyboard ? focused : null;
+      setMenu(placeAt(trigger));
+    }, trigger);
   };
   const run = (fn: () => void) => (e: MouseEvent) => {
     if (stopPropagation) e.stopPropagation();
@@ -218,45 +200,22 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
 
   // The host's entry point, published for its own gesture. It only ever OPENS:
   // an open overlay makes the shell behind it inert, so the gesture never
-  // starts. A peek is the exception, since its host stays live, and a gesture
-  // there turns the peek into an ordinary menu. Always a pointer-open, since a
-  // gesture is what invokes it.
+  // starts. Always a pointer-open, since a gesture is what invokes it.
   //
   // Assigned during render rather than in an effect, so it is live from the
   // first frame. Cleared on unmount, so a row scrolled out of the list cannot
   // be opened through a stale handle.
-  const openFromGesture = (el: HTMLElement, at?: ViewportPoint, peek = false) => {
-    clearHoverTimer();
-    onOpen?.();
-    setOpenedViaKeyboard(false);
-    lastFocusedRef.current = null;
-    setMenu(at ? { anchor: el, box: pointAnchor(at), align: 'start', peek } : placeAt(el, peek));
+  const openFromGesture = (el: HTMLElement, at?: ViewportPoint) => {
+    openWhenReady(() => {
+      onOpen?.();
+      setOpenedViaKeyboard(false);
+      lastFocusedRef.current = null;
+      setMenu(at ? { anchor: el, box: pointAnchor(at), align: 'start' } : placeAt(el));
+    }, el);
   };
   const hostRef = hostOpener?.ref;
   if (hostRef) hostRef.current = openFromGesture;
   useEffect(() => () => { if (hostRef) hostRef.current = null; }, [hostRef]);
-
-  // Hover opens for a mouse only: touch has no hover, and its hold already
-  // opens the menu. A press on the host ends a peek before the press's own
-  // gesture runs, so a tap goes where a tap goes.
-  const hoverRef = hostOpener?.hoverRef;
-  if (hoverRef) {
-    hoverRef.current = {
-      onPointerEnter: (e) => {
-        if (e.pointerType !== 'mouse') return;
-        clearHoverTimer();
-        if (open) return;
-        const el = e.currentTarget as HTMLElement;
-        hoverTimer.current = setTimeout(() => { hoverTimer.current = null; openFromGesture(el, undefined, true); }, HOVER_OPEN_DELAY_MS);
-      },
-      onPointerLeave: closePeekSoon,
-      onPointerDown: () => {
-        clearHoverTimer();
-        if (peeking) setMenu(null);
-      },
-    };
-  }
-  useEffect(() => () => { if (hoverRef) hoverRef.current = null; }, [hoverRef]);
 
   // ↑/↓/Home/End rove focus across the menu items (the Overlay owns Escape;
   // Enter/Space activate the focused <button> natively → its onClick).
@@ -292,11 +251,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   // host's row is never the anchor: its click focuses the thread, so exempting
   // it would let one tap both dismiss the menu and navigate. The re-open race
   // the exemption guards cannot happen there, because a tap never opens it.
-  //
-  // A peek's host IS the anchor (frontend.md § Modals & Popovers, the hover
-  // peek). It must stay live above the inert shell, or the resting pointer
-  // reads as leaving. Its press ends the peek through `onPointerDown`.
-  const overlayAnchor = drawsTrigger ? triggerRef.current : peeking ? menu!.anchor : null;
+  const overlayAnchor = drawsTrigger ? triggerRef.current : null;
 
   return (
     <>
@@ -330,7 +285,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
         panelClass="surface-box thread-overflow-menu"
         panelRole="menu"
         panelRef={menuRef}
-        panelProps={{ onKeyDown: handleMenuKeyDown, onPointerEnter: clearHoverTimer, onPointerLeave: closePeekSoon }}
+        panelProps={{ onKeyDown: handleMenuKeyDown }}
         panelStyle={pos
           ? { position: 'fixed', top: `${pos.top}px`, left: `${pos.left}px` }
           : { visibility: 'hidden' }}

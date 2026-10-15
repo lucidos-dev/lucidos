@@ -257,6 +257,38 @@ async fn a_tree_git_cannot_read_is_not_finished() {
     teardown_test_db(&db_name).await;
 }
 
+/// An integrated sub-thread's commits reach `main` inside its parent's
+/// change, never through its own Apply (ADR 0465). Once they land there, the
+/// child's worktree is finished by the existing rule: its branch carries
+/// nothing `main` lacks.
+#[tokio::test]
+async fn a_child_worktree_is_finished_once_its_commits_land_with_its_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    insert_thread_summary(&pool, thread_id, false).await;
+    let changes = crate::core::changes_projection::ChangesProjection::new(pool.clone());
+    assert!(
+        !super::is_finished_worktree(&pool, &changes, thread_id, &worktree).await,
+        "unmerged work is not finished"
+    );
+
+    let branch = format!("test/{}", &thread_id.simple().to_string()[..8]);
+    let merged = git_cmd(&["merge", "--no-ff", "--no-edit", &branch], &root)
+        .await
+        .expect("land the parent's merge of the child");
+    assert!(
+        merged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    assert!(super::is_finished_worktree(&pool, &changes, thread_id, &worktree).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 #[tokio::test]
 async fn every_cleaned_event_carries_the_callers_actor() {
     use crate::engine::event_bus::{BusEvent, EmittedEvent};

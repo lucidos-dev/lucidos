@@ -4,8 +4,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "codegen": "../../scripts/codegen.sh",
+    "build": "../../scripts/codegen.sh && tsc --noEmit && vite build",
+    "typecheck": "../../scripts/codegen.sh && tsc --noEmit",
     "preview": "vite preview",
+    "pretest": "../../scripts/codegen.sh",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-08
+- **Amended by**: [0478](0478-switch-hands-agent-processes-to-the-resumed-session.md).
+  A teardown that promises an auto-resume reaps nothing, and the resumed
+  session adopts the marker.
 
 ## Context
 
@@ -86,10 +89,10 @@ from the wrapper's own child can.
   (`lifecycle::terminate_decision`), so in practice that is each turn end, as
   for Claude Code.
 - Processes started before this change carry no marker. They are not reaped.
-- **The sweep needs the engine alive when the driver ends.** An engine that
-  exits first, on a crash or a Switch, never runs it. The new engine does not
-  know the old markers. An engine test run still ends at its run limit;
-  anything else lives until a reboot.
+- **The sweep needs the engine alive when the driver ends.** A crash never
+  runs it. A Switch did run it, which killed work the resume expected, so a
+  Switch now hands the processes over instead (ADR 0478). The thread's next
+  session adopts the marker, and its own end reaps what is left.
 - A hung engine test run frees its slot within the run limit. The libtest
   "has been running for over 60 seconds" lines name the test.
 

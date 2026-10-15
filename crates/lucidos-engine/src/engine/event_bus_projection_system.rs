@@ -3,6 +3,8 @@
 //! `ThreadQueue*` events into the `thread_queue` table, and `RepositoryAdded`
 //! into the durable `repo_names` table (so removed repos keep a resolvable
 //! name), and `AppDeleted` into `app_kinds` (so a removed widget stays one).
+//! `McpServerStopped` and `McpServerRemoved` clear the server from every
+//! `thread_summaries.enabled_mcp_servers` (ADR 0430).
 
 use uuid::Uuid;
 
@@ -127,6 +129,19 @@ impl EventBus {
                     .execute(&mut **tx)
                     .await?;
                 }
+                Ok(())
+            }
+            // Stop and Remove switch the server off in every thread (ADR 0430).
+            SystemEvent::McpServerStopped { server_id, .. }
+            | SystemEvent::McpServerRemoved { server_id, .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries \
+                     SET enabled_mcp_servers = array_remove(enabled_mcp_servers, $1) \
+                     WHERE $1 = ANY(enabled_mcp_servers)",
+                )
+                .bind(server_id)
+                .execute(&mut **tx)
+                .await?;
                 Ok(())
             }
             SystemEvent::AppDeleted {

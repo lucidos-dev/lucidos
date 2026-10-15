@@ -58,6 +58,7 @@ function resolvedTo(row: Partial<BackgroundModel>): BackgroundRows {
       reachable: true,
       not_served: [],
       needs_vision: false,
+      asks_no_model: false,
       vision: true,
       default_effort: null,
       recommended: [],

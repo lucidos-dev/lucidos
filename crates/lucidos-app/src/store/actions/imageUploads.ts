@@ -46,7 +46,8 @@ import {
 } from '../pendingUploadRecords';
 import { isConnected, showToast, threadMap } from '../store';
 import type { ThreadState } from '../thread-events';
-import { awaitThreadStarted, isThreadStartPending, serverDraft, serverDraftVersion } from './compose';
+import { awaitThreadStarted, isThreadStartPending } from './compose';
+import { serverComposeOf, serverComposeVersion } from '../composeSync';
 
 /** Backoff before each automatic retry of a transient failure. Its length is
  *  the retry budget: once spent, the entry fails and offers a manual Retry. */
@@ -320,7 +321,7 @@ export function recordStillNeeded(
 effect(() => {
   const entries = pendingUploads.value;
   void composeDrafts.value;
-  void serverDraftVersion.value;
+  void serverComposeVersion.value;
   const pending = new Set<string>();
   for (const list of entries.values()) for (const entry of list) pending.add(entry.localId);
   for (const [localId, controller] of runs) {
@@ -334,7 +335,7 @@ effect(() => {
       record,
       pending.has(record.localId),
       getDraft(record.threadId).image_hashes,
-      serverDraft.get(record.threadId)?.imageHashes,
+      serverComposeOf(record.threadId)?.imageHashes,
     );
     if (!needed) forgetPendingUploadRecord(record.localId);
   }

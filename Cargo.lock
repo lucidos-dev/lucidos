@@ -1039,8 +1039,6 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 [[package]]
 name = "chromiumoxide"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8380ce7721cc895fe8a184c49d615fe755b0c9a3d7986355cee847439fff907f"
 dependencies = [
  "async-std",
  "async-tungstenite",
@@ -1053,6 +1051,7 @@ dependencies = [
  "fnv",
  "futures",
  "futures-timer",
+ "libc",
  "pin-project-lite",
  "reqwest 0.12.28",
  "serde",
@@ -4232,8 +4231,10 @@ version = "0.1.0"
 dependencies = [
  "block2",
  "libc",
+ "lucidos-home",
  "lucidos-installs",
  "lucidos-local-token",
+ "lucidos-owner-lock",
  "lucidos-tailscale",
  "objc2",
  "objc2-app-kit",
@@ -4247,6 +4248,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-updater",
  "tauri-plugin-window-state",
+ "tempfile",
 ]
 
 [[package]]
@@ -4254,8 +4256,13 @@ name = "lucidos-build-slot"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "lucidos-home",
  "tempfile",
 ]
+
+[[package]]
+name = "lucidos-capabilities"
+version = "0.1.0"
 
 [[package]]
 name = "lucidos-cli"
@@ -4268,6 +4275,8 @@ dependencies = [
  "imagesize",
  "libc",
  "lucidos-build-slot",
+ "lucidos-capabilities",
+ "lucidos-home",
  "lucidos-installs",
  "lucidos-local-token",
  "lucidos-tailscale",
@@ -4327,14 +4336,22 @@ dependencies = [
  "glob",
  "hf-hub",
  "hmac",
+ "hyper",
+ "hyper-util",
  "image",
  "kamadak-exif",
  "lettre",
  "libc",
  "lucidos-build-slot",
+ "lucidos-capabilities",
+ "lucidos-engine-socket",
  "lucidos-file-backup-exclusion",
  "lucidos-frame-capability",
+ "lucidos-gateway-constants",
+ "lucidos-home",
  "lucidos-local-token",
+ "lucidos-owner-lock",
+ "lucidos-pg-url",
  "lucidos-tailscale",
  "mail-parser",
  "native-tls",
@@ -4377,6 +4394,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucidos-engine-socket"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "lucidos-home",
+ "lucidos-local-token",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lucidos-eval"
 version = "0.1.0"
 dependencies = [
@@ -4385,12 +4414,14 @@ dependencies = [
  "fastembed",
  "lucidos-engine",
  "lucidos-local-token",
+ "lucidos-pg-url",
  "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
  "sqlx",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "uuid",
@@ -4426,10 +4457,15 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "lucidos-engine-socket",
  "lucidos-file-backup-exclusion",
  "lucidos-frame-capability",
+ "lucidos-gateway-constants",
+ "lucidos-home",
  "lucidos-installs",
  "lucidos-local-token",
+ "lucidos-owner-lock",
+ "lucidos-pg-url",
  "lucidos-tailscale",
  "mach2",
  "qrcode",
@@ -4448,15 +4484,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucidos-gateway-constants"
+version = "0.1.0"
+
+[[package]]
+name = "lucidos-home"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "lucidos-installs"
 version = "0.1.0"
 dependencies = [
+ "lucidos-home",
  "serde",
+ "tempfile",
 ]
 
 [[package]]
 name = "lucidos-local-token"
 version = "0.1.0"
+dependencies = [
+ "lucidos-home",
+ "tempfile",
+]
+
+[[package]]
+name = "lucidos-owner-lock"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "tempfile",
+]
+
+[[package]]
+name = "lucidos-pg-url"
+version = "0.1.0"
+dependencies = [
+ "urlencoding",
+]
 
 [[package]]
 name = "lucidos-tailscale"

@@ -85,9 +85,17 @@ async fn registering_announces_the_entity_event_and_the_file_write() {
     let (dir, am) = workspace();
     let bus = MockEventBus::new();
 
-    let out = register_with_bus(dir.path(), &am, &bus, SOURCE, Some("Example plugins"), None)
-        .await
-        .expect("register");
+    let out = register_with_bus(
+        &crate::engine::git_ops::lock_workspace_repo().await,
+        dir.path(),
+        &am,
+        &bus,
+        SOURCE,
+        Some("Example plugins"),
+        None,
+    )
+    .await
+    .expect("register");
 
     assert!(out.created, "a first registration must report created");
     assert_eq!(out.marketplace.name, "Example plugins");
@@ -119,11 +127,20 @@ async fn renaming_announces_again_with_the_new_name() {
     let (dir, am) = workspace();
     let bus = MockEventBus::new();
 
-    let first = register_with_bus(dir.path(), &am, &bus, SOURCE, Some("example repo"), None)
-        .await
-        .expect("register");
+    let first = register_with_bus(
+        &crate::engine::git_ops::lock_workspace_repo().await,
+        dir.path(),
+        &am,
+        &bus,
+        SOURCE,
+        Some("example repo"),
+        None,
+    )
+    .await
+    .expect("register");
 
     let renamed = register_with_bus(
+        &crate::engine::git_ops::lock_workspace_repo().await,
         dir.path(),
         &am,
         &bus,
@@ -167,14 +184,29 @@ async fn removing_announces_the_removal() {
     let (dir, am) = workspace();
     let bus = MockEventBus::new();
 
-    let registration = register_with_bus(dir.path(), &am, &bus, SOURCE, None, None)
-        .await
-        .expect("register");
+    let registration = register_with_bus(
+        &crate::engine::git_ops::lock_workspace_repo().await,
+        dir.path(),
+        &am,
+        &bus,
+        SOURCE,
+        None,
+        None,
+    )
+    .await
+    .expect("register");
 
-    let removal = unregister_with_bus(dir.path(), &am, &bus, &registration.marketplace.id, None)
-        .await
-        .expect("remove")
-        .expect("a registered marketplace must be removable");
+    let removal = unregister_with_bus(
+        &crate::engine::git_ops::lock_workspace_repo().await,
+        dir.path(),
+        &am,
+        &bus,
+        &registration.marketplace.id,
+        None,
+    )
+    .await
+    .expect("remove")
+    .expect("a registered marketplace must be removable");
 
     assert!(removal.marketplaces.is_empty());
     assert_eq!(removed_ids(&bus), vec![registration.marketplace.id]);
@@ -189,9 +221,16 @@ async fn removing_an_unknown_marketplace_is_a_silent_no_op() {
     let (dir, am) = workspace();
     let bus = MockEventBus::new();
 
-    let outcome = unregister_with_bus(dir.path(), &am, &bus, "no-such-id", None)
-        .await
-        .expect("an unknown id is not an error");
+    let outcome = unregister_with_bus(
+        &crate::engine::git_ops::lock_workspace_repo().await,
+        dir.path(),
+        &am,
+        &bus,
+        "no-such-id",
+        None,
+    )
+    .await
+    .expect("an unknown id is not an error");
 
     assert!(outcome.is_none(), "an unknown id must report not-found");
     assert!(
@@ -208,9 +247,17 @@ async fn the_actor_reaches_the_announced_event() {
     let bus = MockEventBus::new();
     let actor = agent_actor();
 
-    register_with_bus(dir.path(), &am, &bus, SOURCE, None, Some(actor.clone()))
-        .await
-        .expect("register");
+    register_with_bus(
+        &crate::engine::git_ops::lock_workspace_repo().await,
+        dir.path(),
+        &am,
+        &bus,
+        SOURCE,
+        None,
+        Some(actor.clone()),
+    )
+    .await
+    .expect("register");
 
     let events = registered(&bus);
     assert_eq!(
@@ -227,7 +274,16 @@ async fn an_invalid_source_is_rejected_without_writing_or_announcing() {
     let (dir, am) = workspace();
     let bus = MockEventBus::new();
 
-    let outcome = register_with_bus(dir.path(), &am, &bus, "not a url", None, None).await;
+    let outcome = register_with_bus(
+        &crate::engine::git_ops::lock_workspace_repo().await,
+        dir.path(),
+        &am,
+        &bus,
+        "not a url",
+        None,
+        None,
+    )
+    .await;
 
     assert!(
         matches!(outcome, Err(MarketplaceWriteError::InvalidSource(_))),

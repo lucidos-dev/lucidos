@@ -228,9 +228,8 @@
 
 /* On mobile the older chevron's right edge lines up with the header bell's
  * drawn glyph right above it. That glyph sits the header row's inline padding
- * plus half the button's slack inside the screen edge. The 0.625rem is a copy
- * of `.pane-header`'s --header-padding-x, which is declared on the header and
- * so cannot be read here. max() keeps the notch safe-area inset in landscape.
+ * plus half the button's slack inside the screen edge. max() keeps the notch
+ * safe-area inset in landscape.
  *
  * That puts the button partly under `.edge-swipe-zone`, the transparent 1.25rem
  * strip on the pane's right edge. The z-index lifts it clear, as
@@ -238,7 +237,7 @@
 @media (--phone-layout) {
     .notification-detail-header {
         padding-right: max(
-            calc(0.625rem + (var(--mobile-header-icon-box) - var(--mobile-header-glyph-box)) / 2),
+            calc(var(--header-padding-x) + (var(--mobile-header-icon-box) - var(--mobile-header-glyph-box)) / 2),
             var(--safe-area-right)
         );
     }

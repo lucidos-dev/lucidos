@@ -2588,11 +2588,7 @@ begin_step build "Compiling engine + gateway + app, fetching PostgreSQL $PG_VERS
 # Staging steps 1–4 are the platform-agnostic spine shared with the Linux/headless
 # path; they live in scripts/lib/stage_runtime.sh so the recipe exists once.
 
-# ── 1. frontend ─────────────────────────────────────────────────────────────
-step "Building frontend (dist/)"
-stage_runtime_build_frontend "$REPO_ROOT" "$APP_DIR" || die "frontend build failed"
-
-# ── 2. gateway + engine + cli (release) ─────────────────────────────────────
+# ── 1. gateway + engine + cli (release) ─────────────────────────────────────
 # Build engine + gateway + the `lucidos` CLI — all three are bundled. The CLI is
 # load-bearing: the engine launches the CC permission-prompt MCP server via the
 # sibling `lucidos` binary (find_lucidos_cli_dir), so a build that omits it breaks
@@ -2606,6 +2602,11 @@ CLI_BIN="$REPO_ROOT/target/release/lucidos"
 [ -x "$ENGINE_BIN" ] || die "engine binary not found at $ENGINE_BIN"
 [ -x "$GATEWAY_BIN" ] || die "gateway binary not found at $GATEWAY_BIN"
 [ -x "$CLI_BIN" ] || die "lucidos CLI binary not found at $CLI_BIN"
+
+# ── 2. generated files, SDK bundle and frontend ─────────────────────────────
+# After the binaries: codegen renders with the release lucidos-codegen.
+step "Building generated files + SDK bundle + frontend (dist/)"
+stage_runtime_build_frontend "$REPO_ROOT" "$APP_DIR" || die "frontend build failed"
 
 # ── 3. relocatable PostgreSQL + pgvector ────────────────────────────────────
 # Mirrors scripts/prototype/desktop-pg-pgvector-spike.sh (proven recipe). On macOS

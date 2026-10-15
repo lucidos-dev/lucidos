@@ -75,8 +75,9 @@ fn widened_directories(workspace_root: &Path) -> Vec<PathBuf> {
 /// owns; this one belongs to the machine.
 const OS_TMP_DIR: &str = "/tmp";
 
-/// [`OS_TMP_DIR`] as CC should see it: the resolved path, plus the literal
-/// beside it when the two differ.
+/// [`OS_TMP_DIR`] and `$TMPDIR` as CC should see them: each resolved path, plus
+/// the literal beside it when the two differ. The prompt steers scratch files
+/// to `${TMPDIR:-/tmp}`, which on macOS is the per-user temp dir (ADR 0456).
 ///
 /// Why it is granted: an `Edit` outside the session's working directories asks
 /// with reason `workingDir`, and CC honours no bare `Edit` allow rule in any
@@ -93,20 +94,28 @@ const OS_TMP_DIR: &str = "/tmp";
 /// unresolvable path grants nothing and logs why, costing the user the cards
 /// they had before rather than the spawn.
 fn os_tmp_directories() -> Vec<PathBuf> {
-    let literal = Path::new(OS_TMP_DIR);
-    let Ok(resolved) = std::fs::canonicalize(literal) else {
-        crate::log!(
-            "[CcSettings] {} is not a reachable directory. Claude Code will keep asking \
-             before it writes a throwaway file there.",
-            literal.display()
-        );
-        return Vec::new();
-    };
-    if resolved == literal {
-        vec![resolved]
-    } else {
-        vec![resolved, literal.to_path_buf()]
+    os_tmp_directories_with(std::env::var_os("TMPDIR"))
+}
+
+fn os_tmp_directories_with(tmpdir: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let tmpdir = tmpdir.filter(|dir| !dir.is_empty()).map(PathBuf::from);
+    let mut granted: Vec<PathBuf> = Vec::new();
+    for literal in std::iter::once(PathBuf::from(OS_TMP_DIR)).chain(tmpdir) {
+        let Ok(resolved) = std::fs::canonicalize(&literal) else {
+            crate::log!(
+                "[CcSettings] {} is not a reachable directory. Claude Code will keep asking \
+                 before it writes a throwaway file there.",
+                literal.display()
+            );
+            continue;
+        };
+        for entry in [resolved, literal] {
+            if !granted.contains(&entry) {
+                granted.push(entry);
+            }
+        }
     }
+    granted
 }
 
 /// Render the settings file. The `permissions` key is omitted entirely when the
@@ -640,7 +649,7 @@ mod tests {
     /// entry names the same real directory.
     #[test]
     fn os_tmp_entries_all_name_the_same_real_directory() {
-        let entries = os_tmp_directories();
+        let entries = os_tmp_directories_with(None);
         assert!(
             !entries.is_empty(),
             "the OS temp dir must resolve on this platform"
@@ -660,13 +669,29 @@ mod tests {
     /// where `/tmp` is real gets one entry, not a duplicate pair.
     #[test]
     fn os_tmp_emits_the_literal_only_when_it_differs() {
-        let entries = os_tmp_directories();
+        let entries = os_tmp_directories_with(None);
         let real = std::fs::canonicalize(OS_TMP_DIR).expect("OS temp resolves");
         let expected = if real == Path::new(OS_TMP_DIR) { 1 } else { 2 };
         assert_eq!(
             entries.len(),
             expected,
             "one entry when the OS temp path is real, two when it is a symlink",
+        );
+    }
+
+    /// The prompt steers scratch to `${TMPDIR:-/tmp}`, so a session may write
+    /// there without a card, as it may in `/tmp`.
+    #[test]
+    fn the_per_user_temp_dir_is_granted_beside_os_tmp() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let entries = os_tmp_directories_with(Some(tmpdir.path().into()));
+        let real = std::fs::canonicalize(tmpdir.path()).unwrap();
+        assert!(entries.contains(&real), "{entries:?}");
+        assert!(entries.len() > os_tmp_directories_with(None).len());
+        // An unset or empty TMPDIR grants only the OS temp dir.
+        assert_eq!(
+            os_tmp_directories_with(Some(std::ffi::OsString::new())),
+            os_tmp_directories_with(None)
         );
     }
 

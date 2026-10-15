@@ -189,22 +189,33 @@ test_own_starts_an_isolated_gateway_and_stops_it() {
     cat >"$fake" <<EOF
 #!/bin/bash
 env >"$env_file"
+echo \$\$ >"\$LUCIDOS_GATEWAY_DATA/gateway.pid"
 exec -a lucidos-gateway sleep 30
 EOF
     chmod +x "$fake"
     dir="$(e2e_gateway_dir)"
+    # The case patterns below carry a leading paren, because bash 3.2 reads a
+    # bare pattern paren as the end of the command substitution.
     # shellcheck disable=SC2031 # each case scopes its environment to its own subshell
     out="$(
         export WORKSPACE="$E2E_WORKSPACE" ENGINE_PORT=5341 LUCIDOS_E2E_GATEWAY=own
         export LUCIDOS_GATEWAY_PORT=5251 LUCIDOS_WORKSPACE_ID=dev
         ENGINE_BIN="$SANDBOX/lucidos-engine" GATEWAY_BIN="$fake"
-        # Health answers once the fake has written its env; the listing then
-        # reads the registry the harness seeded.
-        curl() { [ -s "$env_file" ]; }
+        # Health answers once the fake has written its env. The adopt POST is
+        # recorded and accepted, and the listing then reports what it carried.
+        # shellcheck disable=SC2329 # called by start_e2e_gateway in this subshell
+        curl() {
+            case "$*" in
+                (*/workspaces/adopt*)
+                    printf '%s\n' "$@" >"$SANDBOX/adopt-request"
+                    printf '{"workspace":{"id":"e2e-test","port":5341}}\n200'
+                    ;;
+                (*) [ -s "$env_file" ] ;;
+            esac
+        }
         # shellcheck disable=SC2329 # called by attach_e2e_gateway in this subshell
         e2e_gateway_listed_port() {
-            python3 -c 'import json,sys; print([w["port"] for w in json.load(open(sys.argv[1]))["workspaces"] if w["id"]=="e2e-test"][0])' \
-                "$dir/config/workspaces.json"
+            if grep -q '"port": 5341' "$SANDBOX/adopt-request"; then echo 5341; fi
         }
         attach_e2e_gateway >/dev/null 2>&1 || echo "attach failed"
         echo "port=${LUCIDOS_GATEWAY_PORT:-} id=${LUCIDOS_WORKSPACE_ID:-}"
@@ -217,9 +228,9 @@ EOF
     esac
     check "data dir is inside the e2e workspace" grep -qx "LUCIDOS_GATEWAY_DATA=$dir" "$env_file"
     check "the gateway inherits no workspace id" not_grep '^LUCIDOS_WORKSPACE_ID=' "$env_file"
-    python3 -c 'import json,sys; w=json.load(open(sys.argv[1]))["workspaces"][0]; sys.exit(0 if w["port"]==5341 and w["autostart"] is False else 1)' \
-        "$dir/config/workspaces.json"
-    assert_eq 0 "$?" "registry lists the engine's port, autostart off"
+    check "the workspace was adopted at the engine's port" grep -q '"port": 5341' "$SANDBOX/adopt-request"
+    check "autostart is left to its off default" not_grep autostart "$SANDBOX/adopt-request"
+    check "nothing wrote the gateway's registry file" test ! -e "$dir/config/workspaces.json"
 
     stop_e2e_gateway >/dev/null
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then

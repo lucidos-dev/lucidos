@@ -403,11 +403,9 @@ impl LucidosEngine {
     /// fan-out of LLM calls is worth avoiding. `continue_chat` itself returns after
     /// spawning, so this does not wait for the turns to finish.
     ///
-    /// Called from `main.rs` AFTER `thread_queue.spawn_settle_subscriber()`: a
-    /// resumed chat turn immediately reads as `running`, and the settle subscriber
-    /// must be live for that status change to reconcile a queue slot. It also must
-    /// follow `recover_orphan_tool_calls`, or the re-entered turn reconstructs an
-    /// unpaired `tool_use` block and the provider rejects the call.
+    /// Called from `main.rs` after `recover_orphan_tool_calls`. Otherwise the
+    /// re-entered turn reconstructs an unpaired `tool_use` block and the
+    /// provider rejects the call.
     ///
     /// Returns the thread ids it actually drove into `continue_chat`, which
     /// `settle_unresumed_switch_threads` needs to EXCLUDE: a resume that has only

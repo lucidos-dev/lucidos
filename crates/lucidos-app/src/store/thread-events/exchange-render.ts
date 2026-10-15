@@ -1,6 +1,7 @@
 import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import type { ThreadStatus } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
+import { formatTokens } from '../../utils/formatTokens';
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, isAgentReplyText, isChangeLifecycleEvent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool, apiCallIdOf, parentToolUseIdOf } from './exchange';
 import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, computeExchanges, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUnsentExchange, isUningestedMessage, isWaitingTypedMessage, opensAwaitingAnswer, toolUseIdOf } from './exchange-grouping';
@@ -163,6 +164,14 @@ export function memoryRecalledLabel(results: number): string {
   if (results <= 0) return 'No memories recalled';
   if (results === 1) return 'Recalled 1 memory';
   return `Recalled ${results} memories`;
+}
+/** Step label for a `CodingAgentCompacted`: the agent shrank its own
+ *  context, and the counter drops here. */
+export function compactedLabel(event: Extract<ThreadEvent, { type: 'CodingAgentCompacted' }>): string {
+  const { pre_tokens: before, post_tokens: after } = event;
+  if (before == null) return 'Compacted its context';
+  if (after == null) return `Compacted its context from ${formatTokens(before)} tokens`;
+  return `Compacted its context from ${formatTokens(before)} to ${formatTokens(after)} tokens`;
 }
 /** The park's own step, i.e. the one the event-wait row replaces. See the
  *  `EventWaitStarted` arm of `exchangeResponseEvents`. */
@@ -427,6 +436,9 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
         });
         break;
       }
+      case 'CodingAgentCompacted':
+        steps.push({ description: compactedLabel(event), outcome: 'success' });
+        break;
       case 'ThoughtStreamed': {
         // ThoughtStreamed marks "about to invoke the LLM with this context".
         // Stay pending (spinner) until the LLM produces output, the next
@@ -722,6 +734,8 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
   let currentContext: ContextAssembledData | undefined;
   let legacyAcc: LegacyContextEvents = {};
   const callCaptures = new Map<string, ContextCapture>();
+  // Each sub-agent's latest capture, keyed by its `Agent` call.
+  const agentCaptures = new Map<string, ContextCapture>();
   const attachLegacyToLastThinking = () => {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
@@ -766,6 +780,9 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         });
         break;
       }
+      case 'CodingAgentCompacted':
+        pushStep({ type: 'step', description: compactedLabel(event), outcome: 'success', created });
+        break;
       case 'ThoughtStreamed': {
         // Stay pending until the next visible output supersedes us. See the
         // longer comment in `exchangeSteps`.
@@ -818,9 +835,11 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         );
         const apiCall = apiCallIdOf(event);
         if (apiCall) callCaptures.set(apiCall, snap);
+        const parent = parentToolUseIdOf(event);
+        if (parent) agentCaptures.set(parent, snap);
         bindSnapshotToStep(
           snap,
-          parentToolUseIdOf(event),
+          parent,
           events,
           (e) => e.type === 'step',
           (e) => e.type === 'step' && e.description === 'Thinking',
@@ -1226,6 +1245,10 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
     e => (e.type === 'step' ? e.api_call_id : undefined),
     (e, snap) => { if (e.type === 'step') e.contextCapture = snap; },
   );
+  for (const e of events) {
+    const final = e.type === 'step' && e.tool_use_id ? agentCaptures.get(e.tool_use_id) : undefined;
+    if (final && e.type === 'step') e.finalContextCapture = final;
+  }
   // Resolve pending spinners on finished exchanges: a missing ToolResult from
   // a killed session, parallel calls with lost results, or a non-last exchange
   // genuinely abandoned. Mid-flight chat injection means a non-last exchange
@@ -1289,8 +1312,9 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
  *  row's `children`, in clock order. The group then sits where the agent row
  *  does, and the parent's own rows keep their places around it (ADR 0201).
  *
- *  A step whose `Agent` call is not in this turn stays where it is. That covers
- *  a call in an earlier exchange, and rows written before the field existed. */
+ *  The grouping routes a sub-agent's events to its `Agent` call's turn. A step
+ *  whose call is not in this turn still stays where it is. That covers a call
+ *  outside the loaded window, and rows written before the field existed. */
 function nestSubAgentSteps(events: ResponseEvent[]): ResponseEvent[] {
   const agents = new Map<string, Extract<ResponseEvent, { type: 'step' }>>();
   for (const e of events) {
@@ -1488,12 +1512,13 @@ export function exchangeError(exchange: Exchange): ExchangeError | null {
  *  - the turn root, in `ChatExchange`, carries the turn's STARTER;
  *  - the failure card, in `ChatExchange`, carries its own `ResponseFailed`
  *    (see `ExchangeError.eventId` above);
- *  - each widget card (`WidgetCard`) carries its own `WidgetShown`, so "Show
- *    in thread" lands on the card and not on the turn's start.
+ *  - each old `WidgetShown`'s inline widget (`InlineWidget`) carries its own
+ *    id, so "Show in thread" lands on it and not on the turn's start. A
+ *    reply's inline widget wears nothing: its pin names the turn's starter.
  *
  *  Every other step is deliberately unstamped, inline steps most of all: the
  *  "Show steps" toggle can hide them, and an id there would resolve only
- *  sometimes. A widget card is a marker, drawn whatever the toggle says.
+ *  sometimes. An old showing is a marker, drawn whatever the toggle says.
  *
  *  Declared here rather than inferred at the deep-link site, so the stamping
  *  rule has ONE definition. `deepLinkAnchorForEvent` reads it to decide

@@ -39,6 +39,8 @@ fn test_spawn_args<'a>(
         binary_override: None,
         permission_mode: None,
         additional_directories: &[],
+        auto_compact: None,
+        agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     }
 }
 
@@ -66,6 +68,8 @@ fn test_spawn_args_with_event<'a>(
         binary_override: None,
         permission_mode: None,
         additional_directories: &[],
+        auto_compact: None,
+        agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     }
 }
 
@@ -93,6 +97,8 @@ fn test_spawn_args_with_repo<'a>(
         binary_override: None,
         permission_mode: None,
         additional_directories: &[],
+        auto_compact: None,
+        agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     }
 }
 
@@ -125,6 +131,8 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         binary_override: None,
         permission_mode: None,
         additional_directories: &[],
+        auto_compact: None,
+        agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     };
     let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
@@ -1036,6 +1044,59 @@ fn build_command_lets_a_workspace_env_var_override_the_byte_idle_deadline() {
     );
 }
 
+fn auto_compact_env(args: &SpawnArgs<'_>) -> Option<String> {
+    collect_envs(&session_command(args, None))
+        .get(std::ffi::OsStr::new(
+            crate::engine::auto_compact_trial::AUTO_COMPACT_WINDOW_ENV,
+        ))
+        .map(|v| v.to_string_lossy().into_owned())
+}
+
+#[test]
+fn build_command_is_unchanged_while_the_auto_compact_trial_is_off() {
+    use crate::engine::auto_compact_trial::{decide, TrialMode};
+    let p = std::path::Path::new("/tmp");
+    let thread_id = uuid::Uuid::new_v4();
+    let unset = test_spawn_args(p, p, thread_id);
+    let mut off = test_spawn_args(p, p, thread_id);
+    off.auto_compact = decide(TrialMode::Off, None, thread_id);
+    let without_marker = |args: &SpawnArgs<'_>| {
+        let mut env = collect_envs(&session_command(args, None));
+        env.remove(std::ffi::OsStr::new(
+            crate::runtime::agent_run_marker::AGENT_RUN_ENV,
+        ));
+        env
+    };
+    assert_eq!(without_marker(&unset), without_marker(&off));
+    assert_eq!(auto_compact_env(&off), None);
+}
+
+#[test]
+fn build_command_sets_the_window_the_setting_records() {
+    use crate::engine::auto_compact_trial::{decide, AutoCompactArm, TrialMode};
+    let p = std::path::Path::new("/tmp");
+    let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    let setting = decide(TrialMode::On, None, uuid::Uuid::new_v4()).unwrap();
+    assert_eq!(setting.arm, AutoCompactArm::Window);
+    args.auto_compact = Some(setting);
+    assert_eq!(
+        auto_compact_env(&args),
+        setting.window.map(|w| w.to_string()),
+        "the spawned window is the recorded one"
+    );
+}
+
+#[test]
+fn build_command_leaves_a_workspace_auto_compact_window_alone() {
+    use crate::engine::auto_compact_trial::{decide, TrialMode, AUTO_COMPACT_WINDOW_ENV};
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![(AUTO_COMPACT_WINDOW_ENV.to_string(), "250000".to_string())];
+    let mut args = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    args.user_env_vars = &user_env;
+    args.auto_compact = decide(TrialMode::Ab, Some("250000"), uuid::Uuid::new_v4());
+    assert_eq!(auto_compact_env(&args).as_deref(), Some("250000"));
+}
+
 /// The argv `--permission-mode` value, for the mode assertions below.
 fn permission_mode_arg(cmd: &tokio::process::Command) -> Option<String> {
     let args: Vec<String> = cmd
@@ -1244,7 +1305,7 @@ fn a_session_without_a_relay_keeps_its_own_vertex_url() {
 }
 
 /// The replay is how the engine learns an input was read (ADR 0268). A spawn
-/// without it would owe every forwarded input until the silent grace settles it.
+/// without it would owe every forwarded input forever, so no idle could exit.
 #[test]
 fn build_command_requests_input_replays_on_fresh_and_resumed_sessions() {
     let thread_id = uuid::Uuid::new_v4();

@@ -21,24 +21,19 @@ use std::path::{Path, PathBuf};
 /// A throwaway `$HOME`, removed when the test ends.
 struct Fixture {
     home: PathBuf,
+    _tmp: tempfile::TempDir,
 }
 
 /// One registry entry, as `(slug, display name)`.
 type Entry<'a> = (&'a str, &'a str);
 
 impl Fixture {
-    fn new(tag: &str) -> Self {
-        let home = std::env::temp_dir().join(format!(
-            "lucidos-peers-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::create_dir_all(&home).unwrap();
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
         // macOS puts the temp dir behind a symlink, and an un-canonicalised
         // root makes every `starts_with` on a resolved path miss.
-        let home = std::fs::canonicalize(&home).unwrap();
-        Fixture { home }
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        Fixture { home, _tmp: tmp }
     }
 
     fn roots(&self) -> ScanRoots {
@@ -112,17 +107,11 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.home).ok();
-    }
-}
-
 // ── Locating a workspace ───────────────────────────────────────────────────
 
 #[test]
 fn a_workspace_on_the_other_install_is_found() {
-    let fx = Fixture::new("other");
+    let fx = Fixture::new();
     fx.desktop_app(&[("work", "work")]);
     let ours = fx.source_checkout(&[("dev", "dev")]);
 
@@ -140,7 +129,7 @@ fn a_workspace_on_the_other_install_is_found() {
 /// listing. Answering with ourselves would send the page back here.
 #[test]
 fn our_own_install_is_never_a_peer() {
-    let fx = Fixture::new("self");
+    let fx = Fixture::new();
     fx.desktop_app(&[("work", "work")]);
     let ours = fx.source_checkout(&[("dev", "dev")]);
 
@@ -149,7 +138,7 @@ fn our_own_install_is_never_a_peer() {
 
 #[test]
 fn a_display_name_resolves_to_its_slug() {
-    let fx = Fixture::new("display");
+    let fx = Fixture::new();
     fx.desktop_app(&[("my-space", "My Space")]);
     let ours = fx.source_checkout(&[]);
 
@@ -162,7 +151,7 @@ fn a_display_name_resolves_to_its_slug() {
 /// The second arm: a name nobody displays, which slugifies onto a real slug.
 #[test]
 fn a_slug_resolves_even_when_no_display_name_matches() {
-    let fx = Fixture::new("slug");
+    let fx = Fixture::new();
     fx.desktop_app(&[("my-space", "Something Else")]);
     let ours = fx.source_checkout(&[]);
 
@@ -174,7 +163,7 @@ fn a_slug_resolves_even_when_no_display_name_matches() {
 
 #[test]
 fn two_installs_carrying_the_name_are_ambiguous() {
-    let fx = Fixture::new("ambiguous");
+    let fx = Fixture::new();
     fx.desktop_app(&[("shared", "shared")]);
     fx.instance("alt", 5300, &[("shared", "shared")]);
     let ours = fx.source_checkout(&[]);
@@ -189,7 +178,7 @@ fn two_installs_carrying_the_name_are_ambiguous() {
 /// directories share one data dir, so they carry one registry between them.
 #[test]
 fn one_install_found_twice_is_not_ambiguous() {
-    let fx = Fixture::new("twice");
+    let fx = Fixture::new();
     fx.desktop_app(&[("work", "work")]);
     let second_dir = fx.home.join("Applications2");
     std::fs::create_dir_all(second_dir.join("Lucidos.app/Contents")).unwrap();
@@ -227,7 +216,7 @@ fn one_install_found_twice_is_not_ambiguous() {
 /// install that may have lost. Naming it navigates the user to a stranger.
 #[test]
 fn a_hit_on_a_port_two_other_installs_contend_for_is_dropped() {
-    let fx = Fixture::new("contended");
+    let fx = Fixture::new();
     fx.desktop_app(&[("work", "work")]);
     fx.instance(
         "alt",
@@ -244,7 +233,7 @@ fn a_hit_on_a_port_two_other_installs_contend_for_is_dropped() {
 /// them into a single hit and inventory order silently picked the winner.
 #[test]
 fn two_installs_sharing_a_port_and_a_slug_never_pick_a_winner() {
-    let fx = Fixture::new("collapse");
+    let fx = Fixture::new();
     fx.desktop_app(&[("shared", "shared")]);
     fx.instance(
         "alt",
@@ -261,7 +250,7 @@ fn two_installs_sharing_a_port_and_a_slug_never_pick_a_winner() {
 /// here, on a slug we do not serve.
 #[test]
 fn an_install_contending_for_our_own_port_is_not_a_peer() {
-    let fx = Fixture::new("contention");
+    let fx = Fixture::new();
     fx.desktop_app(&[("work", "work")]);
     let ours = fx.source_checkout(&[]);
 
@@ -280,7 +269,7 @@ fn an_install_contending_for_our_own_port_is_not_a_peer() {
 /// path, so a traversal reads as an ordinary miss.
 #[test]
 fn a_traversal_shaped_name_is_a_miss() {
-    let fx = Fixture::new("traversal");
+    let fx = Fixture::new();
     fx.desktop_app(&[("work", "work")]);
     let ours = fx.source_checkout(&[]);
 
@@ -293,7 +282,7 @@ fn a_traversal_shaped_name_is_a_miss() {
 
 #[test]
 fn an_install_with_no_registry_is_skipped() {
-    let fx = Fixture::new("bare");
+    let fx = Fixture::new();
     std::fs::create_dir_all(fx.home.join("Applications/Lucidos.app/Contents")).unwrap();
     std::fs::create_dir_all(fx.home.join("Library/Application Support/com.lucidos.app")).unwrap();
     let ours = fx.source_checkout(&[]);

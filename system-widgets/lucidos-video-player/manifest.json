@@ -1,6 +1,7 @@
 {
   "name": "Video player",
   "description": "Plays one video clip: the first frame, play and pause, a scrubber, the time and full screen.",
+  "icon": "assets/icon.svg",
   "kind": "widget",
   "reusable": true,
   "params": {

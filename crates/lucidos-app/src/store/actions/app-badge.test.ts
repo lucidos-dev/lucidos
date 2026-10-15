@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { effect } from '@preact/signals';
-import { unreadNotifications, unreadCount } from '../store';
+import { unreadCount, servedUnreadNotifications } from '../store';
 import type { Notification } from '../types';
 import type { WorkspaceStatus } from '../../api/client/control';
 
@@ -91,7 +91,7 @@ beforeEach(() => {
   // badges its own workspace and never reaches for the control plane.
   mocks.workspaceId = null;
   mocks.isPicker = false;
-  unreadNotifications.value = { status: 'not-loaded' };
+  servedUnreadNotifications.value = { status: 'not-loaded' };
   // Module-level, so a listing left by one case would otherwise be the starting
   // total of the next.
   peerWorkspaces.value = [];
@@ -120,17 +120,17 @@ describe('applyAppBadge', () => {
 
 describe('syncWorkspaceAppBadge', () => {
   it('mirrors the unread set the bell projects', () => {
-    unreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
     syncWorkspaceAppBadge();
     expect(setAppBadge).toHaveBeenCalledWith(2);
   });
 
   it('clears when the unread set is empty or has not loaded — the bell shows no count either', () => {
-    unreadNotifications.value = { status: 'loaded', data: [] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
     syncWorkspaceAppBadge();
     expect(clearAppBadge).toHaveBeenCalledTimes(1);
 
-    unreadNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
     syncWorkspaceAppBadge();
     expect(clearAppBadge).toHaveBeenCalledTimes(2);
     expect(setAppBadge).not.toHaveBeenCalled();
@@ -143,7 +143,7 @@ describe('syncWorkspaceAppBadge', () => {
     // has to be able to overwrite a value it never observed changing. A sync
     // that skipped a write when its own count was unchanged would leave a
     // push-written icon reading 1 next to a bell reading 0.
-    unreadNotifications.value = { status: 'loaded', data: [] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
     syncWorkspaceAppBadge();
     syncWorkspaceAppBadge();
     expect(clearAppBadge).toHaveBeenCalledTimes(2);
@@ -151,7 +151,7 @@ describe('syncWorkspaceAppBadge', () => {
 
   it('does not touch the web badge under Tauri (native dock badge owns it)', () => {
     (isTauri as ReturnType<typeof vi.fn>).mockReturnValue(true);
-    unreadNotifications.value = { status: 'loaded', data: makeUnread(4) };
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(4) };
     syncWorkspaceAppBadge();
     expect(setAppBadge).not.toHaveBeenCalled();
     expect(clearAppBadge).not.toHaveBeenCalled();
@@ -173,14 +173,14 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
       workspace('other', 3),
       workspace('notes', 1),
     ]);
-    unreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
     await refreshOtherWorkspacesUnread();
     expect(setAppBadge).toHaveBeenLastCalledWith(6);
   });
 
   it('counts a workspace with no reported count as 0 (stopped, so no engine to poll)', async () => {
     mocks.listWorkspaces.mockResolvedValue([workspace('other'), workspace('notes', 2)]);
-    unreadNotifications.value = { status: 'loaded', data: [] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
     await refreshOtherWorkspacesUnread();
     expect(setAppBadge).toHaveBeenLastCalledWith(2);
   });
@@ -191,12 +191,12 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
     // not re-probed us). Reading our own row from it would leave the icon
     // disagreeing with the bell about the workspace on screen.
     mocks.listWorkspaces.mockResolvedValue([workspace('myws', 5), workspace('other', 3)]);
-    unreadNotifications.value = { status: 'loaded', data: makeUnread(5) };
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(5) };
     await refreshOtherWorkspacesUnread();
     expect(setAppBadge).toHaveBeenLastCalledWith(8);
 
     // One read, no refetch: 4 of ours + the same 3 elsewhere.
-    unreadNotifications.value = { status: 'loaded', data: makeUnread(4) };
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(4) };
     syncWorkspaceAppBadge();
     expect(setAppBadge).toHaveBeenLastCalledWith(7);
     expect(mocks.listWorkspaces).toHaveBeenCalledTimes(1);
@@ -204,7 +204,7 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
 
   it('keeps the last-good total when the gateway blips', async () => {
     mocks.listWorkspaces.mockResolvedValue([workspace('other', 4)]);
-    unreadNotifications.value = { status: 'loaded', data: makeUnread(1) };
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(1) };
     await refreshOtherWorkspacesUnread();
     expect(setAppBadge).toHaveBeenLastCalledWith(5);
 
@@ -228,7 +228,7 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
     mocks.listWorkspaces
       .mockReturnValueOnce(stale)
       .mockResolvedValueOnce([workspace('other', 1)]);
-    unreadNotifications.value = { status: 'loaded', data: [] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
 
     const first = refreshOtherWorkspacesUnread();
     await refreshOtherWorkspacesUnread();
@@ -248,7 +248,7 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
     // rows, so the fetch has to run.
     (isTauri as ReturnType<typeof vi.fn>).mockReturnValue(true);
     mocks.listWorkspaces.mockResolvedValueOnce([workspace('other', 4)]);
-    unreadNotifications.value = { status: 'loaded', data: [] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
     await refreshOtherWorkspacesUnread();
     expect(mocks.listWorkspaces).toHaveBeenCalled();
     expect(setAppBadge).not.toHaveBeenCalled();
@@ -265,7 +265,7 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
 
 describe('a bare root context badges its own workspace only', () => {
   it('never calls the control plane (a direct engine origin serves one workspace, and has no /~/ routes)', async () => {
-    unreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
     await refreshOtherWorkspacesUnread();
     syncWorkspaceAppBadge();
     expect(mocks.listWorkspaces).not.toHaveBeenCalled();
@@ -281,7 +281,7 @@ describe('why the badge needs an explicit re-assert', () => {
     // re-runs nothing, and an icon badge written behind the page's back (by a
     // push) would never be corrected. This test pins the mechanism so nobody
     // "simplifies" the explicit re-asserts back out.
-    unreadNotifications.value = { status: 'loaded', data: [] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
     let runs = 0;
     const dispose = effect(() => {
       unreadCount.value;
@@ -290,11 +290,11 @@ describe('why the badge needs an explicit re-assert', () => {
     expect(runs).toBe(1);
 
     // A fresh array with the same length — the signal changed, the count didn't.
-    unreadNotifications.value = { status: 'loaded', data: [] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
     expect(runs).toBe(1);
 
     // A real change does re-run it.
-    unreadNotifications.value = { status: 'loaded', data: makeUnread(1) };
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(1) };
     expect(runs).toBe(2);
     dispose();
   });

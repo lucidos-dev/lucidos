@@ -98,6 +98,10 @@ pub(crate) enum PreEmittedOrigin {
     /// subscription does not hold its thread's turn, so there is never a
     /// dangling tool call for the delivery to land in instead.
     WaitReentry(Uuid),
+    /// A *cache keep-alive* (`engine::event_wait::keep_alive`), anchored to its
+    /// own hidden `PromptInjected`. It only ever starts a fresh `--resume` turn:
+    /// it never enters a live session, waits on a hold, or supersedes a card.
+    KeepAlive(Uuid),
 }
 
 impl PreEmittedOrigin {
@@ -106,7 +110,8 @@ impl PreEmittedOrigin {
         match self {
             PreEmittedOrigin::Message(id)
             | PreEmittedOrigin::EngineReentry(id)
-            | PreEmittedOrigin::WaitReentry(id) => id,
+            | PreEmittedOrigin::WaitReentry(id)
+            | PreEmittedOrigin::KeepAlive(id) => id,
         }
     }
 
@@ -114,8 +119,14 @@ impl PreEmittedOrigin {
     pub(crate) fn is_engine_reentry(self) -> bool {
         matches!(
             self,
-            PreEmittedOrigin::EngineReentry(_) | PreEmittedOrigin::WaitReentry(_)
+            PreEmittedOrigin::EngineReentry(_)
+                | PreEmittedOrigin::WaitReentry(_)
+                | PreEmittedOrigin::KeepAlive(_)
         )
+    }
+
+    pub(crate) fn is_keep_alive(self) -> bool {
+        matches!(self, PreEmittedOrigin::KeepAlive(_))
     }
 
     /// How a LIVE thread injects this re-entry. `Message` is not an engine
@@ -123,7 +134,7 @@ impl PreEmittedOrigin {
     pub(crate) fn inject_kind(self) -> crate::engine::InjectedPromptKind {
         match self {
             PreEmittedOrigin::Message(_) => crate::engine::InjectedPromptKind::UserText,
-            PreEmittedOrigin::EngineReentry(_) => {
+            PreEmittedOrigin::EngineReentry(_) | PreEmittedOrigin::KeepAlive(_) => {
                 crate::engine::InjectedPromptKind::ReentryFromEngine
             }
             PreEmittedOrigin::WaitReentry(_) => crate::engine::InjectedPromptKind::ReentryFromWait,
@@ -147,6 +158,7 @@ impl LucidosEngine {
         invocation: TriggerInvocation,
         go_to_review: bool,
         side_effect_grant: Vec<crate::engine::command_guard::SideEffectCategory>,
+        mcp_servers: Vec<String>,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
         // The backend this trigger pinned, or `None` to let the model's own
@@ -171,12 +183,14 @@ impl LucidosEngine {
                 invocation,
                 go_to_review,
                 side_effect_grant,
+                mcp_servers,
                 queue_entry_id,
             }),
             None, // app_context
             None, // file_context
             reasoning_effort,
             provider,
+            None,
             None,
             None,
             None,
@@ -225,6 +239,9 @@ impl LucidosEngine {
         url_context: Option<crate::api::UrlContext>,
         parent_thread_id: Option<Uuid>,
         spawning_event_id: Option<Uuid>,
+        // The child's wake mode, beside its parent link. `None` for every
+        // message but a child's spawning one.
+        wake_mode: Option<crate::engine::thread_events::WakeMode>,
         mode: ActorMode,
         cc_model: Option<&str>,
         coding_agent: Option<crate::runtime::CodingAgent>,
@@ -243,9 +260,9 @@ impl LucidosEngine {
         // behind it. Named rather than a bare `bool` so the call sites stay
         // readable in a column of `None`s.
         urgency: crate::engine::FollowUpUrgency,
-        // This follow-up's place in its thread's order. Only a typed follow-up
-        // to a coding-agent thread holds one, joined by the chat handler.
-        follow_up_turn: Option<crate::engine::FollowUpTurn>,
+        // This input's place in its thread's input order, taken by the chat
+        // handler's admission. Other callers promise no order and pass `None`.
+        input_turn: Option<crate::engine::InputTurn>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         self.process_message_with_steps_internal(
             user_message,
@@ -265,6 +282,7 @@ impl LucidosEngine {
             url_context,
             parent_thread_id,
             spawning_event_id,
+            wake_mode,
             mode,
             cc_model,
             coding_agent,
@@ -274,7 +292,7 @@ impl LucidosEngine {
             voice_session_id,
             None,
             urgency,
-            follow_up_turn,
+            input_turn,
         )
         .await
     }

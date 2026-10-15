@@ -39,6 +39,20 @@ pub async fn is_home_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool
     .await
 }
 
+/// Whether `parent_id`, spawning a child, is the home thread, for the child's
+/// default *wake mode*. An unreadable row reads as no, so the child defaults to
+/// `wake`: every doubt wakes (ADR 0451).
+pub(crate) async fn spawner_is_home(pool: &sqlx::PgPool, parent_id: Uuid) -> bool {
+    is_home_thread(pool, parent_id).await.unwrap_or_else(|e| {
+        crate::log!(
+            "[FanOut] Home check for {} failed, so its child wakes it: {}",
+            parent_id,
+            e
+        );
+        false
+    })
+}
+
 /// Create the home thread unless the workspace already has one, and return its
 /// id. Safe to call on every boot.
 ///

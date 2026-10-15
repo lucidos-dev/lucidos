@@ -302,33 +302,8 @@ pub fn restore_plan(
 mod tests {
     use super::*;
 
-    /// A throwaway app-data dir that removes itself.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("the clock is after the epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("lucidos-window-session-{tag}-{unique}"));
-            std::fs::create_dir_all(&path).expect("create the temp dir");
-            Self(path)
-        }
-
-        fn write_raw(&self, body: &str) {
-            std::fs::write(record_path(&self.0), body).expect("write the record");
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn write_raw(app_data: &Path, body: &str) {
+        std::fs::write(record_path(app_data), body).expect("write the record");
     }
 
     use crate::window_restore::Rect;
@@ -566,8 +541,9 @@ mod tests {
     // always did: each frame unanchored, restoring exactly where it says.
     #[test]
     fn a_record_with_no_anchors_reads_as_before() {
-        let tmp = TempDir::new("unanchored");
-        tmp.write_raw(
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
             r#"{"open":["myws","dev"],"units":"logical-points","geometry":{
                 "myws":{"x":0,"y":356,"width":1280,"height":1084},
                 "dev":{"x":1763,"y":1473,"width":1728,"height":1084}}}"#,
@@ -765,7 +741,7 @@ mod tests {
 
     #[test]
     fn a_written_record_reads_back_identical() {
-        let tmp = TempDir::new("roundtrip");
+        let tmp = tempfile::tempdir().unwrap();
         let session = capture(
             &WindowSession::default(),
             &[snapshot(
@@ -787,8 +763,9 @@ mod tests {
     // so the launch after the upgrade still reopens every workspace.
     #[test]
     fn a_legacy_record_keeps_its_open_set_and_drops_its_frames() {
-        let tmp = TempDir::new("legacy");
-        tmp.write_raw(
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
             r#"{"open":["myws","dev"],
                 "geometry":{"myws":{"x":4050,"y":3250,"width":3456,"height":2168}}}"#,
         );
@@ -801,8 +778,9 @@ mod tests {
 
     #[test]
     fn a_stamped_record_keeps_its_frames() {
-        let tmp = TempDir::new("stamped");
-        tmp.write_raw(
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
             r#"{"open":["myws"],"units":"logical-points",
                 "geometry":{"myws":{"x":100,"y":200,"width":800,"height":600}}}"#,
         );
@@ -815,11 +793,11 @@ mod tests {
     // This runs on the client's boot path, so nothing here may be fatal.
     #[test]
     fn a_missing_or_unreadable_record_restores_nothing() {
-        let tmp = TempDir::new("garbage");
+        let tmp = tempfile::tempdir().unwrap();
         assert_eq!(read(tmp.path()), WindowSession::default());
 
         for body in [r#"{ not json"#, "", r#"{"open":"myws"}"#, "[]"] {
-            tmp.write_raw(body);
+            write_raw(tmp.path(), body);
             assert_eq!(
                 read(tmp.path()),
                 WindowSession::default(),
@@ -832,8 +810,8 @@ mod tests {
     // of restoring nothing.
     #[test]
     fn a_partial_record_keeps_the_half_it_carries() {
-        let tmp = TempDir::new("partial");
-        tmp.write_raw(r#"{"open":["myws"]}"#);
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(tmp.path(), r#"{"open":["myws"]}"#);
         let session = read(tmp.path());
         assert_eq!(session.open, vec!["myws"]);
         assert!(session.geometry.is_empty());

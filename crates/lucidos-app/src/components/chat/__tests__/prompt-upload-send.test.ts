@@ -34,10 +34,8 @@ describe('PromptInput upload send queue', () => {
     expect(promptSource).toContain('Send after image upload');
   });
 
-  // `submit` empties the box at its own dispatch point and returns before that
-  // one, the send being owed to an upload. Left alone, the box would still
-  // claim to hold unsent typing, and `resolveEmptyDraftSync` would adopt the
-  // message just sent straight back as a draft.
+  // `submit` returns before its own clear, the send being owed to an upload,
+  // so the queued send empties the box where it actually dispatches.
   it('empties the box where the queued send actually dispatches', () => {
     const fn = promptSource.match(/function sendQueuedAfterUpload\([\s\S]*?\n  \}/);
     expect(fn, 'sendQueuedAfterUpload() not found').not.toBeNull();

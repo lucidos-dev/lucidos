@@ -253,6 +253,20 @@ URL: {}\n\
 const HOME_THREAD_CONTEXT: &str = "[THREAD CONTEXT]\n\
      This is the workspace's home thread, where the user talks to you by \
      default. It never ends, and nobody can archive or delete it.\n\
+     START A THREAD FOR WORK. Here this replaces SPAWN SPARINGLY's default of \
+     doing the work yourself. Its cap, and never one thread per list item, \
+     still hold. Answer a question or a quick lookup yourself. A conversation \
+     that needs the user's answers, such as the setup interview, stays here. \
+     Give anything more (research, a draft, a multi-step task) its own thread: \
+     run_thread, or run_coding_agent when the user asked for a code change. \
+     Work then runs in parallel, and this thread stays free for the user's \
+     next message.\n\
+     Work the user reads goes in relation='top': no report comes back here, so \
+     this thread pays no re-entry and keeps no filed report. Spawn a child only \
+     when you will act on its result. A child started here defaults to wake_mode \
+     'no-wake': its clean report is filed for your next turn. Pass 'wake' when \
+     you need the result to continue, or 'wake-when-all-done' to combine \
+     several. A failure always wakes you.\n\
      From here follow_up_child_thread reaches ANY thread in this workspace, \
      coding-agent threads included, not only your own children. A thread you did \
      not spawn reports to its own parent, so read its reply later with \
@@ -402,7 +416,7 @@ mod tests {
     use super::super::workspace_prompt_footprint::{
         build_app_knowhow_listing, build_knowhow_section,
     };
-    use super::{active_app_ui_section, active_file_context_section};
+    use super::{active_app_ui_section, active_file_context_section, HOME_THREAD_CONTEXT};
     use crate::core::knowhow::KnowhowDirs;
     use crate::core::{KnowhowListDepth, KnowhowStore};
     use std::path::Path;
@@ -495,6 +509,37 @@ mod tests {
         // But it's a default, not a lock — other work stays possible.
         assert!(section.contains("DEFAULT, not a restriction"));
         assert!(section.contains("work on Lucidos the product itself"));
+    }
+
+    /// Home starts threads for work, overriding only the general rule's
+    /// default of working inline. It still answers a question itself, and the
+    /// setup interview, which runs in Home (ADR 0411), stays there.
+    #[test]
+    fn home_starts_a_thread_for_work_and_answers_questions_itself() {
+        assert!(HOME_THREAD_CONTEXT.contains("START A THREAD FOR WORK"));
+        assert!(HOME_THREAD_CONTEXT.contains("replaces SPAWN SPARINGLY's default"));
+        assert!(HOME_THREAD_CONTEXT.contains("never one thread per list item"));
+        assert!(HOME_THREAD_CONTEXT.contains("Answer a question or a quick lookup yourself"));
+        assert!(HOME_THREAD_CONTEXT.contains("the setup interview, stays here"));
+        assert!(HOME_THREAD_CONTEXT.contains("run_thread, or run_coding_agent"));
+    }
+
+    /// I12 of `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`: Home
+    /// knows its children default to no-wake, and how to ask for more.
+    #[test]
+    fn home_knows_its_children_default_to_no_wake() {
+        assert!(HOME_THREAD_CONTEXT.contains("defaults to wake_mode 'no-wake'"));
+        assert!(HOME_THREAD_CONTEXT.contains("Pass 'wake' when you need the result"));
+        assert!(HOME_THREAD_CONTEXT.contains("'wake-when-all-done' to combine several"));
+        assert!(HOME_THREAD_CONTEXT.contains("A failure always wakes you"));
+    }
+
+    /// ADR 0473: work the user reads is a top-thread, so Home pays for no
+    /// report it would not act on.
+    #[test]
+    fn home_starts_work_the_user_reads_as_a_top_thread() {
+        assert!(HOME_THREAD_CONTEXT.contains("Work the user reads goes in relation='top'"));
+        assert!(HOME_THREAD_CONTEXT.contains("Spawn a child only when you will act on its result"));
     }
 
     #[test]

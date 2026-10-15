@@ -7,13 +7,20 @@
 #   ./scripts/harden-suites.sh stop            # before a fix the result cannot survive
 #   ./scripts/harden-suites.sh wait            # at Phase 4.5: join, then the verdict
 #                   [--codex-abandoned]        #   Phase 3 gave up on the Codex review
-#                   [--budget <seconds>]       #   how long to wait (default 480)
+#                   [--budget <seconds>]       #   how long to wait (default 230)
 #   ./scripts/harden-suites.sh verdict         # the verdict alone
 #   ./scripts/harden-suites.sh start           # a normal run, when the verdict says RERUN
 #
 # `start` selects suites from `git diff main...HEAD`, runs them, and records
-# the start commit. An early run skips the two Codex driver modules, and
-# `wait` runs them alone once the Codex review is joined.
+# the start commit. An early run skips the two Codex driver modules. Once the
+# Codex review is joined, `wait` starts them alone in the background and joins
+# them like any suite, so no `wait` blocks past its budget.
+#
+# `start` also records the tier. An integrated sub-thread's branch runs the
+# fast tier, which the engine names (`lucidos hardened expected-tier`); every
+# other branch runs the full one. The engine's answer wins: HARDEN_TIER names
+# the tier only when no engine answers. HS_LUCIDOS_CMD replaces the CLI in
+# the tests, which must never ask a real engine.
 #
 # The verdict prints one line per suite: PASS, FAIL, VOID <reason>, RUNNING or
 # MISSING. An early result stays valid only while every path changed since the
@@ -25,8 +32,12 @@
 # when the host never recovers (ADR 0351).
 #
 # The run carries the caller's agent run marker, so the turn-end teardown
-# still reaches it (ADR 0391). `stop` walks the pid tree from the recorded pid,
-# never by name.
+# still reaches it (ADR 0391). A Switch leaves it running for the resumed
+# session (ADR 0478). `stop` walks the pid tree from the recorded pid, never
+# by name.
+#
+# A VOID on an allowlisted path names the files that turned the allowlist
+# off. Add each to HS_READ_CHECK_KNOWN if it never reads the path.
 #
 # State and logs: .lucidos/harden-suites/ in the worktree (gitignored).
 #
@@ -78,6 +89,18 @@ branch_paths() {
     git -C "$ROOT" ls-files -o --exclude-standard
 }
 
+# The tier this branch runs. No engine to ask and no HARDEN_TIER is the full
+# tier.
+resolve_tier() {
+    local answer
+    answer="$("${HS_LUCIDOS_CMD:-lucidos}" hardened expected-tier 2>/dev/null)" || answer=""
+    hs_resolve_tier "$answer" "${HARDEN_TIER:-}"
+}
+
+recorded_tier() {
+    hs_normalize_tier "$(cat "$STATE/tier" 2>/dev/null)"
+}
+
 selected_suites() {
     cat "$STATE/suites" 2>/dev/null
     if [ "$(cat "$STATE/mode" 2>/dev/null)" = early ] && grep -q -x rust "$STATE/suites" 2>/dev/null; then
@@ -120,7 +143,7 @@ run_suite() { # <suite>
 }
 
 cmd_start() {
-    local mode=normal suites cargo_lane="" other="" s disabled
+    local mode=normal suites cargo_lane="" other="" s disabled tier label
     case "${1:-}" in
         --early) mode=early ;;
         "") ;;
@@ -140,12 +163,15 @@ cmd_start() {
     echo $$ > "$STATE/pid"
     started_at $$ > "$STATE/pid-started"
     echo "$mode" > "$STATE/mode"
+    tier="$(resolve_tier)"
+    echo "$tier" > "$STATE/tier"
     git -C "$ROOT" rev-parse HEAD > "$STATE/start-sha"
     hs_untracked_fingerprint "$ROOT" > "$STATE/untracked-at-start"
     branch_paths | sort -u > "$STATE/paths"
     { hs_compile_inputs "$ROOT"; hs_source_includes "$ROOT"; } | sort -u > "$STATE/compile-inputs"
     hs_source_includes "$ROOT" 'crates/lucidos-cli/*.rs' > "$STATE/cli-inputs"
     hs_vitest_inputs "$ROOT" > "$STATE/vitest-inputs"
+    hs_generated_drift "$ROOT" > "$STATE/generated-drift"
 
     if ! disabled="$(hs_read_check "$ROOT")"; then
         printf '%s\n' "$disabled" > "$STATE/allowlist-disabled"
@@ -153,7 +179,7 @@ cmd_start() {
         printf '  %s\n' "$disabled"
     fi
 
-    suites="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" < "$STATE/paths")"
+    suites="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" < "$STATE/paths")"
     # The suites file goes last: until it exists, the run is still setting up.
     printf '%s\n' "$suites" | sed '/^$/d' > "$STATE/suites.tmp"
     mv "$STATE/suites.tmp" "$STATE/suites"
@@ -161,7 +187,9 @@ cmd_start() {
         echo "No suites selected for this diff."
         return 0
     fi
-    echo "Suites ($mode): $(tr '\n' ' ' < "$STATE/suites")"
+    label="$mode"
+    if [ "$tier" = fast ]; then label="$mode, fast tier"; fi
+    echo "Suites ($label): $(tr '\n' ' ' < "$STATE/suites")"
 
     for s in $suites; do
         if hs_is_cargo_suite "$s"; then
@@ -177,7 +205,7 @@ cmd_start() {
 }
 
 cmd_stop() {
-    local p i snapshot="" survivors
+    local p snapshot="" survivors
     if ! runner_alive; then
         echo "No suite run is going."
         return 0
@@ -189,7 +217,7 @@ cmd_stop() {
 "
     done
     for p in $(printf '%s' "$snapshot" | cut -d' ' -f1); do kill -TERM "$p" 2>/dev/null; done
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
         survivors="$(still_running "$snapshot")"
         [ -z "$survivors" ] && break
         sleep 1
@@ -207,18 +235,52 @@ still_running() { # <"pid start-time" lines>
     done
 }
 
+# The suites the runner owns: the selection, plus the driver once `wait`
+# started it.
+running_suites() {
+    cat "$STATE/suites"
+    [ -f "$STATE/driver.started" ] && echo driver
+}
+
 all_done() {
     local s
     runner_alive || return 0
     [ -f "$STATE/suites" ] || return 1
-    while IFS= read -r s; do
+    for s in $(running_suites); do
         [ -f "$STATE/$s.exit" ] || return 1
-    done < "$STATE/suites"
+    done
     return 0
 }
 
+# Sleep until every suite is done or the deadline passes. The deadline is on
+# bash's own clock, so a slow host's checks cannot stretch the budget.
+join_until() { # <deadline in $SECONDS>
+    while ! all_done && [ "$SECONDS" -lt "$1" ]; do
+        sleep 1
+    done
+    all_done
+}
+
+# Start the driver run as its own process, so it outlives the `wait` that
+# started it. It takes over the runner record, so `stop` and `wait` reach it.
+start_driver() {
+    local pid
+    # The marker goes first, so the runner record never names a driver run
+    # that the selection lacks.
+    touch "$STATE/driver.started"
+    bash "${BASH_SOURCE[0]}" run-driver > /dev/null 2>&1 &
+    pid=$!
+    echo "$pid" > "$STATE/pid"
+    started_at "$pid" > "$STATE/pid-started"
+}
+
+driver_due() {
+    selected_suites | grep -q -x driver && [ ! -f "$STATE/driver.started" ] && [ ! -f "$STATE/stopped" ] \
+        && [ "$(suite_state rust)" = PASS ]
+}
+
 cmd_wait() {
-    local budget=480 codex_abandoned="" i=0
+    local budget=$HS_WAIT_BUDGET codex_abandoned="" deadline
     while [ $# -gt 0 ]; do
         case "$1" in
             --codex-abandoned) codex_abandoned=1 ;;
@@ -231,31 +293,36 @@ cmd_wait() {
         echo "MISSING: no suite run recorded. Start one: ./scripts/harden-suites.sh start" >&2
         return 2
     fi
-    while ! all_done && [ "$i" -lt "$budget" ]; do
-        sleep 1
-        i=$((i + 1))
-    done
-    if ! all_done; then
+    deadline=$((SECONDS + budget))
+    if ! join_until "$deadline"; then
         echo "Still running after ${budget}s. Re-issue: ./scripts/harden-suites.sh wait"
         return 3
     fi
-    if selected_suites | grep -q -x driver && [ ! -f "$STATE/driver.exit" ] && [ ! -f "$STATE/stopped" ] \
-        && [ "$(suite_state rust)" = PASS ]; then
+    if driver_due; then
         if [ -f "$CODEX_OUT" ] && [ ! -f "$CODEX_DONE" ] && [ -z "$codex_abandoned" ]; then
             echo "The Codex review is still running. Join it (harden.md Phase 3), then re-issue wait."
             echo "If Phase 3 abandoned it, re-issue: ./scripts/harden-suites.sh wait --codex-abandoned"
             return 3
         fi
-        # A long join plus a driver run that relinks the engine can outlast
-        # one 600 s Bash call, so a slow join hands the driver to the next wait.
-        if [ "$i" -gt 120 ]; then
-            echo "Suites joined. Re-issue wait to run the Codex driver tests alone."
+        echo "Starting the Codex driver tests alone."
+        start_driver
+        if ! join_until "$deadline"; then
+            echo "The Codex driver tests are still running. Re-issue: ./scripts/harden-suites.sh wait"
             return 3
         fi
-        echo "Running the Codex driver tests alone."
-        run_suite driver
     fi
     cmd_verdict
+}
+
+# Why a path on the allowlist voided the run: the read check turned the
+# allowlist off at start. Prints nothing for any other unsafe path.
+allowlist_off_note() { # <path>
+    if [ ! -f "$STATE/allowlist-disabled" ] || ! hs_is_safe_path "$1" \
+        || grep -q -x -F -- "$1" "$STATE/compile-inputs" 2>/dev/null; then
+        return 0
+    fi
+    printf ' (the safe-path allowlist is off: %s may read a safe path)' \
+        "$(cut -d' ' -f1 "$STATE/allowlist-disabled" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
 }
 
 # Print the state of one suite: PASS, FAIL, VOID <reason>, RUNNING or MISSING.
@@ -275,7 +342,7 @@ suite_state() { # <suite>
     unsafe="$({ cat "$STATE/$suite.changed" 2>/dev/null; changed_now; } | sort -u \
         | hs_unsafe_paths "$STATE/compile-inputs" "$disabled" | head -1)"
     if [ -n "$unsafe" ]; then
-        echo "VOID $unsafe changed since the start commit"
+        echo "VOID $unsafe changed since the start commit$(allowlist_off_note "$unsafe")"
     elif [ "$(cat "$STATE/$suite.exit")" = 72 ] ||
         grep -q '^ERROR: build refused on host memory' "$STATE/$suite.log" 2>/dev/null; then
         # A gate nested inside `make` refuses with 72, and make exits 2.
@@ -300,7 +367,8 @@ cmd_verdict() {
         return 2
     fi
     # A fix can widen the selection, and no recorded suite would notice.
-    now="$(branch_paths | sort -u | hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs")"
+    hs_generated_drift "$ROOT" > "$STATE/generated-drift-now"
+    now="$(branch_paths | sort -u | hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift-now" "$(recorded_tier)")"
     if [ "$now" != "$(cat "$STATE/suites")" ]; then
         echo "selection VOID the diff now selects: $(printf '%s' "$now" | tr '\n' ' ')"
         rerun=1
@@ -330,6 +398,7 @@ case "${1:-}" in
     start) shift; cmd_start "$@" ;;
     stop) cmd_stop ;;
     wait) shift; cmd_wait "$@" ;;
+    run-driver) run_suite driver ;;
     verdict) cmd_verdict ;;
     -h | --help) usage ;;
     *) usage >&2; exit 1 ;;

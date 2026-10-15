@@ -350,6 +350,8 @@ fn result_usage(value: &serde_json::Value) -> Option<crate::engine::ApiUsage> {
         cache_read_tokens,
         cache_creation_tokens,
         modality: None,
+        service_tier: None,
+        cache_creation_1h_tokens: None,
     })
 }
 
@@ -860,8 +862,8 @@ impl AgentRuntime for ClaudeCodeRuntime {
         let CcCommand {
             mut cmd,
             system_prompt_file,
-            run_marker,
         } = build_command(&args, cli_dir)?;
+        let agent_run = args.agent_run.clone();
         let stream_state = CcStreamState::with_notes_relayed(relays_vertex_calls(&cmd));
         let mut child = super::spawn_env::spawn_below_engine(&mut cmd)?;
         let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
@@ -890,7 +892,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             )
             .await;
             drop(system_prompt_file);
-            super::agent_run_marker::reap_marked_groups(run_marker, GROUP_TEARDOWN_GRACE).await;
+            agent_run.finish(GROUP_TEARDOWN_GRACE).await;
         });
 
         Ok(RunningAgent {
@@ -1012,7 +1014,6 @@ const CC_BYTE_STREAM_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 struct CcCommand {
     cmd: tokio::process::Command,
     system_prompt_file: Option<tempfile::TempPath>,
-    run_marker: super::agent_run_marker::AgentRunMarker,
 }
 
 /// Where the system prompt files live. Inside the workspace rather than the
@@ -1153,9 +1154,9 @@ fn build_command_with_settings(
         cmd.arg("--append-system-prompt-file").arg(file);
     }
     // Agent-independent Lucidos env contract (workspace, host protection,
-    // PG*, subprocess origin, spawn metadata, compile env, PATH), shared
+    // database handle, subprocess origin, spawn metadata, compile env, PATH), shared
     // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.
-    let run_marker = apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
+    apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
     // Push CC's own byte-idle streaming deadline out past the engine's
     // inactivity watchdog, so a provider stall auto-resumes instead of killing
     // the turn. See `CC_BYTE_STREAM_IDLE_TIMEOUT_MS` for the full reasoning.
@@ -1170,6 +1171,15 @@ fn build_command_with_settings(
         .any(|(k, _)| k == IDLE_TIMEOUT_ENV)
     {
         cmd.env(IDLE_TIMEOUT_ENV, CC_BYTE_STREAM_IDLE_TIMEOUT_MS.to_string());
+    }
+    // The auto-compact trial's window, after `apply_lucidos_env` for the same
+    // reason. `auto_compact_trial::decide` already yields to a workspace value.
+    // A temporary measure: docs/temporary-measures.md § "Auto-compact trial".
+    if let Some(window) = args.auto_compact.and_then(|s| s.engine_window()) {
+        cmd.env(
+            crate::engine::auto_compact_trial::AUTO_COMPACT_WINDOW_ENV,
+            window.to_string(),
+        );
     }
     // Replay the thread's account pin. Set AFTER `apply_lucidos_env`, which
     // applied any user-managed `CLAUDE_CONFIG_DIR` first, so the pin wins. An
@@ -1225,7 +1235,6 @@ fn build_command_with_settings(
     Ok(CcCommand {
         cmd,
         system_prompt_file,
-        run_marker,
     })
 }
 
@@ -1531,6 +1540,11 @@ pub(crate) fn format_exit_status(
 /// would sit out that fix.
 pub(crate) const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long a child whose stdout closed gets to exit on its own before the
+/// driver tears it down. A dying process closes its stdout before the OS can
+/// report it gone, so without this wait a stray kill reads as engine teardown.
+const EXIT_AFTER_STDOUT_EOF_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Drive the CC process: forward stdout → events_tx, input/control → stdin,
 /// and react to cancellation. Always emits `AgentEvent::Exited` (best-effort)
 /// before returning so consumers can distinguish a clean close from a panic.
@@ -1562,6 +1576,8 @@ async fn driver_task(
     // group-kill below: after reaping, the pid (hence the group id) may be
     // recycled, so signalling the group would risk unrelated processes.
     let mut child_reaped = false;
+    // True when the loop ended on stdout EOF, where the child is usually exiting.
+    let mut stdout_closed = false;
     // `stream_state` spans lines of THIS stream, and only this one. The driver
     // task owns it, so it lives and dies with the subprocess.
     //
@@ -1590,6 +1606,7 @@ async fn driver_task(
                             }
                         }
                         log!("[ClaudeCode] driver stdout EOF — closing session");
+                        stdout_closed = true;
                         break;
                     }
                     Ok(_) => {
@@ -1741,6 +1758,17 @@ async fn driver_task(
         let _ = events_tx.send(usage);
     }
     let _ = events_tx.send(AgentEvent::OutputEnded);
+
+    // An EOF is usually the child dying, but it can win the race against the
+    // exit itself. Wait briefly, so the child's own status classifies its death.
+    if stdout_closed && !child_reaped {
+        if let Ok(Ok(status)) =
+            tokio::time::timeout(EXIT_AFTER_STDOUT_EOF_GRACE, child.wait()).await
+        {
+            natural_exit_status = Some(status);
+            child_reaped = true;
+        }
+    }
 
     // If the child already died on its own but a different select! arm won the
     // race, reap it here BEFORE any teardown kill. Its true exit status then

@@ -10,6 +10,7 @@ const uninstallMarketplacePlugin = vi.fn();
 vi.mock('../../../store/actions/plugin-uninstall', () => ({ uninstallMarketplacePlugin }));
 
 const { PluginStoreRow } = await import('../StoreTab');
+const { PluginActions, PluginModifiedNotice, PluginTitle } = await import('../pluginCard');
 import { renderPluginReadme } from '../pluginReadme';
 import { contentViewKey } from '../../layout/contentViewKey';
 import { panelOverlay } from '../../../store/store';
@@ -42,12 +43,19 @@ function row(over: Partial<MarketplacePlugin>): MarketplacePlugin {
 
 let host: HTMLDivElement | null = null;
 
-function show(plugin: MarketplacePlugin): HTMLDivElement {
+function show(plugin: MarketplacePlugin, stageInstall: (p: MarketplacePlugin) => void = () => {}): HTMLDivElement {
   host = document.createElement('div');
   document.body.appendChild(host);
-  render(<PluginStoreRow plugin={plugin} installingSource={null} stageInstall={() => {}} />, host);
+  render(<PluginStoreRow plugin={plugin} installingSource={null} stageInstall={stageInstall} />, host);
   return host;
 }
+
+const MODIFIED_INSTALL: Partial<MarketplacePlugin> = {
+  status: 'installed',
+  installed_version: '0.1.0',
+  modified: true,
+  categories: ['productivity'],
+};
 
 afterEach(() => {
   if (host) {
@@ -87,10 +95,62 @@ describe('a Plugins panel row', () => {
   });
 
   it('keeps a button tap to the button', () => {
-    const el = show(row({ status: 'installed', installed_version: '0.1.0' }));
-    el.querySelector<HTMLElement>('.list-row-actions .action-btn-secondary')!.click();
-    expect(uninstallMarketplacePlugin).toHaveBeenCalledOnce();
+    const stageInstall = vi.fn();
+    const el = show(row({}), stageInstall);
+    el.querySelector<HTMLElement>('.list-row-actions .action-btn')!.click();
+    expect(stageInstall).toHaveBeenCalledOnce();
     expect(panelOverlay.value).toBeNull();
+  });
+
+  it('shows one button and leaves Uninstall, the modified notice and the chips to the detail page', () => {
+    const el = show(row({ ...MODIFIED_INSTALL, app_id: 'habit-tracker' }));
+    const buttons = Array.from(el.querySelectorAll('.list-row-actions button'), (b) => b.textContent);
+    expect(buttons).toEqual(['Open']);
+    expect(el.querySelector('.app-store-modified-chip')).toBeNull();
+    expect(el.querySelector('.app-store-status')).toBeNull();
+    expect(el.querySelector('.app-store-plugin-meta')).toBeNull();
+  });
+});
+
+describe('the plugin detail page title', () => {
+  it('keeps the version and the Modified chip the row leaves out', () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    render(<PluginTitle plugin={row({ ...MODIFIED_INSTALL, app_id: 'habit-tracker' })} nameClass="title" />, host);
+    expect(host.querySelector('.app-store-status')?.textContent).toMatch(/^Installed v/);
+    expect(host.querySelector('.app-store-modified-chip')?.textContent).toBe('Modified');
+  });
+});
+
+describe('the plugin detail page buttons', () => {
+  it('offers Uninstall beside the primary button', () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    render(<PluginActions plugin={row({ ...MODIFIED_INSTALL, app_id: 'habit-tracker' })} />, host);
+    const buttons = Array.from(host.querySelectorAll('.list-row-actions button'), (b) => b.textContent);
+    expect(buttons).toEqual(['Uninstall', 'Open']);
+    host.querySelector<HTMLElement>('.action-btn-secondary')!.click();
+    expect(uninstallMarketplacePlugin).toHaveBeenCalledOnce();
+  });
+});
+
+describe('the plugin detail page modified notice', () => {
+  function showNotice(plugin: MarketplacePlugin): HTMLDivElement {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    render(<PluginModifiedNotice plugin={plugin} />, host);
+    return host;
+  }
+
+  it('counts the changed files and offers to send them to the author', () => {
+    const el = showNotice(row({ ...MODIFIED_INSTALL, modified_paths: ['a.html', 'b.js', 'c.css'] }));
+    expect(el.textContent).toContain('You changed 3 files in this plugin.');
+    expect(el.querySelector('button')?.textContent).toBe('Send changes to author');
+  });
+
+  it('draws nothing for an unmodified plugin', () => {
+    const el = showNotice(row({ status: 'installed', installed_version: '0.1.0' }));
+    expect(el.querySelector('.plugin-detail-modified')).toBeNull();
   });
 });
 

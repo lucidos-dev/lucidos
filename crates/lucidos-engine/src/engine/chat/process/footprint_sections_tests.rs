@@ -14,6 +14,8 @@ fn app(id: &str, description: &str) -> App {
         reusable: false,
         built_in: false,
         params: Default::default(),
+        sizes: Vec::new(),
+        transparent: false,
     }
 }
 
@@ -270,4 +272,52 @@ fn an_open_app_listing_is_its_own_kind_named_after_the_app() {
     let item = &open_app_knowhow(&inputs).items[0];
     assert_eq!(item.kind, ItemKind::AppKnowhow);
     assert_eq!(item.name, "Habit Tracker");
+}
+
+/// The MCP tool schemas ride only threads that enable a server (ADR 0430), so
+/// the section lists each server with its threads. It stays out of the
+/// every-turn total, and so does the notice for what the ceiling cut.
+#[test]
+fn the_mcp_schemas_are_per_server_and_outside_the_every_turn_total() {
+    let inputs = FootprintInputs {
+        apps: vec![app("a", "An app.")],
+        mcp_schemas: vec![McpSchemaCost {
+            server_id: "slack".to_string(),
+            name: "Slack".to_string(),
+            chars: 16_154,
+            threads: McpThreadUse {
+                enabled: 1,
+                called: 1,
+            },
+        }],
+        mcp_worst_case_chars: 16_154,
+        mcp_dropped_notice: Some("[MCP TOOLS NOT SENT] cut".to_string()),
+        ..FootprintInputs::default()
+    };
+    let report = assemble(build_sections(&inputs), &LIMITS, |_| {}, Vec::new());
+    let schemas = report
+        .sections
+        .iter()
+        .find(|s| s.id == "mcp-tool-schemas")
+        .unwrap();
+    assert_eq!(schemas.when, SectionWhen::McpEnabled);
+    assert_eq!(schemas.chars, 16_154);
+    assert_eq!(schemas.items.len(), 1);
+    assert_eq!(schemas.items[0].kind, ItemKind::McpServer);
+    assert_eq!(
+        schemas.items[0].mcp_threads,
+        Some(McpThreadUse {
+            enabled: 1,
+            called: 1
+        })
+    );
+    assert_eq!(
+        report.total_chars,
+        report
+            .sections
+            .iter()
+            .filter(|s| s.id != "mcp-tool-schemas" && s.id != "mcp-tools-not-sent")
+            .map(|s| s.chars)
+            .sum::<usize>()
+    );
 }

@@ -75,5 +75,5 @@ the table for its finding.
 | Installed plugin has no `source` (archive install) | Ask whoever shared the plugin for an updated archive that declares `engine` |
 | Authored plugin tree's `manifest.toml` has no `engine`, or an invalid one | Set `engine` to the plugin's floor release and bump `version`, in the author's own tree, never the installed copy |
 
-- **Updates stage the confirm panel, never confirm themselves.** `plugins(action="update", ...)` opens the usual update panel. A fix thread or this audit turn stops there; the user clicks Confirm.
+- **Updates stage the confirm panel, never confirm themselves.** `plugins(action="update", ...)` opens the usual update panel. A fix thread or this audit turn stops there; the user clicks **Update**.
 - **Never edit the installed copy** under `data/`, for the reason § Checks gives. Fix the plugin's own source tree, or propose the change upstream.

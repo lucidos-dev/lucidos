@@ -1,8 +1,7 @@
 // The native desktop counterpart of the OS push (system-knowhow/notifications.md
 // §1, §4). Driven by the engine's `NativePushRequested` SSE, which the engine
-// emits ONLY on the push-ALLOWED branch (no active device) — the mutually
-// exclusive complement of `NotificationToastRequested` (push-suppressed branch,
-// in-app toast). A Tauri desktop app embeds a WKWebView that can't subscribe to
+// emits ONLY on the push-ALLOWED branch, when no page handled the
+// `PresenceCheck` in the app. A Tauri desktop app embeds a WKWebView that can't subscribe to
 // Web Push, so the engine reaches it over the already-open SSE stream and the
 // page renders a native macOS banner via the `show_native_notification` command
 // (Apple's UserNotifications framework / UNUserNotificationCenter, in
@@ -11,7 +10,6 @@
 
 import type { Tap } from '@lucidos/sdk';
 import { isTauri } from '../../utils/platform';
-import { isPageActive } from '../../utils/pageActive';
 import { WORKSPACE_ID } from '../../utils/basePath';
 import {
   showNativeNotification,
@@ -19,16 +17,16 @@ import {
   takePendingNativeTaps,
   listen,
 } from '../../utils/tauri';
-import { dispatchDeepLink, TOAST_REQUEST_STALE_AFTER_MS } from './in-app-notification-toast';
+import { dispatchDeepLink, presentInAppNotification } from './in-app-notification-toast';
 import { parseDeepLinkFromSwMessage, type DeepLinkTarget } from './notification-deeplink';
 import { postClientLog } from '../../utils/liveness';
 
 /** Wall-clock budget after which a `NativePushRequested` is too stale to show.
- *  The toast's budget, since both frames come out of the same PresenceCheck.
  *  A frame that flushes seconds late from a suspended-tab SSE queue would pop a
  *  banner long after the moment passed, so drop it. The bell badge, driven by
- *  NotificationCreated, still reflects it. */
-export const NATIVE_PUSH_STALE_AFTER_MS = TOAST_REQUEST_STALE_AFTER_MS;
+ *  NotificationCreated, still reflects it. Sized to cover the PresenceCheck
+ *  deadline the frame waits behind (`DEADLINE_MS` = 2s) plus delivery. */
+export const NATIVE_PUSH_STALE_AFTER_MS = 5000;
 
 export interface NativePushRequestedPayload {
   notification_id: string;
@@ -45,15 +43,27 @@ export interface NativePushRequestedPayload {
 /** SSE handler for the engine's native desktop surface trigger. Gates before
  *  touching the OS:
  *   - not Tauri → no-op (browser / PWA get the real web push instead);
- *   - stale frame → no-op (late SSE-queue flush);
- *   - page active → no-op (OS surface is for non-active devices; macOS
- *     suppresses banners for the frontmost app anyway).
- *  See system-knowhow/notifications.md §4. */
+ *   - stale frame → no-op (late SSE-queue flush).
+ *
+ *  Then it always surfaces the notification. The page answered the check while
+ *  its window was not in front, but the reader may have brought it forward
+ *  since. So it runs the same in-app step the check does: a toast (or
+ *  auto-read, or the badge alone) if the shell is in front now, else the
+ *  native banner. See system-knowhow/notifications.md §4. */
 export function handleNativePushRequested(payload: NativePushRequestedPayload): void {
   if (!isTauri()) return;
   if (Date.now() - payload.sent_at_ms > NATIVE_PUSH_STALE_AFTER_MS) return;
-  if (isPageActive()) return;
-  void showNativeBanner(payload);
+  const outcome = presentInAppNotification({
+    title: payload.title,
+    body: payload.body,
+    target: {
+      notification: payload.notification_id,
+      thread: payload.thread_id ?? null,
+      event: payload.event_id ?? null,
+      tap: payload.tap ?? null,
+    },
+  });
+  if (outcome === 'not_shown') void showNativeBanner(payload);
 }
 
 /** Payload of the engine's `NativePushDismissRequested` SSE — the cross-device
@@ -76,7 +86,7 @@ export interface NativePushDismissRequestedPayload {
  *     eliminating, the window in which a late dismiss-all could clear a banner
  *     for a notification created after the all-read. A dismiss-all is scoped to
  *     the calling workspace but still sweeps all of ITS delivered banners).
- *  NO `isPageActive()` gate (unlike show): a banner exists only because the
+ *  NO active gate (unlike show): a banner exists only because the
  *  device was inactive when shown; by dismiss time it may be active again, and
  *  removeDeliveredNotifications is a harmless no-op when nothing matches.
  *  See system-knowhow/notifications.md §4. */
@@ -159,8 +169,8 @@ async function showNativeBanner(payload: NativePushRequestedPayload): Promise<vo
  *  lost when the page wasn't listening at emit time — webview reloaded /
  *  suspended-while-trayed / client relaunched — which Tauri does not replay.
  *
- *  Why focus/visibility matter: a native banner only shows while the page is
- *  INACTIVE (handleNativePushRequested gates on isPageActive), so a banner tap
+ *  Why focus/visibility matter: a native banner only shows while the shell is
+ *  not in front (handleNativePushRequested), so a banner tap
  *  ALWAYS lands on a backgrounded/hidden — often JS-throttled — WKWebView.
  *  `route_native_tap` then SHOWS that window WITHOUT reloading it, so the startup
  *  cold drain never re-runs, and the warm `emit_to` is a fire-and-forget

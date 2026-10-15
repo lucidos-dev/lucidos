@@ -106,6 +106,7 @@ async fn message_received_on_child_bumps_parent_blocking_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "follow up".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -148,6 +149,7 @@ async fn response_generated_decrements_parent_blocking_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "ping".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -458,6 +460,7 @@ async fn mixed_siblings_attention_counts_only_wfua_not_running() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "second child".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -531,6 +534,7 @@ async fn three_level_tree_propagates_to_grandparent() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "root task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -555,6 +559,7 @@ async fn three_level_tree_propagates_to_grandparent() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "mid task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -599,6 +604,7 @@ async fn three_level_tree_propagates_to_grandparent() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "cc task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -637,6 +643,7 @@ async fn three_level_tree_propagates_to_grandparent() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "wake".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -687,6 +694,7 @@ async fn rebuild_recomputes_blocking_descendant_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "parent".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -714,6 +722,7 @@ async fn rebuild_recomputes_blocking_descendant_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "running".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -739,6 +748,7 @@ async fn rebuild_recomputes_blocking_descendant_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "wake".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -764,6 +774,7 @@ async fn rebuild_recomputes_blocking_descendant_count() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "idle".into(),
             user_image_hashes: vec![],
             device_id: None,

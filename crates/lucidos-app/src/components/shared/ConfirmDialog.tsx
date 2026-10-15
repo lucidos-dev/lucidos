@@ -1,16 +1,10 @@
 import { useEffect, useRef } from 'preact/hooks';
-import { confirmState } from '../../store/store';
+import { confirmState, settleConfirm } from '../../store/store';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { DialogMessage } from './DialogMessage';
 import { Overlay } from './Overlay';
 import { SurfaceHead } from './Surface';
 import { dialogOwnsKey } from './dialogKeyScope';
-
-function resolve(value: boolean) {
-  const state = confirmState.peek();
-  state.resolve?.(value);
-  confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
-}
 
 export function ConfirmDialog() {
   const state = confirmState.value;
@@ -35,7 +29,7 @@ export function ConfirmDialog() {
         // Buttons handle Enter natively (triggers click); textareas need newlines.
         if (target?.tagName === 'BUTTON' || target?.tagName === 'TEXTAREA') return;
         e.preventDefault();
-        resolve(true);
+        settleConfirm(true);
       }
     }
     document.addEventListener('keydown', handleKey);
@@ -55,7 +49,7 @@ export function ConfirmDialog() {
   return (
     <Overlay
       open
-      onClose={() => resolve(state.acknowledge === true)}
+      onClose={() => settleConfirm(state.acknowledge === true)}
       overlayClass="protected-surface"
       panelClass="surface surface-raised confirm-dialog protected-surface"
       panelRole="dialog"
@@ -90,21 +84,21 @@ export function ConfirmDialog() {
         {/* An acknowledgement has no Cancel: there is nothing to decline, and
             a second button meaning the same as the first reads as a choice
             the user does not have. Escape and an outside click still work,
-            and `resolve(true)` below is why they mean "read it". */}
+            and `settleConfirm(true)` below is why they mean "read it". */}
         {!state.acknowledge && state.extraAction && (
           <button
             class="action-btn action-btn-secondary confirm-extra"
             data-role="confirm-extra"
             onClick={() => {
               state.extraAction!.onClick();
-              resolve(false);
+              settleConfirm(false);
             }}
           >
             {state.extraAction.label}
           </button>
         )}
         {!state.acknowledge && (
-          <button class="action-btn action-btn-secondary" data-role="confirm-cancel" onClick={() => resolve(false)}>
+          <button class="action-btn action-btn-secondary" data-role="confirm-cancel" onClick={() => settleConfirm(false)}>
             {cancelLabel}
           </button>
         )}
@@ -112,7 +106,7 @@ export function ConfirmDialog() {
           ref={okBtnRef}
           class={`action-btn${state.variant === 'danger' ? ' action-btn-danger' : ''}`}
           data-role="confirm-ok"
-          onClick={() => resolve(true)}
+          onClick={() => settleConfirm(true)}
         >
           {state.okLabel}
         </button>

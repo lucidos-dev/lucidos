@@ -1,14 +1,17 @@
 pub mod client;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::core::{McpServer, McpServerStore};
 use crate::engine::context::{estimate_tokens_from_chars, tool_definitions_chars};
-use crate::engine::thread_events::{ActorMode, MessageOrigin};
+use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::thread_events::{
+    ActorMode, EventMeta, McpEnablementSource, MessageOrigin, ThreadEvent,
+};
 use crate::llm::provider::ToolDefinition;
 use client::McpClient;
 use types::McpTool;
@@ -114,9 +117,18 @@ pub struct McpManager {
     /// next user message. The counter is what lets a running turn ask "has the
     /// surface moved since I looked" for the price of one atomic load.
     ///
-    /// Bumped under the `running` write lock and read under its read lock, so
-    /// a stamp always describes the map it was taken with.
+    /// A reader takes its stamp BEFORE it reads the map and the thread's
+    /// enabled set, so a stamp is never newer than what it describes. A change
+    /// to either bumps it after the change lands.
     tool_surface_generation: Arc<AtomicU64>,
+    /// One lock per server id, held from the "is it running" check to the
+    /// insert. Every turn setup starts its thread's servers, so without it two
+    /// threads waking together spawn two processes for one server.
+    start_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Held from a disabled-tools write to its copy onto the running snapshot.
+    /// Without it two writes could commit in one order and copy in the other,
+    /// and dispatch would then disagree with the stored set.
+    disabled_tools_writes: Mutex<()>,
     pool: sqlx::PgPool,
     /// Registry mutations announce through here. Held rather than passed per
     /// call because `McpServerStore`'s mutators require it: registering a
@@ -159,10 +171,10 @@ pub struct McpToolStatus {
 
 /// Status of an MCP server for display.
 ///
-/// `chars` and `tokens` are what the ENABLED tools cost, whether or not the
-/// server is currently up: for a stopped one that answers "what would this cost
-/// if I switched it on". Whether the workspace is paying it right now is
-/// `running`, and [`McpCostTotals`] splits the two.
+/// `chars` and `tokens` are what the tools not switched off cost a thread that
+/// enables the server, whether or not it is up: for a stopped one that answers
+/// "what would this cost if a thread enabled it". [`McpCostTotals`] splits the
+/// running servers from the stopped ones.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpServerStatus {
     pub id: String,
@@ -183,8 +195,8 @@ pub struct McpServerStatus {
     pub disabled_tokens: usize,
 }
 
-/// What the registered MCP servers cost the workspace, split by whether the
-/// workspace is paying it.
+/// What the registered MCP servers cost a thread that enables them, split by
+/// whether the process is running (ADR 0430).
 ///
 /// Every token figure is [`estimate_tokens_from_chars`] of the matching char
 /// figure, never a sum of per-tool tokens: the ratio is integer division, so
@@ -193,12 +205,12 @@ pub struct McpServerStatus {
 pub struct McpCostTotals {
     pub servers: usize,
     pub running_servers: usize,
-    /// Tools in every request right now.
+    /// What the running servers offer a thread that enables them.
     pub tools: usize,
     pub chars: usize,
     pub tokens: usize,
-    /// What the stopped servers would add if switched on. Excludes servers
-    /// whose id cannot dispatch, since those can never be switched on.
+    /// What the stopped servers would add to a thread that enabled them.
+    /// Excludes servers whose id cannot dispatch, since those can never run.
     pub stopped_tools: usize,
     pub stopped_chars: usize,
     pub stopped_tokens: usize,
@@ -249,8 +261,8 @@ impl McpCostTotals {
     }
 }
 
-/// What the running MCP servers contribute to a request, and when that was
-/// true.
+/// What the running servers one thread enabled contribute to its request, and
+/// when that was true.
 ///
 /// The two travel together because a turn holds them for many rounds and has
 /// to decide whether what it holds is still current. See
@@ -260,21 +272,30 @@ pub struct McpToolSurface {
     pub generation: u64,
     /// What did not fit under the ceiling, per server. Empty when all fit.
     pub dropped: Vec<McpDroppedTools>,
+    /// The running servers the thread enabled, so the ones this slice offers
+    /// tools for, plus any the ceiling cut to nothing.
+    pub servers: BTreeSet<String>,
 }
 
 impl McpToolSurface {
     /// The one line that tells the model some tools were not sent, so it can
     /// tell the user. `None` when nothing was dropped.
     pub fn dropped_notice(&self) -> Option<String> {
-        (!self.dropped.is_empty()).then(|| {
-            format!(
-                "[MCP TOOLS NOT SENT] The running MCP servers offer more tools than fit \
-                 their share of this model's context, so these were left out: {}. Tell \
-                 the user, and suggest switching tools off in Settings or stopping a server.",
-                describe_dropped(&self.dropped)
-            )
-        })
+        dropped_notice(&self.dropped)
     }
+}
+
+/// [`McpToolSurface::dropped_notice`] for any fit's leftovers.
+pub fn dropped_notice(dropped: &[McpDroppedTools]) -> Option<String> {
+    (!dropped.is_empty()).then(|| {
+        format!(
+            "[MCP TOOLS NOT SENT] The servers enabled in this thread offer more tools \
+             than fit their share of this model's context, so these were left out: {}. \
+             Tell the user, and suggest switching tools off in Settings or disabling a \
+             server in this thread.",
+            describe_dropped(dropped)
+        )
+    })
 }
 
 /// The tools of one server that did not fit under the ceiling, by wire name,
@@ -324,8 +345,9 @@ fn describe_dropped(dropped: &[McpDroppedTools]) -> String {
 /// engine's own tools and the conversation the rest.
 const MCP_BUDGET_DIVISOR: usize = 4;
 
-/// Chars every running server's tools may take together, for a model with
-/// this context window. Shared by the request path and the cost report.
+/// Chars the tools of the servers one thread enabled may take together, for a
+/// model with this context window. Shared by the request path and the cost
+/// report.
 pub fn mcp_tool_char_ceiling(context_window: usize) -> usize {
     crate::engine::context::agent_context_char_budget(context_window) / MCP_BUDGET_DIVISOR
 }
@@ -334,20 +356,21 @@ pub fn mcp_tool_char_ceiling(context_window: usize) -> usize {
 /// is left out.
 const MCP_WARNING_PERCENT: usize = 80;
 
-/// The running servers against the request budget, as the cost report states
-/// it. Chars throughout, the unit the request packer budgets in.
+/// Every server enabled in one thread against the request budget, as the cost
+/// report states it (ADR 0430). Chars throughout, the unit the request packer
+/// budgets in.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct McpBudget {
     /// What a whole request may carry: system prompt, tools and messages.
     pub request_chars: usize,
-    /// The part of it every running server's tools may take together.
+    /// The part of it the tools of one thread's servers may take together.
     pub mcp_ceiling_chars: usize,
-    /// What a request really carries once the ceiling applies. Less than the
-    /// totals' offered figures exactly when something is dropped.
+    /// What that thread's request carries once the ceiling applies. Less than
+    /// the offered figures exactly when something is dropped.
     pub sent_tools: usize,
     pub sent_chars: usize,
     pub sent_tokens: usize,
-    /// What the running servers lose to that ceiling right now.
+    /// What that thread loses to the ceiling.
     pub dropped: Vec<McpDroppedTools>,
     /// One line for the page once the tools are past or near the ceiling.
     pub warning: Option<String>,
@@ -360,14 +383,10 @@ impl McpBudget {
         let left_out: usize = dropped.iter().map(|d| d.tools.len()).sum();
         let warning = if left_out > 0 {
             Some(format!(
-                "{left_out} {} left out of every request, because the running servers \
-                 offer more than the MCP share of the context: {}. Switch tools off or \
-                 stop a server.",
-                if left_out == 1 {
-                    "tool is"
-                } else {
-                    "tools are"
-                },
+                "A thread that enables every server leaves {left_out} {} out, because \
+                 together they offer more than the MCP share of the context: {}. Switch \
+                 tools off, or enable fewer servers in one thread.",
+                if left_out == 1 { "tool" } else { "tools" },
                 describe_dropped(&dropped)
             ))
         } else if sent_chars.saturating_mul(100)
@@ -375,8 +394,9 @@ impl McpBudget {
             && sent_chars > 0
         {
             Some(format!(
-                "MCP tools fill {}% of their share of the context. Past it, tools are \
-                 left out of requests.",
+                "With every server enabled in one thread, MCP tools fill {}% of their \
+                 share of the context. Past it, tools are left out of that thread's \
+                 requests.",
                 sent_chars.saturating_mul(100) / mcp_ceiling_chars.max(1)
             ))
         } else {
@@ -483,8 +503,26 @@ impl McpStartOutcome {
         } else {
             CALLABLE_IN_THE_OUTER_TURN
         };
-        format!("MCP server '{id}' {state}. {reach}")
+        format!("MCP server '{id}' {state}, and it is enabled in this thread. {reach}")
     }
+}
+
+/// An enabled server a turn's setup could not bring up, and why. The turn
+/// still runs. The model reads each one as a line of `[MCP SERVERS]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpStartFailure {
+    pub server_id: String,
+    pub error: String,
+}
+
+/// What the model is told when it calls a tool of a server its thread has not
+/// enabled. Dispatch refuses it, so the array and the gate agree.
+fn not_enabled_message(server_id: &str, wire_name: &str) -> String {
+    format!(
+        "MCP server '{}' is not enabled in this thread, so tool '{}' was NOT run. \
+         Call mcp enable with id '{}' first if this task needs it.",
+        server_id, wire_name, server_id
+    )
 }
 
 /// What a stop attempt resolved to. Stopping something already stopped is not
@@ -500,14 +538,16 @@ impl McpManager {
         Self {
             running: Arc::new(RwLock::new(HashMap::new())),
             tool_surface_generation: Arc::new(AtomicU64::new(0)),
+            start_locks: std::sync::Mutex::new(HashMap::new()),
+            disabled_tools_writes: Mutex::new(()),
             pool,
             event_bus,
         }
     }
 
-    /// Record that the offered tools just changed. Call it holding the
-    /// `running` write lock, so no reader can see the new map under the old
-    /// stamp.
+    /// Record that some thread's offered tools may just have changed. Call it
+    /// after the change has landed: readers take their stamp before they
+    /// read, so a bump after the change can never hide it.
     fn bump_tool_surface(&self) {
         self.tool_surface_generation.fetch_add(1, Ordering::Release);
     }
@@ -575,11 +615,14 @@ impl McpManager {
         self.tool_surface_generation.load(Ordering::Acquire)
     }
 
-    /// Register a new MCP server (saves to DB and connects).
+    /// Register a new MCP server (saves to DB and connects), and enable it in
+    /// `thread_id`, the thread that asked for it.
     /// `tools_live` says whether the CALLER's tool array picks the new surface
     /// up this turn. See [`McpStartOutcome::describe`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn setup_server(
         &self,
+        thread_id: uuid::Uuid,
         id: &str,
         name: &str,
         command: &str,
@@ -601,16 +644,22 @@ impl McpManager {
 
         // Try to connect immediately
         match self.start_server_internal(&server).await {
-            Ok(tool_count) => Ok(format!(
-                "MCP server '{}' is set up and connected with {} tools available. {}",
-                name,
-                tool_count,
-                if tools_live {
-                    CALLABLE_NOW
-                } else {
-                    CALLABLE_IN_THE_OUTER_TURN
-                }
-            )),
+            Ok(tool_count) => {
+                self.emit_enabled(thread_id, id, McpEnablementSource::Agent, EventMeta::NONE)
+                    .await?;
+                self.bump_tool_surface();
+                Ok(format!(
+                    "MCP server '{}' is set up, connected with {} tools available, and \
+                     enabled in this thread. {}",
+                    name,
+                    tool_count,
+                    if tools_live {
+                        CALLABLE_NOW
+                    } else {
+                        CALLABLE_IN_THE_OUTER_TURN
+                    }
+                ))
+            }
             Err(e) => {
                 // Server is saved but failed to connect — that's OK, user can start later
                 Ok(format!(
@@ -619,11 +668,141 @@ impl McpManager {
                      If the command was not found, give an absolute path to it or install its \
                      interpreter (node/npx/uvx/python) in a standard location — a packaged build \
                      searches only a minimal PATH plus the common install dirs. \
-                     Use start_mcp_server to try again.",
+                     Call mcp enable to try again.",
                     name, e
                 ))
             }
         }
+    }
+
+    /// Enable `id` in `thread_id`, starting the server first if it is not
+    /// running. A start that fails enables nothing, so the thread never lists
+    /// a server it cannot use.
+    ///
+    /// The generation moves even when the server was already running and
+    /// already enabled. Every turn then re-reads its own set, and only the
+    /// thread whose slice changed rewrites its array.
+    pub async fn enable_for_thread(
+        &self,
+        thread_id: uuid::Uuid,
+        id: &str,
+        by: McpEnablementSource,
+        meta: EventMeta,
+    ) -> Result<McpStartOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let outcome = self.start_server(id).await?;
+        self.emit_enabled(thread_id, id, by, meta).await?;
+        self.bump_tool_surface();
+        Ok(outcome)
+    }
+
+    /// Disable `id` in `thread_id` only. The process keeps running for the
+    /// threads that still use it. Returns whether the thread had it enabled.
+    pub async fn disable_for_thread(
+        &self,
+        thread_id: uuid::Uuid,
+        id: &str,
+        by: McpEnablementSource,
+        meta: EventMeta,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.enabled_servers(thread_id).await.contains(id) {
+            return Ok(false);
+        }
+        self.event_bus
+            .emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ThreadMcpServerDisabled {
+                    server_id: id.to_string(),
+                    by,
+                },
+                meta,
+            })
+            .await?;
+        self.bump_tool_surface();
+        Ok(true)
+    }
+
+    /// Enable every server a trigger lists, without starting any: the turn's
+    /// setup starts them with the rest of the thread's set. Each listed id
+    /// no server has comes back as a failure for `[MCP SERVERS]` to report.
+    pub async fn enable_listed(
+        &self,
+        thread_id: uuid::Uuid,
+        server_ids: &[String],
+    ) -> Vec<McpStartFailure> {
+        let mut failures = Vec::new();
+        for id in server_ids {
+            let error = match McpServerStore::get(&self.pool, id).await {
+                Ok(Some(_)) => match self
+                    .emit_enabled(thread_id, id, McpEnablementSource::Trigger, EventMeta::NONE)
+                    .await
+                {
+                    Ok(()) => continue,
+                    Err(e) => format!("could not be enabled: {e}"),
+                },
+                Ok(None) => "the trigger lists it, but no MCP server has this id".to_string(),
+                Err(e) => format!("could not be read: {e}"),
+            };
+            failures.push(McpStartFailure {
+                server_id: id.clone(),
+                error,
+            });
+        }
+        failures
+    }
+
+    /// Start every server `thread_id` enabled that is not running, before the
+    /// turn's first round. Running does not survive a restart, and enabled
+    /// does, so this is where a thread gets its servers back.
+    ///
+    /// The starts run together, so a server that hangs costs the setup one
+    /// connect timeout, not one per server.
+    pub async fn start_enabled_servers(&self, thread_id: uuid::Uuid) -> Vec<McpStartFailure> {
+        let starts = self
+            .enabled_servers(thread_id)
+            .await
+            .into_iter()
+            .map(|id| async move {
+                self.start_server(&id).await.err().map(|e| McpStartFailure {
+                    server_id: id,
+                    error: e.to_string(),
+                })
+            });
+        futures::future::join_all(starts)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Stop a server because someone asked to, which switches it off in every
+    /// thread. `None` when no such server is registered.
+    ///
+    /// The event lands before the process stops. A turn setup after it finds
+    /// the server no longer enabled. One already starting it holds the start
+    /// lock, which the stop waits for.
+    /// Engine shutdown calls [`McpManager::stop_server`] instead, because a
+    /// restart must leave every thread's set as it was.
+    pub async fn stop_everywhere(
+        &self,
+        id: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<Option<McpStopOutcome>, Box<dyn std::error::Error + Send + Sync>> {
+        if McpServerStore::get(&self.pool, id).await?.is_none() {
+            return Ok(None);
+        }
+        self.event_bus
+            .emit(BusEvent::System(SystemEvent::McpServerStopped {
+                server_id: id.to_string(),
+                actor,
+            }))
+            .await?;
+        // A start already past its enabled-set read finishes first, and is
+        // then stopped here, rather than landing after the stop.
+        let start_lock = self.start_lock(id);
+        let _starting = start_lock.lock().await;
+        let outcome = self.stop_server(id).await?;
+        self.bump_tool_surface();
+        Ok(Some(outcome))
     }
 
     /// Start a registered server by id.
@@ -637,6 +816,17 @@ impl McpManager {
         self.start_loaded(&server).await
     }
 
+    /// The lock that orders starts and stops of server `id`.
+    fn start_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.start_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(id.to_string())
+                .or_default(),
+        )
+    }
+
     /// Start a server whose row the caller already has.
     ///
     /// The HTTP routes load the row first so they can answer 404 and "this id
@@ -646,6 +836,8 @@ impl McpManager {
         &self,
         server: &McpServer,
     ) -> Result<McpStartOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let start_lock = self.start_lock(&server.id);
+        let _starting = start_lock.lock().await;
         // A server whose process died must not answer `AlreadyRunning`. That
         // answer ends in CALLABLE_NOW, which would be a lie, and a start is
         // the recovery the model is told to reach for.
@@ -746,7 +938,12 @@ impl McpManager {
         }
     }
 
-    /// Remove a server: stop the process first, then delete the row.
+    /// Remove a server: delete the row, then stop the process.
+    ///
+    /// The row goes first, for the reason [`McpManager::stop_everywhere`]
+    /// emits first: `McpServerRemoved` clears every thread's enabled set, so
+    /// no turn setup can start the server again while it shuts down. The
+    /// process is still in the map until then, so nothing is left unnamed.
     ///
     /// Returns whether a row was actually deleted. The caller needs that fact:
     /// reporting "removed" for an id that never existed is a silent success,
@@ -756,29 +953,29 @@ impl McpManager {
         id: &str,
         actor: Option<MessageOrigin>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        // Stop first. Deleting the row while the process runs would leave it
-        // orphaned, with nothing left that names it.
-        let removed = self.take_running(id).await;
-        if let Some(entry) = removed {
+        let deleted = McpServerStore::unregister(&self.pool, &self.event_bus, id, actor).await?;
+        if let Some(entry) = self.take_running(id).await {
             entry.client.lock().await.shutdown().await;
         }
-
-        McpServerStore::unregister(&self.pool, &self.event_bus, id, actor).await
+        Ok(deleted)
     }
 
-    /// Replace which of a server's tools are switched off, by wire name.
+    /// Switch one of a server's tools off or back on, by wire name.
     /// Returns the stored set, or `None` when no such server exists.
-    pub async fn set_disabled_tools(
+    pub async fn set_tool_disabled(
         &self,
         id: &str,
-        disabled_tools: &[String],
+        wire_name: &str,
+        disabled: bool,
         actor: Option<MessageOrigin>,
     ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
-        let stored = McpServerStore::set_disabled_tools(
+        let _write = self.disabled_tools_writes.lock().await;
+        let stored = McpServerStore::set_tool_disabled(
             &self.pool,
             &self.event_bus,
             id,
-            disabled_tools,
+            wire_name,
+            disabled,
             actor,
         )
         .await?;
@@ -860,6 +1057,19 @@ impl McpManager {
         Ok(format!("Auto-approve {} for MCP server '{}'.", action, id))
     }
 
+    /// The refusal for a call from `thread_id` to a server it did not enable,
+    /// or `None` when it did. The agentic loop asks this before it shows a
+    /// permission card, so nobody is asked to allow a call that cannot run.
+    pub async fn not_enabled_refusal(
+        &self,
+        thread_id: uuid::Uuid,
+        server_id: &str,
+        wire_name: &str,
+    ) -> Option<String> {
+        (!self.enabled_servers(thread_id).await.contains(server_id))
+            .then(|| not_enabled_message(server_id, wire_name))
+    }
+
     /// Why this call must not reach the process, or `None` to go ahead.
     ///
     /// Read live off the registry, never off a snapshot. Every condition here
@@ -869,10 +1079,17 @@ impl McpManager {
     /// tool lands in that window and is ignored.
     async fn dispatch_refusal(
         &self,
+        thread_id: uuid::Uuid,
         server_id: &str,
         wire_name: &str,
         client: &Arc<Mutex<McpClient>>,
     ) -> Option<String> {
+        if let Some(refusal) = self
+            .not_enabled_refusal(thread_id, server_id, wire_name)
+            .await
+        {
+            return Some(refusal);
+        }
         let running = self.running.read().await;
         let Some(entry) = running.get(server_id) else {
             return Some(format!(
@@ -897,14 +1114,26 @@ impl McpManager {
             .then(|| disabled_tool_refusal(server_id, wire_name))
     }
 
-    /// Call an MCP tool. Starts the server on-demand if not running.
+    /// Call an MCP tool for `thread_id`. Starts the server on demand if the
+    /// thread enabled it and it is not running.
     /// Returns (result_string, server_name, auto_approve).
     pub async fn call_tool(
         &self,
+        thread_id: uuid::Uuid,
         server_id: &str,
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<(String, String, bool), Box<dyn std::error::Error + Send + Sync>> {
+        // Before the on-demand start below, so a thread can never bring up a
+        // server it did not enable just by naming one of its tools.
+        let wire_name = format!("mcp__{}__{}", server_id, tool_name);
+        if let Some(refusal) = self
+            .not_enabled_refusal(thread_id, server_id, &wire_name)
+            .await
+        {
+            return Err(refusal.into());
+        }
+
         // A dead process is not a target. Dropping it here is what turns a
         // reuse into the on-demand start below. Reusing it instead fails on a
         // closed pipe, and nothing would ever restart the server.
@@ -926,7 +1155,7 @@ impl McpManager {
                 let server = McpServerStore::get(&self.pool, server_id)
                     .await?
                     .ok_or_else(|| format!("MCP server '{}' not found", server_id))?;
-                self.start_server_internal(&server).await?;
+                self.start_loaded(&server).await?;
                 self.running
                     .read()
                     .await
@@ -947,9 +1176,8 @@ impl McpManager {
         // Asked twice, and the second one is the gate. This is the cheap
         // refusal, so an already-off tool never queues behind a slow call just
         // to be turned away at the end of it.
-        let wire_name = format!("mcp__{}__{}", server_id, tool_name);
         if let Some(refusal) = self
-            .dispatch_refusal(server_id, &wire_name, &target.client)
+            .dispatch_refusal(thread_id, server_id, &wire_name, &target.client)
             .await
         {
             return Err(refusal.into());
@@ -979,7 +1207,7 @@ impl McpManager {
             // Waiting for it can take the whole MCP timeout, and whatever the
             // user did in that window has to win.
             if let Some(refusal) = self
-                .dispatch_refusal(server_id, &wire_name, &target.client)
+                .dispatch_refusal(thread_id, server_id, &wire_name, &target.client)
                 .await
             {
                 return Err(refusal.into());
@@ -990,20 +1218,30 @@ impl McpManager {
         Ok((result, target.server_name, target.auto_approve))
     }
 
-    /// The tools every running server offers, namespaced as
+    /// The tools of every running server `thread_id` enabled, namespaced as
     /// `mcp__{server_id}__{tool_name}` and fitted under `char_ceiling`, and
     /// the generation they were read at.
     ///
-    /// Runs once per LLM call, off the manifest snapshots, so it never waits on
-    /// a tool call in flight.
+    /// Runs on a turn's setup and on any round where the generation moved. It
+    /// reads the manifest snapshots, so it never waits on a tool call in flight.
     ///
-    /// The stamp is taken under the same read lock as the tools, which is what
-    /// makes the two describe one moment. A caller comparing a newer stamp
-    /// against older tools would skip the very change it was watching for.
-    pub async fn tool_surface(&self, char_ceiling: usize) -> McpToolSurface {
+    /// The stamp is taken FIRST, before the enabled set and the map are read.
+    /// Anything that changes after it moves the counter past it, so the turn
+    /// looks again next round. A stamp newer than the tools it came with would
+    /// skip the very change the turn was watching for.
+    pub async fn tool_surface(&self, thread_id: uuid::Uuid, char_ceiling: usize) -> McpToolSurface {
+        let generation = self.tool_surface_generation();
+        let enabled = self.enabled_servers(thread_id).await;
         let running = self.running.read().await;
-        let generation = self.tool_surface_generation.load(Ordering::Acquire);
-        let (tools, dropped) = fit_to_ceiling(offered_by_server(&running), char_ceiling);
+        let servers: BTreeSet<String> = running
+            .keys()
+            .filter(|id| enabled.contains(*id))
+            .cloned()
+            .collect();
+        let (tools, dropped) = fit_to_ceiling(
+            offered_by_server(&running, |id| servers.contains(id)),
+            char_ceiling,
+        );
         drop(running);
 
         if !dropped.is_empty() {
@@ -1017,45 +1255,177 @@ impl McpManager {
             tools,
             generation,
             dropped,
+            servers,
         }
     }
 
-    /// Where the running servers stand against the request budget of a model
-    /// with `context_window`, for the cost report. The fit is the one the
-    /// request applies, so the sent figures are what a request carries.
-    pub async fn budget(&self, context_window: usize) -> McpBudget {
+    /// What each server would put in the request of a thread that enabled it,
+    /// before any ceiling applies: a running server's live tools, a stopped
+    /// one's last seen. A server whose id cannot ride the wire is left out,
+    /// since nothing can ever enable it.
+    async fn offers_if_enabled(
+        &self,
+    ) -> Result<Vec<(String, Vec<ToolDefinition>)>, Box<dyn std::error::Error + Send + Sync>> {
+        self.evict_exited_servers().await;
+        let servers = McpServerStore::list(&self.pool).await?;
         let running = self.running.read().await;
-        let (sent, dropped) = fit_to_ceiling(
-            offered_by_server(&running),
-            mcp_tool_char_ceiling(context_window),
-        );
-        drop(running);
-        McpBudget::new(context_window, &sent, dropped)
+        Ok(servers
+            .iter()
+            .filter(|server| {
+                running.contains_key(&server.id)
+                    || crate::core::mcp_servers::validate_server_id(&server.id).is_ok()
+            })
+            .map(|server| {
+                let (config, tools) = match running.get(&server.id) {
+                    Some(entry) => (&entry.server_config, &*entry.tools),
+                    None => (server, server.tools.as_slice()),
+                };
+                let offered = tool_offers(&server.id, &config.name, tools, &config.disabled_tools)
+                    .into_iter()
+                    .filter_map(ToolOffer::into_offered)
+                    .collect();
+                (server.id.clone(), offered)
+            })
+            .collect())
     }
 
-    /// Get tool definitions for stopped servers (name + description only, no params).
-    /// Used to inform the LLM that these servers exist and can be started.
-    pub async fn get_stopped_server_summaries(&self) -> Vec<String> {
-        let servers = match McpServerStore::list(&self.pool).await {
-            Ok(s) => s,
+    /// The worst case against the request budget of a model with
+    /// `context_window`: one thread that enabled every server (ADR 0430). The
+    /// fit is the one a request applies, so the sent figures are what that
+    /// thread's request would carry.
+    pub async fn budget(
+        &self,
+        context_window: usize,
+    ) -> Result<McpBudget, Box<dyn std::error::Error + Send + Sync>> {
+        let (sent, dropped) = fit_to_ceiling(
+            self.offers_if_enabled().await?,
+            mcp_tool_char_ceiling(context_window),
+        );
+        Ok(McpBudget::new(context_window, &sent, dropped))
+    }
+
+    /// One `[MCP SERVERS]` line per configured server, stating its status in a
+    /// thread that enabled `enabled`. Each `failures` entry no configured
+    /// server explains adds a line too, such as a trigger's unknown id.
+    ///
+    /// A failed read of the registry answers no lines and logs it: the turn
+    /// still runs, and the model simply is not told about MCP this turn.
+    ///
+    /// `trigger_listing` is the firing trigger's `mcp_servers`, or `None` in a
+    /// chat thread. A trigger fire may call only what its trigger lists, so a
+    /// line inviting it to enable anything else would invite a refusal.
+    pub async fn server_lines(
+        &self,
+        enabled: &BTreeSet<String>,
+        failures: &[McpStartFailure],
+        trigger_listing: Option<&[String]>,
+    ) -> Vec<String> {
+        let servers = match self.list_servers().await {
+            Ok(servers) => servers,
             Err(e) => {
-                log!("[MCP] Failed to list servers for stopped summary: {}", e);
+                log!(
+                    "[MCP] Failed to list servers for the turn's server lines: {}",
+                    e
+                );
                 return Vec::new();
             }
         };
-        let running = self.running.read().await;
+        let failure_of = |id: &str| {
+            failures
+                .iter()
+                .find(|f| f.server_id == id)
+                .map(|f| f.error.as_str())
+        };
+        let mut lines: Vec<String> = servers
+            .iter()
+            .map(|status| {
+                let refused_here = trigger_listing
+                    .is_some_and(|listed| !status.auto_approve && !listed.contains(&status.id));
+                if refused_here {
+                    return refused_line(status);
+                }
+                server_line(status, enabled.contains(&status.id), failure_of(&status.id))
+            })
+            .collect();
+        lines.extend(
+            failures
+                .iter()
+                .filter(|f| !servers.iter().any(|s| s.id == f.server_id))
+                .map(|f| format!("- {}: {}.", f.server_id, f.error)),
+        );
+        lines
+    }
 
-        let mut summaries = Vec::new();
-        for server in servers {
-            if !running.contains_key(&server.id) {
-                summaries.push(format!(
-                    "- {} (id: {}) — stopped. Call start_mcp_server to activate.",
-                    server.name, server.id
-                ));
+    /// The servers `thread_id` enabled for itself, read off the projection.
+    ///
+    /// A failed read answers the empty set and logs it. An empty set offers
+    /// fewer tools, which a turn survives, and dispatch then refuses.
+    pub async fn enabled_servers(&self, thread_id: uuid::Uuid) -> BTreeSet<String> {
+        match sqlx::query_scalar::<_, Vec<String>>(
+            "SELECT enabled_mcp_servers FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(ids) => ids.unwrap_or_default().into_iter().collect(),
+            Err(e) => {
+                log!(
+                    "[MCP] Failed to read the enabled servers of thread {}: {}",
+                    thread_id,
+                    e
+                );
+                BTreeSet::new()
             }
         }
+    }
 
-        summaries
+    /// Record that `thread_id` enabled `server_id`, unless it already had.
+    async fn emit_enabled(
+        &self,
+        thread_id: uuid::Uuid,
+        server_id: &str,
+        by: McpEnablementSource,
+        meta: EventMeta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.enabled_servers(thread_id).await.contains(server_id) {
+            return Ok(());
+        }
+        self.event_bus
+            .emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ThreadMcpServerEnabled {
+                    server_id: server_id.to_string(),
+                    by,
+                },
+                meta,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Give a new child thread its parent's enabled servers. After this the
+    /// two sets are independent. Starting them is the child's turn setup.
+    pub async fn inherit_enabled(&self, parent: uuid::Uuid, child: uuid::Uuid) {
+        for server_id in self.enabled_servers(parent).await {
+            if let Err(e) = self
+                .emit_enabled(
+                    child,
+                    &server_id,
+                    McpEnablementSource::Parent,
+                    EventMeta::NONE,
+                )
+                .await
+            {
+                log!(
+                    "[MCP] Thread {} did not inherit '{}' from its parent {}: {}",
+                    child,
+                    server_id,
+                    parent,
+                    e
+                );
+            }
+        }
     }
 
     /// Parse a namespaced tool name like "mcp__blender__create_object"
@@ -1091,9 +1461,8 @@ impl ToolOffer<'_> {
     /// The definition a request actually carries, if any.
     ///
     /// Consuming rather than borrowing, because the request path is the hot
-    /// caller: `tool_surface` runs per LLM call over every tool of
-    /// every running server, and handing back a reference would make it clone
-    /// each one.
+    /// caller: `tool_surface` runs over every tool of every server a thread
+    /// enabled, and handing back a reference would make it clone each one.
     fn into_offered(self) -> Option<ToolDefinition> {
         if self.disabled {
             return None;
@@ -1109,13 +1478,15 @@ impl ToolOffer<'_> {
     }
 }
 
-/// The definitions each running server would put in a request, before any
-/// ceiling applies.
+/// The definitions each running server `included` keeps would put in a
+/// request, before any ceiling applies.
 fn offered_by_server(
     running: &HashMap<String, RunningServer>,
+    included: impl Fn(&str) -> bool,
 ) -> Vec<(String, Vec<ToolDefinition>)> {
     running
         .iter()
+        .filter(|(server_id, _)| included(server_id))
         .map(|(server_id, entry)| {
             let offered = tool_offers(
                 server_id,
@@ -1165,6 +1536,60 @@ fn tool_offers<'a>(
             }
         })
         .collect()
+}
+
+/// How many tools a server offers, or that nobody has seen its list yet.
+fn tool_count_phrase(status: &McpServerStatus) -> String {
+    if status.tools_source == McpToolsSource::NeverObserved {
+        return "tools not yet seen".to_string();
+    }
+    let offered = status
+        .tools
+        .iter()
+        .filter(|t| !t.disabled && t.wire_name.is_some())
+        .count();
+    match offered {
+        1 => "1 tool".to_string(),
+        n => format!("{n} tools"),
+    }
+}
+
+/// The line for a server a trigger fire may not call: its trigger does not
+/// list it, and it has no auto-approve.
+fn refused_line(status: &McpServerStatus) -> String {
+    format!(
+        "- {} ({}): {}. This trigger does not list it, so a call to it is refused in this fire.",
+        status.id,
+        status.name,
+        tool_count_phrase(status)
+    )
+}
+
+/// One server's line in `[MCP SERVERS]`, as the thread reading it sees it.
+/// `failure` is why an enabled server did not start at the turn's setup.
+fn server_line(status: &McpServerStatus, enabled: bool, failure: Option<&str>) -> String {
+    let label = format!("- {} ({})", status.id, status.name);
+    if !status.dispatchable {
+        return format!(
+            "{label}: its id cannot be used, so it can never run. Tell the user to remove it in Settings."
+        );
+    }
+    if let Some(error) = failure {
+        return format!("{label}: enabled in this thread, but it did not start: {error}.");
+    }
+    let tools = tool_count_phrase(status);
+    match (enabled, status.running) {
+        (true, true) => format!("{label}: {tools}, enabled in this thread."),
+        (true, false) => format!(
+            "{label}: {tools}, enabled in this thread but not running. Call mcp enable to start it."
+        ),
+        (false, true) => {
+            format!("{label}: {tools}, running. Call mcp enable to use it here.")
+        }
+        (false, false) => {
+            format!("{label}: {tools}, stopped. Call mcp enable to start it and use it here.")
+        }
+    }
 }
 
 /// Build a server's status from the tool list `tools_source` says to use.
@@ -1713,6 +2138,7 @@ mod tests {
                 server_id: "github".to_string(),
                 tools: (0..25).map(|i| format!("mcp__github__t{i}")).collect(),
             }],
+            servers: BTreeSet::from(["github".to_string()]),
         };
         let notice = surface.dropped_notice().expect("tools were dropped");
         assert_eq!(notice.lines().count(), 1, "{notice}");
@@ -1774,7 +2200,10 @@ mod tests {
             }],
         );
         let warning = past.warning.expect("dropped tools warn");
-        assert!(warning.starts_with("2 tools are left out"), "{warning}");
+        assert!(
+            warning.starts_with("A thread that enables every server leaves 2 tools out"),
+            "{warning}"
+        );
         assert!(warning.contains("server 'github'"), "{warning}");
 
         assert_eq!(McpBudget::new(200_000, &[], Vec::new()).warning, None);
@@ -1813,6 +2242,67 @@ mod tests {
             tools: Vec::new(),
             tools_observed_at: None,
             disabled_tools: disabled.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The invariant "no em dash": every `[MCP SERVERS]` line states the
+    /// reading thread's own status, and none carries U+2014 (the old stopped
+    /// line did).
+    #[test]
+    fn each_server_line_states_the_threads_own_status_without_an_em_dash() {
+        let tools = priced_tools(&["alpha", "beta"]);
+        let status = |running: bool, disabled: &[&str]| {
+            server_status(
+                &server_row("slack", disabled),
+                &tools,
+                if running {
+                    McpToolsSource::Live
+                } else {
+                    McpToolsSource::Cache
+                },
+                running,
+            )
+        };
+        let lines = [
+            server_line(&status(true, &[]), true, None),
+            server_line(&status(true, &["mcp__slack__beta"]), false, None),
+            server_line(&status(false, &[]), false, None),
+            server_line(&status(false, &[]), true, Some("spawn failed")),
+            server_line(&status(false, &[]), true, None),
+        ];
+        assert_eq!(
+            lines[0],
+            "- slack (slack server): 2 tools, enabled in this thread."
+        );
+        assert_eq!(
+            lines[1],
+            "- slack (slack server): 1 tool, running. Call mcp enable to use it here."
+        );
+        assert_eq!(
+            lines[2],
+            "- slack (slack server): 2 tools, stopped. Call mcp enable to start it and use it here."
+        );
+        assert_eq!(
+            lines[3],
+            "- slack (slack server): enabled in this thread, but it did not start: spawn failed."
+        );
+        assert!(lines[4].contains("enabled in this thread but not running"));
+
+        let mut unseen = server_row("github", &[]);
+        unseen.tools_observed_at = None;
+        let unseen = server_status(&unseen, &[], McpToolsSource::NeverObserved, false);
+        assert!(server_line(&unseen, false, None).contains("tools not yet seen, stopped"));
+
+        let unusable = server_status(
+            &server_row("back.stage", &[]),
+            &[],
+            McpToolsSource::Cache,
+            false,
+        );
+        assert!(server_line(&unusable, true, None).contains("can never run"));
+
+        for line in lines.iter() {
+            assert!(!line.contains('\u{2014}'), "{line}");
         }
     }
 
@@ -2215,6 +2705,20 @@ done
 
     /// One manager over several stub servers, for the tests that need two
     /// processes at once.
+    /// A chat thread that enabled `server_ids`, recorded as events alone: no
+    /// server starts, and the generation does not move.
+    async fn thread_enabling(manager: &McpManager, server_ids: &[&str]) -> uuid::Uuid {
+        let thread_id =
+            crate::test_support::seed_chat_thread(&manager.event_bus, "use the stub").await;
+        for id in server_ids {
+            manager
+                .emit_enabled(thread_id, id, McpEnablementSource::User, EventMeta::NONE)
+                .await
+                .unwrap();
+        }
+        thread_id
+    }
+
     async fn manager_with_all(pool: &sqlx::PgPool, stubs: &[(&str, &StubServer)]) -> McpManager {
         let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
         for (id, stub) in stubs {
@@ -2328,24 +2832,47 @@ done
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha", "beta", "gamma"]));
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
         manager.start_server("stub").await.unwrap();
 
-        let all = manager.tool_surface(usize::MAX).await;
+        let all = manager.tool_surface(thread, usize::MAX).await;
         assert!(all.dropped.is_empty());
         let one_tool = tool_definitions_chars(&all.tools[..1]);
 
-        let cut = manager.tool_surface(one_tool).await;
+        let cut = manager.tool_surface(thread, one_tool).await;
         assert_eq!(cut.tools.len(), 1);
         assert_eq!(cut.dropped.len(), 1);
         assert_eq!(cut.dropped[0].tools.len(), 2);
         assert!(cut.dropped_notice().is_some());
 
         // A window small enough that its ceiling fits no tool at all.
-        let budget = manager.budget(0).await;
+        let budget = manager.budget(0).await.unwrap();
         assert_eq!(budget.mcp_ceiling_chars, 0);
         assert_eq!((budget.sent_tools, budget.sent_chars), (0, 0));
         assert_eq!(budget.dropped[0].tools.len(), 3);
         assert!(budget.warning.is_some());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The cost report's budget is the worst case, one thread that enabled
+    /// every server (ADR 0430): a stopped server counts with the tools it last
+    /// offered, and one nobody has seen counts nothing.
+    #[tokio::test]
+    async fn the_budget_counts_every_server_as_one_thread_enabling_them_all() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let up = StubServer::new(&priced_tools(&["alpha"]));
+        let down = StubServer::new(&priced_tools(&["beta", "gamma"]));
+        let unseen = StubServer::new(&priced_tools(&["delta"]));
+        let manager =
+            manager_with_all(&pool, &[("up", &up), ("down", &down), ("unseen", &unseen)]).await;
+        manager.start_server("down").await.unwrap();
+        manager.stop_server("down").await.unwrap();
+        manager.start_server("up").await.unwrap();
+
+        let budget = manager.budget(200_000).await.unwrap();
+        assert_eq!(budget.sent_tools, 3, "up's one tool and down's two");
+        assert!(budget.dropped.is_empty());
 
         crate::test_support::teardown_test_db(&db_name).await;
     }
@@ -2357,6 +2884,7 @@ done
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
         manager.start_server("stub").await.unwrap();
 
         let offered = |surface: McpToolSurface| -> Vec<String> {
@@ -2365,7 +2893,7 @@ done
             names
         };
         assert_eq!(
-            offered(manager.tool_surface(usize::MAX).await),
+            offered(manager.tool_surface(thread, usize::MAX).await),
             vec![
                 "mcp__stub__alpha".to_string(),
                 "mcp__stub__beta".to_string()
@@ -2373,13 +2901,13 @@ done
         );
 
         manager
-            .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+            .set_tool_disabled("stub", "mcp__stub__beta", true, None)
             .await
             .unwrap()
             .expect("the server exists");
 
         assert_eq!(
-            offered(manager.tool_surface(usize::MAX).await),
+            offered(manager.tool_surface(thread, usize::MAX).await),
             vec!["mcp__stub__alpha".to_string()],
             "a disabled tool must leave the request without a restart"
         );
@@ -2388,19 +2916,57 @@ done
         assert!(status.tools.iter().any(|t| t.disabled));
         assert!(status.disabled_chars > 0);
 
-        // Clearing the set brings it straight back.
+        // Switching it back on brings it straight back.
         manager
-            .set_disabled_tools("stub", &[], None)
+            .set_tool_disabled("stub", "mcp__stub__beta", false, None)
             .await
             .unwrap()
             .expect("the server exists");
-        assert_eq!(manager.tool_surface(usize::MAX).await.tools.len(), 2);
+        assert_eq!(
+            manager.tool_surface(thread, usize::MAX).await.tools.len(),
+            2
+        );
 
         assert!(manager
-            .set_disabled_tools("missing", &[], None)
+            .set_tool_disabled("missing", "mcp__missing__x", false, None)
             .await
             .unwrap()
             .is_none());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Two switches on one running server, sent at once, both reach the stored
+    /// set and the running snapshot. The write lock keeps the snapshot copy in
+    /// step with the database, so dispatch and the listing agree (ADR 0437).
+    #[tokio::test]
+    async fn two_switches_at_once_both_reach_the_running_snapshot() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
+        manager.start_server("stub").await.unwrap();
+
+        let (alpha, beta) = tokio::join!(
+            manager.set_tool_disabled("stub", "mcp__stub__alpha", true, None),
+            manager.set_tool_disabled("stub", "mcp__stub__beta", true, None),
+        );
+        alpha.unwrap().expect("the server exists");
+        beta.unwrap().expect("the server exists");
+
+        assert!(
+            manager
+                .tool_surface(thread, usize::MAX)
+                .await
+                .tools
+                .is_empty(),
+            "both tools leave the request"
+        );
+        let status = manager.list_servers().await.unwrap().remove(0);
+        assert!(
+            status.tools.iter().all(|t| t.disabled),
+            "both read as off in the listing"
+        );
 
         crate::test_support::teardown_test_db(&db_name).await;
     }
@@ -2413,10 +2979,11 @@ done
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
         manager.start_server("stub").await.unwrap();
 
         manager
-            .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+            .set_tool_disabled("stub", "mcp__stub__beta", true, None)
             .await
             .unwrap()
             .expect("the server exists");
@@ -2424,7 +2991,7 @@ done
         // Calling it the way an in-flight tool call would, by the wire name the
         // model was shown before the switch.
         let refused = manager
-            .call_tool("stub", "beta", serde_json::json!({}))
+            .call_tool(thread, "stub", "beta", serde_json::json!({}))
             .await
             .expect_err("a disabled tool must not dispatch");
         let message = refused.to_string();
@@ -2438,7 +3005,7 @@ done
         // The refusal is about the switch, not the server: its sibling still
         // reaches the process and runs.
         let (result, server_name, _auto_approve) = manager
-            .call_tool("stub", "alpha", serde_json::json!({}))
+            .call_tool(thread, "stub", "alpha", serde_json::json!({}))
             .await
             .expect("an enabled tool still dispatches");
         assert_eq!(result, "stub ran");
@@ -2447,13 +3014,13 @@ done
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Remove stops the process before deleting the row. The other order leaves
-    /// a live MCP server with nothing left that names it.
+    /// Remove leaves no process behind, and no row.
     #[tokio::test]
-    async fn removing_a_running_server_stops_the_process_first() {
+    async fn removing_a_running_server_stops_its_process() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha"]));
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
         manager.start_server("stub").await.unwrap();
         assert!(stub.is_alive(), "the stub should be up before removal");
 
@@ -2462,7 +3029,11 @@ done
         assert!(!stub.is_alive(), "the process must not outlive its row");
         assert!(McpServerStore::get(&pool, "stub").await.unwrap().is_none());
         assert!(
-            manager.tool_surface(usize::MAX).await.tools.is_empty(),
+            manager
+                .tool_surface(thread, usize::MAX)
+                .await
+                .tools
+                .is_empty(),
             "a removed server must not keep offering tools"
         );
         assert!(manager.list_servers().await.unwrap().is_empty());
@@ -2491,7 +3062,15 @@ done
         let stub = StubServer::new(&priced_tools(&["alpha"]));
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
         let registered = manager
-            .setup_server("fresh", "Fresh", &stub.command, &[], &stub.env, true)
+            .setup_server(
+                crate::test_support::seed_chat_thread(&manager.event_bus, "set it up").await,
+                "fresh",
+                "Fresh",
+                &stub.command,
+                &[],
+                &stub.env,
+                true,
+            )
             .await
             .unwrap();
         assert!(
@@ -2513,8 +3092,9 @@ done
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
         manager.start_server("stub").await.unwrap();
-        let live = manager.tool_surface(usize::MAX).await;
+        let live = manager.tool_surface(thread, usize::MAX).await;
         assert_eq!(live.tools.len(), 2);
 
         // A start is the recovery the model is told to reach for.
@@ -2530,7 +3110,7 @@ done
         // A call must restart it rather than dispatch into a closed pipe.
         stub.kill_and_await_stop().await;
         let (result, _name, _auto_approve) = manager
-            .call_tool("stub", "alpha", serde_json::json!({}))
+            .call_tool(thread, "stub", "alpha", serde_json::json!({}))
             .await
             .expect("a call on a dead server restarts it");
         assert_eq!(result, "stub ran");
@@ -2545,7 +3125,7 @@ done
             "its manifest is remembered now, not read off the process"
         );
 
-        let dropped = manager.tool_surface(usize::MAX).await;
+        let dropped = manager.tool_surface(thread, usize::MAX).await;
         assert!(
             dropped.tools.is_empty(),
             "a dead server must stop costing tokens on every request"
@@ -2567,10 +3147,11 @@ done
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
 
         let before_start = manager.tool_surface_generation();
         manager.start_server("stub").await.unwrap();
-        let started = manager.tool_surface(usize::MAX).await;
+        let started = manager.tool_surface(thread, usize::MAX).await;
         assert_eq!(started.tools.len(), 2);
         assert_ne!(
             started.generation, before_start,
@@ -2591,29 +3172,29 @@ done
         assert_eq!(manager.tool_surface_generation(), started.generation);
 
         manager
-            .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+            .set_tool_disabled("stub", "mcp__stub__beta", true, None)
             .await
             .unwrap()
             .expect("the server exists");
-        let disabled = manager.tool_surface(usize::MAX).await;
+        let disabled = manager.tool_surface(thread, usize::MAX).await;
         assert_eq!(disabled.tools.len(), 1);
         assert_ne!(disabled.generation, started.generation);
 
-        // Re-submitting the same set, and a write for a server nobody
-        // started, both leave the offered tools exactly as they were.
+        // Switching it off again, and a write for a server nobody started,
+        // both leave the offered tools exactly as they were.
         manager
-            .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+            .set_tool_disabled("stub", "mcp__stub__beta", true, None)
             .await
             .unwrap()
             .expect("the server exists");
         manager
-            .set_disabled_tools("missing", &[], None)
+            .set_tool_disabled("missing", "mcp__missing__x", false, None)
             .await
             .unwrap();
         assert_eq!(manager.tool_surface_generation(), disabled.generation);
 
         manager.stop_server("stub").await.unwrap();
-        let stopped = manager.tool_surface(usize::MAX).await;
+        let stopped = manager.tool_surface(thread, usize::MAX).await;
         assert!(
             stopped.tools.is_empty(),
             "a stopped server stops being callable"
@@ -2625,6 +3206,346 @@ done
         manager.stop_server("stub").await.unwrap();
         assert!(manager.remove_server("stub", None).await.unwrap());
         assert_eq!(manager.tool_surface_generation(), stopped.generation);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Enabled per thread (ADR 0430)
+    // -----------------------------------------------------------------------
+
+    fn offered_names(surface: &McpToolSurface) -> Vec<String> {
+        let mut names: Vec<String> = surface.tools.iter().map(|d| d.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    async fn events_named(pool: &sqlx::PgPool, event_type: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type = $1")
+            .bind(event_type)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The invariant "dispatch agrees": a thread that did not enable a running
+    /// server cannot call its tools. Naming a tool does not start the server
+    /// on demand either.
+    #[tokio::test]
+    async fn a_thread_that_did_not_enable_a_server_cannot_call_its_tools() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+        let bystander = crate::test_support::seed_chat_thread(&bus, "unrelated").await;
+
+        assert!(manager
+            .tool_surface(bystander, usize::MAX)
+            .await
+            .tools
+            .is_empty());
+        let refused = manager
+            .call_tool(bystander, "stub", "alpha", serde_json::json!({}))
+            .await
+            .expect_err("a server the thread did not enable must not dispatch")
+            .to_string();
+        assert!(refused.contains("mcp enable"), "{refused}");
+        assert!(refused.contains("NOT run"), "{refused}");
+        assert!(!stub.call_started(), "the call must not reach the process");
+
+        manager.stop_server("stub").await.unwrap();
+        assert!(manager
+            .call_tool(bystander, "stub", "alpha", serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(
+            !stub.is_alive(),
+            "naming a tool must not start a server the thread never enabled"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The invariant "no cross-thread change": thread A enables a server in
+    /// the middle of a turn. The generation moves for every running turn, and
+    /// thread B recomputes the very slice it held, byte for byte. `TurnTools`
+    /// then rewrites nothing (`a_moved_generation_with_the_same_slice_rewrites_nothing`).
+    #[tokio::test]
+    async fn one_thread_enabling_a_server_changes_no_other_threads_slice() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"]));
+        let (manager, bus) = manager_with(&pool, "stub", &stub).await;
+        let a = crate::test_support::seed_chat_thread(&bus, "check the stub").await;
+        let b = crate::test_support::seed_chat_thread(&bus, "something else").await;
+        let b_before = manager.tool_surface(b, usize::MAX).await;
+
+        manager
+            .enable_for_thread(a, "stub", McpEnablementSource::Agent, EventMeta::NONE)
+            .await
+            .unwrap();
+        assert_ne!(
+            manager.tool_surface_generation(),
+            b_before.generation,
+            "every running turn has to look again"
+        );
+
+        assert_eq!(
+            offered_names(&manager.tool_surface(a, usize::MAX).await),
+            ["mcp__stub__alpha", "mcp__stub__beta"]
+        );
+        let b_after = manager.tool_surface(b, usize::MAX).await;
+        assert_eq!(
+            serde_json::to_string(&b_after.tools).unwrap(),
+            serde_json::to_string(&b_before.tools).unwrap()
+        );
+        assert_eq!(b_after.servers, b_before.servers);
+        assert_eq!(b_after.dropped, b_before.dropped);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The invariant "enabled survives a restart, and running does not". A
+    /// fresh manager stands in for the restarted engine: nothing runs at boot,
+    /// and the turn's setup brings the thread's servers back.
+    #[tokio::test]
+    async fn a_threads_enabled_servers_come_back_at_its_next_turn_after_a_restart() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (before_restart, bus) = manager_with(&pool, "stub", &stub).await;
+        let thread_id = crate::test_support::seed_chat_thread(&bus, "use the stub").await;
+        before_restart
+            .enable_for_thread(
+                thread_id,
+                "stub",
+                McpEnablementSource::Agent,
+                EventMeta::NONE,
+            )
+            .await
+            .unwrap();
+        // What shutdown does: every process ends, and nothing is recorded.
+        before_restart.stop_server("stub").await.unwrap();
+        drop(before_restart);
+        assert_eq!(events_named(&pool, "McpServerStopped").await, 0);
+
+        let after_restart = McpManager::new(pool.clone(), bus.clone());
+        assert!(
+            !after_restart.list_servers().await.unwrap()[0].running,
+            "nothing starts a server at boot"
+        );
+        assert!(after_restart
+            .start_enabled_servers(thread_id)
+            .await
+            .is_empty());
+        assert!(stub.is_alive());
+        assert_eq!(
+            offered_names(&after_restart.tool_surface(thread_id, usize::MAX).await),
+            ["mcp__stub__alpha"]
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The invariant "stop reaches every thread": two threads enabled a
+    /// server, and one stop leaves neither offering it, in the projection or
+    /// in the slice. Disabling, by contrast, touches one thread.
+    #[tokio::test]
+    async fn a_stop_switches_a_server_off_in_every_thread_and_a_disable_in_one() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, bus) = manager_with(&pool, "stub", &stub).await;
+        let first = crate::test_support::seed_chat_thread(&bus, "one").await;
+        let second = crate::test_support::seed_chat_thread(&bus, "two").await;
+        for thread_id in [first, second] {
+            manager
+                .enable_for_thread(
+                    thread_id,
+                    "stub",
+                    McpEnablementSource::Agent,
+                    EventMeta::NONE,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(manager
+            .disable_for_thread(first, "stub", McpEnablementSource::User, EventMeta::NONE)
+            .await
+            .unwrap());
+        assert!(manager
+            .tool_surface(first, usize::MAX)
+            .await
+            .tools
+            .is_empty());
+        assert_eq!(
+            manager.tool_surface(second, usize::MAX).await.tools.len(),
+            1
+        );
+        assert!(
+            stub.is_alive(),
+            "a disable leaves the process to the others"
+        );
+        manager
+            .enable_for_thread(first, "stub", McpEnablementSource::Agent, EventMeta::NONE)
+            .await
+            .unwrap();
+
+        let before = manager.tool_surface_generation();
+        assert!(matches!(
+            manager.stop_everywhere("stub", None).await.unwrap(),
+            Some(McpStopOutcome::Stopped { .. })
+        ));
+        assert_ne!(manager.tool_surface_generation(), before);
+        for thread_id in [first, second] {
+            assert!(manager.enabled_servers(thread_id).await.is_empty());
+            assert!(manager
+                .tool_surface(thread_id, usize::MAX)
+                .await
+                .tools
+                .is_empty());
+        }
+        assert_eq!(events_named(&pool, "McpServerStopped").await, 1);
+        assert!(manager.start_enabled_servers(first).await.is_empty());
+        assert!(!stub.is_alive(), "the next turn must not start it again");
+        assert_eq!(
+            manager.stop_everywhere("missing", None).await.unwrap(),
+            None
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The invariant "a trigger that lists a server has its schemas from
+    /// round 1", at the setup half: the fire enables what the trigger lists,
+    /// the setup starts it, and the first surface already carries its tools.
+    /// An id no server has becomes a line of `[MCP SERVERS]`.
+    #[tokio::test]
+    async fn a_trigger_listed_server_is_in_the_turns_first_surface() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, bus) = manager_with(&pool, "stub", &stub).await;
+        let thread_id = crate::test_support::seed_chat_thread(&bus, "hourly watch").await;
+
+        let mut failures = manager
+            .enable_listed(thread_id, &["stub".to_string(), "ghost".to_string()])
+            .await;
+        failures.extend(manager.start_enabled_servers(thread_id).await);
+
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].server_id, "ghost");
+        assert_eq!(
+            offered_names(&manager.tool_surface(thread_id, usize::MAX).await),
+            ["mcp__stub__alpha"]
+        );
+        let lines = manager
+            .server_lines(
+                &manager.enabled_servers(thread_id).await,
+                &failures,
+                Some(&["stub".to_string(), "ghost".to_string()]),
+            )
+            .await;
+        assert_eq!(
+            lines,
+            [
+                "- stub (Stub): 1 tool, enabled in this thread.",
+                "- ghost: the trigger lists it, but no MCP server has this id.",
+            ]
+        );
+
+        // A fire whose trigger does not list the server is told its calls are
+        // refused, rather than invited to enable it.
+        let unlisted = manager
+            .server_lines(&BTreeSet::new(), &[], Some(&["other".to_string()]))
+            .await;
+        assert_eq!(
+            unlisted,
+            ["- stub (Stub): 1 tool. This trigger does not list it, so a call to it is refused in this fire."]
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Two threads waking together both start their shared server. One start
+    /// spawns it, and the other finds it running, so one process serves both.
+    #[tokio::test]
+    async fn concurrent_starts_of_one_server_spawn_one_process() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+
+        let (first, second) =
+            tokio::join!(manager.start_server("stub"), manager.start_server("stub"));
+        let mut outcomes = [first.unwrap(), second.unwrap()];
+        outcomes.sort_by_key(|o| matches!(o, McpStartOutcome::AlreadyRunning { .. }));
+        assert_eq!(
+            outcomes,
+            [
+                McpStartOutcome::Started { tool_count: 1 },
+                McpStartOutcome::AlreadyRunning { tool_count: 1 }
+            ]
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Enabling twice records one event. A start that fails enables nothing,
+    /// so a thread never lists a server it cannot use.
+    #[tokio::test]
+    async fn enabling_is_idempotent_and_a_failed_start_enables_nothing() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, bus) = manager_with(&pool, "stub", &stub).await;
+        McpServerStore::register(
+            &pool,
+            &bus,
+            "broken",
+            "Broken",
+            "/nonexistent/mcp-server",
+            &[],
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let thread_id = crate::test_support::seed_chat_thread(&bus, "go").await;
+
+        for _ in 0..2 {
+            let outcome = manager
+                .enable_for_thread(
+                    thread_id,
+                    "stub",
+                    McpEnablementSource::Agent,
+                    EventMeta::NONE,
+                )
+                .await
+                .unwrap();
+            assert!(outcome
+                .describe("stub", true)
+                .contains("enabled in this thread"));
+        }
+        assert_eq!(events_named(&pool, "ThreadMcpServerEnabled").await, 1);
+
+        assert!(manager
+            .enable_for_thread(
+                thread_id,
+                "broken",
+                McpEnablementSource::Agent,
+                EventMeta::NONE
+            )
+            .await
+            .is_err());
+        assert!(manager
+            .enable_for_thread(
+                thread_id,
+                "missing",
+                McpEnablementSource::Agent,
+                EventMeta::NONE
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            manager.enabled_servers(thread_id).await,
+            BTreeSet::from(["stub".to_string()])
+        );
 
         crate::test_support::teardown_test_db(&db_name).await;
     }
@@ -2642,21 +3563,22 @@ done
         let slow = StubServer::new(&priced_tools(&["alpha"])).slow_to_answer(3);
         let quick = StubServer::new(&priced_tools(&["beta"]));
         let manager = manager_with_all(&pool, &[("slow", &slow), ("quick", &quick)]).await;
+        let thread = thread_enabling(&manager, &["slow", "quick"]).await;
         manager.start_server("slow").await.unwrap();
         manager.start_server("quick").await.unwrap();
 
         let budget = std::time::Duration::from_millis(1500);
-        let busy = manager.call_tool("slow", "alpha", serde_json::json!({}));
+        let busy = manager.call_tool(thread, "slow", "alpha", serde_json::json!({}));
         let meanwhile = async {
             slow.await_call_started().await;
             let answered = tokio::time::timeout(
                 budget,
-                manager.call_tool("quick", "beta", serde_json::json!({})),
+                manager.call_tool(thread, "quick", "beta", serde_json::json!({})),
             )
             .await
             .expect("a call to another server must not wait for the slow one")
             .expect("the quick server answers");
-            let surface = tokio::time::timeout(budget, manager.tool_surface(usize::MAX))
+            let surface = tokio::time::timeout(budget, manager.tool_surface(thread, usize::MAX))
                 .await
                 .expect("tool assembly must not wait for a call in flight");
             (answered, surface)
@@ -2680,12 +3602,13 @@ done
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha", "beta"])).slow_to_answer(1);
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
         manager.start_server("stub").await.unwrap();
 
         let started = std::time::Instant::now();
         let (first, second) = tokio::join!(
-            manager.call_tool("stub", "alpha", serde_json::json!({})),
-            manager.call_tool("stub", "beta", serde_json::json!({})),
+            manager.call_tool(thread, "stub", "alpha", serde_json::json!({})),
+            manager.call_tool(thread, "stub", "beta", serde_json::json!({})),
         );
         let elapsed = started.elapsed();
 
@@ -2707,19 +3630,20 @@ done
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha", "beta"])).slow_to_answer(3);
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
         manager.start_server("stub").await.unwrap();
 
-        let busy = manager.call_tool("stub", "alpha", serde_json::json!({}));
+        let busy = manager.call_tool(thread, "stub", "alpha", serde_json::json!({}));
         let meanwhile = async {
             stub.await_call_started().await;
             // Queued behind the call in flight, and switched off while it
             // waits. It passes the arrival check and must fail the dispatch
             // one.
-            let queued = manager.call_tool("stub", "beta", serde_json::json!({}));
+            let queued = manager.call_tool(thread, "stub", "beta", serde_json::json!({}));
             let switch_off = async {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 manager
-                    .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+                    .set_tool_disabled("stub", "mcp__stub__beta", true, None)
                     .await
                     .unwrap()
                     .expect("the server exists");
@@ -2747,12 +3671,13 @@ done
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let stub = StubServer::new(&priced_tools(&["alpha", "beta"])).slow_to_answer(3);
         let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread = thread_enabling(&manager, &["stub"]).await;
         manager.start_server("stub").await.unwrap();
 
-        let busy = manager.call_tool("stub", "alpha", serde_json::json!({}));
+        let busy = manager.call_tool(thread, "stub", "alpha", serde_json::json!({}));
         let meanwhile = async {
             stub.await_call_started().await;
-            let queued = manager.call_tool("stub", "beta", serde_json::json!({}));
+            let queued = manager.call_tool(thread, "stub", "beta", serde_json::json!({}));
             let stop = async {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 manager.stop_server("stub").await.unwrap()
@@ -2785,11 +3710,12 @@ done
         let flooder = StubServer::new(&priced_tools(&["alpha"]))
             .floods_on_call(client::MAX_FRAME_BYTES + 1_000_000);
         let (manager, _bus) = manager_with(&pool, "flood", &flooder).await;
+        let thread = thread_enabling(&manager, &["flood"]).await;
         manager.start_server("flood").await.unwrap();
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            manager.call_tool("flood", "alpha", serde_json::json!({})),
+            manager.call_tool(thread, "flood", "alpha", serde_json::json!({})),
         )
         .await
         .expect("the cap has to fire well before the 30s deadline")
@@ -2816,6 +3742,7 @@ done
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let broken = StubServer::new(&[]).fails_tools_list("catalog backend is down");
         let (manager, bus) = manager_with(&pool, "broken", &broken).await;
+        let thread = thread_enabling(&manager, &["broken"]).await;
 
         let error = manager
             .start_server("broken")
@@ -2839,7 +3766,11 @@ done
         assert!(!status.running);
         assert_eq!(status.tools_source, McpToolsSource::NeverObserved);
         assert!(status.tools.is_empty());
-        assert!(manager.tool_surface(usize::MAX).await.tools.is_empty());
+        assert!(manager
+            .tool_surface(thread, usize::MAX)
+            .await
+            .tools
+            .is_empty());
 
         // A server that genuinely advertises nothing is the other thing, and
         // it starts.

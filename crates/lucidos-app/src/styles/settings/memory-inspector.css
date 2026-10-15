@@ -249,7 +249,7 @@
     max-height: 18.75rem;
     overflow-y: auto;
     white-space: pre-wrap;
-    word-break: break-all;
+    overflow-wrap: anywhere;
 }
 
 /* Settings → System → Memory: the Tree confirm modal and the backfill bar.
@@ -268,6 +268,146 @@
     min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
+}
+
+/* The memory choice: two cards side by side, stacked on a phone, then what
+   Tree costs a month. The body scrolls, like the Tree confirm's. */
+.memory-choice {
+    width: min(40rem, calc(100vw - 2rem));
+    max-height: calc(var(--app-height, 100dvh) - 2rem - var(--safe-area-top) - var(--safe-area-bottom));
+    display: flex;
+    flex-direction: column;
+}
+
+.memory-choice-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+.memory-choice-body p {
+    margin: 0;
+}
+
+.memory-choice-lead {
+    color: var(--text-secondary);
+}
+
+.memory-choice-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+    gap: var(--space-sm);
+}
+
+.memory-choice-card,
+.memory-choice-cost {
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    padding: var(--space-md);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    min-width: 0;
+}
+
+.memory-choice-card-title {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.memory-choice-card p {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+/* The buttons line up at the foot of both cards, however long the copy. */
+.memory-choice-card .action-btn {
+    align-self: flex-start;
+    margin-top: auto;
+}
+
+/* The compactor model row heads the cost panel: the title, with the picker. */
+.memory-choice-cost > .settings-row {
+    padding: 0;
+}
+
+.memory-choice-cost > .settings-row .settings-row-label {
+    font-weight: 600;
+}
+
+/* Three across, or one a row where three do not fit: never two and an orphan. */
+.memory-choice-cost {
+    container: memory-choice-cost / inline-size;
+}
+
+.memory-choice-tiles {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-sm);
+}
+
+@container memory-choice-cost (max-width: 28rem) {
+    .memory-choice-tiles {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.memory-choice-tile {
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-control);
+    padding: var(--space-sm) var(--space-md);
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    min-width: 0;
+}
+
+.memory-choice-tile-name {
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+}
+
+/* Holds a line while the price loads, so nothing moves when it lands. */
+.memory-choice-tile-usd {
+    min-height: 1.25em;
+    font-size: var(--font-size-2xl);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+}
+
+.memory-choice-tile-usd small {
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+    color: var(--text-secondary);
+}
+
+.memory-choice-tile-range {
+    min-height: 1.25em;
+    font-size: var(--font-size-xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+}
+
+.memory-choice-tile-does {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+.memory-choice-note {
+    min-height: 1.25em;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
 }
 
 .memory-tree-estimate {

@@ -55,8 +55,8 @@
    against a single line of buttons, and `.list-row` top-aligns its children —
    so the actions sat at the row's TOP edge whenever the pane was wide enough to
    keep them beside the info instead of wrapping/stacking below it. Pin them to
-   the bottom edge at every width, the same way `.app-row` / `.trigger-row` do
-   in skills.css. */
+   the bottom edge at every width, the same way `.trigger-row` does in
+   skills.css. */
 .credential-row .list-row-actions,
 .oauth-account-row .list-row-actions {
     align-self: flex-end;

@@ -21,19 +21,16 @@ use super::propagation::{
     reconcile_parent_waiting_children_count, reconcile_proposal_lifecycle_end,
     reincrement_parent_active_count_if_revived, settle_parent_callback,
 };
-use crate::core::store::{EventWaitSummary, LegacyInitiator};
+use crate::core::store::{
+    ComposeReport, ComposeReportRow, EventWaitSummary, LegacyInitiator, COMPOSE_REPORT_COLS,
+};
+use crate::engine::integrated::queued_spawn_is_integrated;
 use crate::engine::thread_events::{
-    ActorMode, AnswerKind, CancelCause, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    ActorMode, CancelCause, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
 use crate::engine::thread_lifecycle::{
     resolve_transition, ArchiveState, ChangeStateKind, ThreadStatus,
 };
-
-/// Whitespace `btrim` must strip when matching a submitted answer against the
-/// stored draft, so the comparison agrees with the client's `String.prototype
-/// .trim()`. Bound as a parameter because one-argument `btrim` strips spaces
-/// only — a textarea's trailing newline would otherwise defeat the match.
-const COMPOSE_TRIM_CHARS: &str = " \t\n\r\u{000b}\u{000c}";
 
 const IDLE: &str = ThreadStatus::Idle.sql_literal();
 const RUNNING: &str = ThreadStatus::Running.sql_literal();
@@ -50,9 +47,8 @@ const WAITING_FOR_USER_ANSWER: &str = ThreadStatus::WaitingForUserAnswer.sql_lit
 /// thread already active must keep its *compose epoch* still, or the reply
 /// draft the reader is typing is refused by the write fence.
 ///
-/// The epoch bump and its broadcast are what a send does, and for the same
-/// reason: a device holding this draft must hear that the slot is gone (see
-/// [`compose_cleared_broadcast`]).
+/// The epoch bump and its broadcast are what a send's accept does, and for the
+/// same reason: a device holding this draft must hear that the slot is gone.
 ///
 /// The CALLERS set `has_response` rather than this helper, folding it into the
 /// recency write each already makes. Both facts are owed on every spoken row,
@@ -63,7 +59,7 @@ async fn a_call_makes_the_thread_real(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     thread_id: Uuid,
 ) -> Result<Vec<BusEvent>, sqlx::Error> {
-    let promoted: Option<(i64,)> = sqlx::query_as(
+    let promoted: Option<ComposeReportRow> = sqlx::query_as(&format!(
         "UPDATE thread_summaries \
          SET state = 'active', \
              compose_text = '', \
@@ -72,15 +68,15 @@ async fn a_call_makes_the_thread_real(
              compose_selection = NULL, \
              compose_epoch = compose_epoch + 1 \
          WHERE thread_id = $1 AND state = 'composing' \
-         RETURNING compose_epoch",
-    )
+         RETURNING {COMPOSE_REPORT_COLS}"
+    ))
     .bind(thread_id)
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(match promoted {
-        Some((epoch,)) => vec![compose_cleared_broadcast(thread_id, epoch)],
-        None => Vec::new(),
-    })
+    Ok(promoted
+        .map(|row| ComposeReport::from(row).broadcast(thread_id, None))
+        .into_iter()
+        .collect())
 }
 
 /// Write a thread's name, and answer whether there was a row to take it.
@@ -104,37 +100,6 @@ async fn write_thread_title(
         .execute(&mut **tx)
         .await?;
     Ok(applied.rows_affected() > 0)
-}
-
-/// Announce that the thread's stored draft is gone, and at which *compose
-/// epoch* (`docs/glossary.md`). Every projection arm that empties the compose
-/// fields owes one of these: the clear is otherwise silent, and a device
-/// holding the same draft keeps showing it until its next thread-summary
-/// reload. A thread event won't do. Its delivery can lag arbitrarily behind the
-/// transaction, so the frontend only trusts a compose REPORT as the server's
-/// current state (`serverDraft` in `store/actions/compose.ts`).
-/// `origin_device_id: None` because this is the server's own report, not any
-/// device's echo, so nobody suppresses it.
-///
-/// It is also how a device learns the new epoch, which is what lets its next
-/// compose PUT carry a value the fence accepts. A device that misses this frame
-/// is not stuck: its next write is refused with `412` carrying the current
-/// epoch, and it retries. Broadcast UNCONDITIONALLY, even when the thread held
-/// no draft to clear, because the epoch moved. The draft-less case is exactly
-/// the reported bug: the client's write was still in flight, so the engine had
-/// nothing yet.
-fn compose_cleared_broadcast(thread_id: Uuid, compose_epoch: i64) -> BusEvent {
-    BusEvent::System(
-        crate::engine::event_bus::SystemEvent::ThreadComposeChanged {
-            id: thread_id,
-            text: String::new(),
-            image_hashes: Vec::new(),
-            mode: None,
-            selection: None,
-            compose_epoch,
-            origin_device_id: None,
-        },
-    )
 }
 
 /// `live_event_waits` with the wait bound as `$2` removed, as a scalar
@@ -235,6 +200,11 @@ impl EventBus {
         // `crates/lucidos-engine/src/scheduler/mod.rs`).
         let skip_blocking_sample = event.is_per_token_streaming();
 
+        // A cache keep-alive turn leaves no trace on the summary row.
+        if self.skips_for_keep_alive(tx, thread_id, event).await? {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
         // Sample is_blocking-relevant state BEFORE the projection mutates it,
         // so the propagation step (after the section transition) can compute
         // an exact delta and walk ancestors via parent_thread_id. None when
@@ -262,7 +232,7 @@ impl EventBus {
         // Step 1: Run metadata updates
         let match_side_effects: Vec<BusEvent> = match event {
             // Thread start events — upsert the summary row
-            ThreadEvent::MessageReceived { text, parent_thread_id, spawning_event_id, mode, .. } => {
+            ThreadEvent::MessageReceived { text, parent_thread_id, spawning_event_id, wake_mode, mode, .. } => {
                 let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("chat");
                 // Map ActorMode to the legacy two-state `initiator` column:
                 // Human → "user", Agent | Engine → "system". The column was
@@ -294,6 +264,13 @@ impl EventBus {
                 } else {
                     (0, msg_initiator)
                 };
+                // An integrated child is integrated from its first row, so a
+                // first run that fails before `SessionStarted` still reads it.
+                // Only a spawning message carries a parent link.
+                let integrated_spawn = match parent_thread_id {
+                    Some(_) => queued_spawn_is_integrated(tx, thread_id).await?,
+                    None => false,
+                };
                 // `parent_callback_pending = ($4 IS NOT NULL)` is load-bearing,
                 // not tidiness. The storage default is FALSE (a top-level
                 // thread owes no parent a card), so without this write a fresh
@@ -303,19 +280,17 @@ impl EventBus {
                 // The CASE in the conflict arm covers a spawn landing on a
                 // pre-existing row, and leaves a parentless row alone.
                 //
-                // `compose_epoch` comes back so the post-commit broadcast can
-                // carry it. A fresh INSERT returns the storage default 0 and the
-                // conflict arm always returns at least 1, which is what
-                // distinguishes "a submission consumed an existing thread's
-                // compose slot" (announce it) from "this row was just created"
-                // (nothing to announce, and no device has heard of the thread
-                // yet). `None` means the discarded-thread guard below matched.
-                let compose_epoch: Option<i64> = sqlx::query_as(&format!(
-                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, parent_thread_id, spawning_event_id, depth, status, last_revived_at, state, parent_callback_pending)
-                       VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, {RUNNING}, NOW(), 'active', $4 IS NOT NULL)
+                // The compose fields are not touched: the send consumed the
+                // compose slot when the engine accepted it (ADR 0450).
+                sqlx::query(&format!(
+                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, parent_thread_id, spawning_event_id, depth, status, last_revived_at, state, parent_callback_pending, wake_mode, coding_agent_integrated, successor_of)
+                       VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, {RUNNING}, NOW(), 'active', $4 IS NOT NULL, $9, $10,
+                               (SELECT s.thread_id FROM thread_summaries s WHERE s.successor_thread_id = $1 LIMIT 1))
                        ON CONFLICT (thread_id) DO UPDATE
                        SET last_activity = NOW(),
                            parent_callback_pending = CASE WHEN $4 IS NOT NULL THEN TRUE ELSE thread_summaries.parent_callback_pending END,
+                           -- Monotone, as in the `SessionStarted` arm.
+                           coding_agent_integrated = thread_summaries.coding_agent_integrated OR $10,
                            -- Attributed recency: a human follow-up bumps
                            -- last_user_action (the drawer sort key); an
                            -- agent/engine follow-up bumps last_agent_action.
@@ -338,24 +313,10 @@ impl EventBus {
                                WHEN thread_summaries.state = 'composing' THEN EXCLUDED.source
                                WHEN thread_summaries.source = 'chat' THEN EXCLUDED.source
                                ELSE thread_summaries.source
-                           END,
-                           compose_text = '',
-                           compose_images = '[]'::jsonb,
-                           compose_mode = NULL,
-                           compose_selection = NULL,
-                           -- The send consumed this thread's compose slot, so
-                           -- every write composed against the old epoch is now
-                           -- stale and `put_compose` must refuse it. Bumped
-                           -- whether or not a draft was actually stored: the
-                           -- reported bug is precisely the case where the
-                           -- client's draft PUT was still in flight, so the
-                           -- engine held nothing to clear and the write landed
-                           -- afterwards. See `docs/glossary.md` § compose epoch.
-                           compose_epoch = thread_summaries.compose_epoch + 1
+                           END
                        -- Defense in depth: refuse to resurrect a discarded thread if a
                        -- stale MessageReceived slips past the API-layer guard.
-                       WHERE thread_summaries.state != 'discarded'
-                       RETURNING compose_epoch"#
+                       WHERE thread_summaries.state != 'discarded'"#
                 ))
                 .bind(thread_id)
                 .bind(text)
@@ -365,9 +326,11 @@ impl EventBus {
                 .bind(initiator)
                 .bind(spawning_event_id)
                 .bind(human)
-                .fetch_optional(&mut **tx)
-                .await?
-                .map(|(epoch,): (i64,)| epoch);
+                // The wake mode lands with the parent link, on the INSERT only.
+                .bind(wake_mode.map(|m| m.as_str()))
+                .bind(integrated_spawn)
+                .execute(&mut **tx)
+                .await?;
 
                 // If this message has a parent, increment the parent's active_children_count.
                 // Parents are always Chat threads — CC threads are always children.
@@ -403,10 +366,7 @@ impl EventBus {
                     }
                 }
 
-                match compose_epoch {
-                    Some(epoch) if epoch > 0 => vec![compose_cleared_broadcast(thread_id, epoch)],
-                    _ => Vec::new(),
-                }
+                Vec::new()
             }
             // Session lifecycle — session start/continuation don't update
             // last_activity (the first real activity event will set it).
@@ -447,12 +407,13 @@ impl EventBus {
                 // (`<ws>/data/apps/<id>/`), so consumers reconstruct it
                 // rather than storing it as its own column. See
                 // `change_ops::load_apply_kind_context`.
-                let (session_repo_id, session_kind, session_folder, session_agent) = match &event {
+                let (session_repo_id, session_kind, session_folder, session_agent, session_integrated) = match &event {
                     ThreadEvent::SessionStarted {
                         repo_id,
                         coding_agent_kind,
                         coding_agent_folder,
                         coding_agent,
+                        integrated,
                         ..
                     } => (
                         repo_id.as_deref(),
@@ -463,16 +424,13 @@ impl EventBus {
                             Some(coding_agent_folder.as_str())
                         },
                         Some(coding_agent.as_str()),
+                        *integrated,
                     ),
-                    _ => (None, None, None, None),
+                    _ => (None, None, None, None, false),
                 };
-                // `compose_epoch` comes back for the same reason as in the
-                // `MessageReceived` arm: only a row that already existed can
-                // have held (or be about to receive) a draft, and only the
-                // coding-agent branch consumes one.
-                let compose_epoch: Option<i64> = sqlx::query_as(&format!(
-                    r#"INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, coding_agent_kind, coding_agent_folder, coding_agent, state)
-                       VALUES ($1, $2, $7, NOW(), NOW(), 0, {RUNNING}, NOW(), $3, $4, $5, $6, 'active')
+                sqlx::query(&format!(
+                    r#"INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, coding_agent_kind, coding_agent_folder, coding_agent, coding_agent_integrated, state)
+                       VALUES ($1, $2, $7, NOW(), NOW(), 0, {RUNNING}, NOW(), $3, $4, $5, $6, $8, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
                        -- Monotone: a coding-agent event sets the flag and
                        -- nothing here clears it, so no ordering of events can
@@ -495,23 +453,15 @@ impl EventBus {
                            -- Same lock for the backend: a thread can never flip
                            -- between Claude Code and Codex mid-conversation.
                            coding_agent = COALESCE(thread_summaries.coding_agent, $6),
-                           state = 'active',
-                           -- Gated too: a coding-agent session start consumes
-                           -- the thread's prompt, but a chat/trigger Continue
-                           -- consumes nothing (the user clicked Continue, they
-                           -- did not send), so their draft must survive. The
-                           -- epoch is gated with it: an epoch bump means "a
-                           -- submission consumed the slot", and a Continue is
-                           -- not one, so bumping there would refuse a perfectly
-                           -- good draft write for nothing.
-                           compose_text = CASE WHEN $7 THEN '' ELSE thread_summaries.compose_text END,
-                           compose_images = CASE WHEN $7 THEN '[]'::jsonb ELSE thread_summaries.compose_images END,
-                           compose_mode = CASE WHEN $7 THEN NULL ELSE thread_summaries.compose_mode END,
-                           compose_selection = CASE WHEN $7 THEN NULL ELSE thread_summaries.compose_selection END,
-                           compose_epoch = thread_summaries.compose_epoch + CASE WHEN $7 THEN 1 ELSE 0 END
+                           -- Monotone like `is_coding_agent`: an integrated
+                           -- thread stays integrated for its whole life.
+                           coding_agent_integrated = thread_summaries.coding_agent_integrated OR $8,
+                           -- The compose fields are not touched: the send that
+                           -- started this session consumed the compose slot
+                           -- when the engine accepted it (ADR 0450).
+                           state = 'active'
                        -- Defense in depth (see MessageReceived above for rationale).
-                       WHERE thread_summaries.state != 'discarded'
-                       RETURNING compose_epoch"#
+                       WHERE thread_summaries.state != 'discarded'"#
                 ))
                 .bind(thread_id)
                 .bind(source)
@@ -520,19 +470,10 @@ impl EventBus {
                 .bind(session_folder)
                 .bind(session_agent)
                 .bind(is_coding_agent_event)
-                .fetch_optional(&mut **tx)
-                .await?
-                .map(|(epoch,): (i64,)| epoch);
-                // Only the coding-agent branch cleared anything, and until this
-                // change it did so silently, so a peer device kept rendering the
-                // consumed draft until its next reload. Announcing it also hands
-                // every device the new epoch.
-                match compose_epoch {
-                    Some(epoch) if is_coding_agent_event && epoch > 0 => {
-                        vec![compose_cleared_broadcast(thread_id, epoch)]
-                    }
-                    _ => Vec::new(),
-                }
+                .bind(session_integrated)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
             }
             ThreadEvent::TriggerStarted { trigger_id, trigger_name, go_to_review, .. } => {
                 let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("trigger");
@@ -816,6 +757,54 @@ impl EventBus {
                 Vec::new()
             }
 
+            // The child's wake decision for this turn. A turn start resets it.
+            ThreadEvent::ParentWakeRequested | ThreadEvent::ParentWakeNotRequested => {
+                let requested = matches!(event, ThreadEvent::ParentWakeRequested);
+                sqlx::query(
+                    "UPDATE thread_summaries SET parent_wake_requested = $2 WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .bind(requested)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            // An Apply Now's bracket: every client reads "applying" here.
+            ThreadEvent::ApplyNowStarted | ThreadEvent::ApplyNowEnded { .. } => {
+                let in_flight = matches!(event, ThreadEvent::ApplyNowStarted);
+                sqlx::query("UPDATE thread_summaries SET apply_in_flight = $2 WHERE thread_id = $1")
+                    .bind(thread_id)
+                    .bind(in_flight)
+                    .execute(&mut **tx)
+                    .await?;
+                Vec::new()
+            }
+            // A set, so enabling twice stores the id once (ADR 0430).
+            ThreadEvent::ThreadMcpServerEnabled { server_id, .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries \
+                     SET enabled_mcp_servers = array_append(enabled_mcp_servers, $2) \
+                     WHERE thread_id = $1 AND NOT ($2 = ANY(enabled_mcp_servers))",
+                )
+                .bind(thread_id)
+                .bind(server_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::ThreadMcpServerDisabled { server_id, .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries \
+                     SET enabled_mcp_servers = array_remove(enabled_mcp_servers, $2) \
+                     WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .bind(server_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+
             // `resolve_transition` moves the thread; neither projects more. A
             // no never clears an unseen request, so it writes nothing.
             ThreadEvent::ThreadUnarchived
@@ -1088,6 +1077,16 @@ impl EventBus {
                     !change_id.is_empty() || commit_sha.is_some(),
                     "ChangeProposed with neither change_id nor commit_sha is malformed"
                 );
+                // Every proposal passes here, whoever emits it. A lane batch's
+                // integration branch lands whole through the landing lane, so
+                // the error rolls the whole emit back (ADR 0463).
+                if crate::engine::git_ops::is_lane_branch(branch_name) {
+                    return Err(format!(
+                        "ChangeProposed refused for thread {thread_id} on {branch_name}: {}",
+                        crate::engine::change_ops::LANE_BRANCH_IS_NOT_A_CHANGE
+                    )
+                    .into());
+                }
                 if !change_id.is_empty() {
                     // CASE preserves 'running' so a follow-up turn overlapping
                     // the emit doesn't yank the thread back to 'idle' while
@@ -1120,6 +1119,17 @@ impl EventBus {
                     .bind(!files.is_empty())
                     .execute(&mut **tx)
                     .await?;
+                    // A set-aside change carries the work now, so no turn end
+                    // withholds it, as after a user's Set aside.
+                    if *set_aside {
+                        sqlx::query(
+                            "UPDATE thread_summaries SET coding_agent_unproposed_reason = NULL \
+                             WHERE thread_id = $1",
+                        )
+                        .bind(thread_id)
+                        .execute(&mut **tx)
+                        .await?;
+                    }
                     ChangesProjection::write_proposed_aggregate(
                         tx,
                         change_id,
@@ -1450,7 +1460,7 @@ impl EventBus {
             // an AskUserQuestion after the thread parked spawns a `--resume`
             // (see `agent_question.rs`, `ANSWERED_AFTER_IDLE_REASON`). So it must
             // flip `idle -> running` UNCONDITIONALLY.
-            ThreadEvent::UserQuestionAnswered { answer, .. } => {
+            ThreadEvent::UserQuestionAnswered { .. } => {
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
                      status = {RUNNING}, last_revived_at = NOW() WHERE thread_id = $1",
@@ -1458,85 +1468,10 @@ impl EventBus {
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
-                // Text typed into the composer to answer a question IS a
-                // submitted draft — but this path never emits `MessageReceived`
-                // (chat/process/run.rs reroutes typed text straight to the
-                // answer), so the send arm's compose clear above never runs for
-                // it. Left unhandled, the draft survives in the projection and
-                // re-syncs to every device the moment the submitting client's
-                // own compose PUT fails to land.
-                //
-                // Scoped to the draft that was ACTUALLY submitted — the client
-                // trims before submitting, the stored draft may not be, so both
-                // sides are trimmed. The character set is bound explicitly
-                // because one-argument `btrim` strips SPACES ONLY, which would
-                // miss the trailing newline a textarea leaves behind. Unlike a
-                // send, which replaces the composer's contents by definition, an
-                // answer says nothing about different text a peer is still
-                // writing, so an unrelated draft must survive. The match is on
-                // text AND image hashes, the same pair the client's supersede
-                // rule uses. A click-only answer submits no composer content
-                // and clears nothing.
-                let submitted_text = match answer {
-                    AnswerKind::FreeText { text, .. } => Some(text.as_str()),
-                    // Multi-select folds the prompt textarea's text in alongside
-                    // the toggled options.
-                    AnswerKind::MultiSelected { text, .. } => Some(text.as_deref().unwrap_or("")),
-                    _ => None,
-                }
-                // An empty submission would match a row whose composer is
-                // already empty, clearing its `compose_selection` for nothing.
-                .filter(|t| !t.trim().is_empty() || !answer.image_hashes().is_empty());
-                let mut cleared_epoch: Option<i64> = None;
-                if let Some(text) = submitted_text {
-                    let cleared = sqlx::query(
-                        "UPDATE thread_summaries \
-                         SET compose_text = '', compose_images = '[]'::jsonb, \
-                             compose_mode = NULL, compose_selection = NULL \
-                         WHERE thread_id = $1 \
-                           AND btrim(compose_text, $3) = btrim($2, $3) \
-                           AND COALESCE(compose_images, '[]'::jsonb) = $4",
-                    )
-                    .bind(thread_id)
-                    .bind(text)
-                    .bind(COMPOSE_TRIM_CHARS)
-                    .bind(serde_json::json!(answer.image_hashes()))
-                    .execute(&mut **tx)
-                    .await?
-                    .rows_affected()
-                        > 0;
-                    // The epoch advances for ANY answer that carried composer
-                    // text, matched or not, and that asymmetry with the clear
-                    // above is the point. The clear must stay conditional
-                    // because an answer says nothing about different text a peer
-                    // is still writing. The fence must not, because the case it
-                    // exists for is exactly the one the content match cannot
-                    // see: the answering device's own compose PUT was still in
-                    // flight, so storage held the older text (or nothing), the
-                    // match failed, and without a bump that stalled write lands
-                    // afterwards and resurrects the answer as a draft. A peer
-                    // whose unrelated draft is now behind the epoch is not
-                    // harmed: its draft survives (the clear didn't touch it) and
-                    // its next write is refused once with the current epoch,
-                    // adopted, and re-issued.
-                    let bumped: Option<(i64,)> = sqlx::query_as(
-                        "UPDATE thread_summaries SET compose_epoch = compose_epoch + 1 \
-                         WHERE thread_id = $1 RETURNING compose_epoch",
-                    )
-                    .bind(thread_id)
-                    .fetch_optional(&mut **tx)
-                    .await?;
-                    // Announced only when a draft was actually cleared: the
-                    // broadcast reports an EMPTY compose, which would be a lie
-                    // about a peer's surviving draft. A device that therefore
-                    // misses this epoch pays one refusal and retry.
-                    cleared_epoch = bumped.map(|(epoch,)| epoch).filter(|_| cleared);
-                }
-                if let Some(epoch) = cleared_epoch {
-                    vec![compose_cleared_broadcast(thread_id, epoch)]
-                } else {
-                    Vec::new()
-                }
+                // The compose fields are not touched: an answer typed into
+                // the composer consumed the compose slot when the engine
+                // accepted it (ADR 0450).
+                Vec::new()
             }
             // A permission resolution only ever unblocks an in-memory broadcast
             // waiter (cc_permission / command_permission / mcp_permission) — it
@@ -1590,6 +1525,30 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
+            ThreadEvent::SuccessorThreadSpawned { successor_thread_id, .. } => {
+                // The successor's row does not exist yet: its first
+                // `MessageReceived` reads this link back into `successor_of`.
+                // The old thread owes its parent nothing more: the successor
+                // reports in its place. A thread hands off once: a racing
+                // second handoff rolls its whole emit back.
+                let linked = sqlx::query(
+                    "UPDATE thread_summaries SET successor_thread_id = $2, \
+                     parent_callback_pending = FALSE \
+                     WHERE thread_id = $1 AND successor_thread_id IS NULL",
+                )
+                .bind(thread_id)
+                .bind(successor_thread_id)
+                .execute(&mut **tx)
+                .await?;
+                if linked.rows_affected() == 0 {
+                    return Err(format!(
+                        "SuccessorThreadSpawned refused for thread {thread_id}: {}",
+                        crate::engine::successor::ALREADY_HANDED_OFF
+                    )
+                    .into());
+                }
+                Vec::new()
+            }
             ThreadEvent::ProposalWithheld { reason, .. } => {
                 // A pending change keeps the row `proposed` (ADR 0397's edge of
                 // a plan recorded under one); otherwise the work is unproposed
@@ -1611,6 +1570,9 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
+            // The lane's bookkeeping moves no status: the change stays
+            // pending while it waits, lands, or leaves the lane.
+            ThreadEvent::ChangeQueued { .. } | ThreadEvent::ChangeUnqueued { .. } => Vec::new(),
             ThreadEvent::ChangeReverted { change_id, .. } => {
                 crate::core::changes_projection::ChangesProjection::write_status(
                     tx, change_id, crate::core::changes::ChangeStatus::Reverted,
@@ -1672,7 +1634,13 @@ impl EventBus {
             // The same write settles a stopped child. It lands on the child's
             // row, outside this event's own attention sample. So the child's
             // ancestors are reconciled here, and its aggregate is rebroadcast.
+            //
+            // A filed report settles the child the same way. It writes nothing
+            // on the parent's own row: the parent does not wake.
             ThreadEvent::ChildThreadCompleted {
+                child_thread_id, ..
+            }
+            | ThreadEvent::ChildReportFiled {
                 child_thread_id, ..
             } => {
                 if settle_parent_callback(tx, *child_thread_id).await? {
@@ -1792,6 +1760,8 @@ impl EventBus {
             // section transition, no last_activity bump).
             | ThreadEvent::ImageUploaded { .. }
             | ThreadEvent::ContextCaptured { .. }
+            // A compaction step changes no status; the turn around it does.
+            | ThreadEvent::CodingAgentCompacted { .. }
             // User removed a queued prompt before ingestion. Pure marker:
             // the original MessageReceived remains in history, and the
             // renderer/agentic loop consult this row without changing the
@@ -1861,6 +1831,8 @@ impl EventBus {
             | ThreadEvent::WidgetShown { .. }
             | ThreadEvent::WidgetPinned { .. }
             | ThreadEvent::WidgetUnpinned { .. }
+            // The Home board derives from its pins and this snapshot on read.
+            | ThreadEvent::HomeBoardArranged { .. }
             // The end of a call says nothing a column holds. Persisted so a
             // session is countable and a trigger can subscribe.
             //

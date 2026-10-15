@@ -58,7 +58,7 @@ mod exec;
 mod file;
 mod images;
 mod judgment;
-mod misc;
+pub(crate) mod misc;
 mod notifications;
 mod proxy;
 mod threads;
@@ -72,7 +72,7 @@ pub use images::{get_image_generation_tool, get_save_thread_image_tool, get_view
 /// keeping a copy that drifts.
 #[cfg(test)]
 pub(crate) use misc::NAVIGABLE_SETTINGS_VIEWS;
-pub(crate) use misc::{request_read_tool, READ_ARG};
+pub(crate) use misc::{wake_parent_tool, READ_ARG, WAKE_ARG};
 pub use notifications::get_notification_tool;
 
 /// Synchronous `run_bash` defaults. Both the JSON schema (described to the
@@ -144,41 +144,20 @@ impl ToolCapabilities {
     }
 }
 
-/// Why a tool family is, or is not, offered to a workspace.
-///
-/// Every row of [`FAMILIES`] and [`CHAT_TAIL`] carries one, so a new family
-/// cannot arrive resident by omission: the row does not compile without it.
-/// [`Gate::Ungated`] is how a family states that it has none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Gate {
-    /// No gate. Every workspace can act on this family.
-    Ungated,
-    /// At least one configured email account.
-    EmailAccount,
-    /// At least one intent.
-    Intent,
-    /// A configured image-generation provider.
-    ImageProvider,
-    /// A configured judgment provider, switched on.
-    JudgmentProvider,
-    /// The Tree memory module, with its summary trees ready.
-    MemoryTree,
-    /// Every turn that is not on Tree. A Tree turn never reads Classic's
-    /// memory, so a tool acting on it would report work that changed nothing.
-    MemoryClassic,
-}
+pub use lucidos_capabilities::Gate;
 
-impl Gate {
-    pub(crate) fn is_open(self, caps: &ToolCapabilities) -> bool {
-        match self {
-            Gate::Ungated => true,
-            Gate::EmailAccount => caps.email_account,
-            Gate::Intent => caps.intent,
-            Gate::ImageProvider => caps.image_provider,
-            Gate::JudgmentProvider => caps.judgment_provider,
-            Gate::MemoryTree => caps.memory_tree,
-            Gate::MemoryClassic => !caps.memory_tree,
-        }
+/// Whether `gate` offers its family to a workspace with `caps`. Every row of
+/// [`FAMILIES`] and [`CHAT_TAIL`] carries a gate, so a new family cannot arrive
+/// resident by omission.
+pub(crate) fn gate_is_open(gate: Gate, caps: &ToolCapabilities) -> bool {
+    match gate {
+        Gate::Ungated => true,
+        Gate::EmailAccount => caps.email_account,
+        Gate::Intent => caps.intent,
+        Gate::ImageProvider => caps.image_provider,
+        Gate::JudgmentProvider => caps.judgment_provider,
+        Gate::MemoryTree => caps.memory_tree,
+        Gate::MemoryClassic => !caps.memory_tree,
     }
 }
 
@@ -291,7 +270,7 @@ const CHAT_TAIL: &[FamilyRow] = &[
 /// Splice one registry table down to the families this workspace can use.
 fn offered(rows: &[FamilyRow], caps: &ToolCapabilities) -> Vec<ToolDefinition> {
     rows.iter()
-        .filter(|(gate, _)| gate.is_open(caps))
+        .filter(|(gate, _)| gate_is_open(*gate, caps))
         .flat_map(|(_, build)| build.render(caps))
         .collect()
 }

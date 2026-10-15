@@ -81,8 +81,7 @@ fn default_true() -> bool {
 
 /// `~/.lucidos/network.toml`. `None` only when `HOME` is unset.
 pub fn network_toml_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".lucidos/network.toml"))
+    Some(lucidos_home::path()?.join("network.toml"))
 }
 
 /// Does the machine-global config file exist? Used by the dev launch path /
@@ -162,14 +161,11 @@ pub fn render_network_toml(gateway_bind: &str, engine_inherit: bool) -> String {
     )
 }
 
-/// Write `network.toml` atomically (temp + rename), creating `~/.lucidos` if
-/// needed. Values are assumed already validated by [`validate_bind_input`].
+/// Write `network.toml` atomically (temp + rename), asserting the Lucidos home
+/// as a storage root first. Values are assumed already validated by
+/// [`validate_bind_input`].
 pub fn write_network_toml(gateway_bind: &str, engine_inherit: bool) -> std::io::Result<()> {
-    let path = network_toml_path()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let path = lucidos_home::ensure()?.join("network.toml");
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, render_network_toml(gateway_bind, engine_inherit))?;
     std::fs::rename(&tmp, &path)
@@ -202,9 +198,9 @@ fn truthy(value: &str) -> bool {
 //
 // A Lucidos process serves TLS iff BOTH `LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY`
 // point at non-empty paths. This mirrors `lucidos_engine::net_config`'s
-// `tls_scheme_from` exactly, and it has to: the gateway decides what scheme to
-// PROXY and HEALTH-PROBE a spawned engine on, while that engine decides what it
-// SERVES with the engine-side copy. A rule that differs here by so much as a
+// `tls_scheme_from` exactly, and it has to: the gateway decides what scheme a
+// spawned engine's ports file names, while that engine decides what it SERVES
+// with the engine-side copy. A rule that differs here by so much as a
 // missing key is a scheme mismatch on a loopback hop, which is the recurring
 // `error sending request for url` bug (ADR 0014, `.claude/rules/rust.md`
 // § "Intra-host scheme"). Duplicated rather than shared because the gateway
@@ -474,9 +470,8 @@ mod tests {
     fn an_unreadable_config_warns_while_an_absent_one_stays_silent() {
         // Both errors come from a real read, so the split holds for what the
         // OS returns, not for an invented kind.
-        let dir = std::env::temp_dir().join(format!("lucidos-net-config-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("a writable temp directory");
+        let tmp = tempfile::tempdir().expect("a writable temp directory");
+        let dir = tmp.path();
 
         let absent_path = dir.join("network.toml");
         let absent = std::fs::read_to_string(&absent_path).expect_err("nothing was written there");
@@ -485,13 +480,11 @@ mod tests {
 
         // A directory stands in for present-but-unreadable. It needs no chmod,
         // so it fails the same way for a root test runner.
-        let unreadable = std::fs::read_to_string(&dir).expect_err("a directory is not a file");
-        let warning = read_failure_warning(&dir, &unreadable)
+        let unreadable = std::fs::read_to_string(dir).expect_err("a directory is not a file");
+        let warning = read_failure_warning(dir, &unreadable)
             .expect("an unreadable config must not fall back to loopback in silence");
         assert!(warning.contains(&dir.display().to_string()), "{warning}");
         assert!(warning.contains(&unreadable.to_string()), "{warning}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Every cert/key pair the two mirrored copies must agree on, and the

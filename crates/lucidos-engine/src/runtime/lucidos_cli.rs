@@ -145,8 +145,8 @@ pub(crate) fn path_with_prefixes(
 /// Env vars to inject into every Lucidos-spawned script (Python, bash,
 /// scheduled tasks). Always sets `LUCIDOS_WORKSPACE`; prepends to `PATH`
 /// `<workspace>/.lucidos/bin` (when the bundled CLI is reachable, so scripts
-/// resolve bare `lucidos …`) AND `pg_bin_dir` (when given + present, so the
-/// advertised bare `psql -c '…'` resolves — in a packaged build psql lives at
+/// resolve bare `lucidos …`) AND `pg_bin_dir` (when given + present, so
+/// `psql "$LUCIDOS_DATABASE_URL"` resolves — in a packaged build psql lives at
 /// `<resources>/postgres/bin` = `LUCIDOS_PG_BIN_DIR`, which is not on the
 /// launchd minimal PATH). `pg_bin_dir` is passed in (from the caller's
 /// `LUCIDOS_PG_BIN_DIR` read) so this stays pure/testable.

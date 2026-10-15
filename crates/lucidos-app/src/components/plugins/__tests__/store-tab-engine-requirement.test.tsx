@@ -2,7 +2,7 @@
 import { afterEach, describe, it, expect } from 'vitest';
 import { render } from 'preact';
 import { pluginRowsInScope, PluginStoreRow } from '../StoreTab';
-import { cardPrimaryAction } from '../pluginCard';
+import { cardPrimaryAction, PluginMeta } from '../pluginCard';
 import type { InstalledPlugin, MarketplacePlugin } from '../../../store/types';
 
 function row(over: Partial<MarketplacePlugin>): MarketplacePlugin {
@@ -36,6 +36,13 @@ let host: HTMLDivElement | null = null;
 function show(plugin: MarketplacePlugin): HTMLDivElement {
   host = document.createElement('div');
   render(<PluginStoreRow plugin={plugin} installingSource={null} stageInstall={() => {}} />, host);
+  return host;
+}
+
+/** The detail page's chips, where the no-requirement note lives. */
+function showMeta(plugin: MarketplacePlugin): HTMLDivElement {
+  host = document.createElement('div');
+  render(<PluginMeta plugin={plugin} />, host);
   return host;
 }
 
@@ -76,16 +83,16 @@ describe('a plugin this Lucidos cannot install', () => {
     const button = el.querySelector<HTMLButtonElement>('.list-row-actions .action-btn');
     expect(button?.disabled).toBe(false);
     expect(el.querySelector('[data-role="engine-requirement"]')).toBeNull();
-    expect(el.querySelector('[data-role="engine-undeclared"]')).toBeNull();
   });
 
-  it('keeps only its own chip, never the no-requirement one', () => {
-    const el = show(row(NEEDS_NEWER));
+  it('keeps only its own chip on the detail page, never the no-requirement one', () => {
+    const el = showMeta(row(NEEDS_NEWER));
+    expect(el.querySelector('[data-role="engine-requirement"]')).not.toBeNull();
     expect(el.querySelector('[data-role="engine-undeclared"]')).toBeNull();
   });
 
   it('reads an empty requirement as declared, since the engine refuses it', () => {
-    const el = show(
+    const el = showMeta(
       row({
         engine_requirement: '',
         engine_compatible: false,
@@ -98,21 +105,26 @@ describe('a plugin this Lucidos cannot install', () => {
 });
 
 describe('a plugin that declares no engine requirement', () => {
-  it('shows a muted chip with the sentence as its tooltip, and a live Install', () => {
-    const el = show(row({}));
+  it('shows a muted chip on the detail page, with the sentence as its tooltip', () => {
+    const el = showMeta(row({}));
     const chip = el.querySelector<HTMLElement>('[data-role="engine-undeclared"]');
     expect(chip?.textContent).toBe('No version requirement');
     expect(chip?.className).toBe('label label-neutral');
     expect(chip?.dataset.tooltip).toBe("This plugin doesn't say which Lucidos version it needs.");
+    expect(el.querySelector('[data-role="engine-requirement"]')).toBeNull();
+  });
+
+  it('keeps the row calm: a live Install and no chip', () => {
+    const el = show(row({}));
     const button = el.querySelector<HTMLButtonElement>('.list-row-actions .action-btn');
     expect(button?.textContent).toBe('Install');
     expect(button?.disabled).toBe(false);
-    expect(el.querySelector('[data-role="engine-requirement"]')).toBeNull();
+    expect(el.querySelector('[data-role="engine-undeclared"]')).toBeNull();
+    expect(el.querySelector('.app-store-plugin-meta')).toBeNull();
   });
 
   it('keeps Update live for an installed plugin with a newer version', () => {
     const el = show(row({ status: 'update_available', installed_version: '0.0.9' }));
-    expect(el.querySelector('[data-role="engine-undeclared"]')).not.toBeNull();
     const button = el.querySelector<HTMLButtonElement>(
       '.list-row-actions .action-btn:not(.action-btn-secondary)',
     );
@@ -133,11 +145,12 @@ describe('a plugin that declares no engine requirement', () => {
     const orphan = (p: InstalledPlugin) =>
       pluginRowsInScope({ status: 'loaded', data: { plugins: [] } }, { status: 'loaded', data: [p] }, true)[0];
 
-    const undeclared = show(orphan(installed()));
-    expect(undeclared.querySelector('[data-role="engine-undeclared"]')).not.toBeNull();
-    render(null, undeclared);
+    expect(orphan(installed()).engine_requirement).toBeUndefined();
+    expect(orphan(installed('>=0.30.0')).engine_requirement).toBe('>=0.30.0');
+  });
 
-    const declared = show(orphan(installed('>=0.30.0')));
-    expect(declared.querySelector('[data-role="engine-undeclared"]')).toBeNull();
+  it('drops the chip once installed, since it only informs an install', () => {
+    const el = showMeta(row({ status: 'installed', installed_version: '0.1.0' }));
+    expect(el.querySelector('[data-role="engine-undeclared"]')).toBeNull();
   });
 });

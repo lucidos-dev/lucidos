@@ -1,11 +1,10 @@
-/** Guards in handleThreadEvent that preserve composeText when the user is
- *  typing during MessageReceived / ThreadDiscarded SSE arrival. */
+/** How SSE thread events and compose reports reach the draft. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import { focusedThreadId, threadMap } from '../store';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 import { handleThreadEvent, handleGlobalEvent } from './thread-sync';
-import { composeEditedAt } from './compose';
+import { noteLocalComposeEdit, _resetComposeSyncForTesting } from '../composeSync';
 import {
   _resetThreadNavForTesting,
   _threadNavStateForTesting,
@@ -86,7 +85,7 @@ function unfocusPrompt(): void {
   };
 }
 
-describe('SSE MessageReceived preserves user-typed compose text', () => {
+describe('SSE thread events and the draft', () => {
   beforeEach(() => {
     focusedThreadId.value = 't-1';
     const map = new Map<string, ThreadState>();
@@ -98,51 +97,34 @@ describe('SSE MessageReceived preserves user-typed compose text', () => {
     focusedThreadId.value = null;
     threadMap.value = new Map();
     _resetComposeDraftsForTesting();
-    composeEditedAt.clear();
+    _resetComposeSyncForTesting();
     (globalThis as any).document = originalDocument;
     vi.restoreAllMocks();
   });
 
-  it('keeps composeText when MessageReceived arrives while user is genuinely typing here (locally edited)', () => {
+  /** A send consumes the compose slot at accept, and the engine reports what
+   *  that left (ADR 0450). The thread event itself never touches the draft,
+   *  whoever sent it and wherever focus is. */
+  it('a MessageReceived leaves the draft alone, focused or not, from any device', () => {
     focusPromptOnThread('t-1');
-    // "User is typing" == a draft THIS device authored — stamp composeEditedAt,
-    // as every local mutation (updateCompose) does. This is what
-    // hasUnsentLocalDraft keys off, NOT DOM focus.
-    composeEditedAt.set('t-1', Date.now());
-
-    handleThreadEvent({
-      thread_id: 't-1',
-      seq: 42,
-      created: '2026-05-04T10:00:00Z',
-      event: { type: 'MessageReceived', text: 'previously sent message', device_id: 'peer-device' },
-    });
-
-    expect(getDraft('t-1').text).toBe('follow up I was typing');
-  });
-
-  it('clears a server-originated (synced) draft on a peer MessageReceived even when the textarea is focused here', () => {
-    // Regression: a follow-up drafted on another device syncs here as a draft
-    // (applyRemoteCompose / stageDraftFromApi → no composeEditedAt stamp). When
-    // the peer SENDS it, this device must clear the stale synced draft. It was
-    // being PRESERVED because the compose-clear was gated on isComposeFocusedHere
-    // rather than authorship (hasUnsentLocalDraft) — so a focused textarea kept a
-    // draft the user never typed. The draft from beforeEach is setDraft-created
-    // (not locally edited), i.e. server-originated.
-    focusPromptOnThread('t-1');
-
     handleThreadEvent({
       thread_id: 't-1',
       seq: 42,
       created: '2026-05-04T10:00:00Z',
       event: { type: 'MessageReceived', text: 'peer-sent follow-up', device_id: 'peer-device' },
     });
+    unfocusPrompt();
+    handleThreadEvent({
+      thread_id: 't-1',
+      seq: 43,
+      created: '2026-05-04T10:00:01Z',
+      event: { type: 'MessageReceived', text: 'another', device_id: 'peer-device' },
+    });
 
-    expect(getDraft('t-1').text).toBe('');
+    expect(getDraft('t-1').text).toBe('follow up I was typing');
   });
 
-  it('still mirrors state=active on MessageReceived even when a locally-edited compose is preserved', () => {
-    focusPromptOnThread('t-1');
-    composeEditedAt.set('t-1', Date.now());
+  it('still mirrors state=active on MessageReceived', () => {
     threadMap.value.get('t-1')!.meta.state = 'composing';
 
     handleThreadEvent({
@@ -153,35 +135,6 @@ describe('SSE MessageReceived preserves user-typed compose text', () => {
     });
 
     expect(threadMap.value.get('t-1')!.meta.state).toBe('active');
-    // Locally-edited draft survives (authorship guard), independent of the state flip.
-    expect(getDraft('t-1').text).toBe('follow up I was typing');
-  });
-
-  it('clears composeText on MessageReceived when textarea is NOT focused (peer send, unattended thread)', () => {
-    unfocusPrompt();
-
-    handleThreadEvent({
-      thread_id: 't-1',
-      seq: 42,
-      created: '2026-05-04T10:00:00Z',
-      event: { type: 'MessageReceived', text: 'peer-sent message', device_id: 'peer-device' },
-    });
-
-    expect(getDraft('t-1').text).toBe('');
-  });
-
-  it('keeps composeText when MessageReceived originated from THIS device, even when textarea unfocused', () => {
-    localStorage.setItem('lucidos-device-id', 'me-device');
-    unfocusPrompt();
-
-    handleThreadEvent({
-      thread_id: 't-1',
-      seq: 42,
-      created: '2026-05-04T10:00:00Z',
-      event: { type: 'MessageReceived', text: 'previously sent message', device_id: 'me-device' },
-    });
-
-    expect(getDraft('t-1').text).toBe('follow up I was typing');
   });
 
   it('keeps composeText when ThreadDiscarded arrives while user is typing', () => {
@@ -339,7 +292,7 @@ describe('SSE ThreadDiscarded from peer returns this device to compose view', ()
   });
 });
 
-describe('SSE ThreadComposeChanged empty-clear from a peer (send/discard elsewhere)', () => {
+describe('SSE ThreadComposeChanged is a compose report', () => {
   beforeEach(() => {
     localStorage.setItem('lucidos-device-id', 'me-device');
     focusedThreadId.value = 't-1';
@@ -352,57 +305,46 @@ describe('SSE ThreadComposeChanged empty-clear from a peer (send/discard elsewhe
     focusedThreadId.value = null;
     threadMap.value = new Map();
     _resetComposeDraftsForTesting();
-    composeEditedAt.clear();
+    _resetComposeSyncForTesting();
     (globalThis as any).document = originalDocument;
     vi.restoreAllMocks();
   });
 
-  it('clears a server-originated draft even when the textarea is focused here', () => {
-    // The peer's compose PUT cleared the shared draft (they sent/discarded it);
-    // its empty ThreadComposeChanged must clear this device's synced mirror. The
-    // focus guard used to drop the WHOLE inbound update — including an empty
-    // clear — leaving the peer's follow-up preserved here. The draft from
-    // beforeEach is setDraft-created (server-originated, no composeEditedAt).
-    focusPromptOnThread('t-1');
-
+  function report(revision: number, text: string): void {
     handleGlobalEvent('ThreadComposeChanged', {
       id: 't-1',
-      text: '',
+      summary_version: revision,
+      compose_epoch: 0,
+      text,
       image_hashes: [],
-      mode: null,
       origin_device_id: 'peer-device',
     });
+  }
 
+  it('an empty report clears a synced draft even when the textarea is focused here', () => {
+    focusPromptOnThread('t-1');
+    report(3, '');
     expect(getDraft('t-1').text).toBe('');
   });
 
-  it('keeps a locally-edited draft on an empty peer clear even when focused (authorship guard)', () => {
+  it('a pending local edit keeps its text over an empty report', () => {
     focusPromptOnThread('t-1');
-    composeEditedAt.set('t-1', Date.now());
-
-    handleGlobalEvent('ThreadComposeChanged', {
-      id: 't-1',
-      text: '',
-      image_hashes: [],
-      mode: null,
-      origin_device_id: 'peer-device',
-    });
-
+    noteLocalComposeEdit('t-1');
+    report(3, '');
     expect(getDraft('t-1').text).toBe('synced-from-peer draft');
   });
 
-  it('still drops a peer NON-empty update while the user is focused here (in-flight typing protected)', () => {
+  /** Dropping it would lose the peer's write: the next keystroke here would
+   *  PUT the older text plus the key over it. */
+  it('a newer non-empty report applies while focused, when nothing is pending', () => {
     focusPromptOnThread('t-1');
+    report(3, 'peer is typing something new');
+    expect(getDraft('t-1').text).toBe('peer is typing something new');
+  });
 
-    handleGlobalEvent('ThreadComposeChanged', {
-      id: 't-1',
-      text: 'peer is typing something new',
-      image_hashes: [],
-      mode: 'lucidos',
-      origin_device_id: 'peer-device',
-    });
-
-    // Focused → a non-empty peer update is not applied (would move the cursor).
-    expect(getDraft('t-1').text).toBe('synced-from-peer draft');
+  it('a report at or below the held revision changes nothing', () => {
+    report(5, 'newer');
+    report(4, 'older, delivered late');
+    expect(getDraft('t-1').text).toBe('newer');
   });
 });

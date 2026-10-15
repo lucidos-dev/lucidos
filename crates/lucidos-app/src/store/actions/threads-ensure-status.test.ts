@@ -32,9 +32,10 @@ import { PENDING_TITLE_PLACEHOLDER, type ThreadState } from '../thread-events';
 import { fetchThreads, fetchThreadById } from '../../api/threads';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { archivingThreadIds, awaitedThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
+import { awaitedThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
 import { _resetThreadEventsFailuresForTesting, clearThreadFetchGuards, ensureThreadByIdInMap, ensureThreadInMap, loadAllThreads, upsertThread } from './thread-loading';
 import { focusSpawnedThread, focusThread, focusThreadOrBootstrap, focusThreadOrBootstrapResult, unfocusThread } from './threads';
+import { _resetRowIntentsForTesting } from '../rowIntents';
 
 // Mock the API module
 vi.mock('../../api/threads', () => ({
@@ -78,7 +79,7 @@ beforeEach(() => {
   drawerOpen.value = false;
   resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
-  archivingThreadIds.value = new Set();
+  _resetRowIntentsForTesting();
   localStorage.removeItem('lucidos-focused-thread');
 });
 

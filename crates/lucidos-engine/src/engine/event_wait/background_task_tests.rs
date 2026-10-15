@@ -34,6 +34,7 @@ fn handle(task_id: &str, deadline: DateTime<Utc>) -> RunningTaskHandle {
         command: "cargo build".to_string(),
         watchdog_deadline: deadline,
         stop_requested: false,
+        polled: false,
     }
 }
 
@@ -387,6 +388,28 @@ fn a_task_being_stopped_is_never_armed_for() {
     let mut stopping = task("lint");
     stopping.stop_requested = true;
     let running = [stopping, task("e2e")];
+    match plan_wait(&running, &[], Some(0), owner()) {
+        ArmingPlan::Arm(tasks) => {
+            assert_eq!(
+                tasks.iter().map(|h| h.task_id.as_str()).collect::<Vec<_>>(),
+                ["e2e"]
+            )
+        }
+        other => panic!("expected Arm, got {other:?}"),
+    }
+    assert_eq!(
+        plan_wait(&running[..1], &[], Some(0), owner()),
+        ArmingPlan::NothingUncovered
+    );
+}
+
+/// The agent reads a polled task's result itself. A later watched `run` arms
+/// for its own task only, so the polled one never re-opens the thread.
+#[test]
+fn a_polled_task_is_never_armed_for() {
+    let mut polled = task("suite");
+    polled.polled = true;
+    let running = [polled, task("e2e")];
     match plan_wait(&running, &[], Some(0), owner()) {
         ArmingPlan::Arm(tasks) => {
             assert_eq!(

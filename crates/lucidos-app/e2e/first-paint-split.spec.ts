@@ -58,8 +58,9 @@ test.describe('first-paint split', () => {
     const html = await page.evaluate(() => document.head.innerHTML);
     expect(html, 'index.html must modulepreload the shell chunk').toMatch(/rel="modulepreload"[^>]*App-[\w-]+\.js/);
 
-    // No user action: the idle prefetch alone must fetch both.
-    await expect.poll(() => scripts.some((p) => /\/WorkspaceSwitcher-[\w-]+\.js$/.test(p))).toBe(true);
+    // No user action: the idle prefetch alone must fetch both. The switcher
+    // row rides in the brand menu rows' chunk, which imports it statically.
+    await expect.poll(() => scripts.some((p) => /\/BrandMenuRows-[\w-]+\.js$/.test(p))).toBe(true);
     await expect.poll(() => scripts.some((p) => /\/TodoListPanel-[\w-]+\.js$/.test(p))).toBe(true);
   });
 

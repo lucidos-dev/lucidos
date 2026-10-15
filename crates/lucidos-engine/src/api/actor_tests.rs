@@ -844,8 +844,7 @@ fn host_pid_var<'a>(vars: &'a [(&'static str, String)], key: &str) -> Option<&'a
 #[test]
 fn host_protection_env_vars_always_sets_host_pid() {
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
-    let workspace = tempfile::tempdir().expect("tempdir");
-    let vars = host_protection_env_vars(workspace.path());
+    let vars = host_protection_env_vars();
     assert_eq!(
         host_pid_var(&vars, "LUCIDOS_HOST_PID"),
         Some(std::process::id().to_string().as_str()),
@@ -853,65 +852,26 @@ fn host_protection_env_vars_always_sets_host_pid() {
     );
 }
 
+/// The build-watch pid counts only while its owner lock is held. So a pidfile
+/// naming a reused pid never makes a session protect an unrelated process.
 #[test]
-fn host_protection_env_vars_includes_frontend_pid_when_pidfile_present() {
-    let _guard = API_PORT_ENV_LOCK.lock().unwrap();
-    let workspace = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(workspace.path().join(".lucidos")).unwrap();
-    std::fs::write(workspace.path().join(".lucidos/frontend.pid"), "54321\n").unwrap();
-    let vars = host_protection_env_vars(workspace.path());
+fn the_build_watch_pid_is_read_only_while_its_lock_is_held() {
+    use lucidos_owner_lock::{build_watch, OwnerLock};
+    let app = tempfile::tempdir().expect("tempdir");
+    let dist = app.path().join("dist");
+    assert_eq!(build_watch_pid(&dist), None, "no watch has ever run here");
+
+    let watcher = OwnerLock::acquire(&build_watch::watch_lock_path(app.path())).unwrap();
+    watcher
+        .publish_pid(&build_watch::pid_path(app.path()))
+        .unwrap();
+    assert_eq!(build_watch_pid(&dist), Some(std::process::id()));
+
+    drop(watcher);
     assert_eq!(
-        host_pid_var(&vars, "LUCIDOS_FRONTEND_PID"),
-        Some("54321"),
-        "LUCIDOS_FRONTEND_PID must equal the trimmed pidfile contents"
-    );
-}
-
-#[test]
-fn host_protection_env_vars_omits_frontend_pid_when_pidfile_missing() {
-    // Tauri / production-bundled installs have no separate Vite process.
-    // Absence of frontend.pid → env var absent (not empty string — an
-    // empty value would still satisfy `[ -n "$LUCIDOS_FRONTEND_PID" ]`
-    // in some shells and confuse the guard).
-    let _guard = API_PORT_ENV_LOCK.lock().unwrap();
-    let workspace = tempfile::tempdir().expect("tempdir");
-    let vars = host_protection_env_vars(workspace.path());
-    assert!(
-        host_pid_var(&vars, "LUCIDOS_FRONTEND_PID").is_none(),
-        "LUCIDOS_FRONTEND_PID must be unset when no pidfile exists"
-    );
-}
-
-#[test]
-fn host_protection_env_vars_omits_frontend_pid_when_pidfile_blank() {
-    let _guard = API_PORT_ENV_LOCK.lock().unwrap();
-    let workspace = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(workspace.path().join(".lucidos")).unwrap();
-    std::fs::write(workspace.path().join(".lucidos/frontend.pid"), "   \n").unwrap();
-    let vars = host_protection_env_vars(workspace.path());
-    assert!(
-        host_pid_var(&vars, "LUCIDOS_FRONTEND_PID").is_none(),
-        "LUCIDOS_FRONTEND_PID must be unset when pidfile is blank"
-    );
-}
-
-#[test]
-fn host_protection_env_vars_omits_frontend_pid_when_pidfile_is_not_a_pid() {
-    // A multi-line or otherwise junk pidfile would otherwise inject an
-    // embedded newline into the env var, silently disabling the hook's
-    // regex match for that pid. Reject anything that isn't a clean u32.
-    let _guard = API_PORT_ENV_LOCK.lock().unwrap();
-    let workspace = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(workspace.path().join(".lucidos")).unwrap();
-    std::fs::write(
-        workspace.path().join(".lucidos/frontend.pid"),
-        "12345\n67890\n",
-    )
-    .unwrap();
-    let vars = host_protection_env_vars(workspace.path());
-    assert!(
-        host_pid_var(&vars, "LUCIDOS_FRONTEND_PID").is_none(),
-        "LUCIDOS_FRONTEND_PID must be unset when pidfile is not a clean u32"
+        build_watch_pid(&dist),
+        None,
+        "the pidfile outlived its holder"
     );
 }
 
@@ -920,12 +880,11 @@ fn host_protection_env_vars_includes_api_port_when_engine_has_one() {
     // The pre-kill Bash hook uses LUCIDOS_API_PORT to block patterns like
     // `lsof -ti :<port> | xargs kill` that target the engine port.
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
-    let workspace = tempfile::tempdir().expect("tempdir");
     // SAFETY: process-wide env mutation gated by API_PORT_ENV_LOCK.
     unsafe {
         std::env::set_var("LUCIDOS_API_PORT", "3007");
     }
-    let vars = host_protection_env_vars(workspace.path());
+    let vars = host_protection_env_vars();
     unsafe {
         std::env::remove_var("LUCIDOS_API_PORT");
     }
@@ -935,11 +894,10 @@ fn host_protection_env_vars_includes_api_port_when_engine_has_one() {
 #[test]
 fn host_protection_env_vars_omits_api_port_when_engine_has_none() {
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
-    let workspace = tempfile::tempdir().expect("tempdir");
     unsafe {
         std::env::remove_var("LUCIDOS_API_PORT");
     }
-    let vars = host_protection_env_vars(workspace.path());
+    let vars = host_protection_env_vars();
     assert!(
         host_pid_var(&vars, "LUCIDOS_API_PORT").is_none(),
         "LUCIDOS_API_PORT must be unset when engine has no port (Tauri / tests)"
@@ -956,13 +914,12 @@ fn host_protection_env_vars_adds_loopback_base_url_under_gateway() {
     // subprocesses the exact loopback base URL so the `lucidos` CLI and scripts
     // reach the engine directly.
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
-    let workspace = tempfile::tempdir().expect("tempdir");
     // SAFETY: process-wide env mutation gated by API_PORT_ENV_LOCK.
     unsafe {
         std::env::set_var("LUCIDOS_API_PORT", "62072");
         std::env::set_var("LUCIDOS_BIND_LOOPBACK", "1");
     }
-    let vars = host_protection_env_vars(workspace.path());
+    let vars = host_protection_env_vars();
     unsafe {
         std::env::remove_var("LUCIDOS_API_PORT");
         std::env::remove_var("LUCIDOS_BIND_LOOPBACK");
@@ -986,12 +943,11 @@ fn host_protection_env_vars_omits_base_url_without_gateway() {
     // and the `.lucidos/ports` file resolves it correctly, so no override is
     // handed down. `LUCIDOS_BIND_LOOPBACK` is set ONLY by the gateway.
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
-    let workspace = tempfile::tempdir().expect("tempdir");
     unsafe {
         std::env::set_var("LUCIDOS_API_PORT", "5173");
         std::env::remove_var("LUCIDOS_BIND_LOOPBACK");
     }
-    let vars = host_protection_env_vars(workspace.path());
+    let vars = host_protection_env_vars();
     unsafe {
         std::env::remove_var("LUCIDOS_API_PORT");
     }

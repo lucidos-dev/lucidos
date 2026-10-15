@@ -21,6 +21,7 @@ import { showToast } from '../store';
 import { failedIfFresh, setLoadingIfFresh, type Loadable } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { DEVICE_ID_PARAM } from '../../utils/deviceIdSeed';
+import { landingHash } from '../../utils/workspaceLanding';
 
 /** The one preview slot. */
 export const frontendPreview = signal<Loadable<FrontendPreviewStatus>>({ status: 'not-loaded' });
@@ -101,7 +102,7 @@ export function previewHref(
   // while the engine answers and reports a miss, which is what a fresh page load
   // needs. `deviceIdSeed`'s parameter strip goes through `URL.toString()`, which
   // keeps the fragment, so the two ride together.
-  const hash = threadId ? `#thread=${encodeURIComponent(threadId)}` : '';
+  const hash = threadId ? landingHash({ thread: threadId }) : '';
   return `${base}${query}${hash}`;
 }
 

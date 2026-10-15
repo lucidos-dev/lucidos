@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { dateRangeLabel, entriesLabel, isSourceText, lineSpan, pendingNote } from './summaryTree';
+import { ENTRY_KINDS } from '@lucidos/engine-constants';
+import { dateRangeLabel, entriesLabel, entryKindOf, isSourceText, lineSpan, pendingNote } from './summaryTree';
+import { formatShortDateWithYear, formatShortTime } from '../../utils/formatTime';
+import { rangeLabel } from '../../utils/rangeLabel';
 
 describe('summary tree line helpers', () => {
   it('reads the span off a workspace or thread node id', () => {
@@ -21,8 +24,22 @@ describe('summary tree line helpers', () => {
 
   it('shows one moment once and a span of days as a range', () => {
     const at = '2026-09-19T12:00:00Z';
-    expect(dateRangeLabel(at, at)).not.toContain('–');
-    expect(dateRangeLabel('2026-09-02T12:00:00Z', '2026-09-19T12:00:00Z')).toContain('–');
+    const [from, to] = [new Date('2026-09-02T12:00:00Z'), new Date(at)];
+    expect(dateRangeLabel(at, at)).toBe(`${formatShortDateWithYear(to)}, ${formatShortTime(to)}`);
+    expect(dateRangeLabel(from.toISOString(), at))
+      .toBe(rangeLabel(formatShortDateWithYear(from), formatShortDateWithYear(to)));
+  });
+
+  it('shows hours of one day as a range of times', () => {
+    const [from, to] = [new Date('2026-09-19T12:00:00Z'), new Date('2026-09-19T12:45:00Z')];
+    expect(dateRangeLabel(from.toISOString(), to.toISOString()))
+      .toBe(`${formatShortDateWithYear(from)}, ${rangeLabel(formatShortTime(from), formatShortTime(to))}`);
+  });
+
+  it('never draws an en or em dash between the ends', () => {
+    for (const to of ['2026-09-19T12:45:00Z', '2026-10-09T12:00:00Z']) {
+      expect(dateRangeLabel('2026-09-19T12:00:00Z', to)).not.toMatch(/[\u2013\u2014]/);
+    }
   });
 
   it('words the pending line for the browser, which has no search', () => {
@@ -31,5 +48,27 @@ describe('summary tree line helpers', () => {
     expect(pendingNote('1 newer entries are not summarised yet. search finds their words'))
       .toBe('1 newer entry is not summarised yet');
     expect(pendingNote('something else')).toBe('something else');
+  });
+
+  it('reads the entry kind a line starts with, as the engine writes it', () => {
+    for (const kind of ENTRY_KINDS) {
+      expect(entryKindOf(`${kind}: body`)).toEqual({ kind, text: 'body' });
+    }
+  });
+
+  it('keeps an artifact path written without a space, and the body under it', () => {
+    expect(entryKindOf('artifact:notes/plan.md')).toEqual({ kind: 'artifact', text: 'notes/plan.md' });
+    expect(entryKindOf('artifact: notes/plan.md\nfirst line')).toEqual({ kind: 'artifact', text: 'notes/plan.md\nfirst line' });
+  });
+
+  it('leaves a line that starts with no entry kind as it is', () => {
+    for (const text of [
+      'turn [Tour] prompt (human): rehearse. response: done',
+      'Result: capitalised is not a kind',
+      'responses: not a kind either',
+      'a summary line',
+    ]) {
+      expect(entryKindOf(text)).toEqual({ kind: null, text });
+    }
   });
 });

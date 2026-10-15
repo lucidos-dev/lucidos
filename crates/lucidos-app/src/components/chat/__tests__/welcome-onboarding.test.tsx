@@ -233,9 +233,9 @@ describe('the setup interview action: the durable way back', () => {
     llmConfigured.value = true;
   });
 
-  it('is in the thread header, immediately before New thread', () => {
+  it('is in the thread header, immediately before Search everywhere', () => {
     const keys = threadHeaderActions().map(a => a.key);
-    expect(keys).toEqual(['setup-interview', 'new-thread', 'search-everywhere']);
+    expect(keys).toEqual(['setup-interview', 'search-everywhere']);
     // Collapse eats from the front, so being first also means this is the first
     // thing to fold into the ⋯ menu when the pane runs out of room, which is
     // right for a once-or-twice action.
@@ -244,8 +244,8 @@ describe('the setup interview action: the durable way back', () => {
   it('is NOT offered when no provider is configured', () => {
     llmConfigured.value = false;
     expect(setupAction()).toBeUndefined();
-    // ...and the row is still the other two, in order.
-    expect(threadHeaderActions().map(a => a.key)).toEqual(['new-thread', 'search-everywhere']);
+    // ...and the row keeps Search everywhere alone.
+    expect(threadHeaderActions().map(a => a.key)).toEqual(['search-everywhere']);
   });
 
   it('confirms before sending, and sends when the user accepts', async () => {

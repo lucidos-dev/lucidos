@@ -17,6 +17,7 @@ pub(crate) mod credential_reveal;
 mod data_api;
 pub(crate) mod diff;
 mod disk_usage;
+pub mod engine_socket;
 pub(crate) mod error;
 mod file_response;
 mod fonts;
@@ -33,6 +34,7 @@ mod images;
 pub(crate) mod internal;
 mod knowhow;
 pub(crate) mod local_auth;
+mod main_check;
 mod mcp;
 mod mcp_permission;
 mod memory;
@@ -667,6 +669,13 @@ pub struct ChatRequest {
     pub event_id: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// The sending page's *input chain* and this input's *input sequence* on
+    /// the thread. Both or neither, and they need `event_id`. The engine
+    /// refuses an input a later one from the same chain overtook (ADR 0449).
+    #[serde(default)]
+    pub input_chain: Option<String>,
+    #[serde(default)]
+    pub input_seq: Option<i64>,
     /// `true` when `thread_id` names a thread that is EXPECTED not to exist yet,
     /// because this request is the one creating it.
     ///
@@ -699,6 +708,11 @@ pub struct ChatRequest {
     /// caused this spawn.
     #[serde(default)]
     pub spawning_event_id: Option<String>,
+    /// The child's *wake mode*: `no-wake`, `wake` or `wake-when-all-done`.
+    /// Allowed only beside `parent_thread_id`. Omitted, a spawn takes its
+    /// parent's default: `no-wake` under the home thread, else `wake`.
+    #[serde(default)]
+    pub wake_mode: Option<String>,
     /// Cross-workspace origin: name of the calling workspace (e.g. `"dev"`,
     /// `"myws"`). When set, the receiver constructs
     /// `MessageOrigin::Workspace` from the three `caller_*` fields. Mutually
@@ -735,6 +749,13 @@ pub struct ChatRequest {
     pub folder: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Spawn an *integrated sub-thread*: a Lucidos-source coding-agent child
+    /// that folds into its Lucidos-source coding-agent parent's branch. It
+    /// runs the fast tier of `/harden` and proposes nothing. Absent means
+    /// independent. `lucidos spawn-thread --integrated` sets it. A
+    /// `mode=human` send cannot carry it and gets a 400.
+    #[serde(default)]
+    pub integrated: bool,
 }
 
 /// Body of `POST /api/v1/chat/cancel` and the default (Stop) mode of
@@ -1529,6 +1550,7 @@ pub fn create_router(
         .merge(owner_approval::router())
         .merge(threads::router())
         .merge(changes::router())
+        .merge(main_check::router())
         .merge(notifications::router())
         .merge(artifacts::router())
         .merge(settings::router())

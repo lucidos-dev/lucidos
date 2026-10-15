@@ -14,6 +14,7 @@ async fn initiator_user_chat() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "hello".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -121,6 +122,7 @@ async fn initiator_inherited_system_to_cc_child() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "run e2e tests".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -173,6 +175,7 @@ async fn initiator_inherited_user_to_cc_child() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "help me".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -198,6 +201,7 @@ async fn initiator_inherited_user_to_cc_child() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -244,6 +248,7 @@ async fn initiator_from_message_source_field() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "system message".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -311,6 +316,7 @@ async fn initiator_preserved_on_session_started_upsert() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "run tests".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -341,6 +347,9 @@ async fn initiator_preserved_on_session_started_upsert() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -380,6 +389,7 @@ async fn spawning_event_id_persists_for_system_spawn() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "spawn a child".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -404,6 +414,7 @@ async fn spawning_event_id_persists_for_system_spawn() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do work".into(),
             user_image_hashes: vec![],
             device_id: None,

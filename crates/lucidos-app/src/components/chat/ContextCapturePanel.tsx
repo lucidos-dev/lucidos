@@ -8,6 +8,7 @@ import { fetchContextCapture, type ContextCapturePayload } from '../../api/threa
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { mergeContextCaptureSections, needsLazyFetch } from './loadStrippedSections';
 import { missingBodyReason, type MissingBodyReason } from './missingBodyReason';
+import { toolCountBySource } from './toolCountBySource';
 import { contextViewer } from '../../store/store';
 import { currentCaptureContext } from '../../store/actions/preferences';
 import { openCaptureContextSetting } from '../../store/actions/menu';
@@ -231,12 +232,13 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
       tokens: sectionTokenScale(hydrated),
       missingBody: missingBodyReason(hydrated, currentCaptureContext()),
     };
+    const agent = hydrated.producer === 'claude_code' ? 'Claude Code' : hydrated.producer === 'codex' ? 'Codex' : null;
     return (
       <>
         <div class="step-detail-context-meta">
           <code>{hydrated.model || '(unknown model)'}</code>
-          <span> · {hydrated.producer === 'claude_code' ? 'Claude Code' : hydrated.producer === 'codex' ? 'Codex' : hydrated.producer === 'auxiliary' ? 'Auxiliary' : 'Main LLM'}</span>
-          <span> · {hydrated.tools.length} tools</span>
+          <span> · {agent ?? (hydrated.producer === 'auxiliary' ? 'Auxiliary' : 'Main LLM')}</span>
+          <span> · {toolCountBySource(hydrated.tools, agent ?? 'Lucidos')}</span>
           {hydrated.legacy && <span class="context-legacy-badge" data-tooltip="Synthesized from legacy events">legacy capture</span>}
         </div>
         <div class="context-sections">

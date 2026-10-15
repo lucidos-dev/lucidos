@@ -171,12 +171,8 @@ mod tests {
 
     #[test]
     fn repo_root_above_finds_the_scripts_marker() {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-gw-reporoot-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(dir.join(REPO_MARKER), "#!/bin/bash\n").unwrap();
         // The published launch dir (ADR 0022) lives OUTSIDE `target/`, so the
@@ -185,13 +181,11 @@ mod tests {
         let exe = dir.join(".launch/debug/plain/lucidos-gateway");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
 
-        assert_eq!(repo_root_above(&exe).as_deref(), Some(dir.as_path()));
+        assert_eq!(repo_root_above(&exe).as_deref(), Some(dir));
         assert_eq!(
             repo_root_above(Path::new("/tmp/nowhere/lucidos-gateway")),
             None
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The real git probe, against a throwaway repo: ancestor → `Some(true)`,
@@ -199,17 +193,12 @@ mod tests {
     /// unresolvable id can never be mistaken for "provably older").
     #[tokio::test]
     async fn commit_is_strict_ancestor_reads_history_direction() {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-gw-ancestry-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
-                .current_dir(&dir)
+                .current_dir(dir)
                 .output()
                 .expect("git runs in the test environment")
         };
@@ -232,12 +221,12 @@ mod tests {
             .to_string();
 
         assert_eq!(
-            commit_is_strict_ancestor(&dir, &first, &second).await,
+            commit_is_strict_ancestor(dir, &first, &second).await,
             Some(true),
             "the earlier commit IS a strict ancestor of the later one"
         );
         assert_eq!(
-            commit_is_strict_ancestor(&dir, &second, &first).await,
+            commit_is_strict_ancestor(dir, &second, &first).await,
             Some(false),
             "the later commit is NOT an ancestor of the earlier one"
         );
@@ -245,17 +234,15 @@ mod tests {
         // `git merge-base --is-ancestor X X` exits 0 — without the prefix-aware
         // screen the same commit would read as "provably older".
         assert_eq!(
-            commit_is_strict_ancestor(&dir, &second[..9], &second).await,
+            commit_is_strict_ancestor(dir, &second[..9], &second).await,
             Some(false),
             "the same commit abbreviated is still not a strict ancestor of itself"
         );
         assert_eq!(
-            commit_is_strict_ancestor(&dir, "0000000000000000000000000000000000000000", &second)
+            commit_is_strict_ancestor(dir, "0000000000000000000000000000000000000000", &second)
                 .await,
             None,
             "an unknown object is indeterminate, never 'provably older'"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

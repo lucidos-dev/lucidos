@@ -19,7 +19,8 @@
 //!    about to *exit*, so a detached task would simply never run — the report has
 //!    to land before we return.
 //! 2. **Only a CLASSIFIED-terminal failure is reported**
-//!    ([`terminal_migration_message`] returns `Option`). Reporting stops the
+//!    ([`terminal_migration_message`] returns `Option`, and a wiped database
+//!    needs the migration marker's say-so). Reporting stops the
 //!    gateway respawning, so treating an unclassified error as terminal would
 //!    turn a workspace that recovers on its own — a dropped connection during
 //!    migrations, say — into a permanently dead one. When in doubt, say nothing
@@ -142,6 +143,24 @@ pub fn terminal_migration_message(
         // is the behavior that recovers a workspace from a transient fault.
         _ => return None,
     })
+}
+
+/// The message for a database whose schema was wiped after it was migrated
+/// (ADR 0481). Terminal: migrating would boot a blank workspace.
+///
+/// Recovery comes first, then the escape hatch. The workspace's files are
+/// intact, so the restored workspace's agent can copy over what changed.
+pub fn wiped_database_message(workspace_dir: &std::path::Path) -> String {
+    let marker = crate::core::migration_marker::path(workspace_dir);
+    format!(
+        "This workspace's database was emptied outside Lucidos, so Lucidos did not open it \
+         blank. To recover, first use Restore from backup in the workspace picker to restore \
+         your latest backup. Then ask the restored workspace's Lucidos Agent to copy over the \
+         files changed since that backup from {}. To start this workspace empty instead, \
+         delete {} and open it again.",
+        workspace_dir.display(),
+        marker.display()
+    )
 }
 
 /// Report a terminal boot failure to the gateway and WAIT for it to land.
@@ -298,6 +317,23 @@ mod tests {
             )
             .is_none(),
             "a transient source/IO fault must stay retryable",
+        );
+    }
+
+    #[test]
+    fn the_wiped_database_message_puts_recovery_first_and_names_both_paths() {
+        let workspace = std::path::Path::new("/home/user/workspaces/myws");
+        let msg = wiped_database_message(workspace);
+        let restore = msg.find("Restore from backup").expect("names the restore");
+        let copy = msg.find("Lucidos Agent").expect("names the agent step");
+        let escape = msg
+            .find("start this workspace empty")
+            .expect("names the escape");
+        assert!(restore < copy && copy < escape, "{msg}");
+        assert!(msg.contains("from /home/user/workspaces/myws."), "{msg}");
+        assert!(
+            msg.contains("delete /home/user/workspaces/myws/.lucidos/database-migrated"),
+            "{msg}"
         );
     }
 

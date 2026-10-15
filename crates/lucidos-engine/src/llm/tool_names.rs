@@ -208,6 +208,10 @@ pub const CANCEL_EVENT_WAIT: &str = "cancel_event_wait";
 /// drawer lists the thread under Review until they have seen it (ADR 0409).
 /// Scoped to the calling thread, like the event-wait tools.
 pub const REQUEST_READ: &str = "request_read";
+/// A child thread's *wake decision*: whether its parent must act on this
+/// turn's report. Offered only to a thread with a parent it reports to, and
+/// scoped to the calling thread.
+pub const WAKE_PARENT: &str = "wake_parent";
 
 /// Ask a judgment provider a set of typed questions about one state.
 ///
@@ -229,6 +233,8 @@ pub const SETUP_MCP_SERVER: &str = "setup_mcp_server";
 pub const LIST_MCP_SERVERS: &str = "list_mcp_servers";
 pub const START_MCP_SERVER: &str = "start_mcp_server";
 pub const STOP_MCP_SERVER: &str = "stop_mcp_server";
+pub const ENABLE_MCP_SERVER: &str = "enable_mcp_server";
+pub const DISABLE_MCP_SERVER: &str = "disable_mcp_server";
 pub const REMOVE_MCP_SERVER: &str = "remove_mcp_server";
 
 // Repository management

@@ -8,6 +8,7 @@ fn bus_event_variants_are_constructable() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "hello".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -156,6 +157,7 @@ fn thread_event_sse_json_has_seq_and_event_id() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "hello".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -199,6 +201,7 @@ fn thread_event_sse_json_includes_meta_channel() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "fix bug".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -239,6 +242,7 @@ fn thread_event_sse_json_omits_channel_when_none() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "hello".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -391,6 +395,8 @@ fn system_changes_updated_matches_server_event_shape() {
                     runs: 32,
                 }),
             },
+            landing_lane: Default::default(),
+            main_check: Default::default(),
         }),
         aggregate: None,
         depth: 0,
@@ -407,6 +413,16 @@ fn system_changes_updated_matches_server_event_shape() {
             "hardening": null,
             "resolving_conflict": { "typical_secs": 1080, "runs": 32 },
         })
+    );
+    // Pins the wire key the client's `landingLane` signal reads.
+    assert_eq!(
+        json["data"]["landing_lane"],
+        serde_json::json!({ "open_batch": null, "waiting": [], "gathering": false })
+    );
+    // Pins the wire key the client's `mainCheck` signal reads.
+    assert_eq!(
+        json["data"]["main_check"],
+        serde_json::json!({ "state": "idle" })
     );
 }
 
@@ -700,8 +716,30 @@ fn reserved_type_names_match_event_type() {
         TreeBackfillProgressed {
             progress: Default::default(),
         },
-        TreeBackfillCompleted { total: 0 },
+        TreeBackfillCompleted {
+            total: 0,
+            spent_usd: None,
+        },
         TreeBackfillReset {},
+        TreeBackfillStarted {
+            estimate: crate::engine::summary_tree::StartEstimate {
+                model: "m".into(),
+                effort: None,
+                calls: Default::default(),
+                cost: None,
+            },
+            cap_usd: None,
+            actor: None,
+        },
+        TreeBackfillCapReached {
+            spent_usd: 0.0,
+            cap_usd: 0.0,
+        },
+        TreeBackfillCapRaised {
+            cap_usd: 0.0,
+            actor: None,
+        },
+        TreeBackfillEnded { spent_usd: None },
         ChangesUpdated {
             pending: vec![],
             set_aside: vec![],
@@ -709,6 +747,34 @@ fn reserved_type_names_match_event_type() {
             total_pending: 0,
             restart_required: false,
             apply_estimates: Default::default(),
+            landing_lane: Default::default(),
+            main_check: Default::default(),
+        },
+        MainCheckStarted {
+            check_id: Uuid::nil(),
+            from_sha: "a".into(),
+            to_sha: "b".into(),
+        },
+        MainCheckPassed {
+            check_id: Uuid::nil(),
+            run_url: None,
+        },
+        MainCheckFailed {
+            check_id: Uuid::nil(),
+            summary: "s".into(),
+            tail: String::new(),
+            run_url: None,
+            fix_thread_id: Uuid::nil(),
+        },
+        MainCheckAbandoned {
+            check_id: Uuid::nil(),
+            reason: "r".into(),
+            run_url: None,
+        },
+        MainCheckRedClosed {
+            check_id: Uuid::nil(),
+            reason: crate::engine::RedCloseReason::Closed,
+            actor: None,
         },
         BackupProgress {
             phase: "p".into(),

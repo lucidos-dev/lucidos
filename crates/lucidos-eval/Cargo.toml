@@ -24,6 +24,7 @@ fixture-gen = ["dep:fastembed"]
 # 0600 file. This crate owns that path and that header name for every sender, so
 # the harness takes it rather than hand-copying the pair a fifth time.
 lucidos-local-token = { path = "../lucidos-local-token" }
+lucidos-pg-url = { path = "../lucidos-pg-url" }
 # The judge calls a model through the engine's provider layer, so it reaches
 # every provider the engine reaches. This does not make the eval a test: the
 # lint above forbids test TARGETS, and says nothing about a dependency.
@@ -42,3 +43,6 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 regex = "1"
 fastembed = { version = "4", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

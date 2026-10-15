@@ -21,7 +21,7 @@ The title only displays. It reads like a drawer row: the status dot starts its
 first line, and the pin and ⋯ centre on that line. Rename… and Suggest name are
 items in the thread ⋯ menu. Rename opens the prompt dialog prefilled with the
 title, and F2 opens the same dialog. Suggest name offers a name in a toast and
-changes nothing until the user takes it.
+changes nothing until the user takes it (moved into the dialog, see § Amendment).
 
 The title row shows on both layouts, whether or not the thread drawer is open.
 On both, its tinted band shows only once the transcript scrolls, with no
@@ -78,3 +78,9 @@ row was in view.
 The rest of this decision stands: the title is display-only, and rename lives
 in the thread menu. The title opens that menu on both layouts (ADR 0333), and
 never edits in place.
+
+**Suggest moved into the Rename dialog.** The maintainer asked for it in place
+of the separate Suggest name item. The dialog now carries a Suggest link beside
+its message. A tap spins the link and locks the field until the name lands. The
+name then fills the field, so the user can keep it, edit it or cancel. The toast
+offer is gone, and the menu holds Rename… alone.

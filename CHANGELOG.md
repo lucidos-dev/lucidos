@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.49.0 — 2026-10-15
+
+### Added
+- The Home board. Widgets pinned to Home show as live tiles in three sizes, and Edit moves, resizes and hides them. A tile keeps its size at every board width. On a desktop the board is a rail at the window's right edge: drag its edge to resize it, and the button in the window corner shows or hides it. On a phone, Home opens on the board with the prompt under it, and a tap on the prompt slides up the Home chat.
+- On a desktop, the Home icon opens the Home chat.
+- Add widget in a thread's ⋯ menu pins a reusable widget to that thread's shelf.
+- A heavy coding-agent thread can continue in a successor thread. The successor carries the branch and the plan, takes the old thread's place, and proposes one change for both. The prompt box offers it when the thread is idle, and the old thread shows a Continued here link to the new one.
+- A trigger lists the MCP servers it uses. Its fires have those servers from the first step, and only a listed server runs without asking.
+- Copy an image from the image viewer.
+- A sub-agent's Done row shows how full its context got.
+- The agent can capture an app as it renders on a named device.
+
+### Changed
+- An MCP server reaches only the threads that switch it on, so a thread that never uses a server no longer pays for its tools. Settings shows each server's cost per thread.
+- A sub-thread's report wakes its parent only when the parent must act. A spawn can set the mode: no-wake, wake, or wake-when-all-done.
+- Trigger runs decide whether they are worth reading, so a routine run stays out of Review.
+- While a Claude Code session waits on its sub-threads or an event, Lucidos keeps its prompt cache warm, so the turn that wakes it costs less.
+- The Tree memory backfill shows its estimate, pauses at 1.5 times that estimate, and asks before it spends more. Backfill calls run at half price on OpenAI's Flex tier where available.
+- A new workspace asks which memory module to use. Classic is almost free. Tree shows what it costs a month for light, medium and heavy use, for the compactor model you pick. Closing the question keeps Classic. A workspace you already use stays on Classic, and you can choose Tree under Settings > System > Memory, which shows the cost first.
+- A widget in a reply and a widget the agent showed are one inline widget, with the same bar, menu and Expand. The agent shows a widget by embedding it in its reply.
+- On a phone, the header and bars slide away as you scroll an app, as they do in a thread. They move when your finger lifts, so they stay steady while you drag.
+- An Apps row has a pin toggle and a ⋯ menu with Edit and Delete. A long press opens the same menu.
+- The Plugins list row is calmer. A plugin's version and update state show on its detail page.
+- Suggest name moved into the Rename dialog, as a link beside the field.
+- Show in Folders highlights the row it lands on.
+- A tap on an Ongoing tile only filters the list. It never opens a thread.
+- An archived thread's worktree is removed an hour after it goes idle. Its work stays on its branch.
+- Other users on the same Mac cannot read Lucidos's data, reach its database, its engines or the agent browser. The agent browser always runs inside Chrome's sandbox.
+- Scripts, coding agents and other processes Lucidos starts never see the engine's database credentials.
+- The engine refuses to start on a database that was wiped, so a workspace never comes up empty.
+- The credential the hook socket presents to an engine is now `~/.lucidos/hook-socket-token`. The gateway mints a fresh one on first start. Nothing reads the old `~/.lucidos/webhook-token` once every gateway on the machine runs this release, so you can delete it then. A webhook's own bearer token is unchanged.
+- Changes to the Lucidos source land through one landing lane. It tries each change on main first, and gathers an Apply All press's conflicts into one batch. The Lucidos menu shows the lane.
+- The image and voice pickers drop retired OpenAI models, and their defaults move to current ones.
+- A release notice can be meant for some workspaces only. The Tree memory notice shows only on a workspace that chose Classic, and links straight to the Memory page.
+- The app opens faster. Menus and dialogs load when you first open them.
+- The thread drawer stays smooth with long folders.
+
+### Fixed
+- Messages sent quickly from one page reach a thread in the order you sent them.
+- Trigger fires, backup schedules and trigger group changes are no longer lost when the engine falls behind on events.
+- No trigger fire starts while the engine shuts down.
+- The packaged app runs one client per user, and `--version` prints the version and exits.
+- A link to a Lucidos thread opens it in Lucidos, in its own workspace's window or tab.
+- A link to a file inside the workspace opens the file preview.
+- Space presses a focused button instead of typing into the prompt box.
+- A pane swipe on a phone always comes to rest on a pane.
+- An app's live stream reconnects after it gives up, and `lucidos.sse.onOpen` runs on every connect.
+- A notification stays unread until the server confirms the read.
+- A link in a release notice opens the page it names.
+- Plugin install and uninstall panels sit centred in the Plugins view.
+- The workspace audit finds old database defaults, removed flags and retired tap values in quoted and argument-list form too.
+
+### Removed
+- Floating widget windows, the widget dock, and the widget list that a hold or hover on the Home icon opened. The Home board keeps Home's widgets in view instead.
+- `lucidos widgets show` and the `widgets` tool's `show` action. Embed a widget in a reply to show it.
+- The toast placement setting. Toasts show in the bottom-right corner.
 ## v0.48.1 — 2026-10-11
 
 ### Added

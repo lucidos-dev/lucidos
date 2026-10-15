@@ -38,7 +38,7 @@ use crate::llm::LlmProvider;
 use crate::engine::event_bus::EventBus;
 use crate::llm::AuxProvider;
 pub use default::ModelSource;
-pub(crate) use default::{recommended, recommended_effort, select as select_model};
+pub(crate) use default::{asks_no_model, recommended, recommended_effort, select as select_model};
 use not_served_report::NotServedRecorder;
 pub(crate) use reach::{NotServed, Reach};
 
@@ -219,6 +219,11 @@ pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
             reasoning: Some(&prefs::REASONING_READ_DECISION),
             needs_vision: false,
         },
+        ContextPurpose::WakeDecision => AuxModelPrefs {
+            model: &prefs::MODEL_WAKE_DECISION,
+            reasoning: Some(&prefs::REASONING_WAKE_DECISION),
+            needs_vision: false,
+        },
         ContextPurpose::QueryClassification => AuxModelPrefs {
             model: &prefs::MODEL_QUERY_CLASSIFICATION,
             reasoning: Some(&prefs::REASONING_QUERY_CLASSIFICATION),
@@ -379,6 +384,7 @@ pub(crate) const BACKGROUND_ROWS: &[ContextPurpose] = &[
     ContextPurpose::MemoryFind,
     ContextPurpose::CommandJudge,
     ContextPurpose::ReadDecision,
+    ContextPurpose::WakeDecision,
 ];
 
 /// The model preference key `purpose` reads, which names its Settings row.
@@ -486,7 +492,8 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
         | ContextPurpose::QueryClassification
         | ContextPurpose::ImageGen
         | ContextPurpose::CommandJudge
-        | ContextPurpose::ReadDecision => SHORT_CALL_BUDGET,
+        | ContextPurpose::ReadDecision
+        | ContextPurpose::WakeDecision => SHORT_CALL_BUDGET,
         // Eight that never ask. None is an auxiliary HTTP call this module
         // times: a turn and the four `AgentModel` purposes run on the agent's
         // own provider and its timeout, and the talker holds a socket. Web
@@ -639,6 +646,7 @@ pub(crate) const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::WebSearch,
     ContextPurpose::Proxy,
     ContextPurpose::ReadDecision,
+    ContextPurpose::WakeDecision,
 ];
 
 #[cfg(test)]
@@ -675,10 +683,11 @@ mod tests {
                 | ContextPurpose::MemoryFind
                 | ContextPurpose::WebSearch
                 | ContextPurpose::Proxy
-                | ContextPurpose::ReadDecision => {}
+                | ContextPurpose::ReadDecision
+                | ContextPurpose::WakeDecision => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 20);
+        assert_eq!(ALL_PURPOSES.len(), 21);
     }
 
     /// The key an unset handle inherits, if any.

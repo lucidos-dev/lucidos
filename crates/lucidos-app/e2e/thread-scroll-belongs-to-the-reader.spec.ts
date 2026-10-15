@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport, disarmFollowSeed } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport, disarmFollowSeed, hideHomeRail } from './helpers';
 
 /** The transcript's scroll position belongs to the reader: the app moves it only
  *  when the reader asks, and exactly ONE of those asks is STANDING rather than
@@ -43,6 +43,7 @@ import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileVie
 test.describe('Transcript scroll belongs to the reader (desktop)', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+    await hideHomeRail(page);
   });
 
   test('a send rides nothing, the toggle rides, and taking it back moves nobody', async ({ page }) => {
@@ -58,6 +59,18 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
 
     const tc = page.locator('.thread-content.visible:visible').first();
     const atBottom = () => tc.evaluate(el => el.scrollTop + el.clientHeight >= el.scrollHeight - 2);
+    // Where the submit's glide came to rest: two reads 150ms apart agree. A
+    // slow host is still mid-glide when the reply finishes.
+    const restingScrollTop = async () => {
+      let last = Number.NaN;
+      await expect.poll(async () => {
+        const now = await tc.evaluate(el => el.scrollTop);
+        const resting = now === last;
+        last = now;
+        return resting;
+      }, { intervals: [150] }).toBe(true);
+      return last;
+    };
     const growLastTurn = () => tc.evaluate((el) => {
       const turns = el.querySelectorAll('.chat-exchange');
       const last = turns[turns.length - 1] as HTMLElement;
@@ -105,7 +118,7 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     // afterwards leaves them exactly there and the chevron is their way down.
     await sendMessage(page, 'List the numbers from 1 to 20, one per line, and nothing else.');
     await waitForResponse(page);
-    const landed = await tc.evaluate(el => el.scrollTop);
+    const landed = await restingScrollTop();
     expect(landed).toBeGreaterThan(50);
     await expect.poll(atBottom).toBe(false);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(1);

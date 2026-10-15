@@ -529,6 +529,16 @@ export function SidebarIcon() {
   );
 }
 
+// The Home rail toggle: `SidebarIcon` mirrored, since the rail is the right
+// column of the window.
+export function RightSidebarIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM15 4v16" />
+    </svg>
+  );
+}
+
 // The thread-drawer toggle on a phone: a bulleted list, since it takes the user
 // to the threads pane, which is a list of threads. Filter holds the same corner
 // of that pane, which is why Filter draws a funnel and never lines.
@@ -742,15 +752,6 @@ export function EditIcon() {
   );
 }
 
-export function SparkleIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" />
-      <path d="M19 3v4M21 5h-4" />
-    </svg>
-  );
-}
-
 export function EyeOffIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -807,13 +808,13 @@ export function CurrentIcon({ size }: { size?: string } = {}) {
   );
 }
 
-// The home thread: a house, wherever a Home entry or a Home row is drawn.
+// The home thread: a house, wherever a Home entry or a Home row is drawn. One
+// path, with the door cut into the base line: two overlapping strokes paint
+// their shared pixels twice and show as bright spots.
 export function HomeIcon({ size }: { size?: string } = {}) {
   return (
     <svg {...(size ? { width: size, height: size } : {})} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M3 10.5 12 3l9 7.5" />
-      <path d="M5 9.5V21h14V9.5" />
-      <path d="M10 21v-6h4v6" />
+      <path d="M4 10 12 3l8 7v9a2 2 0 0 1-2 2h-4v-5a1 1 0 0 0-1-1h-2a1 1 0 0 0-1 1v5H6a2 2 0 0 1-2-2Z" />
     </svg>
   );
 }
@@ -1068,38 +1069,6 @@ export function OpenInCanvasIcon() {
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <rect x="3" y="4" width="18" height="16" rx="2" />
       <path d="M12 4v16" />
-    </svg>
-  );
-}
-
-/* The three widget window modes share one frame, 17 by 15 at the same corner,
-   so they read as one family beside ⋯ and ✕. */
-
-/** A widget window's window mode: a card with a bar. */
-export function WidgetWindowModeIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
-      <path d="M3.5 9h17" />
-    </svg>
-  );
-}
-
-/** A widget window's minimal mode: the widget alone, only its corners. */
-export function WidgetMinimalModeIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M3.5 9V7a2.5 2.5 0 0 1 2.5-2.5h2.5M15.5 4.5H18A2.5 2.5 0 0 1 20.5 7v2M20.5 15v2a2.5 2.5 0 0 1-2.5 2.5h-2.5M8.5 19.5H6A2.5 2.5 0 0 1 3.5 17v-2" />
-    </svg>
-  );
-}
-
-/** A widget window docked under the header. */
-export function WidgetDockedModeIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M3.5 4.5h17" />
-      <rect x="3.5" y="8.5" width="17" height="11" rx="2.5" />
     </svg>
   );
 }

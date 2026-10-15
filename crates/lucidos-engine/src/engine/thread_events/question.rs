@@ -84,8 +84,8 @@ pub enum AnswerKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OwnerApproval {
     pub verb: ThreadReachVerb,
-    /// The thread the act aims at. `None` only for a verb that aims at the
-    /// workspace root (`ThreadReachVerb::aims_at_root`).
+    /// The thread the act aims at. `None` only on a card asked for a
+    /// top-thread before that needed no approval (ADR 0475).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_thread_id: Option<uuid::Uuid>,
 }
@@ -98,5 +98,44 @@ impl AnswerKind {
             | AnswerKind::MultiSelected { image_hashes, .. } => image_hashes,
             AnswerKind::Selected { .. } | AnswerKind::Canceled | AnswerKind::Superseded => &[],
         }
+    }
+
+    /// What the user answered, as text: each picked option's label from
+    /// `options`, then any typed text. `None` when no answer came.
+    pub(crate) fn text(&self, options: &[QuestionOption]) -> Option<String> {
+        let label = |option_id: &str| -> String {
+            options
+                .iter()
+                .find(|o| o.id == option_id)
+                .map_or_else(|| option_id.to_string(), |o| o.label.clone())
+        };
+        match self {
+            AnswerKind::Selected { option_id } => Some(label(option_id)),
+            AnswerKind::FreeText { text, image_hashes } => {
+                Some(with_image_note(text, image_hashes.len()))
+            }
+            AnswerKind::MultiSelected {
+                option_ids,
+                text,
+                image_hashes,
+            } => {
+                let mut parts: Vec<String> = option_ids.iter().map(|o| label(o)).collect();
+                if let Some(text) = text.as_deref().filter(|t| !t.trim().is_empty()) {
+                    parts.push(text.to_string());
+                }
+                Some(with_image_note(&parts.join("; "), image_hashes.len()))
+            }
+            AnswerKind::Canceled | AnswerKind::Superseded => None,
+        }
+    }
+}
+
+/// A message's text, noting attached images so an image-only message still
+/// reads as something.
+pub(crate) fn with_image_note(text: &str, images: usize) -> String {
+    match images {
+        0 => text.to_string(),
+        1 => format!("{text} [1 image]").trim().to_string(),
+        n => format!("{text} [{n} images]").trim().to_string(),
     }
 }

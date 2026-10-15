@@ -10,7 +10,7 @@ import { makeInertBody } from './escapeHtml';
 import { escapeHtmlAttr } from './markedConfig';
 import { addLinkifyMs } from './renderPhaseTimers';
 import { parseRepoPath, type RepoLocator } from '../store/repoPath';
-import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
+import { DATA_PATH_PREFIXES, workspaceDataRoot } from './dataPathPrefixes';
 
 // Cap how many alternatives go into a single regex. WebKit's YARR throws
 // "regular expression too large" on big alternations; V8 has no such limit.
@@ -140,9 +140,9 @@ const DATA_SETTINGS_VIEW_ATTR = /\sdata-settings-view\s*=\s*(?:"[^"]*"|'[^']*')/
 const DATA_TRIGGER_ID_ATTR = /\sdata-trigger-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
 
 /** UI panels reachable from a markdown link like `[Notifications](notifications)`.
- *  Every `MenuItem` plus the two bare `navigate_ui` targets that land somewhere
- *  other than a menu row: `app-store` is the retired alias for Plugins, and
- *  `thread-queue` opens a Settings subview.
+ *  Every `MenuItem` plus the three bare `navigate_ui` targets that land somewhere
+ *  other than a menu row: `home-board` reveals the Home board, `app-store` is
+ *  the retired alias for Plugins, and `thread-queue` opens a Settings subview.
  *
  *  Held apart from `MenuItem` on purpose. This set answers "is this href a
  *  panel", so it stays a plain string set that `utils/` owns without importing
@@ -150,6 +150,7 @@ const DATA_TRIGGER_ID_ATTR = /\sdata-trigger-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
  *  keeps it honest: a menu item or a bare generated target missing here is a
  *  link the agent writes and the reader cannot open. */
 export const NAV_TARGETS: ReadonlySet<string> = new Set([
+  'home-board',
   'notifications',
   'apps',
   'plugins',
@@ -407,6 +408,30 @@ export function extractDataPathTarget(href: string): string | null {
   // Nothing under the sub-tree, or a trailing slash: a directory, not a file.
   if (candidate.length === prefix.length || candidate.endsWith('/')) return null;
   return candidate;
+}
+
+/** Recognize an href that names a file under THIS workspace's `data/` tree by
+ *  its disk path: `<workspacePath>/data/artifacts/x.png`, bare or as a
+ *  `file://` URL. Returns the store path (`artifacts/x.png`), or null.
+ *
+ *  A coding agent works on the workspace's disk, so it links what it wrote by
+ *  disk path. Left to `extractLocalFileTarget`, that link needs an OS opener,
+ *  which a browser does not have. The in-app preview opens it on every client.
+ *
+ *  `workspacePath` comes from `/health` and is empty until that loads, which
+ *  answers null. It percent-decodes the href first, since markdown encodes a
+ *  destination carrying a space. */
+export function extractWorkspaceDiskDataPath(href: string, workspacePath: string): string | null {
+  if (!workspacePath) return null;
+  let decoded = href;
+  try { decoded = decodeURI(href); } catch { /* malformed escape: match the raw href */ }
+  if (/^file:\/\//i.test(decoded)) decoded = decoded.slice('file://'.length);
+  const dataRoot = workspaceDataRoot(workspacePath);
+  if (!decoded.startsWith(dataRoot)) return null;
+  const relative = decoded.slice(dataRoot.length);
+  // A `..` segment can climb out of data/, so the prefix alone proves nothing.
+  if (relative.split('/').some((segment) => segment === '.' || segment === '..')) return null;
+  return extractDataPathTarget(relative);
 }
 
 /** Recognize an href that points at a REAL local filesystem location the OS

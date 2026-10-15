@@ -3,10 +3,10 @@
  * A re-read that was already in flight when the user started typing must drop
  * its reply.
  *
- * The obvious guard is the wrong one. Both surfaces gate whether a re-read
- * STARTS, on `edited` and on `dirty`, and both read that at render time. The
- * reply lands between renders, so a read begun one tick before the first
- * keystroke still resolves and overwrites the draft. Silent data loss, and no
+ * The obvious guard is the wrong one. The editor gates whether a re-read
+ * STARTS on `dirty`, and reads it at render time. The reply lands between
+ * renders, so a read begun one tick before the first keystroke still resolves
+ * and overwrites the draft. Silent data loss, and no
  * test saw it: the ordinary path never has a fetch open while the user types.
  *
  * Each case therefore drives the promise by hand, so the keystroke lands in
@@ -14,29 +14,14 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
+import { AllowlistEditor } from '../settings/AllowlistEditor';
+import { permissionGrantsVersion } from '../../store/store';
 
 /** A promise whose settle time the test owns. */
 function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
   const promise = new Promise<T>((r) => { resolve = r; });
   return { promise, resolve };
-}
-
-const readAppSource = vi.fn();
-vi.mock('../../api/client', async () => {
-  const actual = await vi.importActual<Record<string, unknown>>('../../api/client');
-  return { ...actual, readAppSourceApi: (...args: unknown[]) => readAppSource(...args) };
-});
-
-import { AppUiEditModal } from '../apps/AppUiEditModal';
-import { AllowlistEditor } from '../settings/AllowlistEditor';
-import { appsList, panelOverlay, appSourceEpoch, permissionGrantsVersion } from '../../store/store';
-import type { App } from '../../store/types';
-
-const APP_ID = 'habit-tracker';
-
-function app(): App {
-  return { id: APP_ID, name: 'Habit Tracker', description: 'Tracks habits', reveal: 'on-load', kind: 'app', reusable: false };
 }
 
 async function waitFor(done: () => boolean, budgetMs = 1000): Promise<void> {
@@ -54,70 +39,6 @@ function typeInto(el: HTMLInputElement | HTMLTextAreaElement, value: string): vo
   el.value = value;
   el.dispatchEvent(new Event('input', { bubbles: true }));
 }
-
-describe('the app source editor drops a re-read the user typed under', () => {
-  let host: HTMLElement;
-
-  function sourceBox(): HTMLTextAreaElement {
-    const el = host.querySelector<HTMLTextAreaElement>('textarea.code-textarea');
-    if (!el) throw new Error('the source editor is not rendered');
-    return el;
-  }
-
-  beforeEach(() => {
-    document.body.innerHTML = '';
-    host = document.createElement('div');
-    document.body.appendChild(host);
-    readAppSource.mockReset();
-    appsList.value = { status: 'loaded', data: [app()] };
-    panelOverlay.value = { type: 'form', form: { type: 'app-edit', appId: APP_ID } };
-  });
-
-  afterEach(() => {
-    render(null, host);
-    document.body.innerHTML = '';
-    panelOverlay.value = null;
-    appsList.value = { status: 'not-loaded' };
-    appSourceEpoch.value = 0;
-  });
-
-  it('keeps the edit when the epoch read resolves after the keystroke', async () => {
-    readAppSource.mockResolvedValueOnce({ files: [{ name: 'index.html', content: 'ORIGINAL' }] });
-    render(<AppUiEditModal />, host);
-    await waitFor(() => host.querySelector('textarea.code-textarea') !== null);
-
-    // A coding-agent apply lands: the epoch moves and a re-read starts, but
-    // the engine has not answered yet.
-    const inFlight = deferred<{ files: { name: string; content: string }[] }>();
-    readAppSource.mockReturnValueOnce(inFlight.promise);
-    appSourceEpoch.value++;
-    await waitFor(() => readAppSource.mock.calls.length === 2);
-
-    // The user types INTO that window.
-    typeInto(sourceBox(), 'MY UNSAVED EDIT');
-    await waitFor(() => sourceBox().value === 'MY UNSAVED EDIT');
-
-    // Only now does the read answer, with the bytes that predate the edit.
-    inFlight.resolve({ files: [{ name: 'index.html', content: 'FROM THE AGENT' }] });
-    await settle();
-
-    expect(sourceBox().value).toBe('MY UNSAVED EDIT');
-  });
-
-  it('still swaps in the new bytes when nobody typed', async () => {
-    readAppSource.mockResolvedValueOnce({ files: [{ name: 'index.html', content: 'ORIGINAL' }] });
-    render(<AppUiEditModal />, host);
-    await waitFor(() => host.querySelector('textarea.code-textarea') !== null);
-
-    readAppSource.mockResolvedValueOnce({
-      files: [{ name: 'index.html', content: 'FROM THE AGENT' }],
-    });
-    appSourceEpoch.value++;
-    await waitFor(() => sourceBox().value === 'FROM THE AGENT');
-
-    expect(sourceBox().value).toBe('FROM THE AGENT');
-  });
-});
 
 describe('the allowlist editor drops a re-read the user typed under', () => {
   let host: HTMLElement;

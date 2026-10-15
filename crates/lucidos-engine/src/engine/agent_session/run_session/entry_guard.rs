@@ -34,12 +34,12 @@ use crate::engine::types::{AgentSession, AgentUserInput};
 
 /// Drop-guard over `agent_sessions[thread_id]` for one `run_session` call.
 ///
-/// Identity is the message channel, not the thread id: a recovery hand-off
-/// deliberately leaves the outgoing session in the map until the incoming one
-/// replaces it (see the `recovery_worktree` skip in `run_session`), so a blind
-/// `remove(&thread_id)` on drop would delete the *replacement*. Comparing
-/// `msg_tx` with `same_channel` reaps only the entry this run inserted.
-pub(super) struct SessionEntryGuard {
+/// Identity is the message channel, not the thread id. A claim replaces an
+/// entry whose run has let go, before that run's guard reaps it (see
+/// `spawn_claim`). So a blind `remove(&thread_id)` on drop would delete the
+/// *replacement*. Comparing `msg_tx` with `same_channel` reaps only the entry
+/// this run claimed.
+pub(in crate::engine::agent_session) struct SessionEntryGuard {
     sessions: Arc<Mutex<HashMap<Uuid, AgentSession>>>,
     thread_id: Uuid,
     /// Sender half of *this run's* channel. Held purely as an identity token —
@@ -49,12 +49,15 @@ pub(super) struct SessionEntryGuard {
     /// Set by the engine shutdown sweep, which emits its own terminal for every
     /// running thread. Suppresses ours so a switch doesn't double-report.
     shutting_down: Arc<AtomicBool>,
+    /// Off while the claimed run is starting: an early error is settled by
+    /// the caller, so the guard only reaps. The run arms it with its loop.
+    settles_a_dropped_run: bool,
     event_bus: EventBus,
     pool: sqlx::PgPool,
 }
 
 impl SessionEntryGuard {
-    pub(super) fn new(
+    pub(in crate::engine::agent_session) fn new(
         sessions: Arc<Mutex<HashMap<Uuid, AgentSession>>>,
         thread_id: Uuid,
         msg_tx: UnboundedSender<AgentUserInput>,
@@ -67,9 +70,21 @@ impl SessionEntryGuard {
             thread_id,
             msg_tx,
             shutting_down,
+            settles_a_dropped_run: false,
             event_bus,
             pool,
         }
+    }
+
+    /// From here on a dropped run future leaves a turn nobody will end.
+    pub(in crate::engine::agent_session) fn settle_if_dropped(&mut self) {
+        self.settles_a_dropped_run = true;
+    }
+
+    /// Back to reap-only: the run returned to `Starting`, and an error from
+    /// here is the caller's to settle.
+    pub(in crate::engine::agent_session) fn reap_only(&mut self) {
+        self.settles_a_dropped_run = false;
     }
 }
 
@@ -83,6 +98,7 @@ impl Drop for SessionEntryGuard {
         let thread_id = self.thread_id;
         let msg_tx = self.msg_tx.clone();
         let shutting_down = self.shutting_down.clone();
+        let settles_a_dropped_run = self.settles_a_dropped_run;
         let event_bus = self.event_bus.clone();
         let pool = self.pool.clone();
 
@@ -104,7 +120,7 @@ impl Drop for SessionEntryGuard {
                 thread_id,
                 !reaped.was_live
             );
-            if !reaped.was_live {
+            if !settles_a_dropped_run || !reaped.was_live {
                 // `finalize_direct_agent` sets `process_exited` as its very
                 // first act, so an entry already flagged means the loop DID
                 // run and reach teardown — it just didn't get as far as the
@@ -291,6 +307,7 @@ mod tests {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "run the build".into(),
                 user_image_hashes: vec![],
                 device_id: None,

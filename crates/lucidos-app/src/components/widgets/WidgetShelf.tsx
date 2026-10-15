@@ -12,9 +12,10 @@ import { openShelfWidget, threadWidgetKey, threadWidgetsFor } from '../../store/
 import { closeShelfWidget, rereadThreadWidgets } from '../../store/actions/widgets';
 import { isHomeThread } from '../../store/actions/homeThread';
 import { showWidgetInThread, toggleShelfWidget } from '../../store/actions/widget-actions';
-import { WidgetBar } from './WidgetCard';
+import { WidgetBar } from './InlineWidget';
 import { WidgetFrame } from './WidgetFrame';
-import { widgetMenuItems, type WidgetMenuTarget } from './WidgetMenu';
+import type { WidgetMenuTarget } from './WidgetMenu';
+import { WidgetMenuItems } from './widgetMenuChunks';
 import { useShelfTight } from './useShelfTight';
 
 /** What a chip calls its instance: the label, else the widget's name. */
@@ -80,7 +81,8 @@ function ShelfChip({ threadId, entry, open }: { threadId: string; entry: ThreadW
       <OverflowMenu
         ariaLabel={`${name} widget actions`}
         hostOpener={{ ref: openMenu, trigger: false }}
-        items={(ctx) => widgetMenuItems(ctx, menuTarget(threadId, entry))}
+        itemsChunk={WidgetMenuItems}
+        items={(ctx) => <WidgetMenuItems ctx={ctx} target={menuTarget(threadId, entry)} />}
       />
     </>
   );
@@ -88,9 +90,9 @@ function ShelfChip({ threadId, entry, open }: { threadId: string; entry: ThreadW
 
 /** The widget shelf in a thread's title row (ADRs 0402, 0407, 0415): a chip
  *  per pinned widget instance, and the one a chip dropped open, under the title. Every
- *  widget also shows as a card in the transcript, so an unpinned one has no
- *  chip and loses nothing. Home draws no shelf: its pinned widgets open from
- *  the Home long-press menu as windows (ADR 0419).
+ *  widget also shows as an inline widget in the transcript, so an unpinned one
+ *  has no chip and loses nothing. Home draws no shelf: its pinned widgets are
+ *  tiles on the Home board (ADR 0466).
  *
  *  The dropped open widget covers the transcript, so it is an `<Overlay>`
  *  anchored to its chip: an outside tap or Escape closes it. It rolls open
@@ -190,7 +192,7 @@ export function OpenShelfWidget({ threadId, entry, onClose }: {
 }) {
   const target = menuTarget(threadId, entry);
   return (
-    <div class="widget-card widget-card-shelf">
+    <div class="widget-panel widget-panel-shelf">
       <WidgetBar
         target={target}
         icon={entry.icon}

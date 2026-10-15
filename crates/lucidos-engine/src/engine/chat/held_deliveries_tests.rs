@@ -58,6 +58,7 @@ async fn child_report(bus: &EventBus, thread_id: Uuid) -> Uuid {
             summary: "done".into(),
             pending_change_ids: vec![],
             sub_thread_pending_changes: vec![],
+            integrated_branch: None,
         },
     )
     .await

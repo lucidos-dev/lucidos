@@ -168,16 +168,10 @@ fn claim_refusal_error(msg: &str) -> Option<ApiError> {
 
 /// Classify an `apply_now` error into its HTTP error.
 ///
-/// `404` is not a generic failure here, it is a SIGNAL: the frontend
-/// (`endClaudeCodeAndApply`) reads it as "no live coding-agent session" and
-/// falls back to applying the thread's pending changes one at a time. So every
-/// refusal that is not literally "there is no session" has to be `409`, or the
-/// UI runs the wrong fallback.
-///
-/// Each refusal carries its message and a `reason` slug. The frontend keeps its
-/// "applying" spinner only when an apply really holds the session, and shows
-/// the message either way. Refusals are matched by identity against their
-/// consts, so rewording one cannot silently reclassify it as "no session".
+/// Each refusal is a `409` with its message and a `reason` slug, so the toast
+/// can say which holder refused. Refusals are matched by identity against
+/// their consts. Any other error is a `500` carrying its own message, since
+/// the engine applies pending changes itself when no session is live.
 fn apply_now_error(msg: &str) -> ApiError {
     if let Some(refused) = claim_refusal_error(msg) {
         return refused;
@@ -191,7 +185,7 @@ fn apply_now_error(msg: &str) -> ApiError {
     if msg == crate::engine::claude_code::QUESTION_UNKNOWN_MESSAGE {
         return ApiError::new(StatusCode::CONFLICT, msg).with_reason("question_unknown");
     }
-    StatusCode::NOT_FOUND.into()
+    ApiError::internal(msg.to_string())
 }
 
 pub(super) async fn claude_code_apply_now(
@@ -211,7 +205,12 @@ pub(super) async fn claude_code_apply_now(
     .await?;
     let actor = super::actor::user_actor(&headers, None);
     match state.engine.apply_now(thread_id, actor).await {
-        Ok(_) => Ok(Json(serde_json::json!({ "status": "applying" }))),
+        // The version lets the client hold its "requesting" state until the
+        // row carries the apply's own start (ADR 0437).
+        Ok(summary_version) => Ok(Json(serde_json::json!({
+            "status": "applying",
+            "summary_version": summary_version,
+        }))),
         Err(e) => {
             let msg = e.to_string();
             crate::log!("[API] apply_now failed for {}: {}", thread_id, msg);
@@ -232,11 +231,8 @@ mod apply_now_status_tests {
         (e.status, e.message, e.reason)
     }
 
-    /// The refusal added with the merge-ownership guard must reach the
-    /// frontend's "already applying" branch. As a 404 it would instead hit the
-    /// "no live session" fallback, which loops over the thread's pending
-    /// changes calling `applyChange` on each: the wrong fallback for a thread
-    /// whose merge a resolver already owns.
+    /// The refusal added with the merge-ownership guard is a conflict with its
+    /// own slug, never a generic failure.
     #[test]
     fn a_resolver_owned_merge_is_a_conflict_not_a_missing_session() {
         let msg = crate::engine::MERGE_OWNED_BY_RESOLVER_MESSAGE;
@@ -250,9 +246,8 @@ mod apply_now_status_tests {
         );
     }
 
-    /// A parked question, or a check for one that failed, refuses as 409. As a
-    /// 404 the frontend would fall back to applying the pending change
-    /// directly, which starts the very hardening run the refusal exists to stop.
+    /// A parked question, or a check for one that failed, refuses as 409 with
+    /// its own slug.
     #[test]
     fn a_parked_question_is_a_conflict_not_a_missing_session() {
         use crate::engine::claude_code::{QUESTION_OPEN_MESSAGE, QUESTION_UNKNOWN_MESSAGE};
@@ -286,12 +281,13 @@ mod apply_now_status_tests {
         assert!(!DISCARD_IN_PROGRESS_MESSAGE.contains("apply"));
     }
 
-    /// Anything else still reads as "no live session" so the frontend can fall
-    /// back to applying the pending changes directly.
+    /// Anything else is a failure that names its cause, so the toast can say
+    /// why the apply did not start.
     #[test]
-    fn an_unrecognised_failure_still_signals_no_live_session() {
-        let (status, _, reason) = refusal("Session channel closed");
-        assert_eq!((status, reason), (StatusCode::NOT_FOUND, None));
+    fn an_unrecognised_failure_names_its_cause() {
+        let (status, message, reason) = refusal("Session channel closed");
+        assert_eq!((status, reason), (StatusCode::INTERNAL_SERVER_ERROR, None));
+        assert!(message.contains("Session channel closed"), "{message}");
     }
 }
 

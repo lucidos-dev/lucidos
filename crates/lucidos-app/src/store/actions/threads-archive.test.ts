@@ -34,10 +34,11 @@ import { putComposeOnThread } from '../../api/client';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { _resetComposeDraftsForTesting, draftPresentThreadIds, getDraft } from '../composeDrafts';
-import { ALL_CHANNELS, archivingThreadIds, confirmState, setDrawerGrouping, setSelectedOngoingGroup, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
+import { ALL_CHANNELS, confirmState, setDrawerGrouping, setSelectedOngoingGroup, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
 import { ARCHIVE_PINNED_CONFIRM, focusThread, handleArchiveThread, subscriptionsStoppedByArchive } from './threads';
+import { _resetRowIntentsForTesting, archiveRequestInFlight } from '../rowIntents';
 
 // Mock the API module
 vi.mock('../../api/threads', () => ({
@@ -62,7 +63,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   submitChat: vi.fn().mockResolvedValue(undefined),
   cancelChat: vi.fn(),
   stopClaudeCode: vi.fn(),
-  putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
+  putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied', report: null }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
@@ -84,7 +85,7 @@ beforeEach(() => {
   drawerOpen.value = false;
   resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
-  archivingThreadIds.value = new Set();
+  _resetRowIntentsForTesting();
   // Reset the thread filter to its neutral "show everything" state so one
   // test's narrowed filter can't leak into the next.
   threadChannelFilter.value = new Set(ALL_CHANNELS);
@@ -771,7 +772,7 @@ describe('handleArchiveThread — optimistic UI', () => {
     expect(threadMap.value.get('child')?.meta.section).toBe('inbox');
     expect(threadMap.value.get('parent')?.meta.codingAgentChangeState.kind).toBe('proposed');
     expect(threadMap.value.get('child')?.meta.codingAgentChangeState.kind).toBe('proposed');
-    expect(archivingThreadIds.value.has('parent')).toBe(false);
+    expect(archiveRequestInFlight('parent')).toBe(false);
     expect(toasts.value.some(t => t.type === 'error')).toBe(true);
   });
 });
@@ -838,7 +839,6 @@ describe('handleArchiveThread: a pinned thread', () => {
     (archiveThread as ReturnType<typeof vi.fn>).mockImplementationOnce(
       () => new Promise<{ archived: string[] }>(r => { resolveApi = r; }),
     );
-    const requestStartedAt = Date.now();
     await new Promise(r => setTimeout(r, 5));
 
     const pending = handleArchiveThread('p');
@@ -854,7 +854,7 @@ describe('handleArchiveThread: a pinned thread', () => {
       message_count: 1,
       section: 'inbox',
       status: 'idle',
-    } as any, true, requestStartedAt);
+    } as any, true);
 
     expect(threadMap.value.get('p')!.meta).toMatchObject({ saved: false, section: 'archived' });
 
@@ -871,9 +871,8 @@ describe('handleArchiveThread: a pinned thread', () => {
 // GET is in flight, the GET's pre-archive snapshot lands AFTER the optimistic
 // flip and upsertThread silently overwrites meta.section back to 'inbox' —
 // the row flickers back into Review until the SSE ThreadArchived event
-// finally confirms the move. The fix mirrors the composeEditedAt staleness
-// guard: a request that started before the local flip is by definition stale
-// wrt section + change state.
+// finally confirms the move. The archive is a row intent held until the row
+// reaches the version the POST returned (ADR 0437).
 // ---------------------------------------------------------------------------
 
 describe('handleArchiveThread — stale loadAllThreads response', () => {
@@ -893,11 +892,7 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
     threadMap.value = map;
     focusThread('parent');
 
-    // The stale GET went out BEFORE the user clicked Archive. Sleep so
-    // Date.now() advances past `requestStartedAt` before the flip lands —
-    // the production race only matters when `flip > requestStartedAt`.
-    const requestStartedAt = Date.now();
-    await new Promise(r => setTimeout(r, 5));
+    // The stale GET went out BEFORE the user clicked Archive.
 
     // User clicks Archive — optimistic flip to 'archived'.
     const pending = handleArchiveThread('parent');
@@ -915,7 +910,7 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
       section: 'inbox',              // stale
       status: 'waiting',
       coding_agent_change_state: { kind: 'proposed', requires_restart: false },   // stale
-    } as any, false, requestStartedAt);
+    } as any, false);
 
     // Optimistic flip must survive — no flicker back to Review.
     expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
@@ -941,7 +936,6 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
     threadMap.value = map;
     focusThread('parent');
 
-    const requestStartedAt = Date.now();
     await new Promise(r => setTimeout(r, 5));
 
     const pending = handleArchiveThread('parent');
@@ -958,7 +952,7 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
       status: 'waiting',
       coding_agent_change_state: { kind: 'proposed', requires_restart: false },
       parent_thread_id: 'parent',
-    } as any, false, requestStartedAt);
+    } as any, false);
 
     expect(threadMap.value.get('child')?.meta.section).toBe('archived');
     expect(threadMap.value.get('child')?.meta.codingAgentChangeState.kind).toBe('none');
@@ -989,7 +983,6 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
     // Now a FRESH GET (started after the flip) lands. In the real world this
     // would carry section='archived' once the server has processed the POST.
     await new Promise(r => setTimeout(r, 5));
-    const freshRequestStartedAt = Date.now();
 
     upsertThread(threadMap.value, {
       thread_id: 'parent',
@@ -1001,7 +994,7 @@ describe('handleArchiveThread — stale loadAllThreads response', () => {
       section: 'archived',
       status: 'idle',
       coding_agent_change_state: { kind: 'none' },
-    } as any, false, freshRequestStartedAt);
+    } as any, false);
 
     expect(threadMap.value.get('parent')?.meta.section).toBe('archived');
 
@@ -1140,10 +1133,10 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
     await pending;
   });
 
-  it('lets a post-flip aggregate through once archivingThreadIds clears', async () => {
+  it('lets a post-flip aggregate through once the archive is acknowledged', async () => {
     // The guard must only suppress aggregates that arrived during the
-    // in-flight archive. Once the API resolves and archivingThreadIds is
-    // cleared, subsequent SSE events apply their aggregate normally.
+    // in-flight archive. Once the API resolves, an engine that sends no
+    // version ends the hold, so later SSE events apply their aggregate.
     (archiveThread as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ archived: ['t'] });
 
     const map = new Map<string, ThreadState>();
@@ -1154,7 +1147,7 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
     focusThread('t');
 
     await handleArchiveThread('t');
-    expect(archivingThreadIds.value.has('t')).toBe(false);
+    expect(archiveRequestInFlight('t')).toBe(false);
 
     // After archive completes, an unrelated late SSE arrives with the real
     // backend aggregate. Section should follow the aggregate.
@@ -1184,6 +1177,7 @@ describe('handleArchiveThread — stale SSE aggregate', () => {
         parentThreadId: null,
         parentThreadTitle: null,
         state: 'active',
+        summaryVersion: 1,
       },
     });
 
@@ -1373,7 +1367,7 @@ describe('handleArchiveThread — unsent draft confirm', () => {
   beforeEach(() => {
     toasts.value = [];
     confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
-    (putComposeOnThread as ReturnType<typeof vi.fn>).mockClear().mockResolvedValue({ status: 'applied' });
+    (putComposeOnThread as ReturnType<typeof vi.fn>).mockClear().mockResolvedValue({ status: 'applied', report: null });
   });
 
   function seedDraftThread(): void {
@@ -1448,7 +1442,7 @@ describe('handleArchiveThread — unsent draft confirm', () => {
     expect(archiveThread).toHaveBeenCalledWith('t');
     expect(getDraft('t').text).toBe('');
     expect(draftPresentThreadIds.value.has('t')).toBe(false);
-    expect(putComposeOnThread).toHaveBeenCalledWith('t', '', [], null); // server row cleared
+    expect(putComposeOnThread).toHaveBeenCalledWith('t', '', [], null, undefined, undefined); // server row cleared
   });
 
   it('aborts the archive entirely on Cancel, leaving the draft intact', async () => {
@@ -1490,8 +1484,8 @@ describe('handleArchiveThread — unsent draft confirm', () => {
     expect(getDraft('child').text).toBe('');
     expect(draftPresentThreadIds.value.has('parent')).toBe(false);
     expect(draftPresentThreadIds.value.has('child')).toBe(false);
-    expect(putComposeOnThread).toHaveBeenCalledWith('parent', '', [], null);
-    expect(putComposeOnThread).toHaveBeenCalledWith('child', '', [], null);
+    expect(putComposeOnThread).toHaveBeenCalledWith('parent', '', [], null, undefined, undefined);
+    expect(putComposeOnThread).toHaveBeenCalledWith('child', '', [], null, undefined, undefined);
   });
 
   it('preserves the draft when the archive fails after "Discard draft" was chosen', async () => {

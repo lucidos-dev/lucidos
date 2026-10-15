@@ -1,6 +1,12 @@
 # 0010 — The user-half of the Thread Queue pool mirrors `thread_summaries.status` (one reconcile point, not hand-synced acquire/release)
 
-- **Status:** Accepted (refines the user-slot mechanics of ADR 0008; does not change its policy)
+- **Status:** Accepted, amended by ADR 0443 (refines the user-slot mechanics of ADR 0008; does not change its policy)
+
+> **Amended by [ADR 0443](0443-user-occupancy-is-read-at-admission.md).** The
+> mirror and its reconcile are gone. Admission reads `thread_summaries.status`
+> itself, plus the gate's reservations not yet seen running. The subscriber
+> below only drains. A broadcast lag skipped its reconcile, so the mirror
+> drifted. The goal here, one source of truth, stands.
 - **Date:** 2026-06-15
 
 ## Context

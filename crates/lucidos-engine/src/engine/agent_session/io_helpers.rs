@@ -49,6 +49,7 @@ mod tests {
             images: None,
             origin_event_id: Some(eid),
             kind: crate::engine::AgentInputKind::User,
+            completion: None,
         })
         .unwrap();
         tx.send(AgentUserInput {
@@ -56,6 +57,7 @@ mod tests {
             images: None,
             origin_event_id: None,
             kind: crate::engine::AgentInputKind::User,
+            completion: None,
         })
         .unwrap();
 

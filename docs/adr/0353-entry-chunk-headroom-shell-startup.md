@@ -70,7 +70,8 @@ through `npx`, so they stay strict whatever they inherit.
 - A new listener that only the UI needs belongs in `startShell`, not in client
   startup or `main.tsx`. `store/startup.test.ts` pins the current set to it.
 - The overrun is visible three ways under the build-watch: the build log,
-  `status.json`'s `entryChunk`, and one notification per edge.
+  `status.json`, and one notification per edge. ADR 0436 extended all three to
+  the first-paint budget, under `chunkBudgets`.
 - Attribution over budget needs the guard to report. The clean-build skill
   carries a recipe that names its own process as the parent.
 

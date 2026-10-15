@@ -2,7 +2,7 @@
 //! through `EventBus`, plus its variant-discriminator match-tables
 //! (`event_type`, `aggregate`, `aggregate_id`, `is_persisted`, `to_payload`).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::core::webhook_ingress::{AddressProbe, Family, FamilyVerdict};
@@ -12,7 +12,7 @@ use crate::engine::thread_events::MessageOrigin;
 use crate::scheduler::notifications::Tap;
 
 /// System events — broadcast to SSE, selectively persisted.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum SystemEvent {
     NotificationCreated {
@@ -105,18 +105,61 @@ pub enum SystemEvent {
     /// Older threads keep filling in. `total` counts the scopes it covers.
     TreeBackfillCompleted {
         total: usize,
+        /// What the backfill episode has spent so far, when one is open.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spent_usd: Option<f64>,
     },
     /// A switch to Classic cleared a set ready flag. Coming back to Tree
-    /// backfills again before a turn reads the trees.
+    /// backfills again before a turn reads the trees. It closes the
+    /// backfill episode.
     TreeBackfillReset {},
+    /// A backfill episode opened: the estimate for the compactor's model and
+    /// tier when it began, and the cap it pauses at. `actor` is whoever
+    /// switched the workspace to Tree, unset when the engine resumed one.
+    TreeBackfillStarted {
+        estimate: crate::engine::summary_tree::StartEstimate,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The backfill spent its cap, so the compactor holds the work the
+    /// backfill owes until the user raises the cap or leaves Tree.
+    TreeBackfillCapReached {
+        spent_usd: f64,
+        cap_usd: f64,
+    },
+    /// The user moved the open episode's cap.
+    TreeBackfillCapRaised {
+        cap_usd: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// Every tree is built, which closes the backfill episode. `spent_usd` is
+    /// its whole cost, absent for a model the catalog does not price.
+    TreeBackfillEnded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spent_usd: Option<f64>,
+    },
+    /// Broadcast only, so it is never read back from a row. That is why its
+    /// change lists skip deserializing.
     ChangesUpdated {
+        #[serde(skip_deserializing)]
         pending: Vec<crate::core::changes::Change>,
         /// Kept for later, newest first (ADR 0328).
+        #[serde(skip_deserializing)]
         set_aside: Vec<crate::core::changes::Change>,
+        #[serde(skip_deserializing)]
         applied: Vec<crate::core::changes::Change>,
         total_pending: usize,
         restart_required: bool,
         apply_estimates: crate::engine::apply_estimate::ApplyEstimates,
+        /// The landing lane as it stands: the open lane batch and what waits.
+        #[serde(default)]
+        landing_lane: crate::engine::landing_lane::LaneSnapshot,
+        /// The main check as it stands.
+        #[serde(default)]
+        main_check: crate::engine::MainCheckSnapshot,
     },
     BackupProgress {
         phase: String,
@@ -371,7 +414,7 @@ pub enum SystemEvent {
     },
     /// The user opened an app's UI (ADR 0413). Persisted: it is the only
     /// evidence of use, which the workspace prompt footprint judges an app
-    /// unused by. A reload restore, a history step and a widget card do not
+    /// unused by. A reload restore, a history step and an inline widget do not
     /// emit it.
     AppOpened {
         app_id: String,
@@ -574,35 +617,16 @@ pub enum SystemEvent {
     DeviceHidden {
         device_id: String,
     },
-    /// SSE-only, never persisted. Pure pong trigger — see
-    /// `system-knowhow/notifications.md` §3 (protocol, freshness gate). The
-    /// page answers with a pong; the engine then decides whether to fan out
-    /// the OS push OR instead emit [`Self::NotificationToastRequested`] (§4).
-    /// It deliberately carries NO toast content: the in-app toast is no
-    /// longer rendered on PresenceCheck receipt (that raced the push
-    /// decision and produced a toast-plus-push duplicate on slow links).
-    /// `sent_at_ms` lets the page drop a late ping (iOS PWA SSE-queue flush)
-    /// so a stale pong doesn't arrive after the engine already decided.
+    /// SSE-only, never persisted. The engine asks every connected page what
+    /// it does with a new notification. See `system-knowhow/notifications.md`
+    /// §3 (protocol, freshness gate) and §4 (the row matrix).
+    ///
+    /// It carries the toast content. A page puts the toast on screen, marks
+    /// the row read, or holds it for the badge, and only THEN pongs which. The
+    /// engine suppresses the OS push only on such a pong. So a page that hides
+    /// after answering still leaves the reader the toast it answered for.
+    /// `sent_at_ms` lets the page drop a check that arrives past its deadline.
     PresenceCheck {
-        notification_id: Uuid,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        event_id: Option<Uuid>,
-        deadline_ms: u32,
-        sent_at_ms: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<MessageOrigin>,
-    },
-    /// SSE-only, never persisted. The engine emits this AFTER the
-    /// PresenceCheck (§3) resolves to "an active device exists → suppress the
-    /// OS push": it tells active pages to render the in-app toast (§4).
-    /// Because it is emitted ONLY on the push-suppressed branch (and the OS
-    /// push is emitted ONLY on the complementary branch), a device can never
-    /// receive both a toast and a push for the same notification — they are
-    /// mutually exclusive by the engine's single decision, not by a page-side
-    /// timing race. Carries the toast content so the page renders without a
-    /// re-fetch; `sent_at_ms` drives the page-side freshness gate (drop a
-    /// toast that flushes late after an iOS PWA resume).
-    NotificationToastRequested {
         notification_id: Uuid,
         title: String,
         body: String,
@@ -615,22 +639,21 @@ pub enum SystemEvent {
         /// Defaults to `Tap::Modal` (open inbox) so omitting it stays safe.
         #[serde(default)]
         tap: Tap,
+        deadline_ms: u32,
         sent_at_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
     },
-    /// SSE-only, never persisted. The desktop counterpart of the OS push:
-    /// emitted on the *push-allowed* branch (the complement of
-    /// [`Self::NotificationToastRequested`]) so a connected Tauri desktop app —
-    /// which embeds a WKWebView and can NOT receive Web Push / service-worker
-    /// pushes — renders a NATIVE macOS notification via
-    /// `tauri-plugin-notification`. Broadcast: browser / PWA clients ignore it
-    /// (they already get, or are getting, the real web push), and only a Tauri
-    /// client that is not currently active acts on it. Because it lives on the
-    /// same branch as the web-push fan-out and the opposite branch from the
-    /// in-app toast, a device can never receive both a native banner and a
-    /// toast for one notification — the engine's single `push_allowed` decision
-    /// keeps them mutually exclusive (see `system-knowhow/notifications.md`
-    /// §1, §4). Carries the same content as the toast event so the page renders
-    /// without a re-fetch; `sent_at_ms` drives the page-side freshness gate.
+    /// SSE-only, never persisted. The desktop counterpart of the OS push,
+    /// emitted on the *push-allowed* branch, when no page handled the
+    /// [`Self::PresenceCheck`] in the app. A connected Tauri desktop app embeds a
+    /// WKWebView that can NOT receive Web Push, so it renders a NATIVE macOS
+    /// notification instead. Browser and PWA clients ignore it: they get the
+    /// real web push. A Tauri window brought forward since it answered shows
+    /// the in-app toast instead of the banner, so the frame always surfaces
+    /// (see `system-knowhow/notifications.md` §1, §4). It carries the
+    /// toast content so the page renders without a re-fetch; `sent_at_ms`
+    /// drives the page-side freshness gate.
     NativePushRequested {
         notification_id: Uuid,
         title: String,
@@ -1133,6 +1156,15 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// Someone stopped an MCP server: its process ended, and it is switched
+    /// off in every thread that had enabled it (ADR 0430). Engine shutdown
+    /// ends the processes too, but emits nothing, so threads keep what they
+    /// enabled across a restart.
+    McpServerStopped {
+        server_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// One of the three permission allowlists was rewritten wholesale, through
     /// its Settings editor.
     ///
@@ -1206,12 +1238,12 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// Compose state on a thread changed (text, images, or mode). Broadcast
-    /// to SSE for cross-device sync; intentionally NOT persisted to the events
-    /// table — the `thread_summaries` row holds the current state, and
-    /// keystroke history isn't audit-worthy. Receivers reconcile via the
-    /// `origin_device_id` echo check + "don't clobber my focused textarea"
-    /// guard described in `docs/plans/2026-05-03-threads-as-drafts-design.md`.
+    /// A thread's *compose report* (`docs/glossary.md`) after a change to its
+    /// draft. Broadcast to SSE for cross-device sync; intentionally NOT
+    /// persisted to the events table. The `thread_summaries` row holds the
+    /// current state, and keystroke history isn't audit-worthy. Receivers
+    /// order frames by `summary_version` (ADR 0437). Build one with
+    /// `ComposeReport::broadcast`.
     ThreadComposeChanged {
         id: Uuid,
         text: String,
@@ -1237,6 +1269,11 @@ pub enum SystemEvent {
         /// 0, which is also what a never-submitted thread stores.
         #[serde(default)]
         compose_epoch: i64,
+        /// The *compose revision*: the row's `summary_version` right after the
+        /// statement that produced this report. A receiver ignores a frame at
+        /// or below the revision it already holds.
+        #[serde(default)]
+        summary_version: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_device_id: Option<String>,
     },
@@ -1310,6 +1347,73 @@ pub enum SystemEvent {
         batch_id: Option<Uuid>,
         /// Why it ended, written for the owner to read in the morning.
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The landing lane set changes aside that would not merge cleanly onto
+    /// `main`, and they now resolve together as one *lane batch*. Each member
+    /// names the exact commit the lane lands. The *lane thread* resolves them
+    /// on the batch's integration branch.
+    LaneBatchStarted {
+        batch_id: Uuid,
+        members: Vec<crate::engine::landing_lane::LaneMember>,
+        /// `main` when the batch formed, where its integration branch starts.
+        base_sha: String,
+        lane_thread_id: Uuid,
+    },
+    /// The lane batch landed whole, one landing merge per member. `pre_sha`
+    /// is `main` just before, and `post_sha` is `main` after.
+    LaneBatchLanded {
+        batch_id: Uuid,
+        pre_sha: String,
+        post_sha: String,
+    },
+    /// The lane batch failed as a whole. Every member stays pending and
+    /// apply-ready, and nothing queues it again by itself. `actor` is set for
+    /// a Cancel from the lane.
+    LaneBatchFailed {
+        batch_id: Uuid,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The *main check* started on GitHub against a stripped copy of
+    /// `to_sha`, covering what landed since `from_sha` (ADR 0464).
+    MainCheckStarted {
+        check_id: Uuid,
+        from_sha: String,
+        to_sha: String,
+    },
+    /// The main check passed: `main` at its `to_sha` is green.
+    MainCheckPassed {
+        check_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_url: Option<String>,
+    },
+    /// The main check failed. Main is red, and `fix_thread_id` names the one
+    /// fix thread it opens. `tail` is the end of the failing output.
+    MainCheckFailed {
+        check_id: Uuid,
+        summary: String,
+        #[serde(default)]
+        tail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_url: Option<String>,
+        fix_thread_id: Uuid,
+    },
+    /// The main check ended with no verdict: GitHub was down, the push was
+    /// refused, or the engine restarted mid-run. It starts nothing by itself.
+    MainCheckAbandoned {
+        check_id: Uuid,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_url: Option<String>,
+    },
+    /// The red check closed: its fix landed, or the maintainer closed it.
+    /// `actor` is set for the maintainer's Close.
+    MainCheckRedClosed {
+        check_id: Uuid,
+        reason: crate::engine::RedCloseReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -1611,6 +1715,7 @@ impl SystemEvent {
         "McpServerUpdated",
         "McpServerDisabledToolsChanged",
         "McpServerRemoved",
+        "McpServerStopped",
         "PermissionGrantsChanged",
         "OAuthAccountConnected",
         "OAuthAccountDeleted",
@@ -1622,6 +1727,14 @@ impl SystemEvent {
         "StandingApplyArmed",
         "StandingApplyFired",
         "StandingApplyDropped",
+        "LaneBatchStarted",
+        "LaneBatchLanded",
+        "LaneBatchFailed",
+        "MainCheckStarted",
+        "MainCheckPassed",
+        "MainCheckFailed",
+        "MainCheckAbandoned",
+        "MainCheckRedClosed",
         "EngineSupervisorRespawned",
         "EmailSent",
         "ProxyModulesReloaded",
@@ -1646,6 +1759,10 @@ impl SystemEvent {
         "RecommendedCleanupFailed",
         "TreeBackfillCompleted",
         "TreeBackfillReset",
+        "TreeBackfillStarted",
+        "TreeBackfillCapReached",
+        "TreeBackfillCapRaised",
+        "TreeBackfillEnded",
     ];
 
     /// Whether this event writes a row to the `events` table.
@@ -1681,6 +1798,10 @@ impl SystemEvent {
             Self::TreeBackfillProgressed { .. } => "TreeBackfillProgressed",
             Self::TreeBackfillCompleted { .. } => "TreeBackfillCompleted",
             Self::TreeBackfillReset { .. } => "TreeBackfillReset",
+            Self::TreeBackfillStarted { .. } => "TreeBackfillStarted",
+            Self::TreeBackfillCapReached { .. } => "TreeBackfillCapReached",
+            Self::TreeBackfillCapRaised { .. } => "TreeBackfillCapRaised",
+            Self::TreeBackfillEnded { .. } => "TreeBackfillEnded",
             Self::ChangesUpdated { .. } => "ChangesUpdated",
             Self::BackupProgress { .. } => "BackupProgress",
             Self::BackupCompleted { .. } => "BackupCompleted",
@@ -1728,7 +1849,6 @@ impl SystemEvent {
             Self::DeviceVisible { .. } => "DeviceVisible",
             Self::DeviceHidden { .. } => "DeviceHidden",
             Self::PresenceCheck { .. } => "PresenceCheck",
-            Self::NotificationToastRequested { .. } => "NotificationToastRequested",
             Self::NativePushRequested { .. } => "NativePushRequested",
             Self::NativePushDismissRequested { .. } => "NativePushDismissRequested",
             Self::PluginInstalled { .. } => "PluginInstalled",
@@ -1771,6 +1891,7 @@ impl SystemEvent {
             Self::McpServerUpdated { .. } => "McpServerUpdated",
             Self::McpServerDisabledToolsChanged { .. } => "McpServerDisabledToolsChanged",
             Self::McpServerRemoved { .. } => "McpServerRemoved",
+            Self::McpServerStopped { .. } => "McpServerStopped",
             Self::PermissionGrantsChanged { .. } => "PermissionGrantsChanged",
             Self::OAuthAccountConnected { .. } => "OAuthAccountConnected",
             Self::OAuthAccountDeleted { .. } => "OAuthAccountDeleted",
@@ -1782,6 +1903,14 @@ impl SystemEvent {
             Self::StandingApplyArmed { .. } => "StandingApplyArmed",
             Self::StandingApplyFired { .. } => "StandingApplyFired",
             Self::StandingApplyDropped { .. } => "StandingApplyDropped",
+            Self::LaneBatchStarted { .. } => "LaneBatchStarted",
+            Self::LaneBatchLanded { .. } => "LaneBatchLanded",
+            Self::LaneBatchFailed { .. } => "LaneBatchFailed",
+            Self::MainCheckStarted { .. } => "MainCheckStarted",
+            Self::MainCheckPassed { .. } => "MainCheckPassed",
+            Self::MainCheckFailed { .. } => "MainCheckFailed",
+            Self::MainCheckAbandoned { .. } => "MainCheckAbandoned",
+            Self::MainCheckRedClosed { .. } => "MainCheckRedClosed",
             Self::EngineSupervisorRespawned { .. } => "EngineSupervisorRespawned",
             Self::EmailSent { .. } => "EmailSent",
             Self::ProxyModulesReloaded { .. } => "ProxyModulesReloaded",
@@ -1835,6 +1964,10 @@ impl SystemEvent {
         "TreeBackfillProgressed",
         "TreeBackfillCompleted",
         "TreeBackfillReset",
+        "TreeBackfillStarted",
+        "TreeBackfillCapReached",
+        "TreeBackfillCapRaised",
+        "TreeBackfillEnded",
         "ChangesUpdated",
         "BackupProgress",
         "BackupCompleted",
@@ -1882,7 +2015,6 @@ impl SystemEvent {
         "DeviceVisible",
         "DeviceHidden",
         "PresenceCheck",
-        "NotificationToastRequested",
         "NativePushRequested",
         "NativePushDismissRequested",
         "PluginInstalled",
@@ -1925,6 +2057,7 @@ impl SystemEvent {
         "McpServerUpdated",
         "McpServerDisabledToolsChanged",
         "McpServerRemoved",
+        "McpServerStopped",
         "PermissionGrantsChanged",
         "OAuthAccountConnected",
         "OAuthAccountDeleted",
@@ -1936,6 +2069,14 @@ impl SystemEvent {
         "StandingApplyArmed",
         "StandingApplyFired",
         "StandingApplyDropped",
+        "LaneBatchStarted",
+        "LaneBatchLanded",
+        "LaneBatchFailed",
+        "MainCheckStarted",
+        "MainCheckPassed",
+        "MainCheckFailed",
+        "MainCheckAbandoned",
+        "MainCheckRedClosed",
         "EngineSupervisorRespawned",
         "EmailSent",
         "ProxyModulesReloaded",
@@ -1965,7 +2106,6 @@ impl SystemEvent {
             Self::NotificationCreated { .. }
             | Self::NotificationRead { .. }
             | Self::NotificationsAllRead { .. }
-            | Self::NotificationToastRequested { .. }
             | Self::NativePushRequested { .. }
             | Self::NativePushDismissRequested { .. } => "notification",
             Self::PreferencesChanged { .. }
@@ -2030,7 +2170,11 @@ impl SystemEvent {
             Self::MemoryCorrected { .. }
             | Self::TreeBackfillProgressed { .. }
             | Self::TreeBackfillCompleted { .. }
-            | Self::TreeBackfillReset { .. } => "memory",
+            | Self::TreeBackfillReset { .. }
+            | Self::TreeBackfillStarted { .. }
+            | Self::TreeBackfillCapReached { .. }
+            | Self::TreeBackfillCapRaised { .. }
+            | Self::TreeBackfillEnded { .. } => "memory",
             Self::PinnedAppPinned { .. } | Self::PinnedAppUnpinned { .. } => "pinned_app",
             Self::DeviceRegistered { .. }
             | Self::DeviceRenamed { .. }
@@ -2060,7 +2204,8 @@ impl SystemEvent {
             Self::McpServerRegistered { .. }
             | Self::McpServerUpdated { .. }
             | Self::McpServerDisabledToolsChanged { .. }
-            | Self::McpServerRemoved { .. } => "mcp_server",
+            | Self::McpServerRemoved { .. }
+            | Self::McpServerStopped { .. } => "mcp_server",
             Self::PermissionGrantsChanged { .. } => "permission_grant",
             Self::OAuthAccountConnected { .. } | Self::OAuthAccountDeleted { .. } => {
                 "oauth_account"
@@ -2078,6 +2223,14 @@ impl SystemEvent {
             Self::StandingApplyArmed { .. }
             | Self::StandingApplyFired { .. }
             | Self::StandingApplyDropped { .. } => "standing_apply",
+            Self::LaneBatchStarted { .. }
+            | Self::LaneBatchLanded { .. }
+            | Self::LaneBatchFailed { .. } => "landing_lane",
+            Self::MainCheckStarted { .. }
+            | Self::MainCheckPassed { .. }
+            | Self::MainCheckFailed { .. }
+            | Self::MainCheckAbandoned { .. }
+            | Self::MainCheckRedClosed { .. } => "main_check",
             Self::EngineSupervisorRespawned { .. }
             | Self::FrontendUpdateDeferred { .. }
             | Self::FrontendUpdateStranded { .. }
@@ -2131,9 +2284,6 @@ impl SystemEvent {
                 device_id.clone()
             }
             Self::PresenceCheck {
-                notification_id, ..
-            }
-            | Self::NotificationToastRequested {
                 notification_id, ..
             }
             | Self::NativePushRequested {
@@ -2194,7 +2344,8 @@ impl SystemEvent {
             Self::McpServerRegistered { server_id, .. }
             | Self::McpServerUpdated { server_id, .. }
             | Self::McpServerDisabledToolsChanged { server_id, .. }
-            | Self::McpServerRemoved { server_id, .. } => server_id.clone(),
+            | Self::McpServerRemoved { server_id, .. }
+            | Self::McpServerStopped { server_id, .. } => server_id.clone(),
             Self::PermissionGrantsChanged { grant_file, .. } => grant_file.file_name().to_string(),
             Self::OAuthAccountConnected { account_id, .. }
             | Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),
@@ -2209,6 +2360,14 @@ impl SystemEvent {
             Self::StandingApplyArmed { thread_id, .. }
             | Self::StandingApplyFired { thread_id, .. }
             | Self::StandingApplyDropped { thread_id, .. } => thread_id.to_string(),
+            Self::LaneBatchStarted { batch_id, .. }
+            | Self::LaneBatchLanded { batch_id, .. }
+            | Self::LaneBatchFailed { batch_id, .. } => batch_id.to_string(),
+            Self::MainCheckStarted { check_id, .. }
+            | Self::MainCheckPassed { check_id, .. }
+            | Self::MainCheckFailed { check_id, .. }
+            | Self::MainCheckAbandoned { check_id, .. }
+            | Self::MainCheckRedClosed { check_id, .. } => check_id.to_string(),
             Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),
             // The preview is engine-level, but WHICH thread's worktree it shows
             // is its identity: one preview per thread, one slot at a time.
@@ -2265,6 +2424,15 @@ impl SystemEvent {
 }
 
 impl SystemEvent {
+    /// A stored row back as its typed event: the inverse of [`Self::to_payload`]
+    /// for every variant on its default arm. A trigger or domain row keeps a
+    /// bespoke payload, so it errors here.
+    pub(crate) fn from_stored(
+        payload: serde_json::Value,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(serde_json::from_value(payload)?)
+    }
+
     /// The payload key holding who emitted an event. A domain event's payload
     /// is written by its caller, so this key is the one field in it the engine
     /// owns.

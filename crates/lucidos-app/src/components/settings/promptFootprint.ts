@@ -76,7 +76,6 @@ const KIND_LABELS: Record<FootprintItem['kind'], string> = {
   'oauth-account': 'OAuth account',
   credential: 'Credential',
   'mcp-server': 'MCP server',
-  'mcp-tool': 'MCP tool',
   'app-knowhow': 'App know-how listing',
 };
 
@@ -84,8 +83,13 @@ export function kindLabel(kind: FootprintItem['kind']): string {
   return KIND_LABELS[kind];
 }
 
-/** When an item was last used, for its row. */
+/** When an item was last used, for its row. An MCP server's line says how
+ *  many threads enabled it and how many called it instead. */
 export function usageLine(item: FootprintItem): string | null {
+  if (item.mcp_threads) {
+    const { enabled, called } = item.mcp_threads;
+    return `enabled in ${countOf(enabled, 'thread')}, called in ${called}`;
+  }
   const usage = item.usage;
   if (!usage) return null;
   const verb = item.kind === 'knowhow' ? 'loaded' : item.kind === 'reusable-widget' ? 'shown' : 'opened';

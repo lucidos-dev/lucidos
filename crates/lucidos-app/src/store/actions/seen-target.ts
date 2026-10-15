@@ -10,7 +10,7 @@
  *
  *  The test is the strict one. For a tap naming an event, the reader has seen
  *  it when that event's card is in the transcript's visible band. The measure
- *  is the `isInViewport` the pong already uses. A tap naming a place with no
+ *  is the `isInViewport` Row 1's auto-read already uses. A tap naming a place with no
  *  card is seen when that place is on screen. Either way it must hold for
  *  `SEEN_DWELL_MS`.
  *
@@ -215,6 +215,21 @@ interface WatchedTarget {
 }
 
 const waits = emptySeenWaits();
+/** A notification that arrived while the reader was present. */
+interface Arrival {
+  /** The places on screen at arrival that the reader has not left since. */
+  places: Set<string>;
+  /** Whether the unread set has held its row yet. */
+  seenUnread: boolean;
+}
+
+/** Keyed by notification id, oldest first. See `noteArrivalWhilePresent`. */
+const arrivals = new Map<string, Arrival>();
+
+/** How many arrivals the rule holds at once. A row read before its reload
+ *  lands never reaches the unread set, so no prune ever sees it go. The cap
+ *  bounds those for a reader who stays put. */
+export const MAX_HELD_ARRIVALS = 100;
 let watched: WatchedTarget[] = [];
 let observer: IntersectionObserver | null = null;
 let observed: Element[] = [];
@@ -226,6 +241,58 @@ let dwellTimer: ReturnType<typeof setTimeout> | null = null;
  *  `scheduleResample` be torn down through one call. */
 let cancelCoalesced: (() => void) | null = null;
 let installed = false;
+
+/** Record that a notification arrived, from its `NotificationCreated`. Held
+ *  only while this page is active.
+ *
+ *  Being at a place is not seeing a notification that lands there. Its surface
+ *  is the toast, or the bell badge with toasts off. So the visit under way when
+ *  it arrived does not clear its place target. A later visit does: the reader
+ *  leaves the place, or the page, and comes back.
+ *
+ *  The event, not its presence check, sets the hold. It is what starts the
+ *  unread reload the dwell needs, so the hold is in place before any dwell can
+ *  run. The places are taken now, since the reader can move before the reload.
+ *
+ *  An event target is not held. It has a card to measure, and a card in view
+ *  on arrival is §4 Row 1, which reads it. */
+export function noteArrivalWhilePresent(notificationId: string): void {
+  if (!isPageActive()) return;
+  arrivals.set(notificationId, { places: new Set(visitedKeys(currentLocation())), seenUnread: false });
+  for (const oldest of arrivals.keys()) {
+    if (arrivals.size <= MAX_HELD_ARRIVALS) break;
+    arrivals.delete(oldest);
+  }
+}
+
+/** Release the hold, because the notification's presence check showed this
+ *  page was away when it arrived: the check was stale, or the answer inactive.
+ *
+ *  That is an iOS PWA resuming. Its queue flushes `NotificationCreated` while
+ *  the page is already active again, and the OS push was the surface. */
+export function noteArrivalWhileAway(notificationId: string): void {
+  arrivals.delete(notificationId);
+}
+
+/** End the visits the reader has left. A place no longer on screen leaves
+ *  every arrival, and an arrival with no place left is forgotten. */
+function narrowArrivals(places: ReadonlySet<string>): void {
+  for (const [id, arrival] of arrivals) {
+    for (const key of arrival.places) if (!places.has(key)) arrival.places.delete(key);
+    if (arrival.places.size === 0) arrivals.delete(id);
+  }
+}
+
+/** Forget an arrival once the unread set has held its row and let it go.
+ *
+ *  Never on bare absence. The presence check usually lands before the reload
+ *  that carries the row, and dropping it then would lose the hold. */
+function pruneArrivals(unread: ReadonlySet<string>): void {
+  for (const [id, arrival] of arrivals) {
+    if (unread.has(id)) arrival.seenUnread = true;
+    else if (arrival.seenUnread) arrivals.delete(id);
+  }
+}
 
 function currentLocation(): VisitLocation {
   return {
@@ -244,15 +311,16 @@ function currentLocation(): VisitLocation {
  *  An event target needs three things: its thread focused, that pane on screen,
  *  and its card in the band. The first two stop a card in a mounted but
  *  off-screen mobile pane from counting. `isInViewport` rejects that case too,
- *  so asking here is for readability. */
-function satisfiedIds(): string[] {
-  const loc = currentLocation();
-  const places = new Set(visitedKeys(loc));
+ *  so asking here is for readability.
+ *
+ *  A place target needs its place on screen, in a visit begun after it
+ *  arrived. */
+function satisfiedIds(loc: VisitLocation, places: ReadonlySet<string>): string[] {
   const onThreadPane = threadPaneOnScreen(loc);
   const ids: string[] = [];
   for (const { id, target } of watched) {
     if (target.kind === 'place') {
-      if (places.has(target.key)) ids.push(id);
+      if (places.has(target.key) && !arrivals.get(id)?.places.has(target.key)) ids.push(id);
       continue;
     }
     if (!onThreadPane || loc.focusedThreadId !== target.threadId) continue;
@@ -296,7 +364,15 @@ function rearm(): void {
     keep.add(id);
     watched.push({ id, target: { kind: 'reply-end', threadId }, onSeen: () => reportReplySeen(threadId) });
   }
-  if (notificationsKnown) pruneSeenWaits(waits, keep);
+  if (notificationsKnown) {
+    pruneSeenWaits(waits, keep);
+    pruneArrivals(keep);
+  }
+}
+
+/** The reader left the page, so whatever they come back to is a new visit. */
+function endVisitsIfAway(): void {
+  if (!isPageActive()) arrivals.clear();
 }
 
 /** Tell the engine the user saw the reply, as of the summary this page holds.
@@ -432,15 +508,21 @@ export function resampleSeenTargets(): void {
     // them. A dwell that survived a background would let a card the reader
     // never came back to complete on time spent away.
     waits.since.clear();
+    endVisitsIfAway();
     return;
   }
+  // Before the early return below: a reader can move while the row they were
+  // at is still on its way into the unread set, with nothing yet watched.
+  const loc = currentLocation();
+  const places = new Set(visitedKeys(loc));
+  narrowArrivals(places);
   if (watched.length === 0) {
     disarmViewportObserver();
     return;
   }
   armViewportObserver();
   const now = Date.now();
-  const completed = new Set(sampleSeen(waits, now, satisfiedIds()));
+  const completed = new Set(sampleSeen(waits, now, satisfiedIds(loc, places)));
   for (const { id, onSeen } of watched) if (completed.has(id)) onSeen();
   const due = nextDwellDueIn(waits, now);
   if (due !== null) dwellTimer = setTimeout(resampleSeenTargets, due);
@@ -457,6 +539,7 @@ function standDown(): void {
   clearCoalesced();
   clearDwellTimer();
   waits.since.clear();
+  endVisitsIfAway();
 }
 
 /** Coalesce the several signals that move together into one sample per frame.
@@ -544,5 +627,11 @@ export function _resetSeenTargetWatchForTesting(): void {
   disarmViewportObserver();
   waits.since.clear();
   waits.done.clear();
+  arrivals.clear();
   watched = [];
+}
+
+/** Test-only: how many arrivals the rule still holds. */
+export function _heldArrivalCountForTesting(): number {
+  return arrivals.size;
 }

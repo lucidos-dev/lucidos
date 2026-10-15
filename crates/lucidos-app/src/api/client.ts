@@ -13,6 +13,7 @@ export * from './client/frontendPreview';
 export * from './client/triggers';
 export * from './client/threadQueue';
 export * from './client/threads';
+export * from './client/successor';
 export * from './client/uploadProgress';
 export * from './client/settings';
 export * from './client/themes';

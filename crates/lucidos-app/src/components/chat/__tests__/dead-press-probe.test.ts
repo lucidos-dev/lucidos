@@ -564,7 +564,10 @@ describe('faceName: what the report calls the button', () => {
 // consumes a press becomes the bug it was added to chase.
 describe('the probe consumes no gesture', () => {
   const here: string = dirname(fileURLToPath(import.meta.url));
-  const source = readFileSync(resolve(here, '../deadPressProbe.ts'), 'utf-8');
+  // Both of its modules: the cover sample installs apart from the rest.
+  const source = ['../deadPressProbe.ts', '../pressCover.ts']
+    .map((file) => readFileSync(resolve(here, file), 'utf-8'))
+    .join('\n');
   // Comments stripped, because the module DOCUMENTS what it refuses to call.
   // Scanning the prose would fail on the very sentence explaining the rule.
   const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');

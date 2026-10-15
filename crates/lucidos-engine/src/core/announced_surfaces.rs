@@ -508,6 +508,16 @@ pub const TABLES: &[TableRule] = &[
         },
     },
     TableRule {
+        table: "thread_input_chains",
+        owners: &["api/threads/delete.rs", "engine/chat/input_order.rs"],
+        announcement: Announcement::Silent {
+            reason: "Admission bookkeeping (ADR 0449): the last input sequence \
+                     each page admitted to each thread. No client reads it. \
+                     The input it admits is announced by its own \
+                     MessageReceived or UserQuestionAnswered.",
+        },
+    },
+    TableRule {
         table: "thread_queue",
         owners: &[
             "api/threads/delete.rs",
@@ -526,27 +536,34 @@ pub const TABLES: &[TableRule] = &[
             "core/changes_projection.rs",
             "core/image_migration.rs",
             "core/store/threads/backfill.rs",
+            "core/store/threads/compose.rs",
             "engine/agent_recovery/has_diff.rs",
             "engine/agent_recovery/recovery.rs",
             "engine/event_bus/mod.rs",
             "engine/event_bus/parent_callback.rs",
+            "engine/event_bus_projection_keep_alive.rs",
             "engine/event_bus_projection_propagation.rs",
+            "engine/event_bus_projection_system.rs",
             "engine/event_bus_projection_thread.rs",
             "engine/session_seed.rs",
             "main.rs",
         ],
         announcement: Announcement::Projection {
-            of: "the events table. Every column is derived from a ThreadEvent \
-                 that was already broadcast, and the reconcile/backfill writers \
-                 repair drift in that derivation rather than introducing new \
-                 state.",
+            of: "the events table. Every column is derived from an event that \
+                 was already broadcast: a ThreadEvent, or McpServerStopped and \
+                 McpServerRemoved for enabled_mcp_servers. The compose columns \
+                 are announced by the ThreadComposeChanged each writer emits. \
+                 The reconcile and backfill writers repair drift in that \
+                 derivation rather than introducing new state. keep_alive_turn \
+                 spans a cache keep-alive run, from after its PromptInjected \
+                 anchor to its keep-alive CodingAgentIdled.",
         },
     },
     TableRule {
         table: "webhook_deliveries",
         owners: &["core/webhook_deliveries.rs"],
         announcement: Announcement::Silent {
-            reason: "The nonce ledger a delivery claims before it emits. Holds \
+            reason: "The nonce ledger a delivery writes with its event. Holds \
                      no payload, is listed nowhere, and its only reader is the \
                      next delivery. What a delivery DID is the pinned domain \
                      event it emitted, which announces already; a second event \

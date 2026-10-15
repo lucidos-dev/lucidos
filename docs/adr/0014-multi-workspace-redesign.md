@@ -73,11 +73,10 @@ contradicting §10). The corrected model:
 - The dev gateway's app-data (registry, pidfile, log) is **machine-global**
   (`$HOME/.lucidos/gateway`), and it binds a **fixed** port — so every
   `web-dev.sh` launch reuses the SAME gateway and accumulates into ONE registry.
-  `seed_gateway_registry` adds/refreshes only the launched workspace's runtime
-  fields (`dir`/`port`) and **preserves** a picker-set display `name` +
-  `autostart` flag (so a rename/toggle sticks across relaunch). It removes any
-  legacy `database_url` after migration verification; the shared database URL is
-  derived from the workspace slug.
+  The launcher registers the workspace through the gateway's `adopt` endpoint
+  with its `dir` and `port` (ADR 0438). That **preserves** a picker-set display
+  `name` + `autostart` flag, so a rename or toggle sticks across relaunch. The
+  shared database URL is derived from the workspace slug.
 - **Registry membership = "all ever launched"** — a workspace stays listed in the
   picker after it stops (`stop.sh` POSTs the gateway's `/stop` control API, which
   drops the runtime stack so the supervisor won't respawn it but KEEPS the
@@ -242,6 +241,9 @@ and the outcome-asymmetry are removed; `ProbeOutcome` is retained for the
   longer auto-recovers — it waits for a manual restart. Deliberate: never
   interrupting a healthy busy engine is worth more than auto-recovering a rare
   true hang, and the cascade made auto-recovery net-negative anyway.
+  *Amended by ADR 0438:* an engine that hangs while STOPPING now exits after a
+  20 s teardown deadline, because its owner lock would otherwise hold its
+  successor forever. A running engine that hangs still waits for a restart.
 - **Out of scope (noted):** the underlying memory/CPU contention is an ops
   concern (fewer concurrent debug engines, release builds, Docker VM sizing); and
   the engine's `/api/v1/health` doing two synchronous disk reads per probe

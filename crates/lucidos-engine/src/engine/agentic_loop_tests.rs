@@ -15,25 +15,8 @@ use super::{
     filter_removed_queued_prompts, round_backstop_message, tool_call_cap_message,
 };
 use crate::llm::{Message, MessageContent};
-use crate::test_support::{setup_test_db, teardown_test_db};
+use crate::test_support::{message_received, setup_test_db, teardown_test_db};
 use uuid::Uuid;
-
-fn message_received(text: &str) -> ThreadEvent {
-    ThreadEvent::MessageReceived {
-        provider: None,
-        voice_session_id: None,
-        text: text.to_string(),
-        user_image_hashes: vec![],
-        device_id: None,
-        image_description: None,
-        parent_thread_id: None,
-        spawning_event_id: None,
-        mode: ActorMode::Human,
-        model: None,
-        reasoning_effort: None,
-        origin: None,
-    }
-}
 
 /// Persist a MessageReceived row with the given client-provided event_id and
 /// return the canonical EventMeta used by all events that belong to that
@@ -294,9 +277,10 @@ async fn append_injected_prompts_coalesces_messages_but_emits_each_audit_row() {
         },
     ];
 
+    let workspace = tempfile::tempdir().unwrap();
     let mut messages = Vec::<Message>::new();
     let appended = append_injected_prompts_to_messages(
-        &std::env::temp_dir(),
+        workspace.path(),
         &bus,
         thread_id,
         &meta,
@@ -370,9 +354,10 @@ async fn append_injected_prompts_reports_image_bearing_message_for_pinning() {
         kind: crate::engine::InjectedPromptKind::UserText,
     }];
 
+    let workspace = tempfile::tempdir().unwrap();
     let mut messages = Vec::<Message>::new();
     let appended = append_injected_prompts_to_messages(
-        &std::env::temp_dir(),
+        workspace.path(),
         &bus,
         thread_id,
         &meta,

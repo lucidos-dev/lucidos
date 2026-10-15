@@ -1,5 +1,5 @@
 // AUTO-GENERATED. Do not edit by hand.
-// Regenerate: cargo test -p lucidos-engine --lib generate_font_catalog_files -- --ignored
+// Regenerate: ./scripts/codegen.sh
 //
 // Source of truth: FONT_CATALOG in crates/lucidos-engine/src/core/fonts.rs.
 

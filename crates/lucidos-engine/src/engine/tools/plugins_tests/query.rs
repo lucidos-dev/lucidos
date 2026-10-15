@@ -69,7 +69,7 @@ async fn install_app_fixture(scratch: &Path, bus: &dyn EventBusEmitter) {
 async fn resolve_plugin_query_matches_canonical_id() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     let id = super::resolve_plugin_query(&pool, "no-role-playing")
@@ -77,7 +77,6 @@ async fn resolve_plugin_query_matches_canonical_id() {
         .expect("exact id must resolve");
     assert_eq!(id, "no-role-playing");
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -85,7 +84,7 @@ async fn resolve_plugin_query_matches_canonical_id() {
 async fn resolve_plugin_query_matches_manifest_name_case_insensitive() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     // Manifest name is "No role playing" — same words, mixed casing,
@@ -102,7 +101,6 @@ async fn resolve_plugin_query_matches_manifest_name_case_insensitive() {
         assert_eq!(id, "no-role-playing", "query {q:?}");
     }
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -113,7 +111,7 @@ async fn resolve_plugin_query_matches_app_folder_name() {
     // accept either.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     let id = super::resolve_plugin_query(&pool, "anti-sycophancy-critique")
@@ -127,14 +125,12 @@ async fn resolve_plugin_query_matches_app_folder_name() {
         .expect("re-spaced app folder must resolve");
     assert_eq!(id, "no-role-playing");
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
 #[tokio::test]
 async fn resolve_plugin_query_unknown_returns_not_installed_error() {
     let (pool, db_name) = setup_test_db().await;
-    let scratch = fresh_workspace();
 
     let err = super::resolve_plugin_query(&pool, "no-such-plugin")
         .await
@@ -149,7 +145,6 @@ async fn resolve_plugin_query_unknown_returns_not_installed_error() {
         "error must echo the query, got: {msg}"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -160,7 +155,7 @@ async fn resolve_plugin_query_ambiguous_lists_candidates() {
     // agent can pick one.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
 
     for id in ["demo-one", "demo-two"] {
         let archive_dir = scratch.join(format!("archive-{}", id));
@@ -195,7 +190,6 @@ async fn resolve_plugin_query_ambiguous_lists_candidates() {
     assert!(msg.contains("demo-one"), "error must list demo-one: {msg}");
     assert!(msg.contains("demo-two"), "error must list demo-two: {msg}");
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -206,7 +200,7 @@ async fn resolve_plugin_query_ignores_uninstalled_plugin() {
     // and folder queries.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     let pending: std::sync::Arc<PendingUninstallsMap> =
@@ -237,7 +231,6 @@ async fn resolve_plugin_query_ignores_uninstalled_plugin() {
         );
     }
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -250,7 +243,7 @@ async fn prepare_uninstall_plugin_resolves_via_app_folder() {
     // the recorded files.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     let pending: std::sync::Arc<PendingUninstallsMap> =
@@ -275,7 +268,6 @@ async fn prepare_uninstall_plugin_resolves_via_app_folder() {
     assert!(present.contains(&"apps/anti-sycophancy-critique/index.html"));
     assert!(present.contains(&"apps/anti-sycophancy-critique/manifest.json"));
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -283,7 +275,7 @@ async fn prepare_uninstall_plugin_resolves_via_app_folder() {
 async fn find_plugin_owning_file_returns_owner_for_installed_path() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     let owner = super::find_plugin_owning_file(&pool, "apps/anti-sycophancy-critique/index.html")
@@ -293,7 +285,6 @@ async fn find_plugin_owning_file_returns_owner_for_installed_path() {
     assert_eq!(owner.plugin_id, "no-role-playing");
     assert_eq!(owner.plugin_name, "No role playing");
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -301,7 +292,7 @@ async fn find_plugin_owning_file_returns_owner_for_installed_path() {
 async fn find_plugin_owning_file_returns_none_for_unrelated_paths() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     // A user-authored file the plugin doesn't own — must not be guarded.
@@ -313,7 +304,6 @@ async fn find_plugin_owning_file_returns_none_for_unrelated_paths() {
         "unrelated paths must not resolve to an owner"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -324,7 +314,7 @@ async fn find_plugin_owning_file_returns_none_after_uninstall() {
     // directories etc. without the engine refusing.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     let pending: std::sync::Arc<PendingUninstallsMap> =
@@ -344,7 +334,6 @@ async fn find_plugin_owning_file_returns_none_after_uninstall() {
         "uninstalled plugin's files must no longer be guarded"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -355,7 +344,7 @@ async fn find_plugin_owning_app_returns_owner_for_installed_app() {
     // Deleting that app must resolve to the owning plugin so the handler 409s.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     let owner = super::find_plugin_owning_app(&pool, "anti-sycophancy-critique")
@@ -365,7 +354,6 @@ async fn find_plugin_owning_app_returns_owner_for_installed_app() {
     assert_eq!(owner.plugin_id, "no-role-playing");
     assert_eq!(owner.plugin_name, "No role playing");
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -375,7 +363,7 @@ async fn find_plugin_owning_app_returns_none_for_standalone_app() {
     // owner — it deletes directly, no 409.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     let owner = super::find_plugin_owning_app(&pool, "some-standalone-app")
@@ -398,7 +386,6 @@ async fn find_plugin_owning_app_returns_none_for_standalone_app() {
         "a strict prefix of an owned app folder must not resolve to an owner"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -407,7 +394,7 @@ async fn find_plugin_owning_app_returns_none_after_uninstall() {
     // Once the plugin is uninstalled, its app is no longer guarded.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     install_app_fixture(&scratch, &bus).await;
 
     let pending: std::sync::Arc<PendingUninstallsMap> =
@@ -427,7 +414,6 @@ async fn find_plugin_owning_app_returns_none_after_uninstall() {
         "uninstalled plugin's app must no longer be guarded"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -450,7 +436,7 @@ async fn check_plugin_updates_skips_uninstalled_plugin() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
 
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "v1");
@@ -494,7 +480,6 @@ async fn check_plugin_updates_skips_uninstalled_plugin() {
         single_json
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -562,7 +547,7 @@ async fn check_plugin_updates_ignores_install_with_legacy_unknown_aggregate_id()
     .await
     .expect("insert uninstall");
 
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
 
     // Survey: legacy 'unknown' install + correct uninstall → projection
     // must match by canonical id and report nothing installed.
@@ -575,7 +560,6 @@ async fn check_plugin_updates_ignores_install_with_legacy_unknown_aggregate_id()
         report_json
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -619,7 +603,7 @@ async fn check_plugin_updates_skips_plugin_when_files_are_all_missing_from_disk(
     .await
     .expect("insert install");
 
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
 
     // Survey: registry says installed, but no files on disk → skip.
     let report_json = check_plugin_updates_impl(&scratch, &pool, None).await;
@@ -639,7 +623,6 @@ async fn check_plugin_updates_skips_plugin_when_files_are_all_missing_from_disk(
     assert_eq!(single.len(), 1);
     assert_eq!(single[0]["id"], "ghost-plugin");
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -651,7 +634,7 @@ async fn check_plugin_updates_skips_plugin_when_files_are_all_missing_from_disk(
 async fn installed_summary_surfaces_setup_thread_and_app_id() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
 
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
@@ -686,7 +669,6 @@ async fn installed_summary_surfaces_setup_thread_and_app_id() {
     // falls back to the first (only) app directory.
     assert_eq!(plugin.app_id.as_deref(), Some("anti-sycophancy-critique"));
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 
@@ -696,7 +678,7 @@ async fn installed_summary_surfaces_setup_thread_and_app_id() {
 async fn installed_summary_omits_setup_and_app_when_absent() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb_rx) = EventBus::new(pool.clone());
-    let scratch = fresh_workspace();
+    let (_tmp, scratch) = fresh_workspace();
     let archive_dir = scratch.join("archive");
     std::fs::create_dir_all(&archive_dir).unwrap();
     // A knowhow-only fixture: no app dir, installed with no setup thread.
@@ -718,7 +700,6 @@ async fn installed_summary_omits_setup_and_app_when_absent() {
         "knowhow-only plugin has no app to open"
     );
 
-    let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
 }
 

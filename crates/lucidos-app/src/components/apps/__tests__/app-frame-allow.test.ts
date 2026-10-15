@@ -34,10 +34,13 @@ const APP_SRC = resolve(here, '../../..');
 const REPO = resolve(here, '../../../../../..');
 
 /** The `allow` attribute is semicolon-separated, so these are its tokens. */
-const FEATURES = APP_FRAME_ALLOW.split(';').map((f: string) => f.trim());
+const TOKENS = APP_FRAME_ALLOW.split(';').map((f: string) => f.trim());
 
 /** What the shell delegates, in order. Adding a row here is the decision. */
-const DELEGATED = ['autoplay', 'fullscreen', 'encrypted-media', 'clipboard-write'];
+const DELEGATED = ['autoplay', 'fullscreen *', 'encrypted-media', 'clipboard-write'];
+
+/** A token is a feature name, then an optional allowlist. */
+const featureName = (token: string) => token.split(/\s+/)[0];
 
 /** Every `.tsx` under `src`, so a frame that moves cannot escape the scan. */
 function tsxFiles(dir: string): string[] {
@@ -53,12 +56,25 @@ function tsxFiles(dir: string): string[] {
 describe('what the app frame delegates', () => {
   it('is exactly this list, no more and no less', () => {
     expect(
-      FEATURES,
+      TOKENS,
       'Losing a feature denies it in every app: clipboard-write going missing is '
       + 'how every Copy button died in v0.39.0, silently. Gaining one widens what '
       + 'every app may do. Either way, say why beside the constant and update '
       + 'system-knowhow/js-sdk.md in the same change.',
     ).toEqual(DELEGATED);
+  });
+
+  it('delegates fullscreen to every origin, or WebKit denies it', () => {
+    // A bare feature means `'src'`, the origin of the frame's URL. The frame's
+    // document is opaque, and WebKit never matches it, so the desktop app
+    // denies every app fullscreen. Chromium special-cases the opaque frame.
+    expect(
+      TOKENS,
+      'A bare `fullscreen` reads as `fullscreen \'src\'`, which WebKit never '
+      + 'matches against the frame\'s opaque origin. Every app, and the video '
+      + 'player widget, then fails with "Fullscreen API is disabled by '
+      + 'permissions policy" in the desktop app.',
+    ).toContain('fullscreen *');
   });
 
   it('never delegates clipboard-read, whatever the allowlist syntax', () => {
@@ -107,7 +123,7 @@ describe('what the app frame delegates', () => {
     // file, and a rule is a judgment nothing runs. This is the half a script
     // can hold.
     const doc: string = readFileSync(resolve(REPO, 'system-knowhow/js-sdk.md'), 'utf8');
-    const missing = DELEGATED.filter((feature) => !doc.includes(`\`${feature}\``));
+    const missing = DELEGATED.map(featureName).filter((feature) => !doc.includes(`\`${feature}\``));
 
     expect(
       missing,

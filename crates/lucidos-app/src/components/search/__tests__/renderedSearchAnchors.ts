@@ -29,7 +29,10 @@ type DynamicAnchor =
   /** Not a Settings row, so it needs no search entry. */
   | { kind: 'not-a-setting'; why: string };
 
-const systemOneAnchors = () => Object.values(SYSTEM_ONE_PROVIDERS).map((p) => p.anchor);
+/** The providers drawn by `SystemOneProviderFrame`. A chat provider's System
+ *  One row lives in that provider's own block. */
+const systemOneFrameAnchors = () =>
+  Object.values(SYSTEM_ONE_PROVIDERS).filter((p) => !p.chatProvider).map((p) => p.anchor);
 
 /** Keyed by `<path under components/> <expression>`. */
 const DYNAMIC_ANCHORS: Record<string, DynamicAnchor> = {
@@ -45,10 +48,17 @@ const DYNAMIC_ANCHORS: Record<string, DynamicAnchor> = {
       .filter(({ src }) => src.includes('<ApiKeyProviderSettings'))
       .flatMap(({ src }) => [...src.matchAll(/\bservice="([^"]+)"/g)].map((m) => `models:${m[1]}`)),
   },
-  'settings/SystemOneProviderFrame.tsx spec.anchor': { kind: 'expands', anchors: systemOneAnchors },
+  'settings/SystemOneProviderFrame.tsx spec.anchor': { kind: 'expands', anchors: systemOneFrameAnchors },
+  'settings/SystemOneProviderFrame.tsx props.anchor': { kind: 'forwarded' },
   'settings/SystemOneProviderFrame.tsx `${spec.anchor}-usage`': {
     kind: 'expands',
-    anchors: () => systemOneAnchors().map((a) => `${a}-usage`),
+    anchors: () => systemOneFrameAnchors().map((a) => `${a}-usage`),
+  },
+  'settings/ApiKeyProviderSettings.tsx `models:${systemOne}-usage`': {
+    kind: 'expands',
+    anchors: () => Object.values(SYSTEM_ONE_PROVIDERS)
+      .filter((p) => p.chatProvider)
+      .map((p) => `${p.anchor}-usage`),
   },
   'settings/VoiceSection.tsx `models:voice-section-${section.id}`': {
     kind: 'expands',

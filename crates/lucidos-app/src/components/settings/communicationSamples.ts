@@ -5,12 +5,10 @@ import {
   dismissToast,
   progressDialog,
   TOAST_AUTO_DISMISS_MS,
-  type ToastPlacement,
 } from '../../store/store';
 import { restartDialogState, appUpdateDialogState } from '../../store/progressDialogCopy';
 import type { ProgressDialogState } from '../../store/types';
 import type { AppUpdateRunning } from '../../utils/tauri';
-import type { DropdownOption } from '../shared/Dropdown';
 import type { WebhookIngressOutage, WebhookRefusal } from '../../api/client';
 import type { EventCondition } from '../../store/store';
 import type { SlownessEpisode } from '../../store/actions/slowness';
@@ -25,22 +23,6 @@ import type { SlownessEpisode } from '../../store/actions/slowness';
  *
  *  Copy is taken from the real call sites rather than invented, so a surface is
  *  judged at the lengths that actually occur. */
-
-// --- Toast placement (temporary, see docs/temporary-measures.md) ---
-
-/** Labels say what the shape DOES, not what it is called internally. The picker
- *  exists to answer "which of these looks right", and someone choosing between
- *  them has no other description to go on.
- *
- *  Typing `value` as the union is what keeps this list and the union in step: a
- *  typo here fails the build instead of offering an unpickable shape. */
-export const TOAST_PLACEMENT_OPTIONS: (DropdownOption & { value: ToastPlacement })[] = [
-  { value: 'bottom-right', label: 'Bottom-right corner', description: 'Desktop only, anchored to the window. Mobile keeps the top' },
-  { value: 'top-bleed', label: 'Full width, top', description: 'One bar across both panes, under the header' },
-  { value: 'bottom-bleed', label: 'Full width, bottom', description: 'One bar across both panes, over the composer' },
-  { value: 'card', label: 'Centred card', description: 'One card centred on the window, crossing the divider' },
-  { value: 'pane', label: 'Per pane', description: 'One column centred over each pane' },
-];
 
 // --- Toasts ---
 

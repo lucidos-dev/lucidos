@@ -310,9 +310,8 @@ const CHANGE_STATE_MIGRATION: &str =
     include_str!("../../../migrations/20261009125328_coding_agent_change_state.sql");
 
 /// The migration that last redefined the unproposed-reason CHECK.
-const UNPROPOSED_REASON_MIGRATION: &str = include_str!(
-    "../../../migrations/20261010131513_allow_hardening_missing_unproposed_reason.sql"
-);
+const UNPROPOSED_REASON_MIGRATION: &str =
+    include_str!("../../../migrations/20261014101727_successor_threads.sql");
 
 /// I2: the database admits exactly the Rust state kinds and reasons. A variant
 /// added on one side only fails here, before a row can carry it.
@@ -354,7 +353,8 @@ fn the_state_and_reason_wire_names_equal_their_column_text() {
 }
 
 /// I2: the hold reasons derive from `ProposalHold`, never restated. Every
-/// hold maps to its own reason, and only `TurnIncomplete` comes from elsewhere.
+/// hold maps to its own reason. Only `TurnIncomplete` and `AwaitingLanding`
+/// come from elsewhere.
 #[test]
 fn every_proposal_hold_maps_to_its_own_reason() {
     use crate::engine::change_ops::{PlanHold, ProposalHold};
@@ -363,13 +363,20 @@ fn every_proposal_hold_maps_to_its_own_reason() {
         ProposalHold::Plan(PlanHold::AwaitingApproval),
         ProposalHold::Plan(PlanHold::OutsideBound),
         ProposalHold::HardeningMissing,
+        ProposalHold::IntegratedIntoParent,
+        ProposalHold::CarriedBySuccessor,
     ]
     .into_iter()
     .map(UnproposedReason::from)
     .collect();
     let expected: Vec<UnproposedReason> = UnproposedReason::ALL
         .into_iter()
-        .filter(|r| *r != UnproposedReason::TurnIncomplete)
+        .filter(|r| {
+            !matches!(
+                r,
+                UnproposedReason::TurnIncomplete | UnproposedReason::AwaitingLanding
+            )
+        })
         .collect();
     assert_eq!(from_holds, expected);
 }

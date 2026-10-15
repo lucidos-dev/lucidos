@@ -56,8 +56,8 @@ impl NameRejection {
             ),
             NameRejection::Reserved => format!(
                 "'{name}' is reserved by the engine and can't be used as a user environment \
-                 variable. Names starting with CRED_ or OAUTH_, the PG* database vars, and the \
-                 engine-owned LUCIDOS_* / PATH / RUSTC_WRAPPER vars are off-limits."
+                 variable. Names starting with CRED_ or OAUTH_ and the engine-owned \
+                 LUCIDOS_* / PATH / RUSTC_WRAPPER vars are off-limits."
             ),
         }
     }
@@ -71,12 +71,8 @@ impl NameRejection {
 /// `LUCIDOS_*`-style but user-settable; for coding-agent spawns the engine's
 /// value wins by ordering, for plain scripts the user's value applies.
 const RESERVED_EXACT: &[&str] = &[
-    // Postgres connection (see `core::pg_env_vars`).
-    "PGUSER",
-    "PGPASSWORD",
-    "PGHOST",
-    "PGPORT",
-    "PGDATABASE",
+    // The workspace database (see `core::lucidos_database_url_env`).
+    crate::core::LUCIDOS_DATABASE_URL,
     // Process / build env the engine controls.
     "PATH",
     "RUSTC_WRAPPER",
@@ -553,7 +549,7 @@ pub async fn migrate_env_file_to_db(
 /// directly.
 ///
 /// Reserved names are filtered (via `env_pairs`), so this can NEVER overwrite an
-/// engine-critical process var (`PG*`, `PATH`, internal `LUCIDOS_*`, …).
+/// engine-critical process var (`PATH`, internal `LUCIDOS_*`, …).
 ///
 /// Restart semantics mirror the old `data/.env`, and this half is the one that
 /// needs a restart. Running once at startup means a caller inside the engine
@@ -626,8 +622,7 @@ mod tests {
     #[test]
     fn reserved_names_blocked() {
         for name in [
-            "PGUSER",
-            "PGPASSWORD",
+            "LUCIDOS_DATABASE_URL",
             "PATH",
             "RUSTC_WRAPPER",
             "LUCIDOS_WORKSPACE",
@@ -661,6 +656,22 @@ mod tests {
                 Err(NameRejection::Reserved),
                 "{name} must not be storable as a user variable"
             );
+        }
+    }
+
+    /// The engine sets none of these any more (ADR 0481), so they belong to the
+    /// user's own projects, as `DATABASE_URL` always did.
+    #[test]
+    fn database_names_the_engine_does_not_own_are_storable() {
+        for name in [
+            "DATABASE_URL",
+            "PGUSER",
+            "PGPASSWORD",
+            "PGHOST",
+            "PGPORT",
+            "PGDATABASE",
+        ] {
+            assert_eq!(validate_name(name), Ok(()), "{name} must be storable");
         }
     }
 
@@ -801,7 +812,7 @@ mod tests {
             .expect("upsert LUCIDOS_REPO");
         // A reserved-named row written out-of-band (the API/tool would refuse it)
         // must be filtered out of the injected pairs as a defense-in-depth net.
-        EnvironmentVariableStore::upsert(&pool, &bus, "PGUSER", "evil", None)
+        EnvironmentVariableStore::upsert(&pool, &bus, "LUCIDOS_DATABASE_URL", "evil", None)
             .await
             .expect("upsert reserved row");
 
@@ -818,7 +829,7 @@ mod tests {
             "non-reserved LUCIDOS_* var must be injected"
         );
         assert!(
-            !pairs.iter().any(|(k, _)| k == "PGUSER"),
+            !pairs.iter().any(|(k, _)| k == "LUCIDOS_DATABASE_URL"),
             "reserved engine-owned name must never reach injection"
         );
 

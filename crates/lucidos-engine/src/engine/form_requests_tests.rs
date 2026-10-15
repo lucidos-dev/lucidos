@@ -12,6 +12,7 @@ async fn seed_thread(bus: &EventBus) -> Uuid {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "connect my weather API".into(),
             user_image_hashes: vec![],
             device_id: None,

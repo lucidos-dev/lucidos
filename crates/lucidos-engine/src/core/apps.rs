@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use crate::core::system_widgets::{built_in_widget_prefix, has_built_in_prefix};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::git_ops::WorkspaceRepoLock;
 use crate::engine::thread_events::MessageOrigin;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,115 @@ pub struct AppManifest {
     /// The names a widget takes in its *widget params* (ADR 0415).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, AppParam>,
+    /// The *widget sizes* a widget supports, first the default. Kept verbatim;
+    /// `check_widget_manifest` reads it (ADR 0432).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sizes: Option<Vec<String>>,
+    /// A widget that draws its own shape gets a see-through tile (ADR 0432).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transparent: bool,
+}
+
+/// One of the three sizes a widget takes as a tile on the Home board: one
+/// cell, two cells wide, or two by two (ADR 0432).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WidgetSize {
+    Small,
+    Medium,
+    Large,
+}
+
+impl WidgetSize {
+    /// Smallest first, the order the fallback walks.
+    pub const ALL: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
+
+    /// What a widget that declares no sizes supports: every size, medium
+    /// first because `default_of` starts a tile at the first.
+    pub const UNDECLARED: [Self; 3] = [Self::Medium, Self::Small, Self::Large];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|size| size.as_str() == name)
+    }
+
+    /// The size a new tile of a widget declaring `declared` starts at: its
+    /// first, else the size of a widget that declares none.
+    pub fn default_of(declared: &[Self]) -> Self {
+        declared.first().copied().unwrap_or(Self::UNDECLARED[0])
+    }
+
+    /// The size a tile shows when a layout asks for this one: itself when
+    /// declared, else the nearest smaller declared size, else the nearest
+    /// larger. `declared` is never empty for a loaded widget.
+    pub fn fit(self, declared: &[Self]) -> Self {
+        if declared.contains(&self) {
+            return self;
+        }
+        let smaller = declared.iter().filter(|s| **s < self).max();
+        let larger = declared.iter().filter(|s| **s > self).min();
+        smaller.or(larger).copied().unwrap_or(self)
+    }
+}
+
+/// What the manifest says about a widget's tile, validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidgetTile {
+    /// Never empty for a widget, and empty for an app.
+    pub sizes: Vec<WidgetSize>,
+    pub transparent: bool,
+}
+
+/// The one check of a manifest's `sizes` and `transparent`, shared by the
+/// loader, `create_app` and the plugin installer. Only a widget takes either.
+/// Sizes are known names, at least one, with no duplicate. A widget that
+/// declares none supports all three and starts medium.
+pub fn check_widget_manifest(kind: AppKind, manifest: &AppManifest) -> Result<WidgetTile, String> {
+    if kind != AppKind::Widget {
+        if manifest.sizes.is_some() {
+            return Err("only a widget takes \"sizes\"".into());
+        }
+        if manifest.transparent {
+            return Err("only a widget takes \"transparent\"".into());
+        }
+        return Ok(WidgetTile {
+            sizes: Vec::new(),
+            transparent: false,
+        });
+    }
+    let sizes = match &manifest.sizes {
+        None => WidgetSize::UNDECLARED.to_vec(),
+        Some(names) => parse_widget_sizes(names)?,
+    };
+    Ok(WidgetTile {
+        sizes,
+        transparent: manifest.transparent,
+    })
+}
+
+/// A list of size names as sizes, or why it is not a valid list.
+pub fn parse_widget_sizes(names: &[String]) -> Result<Vec<WidgetSize>, String> {
+    if names.is_empty() {
+        return Err("\"sizes\" must name at least one size".into());
+    }
+    let mut sizes = Vec::with_capacity(names.len());
+    for name in names {
+        let size = WidgetSize::parse(name).ok_or_else(|| {
+            format!("\"{name}\" is not a widget size. Use small, medium or large")
+        })?;
+        if sizes.contains(&size) {
+            return Err(format!("\"sizes\" names \"{name}\" twice"));
+        }
+        sizes.push(size);
+    }
+    Ok(sizes)
 }
 
 /// One name a widget takes in its *widget params*, as its manifest declares it.
@@ -136,10 +246,14 @@ impl WidgetOrigin {
 
 /// What `create_app` makes. A widget always records the thread it was made
 /// in, so a widget without an origin cannot be created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewAppKind {
     App,
-    Widget { origin_thread_id: uuid::Uuid },
+    Widget {
+        origin_thread_id: uuid::Uuid,
+        /// The sizes it declares; `None` writes none, which reads as all three.
+        sizes: Option<Vec<WidgetSize>>,
+    },
 }
 
 /// When the host lifts its cover off an opening app.
@@ -259,9 +373,20 @@ pub struct App {
     /// A *built-in widget*: shipped with Lucidos and read-only (ADR 0415).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub built_in: bool,
+    /// A widget's *widget sizes*, first the default. Empty for an app.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sizes: Vec<WidgetSize>,
+    /// A widget whose tile is see-through, so it draws its own shape.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transparent: bool,
 }
 
 impl App {
+    /// The size a new tile of this widget starts at.
+    pub fn default_size(&self) -> WidgetSize {
+        WidgetSize::default_of(&self.sizes)
+    }
+
     pub fn is_widget(&self) -> bool {
         self.kind == AppKind::Widget
     }
@@ -395,15 +520,28 @@ impl AppManager {
             .unwrap_or_else(|| self.apps_path.join(app_id))
     }
 
+    /// Runs one write with the workspace repo lock held across its existence
+    /// check, its read, its file change and its commit. A merge's
+    /// `checkout -f main` runs under the same lock, so it cannot rewrite the
+    /// file between the save and the commit.
+    async fn under_repo_lock<T>(&self, write: impl FnOnce(&WorkspaceRepoLock) -> T) -> T {
+        let held = crate::engine::git_ops::lock_workspace_repo().await;
+        write(&held)
+    }
+
     /// Stage a single app file and commit.
     /// `app_path` is relative to data/apps/ (e.g., "my-app/index.html").
     ///
-    /// This handle's `Mutex` excludes only the other `AppManager` writes. Every
-    /// other writer of the same repo (`ArtifactManager`, the plugin helpers, a
-    /// coding agent's `git` CLI) races it, so the whole staging plus commit runs
-    /// inside `retry_while_repo_contended`. The repo guard is taken INSIDE the
-    /// closure so a retry re-stages onto a freshly reset index.
-    pub fn commit(&self, app_path: &str, message: &str) -> Result<String, git2::Error> {
+    /// The repo lock excludes the engine's other writers. A coding agent's `git`
+    /// CLI still races it, so the staging plus commit runs inside
+    /// `retry_while_repo_contended`. The repo handle is taken INSIDE the closure
+    /// so a retry re-stages onto a freshly reset index.
+    pub(crate) fn commit(
+        &self,
+        _held: &WorkspaceRepoLock,
+        app_path: &str,
+        message: &str,
+    ) -> Result<String, git2::Error> {
         super::retry_while_repo_contended(|| {
             let repo = self.repo.lock().unwrap();
             let mut index = repo.index()?;
@@ -416,7 +554,12 @@ impl AppManager {
     }
 
     /// Stage multiple app files and commit in one operation.
-    pub fn commit_batch(&self, app_paths: &[String], message: &str) -> Result<String, git2::Error> {
+    fn commit_batch(
+        &self,
+        _held: &WorkspaceRepoLock,
+        app_paths: &[String],
+        message: &str,
+    ) -> Result<String, git2::Error> {
         super::retry_while_repo_contended(|| {
             let repo = self.repo.lock().unwrap();
             let mut index = repo.index()?;
@@ -456,9 +599,23 @@ impl AppManager {
 
         let origin = WidgetOrigin::from_manifest(&id, &manifest)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let kind = AppKind::from_manifest(&id, manifest.kind.as_deref());
+        // A bad value must not drop the widget off its board; the audit reports it.
+        let tile = check_widget_manifest(kind, &manifest).unwrap_or_else(|e| {
+            log!("[Apps] {}: {}, using the default tile", id, e);
+            WidgetTile {
+                sizes: match kind {
+                    AppKind::Widget => WidgetSize::UNDECLARED.to_vec(),
+                    AppKind::App => Vec::new(),
+                },
+                transparent: false,
+            }
+        });
         Ok(App {
             reveal: AppReveal::from_manifest(&id, manifest.reveal.as_deref()),
-            kind: AppKind::from_manifest(&id, manifest.kind.as_deref()),
+            kind,
+            sizes: tile.sizes,
+            transparent: tile.transparent,
             origin,
             reusable: manifest.reusable,
             params: manifest.params,
@@ -617,6 +774,33 @@ impl AppManager {
         if let Some(svg) = files.icon_svg {
             check_icon_svg(svg)?;
         }
+        let created = self
+            .under_repo_lock(|held| {
+                self.create_app_files(held, app_id, name, description, files, kind)
+            })
+            .await?;
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::AppCreated {
+                    app_id: app_id.to_string(),
+                    name: Some(name.to_string()),
+                    actor: None,
+                }),
+                "[Apps] AppCreated",
+            )
+            .await;
+        Ok(created)
+    }
+
+    fn create_app_files(
+        &self,
+        held: &WorkspaceRepoLock,
+        app_id: &str,
+        name: &str,
+        description: &str,
+        files: AppFiles<'_>,
+        kind: NewAppKind,
+    ) -> Result<(PathBuf, String), Box<dyn std::error::Error + Send + Sync>> {
         if self.app_exists(app_id) {
             return Err(format!(
                 "App '{}' already exists. Creating it again would rewrite index.html and \
@@ -629,11 +813,16 @@ impl AppManager {
         let app_dir = self.apps_path.join(app_id);
         std::fs::create_dir_all(&app_dir)?;
 
-        let (kind, origin_thread_id) = match kind {
-            NewAppKind::App => (AppKind::App, None),
-            NewAppKind::Widget { origin_thread_id } => {
-                (AppKind::Widget, Some(origin_thread_id.to_string()))
-            }
+        let (kind, origin_thread_id, sizes) = match kind {
+            NewAppKind::App => (AppKind::App, None, None),
+            NewAppKind::Widget {
+                origin_thread_id,
+                sizes,
+            } => (
+                AppKind::Widget,
+                Some(origin_thread_id.to_string()),
+                sizes.map(|s| s.iter().map(|s| s.as_str().to_string()).collect()),
+            ),
         };
         let manifest = AppManifest {
             name: name.to_string(),
@@ -645,7 +834,10 @@ impl AppManager {
             origin_plugin_id: None,
             reusable: false,
             params: BTreeMap::new(),
+            sizes,
+            transparent: false,
         };
+        check_widget_manifest(kind, &manifest)?;
         // The manifest lands LAST, because its presence is what `app_exists`
         // reads and what the guard above refuses on. A create that dies partway
         // leaves a directory that is not an app yet. The next attempt then
@@ -667,6 +859,7 @@ impl AppManager {
         written.push(format!("{}/manifest.json", app_id));
 
         let commit = self.commit_batch(
+            held,
             &written,
             &format!(
                 "Create {}: {}",
@@ -677,16 +870,6 @@ impl AppManager {
                 name
             ),
         )?;
-        event_bus
-            .emit_or_log(
-                BusEvent::System(SystemEvent::AppCreated {
-                    app_id: app_id.to_string(),
-                    name: Some(name.to_string()),
-                    actor: None,
-                }),
-                "[Apps] AppCreated",
-            )
-            .await;
         Ok((app_dir, commit))
     }
 
@@ -699,31 +882,9 @@ impl AppManager {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         reject_path_traversal(app_id)?;
         self.refuse_built_in(app_id)?;
-        let app_dir = self.apps_path.join(app_id);
-        if !app_dir.exists() {
-            return Err(format!("App not found: {}", app_id).into());
-        }
-        // Read before the manifest goes: `AppDeleted` records it (ADR 0404).
-        let kind = self.load_app(&app_dir, false).ok().map(|app| app.kind);
-
-        std::fs::remove_dir_all(&app_dir)?;
-
-        // The closure keeps the repo guard and the git2 index (neither of which
-        // is Send) out of the await below; otherwise this future stops being
-        // Send and axum refuses the handler. The directory removal above stays
-        // outside it, so a retried attempt only re-stages an already-absent
-        // path onto the winner's head. Staging is tolerant and the commit goes
-        // through `commit_index_unless_unchanged`, because the writer that won
-        // the race may have committed this deletion already.
-        let commit = super::retry_while_repo_contended(|| {
-            let repo = self.repo.lock().unwrap();
-            let mut index = repo.index()?;
-            let base = super::reset_index_to_head(&repo, &mut index)?;
-            let _ = index.remove_dir(Path::new(&format!("data/apps/{}", app_id)), 0);
-            index.write()?;
-            let message = format!("Delete app: {}", app_id);
-            super::commit_index_unless_unchanged(&repo, &message, base)
-        })?;
+        let (kind, commit) = self
+            .under_repo_lock(|held| self.remove_app_dir(held, app_id))
+            .await?;
         event_bus
             .emit_or_log(
                 BusEvent::System(SystemEvent::AppDeleted {
@@ -735,6 +896,47 @@ impl AppManager {
             )
             .await;
         Ok(commit)
+    }
+
+    /// Remove the app's folder and commit. Returns the kind it had, which
+    /// `AppDeleted` records (ADR 0404).
+    fn remove_app_dir(
+        &self,
+        held: &WorkspaceRepoLock,
+        app_id: &str,
+    ) -> Result<(Option<AppKind>, String), Box<dyn std::error::Error + Send + Sync>> {
+        let app_dir = self.apps_path.join(app_id);
+        if !app_dir.exists() {
+            return Err(format!("App not found: {}", app_id).into());
+        }
+        let kind = self.load_app(&app_dir, false).ok().map(|app| app.kind);
+        std::fs::remove_dir_all(&app_dir)?;
+        let paths = [format!("data/apps/{}", app_id)];
+        let commit = self.commit_removals(held, &paths, &format!("Delete app: {}", app_id))?;
+        Ok((kind, commit))
+    }
+
+    /// Commit the removal of directories already gone from disk. The removal
+    /// stays outside the retry, so a retried attempt only re-stages absent
+    /// paths onto the winner's head. Staging is tolerant and the commit goes
+    /// through `commit_index_unless_unchanged`, because a coding agent's `git`
+    /// may have committed the deletion already.
+    fn commit_removals(
+        &self,
+        _held: &WorkspaceRepoLock,
+        repo_dirs: &[String],
+        message: &str,
+    ) -> Result<String, git2::Error> {
+        super::retry_while_repo_contended(|| {
+            let repo = self.repo.lock().unwrap();
+            let mut index = repo.index()?;
+            let base = super::reset_index_to_head(&repo, &mut index)?;
+            for dir in repo_dirs {
+                let _ = index.remove_dir(Path::new(dir), 0);
+            }
+            index.write()?;
+            super::commit_index_unless_unchanged(&repo, message, base)
+        })
     }
 
     /// Update an app's name and description in manifest.json (preserving
@@ -749,24 +951,29 @@ impl AppManager {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         reject_path_traversal(app_id)?;
         self.refuse_built_in(app_id)?;
-        let manifest_path = self.apps_path.join(app_id).join("manifest.json");
-        if !manifest_path.exists() {
-            return Err(format!("App not found: {}", app_id).into());
-        }
-
-        let existing: AppManifest =
-            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
-        let manifest = AppManifest {
-            name: name.to_string(),
-            description: description.to_string(),
-            ..existing
-        };
-        std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
-
-        let commit = self.commit(
-            &format!("{}/manifest.json", app_id),
-            &format!("Update app metadata: {}", name),
-        )?;
+        let commit = self
+            .under_repo_lock(
+                |held| -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                    let manifest_path = self.manifest_path(app_id);
+                    if !manifest_path.exists() {
+                        return Err(format!("App not found: {}", app_id).into());
+                    }
+                    let existing: AppManifest =
+                        serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+                    let manifest = AppManifest {
+                        name: name.to_string(),
+                        description: description.to_string(),
+                        ..existing
+                    };
+                    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+                    Ok(self.commit(
+                        held,
+                        &format!("{}/manifest.json", app_id),
+                        &format!("Update app metadata: {}", name),
+                    )?)
+                },
+            )
+            .await?;
         event_bus
             .emit_or_log(
                 BusEvent::System(SystemEvent::AppUpdated {
@@ -791,11 +998,34 @@ impl AppManager {
         actor: Option<MessageOrigin>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         self.refuse_built_in(app_id)?;
+        let (name, commit) = self
+            .under_repo_lock(|held| self.write_widget_reusable(held, app_id, reusable))
+            .await?;
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::AppUpdated {
+                    app_id: app_id.to_string(),
+                    name: Some(name),
+                    actor,
+                }),
+                "[Apps] AppUpdated",
+            )
+            .await;
+        Ok(commit)
+    }
+
+    /// Returns the widget's name and the commit.
+    fn write_widget_reusable(
+        &self,
+        held: &WorkspaceRepoLock,
+        app_id: &str,
+        reusable: bool,
+    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         let app = self.get_app(app_id)?;
         if !app.is_widget() {
             return Err(format!("'{}' is an app, not a widget", app_id).into());
         }
-        let manifest_path = self.apps_path.join(app_id).join("manifest.json");
+        let manifest_path = self.manifest_path(app_id);
         let existing: AppManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
         if existing.reusable == reusable {
@@ -811,8 +1041,8 @@ impl AppManager {
             ..existing
         };
         std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
-
         let commit = self.commit(
+            held,
             &format!("{}/manifest.json", app_id),
             &format!(
                 "{} widget: {}",
@@ -820,17 +1050,7 @@ impl AppManager {
                 app.name
             ),
         )?;
-        event_bus
-            .emit_or_log(
-                BusEvent::System(SystemEvent::AppUpdated {
-                    app_id: app_id.to_string(),
-                    name: Some(app.name),
-                    actor,
-                }),
-                "[Apps] AppUpdated",
-            )
-            .await;
-        Ok(commit)
+        Ok((app.name, commit))
     }
 
     /// Remove the widgets Delete (a thread) takes with it, in one commit, and
@@ -844,6 +1064,41 @@ impl AppManager {
         app_ids: &[String],
         actor: Option<MessageOrigin>,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let (removed, failure) = self
+            .under_repo_lock(|held| self.remove_widget_dirs(held, app_ids))
+            .await?;
+        for app_id in &removed {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::AppDeleted {
+                        app_id: app_id.clone(),
+                        kind: Some(AppKind::Widget),
+                        actor: actor.clone(),
+                    }),
+                    "[Apps] AppDeleted",
+                )
+                .await;
+        }
+        match failure {
+            Some(e) => Err(format!(
+                "removed {} of {} widgets, then failed: {}",
+                removed.len(),
+                app_ids.len(),
+                e
+            )
+            .into()),
+            None => Ok(removed),
+        }
+    }
+
+    /// Returns the ids removed and committed, and the error that stopped the
+    /// run early, if one did.
+    fn remove_widget_dirs(
+        &self,
+        held: &WorkspaceRepoLock,
+        app_ids: &[String],
+    ) -> Result<(Vec<String>, Option<std::io::Error>), Box<dyn std::error::Error + Send + Sync>>
+    {
         let mut targets: Vec<&String> = Vec::new();
         for app_id in app_ids {
             self.refuse_built_in(app_id)?;
@@ -867,43 +1122,12 @@ impl AppManager {
             }
         }
         if !removed.is_empty() {
-            // Same shape as `delete_app`: the removal stays outside the retry, and
-            // the commit tolerates a winner that already committed it.
-            let commit = super::retry_while_repo_contended(|| {
-                let repo = self.repo.lock().unwrap();
-                let mut index = repo.index()?;
-                let base = super::reset_index_to_head(&repo, &mut index)?;
-                for app_id in &removed {
-                    let _ = index.remove_dir(Path::new(&format!("data/apps/{}", app_id)), 0);
-                }
-                index.write()?;
-                let message = format!("Delete widgets with their thread: {}", removed.join(", "));
-                super::commit_index_unless_unchanged(&repo, &message, base)
-            })?;
+            let dirs: Vec<String> = removed.iter().map(|id| format!("data/apps/{id}")).collect();
+            let message = format!("Delete widgets with their thread: {}", removed.join(", "));
+            let commit = self.commit_removals(held, &dirs, &message)?;
             log!("[Apps] Removed widgets {:?} in {}", removed, commit);
-            for app_id in &removed {
-                event_bus
-                    .emit_or_log(
-                        BusEvent::System(SystemEvent::AppDeleted {
-                            app_id: app_id.clone(),
-                            kind: Some(AppKind::Widget),
-                            actor: actor.clone(),
-                        }),
-                        "[Apps] AppDeleted",
-                    )
-                    .await;
-            }
         }
-        match failure {
-            Some(e) => Err(format!(
-                "removed {} of {} widgets, then failed: {}",
-                removed.len(),
-                app_ids.len(),
-                e
-            )
-            .into()),
-            None => Ok(removed),
-        }
+        Ok((removed, failure))
     }
 
     /// Read all editable text files in an app, returning (name, content) pairs.
@@ -966,25 +1190,29 @@ impl AppManager {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         reject_path_traversal(app_id)?;
         self.refuse_built_in(app_id)?;
-        let app_dir = self.apps_path.join(app_id);
-        if !app_dir.exists() {
-            return Err(format!("App not found: {}", app_id).into());
-        }
-
-        let mut git_paths = Vec::new();
-        for (name, content) in files {
-            if super::is_path_traversal(name) {
-                return Err(format!("Invalid filename: {}", name).into());
-            }
-            let file_path = app_dir.join(name);
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&file_path, content)?;
-            git_paths.push(format!("{}/{}", app_id, name));
-        }
-
-        let commit = self.commit_batch(&git_paths, &format!("Edit app: {}", app_id))?;
+        let commit = self
+            .under_repo_lock(
+                |held| -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                    let app_dir = self.apps_path.join(app_id);
+                    if !app_dir.exists() {
+                        return Err(format!("App not found: {}", app_id).into());
+                    }
+                    let mut git_paths = Vec::new();
+                    for (name, content) in files {
+                        if super::is_path_traversal(name) {
+                            return Err(format!("Invalid filename: {}", name).into());
+                        }
+                        let file_path = app_dir.join(name);
+                        if let Some(parent) = file_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&file_path, content)?;
+                        git_paths.push(format!("{}/{}", app_id, name));
+                    }
+                    Ok(self.commit_batch(held, &git_paths, &format!("Edit app: {}", app_id))?)
+                },
+            )
+            .await?;
         event_bus
             .emit_or_log(
                 BusEvent::System(SystemEvent::AppUpdated {
@@ -1047,8 +1275,9 @@ impl AppManager {
     /// `core::announced_surfaces`: removing one file is not an app lifecycle
     /// change. The caller (`engine/tools/files.rs`) decides whether the deletion
     /// killed the app, by checking whether it took `manifest.json` with it.
-    pub fn delete_file_and_commit(
+    pub(crate) fn delete_file_and_commit(
         &self,
+        _held: &WorkspaceRepoLock,
         app_path: &str,
         message: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -1136,6 +1365,8 @@ pub(crate) mod tests {
                     required: true,
                 },
             )]),
+            sizes: Some(vec!["small".to_string(), "medium".to_string()]),
+            transparent: true,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AppManifest = serde_json::from_str(&json).unwrap();
@@ -1171,6 +1402,131 @@ pub(crate) mod tests {
 
         let plain = serde_json::to_value(manager.get_app("plain").unwrap()).unwrap();
         assert!(plain.get("params").is_none());
+    }
+
+    fn manifest(json: &str) -> AppManifest {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// The one tile check: known names, at least one, no duplicate, and only
+    /// on a widget. None declared reads as all three (ADR 0432).
+    #[test]
+    fn the_widget_manifest_check_refuses_every_bad_sizes_shape() {
+        let widget = |json: &str| check_widget_manifest(AppKind::Widget, &manifest(json));
+        let ok = widget(r#"{"name": "W", "sizes": ["large", "small"], "transparent": true}"#);
+        assert_eq!(
+            ok,
+            Ok(WidgetTile {
+                sizes: vec![WidgetSize::Large, WidgetSize::Small],
+                transparent: true,
+            })
+        );
+        assert_eq!(
+            widget(r#"{"name": "W"}"#).unwrap().sizes,
+            WidgetSize::UNDECLARED.to_vec()
+        );
+        for (json, needle) in [
+            (r#"{"name": "W", "sizes": ["huge"]}"#, "not a widget size"),
+            (r#"{"name": "W", "sizes": ["small", "small"]}"#, "twice"),
+            (r#"{"name": "W", "sizes": []}"#, "at least one"),
+        ] {
+            let err = widget(json).unwrap_err();
+            assert!(err.contains(needle), "{json}: {err}");
+        }
+        for json in [
+            r#"{"name": "A", "sizes": ["small"]}"#,
+            r#"{"name": "A", "transparent": true}"#,
+        ] {
+            let err = check_widget_manifest(AppKind::App, &manifest(json)).unwrap_err();
+            assert!(err.contains("only a widget"), "{json}: {err}");
+        }
+    }
+
+    /// A widget that declares no sizes takes every size and starts medium,
+    /// as a WidgetKit widget does. A declared list is the whole choice.
+    #[test]
+    fn an_undeclared_widget_takes_all_three_sizes_and_starts_medium() {
+        use WidgetSize::*;
+        let mut undeclared = WidgetSize::UNDECLARED.to_vec();
+        assert_eq!(WidgetSize::default_of(&undeclared), Medium);
+        assert_eq!(WidgetSize::default_of(&[]), Medium);
+        undeclared.sort();
+        assert_eq!(undeclared, WidgetSize::ALL.to_vec());
+        assert_eq!(WidgetSize::default_of(&[Large, Small]), Large);
+    }
+
+    /// A widget with no sizes takes all three, a bad list loads with the
+    /// default rather than dropping the widget, and an app carries none.
+    #[test]
+    fn a_widget_loads_its_sizes_and_a_bad_list_falls_back_to_all_three() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+        write_manifest(
+            tmp.path(),
+            "clock",
+            r#"{"name": "Clock", "kind": "widget", "sizes": ["small", "large"], "transparent": true}"#,
+        );
+        write_manifest(
+            tmp.path(),
+            "legacy",
+            r#"{"name": "Legacy", "kind": "widget"}"#,
+        );
+        write_manifest(
+            tmp.path(),
+            "typo",
+            r#"{"name": "Typo", "kind": "widget", "sizes": ["smal"]}"#,
+        );
+        write_manifest(tmp.path(), "plain", r#"{"name": "Plain"}"#);
+
+        let clock = manager.get_app("clock").unwrap();
+        assert_eq!(clock.sizes, vec![WidgetSize::Small, WidgetSize::Large]);
+        assert_eq!(clock.default_size(), WidgetSize::Small);
+        assert!(clock.transparent);
+        let legacy = manager.get_app("legacy").unwrap();
+        assert_eq!(legacy.sizes, WidgetSize::UNDECLARED.to_vec());
+        assert_eq!(legacy.default_size(), WidgetSize::Medium);
+        assert_eq!(
+            manager.get_app("typo").unwrap().sizes,
+            WidgetSize::UNDECLARED.to_vec()
+        );
+        let plain = serde_json::to_value(manager.get_app("plain").unwrap()).unwrap();
+        assert!(plain.get("sizes").is_none() && plain.get("transparent").is_none());
+    }
+
+    /// Rule 4 of the size contract: the asked size if declared, else the
+    /// nearest smaller, else the nearest larger.
+    #[test]
+    fn an_undeclared_size_fits_the_nearest_smaller_then_larger() {
+        use WidgetSize::*;
+        assert_eq!(Medium.fit(&[Small, Medium]), Medium);
+        assert_eq!(Large.fit(&[Small, Medium]), Medium);
+        assert_eq!(Medium.fit(&[Small, Large]), Small);
+        assert_eq!(Small.fit(&[Medium, Large]), Medium);
+        assert_eq!(Medium.fit(&[Large]), Large);
+    }
+
+    /// `create_app` writes the sizes it is given, and refuses none on an app.
+    #[tokio::test]
+    async fn create_app_writes_a_widgets_sizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+        let bus = crate::test_support::offline_event_bus();
+        manager
+            .create_app(
+                &bus,
+                "clock",
+                "Clock",
+                "",
+                "<h1>c",
+                NewAppKind::Widget {
+                    origin_thread_id: uuid::Uuid::nil(),
+                    sizes: Some(vec![WidgetSize::Small, WidgetSize::Medium]),
+                },
+            )
+            .await
+            .unwrap();
+        let clock = manager.get_app("clock").unwrap();
+        assert_eq!(clock.sizes, vec![WidgetSize::Small, WidgetSize::Medium]);
     }
 
     fn write_manifest(ws: &Path, app_id: &str, json: &str) {
@@ -1251,6 +1607,8 @@ pub(crate) mod tests {
             reusable: false,
             params: BTreeMap::new(),
             built_in: false,
+            sizes: Vec::new(),
+            transparent: false,
         };
         let json = serde_json::to_value(&app).unwrap();
         assert_eq!(json["reveal"], "on-ready");
@@ -1711,6 +2069,7 @@ pub(crate) mod tests {
                 "<h1>widget",
                 NewAppKind::Widget {
                     origin_thread_id: origin,
+                    sizes: None,
                 },
             )
             .await
@@ -1886,6 +2245,7 @@ pub(crate) mod tests {
                 "<h1>w",
                 NewAppKind::Widget {
                     origin_thread_id: thread(1),
+                    sizes: None,
                 },
             )
             .await
@@ -1983,7 +2343,11 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .to_string(),
             manager
-                .delete_file_and_commit(&format!("{id}/index.html"), "rm")
+                .delete_file_and_commit(
+                    &crate::engine::git_ops::lock_workspace_repo().await,
+                    &format!("{id}/index.html"),
+                    "rm",
+                )
                 .unwrap_err()
                 .to_string(),
         ];
@@ -2024,5 +2388,123 @@ pub(crate) mod tests {
             manager.built_in_data_path("apps/lucidos-mine/index.html"),
             None
         );
+    }
+
+    // --- every write waits for the workspace repo lock (I7) ---------------
+
+    /// Polls `write` once while this test holds the workspace repo lock, and
+    /// checks it has not touched disk. A merge's `checkout -f main` runs under
+    /// that lock, so a write that saves outside it can be reverted after its
+    /// commit. Then releases the lock and finishes the write.
+    async fn finishes_only_after_the_repo_lock<F: std::future::Future>(
+        write: F,
+        untouched: impl Fn() -> bool,
+    ) -> F::Output {
+        let held = crate::engine::git_ops::WORKSPACE_REPO_MUTEX.lock().await;
+        let mut write = std::pin::pin!(write);
+        tokio::select! {
+            biased;
+            _ = &mut write => panic!("the write finished while another writer held the repo lock"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(
+            untouched(),
+            "the write touched disk while another writer held the repo lock"
+        );
+        drop(held);
+        write.await
+    }
+
+    fn on_main(ws: &Path, repo_path: &str) -> Option<String> {
+        let repo = Repository::open(ws).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(Path::new(repo_path)).ok()?;
+        let blob = entry.to_object(&repo).ok()?.peel_to_blob().ok()?;
+        Some(String::from_utf8_lossy(blob.content()).into_owned())
+    }
+
+    #[tokio::test]
+    async fn every_app_write_waits_for_the_repo_lock() {
+        let bus = crate::test_support::offline_event_bus();
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        let manager = AppManager::new(ws).unwrap();
+        let origin = app_and_widget(&manager, &bus).await;
+        let manifest = |id: &str| -> AppManifest {
+            serde_json::from_str(&std::fs::read_to_string(manager.manifest_path(id)).unwrap())
+                .unwrap()
+        };
+
+        let files = [("index.html".to_string(), "<h1>saved".to_string())];
+        finishes_only_after_the_repo_lock(
+            manager.write_app_source(&bus, "habit-tracker", &files, None),
+            || {
+                std::fs::read_to_string(ws.join("data/apps/habit-tracker/index.html")).unwrap()
+                    == "<h1>app"
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            on_main(ws, "data/apps/habit-tracker/index.html").as_deref(),
+            Some("<h1>saved")
+        );
+
+        finishes_only_after_the_repo_lock(
+            manager.update_app_metadata(&bus, "habit-tracker", "Habits", "", None),
+            || manifest("habit-tracker").name == "Habit Tracker",
+        )
+        .await
+        .unwrap();
+        assert!(on_main(ws, "data/apps/habit-tracker/manifest.json")
+            .unwrap()
+            .contains("\"Habits\""));
+
+        finishes_only_after_the_repo_lock(
+            manager.set_widget_reusable(&bus, "fare-grid", true, None),
+            || !manifest("fare-grid").reusable,
+        )
+        .await
+        .unwrap();
+        assert!(on_main(ws, "data/apps/fare-grid/manifest.json")
+            .unwrap()
+            .contains("\"reusable\": true"));
+        manager
+            .set_widget_reusable(&bus, "fare-grid", false, None)
+            .await
+            .unwrap();
+
+        finishes_only_after_the_repo_lock(
+            manager.create_app(
+                &bus,
+                "doomed-widget",
+                "Doomed",
+                "",
+                "<h1>w",
+                NewAppKind::Widget {
+                    origin_thread_id: origin,
+                    sizes: None,
+                },
+            ),
+            || !ws.join("data/apps/doomed-widget").exists(),
+        )
+        .await
+        .unwrap();
+        assert!(on_main(ws, "data/apps/doomed-widget/manifest.json").is_some());
+
+        finishes_only_after_the_repo_lock(
+            manager.delete_widgets(&bus, &["doomed-widget".to_string()], None),
+            || ws.join("data/apps/doomed-widget").exists(),
+        )
+        .await
+        .unwrap();
+        assert!(on_main(ws, "data/apps/doomed-widget/manifest.json").is_none());
+
+        finishes_only_after_the_repo_lock(manager.delete_app(&bus, "habit-tracker", None), || {
+            ws.join("data/apps/habit-tracker").exists()
+        })
+        .await
+        .unwrap();
+        assert!(on_main(ws, "data/apps/habit-tracker/manifest.json").is_none());
     }
 }

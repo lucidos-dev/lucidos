@@ -2,8 +2,9 @@
 
 use super::*;
 use crate::engine::agent_question::aq_test_helpers::{cc_meta, emit_user_question, seed_cc_thread};
+use crate::engine::event_bus::BusEvent;
 
-use crate::test_support::{setup_test_db, teardown_test_db};
+use crate::test_support::{refuse_event_type, setup_test_db, teardown_test_db};
 
 fn no_blobs() -> &'static Path {
     Path::new("/nonexistent-workspace")
@@ -176,7 +177,7 @@ async fn claims_release_held_messages_one_at_a_time_oldest_first() {
     let next = claim_next_held_message(&bus, &pool, no_blobs(), thread_id)
         .await
         .expect("the oldest is claimed first");
-    assert_eq!((next.id, next.text.as_str()), (first, "first"));
+    assert_eq!((next.held.id, next.held.text.as_str()), (first, "first"));
     assert_eq!(
         count_releases(&pool, thread_id).await,
         1,
@@ -185,12 +186,40 @@ async fn claims_release_held_messages_one_at_a_time_oldest_first() {
     let next = claim_next_held_message(&bus, &pool, no_blobs(), thread_id)
         .await
         .expect("then the next");
-    assert_eq!(next.id, second);
+    assert_eq!(next.held.id, second);
 
     assert!(claim_next_held_message(&bus, &pool, no_blobs(), thread_id)
         .await
         .is_none());
     assert_eq!(count_releases(&pool, thread_id).await, 2);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The delivery's `MessageReceived` is refused. The release must not land
+/// without it, so the message stays held at the head, ahead of a younger one.
+#[tokio::test]
+async fn a_refused_delivery_keeps_the_message_held() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    emit_user_question(&bus, thread_id, "toolu-open#q0").await;
+    let first = hold(&bus, thread_id, "first").await;
+    let second = hold(&bus, thread_id, "second").await;
+    refuse_event_type(&pool, "MessageReceived").await;
+
+    let claimed = claim_next_held_message(&bus, &pool, no_blobs(), thread_id).await;
+
+    assert!(claimed.is_none(), "nothing was delivered");
+    let still_held: Vec<Uuid> = unreleased_held_messages(&pool, no_blobs(), thread_id)
+        .await
+        .expect("read the held messages")
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(still_held, vec![first, second]);
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -223,6 +252,42 @@ async fn a_held_message_can_be_released_only_once() {
     teardown_test_db(&db_name).await;
 }
 
+/// Two claims race for one held message. The unique index refuses the loser's
+/// release, and its `MessageReceived` rolls back with it, so the message is
+/// delivered once.
+#[tokio::test]
+async fn a_claim_that_loses_the_race_delivers_nothing() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    hold(&bus, thread_id, "only once").await;
+
+    let (a, b) = tokio::join!(
+        claim_next_held_message(&bus, &pool, no_blobs(), thread_id),
+        claim_next_held_message(&bus, &pool, no_blobs(), thread_id),
+    );
+
+    assert_eq!(
+        usize::from(a.is_some()) + usize::from(b.is_some()),
+        1,
+        "exactly one claim wins"
+    );
+    let deliveries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 \
+           AND event_type = 'MessageReceived' AND payload->>'text' = 'only once'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("count deliveries");
+    assert_eq!(deliveries, 1);
+    assert_eq!(count_releases(&pool, thread_id).await, 1);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// The store can refuse a release for a reason other than a lost race, such
 /// as a full disk. The claim must then end with the message still held.
 #[tokio::test]
@@ -232,21 +297,7 @@ async fn a_release_the_store_keeps_refusing_ends_the_claim() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
     hold(&bus, thread_id, "first").await;
-    sqlx::query(
-        "CREATE FUNCTION refuse_release() RETURNS trigger AS $$ BEGIN \
-         IF NEW.event_type = 'HeldMessageReleased' THEN RAISE EXCEPTION 'refused'; END IF; \
-         RETURN NEW; END $$ LANGUAGE plpgsql",
-    )
-    .execute(&pool)
-    .await
-    .expect("create the refusing function");
-    sqlx::query(
-        "CREATE TRIGGER refuse_release BEFORE INSERT ON events \
-         FOR EACH ROW EXECUTE FUNCTION refuse_release()",
-    )
-    .execute(&pool)
-    .await
-    .expect("create the refusing trigger");
+    refuse_event_type(&pool, "HeldMessageReleased").await;
 
     let claimed = tokio::time::timeout(
         std::time::Duration::from_secs(10),

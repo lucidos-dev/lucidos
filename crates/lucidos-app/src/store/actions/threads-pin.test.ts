@@ -47,16 +47,15 @@ describe('handleSaveThread — pin error handling', () => {
     mockSave.mockReset();
   });
 
-  it('keeps the optimistic pin and stays quiet when the server 409s (already saved)', async () => {
-    // A duplicate/racing save: the first request already flipped is_saved=TRUE,
-    // so a stale second /threads/save 409s. The desired end-state (pinned) holds
-    // — the icon must NOT revert and no error toast must fire.
-    mockSave.mockRejectedValue(new ApiError(409, 'Thread cannot be saved in its current state'));
+  // A repeat save is a 200 now, so a 409 is a real refusal: the home thread
+  // is never pinned (ADR 0362). The row goes back and the user is told.
+  it('reverts the optimistic pin and toasts when the server refuses it (409)', async () => {
+    mockSave.mockRejectedValue(new ApiError(409, 'The home thread is never pinned.'));
 
     await handleSaveThread('t1');
 
-    expect(threadMap.value.get('t1')!.meta.saved).toBe(true);
-    expect(toasts.value).toHaveLength(0);
+    expect(threadMap.value.get('t1')!.meta.saved).toBe(false);
+    expect(toasts.value).toHaveLength(1);
   });
 
   it('reverts the optimistic pin and toasts on a genuine failure (500)', async () => {
@@ -69,7 +68,7 @@ describe('handleSaveThread — pin error handling', () => {
   });
 
   it('leaves the thread pinned on success', async () => {
-    mockSave.mockResolvedValue(undefined as unknown as void);
+    mockSave.mockResolvedValue({ summary_version: 1 });
 
     await handleSaveThread('t1');
 
@@ -90,7 +89,7 @@ describe('handleSaveThread: pinning an archived thread', () => {
 
   it('moves it to the inbox and the Pinned section before the server answers', async () => {
     let resolve: () => void = () => {};
-    mockSave.mockImplementation(() => new Promise<void>((r) => { resolve = r; }));
+    mockSave.mockImplementation(() => new Promise((r) => { resolve = () => r({ summary_version: 1 }); }));
 
     const pending = handleSaveThread('t1');
     const meta = threadMap.value.get('t1')!.meta;

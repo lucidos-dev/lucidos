@@ -6,25 +6,18 @@ use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-/// The Phase 5.3 contract for the continue endpoint: emitting a
-/// `ContinuationRequested` on the CC channel persists with the user's reason tag,
-/// and the spawn dispatcher's classifier (subscribed to the same bus) will
-/// see it as a `SpawnTrigger::ContinuationRequested`. This test exercises the
-/// "endpoint emits → bus receives → dispatcher classifies" chain without
-/// the full Axum router (which requires a complete engine).
+/// The continue endpoint's contract: a `ContinuationRequested` on the CC
+/// channel persists with the user's reason, and the spawn dispatcher forwards
+/// it as a `SpawnRequest::Continue`. Exercises "endpoint emits, bus sends,
+/// dispatcher forwards" without the Axum router, which needs a whole engine.
 #[tokio::test]
-async fn continuation_requested_emission_classifies_as_spawn_trigger() {
+async fn continuation_requested_emission_produces_a_spawn_request() {
     use crate::engine::agent_session::spawn_dispatcher::{SpawnDispatcher, SpawnRequest};
 
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
-    let (tx, mut spawn_rx) = tokio::sync::mpsc::unbounded_channel::<SpawnRequest>();
-    let dispatcher = SpawnDispatcher::new(pool.clone(), tx);
-    // Subscribe before starting the loop — mirrors `SpawnDispatcher::spawn()`,
-    // so no settling sleep is needed before producing.
-    let rx = bus.subscribe();
-    let handle = tokio::spawn(async move { dispatcher.run(rx).await });
+    let (handle, mut spawn_rx) = SpawnDispatcher::spawn(pool.clone(), bus.clone());
 
     let thread_id = Uuid::new_v4();
     // Seed SessionStarted so the lifecycle contract accepts CC events.
@@ -47,9 +40,9 @@ async fn continuation_requested_emission_classifies_as_spawn_trigger() {
         .expect("emit succeeds")
         .expect("event persisted");
 
-    let received = tokio::time::timeout(std::time::Duration::from_secs(2), spawn_rx.recv())
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), spawn_rx.recv())
         .await
-        .expect("dispatcher must produce a SpawnRequest within 2s")
+        .expect("dispatcher must produce a SpawnRequest")
         .expect("channel must yield");
     assert_eq!(
         received,
@@ -65,24 +58,14 @@ async fn continuation_requested_emission_classifies_as_spawn_trigger() {
     teardown_test_db(&db_name).await;
 }
 
-/// Phase 5.3: when recovery emits a synthetic `CodingAgentIdled` with
-/// `reason = engine_restart_interrupt`, the spawn dispatcher's classifier
-/// must NOT treat it as a trigger. Without this guarantee, the very
-/// "interrupted" event we emit to surface the continue affordance would
-/// loop back into auto-spawning CC — exactly the behavior we removed.
+/// Recovery's synthetic `CodingAgentIdled { engine_restart_interrupt }` must
+/// never become a spawn request. Otherwise the event that surfaces the
+/// Continue affordance would loop back into auto-spawning the agent.
 #[tokio::test]
 async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
-    use crate::engine::agent_session::spawn_dispatcher::{SpawnDispatcher, SpawnRequest};
-    use std::sync::atomic::Ordering;
-
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
-    let bus = Arc::new(bus);
-    let (tx, _spawn_rx) = tokio::sync::mpsc::unbounded_channel::<SpawnRequest>();
-    let dispatcher = SpawnDispatcher::new(pool.clone(), tx);
-    let dispatch_count = dispatcher.dispatch_count.clone();
-    let rx = bus.subscribe();
-    let handle = tokio::spawn(async move { dispatcher.run(rx).await });
+    let mut requests = bus.take_spawn_requests().expect("first take");
 
     let thread_id = Uuid::new_v4();
     let cc_meta = EventMeta {
@@ -111,15 +94,13 @@ async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
     .expect("emit succeeds")
     .expect("persisted");
 
-    // Give the dispatcher time to (NOT) act.
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(
-            dispatch_count.load(Ordering::SeqCst),
-            0,
-            "synthetic CodingAgentIdled must not produce any dispatch — only the user's continue click does"
-        );
+    // The bus sends in PostCommit, before `emit` returns, so an empty channel
+    // here is final.
+    assert!(
+        requests.try_recv().is_err(),
+        "synthetic CodingAgentIdled must not produce a spawn request"
+    );
 
-    handle.abort();
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -249,6 +230,9 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

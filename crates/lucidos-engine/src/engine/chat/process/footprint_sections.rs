@@ -10,12 +10,11 @@ use crate::core::knowhow::{KnowhowDirs, KnowhowSummary};
 use crate::core::response_style::Style;
 use crate::core::{App, CredentialInfo, EmailAccountInfo, Intent, OAuthAccountInfo};
 use crate::engine::prompt_footprint::{
-    app_open_evidence, file_older_than, knowhow_load_evidence, widget_show_evidence, FootprintItem,
-    FootprintLimits, FootprintSection, ItemKind, SectionWhen, SystemPromptArea, UseEvidence,
-    UseVerdict, WorkspacePromptFootprint,
+    app_open_evidence, file_older_than, knowhow_load_evidence, widget_use_evidence, FootprintItem,
+    FootprintLimits, FootprintSection, ItemKind, McpThreadUse, SectionWhen, SystemPromptArea,
+    UseEvidence, UseVerdict, WorkspacePromptFootprint,
 };
 use crate::engine::LucidosEngine;
-use crate::llm::provider::ToolDefinition;
 
 use super::workspace_prompt_footprint as footprint;
 
@@ -41,9 +40,24 @@ pub(crate) struct FootprintInputs {
     pub files: Vec<String>,
     /// Each app's own knowhow docs, by app id.
     pub open_app_knowhow: Vec<(String, Vec<KnowhowSummary>)>,
-    pub stopped_mcp_servers: Vec<String>,
-    pub mcp_tools: Vec<ToolDefinition>,
+    /// `[MCP SERVERS]` as a thread with nothing enabled reads it, which is
+    /// what nearly every turn carries.
+    pub mcp_server_lines: Vec<String>,
+    /// What each server's tools cost a thread that enables it.
+    pub mcp_schemas: Vec<McpSchemaCost>,
+    /// What a thread that enables every server carries, once the MCP ceiling
+    /// applies: the worst case, never every turn.
+    pub mcp_worst_case_chars: usize,
     pub mcp_dropped_notice: Option<String>,
+}
+
+/// One MCP server's schemas, as the footprint reports them (ADR 0430).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct McpSchemaCost {
+    pub server_id: String,
+    pub name: String,
+    pub chars: usize,
+    pub threads: McpThreadUse,
 }
 
 /// One section as built: the text the turn would carry, and its items.
@@ -152,15 +166,15 @@ pub(crate) const SECTIONS: &[SectionSpec] = &[
         build: open_app_knowhow,
     },
     SectionSpec {
-        id: "stopped-mcp-servers",
-        title: "Stopped MCP servers",
+        id: "mcp-servers",
+        title: "MCP servers",
         when: SectionWhen::EveryTurn,
-        build: stopped_mcp_servers,
+        build: mcp_servers,
     },
     SectionSpec {
         id: "mcp-tool-schemas",
         title: "MCP tool schemas",
-        when: SectionWhen::EveryTurn,
+        when: SectionWhen::McpEnabled,
         build: mcp_tool_schemas,
     },
     SectionSpec {
@@ -180,6 +194,7 @@ fn item(kind: ItemKind, id: &str, name: &str, line: &str, clipped_chars: usize) 
         clipped_chars,
         usage: None,
         path: None,
+        mcp_threads: None,
     }
 }
 
@@ -425,38 +440,39 @@ fn open_app_knowhow(inputs: &FootprintInputs) -> BuiltSection {
     BuiltSection::text(largest, items)
 }
 
-fn stopped_mcp_servers(inputs: &FootprintInputs) -> BuiltSection {
+fn mcp_servers(inputs: &FootprintInputs) -> BuiltSection {
     let items = inputs
-        .stopped_mcp_servers
+        .mcp_server_lines
         .iter()
         .map(|line| item(ItemKind::McpServer, line, line, line, 0))
         .collect();
     BuiltSection::text(
-        footprint::build_stopped_mcp_servers_section(&inputs.stopped_mcp_servers),
+        footprint::build_mcp_servers_section(&inputs.mcp_server_lines),
         items,
     )
 }
 
-/// What the running servers' tools cost once the MCP ceiling applies, in the
-/// unit the request packer and the MCP page count.
+/// What each server's tools cost a thread that enables it, in the unit the
+/// request packer and the MCP page count. The section's own figure is the
+/// worst case, every server enabled in one thread, after the MCP ceiling.
 fn mcp_tool_schemas(inputs: &FootprintInputs) -> BuiltSection {
-    let cost = crate::engine::context::tool_definitions_chars;
     let items = inputs
-        .mcp_tools
+        .mcp_schemas
         .iter()
-        .map(|tool| FootprintItem {
-            kind: ItemKind::McpTool,
-            id: tool.name.clone(),
-            name: tool.name.clone(),
-            chars: cost(std::slice::from_ref(tool)),
+        .map(|server| FootprintItem {
+            kind: ItemKind::McpServer,
+            id: server.server_id.clone(),
+            name: server.name.clone(),
+            chars: server.chars,
             clipped_chars: 0,
             usage: None,
             path: None,
+            mcp_threads: Some(server.threads),
         })
         .collect();
     BuiltSection {
         text: None,
-        measured_chars: cost(&inputs.mcp_tools),
+        measured_chars: inputs.mcp_worst_case_chars,
         items,
     }
 }
@@ -594,7 +610,11 @@ fn knowhow_doc_path(dirs: &KnowhowDirs, id: &str) -> Option<PathBuf> {
 impl LucidosEngine {
     /// Load what a chat turn's workspace-grown sections are built from, with
     /// the loaders the turn itself calls.
-    async fn footprint_inputs(&self, intents: Vec<Intent>) -> Result<FootprintInputs, BoxError> {
+    async fn footprint_inputs(
+        &self,
+        intents: Vec<Intent>,
+        unused_days: u32,
+    ) -> Result<FootprintInputs, BoxError> {
         let (apps, widgets) = self.app_manager.apps_and_reusable_widgets()?;
         let (built_in_widgets, reusable_widgets) = widgets.into_iter().partition(|w| w.built_in);
         let (knowhow, app_knowhow) = self.workspace_knowhow_summaries();
@@ -617,10 +637,22 @@ impl LucidosEngine {
             Vec::new()
         });
         let (_, window) = self.chat_model_and_window().await;
-        let surface = self
+        let mcp_budget = self.mcp_manager.budget(window).await?;
+        let mcp_threads =
+            crate::engine::prompt_footprint::mcp_thread_use(&self.pool, unused_days).await?;
+        let mcp_schemas = self
             .mcp_manager
-            .tool_surface(crate::mcp::mcp_tool_char_ceiling(window))
-            .await;
+            .list_servers()
+            .await?
+            .into_iter()
+            .filter(|server| server.dispatchable)
+            .map(|server| McpSchemaCost {
+                threads: mcp_threads.get(&server.id).copied().unwrap_or_default(),
+                server_id: server.id,
+                name: server.name,
+                chars: server.chars,
+            })
+            .collect();
         Ok(FootprintInputs {
             apps,
             reusable_widgets,
@@ -636,9 +668,13 @@ impl LucidosEngine {
             builtin_proxies: self.builtin_proxies_section().await,
             files,
             open_app_knowhow,
-            stopped_mcp_servers: self.mcp_manager.get_stopped_server_summaries().await,
-            mcp_dropped_notice: surface.dropped_notice(),
-            mcp_tools: surface.tools,
+            mcp_server_lines: self
+                .mcp_manager
+                .server_lines(&Default::default(), &[], None)
+                .await,
+            mcp_dropped_notice: crate::mcp::dropped_notice(&mcp_budget.dropped),
+            mcp_schemas,
+            mcp_worst_case_chars: mcp_budget.sent_chars,
         })
     }
 
@@ -651,7 +687,9 @@ impl LucidosEngine {
         let capabilities = self.read_turn_capabilities().await;
         let intent_knowhow = IntentKnowhow::of(&capabilities.intents);
         let gates = capabilities.gates;
-        let inputs = self.footprint_inputs(capabilities.intents).await?;
+        let inputs = self
+            .footprint_inputs(capabilities.intents, limits.unused_days)
+            .await?;
         let system_prompt_areas = super::system_prompt::system_prompt_footprint(
             &gates,
             &self.system_knowhow_summaries(),
@@ -662,7 +700,7 @@ impl LucidosEngine {
         .collect();
         let evidence = Evidence {
             apps: app_open_evidence(&self.pool, limits.unused_days).await?,
-            widgets: widget_show_evidence(&self.pool, limits.unused_days).await?,
+            widgets: widget_use_evidence(&self.pool, limits.unused_days).await?,
             knowhow: knowhow_load_evidence(&self.pool, limits.unused_days).await?,
             app_manager: &self.app_manager,
             knowhow_dirs: self.knowhow_dirs(),
@@ -701,7 +739,11 @@ fn assemble(
             }
         })
         .collect();
-    let total_chars = sections.iter().map(|s| s.chars).sum();
+    let total_chars = sections
+        .iter()
+        .filter(|s| s.when.counts_in_total())
+        .map(|s| s.chars)
+        .sum();
     WorkspacePromptFootprint {
         sections,
         total_chars,

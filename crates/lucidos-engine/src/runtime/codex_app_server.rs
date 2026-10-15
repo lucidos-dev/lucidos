@@ -47,7 +47,8 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 enum PendingRequest {
     Initialize,
     Thread,
-    TurnStart,
+    /// Carries the [`AgentInput::uuid`] of the input the turn starts with.
+    TurnStart(uuid::Uuid),
     TurnInterrupt,
 }
 
@@ -379,7 +380,6 @@ pub(super) async fn app_server_driver_task(
         // Start the next queued turn whenever the thread is ready and idle.
         if thread_ready && !turn_in_flight {
             if let Some(input) = queue.pop_front() {
-                let _ = events_tx.send(AgentEvent::InputRead(None));
                 let thread_id = tracker.session_id.clone().unwrap_or_default();
                 tracker.begin_turn();
                 turn_start = std::time::Instant::now();
@@ -394,7 +394,7 @@ pub(super) async fn app_server_driver_task(
                 );
                 let id = next_id;
                 next_id += 1;
-                pending.insert(id, PendingRequest::TurnStart);
+                pending.insert(id, PendingRequest::TurnStart(input.uuid));
                 let line = request_line(id, "turn/start", params);
                 send_frame!(line);
                 turn_in_flight = true;
@@ -460,7 +460,12 @@ pub(super) async fn app_server_driver_task(
                                         }
                                         thread_ready = true;
                                     }
-                                    (PendingRequest::TurnStart, None) => {
+                                    (PendingRequest::TurnStart(input), None) => {
+                                        // Codex took the input. Reported only
+                                        // now: a read is the turn gap's proof
+                                        // of delivery, so it must not precede
+                                        // the child accepting the turn.
+                                        let _ = events_tx.send(AgentEvent::InputRead { input });
                                         // The turn id for interrupts. Guarded:
                                         // a LATE response (turn already ended,
                                         // next turn possibly started) must not
@@ -515,8 +520,11 @@ pub(super) async fn app_server_driver_task(
                                             turn_start.elapsed().as_millis() as u64);
                                         break 'session;
                                     }
-                                    (PendingRequest::TurnStart, Some(msg)) => {
+                                    (PendingRequest::TurnStart(input), Some(msg)) => {
                                         log!("[CodexAppServer] turn/start rejected: {}", msg);
+                                        // Named before the `Result`, so the idle
+                                        // that follows owes nothing for it.
+                                        let _ = events_tx.send(AgentEvent::InputRejected { input });
                                         for ev in tracker.close_open_tools() {
                                             let _ = events_tx.send(ev);
                                         }

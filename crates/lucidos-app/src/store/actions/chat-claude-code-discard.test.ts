@@ -14,7 +14,6 @@ vi.mock('../store', () => ({
   showToast,
   discardingCCThreadIds,
   applyingNowThreadIds: signal(new Map<string, string>()),
-  archivingThreadIds: signal(new Set<string>()),
   changes: signal<unknown[]>([]),
 }));
 

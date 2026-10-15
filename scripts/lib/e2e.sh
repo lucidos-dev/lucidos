@@ -2,8 +2,8 @@
 
 # Honor an inherited value — a hard assignment here would clobber the sandbox a
 # test pins before sourcing us, and this variable is load-bearing for signalling:
-# `e2e_workspace_env` exports it as $WORKSPACE, which resolves $ENGINE_PIDFILE,
-# which `stop_e2e_engine` sends SIGUSR1 to. Clobbered, a `source e2e.sh` from a
+# `e2e_workspace_env` exports it as $WORKSPACE, whose engine `stop_e2e_engine`
+# sends SIGUSR1 to. Clobbered, a `source e2e.sh` from a
 # test aims that signal at the REAL e2e-test engine instead of the sandbox.
 # Same convention as `e2e_lock.sh` (`${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}`).
 # Nothing in the production path pre-sets it — `e2e-api.sh` / `e2e-browser.sh`
@@ -181,8 +181,8 @@ e2e_workspace_env() {
 }
 
 # ── build_e2e_engine_once ───────────────────────────────────────────────
-# Build the SDK bundle and the engine binaries the suite tests — ONCE per script
-# invocation. Every database recreate restarts the engine (a fresh database is
+# Build the engine binaries the suite tests, then the generated files and SDK
+# bundles — ONCE per script invocation. Every database recreate restarts the engine (a fresh database is
 # only migrated at boot), and each restart lands back here; recompiling
 # mid-suite would swap the binary out from under the running tests, so later
 # calls only LOCATE what the first call built. The marker is exported so the
@@ -193,11 +193,12 @@ build_e2e_engine_once() {
         build_or_find_engine
         return 0
     fi
-    # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
-    # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
-    build_sdk || return 1
     BUILD="1"
     build_or_find_engine || return 1
+    # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
+    # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
+    # The frontend build reads the generated files this writes too.
+    generate_build_outputs || return 1
     export LUCIDOS_E2E_ENGINE_BUILT=1
 }
 
@@ -231,6 +232,8 @@ build_e2e_engine_once() {
 #   tsconfig.json, package.json                — compiler options, deps, scripts
 #   packages/lucidos-sdk/src/                  — the workspace-local package the
 #                                                build aliases in as @lucidos/sdk
+#   packages/lucidos-sdk/dist/                 — the boot and preview bundles the
+#                                                build inlines
 #   crates/lucidos-engine/VERSION              — baked into the bundle by the
 #                                                engine-version plugin
 #   <root>/package.json + package-lock.json    — npm workspaces hoist to the root
@@ -251,6 +254,7 @@ _frontend_build_inputs() {
         "$FRONTEND_DIR/tsconfig.json" \
         "$FRONTEND_DIR/package.json" \
         "$_E2E_PROJECT_DIR/packages/lucidos-sdk/src" \
+        "$_E2E_PROJECT_DIR/packages/lucidos-sdk/dist" \
         "$_E2E_PROJECT_DIR/crates/lucidos-engine/VERSION" \
         "$_E2E_PROJECT_DIR/package.json" \
         "$_E2E_PROJECT_DIR/package-lock.json"
@@ -334,17 +338,25 @@ ensure_workspace_running() {
     # bites where dist/ is stale at boot, which is any worktree, since the
     # build-watch keeps the main checkout current. A reused engine (--no-reset)
     # already holds a pin, and only a restart re-takes it.
+    #
+    # The engine BUILD comes first, though: it writes the generated files the
+    # frontend build reads (build_e2e_engine_once).
+    local engine_running=""
+    if curl -sk "${PROTO}://localhost:${engine_port}/api/v1/health" >/dev/null 2>&1; then
+        engine_running=1
+    else
+        build_e2e_engine_once || return 1
+    fi
     ensure_frontend_built || return 1
 
     # ── Engine ──
-    if curl -sk "${PROTO}://localhost:${engine_port}/api/v1/health" >/dev/null 2>&1; then
+    if [ -n "$engine_running" ]; then
         echo "Engine already running on port $engine_port"
         # Set up env vars that swap_ports normally provides
         swap_ports
     else
         echo "Starting e2e workspace (LUCIDOS_MODEL=$LUCIDOS_MODEL)..."
         setup_postgres
-        build_e2e_engine_once
         swap_ports
         attach_e2e_gateway || return 1
         start_engine
@@ -592,6 +604,7 @@ e2e_spec_spawns_claude_code() {
 # Succeed when a spec has a test tagged @real-claude-code. GitHub mode keeps
 # those on this host, where Claude Code is logged in. Every other spec runs
 # on GitHub, against the fake in crates/lucidos-app/e2e/fake-claude-code/.
+# `-` reads the spec from stdin, for a spec read out of a commit.
 e2e_spec_needs_real_claude_code() {
     grep -q "@real-claude-code" "$1" 2>/dev/null
 }
@@ -657,7 +670,8 @@ export_e2e_mem_sample_env() {
     LUCIDOS_E2E_WEBKIT_PATH_TOKEN="$(_reaper_match)"
     export LUCIDOS_E2E_WEBKIT_PATH_TOKEN
     if [ -n "${LUCIDOS_E2E_RUN_ID:-}" ]; then
-        export LUCIDOS_E2E_MEM_MIRROR="$HOME/.lucidos/e2e-mem/$LUCIDOS_E2E_RUN_ID.log"
+        LUCIDOS_E2E_MEM_MIRROR="$(lucidos_home_dir)/e2e-mem/$LUCIDOS_E2E_RUN_ID.log"
+        export LUCIDOS_E2E_MEM_MIRROR
     else
         unset LUCIDOS_E2E_MEM_MIRROR
     fi
@@ -990,16 +1004,15 @@ stop_e2e_workspace() {
 # legitimate stop, and it also ends the supervisor's restart loop, so the engine
 # stays down until we start it again. No-op when nothing is running.
 stop_e2e_engine() {
-    local pid=""
-    if [ -f "$ENGINE_PIDFILE" ]; then
-        pid="$(cat "$ENGINE_PIDFILE" 2>/dev/null || true)"
+    local pids
+    pids="$(engine_pids_to_signal "$WORKSPACE" | tr '\n' ' ')"
+    pids="${pids% }"
+    if [ -n "$pids" ]; then
+        echo "Stopping engine (PID $pids) so the database can be recreated..."
+        # shellcheck disable=SC2086 # one word per pid
+        kill -USR1 $pids 2>/dev/null || true
+        wait_for_engine_shutdown "$VITE_PORT" "$pids" || true
     fi
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        echo "Stopping engine (PID $pid) so the database can be recreated..."
-        kill -USR1 "$pid" 2>/dev/null || true
-        wait_for_engine_shutdown "$VITE_PORT" "$pid" || true
-    fi
-    rm -f "$ENGINE_PIDFILE"
 }
 
 # ── settle_e2e_workspace_tree ─────────────────────────────────────────────
@@ -1036,12 +1049,11 @@ settle_e2e_workspace_tree() {
 # cleanup_e2e_worktrees, which reads the workspace's own git.
 reset_e2e_workspace_tree() {
     assert_e2e_workspace_is_disposable || return 1
-    local ws="$E2E_WORKSPACE" pid entry removed=0
+    local ws="$E2E_WORKSPACE" entry removed=0 held=0
     [ -d "$ws" ] || return 0
-    pid="$(cat "$ws/.lucidos/engine.pid" 2>/dev/null || true)"
-    case "$pid" in '' | *[!0-9]*) pid="" ;; esac
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        echo "ERROR: the e2e engine (pid $pid) is still running, so its workspace tree was not reset." >&2
+    lock_is_held "$(engine_lock_path "$ws")" || held=$?
+    if [ "$held" -ne 1 ]; then
+        echo "ERROR: an e2e engine still owns $ws, or its lock could not be read, so its workspace tree was not reset." >&2
         return 1
     fi
     for entry in "$ws"/* "$ws"/.[!.]* "$ws"/..?*; do
@@ -1136,6 +1148,9 @@ reset_e2e_database() {
     local db
     db="$(workspace_database_name)"
     echo "Recreating database $db from zero..."
+    # .lucidos/ survives the reset, and so would the migration marker. The
+    # engine would then refuse the new database as wiped (ADR 0481).
+    rm -f "$E2E_WORKSPACE/.lucidos/database-migrated"
     _drop_shared_database "$db" || return 1
     _create_shared_database "$db" || return 1
 
@@ -1154,5 +1169,11 @@ reset_e2e_database() {
 
     # Boots the engine, which runs the whole migration chain against the empty
     # database — seeds included.
-    ensure_workspace_running
+    ensure_workspace_running || return 1
+
+    # A new workspace has not chosen its memory module, so the memory choice
+    # would cover every spec. Answer it as closing the modal does.
+    # memory-choice.spec.ts deletes the answer to see the modal.
+    shared_pg_psql "$db" -v ON_ERROR_STOP=1 -q -c \
+        "INSERT INTO preferences (key, value) VALUES ('memory_module', 'classic') ON CONFLICT (key, COALESCE(device_id, '')) DO NOTHING;"
 }

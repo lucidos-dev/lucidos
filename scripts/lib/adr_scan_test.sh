@@ -1,22 +1,17 @@
 #!/bin/bash
 # Tests for the ADR conflict tooling: the shared library scripts/lib/adr_scan.sh,
 # the allocator scripts/adr-new.sh, the checker scripts/check-adrs.sh, and the
-# `merge=union` attribute in .gitattributes that the whole design rests on.
+# index's merge attribute in .gitattributes.
 #
 # Hermetic: every case builds a throwaway git repo under mktemp -d and runs the
-# real scripts inside it. Nothing reads or writes the Lucidos tree, and no
-# process is signalled, so the outcome cannot drift as the repo gains ADRs.
+# real scripts inside it. Nothing writes the Lucidos tree, and no process is
+# signalled. Only the three attribute checks read the tree, through
+# `git check-attr`, so the outcome cannot drift as the repo gains ADRs.
 #
-# The two behaviours worth stating up front, because they are the reason the
-# tooling is shaped this way (see
-# docs/plans/2026-08-04-conflict-free-adr-index-and-numbering.md):
-#
-#   - `merge=union` turns the guaranteed append/append conflict on the index
-#     into a clean merge. The control case removes ONLY the attribute and
-#     asserts the same merge conflicts, so a future edit to .gitattributes that
-#     silently stops matching is caught here rather than at the next collision.
-#   - Union keeps both lines but neither orders nor deduplicates them, which is
-#     precisely the gap check-adrs.sh covers.
+# The index merges through the keyed `lucidos-sorted-lines` driver (ADR 0460),
+# whose behaviour crates/lucidos-cli tests and scripts/lib/merge_drivers_test.sh
+# covers. Here: the shipped attribute names it, the index resolves to it, and
+# no path still uses union merge, which reordered and duplicated index lines.
 #
 # Run: ./scripts/lib/adr_scan_test.sh
 set -u
@@ -25,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_SRC="$(cd "$SCRIPT_DIR/../.." && pwd)"
 NEW="$REPO_SRC/scripts/adr-new.sh"
 CHECK="$REPO_SRC/scripts/check-adrs.sh"
-ATTRS_LINE="docs/adr/index.md merge=union"
+ATTRS_LINE="docs/adr/index.md merge=lucidos-sorted-lines"
 
 PASS=0
 FAIL=0
@@ -105,78 +100,37 @@ run_new() { # <repo> [args...]
     NEW_RC=$?
 }
 
-# ---------------------------------------------------------------- union merge
-
-test_union_merge_keeps_both_appended_lines() {
-    local repo
-    repo="$(new_repo)"
-    git -C "$repo" checkout -q -b branch-a
-    write_adr "$repo" "0002" "alpha"
-    index_line "$repo" "0002" "alpha"
-    git -C "$repo" add -A && git -C "$repo" commit -qm alpha
-
-    git -C "$repo" checkout -q main
-    git -C "$repo" checkout -q -b branch-b
-    write_adr "$repo" "0003" "bravo"
-    index_line "$repo" "0003" "bravo"
-    git -C "$repo" add -A && git -C "$repo" commit -qm bravo
-
-    if git -C "$repo" merge branch-a --no-edit -q > /dev/null 2>&1; then
-        if grep -q '0002-alpha' "$repo/docs/adr/index.md" \
-            && grep -q '0003-bravo' "$repo/docs/adr/index.md"; then
-            pass "concurrent index appends merge clean and both lines survive"
-        else
-            fail "merge was clean but an index line was lost"
-        fi
-    else
-        fail "concurrent index appends conflicted despite merge=union"
-    fi
-}
-
-test_control_without_the_attribute_conflicts() {
-    local repo
-    repo="$(new_repo)"
-    # Remove ONLY the attribute. If this case ever passes, merge=union stopped
-    # being what makes the case above work and the shipped attribute is dead.
-    rm "$repo/.gitattributes"
-    git -C "$repo" add -A && git -C "$repo" commit -qm "drop attribute"
-
-    git -C "$repo" checkout -q -b branch-a
-    index_line "$repo" "0002" "alpha"
-    git -C "$repo" commit -qam alpha
-    git -C "$repo" checkout -q main
-    git -C "$repo" checkout -q -b branch-b
-    index_line "$repo" "0003" "bravo"
-    git -C "$repo" commit -qam bravo
-
-    if git -C "$repo" merge branch-a --no-edit -q > /dev/null 2>&1; then
-        fail "control: the same merge should conflict without merge=union"
-    else
-        git -C "$repo" merge --abort 2> /dev/null
-        pass "control: without merge=union the identical merge conflicts"
-    fi
-}
+# ------------------------------------------------------------ merge attribute
 
 test_shipped_gitattributes_carries_the_rule() {
     if grep -qxF "$ATTRS_LINE" "$REPO_SRC/.gitattributes" 2> /dev/null; then
-        pass "the shipped .gitattributes carries the index union rule"
+        pass "the shipped .gitattributes names the index driver"
     else
         fail "the shipped .gitattributes no longer carries '$ATTRS_LINE'"
     fi
 }
 
-test_union_is_scoped_to_the_index_alone() {
-    local other stray
-    stray=""
-    for other in docs/adr/README.md docs/glossary.md CHANGELOG.md CLAUDE.md; do
-        if [ "$(git -C "$REPO_SRC" check-attr merge -- "$other" | sed 's/.*: //')" != "unspecified" ]; then
-            stray="$stray $other"
+test_the_index_resolves_to_its_driver() {
+    local got
+    got=$(git -C "$REPO_SRC" check-attr merge -- docs/adr/index.md | sed 's/.*: //')
+    if [ "$got" = "lucidos-sorted-lines" ]; then
+        pass "docs/adr/index.md resolves to the lucidos-sorted-lines driver"
+    else
+        fail "docs/adr/index.md resolves to merge=$got"
+    fi
+}
+
+test_no_path_uses_union_merge() {
+    local path stray=""
+    for path in docs/adr/index.md docs/adr/README.md docs/glossary.md CHANGELOG.md CLAUDE.md; do
+        if [ "$(git -C "$REPO_SRC" check-attr merge -- "$path" | sed 's/.*: //')" = "union" ]; then
+            stray="$stray $path"
         fi
     done
     if [ -z "$stray" ]; then
-        pass "no prose file inherits a merge driver"
+        pass "no path uses union merge"
     else
-        fail "a merge driver reaches prose:$stray"
+        fail "union merge is back on:$stray"
     fi
 }
 
@@ -551,8 +505,8 @@ test_missing_index_fails_closed() {
 
 # ------------------------------------------------------------------ --fix
 
-# Build a repo whose index is in the state a union merge leaves behind: both
-# lines present, the later number first.
+# Build a repo whose index is out of order, as a hand edit or a merge without
+# the driver can leave it: both lines present, the later number first.
 unsorted_repo() {
     local repo
     repo="$(new_repo)"
@@ -619,11 +573,10 @@ test_fix_refuses_to_strand_content() {
     fi
 }
 
-echo "── merge=union ──"
+echo "── merge attribute ──"
 test_shipped_gitattributes_carries_the_rule
-test_union_is_scoped_to_the_index_alone
-test_union_merge_keeps_both_appended_lines
-test_control_without_the_attribute_conflicts
+test_the_index_resolves_to_its_driver
+test_no_path_uses_union_merge
 
 echo "── allocation ──"
 test_allocates_above_main_branch_and_worktree

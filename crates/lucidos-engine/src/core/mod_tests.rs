@@ -1,96 +1,64 @@
 use super::*;
 
 #[test]
-fn pg_env_vars_extracts_standard_url() {
-    let vars = pg_env_vars("postgres://lucidos:lucidos@localhost:5432/lucidos");
-    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
-    assert_eq!(map.get("PGUSER").map(String::as_str), Some("lucidos"));
-    assert_eq!(map.get("PGPASSWORD").map(String::as_str), Some("lucidos"));
-    assert_eq!(map.get("PGHOST").map(String::as_str), Some("localhost"));
-    assert_eq!(map.get("PGPORT").map(String::as_str), Some("5432"));
-    assert_eq!(map.get("PGDATABASE").map(String::as_str), Some("lucidos"));
-}
-
-#[test]
-fn pg_env_vars_accepts_postgresql_scheme() {
-    let vars = pg_env_vars("postgresql://u:p@h:1234/db");
-    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
-    assert_eq!(map.get("PGUSER").map(String::as_str), Some("u"));
-    assert_eq!(map.get("PGPASSWORD").map(String::as_str), Some("p"));
-    assert_eq!(map.get("PGHOST").map(String::as_str), Some("h"));
-    assert_eq!(map.get("PGPORT").map(String::as_str), Some("1234"));
-    assert_eq!(map.get("PGDATABASE").map(String::as_str), Some("db"));
-}
-
-#[test]
-fn pg_env_vars_accepts_passwordless_trust_auth_url() {
-    // The gateway's embedded (packaged) Postgres backend hands the engine a
-    // passwordless URL (trust auth on loopback). It must parse so a picker
-    // restore's `pg_restore`/`psql` get PG* env; PGPASSWORD is simply omitted.
-    let vars = pg_env_vars("postgres://lucidos@127.0.0.1:5599/lucidos");
-    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
-    assert_eq!(map.get("PGUSER").map(String::as_str), Some("lucidos"));
-    assert_eq!(map.get("PGHOST").map(String::as_str), Some("127.0.0.1"));
-    assert_eq!(map.get("PGPORT").map(String::as_str), Some("5599"));
-    assert_eq!(map.get("PGDATABASE").map(String::as_str), Some("lucidos"));
-    assert!(
-        !map.contains_key("PGPASSWORD"),
-        "a passwordless URL must not emit PGPASSWORD"
+fn an_unparseable_boot_url_gives_no_handle() {
+    assert_eq!(read_only_database_url("not a url at all"), None);
+    assert_eq!(read_only_database_url("http://wrong/scheme"), None);
+    assert_eq!(
+        read_only_database_url("postgres://host-but-no-database"),
+        None
     );
 }
 
 #[test]
-fn pg_env_vars_explicit_empty_password_still_emits_pgpassword() {
-    // `user:@host` carried an (empty) password segment; preserve prior behavior
-    // of emitting an empty PGPASSWORD so the no-segment case stays distinct.
-    let vars = pg_env_vars("postgres://u:@host:5432/db");
-    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
-    assert_eq!(map.get("PGPASSWORD").map(String::as_str), Some(""));
+fn the_cached_handle_renders_the_boot_url() {
+    assert_eq!(
+        lucidos_database_url_env(),
+        read_only_database_url(&database_url()).map(|url| (LUCIDOS_DATABASE_URL.to_string(), url))
+    );
 }
 
+/// The engine pool reads the same URL through sqlx, which must reach the
+/// socket too. The literal pins the shape the gateway hands a packaged engine.
 #[test]
-fn pg_env_vars_defaults_port_when_omitted() {
-    let vars = pg_env_vars("postgres://u:p@host/db");
-    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
-    assert_eq!(map.get("PGPORT").map(String::as_str), Some("5432"));
-    assert_eq!(map.get("PGHOST").map(String::as_str), Some("host"));
+fn sqlx_reads_the_packaged_socket_url_as_a_socket() {
+    use std::str::FromStr as _;
+    let options = sqlx::postgres::PgConnectOptions::from_str(
+        "postgres:///lucidos_myws?host=%2FUsers%2Fme%20x%2F.lucidos%2Frun%2Fpg-0123&port=5432&user=lucidos",
+    )
+    .unwrap();
+    assert_eq!(
+        options.get_socket(),
+        Some(&std::path::PathBuf::from(
+            "/Users/me x/.lucidos/run/pg-0123"
+        ))
+    );
+    assert_eq!(options.get_port(), 5432);
+    assert_eq!(options.get_username(), "lucidos");
+    assert_eq!(options.get_database(), Some("lucidos_myws"));
 }
 
+/// A Rust script would read the handle through sqlx. It must reach the socket
+/// and keep the read-only option.
 #[test]
-fn pg_env_vars_decodes_percent_encoded_password() {
-    // password "p@ss/word" url-encoded
-    let vars = pg_env_vars("postgres://u:p%40ss%2Fword@host:5432/db");
-    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
-    assert_eq!(map.get("PGPASSWORD").map(String::as_str), Some("p@ss/word"));
-}
-
-#[test]
-fn pg_env_vars_strips_query_string_from_dbname() {
-    let vars = pg_env_vars("postgres://u:p@host:5432/db?sslmode=require&application_name=engine");
-    let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
-    assert_eq!(map.get("PGDATABASE").map(String::as_str), Some("db"));
-}
-
-#[test]
-fn pg_env_vars_returns_empty_when_url_unparseable() {
-    assert!(pg_env_vars("not a url at all").is_empty());
-    assert!(pg_env_vars("http://wrong/scheme").is_empty());
-    assert!(pg_env_vars("postgres://no-at-sign/db").is_empty());
-}
-
-#[test]
-fn pg_env_vars_cached_returns_same_shape_as_direct_call() {
-    // The cached variant reads from the process env on first access; in the
-    // test process DATABASE_URL may or may not be set. Either way, the
-    // shape (count + key set, or empty) must agree with a fresh call
-    // against the same URL.
-    let direct = pg_env_vars(&database_url());
-    let cached = pg_env_vars_cached();
-    assert_eq!(direct.len(), cached.len());
-    for (a, b) in direct.iter().zip(cached.iter()) {
-        assert_eq!(a.0, b.0);
-        assert_eq!(a.1, b.1);
-    }
+fn sqlx_reads_the_read_only_socket_handle() {
+    use std::str::FromStr as _;
+    let handle = read_only_database_url(
+        "postgres:///lucidos_myws?host=%2FUsers%2Fme%20x%2Frun%2Fpg-0123&user=lucidos",
+    )
+    .expect("renders");
+    let options = sqlx::postgres::PgConnectOptions::from_str(&handle).unwrap();
+    assert_eq!(
+        options.get_socket(),
+        Some(&std::path::PathBuf::from("/Users/me x/run/pg-0123"))
+    );
+    assert_eq!(options.get_username(), "lucidos");
+    assert_eq!(options.get_database(), Some("lucidos_myws"));
+    // The decoded literal pins what Postgres itself receives.
+    assert_eq!(
+        options.get_options(),
+        Some("-c default_transaction_read_only=on")
+    );
 }
 
 #[test]
@@ -212,25 +180,33 @@ fn injected_secret_values_picks_the_secret_bearing_names_only() {
 /// Masking by value is safe only while the value is unique to the secret. Every
 /// dev and e2e workspace uses the literal Postgres password `lucidos`. So does
 /// the user, the database, the binary and every path. Masking it turned
-/// `ls ~/workspaces/dev` into a listing of `[REDACTED]`.
+/// `ls ~/workspaces/dev` into a listing of `[REDACTED]`. So the database
+/// handle is masked whole, and its parts survive elsewhere.
 #[test]
-fn injected_secret_values_leaves_the_postgres_password_alone() {
+fn the_database_handle_is_masked_whole_and_its_parts_survive() {
+    let handle = format!(
+        "postgresql://lucidos:lucidos@localhost:5432/lucidos_dev?options={}",
+        lucidos_pg_url::READ_ONLY_OPTION
+    );
     let env = vec![
-        ("PGUSER".to_string(), "lucidos".to_string()),
-        ("PGPASSWORD".to_string(), "lucidos".to_string()),
-        ("PGDATABASE".to_string(), "lucidos_dev".to_string()),
+        (LUCIDOS_DATABASE_URL.to_string(), handle.to_string()),
         ("CRED_REAL".to_string(), "ghp_uniquevalue".to_string()),
     ];
+    let mut picked = injected_secret_values(&env);
+    picked.sort();
     assert_eq!(
-        injected_secret_values(&env),
-        vec!["ghp_uniquevalue".to_string()],
-        "PGPASSWORD is out of the families entirely"
+        picked,
+        vec!["ghp_uniquevalue".to_string(), handle.to_string()]
     );
-    let result = "ls /Users/me/workspaces/dev/.lucidos: lucidos-engine lucidos_dev";
+    let result = format!(
+        "LUCIDOS_DATABASE_URL={handle}\n\
+         ls /Users/me/workspaces/dev/.lucidos: lucidos-engine lucidos_dev"
+    );
     assert_eq!(
-        redact_secret_values(result, &injected_secret_values(&env)),
-        result,
-        "ordinary output must survive untouched"
+        redact_secret_values(&result, &injected_secret_values(&env)),
+        "LUCIDOS_DATABASE_URL=[REDACTED]\n\
+         ls /Users/me/workspaces/dev/.lucidos: lucidos-engine lucidos_dev",
+        "an `env` dump hides the handle, and ordinary output survives"
     );
 }
 
@@ -1665,8 +1641,8 @@ fn describe_cc_tool_only_claims_one_verb_when_the_whole_patch_agrees() {
 
 #[test]
 fn migrate_top_level_prompts_to_triggers() {
-    let dir = std::env::temp_dir().join("lucidos_test_migrate_prompts");
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
     let prompts_dir = dir.join("data/prompts");
     std::fs::create_dir_all(&prompts_dir).unwrap();
     std::fs::write(
@@ -1686,14 +1662,12 @@ fn migrate_top_level_prompts_to_triggers() {
     assert!(prompts_dir.join("notes.txt").exists());
     // prompts dir still exists (not empty due to notes.txt)
     assert!(prompts_dir.exists());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn migrate_app_prompts_to_intents() {
-    let dir = std::env::temp_dir().join("lucidos_test_migrate_app_prompts");
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
     let app_prompts = dir.join("data/apps/my-app/prompts");
     std::fs::create_dir_all(&app_prompts).unwrap();
     std::fs::write(
@@ -1707,14 +1681,12 @@ fn migrate_app_prompts_to_intents() {
     // prompts/ renamed to intents/
     assert!(dir.join("data/apps/my-app/intents/workflow.md").exists());
     assert!(!app_prompts.exists());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn migrate_skips_if_already_done() {
-    let dir = std::env::temp_dir().join("lucidos_test_migrate_idempotent");
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
 
     // Already-migrated state: intents/ exists, prompts/ also exists with a file
     let app_intents = dir.join("data/apps/my-app/intents");
@@ -1729,14 +1701,12 @@ fn migrate_skips_if_already_done() {
     // prompts/ NOT overwritten — intents/ already existed
     assert!(app_prompts.exists());
     assert!(app_intents.join("new.md").exists());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn migrate_empty_prompts_dir_removed() {
-    let dir = std::env::temp_dir().join("lucidos_test_migrate_empty_prompts");
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
     let prompts_dir = dir.join("data/prompts");
     std::fs::create_dir_all(&prompts_dir).unwrap();
     std::fs::write(
@@ -1750,8 +1720,6 @@ fn migrate_empty_prompts_dir_removed() {
     // File moved, dir should be empty and removed
     assert!(!prompts_dir.exists());
     assert!(dir.join("data/triggers/only/only.md").exists());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// On a fresh workspace (no .gitignore), the file is created with all
@@ -2462,4 +2430,44 @@ fn a_deletion_landing_mid_full_tree_commit_stays_deleted() {
         "the deletion was reverted"
     );
     assert!(tree.get_name("dirty.txt").is_some(), "dirty.txt was lost");
+}
+
+/// The guard the handle exists for: an accidental `DROP SCHEMA` or `CREATE`
+/// through it fails, while a read works and a deliberate write still can.
+#[tokio::test]
+async fn the_database_handle_refuses_writes_until_a_transaction_opts_in() {
+    use sqlx::Connection as _;
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    pool.close().await;
+    let handle = read_only_database_url(&crate::test_support::test_db_url(&db_name))
+        .expect("the test URL renders");
+    let mut conn = sqlx::PgConnection::connect(&handle)
+        .await
+        .expect("connect through the handle");
+
+    for ddl in [
+        "CREATE TABLE handle_probe (id int)",
+        "DROP SCHEMA public CASCADE",
+    ] {
+        let err = sqlx::raw_sql(ddl)
+            .execute(&mut conn)
+            .await
+            .expect_err("a write through the handle must fail");
+        assert!(
+            err.to_string().contains("read-only transaction"),
+            "{ddl}: {err}"
+        );
+    }
+    let one: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&mut conn)
+        .await
+        .expect("a read works");
+    assert_eq!(one, 1);
+    sqlx::raw_sql("BEGIN READ WRITE; CREATE TABLE handle_probe (id int); COMMIT")
+        .execute(&mut conn)
+        .await
+        .expect("an opted-in write works");
+
+    conn.close().await.expect("close");
+    crate::test_support::teardown_test_db(&db_name).await;
 }

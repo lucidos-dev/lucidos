@@ -142,6 +142,16 @@ let _heldGlideFrozenTop: number | null = null;
  *  under the reader, so the start the tween eases from has to move with it.
  *  The tween never reads `scrollTop` after its first frame (ADR 0065). */
 let _shiftTweenStart: ((delta: number) => void) | null = null;
+/** Re-bases the tween in flight's `start`, or null with no tween. Its next
+ *  frames then ease on from the position it last wrote toward a fixed
+ *  `target`. A landing's freeze calls it. Without it, a freeze below where
+ *  the glide was heading would step the reader backwards. */
+let _continueTweenTo: ((target: number) => void) | null = null;
+/** Counts the tweens that have ended. A step compares it after reading its
+ *  target, because a landing's target runs the hold, and the hold can end
+ *  this tween or start another. The step then stops rather than reschedule
+ *  itself beside its replacement (ADR 0065: one tween at a time). */
+let _endedTweens = 0;
 /** Forget the tween: no rAF pending, and nobody owning one. EVERY way a tween
  *  ends goes through this, the natural landing included. So every field
  *  above means "in flight" rather than "was in flight last time". */
@@ -151,6 +161,8 @@ function endScrollAnim() {
   _heldAnimTarget = null;
   _heldGlideFrozenTop = null;
   _shiftTweenStart = null;
+  _continueTweenTo = null;
+  _endedTweens++;
 }
 function cancelScrollAnim() {
   if (_scrollAnimRaf !== null) cancelAnimationFrame(_scrollAnimRaf);
@@ -625,8 +637,9 @@ export function onFollowRideStarted(listener: () => void): () => void {
 type ResolvedTurn = { turn: HTMLElement; drawnAtSubmit: number };
 
 /** Resolves the turn a submit was made on, or null while that turn is not
- *  addressable yet. Asked at submit time and again on every growth round, until
- *  the landing lets go or lapses (see `_pendingLanding`). */
+ *  addressable yet. Asked at submit time, on every growth round, and before
+ *  each frame of the landing's glide, until the landing lets go or lapses (see
+ *  `_pendingLanding`). */
 type TurnResolver = (el: HTMLElement) => ResolvedTurn | null;
 
 /** THE SUBMIT'S LANDING, from the submit until the agent starts (ADR 0080). It
@@ -729,9 +742,61 @@ const LANDING_AGENT_START_MS = 60_000;
 export const DRAWN_ROW_SELECTOR = '.response-content > :not(.disclosure), '
   + '.response-content > .disclosure > .disclosure-body > :not(.response-elision):not([data-thinking-row])';
 
-function drawnRows(turn: HTMLElement): number {
-  if (typeof turn.querySelectorAll !== 'function') return 0;
-  return turn.querySelectorAll(DRAWN_ROW_SELECTOR).length;
+function drawnRows(turn: HTMLElement): ArrayLike<HTMLElement> {
+  if (typeof turn.querySelectorAll !== 'function') return [];
+  return turn.querySelectorAll<HTMLElement>(DRAWN_ROW_SELECTOR);
+}
+
+/** Where THE RELEASING ROUND rests: the live edge, unless `row` reaches past
+ *  it by more than its first line. Then it rests with that line just clear of
+ *  the composer dissolve, and the rest of the row below the fold.
+ *
+ *  `row` is the agent's first row, the one that ended the hold. A step row or
+ *  a streamed reply's opening is about a line tall, so it shows whole. A reply
+ *  that arrives all at once is ONE row. Resting below it carried the reader
+ *  through a reply they never asked to follow (ADR 0080 § Amendment: the
+ *  release shows where the reply starts).
+ *
+ *  Never above the reader, because a landing never scrolls backwards. No row
+ *  means the live edge: a queued turn, a new question card, or a count that
+ *  went down. */
+function releaseRestTop(el: HTMLElement, row: HTMLElement | undefined): number {
+  const edge = liveEdgeTop(el);
+  const lineBottom = row ? firstLineBottom(row) : null;
+  if (lineBottom === null) return edge;
+  const lineBottomTop = lineBottom - el.getBoundingClientRect().top + el.scrollTop;
+  return Math.min(edge, Math.max(el.scrollTop, lineBottomTop + bottomPadding(el) - el.clientHeight));
+}
+
+/** The viewport bottom of `row`'s first line of text, or of the whole row when
+ *  no text in it has a box to measure. Null with no layout at all. */
+function firstLineBottom(row: HTMLElement): number | null {
+  if (typeof row.getBoundingClientRect !== 'function') return null;
+  return firstCharacterRect(row)?.bottom ?? row.getBoundingClientRect().bottom;
+}
+
+/** The box of the first visible character in `row`, whose bottom is the first
+ *  line's. A character rather than the text node, because a node's box spans
+ *  every line it wraps onto. */
+function firstCharacterRect(row: HTMLElement): DOMRect | null {
+  if (typeof document === 'undefined' || !(row instanceof Node)) return null;
+  const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const at = node.textContent?.search(/\S/) ?? -1;
+    if (at < 0) continue;
+    const range = document.createRange();
+    range.setStart(node, at);
+    range.setEnd(node, at + 1);
+    const rect = range.getClientRects()[0];
+    if (rect) return rect;
+  }
+  return null;
+}
+
+/** The transcript's bottom padding: the band the composer dissolve paints
+ *  over, which the live edge scrolls past (ADR 0080). */
+function bottomPadding(el: HTMLElement): number {
+  return typeof getComputedStyle === 'function' ? (parseFloat(getComputedStyle(el).paddingBottom) || 0) : 0;
 }
 
 /** Is this turn a QUEUED follow-up, which will never draw a response of its
@@ -768,9 +833,12 @@ function clampToScrollRange(el: HTMLElement, top: number): number {
   return Math.max(0, Math.min(top, liveEdgeTop(el)));
 }
 
-/** The ONE at-the-live-edge threshold, asked of an OFFSET. 2px of slack absorbs
- *  subpixel rounding (mobile zoom, device-pixel snapping) and the iOS overscroll
- *  bounce, without making the chevron look stuck.
+/** How far short of a resting place still counts as on it. It absorbs subpixel
+ *  rounding (mobile zoom, device-pixel snapping) and the iOS overscroll bounce,
+ *  without making the chevron look stuck. */
+const RESTING_SLACK_PX = 2;
+
+/** The ONE at-the-live-edge threshold, asked of an OFFSET.
  *
  *  Taking an offset rather than reading `scrollTop` is what lets a navigation
  *  ask it of a landing it has not made yet. Two do, and both must: turn stepping
@@ -778,7 +846,7 @@ function clampToScrollRange(el: HTMLElement, top: number): number {
  *  fate by where it is about to come to rest. A target BEYOND the edge answers
  *  true, the browser clamping it back to the edge. */
 function isLiveEdgeTop(el: HTMLElement, top: number): boolean {
-  return top >= liveEdgeTop(el) - 2;
+  return top >= liveEdgeTop(el) - RESTING_SLACK_PX;
 }
 
 /** Is the reader ON the live edge right now? Read by the chevron's reconcile,
@@ -1691,26 +1759,24 @@ function turnLandingClearancePx(turn: HTMLElement): number {
  *  chevron behind it. The write can land where the container already was, and
  *  then no scroll event arrives to do that reconcile itself.
  *
- *  The instant half of `glideToLiveEdge`, factored out for two callers that want
- *  exactly it: the reduced-motion branch below, and `honourAnchoredMutation`,
- *  where landing inside the frame IS the point. Neither may drift from the other
- *  on where the live edge is.
+ *  The instant half of `glideToLiveEdge`, for its reduced-motion branch. A
+ *  releasing round passes the `frozenTop` its glide would have frozen at.
  *
  *  It supersedes EVERY tween, including a held one that `glideToLiveEdge`
  *  would have stood down for. That stand-down exists so a second call cannot
  *  restart the easing part-way, and there is no easing here. */
-function snapToLiveEdge(el: HTMLElement): void {
+function snapToLiveEdge(el: HTMLElement, frozenTop = liveEdgeTop(el)): void {
   cancelScrollAnim();
-  markHeldScroll(el, liveEdgeTop(el));
+  markHeldScroll(el, frozenTop);
   syncAwayFromBottom();
 }
 
 /** Glide to the LIVE EDGE, marking every frame as a held scroll. It is where
  *  BOTH held glides go: the standing follow's ride, and a submit's landing
- *  (ADR 0080). The target is re-read per frame unless `freeze` says otherwise,
- *  so the tween lands on the bottom the transcript has when it ENDS. That
- *  tracks a reply streaming under it, and it covers a response row mounting a
- *  commit after the row the landing waited for.
+ *  (ADR 0080). The target is re-read per frame unless `freezeAt` fixes it, so
+ *  the tween lands on the bottom the transcript has when it ENDS. That tracks
+ *  a reply streaming under it, and it covers a response row mounting a commit
+ *  after the row the landing waited for.
  *
  *  `owner` says WHOSE glide this is, and the stand-down is scoped to it. A
  *  second call for the same owner finds its own glide in flight and leaves it
@@ -1724,16 +1790,16 @@ function snapToLiveEdge(el: HTMLElement): void {
  *
  *  A landing always moves at `SEND_PACE`, since only a submit lands. A ride
  *  takes the pace its caller names. */
-function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freeze = false, ridePace = NAVIGATION_PACE): void {
+function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freezeAt?: number, ridePace = NAVIGATION_PACE): void {
   if (_heldAnim && _heldAnimTarget === owner) {
     // The glide in flight is this owner's own, so its MOTION is left alone. A
     // freeze still reaches it, because a freeze changes where the glide is
     // going rather than restarting how it gets there.
-    if (freeze) freezeLandingGlide(el);
+    if (freezeAt !== undefined) freezeLandingGlide(freezeAt);
     return;
   }
   if (isReducedMotion()) {
-    snapToLiveEdge(el);
+    snapToLiveEdge(el, freezeAt);
     return;
   }
   // Reconcile the chevron on landing for the same reason `scrollToBottomAnimated`
@@ -1744,7 +1810,15 @@ function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freeze = false, ride
   // nothing left to release on. It cannot spin: a fresh glide needs the live
   // edge to have moved again, which needs real growth. A frozen glide replays
   // into a landing already let go, so its round costs nothing.
-  animateScroll((c) => _heldGlideFrozenTop ?? liveEdgeTop(c), () => {
+  //
+  // A landing asks its hold before EVERY frame too, not only on the growth
+  // round. The browser runs a frame before its resize observers. So a reply
+  // committed between the two was tracked to its end before the round that
+  // ends the hold could freeze the glide.
+  animateScroll((c) => {
+    if (owner === 'landing') honourLanding(c);
+    return _heldGlideFrozenTop ?? liveEdgeTop(c);
+  }, () => {
     syncAwayFromBottom();
     if (owner !== 'landing') return;
     const cur = resolveTarget();
@@ -1753,13 +1827,13 @@ function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freeze = false, ride
   _heldAnimTarget = owner;
   // After `animateScroll`, whose own cancel clears the frozen target with the
   // tween it replaced.
-  if (freeze) freezeLandingGlide(el);
+  if (freezeAt !== undefined) freezeLandingGlide(freezeAt);
 }
 
-/** STOP the landing's glide chasing the live edge, and rest it on the edge as it
- *  stands NOW. The hold's LAST glide is what asks. It aims at the edge the
- *  agent's FIRST row left, so a row arriving later cannot carry the reader on to
- *  that one as well. Every other glide keeps the live target, which is what
+/** STOP the landing's glide chasing the live edge, and rest it on `top`. The
+ *  hold's LAST glide is what asks. It aims where the agent's FIRST row left
+ *  the reader (`releaseRestTop`), so a row arriving later cannot carry them on
+ *  to that one as well. Every other glide keeps the live target, which is what
  *  catches the opening instalments (ADR 0080).
  *
  *  It is called from TWO moments of one act, and that is the point. The hold
@@ -1771,11 +1845,12 @@ function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freeze = false, ride
  *
  *  Two guards. Only the LANDING's glide may freeze: a ride tracks the live edge
  *  on purpose, and with no glide at all a target left behind would be inherited
- *  by the next one. Already frozen means the first freeze named the edge the
+ *  by the next one. Already frozen means the first freeze named the place the
  *  reader is owed. */
-function freezeLandingGlide(el: HTMLElement): void {
+function freezeLandingGlide(top: number): void {
   if (!landingGlideInFlight() || _heldGlideFrozenTop !== null) return;
-  _heldGlideFrozenTop = liveEdgeTop(el);
+  _heldGlideFrozenTop = top;
+  _continueTweenTo?.(top);
 }
 
 /** Take a rider to the live edge, writing nothing where they are already on it.
@@ -1848,7 +1923,7 @@ function followSubmit(resolveTurn: TurnResolver, holds = true, aim?: LandingAim)
     // the one BEFORE the submit.
     // A card's turn is already on screen, so there is no arrival to wait for.
     _rideArrival = resolveTurn(el) ? null : { resolveTurn, at: nowMs() };
-    if (!isAtLiveEdge(el)) glideToLiveEdge(el, 'ride', false, SEND_PACE);
+    if (!isAtLiveEdge(el)) glideToLiveEdge(el, 'ride', undefined, SEND_PACE);
     return;
   }
   // A landing already PENDING keeps the floor, unless it has LAPSED. The two
@@ -1913,7 +1988,7 @@ function awaitsNewTurn(newest: (el: HTMLElement) => HTMLElement | null): TurnRes
 function landsOnCard(bodySelector: string, attr: string, value: string): TurnResolver {
   return (el) => {
     const turn = cardTurn(el, bodySelector, attr, value);
-    return turn ? { turn, drawnAtSubmit: drawnRows(turn) } : null;
+    return turn ? { turn, drawnAtSubmit: drawnRows(turn).length } : null;
   };
 }
 
@@ -2103,20 +2178,25 @@ function landOnStart(el: HTMLElement, target: HTMLElement): void {
  *  therefore moves nobody at all.
  *
  *  It is the LANDING half of `glideToLiveEdge`, so the reader's own scroll can
- *  cancel it while a ride survives one. See `_heldAnimTarget`. */
-function landAtLiveEdge(el: HTMLElement, freeze = false): void {
-  if (isAtLiveEdge(el)) {
+ *  cancel it while a ride survives one. See `_heldAnimTarget`.
+ *
+ *  `freezeAt` is a releasing round's rest, which a reader already at or past
+ *  it owes no write either. */
+function landAtLiveEdge(el: HTMLElement, freezeAt?: number): void {
+  const resting = freezeAt === undefined ? isAtLiveEdge(el) : el.scrollTop >= freezeAt - RESTING_SLACK_PX;
+  if (resting) {
     // Nothing to write, but a glide in flight is still going somewhere, and a
     // releasing round must stop it chasing whatever arrives next.
-    if (freeze) freezeLandingGlide(el);
+    if (freezeAt !== undefined) freezeLandingGlide(freezeAt);
     return;
   }
-  glideToLiveEdge(el, 'landing', freeze);
+  glideToLiveEdge(el, 'landing', freezeAt);
 }
 
 /** ONE ROUND OF THE HOLD: re-aim at the live edge, then decide whether the
- *  reader has seen the agent start. Run at submit time and on every growth
- *  round after it, so the two paths cannot answer differently.
+ *  reader has seen the agent start. Run at submit time, on every growth round
+ *  after it, and before each frame of the landing's glide (`glideToLiveEdge`).
+ *  One function, so the three paths cannot answer differently.
  *
  *  Nothing to land on yet means the turn has no box, and the landing waits it
  *  out on the shortest deadline. The aim writes nothing when there
@@ -2129,8 +2209,8 @@ function landAtLiveEdge(el: HTMLElement, freeze = false): void {
  *  scroll is the fifth and lives in `onScroll`, through `cancelLanding`.
  *
  *  A queued turn still gets its ONE aim first, because the reader submitted.
- *  The ending round's aim is FROZEN, which is the whole of the difference
- *  between resting on the agent's first row and being carried past it.
+ *  The ending round's aim is FROZEN on the agent's first row, never past it
+ *  (`releaseRestTop`). Being carried past it is the difference freezing makes.
  *
  *  The row count is compared for CHANGE, not growth. `getCollapsedVisibleEvents`
  *  drops earlier prose when a new text block arrives. A turn's count can
@@ -2150,7 +2230,7 @@ function honourLanding(el: HTMLElement): void {
     if (!landing.holds) {
       _pendingLanding = null;
       if (landing.aim) landing.aim(el, found.turn);
-      else landAtLiveEdge(el, true);
+      else landAtLiveEdge(el, liveEdgeTop(el));
       return;
     }
     landing.on = found;
@@ -2161,11 +2241,13 @@ function honourLanding(el: HTMLElement): void {
   // node nobody can see.
   if (turn.isConnected === false) { _pendingLanding = null; return; }
   // DECIDED before it aims, so the ending round can aim differently. Its glide
-  // freezes, resting the reader where the agent's first row put them rather
-  // than chasing the next one into the same tween.
-  const ending = turnIsQueued(turn) || drawnRows(turn) !== drawnAtSubmit || asksAgain(el, turn);
-  landAtLiveEdge(el, ending);
-  if (!ending) return;
+  // freezes, resting the reader on the agent's first row rather than chasing
+  // the next one into the same tween. A new card ends it without a row.
+  const rows = drawnRows(turn);
+  const asks = asksAgain(el, turn);
+  const ending = turnIsQueued(turn) || rows.length !== drawnAtSubmit || asks;
+  if (!ending) { landAtLiveEdge(el); return; }
+  landAtLiveEdge(el, releaseRestTop(el, asks ? undefined : rows[drawnAtSubmit]));
   _pendingLanding = null;
   _nextCardWatch = { seen: answerableQuestionId(el), at: nowMs() };
 }
@@ -2180,8 +2262,12 @@ function landOnNextCard(el: HTMLElement): boolean {
   const card = answerableQuestionId(el);
   if (card === null || card === watch.seen) return false;
   _nextCardWatch = null;
-  if (landingGlideInFlight()) _heldGlideFrozenTop = liveEdgeTop(el);
-  else landAtLiveEdge(el, true);
+  if (landingGlideInFlight()) {
+    _heldGlideFrozenTop = liveEdgeTop(el);
+    _continueTweenTo?.(_heldGlideFrozenTop);
+  } else {
+    landAtLiveEdge(el, liveEdgeTop(el));
+  }
   return true;
 }
 
@@ -2272,7 +2358,7 @@ function glideToSubmittedTurn(el: HTMLElement): boolean {
   _rideArrival = null;
   // A tween already owns the scroll and re-reads the live edge every frame.
   if (_scrollAnimRaf !== null || isAtLiveEdge(el)) return false;
-  glideToLiveEdge(el, 'ride', false, SEND_PACE);
+  glideToLiveEdge(el, 'ride', undefined, SEND_PACE);
   return true;
 }
 
@@ -2479,10 +2565,12 @@ function reportRideLandedShort(short: number, edge: number, view: number): void 
  *  - `targetOf(el)` is re-read EVERY frame. The eased fraction is applied
  *    between the captured `start` and the LIVE target. A target that grows
  *    mid-tween is therefore tracked, and the curve still lands cleanly at t=1.
+ *    A target read that ended this tween ends its step too (`_endedTweens`).
  *  - `start` is captured on the FIRST frame, after the render-all
  *    scroll-anchoring shift has settled. Thereafter the position is a pure
  *    function of elapsed time and `scrollTop` is never READ again, only written.
- *    An anchor write shifts `start` by its own delta (`_shiftTweenStart`).
+ *    An anchor write shifts `start` by its own delta (`_shiftTweenStart`), and
+ *    a frozen landing re-bases it (`_continueTweenTo`).
  *    There is no yield guard, so an explicit chevron tap always reaches its
  *    target.
  *  - `duration` scales with the initial distance, clamped. The tween ends
@@ -2499,19 +2587,29 @@ function animateScroll(
   pace: ScrollPace = NAVIGATION_PACE,
 ) {
   cancelScrollAnim();
+  const endedBefore = _endedTweens;
   _heldAnim = mark === markHeldScroll;
   let started = false;
   let start = 0;
   let startTime = 0;
   let duration = pace.minMs;
+  // Where the last frame wrote, and how far along the curve it was.
+  let lastTop = 0;
+  let lastEase = 0;
   // Before the first frame there is nothing to carry: `start` is read then.
-  _shiftTweenStart = (delta) => { if (started) start += delta; };
+  _shiftTweenStart = (delta) => { if (started) { start += delta; lastTop += delta; } };
+  // Solves `lastTop = start + (target - start) * lastEase` for `start`. At the
+  // curve's end there is nothing left to re-base: that frame writes the target.
+  _continueTweenTo = (target) => {
+    if (started && lastEase < 1) start = (lastTop - target * lastEase) / (1 - lastEase);
+  };
   const step = (now: number) => {
     const cur = resolveTarget();
     if (!cur) { endScrollAnim(); return; }
     if (!started) {
       started = true;
       start = cur.scrollTop;
+      lastTop = start;
       // Back-date startTime by one nominal frame, so the FIRST painted frame
       // already has a frame's worth of eased progress rather than sitting at
       // t=0. A constant time offset, not a per-frame fraction, so the
@@ -2521,6 +2619,7 @@ function animateScroll(
       duration = Math.min(SCROLL_MAX_MS, Math.max(pace.minMs, distance / SCROLL_PX_PER_MS));
     }
     const target = targetOf(cur);
+    if (_endedTweens !== endedBefore) return;
     const t = Math.min(1, (now - startTime) / duration);
     if (t >= 1) {
       mark(cur, target);
@@ -2528,7 +2627,9 @@ function animateScroll(
       onDone?.();
       return;
     }
-    mark(cur, start + (target - start) * pace.ease(t));
+    lastEase = pace.ease(t);
+    lastTop = start + (target - start) * lastEase;
+    mark(cur, lastTop);
     _scrollAnimRaf = requestAnimationFrame(step);
   };
   _scrollAnimRaf = requestAnimationFrame(step);

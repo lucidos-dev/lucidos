@@ -29,7 +29,7 @@ import {
   _resetPendingUploadRestoreForTesting,
 } from './pendingUploadRestore';
 import { ensureThreadByIdInMap } from './thread-loading';
-import { noteServerDraft } from './compose';
+import { _recordServerComposeForTesting as noteServerDraft } from '../composeSync';
 import { _resetImageUploadRunsForTesting } from './imageUploads';
 import { ApiError, uploadThreadBlob } from '../../api/client';
 import {

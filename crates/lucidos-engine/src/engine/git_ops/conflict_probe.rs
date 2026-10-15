@@ -18,6 +18,16 @@ pub(crate) enum MergeProbe {
     Unknown,
 }
 
+impl MergeProbe {
+    /// The paths that would conflict. A clean or unknown merge names none.
+    pub(crate) fn into_conflicts(self) -> Vec<String> {
+        match self {
+            MergeProbe::Conflicts(files) => files,
+            MergeProbe::Clean | MergeProbe::Unknown => Vec::new(),
+        }
+    }
+}
+
 /// Probe a merge of `theirs` into `ours`, run in `dir`.
 pub(crate) async fn probe_merge(dir: &Path, ours: &str, theirs: &str) -> MergeProbe {
     let args = [

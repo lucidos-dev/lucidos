@@ -8,7 +8,10 @@
 # Covered: no SHA, an unknown SHA, a SHA off HEAD's history, nothing new, a
 # clean merge, a conflicted merge with an extra edit to a clean file, two
 # merges, a merge of a branch that is not the base, and branch commits after
-# the hardening (alone, two, before a merge and after one).
+# the hardening (alone, two, before a merge and after one). Then integrated
+# children's reviewed heads (ADR 0465): a child merge under its head, a child
+# that moved past it, an unknown head, the overlap of a child merge, and a
+# branch with no marker of its own, merging or fast-forwarding.
 #
 # Run: ./scripts/lib/harden_scope_test.sh
 set -u
@@ -133,7 +136,7 @@ echo "a merge of a branch that is not the base"
 new_repo other
 g checkout -q -b side main && commit_file s.txt s "side: work"
 g checkout -q feature && g merge -q --no-edit side
-expect_has "side is not the base" "FULL a merge brought in commits the base lacks" "$(scope "$H")"
+expect_has "side is not the base" "FULL a merge brought in commits no hardening reviewed" "$(scope "$H")"
 
 echo "an explicit base"
 new_repo base
@@ -190,6 +193,84 @@ expect_eq "commit, merge, overlap, in that order" "INCREMENTAL
 commit $C
 merge $M
 overlap shared.txt" "$OUT"
+
+# An integrated child forked from the branch at the hardened SHA: it edits
+# child.txt and shared.txt's last line. Leaves this shell on the branch and
+# sets CH to the child's head. Never call it inside $(...).
+child_branch() { # <child name>
+    g checkout -q -b "$1" feature
+    commit_file child.txt c "child: work"
+    printf 'feature1\nline2\nchild3\n' > shared.txt && g commit -am "child: shared"
+    CH=$(git rev-parse HEAD)
+    g checkout -q feature
+}
+
+echo "a child merge under its reviewed head"
+new_repo childmerge
+child_branch child
+g merge -q --no-ff --no-edit child
+M=$(git rev-parse HEAD)
+expect_has "unreviewed, the child's commits force FULL" "FULL a merge brought in commits no hardening reviewed" "$(scope "$H")"
+OUT=$(HARDEN_REVIEWED_HEADS="$CH" scope "$H")
+expect_eq "reviewed, only the merge is new" "MERGE_ONLY
+merge $M" "$OUT"
+expect_lacks "the child's commits are not the branch's" "child: work" "$OUT"
+expect_eq "heads may come one per line" "MERGE_ONLY" \
+    "$(HARDEN_REVIEWED_HEADS="$(printf '%s\n%s\n' "$H" "$CH")" scope "$H" | head -1)"
+expect_has "an unknown head is ignored, which only widens the review" "FULL" \
+    "$(HARDEN_REVIEWED_HEADS="0123456789abcdef0123456789abcdef01234567" scope "$H")"
+
+echo "a child that moved past its reviewed head"
+new_repo childmoved
+child_branch child
+REVIEWED=$CH
+g checkout -q child && commit_file late.txt l "child: after its hardening" && g checkout -q feature
+g merge -q --no-ff --no-edit child
+expect_has "the unreviewed child commit forces FULL" "FULL a merge brought in commits no hardening reviewed" \
+    "$(HARDEN_REVIEWED_HEADS="$REVIEWED" scope "$H")"
+
+echo "the overlap of a child merge"
+new_repo childoverlap
+child_branch child
+commit_file branch.txt b2 "feature: edit branch.txt after the fork"
+printf 'feature1\nparent2\nline3\n' > shared.txt && g commit -am "feature: shared"
+g merge -q --no-ff --no-edit child
+printf 'feature1\nparent2\nchild3\n' > shared.txt
+g add shared.txt && g commit --no-edit
+OUT=$(HARDEN_REVIEWED_HEADS="$CH" scope "$H")
+expect_eq "first line" "INCREMENTAL" "$(printf '%s\n' "$OUT" | head -1)"
+expect_has "both sides changed shared.txt" "overlap shared.txt" "$OUT"
+expect_lacks "child.txt is the child's alone" "overlap child.txt" "$OUT"
+expect_lacks "branch.txt is the parent's alone" "overlap branch.txt" "$OUT"
+
+echo "a branch with no marker of its own"
+new_repo nomarker
+FORK=$(git merge-base main HEAD)
+child_branch child
+commit_file own.txt o "feature: after the child forked"
+C=$(git rev-parse HEAD)
+g merge -q --no-ff --no-edit child
+M=$(git rev-parse HEAD)
+expect_eq "no heads: FULL as before" "FULL no harden marker" "$(scope "")"
+OUT=$(HARDEN_REVIEWED_HEADS="$CH" scope "")
+expect_eq "its own unreviewed commit, the merge, and the fork point" "INCREMENTAL
+commit $C
+merge $M
+fork-point $FORK" "$OUT"
+expect_lacks "the child reviewed what it forked from, so that is not listed" "commit $H" "$OUT"
+
+echo "a branch with no marker that fast-forwarded to its child"
+mkdir -p "$TMP/fastforward" && cd "$TMP/fastforward" || exit 1
+g init -q -b main
+commit_file a.txt a "main: init"
+FORK=$(git rev-parse HEAD)
+g checkout -q -b parent
+g checkout -q -b child
+commit_file child.txt c "child: work"
+CH=$(git rev-parse HEAD)
+g checkout -q parent && g merge -q --ff-only child
+expect_eq "nothing is the branch's own" "MERGE_ONLY
+fork-point $FORK" "$(HARDEN_REVIEWED_HEADS="$CH" scope "")"
 
 echo
 echo "harden_scope: $PASS passed, $FAIL failed"

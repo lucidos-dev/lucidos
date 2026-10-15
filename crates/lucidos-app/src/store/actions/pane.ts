@@ -39,6 +39,12 @@ export function resolveSwipePane(delta: number): MobileView | null {
   return newIndex !== currentIndex ? MOBILE_VIEWS[newIndex] : null;
 }
 
+/** Commit a pane swipe: move to the neighbouring pane, when there is one. */
+export function swipeToNeighbourPane(paneDelta: -1 | 1): void {
+  const target = resolveSwipePane(paneDelta);
+  if (target) navigateToPane(target);
+}
+
 /** Single entry point for mobile pane switches.
  *  Atomically closes drawers and updates the signal, preventing
  *  intermediate states where a drawer is open on the wrong pane.

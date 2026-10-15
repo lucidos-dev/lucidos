@@ -12,7 +12,7 @@ vi.mock('../CreateThreadView', () => ({
   withScrollAnchor: vi.fn((_anchor: Element | null, fn: () => void) => fn()),
 }));
 import { openSubAgentGroups } from '../../../store/store';
-import type { ResponseEvent, StepOutcome } from '../../../store/types';
+import type { ContextCapture, ResponseEvent, StepOutcome } from '../../../store/types';
 
 type StepEvent = Extract<ResponseEvent, { type: 'step' }>;
 
@@ -75,6 +75,25 @@ describe('SubAgentStepGroup', () => {
 
     draw(agent('unfinished', [child('a1', 'unfinished')]));
     expect(tail()).toBe('Did not finish');
+  });
+
+  it('ended: the tail shows the sub-agent’s final context, not the parent’s', () => {
+    const final: ContextCapture = {
+      producer: 'claude_code',
+      model: 'claude-sonnet-5',
+      context_window: 1_000_000,
+      sections: [],
+      tools: [],
+      estimated_total_tokens: 46_000,
+      trimmed: false,
+    };
+    const counter = () => host.querySelector('[data-role="sub-agent-tail"] .step-context-full')?.textContent ?? null;
+
+    draw({ ...agent('success', [child('a1', 'success')]), context_tokens: 653_000, finalContextCapture: final });
+    expect(counter()).toBe('46k / 1M (5%)');
+
+    draw(agent('success', [child('a1', 'success')]));
+    expect(counter()).toBeNull();
   });
 
   it('ended and unfolded: the list shows the steps, so there is no tail', () => {

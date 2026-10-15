@@ -93,7 +93,9 @@ APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/
 log "using app bundle: $APP (executable: $APP_EXEC, identifier: $APP_ID)"
 
 # ── Isolated temp HOME + free port + seeded fastembed cache ───────────────────
-TMP_HOME="$(mktemp -d -t lucidos-pkg-e2e)"
+# In /tmp, not macOS's long $TMPDIR: the Postgres socket lands in
+# $HOME/.lucidos/run/pg-<digest>, and a socket path must fit 103 bytes.
+TMP_HOME="$(mktemp -d /tmp/lucidos-pkg-e2e.XXXXXX)"
 APP_DATA="$TMP_HOME/Library/Application Support/$APP_ID"
 mkdir -p "$APP_DATA"
 
@@ -190,11 +192,15 @@ log "launched service PID $SVC_PID (logs: $SVC_LOG)"
 #
 # `gateway_curl` carries the machine-local credential the gateway's control
 # plane requires. Deliberately a second copy of the one in `lib/workspace.sh`:
-# this script sources no library, and pulling the whole workspace lib in for one
-# function would drag its launch side effects into a packaged smoke test. Keep
-# the two in step; `lucidos-local-token` owns the header name and the path.
+# pulling the whole workspace lib in for one function would drag its launch
+# side effects into a packaged smoke test. Keep the two in step;
+# `lucidos-local-token` owns the header name, and `lib/storage_root.sh`, a pure
+# helper, names the home.
+# shellcheck source=scripts/lib/storage_root.sh
+source "$SCRIPT_DIR/lib/storage_root.sh"
 gateway_curl() {
-    local token_file="$HOME/.lucidos/local-token"
+    local token_file
+    token_file="$(lucidos_home_dir)/local-token"
     if [ -r "$token_file" ]; then
         curl -H "x-lucidos-local-token: $(cat "$token_file")" "$@"
     else

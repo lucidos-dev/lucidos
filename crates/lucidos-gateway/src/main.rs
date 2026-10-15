@@ -42,10 +42,9 @@ mod build_id;
 #[cfg(test)]
 mod chain_tests;
 mod control;
+mod engine_hop;
 mod error;
 mod file_backup;
-#[cfg(test)]
-mod gateway_constants_codegen_tests;
 mod hook_socket;
 mod installs;
 mod net_config;
@@ -104,7 +103,10 @@ fn boot_failure_line(err: impl std::fmt::Display) -> String {
 /// all.
 fn main() -> std::process::ExitCode {
     match boot() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(server::RunOutcome::Stopped) => std::process::ExitCode::SUCCESS,
+        Ok(server::RunOutcome::AlreadyRunning) => {
+            std::process::ExitCode::from(server::ALREADY_RUNNING_EXIT)
+        }
         Err(e) => {
             eprintln!("{}", boot_failure_line(e));
             std::process::ExitCode::FAILURE
@@ -112,7 +114,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn boot() -> Result<(), BoxError> {
+fn boot() -> Result<server::RunOutcome, BoxError> {
     // `--version` / `-V` before any heavy startup — machine-readable stdout, so
     // bare `println!` (no timestamp prefix) like the engine's `--version`.
     if std::env::args()
@@ -124,7 +126,7 @@ fn boot() -> Result<(), BoxError> {
             LUCIDOS_RELEASE,
             env!("CARGO_PKG_VERSION"),
         );
-        return Ok(());
+        return Ok(server::RunOutcome::Stopped);
     }
 
     // `--build-id` — print the baked build id and exit, BEFORE any runtime/port/PG
@@ -134,7 +136,7 @@ fn boot() -> Result<(), BoxError> {
     // `server::gateway_build_id` and `docs/plans/2026-06-18-gateway-reload-control.md`.
     if std::env::args().skip(1).any(|a| a == "--build-id") {
         println!("{}", server::GATEWAY_BUILD_ID);
-        return Ok(());
+        return Ok(server::RunOutcome::Stopped);
     }
 
     // Above the runtime build: it sets process env, which is sound only while

@@ -316,6 +316,20 @@ fn removing_a_marketplace_cache_takes_only_that_marketplace() {
     assert!(cache_dir(workspace.path(), "m2", "q", "1.0.0").exists());
 }
 
+/// Plugin media goes public, so the agent must never capture the user's real
+/// data for it. `plugins.md` is the only place that tells it so.
+#[test]
+fn the_plugins_knowhow_requires_demo_data_in_media() {
+    let doc = include_str!("../../../../system-knowhow/plugins.md");
+    for expected in [
+        "made-up demo data only, never the user's real data",
+        "Restore each file byte for byte from its backup",
+        "leave that shot out and tell the user why",
+    ] {
+        assert!(doc.contains(expected), "plugins.md lost {expected:?}");
+    }
+}
+
 /// `plugins.md` states the limits to authors. It restates these constants, so
 /// this pins the copy (`.claude/rules/one-definition-per-value.md`).
 #[test]

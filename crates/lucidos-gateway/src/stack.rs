@@ -8,6 +8,7 @@
 //! pidfile and a health probe. Supervision is health-probe based, so it works
 //! identically for spawned and re-adopted engines.
 
+use crate::engine_hop::{self, Credential, EngineAddress};
 use crate::postgres::PgHandle;
 use crate::registry::Workspace;
 use serde::Serialize;
@@ -109,6 +110,13 @@ pub struct StackRuntime {
     /// healthy engine to ask, or a poll that did not answer. Refreshed by the
     /// supervise loop.
     pub last_successful_backup: Option<LastSuccessfulBackup>,
+}
+
+impl StackRuntime {
+    /// Where this stack's engine answers: its engine socket.
+    pub fn engine_address(&self) -> EngineAddress {
+        EngineAddress::for_workspace(&self.resolved_dir, self.ws.port)
+    }
 }
 
 /// What one workspace's engine reports about its backups, from
@@ -229,7 +237,8 @@ fn gateway_tls_handoff(cert: Option<&str>, key: Option<&str>) -> Vec<(&'static s
 /// Spawn a workspace engine: detached, pointed at its workspace dir and
 /// database, told how to call the gateway back for an in-place restart.
 /// Inherits the gateway's environment and overrides the workspace-specific
-/// vars. Writes `<dir>/.lucidos/engine.pid` for re-adoption and reclaim.
+/// vars. Writes no pidfile: the engine publishes its own once it holds the
+/// workspace's owner lock (ADR 0438).
 ///
 /// `loopback` controls the engine's bind, per ADR 0014's dev runtime topology:
 ///   * **packaged, `true`**: loopback only, so the gateway is the sole
@@ -240,8 +249,8 @@ fn gateway_tls_handoff(cert: Option<&str>, key: Option<&str>) -> Vec<(&'static s
 ///
 /// `proto` is the scheme the engine will serve, from the caller's
 /// `engine_scheme()`. Taken as an argument rather than re-derived from
-/// `loopback`, so the ports file cannot disagree with the scheme the gateway
-/// proxies and probes over. Publishing it is part of the spawn (ADR 0136), so
+/// `loopback`, so the ports file cannot disagree with the scheme the engine
+/// serves on its TCP port. Publishing it is part of the spawn (ADR 0136), so
 /// a new spawn site cannot leave a workspace unresolvable.
 pub fn spawn_engine(
     engine_bin: &Path,
@@ -252,7 +261,8 @@ pub fn spawn_engine(
     loopback: bool,
     proto: &str,
 ) -> std::io::Result<Child> {
-    // The engine writes its pidfile in here, and wants a writable CWD.
+    // The engine keeps its owner lock and pidfile in here, and wants a writable
+    // CWD.
     let state_dir = resolved_dir.join(".lucidos");
     std::fs::create_dir_all(&state_dir)?;
 
@@ -296,8 +306,8 @@ pub fn spawn_engine(
     if loopback {
         // Dev and packaged alike (ADR 0096): loopback only. The gateway is the
         // sole network-facing surface and terminates TLS, so the engine serves
-        // plain HTTP. Strip any inherited TLS config, or it would serve https
-        // and the gateway's http proxy would fail. `LUCIDOS_BIND_LOOPBACK=1` is the engine's
+        // plain HTTP. Strip any inherited TLS config, so the port serves the
+        // http its ports file advertises. `LUCIDOS_BIND_LOOPBACK=1` is the engine's
         // `behind_gateway` signal, and the engine also defaults to a loopback
         // bind with `LUCIDOS_BIND_ALL` unset, so this stays loopback-only.
         cmd.env("LUCIDOS_BIND_LOOPBACK", "1")
@@ -307,8 +317,8 @@ pub fn spawn_engine(
     } else {
         // Only `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0`, which nothing sets: the
         // engine is the direct front on its port. KEEP the inherited
-        // TLS so `https://localhost:<port>/` reaches it directly, and the
-        // gateway proxies over the matching scheme. Clear the loopback flag so
+        // TLS so `https://localhost:<port>/` reaches it directly. The gateway
+        // reaches it over its engine socket either way. Clear the loopback flag so
         // a respawn stays network-capable and not flagged as behind-gateway.
         //
         // Bind defaults to all interfaces, and must say so explicitly because
@@ -338,19 +348,6 @@ pub fn spawn_engine(
     }
 
     let child = cmd.spawn()?;
-    // Not fatal, since the engine is already up and serving, but not silent
-    // either. Without the pidfile a re-adopting gateway cannot tell this engine
-    // is alive, and `reclaim_stale_engine` cannot free its port on the next
-    // respawn. Both failures surface far from here, so name the cause here.
-    let pidfile = resolved_dir.join(".lucidos/engine.pid");
-    if let Err(e) = std::fs::write(&pidfile, child.id().to_string()) {
-        crate::log!(
-            "[Gateway] could not write {} for '{}': {e} \
-             (re-adoption and stale-engine reclaim will not see this engine)",
-            pidfile.display(),
-            ws.id
-        );
-    }
     publish_ports_file(resolved_dir, ws, ws.port, proto);
     Ok(child)
 }
@@ -387,8 +384,8 @@ pub fn publish_ports_file(resolved_dir: &Path, ws: &Workspace, api_port: u16, pr
 /// Set `API_PORT` and `PROTO` in a ports file, preserving every other line.
 ///
 /// Key-preserving because the dev scripts own the same file and write more into
-/// it: `scripts/lib/workspace.sh`'s `swap_ports` adds `VITE_PORT`, `PG_PORT`,
-/// `PG_DATABASE` and `DATABASE_URL`, and `scripts/status.sh` sources the result.
+/// it: `scripts/lib/workspace.sh`'s `swap_ports` adds `VITE_PORT`, `PG_PORT`
+/// and `PG_DATABASE`, and `scripts/status.sh` sources the result.
 /// Clobbering it would strip a running dev workspace's database details.
 fn merge_ports_file(existing: Option<&str>, api_port: u16, proto: &str) -> String {
     let api_line = format!("API_PORT={api_port}");
@@ -419,13 +416,24 @@ fn merge_ports_file(existing: Option<&str>, api_port: u16, proto: &str) -> Strin
     out.join("\n")
 }
 
-/// Read the engine pidfile written by [`spawn_engine`].
-pub fn read_pidfile(resolved_dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(resolved_dir.join(".lucidos/engine.pid"))
-        .ok()?
-        .trim()
-        .parse()
+/// The pid of the engine that owns `resolved_dir` right now, if one does.
+///
+/// Read through the owner lock, so a pidfile its holder left behind names
+/// nobody, whichever process now has that pid.
+pub fn live_engine_pid(resolved_dir: &Path) -> Option<u32> {
+    lucidos_owner_lock::engine::live_pid(resolved_dir)
+}
+
+/// Whether an engine owns `resolved_dir`, for a stack held with no [`Child`].
+///
+/// The owner lock answers. [`pid_is_live`] still runs on whatever pid the file
+/// names, for its side effect: it reaps an exited engine of ours, which nothing
+/// else collects after `reload_gateway` re-execs the image.
+pub fn adopted_engine_alive(resolved_dir: &Path) -> bool {
+    let named = std::fs::read_to_string(lucidos_owner_lock::engine::pid_path(resolved_dir))
         .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok());
+    named.is_some_and(pid_is_live) && live_engine_pid(resolved_dir) == named
 }
 
 /// Whether `pid` names a process that is still RUNNING, reaping it first when
@@ -526,21 +534,24 @@ pub fn reap_forked_pid(pid: u32) {
 #[cfg(not(unix))]
 pub fn reap_forked_pid(_pid: u32) {}
 
-/// Send SIGUSR1 to a stale engine recorded in the pidfile, so a respawn does
-/// not collide on the loopback port. Reap it too, if it is our own child.
-/// SIGUSR1 rather than SIGTERM, which the engine ignores.
+/// Send SIGUSR1 to the engine that owns this workspace, if one does. Reap it
+/// too, if it is our own child. SIGUSR1 rather than SIGTERM, which the engine
+/// ignores.
+///
+/// No wait for the exit: the successor's own owner lock holds it until this
+/// engine is gone (ADR 0438).
 ///
 /// The teardown path for an engine the gateway holds no [`Child`] for, and the
 /// reap is not optional: see [`reap_forked_pid`] for why such an engine is so
 /// often still a child of this process. Best-effort throughout.
 ///
 /// **A pid that provably runs another program is never signalled or waited
-/// on.** The engine leaves its pidfile behind when it stops, and the OS reuses
-/// pids. SIGUSR1 terminates a process that does not handle it, so a lazy-start
-/// days after a stop would kill whatever unrelated app now holds that pid.
+/// on.** The lock check and the `kill` are two steps, and the OS reuses pids.
+/// SIGUSR1 terminates a process that does not handle it, so the executable
+/// check stays as the guard across that gap.
 pub fn reclaim_stale_engine(resolved_dir: &Path) {
     #[cfg(unix)]
-    if let Some(pid) = read_pidfile(resolved_dir) {
+    if let Some(pid) = live_engine_pid(resolved_dir) {
         let Some(signal_pid) = single_process_pid(pid) else {
             crate::log!(
                 "[Gateway] ignoring pidfile in {} naming pid {pid}, which is no single process",
@@ -561,12 +572,9 @@ pub fn reclaim_stale_engine(resolved_dir: &Path) {
         unsafe {
             libc::kill(signal_pid, libc::SIGUSR1);
         }
-        // Started BEFORE the sleep, so the wait is already in place when the
-        // engine exits. The very next spawn overwrites the pidfile, so this is
-        // the last moment the pid is known.
+        // The successor publishes over the pidfile once it owns the
+        // workspace, so this is the last moment the pid is known.
         reap_forked_pid(pid);
-        // Give it a moment to release the port.
-        std::thread::sleep(Duration::from_millis(300));
     }
     #[cfg(not(unix))]
     let _ = resolved_dir;
@@ -632,9 +640,9 @@ fn pid_executable(pid: libc::pid_t) -> Option<PathBuf> {
 pub enum ProbeOutcome {
     /// 2xx from `/api/v1/health`.
     Healthy,
-    /// Connect error that is NOT a timeout (connection refused / reset) — the
-    /// engine isn't accepting connections (crashed, or mid-restart). Acted on as
-    /// a respawn only when the process is also dead.
+    /// Nothing accepted on the engine socket: no socket file, or one nobody
+    /// listens on. The engine is booting, crashed or mid-restart. Acted on as a
+    /// respawn only when the process is also dead.
     Unreachable,
     /// The probe timed out (connect or read) — the process is (likely) alive
     /// but too busy to answer within the budget. An alive engine is never culled,
@@ -643,17 +651,70 @@ pub enum ProbeOutcome {
     /// Any other error, or a non-2xx response. Like `Slow`, never culls an alive
     /// engine.
     Other,
+    /// Something answered that is not this workspace's engine. Either the
+    /// kernel did not name this user as the engine socket's owner, and nothing
+    /// was sent, or a 2xx body named another workspace. Never trusted, and like
+    /// `Other` it never culls an alive engine.
+    Foreign,
 }
 
-/// Probe `GET <scheme>://127.0.0.1:<port>/api/v1/health`.
-/// `scheme` is `http` for a loopback (packaged) engine, `https` for a dev engine
-/// that serves TLS directly on its port.
+/// Probe the engine's `GET /api/v1/health` over its engine socket.
 ///
-/// Timeout is classified BEFORE connect: a connect-timeout under load means
-/// "alive but the accept loop is starved" (busy), not "refused", so it must read
-/// as `Slow`. Only a genuine non-timeout connect error is `Unreachable`.
-pub async fn probe_health(client: &reqwest::Client, scheme: &str, port: u16) -> ProbeOutcome {
-    probe_engine(client, scheme, port).await.outcome
+/// `workspace` is the directory the registry says this engine serves. Only a
+/// body naming it is `Healthy`.
+pub async fn probe_health(engine: &EngineAddress, workspace: &Path) -> ProbeOutcome {
+    probe_engine(engine, workspace).await.outcome
+}
+
+/// How long a probe or a read may take before it counts as [`ProbeOutcome::Slow`].
+///
+/// The budget gives a busy engine headroom to answer. It can stay modest
+/// because a `Slow` outcome never culls a live engine.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// GET `path` from the engine and read its whole body, within `budget`.
+///
+/// Each call opens a fresh connection, so a probe verifies the engine accepts
+/// NEW connections rather than that an old one still works.
+async fn get_body(
+    engine: &EngineAddress,
+    path: &str,
+    budget: Duration,
+) -> Result<(axum::http::StatusCode, String), ProbeOutcome> {
+    let exchange = async {
+        let req = axum::http::Request::get(path)
+            .body(axum::body::Body::empty())
+            .map_err(|_| ProbeOutcome::Other)?;
+        let resp = engine_hop::send(engine, req, Credential::None)
+            .await
+            .map_err(|e| {
+                if e.is_foreign() {
+                    crate::log!("[Gateway] engine probe {path} at {engine} refused: {e}");
+                    ProbeOutcome::Foreign
+                } else if e.is_unreachable() {
+                    ProbeOutcome::Unreachable
+                } else {
+                    ProbeOutcome::Other
+                }
+            })?;
+        let status = resp.status();
+        let body = axum::body::to_bytes(axum::body::Body::new(resp.into_body()), usize::MAX)
+            .await
+            .map_err(|_| ProbeOutcome::Other)?;
+        Ok((status, String::from_utf8_lossy(&body).into_owned()))
+    };
+    tokio::time::timeout(budget, exchange)
+        .await
+        .unwrap_or(Err(ProbeOutcome::Slow))
+}
+
+/// [`get_body`] for a read that only a healthy answer feeds: anything else is
+/// "no reading".
+async fn get_success_body(engine: &EngineAddress, path: &str) -> Option<String> {
+    match get_body(engine, path, PROBE_TIMEOUT).await {
+        Ok((status, body)) if status.is_success() => Some(body),
+        _ => None,
+    }
 }
 
 /// One health probe, and what a healthy engine said about its database.
@@ -676,35 +737,49 @@ pub enum DatabaseHealth {
 
 /// [`probe_health`], also reading the database health from the same body, so
 /// the slowness watch costs the supervisor no second request (ADR 0283).
-pub async fn probe_engine(client: &reqwest::Client, scheme: &str, port: u16) -> EngineProbe {
-    let url = format!("{scheme}://127.0.0.1:{port}/api/v1/health");
+///
+/// `workspace` is the directory the registry says this engine serves. Only a
+/// body naming it is `Healthy`.
+pub async fn probe_engine(engine: &EngineAddress, workspace: &Path) -> EngineProbe {
     let outcome = |outcome| EngineProbe {
         outcome,
         database: DatabaseHealth::Reachable,
     };
-    match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => EngineProbe {
-            outcome: ProbeOutcome::Healthy,
-            database: r
-                .text()
-                .await
-                .map_or(DatabaseHealth::Reachable, |body| database_health(&body)),
+    match get_body(engine, "/api/v1/health", PROBE_TIMEOUT).await {
+        Ok((status, body)) if status.is_success() => match own_health_body(&body, workspace) {
+            Some(health) => EngineProbe {
+                outcome: ProbeOutcome::Healthy,
+                database: database_health(&health),
+            },
+            None => outcome(ProbeOutcome::Foreign),
         },
         Ok(_) => outcome(ProbeOutcome::Other),
-        Err(e) if e.is_timeout() => outcome(ProbeOutcome::Slow),
-        Err(e) if e.is_connect() => outcome(ProbeOutcome::Unreachable),
-        Err(_) => outcome(ProbeOutcome::Other),
+        Err(failed) => outcome(failed),
     }
+}
+
+/// The health body, parsed, when it names `workspace` as the engine's own.
+///
+/// The engine reports the `LUCIDOS_WORKSPACE` it runs in as `workspace_path`.
+/// Anything else is `None`: another workspace's engine, a body naming no
+/// workspace, or one that is not JSON. Compared by canonical path, so a
+/// symlinked registry entry still matches, and lexically when either path no
+/// longer resolves.
+fn own_health_body(body: &str, workspace: &Path) -> Option<serde_json::Value> {
+    let health: serde_json::Value = serde_json::from_str(body).ok()?;
+    let reported = Path::new(health.get("workspace_path")?.as_str()?);
+    let same = match (reported.canonicalize(), workspace.canonicalize()) {
+        (Ok(reported), Ok(workspace)) => reported == workspace,
+        _ => reported == workspace,
+    };
+    same.then_some(health)
 }
 
 /// The database health in a health body. Only an explicit `false` for
 /// `database_reachable` is an outage, and only an explicit `true` for
 /// `database_pool_exhausted` blames the pool. An older engine omits either
 /// field, and must never read as worse than it said.
-fn database_health(body: &str) -> DatabaseHealth {
-    let Ok(health) = serde_json::from_str::<serde_json::Value>(body) else {
-        return DatabaseHealth::Reachable;
-    };
+fn database_health(health: &serde_json::Value) -> DatabaseHealth {
     let flag = |key: &str| health.get(key).and_then(serde_json::Value::as_bool);
     match (flag("database_reachable"), flag("database_pool_exhausted")) {
         (Some(false), Some(true)) => DatabaseHealth::PoolExhausted,
@@ -723,59 +798,32 @@ pub struct LiveEngine {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Ask whatever is on `port` whether it is an engine, and when it started.
+/// Ask the engine socket whether `workspace`'s engine is there, and when it
+/// started.
 ///
-/// `None` means nothing answered, so there is nothing to adopt. This is
+/// `None` means no engine of `workspace` answered, so there is nothing to
+/// adopt. Something else answering is the same `None`. This is
 /// [`probe_health`] plus the one field that tells a fresh engine from one a stop
 /// is still draining. The two stay separate because the supervisor's 2s probe of
 /// a stack it already holds has no use for the body.
-pub async fn probe_live_engine(
-    client: &reqwest::Client,
-    scheme: &str,
-    port: u16,
-) -> Option<LiveEngine> {
-    let url = format!("{scheme}://127.0.0.1:{port}/api/v1/health");
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.text().await.ok()?;
+pub async fn probe_live_engine(engine: &EngineAddress, workspace: &Path) -> Option<LiveEngine> {
+    let health = own_health_body(
+        &get_success_body(engine, "/api/v1/health").await?,
+        workspace,
+    )?;
     Some(LiveEngine {
-        started_at: started_at_in(&body),
+        started_at: started_at_in(&health),
     })
 }
 
 /// The `started_at` an engine's health payload reports, as an instant.
 ///
-/// Every failure collapses to `None`: an unparseable body, a missing field, a
-/// timestamp in some other format. A caller reading `None` treats the engine as
+/// Every failure collapses to `None`: a missing field, or a timestamp in some
+/// other format. A caller reading `None` treats the engine as
 /// one it cannot identify, never as a fresh one.
-fn started_at_in(body: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    let stamp = json.get("started_at")?.as_str()?;
+fn started_at_in(health: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let stamp = health.get("started_at")?.as_str()?;
     Some(chrono::DateTime::parse_from_rfc3339(stamp).ok()?.into())
-}
-
-/// A short-timeout client for health probes (distinct from the proxy client,
-/// which has no global timeout so SSE can stream).
-///
-/// Idle pooling is disabled (`pool_max_idle_per_host(0)`) so every 2s probe
-/// opens a **fresh** connection. A health probe must verify the engine accepts
-/// *new* connections, not that a stale pooled keepalive connection still works.
-/// Accepts invalid certs because a dev engine serves its own self-signed cert on
-/// its port, probed via `127.0.0.1` (harmless for the plain-http packaged engine).
-///
-/// The 5s timeout gives a busy engine headroom to answer before the probe is
-/// classified `Slow`. The budget can stay modest because a `Slow` outcome never
-/// culls a live engine, so a slow probe against a working engine is harmless.
-pub fn build_health_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
-        .pool_max_idle_per_host(0)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("failed to build gateway health client")
 }
 
 /// Fetch a running engine's unread-notification count via the count-only probe
@@ -786,14 +834,8 @@ pub fn build_health_client() -> reqwest::Client {
 /// This HTTP read is the ONLY count path: the gateway deliberately holds no DB
 /// handle (ADR 0014 §1). So a STOPPED workspace contributes nothing to the
 /// per-row badge or the aggregate total, which is the settled behaviour.
-/// `text()` and a manual parse avoid pulling reqwest's `json` feature.
-pub async fn fetch_unread_count(client: &reqwest::Client, scheme: &str, port: u16) -> Option<u64> {
-    let url = format!("{scheme}://127.0.0.1:{port}/api/v1/notifications?limit=0");
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.text().await.ok()?;
+pub async fn fetch_unread_count(engine: &EngineAddress) -> Option<u64> {
+    let body = get_success_body(engine, "/api/v1/notifications?limit=0").await?;
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;
     json.get("unread_count")?.as_u64()
 }
@@ -808,17 +850,8 @@ pub async fn fetch_unread_count(client: &reqwest::Client, scheme: &str, port: u1
 /// backed up is not. Older engines have no such route, so a 404 lands here too
 /// and leaves those rows quiet. Deliberately no `provider` parameter and no
 /// cloud call, so this is cheap enough for the 2s supervise pass.
-pub async fn fetch_last_successful_backup(
-    client: &reqwest::Client,
-    scheme: &str,
-    port: u16,
-) -> Option<LastSuccessfulBackup> {
-    let url = format!("{scheme}://127.0.0.1:{port}/api/v1/backup/last-successful");
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.text().await.ok()?;
+pub async fn fetch_last_successful_backup(engine: &EngineAddress) -> Option<LastSuccessfulBackup> {
+    let body = get_success_body(engine, "/api/v1/backup/last-successful").await?;
     parse_last_successful_backup(&body)
 }
 
@@ -902,36 +935,41 @@ pub enum RestartIntentNotify {
 ///
 /// **`None` means skip, not "unknown device".** The engine refuses a call with
 /// no device anyway, so not calling is both cheaper and the same answer.
-///
-/// Scheme comes from the caller's `GatewayState::engine_scheme()`. The gateway
-/// spawned this engine and decided its TLS, so it is not guessing.
 pub async fn notify_restart_intent(
-    client: &reqwest::Client,
-    scheme: &str,
-    port: u16,
+    engine: &EngineAddress,
     device_id: Option<&str>,
 ) -> RestartIntentNotify {
     let Some(device_id) = device_id.map(str::trim).filter(|d| !d.is_empty()) else {
         return RestartIntentNotify::Skipped;
     };
-    let url = format!("{scheme}://127.0.0.1:{port}/api/v1/internal/restart-intent");
-    let sent = client
-        .post(&url)
+    let Ok(req) = axum::http::Request::post("/api/v1/internal/restart-intent")
         .header(HEADER_DEVICE_ID, device_id)
-        .timeout(RESTART_INTENT_TIMEOUT)
-        .send()
-        .await;
+        .body(axum::body::Body::empty())
+    else {
+        return RestartIntentNotify::Failed;
+    };
+    let sent = tokio::time::timeout(
+        RESTART_INTENT_TIMEOUT,
+        engine_hop::send(engine, req, Credential::None),
+    )
+    .await;
     match sent {
-        Ok(r) if r.status().is_success() => RestartIntentNotify::Delivered,
-        Ok(r) => {
+        Ok(Ok(r)) if r.status().is_success() => RestartIntentNotify::Delivered,
+        Ok(Ok(r)) => {
             crate::log!(
-                "[Gateway] restart intent to :{port} returned {}",
+                "[Gateway] restart intent to {engine} returned {}",
                 r.status()
             );
             RestartIntentNotify::Failed
         }
-        Err(e) => {
-            crate::log!("[Gateway] restart intent to :{port} failed: {e}");
+        Ok(Err(e)) => {
+            crate::log!("[Gateway] restart intent to {engine} failed: {e}");
+            RestartIntentNotify::Failed
+        }
+        Err(_) => {
+            crate::log!(
+                "[Gateway] restart intent to {engine} timed out after {RESTART_INTENT_TIMEOUT:?}"
+            );
             RestartIntentNotify::Failed
         }
     }
@@ -940,6 +978,7 @@ pub async fn notify_restart_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_hop::test_engine;
     use crate::registry::Workspace;
 
     #[test]
@@ -961,12 +1000,12 @@ mod tests {
                 r#"{"database_reachable":true,"database_pool_exhausted":true}"#,
                 Reachable,
             ),
-            // An older engine, and a body that is not JSON at all.
+            // An older engine.
             (r#"{"status":"ok"}"#, Reachable),
-            ("not json", Reachable),
         ];
         for (body, report) in table {
-            assert_eq!(database_health(body), report, "{body}");
+            let health = serde_json::from_str(body).unwrap();
+            assert_eq!(database_health(&health), report, "{body}");
         }
     }
 
@@ -1248,12 +1287,15 @@ mod tests {
     // pinning is the wire: the method, the path and the device header.
 
     /// A one-shot engine that records the raw request it was sent, then 204s.
-    async fn capturing_engine() -> (u16, std::sync::Arc<tokio::sync::Mutex<String>>) {
+    /// The directory holds its engine socket, so the caller keeps it alive.
+    async fn capturing_engine() -> (
+        tempfile::TempDir,
+        EngineAddress,
+        std::sync::Arc<tokio::sync::Mutex<String>>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let dir = test_engine::scratch();
+        let (listener, engine) = test_engine::bind(&dir);
         let captured = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
         let c = captured.clone();
         tokio::spawn(async move {
@@ -1267,25 +1309,13 @@ mod tests {
                 let _ = sock.flush().await;
             }
         });
-        (port, captured)
-    }
-
-    /// A free port nothing is listening on, for the unreachable-engine case.
-    async fn dead_port() -> u16 {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        port
+        (dir, engine, captured)
     }
 
     #[tokio::test]
     async fn a_named_device_reaches_the_engines_restart_intent_route() {
-        let (port, captured) = capturing_engine().await;
-        let outcome =
-            notify_restart_intent(&build_health_client(), "http", port, Some("picker-device"))
-                .await;
+        let (_dir, engine, captured) = capturing_engine().await;
+        let outcome = notify_restart_intent(&engine, Some("picker-device")).await;
 
         assert_eq!(outcome, RestartIntentNotify::Delivered);
         let got = captured.lock().await.to_lowercase();
@@ -1303,12 +1333,12 @@ mod tests {
     #[tokio::test]
     async fn the_notify_is_aimed_at_the_stack_being_signalled_and_no_other() {
         // Cross-workspace isolation: restarting one workspace must not touch
-        // another. The port is the only thing that selects a target, so a second
-        // engine on a second port must see nothing at all.
-        let (target, target_saw) = capturing_engine().await;
-        let (bystander, bystander_saw) = capturing_engine().await;
+        // another. The engine socket is the only thing that selects a target, so
+        // a second engine on a second socket must see nothing at all.
+        let (_target_dir, target, target_saw) = capturing_engine().await;
+        let (_bystander_dir, bystander, bystander_saw) = capturing_engine().await;
 
-        notify_restart_intent(&build_health_client(), "http", target, Some("d1")).await;
+        notify_restart_intent(&target, Some("d1")).await;
 
         assert!(
             !target_saw.lock().await.is_empty(),
@@ -1326,11 +1356,11 @@ mod tests {
         // This is what keeps every non-user teardown honest: the supervisor's
         // health respawn, `stop.sh`'s curl, the dev launcher. None of them names
         // a device, so none of them can make a crash look like a user restart.
-        let (port, captured) = capturing_engine().await;
+        let (_dir, engine, captured) = capturing_engine().await;
 
         for absent in [None, Some(""), Some("   ")] {
             assert_eq!(
-                notify_restart_intent(&build_health_client(), "http", port, absent).await,
+                notify_restart_intent(&engine, absent).await,
                 RestartIntentNotify::Skipped,
                 "no device to name means no notify, not an empty one"
             );
@@ -1347,9 +1377,9 @@ mod tests {
         // must do is come back, promptly, with a verdict the caller can log. An
         // engine that is already gone (or wedged) is the common case: the user
         // is restarting it for a reason.
-        let port = dead_port().await;
+        let dir = test_engine::scratch();
         let started = Instant::now();
-        let outcome = notify_restart_intent(&build_health_client(), "http", port, Some("d1")).await;
+        let outcome = notify_restart_intent(&test_engine::unreachable(&dir), Some("d1")).await;
 
         assert_eq!(outcome, RestartIntentNotify::Failed);
         assert!(
@@ -1503,8 +1533,9 @@ mod tests {
     /// stop is still draining.
     #[test]
     fn a_health_payload_names_when_the_engine_started() {
-        let body = r#"{"status":"ok","started_at":"2026-08-22T09:34:40.135361+00:00"}"#;
-        let started = started_at_in(body).expect("an engine reports its start time");
+        let body =
+            serde_json::json!({"status":"ok","started_at":"2026-08-22T09:34:40.135361+00:00"});
+        let started = started_at_in(&body).expect("an engine reports its start time");
         assert_eq!(started.to_rfc3339(), "2026-08-22T09:34:40.135361+00:00");
     }
 
@@ -1513,34 +1544,112 @@ mod tests {
     #[test]
     fn an_unreadable_payload_names_no_start_time() {
         for body in [
-            "",
-            "not json",
             r#"{"status":"ok"}"#,
             r#"{"started_at":42}"#,
             r#"{"started_at":"yesterday"}"#,
         ] {
-            assert!(started_at_in(body).is_none(), "must not parse: {body}");
+            let health = serde_json::from_str(body).unwrap();
+            assert!(started_at_in(&health).is_none(), "must not parse: {body}");
         }
     }
 
     #[tokio::test]
-    async fn a_port_nothing_listens_on_holds_no_engine() {
-        let port = dead_port().await;
+    async fn a_socket_nothing_listens_on_holds_no_engine() {
+        let dir = test_engine::scratch();
         assert_eq!(
-            probe_live_engine(&build_health_client(), "http", port).await,
+            probe_live_engine(&test_engine::unreachable(&dir), Path::new("/ws/a")).await,
             None
+        );
+        assert_eq!(
+            probe_health(&test_engine::unreachable(&dir), Path::new("/ws/a")).await,
+            ProbeOutcome::Unreachable
         );
     }
 
-    /// An engine that answers is adoptable even when it names no start time.
-    /// The stand-in's 204 carries no body, which is that case exactly.
+    /// I8: an engine socket held by somebody else is never healthy and never
+    /// adopted, and the probe sends it nothing. That is what keeps the
+    /// gateway from adopting, or later proxying to, a stranger.
     #[tokio::test]
-    async fn an_engine_that_answers_is_live_even_with_no_start_time() {
-        let (port, _saw) = capturing_engine().await;
+    async fn a_strangers_socket_probes_foreign_and_hears_nothing() {
+        let dir = test_engine::scratch();
+        let (engine, recorded) = test_engine::record_one(&dir);
         assert_eq!(
-            probe_live_engine(&build_health_client(), "http", port).await,
-            Some(LiveEngine { started_at: None })
+            probe_health(&engine.held_by_a_stranger(), Path::new("/ws/a")).await,
+            ProbeOutcome::Foreign
         );
+        assert!(recorded.await.expect("recorder").is_empty());
+
+        let dir = test_engine::scratch();
+        let (engine, recorded) = test_engine::record_one(&dir);
+        assert_eq!(
+            probe_live_engine(&engine.held_by_a_stranger(), Path::new("/ws/a")).await,
+            None
+        );
+        assert!(recorded.await.expect("recorder").is_empty());
+    }
+
+    /// A 2xx is not an identity. The stand-in's 204 names no workspace, so it
+    /// is not this workspace's engine, however healthy it sounds.
+    #[tokio::test]
+    async fn an_answer_that_names_no_workspace_is_no_engine_of_ours() {
+        let (_dir, engine, _saw) = capturing_engine().await;
+        assert_eq!(probe_live_engine(&engine, Path::new("/ws/a")).await, None);
+    }
+
+    /// A stand-in engine answering every health probe with `body`. The
+    /// directory holds its engine socket, so the caller keeps it alive.
+    fn engine_answering(body: String) -> (tempfile::TempDir, EngineAddress) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = test_engine::scratch();
+        let (listener, engine) = test_engine::bind(&dir);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+            }
+        });
+        (dir, engine)
+    }
+
+    /// The supervisor's probe grants Healthy only to this workspace's engine.
+    /// Another workspace's engine answering on the port is Foreign, so it can
+    /// never keep a stack healthy.
+    #[tokio::test]
+    async fn a_probe_answered_by_another_workspace_is_foreign() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (ours, theirs) = (root.path().join("ours"), root.path().join("theirs"));
+        std::fs::create_dir_all(&ours).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        let body =
+            |dir: &Path| serde_json::json!({"status": "ok", "workspace_path": dir}).to_string();
+
+        let (_stranger_dir, stranger) = engine_answering(body(&theirs));
+        assert_eq!(probe_health(&stranger, &ours).await, ProbeOutcome::Foreign);
+        let (_own_dir, own) = engine_answering(body(&ours));
+        assert_eq!(probe_health(&own, &ours).await, ProbeOutcome::Healthy);
+    }
+
+    /// Only a body naming the expected directory counts, by canonical path.
+    #[test]
+    fn a_health_body_is_ours_only_when_it_names_our_workspace() {
+        let root = tempfile::TempDir::new().unwrap();
+        let ours = root.path().join("ours");
+        let theirs = root.path().join("theirs");
+        std::fs::create_dir_all(&ours).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        let body =
+            |dir: &Path| serde_json::json!({"status": "ok", "workspace_path": dir}).to_string();
+        assert!(own_health_body(&body(&ours), &ours).is_some());
+        assert!(own_health_body(&body(&ours.join(".")), &ours).is_some());
+        assert!(own_health_body(&body(&theirs), &ours).is_none());
+        assert!(own_health_body(r#"{"status":"ok"}"#, &ours).is_none());
+        assert!(own_health_body("not json", &ours).is_none());
     }
 
     /// A spawned engine must INHERIT its model cache location rather than be
@@ -1626,7 +1735,8 @@ mod tests {
             "/certs/cert.pem"
         );
         // The engine serves TLS iff it sees `LUCIDOS_TLS_*`. Handing the pair on
-        // under that name would break the gateway's plain-HTTP proxy hop.
+        // under that name would make its loopback port serve https, against the
+        // http its ports file names.
         assert!(handed.iter().all(|(k, _)| !k.starts_with("LUCIDOS_TLS_")));
     }
 
@@ -1688,8 +1798,11 @@ mod tests {
     /// missing: `merge_ports_file` could be perfect and every packaged
     /// workspace still unresolvable. Spawns `/usr/bin/true` as a stand-in
     /// engine, which is enough because publication does not wait on health.
+    ///
+    /// The spawner writes no pidfile. Only the engine names itself, once it
+    /// holds the workspace's owner lock (ADR 0438).
     #[test]
-    fn a_spawn_publishes_the_ports_file_beside_the_pidfile() {
+    fn a_spawn_publishes_the_ports_file_and_leaves_the_pidfile_to_the_engine() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         let ws = Workspace {
@@ -1718,8 +1831,8 @@ mod tests {
             "API_PORT=42000\nPROTO=http\n"
         );
         assert!(
-            dir.join(".lucidos/engine.pid").is_file(),
-            "the ports file must land beside the pidfile, not instead of it"
+            !lucidos_owner_lock::engine::pid_path(dir).exists(),
+            "the spawner named a process that does not own the workspace yet"
         );
     }
 }

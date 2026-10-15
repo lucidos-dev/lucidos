@@ -1,7 +1,7 @@
 use super::*;
 use crate::engine::git_ops::{
     auto_commit_safe_files_if_dirty, find_worktree_for_branch, is_merge_of_branch_into_main,
-    WorktreeLookup,
+    MainLocks, WorktreeLookup, MAIN_LOCKS,
 };
 
 /// Clear a discarded change's branch state, given what git said about it.
@@ -207,6 +207,12 @@ impl LucidosEngine {
         change_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // First, so a change an apply or the landing lane holds is refused
+        // before its thread loses anything.
+        let claim = self
+            .apply_claims
+            .try_claim(change_id)
+            .ok_or(super::apply_claim::APPLY_IN_PROGRESS_MESSAGE)?;
         let thread_id = self
             .changes()
             .get_by_id(change_id)
@@ -216,7 +222,7 @@ impl LucidosEngine {
             // Still running in the worktree the discard is about to reset.
             self.abandon_background_tasks(thread_id, "Discard").await;
         }
-        self.discard_change_quietly(change_id, actor).await?;
+        self.discard_claimed(&claim, actor).await?;
         if let Some(thread_id) = thread_id {
             self.event_bus
                 .settle_child(thread_id, crate::engine::event_bus::ChildSettle::Discarded)
@@ -244,6 +250,22 @@ impl LucidosEngine {
         change_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let claim = self
+            .apply_claims
+            .try_claim(change_id)
+            .ok_or(super::apply_claim::APPLY_IN_PROGRESS_MESSAGE)?;
+        self.discard_claimed(&claim, actor).await
+    }
+
+    /// Discard the change `claim` holds. The claim spans the read and the
+    /// discard: an apply cannot merge the work between them, and this discard
+    /// cannot reset a tree an apply merges.
+    async fn discard_claimed(
+        &self,
+        claim: &super::apply_claim::ApplyClaim,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let change_id = claim.change_id();
         let change = self
             .changes()
             .get_by_id(change_id)
@@ -298,6 +320,11 @@ impl LucidosEngine {
         self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
             change_id,
             crate::engine::apply_all_driver::WITHDRAWN_MEMBER_REASON.to_string(),
+        ));
+        // A queued change leaves the landing lane with `ChangeUnqueued`.
+        self.notify_landing_lane(crate::engine::landing_lane::LaneMsg::Withdrawn(
+            change_id,
+            crate::engine::thread_events::UnqueueReason::Discarded,
         ));
 
         // Other open changes on the same branch? If so, leave the branch and
@@ -360,18 +387,26 @@ impl LucidosEngine {
         };
 
         let repo_root = std::path::PathBuf::from(&change.repo_root);
+        let landing_merge = crate::engine::landing_lane::landing_merge_of(
+            self.pool(),
+            change.thread_id.unwrap_or(change_id),
+            change_id,
+        )
+        .await?;
 
-        // Auto-commit safe files (docs) if they're the only dirty files
-        if auto_commit_safe_files_if_dirty(&repo_root).await {
-            return Err("Cannot revert: the repository has uncommitted changes. Commit or stash them first.".into());
-        }
-
-        let result = if let (Some(pre_sha), Some(post_sha)) = (&shas.pre, &shas.post) {
-            self.revert_with_shas(&repo_root, pre_sha, post_sha, &change.branch_name)
-                .await
-        } else {
-            self.revert_legacy(&repo_root, &change.branch_name).await
+        // A change the landing lane landed is exactly its landing merge.
+        let target = match (&landing_merge, &shas.pre, &shas.post) {
+            (Some(landing), _, _) => RevertTarget::LandingMerge(landing),
+            (None, Some(pre_sha), Some(post_sha)) => RevertTarget::Range {
+                pre_sha,
+                post_sha,
+                branch_name: &change.branch_name,
+            },
+            (None, _, _) => RevertTarget::Legacy {
+                branch_name: &change.branch_name,
+            },
         };
+        let result = revert_on_main(&MAIN_LOCKS, &repo_root, target).await;
 
         match result {
             Ok(()) => {
@@ -399,57 +434,85 @@ impl LucidosEngine {
             Err(e) => Err(e),
         }
     }
+}
 
-    /// Revert using stored pre/post merge SHAs.
-    async fn revert_with_shas(
-        &self,
-        repo_root: &Path,
-        pre_sha: &str,
-        post_sha: &str,
-        branch_name: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        revert_with_shas(repo_root, pre_sha, post_sha, branch_name).await
+/// What Revert undoes on `main`.
+pub(crate) enum RevertTarget<'a> {
+    /// The landing merge the landing lane recorded for the change.
+    LandingMerge(&'a str),
+    /// The merge range an Apply tier recorded.
+    Range {
+        pre_sha: &'a str,
+        post_sha: &'a str,
+        branch_name: &'a str,
+    },
+    /// A change applied before revert tracking: its merge is found by name.
+    Legacy { branch_name: &'a str },
+}
+
+/// Revert a change on `main`. A revert moves `main`, so it takes both of
+/// `main`'s locks, merge lock first, and waits out a landing pass. The dirty
+/// check runs under them too.
+pub(crate) async fn revert_on_main(
+    locks: &MainLocks,
+    repo_root: &Path,
+    target: RevertTarget<'_>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _main = locks.lock_main().await;
+    // Auto-commit safe files (docs) if they're the only dirty files
+    if auto_commit_safe_files_if_dirty(repo_root).await {
+        return Err(
+            "Cannot revert: the repository has uncommitted changes. Commit or stash them first."
+                .into(),
+        );
     }
+    match target {
+        RevertTarget::LandingMerge(landing) => revert_landing_merge(repo_root, landing).await,
+        RevertTarget::Range {
+            pre_sha,
+            post_sha,
+            branch_name,
+        } => revert_with_shas(repo_root, pre_sha, post_sha, branch_name).await,
+        RevertTarget::Legacy { branch_name } => revert_legacy(repo_root, branch_name).await,
+    }
+}
 
-    /// Legacy revert: find the merge commit in recent git history. A change
-    /// that was fast-forwarded before SHA tracking left no record of main's
-    /// pre-merge commit, so it cannot be reverted and errors below.
-    async fn revert_legacy(
-        &self,
-        repo_root: &Path,
-        branch_name: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Find a merge commit that merged this branch INTO main.
-        // Must match "Merge branch 'feature'" or "Merge feature:" patterns,
-        // NOT "Merge branch 'main' into feature" (which is the reverse direction).
-        let log_output = git_cmd(&["log", "--merges", "--oneline", "-50"], repo_root)
-            .await
-            .map_err(|e| format!("Failed to read git log: {}", e))?;
-        if log_output.status.success() {
-            let log_text = String::from_utf8_lossy(&log_output.stdout);
-            if let Some(merge_hash) = log_text
-                .lines()
-                .find(|line| is_merge_of_branch_into_main(line, branch_name))
-                .and_then(|line| line.split_whitespace().next())
-            {
-                return match git_cmd(&["revert", merge_hash, "-m", "1", "--no-edit"], repo_root)
-                    .await
-                {
-                    Ok(o) if o.status.success() => Ok(()),
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                        let _ = git_cmd(&["revert", "--abort"], repo_root).await;
-                        Err(format!("Revert failed (conflicts): {}", stderr).into())
-                    }
-                    Err(e) => Err(format!("Revert error: {}", e).into()),
-                };
-            }
+/// Legacy revert: find the merge commit in recent git history. A change
+/// that was fast-forwarded before SHA tracking left no record of main's
+/// pre-merge commit, so it cannot be reverted and errors below.
+async fn revert_legacy(
+    repo_root: &Path,
+    branch_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Find a merge commit that merged this branch INTO main.
+    // Must match "Merge branch 'feature'" or "Merge feature:" patterns,
+    // NOT "Merge branch 'main' into feature" (which is the reverse direction).
+    let log_output = git_cmd(&["log", "--merges", "--oneline", "-50"], repo_root)
+        .await
+        .map_err(|e| format!("Failed to read git log: {}", e))?;
+    if log_output.status.success() {
+        let log_text = String::from_utf8_lossy(&log_output.stdout);
+        if let Some(merge_hash) = log_text
+            .lines()
+            .find(|line| is_merge_of_branch_into_main(line, branch_name))
+            .and_then(|line| line.split_whitespace().next())
+        {
+            return match git_cmd(&["revert", merge_hash, "-m", "1", "--no-edit"], repo_root).await {
+                Ok(o) if o.status.success() => Ok(()),
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    let _ = git_cmd(&["revert", "--abort"], repo_root).await;
+                    Err(format!("Revert failed (conflicts): {}", stderr).into())
+                }
+                Err(e) => Err(format!("Revert error: {}", e).into()),
+            };
         }
-
-        Err(format!(
-            "Could not find commits for branch '{}'. \
-             The branch may have been deleted and this change was applied before revert tracking was added.",
-            branch_name
-        ).into())
     }
+
+    Err(format!(
+        "Could not find commits for branch '{}'. \
+         The branch may have been deleted and this change was applied before revert tracking was added.",
+        branch_name
+    )
+    .into())
 }

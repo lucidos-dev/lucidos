@@ -212,7 +212,9 @@ impl LlmProvider for RoutingProvider {
         let resolved = ModelSelection::model(&route.wire_id)
             .with_effort(self.effort_for_route(&model, &route, selection.reasoning_effort))
             .with_attempt_timeout(selection.attempt_timeout)
-            .with_forced_tool(selection.forced_tool);
+            .with_forced_tool(selection.forced_tool)
+            .with_service_tier(selection.service_tier)
+            .with_cache_mode(selection.cache_mode);
         let response = provider
             .chat(messages, tools, resolved, system_prompt, on_token, call)
             .await?;
@@ -528,6 +530,76 @@ mod tests {
         )
         .expect("build the stub provider");
         (provider, hits)
+    }
+
+    /// The router rebuilds the selection for the leaf field by field, so a
+    /// requested service tier and cache mode must cross it. The backend
+    /// records the body it was sent and refuses, which ends the call.
+    #[tokio::test]
+    async fn the_service_tier_and_cache_mode_cross_the_router_to_the_leaf() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sent, mut bodies) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0u8; 256 * 1024];
+                let n = stream.read(&mut request).await.unwrap_or(0);
+                let _ = sent.send(String::from_utf8_lossy(&request[..n]).to_string());
+                let body = r#"{"error":{"message":"refused for the test"}}"#;
+                let reply = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        let openai = OpenAiProvider::new_with_base_url(
+            "k".to_string(),
+            "gpt-6.1-sol".to_string(),
+            &format!("http://{addr}/v1"),
+            Vec::new(),
+            false,
+        )
+        .expect("build the stub provider");
+        let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
+            "gpt-6.1-sol".to_string(),
+            ModelRouting::single(ProviderKind::OpenAi, "gpt-6.1-sol"),
+        )])));
+        let router = RoutingProvider::new(
+            None,
+            Some(openai),
+            None,
+            None,
+            None,
+            None,
+            None,
+            registry,
+            "gpt-6.1-sol".to_string(),
+        );
+        let outcome = router
+            .chat(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: crate::llm::MessageContent::Text("hi".to_string()),
+                }],
+                vec![],
+                ModelSelection::model("gpt-6.1-sol")
+                    .with_service_tier(Some(crate::llm::ServiceTier::Flex))
+                    .with_cache_mode(crate::llm::CacheMode::Explicit),
+                None,
+                None,
+                crate::llm::metered::CallToken::for_test(),
+            )
+            .await;
+        assert!(outcome.is_err(), "the backend refuses");
+        let request = bodies.recv().await.expect("the leaf sent a request");
+        assert!(request.contains(r#""service_tier":"flex""#), "{request}");
+        assert!(
+            request.contains(r#""prompt_cache_options":{"mode":"explicit"}"#),
+            "{request}"
+        );
     }
 
     /// A not-found answer on the first route ends the call there (ADR 0247).

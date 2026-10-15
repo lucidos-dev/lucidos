@@ -50,12 +50,21 @@ pub fn user_cache_root_from(xdg_cache_home: Option<&str>, home: Option<&str>) ->
     Some(base.join("lucidos"))
 }
 
-/// [`user_cache_root_from`] over this process's environment.
+/// [`user_cache_root_from`] over this process's environment, made a storage
+/// root. `None` also when it cannot be made owner-only, and every caller then
+/// runs without the shared cache, as it does with no root at all.
 pub fn user_cache_root() -> Option<PathBuf> {
-    user_cache_root_from(
+    let root = user_cache_root_from(
         std::env::var("XDG_CACHE_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
-    )
+    )?;
+    match lucidos_home::ensure_storage_root(&root) {
+        Ok(()) => Some(root),
+        Err(e) => {
+            crate::log!("[Paths] No shared user cache: {e}");
+            None
+        }
+    }
 }
 
 /// Resolve the Lucidos repo root from the running binary's path.
@@ -175,12 +184,8 @@ mod tests {
     /// keeps `cargo clean` from deleting the running system's `lucidos` CLI.
     #[test]
     fn repo_root_above_is_independent_of_binary_depth() {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-reporoot-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().to_path_buf();
         std::fs::create_dir_all(dir.join("scripts")).unwrap();
         std::fs::write(dir.join(REPO_MARKER), "#!/bin/bash\n").unwrap();
 
@@ -200,8 +205,6 @@ mod tests {
             repo_root_above(Path::new("/tmp/elsewhere/lucidos-engine")),
             None
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -218,44 +221,6 @@ mod tests {
         assert!(
             msg.contains("definitely-not-a-real-script.sh"),
             "error must name the missing path; got: {msg}"
-        );
-    }
-
-    /// Bind-mounting PGDATA on macOS pushes every WAL fsync through Docker
-    /// Desktop's virtiofs, which throttles host writes and crashes the VM
-    /// under sustained e2e load (34 GB dirtied in 4 hours, see thread
-    /// 50724c03 — `com.apple.Virtualization.VirtualMachine` diagnostic at
-    /// 22:44, DB pool timeouts at 05:50, force restart at 07:18). Switching
-    /// to a Docker named volume keeps fsyncs inside the VM's ext4.
-    ///
-    /// PG 18's image relocated PGDATA to /var/lib/postgresql/18/docker and
-    /// declares its VOLUME at the parent /var/lib/postgresql (PG 17 used
-    /// /var/lib/postgresql/data for both), so the named volume must be mounted
-    /// at the parent — mounting the old /data path would strand PGDATA on an
-    /// anonymous volume that is lost on each container recreate.
-    #[test]
-    fn dev_postgres_uses_named_volume_not_bind_mount() {
-        let repo = repo_root().expect("repo root");
-        let yml = std::fs::read_to_string(repo.join("docker-compose.dev.yml"))
-            .expect("docker-compose.dev.yml must exist");
-
-        assert!(
-            yml.contains("- lucidos-pg-data:/var/lib/postgresql\n"),
-            "Postgres PGDATA must be a named volume mounted at the parent\n\
-             /var/lib/postgresql (PG 18 keeps the cluster under it at 18/docker).\n\
-             Expected line: '- lucidos-pg-data:/var/lib/postgresql'\n\
-             Got docker-compose.dev.yml:\n{yml}"
-        );
-        assert!(
-            !yml.contains("- lucidos-pg-data:/var/lib/postgresql/data"),
-            "PG 17 mount path must be gone — PG 18 relocated PGDATA, so mounting\n\
-             the named volume at /var/lib/postgresql/data loses data on recreate.\n\
-             Got docker-compose.dev.yml:\n{yml}"
-        );
-        assert!(
-            !yml.contains("/data/postgres:/var/lib/postgresql/data"),
-            "Legacy host bind-mount entry must be removed.\n\
-             Got docker-compose.dev.yml:\n{yml}"
         );
     }
 

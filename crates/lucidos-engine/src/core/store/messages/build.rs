@@ -151,13 +151,17 @@ fn authoring_agent(event: &EventRow) -> Option<AgentParticipant> {
 /// was not looked up, and reads as the report left it.
 pub type ChangeStatuses = HashMap<Uuid, Option<ChangeStatus>>;
 
+/// The two events a child's report arrives as: a card that woke this thread,
+/// or one filed for its next turn. Both carry the same payload.
+const CHILD_REPORT_EVENT_TYPES: &[&str] = &["ChildThreadCompleted", "ChildReportFiled"];
+
 /// Every change id this thread's child reports name: their own and their
 /// sub-threads'.
 pub(crate) fn reported_change_ids(events: &[EventRow]) -> Vec<Uuid> {
     let parse = |v: &serde_json::Value| v.as_str().and_then(|s| Uuid::parse_str(s).ok());
     events
         .iter()
-        .filter(|event| event.event_type == "ChildThreadCompleted")
+        .filter(|event| CHILD_REPORT_EVENT_TYPES.contains(&event.event_type.as_str()))
         .flat_map(|event| {
             let own = event
                 .payload
@@ -205,6 +209,33 @@ pub(crate) const CHANGES_MOVED_ON_NOTE: &str =
 /// completion at LLM call setup) and the fan-in wake (projects a single event
 /// inline as the next user message). Both paths produce identical text.
 pub fn format_child_thread_completed_block(event: &EventRow, statuses: &ChangeStatuses) -> String {
+    format_child_report_block(event, statuses, "[CHILD THREAD COMPLETED]", "")
+}
+
+/// What a filed report says about itself, after the card's own note.
+pub(crate) const REPORT_FILED_NOTE: &str = "\nThis report did not wake you: the child said \
+     you need not act on it right away, so it was filed. You read it now, at the start of \
+     your next turn. Act on it if your work needs it.";
+
+/// Format a persisted `ChildReportFiled` event row as the `[CHILD THREAD REPORT
+/// FILED]` block: the completion card's text under its own heading, plus a
+/// note that it woke nothing.
+pub fn format_child_report_filed_block(event: &EventRow, statuses: &ChangeStatuses) -> String {
+    format_child_report_block(
+        event,
+        statuses,
+        "[CHILD THREAD REPORT FILED]",
+        REPORT_FILED_NOTE,
+    )
+}
+
+/// The block both report events share, under `heading`, closing on `note`.
+fn format_child_report_block(
+    event: &EventRow,
+    statuses: &ChangeStatuses,
+    heading: &str,
+    note: &str,
+) -> String {
     use crate::engine::thread_events::ChildCompletionStatus;
 
     let child_thread_id = event
@@ -296,19 +327,43 @@ pub fn format_child_thread_completed_block(event: &EventRow, statuses: &ChangeSt
     // original reader and is retired (ADR 0109); the `events` tool's
     // `event_id` argument takes the same form.
     format!(
-        "[CHILD THREAD COMPLETED] {} {}\nevent_id: {}{}\nPending changes: {}{}{}{}\n\
+        "{} {} {}\nevent_id: {}{}\nPending changes: {}{}{}{}{}\n\
          Note: phrases like \"session can finish\" or \"## Session Summary\" in \
          the summary describe the child subprocess only — if you were following \
          a multi-step procedure, continue with the next step. Otherwise use \
-         run_thread to refine.",
+         run_thread to refine.{}",
+        heading,
         child_thread_id,
         status,
         event.id,
         title_line,
         pending_section,
         sub_thread_section,
+        integrated_branch_section(event),
         moved_on_note,
-        summary_section
+        summary_section,
+        note
+    )
+}
+
+/// The block's line for the branch an integrated child hands up, or nothing.
+/// The parent's agent merges it: the engine never writes the parent's branch.
+fn integrated_branch_section(event: &EventRow) -> String {
+    let Some(branch) = event
+        .payload
+        .get("integrated_branch")
+        .cloned()
+        .and_then(|v| {
+            serde_json::from_value::<crate::engine::thread_events::IntegratedBranch>(v).ok()
+        })
+    else {
+        return String::new();
+    };
+    format!(
+        "\nIntegrated branch: {} at {}. This child is integrated into your branch, so it \
+         proposes nothing. Merge it now with `git merge {}`, then run `/harden` once over the \
+         merged work.",
+        branch.branch_name, branch.head_sha, branch.branch_name
     )
 }
 
@@ -1106,11 +1161,15 @@ pub(crate) fn build_session_messages_with(
                     }
                 }
             }
-            "ChildThreadCompleted" => {
+            "ChildThreadCompleted" | "ChildReportFiled" => {
                 // Render the typed event as a user-channel block so the parent's
                 // resume LLM sees a clearly-attributed structured callback in
-                // its conversation history.
-                let content = format_child_thread_completed_block(event, statuses);
+                // its conversation history. A filed report says it woke nothing.
+                let content = if event.event_type == "ChildThreadCompleted" {
+                    format_child_thread_completed_block(event, statuses)
+                } else {
+                    format_child_report_filed_block(event, statuses)
+                };
 
                 messages.push(SessionMessage {
                     role: "user".to_string(),

@@ -69,13 +69,13 @@ Write the face files first and `font.json` last, so the font appears only when
 complete:
 
 ```bash
-lucidos data write fonts/brand-sans/BrandSans-Regular.woff2 --from /tmp/BrandSans-Regular.woff2
-lucidos data write fonts/brand-sans/font.json --from /tmp/font.json
+lucidos data write fonts/brand-sans/BrandSans-Regular.woff2 --from "${TMPDIR:-/tmp}/BrandSans-Regular.woff2"
+lucidos data write fonts/brand-sans/font.json --from "${TMPDIR:-/tmp}/font.json"
 ```
 
 The engine checks each write before it reaches disk. A refused write exits
 non-zero with the reason. If the user gave you a URL, download the file once to
-`/tmp` and write it from there.
+`${TMPDIR:-/tmp}`, the per-user temp dir, and write it from there.
 
 Only use a font the user has the right to use. When you fetch one yourself,
 check the licence and put its SPDX id in `license`.

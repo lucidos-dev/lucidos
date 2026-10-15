@@ -1,6 +1,6 @@
 # 0249: A thread waiting only on its sub-threads can have its change applied: amends 0106
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [0442](0442-a-check-and-its-claim-are-one-step.md)
 - **Date**: 2026-09-23
 - **Amends**: [0106: A parked thread's change cannot be applied](0106-a-parked-threads-change-is-not-applicable.md)
 
@@ -105,15 +105,12 @@ the running sub-threads either way.
 Apply Now already did, and what its comment said every path should do. App and
 external-repo changes skip both gates, so an app coding agent is unaffected.
 
-**A narrow window is accepted, not closed.** A child can finish while its
-parent's change is mid-apply. The wake then starts a turn in the worktree the
-apply is resetting. A user already has the same window by typing a follow-up
-straight after pressing Apply. The Tier-2 fast path runs for seconds, and a
-resumed agent needs longer to boot, edit and commit.
-
-Closing the window needs a per-thread apply lock that the spawn path honours.
-That is a larger change than the risk warrants today, in the same spirit as
-0106's own accepted window.
+**The mid-apply window is closed (ADR 0442).** A child can finish while its
+parent's change is mid-apply. A Tier-2 apply now holds the parent thread in
+`agent_sessions` (`SessionPhase::Applying`) while it merges and resets the
+worktree. The wake's spawn claim, and a user's follow-up, wait until the apply
+lets go, then run. An apply that hands the merge to a session passes the hold
+over in one step, so the waiting wake routes to that session.
 
 **Contract.** `available_thread_actions` lost a parameter, so the generated
 TypeScript and the cross-validation fixture were regenerated. The fixture's

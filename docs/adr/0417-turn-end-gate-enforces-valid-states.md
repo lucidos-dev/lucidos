@@ -3,6 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-10-10
 - **Amends**: [0409](0409-review-lists-read-requests.md)
+- **Amended by**: [0446](0446-read-decision-knows-the-parent-acts.md), which tells a forced read decision when the report wakes the parent agent; [0472](0472-trigger-runs-decide-their-read.md), which has every trigger turn decide its own read
 
 ## Context
 

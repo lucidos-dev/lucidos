@@ -46,10 +46,14 @@ fn first_reachable<'a>(
 }
 
 /// What a purpose's measured comparison put ahead of its catalog default.
-/// Evidence: `docs/plans/2026-10-06-memory-tasks-model-comparison.md`.
 fn purpose_lead(purpose: ContextPurpose) -> Vec<&'static str> {
     match purpose {
+        // `docs/plans/2026-10-06-memory-tasks-model-comparison.md`.
         ContextPurpose::Memory => vec!["gpt-5.6-luna"],
+        // `lucidos-eval read-decision`, recorded in ADR 0426.
+        ContextPurpose::ReadDecision => vec!["gemini-3.8-flash", "gpt-5.6-luna"],
+        // `lucidos-eval wake-decision`, recorded in ADR 0448.
+        ContextPurpose::WakeDecision => vec!["gemini-3.8-flash", "gpt-6.1-sol", "gpt-5.6-luna"],
         // The two summary writers share one measured list.
         ContextPurpose::ConversationSummary => {
             COMPACTOR_DEFAULTS.iter().map(|entry| entry.model).collect()
@@ -58,13 +62,28 @@ fn purpose_lead(purpose: ContextPurpose) -> Vec<&'static str> {
     }
 }
 
+/// Whether every model `purpose` runs on unpinned must have cleared its eval.
+/// Such a purpose recommends only its measured lead and catalog default. With
+/// neither reachable it resolves to the chat model, which its caller never
+/// asks (ADR 0448).
+fn measured_only(purpose: ContextPurpose) -> bool {
+    purpose == ContextPurpose::WakeDecision
+}
+
+/// Whether `purpose` asks no model at all, its selection having come from
+/// `source`: it runs only on measured models, and none was reachable.
+pub(crate) fn asks_no_model(purpose: ContextPurpose, source: ModelSource) -> bool {
+    measured_only(purpose) && source == ModelSource::ChatModel
+}
+
 /// The models `purpose` recommends, best first, each once. Settings shows
 /// them first, and the first a configured provider serves is the default.
 ///
 /// `LUCIDOS_EXTRACTION_MODEL` leads when set, except for the command judge,
-/// which it never reached. Then the purpose's measured lead, its catalog
-/// default, and [`AUX_FALLBACKS`]. The compactor recommends its own measured
-/// list (ADR 0373). A purpose with no preference pair recommends nothing.
+/// which it never reached, and a [`measured_only`] purpose. Then the purpose's
+/// measured lead, its catalog default, and [`AUX_FALLBACKS`] unless it is
+/// measured only. The compactor recommends its own measured list (ADR 0373).
+/// A purpose with no preference pair recommends nothing.
 ///
 /// A purpose that needs vision recommends only models that read images, so
 /// its default never lands on one it would then refuse.
@@ -116,13 +135,16 @@ fn recommended_with(purpose: ContextPurpose, extraction_override: Option<&str>) 
             return Vec::new();
         }
     };
-    let env_override = extraction_override.filter(|_| purpose != ContextPurpose::CommandJudge);
+    let measured = measured_only(purpose);
+    let env_override =
+        extraction_override.filter(|_| purpose != ContextPurpose::CommandJudge && !measured);
+    let fallbacks: &[&str] = if measured { &[] } else { AUX_FALLBACKS };
     let mut list: Vec<String> = Vec::new();
     for model in env_override
         .into_iter()
         .chain(purpose_lead(purpose))
         .chain([pair.model.default_text()])
-        .chain(AUX_FALLBACKS.iter().copied())
+        .chain(fallbacks.iter().copied())
     {
         if !list.iter().any(|seen| seen == model) {
             list.push(model.to_string());

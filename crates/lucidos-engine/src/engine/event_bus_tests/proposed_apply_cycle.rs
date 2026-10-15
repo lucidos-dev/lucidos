@@ -273,6 +273,9 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
                 coding_agent_kind: Default::default(),
                 coding_agent_folder: String::new(),
                 app_id: None,
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
             EventMeta {
                 channel: Some(EventChannel::ClaudeCode),
@@ -321,6 +324,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
                 actor: None,
                 pre_merge_sha: None,
                 post_merge_sha: None,
+                landing_merge_sha: None,
                 path: String::new(),
             },
             EventMeta::NONE,
@@ -419,6 +423,7 @@ async fn change_applied_persists_device_actor_in_payload() {
             actor: Some(device.clone()),
             pre_merge_sha: None,
             post_merge_sha: None,
+            landing_merge_sha: None,
             path: String::new(),
         },
         meta: EventMeta::NONE,
@@ -492,147 +497,76 @@ async fn seed_pending_change(bus: &EventBus, thread_id: Uuid, branch: &str) -> U
     change_id
 }
 
-fn change_applied_event(change_id: Uuid) -> ThreadEvent {
-    ThreadEvent::ChangeApplied {
-        change_id: change_id.to_string(),
-        requires_restart: false,
-        client_update: false,
-        commits: vec![],
-        thread_title: None,
-        actor: None,
-        pre_merge_sha: None,
-        post_merge_sha: None,
-        path: String::new(),
+/// `ChangeApplied` is built in one place, the emitter that takes the change's
+/// `ApplyClaim`. Every apply claims before it reads the row. So a second
+/// `ChangeApplied` for one change cannot happen, and the bus needs no filter
+/// for it (ADR 0442). A second construction site would bypass the claim.
+#[test]
+fn change_applied_is_built_only_by_the_claim_holding_emitter() {
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
     }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_sources(&src, &mut files);
+    let builders: Vec<String> = files
+        .iter()
+        .filter(|p| {
+            let name = p.to_string_lossy();
+            !name.contains("_tests") && !name.ends_with("event.rs")
+        })
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .contains("event: ThreadEvent::ChangeApplied {")
+        })
+        .map(|p| p.strip_prefix(&src).unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(builders, vec!["engine/change_ops_emitters.rs".to_string()]);
 }
 
-async fn count_change_applied(pool: &PgPool, change_id: Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events \
-         WHERE event_type = 'ChangeApplied' AND payload->>'change_id' = $1",
-    )
-    .bind(change_id.to_string())
-    .fetch_one(pool)
-    .await
-    .unwrap()
-}
-
-/// Bug: one logical apply must emit `ChangeApplied` at most once per change_id.
-/// A sequential re-apply — an HTTP retry, the Apply-All driver re-firing, or a
-/// post-restart recovery path re-emitting minutes later (the observed
-/// 4-minute-gap, no-actor second emit) — used to persist a SECOND
-/// `ChangeApplied`, rendering two "Change applied" timeline entries with no
-/// input/output between them. The EventBus single-fire guard claims the
-/// change row and suppresses the duplicate.
+/// Two engines on one database each hold their own apply claims, so the claim
+/// cannot stop both from applying one change. The database refuses the second
+/// `ChangeApplied` (ADR 0442).
 #[tokio::test]
-async fn change_applied_emits_once_on_sequential_reapply() {
+async fn the_database_refuses_a_second_change_applied_for_one_change() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _cb) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
-    let change_id = seed_pending_change(&bus, thread_id, "claude-code/once-seq").await;
-
-    // First apply persists the event and flips the change row to applied.
-    bus.emit(BusEvent::Thread {
+    let change_id = seed_pending_change(&bus, thread_id, "claude-code/applied-once").await;
+    let applied = || BusEvent::Thread {
         thread_id,
-        event: change_applied_event(change_id),
+        event: ThreadEvent::ChangeApplied {
+            change_id: change_id.to_string(),
+            requires_restart: false,
+            client_update: false,
+            commits: vec![],
+            thread_title: None,
+            actor: None,
+            pre_merge_sha: None,
+            post_merge_sha: None,
+            landing_merge_sha: None,
+            path: String::new(),
+        },
         meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-    // Second apply (re-emit) of the same change_id must be suppressed.
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: change_applied_event(change_id),
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    };
 
-    assert_eq!(
-        count_change_applied(&pool, change_id).await,
-        1,
-        "ChangeApplied must be persisted at most once per change_id — a sequential \
-         re-apply must not produce a second 'Change applied' timeline entry"
-    );
-
-    let status: ChangeStatus = sqlx::query_scalar("SELECT status FROM changes WHERE id = $1")
-        .bind(change_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        status,
-        ChangeStatus::Applied,
-        "the change row is applied after the first emit"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// Bug: two concurrent applies of one pending change (an Apply double-click, a
-/// client retry, or the user racing the Apply-All driver) both read
-/// status='pending' and both used to emit `ChangeApplied` (~0.6s apart, the
-/// classic double-fire). The `FOR UPDATE` claim in the single-fire guard
-/// serializes them so exactly one event persists.
-#[tokio::test]
-async fn change_applied_emits_once_under_concurrent_apply() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _cb) = EventBus::new(pool.clone());
-    let thread_id = Uuid::new_v4();
-    let change_id = seed_pending_change(&bus, thread_id, "claude-code/once-conc").await;
-
-    let (r1, r2) = tokio::join!(
-        bus.emit(BusEvent::Thread {
-            thread_id,
-            event: change_applied_event(change_id),
-            meta: EventMeta::NONE,
-        }),
-        bus.emit(BusEvent::Thread {
-            thread_id,
-            event: change_applied_event(change_id),
-            meta: EventMeta::NONE,
-        }),
-    );
-    r1.unwrap();
-    r2.unwrap();
-
-    assert_eq!(
-        count_change_applied(&pool, change_id).await,
-        1,
-        "concurrent applies of one change must collapse to exactly one ChangeApplied"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// Guard must NOT suppress legitimate single emits whose change_id has no
-/// `changes` row to claim (a throwaway/test id, or a row whose
-/// `ChangeProposed` never landed — e.g. the external-repo archive carve-out
-/// and the Tier-3 stash→take slow path both emit `ChangeApplied` for a
-/// change with no aggregate row). These must still emit exactly once.
-#[tokio::test]
-async fn change_applied_without_changes_row_still_emits_once() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _cb) = EventBus::new(pool.clone());
-    let thread_id = Uuid::new_v4();
-    start_cc_session(&bus, thread_id, "claude-code/no-row", None).await;
-
-    // Valid UUID, but no ChangeProposed was emitted → no `changes` row exists.
-    let change_id = Uuid::new_v4();
-    bus.emit(BusEvent::Thread {
-        thread_id,
-        event: change_applied_event(change_id),
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
-
-    assert_eq!(
-        count_change_applied(&pool, change_id).await,
-        1,
-        "a ChangeApplied with no changes row to dedup against must still emit once"
+    bus.emit(applied()).await.expect("the first apply records");
+    let Err(second) = bus.emit(applied()).await else {
+        panic!("a second ChangeApplied for one change is refused");
+    };
+    assert!(
+        second
+            .to_string()
+            .contains(crate::engine::change_ops::CHANGE_APPLIED_ONCE_INDEX),
+        "refused by the index, not some other failure: {second}"
     );
 
     pool.close().await;
@@ -676,6 +610,7 @@ async fn slow_path_change_applied_carries_stashed_apply_actor() {
             actor: recovered,
             pre_merge_sha: None,
             post_merge_sha: None,
+            landing_merge_sha: None,
             path: String::new(),
         },
         meta: EventMeta::NONE,
@@ -945,16 +880,9 @@ fn apply_time_dev_refresh_lives_only_on_the_shared_change_applied_emit() {
     }
 }
 
-/// Guard that the post-apply dev refresh runs only for the ACCEPTED
-/// `ChangeApplied`, never for a duplicate the bus suppressed.
-///
-/// The bus's single-fire guard `FOR UPDATE`-locks the change row and returns
-/// `Ok(None)` for a recognized duplicate — which is a routine occurrence, not a
-/// pathology: the ~0.6s double-fire race, Apply-All retries, the
-/// conflict-recovery cleanup, and post-restart re-emits all hit it. `emit_or_log`
-/// throws that verdict away, so emitting through it and then refreshing
-/// unconditionally would let the DUPLICATE supersede the frontend refresh the
-/// ACCEPTED emit just started, and join its rebuild for nothing.
+/// Guard that the post-apply dev refresh runs only for a `ChangeApplied` that
+/// persisted. `emit_or_log` throws the outcome away, so emitting through it and
+/// refreshing unconditionally would start a rebuild for an event that failed.
 #[test]
 fn post_apply_refresh_runs_only_for_the_accepted_change_applied() {
     let emitters = include_str!("../change_ops_emitters.rs");
@@ -965,8 +893,7 @@ fn post_apply_refresh_runs_only_for_the_accepted_change_applied() {
     assert!(
         tail.contains("Ok(res) => res.is_some()"),
         "emit_change_applied must emit via `emit` (not `emit_or_log`) and read the \
-         Ok(Some)/Ok(None) verdict — `emit_or_log` discards the single-fire guard's \
-         suppression, so a duplicate would still fire the refresh"
+         outcome, so a failed emit fires no refresh"
     );
     let accepted_pos = tail
         .find("if accepted {")
@@ -986,7 +913,7 @@ fn post_apply_refresh_runs_only_for_the_accepted_change_applied() {
 /// The branch outlives the apply, and a stale harden marker still counts as
 /// hardened. Without the clear, the thread's NEXT change rides the old plan
 /// approval and `/harden` run (ADR 0249). Gated on the accepted emit, so a
-/// suppressed duplicate cannot wipe a marker recorded for newer work. The live
+/// failed emit cannot wipe a marker recorded for newer work. The live
 /// half is the API e2e test
 /// `a_parents_commits_after_an_apply_come_back_as_a_new_change`.
 #[test]

@@ -82,6 +82,54 @@ mod tests {
         }
     }
 
+    /// The `#rrggbb` colours an SVG names.
+    fn hex_colours(svg: &str) -> std::collections::BTreeSet<&str> {
+        svg.match_indices("\"#")
+            .filter_map(|(at, _)| svg.get(at + 1..at + 8))
+            .collect()
+    }
+
+    /// Every built-in draws its icon in the host glyph style that
+    /// `.claude/rules/system-widgets.md` sets out, in one hue they all share.
+    #[test]
+    fn every_built_in_icon_follows_the_host_glyph_style() {
+        let ws = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(ws.path())
+            .unwrap()
+            .with_system_widgets(Some(repo_system_widgets()));
+        let mut hues = std::collections::BTreeSet::new();
+        for widget in manager.list_reusable_widgets().unwrap() {
+            if !widget.built_in {
+                continue;
+            }
+            let icon = widget
+                .icon
+                .unwrap_or_else(|| panic!("{} has an icon", widget.id));
+            assert!(icon.ends_with(".svg"), "{} draws an SVG", widget.id);
+            let svg =
+                std::fs::read_to_string(repo_system_widgets().join(&widget.id).join(icon)).unwrap();
+            let (root, _) = svg.split_once('>').unwrap();
+            for attr in [
+                r#"viewBox="0 0 24 24""#,
+                r#"fill="none""#,
+                r#"stroke-width="2""#,
+                r#"stroke-linecap="round""#,
+                r#"stroke-linejoin="round""#,
+            ] {
+                assert!(root.contains(attr), "{} root sets {attr}", widget.id);
+            }
+            for banned in ["<text", "Gradient", "<image", "<script"] {
+                assert!(!svg.contains(banned), "{} has no {banned}", widget.id);
+            }
+            hues.extend(hex_colours(&svg).into_iter().map(str::to_string));
+        }
+        assert_eq!(
+            hues.len(),
+            1,
+            "every built-in icon shares one hue: {hues:?}"
+        );
+    }
+
     #[test]
     fn a_missing_staged_dir_warns_naming_its_env_var() {
         let tmp = tempfile::tempdir().unwrap();

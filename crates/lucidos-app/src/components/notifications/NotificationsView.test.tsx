@@ -13,7 +13,7 @@ vi.mock('../../api/client', () => ({
 }));
 
 const { notificationsTabSource, notificationsTabIsLoading } = await import('./NotificationsView');
-const { unreadNotifications, notifications, unreadCount } = await import('../../store/store');
+const { unreadNotifications, notifications, unreadCount, servedNotifications, servedUnreadNotifications } = await import('../../store/store');
 
 function n(id: string, read: boolean): Notification {
   return { id, title: id, message: id, read, created_at: new Date().toISOString() };
@@ -37,8 +37,8 @@ describe('notificationsTabSource — single source of truth for the Unread tab',
     // `unreadNotifications`, and the Unread tab sources the same signal. So the
     // number of rows the Unread tab renders always equals `unreadCount` — the
     // exact invariant the reported bug violated.
-    unreadNotifications.value = { status: 'loaded', data: [n('u1', false), n('u2', false), n('u3', false)] };
-    notifications.value = { status: 'loaded', data: [n('a1', true)] }; // browse list is unrelated
+    servedUnreadNotifications.value = { status: 'loaded', data: [n('u1', false), n('u2', false), n('u3', false)] };
+    servedNotifications.value = { status: 'loaded', data: [n('a1', true)] }; // browse list is unrelated
 
     const tab = notificationsTabSource('unread', unreadNotifications.value, notifications.value);
     const rendered = tab.status === 'loaded' ? tab.data.length : 0;

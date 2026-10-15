@@ -127,7 +127,7 @@ describe('the boot splash resolves motion before it paints', () => {
     expect(boot).toBeGreaterThan(-1);
     expect(boot).toBeLessThan(splash);
     const bundle = readFileSync(
-      resolve(appRoot, '../../packages/lucidos-sdk/src/generated/appearance-boot.host.js'),
+      resolve(appRoot, '../../packages/lucidos-sdk/dist/appearance-boot.host.js'),
       'utf8',
     );
     expect(bundle).toContain('data-motion');

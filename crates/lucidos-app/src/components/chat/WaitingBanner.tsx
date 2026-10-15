@@ -1,8 +1,10 @@
 import type { ComponentChildren } from 'preact';
-import { threadMap, focusedThreadId, getThreadDisplaySection, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, threadUnsettled, standingApplyThreadIds, armingStandingApplyThreadIds, setAsideChangeForThread, pendingChangeForThread } from '../../store/store';
+import { threadMap, focusedThreadId, getThreadDisplaySection, applyingNowThreadIds, applyingChangeThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, threadUnsettled, standingApplyThreadIds, armingStandingApplyThreadIds, setAsideChangeForThread, pendingChangeForThread, landingLane, lanePlace, type LanePlace } from '../../store/store';
+import { LANE_PLACE_LABEL, LANE_THREAD_TIP } from '../../store/actions/landingLane';
+import { archiveRequestInFlight } from '../../store/rowIntents';
 import { bringBackSingleChange, discardSingleChange } from '../../store/actions/chat-changes';
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
-import { handleArchiveThread, handleUnarchiveThread, showBlockedToast } from '../../store/actions/threads';
+import { focusThread, handleArchiveThread, handleUnarchiveThread, showBlockedToast } from '../../store/actions/threads';
 import { BLOCKER_REASON, isDescendantBlocker, type BlockedRefusal } from '../../store/actions/blockerCopy';
 import { exitItems, threadBlocker } from '../../store/actions/threadBlockers';
 import type { ThreadState } from '../../store/thread-events';
@@ -34,6 +36,8 @@ const DISCARD_SET_ASIDE_TOOLTIP = "Throw away this thread's set-aside change.";
 
 type WaitingState =
   | { type: 'applying' }
+  /** The thread's change is in the landing lane, which decides when it lands. */
+  | { type: 'landing'; place: LanePlace; laneThreadId: string | null }
   | { type: 'discarding' }
   | { type: 'canceling'; threadId: string; isCanceling: boolean }
   | {
@@ -65,22 +69,24 @@ export function getWaitingState(): WaitingState | null {
   const thread = threadMap.value.get(focused);
   if (!thread) return null;
 
-  // Apply Now in progress — show disabled "Apply...". This flow stops the
-  // session and commits the change; there's no interruptible turn, so it stays
-  // non-cancelable (unlike the harden/merge sessions handled by the mid-turn
-  // branch below). The Archive button must never render while apply is active;
-  // the actions (handleArchiveThread / endClaudeCodeAndApply) enforce mutual
-  // exclusivity, so applying, dismissing, and discarding can't coexist.
-  if (applyingNowThreadIds.value.has(focused)) return { type: 'applying' };
+  // Apply Now in progress — show disabled "Apply...". The apply's own
+  // hardening and merge turns are the exception: they fall through to the
+  // mid-turn branch below, which keeps their Stop. The Archive button must
+  // never render while apply is active; the actions (handleArchiveThread /
+  // endClaudeCodeAndApply) enforce mutual exclusivity, so applying,
+  // dismissing, and discarding can't coexist.
+  if (applyingNowThreadIds.value.has(focused) && !isMidTurn(effectiveThreadStatus(thread))) {
+    return { type: 'applying' };
+  }
 
   // Discarding in progress — show "Discard..." and block all other actions.
   if (discardingCCThreadIds.value.has(focused)) return { type: 'discarding' };
 
   // Archive in progress — keep showing "Archive..." regardless of SSE state
   // changes so the banner doesn't flash away mid-archive. (The selector returns
-  // no Archive action once the optimistic section flips to 'archived', so this
-  // dedicated flag is what keeps the spinner on screen.)
-  if (archivingThreadIds.value.has(focused)) {
+  // no Archive action once the optimistic section flips to 'archived', so the
+  // in-flight row intent is what keeps the spinner on screen.)
+  if (archiveRequestInFlight(focused)) {
     return { type: 'actions', actions: [], threadId: focused, isArchiving: true, showDiff: false };
   }
 
@@ -105,6 +111,12 @@ export function getWaitingState(): WaitingState | null {
       isCanceling: cancelingThreadIds.value.has(focused),
     };
   }
+
+  // The change waits in the landing lane, or lands in its open batch. The lane
+  // decides when it lands, so the row says where it stands in place of Apply.
+  const lane = landingLane.value;
+  const place = lanePlace(lane, pendingChangeForThread(focused)?.id);
+  if (place) return { type: 'landing', place, laneThreadId: lane.open_batch?.lane_thread_id ?? null };
 
   // Applying but NOT mid-turn — a queued Apply All member waiting its turn: its
   // change is marked applying (reverse-mapped via applyingChangeThreadIds) but no
@@ -199,6 +211,7 @@ const ACTION_ICON: Record<string, () => ComponentChildren> = {
  *  rather than being a reason to overflow the box. */
 export function getBannerActions(state: BannerState): HeaderActionSpec[] {
   if (state.type === 'applying') return [busyAction('applying', 'action-btn-confirm', 'Apply...')];
+  if (state.type === 'landing') return [laneAction(state)];
   if (state.type === 'discarding') return [busyAction('discarding', 'action-btn-danger', 'Discard...')];
   // Archive in flight: a dedicated disabled spinner (the selector no longer
   // returns an Archive action once the optimistic section flips).
@@ -464,6 +477,27 @@ function bringBackAction({ changeId, discardable }: { changeId: string; discarda
  *  neutral button. */
 function protectedButtonClass(variant: string): string {
   return ['action-btn', variant, PROTECTED_SURFACE].filter(Boolean).join(' ');
+}
+
+/** Where the change stands in the landing lane. In the open batch it links
+ *  the lane thread; waiting, it is the one disabled progress face. */
+function laneAction(state: Extract<BannerState, { type: 'landing' }>): HeaderActionSpec {
+  const label = LANE_PLACE_LABEL[state.place];
+  const laneThreadId = state.laneThreadId;
+  if (state.place === 'waiting' || !laneThreadId) return busyAction('landing-lane', '', label);
+  const open = () => focusThread(laneThreadId);
+  return {
+    key: 'landing-lane',
+    label,
+    tooltip: LANE_THREAD_TIP,
+    icon: () => null,
+    render: (attrs) => (
+      <button {...attrs} class="action-btn" data-tooltip={LANE_THREAD_TIP} onClick={open}>
+        {label}
+      </button>
+    ),
+    onClick: open,
+  };
 }
 
 /** A request in flight. Disabled on both sides: `disabledTooltip` is what makes

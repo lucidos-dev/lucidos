@@ -161,6 +161,8 @@ mod tests {
             cache_read_tokens: 10_000,
             cache_creation_tokens: 200,
             modality: None,
+            service_tier: None,
+            cache_creation_1h_tokens: None,
         })
         .unwrap();
         assert_eq!(
@@ -208,6 +210,8 @@ mod tests {
                 output_text_tokens: 20,
                 output_audio_tokens: 44,
             }),
+            service_tier: None,
+            cache_creation_1h_tokens: None,
         })
         .unwrap();
         assert_eq!(json["input_tokens"], 1200);
@@ -390,6 +394,11 @@ pub enum ContextPurpose {
     /// without one (ADR 0417). It owns `model_read_decision`, which follows
     /// no other key.
     ReadDecision,
+    /// The turn-end gate's forced *wake decision*, for a child turn that ended
+    /// without one. It owns `model_wake_decision`, which follows no other key.
+    /// The user can point it at a System One model with
+    /// `judgment_wake_decision`.
+    WakeDecision,
 }
 
 /// SQL predicate over an `events` row: true for an *auxiliary capture*, a
@@ -431,6 +440,7 @@ impl ContextPurpose {
             Self::WebSearch => "Web Search Request",
             Self::Proxy => "Proxied Request",
             Self::ReadDecision => "Read Decision Request",
+            Self::WakeDecision => "Wake Decision Request",
         }
     }
 }
@@ -470,6 +480,16 @@ pub struct ApiUsage {
     /// every other producer writes the payload it always wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modality: Option<ModalityUsage>,
+    /// The tier that served the call, when not the provider's standard one.
+    /// Its rates differ, so a price reads it beside the four counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<crate::llm::ServiceTier>,
+    /// Part of `cache_creation_tokens`: the tokens written to the 1-hour
+    /// cache, billed at 2x base input rather than 1.25x. Only a Claude Code
+    /// session's usage block splits a write by lifetime, so it is absent
+    /// everywhere else. The cache keep-alive reads the session's TTL from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_tokens: Option<u32>,
 }
 
 /// How one call's tokens split across text, audio and image.
@@ -534,6 +554,19 @@ pub struct AgentUserInput {
     /// history is the exchange-starter; emitting another start event would
     /// split the response into a duplicate exchange).
     pub kind: AgentInputKind,
+    /// Answered when the turn that read this input ends. A caller that must
+    /// wait for its own prompt's turn holds the receiver. A session that ends
+    /// first drops the sender, so the receiver reads the session as gone.
+    pub completion: Option<tokio::sync::oneshot::Sender<InputAnswered>>,
+}
+
+/// How an input with a [`AgentUserInput::completion`] was answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputAnswered {
+    /// The turn that read the input reached its `Result`.
+    TurnEnded,
+    /// The agent rejected the input, so no turn will ever read it.
+    Rejected,
 }
 
 impl AgentUserInput {
@@ -639,14 +672,41 @@ pub enum ConflictBinding {
     /// Tier 1: the merge prompt went into a session that already existed. It
     /// merges in the thread's own worktree and outlives the resolution.
     InPlace { change_id: uuid::Uuid },
+    /// A lane thread resolving its lane batch on the integration branch
+    /// (ADR 0463). The lane holds every member's apply claim, so no member
+    /// change names this session as its resolver.
+    LaneBatch { batch_id: uuid::Uuid },
 }
 
 impl ConflictBinding {
-    pub fn change_id(self) -> uuid::Uuid {
+    /// The one change this session resolves. `None` for a lane batch.
+    pub fn change_id(self) -> Option<uuid::Uuid> {
         match self {
-            Self::Detached { change_id } | Self::InPlace { change_id } => change_id,
+            Self::Detached { change_id } | Self::InPlace { change_id } => Some(change_id),
+            Self::LaneBatch { .. } => None,
         }
     }
+}
+
+/// Where a claimed run is in its life. A spawn inserts its entry `Starting`,
+/// in the same `agent_sessions` lock hold that found the thread free
+/// (`agent_session::spawn_claim`). So a second spawn always sees the first.
+pub enum SessionPhase {
+    /// Worktree setup, the startup semaphore and the process spawn. A Stop
+    /// cancels `startup_cancel`, and the agent never takes its first turn.
+    Starting {
+        startup_cancel: tokio_util::sync::CancellationToken,
+    },
+    /// A Tier-2 apply or a late Discard holds the thread while it resets the
+    /// worktree.
+    /// No process exists. A spawn waits for the apply; the apply's own merge
+    /// session takes the entry over as `Starting`.
+    Applying,
+    /// The agent process runs. `control_tx` reaches its runtime;
+    /// `deliver_control_request` keeps back what a backend takes only at spawn.
+    Running {
+        control_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::ControlRequest>,
+    },
 }
 
 /// State for a single active coding-agent session.
@@ -721,8 +781,8 @@ pub struct AgentSession {
     /// Interrupt signal — sends control_request:interrupt to stop current work
     /// without killing the session (like pressing Esc in Claude Code terminal).
     pub interrupt: std::sync::Arc<tokio::sync::Notify>,
-    /// Notified when the CC process enters idle/waiting state.
-    /// Used by `apply_now` to wait for review/conflict resolution to complete.
+    /// Notified when the CC process enters idle/waiting state. The chat
+    /// follow-up redirect waits on it for the interrupted turn's boundary.
     pub idle_notify: std::sync::Arc<tokio::sync::Notify>,
     /// The operation on this session's change that holds the session: Apply
     /// Now or a Tier-1 in-place merge (`Apply`), or an in-session Discard
@@ -747,7 +807,7 @@ pub struct AgentSession {
     /// the length of that turn.
     pub conflict: Option<ConflictBinding>,
     /// Set to true when the run loop decides the subprocess exits. Read through
-    /// [`Self::is_live`]; `wait_for_idle` asks that only when its timeout fires.
+    /// [`Self::is_live`].
     pub process_exited: bool,
     /// Path to the worktree this Claude Code session is working in.
     pub worktree_path: Option<std::path::PathBuf>,
@@ -804,10 +864,9 @@ pub struct AgentSession {
     /// aborting the apply and tearing down the merge worktree underneath the
     /// continuation the watchdog just dispatched.
     pub external_continuation_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Channel for sending control requests from outside the event loop. The
-    /// event loop forwards them to the runtime. `deliver_control_request` keeps
-    /// back the ones a backend takes only at spawn.
-    pub control_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::ControlRequest>,
+    /// Whether the run that claimed this thread has its agent process yet.
+    /// See [`SessionPhase`].
+    pub phase: SessionPhase,
     /// Withdraws for this session's run loop, which owns the input ledger.
     pub withdraw_tx: tokio::sync::mpsc::UnboundedSender<
         crate::engine::agent_session::withdraw::WithdrawInputRequest,
@@ -850,6 +909,9 @@ pub struct AgentSession {
     /// AskUserQuestion, …) — legitimate silence, no fire from either
     /// watchdog.
     pub tools_in_flight: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    /// The question tool uses the run loop has flushed, which a question
+    /// card's gate waits on before its second look.
+    pub(crate) question_flushes: std::sync::Arc<crate::engine::question_card_gate::QuestionFlushes>,
     /// Which coding-agent backend drives this session. Locked at session
     /// creation. Read by the follow-up fast-path to decide how a mid-turn
     /// follow-up is delivered: Claude Code steers the live turn via stdin, so
@@ -871,6 +933,10 @@ pub struct AgentSession {
     /// second concurrent agent on the same worktree — the 2026-07-02
     /// demo-director double-process bug).
     pub agent_cancel: tokio_util::sync::CancellationToken,
+    /// A *cache keep-alive* run. Live, it counts as a hold rather than a live
+    /// session: a real input waits the few seconds until it ends, and never
+    /// joins the hidden turn.
+    pub keep_alive: bool,
 }
 
 impl AgentSession {
@@ -911,6 +977,28 @@ impl AgentSession {
     /// always a window where the entry outlives its loop.
     pub fn is_live(&self) -> bool {
         !self.process_exited && !self.msg_tx.is_closed()
+    }
+
+    pub fn is_starting(&self) -> bool {
+        matches!(self.phase, SessionPhase::Starting { .. })
+    }
+
+    /// An agent process runs behind this entry, as opposed to a spawn still
+    /// starting or an apply holding the thread.
+    pub fn is_running(&self) -> bool {
+        matches!(self.phase, SessionPhase::Running { .. })
+    }
+
+    /// The Stop gesture: interrupt the running turn, or cancel a spawn that
+    /// has no process yet. An interrupt permit stored before the run loop
+    /// exists would otherwise land on the agent's first turn.
+    pub fn interrupt_or_cancel_startup(&self) {
+        match &self.phase {
+            SessionPhase::Starting { startup_cancel } => startup_cancel.cancel(),
+            SessionPhase::Running { .. } => self.interrupt.notify_one(),
+            // `interrupt_route` reads an apply as having no turn to stop.
+            SessionPhase::Applying => {}
+        }
     }
 }
 
@@ -955,7 +1043,9 @@ impl AgentSession {
             shutting_down: Arc::new(AtomicBool::new(false)),
             external_terminal_emitted: Arc::new(AtomicBool::new(false)),
             external_continuation_requested: Arc::new(AtomicBool::new(false)),
-            control_tx: tokio::sync::mpsc::unbounded_channel().0,
+            phase: SessionPhase::Running {
+                control_tx: tokio::sync::mpsc::unbounded_channel().0,
+            },
             withdraw_tx: tokio::sync::mpsc::unbounded_channel().0,
             unforwarded_inputs: Default::default(),
             builtin_commands: vec![],
@@ -965,8 +1055,10 @@ impl AgentSession {
             last_event_at: Arc::new(AtomicI64::new(0)),
             question_resume_pending: false,
             tools_in_flight: Arc::new(AtomicI32::new(0)),
+            question_flushes: Default::default(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             agent_cancel: tokio_util::sync::CancellationToken::new(),
+            keep_alive: false,
         }
     }
 }
@@ -986,6 +1078,9 @@ pub enum ApplyStatus {
     /// Merge conflict — a Claude Code session was spawned (`conflict_thread_id`)
     /// or an in-place merge failed and the original session stays alive.
     Conflict,
+    /// The change waits in the landing lane, or resolves in a lane batch.
+    /// `ChangeApplied` reports its landing, `ChangeUnqueued` its leaving.
+    Queued,
 }
 
 impl Default for ApplyStatus {
@@ -1093,6 +1188,16 @@ impl ApplyResult {
             message: message.into(),
             review_thread_id: Some(review_thread_id),
             files_changed,
+            ..Self::default()
+        }
+    }
+
+    pub fn queued(change_id: Uuid, thread_id: Option<Uuid>, message: impl Into<String>) -> Self {
+        Self {
+            status: ApplyStatus::Queued,
+            change_id,
+            thread_id,
+            message: message.into(),
             ..Self::default()
         }
     }

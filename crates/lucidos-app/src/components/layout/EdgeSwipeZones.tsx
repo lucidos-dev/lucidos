@@ -6,7 +6,7 @@
  *  low-level job: be the topmost thing at the screen edge, ABOVE any app iframe,
  *  so a touch there reaches the host document instead of the frame.
  *
- *  So `MobileSwipeContainer`'s touchstart handler sees an edge touch and can
+ *  So the strip's touch gate (`gateStripTouch`) sees an edge touch and can
  *  `preventDefault()` it. That is the only way to suppress WebKit's native
  *  back/forward gesture in the standalone iOS PWA, since no CSS opt-out exists.
  *  See `shouldSuppressEdgeNavigation`. A pane swipe over an app needs no strip:

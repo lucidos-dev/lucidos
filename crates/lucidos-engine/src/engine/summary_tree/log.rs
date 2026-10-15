@@ -15,7 +15,7 @@ use std::ops::Range;
 use uuid::Uuid;
 
 use crate::engine::thread_events::{
-    ActorMode, AnswerKind, MessageOrigin, QuestionOption, ThreadEvent,
+    with_image_note, ActorMode, AnswerKind, MessageOrigin, QuestionOption, ThreadEvent,
 };
 
 /// The role an entry plays, named by the head word of the thing it is: a
@@ -42,6 +42,19 @@ pub(crate) enum EntryKind {
 }
 
 impl EntryKind {
+    /// Every kind a leaf can name, for the client's generated copy.
+    pub(crate) const ALL: [EntryKind; 9] = [
+        Self::Prompt(ActorMode::Human),
+        Self::Prompt(ActorMode::Agent),
+        Self::Prompt(ActorMode::Engine),
+        Self::Response,
+        Self::Call,
+        Self::Result,
+        Self::Report,
+        Self::Turn,
+        Self::Artifact,
+    ];
+
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Prompt(ActorMode::Human) => "prompt (human)",
@@ -148,6 +161,7 @@ pub(crate) const ENTRY_EVENT_TYPES: &[&str] = &[
     "ToolCalled",
     "ToolResult",
     "ChildThreadCompleted",
+    "ChildReportFiled",
     "ImageDescribed",
     "CodingAgentUserMessageSent",
     "CodingAgentTextStreamed",
@@ -227,7 +241,7 @@ impl Projector {
                 ..
             } => self.push(
                 EntryKind::Prompt(*mode),
-                with_images(text, user_image_hashes.len()),
+                with_image_note(text, user_image_hashes.len()),
                 id,
             ),
             // Only a person speaks into a call. Nothing emits the coding
@@ -262,6 +276,11 @@ impl Projector {
                 child_thread_title,
                 summary,
                 ..
+            }
+            | ThreadEvent::ChildReportFiled {
+                child_thread_title,
+                summary,
+                ..
             } => {
                 let title = child_thread_title.as_deref().unwrap_or("sub-thread");
                 self.push(EntryKind::Report, format!("[{title}] {summary}"), id)
@@ -280,10 +299,18 @@ impl Projector {
             ThreadEvent::ToolCalled { name, args, .. } if self.kind == ThreadKind::LucidosAgent => {
                 self.push(EntryKind::Call, cap(&format!("{name} {args}")), id)
             }
-            ThreadEvent::ToolResult { name, result, .. }
-                if self.kind == ThreadKind::LucidosAgent =>
-            {
-                self.push(EntryKind::Result, cap(&format!("[{name}] {result}")), id)
+            ThreadEvent::ToolResult {
+                name,
+                result,
+                success,
+                ..
+            } if self.kind == ThreadKind::LucidosAgent => {
+                let logged = if *success && knowhow_body(name, result) {
+                    LOADED_KNOWHOW_POINTER
+                } else {
+                    result
+                };
+                self.push(EntryKind::Result, cap(&format!("[{name}] {logged}")), id)
             }
             ThreadEvent::CodingAgentTextStreamed { text, .. } => {
                 if !text.trim().is_empty() {
@@ -365,44 +392,26 @@ impl Projector {
     }
 
     fn answer_text(&self, tool_use_id: &str, answer: &AnswerKind) -> Option<String> {
-        let label = |option_id: &str| -> String {
-            self.questions
-                .iter()
-                .rev()
-                .find(|(q, _)| q == tool_use_id)
-                .and_then(|(_, options)| options.iter().find(|o| o.id == option_id))
-                .map(|o| o.label.clone())
-                .unwrap_or_else(|| option_id.to_string())
-        };
-        match answer {
-            AnswerKind::Selected { option_id } => Some(label(option_id)),
-            AnswerKind::FreeText { text, image_hashes } => {
-                Some(with_images(text, image_hashes.len()))
-            }
-            AnswerKind::MultiSelected {
-                option_ids,
-                text,
-                image_hashes,
-            } => {
-                let mut parts: Vec<String> = option_ids.iter().map(|o| label(o)).collect();
-                if let Some(text) = text.as_deref().filter(|t| !t.trim().is_empty()) {
-                    parts.push(text.to_string());
-                }
-                Some(with_images(&parts.join("; "), image_hashes.len()))
-            }
-            AnswerKind::Canceled | AnswerKind::Superseded => None,
-        }
+        let options = self
+            .questions
+            .iter()
+            .rev()
+            .find(|(q, _)| q == tool_use_id)
+            .map_or(&[][..], |(_, options)| options.as_slice());
+        answer.text(options)
     }
 }
 
-/// A message's text, noting attached images so an image-only message still
-/// leaves an entry.
-fn with_images(text: &str, images: usize) -> String {
-    match images {
-        0 => text.to_string(),
-        1 => format!("{text} [1 image]").trim().to_string(),
-        n => format!("{text} [{n} images]").trim().to_string(),
-    }
+/// What a `load_knowhow` result logs in place of the doc. The body rides the
+/// loaded-knowhow section while it is loaded and leaves with it (ADR 0425), so
+/// a copy here would outlive the unload.
+pub(crate) const LOADED_KNOWHOW_POINTER: &str = "Loaded. While it stays loaded, the body is in \
+    the [LOADED KNOWHOW] section. Call load_knowhow again once it has left.";
+
+/// Whether a successful tool result is a knowhow doc's body. A not-found
+/// answer is not.
+fn knowhow_body(tool: &str, result: &str) -> bool {
+    tool == crate::llm::tool_names::LOAD_KNOWHOW && !crate::core::knowhow::is_not_found_body(result)
 }
 
 /// Keep the head and tail of a long tool call or result, noting the cut.

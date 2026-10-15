@@ -276,11 +276,14 @@ pub enum SubscriptionSurface {
 /// without touching this function. Subscribers scope high-cardinality
 /// per-action variants (`ToolCalled`, and friends) with a `condition:` instead.
 ///
-/// Two families are dropped. The per-token firehose, because running the
+/// Three kinds are dropped. The per-token firehose, because running the
 /// matcher per token would be pure waste. The side-question events, because no
-/// agent may ever see one (ADR 0320).
+/// agent may ever see one (ADR 0320). A *cache keep-alive* idle, because the
+/// agent did not finish anything: it is still waiting.
 pub fn is_subscribable(event: &ThreadEvent) -> bool {
-    !event.is_per_token_streaming() && !event.is_side_question_event()
+    !event.is_per_token_streaming()
+        && !event.is_side_question_event()
+        && !event.is_cache_keep_alive_idle()
 }
 
 /// **The system-side gate.** A live `SystemEvent` reaches the trigger matcher
@@ -688,7 +691,7 @@ fn transient_terminal_hint(name: &str) -> Option<&'static str> {
         "RecommendedCleanupProgress" => {
             Some("RecommendedCleanupCompleted or RecommendedCleanupFailed")
         }
-        "TreeBackfillProgressed" => Some("TreeBackfillCompleted"),
+        "TreeBackfillProgressed" => Some("TreeBackfillCompleted or TreeBackfillEnded"),
         _ => None,
     }
 }

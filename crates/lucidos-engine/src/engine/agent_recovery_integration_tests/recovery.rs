@@ -144,6 +144,9 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -243,6 +246,9 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -270,6 +276,9 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -327,6 +336,9 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -365,6 +377,9 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -403,6 +418,9 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -439,6 +457,9 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -498,6 +519,9 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -617,6 +641,9 @@ async fn last_turn_end_mirrors_the_idle_gate() {
                 coding_agent_kind: Default::default(),
                 coding_agent_folder: String::new(),
                 app_id: None,
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
             meta: cc_meta.clone(),
         })
@@ -695,6 +722,9 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
                     coding_agent_kind: Default::default(),
                     coding_agent_folder: String::new(),
                     app_id: None,
+                    integrated: false,
+                    auto_compact_window: None,
+                    auto_compact_arm: None,
                 },
                 meta,
             })
@@ -957,6 +987,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -989,6 +1020,9 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
                     coding_agent_kind: Default::default(),
                     coding_agent_folder: String::new(),
                     app_id: None,
+                    integrated: false,
+                    auto_compact_window: None,
+                    auto_compact_arm: None,
                 },
                 meta: cc_meta.clone(),
             })
@@ -1176,6 +1210,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
             branch: String::new(),
             origin: None,
             reason: Some(crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into()),
+            resumed_abort_id: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1256,6 +1291,7 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "so go?".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -1305,6 +1341,9 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
                 coding_agent_folder: String::new(),
                 app_id: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
             meta: cc_meta.clone(),
         })
@@ -1472,6 +1511,9 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
             coding_agent_folder: String::new(),
             app_id: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1513,6 +1555,7 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
             actor: Some(device.clone()),
             pre_merge_sha: None,
             post_merge_sha: None,
+            landing_merge_sha: None,
             path: String::new(),
         },
         meta: cc_meta.clone(),
@@ -1545,6 +1588,9 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
             coding_agent_folder: String::new(),
             app_id: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1674,6 +1720,9 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
             coding_agent_kind: crate::engine::agent_session::CodingAgentKind::App,
             coding_agent_folder: format!("/home/u/workspaces/dev/data/apps/{app_id}"),
             app_id: Some(app_id.to_string()),
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1794,6 +1843,9 @@ async fn the_app_id_lookup_answers_none_for_a_non_app_thread() {
             coding_agent_kind: crate::engine::agent_session::CodingAgentKind::Lucidos,
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1848,6 +1900,9 @@ async fn a_crash_still_offers_continue_on_an_app_coding_agent_thread() {
             coding_agent_kind: crate::engine::agent_session::CodingAgentKind::App,
             coding_agent_folder: "/home/u/workspaces/dev/data/apps/habit-tracker".into(),
             app_id: Some("habit-tracker".into()),
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1904,6 +1959,9 @@ async fn a_parked_question_survives_a_restart_on_an_app_coding_agent_thread() {
             coding_agent_kind: crate::engine::agent_session::CodingAgentKind::App,
             coding_agent_folder: "/home/u/workspaces/dev/data/apps/habit-tracker".into(),
             app_id: Some("habit-tracker".into()),
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta.clone(),
     })

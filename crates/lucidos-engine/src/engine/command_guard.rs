@@ -4615,7 +4615,7 @@ mod tests {
     fn ordinary_shapes_the_refusal_set_deliberately_catches() {
         for cmd in [
             // The redirect the engine's own system prompt asks agents to use.
-            "cargo build > /tmp/build.log 2>&1",
+            "cargo build > \"${TMPDIR:-/tmp}/build.log\" 2>&1",
             // This repo's own script idiom: a path-qualified head.
             "./scripts/e2e.sh",
             // A pure READ under a write-capable head. Telling it from
@@ -5289,6 +5289,29 @@ mod tests {
         }
         // Stripping the fd-dup must not mask a real file redirect next to it.
         assert_needs_judge(bash("ls 2>&1 > /etc/out"), "redirect after fd-dup");
+    }
+
+    /// The prompt steers scratch to `${TMPDIR:-/tmp}`, the per-user temp dir on
+    /// macOS (ADR 0456). It must leave the fast path exactly as the `/tmp` form
+    /// it replaced did, so the steer costs no extra judge call or refusal.
+    #[test]
+    fn the_steered_scratch_path_declines_like_tmp() {
+        for (steered, tmp) in [
+            (
+                "cargo build > \"${TMPDIR:-/tmp}/build.log\" 2>&1",
+                "cargo build > /tmp/build.log 2>&1",
+            ),
+            (
+                "cargo build > \"${TMPDIR:-/tmp}/$(basename \"$PWD\").log\" 2>&1",
+                "cargo build > /tmp/$(basename \"$PWD\").log 2>&1",
+            ),
+        ] {
+            assert_eq!(
+                bash_fast_path(steered, None),
+                bash_fast_path(tmp, None),
+                "{steered}"
+            );
+        }
     }
 
     #[test]

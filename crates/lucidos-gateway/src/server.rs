@@ -7,6 +7,7 @@
 use crate::auth;
 use crate::boot_failure::BootFailure;
 use crate::boot_phase::{self, BootPhase};
+use crate::engine_hop::EngineAddress;
 use crate::error::ApiError;
 use crate::hook_socket;
 use crate::net_config;
@@ -153,12 +154,12 @@ struct GatewayInner {
     /// Sent on exactly one hop, the proxy's upstream request, so a wide-bound
     /// engine can tell the gateway from the network. See [`crate::proxy`].
     local_token: String,
-    /// The webhook-delivery token, minted beside [`Self::local_token`].
+    /// The hook socket token, minted beside [`Self::local_token`].
     ///
     /// Presented by the hook socket on its engine hop and by nothing else. It
     /// reaches one engine route, so a delivery from the open internet cannot
-    /// become a workspace restart (`lucidos_local_token::WEBHOOK_TOKEN_FILE`).
-    webhook_token: String,
+    /// become a workspace restart (`lucidos_local_token::HOOK_SOCKET_TOKEN_FILE`).
+    hook_socket_token: String,
     /// This gateway's own paired-device store, under its data dir. Never shared
     /// with another gateway on the machine (`auth::paired_devices_path`).
     paired_devices_path: PathBuf,
@@ -215,8 +216,6 @@ struct GatewayInner {
     /// concurrent per-workspace starts queue here, then create their own
     /// databases.
     pg_lock: AsyncMutex<()>,
-    proxy_client: reqwest::Client,
-    health_client: reqwest::Client,
     /// On-disk registry, source of truth. Mutated under a short lock (never held
     /// across an await / provisioning).
     registry: Mutex<Registry>,
@@ -232,9 +231,9 @@ struct GatewayInner {
     /// engine a stop is still draining. Never persisted: a stop the gateway did
     /// not live to see through has no engine left to guard against.
     stopped_at: RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>,
-    /// Hot-path id to engine-port map for the proxy, so proxying never contends
+    /// Hot-path id to engine address for the proxy, so proxying never contends
     /// with a stack mutex held during a multi-second respawn.
-    routes: RwLock<HashMap<String, u16>>,
+    routes: RwLock<HashMap<String, EngineAddress>>,
     /// id to current cold-boot phase, rendered as the boot-splash label
     /// ([`crate::boot_phase`]). Written by the gateway as it provisions and
     /// spawns, and by the `boot-phase` control endpoint when the engine reports.
@@ -266,6 +265,9 @@ struct GatewayInner {
     /// Cached gateway-binary check, re-run only when the binary's mtime moves,
     /// so the picker's 2s poll does not fork `current_exe --build-id` every tick.
     binary_check: Mutex<GatewayBinaryCheck>,
+    /// The workspaces a scheduled `reload_gateway` hands to the new image, or
+    /// `None` while no reload is scheduled (ADR 0461).
+    scheduled_reload: Mutex<Option<BTreeSet<String>>>,
     /// The machine's one release check: is a newer Lucidos PUBLISHED (ADR 0108)?
     /// A different question from `binary_check`, which asks whether a newer
     /// gateway binary sits on disk in a dev checkout.
@@ -305,7 +307,7 @@ impl GatewayState {
     /// shell served rather than "no frontend configured".
     ///
     /// A supplied dir also roots the paired-device store, in a subdirectory of
-    /// its own. The default scratch path is keyed by pid, so it is shared by
+    /// its own. The default scratch dir is one per process, so it is shared by
     /// every test in the binary, and tests run in parallel: two of them saving
     /// the store at once race on the atomic rename and one fails. A test that
     /// owns a directory gets its own store with it.
@@ -323,9 +325,13 @@ impl GatewayState {
         local_token: &str,
         engine_tls: bool,
     ) -> Self {
+        static SHARED_SCRATCH: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         let scratch = match static_dir.as_ref() {
             Some(dir) => dir.join("state"),
-            None => std::env::temp_dir().join(format!("lucidos-gw-state-{}", std::process::id())),
+            None => SHARED_SCRATCH
+                .get_or_init(|| tempfile::tempdir().unwrap())
+                .path()
+                .to_path_buf(),
         };
         GatewayState {
             inner: Arc::new(GatewayInner {
@@ -333,7 +339,7 @@ impl GatewayState {
                 registry_path: scratch.join("workspaces.json"),
                 gateway_port: 5251,
                 local_token: local_token.to_string(),
-                webhook_token: "test-webhook-token".to_string(),
+                hook_socket_token: "test-hook-socket-token".to_string(),
                 paired_devices_path: scratch.join("paired-devices.json"),
                 device_cookie_name: auth::device_cookie_name(&scratch),
                 paired_devices: Mutex::new(auth::PairedDevices::default()),
@@ -348,8 +354,6 @@ impl GatewayState {
                 pg_backend: PgBackend::Docker,
                 packaged: false,
                 pg_lock: AsyncMutex::new(()),
-                proxy_client: proxy::build_client(),
-                health_client: stack::build_health_client(),
                 registry: Mutex::new(Registry::default()),
                 stacks: AsyncMutex::new(HashMap::new()),
                 starting: AsyncMutex::new(HashSet::new()),
@@ -361,6 +365,7 @@ impl GatewayState {
                 pending_binds: RwLock::new(BTreeSet::new()),
                 exe_path: None,
                 binary_check: Mutex::new(GatewayBinaryCheck::default()),
+                scheduled_reload: Mutex::new(None),
                 // Not packaged and no executable path, so the gate is shut and
                 // no test can reach the network through this.
                 release_check: release_check::ReleaseCheck::new(&release_check::Deployment {
@@ -456,9 +461,9 @@ impl GatewayState {
         &self.inner.local_token
     }
 
-    /// The webhook-delivery credential, for the hook socket's engine hop only.
-    pub fn webhook_token(&self) -> &str {
-        &self.inner.webhook_token
+    /// The hook socket token, for the hook socket's engine hop only.
+    pub fn hook_socket_token(&self) -> &str {
+        &self.inner.hook_socket_token
     }
 
     /// Does this process terminate TLS on its own socket?
@@ -651,16 +656,21 @@ impl GatewayState {
         self.persist_paired_devices()
     }
 
-    /// Loopback port for `id`, if registered. Hot path, so no async locks.
-    fn route(&self, id: &str) -> Option<u16> {
-        self.inner.routes.read().ok()?.get(id).copied()
+    /// The engine serving `id`, if routed. Hot path, so no async locks.
+    fn route(&self, id: &str) -> Option<EngineAddress> {
+        self.inner.routes.read().ok()?.get(id).cloned()
     }
 
-    /// Loopback port serving workspace `slug`, if one is running. `None` covers
+    /// The engine serving workspace `slug`, if one is running. `None` covers
     /// both an unregistered slug and a stopped workspace, which the hook socket
     /// deliberately answers alike.
-    pub fn engine_port(&self, slug: &str) -> Option<u16> {
+    pub fn engine_address(&self, slug: &str) -> Option<EngineAddress> {
         self.route(slug)
+    }
+
+    /// The engine socket a registry entry's engine binds.
+    fn engine_address_of(&self, ws: &Workspace) -> EngineAddress {
+        EngineAddress::for_workspace(&ws.resolve_dir(self.app_data()), ws.port)
     }
 
     /// The port this gateway is configured for.
@@ -671,18 +681,10 @@ impl GatewayState {
         self.inner.gateway_port
     }
 
-    /// The pooled client for a hop to a workspace engine.
-    ///
-    /// Shared with the proxy on purpose: same destination, same TLS posture,
-    /// same connection pool. A second client would double the idle connections
-    /// for no difference in behaviour.
-    pub fn engine_client(&self) -> &reqwest::Client {
-        &self.inner.proxy_client
-    }
-
-    /// The scheme the spawned engine serves on its port. The literals come from
-    /// `net_config` rather than being spelled here, so this side of the hop
-    /// cannot drift from the rule that decided `engine_tls`.
+    /// The scheme the spawned engine serves on its TCP port, for the ports file
+    /// and the spawn. The literals come from `net_config`, so this cannot drift
+    /// from the rule that decided `engine_tls`. The gateway's own hop is the
+    /// engine socket and has no scheme.
     pub fn engine_scheme(&self) -> &'static str {
         if self.inner.engine_tls {
             net_config::SCHEME_HTTPS
@@ -692,7 +694,7 @@ impl GatewayState {
     }
 
     /// Tell ONE stack's engine that a person asked for the teardown it is about
-    /// to be signalled for, over that stack's own port.
+    /// to be signalled for, over that stack's own engine socket.
     ///
     /// Called from the two control-plane entry points, never from
     /// [`Self::respawn_stack`], which is also the supervisor's health-respawn
@@ -704,18 +706,12 @@ impl GatewayState {
         s: &StackRuntime,
         requested_by: Option<&str>,
     ) -> stack::RestartIntentNotify {
-        stack::notify_restart_intent(
-            &self.inner.health_client,
-            self.engine_scheme(),
-            s.ws.port,
-            requested_by,
-        )
-        .await
+        stack::notify_restart_intent(&s.engine_address(), requested_by).await
     }
 
-    fn set_route(&self, id: &str, port: u16) {
+    fn set_route(&self, id: &str, engine: EngineAddress) {
         if let Ok(mut r) = self.inner.routes.write() {
-            r.insert(id.to_string(), port);
+            r.insert(id.to_string(), engine);
         }
     }
 
@@ -730,11 +726,11 @@ impl GatewayState {
             .expect("registering a test workspace");
     }
 
-    /// Point `id` at a port a test controls. That lets a hop run end to end
-    /// against a capturing upstream rather than a real engine.
+    /// Point `id` at an engine socket a test controls. That lets a hop run end
+    /// to end against a capturing upstream rather than a real engine.
     #[cfg(test)]
-    pub(crate) fn set_route_for_test(&self, id: &str, port: u16) {
-        self.set_route(id, port);
+    pub(crate) fn set_route_for_test(&self, id: &str, engine: EngineAddress) {
+        self.set_route(id, engine);
     }
 
     fn clear_route(&self, id: &str) {
@@ -921,21 +917,14 @@ impl GatewayState {
         // stack mutex never stalls this read across the whole map.
         let stacks: HashMap<String, Arc<AsyncMutex<StackRuntime>>> =
             self.inner.stacks.lock().await.clone();
-        let mut ports = Vec::with_capacity(stacks.len());
+        let mut engines = Vec::with_capacity(stacks.len());
         for stack in stacks.values() {
             let s = stack.lock().await;
             if s.health == Health::Healthy {
-                ports.push(s.ws.port);
+                engines.push(s.engine_address());
             }
         }
-        let scheme = self.engine_scheme();
-        let client = &self.inner.health_client;
-        let counts = futures::future::join_all(
-            ports
-                .iter()
-                .map(|&port| async move { stack::fetch_unread_count(client, scheme, port).await }),
-        )
-        .await;
+        let counts = futures::future::join_all(engines.iter().map(stack::fetch_unread_count)).await;
         sum_unread(counts)
     }
 
@@ -1036,11 +1025,11 @@ impl GatewayState {
     ///
     /// An engine adopted after a gateway restart is not this process's child:
     /// it was reparented when the gateway that spawned it exited. Its pidfile
-    /// names it instead. Blocking: it reads files.
+    /// names it instead, while its owner lock is held. Blocking: it reads files.
     fn lucidos_roots(&self, engines: Vec<RunningEngine>) -> Vec<i32> {
         let engines = engines.into_iter().filter_map(|engine| match engine {
             RunningEngine::Child(pid) => Some(pid),
-            RunningEngine::Adopted(dir) => stack::read_pidfile(&dir),
+            RunningEngine::Adopted(dir) => stack::live_engine_pid(&dir),
         });
         let postmaster = match self.inner.pg_backend {
             PgBackend::Embedded { .. } => {
@@ -1086,7 +1075,11 @@ impl GatewayState {
     /// Returns after scheduling the exec so the HTTP caller still gets its
     /// response. `execv` only returns on failure, and then we keep the current
     /// image.
-    pub fn reload_gateway(&self) -> Result<(), BoxError> {
+    ///
+    /// `restart_after` hands one workspace to the new image, which restarts it
+    /// once it has adopted the running engines (ADR 0461). If the exec fails,
+    /// this image restarts it instead, so the switch still happens.
+    pub fn reload_gateway(&self, restart_after: Option<&str>) -> Result<(), BoxError> {
         let exe = self
             .inner
             .exe_path
@@ -1106,23 +1099,129 @@ impl GatewayState {
                         relaunch from the real checkout"
                 .into());
         }
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        {
+            // A reload already scheduled carries this workspace too, so two
+            // switches in its delay both restart.
+            let mut scheduled = self.inner.scheduled_reload.lock().unwrap();
+            if let Some(handover) = scheduled.as_mut() {
+                handover.extend(restart_after.map(str::to_string));
+                return Ok(());
+            }
+            *scheduled = Some(restart_after.map(str::to_string).into_iter().collect());
+        }
         crate::log!(
             "[Gateway] reload requested — re-exec {} (build id {})",
             exe.display(),
             GATEWAY_BUILD_ID
         );
+        let me = self.clone();
         tokio::spawn(async move {
             // Give the 202 response time to flush before we replace the image.
             tokio::time::sleep(Duration::from_millis(300)).await;
-            use std::os::unix::process::CommandExt;
-            // `.exec()` replaces this process image and never returns on success.
-            // Env is inherited; argv mirrors the original launch. CLOEXEC on the
-            // listening socket (Rust default) frees the port for the new image.
-            let err = std::process::Command::new(&exe).args(&args).exec();
+            let (err, handover) = {
+                // Held through the exec. A switch arriving now waits, and the
+                // exec drops its request. It fails visibly rather than joining
+                // a reload this exec would cancel.
+                let mut scheduled = me.inner.scheduled_reload.lock().unwrap();
+                let handover: Vec<String> = scheduled.iter().flatten().cloned().collect();
+                let args = reload_args(std::env::args().skip(1), &handover);
+                use std::os::unix::process::CommandExt;
+                // `.exec()` replaces this process image and never returns on
+                // success. Env is inherited; argv mirrors the original launch.
+                // CLOEXEC on the listening socket (Rust default) frees the port
+                // for the new image. The owner lock alone crosses the exec, so
+                // no other launch can take the data dir in between (ADR 0438).
+                let mut cmd = std::process::Command::new(&exe);
+                cmd.args(&args);
+                if let Some(&fd) = OWNER_LOCK_FD.get() {
+                    cmd.env(INHERITED_LOCK_FD_ENV, fd.to_string());
+                    // SAFETY: runs immediately before `execve`, in this process,
+                    // and only clears one descriptor flag.
+                    unsafe {
+                        cmd.pre_exec(move || {
+                            libc::fcntl(fd, libc::F_SETFD, 0);
+                            Ok(())
+                        });
+                    }
+                }
+                let err = cmd.exec();
+                if let Some(&fd) = OWNER_LOCK_FD.get() {
+                    // SAFETY: the exec failed, so this image keeps running.
+                    // Restore close-on-exec, or every engine spawned next
+                    // inherits the lock.
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                }
+                *scheduled = None;
+                (err, handover)
+            };
             crate::log!("[Gateway] reload re-exec failed, staying on current image: {err}");
+            for id in handover {
+                me.respawn_on_this_image(&id).await;
+            }
         });
         Ok(())
+    }
+
+    /// Whether a restart should move the gateway onto a newer on-disk binary
+    /// first, so the engine it respawns comes from the new gateway (ADR 0461).
+    /// Dev only: a packaged gateway moves with its app, through the updater.
+    async fn gateway_moves_first(&self) -> bool {
+        !self.inner.packaged && self.gateway_update_available().await
+    }
+
+    /// Respawn `id` on this image, for a hand-over whose re-exec failed.
+    async fn respawn_on_this_image(&self, id: &str) {
+        let Some(stack) = self.inner.stacks.lock().await.get(id).cloned() else {
+            return;
+        };
+        self.respawn_requested(&mut *stack.lock().await).await;
+    }
+
+    /// A respawn somebody asked for, as opposed to the supervisor's retries,
+    /// so its attempt count starts over.
+    async fn respawn_requested(&self, s: &mut StackRuntime) {
+        s.restart_attempts = 0;
+        self.respawn_stack(s).await;
+    }
+
+    /// Restart a workspace the previous image handed over. Its engine kept
+    /// running across the re-exec, so wait until this image has adopted it.
+    /// Restarting before that would adopt the old engine instead of replacing
+    /// it (ADR 0461).
+    async fn restart_handed_over(&self, id: &str) {
+        let deadline = Instant::now() + HANDOVER_ADOPT_WAIT;
+        while !self.inner.stacks.lock().await.contains_key(id) {
+            if Instant::now() >= deadline {
+                self.replace_unadopted_engine(id).await;
+                return;
+            }
+            tokio::time::sleep(HANDOVER_ADOPT_POLL).await;
+            self.adopt_running_engines().await;
+        }
+        if let Err(e) = self.restart_workspace(id, None).await {
+            crate::log!("[Gateway] restart of '{id}' handed over by the reload failed: {e}");
+        }
+    }
+
+    /// Finish a handed-over restart whose engine this image never adopted.
+    /// Signal the engine directly, wait for it to let go of the workspace, then
+    /// start the workspace fresh. Starting it while the old engine answers
+    /// would adopt that engine, and the switch would silently not happen.
+    async fn replace_unadopted_engine(&self, id: &str) {
+        crate::log!(
+            "[Gateway] '{id}' was not adopted within {HANDOVER_ADOPT_WAIT:?}; replacing its engine"
+        );
+        let Some(ws) = self.inner.registry.lock().unwrap().get(id).cloned() else {
+            crate::log!("[Gateway] handed-over workspace '{id}' is no longer registered");
+            return;
+        };
+        let dir = ws.resolve_dir(self.app_data());
+        stack::reclaim_stale_engine(&dir);
+        let deadline = Instant::now() + HANDOVER_ADOPT_WAIT;
+        while stack::live_engine_pid(&dir).is_some() && Instant::now() < deadline {
+            tokio::time::sleep(HANDOVER_ADOPT_POLL).await;
+        }
+        self.lazy_start(id).await;
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -1153,9 +1252,9 @@ impl GatewayState {
             let me = self.clone();
             let restore = Arc::clone(&restore);
             async move {
-                let running =
-                    stack::probe_health(&me.inner.health_client, me.engine_scheme(), ws.port).await
-                        == ProbeOutcome::Healthy;
+                let dir = ws.resolve_dir(me.app_data());
+                let running = stack::probe_health(&me.engine_address_of(&ws), &dir).await
+                    == ProbeOutcome::Healthy;
                 match boot_action(&ws, running, &restore) {
                     // `bring_up` re-adopts a healthy engine and only spawns when
                     // none is running, so it is right for both cases.
@@ -1166,17 +1265,6 @@ impl GatewayState {
             }
         });
         futures::future::join_all(futures).await;
-    }
-
-    /// Re-read the on-disk registry into memory. The dev launcher writes the
-    /// shared registry file directly, so a running gateway's copy can lag a
-    /// freshly-launched workspace. A bad read is logged, not propagated: a
-    /// transient parse error must not break a restart of a known workspace.
-    fn sync_registry_from_disk(&self) {
-        match Registry::load(&self.inner.registry_path) {
-            Ok(reg) => *self.inner.registry.lock().unwrap() = reg,
-            Err(e) => crate::log!("[Gateway] registry reload failed: {}", e),
-        }
     }
 
     /// Lazily start a registered-but-stopped workspace for a document
@@ -1235,13 +1323,11 @@ impl GatewayState {
         }
         // Concurrently, and with no lock held, for the reason the supervisor's
         // own probe phase spells out: one slow engine must not serialize a pass.
-        let scheme = self.engine_scheme();
-        let client = &self.inner.health_client;
-        let found = futures::future::join_all(
-            candidates
-                .iter()
-                .map(|ws| stack::probe_live_engine(client, scheme, ws.port)),
-        )
+        let found = futures::future::join_all(candidates.iter().map(|ws| {
+            let engine = self.engine_address_of(ws);
+            let dir = ws.resolve_dir(self.app_data());
+            async move { stack::probe_live_engine(&engine, &dir).await }
+        }))
         .await;
 
         for (ws, live) in candidates.into_iter().zip(found) {
@@ -1307,7 +1393,7 @@ impl GatewayState {
             last_unread: None,
             last_successful_backup: None,
         };
-        self.set_route(&ws.id, ws.port);
+        self.set_route(&ws.id, stack.engine_address());
         self.install_stack(&ws.id, stack).await;
         // Already up, so there is no boot window to narrate and nothing failed.
         self.clear_boot_phase(&ws.id);
@@ -1331,7 +1417,9 @@ impl GatewayState {
     /// boot failure so the splash can explain itself. See ADR 0014.
     async fn bring_up(&self, ws: Workspace) {
         let resolved_dir = ws.resolve_dir(self.app_data());
-        if let Err(e) = std::fs::create_dir_all(resolved_dir.join("data")) {
+        let created = lucidos_home::ensure_storage_root(&resolved_dir)
+            .and_then(|()| std::fs::create_dir_all(resolved_dir.join("data")));
+        if let Err(e) = created {
             crate::log!("[Gateway] {} create dir failed: {}", ws.id, e);
         }
 
@@ -1385,7 +1473,7 @@ impl GatewayState {
             }
         };
 
-        self.set_route(&ws.id, ws.port);
+        self.set_route(&ws.id, stack.engine_address());
         self.install_stack(&ws.id, stack).await;
         crate::log!("[Gateway] workspace '{}' engine on :{}", ws.id, ws.port);
     }
@@ -1469,7 +1557,11 @@ impl GatewayState {
         self.clear_boot_failure(&ws.id);
         let prov = self.ensure_postgres(ws).await?;
 
-        if stack::probe_health(&self.inner.health_client, self.engine_scheme(), ws.port).await
+        if stack::probe_health(
+            &EngineAddress::for_workspace(resolved_dir, ws.port),
+            resolved_dir,
+        )
+        .await
             == ProbeOutcome::Healthy
         {
             crate::log!("[Gateway] re-adopting healthy engine for '{}'", ws.id);
@@ -1582,12 +1674,23 @@ impl GatewayState {
     ///
     /// Idempotent for the same path, and never a silent repoint. See
     /// [`address_points_elsewhere_message`] for what a mismatch means.
+    ///
+    /// `port` is for a caller that allocates ports itself, the dev launcher. It
+    /// may move a stopped workspace, never a running one, and never onto a port
+    /// another entry holds. That is how the launcher registers without writing
+    /// `workspaces.json` behind this gateway.
     pub async fn adopt_workspace(
         &self,
         dir: &Path,
         name: Option<&str>,
         autostart: Option<bool>,
+        port: Option<u16>,
     ) -> Result<Workspace, ApiError> {
+        if port == Some(0) {
+            return Err(ApiError::bad_request(
+                "port 0 is not a port an engine can bind",
+            ));
+        }
         if !dir.is_absolute() {
             return Err(ApiError::bad_request(format!(
                 "'{}' is not an absolute path. Adoption registers a directory as it is, so \
@@ -1628,9 +1731,26 @@ impl GatewayState {
             )));
         }
         let name = name.map(str::trim).filter(|n| !n.is_empty());
+        // Once every refusal has passed, and before the registry changes, so a
+        // refused adopt leaves the directory as it found it.
+        let make_storage_root = || {
+            lucidos_home::ensure_storage_root(dir).map_err(|e| ApiError::bad_request(e.to_string()))
+        };
 
         let ws = {
+            // Held across the registry write, in the adopt pass's order. So no
+            // engine can start on the old port while this moves it.
+            let stacks = self.inner.stacks.lock().await;
+            let starting = self.inner.starting.lock().await;
             let mut reg = self.inner.registry.lock().unwrap();
+            if let Some(port) = port {
+                if let Some(holder) = reg.workspaces.iter().find(|w| w.id != id && w.port == port) {
+                    return Err(ApiError::conflict(format!(
+                        "port {port} belongs to workspace '{}'",
+                        holder.id
+                    )));
+                }
+            }
             // The name first, new entry or not, so the refusal is the sentence
             // create gives. `except_id` lets a re-adopt pass its own name back.
             if let Some(name) = name {
@@ -1651,10 +1771,23 @@ impl GatewayState {
                             dir,
                         )));
                     }
-                    // Same place, so update in place. The port stays: moving it
-                    // would strand an engine already running on it. `dir` stays
-                    // too, since what is stored already resolves here.
+                    // Same place, so update in place. `dir` stays, since what is
+                    // stored already resolves here. The port moves only when no
+                    // engine runs or is starting: moving it under one strands it.
+                    if let Some(port) = port.filter(|p| *p != existing.port) {
+                        if stacks.contains_key(&id) || starting.contains(&id) {
+                            return Err(ApiError::conflict(format!(
+                                "'{id}' is running on port {}, so it cannot move to port \
+                                 {port}. Stop it first.",
+                                existing.port
+                            )));
+                        }
+                    }
+                    make_storage_root()?;
                     let entry = reg.get_mut(&id).expect("just found");
+                    if let Some(port) = port {
+                        entry.port = port;
+                    }
                     if let Some(name) = name {
                         entry.name = name.to_string();
                     }
@@ -1665,9 +1798,13 @@ impl GatewayState {
                 }
                 None => {
                     refuse_an_id_postgres_would_truncate(basename, &id)?;
-                    let port = reg
-                        .allocate_port()
-                        .map_err(|e| ApiError::internal(e.to_string()))?;
+                    make_storage_root()?;
+                    let port = match port {
+                        Some(port) => port,
+                        None => reg
+                            .allocate_port()
+                            .map_err(|e| ApiError::internal(e.to_string()))?,
+                    };
                     let entry = Workspace {
                         id: id.clone(),
                         name: name.unwrap_or(basename).to_string(),
@@ -1889,7 +2026,7 @@ impl GatewayState {
         if let Some(parent) = resolved_dir.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create workspaces dir: {e}"))?;
         }
-        std::fs::create_dir(&resolved_dir).map_err(|e| {
+        lucidos_home::create_new_storage_root(&resolved_dir).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 format!(
                     "{} already exists and may hold a workspace's files. Move it aside, \
@@ -1969,7 +2106,7 @@ impl GatewayState {
                     last_unread: None,
                     last_successful_backup: None,
                 };
-                self.set_route(&ws.id, ws.port);
+                self.set_route(&ws.id, stack.engine_address());
                 self.install_stack(&ws.id, stack).await;
                 crate::log!("[Gateway] restored '{}' engine on :{}", ws.id, ws.port);
             }
@@ -2117,10 +2254,10 @@ impl GatewayState {
         Ok(())
     }
 
-    /// Start or restart one workspace. Resyncs the registry from disk first so
-    /// a freshly-launched workspace is known. An existing stack is respawned
-    /// onto the rebuilt binary, which is the Apply case; otherwise the registry
-    /// entry is brought up.
+    /// Start or restart one workspace. An existing stack is respawned onto the
+    /// rebuilt binary, which is the Apply case; otherwise the registry entry is
+    /// brought up. When a newer gateway is on disk, the gateway re-execs onto
+    /// it first and the new image does the respawn (ADR 0461).
     ///
     /// `requested_by` is the device id the picker sent, and `None` for every
     /// caller that is not a person clicking. Present, it is handed to the engine
@@ -2131,20 +2268,26 @@ impl GatewayState {
         id: &str,
         requested_by: Option<&str>,
     ) -> Result<(), BoxError> {
-        // The dev launcher writes the shared registry file directly before
-        // POSTing here, so pick up any newly-seeded entry or flag change.
-        self.sync_registry_from_disk();
         let existing = self.inner.stacks.lock().await.get(id).cloned();
         match existing {
             Some(stack) => {
                 let mut s = stack.lock().await;
-                s.restart_attempts = 0;
                 // BEFORE the respawn, whose first act is to signal the engine.
                 // Awaited rather than spawned: the actor must be stashed by the
                 // time the engine reaches its shutdown handler, and losing that
                 // race gives the teardown a crash-shaped attribution.
                 self.notify_restart_intent(&s, requested_by).await;
-                self.respawn_stack(&mut s).await;
+                // After the intent, so the engine already holds the actor when
+                // the new image signals it.
+                if self.gateway_moves_first().await {
+                    match self.reload_gateway(Some(id)) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            crate::log!("[Gateway] restarting '{id}' on the current image: {e}")
+                        }
+                    }
+                }
+                self.respawn_requested(&mut s).await;
                 Ok(())
             }
             None => {
@@ -2171,17 +2314,14 @@ impl GatewayState {
     ///
     /// A slug this gateway does not know is a 404, not a silent success.
     /// Several gateways run on one machine, each owning its own workspaces, so
-    /// the answer is how a caller learns it reached the wrong one. The registry
-    /// is resynced from disk first, exactly as [`Self::restart_workspace`] does
-    /// it: the dev launcher seeds that file directly, so the refusal must be
-    /// about the file rather than about stale memory. Stopping a KNOWN workspace
-    /// that is not running stays a 202, which keeps the call idempotent.
+    /// the answer is how a caller learns it reached the wrong one. Stopping a
+    /// KNOWN workspace that is not running stays a 202, which keeps the call
+    /// idempotent.
     pub async fn stop_workspace(
         &self,
         id: &str,
         requested_by: Option<&str>,
     ) -> Result<(), ApiError> {
-        self.sync_registry_from_disk();
         if !self.inner.registry.lock().unwrap().contains(id) {
             return Err(ApiError::not_found(format!("workspace '{id}' not found")));
         }
@@ -2365,13 +2505,18 @@ impl GatewayState {
         // state, not the network round-trip.
         let mut candidates: Vec<ProbeTarget> = Vec::with_capacity(stacks.len());
         for stack in stacks {
-            let (id, port, last_spawn) = {
+            let (id, engine, dir, last_spawn) = {
                 let s = stack.lock().await;
                 // A stack capped as Unhealthy is left for manual retry/delete.
                 if s.health == Health::Unhealthy {
                     continue;
                 }
-                (s.ws.id.clone(), s.ws.port, s.last_spawn)
+                (
+                    s.ws.id.clone(),
+                    s.engine_address(),
+                    s.resolved_dir.clone(),
+                    s.last_spawn,
+                )
             };
             // A concurrent delete may have removed this stack from the map, and
             // trashed its dir, while we held only the snapshot Arc. Never
@@ -2382,15 +2527,14 @@ impl GatewayState {
             candidates.push(ProbeTarget {
                 stack,
                 id,
-                port,
+                engine,
+                dir,
                 last_spawn,
             });
         }
 
         // Probe phase: run every candidate's health probe CONCURRENTLY with no
         // stack lock held, so one slow engine never serializes the whole pass.
-        let scheme = self.engine_scheme();
-        let client = &self.inner.health_client;
         // The unread count and the backup line ride the same pass, and only for
         // an engine that answers healthy. These are the sole paths to either,
         // because the gateway holds no DB handle (ADR 0014 §1). A stopped
@@ -2399,13 +2543,13 @@ impl GatewayState {
         // second costs the pass nothing.
         let outcomes: Vec<EngineReadings> =
             futures::future::join_all(candidates.iter().map(|t| async move {
-                let probe = stack::probe_engine(client, scheme, t.port).await;
+                let probe = stack::probe_engine(&t.engine, &t.dir).await;
                 if probe.outcome != ProbeOutcome::Healthy {
                     return (probe, None, None);
                 }
                 let (unread, backup) = futures::future::join(
-                    stack::fetch_unread_count(client, scheme, t.port),
-                    stack::fetch_last_successful_backup(client, scheme, t.port),
+                    stack::fetch_unread_count(&t.engine),
+                    stack::fetch_last_successful_backup(&t.engine),
                 )
                 .await;
                 (probe, unread, backup)
@@ -2557,7 +2701,9 @@ impl GatewayState {
 struct ProbeTarget {
     stack: Arc<AsyncMutex<StackRuntime>>,
     id: String,
-    port: u16,
+    engine: EngineAddress,
+    /// The workspace directory a healthy answer must name.
+    dir: PathBuf,
     last_spawn: Option<Instant>,
 }
 
@@ -2764,15 +2910,13 @@ fn provision_failure_action(kind: ProvisionErrorKind, attempts: u32) -> Provisio
 ///
 /// Both arms must stay zombie-aware. `kill(pid, 0)` succeeds for a process that
 /// has already exited, and an engine wrongly read as alive is never culled by
-/// [`respawn_decision`]. It would sit on the boot splash forever.
+/// [`respawn_decision`]. It would sit on the boot splash forever. The handle-less
+/// arm asks the owner lock, which a zombie no longer holds.
 fn engine_process_alive(s: &mut StackRuntime) -> bool {
     if let Some(child) = s.engine.as_mut() {
         return matches!(child.try_wait(), Ok(None));
     }
-    match stack::read_pidfile(&s.resolved_dir) {
-        Some(pid) => stack::pid_is_live(pid),
-        None => false,
-    }
+    stack::adopted_engine_alive(&s.resolved_dir)
 }
 
 /// Stop a stack's engine process with SIGUSR1, which the engine stops on where
@@ -2897,15 +3041,37 @@ fn resolve_static_dir(dir: Option<PathBuf>, packaged: bool) -> Result<Option<Pat
 }
 
 /// `lucidos-gateway` entry point.
-pub async fn run() -> Result<(), BoxError> {
+/// How [`run`] ended, short of an error.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Served, then stopped on request.
+    Stopped,
+    /// Another gateway owns this data directory, so this one touched nothing.
+    AlreadyRunning,
+}
+
+/// The exit code of a gateway that found its data directory already owned.
+/// `scripts/lib/gateway_supervisor.sh` stops on it rather than respawning.
+pub const ALREADY_RUNNING_EXIT: u8 = 75;
+
+pub async fn run() -> Result<RunOutcome, BoxError> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
     let _ = dotenvy::dotenv();
     raise_fd_limit();
 
-    let app_data = resolve_app_data()?;
-    std::fs::create_dir_all(&app_data)?;
+    lucidos_home::ensure()?;
+    let app_data = lucidos_home::gateway_data_dir().ok_or("HOME not set")?;
+    // Held as a `run()` local for this gateway's whole life. First, so a loser
+    // never loads the registry, probes an engine or reclaims one (ADR 0438).
+    let Some(_owner_lock) = claim_data_dir(&app_data)? else {
+        crate::log!(
+            "[Gateway] another gateway already owns {}, so this one exits",
+            app_data.display()
+        );
+        return Ok(RunOutcome::AlreadyRunning);
+    };
     let registry_path = app_data.join("config/workspaces.json");
     // The dev default, and only the no-env fallback: both real launch paths
     // pass `LUCIDOS_API_PORT`. Dev injects 5251 and the packaged app 5252, so
@@ -3010,10 +3176,10 @@ pub async fn run() -> Result<(), BoxError> {
     // and both e2e suites would then fail one request at a time. Failing here
     // says why, once.
     let local_token = auth::ensure_local_token()?;
-    // Its webhook-scoped sibling, on the same terms. The hook socket presents
+    // Its delivery-scoped sibling, on the same terms. The hook socket presents
     // this on its engine hop, so a gateway without it could forward no delivery
     // to an engine that requires a credential.
-    let webhook_token = auth::ensure_webhook_token()?;
+    let hook_socket_token = auth::ensure_hook_socket_token()?;
     // Per gateway, under this process's own data dir, so the packaged app and a
     // dev checkout stop overwriting one machine-global file. The legacy path
     // seeds this store once, which is what keeps an already-paired device in.
@@ -3055,7 +3221,7 @@ pub async fn run() -> Result<(), BoxError> {
                 registry_path,
                 gateway_port,
                 local_token,
-                webhook_token,
+                hook_socket_token,
                 paired_devices_path,
                 paired_devices: Mutex::new(paired_devices),
                 paired_devices_writing: Mutex::new(()),
@@ -3069,8 +3235,6 @@ pub async fn run() -> Result<(), BoxError> {
                 pg_backend,
                 packaged,
                 pg_lock: AsyncMutex::new(()),
-                proxy_client: proxy::build_client(),
-                health_client: stack::build_health_client(),
                 registry: Mutex::new(registry),
                 stacks: AsyncMutex::new(HashMap::new()),
                 starting: AsyncMutex::new(HashSet::new()),
@@ -3082,6 +3246,7 @@ pub async fn run() -> Result<(), BoxError> {
                 pending_binds: RwLock::new(BTreeSet::new()),
                 exe_path: exe_path.clone(),
                 binary_check: Mutex::new(GatewayBinaryCheck::default()),
+                scheduled_reload: Mutex::new(None),
                 release_check: release_check::ReleaseCheck::new(
                     &release_check::Deployment::from_env(packaged, exe_path, release_app_data),
                 ),
@@ -3099,6 +3264,18 @@ pub async fn run() -> Result<(), BoxError> {
     // A first-run empty registry is a no-op: nothing is auto-created, so the
     // smart root serves the picker and the user names their first workspace.
     state.boot_all().await;
+
+    // A switch that re-execed this gateway first hands its workspaces over,
+    // and this image restarts them once it has adopted their engines (ADR 0461).
+    let handed_over = restart_after_reload(std::env::args().skip(1));
+    if !handed_over.is_empty() {
+        let restarter = state.clone();
+        tokio::spawn(async move {
+            for id in handed_over {
+                restarter.restart_handed_over(&id).await;
+            }
+        });
+    }
 
     // Supervisor.
     {
@@ -3151,7 +3328,8 @@ pub async fn run() -> Result<(), BoxError> {
         });
     }
 
-    serve(state, gateway_port, gateway_bind_choice).await
+    serve(state, gateway_port, gateway_bind_choice).await?;
+    Ok(RunOutcome::Stopped)
 }
 
 /// The gateway's whole HTTP surface, assembled.
@@ -3496,7 +3674,7 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
         .map(|(_, rest)| rest)
         .unwrap_or("");
     match state.route(&slug) {
-        Some(port) => {
+        Some(engine) => {
             if rest == "manifest.json" {
                 return serve_workspace_manifest(&state, &slug);
             }
@@ -3519,22 +3697,13 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                     return proxy::stalled_page();
                 }
             }
-            let target = format!("{}://127.0.0.1:{port}", state.engine_scheme());
             // The route is set the instant `bring_up` spawns the engine, while
             // it is still Booting. So a cold-open navigation lands HERE rather
             // than on the no-route branch below. The boot phase goes with it so
             // the proxy's connect-failure splash can narrate what the engine
             // reported. A transient restart has no phase set.
             let boot_label = state.boot_splash_label(&slug);
-            proxy::proxy(
-                &state.inner.proxy_client,
-                &target,
-                &slug,
-                &boot_label,
-                state.local_token(),
-                req,
-            )
-            .await
+            proxy::proxy(&engine, &slug, &boot_label, state.local_token(), req).await
         }
         None => {
             // No live route. A registered-but-stopped workspace lazy-starts on
@@ -4135,14 +4304,111 @@ fn find_head_open_end(html: &str) -> Option<usize> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Resolve the gateway's base dir. `LUCIDOS_GATEWAY_DATA` wins, else
-/// `~/.lucidos/gateway`. Packaged sets it to the OS app-data dir.
-fn resolve_app_data() -> Result<PathBuf, BoxError> {
-    if let Some(d) = std::env::var_os("LUCIDOS_GATEWAY_DATA") {
-        return Ok(PathBuf::from(d));
+/// Where a `reload_gateway` re-exec tells the new image which descriptor
+/// still holds the owner lock.
+const INHERITED_LOCK_FD_ENV: &str = "LUCIDOS_GATEWAY_LOCK_FD";
+
+/// Where a `reload_gateway` re-exec names the workspace the new image restarts.
+const RESTART_AFTER_RELOAD_ARG: &str = "--restart-workspace-after-reload=";
+
+/// How long a new image waits to adopt a handed-over engine, and how often it
+/// looks. The engine is running, so its first probe normally adopts it.
+const HANDOVER_ADOPT_WAIT: Duration = Duration::from_secs(30);
+const HANDOVER_ADOPT_POLL: Duration = Duration::from_millis(500);
+
+/// The argv a re-exec runs with: this image's own minus any earlier hand-over,
+/// so a later reload never repeats it, plus one argument per handed-over id.
+fn reload_args(current: impl IntoIterator<Item = String>, handover: &[String]) -> Vec<String> {
+    current
+        .into_iter()
+        .filter(|a| !a.starts_with(RESTART_AFTER_RELOAD_ARG))
+        .chain(
+            handover
+                .iter()
+                .map(|id| format!("{RESTART_AFTER_RELOAD_ARG}{id}")),
+        )
+        .collect()
+}
+
+/// The workspaces a re-exec handed this image to restart.
+fn restart_after_reload(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    args.into_iter()
+        .filter_map(|a| a.strip_prefix(RESTART_AFTER_RELOAD_ARG).map(str::to_string))
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// The descriptor holding this gateway's owner lock, for `reload_gateway`.
+#[cfg(unix)]
+static OWNER_LOCK_FD: std::sync::OnceLock<std::os::fd::RawFd> = std::sync::OnceLock::new();
+
+/// Own the gateway data directory, or learn that another gateway does.
+///
+/// `None` means another live gateway holds the owner lock. Checking and taking
+/// are one call, so two gateways launched together cannot both pass.
+fn claim_data_dir(app_data: &Path) -> Result<Option<lucidos_owner_lock::OwnerLock>, BoxError> {
+    use lucidos_owner_lock::{gateway, OwnerLock};
+    lucidos_home::ensure_storage_root(app_data)?;
+    let lock_path = gateway::lock_path(app_data);
+    let inherited = std::env::var(INHERITED_LOCK_FD_ENV).ok();
+    let lock = match inherited_lock(&lock_path, inherited.as_deref())? {
+        Some(lock) => lock,
+        None => match OwnerLock::try_acquire(&lock_path)? {
+            Some(lock) => lock,
+            None => return Ok(None),
+        },
+    };
+    lock.publish_pid(&gateway::pid_path(app_data))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let _ = OWNER_LOCK_FD.set(lock.as_raw_fd());
     }
-    let home = std::env::var_os("HOME").ok_or("HOME not set")?;
-    Ok(PathBuf::from(home).join(".lucidos/gateway"))
+    Ok(Some(lock))
+}
+
+/// The owner lock a `reload_gateway` re-exec carried across `exec`, when this
+/// image is one.
+///
+/// Its open file still holds the lock, so taking it again cannot lose: not to
+/// a rival gateway, and not to an engine child still holding a copy mid-exec.
+/// A descriptor that is closed or names another file is left alone.
+#[cfg(unix)]
+fn inherited_lock(
+    lock_path: &Path,
+    inherited_fd: Option<&str>,
+) -> std::io::Result<Option<lucidos_owner_lock::OwnerLock>> {
+    use std::os::fd::{FromRawFd as _, IntoRawFd as _, RawFd};
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(fd) = inherited_fd.and_then(|v| v.parse::<RawFd>().ok()) else {
+        return Ok(None);
+    };
+    // SAFETY: F_GETFD only asks whether `fd` is open, and touches no memory.
+    if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Ok(None);
+    }
+    // SAFETY: `fd` is open. Ownership is released again below unless it is
+    // provably the lock file.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let (held, expected) = (file.metadata(), std::fs::metadata(lock_path));
+    let same =
+        matches!((&held, &expected), (Ok(h), Ok(e)) if (h.dev(), h.ino()) == (e.dev(), e.ino()));
+    if !same {
+        let _ = file.into_raw_fd();
+        return Ok(None);
+    }
+    // SAFETY: restores close-on-exec on a descriptor this process now owns, so
+    // no engine it spawns inherits the lock.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    lucidos_owner_lock::OwnerLock::adopt(file)
+}
+
+#[cfg(not(unix))]
+fn inherited_lock(
+    _lock_path: &Path,
+    _inherited_fd: Option<&str>,
+) -> std::io::Result<Option<lucidos_owner_lock::OwnerLock>> {
+    Ok(None)
 }
 
 /// Install graceful-stop handlers. The gateway exits on Ctrl+C / SIGUSR1 but
@@ -4393,19 +4659,13 @@ mod tests {
     // exercised against a real fork: a zombie is a property of the process
     // table, and no test that stubs the process layer can produce one.
 
-    /// A throwaway workspace dir, named per test and per process so parallel
-    /// tests never share one.
+    /// A throwaway workspace dir, removed when its guard drops.
     #[cfg(unix)]
-    fn reap_scratch_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-gw-reap-{}-{}-{:?}",
-            label,
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+    fn reap_scratch_dir() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".lucidos")).unwrap();
-        dir
+        (tmp, dir)
     }
 
     /// Block until `pid` has left the process table ENTIRELY, rather than
@@ -4476,17 +4736,24 @@ mod tests {
     /// platforms report a symlinked executable by its target's name.
     #[cfg(unix)]
     fn spawn_stand_in_engine_binary(dir: &Path) -> std::process::Child {
-        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-            .into_iter()
-            .map(Path::new)
-            .find(|p| p.is_file())
-            .expect("a sleep binary");
+        // This test binary, not `/bin/sleep`: macOS SIGKILLs a copied Apple
+        // platform binary at exec, so that stand-in died on its own.
         let engine = dir.join("lucidos-engine");
-        std::fs::copy(sleep, &engine).expect("copy sleep");
+        std::fs::copy(std::env::current_exe().expect("test binary"), &engine)
+            .expect("copy the test binary under the engine's name");
         // Linux refuses to exec a file another thread's fork still holds open
         // for writing, which a parallel test run can briefly cause.
         for _ in 0..50 {
-            match std::process::Command::new(&engine).arg("30").spawn() {
+            match std::process::Command::new(&engine)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "server::tests::stand_in_engine_body",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
                 Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -4496,11 +4763,28 @@ mod tests {
         panic!("the stand-in engine stayed busy");
     }
 
+    /// What a stand-in engine runs: a long sleep.
+    #[test]
+    #[ignore = "spawned by the reclaim tests as a stand-in engine"]
+    fn stand_in_engine_body() {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Stand in for an engine that owns `dir`: hold its owner lock and publish
+    /// `pid` the way the engine publishes its own. Drop the guard to "exit".
+    fn own_as_engine(dir: &Path, pid: u32) -> lucidos_owner_lock::OwnerLock {
+        let lock =
+            lucidos_owner_lock::OwnerLock::acquire(&lucidos_owner_lock::engine::lock_path(dir))
+                .expect("the scratch workspace's engine lock is free");
+        std::fs::write(lucidos_owner_lock::engine::pid_path(dir), pid.to_string()).unwrap();
+        lock
+    }
+
     /// We hold the `Child`, so the wait rides it.
     #[cfg(unix)]
     #[test]
     fn stopping_an_engine_we_hold_the_handle_for_reaps_it() {
-        let dir = reap_scratch_dir("handle");
+        let (_tmp, dir) = reap_scratch_dir();
         let child = spawn_stand_in_engine();
         let pid = child.id();
         let mut s = reap_test_stack(Some(child), dir.clone());
@@ -4512,7 +4796,6 @@ mod tests {
             "an engine stopped through its Child handle is still in the process \
              table (pid {pid})"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `reload_gateway` re-execs the gateway image in place. The pid is
@@ -4522,10 +4805,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stopping_a_re_adopted_engine_reaps_it_too() {
-        let dir = reap_scratch_dir("readopted");
+        let (_tmp, dir) = reap_scratch_dir();
         let child = spawn_stand_in_engine_binary(&dir);
         let pid = child.id();
-        std::fs::write(dir.join(".lucidos/engine.pid"), pid.to_string()).unwrap();
+        let _owner = own_as_engine(&dir, pid);
         // Exactly what `execv` does to the handle: dropped without a wait,
         // while the process carries on as our child.
         drop(child);
@@ -4538,7 +4821,6 @@ mod tests {
             "a re-adopted engine was signalled but never waited on, so pid {pid} \
              is now a zombie for the gateway's lifetime"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A pid that is NOT our child must not hold the reaping thread, and must
@@ -4550,25 +4832,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reclaiming_a_pid_that_is_not_our_child_returns_promptly() {
-        let dir = reap_scratch_dir("foreign");
+        let (_tmp, dir) = reap_scratch_dir();
         let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn true");
         let pid = child.id();
         child.wait().expect("reap the fixture");
-        std::fs::write(dir.join(".lucidos/engine.pid"), pid.to_string()).unwrap();
+        let _owner = own_as_engine(&dir, pid);
 
         let started = Instant::now();
         stack::reclaim_stale_engine(&dir);
 
-        // Comfortably above the function's own 300ms port-release pause and
-        // comfortably below "it blocked on a wait that will never return".
+        // Comfortably below "it blocked on a wait that will never return".
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "reclaiming a pid that is not our child must not block: took {:?}",
             started.elapsed()
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A delete whose move to trash failed leaves the data at the address,
@@ -4598,15 +4878,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&leftover).unwrap(), "keep me");
     }
 
-    /// A stopped workspace keeps its pidfile, and the OS reuses pids. A
-    /// lazy-start days later must not SIGUSR1 whatever app now holds that pid,
-    /// because the default disposition terminates it.
+    /// The lock check and the `kill` are two steps, and the OS reuses pids. A
+    /// pid read under a held lock must still run the engine binary before it
+    /// is signalled, because SIGUSR1's default disposition terminates.
     #[cfg(unix)]
     #[test]
     fn reclaiming_a_pid_reused_by_another_program_leaves_it_running() {
-        let dir = reap_scratch_dir("reused");
+        let (_tmp, dir) = reap_scratch_dir();
         let mut bystander = spawn_stand_in_engine();
-        std::fs::write(dir.join(".lucidos/engine.pid"), bystander.id().to_string()).unwrap();
+        let _owner = own_as_engine(&dir, bystander.id());
 
         stack::reclaim_stale_engine(&dir);
 
@@ -4619,7 +4899,259 @@ mod tests {
             survived,
             "a pidfile reclaim killed a process that is not the engine"
         );
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two gateways on one data directory: the second learns it lost, and the
+    /// pidfile keeps naming the first.
+    #[test]
+    fn a_second_gateway_cannot_claim_an_owned_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = claim_data_dir(dir.path())
+            .unwrap()
+            .expect("a free data dir");
+        let pid_path = lucidos_owner_lock::gateway::pid_path(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(&pid_path).unwrap(),
+            std::process::id().to_string()
+        );
+        std::fs::write(&pid_path, "the-winner").unwrap();
+        assert!(claim_data_dir(dir.path()).unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&pid_path).unwrap(),
+            "the-winner",
+            "a loser must not name itself"
+        );
+        drop(first);
+    }
+
+    /// A data dir from before the storage-root rule converges on the claim.
+    #[cfg(unix)]
+    #[test]
+    fn claiming_the_data_dir_makes_it_a_storage_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _lock = claim_data_dir(dir.path())
+            .unwrap()
+            .expect("a free data dir");
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, lucidos_home::STORAGE_ROOT_MODE);
+    }
+
+    /// The Lucidos home is a storage root before the gateway reads anything.
+    #[test]
+    fn the_gateway_asserts_the_lucidos_home_first() {
+        let source = include_str!("server.rs");
+        let run = &source[source.find("pub async fn run()").expect("run() exists")..];
+        let asserted = run
+            .find("lucidos_home::ensure()?")
+            .expect("run() asserts the Lucidos home");
+        let claimed = run
+            .find("claim_data_dir(&app_data)")
+            .expect("run() claims the data dir");
+        assert!(asserted < claimed);
+    }
+
+    /// A reload re-exec keeps its lock. The inherited descriptor shares the
+    /// open file that holds it, so the new image takes it again. Every other
+    /// opener, rival gateway or not, is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_reloaded_gateway_takes_back_the_lock_it_carried_across_exec() {
+        use std::os::fd::AsRawFd as _;
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = lucidos_owner_lock::gateway::lock_path(dir.path());
+        let before_exec = lucidos_owner_lock::OwnerLock::acquire(&lock_path).unwrap();
+        // SAFETY: dup of a descriptor this test owns, as exec would carry it.
+        let carried = unsafe { libc::dup(before_exec.as_raw_fd()) };
+
+        let after_exec = inherited_lock(&lock_path, Some(&carried.to_string()))
+            .unwrap()
+            .expect("the carried descriptor still holds the lock");
+        assert!(lucidos_owner_lock::OwnerLock::try_acquire(&lock_path)
+            .unwrap()
+            .is_none());
+        drop(after_exec);
+        drop(before_exec);
+    }
+
+    /// A stale variable naming some other open file is not a lock, and the
+    /// descriptor is left open for whoever owns it.
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_descriptor_naming_another_file_is_ignored() {
+        use std::os::fd::AsRawFd as _;
+        let dir = tempfile::tempdir().unwrap();
+        let other = std::fs::File::create(dir.path().join("other")).unwrap();
+        let lock_path = lucidos_owner_lock::gateway::lock_path(dir.path());
+        std::fs::write(&lock_path, "").unwrap();
+        let fd = other.as_raw_fd().to_string();
+        assert!(inherited_lock(&lock_path, Some(&fd)).unwrap().is_none());
+        assert!(inherited_lock(&lock_path, Some("not-a-fd"))
+            .unwrap()
+            .is_none());
+        // SAFETY: F_GETFD only asks whether the descriptor is still open.
+        assert!(unsafe { libc::fcntl(other.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    /// A loser must touch nothing: no registry, no token, no engine. Pinned on
+    /// the source, because the property is an ordering inside `run`.
+    #[test]
+    fn the_gateway_claims_its_data_dir_before_anything_else() {
+        let source = include_str!("server.rs");
+        let run = &source[source.find("pub async fn run()").expect("run() exists")..];
+        let claimed = run
+            .find("claim_data_dir(&app_data)")
+            .expect("run() claims the data dir");
+        for later in [
+            "validate_engine_bin(",
+            "Registry::load(",
+            "ensure_local_token()",
+            ".boot_all()",
+            "serve(state",
+        ] {
+            let at = run.find(later).unwrap_or_else(|| panic!("{later} moved"));
+            assert!(claimed < at, "{later} runs before the data dir is owned");
+        }
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// A switch hands its workspaces to the re-exec, and the new image reads them.
+    #[test]
+    fn a_reload_hands_its_workspaces_to_the_new_image() {
+        let args = reload_args(strings(&["--flag"]), &strings(&["dev", "myws"]));
+        assert_eq!(args[0], "--flag");
+        assert_eq!(restart_after_reload(args), strings(&["dev", "myws"]));
+    }
+
+    /// A later reload, such as the picker's, must not restart them again.
+    #[test]
+    fn a_later_reload_drops_the_earlier_hand_over() {
+        let handed = reload_args(strings(&["--flag"]), &strings(&["dev"]));
+        assert_eq!(reload_args(handed.clone(), &[]), strings(&["--flag"]));
+        let again = reload_args(handed, &strings(&["myws"]));
+        assert_eq!(restart_after_reload(again.clone()), strings(&["myws"]));
+        assert_eq!(again.len(), 2);
+    }
+
+    #[test]
+    fn an_image_started_without_a_hand_over_restarts_nothing() {
+        assert!(restart_after_reload(strings(&["--flag"])).is_empty());
+        assert!(restart_after_reload(reload_args(strings(&[]), &strings(&[""]))).is_empty());
+    }
+
+    /// The engine must hold the clicking device before anything can signal it,
+    /// or the switch settles as a crash. Pinned on the source, because the
+    /// property is an ordering inside `restart_workspace`.
+    #[test]
+    fn a_restart_posts_the_intent_before_the_gateway_moves_first() {
+        let source = include_str!("server.rs");
+        let restart = &source[source
+            .find("pub async fn restart_workspace(")
+            .expect("restart_workspace exists")..];
+        let notified = restart
+            .find("self.notify_restart_intent(&s, requested_by)")
+            .expect("restart_workspace posts the intent");
+        let reloaded = restart
+            .find("self.reload_gateway(Some(id))")
+            .expect("restart_workspace can move the gateway first");
+        let respawned = restart
+            .find("self.respawn_requested(&mut s)")
+            .expect("restart_workspace respawns");
+        assert!(notified < reloaded && reloaded < respawned);
+    }
+
+    /// The new image restarts the handed-over workspace only once it has
+    /// adopted the running engines, so the restart replaces the old engine.
+    #[test]
+    fn the_new_image_restarts_the_hand_over_after_its_boot_pass() {
+        let source = include_str!("server.rs");
+        let run = &source[source.find("pub async fn run()").expect("run() exists")..];
+        let booted = run.find(".boot_all()").expect("run() boots");
+        let handed = run
+            .find("restart_after_reload(std::env::args()")
+            .expect("run() reads the hand-over");
+        assert!(booted < handed);
+    }
+
+    /// Rust writes both pidfiles and the shell launchers read them, so the
+    /// shell's paths must name the same files. Shell cannot import the paths.
+    #[test]
+    fn the_shell_reads_the_pidfiles_the_owners_write() {
+        use lucidos_owner_lock::{build_watch, engine, gateway};
+        let workspace_sh = include_str!("../../../scripts/lib/workspace.sh");
+        let flock_sh = include_str!("../../../scripts/lib/flock.sh");
+        let name = |p: std::path::PathBuf| p.file_name().unwrap().to_string_lossy().into_owned();
+        let rel = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        let gateway_pid = name(gateway::pid_path(Path::new("/d")));
+        assert!(
+            workspace_sh.contains(&format!(
+                "gateway_pidfile()  {{ echo \"$(gateway_data_dir)/{gateway_pid}\"; }}"
+            )),
+            "workspace.sh's gateway_pidfile must name {gateway_pid}"
+        );
+        for (function, path) in [
+            ("engine_lock_path", rel(engine::lock_path(Path::new("")))),
+            ("engine_pid_path", rel(engine::pid_path(Path::new("")))),
+            (
+                "engine_successor_lock_path",
+                rel(engine::successor_lock_path(Path::new(""))),
+            ),
+            (
+                "engine_successor_pid_path",
+                rel(engine::successor_pid_path(Path::new(""))),
+            ),
+        ] {
+            assert!(
+                flock_sh.contains(&format!("{function}() {{ echo \"$1/{path}\"; }}")),
+                "flock.sh's {function} must name {path}"
+            );
+        }
+        let dir = name(build_watch::dir(Path::new("/app")));
+        assert!(
+            workspace_sh.contains(&format!("/crates/lucidos-app/{dir}\"; }}")),
+            "workspace.sh's build_watch_dir must name {dir}"
+        );
+        for path in [
+            build_watch::watch_lock_path(Path::new("/app")),
+            build_watch::pid_path(Path::new("/app")),
+            build_watch::consumers_lock_path(Path::new("/app")),
+        ] {
+            let file = name(path);
+            assert!(
+                workspace_sh.contains(&format!("echo \"$(build_watch_dir)/{file}\"; }}")),
+                "workspace.sh must name the build-watch's {file}"
+            );
+        }
+    }
+
+    /// The supervisor stops on the already-running exit, so it must name the
+    /// same number. Shell cannot import the constant, hence a pin.
+    #[test]
+    fn the_supervisor_treats_already_running_as_a_clean_stop() {
+        let script = include_str!("../../../scripts/lib/gateway_supervisor.sh");
+        assert!(
+            script.contains(&format!(
+                "local already_running_exit={ALREADY_RUNNING_EXIT}"
+            )),
+            "gateway_supervisor.sh must carry ALREADY_RUNNING_EXIT"
+        );
+    }
+
+    /// A pidfile with no owner lock behind it names nobody. The holder that
+    /// wrote it has exited, so the pid may now be a successor still waiting for
+    /// the lock. Reclaim and liveness both read through `live_engine_pid`.
+    #[test]
+    fn an_unlocked_pidfile_names_no_engine() {
+        let (_tmp, dir) = reap_scratch_dir();
+        // The lock file a lock-aware engine left behind when it exited.
+        std::fs::write(lucidos_owner_lock::engine::lock_path(&dir), "").unwrap();
+        std::fs::write(lucidos_owner_lock::engine::pid_path(&dir), "4242").unwrap();
+        assert_eq!(stack::live_engine_pid(&dir), None);
+        assert!(!stack::adopted_engine_alive(&dir));
     }
 
     // ── Retrying an optional bind ────────────────────────────────────────────
@@ -4674,8 +5206,7 @@ mod tests {
     #[test]
     fn lucidos_roots_name_spawned_and_adopted_engines() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".lucidos")).unwrap();
-        std::fs::write(dir.path().join(".lucidos/engine.pid"), "4242\n").unwrap();
+        let _owner = own_as_engine(dir.path(), 4242);
         let state = GatewayState::for_tests();
 
         let roots = state.lucidos_roots(vec![
@@ -5958,10 +6489,41 @@ mod tests {
         assert_eq!(ws.dir, arm.to_string_lossy());
         assert!(ws.port > 0, "the caller boots on this port");
         assert!(ws.database_url.is_none(), "the shared cluster derives it");
-        // Registration only. An engine would have landed here, and spawning one
-        // writes `.lucidos/engine.pid` into the adopted directory.
+        // Registration only. Spawning an engine creates `.lucidos/` in the
+        // adopted directory, for its state and its owner lock.
         assert!(state.inner.stacks.lock().await.is_empty());
         assert!(!arm.join(".lucidos").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_directory_becomes_a_storage_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        std::fs::set_permissions(&arm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        adopted(&state, json!({ "dir": arm })).await;
+
+        let mode = std::fs::metadata(&arm).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, lucidos_home::STORAGE_ROOT_MODE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_adopt_leaves_the_directory_mode_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (state, root) = adopting_state();
+        let here = a_directory(&a_directory(root.path(), "here"), "eval-lean-1");
+        let elsewhere = a_directory(&a_directory(root.path(), "elsewhere"), "eval-lean-1");
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+        adopted(&state, json!({ "dir": here })).await;
+
+        let (status, _) = adopt(&state, json!({ "dir": elsewhere })).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        let mode = std::fs::metadata(&elsewhere).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 
     #[tokio::test]
@@ -6036,6 +6598,97 @@ mod tests {
         );
         // Its own name is not a collision with itself.
         assert_eq!(adopted(&state, named).await.name, "Lean arm, repeat 1");
+    }
+
+    /// The dev launcher allocates a workspace's port itself, so it adopts with
+    /// that port rather than taking one the registry picks.
+    #[tokio::test]
+    async fn adopting_with_a_port_registers_that_port() {
+        let (state, root) = adopting_state();
+        let dir = a_directory(root.path(), "dev");
+
+        let ws = adopted(&state, json!({ "dir": dir, "port": 45173 })).await;
+
+        assert_eq!(ws.port, 45173);
+        assert!(!ws.autostart, "a launcher's workspace starts when launched");
+        let saved = Registry::load(&state.inner.registry_path).unwrap();
+        assert_eq!(saved.get("dev").unwrap().port, 45173);
+    }
+
+    /// A relaunch on a new port moves a stopped workspace there, and keeps
+    /// what the picker set.
+    #[tokio::test]
+    async fn re_adopting_a_stopped_workspace_with_a_new_port_moves_it() {
+        let (state, root) = adopting_state();
+        let dir = a_directory(root.path(), "dev");
+        adopted(&state, json!({ "dir": dir, "port": 45173 })).await;
+        state.rename_workspace("dev", "Dev box").await.unwrap();
+        state.set_autostart("dev", true).await.unwrap();
+
+        let moved = adopted(&state, json!({ "dir": dir, "port": 45174 })).await;
+
+        assert_eq!(moved.port, 45174);
+        assert_eq!(moved.name, "Dev box");
+        assert!(moved.autostart);
+    }
+
+    #[tokio::test]
+    async fn adopting_a_port_another_workspace_holds_is_refused() {
+        let (state, root) = adopting_state();
+        let first = a_directory(root.path(), "dev");
+        let second = a_directory(root.path(), "myws");
+        adopted(&state, json!({ "dir": first, "port": 45173 })).await;
+
+        let (status, body) = adopt(&state, json!({ "dir": second, "port": 45173 })).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("'dev'"), "{body}");
+        assert_eq!(registered(&state).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn adopting_port_zero_is_refused() {
+        let (state, root) = adopting_state();
+        let dir = a_directory(root.path(), "dev");
+        let (status, body) = adopt(&state, json!({ "dir": dir, "port": 0 })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(registered(&state).is_empty());
+    }
+
+    /// Moving the port under a running engine would strand it: the gateway
+    /// would route to a port nothing serves.
+    #[tokio::test]
+    async fn moving_the_port_of_a_running_workspace_is_refused() {
+        let (state, root) = adopting_state();
+        let dir = a_directory(root.path(), "eval-lean-1");
+        let ws = adopted(&state, json!({ "dir": dir })).await;
+        let _engine = StubEngine::serving(&state, &ws, minutes_ago(5));
+        state.adopt_running_engines().await;
+        let routed = Some(state.engine_address_of(&ws));
+        assert_eq!(state.route("eval-lean-1"), routed);
+
+        let other = ws.port.checked_add(1).unwrap_or(ws.port - 1);
+        let (status, body) = adopt(&state, json!({ "dir": dir, "port": other })).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(registered(&state)[0].port, ws.port);
+        assert_eq!(state.route("eval-lean-1"), routed);
+        // The same port is not a move.
+        adopted(&state, json!({ "dir": dir, "port": ws.port })).await;
+    }
+
+    /// The launcher used to rewrite `workspaces.json` behind a running gateway,
+    /// and a stop re-read the file. A truncated file read as an empty registry,
+    /// so the stop answered 404 and the gateway forgot every workspace.
+    #[tokio::test]
+    async fn a_stop_never_rereads_the_registry_file() {
+        let (state, root) = adopting_state();
+        let dir = a_directory(root.path(), "eval-lean-1");
+        let ws = adopted(&state, json!({ "dir": dir })).await;
+        std::fs::write(&state.inner.registry_path, "").unwrap();
+
+        assert_eq!(stop_call(&state, "eval-lean-1").await, StatusCode::ACCEPTED);
+        assert_eq!(registered(&state), vec![ws]);
     }
 
     #[tokio::test]
@@ -6156,28 +6809,49 @@ mod tests {
         chrono::Utc::now() - chrono::Duration::minutes(minutes)
     }
 
-    /// A stand-in engine on `port`, answering `/api/v1/health` until the test
-    /// drops it. It reports a start time, which is how the gateway tells a fresh
-    /// engine from one a stop is still draining.
+    /// A stand-in engine on a workspace's engine socket, answering
+    /// `/api/v1/health` until the test drops it. It names the workspace it
+    /// serves, which is how the gateway knows it is that workspace's engine. It
+    /// reports a start time, which is how the gateway tells a fresh engine from
+    /// one a stop is still draining.
     struct StubEngine {
         started_at: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
     impl StubEngine {
-        async fn on(port: u16, started_at: chrono::DateTime<chrono::Utc>) -> StubEngine {
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .expect("the port the registry just allocated is free");
+        /// A stand-in engine whose health body names `ws`'s directory.
+        fn serving(
+            state: &GatewayState,
+            ws: &Workspace,
+            started_at: chrono::DateTime<chrono::Utc>,
+        ) -> StubEngine {
+            let dir = ws.resolve_dir(state.app_data());
+            StubEngine::naming(state, ws, &dir, started_at)
+        }
+
+        /// A stand-in on `ws`'s engine socket whose health body names `named`.
+        fn naming(
+            state: &GatewayState,
+            ws: &Workspace,
+            named: &Path,
+            started_at: chrono::DateTime<chrono::Utc>,
+        ) -> StubEngine {
+            let workspace = named.to_string_lossy().into_owned();
+            let listener = crate::engine_hop::test_engine::bind_for_workspace(
+                &ws.resolve_dir(state.app_data()),
+            );
             let started_at = Arc::new(Mutex::new(started_at));
             let reported = Arc::clone(&started_at);
             let task = tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 while let Ok((mut sock, _)) = listener.accept().await {
-                    let body = format!(
-                        r#"{{"status":"ok","started_at":"{}"}}"#,
-                        reported.lock().unwrap().to_rfc3339()
-                    );
+                    let body = serde_json::json!({
+                        "status": "ok",
+                        "workspace_path": workspace,
+                        "started_at": reported.lock().unwrap().to_rfc3339(),
+                    })
+                    .to_string();
                     tokio::spawn(async move {
                         let mut buf = [0u8; 1024];
                         let _ = sock.read(&mut buf).await;
@@ -6195,7 +6869,7 @@ mod tests {
             StubEngine { started_at, task }
         }
 
-        /// A DIFFERENT engine takes the port over, which is what the eval
+        /// A DIFFERENT engine takes the workspace over, which is what the eval
         /// harness does after it releases an arm.
         fn relaunched(&self) {
             *self.started_at.lock().unwrap() = chrono::Utc::now() + chrono::Duration::seconds(1);
@@ -6221,7 +6895,7 @@ mod tests {
         let (state, root) = adopting_state();
         let arm = a_directory(root.path(), "eval-lean-1");
         let ws = adopted(&state, json!({ "dir": arm })).await;
-        let _engine = StubEngine::on(ws.port, minutes_ago(5)).await;
+        let _engine = StubEngine::serving(&state, &ws, minutes_ago(5));
 
         state.adopt_running_engines().await;
 
@@ -6234,9 +6908,26 @@ mod tests {
         assert_eq!(status.last_error, None, "nothing failed here");
         assert_eq!(
             state.route("eval-lean-1"),
-            Some(ws.port),
+            Some(state.engine_address_of(&ws)),
             "and it is proxied, not merely badged"
         );
+    }
+
+    /// Whatever answers health on a workspace's engine socket is not that
+    /// workspace's engine until it says so. Adopting a stranger would proxy this
+    /// workspace's traffic, with the local token, to another workspace.
+    #[tokio::test]
+    async fn an_engine_serving_another_workspace_is_not_adopted() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        let stranger = a_directory(root.path(), "eval-control-1");
+        let ws = adopted(&state, json!({ "dir": arm })).await;
+        let _engine = StubEngine::naming(&state, &ws, &stranger, minutes_ago(5));
+
+        state.adopt_running_engines().await;
+
+        assert_eq!(state.route("eval-lean-1"), None, "a stranger was adopted");
+        assert!(state.inner.stacks.lock().await.is_empty());
     }
 
     /// The pass reports; it never starts. A registered workspace with no engine
@@ -6318,7 +7009,7 @@ mod tests {
         let (state, root) = adopting_state();
         let arm = a_directory(root.path(), "eval-lean-1");
         let ws = adopted(&state, json!({ "dir": arm })).await;
-        let _engine = StubEngine::on(ws.port, minutes_ago(5)).await;
+        let _engine = StubEngine::serving(&state, &ws, minutes_ago(5));
         state.adopt_running_engines().await;
         assert_eq!(one_status(&state).await.health, Health::Healthy);
 
@@ -6343,7 +7034,7 @@ mod tests {
         let (state, root) = adopting_state();
         let arm = a_directory(root.path(), "eval-lean-1");
         let ws = adopted(&state, json!({ "dir": arm })).await;
-        let engine = StubEngine::on(ws.port, minutes_ago(5)).await;
+        let engine = StubEngine::serving(&state, &ws, minutes_ago(5));
         state.adopt_running_engines().await;
         state.stop_workspace("eval-lean-1", None).await.unwrap();
 
@@ -6365,7 +7056,7 @@ mod tests {
         let (state, root) = adopting_state();
         let arm = a_directory(root.path(), "eval-lean-1");
         let ws = adopted(&state, json!({ "dir": arm })).await;
-        let _engine = StubEngine::on(ws.port, minutes_ago(5)).await;
+        let _engine = StubEngine::serving(&state, &ws, minutes_ago(5));
 
         // What a delete landing mid-probe leaves behind.
         state

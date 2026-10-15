@@ -31,6 +31,7 @@ async fn seed_thread(bus: &EventBus, parent: Option<uuid::Uuid>) -> (Uuid, Uuid)
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: format!("please remember {BODY_MARKER}"),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -454,6 +455,7 @@ async fn a_surviving_parent_stops_counting_the_deleted_subtree() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "work".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -551,6 +553,9 @@ async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })
@@ -568,6 +573,9 @@ async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta::NONE,
     })

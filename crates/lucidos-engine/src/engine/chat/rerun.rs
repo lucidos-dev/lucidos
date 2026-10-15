@@ -20,9 +20,9 @@
 //!    event id is the `pre_emitted_origin`, so the rerun's events link to the
 //!    resume boundary.
 //!
-//! Idempotency: if a ContinuationStarted already exists newer than the most
-//! recent ResponseAborted, the call is a no-op (returns Ok). Prevents
-//! double-Continue from doubling the rerun.
+//! Idempotency: the `ContinuationStarted` carries the abort it resumes as
+//! `resumed_abort_id`, and a unique index lets only one land per abort. A
+//! second Continue loses at that insert and returns `AlreadyResumed`.
 //!
 //! Steps 3–4 (the boundary + reminder) belong to THIS path only — a genuine
 //! interruption the user asked to revive. The other caller of
@@ -43,12 +43,13 @@ use crate::engine::thread_events::{
 use crate::engine::LucidosEngine;
 
 /// Type-erased return of [`LucidosEngine::spawn_chat_resume`], yielding the
-/// anchor event id. Boxed rather than opaque to break a mutual async recursion
+/// anchor claim. Boxed rather than opaque to break a mutual async recursion
 /// — see that method's doc comment for why the erasure is load-bearing.
 pub(crate) type ChatResumeFuture = std::pin::Pin<
     Box<
-        dyn std::future::Future<Output = Result<Uuid, Box<dyn std::error::Error + Send + Sync>>>
-            + Send,
+        dyn std::future::Future<
+                Output = Result<ResumeAnchorClaim, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send,
     >,
 >;
 
@@ -77,7 +78,13 @@ pub(crate) enum ChatResumeAnchor {
     /// `interrupted_turn` is that run's originating event, and it is the lower
     /// bound of the queued-message recovery: see
     /// [`ChatResumeAnchor::interrupted_turn`].
-    NewBoundary { interrupted_turn: Option<Uuid> },
+    ///
+    /// `resumed_abort` is that run's `ResponseAborted`. The boundary claims it,
+    /// so a second resume of the same abort is refused at the insert.
+    NewBoundary {
+        interrupted_turn: Option<Uuid>,
+        resumed_abort: Option<Uuid>,
+    },
     /// Answer-driven resume of a turn that was **never terminated** — a thread
     /// parked on an `ask_user_question` survived a restart (no abort was
     /// emitted; see `agent_recovery::thread_has_unanswered_question`) and the
@@ -103,14 +110,32 @@ impl ChatResumeAnchor {
     /// would sweep the whole thread, so that resume recovers nothing.
     pub(crate) fn interrupted_turn(self) -> Option<Uuid> {
         match self {
-            Self::NewBoundary { interrupted_turn } => interrupted_turn,
+            Self::NewBoundary {
+                interrupted_turn, ..
+            } => interrupted_turn,
             Self::ExistingTurn(request_event_id) => Some(request_event_id),
         }
     }
 }
 
+/// The unique index that lets one `ContinuationStarted` claim each abort.
+const RESUMED_ABORT_UNIQUE_INDEX: &str = "events_resumed_abort_unique";
+
+/// What [`emit_resume_anchor`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeAnchorClaim {
+    /// The re-entered turn must be stamped with this `request_event_id`.
+    Anchored(Uuid),
+    /// Another resume already claimed this abort, and nothing was emitted.
+    AlreadyResumed,
+}
+
 /// Emit whatever timeline boundary `anchor` calls for and return the
 /// `request_event_id` the re-entered turn must be stamped with.
+///
+/// The `ContinuationStarted` insert is the claim on the abort it resumes. Two
+/// concurrent resumes of one abort both reach it, and the index refuses the
+/// second, so only one rerun ever spawns.
 ///
 /// Split out of [`LucidosEngine::spawn_chat_resume`] so the emitted-event
 /// surface — the whole user-visible difference between "the reminder appears"
@@ -123,13 +148,16 @@ pub(crate) async fn emit_resume_anchor(
     engine_note: &str,
     channel: EventChannel,
     actor: Option<MessageOrigin>,
-) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
-    if let ChatResumeAnchor::ExistingTurn(request_event_id) = anchor {
-        return Ok(request_event_id);
-    }
+) -> Result<ResumeAnchorClaim, Box<dyn std::error::Error + Send + Sync>> {
+    let resumed_abort = match anchor {
+        ChatResumeAnchor::ExistingTurn(request_event_id) => {
+            return Ok(ResumeAnchorClaim::Anchored(request_event_id))
+        }
+        ChatResumeAnchor::NewBoundary { resumed_abort, .. } => resumed_abort,
+    };
 
     // ContinuationStarted opens the new exchange in the timeline.
-    let continuation_started_id = bus
+    let emitted = bus
         .emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ContinuationStarted {
@@ -138,6 +166,7 @@ pub(crate) async fn emit_resume_anchor(
                 // Chat rerun carries its own engine note, not a CC
                 // continuation reason.
                 reason: None,
+                resumed_abort_id: resumed_abort,
             },
             meta: EventMeta {
                 channel: Some(channel),
@@ -145,9 +174,16 @@ pub(crate) async fn emit_resume_anchor(
                 ..EventMeta::NONE
             },
         })
-        .await?
-        .expect("ContinuationStarted is persisted")
-        .event_id;
+        .await;
+    let continuation_started_id = match emitted {
+        Ok(result) => result.expect("ContinuationStarted is persisted").event_id,
+        Err(e)
+            if crate::engine::event_bus::violates_unique_index(&*e, RESUMED_ABORT_UNIQUE_INDEX) =>
+        {
+            return Ok(ResumeAnchorClaim::AlreadyResumed)
+        }
+        Err(e) => return Err(e),
+    };
 
     // PromptInjected carries the engine note for the audit trail.
     // request_event_id points at ContinuationStarted so the resume
@@ -170,7 +206,7 @@ pub(crate) async fn emit_resume_anchor(
     })
     .await?;
 
-    Ok(continuation_started_id)
+    Ok(ResumeAnchorClaim::Anchored(continuation_started_id))
 }
 
 /// Outcome of `continue_chat` — used by the HTTP handler to log clearly.
@@ -179,8 +215,8 @@ pub enum ContinueChatOutcome {
     /// Rerun was kicked off (ContinuationStarted + PromptInjected
     /// emitted, agentic loop spawned).
     Resumed,
-    /// A ContinuationStarted already exists newer than the latest
-    /// ResponseAborted. The click is a no-op — likely a double-Continue race.
+    /// Another resume already claimed the latest ResponseAborted. The click
+    /// is a no-op, typically a double Continue.
     AlreadyResumed,
     /// No ResponseAborted exists for this thread, or no originating event was
     /// found. Nothing to continue.
@@ -219,17 +255,15 @@ impl LucidosEngine {
             }
         };
 
-        // Idempotency: if a ContinuationStarted already exists with a higher
-        // sequence than the abort, the user's previous click already started
-        // a rerun. Don't double-spawn. The 20260513 migration rewrites the
-        // older names (`SessionRecovered`, `SessionResumed`) to
-        // `ContinuationStarted` at startup, so a single-name match suffices
-        // — sqlx runs migrations before any query.
-        let already_resumed: bool = sqlx::query_scalar::<_, bool>(
+        // A boundary that claims no abort carries no `resumed_abort_id`: a row
+        // written before the claim existed, or the answer-driven fallback. The
+        // index cannot see one, so an abort it follows counts as resumed.
+        let resumed_unclaimed: bool = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS ( \
                 SELECT 1 FROM events \
                 WHERE aggregate_id = $1 \
                   AND event_type = 'ContinuationStarted' \
+                  AND payload->>'resumed_abort_id' IS NULL \
                   AND sequence > (SELECT sequence FROM events WHERE id = $2) \
             )",
         )
@@ -237,10 +271,10 @@ impl LucidosEngine {
         .bind(abort_event_id)
         .fetch_one(self.pool())
         .await?;
-
-        if already_resumed {
+        if resumed_unclaimed {
             log!(
-                "[Continue] ContinuationStarted already exists newer than abort for thread {} — no-op",
+                "[Continue] Abort {} on thread {} was resumed by an unclaimed boundary: no-op",
+                abort_event_id,
                 thread_id
             );
             return Ok(ContinueChatOutcome::AlreadyResumed);
@@ -298,19 +332,31 @@ impl LucidosEngine {
         // A genuine interruption the user asked to revive → the resume gets its
         // own boundary + the side-effect reminder. The anchor carries the
         // interrupted turn so the resume can also recover whatever the user
-        // queued behind it.
-        self.spawn_chat_resume(
-            thread_id,
-            engine_note,
-            resume_channel,
-            actor,
-            ChatResumeAnchor::NewBoundary {
-                interrupted_turn: Some(originating_event_id),
-            },
-        )
-        .await?;
+        // queued behind it, and the abort so only one resume claims it.
+        let claim = self
+            .spawn_chat_resume(
+                thread_id,
+                engine_note,
+                resume_channel,
+                actor,
+                ChatResumeAnchor::NewBoundary {
+                    interrupted_turn: Some(originating_event_id),
+                    resumed_abort: Some(abort_event_id),
+                },
+            )
+            .await?;
 
-        Ok(ContinueChatOutcome::Resumed)
+        Ok(match claim {
+            ResumeAnchorClaim::Anchored(_) => ContinueChatOutcome::Resumed,
+            ResumeAnchorClaim::AlreadyResumed => {
+                log!(
+                    "[Continue] Abort {} on thread {} was already resumed: no-op",
+                    abort_event_id,
+                    thread_id
+                );
+                ContinueChatOutcome::AlreadyResumed
+            }
+        })
     }
 
     /// Re-enter the agentic loop with `engine_note` as the current turn, anchored
@@ -324,10 +370,10 @@ impl LucidosEngine {
     /// a restart — the chat parity of CC's `--resume`). One re-entry site so the
     /// two paths can't drift on how a chat continuation is spawned.
     ///
-    /// Returns the anchor event id (the `pre_emitted_origin` every resulting
-    /// event is stamped with, so the frontend groups them into the resume
-    /// exchange — or, for `ExistingTurn`, back into the turn that was
-    /// interrupted).
+    /// Returns the anchor claim. Its event id is the `pre_emitted_origin` every
+    /// resulting event is stamped with. The frontend groups them by it into the
+    /// resume exchange (or, for `ExistingTurn`, back into the turn that was
+    /// interrupted). A lost claim spawns nothing.
     ///
     /// Returns a boxed `dyn Future` rather than being a plain `async fn` on
     /// purpose: this method is reachable from `process_message_with_steps` (the
@@ -363,7 +409,7 @@ impl LucidosEngine {
                     0
                 });
 
-            let anchor_event_id = emit_resume_anchor(
+            let anchor_event_id = match emit_resume_anchor(
                 &engine.event_bus,
                 thread_id,
                 anchor,
@@ -371,7 +417,11 @@ impl LucidosEngine {
                 channel,
                 actor,
             )
-            .await?;
+            .await?
+            {
+                ResumeAnchorClaim::Anchored(id) => id,
+                ResumeAnchorClaim::AlreadyResumed => return Ok(ResumeAnchorClaim::AlreadyResumed),
+            };
 
             let recovered = ingest_queued_messages_for_resume(
                 ResumeStores {
@@ -419,6 +469,7 @@ impl LucidosEngine {
                         None,
                         None,
                         None,
+                        None,
                         ActorMode::Engine,
                         None,
                         None,
@@ -435,7 +486,7 @@ impl LucidosEngine {
                 }
             });
 
-            Ok(anchor_event_id)
+            Ok(ResumeAnchorClaim::Anchored(anchor_event_id))
         })
     }
 }
@@ -466,9 +517,10 @@ pub(crate) struct RecoveredMessages {
 /// return what the resumed turn should carry.
 ///
 /// The announcement is a `PromptInjected` per message, awaited before the
-/// loop is spawned. That write is what a second resume reads, so it is the
-/// whole idempotency story: a double Continue finds the marker and recovers
-/// nothing.
+/// loop is spawned. That write is what a second resume reads, so a later
+/// resume, or one racing the boot sweep, finds the marker and recovers
+/// nothing. A double Continue of one abort never gets here: the anchor's
+/// claim refuses it first.
 ///
 /// Anchored on the RESUME, not on the first recovered message, because the
 /// turn's own `PreEmittedOrigin` is the resume anchor. The live orphan path
@@ -952,6 +1004,7 @@ mod tests {
             ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: text.to_string(),
                 user_image_hashes: vec![],
                 device_id: None,

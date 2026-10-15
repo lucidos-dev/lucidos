@@ -62,33 +62,34 @@ function observedStamp(server: McpServerStatus): string | null {
 
 /** What this server costs, stated in the tense its state allows.
  *
- *  A running server's figure is what every request is paying now. A stopped
- *  one's is conditional and carries the manifest date. A never-observed one has
- *  no figure at all, which is the distinction the manifest cache exists for: a
- *  server nobody has connected to is unknown, not free. */
+ *  Only a thread that enables a server pays for its tools (ADR 0430), so every
+ *  figure is per enabling thread. A stopped one's carries the manifest date. A
+ *  never-observed one has no figure at all, which is the distinction the
+ *  manifest cache exists for: a server nobody has connected to is unknown, not
+ *  free. */
 export function mcpServerCostLine(server: McpServerStatus): string {
   if (server.tools_source === 'never-observed') {
     return 'Tools never observed, so what this server would cost is unknown. Start it once to find out.';
   }
   const cost = `${plural(callableToolCount(server), 'tool')}, ~${formatTokens(server.tokens)} tokens`;
-  if (server.running) return `${cost} in every request.`;
+  if (server.running) return `${cost}. Adds them to each thread that enables it.`;
   const seen = observedStamp(server);
   const tail = seen ? ` ${seen}` : '';
   if (!server.dispatchable) {
     return `${cost} cached, and none of them can ever be called.${tail}`;
   }
-  return `Would add ${cost} if switched on.${tail}`;
+  return `Would add ${cost} to each thread that enables it.${tail}`;
 }
 
-/** What one tool costs the request that carries it. */
+/** What one tool costs a thread that enables its server. */
 export function mcpToolCostLine(tool: McpToolStatus): string {
   if (tool.wire_name === null) {
     return 'No usable name on the wire, so it can never be called and costs nothing.';
   }
   if (tool.disabled) {
-    return `Switched off, keeping ~${formatTokens(tool.tokens)} tokens out of every request.`;
+    return `Switched off, keeping ~${formatTokens(tool.tokens)} tokens out of every thread.`;
   }
-  return `~${formatTokens(tool.tokens)} tokens in every request.`;
+  return `~${formatTokens(tool.tokens)} tokens in each thread that enables the server.`;
 }
 
 /** Tools by descending cost, because the expensive one is what the user came
@@ -97,20 +98,6 @@ export function sortToolsByCost(tools: McpToolStatus[]): McpToolStatus[] {
   return [...tools].sort(
     (a, b) => b.tokens - a.tokens || (a.wire_name ?? a.name).localeCompare(b.wire_name ?? b.name),
   );
-}
-
-/** The wire names this server has switched off, which is exactly the set the
- *  PUT replaces.
- *
- *  Read off the server the page is SHOWING, after the optimistic flip. That is
- *  what makes two quick clicks safe: the second write carries the first one's
- *  flip too, so neither can undo the other. A name left over from a tool the
- *  server no longer ships also drops out, which is right: it would filter
- *  nothing anyway. */
-export function disabledWireNames(server: McpServerStatus): string[] {
-  return server.tools
-    .filter((t) => t.disabled && t.wire_name !== null)
-    .map((t) => t.wire_name as string);
 }
 
 /** Flip one tool's switch in the loaded response, and nothing else.
@@ -141,15 +128,16 @@ export function patchToolDisabled(
 
 /** The header lines, each `null` when it has nothing to say. */
 export interface McpHeaderSummary {
-  /** What every request is paying right now. */
+  /** The worst case: what one thread that enabled every server pays. */
   live: string;
   /** Share of what a request to the resolved model can carry, or `null`
    *  when the engine reports no window for it. */
   share: string | null;
   /** The engine's warning once the tools are past or near their ceiling. */
   warning: string | null;
-  /** What the stopped servers would add if switched on. */
-  stopped: string | null;
+  /** How many servers run this session, and that a thread pays only for the
+   *  ones it enabled. */
+  running: string | null;
   /** What the switched-off tools are keeping out. */
   disabled: string | null;
 }
@@ -161,9 +149,9 @@ export function mcpHeaderSummary(
   budget: McpBudget,
 ): McpHeaderSummary {
   const live =
-    totals.running_servers === 0
-      ? 'No servers on, so MCP adds nothing to a request'
-      : `${plural(totals.running_servers, 'server')} on, ${plural(budget.sent_tools, 'tool')}, ~${formatTokens(budget.sent_tokens)} tokens per request`;
+    totals.servers === 0
+      ? 'No servers registered, so MCP adds nothing to a request'
+      : `Up to ${plural(budget.sent_tools, 'tool')}, ~${formatTokens(budget.sent_tokens)} tokens per request, in a thread that enables every server`;
 
   let share: string | null = null;
   if (budget.request_chars > 0) {
@@ -174,17 +162,17 @@ export function mcpHeaderSummary(
     share = `${text} of what a request to ${model} can carry (${formatTokens(contextWindow)} context window)`;
   }
 
-  const stopped =
-    totals.stopped_tools === 0
+  const running =
+    totals.servers === 0
       ? null
-      : `${plural(totals.stopped_tools, 'more tool')} available, ~${formatTokens(totals.stopped_tokens)} tokens if switched on`;
+      : `${totals.running_servers} of ${plural(totals.servers, 'server')} running this session. A thread pays only for the servers it enabled`;
 
   const disabled =
     totals.disabled_tools === 0
       ? null
-      : `${plural(totals.disabled_tools, 'tool')} switched off, keeping ~${formatTokens(totals.disabled_tokens)} tokens out of every request`;
+      : `${plural(totals.disabled_tools, 'tool')} switched off, keeping ~${formatTokens(totals.disabled_tokens)} tokens out of every thread`;
 
-  return { live, share, warning: budget.warning, stopped, disabled };
+  return { live, share, warning: budget.warning, running, disabled };
 }
 
 /** How a failed per-server verb reads on the row.

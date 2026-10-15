@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import type { VNode } from 'preact';
-import { InlineStep, contextLabel } from '../chat-exchange-parts';
+import { InlineStep, StepContext, contextLabel } from '../chat-exchange-parts';
 import { vnodeToText } from './vnodeToText';
 import { contextViewer } from '../../../store/store';
 import type { ContextCapture, ResponseEvent } from '../../../store/types';
@@ -73,7 +73,7 @@ describe('InlineStep context suffix', () => {
  *  longer gets a row of its own to click. So it has to BE a button wherever
  *  there is a snapshot behind it, and must not pretend to be one where there
  *  isn't. */
-describe('InlineStep context counter as a click target', () => {
+describe('StepContext as a click target', () => {
   const capture: ContextCapture = {
     producer: 'main_llm',
     model: 'claude-opus-5[1m]',
@@ -84,13 +84,8 @@ describe('InlineStep context counter as a click target', () => {
     trimmed: false,
   };
 
-  function counterOf(event: Extract<ResponseEvent, { type: 'step' }>) {
-    const vnode = InlineStep({ event }) as VNode<{ children?: unknown }>;
-    const children = vnode.props.children as (VNode<Record<string, unknown>> | false | undefined)[];
-    return children.find(
-      (c): c is VNode<Record<string, unknown>> => !!c && String(c.props.class ?? '').startsWith('step-context'),
-    )!;
-  }
+  const counterOf = (event: Extract<ResponseEvent, { type: 'step' }>) =>
+    StepContext({ event }) as VNode<Record<string, unknown>>;
 
   afterEach(() => { contextViewer.value = null; });
 

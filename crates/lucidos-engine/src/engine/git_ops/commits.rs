@@ -64,7 +64,7 @@ pub(crate) async fn root_commit_sha(repo_root: &Path) -> Option<String> {
 ///
 /// An unanswerable `git status` also returns `true`, the same tri-state rule
 /// [`worktree_dirtiness`] follows. A `false` here is what lets `apply_change`
-/// reach `ff_main_to`, whose `checkout -f main` discards whatever the repo root
+/// reach `ff_main_to_locked`, whose `checkout -f main` discards whatever the repo root
 /// holds uncommitted. `git status` exits non-zero when the path is not a work
 /// tree, and when a filter such as git-crypt blows up on a locked repo. Neither
 /// says there is nothing to lose. Reporting dirty costs the user a retry behind
@@ -816,11 +816,17 @@ pub(crate) async fn auto_commit_preserving_marker(
     if !has_changes {
         return;
     }
-    let marker_fresh = is_harden_marker_fresh(pool, repo_root, branch_name).await;
+    // The re-stamp keeps the tier the run certified.
+    let fresh_tier = match harden_marker(pool, repo_root, branch_name).await {
+        HardenMarker::Recorded {
+            fresh: true, tier, ..
+        } => Some(tier),
+        _ => None,
+    };
     stage_and_commit_logged(worktree_path, message).await;
-    if marker_fresh {
+    if let Some(tier) = fresh_tier {
         if let Some(sha) = current_head_sha(worktree_path).await {
-            if let Err(e) = record_hardened(pool, repo_root, branch_name, &sha).await {
+            if let Err(e) = record_hardened(pool, repo_root, branch_name, &sha, tier).await {
                 log!(
                     "[Git] Failed to re-stamp hardened_branches for {}: {}",
                     branch_name,

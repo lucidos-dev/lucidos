@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-e2e-workflow.sh: fail if .github/workflows/e2e.yml broke one of its
-# limits (ADR 0382). /harden Phase 4.5 runs it on every change.
+# limits (ADRs 0382, 0464). /harden Phase 4.5 runs it on every change.
 #
 #   ./scripts/check-e2e-workflow.sh [<e2e.yml> [<workflows-dir>]]
 #
@@ -13,6 +13,12 @@
 #   6. mobile-webkit runs on macOS: the macos job runs on macos-15 and takes
 #      the plan's macOS matrix.
 #   7. No other workflow triggers on e2e/**.
+#   8. The plan job runs only on an e2e/** push, and seed-cache only on main.
+#      Every other job needs the plan job, so only a run's request starts it.
+#      The engine job also runs only when the plan asks for it.
+#   9. Every action is pinned by a full commit sha.
+#
+# Tested by scripts/lib/check_e2e_workflow_test.sh.
 #
 # Stdlib Python reading lines, because the runners' YAML library is not on
 # every Mac. Exit 0 clean, 1 on any broken limit.
@@ -83,6 +89,29 @@ uploads = sum(1 for l in code if "actions/upload-artifact@" in l)
 retentions = [l.split(":", 1)[1].strip() for l in code if re.match(r"^\s*retention-days:", l)]
 if len(retentions) != uploads or any(r != "1" for r in retentions):
     errors.append(f"every artifact must set retention-days: 1 ({uploads} uploads, retentions {retentions})")
+
+def job_if(name):
+    ifs = [l for l in all_jobs.get(name, []) if re.match(r"^    if:", l)]
+    return ifs[0] if ifs else ""
+
+if f"startsWith(github.ref, 'refs/heads/{prefix}')" not in job_if("plan"):
+    errors.append(f"the plan job must run only on an {prefix} branch")
+if "github.ref == 'refs/heads/main'" not in job_if("seed-cache"):
+    errors.append("the seed-cache job must run only on main")
+for name, body in all_jobs.items():
+    if name in ("plan", "seed-cache"):
+        continue
+    needs = [l for l in body if re.match(r"^    needs:", l)]
+    if not needs or not re.search(r"(:\s*|[\[,]\s*)plan\s*($|[\],])", needs[0]):
+        errors.append(f"job {name} does not need the plan job, so it could run on a push to main")
+
+if "engine" in all_jobs and "needs.plan.outputs.has_engine == 'true'" not in job_if("engine"):
+    errors.append("the engine job must run only when the plan asks for it (has_engine)")
+
+for l in code:
+    m = re.search(r"uses:\s*(\S+)", l)
+    if m and not re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", m.group(1)):
+        errors.append(f"action not pinned by commit: {m.group(1)}")
 
 mac = all_jobs.get("macos", [])
 if "    runs-on: macos-15" not in mac or not any("fromJSON(needs.plan.outputs.macos)" in l for l in mac):

@@ -38,21 +38,20 @@ fi
 source "$SCRIPT_DIR/lib/sleep.sh"
 source "$SCRIPT_DIR/lib/workspace.sh"
 
+# The descriptor stop_workspace waits on the engine lock with.
+ENGINE_WAIT_FD=6
+
 # Stop a single workspace by its path
 stop_workspace() {
     local ws="$1"
     local stopped=""
-
-    local engine_pid_file="$ws/.lucidos/engine.pid"
-    local frontend_pid_file="$ws/.lucidos/frontend.pid"
-    local build_watch_pid_file="$ws/.lucidos/build-watch.pid"
 
     # A gateway is a shared, machine-global process fronting many workspaces
     # (ADR 0014), so do NOT kill it here: that would take down every other
     # workspace's proxy. Instead ask it to stop just THIS workspace's engine and
     # drop its stack, so the gateway's supervisor won't respawn it. The registry
     # entry survives, so the workspace stays listed in the picker as stopped. The
-    # engine.pid SIGUSR1 below is the fallback when the gateway is unreachable.
+    # engine SIGUSR1 below is the fallback when the gateway is unreachable.
     # To stop the gateway itself: kill $(cat "$(gateway_pidfile)").
     #
     # WHICH gateway comes out of the engine we are about to stop, never from a
@@ -62,7 +61,7 @@ stop_workspace() {
     # run and the packaged supervisor free to respawn what it had stopped.
     local gw_pid gw_port gw_source slug status
     slug="$(workspace_slug)"
-    gw_port="$(engine_gateway_port "$engine_pid_file")"
+    gw_port="$(engine_gateway_port "$ws")"
     if [ -n "$gw_port" ]; then
         gw_source="the engine"
     else
@@ -103,46 +102,27 @@ stop_workspace() {
 
     # Stop engine via SIGUSR1, not SIGTERM — the engine ignores SIGTERM to
     # survive accidental `xargs kill` from CC subprocess test scripts (see
-    # main.rs shutdown_signal). SIGUSR1 is the legitimate stop signal.
-    # Remembered past this block for the build-watch teardown below: a SIGUSR1'd
-    # engine drains for seconds, so it is still in the process table when the
-    # teardown takes its vote, and counting it would spare the watch forever.
-    local stopped_engine_pid=""
-    if [ -f "$engine_pid_file" ]; then
-        local pid
-        pid="$(cat "$engine_pid_file")"
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "Stopping engine (PID $pid) for $ws"
-            kill -USR1 "$pid" 2>/dev/null || true
-            stopped_engine_pid="$pid"
-            stopped="1"
-        fi
-        rm -f "$engine_pid_file"
-    fi
+    # main.rs shutdown_signal). SIGUSR1 is the legitimate stop signal. The pid
+    # is trusted only while the engine holds its lock (ADR 0438). A successor
+    # waiting mid-respawn is signalled too, or it boots once the owner is gone.
+    local pid
+    for pid in $(engine_pids_to_signal "$ws"); do
+        echo "Stopping engine (PID $pid) for $ws"
+        kill -USR1 "$pid" 2>/dev/null || true
+        stopped="1"
+    done
 
-    # Release the frontend marker. ADR 0014: the engine serves dist/ directly —
-    # frontend.pid records the SHARED build-watch pid for ref-counting, which
-    # release_frontend_marker removes WITHOUT killing (peers may share it); the
-    # teardown below decides the shared watch's fate. A distinct dev-server pid
-    # (e2e) is killed.
-    [ -n "$(release_frontend_marker "$frontend_pid_file")" ] && stopped="1"
-
-    # The --built mode `vite build --watch` is a checkout-level singleton shared
-    # by every workspace of this checkout (see build_watch_pidfile in
-    # workspace.sh). Clean up a legacy per-workspace build-watch.pid from
-    # pre-singleton runs, then tear down the shared build-watch only if THIS was
-    # the last workspace serving the frontend (frontend.pid removed above).
-    if [ -f "$build_watch_pid_file" ]; then
-        local pid
-        pid="$(cat "$build_watch_pid_file")"
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "Stopping legacy per-workspace build-watch (PID $pid) for $ws"
-            kill "$pid" 2>/dev/null || true
-            stopped="1"
+    # A draining engine still holds its build-watch consumer lock, so wait for
+    # it to exit before the teardown asks whether anything still serves this
+    # checkout. The kernel drops the engine lock at exit, and the engine bounds
+    # its own drain.
+    if [ -n "$stopped" ] && lock_is_held "$(engine_lock_path "$ws")"; then
+        echo "Waiting for the engine to finish draining..."
+        if flock_open "$ENGINE_WAIT_FD" "$(engine_lock_path "$ws")" sh; then
+            flock_close "$ENGINE_WAIT_FD"
         fi
-        rm -f "$build_watch_pid_file"
     fi
-    teardown_shared_build_watch_if_idle "$stopped_engine_pid"
+    teardown_shared_build_watch_if_idle
 
     # Stop legacy per-workspace PostgreSQL container if --force. The shared
     # PostgreSQL container is never stopped for one workspace; it serves peers.

@@ -17,6 +17,7 @@ async fn test_valid_request_event_id_accepted() {
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: "fix this".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -97,6 +98,7 @@ async fn test_automated_prompt_creates_valid_origin() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "initial".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -121,6 +123,7 @@ async fn test_automated_prompt_creates_valid_origin() {
         .emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::CodingAgentPromptSent {
+                input_event_id: None,
                 text: "Run /harden now.".into(),
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 origin: None,
@@ -195,6 +198,7 @@ async fn empty_coding_agent_prompt_sent_does_not_flip_status_to_running() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do the thing".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -263,6 +267,7 @@ async fn empty_coding_agent_prompt_sent_does_not_flip_status_to_running() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::CodingAgentPromptSent {
+            input_event_id: None,
             text: String::new(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             origin: None,
@@ -311,6 +316,9 @@ async fn cc_follow_up_after_exit_resumes_via_db() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -374,6 +382,7 @@ async fn cc_follow_up_after_exit_resumes_via_db() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "follow-up message".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -440,6 +449,9 @@ async fn cc_session_id_survives_engine_restart() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

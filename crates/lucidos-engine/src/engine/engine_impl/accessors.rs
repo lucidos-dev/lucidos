@@ -174,8 +174,8 @@ impl LucidosEngine {
 
     /// Hold across any write+commit on the workspace repo. See
     /// [`crate::engine::git_ops::WORKSPACE_REPO_MUTEX`] for what else holds it.
-    pub(crate) async fn lock_workspace_repo(&self) -> tokio::sync::MutexGuard<'static, ()> {
-        crate::engine::git_ops::WORKSPACE_REPO_MUTEX.lock().await
+    pub(crate) async fn lock_workspace_repo(&self) -> crate::engine::git_ops::WorkspaceRepoLock {
+        crate::engine::git_ops::lock_workspace_repo().await
     }
 
     /// Get the Lucidos source repo root (resolved at startup).
@@ -323,16 +323,18 @@ impl LucidosEngine {
         self.user_timezone.read().await.clone()
     }
 
-    /// Record that `(repo_root, branch_name)` has been hardened at `head_sha`.
-    /// Called by the `/api/v1/internal/mark-hardened` endpoint that
-    /// `lucidos hardened mark` hits from `/harden` Phase 5.
-    pub async fn record_hardened(
+    /// Record that `(repo_root, branch_name)` has been hardened at `head_sha`
+    /// by a run of `tier`. Called by the `/api/v1/internal/mark-hardened`
+    /// endpoint that `lucidos hardened mark` hits from `/harden` Phase 5.
+    pub(crate) async fn record_hardened(
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
         head_sha: &str,
+        tier: crate::engine::git_ops::HardenTier,
     ) -> Result<(), sqlx::Error> {
-        crate::engine::git_ops::record_hardened(&self.pool, repo_root, branch_name, head_sha).await
+        crate::engine::git_ops::record_hardened(&self.pool, repo_root, branch_name, head_sha, tier)
+            .await
     }
 
     pub(crate) async fn harden_marker(
@@ -586,7 +588,8 @@ fn normalize_data_path(relative_path: &str) -> Result<String, String> {
 ///
 /// Everything else under `.lucidos/` stays unaddressable in both directions:
 /// `worktrees/` holds entire source checkouts, `exhaust/` is engine runtime
-/// scratch, and `engine.pid` / `ports` / `cc-commands.json` are process state.
+/// scratch, and `engine.pid` / `engine.lock` / `ports` / `cc-commands.json` are
+/// process state.
 /// None of it is "a file in the workspace" in the sense the tool advertises.
 fn normalize_lucidos_path(had_data_prefix: bool, stripped: &str) -> Result<String, String> {
     let tmp = crate::core::TMP_DIR;
@@ -822,6 +825,7 @@ mod normalize_data_path_tests {
             ".lucidos/exhaust/y",
             ".lucidos/worktrees/thread-x/src/main.rs",
             ".lucidos/engine.pid",
+            ".lucidos/engine.lock",
             "data/.lucidos/tmp/x.md",
         ] {
             match normalize_data_path(p) {
@@ -839,6 +843,7 @@ mod normalize_data_path_tests {
             ".lucidos/worktrees/thread-x/src/main.rs",
             ".lucidos/exhaust/run.log",
             ".lucidos/engine.pid",
+            ".lucidos/engine.lock",
             ".lucidos/ports",
             ".lucidos/cc-commands.json",
         ] {

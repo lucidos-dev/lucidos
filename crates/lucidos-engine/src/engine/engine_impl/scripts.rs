@@ -125,60 +125,17 @@ impl LucidosEngine {
         emitting_trigger_id: Option<&str>,
     ) -> Vec<(String, String)> {
         use crate::core::EnvironmentVariableStore;
-        use crate::runtime::lucidos_cli::{lucidos_cli_dir, workspace_script_env_vars};
 
-        // User-managed environment variables FIRST. Everything engine-owned
-        // below (workspace/PATH, PG*, origin token, host-protection, CRED_*,
-        // OAUTH_*) is appended after, and the spawn applies the pairs in order
-        // via `cmd.env`, so a user var can never override an engine-owned one
-        // (`env_pairs` also drops reserved names as a second backstop).
+        // User-managed environment variables FIRST. The spawn applies the pairs
+        // in order, so an engine-owned var always wins a collision. `env_pairs`
+        // also drops reserved names, as a second backstop.
         let mut env_vars = EnvironmentVariableStore::spawn_pairs(&self.pool, "Python").await;
-
-        // Prepend the bundled PG client dir (packaged: <resources>/postgres/bin)
-        // to the script PATH so the advertised bare `psql -c '…'` resolves; it's
-        // not on the launchd minimal PATH. Unset in dev (docker PG on PATH).
-        let pg_bin_dir = std::env::var_os("LUCIDOS_PG_BIN_DIR").map(std::path::PathBuf::from);
-        env_vars.extend(workspace_script_env_vars(
+        env_vars.extend(engine_owned_script_env(
             self.workspace_path(),
-            lucidos_cli_dir(),
-            pg_bin_dir.as_deref(),
+            thread_id,
+            chain_depth,
+            emitting_trigger_id,
         ));
-
-        // PG* env so spawned scripts can run `psql -c '…'` bare. Keeps the
-        // password out of argv (which we capture into events) — see
-        // `core::pg_env_vars` doc for the full rationale.
-        env_vars.extend(crate::core::pg_env_vars_cached().iter().cloned());
-
-        // Subprocess-origin env (token + optional source thread id). Single
-        // source of truth via `api::actor::subprocess_origin_env_vars` so a
-        // future subprocess surface (MCP child, signer host, …) cannot ship
-        // without origin attribution — the failure mode that grew the
-        // original incident.
-        //
-        // The depth is read here, inline, because a script trigger builds its
-        // env inside the fire's own scope. It is what lets the script's
-        // `lucidos events emit` stay on the fire's chain instead of restarting
-        // it at 0 on the axum request task.
-        env_vars.extend(
-            crate::api::actor::subprocess_origin_env_vars(
-                thread_id,
-                chain_depth,
-                emitting_trigger_id,
-            )
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v)),
-        );
-
-        // Host-process kill-guard env (LUCIDOS_HOST_PID + optional
-        // FRONTEND_PID + optional API_PORT). Same single-source-of-truth
-        // rationale as subprocess_origin_env_vars above — without this, a
-        // python/bash tool that shells out to `web-dev.sh` or `ports.sh`
-        // could free up the engine's port by killing the engine itself.
-        env_vars.extend(
-            crate::api::actor::host_protection_env_vars(self.workspace_path())
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v)),
-        );
         env_vars
     }
 
@@ -361,24 +318,11 @@ impl LucidosEngine {
     /// Commit all dirty data/ files with a 30s timeout, logging success/failure.
     /// Shared by all code paths that may produce dirty files (scripts, Claude Code, run_python).
     pub(crate) async fn commit_dirty_logged(&self, message: &str, context: &str) {
-        // `commit_all_dirty` stages ALL of data/, so it records anything missing
-        // from the working tree as a deletion. Taken while a merge has published
-        // main but not yet synced the repo root, it commits the just-merged files
-        // as deleted, straight onto main. REPO_WORKTREE_MUTEX makes the merge's
-        // publish+sync and that snapshot mutually exclusive.
-        //
-        // The exclusion is deliberately NOT taken here. `commit_all_dirty` holds
-        // it itself, across the `spawn_blocking` closure that does the libgit2
-        // work; a blocking task cannot be cancelled, so a guard scoped to this
-        // function would be released the instant the timeout below fires, leaving
-        // that closure writing the index with the lock free. Holding it here as
-        // well would just queue this call behind its own snapshot.
-        //
-        // The timeout therefore now bounds waiting for the exclusion as well as
-        // the snapshot itself, which is the ceiling this shared path (scripts,
-        // coding agents, run_python) wants: giving up while still queued starts
-        // no git work at all, and the next auto-commit picks the same files up,
-        // because it stages all of data/.
+        // `commit_all_dirty` takes the workspace repo lock itself and moves it
+        // into its blocking closure, so a caller must not hold it here. The
+        // timeout therefore bounds waiting for the lock as well as the snapshot.
+        // Giving up while still queued starts no git work at all. The next
+        // auto-commit picks the same files up, because it stages all of data/.
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.artifact_manager.commit_all_dirty(message),
@@ -408,6 +352,54 @@ impl LucidosEngine {
             Ok(Ok(None)) => {}
         }
     }
+}
+
+/// The engine-owned, secret-free part of a script's env: workspace and PATH,
+/// the database handle, origin attribution and host protection.
+fn engine_owned_script_env(
+    workspace: &std::path::Path,
+    thread_id: Option<Uuid>,
+    chain_depth: u32,
+    emitting_trigger_id: Option<&str>,
+) -> Vec<(String, String)> {
+    use crate::runtime::lucidos_cli::{lucidos_cli_dir, workspace_script_env_vars};
+
+    // Prepend the bundled PG client dir (packaged: <resources>/postgres/bin)
+    // to the script PATH so `psql "$LUCIDOS_DATABASE_URL"` resolves; it's not
+    // on the launchd minimal PATH. Unset in dev (docker PG on PATH).
+    let pg_bin_dir = std::env::var_os("LUCIDOS_PG_BIN_DIR").map(std::path::PathBuf::from);
+    let mut env_vars =
+        workspace_script_env_vars(workspace, lucidos_cli_dir(), pg_bin_dir.as_deref());
+
+    // The read-only database handle, and no `PG*` vars: an empty connection
+    // string must reach nothing (ADR 0481).
+    env_vars.extend(crate::core::lucidos_database_url_env());
+
+    // Subprocess-origin env (token + optional source thread id), from the one
+    // definition in `api::actor::subprocess_origin_env_vars`. So a future
+    // subprocess surface (MCP child, signer host, …) cannot ship without
+    // origin attribution, the failure mode that grew the original incident.
+    //
+    // The depth is read by the caller, inline, because a script trigger
+    // builds its env inside the fire's own scope. It is what lets the
+    // script's `lucidos events emit` stay on the fire's chain instead of
+    // restarting it at 0 on the axum request task.
+    env_vars.extend(
+        crate::api::actor::subprocess_origin_env_vars(thread_id, chain_depth, emitting_trigger_id)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v)),
+    );
+
+    // Host-process kill-guard env (LUCIDOS_HOST_PID + optional
+    // FRONTEND_PID + optional API_PORT), from one definition too. Without it,
+    // a python/bash tool that shells out to `web-dev.sh` or `ports.sh` could
+    // free up the engine's port by killing the engine itself.
+    env_vars.extend(
+        crate::api::actor::host_protection_env_vars()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v)),
+    );
+    env_vars
 }
 
 /// Spawn the script under the engine's `pipefail` shell (see `core::shell`) in
@@ -446,6 +438,37 @@ async fn run_shell_script_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine half of every script, tool and agent-task env. The user's
+    /// own variables come first and may name `PG*`; the engine adds none
+    /// (ADR 0481).
+    #[test]
+    fn a_script_env_gets_the_read_only_handle_and_no_libpq_defaults() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let env = engine_owned_script_env(workspace.path(), Some(Uuid::new_v4()), 0, None);
+        for name in [
+            "PGUSER",
+            "PGPASSWORD",
+            "PGHOST",
+            "PGPORT",
+            "PGDATABASE",
+            "DATABASE_URL",
+        ] {
+            assert!(
+                !env.iter().any(|(key, _)| key == name),
+                "{name} reached a script"
+            );
+        }
+        let handle = env
+            .iter()
+            .find(|(key, _)| key == crate::core::LUCIDOS_DATABASE_URL)
+            .map(|(_, value)| value.as_str())
+            .expect("a script gets the database handle");
+        assert!(
+            handle.ends_with(lucidos_pg_url::READ_ONLY_OPTION),
+            "{handle}"
+        );
+    }
 
     /// A scheduled script's output leaves through the redaction, not around it.
     ///
@@ -489,9 +512,8 @@ mod tests {
         // timeout SIGKILLs the shell mid-sleep, so the sentinel is never
         // written. Without it, the orphaned child would finish the sleep and
         // touch the sentinel after the future was dropped.
-        let dir = std::env::temp_dir().join("lucidos_test_shell_kill_on_drop");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let sentinel = dir.join("sentinel");
         let script = dir.join("slow.sh");
         std::fs::write(
@@ -517,7 +539,5 @@ mod tests {
             !sentinel.exists(),
             "sentinel was created — the timed-out shell child leaked (kill_on_drop missing)"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

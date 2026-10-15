@@ -978,8 +978,8 @@ export const ui = {
 
   /**
    * The id of the thread the user has open in the thread pane, or `null` on the
-   * empty compose view. A widget window floating over a thread reads that
-   * thread, not the widget's own. A compose draft and Home are threads too.
+   * empty compose view. A Home board tile beside a thread reads that thread,
+   * not the widget's own. A compose draft and Home are threads too.
    *
    * An app or a panel in the Canvas pane leaves the value alone: the thread is
    * still open beside it. Rejects with no host around the app (its own tab).

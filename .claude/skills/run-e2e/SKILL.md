@@ -44,16 +44,23 @@ it exists to replace.
 
 ## Run it as a background task, and send its output to a log file
 
-A full run outlives a foreground call's 10-minute ceiling, and a job you
-background yourself dies when your turn ends. Claude Code has no blocking wait
-tool either. So hand the run to the engine as a *background task*, then end
-your turn: the engine re-opens the thread when the suite finishes, with its
-exit status and the tail of its output.
+A full run outlives a 4-minute foreground call, the most a call may block
+before the prompt cache expires. A job you background yourself dies when your
+turn ends. So hand the run to the engine as a *background task*.
+
+Poll the run. Wait on it in the foreground with `timeout: 240000`, and
+re-issue `wait` until it reports finished. Each `wait` returns within 230 s,
+so the cache stays warm:
 
 ```
-lucidos background-task run --description "the full e2e suite" \
+lucidos background-task run --poll --description "the full e2e suite" \
   -- 'mkdir -p .lucidos && ./scripts/e2e.sh > .lucidos/e2e.log 2>&1'
+lucidos background-task wait <task_id>
 ```
+
+A run queued behind a held lock has an open-ended wait. It drops `--poll`
+and ends the turn instead. The engine re-opens the thread when the
+suite finishes, with its exit status and the tail of its output.
 
 Redirect into the worktree's own gitignored `.lucidos/` rather than a shared
 `/tmp` name another session could truncate. The log is where you read the
@@ -76,10 +83,9 @@ tail -40 .lucidos/e2e.log
 grep -nE "passed|failed|Error|✘" .lucidos/e2e.log | tail -20
 ```
 
-Do NOT wait with `sleep + tail`, and do not stay in the turn polling the log:
-each check re-reads your whole context, and the re-open already tells you when
-the suite is done. `lucidos background-task output <task_id>` shows progress if
-you have a reason to look before then.
+Do NOT wait with `sleep + tail`, and do not poll the log: `wait` already
+blocks until the suite is done or its 230 s pass, and hands you the new
+output.
 
 The slow start is normal. `ensure_workspace_running` in `scripts/lib/e2e.sh`
 prints "Starting e2e workspace (LUCIDOS_MODEL=mock)... Probing" while it builds

@@ -319,12 +319,14 @@ pub const FLAG_OFF_VALUES: &[&str] = &["0", "false", "no", "off"];
 /// snapped at the routing chokepoint, so changing the model can never make a
 /// stored preference unwritable.
 pub(crate) const REASONING_EFFORTS: &[&str] = crate::llm::EFFORT_LADDER;
+/// The OpenAI image model `auto` runs when no Vertex project is configured.
+pub const OPENAI_IMAGE_MODEL: &str = "gpt-image-2.5-flare";
 /// The frontend reads these lists from the generated catalog.
 const IMAGE_MODELS: &[&str] = &[
     "auto",
     "imagen-4",
-    "gpt-image-1",
-    "gpt-image-1.5",
+    OPENAI_IMAGE_MODEL,
+    "gpt-image-2.5-sunburst",
     "gpt-image-2",
 ];
 /// The routing lives in `crates/lucidos-app/src/utils/openExternalUrl.ts`.
@@ -442,7 +444,7 @@ pub const IMAGE_MODEL: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(IMAGE_MODELS),
     default: PrefDefault::Value("auto"),
-    description: "Model used by generate_image. 'auto' lets the engine choose.",
+    description: "Model used by generate_image. 'auto' runs Imagen 4 when a Google Cloud project is configured, else gpt-image-2.5-flare on an OpenAI key. gpt-image-2.5-flare is the fast everyday model; gpt-image-2.5-sunburst is for precise edits.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -585,7 +587,7 @@ pub const MODEL_READ_DECISION: Pref<Text> = Pref::text(PrefSpec {
     value: PrefValue::Text,
     default: PrefDefault::Value(BACKGROUND_MODEL),
     description: concat!(
-        "Background model that decides whether a reply is worth reading, when a turn ended without deciding. It sees the turn's message and its reply, and must call request_read. A Claude model that always thinks cannot be made to, so the reply then waits under Review. It follows no other key.",
+        "Background model that decides whether a reply is worth reading, when a turn ended without deciding. It sees the turn's message, a question the user answered inside the turn, and its reply, and must answer one forced yes/no question. While unset, the engine runs the first of gemini-3.8-flash and gpt-5.6-luna that a configured provider serves, else this default. A Claude model that always thinks cannot be forced, so the reply then waits under Review. Settings offers the System One models in the same control, which write judgment_read_decision instead. It follows no other key.",
         aux_fallback_note!()
     ),
     side_effect: PrefSideEffect::None,
@@ -600,6 +602,31 @@ pub const REASONING_READ_DECISION: Pref<Text> = Pref::text(PrefSpec {
     default: PrefDefault::Value("none"),
     description: concat!(
         "Thinking budget for the read decision, one yes or no. A forced call on Claude runs without thinking whatever this says.",
+        task_tier_note!()
+    ),
+    side_effect: PrefSideEffect::None,
+});
+
+pub const MODEL_WAKE_DECISION: Pref<Text> = Pref::text(PrefSpec {
+    key: "model_wake_decision",
+    label: "Wake-decision model",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Value(BACKGROUND_MODEL),
+    description: "Background model that decides whether a child thread's report wakes its parent, when the child's turn ended without deciding and judgment_wake_decision leaves it on chat. It sees the message that opened the child's turn, the parent's latest reply, the child's reply and how many siblings still run, and must answer one forced yes/no question. While unset, the engine runs the first of gemini-3.8-flash, gpt-6.1-sol, gpt-5.6-luna and this default that a configured provider serves: the models lucidos-eval wake-decision measured. With none of them served, no chat model is asked and the parent wakes. A Claude model that always thinks cannot be forced, so its calls fail and the parent wakes. Setting it keeps the wake decision on chat even while OpenAI is configured, on the model it names. A failed call wakes the parent. It follows no other key. GET /api/v1/models/background says which model runs.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const REASONING_WAKE_DECISION: Pref<Text> = Pref::text(PrefSpec {
+    key: "reasoning_wake_decision",
+    label: "Wake-decision reasoning",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(REASONING_EFFORTS),
+    default: PrefDefault::Value("none"),
+    description: concat!(
+        "Thinking budget for the wake decision, one yes or no. A forced call on Claude runs without thinking whatever this says.",
         task_tier_note!()
     ),
     side_effect: PrefSideEffect::None,
@@ -693,7 +720,7 @@ pub const MODEL_VOICE_TALKER: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Text,
     default: PrefDefault::Value("gpt-realtime-2.1"),
-    description: "Speech-to-speech model a voice session speaks through. It holds the conversation and nothing else: it can change nothing, so every action still goes through the ordinary agent. Two families, and this id picks which protocol the call opens on. A 'gpt-realtime-*' model bills by the token, and the caller can settle a card or ring off out loud. 'gpt-live-1' listens while it speaks, so it takes an interruption better, but it holds no tools: a card is settled by tapping it and a call is ended on the button. It bills by the minute, which the usage rollup does not show. Not a chat-model registry row, because neither family can serve an ordinary turn.",
+    description: "Speech-to-speech model a voice session speaks through. It holds the conversation and nothing else: it can change nothing, so every action still goes through the ordinary agent. Two families, and this id picks which protocol the call opens on. A 'gpt-realtime-*' model bills by the token, and the caller can settle a card or ring off out loud. 'gpt-live-1' listens while it speaks, so it takes an interruption better, but it holds no tools: a card is settled by tapping it and a call is ended on the button. It bills by the minute, which the usage rollup does not show. Not a chat-model registry row, because neither family can serve an ordinary turn. OpenAI retired gpt-realtime, gpt-realtime-mini and the gpt-4o realtime models, so they are refused.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -703,8 +730,8 @@ pub const MODEL_VOICE_TRANSCRIBER: Pref<Text> = Pref::text(PrefSpec {
     access: PrefAccess::Agent,
     scope: PrefScope::Global,
     value: PrefValue::Text,
-    default: PrefDefault::Value("gpt-4o-mini-transcribe"),
-    description: "Model turning the caller's speech into text inside a voice session, and only on a realtime one. A 'gpt-live-1' talker transcribes the caller itself and reads no id here, so this key does nothing for it. The second and last model in the voice loop: nothing translates and nothing summarises. Which language it is pinned to comes from 'language', not from here.",
+    default: PrefDefault::Value("gpt-transcribe"),
+    description: "Model turning the caller's speech into text inside a voice session, and only on a realtime one. A 'gpt-live-1' talker transcribes the caller itself and reads no id here, so this key does nothing for it. The second and last model in the voice loop: nothing translates and nothing summarises. Which language it is pinned to comes from 'language', not from here. OpenAI retired whisper-1 and the gpt-4o transcribers, so they are refused.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -919,14 +946,18 @@ pub const WORKSPACE_PROMPT_FOOTPRINT_UNUSED_DAYS: Pref<Number> = Pref::number(Pr
 });
 
 // ---- Memory module (global, ADR 0362) ----
-pub const MEMORY_MODULE: Pref<Text> = Pref::text(PrefSpec {
+/// The module an unset `memory_module` runs. Classic starts no compactor, so a
+/// workspace spends nothing on Tree before the user chooses.
+pub const MEMORY_MODULE_WHILE_UNSET: &str = "classic";
+
+pub const MEMORY_MODULE: Pref<Optional> = Pref::optional(PrefSpec {
     key: "memory_module",
     label: "Memory module",
     access: PrefAccess::Agent,
     scope: PrefScope::Global,
-    value: PrefValue::Enum(&["classic", "tree"]),
-    default: PrefDefault::Value("classic"),
-    description: "How a turn gets its past. 'classic' is the conversation summariser, memory recall and memory search. 'tree' is the summary trees: each turn reads a workspace memory view and a thread memory view, and the agent gets the recall tool (zoom, find, search, date). Choosing 'tree' starts the compactor, which summarises the workspace once in the background. Turns stay on Classic until the workspace tree and the threads active in the last 7 days are built; older threads fill in after. Applies from the next turn.",
+    value: PrefValue::Enum(&[MEMORY_MODULE_WHILE_UNSET, "tree"]),
+    default: PrefDefault::Unset("ask the user; Classic runs meanwhile"),
+    description: "How a turn gets its past. 'classic' is the conversation summariser, memory recall and memory search. It is almost free: on long threads it makes a small summary call now and then. 'tree' is the summary trees. Each turn reads a workspace memory view and a thread memory view, and the agent gets the recall tool (zoom, find, search, date). Tree costs money: a compactor model writes the summaries after each turn. A new workspace asks the user in the memory choice, and runs Classic until they answer. Do not choose for the user: point them at the memory choice or at Settings > System > Memory, which show what Tree costs. Choosing 'tree' starts the compactor, which summarises the workspace once in the background. Turns stay on Classic until the workspace tree and the threads active in the last 7 days are built; older threads fill in after. Applies from the next turn.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1038,6 +1069,19 @@ pub const CODING_AGENT_CLAUDE_PERMISSION_MODE: Pref<Text> = Pref::text(PrefSpec 
     value: PrefValue::Enum(&["accept-edits", "auto"]),
     default: PrefDefault::Value("accept-edits"),
     description: "Which of Claude Code's own permission modes coding-agent threads run in. 'accept-edits' is the default and cards anything outside the session's working directories. 'auto' lets Claude Code's safety classifier approve routine actions instead, which reaches shapes no allowlist can (a `cd` combined with a redirect, a write, or git). Four costs: it ignores a bare `Bash` entry in `cc-allowed-tools`, it denies rather than cards when the classifier is unreachable, a denial streak falls back to prompting, and each gated call pays a classifier round-trip. Applies to new sessions.",
+    side_effect: PrefSideEffect::None,
+});
+
+/// The auto-compact trial's switch. A temporary measure:
+/// `docs/temporary-measures.md` § "Auto-compact trial".
+pub const CODING_AGENT_AUTO_COMPACT_TRIAL: Pref<Text> = Pref::text(PrefSpec {
+    key: "coding_agent_auto_compact_trial",
+    label: "Auto-compact trial",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(crate::engine::auto_compact_trial::TRIAL_MODES),
+    default: PrefDefault::Value("off"),
+    description: "The auto-compact trial for Claude Code threads. 'off' (the default) leaves Claude Code's own compaction alone. 'ab' gives a 400k-token auto-compact window to half of all top-level threads, each with its sub-threads and successors, picked by a stable hash. A thread keeps the arm it first ran in. 'on' gives every family that window. A workspace CLAUDE_CODE_AUTO_COMPACT_WINDOW env var always wins. Applies to new sessions.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1278,6 +1322,38 @@ pub const JUDGMENT_MEMORY_FIND: Pref<Optional> = Pref::optional(PrefSpec {
     value: PrefValue::Text,
     default: PrefDefault::Unset("find runs on its chat model"),
     description: "The System One model the recall tool's find asks, by id. Unset asks model_memory_find.",
+    side_effect: PrefSideEffect::None,
+});
+
+/// What an unset wake-decision backend runs on (`WAKE_DECISION_DEFAULT`,
+/// ADRs 0435 and 0472).
+const WAKE_DECISION_UNSET: PrefDefault = PrefDefault::Unset(
+    "OpenAI Decisions while the OpenAI provider is configured and no chat model is pinned for this decision, else the chat model",
+);
+
+pub const JUDGMENT_READ_DECISION: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "judgment_read_decision",
+    label: "Read-decision backend",
+    access: PrefAccess::Human {
+        hint: "which backend decides whether the user should read a reply (chat, or a System One model such as jev or openai): picking a System One model sends every undecided reply to that vendor, so only the user decides, in Settings → Models (Background tasks), never via set_preference",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Unset("the read decision runs on its chat model"),
+    description: "The System One model that makes a turn's read decision, by id, or chat for model_read_decision. Unset runs on model_read_decision.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const JUDGMENT_WAKE_DECISION: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "judgment_wake_decision",
+    label: "Wake-decision backend",
+    access: PrefAccess::Human {
+        hint: "which backend decides whether a child thread's report wakes its parent (chat, or a System One model such as jev or openai): picking a System One model sends the child's reply to that vendor, so only the user decides, in Settings → Models (Background tasks), never via set_preference",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: WAKE_DECISION_UNSET,
+    description: "The System One model that decides whether a child thread's report wakes its parent, by id, or chat for model_wake_decision. Unset runs on OpenAI Decisions while the OpenAI provider is configured and on and model_wake_decision is unset, else on model_wake_decision. Any doubt or failed call wakes the parent.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1528,6 +1604,19 @@ pub const SYSTEM_ONE_CUSTOM_MODEL: Pref<Optional> = Pref::optional(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const SYSTEM_ONE_OPENROUTER_MODEL: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "system_one_openrouter_model",
+    label: "OpenRouter System One model",
+    access: PrefAccess::Human {
+        hint: "which System One model OpenRouter's System One row asks, and so which vendor sees what a judgment judges: set on the OpenRouter row in Settings → Models → Providers, never via set_preference",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Unset("Jev, at TypeSafe's current version"),
+    description: "The OpenRouter model id the OpenRouter System One row asks, such as another vendor's System One model. Unset asks Jev.",
+    side_effect: PrefSideEffect::None,
+});
+
 // ---- Engine bookkeeping: refused to the agent, written silently ----
 
 pub const VAPID_KEYS: Pref<Optional> = Pref::optional(PrefSpec {
@@ -1644,6 +1733,8 @@ pub const CATALOG: &[&PrefSpec] = &[
     &REASONING_MEMORY_FIND.spec,
     &MODEL_READ_DECISION.spec,
     &REASONING_READ_DECISION.spec,
+    &MODEL_WAKE_DECISION.spec,
+    &REASONING_WAKE_DECISION.spec,
     &MODEL_MEMORY.spec,
     &REASONING_MEMORY.spec,
     &MODEL_QUERY_CLASSIFICATION.spec,
@@ -1681,6 +1772,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &CODING_AGENT_CLAUDE_PATH.spec,
     &CODING_AGENT_CODEX_PATH.spec,
     &CODING_AGENT_CLAUDE_PERMISSION_MODE.spec,
+    &CODING_AGENT_AUTO_COMPACT_TRIAL.spec,
     &THEME_MODE.spec,
     &FONT_FAMILY.spec,
     &UI_SCALE.spec,
@@ -1700,6 +1792,8 @@ pub const CATALOG: &[&PrefSpec] = &[
     &JUDGMENT_COMMAND_GUARD.spec,
     &JUDGMENT_QUERY_CLASSIFICATION.spec,
     &JUDGMENT_MEMORY_FIND.spec,
+    &JUDGMENT_READ_DECISION.spec,
+    &JUDGMENT_WAKE_DECISION.spec,
     &MAX_TOOL_CALLS.spec,
     &CAPTURE_CONTEXT.spec,
     &KEYBINDINGS.spec,
@@ -1719,6 +1813,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &LOCAL_BASE_URL.spec,
     &SYSTEM_ONE_CUSTOM_URL.spec,
     &SYSTEM_ONE_CUSTOM_MODEL.spec,
+    &SYSTEM_ONE_OPENROUTER_MODEL.spec,
     &VAPID_KEYS.spec,
     &BACKUP_LAST_RUN.spec,
     &RELEASE_NOTICE_CURSOR.spec,
@@ -1740,6 +1835,79 @@ pub const RETIRED_KEYS: &[(&str, &str)] = &[(
     "home_thread_enabled",
     "home_thread_enabled was removed: every workspace has a home thread now (ADR 0411).",
 )];
+
+/// Model ids their provider shut down, each as `(key, retired, replacement)`.
+///
+/// A write of a retired id is refused, naming the replacement. A stored one
+/// fails validation, so it reads as the default. The engine also rewrites stored
+/// ones at boot (`PreferenceStore::replace_retired_values`), which keeps a
+/// user's own choice, such as a mini model staying mini.
+pub const RETIRED_VALUES: &[(&str, &str, &str)] = &[
+    (IMAGE_MODEL.key(), "gpt-image-1", OPENAI_IMAGE_MODEL),
+    (IMAGE_MODEL.key(), "gpt-image-1.5", OPENAI_IMAGE_MODEL),
+    (MODEL_VOICE_TALKER.key(), "gpt-realtime", "gpt-realtime-2.1"),
+    (
+        MODEL_VOICE_TALKER.key(),
+        "gpt-4o-realtime",
+        "gpt-realtime-2.1",
+    ),
+    (
+        MODEL_VOICE_TALKER.key(),
+        "gpt-4o-realtime-preview",
+        "gpt-realtime-2.1",
+    ),
+    (
+        MODEL_VOICE_TALKER.key(),
+        "gpt-realtime-mini",
+        "gpt-realtime-2.1-mini",
+    ),
+    (
+        MODEL_VOICE_TALKER.key(),
+        "gpt-4o-mini-realtime",
+        "gpt-realtime-2.1-mini",
+    ),
+    (
+        MODEL_VOICE_TALKER.key(),
+        "gpt-4o-mini-realtime-preview",
+        "gpt-realtime-2.1-mini",
+    ),
+    (MODEL_VOICE_TRANSCRIBER.key(), "whisper-1", "gpt-transcribe"),
+    (
+        MODEL_VOICE_TRANSCRIBER.key(),
+        "gpt-4o-transcribe",
+        "gpt-transcribe",
+    ),
+    (
+        MODEL_VOICE_TRANSCRIBER.key(),
+        "gpt-4o-mini-transcribe",
+        "gpt-transcribe",
+    ),
+    (
+        MODEL_VOICE_TRANSCRIBER.key(),
+        "gpt-4o-transcribe-diarize",
+        "gpt-transcribe",
+    ),
+];
+
+/// What replaced `value` for `key`, or `None` when it is not retired.
+pub fn retired_value_replacement(key: &str, value: &str) -> Option<&'static str> {
+    RETIRED_VALUES
+        .iter()
+        .find(|(k, retired, _)| *k == key && *retired == value.trim())
+        .map(|(_, _, replacement)| *replacement)
+}
+
+/// What a writer of a retired model id is told, or `None` for a live value.
+/// Every write path refuses with it: [`validate`] for the agent's tool, and
+/// `engine::preferences` for Settings and raw HTTP.
+pub fn retired_value_refusal(key: &str, value: &str) -> Option<String> {
+    retired_value_replacement(key, value).map(|replacement| {
+        format!(
+            "'{key}' no longer takes '{}': its provider retired it. Use '{replacement}'.",
+            value.trim()
+        )
+    })
+}
 
 /// What a writer of a retired key is told, or `None` for any other key.
 pub fn retired_key_reason(key: &str) -> Option<&'static str> {
@@ -1787,6 +1955,9 @@ pub fn is_silent_key(key: &str) -> bool {
 /// Validate `value` against a spec's [`PrefValue`]. Returns a human-readable
 /// error (suitable to hand back to the agent) on rejection.
 pub fn validate(spec: &PrefSpec, value: &str) -> Result<(), String> {
+    if let Some(refusal) = retired_value_refusal(spec.key, value) {
+        return Err(refusal);
+    }
     match spec.value {
         PrefValue::Bool => {
             if value == "true" || value == "false" {
@@ -1938,6 +2109,67 @@ mod tests {
                 "{key} is retired but still in the catalog"
             );
         }
+    }
+
+    /// A dead model id must not be writable, and the writer is told what
+    /// replaced it rather than handed the whole allowed list.
+    #[test]
+    fn every_retired_value_is_refused_naming_its_replacement() {
+        for (key, retired, replacement) in RETIRED_VALUES {
+            let spec = spec(key).unwrap_or_else(|| panic!("{key} is not a catalog key"));
+            let refusal = validate(spec, retired)
+                .expect_err(&format!("{key} still accepts the retired {retired}"));
+            assert!(
+                refusal.contains(replacement),
+                "the refusal of {retired} names no replacement: {refusal}"
+            );
+        }
+    }
+
+    /// The startup rewrite writes the replacement as a global row. A
+    /// replacement that fails validation reads as the default, and one that is
+    /// itself retired would be rewritten again on the next boot.
+    #[test]
+    fn every_retired_value_maps_onto_a_live_global_value() {
+        for (key, retired, replacement) in RETIRED_VALUES {
+            let spec = spec(key).unwrap_or_else(|| panic!("{key} is not a catalog key"));
+            assert_eq!(spec.scope, PrefScope::Global, "{key} is not global");
+            assert!(
+                validate(spec, replacement).is_ok(),
+                "{retired} maps onto {replacement}, which {key} refuses"
+            );
+            assert_eq!(
+                retired_value_replacement(key, replacement),
+                None,
+                "{retired} maps onto {replacement}, which is retired too"
+            );
+        }
+    }
+
+    /// A fresh workspace reads the default, so a retired default is a dead
+    /// feature on every install that never opened Settings.
+    #[test]
+    fn no_default_is_a_retired_value() {
+        for spec in CATALOG {
+            if let Some(default) = spec.default_value() {
+                assert_eq!(
+                    retired_value_replacement(spec.key, default),
+                    None,
+                    "{} defaults to the retired {default}",
+                    spec.key
+                );
+            }
+        }
+    }
+
+    /// The auto fallback is one of the ids the picker offers, so a user can
+    /// pin the model auto already runs. The literals pin OpenAI's own ids.
+    #[test]
+    fn the_image_picker_offers_both_current_openai_models() {
+        for id in ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst"] {
+            assert!(IMAGE_MODELS.contains(&id), "{id} is not offered");
+        }
+        assert!(IMAGE_MODELS.contains(&OPENAI_IMAGE_MODEL));
     }
 
     /// A handle const missing from `CATALOG` would be readable but invisible
@@ -2353,6 +2585,5 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-#[path = "preference_catalog_codegen_tests.rs"]
-mod codegen_tests;
+#[path = "preference_catalog_codegen.rs"]
+pub(crate) mod codegen;

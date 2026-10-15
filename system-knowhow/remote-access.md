@@ -861,10 +861,10 @@ can be widened. It then requires a local credential on every path but
 - Local callers need no setup. The CLI, the gateway's proxy hop and the webhook
   hop already present their credential.
 
-Two credentials exist, both minted by the gateway, both mode 0600.
-`~/.lucidos/local-token` reaches everything, and `~/.lucidos/webhook-token`
-reaches only webhook delivery. So a `tailscale funnel` on the hook port cannot
-restart a workspace.
+Two credentials exist, both minted at startup, both mode 0600.
+`~/.lucidos/local-token` reaches everything, and
+`~/.lucidos/hook-socket-token` reaches only webhook delivery. So a
+`tailscale funnel` on the hook port cannot restart a workspace.
 
 Binding to the tailnet IP itself (`100.x.y.z`) is the middle ground: the
 tailnet reaches it, the coffee-shop LAN does not.

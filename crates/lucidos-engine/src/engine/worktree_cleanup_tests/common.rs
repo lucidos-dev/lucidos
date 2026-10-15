@@ -317,6 +317,27 @@ pub(crate) async fn insert_old_event(pool: &PgPool, thread_id: Uuid, age_secs: i
     .expect("insert old event");
 }
 
+/// Insert a backdated `SessionStarted` naming `branch`, the thread's own
+/// branch as the archived removal reads it.
+pub(crate) async fn insert_session_started(
+    pool: &PgPool,
+    thread_id: Uuid,
+    branch: &str,
+    age_secs: i64,
+) {
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2::text, 'SessionStarted', $3, NOW() - make_interval(secs => $4), $2::uuid)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(thread_id)
+    .bind(json!({ "branch": branch }))
+    .bind(age_secs as f64)
+    .execute(pool)
+    .await
+    .expect("insert SessionStarted event");
+}
+
 /// Insert a backdated `ChildThreadCompleted` event on `parent_id` referencing
 /// `child_id`. Used by the fan-in retention tests (ADR 0011, B2): when this is
 /// the parent's latest event, the parent still owes a resume and its worktree

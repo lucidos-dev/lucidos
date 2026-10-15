@@ -1,5 +1,6 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, navigateToApp, openThreadDrawer, stampOverlayBuild, DRAWER_TOGGLE_LABEL } from './helpers';
+import { assertHealthy, hideHomeRail, minThreadPane, navigateToApp, openThreadDrawer, stampOverlayBuild, DRAWER_TOGGLE_LABEL } from './helpers';
+import { THREAD_ROW_LEAD_CONTROLS } from '../src/store/paneMinimums';
 
 /** Clamped divider drags (SplitLayout / DrawerDivider + splitHelpers; ADR 0056):
  *  a drag is clamped to the pane minimums as it moves, so it stops at the wall
@@ -16,12 +17,13 @@ import { assertHealthy, navigateToApp, openThreadDrawer, stampOverlayBuild, DRAW
 const SETTLE_MS = 1200;
 // All three pane floors are derived from the root font size now
 // (store/paneMinimums.ts), and these projects run at a 16px root. The Canvas
-// one is still the 360 it was written as. The Conversation one is 338: it is
-// derived from its own header row, which starts after the traffic-lights
-// reserve. The drawer's is not restated at all, since this spec MEASURES where
-// the clamp puts it.
-const MIN_THREAD_PANE = 338;
+// one is still the 360 it was written as. The Conversation one depends on its
+// header row: the traffic-lights reserve and the controls leading it. So this
+// spec computes it with the app's own function, from what the page shows. The
+// drawer's is not restated at all, since this spec MEASURES where the clamp
+// puts it.
 const MIN_CONTENT_PANE = 360;
+
 // Well below the drawer's floor: the clamp must refuse to follow the pointer
 // there rather than land and be corrected.
 const BELOW_FLOOR_X = 150;
@@ -69,26 +71,35 @@ async function drawerWidth(page: Page): Promise<number> {
  *  copies of these classes, so an unscoped `querySelector` returns the hidden
  *  mobile one (the 0x0-rect trap in .claude/rules/frontend.md). */
 async function threadHeaderGapX(page: Page): Promise<number> {
-  const gap = await page.evaluate(() => {
+  const gap = await page.evaluate((leadSelector) => {
     const header = document.querySelector('.desktop-header');
     if (!header) return null;
+    const shown = (els: Iterable<Element | null>) => [...els]
+      .map((el) => el?.getBoundingClientRect())
+      .filter((r): r is DOMRect => !!r && r.width > 0);
     // The drawer toggle rests in the header's corner. With the drawer shut, it
     // leads the thread side. With the drawer open, it sits over the drawer, so
-    // the gap starts no earlier than the thread side itself does.
-    const leading = header.querySelector('.thread-toggle-slot')?.getBoundingClientRect();
-    const leadingRight = leading && leading.width > 0 ? leading.right : 0;
+    // the gap starts no earlier than the thread side itself does. New thread,
+    // and Home once it shows, lead the row after it.
+    const leadingRight = Math.max(0, ...shown([header.querySelector('.thread-toggle-slot'), ...document.querySelectorAll(leadSelector)]).map((r) => r.right));
     const threadSide = header.querySelector('.pane-header-brand')?.getBoundingClientRect();
     // The whole centred cluster, not the mark inside it: the chevrons take its
     // ends, so the mark's left edge is well inside the interactive run.
     const cluster = header.querySelector('.pane-header-brand-label')?.getBoundingClientRect();
-    if (!cluster || cluster.width === 0) return null;
-    return { from: Math.max(leadingRight, threadSide?.left ?? 0), to: cluster.left };
-  });
+    if (!cluster || cluster.width === 0 || !threadSide) return null;
+    // The thread side's trailing actions start past the cluster.
+    const trailingLeft = Math.min(threadSide.right, ...shown(header.querySelectorAll('button, a'))
+      .filter((r) => r.left >= cluster.right && r.left < threadSide.right)
+      .map((r) => r.left));
+    const before = { from: Math.max(leadingRight, threadSide.left), to: cluster.left };
+    const after = { from: cluster.right, to: trailingLeft };
+    return before.to - before.from >= after.to - after.from ? before : after;
+  }, THREAD_ROW_LEAD_CONTROLS);
   expect(gap, 'desktop header: leading cluster / brand cluster not laid out').not.toBeNull();
   expect(
     gap!.to - gap!.from,
-    `no non-interactive gap left on the thread header (leading cluster ends at `
-      + `${gap!.from.toFixed(1)}, the brand cluster starts at ${gap!.to.toFixed(1)}): `
+    `no non-interactive gap left on the thread header (the widest runs from `
+      + `${gap!.from.toFixed(1)} to ${gap!.to.toFixed(1)}): `
       + `header dblclick has nowhere left to land`,
   ).toBeGreaterThan(16);
   return (gap!.from + gap!.to) / 2;
@@ -114,6 +125,7 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
       localStorage.setItem('lucidos-thread-drawer-width', String(width));
     }, OPEN_DRAWER_WIDTH);
+    await hideHomeRail(page);
     await navigateToApp(page);
   });
 
@@ -132,13 +144,14 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
     await dragDivider(page, '.split-divider', 2, { release: false });
     await page.evaluate(() => new Promise(requestAnimationFrame));
     const during = await threadPaneWidth(page);
-    expect(Math.abs(during - MIN_THREAD_PANE),
-      `mid-drag the thread pane sat at ${during}, not its ${MIN_THREAD_PANE} minimum`)
+    const floor = await minThreadPane(page);
+    expect(Math.abs(during - floor),
+      `mid-drag the thread pane sat at ${during}, not its ${floor} minimum`)
       .toBeLessThanOrEqual(2);
 
     await page.mouse.up();
     await page.waitForTimeout(SETTLE_MS);
-    expect(Math.abs(await threadPaneWidth(page) - MIN_THREAD_PANE)).toBeLessThanOrEqual(2);
+    expect(Math.abs(await threadPaneWidth(page) - floor)).toBeLessThanOrEqual(2);
   });
 
   test('the content pane stops at ITS minimum too, at the other end', async ({ page }) => {
@@ -277,12 +290,13 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
     await dragDivider(page, '.drawer-divider', 900, { release: false });
     await page.evaluate(() => new Promise(requestAnimationFrame));
     const during = await threadPaneWidth(page);
+    const floor = await minThreadPane(page);
     expect(during, `mid-drag the thread pane sat at ${during}`)
-      .toBeGreaterThanOrEqual(MIN_THREAD_PANE - 2);
+      .toBeGreaterThanOrEqual(floor - 2);
 
     await page.mouse.up();
     await page.waitForTimeout(SETTLE_MS);
-    expect(await threadPaneWidth(page)).toBeGreaterThanOrEqual(MIN_THREAD_PANE - 2);
+    expect(await threadPaneWidth(page)).toBeGreaterThanOrEqual(floor - 2);
   });
 
   test('drawer toggle slides the drawer header shut with the drawer — no pop', async ({ page }) => {
@@ -440,6 +454,7 @@ test.describe('Threads header: a pane-centred title, and a band that answers no 
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
       localStorage.setItem('lucidos-thread-drawer-width', String(w));
     }, WIDE_DRAWER);
+    await hideHomeRail(page);
     await navigateToApp(page);
   });
 

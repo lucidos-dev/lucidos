@@ -1,0 +1,127 @@
+/**
+ * The Home rail's chrome reads like the panes beside it. Its toggle is one
+ * control that holds the window's corner in both rail states.
+ *
+ * Source scans, like `header-drawer-toggle-pinned.test.ts`: a fade, a second
+ * position property or a hairline is a fact of the sheet.
+ */
+import { describe, it, expect } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+
+import { cssRules, rulesTargeting, styleSheetPaths, type CssRule } from './css-rule-helpers';
+
+const stylesDir: string = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const styles = (rel: string): string => readFileSync(resolve(stylesDir, rel), 'utf-8');
+
+const railCss = styles('panels/home-board.css');
+const shellCss = styles('panels/shell.css');
+
+/** The one rule with this exact selector. */
+function rule(css: string, selector: string): CssRule {
+  const found = cssRules(css).filter(r => r.selector === selector);
+  expect(found.length, `expected exactly one \`${selector}\` rule`).toBe(1);
+  return found[0];
+}
+
+describe('the rail reads like the panes', () => {
+  it('draws its separator with the pane divider\'s width and colour', () => {
+    const split = rule(shellCss, '.split-divider').props;
+    const band = rule(railCss, '.home-rail-divider').props;
+    expect(band.get('width')).toBe(split.get('width'));
+    // Clear in the header row like .app-header::after, the pane colour below.
+    expect(band.get('background')).toContain('var(--header-divider)');
+    expect(band.get('background')).toContain(split.get('background'));
+  });
+
+  it('draws no hairline of its own on its edge or under its head', () => {
+    for (const r of rulesTargeting(railCss, 'home-rail')) {
+      expect(r.props.has('border-left'), `${r.selector} { border-left }`).toBe(false);
+    }
+    for (const r of rulesTargeting(railCss, 'home-board-head')) {
+      expect(r.props.has('border-bottom'), `${r.selector} { border-bottom }`).toBe(false);
+    }
+  });
+});
+
+describe('a window-framed reader of the divider leaves the rail\'s room out', () => {
+  // In the header, `--divider-x`'s 100% is the header, which the rail already
+  // shrank. In a `position: fixed` box it is the whole window.
+  it('takes the rail\'s share off --divider-x for the window frame', () => {
+    const root = cssRules(shellCss).find(r => r.selector === ':root' && r.props.has('--divider-x'))!.props;
+    expect(root.get('--divider-x-in-window')).toBe('calc(var(--divider-x) - var(--sr) * var(--home-rail-room))');
+    expect(rule(railCss, ':root').props.get('--home-rail-room')).toBe('0px');
+    expect(rule(railCss, ':root[data-home-rail]').props.get('--home-rail-room')).toBe('var(--home-rail-width)');
+    expect(rule(railCss, '.app-shell').props.get('padding-right')).toBe('var(--home-rail-room)');
+  });
+
+  it('is read by every rule outside the header\'s own regions', () => {
+    const readers = styleSheetPaths(stylesDir)
+      .filter(path => !path.endsWith('panels/shell.css'))
+      .flatMap(path => cssRules(readFileSync(path, 'utf-8'))
+        .filter(r => [...r.props.values()].some(v => /var\(--divider-x\)/.test(v)))
+        .map(r => `${path}: ${r.selector}`));
+    expect(readers).toEqual([]);
+  });
+});
+
+describe('the rail toggle is one control in the window corner', () => {
+  const slotRules = (): CssRule[] => rulesTargeting(railCss, 'home-rail-toggle-slot');
+
+  it('holds the window corner whether the rail shows or not, and never fades', () => {
+    const base = rule(railCss, '.home-rail-toggle-slot').props;
+    expect(base.get('position')).toBe('fixed');
+    expect(base.get('right')).toBe('var(--header-padding-x)');
+    for (const r of slotRules()) {
+      expect(r.props.has('opacity'), `${r.selector} { opacity }`).toBe(false);
+      expect(r.props.has('left'), `${r.selector} { left }`).toBe(false);
+      if (r.selector !== '.home-rail-toggle-slot') expect(r.props.has('right'), `${r.selector} { right }`).toBe(false);
+    }
+  });
+
+  it('ends the rail\'s head, which keeps room for it', () => {
+    const head = rule(railCss, '.home-rail .home-board-head').props;
+    const padding = (head.get('padding') ?? '').replace(/\s+/g, ' ');
+    expect(padding).toContain('max( calc(var(--header-padding-x) + var(--header-icon-box) + var(--space-sm)),');
+  });
+
+  it('rests where the bell row keeps room for it while the rail is hidden', () => {
+    const docked = rule(
+      shellCss,
+      ':root[data-home-rail-toggle]:not([data-home-rail]) .app-header .content-header-elements',
+    ).props;
+    // Padding, never a moved `right`, so the centred title holds still.
+    expect(docked.has('right')).toBe(false);
+    expect(docked.get('padding-right')).toBe('calc(var(--header-icon-box) + var(--pane-header-gap))');
+  });
+
+  it('grows both content reserves by its box and one gap while docked', () => {
+    const terms = (value: string | undefined) => {
+      const m = /calc\((\d+) \* var\(--header-icon-box\) \+ (\d+) \* 0\.25rem\)/.exec(value ?? '');
+      return m ? [Number(m[1]), Number(m[2])] : null;
+    };
+    const root = cssRules(shellCss).find(r => r.selector === ':root' && r.props.has('--content-side-reserve'))!.props;
+    const docked = rule(shellCss, ':root[data-home-rail-toggle]:not([data-home-rail])').props;
+    for (const token of ['--content-side-reserve', '--content-unfolded-reserve']) {
+      const [boxes, gaps] = terms(root.get(token))!;
+      expect(terms(docked.get(token)), token).toEqual([boxes + 1, gaps + 1]);
+    }
+  });
+
+  it('shrinks away when not offered, or when docked with no Canvas row', () => {
+    const gone = slotRules().filter(r => r.props.get('width') === '0');
+    expect(gone.length).toBe(1);
+    expect(gone[0].selector).toContain(':root:not([data-home-rail-toggle]) .home-rail-toggle-slot');
+    expect(gone[0].selector).toContain(':root[data-content-collapsed]:not([data-home-rail]) .home-rail-toggle-slot');
+    expect(gone[0].props.get('visibility')).toBe('hidden');
+  });
+
+  it('keeps up with a divider drag', () => {
+    const killed = cssRules(railCss).find(r => r.props.get('transition') === 'none')!;
+    expect(killed.selector).toContain(':root[data-pane-resizing] .home-rail-toggle-slot');
+  });
+});

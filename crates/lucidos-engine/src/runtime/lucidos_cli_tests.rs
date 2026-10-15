@@ -222,7 +222,7 @@ fn workspace_script_env_vars_prepends_bin_dir_to_path() {
 #[test]
 fn workspace_script_env_vars_prepends_pg_bin_dir_for_bare_psql() {
     // Packaged builds: psql lives at LUCIDOS_PG_BIN_DIR, not on the launchd PATH.
-    // The dir must be prepended so the advertised bare `psql -c '…'` resolves.
+    // The dir must be prepended so `psql "$LUCIDOS_DATABASE_URL"` resolves.
     let ws = tempfile::tempdir().unwrap();
     let pg = tempfile::tempdir().unwrap();
     let vars = workspace_script_env_vars(ws.path(), None, Some(pg.path()));
@@ -230,7 +230,7 @@ fn workspace_script_env_vars_prepends_pg_bin_dir_for_bare_psql() {
     let path = map.get("PATH").expect("PATH must be set when PG dir given");
     assert!(
         std::env::split_paths(path).any(|p| p == pg.path()),
-        "LUCIDOS_PG_BIN_DIR must be on the script PATH so bare `psql` resolves: {path}"
+        "LUCIDOS_PG_BIN_DIR must be on the script PATH so `psql` resolves: {path}"
     );
 }
 

@@ -14,8 +14,10 @@
 # LUCIDOS_NO_GATEWAY=1 falls back to the legacy direct-engine model, the same
 # fork web-dev.sh has. The window then loads the engine root.
 #
-# The window rebuilds and restarts itself when the desktop app's Rust code
-# changes. Frontend changes arrive through the engine, as in any browser.
+# The window runs from its published launch binary, beside the engine and the
+# gateway. It moves to a new build only when its engine does, on "Switch to new
+# version" (ADR 0461). Frontend changes arrive through the engine, as in any
+# browser.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,22 +44,29 @@ else
 fi
 
 check_prereqs
-check_tauri_cli
 resolve_workspace
 allocate_ports "$WORKSPACE"
 detect_tls
 setup_postgres
 kill_stale_processes
 build_or_find_engine
+# build_or_find_engine builds the window once this checkout has one, so only
+# the first launch builds it here.
+DEV_WINDOW_LAUNCH_DIR="$(launch_bin_dir)"
+if [ ! -f "$(dev_window_bin "$DEV_WINDOW_LAUNCH_DIR")" ]; then
+    build_dev_window "$DEV_WINDOW_LAUNCH_DIR"
+fi
+# Resolved, because the window's re-exec names itself by its resolved path and
+# stop_dev_windows matches on it.
+DEV_WINDOW_BIN="$(dev_window_bin "$(cd "$DEV_WINDOW_LAUNCH_DIR" && pwd -P)")"
 # Before the stack starts, so /api/v1/sdk.js is ready immediately.
-build_sdk
+generate_build_outputs
 swap_ports
 
 # Gateway model by default (ADR 0014), matching web-dev.sh.
 if [ -n "${LUCIDOS_NO_GATEWAY:-}" ]; then
     start_engine
 else
-    seed_gateway_registry
     start_gateway
 fi
 
@@ -75,9 +84,8 @@ show_banner "tauri"
 WINDOW_URL="$(desktop_window_url \
     "${GATEWAY_MODE:-}" "$PROTO" "$GATEWAY_PORT" "${GATEWAY_WS_ID:-}" "$ENGINE_PORT")"
 
-# Replace this checkout's previous window, if one is still running. With the
-# watcher on, a survivor would mean two watchers rebuilding on every change.
-stop_tauri_dev_watchers "$FRONTEND_DIR"
+# Replace this checkout's previous window, if one is still running.
+stop_dev_windows "$DEV_WINDOW_BIN"
 
 # Leaves the shared gateway and every peer workspace running. See
 # cleanup_processes, which releases only this workspace's own markers.
@@ -85,22 +93,8 @@ trap 'cleanup_processes; exit 0' SIGINT SIGTERM
 
 echo "Launching Tauri desktop app at $WINDOW_URL ..."
 
-# Run Tauri in the foreground. Closing the window ends `cargo tauri dev` and
-# this script; Ctrl-C signals the whole process group and fires the trap.
-#
-# The watcher is on: a change to the app's Rust inputs, or to a path crate it
-# depends on, rebuilds and restarts the window. The allow-list in
-# crates/.taurignore scopes it, so frontend edits and engine or gateway rebuilds
-# never restart it.
-# The old reason for `--no-watch` is gone: a restart once killed the live Vite
-# server, which ADR 0014 removed. Why it is safe now:
-# docs/plans/2026-09-25-tauri-dev-window-rebuilds-on-app-changes.md.
-#
-# --config: override devUrl to the door serving this workspace.
-# Trailing `-- --locked` reaches the inner cargo build, so this window is built
-# strictly from the committed Cargo.lock and errors on manifest drift instead of
-# rewriting it (ADR 0020). Same form as `cargo tauri build` in build-dmg.sh.
+# Run the window in the foreground. Closing it ends this script; Ctrl-C signals
+# the whole process group and fires the trap. No file watcher restarts it: the
+# window re-execs onto a newer published binary once its engine has switched.
 cd "$FRONTEND_DIR"
-cargo tauri dev \
-    --config "{\"build\":{\"devUrl\":\"$WINDOW_URL\"}}" \
-    -- --locked
+LUCIDOS_DEV_WINDOW_URL="$WINDOW_URL" "$DEV_WINDOW_BIN"

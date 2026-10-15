@@ -111,6 +111,74 @@ pub enum ChildCompletionStatus {
     Interrupted,
 }
 
+/// What a child's clean finish does to its parent, declared by the spawn: the
+/// child's *wake mode* (ADR 0451). A failure wakes the parent under every mode.
+///
+/// A child spawned with no mode (before modes existed) has none, and its turns
+/// fall back to the *wake decision*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WakeMode {
+    /// The user reads the result, and the parent may still want it. A clean
+    /// report is filed, and the parent reads it on its next turn.
+    NoWake,
+    /// The parent needs the result to continue, so every report wakes it.
+    Wake,
+    /// The parent combines several results. A clean report wakes it only when
+    /// no other child of its batch is still working, and is filed before that.
+    WakeWhenAllDone,
+}
+
+impl WakeMode {
+    /// Every mode, in the order the docs list them.
+    pub const ALL: [Self; 3] = [Self::NoWake, Self::Wake, Self::WakeWhenAllDone];
+
+    /// The wire name, which is also the stored column value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoWake => "no-wake",
+            Self::Wake => "wake",
+            Self::WakeWhenAllDone => "wake-when-all-done",
+        }
+    }
+
+    /// Read a wire name. `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == value)
+    }
+
+    /// The wire names, comma-separated, for an error that lists them.
+    pub fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The mode a child spawn runs under: the one it declared, else the
+    /// default for its parent. The home thread's work is for the user, so its
+    /// children default to `NoWake`. Every other parent defaults to `Wake`.
+    pub fn for_spawn(declared: Option<Self>, parent_is_home: bool) -> Self {
+        declared.unwrap_or(if parent_is_home {
+            Self::NoWake
+        } else {
+            Self::Wake
+        })
+    }
+
+    /// Read a spawn's optional `wake_mode` argument. A value that names no
+    /// mode is an error listing the valid ones, never a silent default.
+    pub fn from_arg(value: Option<&str>) -> Result<Option<Self>, String> {
+        match value {
+            None => Ok(None),
+            Some(name) => Self::parse(name).map(Some).ok_or_else(|| {
+                format!("`wake_mode` must be one of {}, not `{name}`", Self::names())
+            }),
+        }
+    }
+}
+
 /// One pending change held by a sub-thread of the thread a
 /// `ChildThreadCompleted` reports on: any descendant, not the thread itself.
 ///
@@ -127,4 +195,45 @@ pub struct SubThreadPendingChange {
     /// Same meaning as `PendingThreadState::unsettled`: that sub-thread was still
     /// working on the change when the card was sent.
     pub thread_unsettled: bool,
+}
+
+/// The branch an integrated sub-thread hands up to its parent, named on the
+/// child's report. Set only when the child's work is hardened and waits for
+/// the parent's agent to merge it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegratedBranch {
+    pub branch_name: String,
+    /// The head the child's `/harden` certified.
+    pub head_sha: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WakeMode;
+
+    #[test]
+    fn each_wake_mode_name_is_its_serde_name() {
+        for mode in WakeMode::ALL {
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+            assert_eq!(WakeMode::parse(mode.as_str()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn a_spawn_defaults_by_parent_and_a_declared_mode_wins() {
+        assert_eq!(WakeMode::for_spawn(None, true), WakeMode::NoWake);
+        assert_eq!(WakeMode::for_spawn(None, false), WakeMode::Wake);
+        for mode in WakeMode::ALL {
+            assert_eq!(WakeMode::for_spawn(Some(mode), true), mode);
+            assert_eq!(WakeMode::for_spawn(Some(mode), false), mode);
+        }
+    }
+
+    #[test]
+    fn an_unknown_wake_mode_is_refused_with_the_valid_names() {
+        assert_eq!(WakeMode::from_arg(None), Ok(None));
+        assert_eq!(WakeMode::from_arg(Some("wake")), Ok(Some(WakeMode::Wake)));
+        let err = WakeMode::from_arg(Some("file")).unwrap_err();
+        assert!(err.contains("no-wake, wake, wake-when-all-done"), "{err}");
+    }
 }

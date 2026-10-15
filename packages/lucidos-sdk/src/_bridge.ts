@@ -24,6 +24,7 @@ export const BRIDGE_PUSH_TYPE = 'lucidos:bridge:push';
 export type BridgeOp =
   | 'fetch'
   | 'sse.open'
+  | 'sse.types'
   | 'sse.close'
   | 'storage.prime'
   | 'storage.set'

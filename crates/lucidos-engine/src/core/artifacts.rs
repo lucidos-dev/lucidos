@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use super::ARTIFACTS_DIR;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::git_ops::WorkspaceRepoLock;
 
 /// Subdirectories under `data/` that browseable workspace tools (list_files,
 /// glob_files, grep_files) walk. Anything outside these — postgres event
@@ -298,8 +299,9 @@ impl ArtifactManager {
     /// Created-vs-Updated is decided from whether the file existed BEFORE this
     /// write, checked here so no caller has to sequence that itself. See
     /// [`WriteAnnouncement`] for the one case that suppresses the entity event.
-    pub async fn write_and_commit(
+    pub(crate) async fn write_and_commit(
         &self,
+        held: &WorkspaceRepoLock,
         event_bus: &EventBus,
         relative_path: &str,
         content: impl AsRef<[u8]>,
@@ -308,7 +310,7 @@ impl ArtifactManager {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let existed = self.artifact_exists(relative_path);
         self.write_artifact(relative_path, content)?;
-        let commit_sha = self.commit(relative_path, message).await?;
+        let commit_sha = self.commit(held, relative_path, message).await?;
         if let WriteAnnouncement::Entity {
             source,
             writer_thread_id,
@@ -331,8 +333,9 @@ impl ArtifactManager {
     }
 
     /// Write multiple artifacts and commit them all in one operation
-    pub async fn write_batch_and_commit(
+    pub(crate) async fn write_batch_and_commit(
         &self,
+        held: &WorkspaceRepoLock,
         files: &[(String, String)],
         message: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -340,6 +343,7 @@ impl ArtifactManager {
             self.write_artifact(path, content)?;
         }
         self.commit_batch(
+            held,
             &files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             message,
         )
@@ -349,7 +353,12 @@ impl ArtifactManager {
 
     /// Stage a single artifact file and commit.
     /// `artifact_path` is relative to data/artifacts/ (e.g., "user_profile.md").
-    pub async fn commit(&self, artifact_path: &str, message: &str) -> Result<String, git2::Error> {
+    pub(crate) async fn commit(
+        &self,
+        _held: &WorkspaceRepoLock,
+        artifact_path: &str,
+        message: &str,
+    ) -> Result<String, git2::Error> {
         reject_path_traversal(artifact_path)?;
         let repo_path = format!("{}/{}", ARTIFACTS_DIR, artifact_path);
         self.commit_repo_path(&repo_path, message).await
@@ -357,8 +366,9 @@ impl ArtifactManager {
 
     /// Stage multiple artifact files and commit in one operation (for batch imports).
     /// Each path is relative to data/artifacts/.
-    pub async fn commit_batch(
+    pub(crate) async fn commit_batch(
         &self,
+        _held: &WorkspaceRepoLock,
         artifact_paths: &[String],
         message: &str,
     ) -> Result<String, git2::Error> {
@@ -389,8 +399,9 @@ impl ArtifactManager {
 
     /// Stage a data-relative path (e.g., "scripts/foo.py", "knowhow/bar.md") and commit.
     /// Path is relative to `data/` — any known subdirectory works.
-    pub async fn commit_data_path(
+    pub(crate) async fn commit_data_path(
         &self,
+        _held: &WorkspaceRepoLock,
         data_relative_path: &str,
         message: &str,
     ) -> Result<String, git2::Error> {
@@ -401,8 +412,9 @@ impl ArtifactManager {
 
     /// Stage multiple data-relative paths and commit in one operation.
     /// Each path is relative to `data/` (e.g., "artifacts/report.csv", "knowhow/guide.md").
-    pub async fn commit_data_paths(
+    pub(crate) async fn commit_data_paths(
         &self,
+        _held: &WorkspaceRepoLock,
         data_relative_paths: &[String],
         message: &str,
     ) -> Result<String, git2::Error> {
@@ -436,8 +448,9 @@ impl ArtifactManager {
     /// Emits `ArtifactDeleted` for a path under `artifacts/`, which is the only
     /// `data/` subtree with a list that reloads on an entity event. Other
     /// subtrees commit silently, matching their registry classification.
-    pub async fn delete_data_path_and_commit(
+    pub(crate) async fn delete_data_path_and_commit(
         &self,
+        _held: &WorkspaceRepoLock,
         event_bus: &EventBus,
         data_relative_path: &str,
         message: &str,
@@ -510,7 +523,7 @@ impl ArtifactManager {
     /// Stage and commit all dirty files under data/ (artifacts, apps, etc.).
     /// Returns Some(commit_sha) if there were changes, None if clean.
     ///
-    /// Holds `REPO_WORKTREE_MUTEX` for the real lifetime of the snapshot.
+    /// Holds the workspace repo lock for the real lifetime of the snapshot.
     /// Staging all of `data/` records anything missing from the working tree as a
     /// deletion, so a snapshot taken while a merge has published `main` but not
     /// yet synced the repo root commits the just-merged files as deleted, onto
@@ -520,24 +533,24 @@ impl ArtifactManager {
     /// any other cancellation) would otherwise free the exclusion with this
     /// closure still writing the index.
     ///
-    /// The lock lives here rather than at the call site so no caller can forget
-    /// it or scope it too narrowly, and for that reason a caller must NOT hold
-    /// `REPO_WORKTREE_MUTEX` across this call. The single-path commit helpers
-    /// above deliberately take no lock at all: they stage one named path onto the
-    /// current head, so they cannot record an unrelated deletion.
-    pub async fn commit_all_dirty(&self, message: &str) -> Result<Option<String>, git2::Error> {
-        let worktree_guard = crate::engine::git_ops::lock_repo_worktree_owned().await;
+    /// The lock lives here, so no caller can scope it too narrowly. A caller
+    /// must therefore NOT hold it across this call.
+    pub(crate) async fn commit_all_dirty(
+        &self,
+        message: &str,
+    ) -> Result<Option<String>, git2::Error> {
+        let held = crate::engine::git_ops::lock_workspace_repo().await;
         let repo = self.repo.clone();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
             // Rebound so it is captured by the closure and dropped when the
             // closure returns, on every path out of it. That drop point is the
             // whole guarantee.
-            let _worktree_guard = worktree_guard;
-            // The worktree guard excludes the engine's OWN git-CLI paths, not a
-            // git process outside this engine, so the index can still be locked
-            // under us here, and HEAD can still move under us between the parent
-            // read and the commit; see `retry_while_repo_contended`.
+            let _held = held;
+            // The lock excludes the engine's own writers, not a git process
+            // outside it. That process can still lock the index, or move HEAD
+            // between the parent read and the commit. See
+            // `retry_while_repo_contended`.
             super::retry_while_repo_contended(|| {
                 let repo = repo.lock().unwrap();
                 let mut index = repo.index()?;
@@ -629,14 +642,15 @@ impl ArtifactManager {
 
     /// Delete an artifact and commit the deletion. Announces through
     /// [`Self::delete_data_path_and_commit`].
-    pub async fn delete_and_commit(
+    pub(crate) async fn delete_and_commit(
         &self,
+        held: &WorkspaceRepoLock,
         event_bus: &EventBus,
         relative_path: &str,
         message: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let data_relative = format!("artifacts/{}", relative_path);
-        self.delete_data_path_and_commit(event_bus, &data_relative, message)
+        self.delete_data_path_and_commit(held, event_bus, &data_relative, message)
             .await
     }
 
@@ -909,7 +923,14 @@ mod tests {
         let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
 
         manager.write_artifact("test.txt", "hello").unwrap();
-        let commit_sha = manager.commit("test.txt", "Add test file").await.unwrap();
+        let commit_sha = manager
+            .commit(
+                &crate::engine::git_ops::lock_workspace_repo().await,
+                "test.txt",
+                "Add test file",
+            )
+            .await
+            .unwrap();
 
         assert!(!commit_sha.is_empty());
     }
@@ -1006,6 +1027,7 @@ mod tests {
 
         manager
             .write_and_commit(
+                &crate::engine::git_ops::lock_workspace_repo().await,
                 &bus,
                 "notes.md",
                 "one",
@@ -1019,6 +1041,7 @@ mod tests {
             .unwrap();
         manager
             .write_and_commit(
+                &crate::engine::git_ops::lock_workspace_repo().await,
                 &bus,
                 "notes.md",
                 "two",
@@ -1044,6 +1067,7 @@ mod tests {
         // rather than adding to it, so an import is not double-announced.
         manager
             .write_and_commit(
+                &crate::engine::git_ops::lock_workspace_repo().await,
                 &bus,
                 "imported/doc.txt",
                 "x",
@@ -1062,7 +1086,12 @@ mod tests {
         assert_eq!(after, 2, "a superseded write must not add an entity event");
 
         manager
-            .delete_and_commit(&bus, "notes.md", "Delete notes")
+            .delete_and_commit(
+                &crate::engine::git_ops::lock_workspace_repo().await,
+                &bus,
+                "notes.md",
+                "Delete notes",
+            )
             .await
             .unwrap();
         let deleted: i64 =
@@ -1123,6 +1152,7 @@ mod tests {
 
         let sha = am
             .commit_data_paths(
+                &crate::engine::git_ops::lock_workspace_repo().await,
                 &["artifacts/a.csv".to_string(), "knowhow/b.md".to_string()],
                 "test: commit two data paths",
             )
@@ -1146,6 +1176,7 @@ mod tests {
         std::fs::write(ws.join("data/artifacts/report.csv"), "col1\n1").unwrap();
 
         am.commit_data_paths(
+            &crate::engine::git_ops::lock_workspace_repo().await,
             &[".env".to_string(), "artifacts/report.csv".to_string()],
             "test: a script's output beside a secret",
         )

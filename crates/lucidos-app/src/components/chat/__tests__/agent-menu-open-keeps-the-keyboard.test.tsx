@@ -4,7 +4,7 @@
  *  On iOS, a blurred prompt drops the keyboard. The shell then grows under a
  *  panel placed for the shrunk viewport, and the panel jumps. With the keyboard
  *  up, the menu's filter box takes it over, and closing hands it back. */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 
@@ -15,6 +15,10 @@ vi.mock('../../../store/actions/models', async (importOriginal) => ({
 
 const { CodingAgentControlMenu, menuTakesFocus } = await import('../CodingAgentControlMenu');
 const { LucidosControlMenu } = await import('../LucidosControlMenu');
+const { controlMenuParts } = await import('../controlMenuParts');
+
+// The menus' panel parts are code-split. Warm them, so a press opens at once.
+beforeAll(() => controlMenuParts.preload());
 
 let host: HTMLDivElement;
 

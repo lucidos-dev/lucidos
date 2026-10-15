@@ -64,7 +64,7 @@ function leadPx(remPx: number, packaged: boolean): number {
 
 /** `--brand-side-reserve`, resolved. The wider of the two ends, paid at both. */
 function reservePx(remPx: number, packaged: boolean): number {
-  const trailing = (0.5 + 3 * ICON_BOX_REM + 2 * 0.25) * remPx;
+  const trailing = (0.5 + 2 * ICON_BOX_REM + 0.25) * remPx;
   return Math.max(leadPx(remPx, packaged), trailing);
 }
 
@@ -73,9 +73,9 @@ describe('computeMinThreadPaneWidth', () => {
     // The cluster is centred on the PANE (`.pane-header-brand-label`), not on
     // the gap between the clusters flanking it. So the floor is
     // `2 * side + cluster`, and whatever leads the row is paid on both sides.
-    expect(computeMinThreadPaneWidth(16, LIGHTS_RESERVE_PX, false))
+    expect(computeMinThreadPaneWidth(16, LIGHTS_RESERVE_PX, 0))
       .toBe(Math.ceil(2 * (LIGHTS_RESERVE_PX + ICON_BOX_REM * 16) + CLUSTER_REM * 16));
-    expect(computeMinThreadPaneWidth(16, LIGHTS_RESERVE_PX, false)).toBe(338);
+    expect(computeMinThreadPaneWidth(16, LIGHTS_RESERVE_PX, 0)).toBe(338);
   });
 
   it('scales with the root font size, because the row does', () => {
@@ -83,16 +83,24 @@ describe('computeMinThreadPaneWidth', () => {
     // the root, so it tracked no part of the row. Here the rem terms scale and
     // the px lead does not. That makes the floor tighter at large scales and
     // wider at small ones.
-    expect(computeMinThreadPaneWidth(20, LIGHTS_RESERVE_PX, false)).toBe(382);
-    expect(computeMinThreadPaneWidth(24, LIGHTS_RESERVE_PX, false)).toBe(427);
-    expect(computeMinThreadPaneWidth(28, LIGHTS_RESERVE_PX, false)).toBe(471);
+    expect(computeMinThreadPaneWidth(20, LIGHTS_RESERVE_PX, 0)).toBe(382);
+    expect(computeMinThreadPaneWidth(24, LIGHTS_RESERVE_PX, 0)).toBe(427);
+    expect(computeMinThreadPaneWidth(28, LIGHTS_RESERVE_PX, 0)).toBe(471);
   });
 
   it('floors the lead at the row\'s own padding, for a lead that is not there', () => {
     // The `max` keeps it honest at the other end of the scale, exactly as the
     // drawer's does: at a large enough root the rem padding is the wider end.
-    expect(computeMinThreadPaneWidth(16, 0, false))
+    expect(computeMinThreadPaneWidth(16, 0, 0))
       .toBe(Math.ceil(2 * (PAD_REM * 16 + ICON_BOX_REM * 16) + CLUSTER_REM * 16));
+  });
+
+  it('pays a box and a gap at both ends for each control leading the row', () => {
+    // New thread, Home beside it, and the dock toggle while a widget is docked.
+    const gapRem = 0.25;
+    const bare = computeMinThreadPaneWidth(16, LIGHTS_RESERVE_PX, 0);
+    expect(computeMinThreadPaneWidth(16, LIGHTS_RESERVE_PX, 1)).toBe(bare + 2 * (ICON_BOX_REM + gapRem) * 16);
+    expect(computeMinThreadPaneWidth(16, LIGHTS_RESERVE_PX, 2)).toBe(bare + 4 * (ICON_BOX_REM + gapRem) * 16);
   });
 
   it('is ONE floor for every desktop client', () => {
@@ -113,7 +121,7 @@ describe('computeMinThreadPaneWidth', () => {
 describe('the centred cluster cannot reach a flanking control', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  const floorAt = (remPx: number) => computeMinThreadPaneWidth(remPx, LIGHTS_RESERVE_PX, false);
+  const floorAt = (remPx: number) => computeMinThreadPaneWidth(remPx, LIGHTS_RESERVE_PX, 0);
 
   it.each(ROOTS)('clears both ends at a %ipx root, on both builds', (remPx) => {
     for (const packaged of [true, false]) {

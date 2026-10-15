@@ -6,7 +6,9 @@ use crate::core::mcp_servers::validate_server_id;
 use crate::core::{McpServer, McpServerStore};
 use crate::engine::cc_permission::resolve_coding_agent_permission;
 use crate::engine::claude_code::AllowScope;
+use crate::engine::thread_events::{EventMeta, McpEnablementSource};
 use crate::mcp::{McpCostTotals, McpStartOutcome, McpStopOutcome};
+use axum::routing::patch;
 
 #[derive(Deserialize)]
 pub(super) struct McpConsentResponse {
@@ -119,9 +121,10 @@ pub(super) async fn set_mcp_auto_approve(
 /// and the Context Viewer use. A second ratio in the frontend is what once
 /// reported a 205k prompt as 361k.
 ///
-/// `budget` states what a request really sends once the MCP tool ceiling
-/// applies, and what the ceiling drops. Its share must stay chars against the
-/// request's own char budget, the unit and total the packer fills.
+/// `budget` states the worst case, one thread that enabled every server: what
+/// its request sends once the MCP tool ceiling applies, and what the ceiling
+/// drops. Its share must stay chars against the request's own char budget, the
+/// unit and total the packer fills.
 pub(super) async fn list_mcp_servers(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -136,7 +139,12 @@ pub(super) async fn list_mcp_servers(
     // The window the resolved model actually has, so the page can state the
     // share of it these tools occupy.
     let (model, context_window) = state.engine.chat_model_and_window().await;
-    let budget = state.engine.mcp_manager.budget(context_window).await;
+    let budget = state
+        .engine
+        .mcp_manager
+        .budget(context_window)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to cost MCP servers: {e}")))?;
 
     Ok(Json(serde_json::json!({
         "servers": servers,
@@ -213,26 +221,105 @@ pub(super) async fn start_mcp_server(
     })))
 }
 
-/// POST /api/v1/mcp/servers/:id/stop: stop a running server.
+/// POST /api/v1/mcp/servers/:id/stop: stop a server, which switches it off
+/// in every thread (ADR 0430).
 ///
 /// Stopping one that is already stopped is a 200, not an error: the caller
 /// asked for a state and got it. Only an unknown id is a 404.
 pub(super) async fn stop_mcp_server(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    load_server(&state, &id).await?;
-
+    let actor = super::actor::require_user_actor(&headers, &state.pool, None).await?;
     let outcome = state
         .engine
         .mcp_manager
-        .stop_server(&id)
+        .stop_everywhere(&id, Some(actor))
         .await
-        .map_err(|e| ApiError::internal(format!("Failed to stop MCP server '{id}': {e}")))?;
+        .map_err(|e| ApiError::internal(format!("Failed to stop MCP server '{id}': {e}")))?
+        .ok_or_else(|| ApiError::not_found(format!("MCP server '{id}' not found")))?;
 
     Ok(Json(serde_json::json!({
         "running": false,
         "was_running": matches!(outcome, McpStopOutcome::Stopped { .. }),
+    })))
+}
+
+/// A 404 unless `thread_id` names a thread.
+async fn require_thread(state: &AppState, thread_id: Uuid) -> Result<(), ApiError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1)")
+            .bind(thread_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| ApiError::internal(format!("Failed to read thread {thread_id}: {e}")))?;
+    if exists {
+        Ok(())
+    } else {
+        Err(ApiError::not_found(format!("Thread {thread_id} not found")))
+    }
+}
+
+/// POST /api/v1/threads/:thread_id/mcp-servers/:id/enable: enable a server in
+/// one thread, starting it if it is not running (ADR 0430).
+pub(super) async fn enable_thread_mcp_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((thread_id, id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = super::actor::require_user_actor(&headers, &state.pool, None).await?;
+    require_thread(&state, thread_id).await?;
+    let server = load_server(&state, &id).await?;
+    if let Some(e) = unusable_id_error(&server) {
+        return Err(e);
+    }
+
+    let outcome = state
+        .engine
+        .mcp_manager
+        .enable_for_thread(
+            thread_id,
+            &id,
+            McpEnablementSource::User,
+            EventMeta::with_actor(Some(actor)),
+        )
+        .await
+        .map_err(|e| start_failed_error(&id, e))?;
+
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "already_running": matches!(outcome, McpStartOutcome::AlreadyRunning { .. }),
+        "tool_count": outcome.tool_count(),
+    })))
+}
+
+/// POST /api/v1/threads/:thread_id/mcp-servers/:id/disable: disable a server
+/// in one thread. The process keeps running for the threads that use it.
+pub(super) async fn disable_thread_mcp_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((thread_id, id)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = super::actor::require_user_actor(&headers, &state.pool, None).await?;
+    require_thread(&state, thread_id).await?;
+    load_server(&state, &id).await?;
+
+    let was_enabled = state
+        .engine
+        .mcp_manager
+        .disable_for_thread(
+            thread_id,
+            &id,
+            McpEnablementSource::User,
+            EventMeta::with_actor(Some(actor)),
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to disable MCP server '{id}': {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "enabled": false,
+        "was_enabled": was_enabled,
     })))
 }
 
@@ -260,29 +347,31 @@ pub(super) async fn remove_mcp_server(
 }
 
 #[derive(Deserialize)]
-pub(super) struct McpDisabledToolsRequest {
-    /// The full set to store, by WIRE name (`mcp__<server>__<tool>`). A
-    /// replacement, not a delta, so a stale client cannot re-enable a tool it
-    /// never knew about.
-    disabled_tools: Vec<String>,
+pub(super) struct McpToolSwitchRequest {
+    /// The tool, by WIRE name (`mcp__<server>__<tool>`).
+    wire_name: String,
+    /// True switches it off, false back on.
+    disabled: bool,
 }
 
-/// PUT /api/v1/mcp/servers/:id/disabled-tools: set which tools are switched
-/// off.
+/// PATCH /api/v1/mcp/servers/:id/disabled-tools: switch one tool off or back
+/// on, and answer with the stored set.
 ///
-/// Names are not checked against the manifest. A stopped server may have none
-/// to check against, and a name matching no tool simply filters nothing.
+/// One tool per call, so two clients' switches commute rather than one
+/// whole-set write overwriting the other (ADR 0437). Names are not checked
+/// against the manifest. A stopped server may have none to check against, and
+/// a name matching no tool simply filters nothing.
 pub(super) async fn set_mcp_disabled_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(body): Json<McpDisabledToolsRequest>,
+    Json(body): Json<McpToolSwitchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = super::actor::user_actor(&headers, None);
     let stored = state
         .engine
         .mcp_manager
-        .set_disabled_tools(&id, &body.disabled_tools, actor)
+        .set_tool_disabled(&id, &body.wire_name, body.disabled, actor)
         .await
         .map_err(|e| ApiError::internal(format!("Failed to update MCP server '{id}': {e}")))?
         .ok_or_else(|| ApiError::not_found(format!("MCP server '{id}' not found")))?;
@@ -315,7 +404,8 @@ pub(super) async fn put_mcp_allowed_tools(
         .map_err(|(status, message)| ApiError::new(status, message))
 }
 
-/// Routes for the `/mcp/*` surface, plus the `mcp-allowed-tools` editor.
+/// Routes for the `/mcp/*` surface, a thread's enabled servers, and the
+/// `mcp-allowed-tools` editor.
 ///
 /// The per-server verbs take the id as a path param. `auto-approve` keeps its
 /// body form so the client that already calls it does not break.
@@ -328,8 +418,16 @@ pub(super) fn router() -> Router<AppState> {
         .route("/mcp/servers/:id/start", post(start_mcp_server))
         .route("/mcp/servers/:id/stop", post(stop_mcp_server))
         .route(
+            "/threads/:thread_id/mcp-servers/:id/enable",
+            post(enable_thread_mcp_server),
+        )
+        .route(
+            "/threads/:thread_id/mcp-servers/:id/disable",
+            post(disable_thread_mcp_server),
+        )
+        .route(
             "/mcp/servers/:id/disabled-tools",
-            put(set_mcp_disabled_tools),
+            patch(set_mcp_disabled_tools),
         )
         .route(
             "/mcp-allowed-tools",
@@ -428,22 +526,18 @@ mod tests {
         assert!(e.message.contains("characters"), "{}", e.message);
     }
 
-    /// The disabled set is a replacement, so the body has to carry the whole
-    /// selection. An empty array is a valid selection (nothing off), not a
-    /// missing field.
+    /// A switch names one tool and which way it goes. Both fields are
+    /// required: a body missing `disabled` must not read as "back on".
     #[test]
-    fn disabled_tools_body_takes_a_full_set() {
-        let body: McpDisabledToolsRequest =
-            serde_json::from_str(r#"{"disabled_tools":["mcp__slack__post_message"]}"#).unwrap();
-        assert_eq!(body.disabled_tools, vec!["mcp__slack__post_message"]);
+    fn a_tool_switch_names_one_tool_and_its_direction() {
+        let body: McpToolSwitchRequest =
+            serde_json::from_str(r#"{"wire_name":"mcp__slack__post_message","disabled":true}"#)
+                .unwrap();
+        assert_eq!(body.wire_name, "mcp__slack__post_message");
+        assert!(body.disabled);
 
-        let cleared: McpDisabledToolsRequest =
-            serde_json::from_str(r#"{"disabled_tools":[]}"#).unwrap();
-        assert!(cleared.disabled_tools.is_empty());
-
-        // Omitting it entirely is rejected rather than read as "disable
-        // nothing", which would silently re-enable every tool.
-        assert!(serde_json::from_str::<McpDisabledToolsRequest>("{}").is_err());
+        assert!(serde_json::from_str::<McpToolSwitchRequest>(r#"{"wire_name":"x"}"#).is_err());
+        assert!(serde_json::from_str::<McpToolSwitchRequest>(r#"{"disabled":false}"#).is_err());
     }
 
     /// The saved preference wins over the boot-time provider default, and the

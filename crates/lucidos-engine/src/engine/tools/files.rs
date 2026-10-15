@@ -3,6 +3,7 @@ use super::super::LucidosEngine;
 use super::app_lint::{app_lint_note, app_lint_note_on_disk};
 use crate::core::AppKind;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::git_ops::WorkspaceRepoLock;
 use base64::Engine as _;
 use std::path::Path;
 
@@ -300,7 +301,7 @@ enum ManifestOp {
 
 /// What a file tool did to one `data/` path.
 #[derive(Clone, Copy)]
-enum DataFileChange<'a> {
+pub(super) enum DataFileChange<'a> {
     Written { commit: &'a str },
     Edited,
     Deleted { commit: &'a str },
@@ -309,7 +310,8 @@ enum DataFileChange<'a> {
 /// The `DataFile*` event announcing a file tool's change to a `data/` path.
 /// An open preview of that file refreshes on it, and so does the theme picker.
 /// `None` under `artifacts/`, whose own `Artifact*` events announce it.
-fn data_file_event(data_path: &str, change: DataFileChange) -> Option<SystemEvent> {
+/// `run_python` announces its staged writes through this too.
+pub(super) fn data_file_event(data_path: &str, change: DataFileChange) -> Option<SystemEvent> {
     if data_path.starts_with("artifacts/") {
         return None;
     }
@@ -476,6 +478,7 @@ impl LucidosEngine {
     /// Commit a file change via the appropriate manager: shared user dir, app, or workspace artifact.
     async fn commit_file_change(
         &self,
+        held: &WorkspaceRepoLock,
         data_path: &str,
         full_path: &Path,
         message: &str,
@@ -485,10 +488,10 @@ impl LucidosEngine {
                 crate::core::user_dir::auto_commit(root, &relative, message);
                 Ok(SHARED_COMMIT.to_string())
             }
-            ChangeOwner::App(app_path) => Ok(self.app_manager.commit(app_path, message)?),
+            ChangeOwner::App(app_path) => Ok(self.app_manager.commit(held, app_path, message)?),
             ChangeOwner::Workspace => Ok(self
                 .artifact_manager
-                .commit_data_path(data_path, message)
+                .commit_data_path(held, data_path, message)
                 .await?),
         }
     }
@@ -496,6 +499,7 @@ impl LucidosEngine {
     /// Delete a file and commit the removal in the repo that owns it.
     async fn delete_file_change(
         &self,
+        held: &WorkspaceRepoLock,
         data_path: &str,
         full_path: &Path,
         message: &str,
@@ -505,12 +509,12 @@ impl LucidosEngine {
                 crate::core::user_dir::remove_and_commit(root, &relative, message)?;
                 Ok(SHARED_COMMIT.to_string())
             }
-            ChangeOwner::App(app_path) => {
-                Ok(self.app_manager.delete_file_and_commit(app_path, message)?)
-            }
+            ChangeOwner::App(app_path) => Ok(self
+                .app_manager
+                .delete_file_and_commit(held, app_path, message)?),
             ChangeOwner::Workspace => Ok(self
                 .artifact_manager
-                .delete_data_path_and_commit(&self.event_bus, data_path, message)
+                .delete_data_path_and_commit(held, &self.event_bus, data_path, message)
                 .await?),
         }
     }
@@ -798,7 +802,7 @@ impl LucidosEngine {
         // A `data/` edit reads, rewrites and commits under one hold of the repo
         // lock. Read outside it, two concurrent edits both start from the same
         // version and the later write silently drops the other's change.
-        let _repo_guard = match repo {
+        let data_lock = match repo {
             None => Some(self.lock_workspace_repo().await),
             Some(_) => None,
         };
@@ -842,7 +846,7 @@ impl LucidosEngine {
         // A repo edit stops at the write. Nothing below applies to it. The lock
         // guards the workspace tree, the commit and the announcements are about
         // `data/`, and an app id cannot come from a repo path.
-        if repo.is_some() {
+        let Some(data_lock) = data_lock else {
             std::fs::write(&full_path, &new_content)
                 .map_err(|e| format!("Failed to write file: {}", e))?;
             return Ok(FileEditResult {
@@ -850,7 +854,7 @@ impl LucidosEngine {
                 outcome,
                 target: EditTarget::RepoWorkingTree,
             });
-        }
+        };
 
         let app_existed_before = data_path_app_id(path)
             .map(|id| self.app_manager.app_exists(id))
@@ -864,7 +868,7 @@ impl LucidosEngine {
             .map(|m| m.to_string())
             .unwrap_or_else(|| format!("Edit {}", path));
         let commit_sha = self
-            .commit_file_change(path, &full_path, &commit_msg)
+            .commit_file_change(&data_lock, path, &full_path, &commit_msg)
             .await
             .map_err(|e| format!("Failed to commit: {}", e))?;
 
@@ -1353,7 +1357,7 @@ impl LucidosEngine {
                     ));
                 }
 
-                let _repo_guard = self.lock_workspace_repo().await;
+                let held = self.lock_workspace_repo().await;
 
                 // Create parent directories and write
                 if let Some(parent) = full_path.parent() {
@@ -1373,7 +1377,7 @@ impl LucidosEngine {
                         format!("{} {}", action, path)
                     });
                 let commit_sha = self
-                    .commit_file_change(path, &full_path, &commit_msg)
+                    .commit_file_change(&held, path, &full_path, &commit_msg)
                     .await?;
 
                 if let Some(artifact_path) = path.strip_prefix("artifacts/") {
@@ -1628,7 +1632,7 @@ impl LucidosEngine {
                     .map(|id| self.app_manager.app_exists(id))
                     .unwrap_or(false);
 
-                let _repo_guard = self.lock_workspace_repo().await;
+                let held = self.lock_workspace_repo().await;
 
                 // A theme or a font lands as the exact bytes it was checked as.
                 // They are read under the lock, so the source cannot change
@@ -1670,7 +1674,7 @@ impl LucidosEngine {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("Copy {} to {}", source, &dst_data_path));
                 let commit_sha = self
-                    .commit_file_change(&dst_data_path, &dst_path, &commit_msg)
+                    .commit_file_change(&held, &dst_data_path, &dst_path, &commit_msg)
                     .await?;
 
                 // Emit event for artifacts
@@ -1781,7 +1785,7 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                 let kind_before =
                     data_path_app_id(path).and_then(|id| self.app_manager.app_kind(id));
 
-                let _repo_guard = self.lock_workspace_repo().await;
+                let held = self.lock_workspace_repo().await;
 
                 let commit_msg = args
                     .get("message")
@@ -1789,7 +1793,7 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("Delete {}", path));
                 let commit_sha = self
-                    .delete_file_change(path, &full_path, &commit_msg)
+                    .delete_file_change(&held, path, &full_path, &commit_msg)
                     .await?;
 
                 // A deleted profile has to leave the cache too, or the engine

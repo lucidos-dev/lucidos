@@ -797,8 +797,8 @@ mod tests {
         // itself. A login shell reads it after `/etc/profile`, which on Debian
         // overwrites PATH outright.
         let nvm_bin = "/home/u/.nvm/versions/node/v22.3.0/bin";
-        let home = a_fresh_temp_path("home");
-        std::fs::create_dir_all(&home).expect("temp HOME");
+        let home_dir = tempfile::tempdir().expect("temp HOME");
+        let home = home_dir.path();
         std::fs::write(
             home.join(".profile"),
             format!(
@@ -810,9 +810,8 @@ mod tests {
         )
         .expect("write the profile");
         let mut cmd = login_shell_command(Path::new("/bin/sh"));
-        cmd.env("HOME", &home).env_remove("ENV");
+        cmd.env("HOME", home).env_remove("ENV");
         let stdout = read_stdout_bounded(cmd, "the test shell", Duration::from_secs(10));
-        let _ = std::fs::remove_dir_all(&home);
         let stdout = stdout.expect("/bin/sh answers");
         let shell_env = parse_null_delimited(env_after_marker(&stdout).expect("marker"));
 
@@ -869,14 +868,6 @@ mod tests {
         cmd
     }
 
-    /// A path in the temp dir that no other test uses, and no leftover file.
-    fn a_fresh_temp_path(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("lucidos-shell-env-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        path
-    }
-
     #[test]
     fn a_hung_child_is_killed_at_the_deadline_and_reported() {
         let started = Instant::now();
@@ -903,7 +894,8 @@ mod tests {
         // child would touch the marker file half a second in, so its absence
         // afterwards proves the whole process GROUP was killed. Killing only
         // the shell would leave that child holding the stdout pipe.
-        let marker = a_fresh_temp_path("descendant");
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("descendant");
         let script = format!("( sleep 0.5; touch '{}' ) & sleep 30", marker.display());
         let started = Instant::now();
         read_stdout_bounded(

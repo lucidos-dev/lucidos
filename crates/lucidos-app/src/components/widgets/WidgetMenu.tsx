@@ -5,12 +5,14 @@ import {
   makeAppFromWidget,
   makeWidgetReusable,
   openWidgetInCanvas,
+  pinWidgetToHome,
   pinWidgetToShelf,
   showWidgetInThread,
   stopReusingWidget,
   unpinWidgetFromShelf,
 } from '../../store/actions/widget-actions';
-import { isHomeThread } from '../../store/actions/homeThread';
+import { homeThreadId, isHomeThread } from '../../store/actions/homeThread';
+import { threadWidget } from '../../store/widgets';
 import type { WidgetParams } from '../../utils/widgetParams';
 
 /** The widget instance a menu acts on, in the thread it is shown in. */
@@ -28,8 +30,11 @@ export interface WidgetMenuTarget {
   /** A built-in widget ships with Lucidos and is always reusable. */
   builtIn: boolean;
   pinned: boolean;
-  /** Where "Show in thread" lands. Absent on the thread's card, which is there. */
+  /** Where "Show in thread" lands. Absent on the inline widget, which is there. */
   shownEventId?: string;
+  /** The event that draws this inline widget. A pin records it, so "Show in
+   *  thread" lands back on it. */
+  drawnByEventId?: string;
 }
 
 function Item({ icon, label, hint, onClick }: {
@@ -90,9 +95,25 @@ export function widgetMenuItems({ run }: OverflowMenuContext, w: WidgetMenuTarge
           onClick={run(() => void unpinWidgetFromShelf(instance, w.name))}
         />
       ) : (
-        <PinItem threadId={w.threadId} onClick={run(() => void pinWidgetToShelf(instance, w.name))} />
+        <PinItem threadId={w.threadId} onClick={run(() => void pinWidgetToShelf(instance, w.name, w.drawnByEventId))} />
       )}
+      <PinToHomeItem target={w} run={run} />
     </>
+  );
+}
+
+/** Every thread but Home offers Pin to Home beside Pin to shelf, until the
+ *  instance is on Home's board (ADR 0432). */
+function PinToHomeItem({ target: w, run }: { target: WidgetMenuTarget; run: OverflowMenuContext['run'] }) {
+  const home = homeThreadId.value;
+  if (!home || home === w.threadId || threadWidget(home, w.appId, w.params)?.pinned) return null;
+  return (
+    <Item
+      icon={<PinIcon />}
+      label="Pin to Home"
+      hint="A tile on the Home board"
+      onClick={run(() => void pinWidgetToHome({ appId: w.appId, params: w.params, label: w.label }, w.name))}
+    />
   );
 }
 
@@ -101,20 +122,8 @@ function PinItem({ threadId, onClick }: { threadId: string; onClick: (e: MouseEv
   return <Item icon={<PinIcon />} label={isHomeThread(threadId) ? 'Pin to Home' : 'Pin to shelf'} onClick={onClick} />;
 }
 
-/** A *widget embed*'s menu, in a reply (ADR 0415). An embed records no
- *  showing, so its menu offers what needs none: a pin, which adds the instance
- *  to the shelf, and the widget full size in Canvas. */
-export function embedMenuItems({ run }: OverflowMenuContext, w: Omit<WidgetMenuTarget, 'reusable' | 'builtIn' | 'pinned' | 'shownEventId'>) {
-  const instance = { appId: w.appId, threadId: w.threadId, params: w.params, label: w.label };
-  return (
-    <>
-      <PinItem threadId={w.threadId} onClick={run(() => void pinWidgetToShelf(instance, w.name))} />
-      <Item
-        icon={<OpenInCanvasIcon />}
-        label="Open in Canvas"
-        hint="Full size, beside the thread"
-        onClick={run(() => void openWidgetInCanvas(w.appId, w.name, w.params))}
-      />
-    </>
-  );
+/** `widgetMenuItems` as a component, for the chunk `widgetMenuChunks.ts`
+ *  loads on demand. */
+export function WidgetMenuItems({ ctx, target }: { ctx: OverflowMenuContext; target: WidgetMenuTarget }) {
+  return widgetMenuItems(ctx, target);
 }

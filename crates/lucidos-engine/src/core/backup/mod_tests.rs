@@ -172,9 +172,8 @@ fn backup_run_from_event_parses_failed_and_bare_payload() {
 
 #[test]
 fn apply_pg_env_errors_on_malformed_url() {
-    // pg_env_vars returns empty Vec on parse failure; apply_pg_env must
-    // surface that as a loud Err so the subprocess never spawns with
-    // zero PG* vars and a misleading libpq error.
+    // A parse failure must be a loud Err, so `pg_dump` never spawns with no
+    // PG* vars and a misleading libpq error.
     let mut cmd = std::process::Command::new("true");
     assert!(apply_pg_env(&mut cmd, "mysql://x@y/z").is_err());
     assert!(apply_pg_env(&mut cmd, "not a url").is_err());

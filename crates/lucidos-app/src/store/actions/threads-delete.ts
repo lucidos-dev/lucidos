@@ -19,11 +19,11 @@ import { ApiError } from '../../api/client';
 import { deletePreflight, deleteThreadFamily, type DeletePreflight } from '../../api/threads';
 import type { ConfirmDetails } from '../types';
 import {
-  archivingThreadIds,
   showConfirm,
   showToast,
   threadMap,
 } from '../store';
+import { archiveRequestInFlight } from '../rowIntents';
 import { errorDetail } from '../../utils/errorDetail';
 import { blockedRefusal, blockerFromMembers } from './blockerCopy';
 import { collectThreadFamily } from './threadFamily';
@@ -140,7 +140,7 @@ export function formatDeleteErrorToast(err: unknown): string {
  *  user has confirmed something the engine was never going to do.
  */
 export async function handleDeleteThread(threadId: string): Promise<void> {
-  if (archivingThreadIds.value.has(threadId)) return;
+  if (archiveRequestInFlight(threadId)) return;
 
   let preflight: DeletePreflight;
   try {

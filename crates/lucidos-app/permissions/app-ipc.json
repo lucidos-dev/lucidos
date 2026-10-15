@@ -18,6 +18,7 @@
           "startup_status",
           "restart_app",
           "restart_service",
+          "follow_engine_switch",
           "quit_lucidos",
           "uninstall_lucidos",
           "open_url_external",

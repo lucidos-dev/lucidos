@@ -285,6 +285,7 @@ mod tests {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -410,6 +411,9 @@ mod tests {
                 coding_agent_kind: Default::default(),
                 coding_agent_folder: String::new(),
                 app_id: None,
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
         )
         .await;
@@ -468,6 +472,9 @@ mod tests {
                 coding_agent_kind: Default::default(),
                 coding_agent_folder: String::new(),
                 app_id: None,
+                integrated: false,
+                auto_compact_window: None,
+                auto_compact_arm: None,
             },
         )
         .await;

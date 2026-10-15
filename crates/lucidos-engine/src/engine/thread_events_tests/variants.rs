@@ -133,6 +133,8 @@ fn context_captured_event_type_and_persistence() {
             cache_read_tokens: 10_000,
             cache_creation_tokens: 200,
             modality: None,
+            service_tier: None,
+            cache_creation_1h_tokens: None,
         }),
         trimmed: false,
         trim_passes: Vec::new(),
@@ -195,6 +197,28 @@ fn context_captured_event_type_and_persistence() {
         }
         other => panic!("expected ContextCaptured, got {other:?}"),
     }
+}
+
+/// The 1-hour split is optional both ways: an older usage block reads as no
+/// split, and a producer that has none writes no key.
+#[test]
+fn a_usage_without_the_1_hour_split_reads_as_none_and_writes_no_key() {
+    let old: crate::engine::ApiUsage = serde_json::from_str(
+        r#"{"input_tokens":100,"output_tokens":5,"cache_read_tokens":0,"cache_creation_tokens":40}"#,
+    )
+    .unwrap();
+    assert_eq!(old.cache_creation_1h_tokens, None);
+    let written = serde_json::to_value(old).unwrap();
+    assert!(written.get("cache_creation_1h_tokens").is_none());
+
+    let split = crate::engine::ApiUsage {
+        cache_creation_1h_tokens: Some(40),
+        ..old
+    };
+    assert_eq!(
+        serde_json::to_value(split).unwrap()["cache_creation_1h_tokens"],
+        40
+    );
 }
 
 /// Back-compat for every capture row written before `purpose` existed, which
@@ -389,6 +413,7 @@ fn child_thread_completed_event_round_trips() {
         summary: "All green".into(),
         pending_change_ids: vec!["change-1".into()],
         sub_thread_pending_changes: vec![],
+        integrated_branch: None,
     };
     let v = serde_json::to_value(&evt).unwrap();
     assert_eq!(v["type"], "ChildThreadCompleted");
@@ -408,6 +433,7 @@ fn child_thread_completed_event_type_is_pascal_case_name() {
         summary: String::new(),
         pending_change_ids: vec![],
         sub_thread_pending_changes: vec![],
+        integrated_branch: None,
     };
     assert_eq!(evt.event_type(), "ChildThreadCompleted");
     assert!(evt.is_persisted());
@@ -425,6 +451,7 @@ fn child_thread_completed_skips_empty_optional_fields() {
         summary: "boom".into(),
         pending_change_ids: vec![],
         sub_thread_pending_changes: vec![],
+        integrated_branch: None,
     };
     let v = serde_json::to_value(&evt).unwrap();
     assert!(v.get("child_thread_title").is_none());
@@ -464,6 +491,7 @@ fn child_thread_completed_indexable_text_returns_summary() {
         summary: "deployment finished cleanly".into(),
         pending_change_ids: vec![],
         sub_thread_pending_changes: vec![],
+        integrated_branch: None,
     };
     assert_eq!(evt.indexable_text(), Some("deployment finished cleanly"));
 }
@@ -791,6 +819,7 @@ fn widget_events_carry_the_app_id_and_nothing_else() {
                 app_id: "fare-grid".into(),
                 params: None,
                 label: None,
+                shown_event_id: None,
             },
             "WidgetPinned",
         ),

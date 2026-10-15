@@ -22,7 +22,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
 
-use crate::planned::{query_state, PlannedState, NEW_THREAD_HANDOFF};
+use crate::planned::{card_shape, query_state, PlannedState};
 use crate::workspace::{resolve_from_env, BoxError};
 
 #[derive(Debug, Deserialize)]
@@ -100,25 +100,24 @@ pub(crate) fn build_deny_json(file_path: &str) -> String {
 /// fork kept `Request changes` as a third button, which then meant only "I will
 /// type what I want changed": the dead-end shape the prompts' NEVER AUTHOR AN
 /// "OTHER" OPTION rule bans.
-pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
+///
+/// `shape` is [`card_shape`]'s answer for this thread's measured context, the
+/// same text `lucidos planned mark` printed.
+pub(crate) fn build_awaiting_approval_json(file_path: &str, shape: &str) -> String {
     let reason = format!(
         "Edit blocked: the implementation plan on this branch is awaiting the user's approval. \
          Do NOT re-run the `implementation-plan` skill: the plan is already recorded. Summarize \
-         the plan in your message, then ASK FOR APPROVAL WITH THE `AskUserQuestion` TOOL, offering \
-         `Approve` and `Request changes`. The card's question is one short line that never \
-         repeats the summary. The option pair is a FLOOR: `Approve` first, `Request changes` second ONLY \
-         when the plan offers no real fork. If it offers one (a narrower scope, one layer instead \
-         of two), that fork takes the second slot and `Request changes` is dropped, never carried \
-         alongside it as a third. Approval is a DECISION question, not a post-work confirmation: \
+         the plan in your message, then ASK FOR APPROVAL WITH THE `AskUserQuestion` TOOL. The \
+         card's question is one short line that never repeats the summary. {shape} Approval is a \
+         DECISION question, not a post-work confirmation: \
          this very hook is blocking your edits until it is answered, so asking in plain prose \
          leaves the thread idle. Once the user approves, run `lucidos planned approve` to unblock \
          implementation, then retry your edit to `{path}`. Picking a fork is an approval too: \
          revise the plan file to that variant, re-commit, then run `lucidos planned approve`. If \
          the user requests changes instead, revise the plan file under docs/plans/, re-commit, \
          and ask again: the new message names only what changed, and the plan file holds the rest \
-         (the marker stays `proposed` until approved). {handoff}",
+         (the marker stays `proposed` until approved).",
         path = file_path,
-        handoff = NEW_THREAD_HANDOFF,
     );
     deny_envelope(&reason)
 }
@@ -183,9 +182,10 @@ pub(crate) fn run() -> Result<(), BoxError> {
     match query_state(&ws) {
         Ok(PlannedState::Satisfied) => Ok(()),
         Ok(PlannedState::Proposed) => {
+            let shape = card_shape(crate::successor::read_own_context(&ws));
             println!(
                 "{}",
-                build_awaiting_approval_json(&payload.tool_input.file_path)
+                build_awaiting_approval_json(&payload.tool_input.file_path, &shape)
             );
             Ok(())
         }
@@ -270,7 +270,11 @@ mod tests {
 
     #[test]
     fn awaiting_approval_json_directs_to_approve_not_replan() {
-        let out = build_awaiting_approval_json("/tmp/x.rs");
+        let small = crate::successor::ContextReading::Read {
+            input_tokens: Some(40_000),
+            offer: false,
+        };
+        let out = build_awaiting_approval_json("/tmp/x.rs", &card_shape(small));
         let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -301,7 +305,7 @@ mod tests {
         // option pair identical to the prompt rules and the skill.
         for needle in [
             "`AskUserQuestion`",
-            "`Approve` and `Request changes`",
+            "`Approve` / `Request changes`",
             "DECISION question",
             // The pair is a FLOOR, described the same way here as in the two
             // prompt rules and the skill: a plan that offers a real fork puts
@@ -314,16 +318,6 @@ mod tests {
             // The card renders under the agent's message. A card restating the
             // summary makes the user read the plan twice.
             "never repeats the summary",
-            // A heavy planning thread can hand the build to a fresh child. The
-            // option drops `Request changes` exactly as a fork does, and the
-            // builder merges this branch to get the plan commit.
-            "`Implement in a new thread`",
-            "`Request changes` is dropped whenever it appears",
-            // Without a backend flag the spawn starts a chat thread, which
-            // has no worktree to merge into or build in.
-            "--relation child --coding-agent",
-            "git merge <this branch>",
-            "without asking again",
         ] {
             assert!(
                 reason.contains(needle),
@@ -331,6 +325,36 @@ mod tests {
                  (missing {needle:?}): {reason}"
             );
         }
+    }
+
+    /// I11: the number decides the shape, never the agent. A large thread
+    /// leads with the successor; a small or unreadable one gets today's pair.
+    #[test]
+    fn the_card_shape_follows_the_measured_context() {
+        use crate::successor::ContextReading;
+        let large = card_shape(ContextReading::Read {
+            input_tokens: Some(240_000),
+            offer: true,
+        });
+        for needle in [
+            "240k tokens",
+            "`Implement in a new thread (Recommended)` first",
+            "`Approve here` second",
+            "Never offer `Request changes`",
+            "lucidos successor spawn --narrative",
+            "without asking again",
+        ] {
+            assert!(large.contains(needle), "missing {needle:?}: {large}");
+        }
+        let small = card_shape(ContextReading::Read {
+            input_tokens: Some(240_000),
+            offer: false,
+        });
+        assert!(small.contains("`Approve` / `Request changes`"));
+        assert!(!small.contains("new thread"), "the engine said no: {small}");
+        let unknown = card_shape(ContextReading::Unknown);
+        assert!(unknown.contains("`Approve` / `Request changes`"));
+        assert!(unknown.contains("could not read this thread's context size"));
     }
 
     #[test]

@@ -4,14 +4,11 @@ use super::{plugin_trigger_slug, validate_plugin_triggers_event_driven};
 use crate::core::plugins::PlannedFile;
 use std::path::PathBuf;
 
-fn tmpfile(name: &str, contents: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "lucidos_plugin_trig_{}_{}",
-        name,
-        uuid::Uuid::new_v4()
-    ));
+fn tmpfile(name: &str, contents: &str) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join(name);
     std::fs::write(&p, contents).unwrap();
-    p
+    (tmp, p)
 }
 
 #[test]
@@ -32,7 +29,7 @@ fn plugin_trigger_slug_matches_only_trigger_toml() {
 
 #[test]
 fn event_driven_trigger_passes_validation() {
-    let src = tmpfile(
+    let (_tmp, src) = tmpfile(
         "event",
         r#"
 name = "On sleep"
@@ -52,7 +49,7 @@ event_type = "SleepImported"
 
 #[test]
 fn cron_bearing_trigger_is_rejected() {
-    let src = tmpfile(
+    let (_tmp, src) = tmpfile(
         "cron",
         r#"
 name = "Nightly"
@@ -73,7 +70,7 @@ intent = "run"
 
 #[test]
 fn malformed_trigger_toml_is_rejected() {
-    let src = tmpfile("bad", "this is not = valid toml [[[");
+    let (_tmp, src) = tmpfile("bad", "this is not = valid toml [[[");
     let planned = vec![PlannedFile {
         source: src,
         data_relative: "triggers/bad/trigger.toml".to_string(),

@@ -2,7 +2,7 @@
 //!
 //! Each `AgentRuntime` implementor builds its own CLI command (flags, stdio,
 //! protocol) but the *Lucidos* environment contract — workspace resolution,
-//! host-process protection, Postgres credentials, subprocess-origin
+//! host-process protection, the workspace database handle, subprocess-origin
 //! attribution, spawn metadata — is agent-independent. Centralizing it here
 //! means a new runtime (Codex, ForgeCode, …) cannot ship without it, and a
 //! change to the contract lands in one place.
@@ -14,7 +14,7 @@ use std::path::Path;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use super::agent_run_marker::{AgentRunMarker, AGENT_RUN_ENV};
+use super::agent_run_marker::AGENT_RUN_ENV;
 use super::agent_runtime::SpawnArgs;
 use super::lucidos_cli::path_with_prefixes;
 
@@ -26,37 +26,36 @@ use super::lucidos_cli::path_with_prefixes;
 /// - `LUCIDOS_WORKSPACE` — workspace resolution for the `lucidos` CLI.
 /// - Host-process protection (`LUCIDOS_HOST_PID` + friends) — see
 ///   `api::actor::host_protection_env_vars`.
-/// - `PG*` vars so the agent can run `psql -c '…'` bare without leaking the
-///   password into persisted tool-call argv — see `core::pg_env_vars`.
+/// - `LUCIDOS_DATABASE_URL`, the read-only workspace database handle. No
+///   `PG*` vars: an empty connection string must reach nothing (ADR 0481).
 /// - Subprocess-origin attribution (`LUCIDOS_AGENT_ORIGIN_TOKEN` +
 ///   `LUCIDOS_THREAD_ID`) — see `api::actor::subprocess_origin_env_vars`.
 /// - `LUCIDOS_EVENT_ID` / `LUCIDOS_REPO` / `LUCIDOS_SESSION_KIND` spawn
 ///   metadata consumed by `lucidos spawn-thread` and `cc-stop-reminder`.
-/// - A fresh agent run marker (`LUCIDOS_AGENT_RUN`). It is returned, so the
-///   caller can reap what outlives the agent (`agent_run_marker`).
+/// - The agent run marker (`LUCIDOS_AGENT_RUN`) from `args.agent_run`, whose
+///   `finish` reaps what outlives the agent (`agent_run_marker`).
 /// - The compile env from `agent_compile_env`: `RUSTC_WRAPPER` (sccache when
 ///   on PATH, explicitly empty otherwise), the agents' own sccache daemon, and
 ///   a Lucidos source tree's compile mode.
 /// - `PATH` prefixed with the `lucidos` CLI dir when one was found, AND the
-///   bundled Postgres bin dir (`LUCIDOS_PG_BIN_DIR`) when set — a packaged
-///   build's `psql` lives there, not on the service manager's minimal PATH,
-///   and the `PG*` vars above advertise that bare `psql -c '…'` works.
+///   bundled Postgres bin dir (`LUCIDOS_PG_BIN_DIR`) when set. A packaged
+///   build's `psql` lives there, not on the service manager's minimal PATH.
 ///   Mirrors `workspace_script_env_vars` (chat bash/python tools).
 pub(super) fn apply_lucidos_env(
     cmd: &mut tokio::process::Command,
     args: &SpawnArgs<'_>,
     cli_dir: Option<&Path>,
     log_label: &str,
-) -> AgentRunMarker {
+) {
     // User-managed env vars FIRST so every engine-owned var below overrides on
     // collision (e.g. a user `LUCIDOS_REPO` is replaced by the spawn's repo
     // context). The pairs are already reserved-name-filtered by `env_pairs`.
     crate::core::apply_to_subprocess_env(cmd, args.user_env_vars);
     cmd.env("LUCIDOS_WORKSPACE", args.workspace_path);
-    for (key, value) in crate::api::actor::host_protection_env_vars(args.workspace_path) {
+    for (key, value) in crate::api::actor::host_protection_env_vars() {
         cmd.env(key, value);
     }
-    for (key, value) in crate::core::pg_env_vars_cached() {
+    if let Some((key, value)) = crate::core::lucidos_database_url_env() {
         cmd.env(key, value);
     }
     // A coding-agent session emits from a spawn tree no task-local reaches.
@@ -94,8 +93,7 @@ pub(super) fn apply_lucidos_env(
     if args.interactive {
         cmd.env("LUCIDOS_SESSION_KIND", "interactive");
     }
-    let marker = AgentRunMarker::mint();
-    cmd.env(AGENT_RUN_ENV, marker.value());
+    cmd.env(AGENT_RUN_ENV, args.agent_run.marker().value());
     // sccache speeds up the heavy lucidos-engine rebuilds an agent session
     // triggers, but it's a dev-machine optimization (installed by
     // scripts/lib/preflight.sh), not a runtime dependency of the shipped
@@ -125,14 +123,13 @@ pub(super) fn apply_lucidos_env(
             }
         }
     }
-    marker
 }
 
 /// The dirs to prepend to an agent child's PATH: the `lucidos` CLI dir first
 /// (so `lucidos …` resolves — its position is load-bearing for the workspace
 /// symlink contract), then the bundled Postgres bin dir when the packaged env
-/// provides one that exists (so the advertised bare `psql -c '…'` resolves —
-/// mirrors `workspace_script_env_vars` for chat bash/python tools). In dev
+/// provides one that exists, so `psql "$LUCIDOS_DATABASE_URL"` resolves. It
+/// mirrors `workspace_script_env_vars` for chat bash/python tools. In dev
 /// `LUCIDOS_PG_BIN_DIR` is unset ⇒ no PG entry, unchanged behavior. Split from
 /// `apply_lucidos_env` so the decision is unit-testable without process env.
 fn agent_path_prefixes(
@@ -392,6 +389,13 @@ pub(crate) fn kill_child_process_group_now(pid: u32) {
     signal_child_process_group(pid, KILL_SIGNAL);
 }
 
+/// SIGTERM a child's whole process group, and return at once. For a caller
+/// that waits on the child itself and forces only what outlives its grace.
+/// Same reaping caveat as [`kill_child_process_group_now`].
+pub(crate) fn terminate_child_process_group(pid: u32) {
+    signal_child_process_group(pid, TERM_SIGNAL);
+}
+
 /// The process group `pid` belongs to, or `None` when the process is gone or
 /// the pid cannot be named. A read, never a signal.
 #[cfg(unix)]
@@ -412,6 +416,11 @@ pub(crate) fn process_group_of(_pid: u32) -> Option<u32> {
 const KILL_SIGNAL: i32 = libc::SIGKILL;
 #[cfg(not(unix))]
 const KILL_SIGNAL: i32 = 9;
+/// `SIGTERM`, named for the same reason.
+#[cfg(unix)]
+const TERM_SIGNAL: i32 = libc::SIGTERM;
+#[cfg(not(unix))]
+const TERM_SIGNAL: i32 = 15;
 
 /// Drain remaining stderr from an agent child (up to 4 KB).
 ///
@@ -520,6 +529,7 @@ pub(crate) fn agent_compile_env(worktree: &Path) -> Vec<(&'static str, String)> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::agent_run_marker::AgentRun;
     use super::*;
 
     /// A pid of 0 must never reach `kill`. `kill(0, sig)` signals the caller's
@@ -569,33 +579,85 @@ mod tests {
             binary_override: None,
             permission_mode: None,
             additional_directories: &[],
+            auto_compact: None,
+            agent_run: AgentRun::unrecorded(),
         }
     }
 
-    /// The teardown reaps by the marker it was handed. If that differed from
-    /// the one in the agent's environment, nothing would ever match.
-    #[tokio::test]
-    async fn every_agent_spawn_carries_the_fresh_marker_it_returns() {
+    /// Codex's env is exactly this shared contract, so the auto-compact trial
+    /// must never reach it, whatever the spawn carries.
+    #[test]
+    fn the_shared_env_contract_never_sets_the_auto_compact_window() {
+        use crate::engine::auto_compact_trial::{decide, TrialMode, AUTO_COMPACT_WINDOW_ENV};
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let mut args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
+        args.auto_compact = decide(TrialMode::On, None, uuid::Uuid::new_v4());
+        let mut cmd = tokio::process::Command::new("true");
+        apply_lucidos_env(&mut cmd, &args, None, "SpawnEnvTest");
+        assert!(
+            !cmd.as_std()
+                .get_envs()
+                .any(|(key, value)| key == AUTO_COMPACT_WINDOW_ENV && value.is_some()),
+            "a Codex spawn must not get the window"
+        );
+    }
+
+    /// The incident: an unset variable made `psql ""`, and libpq fell back to
+    /// the injected `PG*` vars, which named the live workspace database. The
+    /// agent gets only the read-only handle (ADR 0481).
+    #[test]
+    fn an_agent_spawn_gets_the_read_only_handle_and_no_libpq_defaults() {
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
-        let stamped = |cmd: &tokio::process::Command| {
-            cmd.as_std()
-                .get_envs()
-                .find(|(key, _)| *key == AGENT_RUN_ENV)
-                .and_then(|(_, value)| value?.to_str().map(str::to_string))
-        };
-
-        let mut first = tokio::process::Command::new("true");
-        let first_marker = apply_lucidos_env(&mut first, &args, None, "SpawnEnvTest");
-        let mut second = tokio::process::Command::new("true");
-        let second_marker = apply_lucidos_env(&mut second, &args, None, "SpawnEnvTest");
-
-        assert_eq!(stamped(&first).as_deref(), Some(first_marker.value()));
-        assert_eq!(stamped(&second).as_deref(), Some(second_marker.value()));
-        assert_ne!(
-            first_marker, second_marker,
-            "each spawn gets its own marker"
+        let mut cmd = tokio::process::Command::new("true");
+        apply_lucidos_env(&mut cmd, &args, None, "SpawnEnvTest");
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for name in [
+            "PGUSER",
+            "PGPASSWORD",
+            "PGHOST",
+            "PGPORT",
+            "PGDATABASE",
+            "DATABASE_URL",
+        ] {
+            assert!(!envs.contains_key(name), "{name} reached the agent");
+        }
+        let handle = envs
+            .get(crate::core::LUCIDOS_DATABASE_URL)
+            .cloned()
+            .flatten()
+            .expect("the agent gets the database handle");
+        assert!(
+            handle.ends_with(lucidos_pg_url::READ_ONLY_OPTION),
+            "{handle}"
         );
+    }
+
+    /// The driver reaps by the run it was handed. If that marker differed from
+    /// the one in the agent's environment, nothing would ever match.
+    #[tokio::test]
+    async fn every_agent_spawn_carries_the_marker_of_its_run() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
+
+        let mut cmd = tokio::process::Command::new("true");
+        apply_lucidos_env(&mut cmd, &args, None, "SpawnEnvTest");
+        let stamped = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == AGENT_RUN_ENV)
+            .and_then(|(_, value)| value?.to_str().map(str::to_string));
+
+        assert_eq!(stamped.as_deref(), Some(args.agent_run.marker().value()));
     }
 
     /// Guards the exclusion, so widening it fails here rather than in a
@@ -737,9 +799,9 @@ mod tests {
     }
 
     // ── Agent-child PATH prefixes (agent_path_prefixes) ────────────────────
-    // Packaged builds: bare `psql` inside a CC/Codex session must resolve to
-    // the bundled Postgres (LUCIDOS_PG_BIN_DIR) — the PG* env vars advertise
-    // it. Dev (no env var) stays cli-dir-only.
+    // Packaged builds: `psql` inside a CC/Codex session must resolve to the
+    // bundled Postgres (LUCIDOS_PG_BIN_DIR). Dev (no env var) stays
+    // cli-dir-only.
 
     #[test]
     fn agent_path_prefixes_cli_dir_only_in_dev() {

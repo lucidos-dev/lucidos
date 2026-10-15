@@ -5,9 +5,11 @@ use uuid::Uuid;
 
 use super::event;
 use crate::engine::summary_tree::log::{
-    cap, project, EntryKind, StoredEvent, ThreadKind, ENTRY_EVENT_TYPES, TURN_END_EVENT_TYPES,
+    cap, project, EntryKind, StoredEvent, ThreadKind, ENTRY_EVENT_TYPES, LOADED_KNOWHOW_POINTER,
+    TURN_END_EVENT_TYPES,
 };
 use crate::engine::thread_events::ActorMode;
+use crate::llm::tool_names::LOAD_KNOWHOW;
 
 fn stored(values: Vec<serde_json::Value>) -> Vec<StoredEvent> {
     values
@@ -55,6 +57,40 @@ fn a_lucidos_agent_turn_logs_at_full_fidelity() {
             ),
             (EntryKind::Result, "[read_file] # Plan".to_string()),
             (EntryKind::Response, "The plan has one heading.".to_string()),
+        ]
+    );
+}
+
+/// A loaded doc's body rides the loaded-knowhow section and leaves with it, so
+/// the log keeps a pointer. A not-found answer or a failure is no body, and
+/// logs as it is.
+#[test]
+fn a_load_knowhow_result_logs_a_pointer_not_the_body() {
+    let body = "[SYSTEM-KNOWHOW: lucidos-cli]\nthe whole recipe";
+    let missing = "System knowhow 'nope' not found.";
+    let entries = kinds_and_texts(
+        ThreadKind::LucidosAgent,
+        vec![
+            json!({"type": "MessageReceived", "text": "load it", "mode": "human"}),
+            json!({"type": "ToolCalled", "name": LOAD_KNOWHOW, "args": {"id": "lucidos-cli"}}),
+            json!({"type": "ToolResult", "name": LOAD_KNOWHOW, "result": body}),
+            json!({"type": "ToolCalled", "name": LOAD_KNOWHOW, "args": {"id": "nope"}}),
+            json!({"type": "ToolResult", "name": LOAD_KNOWHOW, "result": missing}),
+            json!({"type": "ToolCalled", "name": LOAD_KNOWHOW, "args": {}}),
+            json!({"type": "ToolResult", "name": LOAD_KNOWHOW, "result": "id is required", "success": false}),
+        ],
+    );
+    let results: Vec<&str> = entries
+        .iter()
+        .filter(|(kind, _)| *kind == EntryKind::Result)
+        .map(|(_, text)| text.as_str())
+        .collect();
+    assert_eq!(
+        results,
+        vec![
+            format!("[{LOAD_KNOWHOW}] {LOADED_KNOWHOW_POINTER}").as_str(),
+            format!("[{LOAD_KNOWHOW}] {missing}").as_str(),
+            format!("[{LOAD_KNOWHOW}] id is required").as_str(),
         ]
     );
 }
@@ -293,4 +329,24 @@ fn every_projected_type_is_in_a_type_list() {
     for name in ["ResponseGenerated", "CodingAgentIdled"] {
         assert!(TURN_END_EVENT_TYPES.contains(&name), "{name}");
     }
+}
+
+#[test]
+fn every_entry_kind_is_listed_once() {
+    // An exhaustive match: a new variant fails to compile until it is listed.
+    fn listed(kind: EntryKind) -> bool {
+        match kind {
+            EntryKind::Prompt(ActorMode::Human | ActorMode::Agent | ActorMode::Engine)
+            | EntryKind::Response
+            | EntryKind::Call
+            | EntryKind::Result
+            | EntryKind::Report
+            | EntryKind::Turn
+            | EntryKind::Artifact => EntryKind::ALL.contains(&kind),
+        }
+    }
+    assert!(EntryKind::ALL.into_iter().all(listed));
+    let names: std::collections::HashSet<&str> =
+        EntryKind::ALL.iter().map(EntryKind::as_str).collect();
+    assert_eq!(names.len(), EntryKind::ALL.len());
 }

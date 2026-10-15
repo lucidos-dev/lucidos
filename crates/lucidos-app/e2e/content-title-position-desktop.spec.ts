@@ -39,7 +39,7 @@
  */
 import { test, expect, type Page } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
-import { assertHealthy, gotoWithRetry, clickVisibleElement } from './helpers';
+import { assertHealthy, gotoWithRetry, clickVisibleElement, hideHomeRail } from './helpers';
 
 const APP_ID = 'e2e-desktop-title-position';
 const APP_NAME = 'Half Marathon';
@@ -182,6 +182,7 @@ test.describe('the desktop content title holds its position across views', () =>
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+    await hideHomeRail(page);
   });
 
   test('the chevrons land on the same x for a short and a long title', async ({ page }) => {

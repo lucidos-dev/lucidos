@@ -402,6 +402,27 @@ async fn add_paths_to_worktree_exclude_is_idempotent() {
     assert_eq!(skill_count, 1, "skill dir duplicated: {body}");
 }
 
+/// The entries must be on disk when the call returns, because the caller runs
+/// `git status` next. A tokio `File` write only queues the bytes on the
+/// blocking pool, so a busy host ran git against the old exclude file. The
+/// read is synchronous on purpose: it must not yield to that pool first.
+#[tokio::test]
+async fn add_paths_to_worktree_exclude_has_written_every_entry_when_it_returns() {
+    let (_tmp, repo) = make_test_repo().await;
+    let exclude = repo.join(".git/info/exclude");
+
+    for i in 0..200 {
+        let entry = format!("entry-{i}/");
+        add_paths_to_worktree_exclude(&repo, &[entry.as_str()]).await;
+
+        let body = std::fs::read_to_string(&exclude).unwrap_or_default();
+        assert!(
+            body.lines().any(|l| l == entry),
+            "{entry} was still in flight when the call returned: {body}"
+        );
+    }
+}
+
 /// Regression test for the fact that git silently ignores per-worktree
 /// `info/exclude` files — exclude entries must land in the COMMON
 /// .git/info/exclude or `git status` won't honor them. This test exercises

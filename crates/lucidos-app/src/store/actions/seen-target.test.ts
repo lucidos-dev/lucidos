@@ -39,17 +39,21 @@ import {
   settingsSubview,
   splitRatio,
   threadMap,
-  unreadNotifications,
+  servedUnreadNotifications,
 } from '../store';
 import { makeThreadState } from './threads-test-helpers';
 import {
+  MAX_HELD_ARRIVALS,
   RENDER_WATCH_MS,
   SEEN_DWELL_MS,
+  _heldArrivalCountForTesting,
   _resetSeenTargetWatchForTesting,
   contentPaneOnScreen,
   emptySeenWaits,
   installSeenTargetWatch,
   nextDwellDueIn,
+  noteArrivalWhileAway,
+  noteArrivalWhilePresent,
   pruneSeenWaits,
   resampleSeenTargets,
   sampleSeen,
@@ -256,13 +260,13 @@ describe('the watch', () => {
     settingsSubview.value = 'main';
     splitRatio.value = 0.4;
     mobileView.value = 'thread';
-    unreadNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
     _resetSeenTargetWatchForTesting();
     installSeenTargetWatch();
   });
 
   afterEach(() => {
-    unreadNotifications.value = { status: 'not-loaded' };
+    servedUnreadNotifications.value = { status: 'not-loaded' };
     _resetSeenTargetWatchForTesting();
     removeObserverFakes();
     vi.useRealTimers();
@@ -278,7 +282,7 @@ describe('the watch', () => {
   it('reads a notification whose event card is in the band', () => {
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(true);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     dwell();
     expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
   });
@@ -287,7 +291,7 @@ describe('the watch', () => {
     // This is §4 Row 2. Being on the thread is not being at the event.
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(false);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     dwell();
     expect(markReadOptimistic).not.toHaveBeenCalled();
   });
@@ -295,7 +299,7 @@ describe('the watch', () => {
   it('leaves a notification whose card is in another thread', () => {
     focusedThreadId.value = 't-2';
     isInViewport.mockReturnValue(true);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     dwell();
     expect(markReadOptimistic).not.toHaveBeenCalled();
   });
@@ -304,7 +308,7 @@ describe('the watch', () => {
     focusedThreadId.value = 't-1';
     splitRatio.value = 0;
     isInViewport.mockReturnValue(true);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     dwell();
     expect(markReadOptimistic).not.toHaveBeenCalled();
   });
@@ -313,9 +317,153 @@ describe('the watch', () => {
     activeMenuItem.value = 'settings';
     settingsSubview.value = 'backup';
     const tap = { kind: 'navigate', to: { target: 'settings', settings_view: 'backup' } } as Tap;
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', tap)] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', tap)] };
     dwell();
     expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+  });
+
+  /** The reported bug. An agent's `send_notification` taps to its own thread,
+   *  and the reader is in that thread when it lands. Being there is not seeing
+   *  it: the toast is its surface, or the bell badge with toasts off. */
+  describe('a notification that lands where the reader already is', () => {
+    it('stays unread for the visit under way when it arrived', () => {
+      focusedThreadId.value = 't-1';
+      noteArrivalWhilePresent('n-1');
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      dwell();
+      vi.setSystemTime(SEEN_DWELL_MS * 5);
+      resampleSeenTargets();
+      expect(markReadOptimistic).not.toHaveBeenCalled();
+    });
+
+    it('is read by a later visit, once the reader leaves and comes back', () => {
+      focusedThreadId.value = 't-1';
+      noteArrivalWhilePresent('n-1');
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      resampleSeenTargets();
+      focusedThreadId.value = 't-2';
+      resampleSeenTargets();
+      focusedThreadId.value = 't-1';
+      vi.setSystemTime(100);
+      resampleSeenTargets();
+      vi.setSystemTime(100 + SEEN_DWELL_MS);
+      resampleSeenTargets();
+      expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+    });
+
+    it('is read by a later visit after the page stops being active', () => {
+      focusedThreadId.value = 't-1';
+      noteArrivalWhilePresent('n-1');
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      resampleSeenTargets();
+      isPageActive.mockReturnValue(false);
+      resampleSeenTargets();
+      isPageActive.mockReturnValue(true);
+      vi.setSystemTime(100);
+      resampleSeenTargets();
+      vi.setSystemTime(100 + SEEN_DWELL_MS);
+      resampleSeenTargets();
+      expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+    });
+
+    it('is not held when it arrives while the page is inactive', () => {
+      focusedThreadId.value = 't-1';
+      isPageActive.mockReturnValue(false);
+      noteArrivalWhilePresent('n-1');
+      isPageActive.mockReturnValue(true);
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      dwell();
+      expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+    });
+
+    it('lets go once its presence check shows the page was away', () => {
+      // An iOS PWA resuming flushes NotificationCreated while already active.
+      // Its presence check is stale by then, and the OS push was the surface.
+      focusedThreadId.value = 't-1';
+      noteArrivalWhilePresent('n-1');
+      noteArrivalWhileAway('n-1');
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      dwell();
+      expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+    });
+
+    it('is held before the unread set lands', () => {
+      // The creation event starts the reload, so the hold always beats it.
+      focusedThreadId.value = 't-1';
+      servedUnreadNotifications.value = { status: 'loaded', data: [] };
+      noteArrivalWhilePresent('n-1');
+      resampleSeenTargets();
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      dwell();
+      expect(markReadOptimistic).not.toHaveBeenCalled();
+    });
+
+    it('is read by a visit that starts before the unread set lands', () => {
+      focusedThreadId.value = 't-2';
+      servedUnreadNotifications.value = { status: 'loaded', data: [] };
+      noteArrivalWhilePresent('n-1');
+      focusedThreadId.value = 't-1';
+      resampleSeenTargets();
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      dwell();
+      expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+    });
+
+    it('is read after a round trip away that ends before the unread set lands', () => {
+      focusedThreadId.value = 't-1';
+      servedUnreadNotifications.value = { status: 'loaded', data: [] };
+      noteArrivalWhilePresent('n-1');
+      focusedThreadId.value = 't-2';
+      resampleSeenTargets();
+      focusedThreadId.value = 't-1';
+      resampleSeenTargets();
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      dwell();
+      expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+    });
+
+    it('is forgotten once read, while the reader stays put', () => {
+      focusedThreadId.value = 't-1';
+      noteArrivalWhilePresent('n-1');
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      resampleSeenTargets();
+      expect(_heldArrivalCountForTesting()).toBe(1);
+      servedUnreadNotifications.value = { status: 'loaded', data: [] };
+      expect(_heldArrivalCountForTesting()).toBe(0);
+    });
+
+    it('keeps at most MAX_HELD_ARRIVALS, the newest, however long the reader stays', () => {
+      // A row read before its reload lands never enters the unread set, so
+      // nothing prunes its arrival while the reader stays put.
+      focusedThreadId.value = 't-1';
+      for (let i = 0; i <= MAX_HELD_ARRIVALS; i++) noteArrivalWhilePresent(`n-${i}`);
+      expect(_heldArrivalCountForTesting()).toBe(MAX_HELD_ARRIVALS);
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-0', threadTap('t-1'))] };
+      dwell();
+      expect(markReadOptimistic).toHaveBeenCalledWith('n-0');
+    });
+
+    it('is read by the first visit when it arrived somewhere else', () => {
+      focusedThreadId.value = 't-2';
+      noteArrivalWhilePresent('n-1');
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1'))] };
+      resampleSeenTargets();
+      focusedThreadId.value = 't-1';
+      vi.setSystemTime(100);
+      resampleSeenTargets();
+      vi.setSystemTime(100 + SEEN_DWELL_MS);
+      resampleSeenTargets();
+      expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+    });
+
+    it('leaves an event target to its card, which Row 1 reads on arrival', () => {
+      focusedThreadId.value = 't-1';
+      isInViewport.mockReturnValue(true);
+      noteArrivalWhilePresent('n-1');
+      servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+      dwell();
+      expect(markReadOptimistic).toHaveBeenCalledWith('n-1');
+    });
   });
 
   it('never reads a modal notification, whatever is on screen', () => {
@@ -324,7 +472,7 @@ describe('the watch', () => {
     const row = unread('n-1', { kind: 'modal' });
     // Provenance only. Its thread being read must not clear it.
     (row as { thread_id?: string }).thread_id = 't-1';
-    unreadNotifications.value = { status: 'loaded', data: [row] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [row] };
     dwell();
     expect(markReadOptimistic).not.toHaveBeenCalled();
   });
@@ -426,7 +574,7 @@ describe('the watch', () => {
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(true);
     isPageActive.mockReturnValue(false);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     dwell();
     expect(markReadOptimistic).not.toHaveBeenCalled();
   });
@@ -434,7 +582,7 @@ describe('the watch', () => {
   it('starts the dwell again after a background, never resuming it', () => {
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(true);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     resampleSeenTargets();
     isPageActive.mockReturnValue(false);
     vi.setSystemTime(500);
@@ -455,7 +603,7 @@ describe('the watch', () => {
     isInViewport.mockReturnValue(true);
     resampleSeenTargets();
     vi.setSystemTime(5000);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     resampleSeenTargets();
     vi.setSystemTime(5000 + SEEN_DWELL_MS);
     resampleSeenTargets();
@@ -465,7 +613,7 @@ describe('the watch', () => {
   it('reads each notification once, however many samples land', () => {
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(true);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     dwell();
     for (let i = 2; i < 8; i++) {
       vi.setSystemTime(SEEN_DWELL_MS * i);
@@ -481,7 +629,7 @@ describe('the watch', () => {
     // The whole chain with nothing driven by hand: the location effect, the
     // coalescer, and the timer the first sample schedules for itself.
     isInViewport.mockReturnValue(true);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     focusedThreadId.value = 't-1';
     vi.advanceTimersByTime(A_FRAME);
     expect(markReadOptimistic).not.toHaveBeenCalled();
@@ -498,7 +646,7 @@ describe('the watch', () => {
     stubQuerySelectorAll(() => cards);
 
     focusedThreadId.value = 't-1';
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     resampleSeenTargets();
 
     // The card is not in the DOM yet, so the render watch is what stands guard.
@@ -521,7 +669,7 @@ describe('the watch', () => {
     stubQuerySelectorAll(() => []);
 
     focusedThreadId.value = 't-1';
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     resampleSeenTargets();
     expect(observers.mutation).toHaveLength(1);
     expect(observers.disconnected).toBe(0);
@@ -540,7 +688,7 @@ describe('the watch', () => {
     // survived the blur would complete on the advance below.
     focusedThreadId.value = 't-1';
     isInViewport.mockReturnValue(true);
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     resampleSeenTargets();
 
     window.dispatchEvent(new Event('blur'));
@@ -557,7 +705,7 @@ describe('the watch', () => {
     // The card enters the band with no navigation at all, which is the case a
     // location-only rule would miss.
     focusedThreadId.value = 't-1';
-    unreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
+    servedUnreadNotifications.value = { status: 'loaded', data: [unread('n-1', threadTap('t-1', 'e-1'))] };
     vi.advanceTimersByTime(SEEN_DWELL_MS * 2);
     expect(markReadOptimistic).not.toHaveBeenCalled();
     isInViewport.mockReturnValue(true);
@@ -571,7 +719,7 @@ describe('the watch', () => {
     // Drawer browsing with the arrow keys. Each thread's card is in the band on
     // arrival, and none of them is read.
     isInViewport.mockReturnValue(true);
-    unreadNotifications.value = {
+    servedUnreadNotifications.value = {
       status: 'loaded',
       data: [
         unread('n-1', threadTap('t-1', 'e-1')),

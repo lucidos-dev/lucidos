@@ -40,6 +40,7 @@ fn user_message(text: &str) -> ThreadEvent {
     ThreadEvent::MessageReceived {
         provider: None,
         voice_session_id: None,
+        wake_mode: None,
         text: text.into(),
         user_image_hashes: vec![],
         device_id: None,
@@ -154,6 +155,9 @@ async fn cancel_does_not_terminate_session() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta(),
     })

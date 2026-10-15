@@ -6,7 +6,7 @@ import {
   putMcpAllowedTools,
   removeMcpServer,
   setMcpAutoApprove,
-  setMcpDisabledTools,
+  setMcpToolDisabled,
   startMcpServer,
   stopMcpServer,
   type McpServerStatus,
@@ -27,6 +27,7 @@ import { LoadableToggle } from '../shared/LoadableToggle';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkeletonProvider, SkText } from '../shared/Skeleton';
 import { AllowlistEditor } from './AllowlistEditor';
+import { intentsAfterServe, toolIntentKey, withToolIntents, type ToolIntents } from './mcpToolIntents';
 import {
   describeMcpRowError,
   mcpHeaderSummary,
@@ -35,8 +36,6 @@ import {
   mcpServerStateLabel,
   mcpToolCostLine,
   type McpServerState,
-  disabledWireNames,
-  patchToolDisabled,
   sortToolsByCost,
   type McpHeaderSummary,
   type McpRowError,
@@ -87,14 +86,11 @@ function mcpToolRow(tool: McpToolStatus, props: McpServerRowProps): VNode {
       </div>
       <div class="mcp-tool-actions">
         {/* No switch without a wire name: `disabled_tools` holds wire names, so
-            there is nothing to store, and the tool is already uncallable.
-            Held while a server verb runs, because that verb reloads the list
-            and a flip made under it would be reverted by the reply. */}
+            there is nothing to store, and the tool is already uncallable. */}
         {wire !== null && (
           <LoadableToggle
             loaded
             checked={!tool.disabled}
-            disabled={props.pending != null}
             ariaLabel={`Offer ${wire} to the agent`}
             onChange={(on) => props.onSetToolDisabled?.(wire, !on)}
           />
@@ -229,8 +225,8 @@ function mcpCostSummary(summary: McpHeaderSummary | null, sk = false): VNode {
         <SkText class="mcp-cost-share" as="div" w="14rem">{summary?.share}</SkText>
       )}
       {!sk && summary?.warning && <div class="mcp-cost-warning">{summary.warning}</div>}
-      {(sk || summary?.stopped) && (
-        <SkText class="mcp-cost-aside" as="div" w="17rem">{summary?.stopped}</SkText>
+      {(sk || summary?.running) && (
+        <SkText class="mcp-cost-aside" as="div" w="17rem">{summary?.running}</SkText>
       )}
       {(sk || summary?.disabled) && (
         <SkText class="mcp-cost-aside" as="div" w="17rem">{summary?.disabled}</SkText>
@@ -273,11 +269,13 @@ export function mcpServersBody(props: McpServersBodyProps): VNode {
           Context cost
           <Explainer title="Context cost">
             <p>
-              Every tool an MCP server offers rides on every request, as a name, a
-              description and a JSON schema. That is a permanent per-turn cost, paid
-              whether or not the agent uses the tool.
+              A thread switches an MCP server on when it needs it. From then on,
+              every tool the server offers rides on every request of that thread, as a
+              name, a description and a JSON schema. A thread that never enables a
+              server pays nothing for it.
             </p>
             <p>
+              The headline is the worst case: one thread that enables every server.
               The engine measures it, so these figures are the same ones the request
               packer and the context viewer work from.
             </p>
@@ -298,8 +296,8 @@ export function mcpServersBody(props: McpServersBodyProps): VNode {
       <div class="settings-section">
         <div class="settings-section-title" data-search-anchor="mcp:servers">Servers</div>
         <p class="settings-row-note">
-          Nothing starts an MCP server when the engine starts. Every server running here
-          was switched on by hand, and an engine restart switches them all off again.
+          Nothing starts an MCP server when the engine starts. A thread's next turn starts
+          the servers it enabled, and an engine restart stops them all again.
         </p>
         {data.status === 'failed' ? null : (
           <LoadingFade
@@ -351,84 +349,65 @@ function withoutKey<T>(map: Record<string, T>, key: string): Record<string, T> {
 }
 
 /** Settings → MCP Servers: what each registered server offers the agent, what
- *  it costs every request, and the switches for both. */
+ *  it costs a thread that enables it, and the switches for both. */
 export function McpServersPage() {
-  const [loadable, setLoadable] = useState<Loadable<McpServersResponse>>({ status: 'not-loaded' });
+  const [served, setServed] = useState<Loadable<McpServersResponse>>({ status: 'not-loaded' });
+  const [intents, setIntentState] = useState<ToolIntents>(new Map());
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set<string>());
   const [pending, setPending] = useState<Record<string, McpRowVerb>>({});
   const [errors, setErrors] = useState<Record<string, McpRowError>>({});
-  const showLoading = useDelayedLoading(loadable);
-  /** What the page is showing, readable synchronously. A second tool click in
-   *  the same frame must see the first click's flip, and the render carrying
-   *  it has not happened yet. */
-  const shown = useRef<McpServersResponse | null>(null);
-  /** The last queued write per server. The disabled-tools PUT replaces the
-   *  whole set, so two in flight can settle backwards and re-enable a tool the
-   *  user just switched off. */
-  const writes = useRef(new Map<string, Promise<void>>());
-  /** Bumped by every local write, before it goes out. A reload that started
-   *  earlier is older than the write and must drop its reply rather than
-   *  apply it. `writes` cannot answer this: its entries are per server and are
-   *  never removed, so it says nothing about what is outstanding NOW. */
-  const localWrites = useRef(0);
+  const showLoading = useDelayedLoading(served);
+  /** The pending switches, readable between awaits (ADR 0437). */
+  const intentsNow = useRef<ToolIntents>(new Map());
+  /** Every list fetch takes the next epoch as it starts. */
+  const fetchEpoch = useRef(0);
+  /** The epoch of the list on screen. An older fetch landing later is
+   *  dropped, so a slow reply never replaces a newer one. */
+  const servedEpoch = useRef(0);
+  /** Tools whose switch request is out, by `toolIntentKey`. */
+  const sending = useRef(new Set<string>());
 
-  function showData(data: McpServersResponse) {
-    shown.current = data;
-    setLoadable({ status: 'loaded', data });
+  function setIntents(next: ToolIntents) {
+    intentsNow.current = next;
+    setIntentState(next);
+  }
+
+  /** Fetch the list, show it unless a newer fetch already landed, and end
+   *  every switch it reflects. */
+  async function load(): Promise<void> {
+    const epoch = ++fetchEpoch.current;
+    const data = await fetchMcpServers();
+    if (epoch <= servedEpoch.current) return;
+    servedEpoch.current = epoch;
+    setServed({ status: 'loaded', data });
+    setIntents(intentsAfterServe(intentsNow.current, epoch));
   }
 
   useEffect(() => {
-    setLoadable({ status: 'loading' });
-    fetchMcpServers()
-      .then(showData)
-      .catch((e) => setLoadable(toFailed(e)));
+    setServed({ status: 'loading' });
+    // A newer fetch may have served the list while this one was out.
+    load().catch((e) => { if (servedEpoch.current === 0) setServed(toFailed(e)); });
   }, []);
 
   /** Re-read the list after a mutation. Every figure on the page comes from one
    *  response, so the header and the rows can never disagree. A failure here
-   *  toasts rather than blanking a list that is merely stale.
-   *
-   *  `stillWanted` is checked once the data lands, so a reload can be dropped
-   *  by whatever happened while it was in flight. Without it a tool switched
-   *  off mid-reload bounces back: the reply predates the flip and knows
-   *  nothing about it. */
-  async function refresh(stillWanted: () => boolean = () => true) {
+   *  toasts rather than blanking a list that is merely stale. */
+  async function refresh(): Promise<void> {
     try {
-      const data = await fetchMcpServers();
-      if (stillWanted()) showData(data);
+      await load();
     } catch (e) {
       showToast(`Failed to refresh MCP servers: ${errorDetail(e)}`, 'error');
     }
   }
 
   // A server the agent registers, or a tool switched off on another device,
-  // repaints this page with no reload (ADR 0118). Two guards, for two races.
-  //
-  // `paused` skips it while a row verb runs, which can take seconds: that verb
-  // refreshes when it settles. Held, not dropped, so the frame still lands.
-  //
-  // `stillWanted` covers the race `paused` cannot see. A tool switch is
-  // optimistic and queues its write outside `pending`, and its own event bumps
-  // this counter. A reload fired by that event would land on top of the NEXT
-  // flip and bounce the switch back. That is the bug `18874e1da` fixed, and
-  // this is the same seam taken from the SSE side.
-  useVersionedRefresh(
-    mcpServersVersion.value,
-    Object.keys(pending).length > 0,
-    () => {
-      const startedAt = localWrites.current;
-      void refresh(() => localWrites.current === startedAt);
-    },
-  );
-  // The same re-read for a pull, with the same two guards: held while a row
-  // verb runs, and dropped if a local write lands under it.
-  usePanelRefresh('MCP servers', Object.keys(pending).length > 0 ? null : () => {
-    const startedAt = localWrites.current;
-    return refresh(() => localWrites.current === startedAt);
-  });
+  // repaints this page with no reload (ADR 0118). Held, not dropped, while a
+  // row verb runs, which refreshes when it settles. A pending switch needs no
+  // guard: it is laid over whatever list lands.
+  useVersionedRefresh(mcpServersVersion.value, Object.keys(pending).length > 0, () => void refresh());
+  usePanelRefresh('MCP servers', Object.keys(pending).length > 0 ? null : refresh);
 
   async function runVerb(server: McpServerStatus, verb: McpRowVerb, call: () => Promise<void>) {
-    localWrites.current++;
     setPending((prev) => ({ ...prev, [server.id]: verb }));
     setErrors((prev) => withoutKey(prev, server.id));
     try {
@@ -457,8 +436,16 @@ export function McpServersPage() {
     });
   }
 
-  function setRunning(server: McpServerStatus, running: boolean) {
-    void runVerb(server, running ? 'start' : 'stop', async () => {
+  async function setRunning(server: McpServerStatus, running: boolean) {
+    if (!running) {
+      const confirmed = await showConfirm(
+        `Stop the MCP server "${server.name}"?\n\nIt is switched off in every thread that enabled it. A thread that needs it again has to enable it again.`,
+        'Stop',
+        { variant: 'default' },
+      );
+      if (!confirmed) return;
+    }
+    await runVerb(server, running ? 'start' : 'stop', async () => {
       if (running) await startMcpServer(server.id);
       else await stopMcpServer(server.id);
     });
@@ -483,37 +470,43 @@ export function McpServersPage() {
   }
 
   /** Optimistic, unlike start and stop: the switch is a local write with no
-   *  process behind it. Only the switch moves, never a figure. The refetch
-   *  brings the engine's own totals, which is what makes the saving visible.
-   *
-   *  Writes for one server are queued rather than raced, and each sends the set
-   *  the page is showing when its turn comes. Two clicks therefore agree on the
-   *  same final set, however their round trips interleave. Only the last write
-   *  in the queue refetches, so a run of clicks costs one reload. */
+   *  process behind it. It is a pending intent laid over every list that
+   *  lands until a list fetched after the engine's answer shows it (ADR 0437).
+   *  Only the switch moves, never a figure: the refetch brings the engine's
+   *  own totals. */
   function setToolDisabled(server: McpServerStatus, wireName: string, disabled: boolean) {
-    const base = shown.current;
-    if (!base) return;
-    localWrites.current++;
-    showData(patchToolDisabled(base, server.id, wireName, disabled));
-
-    const isLast = () => writes.current.get(server.id) === mine;
-    const run = async () => {
-      const current = shown.current?.servers.find((s) => s.id === server.id);
-      if (!current) return;
-      try {
-        await setMcpDisabledTools(server.id, disabledWireNames(current));
-      } catch (e) {
-        showToast(`Failed to update ${server.name}: ${errorDetail(e)}`, 'error');
-      }
-      // Either way, once this is the last queued write: on success for the real
-      // figures, on failure to undo the flip.
-      if (isLast()) await refresh(isLast);
-    };
-    const prior = writes.current.get(server.id) ?? Promise.resolve();
-    // Run on either settle, so one rejected write cannot strand the queue.
-    const mine: Promise<void> = prior.then(run, run);
-    writes.current.set(server.id, mine);
+    const key = toolIntentKey(server.id, wireName);
+    setIntents(new Map(intentsNow.current).set(key, { serverId: server.id, wireName, disabled, ackedAt: null }));
+    if (!sending.current.has(key)) void sendSwitch(server, key);
   }
+
+  /** Send a tool's latest switch, and send again if the user flipped it while
+   *  the request was out. One request per tool at a time, because off then on
+   *  for one tool does not commute. Switches on different tools do. */
+  async function sendSwitch(server: McpServerStatus, key: string) {
+    sending.current.add(key);
+    try {
+      for (let sent = intentsNow.current.get(key); sent; sent = intentsNow.current.get(key)) {
+        await setMcpToolDisabled(server.id, sent.wireName, sent.disabled);
+        const latest = intentsNow.current.get(key);
+        if (latest && latest.disabled !== sent.disabled) continue;
+        if (latest) setIntents(new Map(intentsNow.current).set(key, { ...latest, ackedAt: fetchEpoch.current }));
+        break;
+      }
+    } catch (e) {
+      const next = new Map(intentsNow.current);
+      next.delete(key);
+      setIntents(next);
+      showToast(`Failed to update ${server.name}: ${errorDetail(e)}`, 'error');
+    } finally {
+      sending.current.delete(key);
+    }
+    await refresh();
+  }
+
+  const loadable: Loadable<McpServersResponse> = served.status === 'loaded'
+    ? { status: 'loaded', data: withToolIntents(served.data, intents) }
+    : served;
 
   return (
     <>
@@ -524,7 +517,7 @@ export function McpServersPage() {
         pending,
         errors,
         onToggleExpanded: toggleExpanded,
-        onSetRunning: setRunning,
+        onSetRunning: (server, running) => void setRunning(server, running),
         onSetAutoApprove: setAutoApprove,
         onRemove: (server) => void removeServer(server),
         onSetToolDisabled: setToolDisabled,

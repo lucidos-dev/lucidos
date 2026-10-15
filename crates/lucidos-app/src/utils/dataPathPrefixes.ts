@@ -21,3 +21,10 @@ export const DATA_PATH_PREFIXES: readonly string[] = [
   'fonts/',
   'system-knowhow/',
 ];
+
+/** Where a workspace's `data/` tree sits on disk, ending in `/`. Both the
+ *  disk path of a data file and its inverse build on this. `workspacePath`
+ *  comes off the wire, so a trailing slash on it is tolerated. */
+export function workspaceDataRoot(workspacePath: string): string {
+  return `${workspacePath.replace(/\/+$/, '')}/data/`;
+}

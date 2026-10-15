@@ -16,6 +16,7 @@ const CHAT_MODEL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::MemoryFind,
     ContextPurpose::CommandJudge,
     ContextPurpose::ReadDecision,
+    ContextPurpose::WakeDecision,
 ];
 
 const CHAT_MODEL: &str = "claude-opus-5-5";
@@ -62,63 +63,98 @@ async fn the_default_follows_the_configured_providers() {
     let flash38 = "gemini-3.8-flash";
     let sonnet = "claude-sonnet-5-5";
     // Per install: most purposes (the judge among them), extraction, the
-    // summary. The judge's measured default leads the shared fallbacks, so it
-    // resolves like the rest.
-    let rows: &[(&[ProviderKind], Served, Served, Served)] = &[
+    // summary, the read decision, and the wake decision. The judge's measured
+    // default leads the shared fallbacks, so it resolves like the rest. The
+    // wake decision runs only on a measured model, so with none reachable it
+    // resolves to the chat model, which its gate never asks (`None`).
+    type Row<'a> = (
+        &'a [ProviderKind],
+        Served,
+        Served,
+        Served,
+        Served,
+        Option<Served>,
+    );
+    let rows: &[Row] = &[
         (
             &[Vertex],
             (gemini, Vertex),
             (gemini, Vertex),
             (flash38, Vertex),
+            (flash38, Vertex),
+            Some((flash38, Vertex)),
         ),
         (
             &ProviderKind::ALL,
             (gemini, Vertex),
             (luna, OpenAi),
             (sol, OpenAi),
+            (flash38, Vertex),
+            Some((flash38, Vertex)),
         ),
         (
             &[Vertex, Anthropic],
             (gemini, Vertex),
             (gemini, Vertex),
             (flash38, Vertex),
+            (flash38, Vertex),
+            Some((flash38, Vertex)),
         ),
         (
             &[OpenRouter],
             (gemini, OpenRouter),
             (luna, OpenRouter),
             (sol, OpenRouter),
+            (flash38, OpenRouter),
+            Some((flash38, OpenRouter)),
         ),
-        (&[OpenAi], (mini, OpenAi), (luna, OpenAi), (sol, OpenAi)),
+        (
+            &[OpenAi],
+            (mini, OpenAi),
+            (luna, OpenAi),
+            (sol, OpenAi),
+            (luna, OpenAi),
+            Some((sol, OpenAi)),
+        ),
         (
             &[Anthropic],
             (haiku, Anthropic),
             (haiku, Anthropic),
             (sonnet, Anthropic),
+            (haiku, Anthropic),
+            None,
         ),
         (
             &[OpenAi, Anthropic],
             (mini, OpenAi),
             (luna, OpenAi),
             (sol, OpenAi),
+            (luna, OpenAi),
+            Some((sol, OpenAi)),
         ),
     ];
-    for (kinds, most, extraction, summary) in rows {
+    for (kinds, most, extraction, summary, read, wake) in rows {
         for purpose in CHAT_MODEL_PURPOSES {
             let expected = match purpose {
-                ContextPurpose::Memory => extraction,
-                ContextPurpose::ConversationSummary => summary,
-                _ => most,
+                ContextPurpose::Memory => Some(extraction),
+                ContextPurpose::ConversationSummary => Some(summary),
+                ContextPurpose::ReadDecision => Some(read),
+                ContextPurpose::WakeDecision => wake.as_ref(),
+                _ => Some(most),
             };
-            assert_eq!(
-                resolved(&registry, *purpose, kinds),
-                (
-                    expected.0.to_string(),
-                    ModelSource::Default,
-                    Some(expected.1)
+            let (model, source, provider) = resolved(&registry, *purpose, kinds);
+            match expected {
+                Some((expected, served_by)) => assert_eq!(
+                    (model.as_str(), source, provider),
+                    (*expected, ModelSource::Default, Some(*served_by)),
+                    "{purpose:?} on {kinds:?}"
                 ),
-                "{purpose:?} on {kinds:?}"
-            );
+                None => assert_eq!(
+                    (model.as_str(), source),
+                    (CHAT_MODEL, ModelSource::ChatModel),
+                    "{purpose:?} on {kinds:?}"
+                ),
+            }
         }
     }
     pool.close().await;
@@ -299,9 +335,10 @@ async fn a_stored_text_only_pick_stays_the_pick() {
 }
 
 /// The env override leads every purpose but the command judge, which never
-/// read it. It goes ahead of a purpose's measured lead too.
+/// read it, and the wake decision, which runs only on measured models. It
+/// goes ahead of a purpose's measured lead too.
 #[test]
-fn the_extraction_override_leads_all_but_the_judge() {
+fn the_extraction_override_leads_all_but_the_judge_and_the_wake_decision() {
     let with_env = |purpose| recommended_with(purpose, Some("gemini-3.8-flash"));
     assert_eq!(with_env(ContextPurpose::Memory)[0], "gemini-3.8-flash");
     assert!(with_env(ContextPurpose::Memory)[1..].starts_with(
@@ -315,10 +352,15 @@ fn the_extraction_override_leads_all_but_the_judge() {
         with_env(ContextPurpose::CommandJudge)[0],
         "gemini-3-flash-preview"
     );
+    assert_eq!(
+        with_env(ContextPurpose::WakeDecision),
+        recommended_with(ContextPurpose::WakeDecision, None)
+    );
 }
 
 /// Each purpose's measured lead heads its list, then its catalog default, and
-/// no model appears twice.
+/// no model appears twice. The shared fallbacks follow, except on a purpose
+/// that runs only on measured models.
 #[test]
 fn the_lead_then_the_catalog_default_head_the_list_and_nothing_repeats() {
     for purpose in CHAT_MODEL_PURPOSES {
@@ -339,8 +381,32 @@ fn the_lead_then_the_catalog_default_head_the_list_and_nothing_repeats() {
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), list.len(), "{purpose:?} repeats a model");
+        if measured_only(*purpose) {
+            assert_eq!(list.len(), lead.len() + 1, "{purpose:?}: {list:?}");
+            continue;
+        }
         for fallback in AUX_FALLBACKS {
             assert!(list.iter().any(|m| m == fallback), "{purpose:?}");
+        }
+    }
+}
+
+/// Only a measured-only purpose that fell to the chat model asks no model. A
+/// pin and a measured default both run, and every other purpose runs on the
+/// chat model as before.
+#[test]
+fn only_a_measured_only_purpose_on_the_chat_model_asks_no_model() {
+    for purpose in CHAT_MODEL_PURPOSES {
+        for source in [
+            ModelSource::Preference,
+            ModelSource::Default,
+            ModelSource::ChatModel,
+        ] {
+            assert_eq!(
+                asks_no_model(*purpose, source),
+                *purpose == ContextPurpose::WakeDecision && source == ModelSource::ChatModel,
+                "{purpose:?} from {source:?}"
+            );
         }
     }
 }
@@ -360,7 +426,7 @@ async fn every_fallback_has_a_registry_row() {
 
 /// The catalog describes the list in prose for the agent and Settings, which
 /// cannot import it. Every background row whose model key carries a literal
-/// default names its lead and every fallback.
+/// default names its lead, and every fallback it can reach.
 #[test]
 fn the_description_names_the_lead_and_every_fallback() {
     use crate::core::preference_catalog::PrefDefault;
@@ -371,7 +437,12 @@ fn the_description_names_the_lead_and_every_fallback() {
         if !matches!(pair.model.spec.default, PrefDefault::Value(_)) {
             continue;
         }
-        for model in purpose_lead(*purpose).iter().chain(AUX_FALLBACKS) {
+        let fallbacks: &[&str] = if measured_only(*purpose) {
+            &[]
+        } else {
+            AUX_FALLBACKS
+        };
+        for model in purpose_lead(*purpose).iter().chain(fallbacks) {
             assert!(
                 pair.model.spec.description.contains(model),
                 "{} omits {model}",
@@ -381,7 +452,7 @@ fn the_description_names_the_lead_and_every_fallback() {
     }
 }
 
-/// The two leads name models the registry can route.
+/// Every lead names a model the registry can route.
 #[tokio::test]
 async fn every_lead_has_a_registry_row() {
     let (pool, db_name) = setup_test_db().await;

@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-05
+- **Amended by**: [0441: An event that records another commits with it](0441-an-event-that-records-another-commits-with-it.md)
 
 ## Context
 
@@ -43,6 +44,7 @@ tool, and:
    boot.** A resolution is immediately followed by exactly one of two events:
    the paired `await_event` `ToolResult` when the wait was still attached, or a
    `PromptInjected` carrying the payload as prose when it had detached.
+   The resolution and its anchor commit in one atomic emit (ADR 0441).
 
 ## Rationale
 
@@ -171,7 +173,7 @@ parked thread can never exist without it.
 
 **A blocking call that holds the loop open** (`await_event(..., block=true)`,
 the `bash_output(wait_secs)` shape). Rejected: status stays `running`, so
-`reconcile_user_slot` keeps the Thread Queue slot for the whole wait. N blocked
+the Thread Queue counts the thread for the whole wait (ADR 0443). N blocked
 threads occupy the pool while the very work that would emit their events queues
 behind them, which is a genuine deadlock and not merely waste. It also pins a
 tokio task, the full message array and the LLM context for the duration, and

@@ -1,9 +1,11 @@
 #!/bin/bash
 # Tests for e2e GitHub mode: scripts/lib/e2e_github.sh, the plan half of
 # scripts/e2e-github-shard.sh, and its fake Claude Code install (ADR 0382).
+# Also the driver's --commit selection and the main check's (ADR 0464).
 #
-# Hermetic. A throwaway git repo, an invented denylist, and stubbed `git push`
-# and `gh`, so nothing here reaches a remote, the network or a real token.
+# Hermetic. A throwaway git repo, an invented denylist, and stubbed
+# release_tree_push, release_tree_delete_ref and `gh`, so nothing here reaches a
+# remote, the network or a real token.
 #
 # Run: ./scripts/lib/e2e_github_test.sh
 set -u
@@ -126,6 +128,28 @@ test_an_unloadable_denylist_refuses() {
     if [ -z "$out" ]; then pass "an unloadable denylist refuses"; else fail "built $out with no denylist"; fi
 }
 
+test_a_named_commit_is_what_gets_stripped() {
+    echo "test: --commit strips the commit it names, not HEAD"
+    local named commit
+    named="$(git -C "$REPO" rev-parse HEAD)"
+    echo "fn later() {}" >"$REPO/src/later.rs"
+    git -C "$REPO" add -A && git -C "$REPO" commit -qm "a later commit"
+    commit="$(e2e_github_build_commit "$REPO" "$REQUEST" 20261007-120000-ab12 "$named" 2>/dev/null)"
+    if [ -n "$commit" ] && git -C "$REPO" cat-file -e "$commit:src/main.rs" 2>/dev/null \
+        && ! git -C "$REPO" cat-file -e "$commit:src/later.rs" 2>/dev/null; then
+        pass "the named commit's tree was pushed, without HEAD's later file"
+    else
+        fail "the named commit was not what got built ($commit)"
+    fi
+    commit="$(e2e_github_build_commit "$REPO" "$REQUEST" 20261007-120000-ab12 2>/dev/null)"
+    if [ -n "$commit" ] && git -C "$REPO" cat-file -e "$commit:src/later.rs" 2>/dev/null; then
+        pass "with no commit named, HEAD is built"
+    else
+        fail "HEAD was not built by default ($commit)"
+    fi
+    git -C "$REPO" rm -q src/later.rs && git -C "$REPO" commit -qm "drop the later file"
+}
+
 test_only_run_branches_qualify() {
     echo "test: only e2e/<run-id> names an e2e run branch"
     local b ok=1
@@ -138,22 +162,84 @@ test_only_run_branches_qualify() {
     [ -z "$ok" ] || pass "e2e run branches accepted, every other ref refused"
 }
 
-# shellcheck disable=SC2317 # the git stub is called by the function under test
+# shellcheck disable=SC2317 # the stub is called by the function under test
 test_delete_refuses_anything_but_a_run_branch() {
     echo "test: e2e_github_delete_branch never deletes a ref outside e2e/"
-    local calls="$SANDBOX/git-calls"
+    local calls="$SANDBOX/delete-calls"
     : >"$calls"
     (
-        # shellcheck disable=SC2032 # a subshell stub, never reached through xargs
-        git() { echo "git $*" >>"$calls"; }
+        # The mirror's one door, stubbed: release_tree_push_test.sh drives the
+        # real one against a local bare repo.
+        release_tree_delete_ref() { echo "$*" >>"$calls"; }
         e2e_github_delete_branch "$REPO" main 2>/dev/null
         e2e_github_delete_branch "$REPO" rc/0.30.0 2>/dev/null
         e2e_github_delete_branch "$REPO" e2e/20261007-120000-ab12
     )
-    if [ "$(grep -c . "$calls")" = 1 ] && grep -q -- "--delete refs/heads/e2e/20261007-120000-ab12" "$calls"; then
-        pass "only the e2e run branch reached git"
+    if [ "$(cat "$calls")" = "$REPO $E2E_GITHUB_REMOTE refs/heads/e2e/20261007-120000-ab12" ]; then
+        pass "only the e2e run branch reached the mirror's door"
     else
-        fail "git calls were: $(cat "$calls")"
+        fail "delete calls were: $(cat "$calls")"
+    fi
+}
+
+# shellcheck disable=SC2317,SC2329 # gh and the door are stubbed for the function under test
+test_stopping_a_run_survives_a_broken_stderr() {
+    echo "test: e2e_github_stop_run cancels the run and deletes its branch even when stderr is a broken pipe"
+    local calls="$SANDBOX/stop-calls" fifo="$SANDBOX/stop-fifo"
+    : >"$calls"
+    mkfifo "$fifo"
+    (
+        gh() { echo "gh $*" >>"$calls"; }
+        release_tree_delete_ref() { echo "delete $3" >>"$calls"; }
+        # A pipe whose only reader has gone, as the main check's log reader
+        # does when engine shutdown signals its whole process group.
+        exec 4<>"$fifo"
+        exec 5>"$fifo"
+        exec 4<&-
+        e2e_github_stop_run "$REPO" e2e/20261007-120000-ab12 4242 1 2>&5
+    ) 2>/dev/null
+    if grep -q "^gh run cancel 4242 " "$calls" && grep -q "^delete refs/heads/e2e/20261007-120000-ab12$" "$calls"; then
+        pass "both calls ran after the first write hit the broken pipe"
+    else
+        fail "calls were: $(cat "$calls")"
+    fi
+    : >"$calls"
+    (
+        gh() { echo "gh $*" >>"$calls"; }
+        release_tree_delete_ref() { echo "delete $3" >>"$calls"; }
+        e2e_github_stop_run "$REPO" e2e/20261007-120000-ab12 "" "" 2>/dev/null
+    )
+    if [ ! -s "$calls" ]; then
+        pass "a finished, unpushed run needs neither call"
+    else
+        fail "calls were: $(cat "$calls")"
+    fi
+}
+
+# shellcheck disable=SC2317 # the stub is called by the function under test
+test_the_push_goes_through_the_mirror_door() {
+    echo "test: e2e_github_push hands only a run branch to release_tree_push"
+    local calls="$SANDBOX/push-calls" out
+    : >"$calls"
+    (
+        release_tree_push() { echo "$*" >>"$calls"; }
+        e2e_github_push "$REPO" abc123 main 2>/dev/null
+        e2e_github_push "$REPO" abc123 e2e/20261007-120000-ab12
+    )
+    if [ "$(cat "$calls")" = "$REPO $E2E_GITHUB_REMOTE abc123 refs/heads/e2e/20261007-120000-ab12" ]; then
+        pass "only the e2e run branch reached the mirror's door"
+    else
+        fail "push calls were: $(cat "$calls")"
+    fi
+    if out="$(
+        release_tree_push() { echo "mirror push refused (scan): planted" >&2; return 1; }
+        e2e_github_push "$REPO" abc123 e2e/20261007-120000-ab12 2>&1
+    )"; then
+        fail "a refused push reported success"
+    elif [[ "$out" == *"mirror push refused (scan)"* ]]; then
+        pass "a refusal fails the push and surfaces its reason"
+    else
+        fail "a refusal was swallowed: $out"
     fi
 }
 
@@ -164,6 +250,7 @@ test_the_sweep_removes_only_old_finished_run_branches() {
     : >"$deletes"
     (
         e2e_github_now() { e2e_github_branch_started e2e/20261008-120000-ffff; }
+        # shellcheck disable=SC2032 # a subshell stub, never reached through xargs
         git() {
             case "$*" in
                 *ls-remote*)
@@ -174,9 +261,9 @@ test_the_sweep_removes_only_old_finished_run_branches() {
                     printf 'e\trefs/heads/e2e/20261008-110000-cccc\n'
                     printf 'f\trefs/heads/e2e/not-a-run\n'
                     ;;
-                *--delete*) echo "$*" >>"$deletes" ;;
             esac
         }
+        release_tree_delete_ref() { echo "$*" >>"$deletes"; }
         gh() {
             case "$*" in
                 *20261006-090000-aaaa*) echo 0 ;;
@@ -278,7 +365,41 @@ test_the_unavailable_reason_names_each_precondition() {
     if [ -z "$out" ]; then pass "a clean maintainer checkout can use GitHub"; else fail "refused with: $out"; fi
     echo "scratch" >"$repo/untracked.txt"
     expect_outcome "a dirty tree is named" "*uncommitted*" "$(e2e_github_unavailable_reason "$repo")"
+    out="$(e2e_github_unavailable_reason "$repo" "$(git -C "$repo" rev-parse HEAD)")"
+    if [ -z "$out" ]; then pass "a named commit ignores the dirty tree beside it"; else fail "refused with: $out"; fi
+    expect_outcome "a commit that does not resolve is named" "*names no commit*" \
+        "$(e2e_github_unavailable_reason "$repo" 0000000000000000000000000000000000000000)"
     unset -f gh
+}
+
+test_the_main_check_selection_has_no_fallback() {
+    echo "test: main-check needs --commit, and an unmet precondition is no verdict"
+    local driver="$SCRIPT_DIR/../e2e-github.sh" rc out
+    out="$("$driver" main-check 2>&1)"; rc=$?
+    if [ "$rc" = 1 ] && [[ "$out" == *"pass --commit"* ]]; then
+        pass "main-check without --commit is a usage error"
+    else
+        fail "rc=$rc: $out"
+    fi
+    out="$("$driver" main-check --commit 2>&1)"; rc=$?
+    if [ "$rc" = 1 ] && [[ "$out" == *"--commit needs a commit"* ]]; then
+        pass "--commit with no value is a usage error"
+    else
+        fail "rc=$rc: $out"
+    fi
+    # A commit nobody has fails the preflight, before anything is built or pushed.
+    out="$("$driver" main-check --commit 0000000000000000000000000000000000000000 2>&1)"; rc=$?
+    if [ "$rc" = "$E2E_GITHUB_NO_VERDICT_EXIT" ] && [[ "$out" == *"GitHub mode cannot run"* ]]; then
+        pass "an unmet precondition exits 76, with no local fallback"
+    else
+        fail "rc=$rc: $out"
+    fi
+    out="$("$driver" api --commit 0000000000000000000000000000000000000000 2>&1)"; rc=$?
+    if [ "$rc" = 1 ]; then
+        pass "any other selection keeps exit 1 for an unmet precondition"
+    else
+        fail "rc=$rc: $out"
+    fi
 }
 
 # A fake download: the plan, then one directory per shard.
@@ -335,6 +456,107 @@ test_the_report_matches_the_local_tally_and_exit_codes() {
     if [ "$rc" = "$E2E_GITHUB_NO_VERDICT_EXIT" ]; then pass "no plan is no verdict"; else fail "no plan rc=$rc"; fi
 }
 
+test_the_report_counts_the_engine_suite() {
+    echo "test: the engine suite reports first, and its failure fails the run"
+    local d="$SANDBOX/report-engine" out rc
+    mkdir -p "$d/e2e-plan"
+    printf '%s\n' "engine engine - 1 1" "api api - 1 1" >"$d/e2e-plan/entries"
+    fake_shard "$d" engine 101 "test result: FAILED. 1 failed"
+    fake_shard "$d" api 0 "test result: ok"
+    out="$(e2e_github_report "$d" 2>&1)"; rc=$?
+    if [ "$rc" = 101 ] && [[ "$out" == *"── engine exit code: 101 ──"* ]] \
+        && [ "$(printf '%s\n' "$out" | grep -n '══ engine' | cut -d: -f1)" -lt "$(printf '%s\n' "$out" | grep -n '══ api' | cut -d: -f1)" ]; then
+        pass "engine reports before api and fails the run with its code"
+    else
+        fail "rc=$rc: $out"
+    fi
+}
+
+test_a_refused_build_is_no_verdict_and_a_failure_outranks_it() {
+    echo "test: a shard whose build the memory gate refused is no verdict, and a real failure still wins"
+    local d="$SANDBOX/report-refused" out rc
+    mkdir -p "$d/e2e-plan"
+    printf '%s\n' "engine engine - 1 1" "api api - 1 1" >"$d/e2e-plan/entries"
+    fake_shard "$d" engine "$HOST_MEMORY_BUILD_REFUSED_EXIT" "[build-memory-gate] the build never started"
+    fake_shard "$d" api 0 "test result: ok"
+    out="$(e2e_github_report "$d" 2>&1)"; rc=$?
+    if [ "$rc" = "$E2E_GITHUB_NO_VERDICT_EXIT" ] && [[ "$out" == *"ERROR: the engine shard's build never started"* ]]; then
+        pass "a refused engine build is no verdict, and says why"
+    else
+        fail "rc=$rc: $out"
+    fi
+
+    d="$SANDBOX/report-refused-red"
+    mkdir -p "$d/e2e-plan"
+    printf '%s\n' "engine engine - 1 1" "api api - 1 1" "chromium-1-1 browser chromium 1 1" >"$d/e2e-plan/entries"
+    fake_shard "$d" engine "$HOST_MEMORY_BUILD_REFUSED_EXIT" "[build-memory-gate] the build never started"
+    fake_shard "$d" api 0 "test result: ok"
+    fake_shard "$d" chromium-1-1 1 "$PW_FAIL_LOG"
+    e2e_github_report "$d" >/dev/null 2>&1; rc=$?
+    if [ "$rc" = 1 ]; then pass "a later red phase outranks an earlier no verdict"; else fail "rc=$rc"; fi
+}
+
+# shellcheck disable=SC2317,SC2329 # gh, the clock and sleep are stubbed for the function under test
+test_the_wait_gives_up_with_no_verdict() {
+    echo "test: e2e_github_wait ends with no verdict when the run never completes in time"
+    local clock="$SANDBOX/wait-clock" out rc
+    echo 1000 >"$clock"
+    out="$(
+        sleeps=0
+        gh() { return 1; }
+        e2e_github_now() { cat "$clock"; }
+        # Each sleep moves the fake clock, so no time passes. A wait with no
+        # deadline runs out of sleeps instead of hanging the suite.
+        sleep() {
+            sleeps=$((sleeps + 1))
+            [ "$sleeps" -le 50 ] || exit 99
+            echo $(($(cat "$clock") + $1)) >"$clock"
+        }
+        E2E_GITHUB_RUN_WAIT_SECS=120 E2E_GITHUB_POLL_SECS=30 e2e_github_wait 4242 2>&1
+    )"; rc=$?
+    if [ "$rc" = "$E2E_GITHUB_NO_VERDICT_EXIT" ] && [[ "$out" == *"ERROR: run 4242 did not complete within 120s"* ]]; then
+        pass "a gh that keeps failing ends in no verdict at the deadline"
+    else
+        fail "rc=$rc: $out"
+    fi
+    echo 1000 >"$clock"
+    out="$(
+        gh() { echo '{"status": "completed", "conclusion": "success", "jobs": []}'; }
+        e2e_github_now() { cat "$clock"; }
+        sleep() { exit 99; }
+        E2E_GITHUB_RUN_WAIT_SECS=0 e2e_github_wait 4242 2>/dev/null
+    )"; rc=$?
+    if [ "$rc" = 0 ] && [ "$out" = success ]; then
+        pass "a completed run still reports its conclusion"
+    else
+        fail "rc=$rc: $out"
+    fi
+}
+
+test_the_plan_gives_the_engine_suite_its_own_job() {
+    echo "test: the plan runs the engine suite in its own job, and only when asked"
+    local req="$SANDBOX/engine-request.json" out="$SANDBOX/engine-plan" ghout="$SANDBOX/engine-gh-output"
+    echo '{"suites": ["engine", "api"], "api_args": [], "browser": {"projects": [], "specs": [], "pw_args": []}}' >"$req"
+    : >"$ghout"
+    E2E_GITHUB_REQUEST="$req" E2E_GITHUB_OUT="$out" GITHUB_OUTPUT="$ghout" \
+        "$SCRIPT_DIR/../e2e-github-shard.sh" plan >/dev/null
+    if grep -q '^has_engine=true$' "$ghout" && grep -q "^engine engine - 1 1$" "$out/plan/entries" \
+        && ! grep '^linux=' "$ghout" | grep -q engine; then
+        pass "the engine suite gets its own job and stays out of the Linux matrix"
+    else
+        fail "gh output: $(tr '\n' ';' <"$ghout") entries: $(tr '\n' ';' <"$out/plan/entries")"
+    fi
+    echo '{"suites": ["api"], "api_args": [], "browser": {"projects": [], "specs": [], "pw_args": []}}' >"$req"
+    : >"$ghout"
+    E2E_GITHUB_REQUEST="$req" E2E_GITHUB_OUT="$out" GITHUB_OUTPUT="$ghout" \
+        "$SCRIPT_DIR/../e2e-github-shard.sh" plan >/dev/null
+    if grep -q '^has_engine=false$' "$ghout"; then
+        pass "a request without it runs no engine job"
+    else
+        fail "gh output: $(tr '\n' ';' <"$ghout")"
+    fi
+}
+
 test_the_plan_puts_webkit_on_macos_and_respects_test_ignore() {
     echo "test: the shard plan sends mobile-webkit to macOS and drops specs a project ignores"
     local req="$SANDBOX/plan-request.json" out="$SANDBOX/plan-out" ghout="$SANDBOX/gh-output" specs="" i
@@ -374,6 +596,64 @@ test_only_tagged_specs_stay_on_the_local_leg() {
         ! e2e_spec_needs_real_claude_code "$spec_dir/$spec.spec.ts" || wrong="$wrong $spec(tagged)"
     done
     if [ -z "$wrong" ]; then pass "four files local, eight on GitHub against the fake"; else fail "misrouted:$wrong"; fi
+}
+
+test_a_named_commit_routes_the_specs_it_holds() {
+    echo "test: under --commit the browser specs are listed and read from that commit, not the working tree"
+    local repo="$SANDBOX/spec-repo" dir commit out
+    dir="$repo/$E2E_GITHUB_SPEC_DIR"
+    git init -q "$repo"
+    mkdir -p "$dir"
+    echo "test('resume', { tag: '@real-claude-code' }, () => {})" >"$dir/resume.spec.ts"
+    echo "test('send', () => {})" >"$dir/chat.spec.ts"
+    git -C "$repo" add -A
+    git -C "$repo" -c user.email=dev@example.com -c user.name=Dev commit -qm specs
+    commit="$(git -C "$repo" rev-parse HEAD)"
+    # The working tree moves on: chat gains the tag, resume goes, a spec arrives.
+    echo "test('send', { tag: '@real-claude-code' }, () => {})" >"$dir/chat.spec.ts"
+    rm "$dir/resume.spec.ts"
+    echo "test('new', () => {})" >"$dir/later.spec.ts"
+
+    out="$(e2e_github_split_specs "$repo" "$commit" | sort | tr '\n' ';')"
+    if [ "$out" = "local resume.spec.ts;remote chat.spec.ts;" ]; then
+        pass "the commit's specs, routed by the commit's tags"
+    else
+        fail "routes from the commit: $out"
+    fi
+    out="$(e2e_github_split_specs "$repo" "" | sort | tr '\n' ';')"
+    if [ "$out" = "local chat.spec.ts;remote later.spec.ts;" ]; then
+        pass "without a commit, the working tree's specs"
+    else
+        fail "routes from the working tree: $out"
+    fi
+    out="$(e2e_github_split_specs "$repo" "$commit" resume.spec.ts)"
+    if [ "$out" = "local resume.spec.ts" ]; then
+        pass "a named spec is read from the commit"
+    else
+        fail "named spec: $out"
+    fi
+    if out="$(e2e_github_split_specs "$repo" "$commit" later.spec.ts 2>&1)"; then
+        fail "a spec the commit lacks was routed: $out"
+    elif [[ "$out" == *"no spec named later.spec.ts in $commit"* ]]; then
+        pass "a spec the commit lacks is refused, naming the commit"
+    else
+        fail "refusal: $out"
+    fi
+
+    # The tag sits on line one of a spec far bigger than a pipe buffer. The
+    # driver runs under pipefail, so the check must not lose git to SIGPIPE.
+    {
+        echo "test('big', { tag: '@real-claude-code' }, () => {})"
+        yes "// filler that pads the spec past any pipe buffer" | head -n 50000
+    } >"$dir/big.spec.ts"
+    git -C "$repo" add -A
+    git -C "$repo" -c user.email=dev@example.com -c user.name=Dev commit -qm big
+    out="$(set -o pipefail; e2e_github_split_specs "$repo" "$(git -C "$repo" rev-parse HEAD)" big.spec.ts)"
+    if [ "$out" = "local big.spec.ts" ]; then
+        pass "a large tagged spec in a commit stays local under pipefail"
+    else
+        fail "large spec: $out"
+    fi
 }
 
 test_a_spec_file_among_playwright_args_is_a_selection() {
@@ -503,19 +783,28 @@ if [ -n "$HAVE_RELEASE_TREE" ]; then
     test_the_pushed_commit_is_stripped_parentless_and_generic
     test_the_scan_refuses_a_planted_token
     test_an_unloadable_denylist_refuses
+    test_a_named_commit_is_what_gets_stripped
 else
     echo "skipped: the commit tests need scripts/lib/release_tree.sh, which the mirror does not ship"
 fi
 test_only_run_branches_qualify
 test_delete_refuses_anything_but_a_run_branch
+test_stopping_a_run_survives_a_broken_stderr
+test_the_push_goes_through_the_mirror_door
 test_the_sweep_removes_only_old_finished_run_branches
 test_the_handoff_defaults_to_github
 test_the_handoff_stays_local_when_asked_or_inherited
 test_the_handoff_falls_back_only_without_github
 test_the_unavailable_reason_names_each_precondition
+test_the_main_check_selection_has_no_fallback
 test_the_report_matches_the_local_tally_and_exit_codes
+test_the_report_counts_the_engine_suite
+test_a_refused_build_is_no_verdict_and_a_failure_outranks_it
+test_the_wait_gives_up_with_no_verdict
+test_the_plan_gives_the_engine_suite_its_own_job
 test_the_plan_puts_webkit_on_macos_and_respects_test_ignore
 test_only_tagged_specs_stay_on_the_local_leg
+test_a_named_commit_routes_the_specs_it_holds
 test_a_spec_file_among_playwright_args_is_a_selection
 test_the_plan_refuses_a_real_claude_code_spec
 test_the_fake_installs_only_on_a_runner_and_never_over_a_claude

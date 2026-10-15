@@ -339,8 +339,14 @@ pub fn apply_default_cache_dir(workspace: &Path) {
         std::env::var("XDG_CACHE_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
     );
+    // The shared dir sits in the user cache root, a storage root.
+    let created = |dir: &Path| {
+        dir.parent()
+            .map_or(Ok(()), lucidos_home::ensure_storage_root)
+            .and_then(|()| std::fs::create_dir_all(dir))
+    };
     match &shared {
-        Some(dir) => match std::fs::create_dir_all(dir) {
+        Some(dir) => match created(dir) {
             Ok(()) => {
                 std::env::set_var("FASTEMBED_CACHE_DIR", dir);
                 log!(
@@ -1358,8 +1364,18 @@ mod tests {
             fake_blobs_dir(cache.path()).join(format!("{FAKE_ETAG}.{LOCK_EXTENSION}")),
         )
         .expect("open lock file");
-        lock.try_lock()
-            .expect("a failed fetch must release the blob lock for the next attempt");
+        // A child forked elsewhere in this suite holds the lock until it
+        // reaches `exec`, so the release gets two seconds (see
+        // `engine_version::tests::eventually`).
+        let mut last = lock.try_lock();
+        for _ in 0..200 {
+            if last.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            last = lock.try_lock();
+        }
+        last.expect("a failed fetch must release the blob lock for the next attempt");
     }
 
     /// The layout invariant against `hf-hub`'s own reader, which is what

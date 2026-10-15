@@ -1,7 +1,17 @@
 # 0060: An in-flight conflict resolution owns its change's merge exclusively
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [0442](0442-a-check-and-its-claim-are-one-step.md), and by [0463](0463-landing-lane.md)
 - **Date**: 2026-08-11
+
+> **Amended by ADR 0442.** Every apply now holds an in-memory claim on its change
+> (`change_ops::apply_claim`). It takes the claim before it reads the row, and the
+> merge session or recovery task it hands off to holds it. That closes the Tier-2 /
+> Tier-3 startup window this ADR accepted.
+
+> The rejection below of "an in-memory claim spanning a spawn" is re-decided. It
+> rested on a missed clear wedging Apply. A drop guard clears on every exit, a
+> panic and a dropped request future included. The resolver
+> binding stays, for a resolver that went idle holding its pairing.
 
 ## Context
 

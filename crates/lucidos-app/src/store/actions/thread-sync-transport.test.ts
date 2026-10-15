@@ -47,6 +47,13 @@ vi.mock('@lucidos/event-stream', async (importOriginal) => ({
   openEventStream,
 }));
 
+/** What app frames hear about the stream, through the host relay. */
+const fanOutEventStreamStatus = vi.fn();
+vi.mock('./app-bridge', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  fanOutEventStreamStatus,
+}));
+
 const threadMap = signal(new Map<string, { meta: { id: string }; eventsLoaded: boolean }>());
 const focusedThreadId = signal<string | null>(null);
 const recommendedCleanupProgress = signal<{ done: number; total: number } | null>(null);
@@ -190,6 +197,22 @@ describe('the shell attaching to a transport', () => {
 
     opened?.handlers.onError();
     expect(status()).toBe('disconnected');
+  });
+
+  it('tells app frames about a teardown it makes itself, then the reopen', () => {
+    // The resume path disconnects and reconnects on purpose. By then the
+    // closed transport's own error handler is stale. Without this, a frame
+    // keeps believing the stream is up and misses the reopen it resyncs on.
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    expect(fanOutEventStreamStatus).toHaveBeenLastCalledWith('open');
+
+    disconnectThreadEvents();
+    expect(fanOutEventStreamStatus).toHaveBeenLastCalledWith('error');
+
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    expect(fanOutEventStreamStatus).toHaveBeenLastCalledWith('open');
   });
 
   it('reconciles on the open that follows an error, not on the first one', async () => {

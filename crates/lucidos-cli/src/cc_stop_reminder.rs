@@ -24,6 +24,11 @@ pub(crate) const SESSION_KIND_ENV: &str = "LUCIDOS_SESSION_KIND";
 /// to redirect plaintext questions to AskUserQuestion".
 pub(crate) const SESSION_KIND_INTERACTIVE: &str = "interactive";
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "an empty marker that must outlive this process; `write_sentinel` creates it \
+              exclusively, so a planted symlink is refused"
+)]
 fn cc_sentinel_path(kind: &str, key: &str) -> PathBuf {
     std::env::temp_dir().join(format!("lucidos-cc-{}-{}", kind, key))
 }
@@ -179,8 +184,18 @@ pub(crate) fn run() -> Result<(), BoxError> {
 /// Writing the sentinel is the redirect's loop guard. If it silently failed,
 /// the hook would redirect the same question on every Stop. Surface the failure on stderr (CC's hook
 /// stderr is preserved) instead of `let _ = `.
+///
+/// Created exclusively, so a symlink another user planted at the path is
+/// refused rather than followed. A sentinel already there is the guard holding.
 fn write_sentinel(path: &Path) {
-    if let Err(e) = std::fs::write(path, b"") {
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+    if let Err(e) = created.map(drop).or_else(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => Ok(()),
+        _ => Err(e),
+    }) {
         eprintln!(
             "[cc-stop-reminder] sentinel write failed at {}: {}",
             path.display(),

@@ -1,6 +1,6 @@
 # 0314: Apply All parks a change that hits a merge conflict and keeps applying the rest
 
-- **Status**: Accepted
+- **Status**: Accepted, amended by [0463](0463-landing-lane.md) and [0480](0480-apply-all-press-lands-as-one-lane-batch.md)
 - **Date**: 2026-09-28
 
 ## Context

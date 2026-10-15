@@ -33,6 +33,7 @@ fn config(slug: &str, run: TriggerRun) -> TriggerConfig {
         go_to_review: false,
         group_id: None,
         side_effect_grant: vec![],
+        mcp_servers: vec![],
         plugin_id: None,
         model: None,
         reasoning_effort: None,
@@ -66,6 +67,8 @@ fn roundtrips_an_event_trigger_with_condition_and_grant() {
         condition: Some(serde_json::json!({ "sleep_score": { "$lt": 70 } })),
     }];
     c.side_effect_grant = vec![SideEffectCategory::Email, SideEffectCategory::ExternalApi];
+    // A scalar array, so it must serialise above `on` and `run` too.
+    c.mcp_servers = vec!["oura".to_string(), "slack".to_string()];
     c.app_id = Some("sleep".to_string());
     c.go_to_review = true;
 
@@ -76,6 +79,7 @@ fn roundtrips_an_event_trigger_with_condition_and_grant() {
     assert_eq!(parsed.on.len(), 1);
     assert_eq!(parsed.on[0].event_type, "SleepImported");
     assert!(parsed.on[0].condition.is_some());
+    assert_eq!(parsed.mcp_servers, ["oura", "slack"]);
 }
 
 /// `model` / `reasoning_effort` are scalars, so they must serialise ABOVE the

@@ -1,15 +1,14 @@
 /// Validates that idle_notify (using notify_waiters) wakes a registered waiter.
-/// This is the contract that send_and_wait and apply_now_inner depend on:
-/// the Result handler must call idle_notify.notify_waiters() so that
-/// any task waiting on idle_notify.notified() wakes up.
+/// The chat follow-up redirect depends on it: the Result handler calls
+/// idle_notify.notify_waiters(), so a task waiting on idle_notify.notified()
+/// wakes up.
 #[tokio::test]
 async fn idle_notify_wakes_registered_waiter() {
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let notify2 = notify.clone();
 
-    // Simulate send_and_wait: register a waiter BEFORE the notification
+    // Register a waiter BEFORE the notification, as the redirect does.
     let waiter = tokio::spawn(async move {
-        // Use the same 5s timeout pattern as send_and_wait
         match tokio::time::timeout(std::time::Duration::from_secs(2), notify2.notified()).await {
             Ok(()) => true,  // Woken by notify_waiters
             Err(_) => false, // Timed out — notify_waiters was never called
@@ -26,7 +25,7 @@ async fn idle_notify_wakes_registered_waiter() {
     assert!(
         woken,
         "idle_notify.notify_waiters() must wake registered waiters — \
-                         this is the contract that send_and_wait depends on"
+                         the follow-up redirect depends on it"
     );
 }
 
@@ -301,6 +300,7 @@ async fn idle_session_routes_followup_via_msg_tx() {
                 images: None,
                 origin_event_id: None,
                 kind: crate::engine::AgentInputKind::User,
+                completion: None,
             })
             .is_ok(),
         "send should succeed when receiver is alive"
@@ -345,6 +345,7 @@ async fn closed_channel_returns_error() {
         images: None,
         origin_event_id: None,
         kind: crate::engine::AgentInputKind::User,
+        completion: None,
     });
     assert!(result.is_err(), "send should fail when receiver is dropped");
 }
@@ -511,7 +512,7 @@ fn an_effort_change_reaches_claude_code_at_its_next_spawn_and_codex_on_its_chann
         let mut session = make_test_session(msg_tx, !in_flight);
         session.coding_agent = agent;
         let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
-        session.control_tx = control_tx;
+        session.phase = crate::engine::SessionPhase::Running { control_tx };
 
         let outcome = deliver_control_request(&mut session, effort());
 
@@ -535,7 +536,7 @@ fn a_model_change_reaches_a_running_claude_code_turn() {
     let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut session = make_test_session(msg_tx, false);
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
-    session.control_tx = control_tx;
+    session.phase = crate::engine::SessionPhase::Running { control_tx };
 
     let request = ControlRequest::SetModel {
         model: "haiku".into(),
@@ -812,4 +813,28 @@ fn run_merge_session_tier2_routes_through_start_merge_and_get_prompt() {
          so the panel shows real numbers. Body was:\n{}",
         body
     );
+}
+
+/// A starting agent has no runtime to take the request. Recording it anyway
+/// would report a model switch that never reaches the process.
+#[test]
+fn a_starting_agent_refuses_a_control_request() {
+    use super::control::deliver_control_request;
+    use crate::runtime::ControlRequest;
+
+    let mut sessions = std::collections::HashMap::new();
+    let thread_id = uuid::Uuid::new_v4();
+    let _claim = crate::engine::agent_session::spawn_claim::claim_thread_for(
+        &mut sessions,
+        thread_id,
+        crate::runtime::CodingAgent::ClaudeCode,
+        crate::engine::agent_session::spawn_claim::ClaimFor::Run,
+    )
+    .unwrap();
+    let session = sessions.get_mut(&thread_id).unwrap();
+    let request = ControlRequest::SetModel {
+        model: "haiku".into(),
+    };
+    assert!(deliver_control_request(session, request).is_err());
+    assert_eq!(session.current_model, None, "nothing is recorded");
 }

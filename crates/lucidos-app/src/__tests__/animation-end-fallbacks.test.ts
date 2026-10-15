@@ -22,11 +22,13 @@ import { clientSourcePaths } from '../styles/__tests__/css-rule-helpers';
 const srcRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /** How each listener completes without its event. `requires` must appear in
- *  the file's code, so the answer cannot rot into a claim. */
-const AUDITED: Record<string, { how: string; requires: RegExp | null }> = {
+ *  the code of `fallbackIn`, or of the file itself, so the answer cannot rot
+ *  into a claim. */
+const AUDITED: Record<string, { how: string; requires: RegExp | null; fallbackIn?: string }> = {
   'components/layout/Drawer.tsx': {
     how: 'closes at once under reduced motion, and a scaled fallback timer closes a stalled slide-out',
     requires: /isReducedMotion\(\)[\s\S]*setTimeout\(/,
+    fallbackIn: 'components/layout/drawerState.ts',
   },
   'components/layout/ThreadPane.tsx': {
     how: 'skips the FLIP under reduced motion, and a scaled safety timer clears the gate',
@@ -77,10 +79,10 @@ describe('animation end listeners', () => {
     ).toEqual(Object.keys(AUDITED).sort());
   });
 
-  for (const [file, { how, requires }] of Object.entries(AUDITED)) {
+  for (const [file, { how, requires, fallbackIn }] of Object.entries(AUDITED)) {
     if (!requires) continue;
     it(`${file}: ${how}`, () => {
-      expect(code(resolve(srcRoot, file))).toMatch(requires);
+      expect(code(resolve(srcRoot, fallbackIn ?? file))).toMatch(requires);
     });
   }
 });

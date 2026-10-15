@@ -23,8 +23,19 @@ pub enum SectionWhen {
     Gated,
     /// Only while the user has an app open.
     OpenApp,
-    /// Only when the MCP servers offer more tools than fit.
+    /// Only when a thread's enabled MCP servers offer more tools than fit.
     ToolsDropped,
+    /// Only in the threads that enable an MCP server (ADR 0430).
+    McpEnabled,
+}
+
+impl SectionWhen {
+    /// Whether a section with this `when` counts toward the report's total.
+    /// The MCP schemas, and the notice for the ones the ceiling cuts, ride only
+    /// threads that enable servers, and nearly every thread enables none.
+    pub fn counts_in_total(self) -> bool {
+        !matches!(self, Self::McpEnabled | Self::ToolsDropped)
+    }
 }
 
 /// What a footprint item is, which says where it is edited.
@@ -41,7 +52,6 @@ pub enum ItemKind {
     OauthAccount,
     Credential,
     McpServer,
-    McpTool,
     /// One app's own know-how listing, sent while that app is open.
     AppKnowhow,
 }
@@ -86,6 +96,18 @@ pub struct FootprintItem {
     /// Absent for a doc outside the workspace, such as a shared one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// An MCP server's schemas only: which threads paid for them and which
+    /// used them, over the unused window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_threads: Option<McpThreadUse>,
+}
+
+/// How many threads enabled one MCP server, and how many called one of its
+/// tools, over the unused window (ADR 0430).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct McpThreadUse {
+    pub enabled: i64,
+    pub called: i64,
 }
 
 /// One workspace-grown section of a chat turn.
@@ -110,8 +132,10 @@ pub struct SystemPromptArea {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkspacePromptFootprint {
     pub sections: Vec<FootprintSection>,
-    /// Every section summed: the worst turn, with every gate open and the
-    /// largest app open.
+    /// Every section that can ride every turn, summed: the worst turn, with
+    /// every gate open and the largest app open. The MCP tool schemas and their
+    /// tools-not-sent notice are not in it, since only a thread that enables a
+    /// server carries them.
     pub total_chars: usize,
     pub over_total_ceiling: bool,
     pub section_ceiling: usize,
@@ -230,9 +254,13 @@ const APP_OPENS: UseSource = UseSource {
     thread_scoped: false,
 };
 
-const WIDGET_SHOWS: UseSource = UseSource {
+/// A widget is used where it is pinned, and where an old `WidgetShown` showed
+/// it (ADR 0466). Its embeds in replies count too, but the embed grammar reads
+/// those (`widget_embed_uses`). A reply has no `app_id`, so it adds no use
+/// here, only its age to the record's coverage.
+const WIDGET_PINS: UseSource = UseSource {
     id: "payload->>'app_id'",
-    filter: "event_type = 'WidgetShown'",
+    filter: "event_type IN ('WidgetShown', 'WidgetPinned', 'ResponseGenerated')",
     thread_scoped: true,
 };
 
@@ -313,9 +341,83 @@ pub async fn app_open_evidence(pool: &PgPool, days: u32) -> Result<UseEvidence, 
     use_evidence(pool, &APP_OPENS, days).await
 }
 
-/// Reusable widgets by their newest `WidgetShown`, in any thread.
-pub async fn widget_show_evidence(pool: &PgPool, days: u32) -> Result<UseEvidence, BoxError> {
-    use_evidence(pool, &WIDGET_SHOWS, days).await
+/// Reusable widgets by their newest use, in any thread: an embed in a reply,
+/// a pin, or an old `WidgetShown`.
+pub async fn widget_use_evidence(pool: &PgPool, days: u32) -> Result<UseEvidence, BoxError> {
+    let mut evidence = use_evidence(pool, &WIDGET_PINS, days).await?;
+    for (app_id, used) in widget_embed_uses(pool, days).await? {
+        let newer = evidence
+            .last_use
+            .get(&app_id)
+            .is_none_or(|known| used.days_ago < known.days_ago);
+        if newer {
+            evidence.last_use.insert(app_id, used);
+        }
+    }
+    Ok(evidence)
+}
+
+/// The newest embed of each widget in a reply. The reply's whole text is read,
+/// since a streamed chunk can split an embed, and the embed grammar decides
+/// what draws: an example in a code block does not.
+async fn widget_embed_uses(pool: &PgPool, days: u32) -> Result<HashMap<String, LastUse>, BoxError> {
+    let rows: Vec<(String, i64, bool)> = sqlx::query_as(
+        "SELECT payload->>'text', \
+                floor(EXTRACT(EPOCH FROM now() - created) / 86400)::bigint, \
+                created >= now() - make_interval(days => $1) \
+         FROM events WHERE event_type = 'ResponseGenerated' AND payload->>'text' LIKE '%](app:%'",
+    )
+    .bind(days as i32)
+    .fetch_all(pool)
+    .await?;
+    let mut uses: HashMap<String, LastUse> = HashMap::new();
+    for (text, days_ago, in_window) in rows {
+        for found in crate::engine::widget_embed::scan(&text) {
+            let Ok(embed) = found.embed else { continue };
+            let used = LastUse {
+                days_ago,
+                in_window,
+            };
+            let newer = uses
+                .get(&embed.app_id)
+                .is_none_or(|known| days_ago < known.days_ago);
+            if newer {
+                uses.insert(embed.app_id, used);
+            }
+        }
+    }
+    Ok(uses)
+}
+
+/// Per MCP server id: the threads that enabled it, and the threads that called
+/// one of its tools, in the last `days`. Resolved in SQL (ADR 0053).
+pub async fn mcp_thread_use(
+    pool: &PgPool,
+    days: u32,
+) -> Result<HashMap<String, McpThreadUse>, BoxError> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT server_id, \
+                count(DISTINCT thread_id) FILTER (WHERE enabled), \
+                count(DISTINCT thread_id) FILTER (WHERE NOT enabled) \
+         FROM ( \
+           SELECT payload->>'server_id' AS server_id, thread_id, TRUE AS enabled \
+           FROM events WHERE event_type = 'ThreadMcpServerEnabled' \
+             AND created >= now() - make_interval(days => $1) \
+           UNION ALL \
+           SELECT split_part(payload->>'name', '__', 2), thread_id, FALSE \
+           FROM events WHERE event_type = 'ToolCalled' \
+             AND payload->>'name' LIKE 'mcp\\_\\_%' \
+             AND created >= now() - make_interval(days => $1) \
+         ) uses \
+         WHERE server_id <> '' GROUP BY server_id",
+    )
+    .bind(days as i32)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(server_id, enabled, called)| (server_id, McpThreadUse { enabled, called }))
+        .collect())
 }
 
 /// Knowhow docs by their newest read the engine saw, keyed by the id the
@@ -439,7 +541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn widget_shows_and_knowhow_loads_are_keyed_by_the_id_they_name() {
+    async fn widget_uses_and_knowhow_loads_are_keyed_by_the_id_they_name() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         seed(
             &pool,
@@ -466,8 +568,42 @@ mod tests {
         )
         .await;
 
-        let widgets = widget_show_evidence(&pool, 60).await.unwrap();
-        assert!(widgets.last_use["fare-grid"].in_window);
+        seed(
+            &pool,
+            "ResponseGenerated",
+            "x",
+            serde_json::json!({ "text": "Pick one: ![Fares](app:fare-picker?params={\"day\":1}), ![](app:clock) or ![v](app:Fare_grid.v2). Written `![x](app:example)`." }),
+            3,
+        )
+        .await;
+        seed(
+            &pool,
+            "WidgetPinned",
+            "x",
+            serde_json::json!({ "app_id": "inbox" }),
+            30,
+        )
+        .await;
+
+        let widgets = widget_use_evidence(&pool, 60).await.unwrap();
+        assert!(widgets.last_use["fare-grid"].in_window, "an old showing");
+        assert!(
+            widgets.last_use["fare-picker"].in_window,
+            "an embed in a reply"
+        );
+        assert!(
+            widgets.last_use["clock"].in_window,
+            "a second embed in the same reply"
+        );
+        assert!(
+            widgets.last_use["Fare_grid.v2"].in_window,
+            "any id the embed grammar takes"
+        );
+        assert!(
+            !widgets.last_use.contains_key("example"),
+            "an embed in code draws nothing, so it is no use"
+        );
+        assert!(widgets.last_use["inbox"].in_window, "a pin");
 
         seed(
             &pool,
@@ -524,7 +660,7 @@ mod tests {
         assert!(knowhow.covers_window);
         assert!(
             !widgets.covers_window,
-            "two days of WidgetShown cannot cover sixty"
+            "a month of widget uses cannot cover sixty days"
         );
 
         // A deleted thread took its loads with it, so a missing load inside
@@ -548,6 +684,62 @@ mod tests {
             app_open_evidence(&pool, 60).await.unwrap().covers_window,
             "app opens are not thread events, so a delete leaves them whole"
         );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A thread event `days_ago` old, on `thread_id`.
+    async fn seed_on_thread(
+        pool: &PgPool,
+        thread_id: uuid::Uuid,
+        event_type: &str,
+        payload: serde_json::Value,
+        days_ago: i32,
+    ) {
+        sqlx::query(
+            "INSERT INTO events (id, aggregate, aggregate_id, thread_id, event_type, payload, created) \
+             VALUES ($1, 'thread', $2, $3, $4, $5, now() - make_interval(days => $6))",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(thread_id.to_string())
+        .bind(thread_id)
+        .bind(event_type)
+        .bind(payload)
+        .bind(days_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Per server: the threads that enabled it and the threads that called
+    /// one of its tools, inside the window only, each thread once.
+    #[tokio::test]
+    async fn mcp_thread_use_counts_enabling_and_calling_threads_in_the_window() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (a, b, old) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        let enabled = |id: &str| serde_json::json!({ "server_id": id, "by": "agent" });
+        let called = |name: &str| serde_json::json!({ "name": name, "args": {} });
+        seed_on_thread(&pool, a, "ThreadMcpServerEnabled", enabled("slack"), 1).await;
+        seed_on_thread(&pool, b, "ThreadMcpServerEnabled", enabled("slack"), 2).await;
+        seed_on_thread(&pool, a, "ToolCalled", called("mcp__slack__search"), 1).await;
+        seed_on_thread(&pool, a, "ToolCalled", called("mcp__slack__post"), 1).await;
+        seed_on_thread(&pool, old, "ThreadMcpServerEnabled", enabled("jira"), 90).await;
+        seed_on_thread(&pool, a, "ToolCalled", called("read_file"), 1).await;
+
+        let usage = mcp_thread_use(&pool, 30).await.unwrap();
+        assert_eq!(
+            usage.get("slack"),
+            Some(&McpThreadUse {
+                enabled: 2,
+                called: 1
+            })
+        );
+        assert_eq!(usage.get("jira"), None, "outside the window");
+        assert_eq!(usage.len(), 1, "{usage:?}");
 
         crate::test_support::teardown_test_db(&db_name).await;
     }

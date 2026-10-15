@@ -1,6 +1,4 @@
 import { useEffect } from 'preact/hooks';
-import { toastPlacement, isToastPlacement } from '../../store/store';
-import { Dropdown } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
 import { backupReminderBody } from '../layout/BackupReminderBanner';
 import { connectionBannerBody } from '../layout/ConnectionBanner';
@@ -17,7 +15,6 @@ import {
   SAMPLE_UNCLEAR_EPISODE,
   SAMPLE_WEBHOOK_REFUSAL,
   SAMPLE_WEBHOOK_VERIFICATION_REFUSAL,
-  TOAST_PLACEMENT_OPTIONS,
   sampleShortToast,
   sampleLongToast,
   sampleErrorToast,
@@ -46,8 +43,7 @@ import {
  *  exists because that split is only judgeable side by side.
  *
  *  Permanent, not scaffolding. These surfaces get iterated on, and this is
- *  where that happens. The one temporary thing on it is the toast-placement
- *  picker, which goes when a shape is chosen (docs/temporary-measures.md).
+ *  where that happens.
  *
  *  NOTHING HERE PERFORMS AN OPERATION. Every button renders a surface and
  *  stops. See `communicationSamples.ts` and its inertness guard. */
@@ -65,29 +61,6 @@ export function CommunicationSurfacesPage() {
           Transient status and deferrable offers. Ignorable by design: a toast that
           must be answered belongs in a dialog.
         </p>
-        <div class="settings-row" data-search-anchor="surfaces:toast-placement">
-          <span class="settings-row-label">
-            Placement
-            <Explainer title="Toast placement">
-              <p>
-                Where the stack sits and how wide a toast is drawn. A full-width bar
-                covers the pane divider; a narrower card sits on it, with the seam
-                showing above and below.
-              </p>
-              <p>
-                Per-device and temporary: this picker exists to choose a shape, and
-                goes once one is chosen. Takes effect immediately, no reload.
-              </p>
-            </Explainer>
-          </span>
-          <div class="settings-row-options">
-            <Dropdown
-              options={TOAST_PLACEMENT_OPTIONS}
-              value={toastPlacement.value}
-              onChange={(v) => { if (isToastPlacement(v)) toastPlacement.value = v; }}
-            />
-          </div>
-        </div>
         <div class="settings-row">
           <span class="settings-row-label">Samples</span>
           <div class="settings-row-options surfaces-sample-buttons">

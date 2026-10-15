@@ -695,6 +695,7 @@ async fn get_filter_facets_labels_apps_and_widgets_including_removed_ones() {
             "<h1>w",
             NewAppKind::Widget {
                 origin_thread_id: Uuid::from_u128(2),
+                sizes: None,
             },
         )
         .await

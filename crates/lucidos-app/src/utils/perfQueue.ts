@@ -2,8 +2,9 @@
  *  latency) calls `recordPerfSample`; samples accumulate in a bounded in-memory
  *  buffer and flush as a BATCH to `POST /api/v1/internal/client-logs` — one
  *  request for many samples instead of one POST per sample — which the engine
- *  appends to `engine.log` as `[Client/perf] …` lines. Greppable, no DB / no
- *  events-table rows (the bloat we deliberately avoid).
+ *  appends to its log as `[Client/perf] …` lines. Greppable, no DB / no
+ *  events-table rows (the bloat we deliberately avoid). Under the gateway that
+ *  log is `~/.lucidos/gateway/gateway.log`: see `docs/client-logs.md`.
  *
  *  Strictly fire-and-forget: a flush failure, an unreachable engine, or a
  *  teardown mid-flight must never throw into or block the app — telemetry is a

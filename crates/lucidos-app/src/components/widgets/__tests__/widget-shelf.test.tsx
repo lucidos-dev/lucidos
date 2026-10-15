@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
  * The widget shelf draws a chip per pinned widget in a thread's title row.
- * Home draws none: its pinned widgets live in the Home long-press menu and
- * their windows (ADR 0419), so a chip there would repeat them.
+ * Home draws none: its pinned widgets are tiles on the Home board (ADR 0466),
+ * so a chip there would repeat them.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -16,7 +16,7 @@ import { WidgetShelf } from '../WidgetShelf';
 let host: HTMLDivElement;
 
 function widget(appId: string): ThreadWidget {
-  return { app_id: appId, name: appId, reusable: false, reveal: 'on-load', pinned: true, shown_event_id: `ev-${appId}` };
+  return { app_id: appId, name: appId, reusable: false, reveal: 'on-load', sizes: ['medium'], pinned: true, shown_event_id: `ev-${appId}` };
 }
 
 const chips = () => [...host.querySelectorAll<HTMLElement>('[data-widget-chip]')].map((el) => el.dataset.widgetChip);

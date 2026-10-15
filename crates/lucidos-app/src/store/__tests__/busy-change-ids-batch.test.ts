@@ -5,11 +5,11 @@
  * Otherwise a queued member offers Apply and Discard mid-batch.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { applyAllBatch, applyingChangeIds, applyingNowThreadIds, busyChangeIds, changes } from '../store';
+import { applyAllBatch, applyingChangeIds, applyNowRequests, busyChangeIds, changes } from '../store';
 
 beforeEach(() => {
   applyingChangeIds.value = new Set();
-  applyingNowThreadIds.value = new Map();
+  applyNowRequests.value = new Map();
   changes.value = { status: 'loaded', data: [] };
   applyAllBatch.value = null;
 });

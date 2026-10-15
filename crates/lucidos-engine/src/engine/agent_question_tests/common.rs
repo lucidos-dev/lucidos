@@ -59,6 +59,9 @@ pub(crate) async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: cc_meta(),
     })
@@ -92,6 +95,7 @@ pub(crate) async fn seed_chat_thread(bus: &EventBus, thread_id: Uuid, text: &str
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,

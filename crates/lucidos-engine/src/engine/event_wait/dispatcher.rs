@@ -50,20 +50,92 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::Value;
+use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
 use super::{
     catch_up_from_watermark, emit_cancel, emit_delivery, emit_expiry, expired_waits,
     is_awaitable_event, rebuild_live_waits, waits_matching, CancelWaitOutcome, LiveWait,
-    ResolutionEmitError, WaitReentry, WaitReentryRequest, DEADLINE_SWEEP_INTERVAL,
+    WaitReentry, WaitReentryRequest, DEADLINE_SWEEP_INTERVAL,
 };
 use crate::core::event_subscription::{
     is_subscribable_system_event, matchable_system_payload, matchable_thread_payload,
     validate_subscribable_event_type, SubscriptionSurface, SubscriptionVerdict,
 };
-use crate::engine::event_bus::{BusEvent, EmittedEvent};
-use crate::engine::thread_events::{ActorMode, EventWaitCancelCause};
+use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope};
+use crate::engine::thread_events::{ActorMode, EventWaitCancelCause, ThreadEvent};
 use crate::engine::{LucidosEngine, PreEmittedOrigin};
+
+/// The event types whose row ends every wait on its thread.
+const WAIT_ENDING_EVENT_TYPES: [&str; 2] = ["ThreadArchived", "ThreadDiscarded"];
+
+/// What one read of the bus asks the dispatcher to do.
+#[derive(Debug)]
+struct DispatcherStep {
+    /// Threads whose waits end, from a live frame or the rows a lag dropped.
+    ended: Vec<(Uuid, EventWaitCancelCause)>,
+    /// The live frame to offer to every wait.
+    offer: Option<EmittedEvent>,
+    /// A lag dropped frames, so every live wait rescans from its watermark.
+    rescan: bool,
+}
+
+/// The dispatcher's step for one `recv` result. `None` once the bus closes.
+async fn dispatcher_step(
+    received: Result<EmittedEvent, RecvError>,
+    replay: &mut LagReplay,
+    pool: &sqlx::PgPool,
+) -> Option<DispatcherStep> {
+    match received {
+        Ok(emitted) => Some(DispatcherStep {
+            ended: replay
+                .live(&emitted)
+                .then(|| wait_ending(&emitted))
+                .flatten()
+                .into_iter()
+                .collect(),
+            offer: Some(emitted),
+            rescan: false,
+        }),
+        Err(RecvError::Lagged(n)) => {
+            // The ends come first, so no wait on an archived thread is left
+            // for the rescan to deliver. The rescan then covers the matches:
+            // each wait scans from its own watermark, which never moves.
+            crate::log!(
+                "[EventWait] EventBus subscriber lagged by {} events, replaying archives \
+                 and re-scanning every live wait",
+                n
+            );
+            Some(DispatcherStep {
+                ended: replay
+                    .missed(pool)
+                    .await
+                    .iter()
+                    .filter_map(wait_ending)
+                    .collect(),
+                offer: None,
+                rescan: true,
+            })
+        }
+        Err(RecvError::Closed) => None,
+    }
+}
+
+/// The thread a frame ends, and why: an archive or a discard.
+fn wait_ending(emitted: &EmittedEvent) -> Option<(Uuid, EventWaitCancelCause)> {
+    let BusEvent::Thread {
+        thread_id, event, ..
+    } = &emitted.typed
+    else {
+        return None;
+    };
+    let cause = match event {
+        ThreadEvent::ThreadArchived => EventWaitCancelCause::ThreadArchived,
+        ThreadEvent::ThreadDiscarded { .. } => EventWaitCancelCause::ThreadDiscarded,
+        _ => return None,
+    };
+    Some((*thread_id, cause))
+}
 
 impl LucidosEngine {
     /// Start the dispatcher's two background tasks: the bus subscriber and the
@@ -75,35 +147,26 @@ impl LucidosEngine {
     /// every wait's watermark precedes it. The other order leaves a genuine
     /// hole: the rebuild finishes, an event lands, and nobody is listening yet.
     pub fn start_event_wait_dispatcher(self: &Arc<Self>) {
-        let mut rx = self.event_bus.subscribe();
+        let (mut rx, mut replay) = LagReplay::subscribe(
+            &self.event_bus,
+            ReplayScope::Workspace,
+            Some(WAIT_ENDING_EVENT_TYPES.to_vec()),
+        );
         let engine = self.clone();
         tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(emitted) => {
-                        engine.cancel_waits_ended_by(&emitted).await;
-                        engine.offer_event_to_waits(&emitted).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        // The skipped batch is exactly the gap the watermark
-                        // scan was built for, so run it rather than logging the
-                        // loss and moving on. Without this a burst of events
-                        // (an e2e run, an Apply All) can drop the one match a
-                        // thread was watching for, and the thread then sleeps to
-                        // its deadline for no reason.
-                        crate::log!(
-                            "[EventWait] EventBus subscriber lagged by {} events, \
-                             re-scanning every live wait",
-                            n
-                        );
-                        engine.catch_up_all_event_waits().await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        crate::log!("[EventWait] EventBus closed, stopping wait dispatcher");
-                        break;
-                    }
+            while let Some(step) = dispatcher_step(rx.recv().await, &mut replay, &engine.pool).await
+            {
+                for (thread_id, cause) in step.ended {
+                    engine.cancel_waits_ended_by(thread_id, cause).await;
+                }
+                if let Some(emitted) = step.offer {
+                    engine.offer_event_to_waits(&emitted).await;
+                }
+                if step.rescan {
+                    engine.catch_up_all_event_waits().await;
                 }
             }
+            crate::log!("[EventWait] EventBus closed, stopping wait dispatcher");
         });
 
         let engine = self.clone();
@@ -116,6 +179,7 @@ impl LucidosEngine {
                     break;
                 }
                 engine.sweep_expired_event_waits().await;
+                engine.beat_cache_keep_alives().await;
             }
         });
     }
@@ -162,22 +226,7 @@ impl LucidosEngine {
     /// call sites, both of them explicit requests rather than consequences:
     /// **Stop waiting** targets one subscription, and an agent stand-down
     /// targets one or all of the calling thread's own.
-    async fn cancel_waits_ended_by(&self, emitted: &EmittedEvent) {
-        let BusEvent::Thread {
-            thread_id, event, ..
-        } = &emitted.typed
-        else {
-            return;
-        };
-        let cause = match event {
-            crate::engine::thread_events::ThreadEvent::ThreadArchived => {
-                EventWaitCancelCause::ThreadArchived
-            }
-            crate::engine::thread_events::ThreadEvent::ThreadDiscarded { .. } => {
-                EventWaitCancelCause::ThreadDiscarded
-            }
-            _ => return,
-        };
+    async fn cancel_waits_ended_by(&self, thread_id: Uuid, cause: EventWaitCancelCause) {
         // Cheap guard so the common case (any archive, on any thread, with no
         // waits anywhere) costs one map read rather than a `for_thread` clone.
         if self.live_waits.is_empty().await {
@@ -186,7 +235,7 @@ impl LucidosEngine {
         // Engine-internal: archive/discard arrive off the bus, and the actor
         // that caused them is already recorded on the ThreadArchived /
         // ThreadDiscarded event itself.
-        self.cancel_event_waits_for_thread(*thread_id, cause, None)
+        self.cancel_event_waits_for_thread(thread_id, cause, None)
             .await;
     }
 
@@ -346,50 +395,28 @@ impl LucidosEngine {
         }
     }
 
-    /// A resolution emit failed. Decide, from WHICH emit failed, whether the
-    /// wait is still the engine's to keep.
+    /// A resolution emit failed, so nothing was written and the wait is still
+    /// live. Put it back.
     ///
     /// `take` has already removed it from the cache, so doing nothing here is
-    /// not neutral: it strands the thread. The wait would be gone from the live
-    /// set, so no event can match it and no sweep can expire it, while its
-    /// `EventWaitStarted` is still unresolved in the store, so only a restart
-    /// would ever notice. That is the worst outcome available for a transient
-    /// write failure, and strictly worse than the polling this replaces.
+    /// not neutral: it strands the thread. No event could match the wait and
+    /// no sweep could expire it, while its `EventWaitStarted` stays unresolved
+    /// in the store until a restart notices.
     async fn resolution_emit_failed(
         &self,
         wait: &LiveWait,
         what: &str,
-        error: ResolutionEmitError,
+        error: Box<dyn std::error::Error + Send + Sync>,
     ) {
-        match error {
-            ResolutionEmitError::Unresolved(e) => {
-                crate::log!(
-                    "[EventWait] {} emit failed for wait {} on thread {}: {}. Re-arming: \
-                     nothing was persisted, so the wait is still live",
-                    what,
-                    wait.wait_id,
-                    wait.thread_id,
-                    e
-                );
-                self.live_waits.insert(wait.clone()).await;
-            }
-            ResolutionEmitError::AnchorMissing(e) => {
-                // NOT re-armed: the resolution IS persisted, so re-arming would
-                // let this wait resolve a second time. The thread is left with
-                // a resolution as its last word, which the ordinary restart
-                // machinery settles (the orphan sweep closes the dangling call
-                // and the user gets Continue).
-                crate::log!(
-                    "[EventWait] {} anchor emit failed for wait {} on thread {}: {}. \
-                     The wait is resolved but the thread will not resume until it is \
-                     continued or the engine restarts",
-                    what,
-                    wait.wait_id,
-                    wait.thread_id,
-                    e
-                );
-            }
-        }
+        crate::log!(
+            "[EventWait] {} emit failed for wait {} on thread {}: {}. Re-arming: \
+             nothing was persisted, so the wait is still live",
+            what,
+            wait.wait_id,
+            wait.thread_id,
+            error
+        );
+        self.live_waits.insert(wait.clone()).await;
     }
 
     /// Hand a resolved wait's re-entry to the consumer task.
@@ -479,6 +506,7 @@ impl LucidosEngine {
                 Some(is_coding_agent),
                 None,
                 Some(thread_id),
+                None,
                 None,
                 None,
                 None,
@@ -684,8 +712,7 @@ impl LucidosEngine {
         };
         if let Err(e) = emit_cancel(&self.event_bus, &wait, cause, actor).await {
             self.resolution_emit_failed(&wait, "Cancel", e).await;
-            // A cancel writes one event and nothing else, so the only failure
-            // it can report is `Unresolved`, and that is NOT `NotLive`: the
+            // A failed cancel wrote nothing, and that is NOT `NotLive`: the
             // wait exists and the re-arm above put it back, so the button is
             // about to work again.
             return CancelWaitOutcome::EmitFailed;
@@ -799,3 +826,7 @@ impl LucidosEngine {
         canceled
     }
 }
+
+#[cfg(test)]
+#[path = "dispatcher_tests.rs"]
+mod tests;

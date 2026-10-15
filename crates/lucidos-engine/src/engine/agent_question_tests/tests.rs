@@ -579,6 +579,7 @@ async fn lookup_question_channel_returns_chat_for_chat_emitter() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "ask me about colors".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1273,6 +1274,7 @@ async fn chat_text_streamed_orphans_active_lookup_on_chat_thread() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "ask me something".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1379,16 +1381,20 @@ async fn answered_after_restart_resume_emits_no_boundary_or_reminder() {
         "the resume must continue the turn that asked, not open a new one"
     );
 
-    let anchor_event_id = crate::engine::chat::rerun::emit_resume_anchor(
-        &bus,
-        thread_id,
-        anchor,
-        "[Engine note — resumed after restart] …",
-        EventChannel::Chat,
-        None,
-    )
-    .await
-    .expect("emit_resume_anchor");
+    let crate::engine::chat::rerun::ResumeAnchorClaim::Anchored(anchor_event_id) =
+        crate::engine::chat::rerun::emit_resume_anchor(
+            &bus,
+            thread_id,
+            anchor,
+            "[Engine note — resumed after restart] …",
+            EventChannel::Chat,
+            None,
+        )
+        .await
+        .expect("emit_resume_anchor")
+    else {
+        panic!("no other resume claims this anchor");
+    };
 
     assert_eq!(
         anchor_event_id, turn_id,
@@ -1423,18 +1429,23 @@ async fn interrupted_response_continue_still_emits_boundary_and_reminder() {
     seed_chat_thread(&bus, thread_id, "write me a story").await;
     let note = "[Engine note — this is a rerun]\n- send_notification(Ping) → ok";
 
-    let anchor_event_id = crate::engine::chat::rerun::emit_resume_anchor(
-        &bus,
-        thread_id,
-        ChatResumeAnchor::NewBoundary {
-            interrupted_turn: None,
-        },
-        note,
-        EventChannel::Chat,
-        None,
-    )
-    .await
-    .expect("emit_resume_anchor");
+    let crate::engine::chat::rerun::ResumeAnchorClaim::Anchored(anchor_event_id) =
+        crate::engine::chat::rerun::emit_resume_anchor(
+            &bus,
+            thread_id,
+            ChatResumeAnchor::NewBoundary {
+                interrupted_turn: None,
+                resumed_abort: None,
+            },
+            note,
+            EventChannel::Chat,
+            None,
+        )
+        .await
+        .expect("emit_resume_anchor")
+    else {
+        panic!("no other resume claims this anchor");
+    };
 
     assert_eq!(
         count_events_of_type(&pool, thread_id, "ContinuationStarted").await,
@@ -1484,7 +1495,8 @@ async fn ask_call_without_request_event_id_falls_back_to_boundary() {
     assert_eq!(
         resume_anchor_for_ask(ask.as_ref(), thread_id),
         ChatResumeAnchor::NewBoundary {
-            interrupted_turn: None
+            interrupted_turn: None,
+            resumed_abort: None,
         },
     );
 
@@ -1492,7 +1504,8 @@ async fn ask_call_without_request_event_id_falls_back_to_boundary() {
     assert_eq!(
         resume_anchor_for_ask(None, thread_id),
         ChatResumeAnchor::NewBoundary {
-            interrupted_turn: None
+            interrupted_turn: None,
+            resumed_abort: None,
         },
     );
 

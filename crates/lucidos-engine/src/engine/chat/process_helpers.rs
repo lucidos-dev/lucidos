@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -15,7 +14,6 @@ use crate::engine::thread_events::{
     EventChannel, EventMeta, MessageOrigin, ThreadEvent, TriggerInvocation,
 };
 use crate::engine::types::AgentSession;
-use crate::engine::ThreadHandle;
 
 /// Trigger context passed into the chat process flow. None for user-driven chat.
 pub(super) struct TriggerContext {
@@ -31,6 +29,9 @@ pub(super) struct TriggerContext {
     /// command guard consults it to decide whether an `IrreversibleDanger`
     /// command may run unattended; an ungranted side-effect fails the trigger.
     pub side_effect_grant: Vec<crate::engine::command_guard::SideEffectCategory>,
+    /// The MCP servers the trigger lists. The fire enables each in its thread
+    /// before round 1 (ADR 0430).
+    pub mcp_servers: Vec<String>,
     /// The *Thread Queue* entry this fire was admitted under.
     ///
     /// A trigger entry binds no thread at submit time, so the turn reports the
@@ -444,67 +445,6 @@ pub(super) fn build_system_knowhow_section(
     section
 }
 
-/// Bridge the race between a chat handler that has already taken
-/// `active_threads[thread_id]` (and is mid-spawn of a Claude Code subprocess) and the
-/// fast-path on a follow-up POST that needs `agent_sessions[thread_id]` to
-/// exist before it can route via `msg_tx`.
-///
-/// Without this bridge, a follow-up POST that arrives in the 1-10s window
-/// between `register_thread` and `agent_sessions.insert()` falls to the slow
-/// path, blocks 60s in `register_thread_queued`, then force-evicts the
-/// still-spawning CC. Symptoms: `ResponseAborted (cause=safety_net)` on a
-/// fresh CC turn, plus a brand-new replacement spawn that often dies
-/// immediately because its resume points at the just-killed conversation.
-///
-/// Returns `true` when `agent_sessions[thread_id]` is populated with a live
-/// session (see `AgentSession::is_live` — a phantom left by a dropped run
-/// future does not count) before the deadline. Returns `false` when:
-///   - `active_threads[thread_id]` clears before population (chat handler
-///     bailed without registering a session — fall through to a fresh spawn);
-///   - the deadline elapses (caller falls through to slow path).
-///
-/// `poll_interval` keeps the busy-loop bounded — at the default 100ms a
-/// 30-second deadline is 300 mutex acquisitions, dwarfed by the cost of CC
-/// startup itself.
-pub(super) async fn wait_for_cc_session_alive(
-    agent_sessions: &TokioMutex<HashMap<Uuid, AgentSession>>,
-    active_threads: &StdMutex<HashMap<Uuid, ThreadHandle>>,
-    thread_id: Uuid,
-    deadline: Duration,
-    poll_interval: Duration,
-) -> bool {
-    let start = std::time::Instant::now();
-    let mut logged_wait = false;
-    loop {
-        {
-            let guard = agent_sessions.lock().await;
-            if let Some(s) = guard.get(&thread_id) {
-                if s.is_live() {
-                    return true;
-                }
-            }
-        }
-        // No chat handler is mid-spawn anymore — no point in waiting.
-        let chat_active = active_threads.lock().unwrap().contains_key(&thread_id);
-        if !chat_active {
-            return false;
-        }
-        if !logged_wait {
-            log!(
-                "[Chat] Thread {} active in chat but no agent session yet — \
-                 bridging spawn race (up to {}s)",
-                thread_id,
-                deadline.as_secs()
-            );
-            logged_wait = true;
-        }
-        if start.elapsed() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
-}
-
 /// Backstop on how long the follow-up fast-path blocks waiting for an
 /// interrupted turn to reach a boundary before routing the follow-up anyway.
 /// The graceful interrupt (Codex `turn/interrupt`, Claude Code
@@ -585,7 +525,7 @@ pub(super) fn should_redirect_followup(
 /// routes the follow-up normally.
 ///
 /// Pure over the map (no engine, no async) so the arming behavior is unit-tested
-/// with a fake session, like `wait_for_cc_session_alive`.
+/// with a fake session.
 pub(super) fn arm_followup_redirect(
     sessions: &mut HashMap<Uuid, AgentSession>,
     thread_id: Uuid,
@@ -594,6 +534,11 @@ pub(super) fn arm_followup_redirect(
     origin: &Option<MessageOrigin>,
 ) -> Option<std::sync::Arc<tokio::sync::Notify>> {
     let s = sessions.get_mut(&thread_id)?;
+    // A starting run has no turn to interrupt yet: the follow-up just queues
+    // behind its first prompt. Interrupting would cancel the spawn.
+    if !s.is_running() {
+        return None;
+    }
     if !should_redirect_followup(s.coding_agent, s.is_in_flight(), is_user_message, urgent) {
         return None;
     }

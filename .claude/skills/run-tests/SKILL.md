@@ -1,6 +1,6 @@
 ---
 name: run-tests
-description: Use when asked to "run tests", "build & test", "check the engine builds", or any variant — builds the engine (`cargo build -p lucidos-engine --release`) and runs the full engine suite via `./scripts/test-engine.sh --full` (which provisions a disposable Postgres — bare `cargo test -p lucidos-engine` panics every DB-backed integration test), plus the frontend Vitest suite (`cd crates/lucidos-app && npx tsc --noEmit && npm test`). Fixes failures at root cause, never bypasses with #[ignore], reports exact pass/fail counts.
+description: Use when asked to "run tests", "build & test", "check the engine builds", or any variant. It builds the engine (`cargo build -p lucidos-engine --release`) and runs the full engine suite via `./scripts/test-engine.sh --full`, which provisions a disposable Postgres (bare `cargo test -p lucidos-engine` panics every DB-backed integration test). It also runs the frontend suite (`cd crates/lucidos-app && npm run typecheck && npm test`). Fixes failures at root cause, never bypasses with #[ignore], reports exact pass/fail counts.
 ---
 
 # Run tests (engine + frontend unit)
@@ -43,9 +43,9 @@ Run both phases. If either fails, the whole skill FAILED.
       as FAILED (infra), not green. To narrow to a filter while iterating a fix:
       `./scripts/test-engine.sh -- -- <test_name>` (the double `--` is required so
       the names reach the test binary, not cargo).
-2. **Frontend unit (Vitest + tsc).** `cd crates/lucidos-app && npx tsc --noEmit && npm test`.
+2. **Frontend unit (Vitest + tsc).** `cd crates/lucidos-app && npm run typecheck && npm test`. Both run `./scripts/codegen.sh` first, so neither checks a stale generated file.
    - `npm test` runs `vitest run` (single pass, no watch).
-   - `npx tsc --noEmit` catches type regressions that Vitest alone misses.
+   - The type check catches type regressions that Vitest alone misses.
    - Run from the `crates/lucidos-app` directory — npm workspaces resolve
      correctly from there.
 
@@ -74,63 +74,45 @@ output is too large, redirect to a log file and capture `$?` directly,
 then grep the log — never let a pipe stand between you and the exit
 status:
 
+The build and the full engine suite outlast a 4-minute foreground call. No
+call may block longer, or the prompt cache expires. Run
+each as a polled background task, and wait on it in the foreground with
+`timeout: 240000`:
+
 ```sh
-./scripts/test-engine.sh --full > /tmp/engine-test.log 2>&1; echo "EXIT: $?"
-tail -100 /tmp/engine-test.log   # inspect AFTER capturing the real exit
+lucidos background-task run --poll --description "the full engine suite" \
+  -- 'mkdir -p .lucidos && ./scripts/test-engine.sh --full > .lucidos/engine-test.log 2>&1'
+lucidos background-task wait <task_id>   # re-issue until it reports finished
+tail -100 .lucidos/engine-test.log       # inspect AFTER reading the real exit
 ```
 
-A "PASSED" claim requires the echoed `EXIT: 0` you printed yourself AND
-the `test result: ok.` line with `0 failed` — a trimmed tail alone can
-lie. Cross-check both: a non-zero exit with no `test result:` line at all
+Each `wait` returns within 230 s. The final record's `exit_code` is the
+script's own, since the engine runs the command un-piped. A "PASSED" claim
+requires that `exit_code: 0` AND the `test result: ok.` line with `0 failed`
+— a trimmed tail alone can lie. Cross-check both: a non-zero exit with no `test result:` line at all
 usually means the *infra* failed (Docker down, port in use), not a test —
 report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Expect **`20 ignored` in the lib run and `0 ignored` in the doctest run**,
+Expect **`8 ignored` in the lib run and `0 ignored` in the doctest run**,
 and nothing else. Any other ignored test is a real skip and must be
 fixed. (`crates/lucidos-engine/tests/`, the integration binaries, has
-no `#[ignore]` at all.) The twenty are four different things:
-**thirteen codegen writers**, **four diagnostic printers**, **two
+no `#[ignore]` at all.) The eight are four different things:
+**one codegen writer**, **four diagnostic printers**, **two
 live-provider checks**, and **one subprocess body**.
 
-### The thirteen codegen writers
+### The one codegen writer
 
-The table lists fourteen. The last row is in `lucidos-gateway`, so the
-engine's lib run counts thirteen.
-
-Every one of them is paired with a *non-ignored* staleness guard that
-fails `cargo test` when the generated file on disk no longer matches
-what the writer would produce. That pairing is the whole reason the
-`#[ignore]` is legitimate:
-the writer is `#[ignore]`d because *running* it rewrites a checked-in
-source file (a test must not mutate the tree), while the guard means a
-stale artifact still reds the suite. Rust stays the source of truth; the
-generated file is a build product that happens to be committed. So this
-is not a skipped test — it is a test split into "check" (always runs)
-and "regenerate" (run on demand). Don't re-litigate it, and don't
-"fix" it by un-ignoring the writers.
-
-| `#[ignore]` writer | Non-ignored staleness guard |
-|---|---|
-| `capability_manifest::codegen::generate_cli_commands_file` | `generated_cli_commands_is_up_to_date` |
-| `capability_manifest::codegen::generate_sdk_capabilities_file` | `generated_sdk_capabilities_is_up_to_date` |
-| `engine::thread_lifecycle::contract_tests::generate_typescript_file` | the contract-staleness assert in `thread_lifecycle_tests/contract.rs` |
-| `engine::thread_lifecycle::contract_tests::generate_cross_validation_fixture_file` | same file's fixture-staleness assert |
-| `llm::tools::misc::navigate_targets_codegen::generate_navigate_targets_file` | `generated_navigate_targets_is_up_to_date` |
-| `engine::thread_events::ts_codegen::generate_thread_event_wire_file` | `generated_thread_event_wire_is_up_to_date` |
-| `core::store::messages::spoken_merge::tests::generate_spoken_merge_fixture_file` | `spoken_merge_fixture_is_up_to_date` |
-| `engine::title_match::tests::generate_title_match_fixture_file` | `title_match_fixture_is_up_to_date` |
-| `core::fonts::tests::generate_font_catalog_files` | `generated_font_catalog_is_up_to_date` and `generated_font_faces_are_up_to_date` |
-| `core::themes::parts::tests::generate_theme_parts_files` | `generated_theme_parts_ts_is_up_to_date` and `generated_theme_parts_css_is_up_to_date` |
-| `api::app_reach::tests::generate_app_reach_file` | `generated_app_reach_is_up_to_date` |
-| `core::preference_catalog::codegen_tests::generate_preference_catalog_file` | `generated_preference_catalog_is_up_to_date` |
-| `engine_constants_codegen_tests::generate_engine_constants_file` | `generated_engine_constants_are_up_to_date` |
-| `lucidos-gateway`: `generate_gateway_constants_file` (`cargo test -p lucidos-gateway generate_gateway_constants_file -- --ignored`) | `generated_gateway_constants_are_up_to_date` |
-
-When a guard fails it prints the exact regeneration command; run that,
-then re-run the suite. `cargo test -p lucidos-engine --lib -- --ignored --list`
-prints the live list if you need to re-check the set.
+`codegen::tests::write_generated_outputs` writes every generated file
+into `$LUCIDOS_CODEGEN_OUT`. It is not a test: `scripts/codegen.sh`
+runs it to render a cache miss when no freshly built `lucidos-codegen`
+is at hand, because it reuses the compile `make test` already paid for.
+It satisfies clause (a): the non-ignored
+`every_generated_file_renders_once_into_a_generated_folder` runs every
+renderer on every suite run, so a renderer that refuses still reds it.
+Generated files are build outputs, so there is no staleness guard to
+pair it with: `scripts/codegen.sh` regenerates them on every use.
 
 ### The four diagnostic printers
 

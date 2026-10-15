@@ -37,6 +37,7 @@ async fn a_follow_up_on_a_thread_with_a_pending_change_rebuilds_the_changes_fram
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "revise the plan".into(),
             user_image_hashes: vec![],
             device_id: None,

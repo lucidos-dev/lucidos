@@ -36,23 +36,17 @@
 //! The SDK's `lucidos.ui.applyPreferences()` continues to handle live SSE
 //! updates; it just overwrites the values this script set.
 
+use super::sdk::{BuiltSdkFile, APPEARANCE_BOOT_FILE};
 use super::*;
 
 use crate::core::{prefs, PreferenceStore};
 
-/// The appearance FOUC script, built from `packages/lucidos-sdk/src/boot/` and
-/// checked in. The app shell inlines the sibling `host` bundle into its own
-/// `<head>`, so the two documents run ONE program: they used to run two
-/// hand-copied ones, held together by a comment asking the next editor to keep
-/// them in sync.
-///
-/// `include_str!` bakes it into the binary at compile time (cross-crate path,
-/// same as `api/sdk.rs` does with the app's shared component CSS), so the
-/// packaged build carries it with no runtime file dependency and `cargo build`
-/// never needs npm to have run. A staleness test in the SDK package fails if
-/// the committed bundle no longer matches its source.
-const SDK_PREFS_JS: &str =
-    include_str!("../../../../packages/lucidos-sdk/src/generated/appearance-boot.iframe.js");
+/// The appearance FOUC script, built from `packages/lucidos-sdk/src/boot/` into
+/// the SDK's `dist/`. The app shell inlines the sibling `host` bundle into its
+/// own `<head>`, so the two documents run ONE program. What the bundle says is
+/// tested where it is built, in
+/// `packages/lucidos-sdk/src/boot/iframeBundle.test.ts`.
+static SDK_PREFS_JS: BuiltSdkFile = BuiltSdkFile::new(APPEARANCE_BOOT_FILE);
 
 /// The preference keys an app frame needs before anything async can answer, in
 /// the order the SDK resolves them. The appearance keys paint the first frame.
@@ -102,6 +96,9 @@ pub(super) async fn serve_sdk_prefs_js(
     State(state): State<AppState>,
     Query(query): Query<SdkPrefsQuery>,
 ) -> Response {
+    let Some(script) = SDK_PREFS_JS.read() else {
+        return SDK_PREFS_JS.missing();
+    };
     let Some(device) = query.device.as_deref() else {
         // No device named, so the body is the bundle every caller shares and
         // stays cacheable exactly as it was.
@@ -113,7 +110,7 @@ pub(super) async fn serve_sdk_prefs_js(
                 ),
                 (header::CACHE_CONTROL, "public, max-age=300"),
             ],
-            SDK_PREFS_JS,
+            script,
         )
             .into_response();
     };
@@ -144,7 +141,7 @@ pub(super) async fn serve_sdk_prefs_js(
             // That flash is what this route exists to remove.
             (header::CACHE_CONTROL, "no-store"),
         ],
-        format!("{}{}", seed_line(&prefs), SDK_PREFS_JS),
+        seeded_script(&prefs, &script),
     )
         .into_response()
 }
@@ -188,6 +185,12 @@ fn with_workspace_font(
     }
 }
 
+/// The boot script with its seed in front: the bundle reads the seed, so it
+/// must run after it.
+fn seeded_script(prefs: &std::collections::HashMap<String, String>, script: &str) -> String {
+    format!("{}{script}", seed_line(prefs))
+}
+
 /// The `window.__lucidosPrefs = {…};` line prepended to the bundle, or an empty
 /// string when nothing is stored.
 ///
@@ -227,156 +230,20 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
-    /// The VALUES this script applies (the theme default, the font stacks, the
-    /// ligature pairs, the scale grid, the style-override rules) are asserted
-    /// once, at their source, in `packages/lucidos-sdk/src/appearance.test.ts`.
-    /// Re-asserting them here would be re-checking a copy that no longer exists,
-    /// and it would pin esbuild's output formatting instead of behaviour.
-    ///
-    /// What is left is the ENGINE's side of the contract: that the artifact it
-    /// serves is the boot script, is complete, is the IFRAME build, and still
-    /// reads the workspace-scoped keys the shell writes.
-
-    #[test]
-    fn serves_the_generated_boot_bundle() {
-        assert!(
-            SDK_PREFS_JS.contains("GENERATED from packages/lucidos-sdk/src/boot/"),
-            "the served script must be the built bundle, not something hand-edited here"
-        );
-        // Wrapped so its locals never reach the iframe's global scope. esbuild's
-        // IIFE wrapper is an arrow form, hence the loose check.
-        assert!(SDK_PREFS_JS.contains("(() => {"));
-        assert!(SDK_PREFS_JS.trim_end().ends_with("})();"));
-    }
-
-    #[test]
-    fn script_is_the_iframe_build_not_the_shell_one() {
-        // The two entry points differ in exactly the pieces that are the SHELL's:
-        // the boot-splash gradient and the theme-telemetry POST. Serving the host
-        // bundle to app iframes would paint the brand gradient behind every app
-        // and have each of them POST breadcrumbs on load.
-        assert!(
-            !SDK_PREFS_JS.contains("radial-gradient"),
-            "the boot splash belongs to the shell"
-        );
-        assert!(
-            !SDK_PREFS_JS.contains("client-log"),
-            "theme telemetry belongs to the shell"
-        );
-        // And the shell's escape hatch is not the iframe's: the shell clears the
-        // key before an iframe loads, so `?style-reset` must be off here.
-        assert!(SDK_PREFS_JS.contains("styleReset: false"));
-    }
-
-    #[test]
-    fn script_reads_theme_mode_font_and_scale_from_the_seed_then_storage() {
-        // Two sources, in that order. The seed is what an ISOLATED app frame
-        // has, since it can read none of the shell's storage. Storage is the
-        // shell's own path, and the fallback behind the seed everywhere else.
-        // The bundle carries the generated catalog's key objects, so each key
-        // is the catalog's own.
-        for key in [
-            prefs::THEME_MODE.key(),
-            prefs::FONT_FAMILY.key(),
-            prefs::UI_SCALE.key(),
-        ] {
-            assert!(
-                SDK_PREFS_JS.contains(&format!(r#"key: "{key}""#)),
-                "sdk-prefs.js must carry the generated catalog's {key}"
-            );
-        }
-        assert!(SDK_PREFS_JS.contains("THEME_MODE_KEY = PREF_THEME_MODE.key"));
-        assert!(SDK_PREFS_JS.contains(r#"THEME_MODE_STORAGE_KEY = "lucidos-theme-mode""#));
-        assert!(SDK_PREFS_JS.contains("seeded(served, THEME_MODE_KEY, THEME_MODE_STORAGE_KEY)"));
-        assert!(
-            SDK_PREFS_JS.contains(r#"seeded(served, PREF_FONT_FAMILY.key, "lucidos-font-family")"#),
-            "sdk-prefs.js must read font-family from the seed, then storage"
-        );
-        // Scale reads the seed inline rather than through `seeded`, because it
-        // carries the two pre-grid aliases as well. Same order, same fallback.
-        assert!(SDK_PREFS_JS.contains("served[PREF_UI_SCALE.key]"));
-        assert!(SDK_PREFS_JS.contains(r#"served["text-size"]"#));
-        assert!(SDK_PREFS_JS.contains(r#"wsLocalGet("lucidos-ui-scale")"#));
-    }
-
+    /// The boot script reads the global this route prepends. Two halves of one
+    /// contract in two languages, so a rename on either side has to be a rename
+    /// on both.
     #[test]
     fn the_seed_the_script_reads_is_the_one_this_route_writes() {
-        // Two halves of one contract in two languages, so a rename on either
-        // side has to be a rename on both.
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packages/lucidos-sdk/src/boot/appearanceBoot.ts"),
+        )
+        .expect("the boot source exists");
         assert!(
-            SDK_PREFS_JS.contains(&format!("globalThis.{SEED_GLOBAL}")),
-            "the bundle must read the global this route prepends"
+            source.contains(&format!(".{SEED_GLOBAL};")),
+            "appearanceBoot.ts must read globalThis.{SEED_GLOBAL}"
         );
-    }
-
-    #[test]
-    fn script_namespaces_keys_per_workspace() {
-        // The iframe realm has no access to the parent's Storage.prototype
-        // override, so it must derive the workspace slug and namespace the keys
-        // itself, or a parent `ws:<slug>:lucidos-theme-mode` write would never match
-        // the iframe read and every app would FOUC. Direct to an engine the
-        // slug is the path before `/app/`. Behind a gateway the engine stamps a
-        // frame capability base, and the slug is everything before that segment
-        // (ADR 0238). The script has to carry both derivations.
-        assert!(SDK_PREFS_JS.contains("indexOf(\"/app/\")"));
-        assert!(SDK_PREFS_JS.contains("~cap"));
-        assert!(SDK_PREFS_JS.contains("ws:"));
-    }
-
-    #[test]
-    fn script_has_no_unscoped_appearance_reads() {
-        // Guard against a regression that drops the wsKey() wrapper. No raw,
-        // string-literal read of a per-workspace appearance key may remain.
-        for key in [
-            "lucidos-theme-mode",
-            "lucidos-font-family",
-            "lucidos-ui-scale",
-            "lucidos-style-overrides",
-        ] {
-            let raw = format!("localStorage.getItem(\"{key}\")");
-            assert!(
-                !SDK_PREFS_JS.contains(&raw),
-                "sdk-prefs.js must not read {key} unscoped, wrap it in wsKey()"
-            );
-        }
-    }
-
-    #[test]
-    fn script_resolves_system_theme_mode_via_matchmedia() {
-        // `system` must defer to matchMedia at execution time so light-OS
-        // browsers don't FOUC dark-then-light.
-        assert!(SDK_PREFS_JS.contains("matchMedia(\"(prefers-color-scheme: light)\")"));
-    }
-
-    #[test]
-    fn script_sets_data_theme_mode_and_bg_primary() {
-        assert!(SDK_PREFS_JS.contains(r#"THEME_MODE_ATTRIBUTE = "data-theme-mode""#));
-        assert!(SDK_PREFS_JS.contains("setAttribute(THEME_MODE_ATTRIBUTE, resolved)"));
-        assert!(SDK_PREFS_JS.contains("setProperty(\"--bg-primary\""));
-        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-ui\""));
-        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-text\""));
-        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-code\""));
-    }
-
-    #[test]
-    fn script_sets_inline_html_background() {
-        // iOS PWA regression: until the iframe's stylesheet applies
-        // `html { background: var(--bg-primary); }`, <html> has no background
-        // and WKWebView's underlying white shows through any area body doesn't
-        // cover. Setting style.background directly on <html> from FOUC closes
-        // that gap on first paint.
-        assert!(
-            SDK_PREFS_JS.contains("d.style.background ="),
-            "FOUC must set d.style.background inline, not just the --bg-primary CSS variable"
-        );
-    }
-
-    #[test]
-    fn script_never_sets_font_feature_settings_directly() {
-        // Scope is decided by the two rules in api/sdk_iframe.css, which consume
-        // the published custom properties. The bare property is inherited, so
-        // writing it here would ligature an app's prose as well as its code.
-        assert!(!SDK_PREFS_JS.contains("setProperty(\"font-feature-settings\""));
     }
 
     /// A stored preference map. The expected seed lines below spell their keys
@@ -509,10 +376,9 @@ mod tests {
 
     #[test]
     fn the_seed_precedes_the_bundle_it_feeds() {
-        let body = format!(
-            "{}{}",
-            seed_line(&stored(&[(prefs::THEME_MODE.key(), "dark")])),
-            SDK_PREFS_JS
+        let body = seeded_script(
+            &stored(&[(prefs::THEME_MODE.key(), "dark")]),
+            "(() => {})();",
         );
         let seed_at = body.find("__lucidosPrefs").expect("seed present");
         let bundle_at = body.find("(() => {").expect("bundle present");
@@ -520,17 +386,5 @@ mod tests {
             seed_at < bundle_at,
             "the bundle reads the seed, so it must run after it"
         );
-    }
-
-    #[test]
-    fn script_still_applies_the_style_remote() {
-        // Presence only. Two behaviours that used to be asserted here by reading
-        // the script top to bottom cannot be: in a BUNDLE the source order of a
-        // definition says nothing about execution order. That "overrides are
-        // applied last" rule, and "no stored scale leaves --user-ui-scale
-        // unset", are now driven for real against a fake document in
-        // `packages/lucidos-sdk/src/boot/appearanceBoot.test.ts`, which is a
-        // stronger check than the scan ever was.
-        assert!(SDK_PREFS_JS.contains("lucidos-style-overrides"));
     }
 }

@@ -4,9 +4,10 @@ use crate::core::prefs;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::triggers::{
-    is_valid_trigger_slug, normalize_route_setting, resolve_trigger_provider_update,
-    validate_script_extension, validate_trigger_provider, validate_trigger_reasoning_effort,
-    EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
+    is_valid_trigger_slug, normalize_mcp_servers, normalize_route_setting,
+    resolve_trigger_provider_update, validate_script_extension, validate_trigger_provider,
+    validate_trigger_reasoning_effort, EventSubscription, TriggerConfig, TriggerRun,
+    TriggerRunStatus,
 };
 
 #[derive(Serialize)]
@@ -61,6 +62,9 @@ pub struct TriggerInfo {
     /// side-effect categories it may perform unattended. Empty = none granted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// The MCP server ids this trigger's fires use (ADR 0430). Empty = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
     /// Plugin provenance (ADR 0019) — the id of the *plugin* that auto-registered
     /// this trigger, or absent for a user-created one. Drives the Triggers
     /// panel's "from \<plugin\>" chip.
@@ -113,6 +117,7 @@ impl TriggerInfo {
             go_to_review: config.go_to_review,
             group_id: config.group_id.clone(),
             side_effect_grant: config.side_effect_grant.clone(),
+            mcp_servers: config.mcp_servers.clone(),
             plugin_id: config.plugin_id.clone(),
             model: config.model.clone(),
             reasoning_effort: config.reasoning_effort.clone(),
@@ -178,6 +183,11 @@ pub struct CreateTriggerCronRequest {
     /// irreversible side-effect. Unknown category strings 4xx via serde.
     #[serde(default)]
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// The MCP server ids this trigger's fires use (ADR 0430). Only these
+    /// servers' tools run silently in its threads. An id no server has yet is
+    /// accepted, and each fire reports it.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
     /// The **trigger model** this trigger's intent fires on. Omitted, null, or
     /// blank = the account `chat_model` preference, which is what every trigger
     /// did before the field existed. Not checked against the model registry:
@@ -231,6 +241,10 @@ pub struct UpdateTriggerCronRequest {
     /// = replace with the new set. Unknown category strings 4xx via serde.
     #[serde(default)]
     pub side_effect_grant: Option<Vec<SideEffectCategory>>,
+    /// Full replacement for the MCP server ids. None = field absent (don't
+    /// change), Some(empty) = clear, Some(non-empty) = replace.
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<String>>,
     /// None = field absent (don't change), Some(None) = explicitly null (back to
     /// the account `chat_model` preference), Some(Some(v)) = set. A blank string
     /// clears too: blank is how the form's "Default" option travels.
@@ -467,6 +481,10 @@ pub(super) async fn create_trigger(
         payload["side_effect_grant"] = serde_json::to_value(&request.side_effect_grant)
             .expect("SideEffectCategory serialization is infallible");
     }
+    let mcp_servers = normalize_mcp_servers(request.mcp_servers.iter().map(String::as_str));
+    if !mcp_servers.is_empty() {
+        payload["mcp_servers"] = serde_json::json!(mcp_servers);
+    }
     // Model / reasoning effort: only stamped when the user picked something
     // other than Default, so a trigger on the account defaults keeps exactly the
     // payload it had before the fields existed.
@@ -646,6 +664,10 @@ pub(super) async fn update_trigger(
     if let Some(ref grant) = request.side_effect_grant {
         update_payload["side_effect_grant"] =
             serde_json::to_value(grant).expect("SideEffectCategory serialization is infallible");
+    }
+    if let Some(ref ids) = request.mcp_servers {
+        update_payload["mcp_servers"] =
+            serde_json::json!(normalize_mcp_servers(ids.iter().map(String::as_str)));
     }
     // Model / reasoning effort: same null-vs-absent semantics as app_id, so a
     // rename-only save leaves the trigger's model alone while an explicit null

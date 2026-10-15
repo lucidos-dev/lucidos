@@ -26,17 +26,22 @@
 # Clean exit codes (child exited on purpose → stay dead, do NOT respawn):
 #   0   — graceful_shutdown completed (gateway handled SIGUSR1 or SIGINT)
 #   130 — SIGINT default action  (before handler installed)
-#   138 — SIGUSR1 default action (signal arrived before handler installed)
+#   128 + SIGUSR1 — SIGUSR1 default action (arrived before the handler).
+#         138 on Linux and 158 on macOS, so it is computed, never written.
+#   75  — another gateway already owns the data dir (`ALREADY_RUNNING_EXIT`
+#         in server.rs). This launch lost, and the winner is serving.
 #
-# Usage: run_gateway_supervised <pidfile> <logfile> <cmd...>
+# Usage: run_gateway_supervised <state_dir> <logfile> <cmd...>
 #
-# Writes the running gateway child's pid to <pidfile> on every (re)start so
-# start_gateway's reuse-health check, the `-b` stop path, and the documented
-# `kill $(cat …/gateway.pid)` all read the live child pid even after a respawn.
+# Writes no pidfile. The gateway publishes `gateway.pid` itself once it holds
+# the data dir's owner lock, so a launch that loses never overwrites the
+# winner's pid (ADR 0438). <state_dir> receives the crash sidecar below.
 run_gateway_supervised() {
-    local pidfile="$1"
+    local state_dir="$1"
     local logfile="$2"
     shift 2
+    local usr1_exit=$((128 + $(kill -l USR1)))
+    local already_running_exit=75
 
     # Capture the supervisor's own PID for self-identifying log lines. `$$` is the
     # parent's in a `( … ) &` subshell on bash 3.2 (macOS default); the portable
@@ -76,15 +81,13 @@ run_gateway_supervised() {
 
         "$@" >> "$logfile" 2>&1 &
         local child_pid=$!
-        echo "$child_pid" > "$pidfile"
         _gw_sup_log "spawned child pid=$child_pid"
 
         wait "$child_pid"
         local exit_code=$?
 
-        # 0 = graceful_shutdown; 130 = SIGINT default; 138 = SIGUSR1 default.
         case "$exit_code" in
-            0|130|138)
+            0|130|"$usr1_exit"|"$already_running_exit")
                 _gw_sup_log "child pid $child_pid exited cleanly ($exit_code), supervisor stopping"
                 break
                 ;;
@@ -98,7 +101,7 @@ run_gateway_supervised() {
         # before adding any free-text field. Best-effort: a write failure only
         # loses one breadcrumb, not the respawn.
         local sidecar
-        sidecar="$(dirname "$pidfile")/gateway.last-death.json"
+        sidecar="$state_dir/gateway.last-death.json"
         local died_at
         died_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
         printf '{"old_pid":%d,"exit_code":%d,"died_at":"%s","supervisor_pid":%d}\n' \

@@ -1,7 +1,12 @@
 # 0026 — A coding-agent session is never owned by a request future, and a map entry always implies a live loop
 
-- **Status** — Accepted
+- **Status** — Accepted, amended by [0442](0442-a-check-and-its-claim-are-one-step.md)
 - **Date** — 2026-07-28
+
+> **Amended by ADR 0442.** A spawn now inserts its entry when it claims the thread,
+> before its process exists (`SessionPhase::Starting`). An entry implies a claimed
+> run, starting or running. `is_live()` and `SessionEntryGuard` keep their roles: the
+> claim owns the receiver, and the guard only reaps until the run starts its loop.
 
 ## Context
 

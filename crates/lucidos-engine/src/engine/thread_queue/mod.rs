@@ -23,16 +23,13 @@
 //!   frees.
 //! - **User-initiated work** goes through [`ThreadQueue::acquire_user_slot`]:
 //!   the caller (chat handler) runs it itself; the queue only gates the START
-//!   (back-pressure at pool-max) and counts the slot. From there the slot's
-//!   lifetime is owned by [`ThreadQueue::reconcile_user_slot`], driven by the
-//!   settle subscriber off `thread_summaries.status` — the SINGLE place the
-//!   user-half of the pool moves in and out, so it can never drift from real
-//!   thread status (a thread that parks on a question, resumes, is continued,
-//!   or auto-resumes after restart all converge correctly). These slots live
-//!   in-memory only — ephemeral runtime (a dead response is gone on restart,
-//!   never re-fired), so they are NOT persisted; the panel API merges them in
-//!   and a transient `ThreadQueueChanged` refreshes the panel when only user
-//!   state moves.
+//!   (back-pressure at pool-max). User occupancy is read at each admission
+//!   (ADR 0443): running user threads in `thread_summaries`, plus gate
+//!   reservations whose thread has not started running yet. A thread counts
+//!   exactly while it is `running`, however it got there. No subscriber has to
+//!   deliver an event for that to hold. Reservations live in memory only (a
+//!   dead response is gone on restart, never re-fired); the panel API merges
+//!   them in.
 //!
 //! Over capacity, work is enqueued (user waiters first, then FIFO per trigger,
 //! best-effort across triggers) instead of running unbounded.
@@ -56,6 +53,7 @@ pub(crate) use request::truncate_summary;
 pub use request::ThreadQueueRequest;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -118,21 +116,33 @@ struct ActiveSlot {
     chain_depth: u32,
 }
 
-/// One admitted user-initiated response occupying the pool. In-memory only —
-/// never persisted (a dead response is gone on restart, never re-fired).
-struct UserSlot {
-    /// The thread running the response, for the panel's Running list.
-    thread_id: Option<Uuid>,
+/// A gate admission, held until its guard drops. It counts toward the pool
+/// until it is seen: its thread is `running`, or has started a turn since
+/// admission. From then on the thread's own status counts instead.
+/// In-memory only (a dead response is gone on restart).
+struct UserReservation {
+    thread_id: Uuid,
     summary: String,
     admitted_at: DateTime<Utc>,
+    /// The thread's highest event sequence at admission. A turn start with a
+    /// higher one is this reservation's turn, so the reservation is seen.
+    after_seq: i64,
+    seen: bool,
+}
+
+/// A thread that occupies a user slot because it is `running`: one the user
+/// started, or one a live gate admission is for. Read at admission.
+struct RunningThread {
+    summary: String,
+    revived_at: DateTime<Utc>,
 }
 
 /// A user-initiated response waiting for a free slot (pool at max). Drains
 /// with priority — ahead of background, behind the reserved-background floor.
 struct UserWaiter {
-    /// Stable id for this waiter / its eventual [`UserSlot`].
+    /// Stable id for this waiter, and for its reservation once admitted.
     entry_id: Uuid,
-    thread_id: Option<Uuid>,
+    thread_id: Uuid,
     summary: String,
     queued_at: DateTime<Utc>,
     /// Resolved by the drainer once admitted, unblocking the chat task.
@@ -143,22 +153,10 @@ struct QueueState {
     policy: CapacityPolicy,
     queued: VecDeque<QueueEntry>,
     active: HashMap<Uuid, ActiveSlot>,
-    /// Admitted user-initiated responses (in-memory only — see [`UserSlot`]).
-    user_active: HashMap<Uuid, UserSlot>,
+    /// Live gate admissions, keyed by the gate's entry id.
+    user_reservations: HashMap<Uuid, UserReservation>,
     /// User-initiated responses waiting for a slot (priority line, FIFO).
     user_queued: VecDeque<UserWaiter>,
-    /// `thread_id` to the `user_active` key its slot was filed under before
-    /// [`ThreadQueue::reconcile_user_slot`] removed it on a park/idle.
-    ///
-    /// This is what lets the resume RE-file the slot under its ORIGINAL key.
-    /// [`UserSlotGuard`]'s backstop matches the gate's `entry_id`, so a resume
-    /// that minted a fresh `Uuid` put the slot permanently out of the guard's
-    /// reach: pair that with a settle missed on broadcast lag and the slot was
-    /// leaked for the life of the process, and enough leaks block every chat
-    /// POST on the pool. Keyed by thread because that is what reconcile has in
-    /// hand, and bounded by it: one parked key per thread, cleared when the
-    /// slot is re-filed or the guard drops.
-    parked_user_slots: HashMap<Uuid, Uuid>,
     /// Per-trigger notification cooldowns (allowed-ephemeral — a restart
     /// resetting the cooldown at worst re-notifies once).
     delay_notified: HashMap<String, Instant>,
@@ -166,15 +164,36 @@ struct QueueState {
 }
 
 impl QueueState {
-    /// Everything occupying the shared pool — background admits + user admits.
-    fn total_active(&self) -> usize {
-        self.active.len() + self.user_active.len()
+    /// User occupancy: every occupying running thread, plus each reservation
+    /// not yet seen. `running` comes from [`ThreadQueue::read_user_occupancy`].
+    fn user_active(&self, running: &HashMap<Uuid, RunningThread>) -> usize {
+        running.len() + self.unseen_reservations(None)
+    }
+
+    /// Unseen reservations, leaving out `except`'s own.
+    fn unseen_reservations(&self, except: Option<Uuid>) -> usize {
+        self.user_reservations
+            .values()
+            .filter(|r| !r.seen && Some(r.thread_id) != except)
+            .count()
+    }
+
+    /// User occupancy without `thread_id`'s own share, for admitting a request
+    /// on that thread. A follow-up whose message already set the thread
+    /// `running` must not wait for a slot it holds itself.
+    fn user_active_besides(
+        &self,
+        running: &HashMap<Uuid, RunningThread>,
+        thread_id: Uuid,
+    ) -> usize {
+        running.len() - usize::from(running.contains_key(&thread_id))
+            + self.unseen_reservations(Some(thread_id))
     }
 
     /// The "Lucidos is at capacity" notification, when the pool is full and
     /// its cooldown has elapsed. Call under the state lock, send after.
-    fn capacity_notification_due(&mut self) -> Option<(String, String)> {
-        if self.total_active() < self.policy.max_concurrent_total
+    fn capacity_notification_due(&mut self, user_active: usize) -> Option<(String, String)> {
+        if self.active.len() + user_active < self.policy.max_concurrent_total
             || self
                 .global_notified
                 .is_some_and(|t| t.elapsed() < NOTIFY_COOLDOWN)
@@ -207,7 +226,12 @@ impl QueueState {
         elapsed
     }
 
-    fn counts_for(&self, kind: ThreadQueueKind, trigger_id: Option<&str>) -> AdmissionCounts {
+    fn counts_for(
+        &self,
+        kind: ThreadQueueKind,
+        trigger_id: Option<&str>,
+        user_active: usize,
+    ) -> AdmissionCounts {
         let kind_active = self.active.values().filter(|s| s.kind == kind).count();
         let (trigger_active, trigger_queued) = match trigger_id {
             Some(tid) => (
@@ -224,7 +248,7 @@ impl QueueState {
         };
         AdmissionCounts {
             background_active: self.active.len(),
-            user_active: self.user_active.len(),
+            user_active,
             kind_active,
             trigger_active,
             trigger_queued,
@@ -254,30 +278,23 @@ pub struct SubmitOutcome {
     pub completion: oneshot::Receiver<()>,
 }
 
-/// RAII handle for a user-initiated pool slot from
-/// [`ThreadQueue::acquire_user_slot`]. Releasing on drop (even on panic)
-/// frees the slot and drains, so a crashed chat task can't leak capacity.
+/// RAII handle for a gate admission from [`ThreadQueue::acquire_user_slot`].
+/// Dropping it (even on panic) removes the gate's reservation or waiter, so a
+/// crashed chat task can't leak capacity.
 pub struct UserSlotGuard {
     queue: Arc<ThreadQueue>,
     entry_id: Uuid,
-    /// The thread the gate reserved for. Carried ONLY so the drop can clear
-    /// this thread's `parked_user_slots` key when the task ends while its
-    /// thread is parked. Releasing the slot itself stays keyed by `entry_id`;
-    /// see [`ThreadQueue::release_user_slot`] for why a by-thread release would
-    /// be wrong.
-    thread_id: Option<Uuid>,
 }
 
 impl Drop for UserSlotGuard {
     fn drop(&mut self) {
         // release_user_slot is async; the drop runs in a sync context, so hand
-        // the cleanup to a detached task. The pool count is in-memory, so a
+        // the cleanup to a detached task. Reservations are in-memory, so a
         // missed release at shutdown is harmless (it dies with the process).
         let queue = self.queue.clone();
         let entry_id = self.entry_id;
-        let thread_id = self.thread_id;
         tokio::spawn(async move {
-            queue.release_user_slot(entry_id, thread_id).await;
+            queue.release_user_slot(entry_id).await;
         });
     }
 }
@@ -287,7 +304,7 @@ impl Drop for UserSlotGuard {
 /// `thread_queue` row (`kind` is always `user-chat` for these).
 pub struct UserQueueEntry {
     pub id: Uuid,
-    pub thread_id: Option<Uuid>,
+    pub thread_id: Uuid,
     pub summary: String,
     /// `"admitted"` (Running) or `"queued"` (waiting for a slot).
     pub status: &'static str,
@@ -329,46 +346,31 @@ pub struct ThreadQueueSnapshot {
     pub policy: CapacityPolicy,
 }
 
-/// Thread events on which the settle subscriber reconciles the user pool against
-/// the (now-committed) `thread_summaries.status`, so the pool stays a faithful
-/// mirror of real thread status — the SINGLE place the user-half of the pool
-/// moves in and out. Reconcile reads the actual post-commit status, so it's
-/// *direction-agnostic*; this predicate only needs to fire on the status
-/// transitions that matter.
-///
-/// Two deliberate groups, and one deliberate exclusion:
-///
-/// - **→ running WITHOUT a back-pressure gate** — resume after a park,
-///   continuation respawn, post-restart auto-resume, and engine-injected
-///   prompts (hardening / conflict recovery). reconcile is the *sole adder*
-///   for these, so they MUST be here — this is what fixes the reported bug and
-///   its whole family.
-/// - **→ not-running** — parked on the user, terminal, or back to idle.
-///   reconcile removes; removal is idempotent so these can never double-count.
-/// - **Excluded: gate-covered starts** (`MessageReceived`, `SessionStarted`,
-///   `CodingAgentUserMessageSent`, `PromptInjected`). These are always
-///   preceded by [`Self::acquire_user_slot`] inserting the slot (or are
-///   mid-flight into an already-counted thread), so reconcile must NOT also add
-///   on them — `acquire_user_slot` adds unconditionally, so a reconcile add
-///   racing it would double-count. The gate owns the start; reconcile owns
-///   everything after.
-///
-/// Per-token streaming and pure metadata/audit events never move status and are
-/// excluded. A missed status variant degrades to "the pool lags status until
-/// the next status event for that thread (or the gate guard's drop)", never a
-/// hard break — mirror new status arms here.
-fn affects_user_running(event: &ThreadEvent) -> bool {
-    matches!(
-        event,
-        // → running with no gate — reconcile is the sole adder.
-        ThreadEvent::ContinuationStarted { .. }
-            | ThreadEvent::ContinuationRequested { .. }
-            | ThreadEvent::UserQuestionAnswered { .. }
-            | ThreadEvent::CodingAgentPermissionResolved { .. }
-            | ThreadEvent::CommandPermissionResolved { .. }
-            | ThreadEvent::McpPermissionResolved { .. }
-            | ThreadEvent::CodingAgentPromptSent { .. }
-            | ThreadEvent::CodingAgentInputRead {
+/// Event types that move a thread to `running`. A gate reservation is seen,
+/// and stops counting, once its thread has one of these after the reservation.
+/// The drain hint fires on them too, so the panel shows a thread that starts.
+const TURN_START_EVENT_TYPES: &[&str] = &[
+    "MessageReceived",
+    "SessionStarted",
+    "CodingAgentUserMessageSent",
+    "PromptInjected",
+    "ContinuationStarted",
+    "ContinuationRequested",
+    "UserQuestionAnswered",
+    "CodingAgentPermissionResolved",
+    "CommandPermissionResolved",
+    "McpPermissionResolved",
+    "CodingAgentPromptSent",
+];
+
+/// Thread events after which user occupancy may have moved: a turn starts, a
+/// thread parks on the user, or a turn ends. The drain hint subscriber drains
+/// on them. A missed one only delays a drain: admission reads occupancy fresh.
+fn moves_user_occupancy(event: &ThreadEvent) -> bool {
+    TURN_START_EVENT_TYPES.contains(&event.event_type())
+        || matches!(
+            event,
+            ThreadEvent::CodingAgentInputRead {
                 started_turn: true,
                 ..
             }
@@ -388,7 +390,7 @@ fn affects_user_running(event: &ThreadEvent) -> bool {
             | ThreadEvent::ChangeApplied { .. }
             | ThreadEvent::ChangeDiscarded { .. }
             | ThreadEvent::ThreadArchived
-    )
+        )
 }
 
 /// Central admission-control manager. Lives on [`LucidosEngine`] as
@@ -410,6 +412,10 @@ pub struct ThreadQueue {
     executor: OnceLock<Arc<dyn ThreadQueueExecutor>>,
     /// Weak engine handle, used only for push fan-out on queue notifications.
     engine: OnceLock<Weak<LucidosEngine>>,
+    /// The engine's own shutdown signal (`LucidosEngine::is_shutting_down`
+    /// reads the same atomic). Held rather than reached through `engine`, so a
+    /// trigger fire is held even before the engine is attached.
+    shutting_down: Arc<AtomicBool>,
     state: tokio::sync::Mutex<QueueState>,
 }
 
@@ -421,6 +427,7 @@ impl ThreadQueue {
         workspace_path: std::path::PathBuf,
         trigger_write_lock: Arc<tokio::sync::Mutex<()>>,
         policy: CapacityPolicy,
+        shutting_down: Arc<AtomicBool>,
     ) -> Self {
         Self {
             pool,
@@ -430,13 +437,13 @@ impl ThreadQueue {
             trigger_write_lock,
             executor: OnceLock::new(),
             engine: OnceLock::new(),
+            shutting_down,
             state: tokio::sync::Mutex::new(QueueState {
                 policy,
                 queued: VecDeque::new(),
                 active: HashMap::new(),
-                user_active: HashMap::new(),
+                user_reservations: HashMap::new(),
                 user_queued: VecDeque::new(),
-                parked_user_slots: HashMap::new(),
                 delay_notified: HashMap::new(),
                 global_notified: None,
             }),
@@ -537,6 +544,19 @@ impl ThreadQueue {
             .is_ok_and(|configs| configs.get(trigger_id).is_some_and(|c| c.paused))
     }
 
+    /// Whether an entry of `kind` must wait for the next engine.
+    ///
+    /// Once shutdown has begun, the API a trigger's run calls back into is
+    /// closing, so a fire started now fails on its first `lucidos` call. Held,
+    /// it stays `queued`, and the next engine's boot recovery runs it. Spawn
+    /// kinds are not held: running work that spawns one is torn down anyway.
+    ///
+    /// Asked under the state lock at admission, which is the boundary: a fire
+    /// admitted before the flag flips is in flight, and finishes (ADR 0429).
+    fn held_for_shutdown(&self, kind: ThreadQueueKind) -> bool {
+        kind.is_trigger_fire() && self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Submit a background spawn. Admits immediately when capacity allows
     /// (the executor's `prepare` hook runs inline, before this returns);
     /// otherwise the entry waits in the queue. Never blocks on execution.
@@ -584,12 +604,20 @@ impl ThreadQueue {
             completion_tx: Some(completion_tx),
         };
 
-        let decision = {
+        let (decision, user_active) = {
             let mut state = self.state.lock().await;
-            let counts = state.counts_for(kind, trigger_id.as_deref());
-            let decision = state
+            let running = self.read_user_occupancy(&mut state, None).await;
+            let user_active = state.user_active(&running);
+            let counts = state.counts_for(kind, trigger_id.as_deref(), user_active);
+            let decision = match state
                 .policy
-                .decide_submit(counts, kind, trigger_id.is_some());
+                .decide_submit(counts, kind, trigger_id.is_some())
+            {
+                AdmissionDecision::Admit if self.held_for_shutdown(kind) => {
+                    AdmissionDecision::Queue
+                }
+                decision => decision,
+            };
             match decision {
                 AdmissionDecision::Admit => {
                     state.active.insert(
@@ -607,7 +635,7 @@ impl ThreadQueue {
                 | AdmissionDecision::Overflow
                 | AdmissionDecision::Coalesce => {}
             }
-            decision
+            (decision, user_active)
         };
 
         match decision {
@@ -636,7 +664,10 @@ impl ThreadQueue {
                 let (position, notify) = {
                     let mut state = self.state.lock().await;
                     state.queued.push_back(entry);
-                    (state.queued.len(), state.capacity_notification_due())
+                    (
+                        state.queued.len(),
+                        state.capacity_notification_due(user_active),
+                    )
                 };
                 if let Some((title, message)) = notify {
                     self.notify(title, message).await;
@@ -784,16 +815,23 @@ impl ThreadQueue {
     pub async fn drain(self: &Arc<Self>) {
         let (to_admit, to_drop, woke) = {
             let mut state = self.state.lock().await;
+            let running = self.read_user_occupancy(&mut state, None).await;
             let mut to_admit: Vec<QueueEntry> = Vec::new();
             let mut to_drop: Vec<(QueueEntry, String)> = Vec::new();
 
             // Phase 1 — background reclaims up to its reserved floor first.
             let floor = state.policy.effective_reserved_background();
-            self.drain_background_into(&mut state, floor, &mut to_admit, &mut to_drop);
+            self.drain_background_into(&mut state, &running, floor, &mut to_admit, &mut to_drop);
             // Phase 2 — user-initiated waiters take priority for free slots.
-            let woke = Self::drain_users(&mut state);
+            let woke = self.drain_users(&mut state, &running).await;
             // Phase 3 — background fills whatever capacity remains.
-            self.drain_background_into(&mut state, usize::MAX, &mut to_admit, &mut to_drop);
+            self.drain_background_into(
+                &mut state,
+                &running,
+                usize::MAX,
+                &mut to_admit,
+                &mut to_drop,
+            );
 
             (to_admit, to_drop, woke)
         };
@@ -851,6 +889,7 @@ impl ThreadQueue {
     fn drain_background_into(
         &self,
         state: &mut QueueState,
+        running: &HashMap<Uuid, RunningThread>,
         bg_target: usize,
         to_admit: &mut Vec<QueueEntry>,
         to_drop: &mut Vec<(QueueEntry, String)>,
@@ -865,6 +904,10 @@ impl ThreadQueue {
                 let e = &state.queued[i];
                 (e.kind, e.trigger_id.clone())
             };
+            if self.held_for_shutdown(kind) {
+                i += 1;
+                continue;
+            }
             if let Some(ref tid) = trigger_id {
                 if skipped.contains(tid) {
                     i += 1;
@@ -905,7 +948,7 @@ impl ThreadQueue {
                     Some(false) => {}
                 }
             }
-            let counts = state.counts_for(kind, trigger_id.as_deref());
+            let counts = state.counts_for(kind, trigger_id.as_deref(), state.user_active(running));
             match state
                 .policy
                 .decide_drain(counts, kind, trigger_id.is_some())
@@ -938,27 +981,28 @@ impl ThreadQueue {
     /// User admission scan (drain phase 2). Admits user-initiated waiters
     /// FIFO while the pool has a free slot. Returns the wake senders to fire
     /// after the lock is released (each unblocks its waiting chat task).
-    fn drain_users(state: &mut QueueState) -> Vec<oneshot::Sender<()>> {
+    async fn drain_users(
+        &self,
+        state: &mut QueueState,
+        running: &HashMap<Uuid, RunningThread>,
+    ) -> Vec<oneshot::Sender<()>> {
         let mut woke = Vec::new();
-        while state.policy.user_can_admit(state.total_active()) {
-            let Some(waiter) = state.user_queued.pop_front() else {
+        while let Some(thread_id) = state.user_queued.front().map(|w| w.thread_id) {
+            let besides = state.user_active_besides(running, thread_id);
+            if !state.policy.user_can_admit(state.active.len() + besides) {
                 break;
-            };
-            state.user_active.insert(
-                waiter.entry_id,
-                UserSlot {
-                    thread_id: waiter.thread_id,
-                    summary: waiter.summary,
-                    admitted_at: Utc::now(),
-                },
-            );
+            }
+            let waiter = state.user_queued.pop_front().expect("front checked above");
+            self.reserve_user_slot(state, running, waiter.entry_id, thread_id, waiter.summary)
+                .await;
             woke.push(waiter.wake);
         }
         woke
     }
 
     /// Force-admit a queued entry, ignoring every cap. User intent ("Run
-    /// now" in the Thread Queue panel) — `actor` stamps the admission.
+    /// now" in the Thread Queue panel), and `actor` stamps the admission.
+    /// The shutdown hold still applies: it is not a cap.
     pub async fn run_now(
         self: &Arc<Self>,
         entry_id: Uuid,
@@ -971,6 +1015,11 @@ impl ThreadQueue {
                 .iter()
                 .position(|e| e.id == entry_id)
                 .ok_or_else(|| "entry is not queued (already running or gone)".to_string())?;
+            if self.held_for_shutdown(state.queued[idx].kind) {
+                return Err(
+                    "the engine is shutting down; the next engine runs this fire".to_string(),
+                );
+            }
             let mut entry = state
                 .queued
                 .remove(idx)
@@ -1131,39 +1180,30 @@ impl ThreadQueue {
     /// until a slot frees, so a person briefly waits only at true pool-max
     /// (ADR 0008). In-memory only — never persisted.
     ///
-    /// The gate seeds the slot; from there [`Self::reconcile_user_slot`] (driven
-    /// by the settle subscriber off `thread_summaries.status`) owns the slot's
-    /// lifetime — it removes it when the thread parks/idles/terminates and
-    /// re-adds it on resume — so the panel always mirrors real thread status.
-    /// The returned guard's drop is the BACKSTOP: it releases the gate's
-    /// reservation if the task dies before reconcile cleared it (normally a
-    /// no-op, since the terminal status event already reconciled the slot away).
+    /// The admission leaves a reservation until the thread starts running. From
+    /// then on `thread_summaries` counts the thread (ADR 0443). The returned
+    /// guard's drop removes a reservation the thread never reached.
     ///
-    /// **The guard is built before the first `.await`, not at the end.** The
-    /// reservation lands in `user_queued` / `user_active` under the lock, and
-    /// everything after that is cancellable. An aborted caller drops this future
-    /// at `emit_changed` or at the wake. A reservation with no guard behind it
-    /// has nobody left to release it: the drainer admits the dead waiter, its
-    /// wake send fails into `let _ =`, and the slot is held for the life of the
-    /// process. Enough of those and every chat POST blocks on the pool. Owning
-    /// the reservation from the moment it exists is what releases it on cancel.
+    /// **The guard is built before the first `.await` after the reservation.**
+    /// The reservation lands in `user_queued` / `user_reservations` under the
+    /// lock, and everything after that is cancellable. An aborted caller drops
+    /// this future at `emit_changed` or at the wake. A reservation with no guard
+    /// behind it has nobody left to release it: the drainer admits the dead
+    /// waiter, its wake send fails into `let _ =`, and the slot is held for the
+    /// life of the process. Owning it from the moment it exists releases it.
     pub async fn acquire_user_slot(
         self: &Arc<Self>,
-        thread_id: Option<Uuid>,
+        thread_id: Uuid,
         summary: String,
     ) -> UserSlotGuard {
         let entry_id = Uuid::new_v4();
         let wait = {
             let mut state = self.state.lock().await;
-            if state.policy.user_can_admit(state.total_active()) {
-                state.user_active.insert(
-                    entry_id,
-                    UserSlot {
-                        thread_id,
-                        summary,
-                        admitted_at: Utc::now(),
-                    },
-                );
+            let running = self.read_user_occupancy(&mut state, Some(thread_id)).await;
+            let besides = state.user_active_besides(&running, thread_id);
+            if state.policy.user_can_admit(state.active.len() + besides) {
+                self.reserve_user_slot(&mut state, &running, entry_id, thread_id, summary)
+                    .await;
                 None
             } else {
                 let (tx, rx) = oneshot::channel();
@@ -1177,12 +1217,11 @@ impl ThreadQueue {
                 Some(rx)
             }
         };
-        // Own the reservation before the first await, so cancelling anything
+        // Own the reservation before the next await, so cancelling anything
         // below releases it instead of stranding it. See the doc comment.
         let guard = UserSlotGuard {
             queue: self.clone(),
             entry_id,
-            thread_id,
         };
         // Panel: a new running (admitted) or waiting (queued) user entry.
         self.emit_changed().await;
@@ -1194,40 +1233,176 @@ impl ThreadQueue {
         guard
     }
 
-    /// Backstop release of the gate's reserved slot, keyed by the guard's
-    /// `entry_id` — fires from [`UserSlotGuard`]'s drop when the chat task ends.
-    /// Normally a no-op: [`Self::reconcile_user_slot`] already removed the slot
-    /// (by thread id) on the terminal status event. It still matters when the
-    /// task dies without a terminal status event (a reserved-but-never-started
-    /// thread, or broadcast lag), or to clear a still-**queued** waiter whose
-    /// task gave up before admission. Refreshes the panel and drains so the
-    /// freed slot admits waiting work.
+    /// Record an admission. On a thread already `running` the reservation is
+    /// born seen: the thread's status holds the slot. Any other reservation
+    /// counts until its thread starts a turn. The await reads the thread's
+    /// high-water mark and inserts nothing, so a cancel there leaves no trace.
+    async fn reserve_user_slot(
+        &self,
+        state: &mut QueueState,
+        running: &HashMap<Uuid, RunningThread>,
+        entry_id: Uuid,
+        thread_id: Uuid,
+        summary: String,
+    ) {
+        let seen = running.contains_key(&thread_id);
+        let after_seq = if seen {
+            0
+        } else {
+            self.thread_high_water(thread_id).await
+        };
+        state.user_reservations.insert(
+            entry_id,
+            UserReservation {
+                thread_id,
+                summary,
+                admitted_at: Utc::now(),
+                after_seq,
+                seen,
+            },
+        );
+    }
+
+    /// The thread's highest event sequence. A failed read returns 0, so the
+    /// reservation counts as seen by the thread's next status read: an unknown
+    /// admits rather than holding a slot nobody can release.
+    async fn thread_high_water(&self, thread_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events \
+             WHERE aggregate = 'thread' AND aggregate_id = $1",
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            log!(
+                "[ThreadQueue] high-water read failed for {}: {}",
+                thread_id,
+                e
+            );
+            0
+        })
+    }
+
+    /// Read user occupancy for an admission, under the state lock (ADR 0443).
+    /// Returns the running threads that occupy a user slot: every user-started
+    /// one, plus any a live admission, a waiter or `candidate` is for, whoever
+    /// started it. Marks each reservation seen once its thread is running or
+    /// has started a turn since admission.
     ///
-    /// **It stays keyed by `entry_id` alone, and `parked_user_slots` is what
-    /// makes that sufficient.** `reconcile_user_slot` removes a parked thread's
-    /// slot and re-files it on resume; when it minted a fresh `Uuid` there, the
-    /// guard's `entry_id` matched nothing afterwards and this backstop could
-    /// never fire. Pair that with a settle missed on broadcast lag (the
-    /// subscriber skips reconcile for dropped events) and the slot leaked for
-    /// the life of the process, and enough leaks block every chat POST on the
-    /// pool. The resume now re-files under the parked key, so identity survives
-    /// the round trip and no by-thread fallback is needed. A fallback would be
-    /// worse than the leak it fixed: it releases whatever slot currently holds
-    /// the thread, which after a second gate for the same thread is the NEWER
-    /// request's slot, admitting queued work above the configured pool limit
-    /// with no status transition guaranteed to put it back.
+    /// A seen reservation stays until its guard drops. It keeps a follow-up's
+    /// thread in the read above, so an agent-started thread the user resumed
+    /// counts while it runs.
     ///
-    /// `thread_id` is taken only to drop this thread's parked key, so a guard
-    /// dropped while its thread is parked leaves nothing behind in the map.
-    async fn release_user_slot(self: &Arc<Self>, entry_id: Uuid, thread_id: Option<Uuid>) {
-        let removed = {
-            let mut state = self.state.lock().await;
-            if let Some(tid) = thread_id {
-                if state.parked_user_slots.get(&tid) == Some(&entry_id) {
-                    state.parked_user_slots.remove(&tid);
+    /// The started-a-turn check is what keeps a parked thread at zero. A
+    /// thread that starts and parks between two admissions is never observed
+    /// running, but its turn start is in the log either way.
+    ///
+    /// A failed read counts no running threads and marks nothing seen: an
+    /// unknown admits work rather than blocking every chat on the pool.
+    async fn read_user_occupancy(
+        &self,
+        state: &mut QueueState,
+        candidate: Option<Uuid>,
+    ) -> HashMap<Uuid, RunningThread> {
+        let admitted: Vec<Uuid> = state
+            .user_reservations
+            .values()
+            .map(|r| r.thread_id)
+            .chain(state.user_queued.iter().map(|w| w.thread_id))
+            .chain(candidate)
+            .collect();
+        let running: HashMap<Uuid, RunningThread> =
+            match sqlx::query_as::<_, (Uuid, String, DateTime<Utc>)>(&format!(
+                "SELECT thread_id, \
+                    COALESCE(NULLIF(title, ''), NULLIF(first_message, ''), ''), \
+                    COALESCE(last_revived_at, created_at) \
+                 FROM thread_summaries \
+                 WHERE status = {} AND (initiator = 'user' OR thread_id = ANY($1))",
+                ThreadStatus::Running.sql_literal()
+            ))
+            .bind(&admitted)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|(tid, summary, revived_at)| {
+                        let summary = truncate_summary(summary.trim());
+                        (
+                            tid,
+                            RunningThread {
+                                summary,
+                                revived_at,
+                            },
+                        )
+                    })
+                    .collect(),
+                Err(e) => {
+                    log!("[ThreadQueue] user occupancy read failed: {}", e);
+                    return HashMap::new();
+                }
+            };
+        for r in state.user_reservations.values_mut() {
+            if running.contains_key(&r.thread_id) {
+                r.seen = true;
+            }
+        }
+
+        let (ids, threads, after): (Vec<Uuid>, Vec<String>, Vec<i64>) = state
+            .user_reservations
+            .iter()
+            .filter(|(_, r)| !r.seen)
+            .map(|(id, r)| (*id, r.thread_id.to_string(), r.after_seq))
+            .fold(
+                (Vec::new(), Vec::new(), Vec::new()),
+                |(mut ids, mut threads, mut after), (id, tid, seq)| {
+                    ids.push(id);
+                    threads.push(tid);
+                    after.push(seq);
+                    (ids, threads, after)
+                },
+            );
+        if ids.is_empty() {
+            return running;
+        }
+        match sqlx::query_scalar::<_, Uuid>(
+            "SELECT r.entry_id \
+             FROM unnest($1::uuid[], $2::text[], $3::bigint[]) AS r(entry_id, thread, after_seq) \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM events e \
+                 WHERE e.aggregate = 'thread' AND e.aggregate_id = r.thread \
+                   AND e.sequence > r.after_seq AND e.event_type = ANY($4) \
+             )",
+        )
+        .bind(&ids)
+        .bind(&threads)
+        .bind(&after)
+        .bind(TURN_START_EVENT_TYPES)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(seen) => {
+                for id in seen {
+                    if let Some(r) = state.user_reservations.get_mut(&id) {
+                        r.seen = true;
+                    }
                 }
             }
-            if state.user_active.remove(&entry_id).is_some() {
+            Err(e) => log!("[ThreadQueue] reservation read failed: {}", e),
+        }
+        running
+    }
+
+    /// Release the gate's reservation or waiter, keyed by the guard's
+    /// `entry_id`. Fires from [`UserSlotGuard`]'s drop when the chat task ends.
+    /// An unseen reservation frees its slot here, and so does a seen one whose
+    /// thread was counted only because of it. A still-**queued** waiter whose
+    /// task gave up is dropped from the line. Refreshes the panel and drains.
+    async fn release_user_slot(self: &Arc<Self>, entry_id: Uuid) {
+        let removed = {
+            let mut state = self.state.lock().await;
+            if state.user_reservations.remove(&entry_id).is_some() {
                 true
             } else {
                 let before = state.user_queued.len();
@@ -1241,20 +1416,33 @@ impl ThreadQueue {
         }
     }
 
-    /// Snapshot of in-memory user-initiated occupants for the panel API to
-    /// merge with the persisted background rows (admitted = Running, queued =
-    /// Queued).
+    /// Every user-initiated occupant, for the panel API to merge with the
+    /// persisted background rows: occupying running threads and unseen
+    /// reservations (admitted = Running), then waiters (queued = Queued).
     pub async fn user_entries(&self) -> Vec<UserQueueEntry> {
-        let state = self.state.lock().await;
-        let mut out = Vec::with_capacity(state.user_active.len() + state.user_queued.len());
-        for (id, slot) in &state.user_active {
+        let mut state = self.state.lock().await;
+        let running = self.read_user_occupancy(&mut state, None).await;
+        let mut out = Vec::with_capacity(
+            running.len() + state.user_reservations.len() + state.user_queued.len(),
+        );
+        for (tid, thread) in running {
+            out.push(UserQueueEntry {
+                id: tid,
+                thread_id: tid,
+                summary: thread.summary,
+                status: "admitted",
+                queued_at: thread.revived_at,
+                admitted_at: Some(thread.revived_at),
+            });
+        }
+        for (id, r) in state.user_reservations.iter().filter(|(_, r)| !r.seen) {
             out.push(UserQueueEntry {
                 id: *id,
-                thread_id: slot.thread_id,
-                summary: slot.summary.clone(),
+                thread_id: r.thread_id,
+                summary: r.summary.clone(),
                 status: "admitted",
-                queued_at: slot.admitted_at,
-                admitted_at: Some(slot.admitted_at),
+                queued_at: r.admitted_at,
+                admitted_at: Some(r.admitted_at),
             });
         }
         for w in &state.user_queued {
@@ -1271,12 +1459,11 @@ impl ThreadQueue {
     }
 
     /// The merged Thread Queue view — persisted background rows (FIFO by
-    /// `sequence`) followed by the in-memory user-initiated occupants
+    /// `sequence`) followed by the user-initiated occupants
     /// (`kind: "user-chat"`) — plus the active capacity policy. The SINGLE
     /// source of truth shared by `GET /api/v1/thread-queue` and the
     /// `list_thread_queue` LLM tool, so the panel and the tool can never
-    /// disagree about who occupies the pool (the divergence that let the tool
-    /// report an empty pool while the panel showed phantom user-chat rows).
+    /// disagree about who occupies the pool.
     pub async fn snapshot(&self) -> Result<ThreadQueueSnapshot, sqlx::Error> {
         let mut entries: Vec<ThreadQueueEntryView> = sqlx::query_as(
             "SELECT id, kind, trigger_id, trigger_name, thread_id, summary, status, queued_at, admitted_at \
@@ -1284,14 +1471,13 @@ impl ThreadQueue {
         )
         .fetch_all(&self.pool)
         .await?;
-        // Merge the in-memory user-initiated occupants (never persisted rows).
         for u in self.user_entries().await {
             entries.push(ThreadQueueEntryView {
                 id: u.id,
                 kind: "user-chat".to_string(),
                 trigger_id: None,
                 trigger_name: None,
-                thread_id: u.thread_id,
+                thread_id: Some(u.thread_id),
                 summary: u.summary,
                 status: u.status.to_string(),
                 queued_at: u.queued_at,
@@ -1302,165 +1488,71 @@ impl ThreadQueue {
         Ok(ThreadQueueSnapshot { entries, policy })
     }
 
-    /// Converge the in-memory user-initiated pool for `thread_id` onto its
-    /// authoritative `thread_summaries.status` — the SINGLE place the user-half
-    /// of the pool moves in and out, so it can never drift from reality:
-    ///
-    /// - A user-initiated thread that is `running` occupies **exactly one**
-    ///   user slot (added here if missing).
-    /// - Anything else — idle, parked on the user (`waiting_for_user_answer`),
-    ///   failed, terminal, or any non-user / background thread — occupies
-    ///   **none** (removed here if present).
-    ///
-    /// Because it reads the real, just-committed status (the subscriber observes
-    /// events post-`tx.commit()`, post-projection) it is *direction-agnostic*:
-    /// it doesn't matter whether the triggering event was a park, a resume, or a
-    /// termination — reconcile reads where the thread actually landed and makes
-    /// the pool match. That is what fixes the whole family in one stroke: a
-    /// thread that parks on a question then resumes, a continuation respawn, and
-    /// a post-restart auto-resume all flip `status` back to `running`, so the
-    /// slot reappears with no per-path re-acquire wiring.
-    ///
-    /// Adding here is unconditional (no capacity wait): a thread that's already
-    /// `running` cannot be made to wait — back-pressure applies only to NEW work
-    /// via [`Self::acquire_user_slot`], which still gates the start. For NEW
-    /// work the gate has already inserted the slot, so the first reconcile is a
-    /// no-op. Idempotent; a cheap PK lookup that no-ops for every background
-    /// thread (`initiator != 'user'`) and every already-consistent thread.
-    pub async fn reconcile_user_slot(self: &Arc<Self>, thread_id: Uuid) {
-        let row: Option<(ThreadStatus, String, String)> = match sqlx::query_as(
-            "SELECT status, initiator, \
-                    COALESCE(NULLIF(title, ''), NULLIF(first_message, ''), '') \
-             FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_optional(&self.pool)
-        .await
-        {
-            Ok(row) => row,
-            // Leave the pool UNCHANGED on a transient query error — don't read a
-            // failed status read as "not running" and yank a live thread's slot
-            // (that would drop it from the panel until the next status event).
-            // The next status event for the thread reconciles it correctly.
-            Err(e) => {
-                log!(
-                    "[ThreadQueue] reconcile_user_slot query failed for {}: {} — leaving pool unchanged",
-                    thread_id,
-                    e
-                );
-                return;
-            }
-        };
-        // Only user-initiated threads occupy a user slot; background spawns
-        // (initiator 'system'/'unknown') are tracked via the `thread_queue`
-        // projection, not here.
-        let should_occupy = matches!(
-            row.as_ref(),
-            Some((status, initiator, _)) if *status == ThreadStatus::Running && initiator == "user"
-        );
+    /// Drain, and refresh the panel, whenever user occupancy may have moved.
+    /// Spawned once at boot. A hint only: admission reads occupancy itself, so
+    /// a lag loses nothing and just triggers a drain (ADR 0443).
+    pub fn spawn_drain_hint_subscriber(self: &Arc<Self>) {
+        let rx = self.bus.subscribe();
+        tokio::spawn(self.clone().run_drain_hints(rx));
+    }
 
-        let (added, removed) = {
-            let mut state = self.state.lock().await;
-            let has_slot = state
-                .user_active
-                .values()
-                .any(|s| s.thread_id == Some(thread_id));
-            match (should_occupy, has_slot) {
-                (true, false) => {
-                    let summary = row
-                        .as_ref()
-                        .map(|(_, _, s)| truncate_summary(s.trim()))
-                        .unwrap_or_default();
-                    // Re-file under the key this thread's slot was parked at, so
-                    // the gate's `UserSlotGuard` can still release it. A fresh
-                    // `Uuid` here put the slot permanently out of the guard's
-                    // reach; see `parked_user_slots`. No parked key means this
-                    // resume has no live guard behind it, so a fresh one is
-                    // right and the reconcile removal below owns the slot.
-                    let entry_id = state
-                        .parked_user_slots
-                        .remove(&thread_id)
-                        .unwrap_or_else(Uuid::new_v4);
-                    state.user_active.insert(
-                        entry_id,
-                        UserSlot {
-                            thread_id: Some(thread_id),
-                            summary,
-                            admitted_at: Utc::now(),
-                        },
-                    );
-                    (true, false)
-                }
-                (false, true) => {
-                    if let Some(key) = state
-                        .user_active
-                        .iter()
-                        .find(|(_, s)| s.thread_id == Some(thread_id))
-                        .map(|(k, _)| *k)
-                    {
-                        state.parked_user_slots.insert(thread_id, key);
+    async fn run_drain_hints(
+        self: Arc<Self>,
+        mut rx: tokio::sync::broadcast::Receiver<crate::engine::event_bus::EmittedEvent>,
+    ) {
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            match rx.recv().await {
+                Ok(emitted) => {
+                    if self.is_occupancy_hint(&emitted).await {
+                        self.occupancy_moved().await;
                     }
-                    state
-                        .user_active
-                        .retain(|_, s| s.thread_id != Some(thread_id));
-                    (false, true)
                 }
-                // Already consistent (running with a slot, or not-running with
-                // none) — nothing to do.
-                _ => (false, false),
+                Err(RecvError::Lagged(n)) => {
+                    log!(
+                        "[ThreadQueue] drain hint subscriber lagged by {} events; draining",
+                        n
+                    );
+                    self.occupancy_moved().await;
+                }
+                Err(RecvError::Closed) => {
+                    log!("[ThreadQueue] drain hint channel closed — exiting");
+                    break;
+                }
             }
-        };
-        if added || removed {
-            self.emit_changed().await;
-        }
-        // Removal frees a slot — drain so waiting work takes it. An add only
-        // adds load (the thread is already running), so it needs no drain.
-        if removed {
-            self.drain().await;
         }
     }
 
-    /// Subscribe to the bus and keep the user-half of the pool in lockstep with
-    /// each thread's `thread_summaries.status` (see [`Self::reconcile_user_slot`]).
-    /// Spawned once at boot. Survives broadcast lag — a dropped event at worst
-    /// leaves a slot stale until the next status event for that thread (or the
-    /// gate guard's drop), so the consumer must never exit on `Lagged`.
-    pub fn spawn_settle_subscriber(self: &Arc<Self>) {
-        let mgr = self.clone();
-        let mut rx = self.bus.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(emitted) => {
-                        // Only persisted thread events have a committed status to
-                        // read; transient (seq == None) events never change it.
-                        if emitted.seq.is_none() {
-                            continue;
-                        }
-                        if let BusEvent::Thread {
-                            thread_id, event, ..
-                        } = &emitted.typed
-                        {
-                            if affects_user_running(event) {
-                                mgr.reconcile_user_slot(*thread_id).await;
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        log!(
-                            "[ThreadQueue] settle subscriber lagged by {} events — \
-                             user-slot reconcile skipped for those; continuing",
-                            n
-                        );
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log!("[ThreadQueue] settle subscriber channel closed — exiting");
-                        break;
-                    }
-                }
-            }
-        });
+    /// A committed status move on a thread that may hold a user slot: a user
+    /// thread, or one a live admission is for. A missing aggregate counts as
+    /// user, since a spare drain costs nothing.
+    async fn is_occupancy_hint(&self, emitted: &crate::engine::event_bus::EmittedEvent) -> bool {
+        let BusEvent::Thread {
+            thread_id, event, ..
+        } = &emitted.typed
+        else {
+            return false;
+        };
+        if emitted.seq.is_none() || !moves_user_occupancy(event) {
+            return false;
+        }
+        let user_started = emitted
+            .aggregate
+            .as_ref()
+            .is_none_or(|a| a.initiator == crate::core::store::LegacyInitiator::User);
+        user_started
+            || self
+                .state
+                .lock()
+                .await
+                .user_reservations
+                .values()
+                .any(|r| r.thread_id == *thread_id)
+    }
+
+    async fn occupancy_moved(self: &Arc<Self>) {
+        self.emit_changed().await;
+        self.drain().await;
     }
 
     /// Transient panel refresh after an in-memory-only change (a user slot

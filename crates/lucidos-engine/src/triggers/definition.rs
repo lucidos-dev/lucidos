@@ -57,6 +57,10 @@ pub struct TriggerDefinition {
     pub plugin_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// The MCP server ids this trigger's fires use (ADR 0430). A scalar array,
+    /// so it must stay above the table fields below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
     /// The **trigger model** this trigger's intent fires on. Omitted (None) =
     /// the account `chat_model` preference. Scalar, so it must stay above the
     /// table fields below.
@@ -89,6 +93,7 @@ impl TriggerDefinition {
             go_to_review: c.go_to_review,
             plugin_id: c.plugin_id.clone(),
             side_effect_grant: c.side_effect_grant.clone(),
+            mcp_servers: c.mcp_servers.clone(),
             model: c.model.clone(),
             reasoning_effort: c.reasoning_effort.clone(),
             provider: c.provider.clone(),
@@ -114,6 +119,7 @@ impl TriggerDefinition {
             "go_to_review": self.go_to_review,
             "group_id": self.group_id,
             "side_effect_grant": self.side_effect_grant,
+            "mcp_servers": self.mcp_servers,
             "plugin_id": plugin_id,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,

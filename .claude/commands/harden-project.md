@@ -88,10 +88,10 @@ Use Grep across `crates/` to verify each item. Be conservative — only fix item
 
 ## Phase 3.5: Temporary-measures Reconciliation
 
-The whole-tree face of the **temporary-measures & marker-hygiene** check (the
-per-change face lives in `/harden` Phase 2 Agent 2 — same registry, same markers,
-same inclusion test, same "register it" escape valve; this one just sweeps the
-whole tree instead of a diff). It is a **reporting** pass for anything that needs judgment. The one exception
+The whole-tree face of the **temporary-measures & marker-hygiene** check. The
+per-change face is the compliance angle of the `code-review` skill, which
+`/harden` Phase 1 runs. Both use the same registry, markers, inclusion test
+and "register it" escape valve; this one sweeps the whole tree, not a diff. It is a **reporting** pass for anything that needs judgment. The one exception
 is below: a condition the tree proves met is a fix, not a report.
 
 Read `docs/temporary-measures.md` (governed by `.claude/rules/temporary-measures.md`),

@@ -1,9 +1,10 @@
 //! The widgets section an agent's prompt carries (ADR 0415).
 //!
 //! One builder serves the chat agent and the coding agents, so both learn the
-//! same embed rule and see the same widgets. The chat agent also makes and
-//! shows widgets, so its section opens with that guidance.
+//! same embed rule and see the same widgets. The chat agent also makes
+//! widgets, so its section opens with that guidance.
 
+use crate::core::apps::WidgetSize;
 use crate::core::App;
 
 /// Who reads the section.
@@ -37,11 +38,11 @@ pub fn widgets_rules(audience: WidgetAudience) -> String {
     }
 }
 
-/// How the chat agent makes, shows and pins a widget (ADRs 0402, 0407).
+/// How the chat agent makes and pins a widget (ADRs 0402, 0407, 0466).
 fn making_guidance(automatic: bool) -> String {
     let mut text = String::from(
-        "A widget is a small interactive answer: create_app with kind=\"widget\". It shows \
-         inline at this turn as a card, and is not on the shelf unless pinned. Fit one phone \
+        "A widget is a small interactive answer: create_app with kind=\"widget\", then embed it \
+         in your reply. It is not on the shelf unless pinned. Fit one phone \
          screen with no scroll area inside, so its top screen carries the answer; more than \
          that is an app. Name it by what it does in two or three words (\"Flight picker\"), \
          and put the specifics inside it. ",
@@ -58,12 +59,13 @@ fn making_guidance(automatic: bool) -> String {
     text.push_str(
         "Pin it with widgets(action=\"pin\") only when the user will come back to it in this \
          thread, such as a picker. Lead with one shape, not a table: a .ring, a .bar-run, or \
-         a .choice-row to pick from. Skip the title, since the card shows the name, and draw no \
-         border inside the card. Keep the accent for the one thing that matters. Animate what \
+         a .choice-row to pick from. Skip the title, since its bar shows the name, and draw no \
+         border inside the widget. Keep the accent for the one thing that matters. Animate what \
          a tap changes, on the --duration-* tokens, and stay calm under data-motion=\"reduce\". \
          Read data through lucidos.* and listen on lucidos.sse instead of baking it into the \
-         HTML. widgets(action=\"show\", params=…) \
-         puts a listed widget in this thread as a card.\n\n",
+         HTML. Pinned to Home it is a Home board tile of any size; \
+         create_app sizes narrows that. Arrange the board only when the \
+         user asks in this turn, and never choose a new pin's size.\n\n",
     );
     text
 }
@@ -80,7 +82,7 @@ const EMBED_RULE: &str = "EMBED A WIDGET WHERE A PICTURE DRAWS: `![label](app:<i
 /// so it is *system prompt footprint* (ADR 0413).
 pub const WIDGETS_LIST_HEADER: &str = "\nWidgets to embed:\n";
 
-/// The widgets an agent may show or embed, each with its params. Empty when
+/// The widgets an agent may embed, each with its params. Empty when
 /// there is none.
 pub fn widgets_list(widgets: &[App]) -> String {
     if widgets.is_empty() {
@@ -93,11 +95,18 @@ pub fn widgets_list(widgets: &[App]) -> String {
     text
 }
 
-/// One widget as the list carries it: its line, then one line per param.
+/// One widget as the list carries it: its line, naming its Home board sizes
+/// only when it narrows them from all three, then one line per param.
 pub fn widget_line(widget: &App) -> String {
     let built_in = if widget.built_in { ", built in" } else { "" };
+    let sizes = if widget.sizes.len() < WidgetSize::ALL.len() {
+        let names: Vec<&str> = widget.sizes.iter().map(|s| s.as_str()).collect();
+        format!(", sizes {}", names.join(", "))
+    } else {
+        String::new()
+    };
     let mut text = format!(
-        "- **{}** (id: `{}`{built_in}): {}\n",
+        "- **{}** (id: `{}`{built_in}{sizes}): {}\n",
         widget.name,
         widget.id,
         app_description(&widget.description)
@@ -140,6 +149,8 @@ mod tests {
                 },
             )]),
             built_in: true,
+            sizes: WidgetSize::UNDECLARED.to_vec(),
+            transparent: false,
         }
     }
 
@@ -177,6 +188,27 @@ mod tests {
         }
     }
 
+    /// A widget that takes every size lists none; one that narrows them lists
+    /// what it takes.
+    #[test]
+    fn the_list_names_sizes_only_for_a_widget_that_narrows_them() {
+        assert!(!widget_line(&player()).contains("sizes"));
+        let clock = App {
+            sizes: vec![WidgetSize::Small, WidgetSize::Large],
+            ..player()
+        };
+        assert!(widget_line(&clock).contains("built in, sizes small, large):"));
+    }
+
+    /// The chat agent arranges Home only when asked, and never sizes a new pin
+    /// (ADR 0432).
+    #[test]
+    fn the_chat_agent_arranges_home_only_when_asked() {
+        let chat = build_widgets_section(&[player()], WidgetAudience::Chat { automatic: true });
+        assert!(chat.contains("Arrange the board only when the user asks in this turn"));
+        assert!(chat.contains("never choose a new pin's size"));
+    }
+
     /// Both prompts build the section here: the chat agent through its apps
     /// section, a coding agent at spawn. Pinned in the source, since neither
     /// prompt can be built without an engine.
@@ -200,7 +232,7 @@ mod tests {
         for automatic in [true, false] {
             let chat = build_widgets_section(&[player()], WidgetAudience::Chat { automatic });
             assert!(chat.contains("one shape, not a table"), "{chat}");
-            assert!(chat.contains("no border inside the card"), "{chat}");
+            assert!(chat.contains("no border inside the widget"), "{chat}");
             for class in [".ring", ".bar-run", ".choice-row"] {
                 assert!(chat.contains(class), "{class}: {chat}");
                 assert!(!coding.contains(class), "{class}: {coding}");

@@ -12,11 +12,11 @@ vi.mock('../../api/client/widgets', () => ({
   unpinWidgetApi: vi.fn(),
 }));
 
-const { appliedThreadWidgetTicket, threadWidgets, threadWidgetsFor } = await import('../widgets');
+const { threadWidgets, threadWidgetsFor } = await import('../widgets');
 const { forgetThreadWidgets, refreshThreadWidgetsNaming, rereadThreadWidgets } = await import('./widgets');
 
 function widget(appId: string): ThreadWidget {
-  return { app_id: appId, name: appId, reusable: false, reveal: 'on-load', pinned: false, shown_event_id: `e-${appId}` };
+  return { app_id: appId, name: appId, reusable: false, reveal: 'on-load', sizes: ['medium'], pinned: false, shown_event_id: `e-${appId}` };
 }
 
 /** A fetch the test settles by hand, in any order. */
@@ -40,7 +40,7 @@ describe('the thread widgets store (ADRs 0402, 0407)', () => {
     fetchThreadWidgets.mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
 
     rereadThreadWidgets('t1');
-    const second = rereadThreadWidgets('t1');
+    rereadThreadWidgets('t1');
     newer.resolve([widget('currency')]);
     await flush();
     older.resolve([widget('fare-grid'), widget('currency')]);
@@ -48,7 +48,6 @@ describe('the thread widgets store (ADRs 0402, 0407)', () => {
 
     const widgets = threadWidgetsFor('t1');
     expect(widgets.status === 'loaded' && widgets.data.map((w) => w.app_id)).toEqual(['currency']);
-    expect(appliedThreadWidgetTicket('t1')).toBe(second);
   });
 
   it('re-reads only the threads whose widgets include a changed app', async () => {

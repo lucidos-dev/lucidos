@@ -76,25 +76,10 @@ pub(crate) fn write_if_changed(app: &tauri::AppHandle, file: &str, value: &str, 
 mod tests {
     use super::*;
 
-    /// A tempdir of this module's own, since the helpers under test take an
-    /// `AppHandle` for the path and a bare `&Path` for the read.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "lucidos-config-scalar-{}-{}-{:?}",
-            std::process::id(),
-            name,
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn an_absent_file_reads_as_absent_rather_than_as_an_error() {
-        let dir = scratch("absent");
-        assert_eq!(read(&dir.join("nothing-here")), None);
-        std::fs::remove_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read(&dir.path().join("nothing-here")), None);
     }
 
     #[test]
@@ -102,10 +87,9 @@ mod tests {
         // The write side is expected to store the canonical form, but a
         // hand-edited file picks up a trailing newline from any editor, and the
         // caller's parse must not have to know that.
-        let dir = scratch("trim");
-        let file = dir.join("value");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("value");
         std::fs::write(&file, "  #15549e\n").unwrap();
         assert_eq!(read(&file).as_deref(), Some("#15549e"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

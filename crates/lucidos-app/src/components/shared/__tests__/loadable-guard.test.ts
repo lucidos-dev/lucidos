@@ -37,6 +37,7 @@ function hasLoadingFlagState(code: string): boolean {
 
 /** Reads that may stay outside a `Loadable`, each with the rule that says so. */
 const READ_EXEMPT: Record<string, Exemption> = {
+  'components/chat/SuccessorStrip.tsx': { tag: 'best-effort', why: 'an unasked offer that is simply absent when the context is unreadable' },
   'components/credentials/CredentialItem.tsx': { tag: 'returns-value', why: 'copies a secret on a press; failure toasts' },
   'components/settings/SettingsView.tsx': { tag: 'returns-value', why: 'hands the read to AllowlistEditor, which holds the Loadable' },
   'store/actions/app-badge.ts': { tag: 'best-effort', why: 'cross-workspace unread count for the icon badge' },

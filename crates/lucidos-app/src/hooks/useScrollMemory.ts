@@ -1166,6 +1166,11 @@ export function useScrollMemory(
   // still listening, which is the window `onScroll`'s first guard closes.
   const keyRef = useRef(key);
   keyRef.current = key;
+  // Whether the latest render paused it. The effect detaches only after
+  // paint, and the swap that paused it (another view, an emptied list) can
+  // clamp the offset first. That scroll is not the reader's place.
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
 
   useEffect(() => {
     if (!key || paused) return;
@@ -1176,7 +1181,7 @@ export function useScrollMemory(
       resetOnEmpty,
       followsLiveEdge,
       anchorsToContent,
-      isCurrent: () => keyRef.current === key,
+      isCurrent: () => keyRef.current === key && !pausedRef.current,
     });
   }, [ref, key, paused, resetOnEmpty, followsLiveEdge, anchorsToContent]);
 }

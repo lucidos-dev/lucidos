@@ -12,9 +12,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { useRef } from 'preact/hooks';
-import { useHideOnScroll } from '../useHideOnScroll';
+import { APP_PANEL_BARS_AWAY_ATTR, useHideOnScroll } from '../useHideOnScroll';
+import { APP_SCROLL_MESSAGE_TYPE, APP_TOUCH_MESSAGE_TYPE } from '@lucidos/app-scroll';
 import { mobileView, preferences } from '../../store/store';
 import { viewportIsMobile } from '../../utils/viewport';
+import { findSurface } from '../../store/actions/find-bar';
 
 const HEADER_PX = 100;
 let headerPx = HEADER_PX;
@@ -73,6 +75,7 @@ beforeEach(() => {
 
 afterEach(() => {
   render(null, host);
+  findSurface.value = null;
   document.body.innerHTML = '';
   Object.defineProperty(window, 'innerWidth', { value: desktopWidth, configurable: true });
   vi.restoreAllMocks();
@@ -128,5 +131,193 @@ describe('a header that grows while away', () => {
     await frames();
 
     expect(document.querySelector<HTMLElement>('.app-header')!.style.translate).toBe(`0 ${-150 / 16}rem`);
+  });
+});
+
+/** A mobile Canvas pane showing an app, plus a widget frame elsewhere. */
+function mountAppPane(): { panel: HTMLElement; frame: HTMLIFrameElement; widget: HTMLIFrameElement } {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'mobile-swipe-wrapper';
+  wrapper.innerHTML = `
+    <div class="mobile-swipe-pane">
+      <div class="content-pane-body has-app-ui">
+        <div data-role="app-ui-panel" class="app-ui-inline"><iframe data-role="app-ui-frame"></iframe></div>
+      </div>
+    </div>
+    <div class="mobile-swipe-pane"><iframe data-role="app-ui-frame" class="widget"></iframe></div>`;
+  document.body.appendChild(wrapper);
+  return {
+    panel: wrapper.querySelector<HTMLElement>('[data-role="app-ui-panel"]')!,
+    frame: wrapper.querySelector<HTMLIFrameElement>('.app-ui-inline iframe')!,
+    widget: wrapper.querySelector<HTMLIFrameElement>('iframe.widget')!,
+  };
+}
+
+function reportScroll(frame: HTMLIFrameElement, delta: number, top: number) {
+  window.dispatchEvent(new MessageEvent('message', {
+    data: { type: APP_SCROLL_MESSAGE_TYPE, delta, top, max: 3000 },
+    source: frame.contentWindow,
+  }));
+}
+
+function reportTouch(frame: HTMLIFrameElement, touching: boolean) {
+  window.dispatchEvent(new MessageEvent('message', {
+    data: { type: APP_TOUCH_MESSAGE_TYPE, touching },
+    source: frame.contentWindow,
+  }));
+}
+
+describe('the bars over an app', () => {
+  const headerTranslate = () => document.querySelector<HTMLElement>('.app-header')!.style.translate;
+
+  beforeEach(() => {
+    mobileView.value = 'content';
+  });
+
+  it("follow the app's reported scroll, and take the panel with them", async () => {
+    const { panel, frame } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+
+    reportScroll(frame, 300, 300);
+    expect(headerTranslate()).toBe(`0 ${-HEADER_PX / 16}rem`);
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(true);
+
+    reportScroll(frame, -50, 250);
+    expect(headerTranslate()).toBe('');
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(false);
+  });
+
+  it('stay shown near the top of the app', async () => {
+    const { frame } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+    reportScroll(frame, 60, 60);
+    expect(headerTranslate()).toBe('');
+  });
+
+  it("ignore a widget frame's scroll", async () => {
+    const { panel, widget } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+    reportScroll(widget, 300, 300);
+    expect(headerTranslate()).toBe('');
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(false);
+  });
+
+  it('stay pinned with dynamic bars off', async () => {
+    preferences.value = { status: 'loaded', data: { mobile_dynamic_bars: 'false' } };
+    const { panel, frame } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+    reportScroll(frame, 300, 300);
+    expect(headerTranslate()).toBe('');
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(false);
+  });
+
+  it('come back when the app reloads into a new frame', async () => {
+    const { panel, frame } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+    reportScroll(frame, 300, 300);
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(true);
+
+    const reloaded = document.createElement('iframe');
+    reloaded.setAttribute('data-role', 'app-ui-frame');
+    frame.replaceWith(reloaded);
+    await frames();
+    expect(headerTranslate()).toBe('');
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(false);
+  });
+
+  it('hold still while the finger is on the app, and move once it lifts', async () => {
+    const { panel, frame } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+
+    reportTouch(frame, true);
+    reportScroll(frame, 300, 300);
+    expect(headerTranslate()).toBe('');
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(false);
+    reportTouch(frame, false);
+    expect(headerTranslate()).toBe(`0 ${-HEADER_PX / 16}rem`);
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(true);
+
+    reportTouch(frame, true);
+    reportScroll(frame, -50, 250);
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(true);
+    reportTouch(frame, false);
+    expect(headerTranslate()).toBe('');
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(false);
+  });
+
+  it("ignore a widget frame's touch", async () => {
+    const { panel, frame, widget } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+    reportTouch(widget, true);
+    reportScroll(frame, 300, 300);
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(true);
+  });
+
+  it('forget the finger when the app reloads into a new frame', async () => {
+    const { panel, frame } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+    reportTouch(frame, true);
+
+    const reloaded = document.createElement('iframe');
+    reloaded.setAttribute('data-role', 'app-ui-frame');
+    frame.replaceWith(reloaded);
+    await frames();
+    reportScroll(reloaded, 300, 300);
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(true);
+  });
+
+  it('forget the finger on a pane swipe', async () => {
+    mountMobileTree();
+    const { panel, frame } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+    reportTouch(frame, true);
+
+    mobileView.value = 'thread';
+    await frames();
+    mobileView.value = 'content';
+    await frames();
+    reportScroll(frame, 300, 300);
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(true);
+  });
+
+  it('show the bars when the find bar pins them under a finger', async () => {
+    const { panel, frame } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+    reportScroll(frame, 300, 300);
+    reportTouch(frame, true);
+
+    findSurface.value = 'content';
+    await frames();
+    expect(headerTranslate()).toBe('');
+    expect(panel.hasAttribute(APP_PANEL_BARS_AWAY_ATTR)).toBe(false);
+  });
+
+  it('write the header only when its place changes', async () => {
+    const { frame } = mountAppPane();
+    render(<Header />, host);
+    await frames();
+    reportScroll(frame, 300, 300);
+    const header = document.querySelector<HTMLElement>('.app-header')!;
+    let value = header.style.translate;
+    let writes = 0;
+    Object.defineProperty(header.style, 'translate', {
+      configurable: true,
+      get: () => value,
+      set: (next: string) => { writes++; value = next; },
+    });
+    reportScroll(frame, 40, 340);
+    reportScroll(frame, 40, 380);
+    expect(writes).toBe(0);
+    expect(value).toBe(`0 ${-HEADER_PX / 16}rem`);
   });
 });

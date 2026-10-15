@@ -8,9 +8,11 @@
  * injected into it minutes later, so the model read them backwards too.
  *
  * The chain must not cost anything the user can see: the optimistic rows still
- * appear instantly, a failed send never blocks the next one, and a POST that
- * never settles releases the chain rather than swallowing every later message
- * for the length of `SUBMIT_CHAT_TIMEOUT_MS`.
+ * appear instantly, and a failed send never blocks the next one.
+ *
+ * The chain only paces, and a successor waits for its predecessor to settle
+ * with no timer. The engine orders, by the page's input chain and each send's
+ * input sequence (ADR 0449).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -84,14 +86,20 @@ vi.mock('../../utils/tauri', () => ({
 }));
 
 import { focusedThreadId, threadMap, selectedScope, connectionStatus, panelOverlay } from '../store';
-import { sendMessage } from './chat';
-import { inSendChain, SEND_CHAIN_MAX_HOLD_MS } from './sendChain';
-import { SEND_RETRY_BACKOFF_MS, SEND_RETRY_DEADLINE_MS } from './sendRetry';
+import { retryUnsentMessage, sendMessage } from './chat';
+import { inSendChain } from './sendChain';
+import { SEND_RETRY_BACKOFF_MS } from './sendRetry';
+import { pageOwnerId } from '../pageOwner';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
 import { getDeviceId } from './devices';
 import { makeOptimisticThreadState } from '../thread-events';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
 import { ApiError, submitChat } from '../../api/client';
-import { SUBMIT_CHAT_TIMEOUT_MS } from '../../api/client/chat';
 import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
 
@@ -130,6 +138,9 @@ async function flush(): Promise<void> {
 }
 
 const sentMessages = () => mockedSubmitChat.mock.calls.map(c => (c[0] as { message: string }).message);
+
+interface PositionedBody { message: string; event_id: string; input_chain: string; input_seq: number }
+const sentBodies = () => mockedSubmitChat.mock.calls.map(c => c[0] as unknown as PositionedBody);
 
 beforeEach(() => {
   threadMap.value = new Map();
@@ -222,32 +233,6 @@ describe('per-thread send serialization', () => {
     expect(sentMessages()).toEqual(['A', 'A', 'A', 'B', 'C']);
   });
 
-  it('times the safety bound from the earlier send\'s turn, so three sends behind a hung one keep their order', async () => {
-    vi.useFakeTimers();
-    seedActiveThread(THREAD_A);
-    const hung = deferred<{ event_id: string }>();
-    const second = deferred<{ event_id: string }>();
-    mockedSubmitChat
-      .mockReturnValueOnce(hung.promise)
-      .mockReturnValueOnce(second.promise)
-      .mockResolvedValueOnce({ event_id: 'e3' });
-
-    void sendMessage('A', undefined, { threadId: THREAD_A, focus: false });
-    void sendMessage('B', undefined, { threadId: THREAD_A, focus: false });
-    const p3 = sendMessage('C', undefined, { threadId: THREAD_A, focus: false });
-    await vi.advanceTimersByTimeAsync(SEND_CHAIN_MAX_HOLD_MS + 1);
-    // B's own turn has only just come, so C still waits on B.
-    expect(sentMessages()).toEqual(['A', 'B']);
-
-    second.resolve({ event_id: 'e2' });
-    await p3;
-    expect(sentMessages()).toEqual(['A', 'B', 'C']);
-  });
-
-  it('bounds the hold by the longest a send can legitimately take', () => {
-    expect(SEND_CHAIN_MAX_HOLD_MS).toBeGreaterThan(SEND_RETRY_DEADLINE_MS + SUBMIT_CHAT_TIMEOUT_MS);
-  });
-
   it('a send that throws before its POST frees the slot at once', async () => {
     seedActiveThread(THREAD_A);
     mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
@@ -297,23 +282,85 @@ describe('per-thread send serialization', () => {
     expect(sentMessages()).toEqual(['after the tap']);
   });
 
-  it('releases the chain when a POST never settles, so later messages still go out', async () => {
+  it('a successor waits for an unsettled send however long it takes, with no timer', async () => {
+    // The engine refuses an overtaken input, so a timer that released the
+    // successor early would only get the earlier send refused.
     vi.useFakeTimers();
     seedActiveThread(THREAD_A);
-    const never = deferred<{ event_id: string }>();
+    const unsettled = deferred<{ event_id: string }>();
     mockedSubmitChat
-      .mockReturnValueOnce(never.promise)
+      .mockReturnValueOnce(unsettled.promise)
       .mockResolvedValueOnce({ event_id: 'e2' });
 
-    void sendMessage('first', undefined, { threadId: THREAD_A, focus: false });
+    const p1 = sendMessage('first', undefined, { threadId: THREAD_A, focus: false });
     const p2 = sendMessage('second', undefined, { threadId: THREAD_A, focus: false });
-    await vi.advanceTimersByTimeAsync(SEND_CHAIN_MAX_HOLD_MS - 1);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(sentMessages()).toEqual(['first']);
 
-    await vi.advanceTimersByTimeAsync(2);
-    await p2;
-
+    unsettled.resolve({ event_id: 'e1' });
+    await Promise.all([p1, p2]);
     expect(sentMessages()).toEqual(['first', 'second']);
+  });
+
+  it('the chain holds no timer', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const source = readFileSync(resolve(here, 'sendChain.ts'), 'utf8');
+    expect(source).not.toMatch(/setTimeout|setInterval/);
+  });
+
+  it('each send carries the page\'s input chain and a sequence in the order it was pressed', async () => {
+    seedActiveThread(THREAD_A);
+    seedActiveThread(THREAD_B);
+    mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
+
+    await Promise.all([
+      sendMessage('first', undefined, { threadId: THREAD_A, focus: false }),
+      sendMessage('on B', undefined, { threadId: THREAD_B, focus: false }),
+      sendMessage('second', undefined, { threadId: THREAD_A, focus: false }),
+    ]);
+
+    const [first, onB, second] = sentBodies();
+    for (const body of [first, onB, second]) expect(body.input_chain).toBe(pageOwnerId);
+    expect(second.input_seq).toBe(first.input_seq + 1);
+    // Each thread numbers its own inputs.
+    expect(onB.input_seq).not.toBe(first.input_seq + 1);
+  });
+
+  it('a quiet retry resends the same sequence, since it is the same input', async () => {
+    vi.useFakeTimers();
+    seedActiveThread(THREAD_A);
+    mockedSubmitChat
+      .mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValueOnce({ event_id: 'e1' });
+
+    const p = sendMessage('retried', undefined, { threadId: THREAD_A, focus: false });
+    await vi.advanceTimersByTimeAsync(SEND_RETRY_BACKOFF_MS[0]);
+    await p;
+
+    const [attempt, retry] = sentBodies();
+    expect(attempt.input_seq).toBeGreaterThan(0);
+    expect(retry.input_seq).toBe(attempt.input_seq);
+    expect(retry.event_id).toBe(attempt.event_id);
+  });
+
+  it('a manual Retry of a Not sent message takes a fresh sequence and keeps its event id', async () => {
+    vi.useFakeTimers();
+    seedActiveThread(THREAD_A);
+    mockedSubmitChat.mockRejectedValue(new TypeError('Load failed'));
+    const unsent = sendMessage('not sent', undefined, { threadId: THREAD_A, focus: false });
+    for (const delay of SEND_RETRY_BACKOFF_MS) await vi.advanceTimersByTimeAsync(delay);
+    expect(await unsent).toBe('shown-as-failed');
+    const original = sentBodies()[0];
+
+    mockedSubmitChat.mockReset();
+    mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
+    await sendMessage('sent after', undefined, { threadId: THREAD_A, focus: false });
+    await retryUnsentMessage(original.event_id);
+
+    const [after, retried] = sentBodies();
+    // The engine dedupes it by event id, and orders it after what was sent since.
+    expect(retried.event_id).toBe(original.event_id);
+    expect(retried.input_seq).toBeGreaterThan(after.input_seq);
   });
 
   it('does not serialize across different threads', async () => {

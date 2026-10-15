@@ -45,7 +45,7 @@ describe('app surfaces draw AppIcon', () => {
       </>,
       host,
     );
-    const [first, second] = [...host.querySelectorAll('.app-row-lead')];
+    const [first, second] = [...host.querySelectorAll('.app-row')];
     expect(first.querySelector('.app-icon-image img')?.getAttribute('src'))
       .toMatch(/\/app\/habit-tracker\/assets\/icon\.svg$/);
     expect(second.querySelector('.app-icon-monogram')?.textContent).toBe('D');

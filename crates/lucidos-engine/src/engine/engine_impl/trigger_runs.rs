@@ -285,6 +285,7 @@ mod tests {
             go_to_review: false,
             group_id: None,
             side_effect_grant: vec![],
+            mcp_servers: vec![],
             plugin_id: None,
             model: None,
             reasoning_effort: None,

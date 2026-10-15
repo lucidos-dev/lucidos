@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 /// their executables are the same file, and only the data dir differs.
 pub fn inventory(exe: Option<PathBuf>, app_data: &Path) -> Inventory {
     let Some(roots) = ScanRoots::for_machine() else {
-        // Unreachable in practice: `resolve_app_data` already refuses to boot
-        // without `HOME`. Logged rather than returned silently. An empty
+        // Unreachable in practice: the gateway already refuses to boot without
+        // `HOME`. Logged rather than returned silently. An empty
         // inventory renders as "this machine has no installs", the opposite of
         // what this surface exists to say.
         crate::log!("[Installs] HOME is not set; cannot enumerate installs");

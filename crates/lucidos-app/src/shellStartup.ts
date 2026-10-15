@@ -4,9 +4,14 @@
  *  Nothing here can matter any earlier. Nobody can press, type, open an app
  *  frame or see a restored message before the shell renders. So each install
  *  still runs ahead of the first frame that could need it, and its code stays
- *  out of the entry chunk. See *shell startup* in `docs/glossary.md`. */
+ *  out of the entry chunk. See *shell startup* in `docs/glossary.md`.
+ *
+ *  One install loads on its own: the composer's press probe. It is the largest
+ *  module here and only a diagnostic, so it arms one chunk fetch after the
+ *  shell instead of growing the shell chunk. Its pointerdown cover sample must
+ *  run before any overlay's listener, so that part installs here at once. */
 
-import { installDeadPressProbe } from './components/chat/deadPressProbe';
+import { installPressCoverWatch } from './components/chat/pressCover';
 import { installDeadKeystrokeProbe } from './components/chat/deadKeystrokeProbe';
 import { installToastPressProbe } from './components/shared/toastPressProbe';
 import { installAppKeybindingsSync } from './store/actions/app-keybindings';
@@ -31,7 +36,13 @@ export function startShell(): () => void {
   provideScrollState(scrollState);
   // Three diagnostics, not features: the composer's buttons, its textarea and
   // the toasts' buttons. See their headers and docs/temporary-measures.md.
-  installDeadPressProbe();
+  installPressCoverWatch();
+  // A failed load is telemetry, not a toast: nobody asked for the probe, and
+  // the next page load arms it again.
+  import('./components/chat/deadPressProbe').then(
+    (probe) => probe.installDeadPressProbe(),
+    (err: unknown) => console.warn('[shell] could not load the press probe:', err),
+  );
   installDeadKeystrokeProbe();
   installToastPressProbe();
   // The *seen target* rule: a notification clears once the reader has looked

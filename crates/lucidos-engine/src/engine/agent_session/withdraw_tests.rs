@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::agent_session::input_ledger::{ReadInput, Settled};
 use crate::runtime::AgentInput;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use futures::{FutureExt, StreamExt};
@@ -48,7 +49,7 @@ async fn an_input_that_is_not_owed_is_already_read() {
 async fn a_backend_without_withdraws_refuses() {
     let id = Uuid::new_v4();
     let mut inputs = InputLedger::new();
-    inputs.forwarded(vec![id], &sent("queued"));
+    inputs.forwarded(vec![id], &sent("queued"), None);
     let mut pending = PendingWithdraws::new();
     let (withdraw, answer) = request(id);
     begin_withdraw(&inputs, None, withdraw, &mut pending);
@@ -63,7 +64,7 @@ async fn a_backend_without_withdraws_refuses() {
 async fn a_driver_that_ended_refuses() {
     let id = Uuid::new_v4();
     let mut inputs = InputLedger::new();
-    inputs.forwarded(vec![id], &sent("queued"));
+    inputs.forwarded(vec![id], &sent("queued"), None);
     let (driver, driver_rx) = mpsc::unbounded_channel();
     drop(driver_rx);
     let mut pending = PendingWithdraws::new();
@@ -86,7 +87,7 @@ async fn a_withdrawn_input_leaves_the_ledger_and_records_its_tombstone() {
     let id = Uuid::new_v4();
     let queued = sent("never mind");
     let mut inputs = InputLedger::new();
-    inputs.forwarded(vec![id], &queued);
+    inputs.forwarded(vec![id], &queued, None);
 
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
@@ -113,7 +114,7 @@ async fn a_refused_withdraw_records_nothing() {
     let thread_id = Uuid::new_v4();
     let id = Uuid::new_v4();
     let mut inputs = InputLedger::new();
-    inputs.forwarded(vec![id], &sent("queued"));
+    inputs.forwarded(vec![id], &sent("queued"), None);
 
     for outcome in [
         InputWithdrawal::AlreadyRead,
@@ -233,7 +234,7 @@ async fn a_withdrawal_whose_tombstone_failed_records_it_on_retry() {
     let thread_id = Uuid::new_v4();
     let id = Uuid::new_v4();
     let mut inputs = InputLedger::new();
-    inputs.forwarded(vec![id], &sent("queued"));
+    inputs.forwarded(vec![id], &sent("queued"), None);
     inputs.withdrawn(id);
 
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
@@ -263,8 +264,10 @@ async fn a_read_after_a_drop_settles_the_input_it_names() {
     let thread_id = Uuid::new_v4();
     let [a, b] = [Uuid::new_v4(), Uuid::new_v4()];
     let mut inputs = InputLedger::new();
-    inputs.forwarded(vec![a], &sent("never mind"));
-    inputs.forwarded(vec![b], &sent("check the totals"));
+    inputs.forwarded(vec![a], &sent("never mind"), None);
+    let b_input = sent("check the totals");
+    let b_uuid = b_input.uuid;
+    inputs.forwarded(vec![b], &b_input, None);
 
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
@@ -277,11 +280,14 @@ async fn a_read_after_a_drop_settles_the_input_it_names() {
 
     // B's replay arrives next. The run loop settles answers before it.
     settle_answered_withdraws(&bus, thread_id, &mut inputs, &mut pending).await;
-    let replay = crate::runtime::AgentEvent::InputRead(Some(crate::runtime::ReplayedInput {
-        texts: vec!["check the totals".into()],
-        images: 0,
-    }));
-    assert_eq!(inputs.observe(&replay), vec![b]);
+    let replay = crate::runtime::AgentEvent::InputRead { input: b_uuid };
+    assert_eq!(
+        inputs.observe(&replay),
+        Settled::Read(vec![ReadInput {
+            event_id: b,
+            verbatim: false
+        }])
+    );
     assert_eq!(tombstones(&pool, thread_id).await, [a.to_string()]);
 
     pool.close().await;

@@ -41,6 +41,9 @@ export const APP_FRAME_ISOLATED = !APP_FRAME_SANDBOX.includes('allow-same-origin
  * origin, `self` covered it and the attribute was a formality.
  *
  * - `autoplay`, `fullscreen`, `encrypted-media`: an app playing media.
+ * - `fullscreen *` names every origin. A bare feature means `'src'`, the
+ *   origin of the frame's URL. WebKit never matches that against the frame's
+ *   opaque origin, so the desktop app would deny every app fullscreen.
  * - `clipboard-write`: every Copy button in every app. Without it Chromium
  *   rejects `writeText` with `NotAllowedError` and the text never lands, which
  *   is silent because app code does not await the promise. WebKit allows the
@@ -51,4 +54,4 @@ export const APP_FRAME_ISOLATED = !APP_FRAME_SANDBOX.includes('allow-same-origin
  * copied. That may be a password or a token from another app, for no gesture
  * aimed at the app. Nothing in the SDK needs it.
  */
-export const APP_FRAME_ALLOW = 'autoplay; fullscreen; encrypted-media; clipboard-write';
+export const APP_FRAME_ALLOW = 'autoplay; fullscreen *; encrypted-media; clipboard-write';

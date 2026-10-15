@@ -1,5 +1,5 @@
 import { recordIpcOutcome } from './ipcHealth';
-import type { WorkspaceLanding } from './workspaceLanding';
+import { landingName, type WorkspaceLanding } from './workspaceLanding';
 
 declare global {
   interface Window {
@@ -504,7 +504,10 @@ export function showWorkspaceInNativeWindow(
   workspace: string,
   landing?: WorkspaceLanding,
 ): Promise<void> {
-  return invoke('show_workspace_window', { workspace, landing: landing ?? null });
+  return invoke('show_workspace_window', {
+    workspace,
+    landing: landing ? landingName(landing) : null,
+  });
 }
 
 /** Surface the engine's connect URLs (localhost / LAN / Tailscale). Only call

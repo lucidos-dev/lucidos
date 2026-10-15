@@ -965,6 +965,24 @@ fn files_require_restart_detects_rust_and_migrations() {
     ]));
 }
 
+/// The dev window moves to its config only at a switch (ADR 0461).
+#[test]
+fn files_require_restart_for_the_desktop_apps_compile_inputs() {
+    for input in [
+        "crates/lucidos-app/tauri.conf.json",
+        "crates/lucidos-app/Info.plist",
+        "crates/lucidos-app/capabilities/default.json",
+        "crates/lucidos-app/permissions/app-ipc.json",
+        "crates/lucidos-app/icons/icon.icns",
+    ] {
+        assert!(files_require_restart(&[input.into()]), "{input}");
+    }
+    // Only `cargo tauri build` reads the entitlements.
+    assert!(!files_require_restart(&[
+        "crates/lucidos-app/Entitlements.plist".into()
+    ]));
+}
+
 #[test]
 fn files_require_restart_ignores_tests_and_docs() {
     assert!(!files_require_restart(&[
@@ -1100,6 +1118,20 @@ fn a_file_a_binary_embeds_requires_a_restart() {
         missed.is_empty(),
         "a binary embeds these, but an Apply that edits one offers no restart: {missed:?}. \
          Add each to EMBEDDED_FILES in restart_detection.rs."
+    );
+    // A generated file is a build output that a clean clone lacks, so no
+    // binary may embed one. Render it at runtime instead.
+    let generated: Vec<&String> = embedded
+        .iter()
+        .filter(|f| {
+            crate::codegen::GENERATED_DIRS
+                .iter()
+                .any(|dir| f.starts_with(&format!("{dir}/")))
+        })
+        .collect();
+    assert!(
+        generated.is_empty(),
+        "a binary embeds these generated files: {generated:?}"
     );
 }
 

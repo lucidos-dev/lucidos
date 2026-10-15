@@ -712,6 +712,13 @@ service_systemd_load() {
     return 0
 }
 
+# service_systemd_stop <unit-name> — stop the unit, keeping it enabled. Returns
+# non-zero if it is still active afterwards.
+service_systemd_stop() {
+    systemctl --user stop "$1" >/dev/null 2>&1 || true
+    ! service_systemd_is_active "$1"
+}
+
 # service_systemd_unload <unit-name> — disable + stop the unit, then reload.
 service_systemd_unload() {
     systemctl --user disable --now "$1" >/dev/null 2>&1 || true
@@ -751,27 +758,90 @@ service_write_network_toml() {
     mv "$path.tmp" "$path"
 }
 
-# service_stop_embedded_runtime <data> <runtime-root> — best-effort graceful stop
-# of what the gateway spawned, so an uninstall leaves no orphans (mirrors
-# crates/lucidos-app/src/desktop.rs shutdown order): SIGUSR1 each workspace engine
-# (engines ignore SIGTERM), then `pg_ctl -m fast stop` the embedded cluster at
-# <data>/pgdata using the bundled binaries + libpath. No-op for anything missing.
-# Call this AFTER the gateway is unregistered, so it can't respawn the engines.
+# _service_engine_live_pid <workspace> — the engine's pid to signal: printed only
+# while it holds <workspace>/.lucidos/engine.lock (ADR 0438) and still runs
+# lucidos-engine. uninstall.sh fetches this file alone, so it cannot source
+# flock.sh. service_test.sh checks it answers as flock.sh's owner check does.
+# Returns 2, printing nothing, when perl is missing.
+#
+# No lock file means no lock-aware engine ever ran there, and the program check
+# alone decides. Temporary measure: docs/temporary-measures.md § "Pre-lock
+# engine pidfile fallback".
+_service_engine_live_pid() {
+    local lock="$1/.lucidos/engine.lock" pid argv0
+    pid="$(tr -d '[:space:]' < "$1/.lucidos/engine.pid" 2>/dev/null || true)"
+    case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+    [ "$pid" -gt 1 ] || return 0
+    if [ -e "$lock" ]; then
+        command -v perl >/dev/null 2>&1 || return 2
+        perl -MFcntl=:flock -e '
+            open(my $fh, "<", $ARGV[0]) or exit 0;
+            exit 0 if flock($fh, LOCK_SH | LOCK_NB);
+            exit($!{EWOULDBLOCK} ? 1 : 0);
+        ' "$lock" && return 0
+    fi
+    argv0="$(ps -o command= -p "$pid" 2>/dev/null)" || return 0
+    argv0="${argv0%% *}"
+    if [ "${argv0##*/}" = lucidos-engine ]; then echo "$pid"; fi
+}
+
+# service_engine_exit_timeout — seconds a signalled engine gets to exit, as the
+# desktop teardown gives it (LAUNCHD_EXIT_TIMEOUT in desktop.rs).
+service_engine_exit_timeout() { printf '%s' 20; }
+
+# _service_wait_engines_gone <secs> <pid>... — wait for signalled engines to exit.
+# A draining engine still writes its teardown events, so Postgres must outlive
+# it. A gateway started next would also adopt one still answering. At the
+# deadline, a pid that still runs lucidos-engine gets SIGKILL.
+_service_wait_engines_gone() {
+    local secs="$1" deadline pid argv0
+    shift
+    deadline=$(( $(date +%s) + secs ))
+    for pid in "$@"; do
+        while kill -0 "$pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
+            sleep 0.2
+        done
+        kill -0 "$pid" 2>/dev/null || continue
+        argv0="$(ps -o command= -p "$pid" 2>/dev/null)" || continue
+        argv0="${argv0%% *}"
+        if [ "${argv0##*/}" = lucidos-engine ]; then
+            echo "WARNING: engine pid $pid did not exit within ${secs}s; force-killing it." >&2
+            kill -KILL "$pid" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+# service_stop_embedded_runtime <data> <runtime-root> [engine-exit-secs] —
+# best-effort graceful stop of what the gateway spawned (mirrors
+# crates/lucidos-app/src/desktop.rs shutdown order). SIGUSR1 each workspace
+# engine (engines ignore SIGTERM) and wait for it to exit. Then `pg_ctl -m fast
+# stop` the embedded cluster at <data>/pgdata with the bundled binaries + libpath.
+# No-op for anything missing. Call this AFTER the gateway is unregistered, so it
+# can't respawn the engines. uninstall.sh and an install over a running instance
+# both use it.
 service_stop_embedded_runtime() {
-    local data="${1%/}" root="${2%/}"
+    local data="${1%/}" root="${2%/}" exit_secs="${3:-$(service_engine_exit_timeout)}"
     local workspaces="$data/workspaces" pgdata="$data/pgdata"
-    local pidfile pid pg_bin pg_lib
+    local pidfile ws pid rc pg_bin pg_lib signalled=""
 
     if [ -d "$workspaces" ]; then
         for pidfile in "$workspaces"/*/.lucidos/engine.pid; do
             [ -f "$pidfile" ] || continue
-            pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+            ws="${pidfile%/.lucidos/engine.pid}"
+            rc=0
+            pid="$(_service_engine_live_pid "$ws")" || rc=$?
+            if [ "$rc" -eq 2 ]; then
+                echo "WARNING: perl is not installed, so the engine of $ws could not be verified and was not signalled." >&2
+                continue
+            fi
             if [ -n "$pid" ]; then
                 kill -USR1 "$pid" >/dev/null 2>&1 || true
+                signalled="$signalled $pid"
             fi
-            rm -f "$pidfile" 2>/dev/null || true
         done
     fi
+    # shellcheck disable=SC2086 # one word per pid
+    _service_wait_engines_gone "$exit_secs" $signalled
 
     pg_bin="$root/postgres/bin"
     pg_lib="$root/postgres/lib"

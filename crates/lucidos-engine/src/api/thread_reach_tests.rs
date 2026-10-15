@@ -19,6 +19,8 @@ const EVERY_VERB: &[ThreadReachVerb] = &[
     ThreadReachVerb::Archive,
     ThreadReachVerb::Cancel,
     ThreadReachVerb::Control,
+    ThreadReachVerb::AskSideQuestion,
+    ThreadReachVerb::DismissSideQuestion,
     ThreadReachVerb::Apply,
     ThreadReachVerb::Discard,
     ThreadReachVerb::SetAside,
@@ -27,7 +29,13 @@ const EVERY_VERB: &[ThreadReachVerb] = &[
     ThreadReachVerb::AnswerQuestion,
     ThreadReachVerb::ResolvePermission,
     ThreadReachVerb::Continue,
+    ThreadReachVerb::SpawnSuccessor,
+];
+
+/// The verbs that left clause 4 (ADR 0475). Kept for stored approval cards.
+const RETIRED_VERBS: &[ThreadReachVerb] = &[
     ThreadReachVerb::CreateTopThread,
+    ThreadReachVerb::DetachChild,
 ];
 
 /// Every surface carrying a clause-4 verb, and the file its handler lives in.
@@ -50,7 +58,9 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("changes.rs", CHANGES_RS, "revert_change"),
     ("changes.rs", CHANGES_RS, "apply_all_changes"),
     ("changes.rs", CHANGES_RS, "discard_all_changes"),
-    ("chat.rs", CHAT_RS, "chat_submit"),
+    ("changes.rs", CHANGES_RS, "remove_from_landing_lane"),
+    ("changes.rs", CHANGES_RS, "cancel_lane_batch"),
+    ("threads/successor.rs", SUCCESSOR_RS, "spawn_successor"),
     ("chat.rs", CHAT_RS, "cancel_chat"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_stop"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_apply_now"),
@@ -96,6 +106,7 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
 
 const CHANGES_RS: &str = include_str!("changes.rs");
 const CHAT_RS: &str = include_str!("chat.rs");
+const SUCCESSOR_RS: &str = include_str!("threads/successor.rs");
 const CLAUDE_CODE_RS: &str = include_str!("claude_code.rs");
 const DISK_USAGE_RS: &str = include_str!("disk_usage.rs");
 const ACTIONS_RS: &str = include_str!("threads/actions.rs");
@@ -172,6 +183,25 @@ fn every_clause_4_route_asks_the_gate() {
         assert!(
             !GATE_CALLS.iter().any(|call| body.contains(call)),
             "the body slicer is over-reading at {read_only}: a read cannot contain the gate"
+        );
+    }
+}
+
+/// ADR 0475: creating a top-thread and an agent's detach ask no gate. The
+/// create route and the engine's move are where the gate used to sit.
+#[test]
+fn creating_a_top_thread_asks_no_gate() {
+    for (source, handler) in [
+        (CHAT_RS, "chat_submit"),
+        (
+            include_str!("../engine/chat/child_detach.rs"),
+            "move_child_to_top_level",
+        ),
+    ] {
+        let body = handler_body(source, handler).expect("the handler exists");
+        assert!(
+            !GATE_CALLS.iter().any(|call| body.contains(call)),
+            "{handler} asks the gate again"
         );
     }
 }
@@ -288,6 +318,7 @@ async fn seed_thread_opened_by(
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "work".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -589,6 +620,93 @@ async fn every_verb_reaches_the_caller_s_own_subtree_with_no_owner_turn() {
     teardown_test_db(&db_name).await;
 }
 
+/// ADR 0475: a retired verb needs no authority. A thread in a turn nobody's
+/// device opened, and a subprocess with no thread, both pass at any target.
+#[tokio::test]
+async fn a_retired_verb_passes_with_no_authority() {
+    let (pool, db_name) = setup_test_db().await;
+    let f = family(&pool).await;
+
+    for verb in RETIRED_VERBS {
+        assert!(!verb.needs_authority(), "{verb:?}");
+        for caller in [Some(f.child), None] {
+            for target in [None, Some(f.child), Some(f.sibling)] {
+                assert_eq!(
+                    authority_held(&pool, caller, None, target, *verb)
+                        .await
+                        .unwrap(),
+                    Some(HeldAuthority::NoneNeeded),
+                    "{verb:?} from {caller:?} at {target:?}"
+                );
+                assert!(
+                    refuse_without_authority(
+                        &bus_for(&pool),
+                        &agent_headers(caller),
+                        target,
+                        *verb
+                    )
+                    .await
+                    .is_ok(),
+                    "{verb:?} from {caller:?} at {target:?}"
+                );
+            }
+        }
+    }
+    assert!(EVERY_VERB.iter().all(|verb| verb.needs_authority()));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// I13: a child hands off by starting its successor under its parent. That
+/// is an act in the parent's subtree, which the child does not reach on its
+/// own. The owner's turn carries it; the parent itself always may.
+#[tokio::test]
+async fn a_child_needs_the_owner_to_start_its_successor_under_its_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let f = family(&pool).await;
+    let verb = ThreadReachVerb::SpawnSuccessor;
+
+    assert!(matches!(
+        refuse_without_authority(
+            &bus_for(&pool),
+            &agent_headers(Some(f.child)),
+            Some(f.root),
+            verb
+        )
+        .await,
+        Err(ThreadReachError::OutOfReach { .. })
+    ));
+    assert!(
+        refuse_without_authority(
+            &bus_for(&pool),
+            &agent_headers(Some(f.root)),
+            Some(f.root),
+            verb
+        )
+        .await
+        .is_ok(),
+        "the parent itself reaches its own subtree"
+    );
+    let opened = Uuid::new_v4();
+    seed_thread_opened_by(&bus, opened, Some(f.root), Some(owner_device())).await;
+    assert!(
+        refuse_without_authority(
+            &bus_for(&pool),
+            &agent_headers(Some(opened)),
+            Some(f.root),
+            verb
+        )
+        .await
+        .is_ok(),
+        "a child in a turn the owner opened carries their instruction"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Clause 5: the owner opened this turn, so their words in it are the press.
 /// The same caller that was refused above now reaches its sibling.
 #[tokio::test]
@@ -609,15 +727,10 @@ async fn a_turn_the_owner_opened_reaches_past_the_subtree() {
         );
     }
     assert!(
-        refuse_without_authority(
-            &bus_for(&pool),
-            &headers,
-            None,
-            ThreadReachVerb::CreateTopThread
-        )
-        .await
-        .is_ok(),
-        "so does an act aimed at the root, which is nobody's subtree"
+        refuse_without_authority(&bus_for(&pool), &headers, None, ThreadReachVerb::Apply)
+            .await
+            .is_ok(),
+        "so does an act aimed at the workspace, which is nobody's subtree"
     );
 
     pool.close().await;

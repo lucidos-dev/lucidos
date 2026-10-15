@@ -176,19 +176,26 @@ mod conversation_section_tests {
 
 mod relation_tests {
     use super::super::special_tool::{parse_relation, Relation};
+    use crate::engine::thread_events::WakeMode;
     use serde_json::json;
     use uuid::Uuid;
 
     #[test]
     fn parse_relation_defaults_to_child_when_omitted() {
         let args = json!({"prompt": "do the thing"});
-        assert!(matches!(parse_relation(&args), Ok(Relation::Child)));
+        assert!(matches!(
+            parse_relation(&args, false),
+            Ok(Relation::Child(_))
+        ));
     }
 
     #[test]
     fn parse_relation_accepts_child() {
         let args = json!({"prompt": "x", "relation": "child"});
-        assert!(matches!(parse_relation(&args), Ok(Relation::Child)));
+        assert!(matches!(
+            parse_relation(&args, false),
+            Ok(Relation::Child(_))
+        ));
     }
 
     #[test]
@@ -198,19 +205,22 @@ mod relation_tests {
         // Older LLM tool calls and persisted prompts may still send `"sub"`,
         // so it must keep deserializing to Child.
         let args = json!({"prompt": "x", "relation": "sub"});
-        assert!(matches!(parse_relation(&args), Ok(Relation::Child)));
+        assert!(matches!(
+            parse_relation(&args, false),
+            Ok(Relation::Child(_))
+        ));
     }
 
     #[test]
     fn parse_relation_accepts_top() {
         let args = json!({"prompt": "x", "relation": "top"});
-        assert!(matches!(parse_relation(&args), Ok(Relation::Top)));
+        assert!(matches!(parse_relation(&args, false), Ok(Relation::Top)));
     }
 
     #[test]
     fn parse_relation_rejects_unknown_value() {
         let args = json!({"prompt": "x", "relation": "sibling"});
-        let err = parse_relation(&args).expect_err("unknown value must error");
+        let err = parse_relation(&args, false).expect_err("unknown value must error");
         assert!(
             err.contains("relation must be") && err.contains("sibling"),
             "error must name the bad value: {}",
@@ -223,14 +233,15 @@ mod relation_tests {
         // {"relation": 42} — wrong type. The parser must fail loudly so the
         // LLM sees the contract violation instead of silently getting "child".
         let args = json!({"prompt": "x", "relation": 42});
-        assert!(parse_relation(&args).is_err());
+        assert!(parse_relation(&args, false).is_err());
     }
 
     #[test]
     fn child_linkage_passes_parent_and_event_through() {
         let spawning_thread = Uuid::new_v4();
         let tool_event = Uuid::new_v4();
-        let (parent, event) = Relation::Child.spawn_linkage(spawning_thread, Some(tool_event));
+        let (parent, event) =
+            Relation::Child(WakeMode::Wake).spawn_linkage(spawning_thread, Some(tool_event));
         assert_eq!(parent, Some(spawning_thread));
         assert_eq!(event, Some(tool_event));
     }
@@ -253,13 +264,56 @@ mod relation_tests {
     #[test]
     fn child_run_thread_text_promises_auto_resume() {
         let child = Uuid::new_v4();
-        let text = Relation::Child.run_thread_success_text(child, "dev");
+        let text = Relation::Child(WakeMode::Wake).run_thread_success_text(child, "dev");
         assert!(
-            text.contains("automatically resume"),
-            "child spawn must tell the LLM the parent will auto-resume: {}",
+            text.contains("automatically resumes"),
+            "a wake child spawn must tell the LLM the parent will auto-resume: {}",
             text
         );
         assert!(text.contains(&child.to_string()));
+    }
+
+    /// I7 and I9 of `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`.
+    #[test]
+    fn a_child_takes_its_parents_default_wake_mode_unless_it_declares_one() {
+        let omitted = serde_json::json!({});
+        assert_eq!(
+            parse_relation(&omitted, true),
+            Ok(Relation::Child(WakeMode::NoWake))
+        );
+        assert_eq!(
+            parse_relation(&omitted, false),
+            Ok(Relation::Child(WakeMode::Wake))
+        );
+        let declared = serde_json::json!({"wake_mode": "wake-when-all-done"});
+        assert_eq!(
+            parse_relation(&declared, true),
+            Ok(Relation::Child(WakeMode::WakeWhenAllDone))
+        );
+        let unknown = serde_json::json!({"wake_mode": "file"});
+        assert!(parse_relation(&unknown, false)
+            .unwrap_err()
+            .contains("no-wake"));
+    }
+
+    #[test]
+    fn a_top_spawn_refuses_a_wake_mode() {
+        let args = serde_json::json!({"relation": "top", "wake_mode": "wake"});
+        let err = parse_relation(&args, false).unwrap_err();
+        assert!(err.contains("top thread never reports back"), "{err}");
+        let plain = serde_json::json!({"relation": "top"});
+        assert_eq!(parse_relation(&plain, true), Ok(Relation::Top));
+    }
+
+    #[test]
+    fn each_child_spawn_text_states_what_its_wake_mode_does() {
+        let child = Uuid::new_v4();
+        let text = |mode| Relation::Child(mode).run_thread_success_text(child, "dev");
+        assert!(text(WakeMode::NoWake).contains("does NOT resume this conversation"));
+        assert!(text(WakeMode::WakeWhenAllDone).contains("the last one to finish resumes"));
+        assert!(text(WakeMode::Wake).contains("automatically resumes"));
+        let queued = Relation::Child(WakeMode::NoWake).queued_spawn_text("Thread", child, 2);
+        assert!(queued.contains("no-wake"), "{queued}");
     }
 
     #[test]
@@ -277,7 +331,7 @@ mod relation_tests {
     #[test]
     fn child_run_coding_agent_text_describes_new_thread() {
         let child = Uuid::new_v4();
-        let text = Relation::Child.run_coding_agent_success_text(
+        let text = Relation::Child(WakeMode::Wake).run_coding_agent_success_text(
             child,
             "dev",
             crate::runtime::CodingAgent::ClaudeCode,
@@ -305,7 +359,7 @@ mod relation_tests {
     #[test]
     fn run_coding_agent_text_stamps_workspace_into_body_and_link() {
         let child = Uuid::new_v4();
-        for relation in [Relation::Child, Relation::Top] {
+        for relation in [Relation::Child(WakeMode::Wake), Relation::Top] {
             let text = relation.run_coding_agent_success_text(
                 child,
                 "dev",
@@ -329,7 +383,7 @@ mod relation_tests {
     #[test]
     fn run_thread_text_stamps_workspace_into_body_and_link() {
         let child = Uuid::new_v4();
-        for relation in [Relation::Child, Relation::Top] {
+        for relation in [Relation::Child(WakeMode::Wake), Relation::Top] {
             let text = relation.run_thread_success_text(child, "myws");
             assert!(
                 text.contains("workspace 'myws'"),

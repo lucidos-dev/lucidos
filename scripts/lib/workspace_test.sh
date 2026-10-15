@@ -20,6 +20,8 @@ pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 # Source the lib in a way that doesn't require global setup.
 # shellcheck source=workspace.sh
 source "$SCRIPT_DIR/workspace.sh"
+# shellcheck source=scripts/lib/flock_test_support.sh
+source "$SCRIPT_DIR/flock_test_support.sh"
 
 # No `lsof` stub here, unlike `ports_test.sh`, and deliberately.
 #
@@ -31,35 +33,6 @@ source "$SCRIPT_DIR/workspace.sh"
 # this project is running, and a stub answering "nothing is listening" makes
 # eight tests measure the wrong thing. Add one only alongside a test that can
 # reach a signal.
-
-# ── process-table seam (stubbed for the WHOLE file) ────────────────────
-# ADR 0025: a synthetic feed is the entire answer, never a fall-back to the
-# real host. Overriding the two functions outright is what guarantees that, so
-# the teardown's verdict can never depend on what is running on this machine.
-#
-# The default is an empty table read successfully, which means "no engine
-# serves this checkout" and lets a teardown proceed. Each test that cares sets
-# its own feed and restores this one.
-SYNTHETIC_PS_LISTING=""
-SYNTHETIC_PS_RC=0
-SYNTHETIC_PROC_ENV=""
-
-_build_watch_ps_listing() {
-    printf '%s' "$SYNTHETIC_PS_LISTING"
-    return "$SYNTHETIC_PS_RC"
-}
-
-# One `<pid>|<ps -E line>` record per feed line.
-_build_watch_proc_env() {
-    printf '%s\n' "$SYNTHETIC_PROC_ENV" |
-        awk -F'|' -v want="$1" '$1 == want { print substr($0, index($0, "|") + 1) }'
-}
-
-reset_process_table() {
-    SYNTHETIC_PS_LISTING=""
-    SYNTHETIC_PS_RC=0
-    SYNTHETIC_PROC_ENV=""
-}
 
 # ── fixture helpers ────────────────────────────────────────────────────
 make_pkg_dir() {
@@ -78,248 +51,146 @@ make_pkg_dir() {
     fi
 }
 
-write_pid_for_workspace() {
-    local ws_name="$1"
-    local pid="$2"
-    local dir="$HOME/workspaces/$ws_name/.lucidos"
+# Hold <project>'s build-watch lock and publish the holder's pid, as a running
+# watcher does. Sets HOLDER_PID and HOLDER_RELEASE.
+hold_build_watch() { # <project>
+    local dir="$1/crates/lucidos-app/.build-watch"
     mkdir -p "$dir"
-    echo "$pid" > "$dir/frontend.pid"
+    start_lock_holder "$SANDBOX" "$dir/watch.lock" ex "$dir/pid"
 }
 
-# ── Test 1: refuse npm install when a frontend in THIS project is running ──
-test_refuses_install_when_same_project_frontend_running() {
-    echo "test: refuses install when a frontend in this project is running"
+# ── Test 1: refuse npm install while THIS checkout's build-watch runs ──
+test_refuses_install_when_this_checkouts_build_watch_runs() {
+    echo "test: refuses install while this checkout's build-watch runs"
 
     # `local PROJECT_DIR` shadows the global that ensure_npm_deps reads —
     # bash dynamic scoping makes the local visible to called functions.
     local PROJECT_DIR="$SANDBOX/proj-conflict"
-    local pkg="$PROJECT_DIR"
-    make_pkg_dir "$pkg" 0       # no node_modules → install IS needed
+    make_pkg_dir "$PROJECT_DIR" 0       # no node_modules → install IS needed
+    hold_build_watch "$PROJECT_DIR"
 
-    # Fake Vite running with cwd inside PROJECT_DIR, mirroring the real layout
-    # ($PROJECT_DIR/crates/lucidos-app). Backgrounded inline (NOT inside a
-    # helper called via $()) so the child stays alive until this test ends.
-    mkdir -p "$PROJECT_DIR/crates/lucidos-app"
-    ( cd "$PROJECT_DIR/crates/lucidos-app" && exec sleep 30 ) &
-    local fake_pid=$!
-    disown "$fake_pid" 2>/dev/null || true   # suppress "Terminated" noise on cleanup
-    write_pid_for_workspace "other-ws" "$fake_pid"
-
-    # Override `npm` so we can detect if install is attempted.
     npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
     export -f npm
-
-    local out
-    out="$(ensure_npm_deps "$pkg" "test deps" 2>&1)"
-    local rc=$?
-
-    kill "$fake_pid" 2>/dev/null || true
+    local out rc=0
+    out="$(ensure_npm_deps "$PROJECT_DIR" "test deps" 2>&1)" || rc=$?
     unset -f npm
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 
-    if [ $rc -eq 0 ]; then
-        fail "expected non-zero exit, got 0"
-    else
-        pass "exited non-zero ($rc)"
-    fi
+    if [ $rc -eq 0 ]; then fail "expected non-zero exit, got 0"; else pass "exited non-zero ($rc)"; fi
     if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
-        fail "npm install ran despite running frontend"
+        fail "npm install ran under a running build-watch"
     else
         pass "npm install did NOT run"
     fi
-    if echo "$out" | grep -q "other-ws"; then
-        pass "error message names the running workspace"
+    if echo "$out" | grep -q "build-watch (PID $HOLDER_PID)"; then
+        pass "the error names the build-watch and its pid"
     else
-        fail "error message did not mention 'other-ws': $out"
+        fail "error message did not name the watch: $out"
     fi
 }
 
-# ── Test 1a: ENGINE_ONLY restart skips (does not abort) when frontend running ──
+# ── Test 1a: ENGINE_ONLY restart skips (does not abort) under a running watch ──
 # The engine-only restart (CC Apply) deliberately keeps this checkout's frontend
-# alive. When the applied change bumped a dependency, installing would corrupt
-# that Vite — but aborting would leave the workspace with no engine at all
-# (build_sdk runs before the ENGINE_ONLY early-exit). So ENGINE_ONLY must skip
-# the install, warn, and return 0 so the engine still comes up.
-test_engine_only_skips_install_when_frontend_running() {
-    echo "test: ENGINE_ONLY restart skips install (no abort) when frontend running"
+# alive, and generate_build_outputs runs on that path. Aborting would leave the workspace with
+# no engine at all, so ENGINE_ONLY skips the install, warns, and returns 0.
+test_engine_only_skips_install_when_build_watch_runs() {
+    echo "test: ENGINE_ONLY restart skips install (no abort) under a running build-watch"
 
     local PROJECT_DIR="$SANDBOX/proj-engine-only"
-    local pkg="$PROJECT_DIR"
-    make_pkg_dir "$pkg" 0       # no node_modules → install IS needed
+    make_pkg_dir "$PROJECT_DIR" 0
     # Dynamic scoping makes this visible to ensure_npm_deps, like PROJECT_DIR.
     local ENGINE_ONLY=1
-
-    mkdir -p "$PROJECT_DIR/crates/lucidos-app"
-    ( cd "$PROJECT_DIR/crates/lucidos-app" && exec sleep 30 ) &
-    local fake_pid=$!
-    disown "$fake_pid" 2>/dev/null || true
-    write_pid_for_workspace "dev" "$fake_pid"
+    hold_build_watch "$PROJECT_DIR"
 
     npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
     export -f npm
-
-    local out rc
-    out="$(ensure_npm_deps "$pkg" "workspace dependencies" 2>&1)"
-    rc=$?
-
-    kill "$fake_pid" 2>/dev/null || true
+    local out rc=0
+    out="$(ensure_npm_deps "$PROJECT_DIR" "workspace dependencies" 2>&1)" || rc=$?
     unset -f npm
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 
-    if [ $rc -eq 0 ]; then
-        pass "exited 0 (engine restart not aborted)"
-    else
-        fail "expected exit 0, got $rc; output: $out"
-    fi
+    if [ $rc -eq 0 ]; then pass "exited 0 (engine restart not aborted)"; else fail "expected exit 0, got $rc; output: $out"; fi
     if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
-        fail "npm install ran despite running frontend"
+        fail "npm install ran under a running build-watch"
     else
         pass "npm install did NOT run (frontend preserved)"
     fi
-    if echo "$out" | grep -q "WARNING"; then
-        pass "warned that deps changed"
-    else
-        fail "expected a WARNING about deferred deps; output: $out"
-    fi
-    # Exact bullet-line match — a loose "dev" would also hit "web-dev.sh" in the
-    # warning text, so assert the listed-workspace line specifically.
-    if echo "$out" | grep -qx "  - dev"; then
-        pass "warning names the running workspace"
-    else
-        fail "warning did not list '  - dev': $out"
-    fi
+    if echo "$out" | grep -q "WARNING"; then pass "warned that deps changed"; else fail "expected a WARNING: $out"; fi
 }
 
-# ── Test 1b: allow install when running frontend is in a DIFFERENT checkout ──
-# Mirrors the CC-worktree case: a Vite running from main repo doesn't
-# share node_modules with a worktree, so installing in the worktree is safe.
-test_allows_install_when_other_checkout_frontend_running() {
-    echo "test: allows install when running frontend is in a different checkout"
+# ── Test 1b: a build-watch in a DIFFERENT checkout does not block ──
+# Mirrors the CC-worktree case: the watch lock lives in its own checkout, so a
+# watch in the main repo does not share node_modules with a worktree.
+test_allows_install_when_another_checkouts_build_watch_runs() {
+    echo "test: allows install while another checkout's build-watch runs"
 
     local PROJECT_DIR="$SANDBOX/proj-worktree"
-    local pkg="$PROJECT_DIR"
-    make_pkg_dir "$pkg" 0       # no node_modules → install IS needed
-
-    # Fake Vite cwd in a DIFFERENT physical project (simulating main repo
-    # while we install in a worktree).
-    local other_project="$SANDBOX/proj-main"
-    mkdir -p "$other_project/crates/lucidos-app"
-    ( cd "$other_project/crates/lucidos-app" && exec sleep 30 ) &
-    local fake_pid=$!
-    disown "$fake_pid" 2>/dev/null || true
-    write_pid_for_workspace "main-ws" "$fake_pid"
+    make_pkg_dir "$PROJECT_DIR" 0
+    hold_build_watch "$SANDBOX/proj-main"
 
     npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
     export -f npm
-
-    local out
-    out="$(ensure_npm_deps "$pkg" "test deps" 2>&1)"
-    local rc=$?
-
-    kill "$fake_pid" 2>/dev/null || true
+    local out rc=0
+    out="$(ensure_npm_deps "$PROJECT_DIR" "test deps" 2>&1)" || rc=$?
     unset -f npm
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 
-    if [ $rc -ne 0 ]; then
-        fail "expected exit 0, got $rc; output: $out"
-    else
-        pass "exited 0"
-    fi
-    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
-        pass "npm install ran"
-    else
-        fail "npm install did not run; output: $out"
-    fi
+    if [ $rc -ne 0 ]; then fail "expected exit 0, got $rc; output: $out"; else pass "exited 0"; fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then pass "npm install ran"; else fail "npm install did not run; output: $out"; fi
 }
 
-# ── Test 2: install proceeds when no frontends are running ──
-test_installs_when_no_frontend_running() {
-    echo "test: installs when no frontend running"
+# ── Test 2: install proceeds when no build-watch runs ──
+test_installs_when_no_build_watch_runs() {
+    echo "test: installs when no build-watch runs"
 
-    rm -rf "${HOME:?}/workspaces"
-
-    local pkg="$SANDBOX/pkg-needs-install-2"
-    make_pkg_dir "$pkg" 0
+    local PROJECT_DIR="$SANDBOX/proj-idle"
+    make_pkg_dir "$PROJECT_DIR" 0
 
     npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
     export -f npm
-
-    local out
-    out="$(ensure_npm_deps "$pkg" "test deps" 2>&1)"
-    local rc=$?
+    local out rc=0
+    out="$(ensure_npm_deps "$PROJECT_DIR" "test deps" 2>&1)" || rc=$?
     unset -f npm
 
-    if [ $rc -ne 0 ]; then
-        fail "expected exit 0, got $rc; output: $out"
-    else
-        pass "exited 0"
-    fi
-    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
-        pass "npm install ran"
-    else
-        fail "npm install did not run; output: $out"
-    fi
+    if [ $rc -ne 0 ]; then fail "expected exit 0, got $rc; output: $out"; else pass "exited 0"; fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then pass "npm install ran"; else fail "npm install did not run; output: $out"; fi
 }
 
-# ── Test 3: stale pidfile (process gone) does not block install ──
-test_stale_pidfile_does_not_block() {
-    echo "test: stale pidfile does not block install"
+# ── Test 3: a pidfile whose watch lock nobody holds does not block ──
+test_an_unlocked_build_watch_pidfile_does_not_block() {
+    echo "test: a build-watch pidfile with no lock held does not block install"
 
-    rm -rf "${HOME:?}/workspaces"
-
-    local pkg="$SANDBOX/pkg-needs-install-3"
-    make_pkg_dir "$pkg" 0
-
-    # PID 999999 is almost certainly not alive.
-    write_pid_for_workspace "ghost-ws" 999999
+    local PROJECT_DIR="$SANDBOX/proj-ghost-watch"
+    make_pkg_dir "$PROJECT_DIR" 0
+    mkdir -p "$PROJECT_DIR/crates/lucidos-app/.build-watch"
+    echo "$$" > "$PROJECT_DIR/crates/lucidos-app/.build-watch/pid"
 
     npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
     export -f npm
-
-    local out
-    out="$(ensure_npm_deps "$pkg" "test deps" 2>&1)"
-    local rc=$?
+    local out rc=0
+    out="$(ensure_npm_deps "$PROJECT_DIR" "test deps" 2>&1)" || rc=$?
     unset -f npm
 
-    if [ $rc -ne 0 ]; then
-        fail "stale pidfile blocked install; output: $out"
-    else
-        pass "stale pidfile did not block install"
-    fi
+    if [ $rc -ne 0 ]; then fail "an unlocked pidfile blocked install; output: $out"; else pass "it did not block install"; fi
 }
 
 # ── Test 4: no install needed → no check, no failure ──
 test_no_install_needed_skips_check() {
-    echo "test: no install needed skips frontend check"
+    echo "test: no install needed skips the build-watch check"
 
-    rm -rf "${HOME:?}/workspaces"
-
-    local pkg="$SANDBOX/pkg-fresh"
-    make_pkg_dir "$pkg" 1       # node_modules present → no install needed
-
-    # Even with a running frontend, we should not fail because no install runs.
-    sleep 30 &
-    local fake_pid=$!
-    disown "$fake_pid" 2>/dev/null || true   # suppress "Terminated" noise on cleanup
-    write_pid_for_workspace "other-ws" "$fake_pid"
+    local PROJECT_DIR="$SANDBOX/proj-fresh"
+    make_pkg_dir "$PROJECT_DIR" 1       # node_modules present → no install needed
+    hold_build_watch "$PROJECT_DIR"
 
     npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
     export -f npm
-
-    local out
-    out="$(ensure_npm_deps "$pkg" "test deps" 2>&1)"
-    local rc=$?
-
-    kill "$fake_pid" 2>/dev/null || true
+    local out rc=0
+    out="$(ensure_npm_deps "$PROJECT_DIR" "test deps" 2>&1)" || rc=$?
     unset -f npm
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 
-    if [ $rc -ne 0 ]; then
-        fail "no-install case errored; output: $out"
-    else
-        pass "no-install case exited 0"
-    fi
-    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then
-        fail "npm install ran when not needed"
-    else
-        pass "npm install did not run"
-    fi
+    if [ $rc -ne 0 ]; then fail "no-install case errored; output: $out"; else pass "no-install case exited 0"; fi
+    if echo "$out" | grep -q "NPM_INSTALL_RAN"; then fail "npm install ran when not needed"; else pass "npm install did not run"; fi
 }
 
 # ── Test 5: resolve_workspace_path expands bare names like web-dev.sh ──
@@ -423,12 +294,10 @@ test_workspace_member_with_root_deps_skips_install() {
 EOF
     echo '{"name":"pkg-member"}' > "$root/pkg-member/package.json"
 
-    # Pin a running frontend for another workspace — if the function decides
-    # install IS needed, this would make it exit 1.
-    sleep 30 &
-    local fake_pid=$!
-    disown "$fake_pid" 2>/dev/null || true
-    write_pid_for_workspace "other-ws" "$fake_pid"
+    # A running build-watch in this checkout: if the function decides install
+    # IS needed, this would make it exit 1.
+    local PROJECT_DIR="$root"
+    hold_build_watch "$root"
 
     npm() { echo "NPM_INSTALL_RAN" >&2; return 0; }
     export -f npm
@@ -437,7 +306,7 @@ EOF
     out="$(ensure_npm_deps "$root/pkg-member" "frontend deps" 2>&1)"
     rc=$?
 
-    kill "$fake_pid" 2>/dev/null || true
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
     unset -f npm
 
     if [ $rc -ne 0 ]; then
@@ -517,13 +386,9 @@ test_noop_rewrite_does_not_trigger_install() {
     # Establish the stamp from the original content.
     ensure_npm_deps "$pkg" "test deps" >/dev/null 2>&1
 
-    # Simulate a running frontend in THIS project — would force exit 1 if the
+    # A running build-watch in THIS checkout would force exit 1 if the
     # function wrongly decided an install was needed.
-    mkdir -p "$PROJECT_DIR/crates/lucidos-app"
-    ( cd "$PROJECT_DIR/crates/lucidos-app" && exec sleep 30 ) &
-    local fake_pid=$!
-    disown "$fake_pid" 2>/dev/null || true
-    write_pid_for_workspace "live-ws" "$fake_pid"
+    hold_build_watch "$PROJECT_DIR"
 
     # No-op rewrite: identical bytes, fresh mtime (what `git checkout` does).
     echo '{"name":"x"}' > "$pkg/package.json"
@@ -533,7 +398,7 @@ test_noop_rewrite_does_not_trigger_install() {
     out="$(ensure_npm_deps "$pkg" "test deps" 2>&1)"
     rc=$?
 
-    kill "$fake_pid" 2>/dev/null || true
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
     unset -f npm
 
     if [ $rc -ne 0 ]; then
@@ -614,12 +479,6 @@ test_interrupted_install_is_reinstalled() {
     fi
 }
 
-# ── Shared build-watch teardown (checkout-level singleton, ref-counted) ──
-# teardown_shared_build_watch_if_idle must keep the shared `vite build --watch`
-# alive while ANY workspace of the checkout is still serving the frontend, and
-# only kill it when the last one is gone. Mirrors how cleanup_processes / stop.sh
-# tear it down. The ref-count reuses running_frontend_workspaces_in_project, so a
-# fake Vite preview with cwd inside the project stands in for "still serving".
 test_gateway_scope_ignores_the_optin() {
     echo "test: the opt-out CANNOT buy a worktree-rooted machine-global gateway"
 
@@ -691,322 +550,174 @@ test_gateway_scope_allows_a_real_checkout() {
     fi
 }
 
-test_keeps_shared_build_watch_when_a_workspace_still_serves() {
-    echo "test: shared build-watch survives while another workspace still serves"
+# ── the shared build-watch singleton, by locks (ADR 0438) ──────────────
+# Hermetic. Each checkout is a sandbox whose `node` is a stand-in watcher: it
+# records its pid, publishes dist/index.html, then holds on, so it keeps the
+# watch lock the real wrapper hands it. Every pause is a FIFO, never a sleep.
 
-    local PROJECT_DIR="$SANDBOX/proj-bw-keep"
-    mkdir -p "$PROJECT_DIR/crates/lucidos-app/.build-watch"
-
-    # Fake shared build-watch process + its checkout-level pidfile.
-    ( exec sleep 30 ) & local bw_pid=$!
-    disown "$bw_pid" 2>/dev/null || true
-    echo "$bw_pid" > "$(build_watch_pidfile)"
-
-    # A sibling workspace's Vite preview, cwd inside the project → "still serving".
-    ( cd "$PROJECT_DIR/crates/lucidos-app" && exec sleep 30 ) & local fe_pid=$!
-    disown "$fe_pid" 2>/dev/null || true
-    write_pid_for_workspace "sibling-ws" "$fe_pid"
-
-    teardown_shared_build_watch_if_idle >/dev/null 2>&1
-
-    if kill -0 "$bw_pid" 2>/dev/null; then
-        pass "build-watch left running while a workspace still serves"
-    else
-        fail "build-watch was killed despite a serving workspace"
-    fi
-    if [ -f "$(build_watch_pidfile)" ]; then
-        pass "build-watch pidfile preserved"
-    else
-        fail "build-watch pidfile was removed"
-    fi
-
-    kill "$bw_pid" "$fe_pid" 2>/dev/null || true
-}
-
-test_kills_shared_build_watch_when_no_workspace_serves() {
-    echo "test: shared build-watch torn down when the last workspace stops"
-
-    local PROJECT_DIR="$SANDBOX/proj-bw-kill"
-    mkdir -p "$PROJECT_DIR/crates/lucidos-app/.build-watch"
-    rm -rf "${HOME:?}/workspaces"   # no workspace serving this checkout
-
-    ( exec sleep 30 ) & local bw_pid=$!
-    disown "$bw_pid" 2>/dev/null || true
-    echo "$bw_pid" > "$(build_watch_pidfile)"
-
-    teardown_shared_build_watch_if_idle >/dev/null 2>&1
-
-    # Give the kill a beat to land.
-    local waited=0
-    while kill -0 "$bw_pid" 2>/dev/null && [ "$waited" -lt 20 ]; do sleep 0.1; waited=$((waited+1)); done
-
-    if kill -0 "$bw_pid" 2>/dev/null; then
-        fail "build-watch still running with no serving workspace"
-        kill "$bw_pid" 2>/dev/null || true
-    else
-        pass "build-watch killed when no workspace serves"
-    fi
-    if [ -f "$(build_watch_pidfile)" ]; then
-        fail "build-watch pidfile not removed"
-    else
-        pass "build-watch pidfile removed"
-    fi
-}
-
-# ── the teardown asks what is RUNNING, not what a marker file says ──────
-# ADR 0219's principle, applied to the shared build-watch. `frontend.pid` is
-# written only by start_frontend_built, so an engine the gateway spawned is
-# invisible to the marker scan. Every fixture below therefore writes NO marker
-# at all: the engine query is the only thing that can spare the watch.
-
-# Stand up a sandboxed checkout with a live fake build-watch and no markers.
-# Sets BW_PID; the caller owns killing it.
-#
-# Deliberately NOT echoing the pid: a `$(...)` call would hold the command
-# substitution's pipe open through the backgrounded child and hang the suite.
-# The sibling tests background inline for the same reason.
-BW_PID=""
-arrange_markerless_checkout() {
+# Make <project> a checkout with a stand-in watcher.
+arrange_build_watch_checkout() { # <project>
     local project="$1"
-    mkdir -p "$project/crates/lucidos-app/.build-watch" "$project/crates/lucidos-app/dist"
-    rm -rf "${HOME:?}/workspaces"
-    ( exec sleep 30 ) &
-    BW_PID=$!
-    disown "$BW_PID" 2>/dev/null || true
-    echo "$BW_PID" > "$project/crates/lucidos-app/.build-watch/pid"
+    mkdir -p "$project/crates/lucidos-app/dist" "$project/bin"
+    cat >"$project/bin/node" <<'EOF'
+#!/bin/bash
+echo "$$" >>"$BW_SPAWN_LOG"
+mkdir -p dist && echo built >dist/index.html
+exec sleep 600
+EOF
+    chmod +x "$project/bin/node"
+    echo stale >"$project/crates/lucidos-app/dist/stale"
+    : >"$project/spawns"
 }
 
-# Did the teardown spare the watch? Waits out the kill the way the sibling
-# tests do, so a slow signal cannot read as a survival.
-build_watch_survived() {
-    local pid="$1" waited=0
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 20 ]; do sleep 0.1; waited=$((waited+1)); done
-    kill -0 "$pid" 2>/dev/null
+# Run start_frontend_built for <project>, as a launch does. Call it inside a
+# subshell, which may first override a hook.
+launch_frontend() { # <project>
+    PROJECT_DIR="$1"
+    FRONTEND_DIR="$1/crates/lucidos-app"
+    ENGINE_BIN=""
+    PATH="$1/bin:$PATH"
+    export BW_SPAWN_LOG="$1/spawns"
+    start_frontend_built
 }
 
-test_a_gateway_spawned_engine_keeps_the_build_watch() {
-    echo "test: an engine with no frontend.pid still keeps the shared build-watch"
-
-    # The incident. This engine was spawned by the gateway, so no marker names
-    # it, and the old ref-count read the checkout as idle while it was serving.
-    local PROJECT_DIR="$SANDBOX/proj-bw-gateway"
-    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
-    SYNTHETIC_PS_LISTING=" 4242 /repo/.launch/debug/plain/lucidos-engine"
-    SYNTHETIC_PROC_ENV="4242|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin"
-
-    local out; out="$(teardown_shared_build_watch_if_idle 2>&1)"
-
-    if build_watch_survived "$bw_pid"; then
-        pass "the watch survives an engine that carries no marker"
-    else
-        fail "killed the watch out from under a live engine (the incident)"
-    fi
-    if [ -f "$PROJECT_DIR/crates/lucidos-app/.build-watch/pid" ]; then
-        pass "the pidfile is left in place"
-    else
-        fail "removed the pidfile while an engine was serving"
-    fi
-    case "$out" in
-        *"Keeping"*4242*) pass "it says which engine spared the watch" ;;
-        *) fail "a silent refusal is what made this take hours: $out" ;;
-    esac
-
-    kill "$bw_pid" 2>/dev/null || true
-    reset_process_table
+teardown_for() { # <project>
+    (PROJECT_DIR="$1"; teardown_shared_build_watch_if_idle)
 }
 
-test_a_dist_that_does_not_resolve_still_keeps_the_build_watch() {
-    echo "test: an engine whose dist/ will not resolve still keeps the watch"
+spawn_count() { wc -l <"$1/spawns" | tr -d ' '; }
 
-    # The atomic publish renames dist.staging onto dist/, so the directory is
-    # briefly absent. Dropping the engine there would open a window in which a
-    # concurrent stop tears the watch down, which is the bug in miniature.
-    local PROJECT_DIR="$SANDBOX/proj-bw-midpublish"
-    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
-    rmdir "$PROJECT_DIR/crates/lucidos-app/dist"
-    SYNTHETIC_PS_LISTING=" 4545 /repo/.launch/debug/plain/lucidos-engine"
-    SYNTHETIC_PROC_ENV="4545|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin"
+test_two_launches_start_one_build_watch() {
+    echo "test: two concurrent launches start one build-watch, and only it clears dist/"
+    local p="$SANDBOX/proj-bw-race" line
+    arrange_build_watch_checkout "$p"
+    channel_open 6 "$SANDBOX/bw-race.events"
+    channel_open 5 "$SANDBOX/bw-race.go"
 
-    teardown_shared_build_watch_if_idle >/dev/null 2>&1
+    # Launch A probes, finds no watch, and pauses there, inside start.lock.
+    (
+        # shellcheck disable=SC2317 # called by start_frontend_built
+        build_watch_running() {
+            local rc=0
+            lock_is_held "$(build_watch_lock)" || rc=$?
+            echo "A probed $rc" >&6
+            read -r _ <&5
+            return "$rc"
+        }
+        launch_frontend "$p"
+    ) >"$SANDBOX/bw-race.a" 2>&1 &
+    local a=$!
+    read -r line <&6
+    if [ "$line" = "A probed 1" ]; then pass "A found no watch"; else fail "A saw: $line"; fi
 
-    if build_watch_survived "$bw_pid"; then
-        pass "an unresolvable dist/ is compared lexically, not dropped"
-    else
-        fail "a mid-publish rename opened a teardown window"
-    fi
+    # Launch B must wait for A's decision rather than make its own.
+    (
+        # shellcheck disable=SC2317 # called by flock_open
+        _flock_waiting() { echo "B waiting" >&6; }
+        launch_frontend "$p"
+    ) >"$SANDBOX/bw-race.b" 2>&1 &
+    local b=$!
+    read -r line <&6
+    if [ "$line" = "B waiting" ]; then pass "B waited on the start lock"; else fail "B saw: $line"; fi
 
-    kill "$bw_pid" 2>/dev/null || true
-    reset_process_table
+    echo go >&5
+    wait "$a" || fail "launch A failed: $(cat "$SANDBOX/bw-race.a")"
+    wait "$b" || fail "launch B failed: $(cat "$SANDBOX/bw-race.b")"
+    channel_close 5
+    channel_close 6
+
+    if [ "$(spawn_count "$p")" = 1 ]; then pass "exactly one watcher started"; else fail "$(spawn_count "$p") watchers started"; fi
+    if grep -q "Reusing shared frontend build-watch (PID $(cat "$p/spawns"))" "$SANDBOX/bw-race.b"; then pass "B reused A's watcher"; else fail "B: $(cat "$SANDBOX/bw-race.b")"; fi
+    if [ ! -e "$p/crates/lucidos-app/dist/stale" ]; then pass "the owner cleared the old dist/"; else fail "the old dist/ survived the new watcher"; fi
+
+    teardown_for "$p" >/dev/null
 }
 
-test_an_unreadable_process_table_keeps_the_build_watch() {
-    echo "test: a process table that could not be read leaves the watch alone"
-
-    # Unknown is not "no". A wrong "still serving" leaks one node process; a
-    # wrong "nothing serving" is the incident above.
-    local PROJECT_DIR="$SANDBOX/proj-bw-unknown"
-    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
-    SYNTHETIC_PS_RC=1
-
-    local out; out="$(teardown_shared_build_watch_if_idle 2>&1)"
-
-    if build_watch_survived "$bw_pid"; then
-        pass "an unreadable table does not authorize the kill"
-    else
-        fail "killed the watch on a probe that never ran"
-    fi
-    case "$out" in
-        *"could not read the process table"*) pass "it names the unknown" ;;
-        *) fail "the refusal should say the probe failed: $out" ;;
-    esac
-
-    kill "$bw_pid" 2>/dev/null || true
-    reset_process_table
+test_a_reuse_leaves_dist_alone() {
+    echo "test: a launch that reuses a running watch never touches dist/"
+    local p="$SANDBOX/proj-bw-reuse"
+    arrange_build_watch_checkout "$p"
+    (launch_frontend "$p") >/dev/null 2>&1 || fail "the first launch failed"
+    echo keep >"$p/crates/lucidos-app/dist/keep"
+    local out
+    out="$( (launch_frontend "$p") 2>&1)" || fail "the second launch failed: $out"
+    case "$out" in *"Reusing shared frontend build-watch"*) pass "reused" ;; *) fail "$out" ;; esac
+    if [ -e "$p/crates/lucidos-app/dist/keep" ]; then pass "dist/ untouched"; else fail "a reuse cleared dist/"; fi
+    if [ "$(spawn_count "$p")" = 1 ]; then pass "no second watcher"; else fail "$(spawn_count "$p") watchers"; fi
+    teardown_for "$p" >/dev/null
 }
 
-test_the_engine_being_stopped_does_not_spare_the_build_watch() {
-    echo "test: the workspace on its way out casts neither vote"
+test_a_consumer_keeps_the_build_watch() {
+    echo "test: teardown keeps the watch while a consumer holds the consumer lock"
+    local p="$SANDBOX/proj-bw-consumer" watcher out
+    arrange_build_watch_checkout "$p"
+    (launch_frontend "$p") >/dev/null 2>&1 || fail "the launch failed"
+    watcher="$(cat "$p/spawns")"
 
-    # The shape stop.sh actually has. It SIGUSR1s the engine and reaches the
-    # teardown milliseconds later, while a graceful drain still has seconds to
-    # run, so the engine it just stopped is still in the process table. Counting
-    # it makes the teardown a permanent no-op at its primary call site, and the
-    # watch leaks on every stop. The marker vote already excludes the stopping
-    # workspace (release_frontend_marker runs first); this is its counterpart.
-    local PROJECT_DIR="$SANDBOX/proj-bw-draining"
-    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
-    SYNTHETIC_PS_LISTING=" 4848 /repo/.launch/debug/plain/lucidos-engine"
-    SYNTHETIC_PROC_ENV="4848|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin"
+    # An engine serving this dist/ holds the consumer lock for its life.
+    start_lock_holder "$SANDBOX" "$p/crates/lucidos-app/.build-watch/consumers.lock" sh
+    out="$(teardown_for "$p")"
+    if kill -0 "$watcher" 2>/dev/null; then pass "the watch survives a live consumer"; else fail "killed the watch under a consumer"; fi
+    case "$out" in *Keeping*) pass "it says why it kept the watch" ;; *) fail "silent refusal: $out" ;; esac
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 
-    teardown_shared_build_watch_if_idle 4848 >/dev/null 2>&1
-
-    if build_watch_survived "$bw_pid"; then
-        fail "the draining engine spared the watch, so a stop never tears it down"
-        kill "$bw_pid" 2>/dev/null || true
+    teardown_for "$p" >/dev/null
+    if kill -0 "$watcher" 2>/dev/null; then
+        fail "the watch outlived the teardown that stopped it"
     else
-        pass "the excluded engine does not keep the watch alive"
+        pass "with no consumer left, the watch is gone when teardown returns"
     fi
-
-    # And the exclusion is narrow: a DIFFERENT live engine still spares it.
-    arrange_markerless_checkout "$PROJECT_DIR"; bw_pid="$BW_PID"
-    SYNTHETIC_PS_LISTING=" 4848 /repo/.launch/debug/plain/lucidos-engine
- 4949 /repo/.launch/debug/plain/lucidos-engine"
-    SYNTHETIC_PROC_ENV="4848|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin
-4949|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$PROJECT_DIR/crates/lucidos-app/dist PATH=/bin"
-
-    teardown_shared_build_watch_if_idle 4848 >/dev/null 2>&1
-
-    if build_watch_survived "$bw_pid"; then
-        pass "a peer engine still spares the watch"
-    else
-        fail "excluding the stopped engine also dropped a live peer"
-    fi
-
-    kill "$bw_pid" 2>/dev/null || true
-    reset_process_table
 }
 
-test_an_engine_whose_environment_will_not_read_keeps_the_build_watch() {
-    echo "test: a live engine we cannot characterize is unknown, not idle"
-
-    # The listing is one probe and the per-engine environment read is another.
-    # Guarding only the first put the bug back one level down: a live engine
-    # whose environment `ps -E` will not hand over read as "not serving".
-    local PROJECT_DIR="$SANDBOX/proj-bw-blindenv"
-    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
-    SYNTHETIC_PS_LISTING=" 4646 /repo/.launch/debug/plain/lucidos-engine"
-    # argv only, no environment pairs: what `ps -E` prints when it may not read
-    # the environment of a process that is nonetheless alive.
-    SYNTHETIC_PROC_ENV="4646|/repo/.launch/debug/plain/lucidos-engine"
-
-    local out; out="$(teardown_shared_build_watch_if_idle 2>&1)"
-
-    if build_watch_survived "$bw_pid"; then
-        pass "an unreadable environment does not authorize the kill"
-    else
-        fail "killed the watch over an engine it simply could not read"
-    fi
-    case "$out" in
-        *"could not read the process table"*) pass "it names the unknown" ;;
-        *) fail "the refusal should say the probe failed: $out" ;;
-    esac
-
-    kill "$bw_pid" 2>/dev/null || true
-    reset_process_table
+test_a_watch_from_before_the_lock_is_stopped_once() {
+    echo "test: a watch from before the watch lock is stopped, and only that one"
+    local PROJECT_DIR="$SANDBOX/proj-bw-pre-lock" out
+    mkdir -p "$PROJECT_DIR/crates/lucidos-app/.build-watch"
+    echo "$$" >"$PROJECT_DIR/crates/lucidos-app/.build-watch/pid"
+    # `ps` and `kill` are stubbed, so nothing real is listed or signalled.
+    out="$( ps() { echo "node dev-build-watch.mjs"; }; kill() { echo "killed $*"; }
+        stop_pre_lock_build_watch )"
+    case "$out" in *"killed $$"*) pass "the old watcher is stopped" ;; *) fail "not stopped: $out" ;; esac
+    out="$( ps() { echo "node some-other-script.mjs"; }; kill() { echo "killed $*"; }
+        stop_pre_lock_build_watch )"
+    case "$out" in *killed*) fail "stopped a node process that is not the watch: $out" ;; *) pass "another node process is left alone" ;; esac
+    : >"$PROJECT_DIR/crates/lucidos-app/.build-watch/watch.lock"
+    out="$( ps() { echo "node dev-build-watch.mjs"; }; kill() { echo "killed $*"; }
+        stop_pre_lock_build_watch )"
+    case "$out" in *killed*) fail "acted although the watch lock exists: $out" ;; *) pass "once the lock exists, it does nothing" ;; esac
 }
 
-test_an_engine_that_serves_no_dist_does_not_keep_the_build_watch() {
-    echo "test: a readable environment with no LUCIDOS_STATIC_DIR is a real answer"
+test_a_launch_in_flight_keeps_the_build_watch() {
+    echo "test: teardown never races a launch that is starting the watch"
+    local p="$SANDBOX/proj-bw-midstart" line out
+    arrange_build_watch_checkout "$p"
+    (launch_frontend "$p") >/dev/null 2>&1 || fail "the first launch failed"
+    channel_open 6 "$SANDBOX/bw-mid.events"
+    channel_open 5 "$SANDBOX/bw-mid.go"
+    (
+        # shellcheck disable=SC2317 # called by start_frontend_built
+        build_watch_running() {
+            local rc=0
+            lock_is_held "$(build_watch_lock)" || rc=$?
+            echo "probed $rc" >&6
+            read -r _ <&5
+            return "$rc"
+        }
+        launch_frontend "$p"
+    ) >/dev/null 2>&1 &
+    local launch=$!
+    read -r line <&6
+    if [ "$line" = "probed 0" ]; then pass "the launch is deciding to reuse the watch"; else fail "saw: $line"; fi
 
-    # The counterpart to the test above, and the reason the two are told apart
-    # by PATH rather than by the static dir being absent. This engine serves no
-    # dist at all, which is an answer, not a gap.
-    local PROJECT_DIR="$SANDBOX/proj-bw-nodist"
-    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
-    SYNTHETIC_PS_LISTING=" 4747 /repo/.launch/debug/plain/lucidos-engine"
-    SYNTHETIC_PROC_ENV="4747|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_WORKSPACE=/w/other PATH=/bin"
+    out="$(teardown_for "$p")"
+    case "$out" in *Keeping*) pass "the teardown refused" ;; *) fail "teardown ran mid-launch: $out" ;; esac
+    if kill -0 "$(cat "$p/spawns")" 2>/dev/null; then pass "the watch the launch is reusing survives"; else fail "killed the watch the launch was reusing"; fi
 
-    teardown_shared_build_watch_if_idle >/dev/null 2>&1
-
-    if build_watch_survived "$bw_pid"; then
-        fail "an engine serving no dist wrongly spared the watch"
-        kill "$bw_pid" 2>/dev/null || true
-    else
-        pass "a readable environment without the var lets the teardown run"
-    fi
-
-    reset_process_table
-}
-
-test_an_engine_of_another_checkout_does_not_keep_the_build_watch() {
-    echo "test: an engine serving a DIFFERENT checkout lets the teardown run"
-
-    # Without this the teardown becomes a blanket no-op and the watch leaks on
-    # every stop. A worktree's own dist/ is the case that matters in practice.
-    local PROJECT_DIR="$SANDBOX/proj-bw-sibling"
-    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
-    local other="$SANDBOX/proj-bw-sibling-elsewhere"
-    mkdir -p "$other/crates/lucidos-app/dist"
-    SYNTHETIC_PS_LISTING=" 4343 /repo/.launch/debug/plain/lucidos-engine"
-    SYNTHETIC_PROC_ENV="4343|/repo/.launch/debug/plain/lucidos-engine LUCIDOS_STATIC_DIR=$other/crates/lucidos-app/dist PATH=/bin"
-
-    teardown_shared_build_watch_if_idle >/dev/null 2>&1
-
-    if build_watch_survived "$bw_pid"; then
-        fail "a foreign checkout's engine wrongly spared the watch"
-        kill "$bw_pid" 2>/dev/null || true
-    else
-        pass "the watch is torn down when nothing serves THIS checkout"
-    fi
-
-    reset_process_table
-}
-
-test_a_coding_agent_session_is_not_an_engine() {
-    echo "test: a session that merely INHERITS the engine's env is not an engine"
-
-    # Not hypothetical, and not merely the ADR 0025 rule restated. A coding-agent
-    # session is forked BY an engine, so LUCIDOS_STATIC_DIR really is in its
-    # environment, and it carries the thread transcript in a ~22 KB argument.
-    # Matching the whole command line would count every such session as an
-    # engine and the watch would then never be torn down at all.
-    local PROJECT_DIR="$SANDBOX/proj-bw-ccsession"
-    arrange_markerless_checkout "$PROJECT_DIR"; local bw_pid="$BW_PID"
-    local dist="$PROJECT_DIR/crates/lucidos-app/dist"
-    mkdir -p "$dist"
-    SYNTHETIC_PS_LISTING=" 4444 /home/u/.local/bin/claude --append-system-prompt the build-watch republishes $dist and lucidos-engine serves it"
-    SYNTHETIC_PROC_ENV="4444|/home/u/.local/bin/claude --append-system-prompt … LUCIDOS_STATIC_DIR=$dist PATH=/bin"
-
-    teardown_shared_build_watch_if_idle >/dev/null 2>&1
-
-    if build_watch_survived "$bw_pid"; then
-        fail "a coding-agent session was counted as an engine"
-        kill "$bw_pid" 2>/dev/null || true
-    else
-        pass "selection is on argv[0], so a mention is not a match"
-    fi
-
-    reset_process_table
+    echo go >&5
+    wait "$launch" || fail "the paused launch failed"
+    channel_close 5
+    channel_close 6
+    teardown_for "$p" >/dev/null
 }
 
 test_shared_pg_sql_quoting() {
@@ -1068,7 +779,7 @@ test_legacy_pg_volume_layout_detects_root_pgdata() {
 }
 
 test_swap_ports_writes_shared_database_url() {
-    echo "test: swap_ports writes workspace-specific shared database URL"
+    echo "test: swap_ports exports the shared database URL and writes no secret"
 
     local PROJECT_DIR="$SANDBOX/proj-shared-db-url"
     local FRONTEND_DIR="$PROJECT_DIR/crates/lucidos-app"
@@ -1088,13 +799,17 @@ test_swap_ports_writes_shared_database_url() {
     else
         fail "ports file missing PG_DATABASE=lucidos_dev-project: $(cat "$ports_file")"
     fi
-    if grep -qx "DATABASE_URL=postgres://lucidos:lucidos@localhost:5544/lucidos_dev-project" "$ports_file"; then
-        pass "ports file records shared DATABASE_URL"
+    # The ports file is 0644 inside a workspace other local users can read,
+    # so the cluster's secret must never land in it.
+    local secret
+    secret="$(shared_pg_password)"
+    if grep -q "DATABASE_URL" "$ports_file" || grep -qF "$secret" "$ports_file"; then
+        fail "ports file carries the shared cluster's secret: $(cat "$ports_file")"
     else
-        fail "ports file missing shared DATABASE_URL: $(cat "$ports_file")"
+        pass "ports file carries no secret"
     fi
-    if [ "$DATABASE_URL" = "postgres://lucidos:lucidos@localhost:5544/lucidos_dev-project" ]; then
-        pass "DATABASE_URL exported for direct engine mode"
+    if [ "$DATABASE_URL" = "postgres://lucidos:$secret@localhost:5544/lucidos_dev-project" ]; then
+        pass "DATABASE_URL exported for direct engine mode, with the minted secret"
     else
         fail "unexpected DATABASE_URL export: ${DATABASE_URL:-<unset>}"
     fi
@@ -1178,75 +893,86 @@ test_swap_ports_keeps_the_proto_detect_tls_wrote() {
     fi
 }
 
-test_seed_gateway_registry_removes_legacy_database_url() {
-    echo "test: seed_gateway_registry removes legacy database_url"
-
-    local PROJECT_DIR="$SANDBOX/proj-registry"
-    mkdir -p "$PROJECT_DIR" "$HOME/workspaces/dev/.lucidos" "$(gateway_data_dir)/config"
-    WORKSPACE="$HOME/workspaces/dev"
-    ENGINE_PORT=5173
-    GATEWAY_PORT=5251
-
-    cat > "$(gateway_data_dir)/config/workspaces.json" <<'JSON'
-{
-  "workspaces": [
-    {
-      "id": "dev",
-      "name": "Picker Name",
-      "dir": "/old/dev",
-      "port": 5000,
-      "database_url": "postgres://lucidos:lucidos@localhost:5439/lucidos",
-      "autostart": true
-    }
-  ]
+# ── adopt_into_gateway: register through the gateway, never its file ──
+# `curl` is shadowed in a subshell, so no request leaves this process. It records
+# what it was asked and answers with the canned status and body.
+adopt_with() { # <http-code> <body>
+    printf '%s' "$2" >"$SANDBOX/adopt-body"
+    printf '%s' "$1" >"$SANDBOX/adopt-code"
+    : >"$SANDBOX/adopt-args"
+    mkdir -p "$SANDBOX/ws-adopt/.lucidos"
+    (
+        set -e
+        WORKSPACE="$SANDBOX/ws-adopt"; ENGINE_PORT=5273; PROTO=https; GATEWAY_PORT=5251
+        # shellcheck disable=SC2317 # called by adopt_into_gateway
+        curl() {
+            printf '%s\n' "$@" >>"$SANDBOX/adopt-args"
+            printf '%s\n%s' "$(cat "$SANDBOX/adopt-body")" "$(cat "$SANDBOX/adopt-code")"
+        }
+        adopt_into_gateway >/dev/null 2>"$SANDBOX/adopt-err"
+        echo "id=$GATEWAY_WS_ID"
+    )
 }
-JSON
 
-    seed_gateway_registry >/dev/null
-
+test_adopt_registers_the_dir_and_port_through_the_gateway() {
+    echo "test: adopt_into_gateway posts the dir and port, and takes the id from the answer"
     local out
-    out="$(python3 - "$(gateway_data_dir)/config/workspaces.json" <<'PY'
-import json, sys
-w = json.load(open(sys.argv[1]))["workspaces"][0]
-print(w.get("name"))
-print(w.get("dir"))
-print(w.get("port"))
-print(w.get("autostart"))
-print("database_url" in w)
-PY
-)"
-    if echo "$out" | grep -qx "Picker Name"; then
-        pass "display name preserved"
+    out="$(adopt_with 200 '{"workspace":{"id":"ws-adopt","port":5273}}')"
+    if [ "$out" = "id=ws-adopt" ]; then
+        pass "GATEWAY_WS_ID comes from the gateway's answer"
     else
-        fail "display name not preserved: $out"
+        fail "got '$out'"
     fi
-    if echo "$out" | grep -qx "$WORKSPACE"; then
-        pass "workspace dir refreshed"
+    if grep -qx "https://localhost:5251/~/api/v1/control/workspaces/adopt" "$SANDBOX/adopt-args"; then
+        pass "posted to the adopt endpoint"
     else
-        fail "workspace dir not refreshed: $out"
+        fail "unexpected request: $(cat "$SANDBOX/adopt-args")"
     fi
-    if echo "$out" | grep -qx "5173"; then
-        pass "engine port refreshed"
+    if grep -q "\"dir\": \"$SANDBOX/ws-adopt\"" "$SANDBOX/adopt-args" \
+        && grep -q '"port": 5273' "$SANDBOX/adopt-args"; then
+        pass "the body names the directory and the engine's port"
     else
-        fail "engine port not refreshed: $out"
+        fail "unexpected body: $(cat "$SANDBOX/adopt-args")"
     fi
-    if echo "$out" | grep -qx "True"; then
-        pass "autostart preserved"
+    if grep -q "autostart\|\"name\"" "$SANDBOX/adopt-args"; then
+        fail "the body overrides what the picker owns"
     else
-        fail "autostart not preserved: $out"
+        pass "name and autostart are left to the gateway"
     fi
-    if echo "$out" | grep -qx "False"; then
-        pass "legacy database_url removed"
+    if [ -e "$(gateway_data_dir)/config/workspaces.json" ]; then
+        fail "the launcher wrote the gateway's registry file"
     else
-        fail "database_url still present: $out"
+        pass "nothing wrote workspaces.json"
     fi
 }
 
-test_refuses_install_when_same_project_frontend_running
-test_engine_only_skips_install_when_frontend_running
-test_allows_install_when_other_checkout_frontend_running
-test_installs_when_no_frontend_running
-test_stale_pidfile_does_not_block
+test_adopt_refusal_fails_the_launch() {
+    echo "test: a refused adopt fails the launch and quotes the gateway"
+    local out
+    out="$(adopt_with 409 '{"error":"port 5273 belongs to workspace '"'"'myws'"'"'"}')"
+    if [ -z "$out" ]; then
+        pass "the launch stopped"
+    else
+        fail "carried on after a refusal: $out"
+    fi
+    if grep -q "belongs to workspace 'myws'" "$SANDBOX/adopt-err"; then
+        pass "the gateway's reason is quoted"
+    else
+        fail "stderr was: $(cat "$SANDBOX/adopt-err")"
+    fi
+    out="$(adopt_with 000 '')"
+    if [ -z "$out" ]; then
+        pass "no answer fails too"
+    else
+        fail "carried on with no gateway: $out"
+    fi
+}
+
+test_refuses_install_when_this_checkouts_build_watch_runs
+test_engine_only_skips_install_when_build_watch_runs
+test_allows_install_when_another_checkouts_build_watch_runs
+test_installs_when_no_build_watch_runs
+test_an_unlocked_build_watch_pidfile_does_not_block
 test_no_install_needed_skips_check
 test_workspace_member_with_root_deps_skips_install
 test_workspace_member_install_when_package_json_bumped
@@ -1264,7 +990,8 @@ test_swap_ports_writes_shared_database_url
 test_swap_ports_keeps_the_proto_detect_tls_wrote
 test_relaunching_leaves_exactly_one_proto_line
 test_detect_tls_records_the_scheme_with_no_ports_file_yet
-test_seed_gateway_registry_removes_legacy_database_url
+test_adopt_registers_the_dir_and_port_through_the_gateway
+test_adopt_refusal_fails_the_launch
 
 # ── worktree-pinned stack guard ────────────────────────────────────────
 # Regression cover for the 2026-07-26 incident: the whole stack (gateway binary,
@@ -1901,97 +1628,6 @@ test_locate_prefers_published_and_falls_back() {
     esac
 }
 
-# ── pid_is_live ────────────────────────────────────────────────────────
-# The zombie case is the whole point: `kill -0` succeeds for a defunct
-# process, which is what let a dead engine report as running.
-test_pid_is_live_rejects_a_zombie() {
-    echo "pid_is_live"
-
-    # A live process we own: `sleep` in the background, killed at the end.
-    sleep 30 &
-    local live_pid=$!
-    if pid_is_live "$live_pid"; then
-        pass "a running process is live"
-    else
-        fail "a running process was reported dead (pid $live_pid)"
-    fi
-
-    # A real zombie: fork a child that exits immediately from a parent that
-    # never reaps it, and hold that parent open while we probe. python3 is
-    # already required by this repo's scripts.
-    local zombie_dir="$SANDBOX/zombie"
-    mkdir -p "$zombie_dir"
-    python3 -c "
-import os, sys, time
-pid = os.fork()
-if pid == 0:
-    os._exit(0)
-sys.stdout.write(str(pid))
-sys.stdout.flush()
-time.sleep(10)
-" > "$zombie_dir/pid" &
-    local holder_pid=$!
-    local zombie_pid="" waited=0
-    while [ -z "$zombie_pid" ] && [ "$waited" -lt 50 ]; do
-        sleep 0.1
-        zombie_pid="$(cat "$zombie_dir/pid" 2>/dev/null || true)"
-        waited=$((waited + 1))
-    done
-
-    if [ -z "$zombie_pid" ]; then
-        fail "could not fork a zombie to test against"
-    else
-        # Guard the premise: this test is only meaningful while the pid really
-        # is a zombie that `kill -0` still accepts.
-        local state
-        state="$(ps -o state= -p "$zombie_pid" 2>/dev/null | tr -d '[:space:]')"
-        if [ "${state:0:1}" != "Z" ]; then
-            fail "fixture pid $zombie_pid is not a zombie (state '$state')"
-        elif ! kill -0 "$zombie_pid" 2>/dev/null; then
-            fail "fixture zombie $zombie_pid is not kill -0 visible, premise gone"
-        elif pid_is_live "$zombie_pid"; then
-            fail "a zombie was reported live (pid $zombie_pid)"
-        else
-            pass "a zombie is not live (kill -0 says otherwise)"
-        fi
-    fi
-
-    kill -KILL "$holder_pid" 2>/dev/null || true
-    kill -KILL "$live_pid" 2>/dev/null || true
-    wait "$holder_pid" 2>/dev/null || true
-    wait "$live_pid" 2>/dev/null || true
-
-    # A pid that has gone entirely (reaped, or never existed).
-    if pid_is_live "$live_pid"; then
-        fail "a reaped pid was reported live (pid $live_pid)"
-    else
-        pass "a gone pid is not live"
-    fi
-
-    # Garbage pidfile contents must not be live, and must not error.
-    if pid_is_live ""; then
-        fail "an empty pid was reported live"
-    else
-        pass "an empty pid is not live"
-    fi
-    if pid_is_live "not-a-pid"; then
-        fail "a non-numeric pid was reported live"
-    else
-        pass "a non-numeric pid is not live"
-    fi
-}
-
-test_pid_is_live_rejects_a_zombie
-test_keeps_shared_build_watch_when_a_workspace_still_serves
-test_kills_shared_build_watch_when_no_workspace_serves
-test_a_gateway_spawned_engine_keeps_the_build_watch
-test_a_dist_that_does_not_resolve_still_keeps_the_build_watch
-test_an_unreadable_process_table_keeps_the_build_watch
-test_the_engine_being_stopped_does_not_spare_the_build_watch
-test_an_engine_whose_environment_will_not_read_keeps_the_build_watch
-test_an_engine_that_serves_no_dist_does_not_keep_the_build_watch
-test_an_engine_of_another_checkout_does_not_keep_the_build_watch
-test_a_coding_agent_session_is_not_an_engine
 test_launch_bin_dir_is_per_profile_and_variant
 test_launch_dir_is_outside_cargo_target
 test_worktree_refusal_still_sees_a_worktree_launch_dir
@@ -2009,6 +1645,11 @@ test_real_checkout_is_not_refused
 test_gateway_scope_ignores_the_optin
 test_stack_scope_still_honours_the_optin
 test_gateway_scope_allows_a_real_checkout
+test_two_launches_start_one_build_watch
+test_a_reuse_leaves_dist_alone
+test_a_consumer_keeps_the_build_watch
+test_a_launch_in_flight_keeps_the_build_watch
+test_a_watch_from_before_the_lock_is_stopped_once
 
 # ── direct-engine network bind ─────────────────────────────────────────
 # Nothing authenticates a directly-launched engine's port, so what this helper
@@ -2250,29 +1891,37 @@ test_an_empty_feed_never_reaches_the_real_ps
 # ── engine_gateway_port: which gateway owns this workspace ─────────────
 #
 # Hermetic: `ps` is shadowed as a function inside each subshell, so no real
-# process is listed. It is the only host call the function makes. `kill -0` runs
-# for real, because signal 0 sends nothing, and the two pids below are chosen so
-# its answer is fixed: this shell is alive, and DEAD_PID is above the macOS pid
-# ceiling, so no process can ever carry it. Shadowing `ps` per subshell rather
-# than for the whole file keeps the eight probes above reading the real host, as
-# they need to.
+# process is listed. It is the only host call the function makes. The engine
+# lock is held by a holder process this file spawned, so the pid is trusted only
+# where the test says an engine owns the workspace. DEAD_PID is above the macOS
+# pid ceiling, so no process can ever carry it. Shadowing `ps` per subshell
+# rather than for the whole file keeps the eight probes above reading the real
+# host, as they need to.
 DEAD_PID=4194304
 
-# Run engine_gateway_port against a pidfile holding $1 ("none" writes no file),
-# with `ps` answering the line $2.
+# Run engine_gateway_port for a workspace whose engine.pid holds $1 ("none"
+# writes no file), with `ps` answering the line $2. $3 "held" means an engine
+# holds the workspace's lock.
 gateway_port_for() {
-    local pid="$1" psline="$2" dir
-    dir="$SANDBOX/gwport-$RANDOM/.lucidos"
-    mkdir -p "$dir"
-    [ "$pid" = "none" ] || printf '%s\n' "$pid" >"$dir/engine.pid"
+    local pid="$1" psline="$2" lock="${3:-}" ws
+    ws="$SANDBOX/gwport-$RANDOM"
+    mkdir -p "$ws/.lucidos"
+    [ "$pid" = "none" ] || printf '%s\n' "$pid" >"$ws/.lucidos/engine.pid"
+    : >"$ws/.lucidos/engine.lock"
+    if [ "$lock" = held ]; then
+        start_lock_holder "$SANDBOX" "$ws/.lucidos/engine.lock" ex
+    fi
     (
         # shellcheck disable=SC2317 # called through engine_gateway_port
         ps() {
             printf 'PS\n' >>"$SANDBOX/gwport-calls"
             printf '%s\n' "$psline"
         }
-        engine_gateway_port "$dir/engine.pid"
+        engine_gateway_port "$ws"
     )
+    if [ "$lock" = held ]; then
+        release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
+    fi
 }
 
 PACKAGED_PS="/Applications/Lucidos.app/Contents/MacOS/lucidos-engine \
@@ -2282,7 +1931,7 @@ LUCIDOS_WORKSPACE_ID=packaged LUCIDOS_GATEWAY_PORT=5252 LUCIDOS_API_PORT=59704 P
 test_engine_gateway_port_reads_the_packaged_gateway() {
     echo "test: engine_gateway_port reads the port off the engine being stopped"
     local got
-    got="$(gateway_port_for "$$" "$PACKAGED_PS")"
+    got="$(gateway_port_for "$$" "$PACKAGED_PS" held)"
     if [ "$got" = "5252" ]; then
         pass "a packaged workspace's engine names the gateway that owns it"
     else
@@ -2294,7 +1943,7 @@ test_engine_gateway_port_is_empty_without_a_gateway() {
     echo "test: engine_gateway_port answers nothing when there is no gateway to name"
     local got
     # LUCIDOS_NO_GATEWAY dev and the e2e harness: a live engine, no gateway var.
-    got="$(gateway_port_for "$$" "/opt/lucidos/bin/lucidos-engine LUCIDOS_WORKSPACE=/ws/e2e PATH=/bin")"
+    got="$(gateway_port_for "$$" "/opt/lucidos/bin/lucidos-engine LUCIDOS_WORKSPACE=/ws/e2e PATH=/bin" held)"
     if [ -z "$got" ]; then
         pass "an engine started with no gateway names none"
     else
@@ -2306,7 +1955,8 @@ test_engine_gateway_port_never_lists_a_dead_or_absent_pid() {
     echo "test: engine_gateway_port lists no process for a dead, absent or junk pid"
     : >"$SANDBOX/gwport-calls"
     local got
-    for pid in "$DEAD_PID" none not-a-pid; do
+    # A live pid with no lock held is the shape of a pid the OS reused.
+    for pid in "$DEAD_PID" none not-a-pid "$$"; do
         got="$(gateway_port_for "$pid" "$PACKAGED_PS")"
         [ -z "$got" ] || fail "pid '$pid' yielded '$got'"
     done
@@ -2713,7 +2363,6 @@ ensure_running_with() { # <engine-is-live: 1 or empty>
         # shellcheck disable=SC2317 # all called by ensure_workspace_engine_running
         {
             engine_on_port_serves_workspace() { [ -n "$LIVE" ]; }
-            gateway_lists_workspace() { return 0; }
             gateway_curl() { return 0; }
             wait_for_workspace_health() { return 0; }
             curl() { queued_curl; }
@@ -2786,54 +2435,6 @@ test_a_running_engine_is_adopted_not_restarted
 test_a_stopped_engine_is_started
 test_the_apply_switch_always_respawns
 
-# ── gateway_lists_workspace: adopting must not skip the registry sync ──
-#
-# The restart POST is the only thing that makes a running gateway re-read
-# `workspaces.json` (`sync_registry_from_disk`), and `adopt_running_engines`
-# walks the in-memory list. So an engine answering for a slug the gateway has
-# never heard of must still take the POST, or the window loads a route nothing
-# serves. `curl` is shadowed in a subshell, so no request leaves this process.
-lists_workspace_with() { # <body> <ws-id>
-    printf '%s' "$1" >"$SANDBOX/gateway-body"
-    (
-        set -e
-        PROTO=https; GATEWAY_PORT=5251; GATEWAY_WS_ID="$2"
-        # shellcheck disable=SC2317 # called by gateway_lists_workspace
-        curl() { cat "$SANDBOX/gateway-body"; }
-        gateway_lists_workspace && echo yes || echo no
-    )
-}
-
-test_a_listed_workspace_is_adoptable() {
-    echo "test: gateway_lists_workspace finds the slug in the control listing"
-    local body='{"workspaces":[{"id":"other","port":5273},{"id":"dev","port":5173}]}'
-    if [ "$(lists_workspace_with "$body" dev)" = "yes" ]; then
-        pass "a listed workspace reads as known"
-    else
-        fail "the gateway lists 'dev' and the probe missed it"
-    fi
-}
-
-test_an_unlisted_workspace_still_takes_the_post() {
-    echo "test: a slug the gateway never heard of is not adoptable"
-    local body='{"workspaces":[{"id":"other","port":5273}]}'
-    if [ "$(lists_workspace_with "$body" dev)" = "no" ]; then
-        pass "an unlisted workspace still asks for the restart"
-    else
-        fail "adopted a slug with no registry entry, so nothing would route"
-    fi
-    # An unreachable gateway answers nothing, and guessing "known" there would
-    # strand the launch on the same dead route.
-    if [ "$(lists_workspace_with "" dev)" = "no" ]; then
-        pass "an unreachable gateway falls back to the POST"
-    else
-        fail "an empty answer read as a known workspace"
-    fi
-}
-
-test_a_listed_workspace_is_adoptable
-test_an_unlisted_workspace_still_takes_the_post
-
 # ── wait_for_workspace_health: the probe carries the local credential ──
 #
 # The gateway gates every `/<slug>/api/v1/*` path, health included, so an
@@ -2896,8 +2497,8 @@ test_shared_pg_psql_follows_the_external_port() {
         unset LUCIDOS_EXTERNAL_PG_PORT
         shared_pg_psql mydb -tAc "SELECT 1"
     )"
-    if [ "$external" = "psql -h 127.0.0.1 -p 5999 -U lucidos -d mydb -tAc SELECT 1 PGPASSWORD=lucidos" ]; then
-        pass "the external port reaches psql over loopback TCP"
+    if [ "$external" = "psql -h 127.0.0.1 -p 5999 -U lucidos -d mydb -tAc SELECT 1 PGPASSWORD=$(shared_pg_password)" ]; then
+        pass "the external port reaches psql over loopback TCP, with the minted secret in its env"
     else
         fail "external call was '$external'"
     fi

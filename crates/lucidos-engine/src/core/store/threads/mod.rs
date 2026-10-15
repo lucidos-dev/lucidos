@@ -175,6 +175,10 @@ pub struct ThreadSummary {
     /// the user has not seen it yet (ADR 0409). Lists the thread in the
     /// drawer's Review group. Counts toward neither attention nor blocking.
     pub read_requested: bool,
+    /// Whether an Apply Now is running on this thread, from its
+    /// `ApplyNowStarted` to its `ApplyNowEnded` (ADR 0437). Every client reads
+    /// "applying" from here rather than inferring it.
+    pub apply_in_flight: bool,
     /// Thread status, computed by the backend. Nothing writes `waiting` any
     /// more; it survives on historical rows.
     pub status: ThreadStatus,
@@ -199,6 +203,12 @@ pub struct ThreadSummary {
     /// Cached title of the parent thread — saves an extra round-trip when the
     /// route panel renders "Parent thread · <title>" links.
     pub parent_thread_title: Option<String>,
+    /// The *successor thread* this one continued in, once it handed off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor: Option<SuccessorLink>,
+    /// The thread this *successor thread* continues.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_of: Option<SuccessorLink>,
     /// Trigger that fired this thread (only for `channel == "trigger"` threads).
     /// Snapshotted by the projection on `TriggerStarted`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -394,6 +404,7 @@ struct ThreadRow {
     attention_descendant_count: i64,
     is_stopped_child: bool,
     read_requested: bool,
+    apply_in_flight: bool,
     live_event_wait_count: i64,
     /// `sqlx::types::Json` rather than a bare `Vec`, because that is what
     /// decodes a JSONB column into a typed value.
@@ -411,6 +422,10 @@ struct ThreadRow {
     has_response: bool,
     parent_thread_id: Option<String>,
     parent_thread_title: Option<String>,
+    successor_thread_id: Option<String>,
+    successor_thread_title: Option<String>,
+    successor_of: Option<String>,
+    successor_of_title: Option<String>,
     trigger_id: Option<String>,
     trigger_name: Option<String>,
     cc_repo_id: Option<String>,
@@ -481,6 +496,9 @@ pub struct ThreadAggregate {
     /// aggregate so the Review group gains and loses the thread live, on every
     /// device.
     pub read_requested: bool,
+    /// See `ThreadSummary::apply_in_flight`. Carried on the per-event SSE
+    /// aggregate so every device shows the apply start and end live.
+    pub apply_in_flight: bool,
     /// Count of *event waits* this thread holds unresolved. See
     /// `ThreadSummary::live_event_wait_count`. Carried on the per-event SSE
     /// aggregate so the Waiting dot lights the moment a wait is registered or
@@ -505,6 +523,13 @@ pub struct ThreadAggregate {
     pub last_revived_at: Option<chrono::DateTime<chrono::Utc>>,
     pub parent_thread_id: Option<String>,
     pub parent_thread_title: Option<String>,
+    /// See `ThreadSummary::successor`. Carried here so "Continued in" appears
+    /// live on the handoff's `SuccessorThreadSpawned`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor: Option<SuccessorLink>,
+    /// See `ThreadSummary::successor_of`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub successor_of: Option<SuccessorLink>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -573,6 +598,7 @@ fn row_to_thread_aggregate(
         attention_descendant_count: r.attention_descendant_count,
         is_stopped_child: r.is_stopped_child,
         read_requested: r.read_requested,
+        apply_in_flight: r.apply_in_flight,
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,
         coding_agent_change_state: CodingAgentChangeState::from_columns(
@@ -587,6 +613,8 @@ fn row_to_thread_aggregate(
         last_revived_at: r.last_revived_at,
         parent_thread_id: r.parent_thread_id,
         parent_thread_title: r.parent_thread_title,
+        successor: SuccessorLink::from_columns(r.successor_thread_id, r.successor_thread_title),
+        successor_of: SuccessorLink::from_columns(r.successor_of, r.successor_of_title),
         trigger_id: r.trigger_id,
         trigger_name: r.trigger_name,
         cc_repo_id: r.cc_repo_id,
@@ -596,6 +624,19 @@ fn row_to_thread_aggregate(
         coding_agent: r.coding_agent,
         state: ThreadState::from_db_str(&r.state)?,
     })
+}
+
+/// One end of a *successor thread* link: the other thread and its title.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SuccessorLink {
+    pub thread_id: String,
+    pub title: Option<String>,
+}
+
+impl SuccessorLink {
+    fn from_columns(thread_id: Option<String>, title: Option<String>) -> Option<Self> {
+        thread_id.map(|thread_id| Self { thread_id, title })
+    }
 }
 
 /// SQL column list for thread summary queries, qualified with `alias` so the
@@ -619,13 +660,17 @@ fn thread_cols(alias: &str) -> String {
         "{a}.thread_id::text, {a}.title, {a}.first_message, {a}.source, {a}.initiator, {a}.created_at, {a}.last_activity, \
         {a}.last_user_action, {a}.last_agent_action, \
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.waiting_children_count::bigint, {a}.total_children_count::bigint, \
-        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, {a}.read_requested, \
+        {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, {a}.read_requested, {a}.apply_in_flight, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
         {a}.status, {a}.summary_version, {a}.coding_agent_change_state, {a}.coding_agent_unproposed_reason, {a}.coding_agent_requires_restart, \
         {a}.coding_agent_is_external_repo, {a}.last_revived_at, \
         {a}.is_saved, {a}.is_home, {a}.has_response, \
         {a}.parent_thread_id::text AS parent_thread_id, \
         (SELECT p.title FROM thread_summaries p WHERE p.thread_id = {a}.parent_thread_id) AS parent_thread_title, \
+        {a}.successor_thread_id::text AS successor_thread_id, \
+        (SELECT n.title FROM thread_summaries n WHERE n.thread_id = {a}.successor_thread_id) AS successor_thread_title, \
+        {a}.successor_of::text AS successor_of, \
+        (SELECT o.title FROM thread_summaries o WHERE o.thread_id = {a}.successor_of) AS successor_of_title, \
         {a}.trigger_id, {a}.trigger_name, \
         {a}.cc_repo_id, \
         {repo_name} AS cc_repo_name, \
@@ -710,6 +755,7 @@ fn row_to_thread_summary(
         attention_descendant_count: r.attention_descendant_count,
         is_stopped_child: r.is_stopped_child,
         read_requested: r.read_requested,
+        apply_in_flight: r.apply_in_flight,
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,
         status: ThreadStatus::parse(&r.status),
@@ -723,6 +769,8 @@ fn row_to_thread_summary(
         last_revived_at: r.last_revived_at,
         parent_thread_id: r.parent_thread_id,
         parent_thread_title: r.parent_thread_title,
+        successor: SuccessorLink::from_columns(r.successor_thread_id, r.successor_thread_title),
+        successor_of: SuccessorLink::from_columns(r.successor_of, r.successor_of_title),
         trigger_id: r.trigger_id,
         trigger_name: r.trigger_name,
         cc_repo_id: r.cc_repo_id,
@@ -865,6 +913,16 @@ pub fn active_thread_statuses() -> [&'static str; 2] {
     ]
 }
 
+/// SQL for "the thread aliased `alias` is still working": in flight, or ended
+/// a turn holding a live event wait, which wakes it for another. Bind
+/// [`active_thread_statuses`] to `statuses_param`.
+///
+/// A child still working owes its parent a report, so a parent's sibling count
+/// and a *wake mode* batch both read this.
+pub fn still_working_sql(alias: &str, statuses_param: &str) -> String {
+    format!("({alias}.status = ANY({statuses_param}) OR {alias}.live_event_wait_count > 0)")
+}
+
 /// Parse caller-supplied status filter values into the typed form
 /// [`StatusFilter::OneOf`] takes.
 ///
@@ -938,8 +996,11 @@ pub struct ThreadTimelineEvent {
 }
 
 mod backfill;
+mod compose;
 mod drafts;
 mod events;
+
+pub use compose::{consume_compose_slot, ComposeReport, ComposeReportRow, COMPOSE_REPORT_COLS};
 
 pub use drafts::{
     attach_reader_fields, char_length, has_draft, text_preview, thread_link, DraftSummary,
@@ -972,6 +1033,10 @@ mod search_tests;
 #[cfg(test)]
 #[path = "../threads_tests/drafts.rs"]
 mod drafts_tests;
+
+#[cfg(test)]
+#[path = "../threads_tests/compose.rs"]
+mod compose_tests;
 
 #[cfg(test)]
 #[path = "../threads_tests/extraction.rs"]

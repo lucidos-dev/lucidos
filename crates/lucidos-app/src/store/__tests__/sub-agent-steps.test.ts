@@ -111,6 +111,18 @@ describe('sub-agent steps fold under their agent row', () => {
     expect(tokens(agentB)).toBe(653_000);
   });
 
+  it('keeps each sub-agent’s last capture on its Agent row, even one no step owns', () => {
+    const top = steps(exchangeResponseEvents(exchangeOf([
+      ...twoParallelAgents,
+      // The report-writing call makes no tool call, so no child row takes it.
+      capture(47_000, 'agent-a', 'msg_report'),
+    ])));
+    const [agentA, agentB] = top;
+
+    expect(agentA.finalContextCapture?.estimated_total_tokens).toBe(47_000);
+    expect(agentB.finalContextCapture?.estimated_total_tokens).toBe(50_000);
+  });
+
   it('binds captures by agent in the flat step projection too', () => {
     const flat = exchangeSteps(exchangeOf(twoParallelAgents));
     const byId = (id: string) => flat.find(s => s.tool_use_id === id)?.contextCapture?.estimated_total_tokens;
@@ -154,6 +166,32 @@ describe('sub-agent steps fold under their agent row', () => {
     const drawn = rowsDrawnByClamp(events, { showSteps: true, showDetails: true, folded: false });
 
     expect(drawn.filter(Boolean)).toHaveLength(2);
+  });
+
+  it('keeps folding a running agent’s steps after a mid-run follow-up opens a new turn', () => {
+    const events: ThreadEvent[] = [
+      { type: 'MessageReceived', text: 'review it' } as ThreadEvent,
+      { type: 'CodingAgentPromptSent' } as ThreadEvent,
+      call('agent-a', 'Agent', { description: 'Fix the findings' }),
+      call('a1', 'Edit', { file_path: 'driver.rs' }, 'agent-a'),
+      { type: 'MessageReceived', text: 'some more main changes now' } as ThreadEvent,
+      call('a2', 'Edit', { file_path: 'driver.rs' }, 'agent-a'),
+      { type: 'CodingAgentPromptSent' } as ThreadEvent,
+      result('a2', 'agent-a'),
+      capture(375_000, 'agent-a'),
+      call('a3', 'Read', { file_path: 'driver.rs' }, 'agent-a'),
+    ];
+    const map = new Map<number, StoredEvent>(
+      events.map((e, i): [number, StoredEvent] => [i + 1, { ...e, created: at(i) }]),
+    );
+    const [first, followUp] = groupIntoExchanges(map);
+
+    const [agentA] = steps(exchangeResponseEvents(first));
+    expect(labels(agentA.children)).toEqual(['a1', 'a2', 'a3']);
+    expect(agentA.children?.[2].contextCapture).toBeUndefined();
+    expect(agentA.children?.[1].contextCapture?.estimated_total_tokens).toBe(375_000);
+    // The follow-up's turn holds only the session's own pending marker.
+    expect(steps(exchangeResponseEvents(followUp)).map(s => s.description)).toEqual(['Thinking']);
   });
 
   it('settles a still-running child when the turn ends', () => {

@@ -45,12 +45,12 @@ describe("the home thread's row in a filtered view", () => {
   it('draws a house and no pin', () => {
     mount(true);
     expect(host.querySelector('.thread-icon svg')).not.toBeNull();
-    expect(host.querySelector('.pin-thread-btn')).toBeNull();
+    expect(host.querySelector('.pin-btn')).toBeNull();
   });
 
   it('leaves the pin on every other row', () => {
     mount(false);
     expect(host.querySelector('.thread-icon')).toBeNull();
-    expect(host.querySelector('.pin-thread-btn')).not.toBeNull();
+    expect(host.querySelector('.pin-btn')).not.toBeNull();
   });
 });

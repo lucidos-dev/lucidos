@@ -311,14 +311,17 @@ fn the_human_refusal_tells_the_agent_what_to_do_instead() {
 
 #[test]
 fn an_existing_thread_is_always_addressable() {
-    assert!(thread_target_is_addressable(true, None, None, false));
+    assert!(thread_target_is_addressable(true, false, None, None, false));
 }
 
 #[test]
 fn an_unknown_thread_with_no_create_signal_is_refused() {
-    assert!(!thread_target_is_addressable(false, None, None, false));
+    assert!(!thread_target_is_addressable(
+        false, false, None, None, false
+    ));
     // An explicit `false` is not a create signal either.
     assert!(!thread_target_is_addressable(
+        false,
         false,
         Some(false),
         None,
@@ -329,17 +332,32 @@ fn an_unknown_thread_with_no_create_signal_is_refused() {
 #[test]
 fn each_create_signal_admits_an_unknown_thread() {
     // The frontend's raw new send, which mints its own uuid.
-    assert!(thread_target_is_addressable(false, Some(true), None, false));
+    assert!(thread_target_is_addressable(
+        false,
+        false,
+        Some(true),
+        None,
+        false
+    ));
     // A same-workspace spawn with callback (`lucidos spawn-thread --relation
     // child`), which is why that CLI needed no new flag.
     assert!(thread_target_is_addressable(
+        false,
         false,
         None,
         Some(Uuid::new_v4()),
         false
     ));
     // A cross-workspace spawn (`workspace_client`, `spawn-thread --to`), same.
-    assert!(thread_target_is_addressable(false, None, None, true));
+    assert!(thread_target_is_addressable(false, false, None, None, true));
+}
+
+/// The client sends a thread's second message once the first is acked, and
+/// the first may not be recorded yet. The thread then has an admitted input
+/// and no row, and the second send must order behind it, not 404 (ADR 0449).
+#[test]
+fn an_unknown_thread_with_an_admitted_input_is_addressable() {
+    assert!(thread_target_is_addressable(false, true, None, None, false));
 }
 
 #[test]
@@ -414,6 +432,8 @@ fn base_req(mode: ActorMode) -> ChatRequest {
         cc_model: None,
         event_id: None,
         thread_id: None,
+        input_chain: None,
+        input_seq: None,
         new_thread: None,
         conflict_change_id: None,
         repo_id: None,
@@ -422,10 +442,31 @@ fn base_req(mode: ActorMode) -> ChatRequest {
         mode,
         parent_thread_id: None,
         spawning_event_id: None,
+        wake_mode: None,
         caller_workspace: None,
         caller_thread_id: None,
         caller_event_id: None,
+        integrated: false,
     }
+}
+
+/// I9 of `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`: a wake
+/// mode rides only beside a parent, and names a real mode.
+#[test]
+fn a_wake_mode_needs_a_parent_and_a_known_name() {
+    let mut req = base_req(ActorMode::Agent);
+    req.parent_thread_id = Some(Uuid::new_v4().to_string());
+    req.wake_mode = Some("wake-when-all-done".into());
+    let v = validate_mode_and_spawn(&req).unwrap();
+    assert_eq!(v.declared_wake_mode, Some(WakeMode::WakeWhenAllDone));
+
+    req.wake_mode = Some("file".into());
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
+
+    let mut top = base_req(ActorMode::Agent);
+    top.caller_workspace = Some("dev".into());
+    top.wake_mode = Some("wake".into());
+    assert_eq!(spawn_refusal(&top), StatusCode::BAD_REQUEST);
 }
 
 /// The status `validate_mode_and_spawn` refused with. It returns an `ApiError`,
@@ -999,6 +1040,7 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             voice_session_id: None,
+            wake_mode: None,
             text: "queued".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1040,6 +1082,7 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
         thread_id,
         event: ThreadEvent::MessageReceived {
             voice_session_id: None,
+            wake_mode: None,
             text: "remove me".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1104,6 +1147,7 @@ async fn persist_message(
         thread_id,
         event: ThreadEvent::MessageReceived {
             voice_session_id: None,
+            wake_mode: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1425,8 +1469,8 @@ fn a_mode_the_credential_contradicts_is_a_400_not_a_panic() {
 // ── subprocess_gate_applies ─────────────────────────────────────────
 
 /// A token holder that adds `caller_workspace` keeps the gate for an existing
-/// thread and for `mode: human`. Only an agent's create skips it, and the
-/// top-thread authority check covers that create.
+/// thread and for `mode: human`. Only an agent's create skips it: a top-thread
+/// any caller may make (ADR 0475).
 #[test]
 fn caller_workspace_skips_the_subprocess_gate_only_for_a_create() {
     for mode in [ActorMode::Agent, ActorMode::Engine] {
@@ -1466,4 +1510,25 @@ fn a_token_holder_naming_another_workspace_cannot_post_into_an_existing_thread()
         None,
         false
     ));
+}
+
+// ── refuse_unfit_integrated_spawn ────────────────────────────────────
+
+/// A `mode=human` spawn runs at once, outside the Thread Queue, and only the
+/// queued request carries `integrated`. So the pair is refused by name rather
+/// than starting an independent child.
+#[tokio::test]
+async fn an_integrated_spawn_in_human_mode_is_refused_by_name() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let refusal =
+        refuse_unfit_integrated_spawn(&pool, Some(Uuid::new_v4()), true, false, None, false, true)
+            .await
+            .expect_err("human mode cannot carry integrated");
+    assert_eq!(refusal.status, StatusCode::BAD_REQUEST);
+    assert!(
+        refusal.message.contains("--mode human"),
+        "{}",
+        refusal.message
+    );
+    crate::test_support::teardown_test_db(&db_name).await;
 }

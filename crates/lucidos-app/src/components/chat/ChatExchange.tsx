@@ -1,5 +1,5 @@
 import { Fragment, type ComponentChildren } from 'preact';
-import { WidgetCard } from '../widgets/WidgetCard';
+import { InlineWidget } from '../widgets/InlineWidget';
 import { ReplyHtml } from '../widgets/useWidgetEmbedSlots';
 import type { ReadonlySignal, Signal } from '@preact/signals';
 import { memo } from 'preact/compat';
@@ -222,6 +222,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const apps = loadedOr(appsList.value, NO_APPS);
 
   const userMessage = exchangeUserMessage(exchange);
+  // A reply's inline widget records it on a pin, so "Show in thread" lands here.
+  const starterId = exchangeStarterId(exchange);
   const userImageHashes = exchangeUserImageHashes(exchange);
   const timestamp = exchangeTimestamp(exchange);
   // A "Read" label dates the read, so the time beside it agrees with it. The
@@ -596,6 +598,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
               html={chunkHtmls.get(row.event) ?? ''}
               final
               threadId={threadId}
+              eventId={starterId}
             />
           </Disclosure>
         );
@@ -635,13 +638,14 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
     if (evt.type === 'widget') {
       return (
-        <WidgetCard
+        <InlineWidget
           key={`wg${k}`}
           threadId={threadId}
           appId={evt.app_id}
           params={evt.params}
           label={evt.label}
           eventId={evt.event_id}
+          stamped
         />
       );
     }
@@ -676,7 +680,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
       : canCollapseInitiator ? 'initiator' : undefined;
 
   return (
-    <div class="chat-exchange" data-event-id={exchangeStarterId(exchange)} data-change-id={changeId || undefined}
+    <div class="chat-exchange" data-event-id={starterId} data-change-id={changeId || undefined}
          data-thread-id={threadId} data-user-seq={exchange.userSeq} data-collapse-kind={collapseKind}
          data-head-clamped={rowsHidden > 0 ? '' : undefined}>
       {/* Keyed, because a fragment omits this one and both panels animate.
@@ -747,7 +751,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
             ...(isResume ? [<div class="response-content" key="resume"><ResumeCard exchange={exchange} /></div>] : []),
             ...(hasEvents ? [] : [
               <div class="response-content markdown-content" key="streamed" onClick={handleLinkClick}>
-                <ReplyHtml html={responseHtmlLinkified} final={!streamingBuffer} threadId={threadId} />
+                <ReplyHtml html={responseHtmlLinkified} final={!streamingBuffer} threadId={threadId} eventId={starterId} />
               </div>,
             ]),
             ...bodyPieces.map((piece) => (piece.kind === 'cards'
@@ -1071,6 +1075,7 @@ function initiatorSummary(exchange: Exchange): string {
     case 'McpConsentRequested':          return `Tool consent requested: ${ev.tool}`;
     case 'ChildThreadCompleted':         return '';
     case 'ChildThreadStopped':           return '';
+    case 'ChildReportFiled':             return '';
     case 'ChildThreadDetached':          return '';
     default:                         return '';
   }
@@ -1488,6 +1493,26 @@ export function describeInitiator(
             pendingChangeIds={ev.pending_change_ids}
             subThreadPendingChanges={ev.sub_thread_pending_changes}
             heldNote={heldNote}
+          />
+        ),
+      };
+    case 'ChildReportFiled':
+      // The same fan-in files this in place of the completion card when the
+      // child said this thread need not act. It woke nothing, and says so.
+      return {
+        variant: 'system',
+        icon: <LucidosGlyph />,
+        label: ENGINE_LABEL,
+        actorClickable: false,
+        details: (
+          <ChildCompletionRow
+            childThreadId={ev.child_thread_id}
+            childThreadTitle={ev.child_thread_title}
+            status={ev.status}
+            summary={ev.summary}
+            pendingChangeIds={ev.pending_change_ids}
+            subThreadPendingChanges={ev.sub_thread_pending_changes}
+            filed
           />
         ),
       };

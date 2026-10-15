@@ -1,7 +1,7 @@
 import { renameThread, suggestTitle } from '../../api/threads';
 import { errorDetail } from '../../utils/errorDetail';
 import { threadDisplayTitle } from '../../utils/threadTitle';
-import { removeToast, showPrompt, showToast, threadMap, TOAST_AUTO_DISMISS_MS } from '../store';
+import { showPrompt, showToast, threadMap } from '../store';
 import type { ThreadState } from '../thread-events';
 
 /** The title to send for a rename, or null when there is nothing to send: a
@@ -41,47 +41,35 @@ async function rename(threadId: string, title: string, next: string): Promise<vo
   }
 }
 
-/** Ask for a new name in a dialog prefilled with the current one. */
+/** Ask for a new name in a dialog prefilled with the current one. Its Suggest
+ *  link fills the field with a name from the engine, where one is offered. */
 export async function promptRenameThread(threadId: string): Promise<void> {
+  const thread = threadMap.value.get(threadId);
   const title = currentTitle(threadId, canRenameThread);
   if (title === null) return;
   const answer = await showPrompt('Give this thread a new name.', {
     title: 'Rename thread',
     defaultValue: title,
     okLabel: 'Rename',
+    suggest: canSuggestThreadName(thread) ? () => suggestName(threadId, title) : undefined,
   });
   const next = answer === null ? null : normalizeRename(answer, title);
   if (next !== null) await rename(threadId, title, next);
 }
 
-/** Ask the engine for a name and offer it in a toast. Nothing changes unless
- *  the user takes it. */
-export async function suggestThreadName(threadId: string): Promise<void> {
-  const title = currentTitle(threadId, canSuggestThreadName);
-  if (title === null) return;
-  const key = `suggest-thread-name-${threadId}`;
-  showToast('Finding a better name…', 'info', { key, spinning: true });
+/** A name from the engine, or null when it fails or finds none better. Each
+ *  null case says why in a toast. */
+async function suggestName(threadId: string, title: string): Promise<string | null> {
   let suggestion: string;
   try {
     suggestion = (await suggestTitle(threadId)).trim();
   } catch (err) {
-    showToast(`Could not suggest a name for "${title}": ${errorDetail(err)}`, 'error', { key });
-    return;
+    showToast(`Could not suggest a name for "${title}": ${errorDetail(err)}`, 'error');
+    return null;
   }
   if (!suggestion || suggestion === title) {
-    showToast(`"${title}" already fits this thread.`, 'info', { key, title: 'No better name', autoDismissMs: TOAST_AUTO_DISMISS_MS });
-    return;
+    showToast(`"${title}" already fits this thread.`, 'info', { title: 'No better name' });
+    return null;
   }
-  showToast(suggestion, 'info', {
-    key,
-    title: 'Suggested name',
-    action: {
-      label: 'Use it',
-      variant: 'confirm',
-      onClick: () => {
-        removeToast(key);
-        void rename(threadId, title, suggestion);
-      },
-    },
-  });
+  return suggestion;
 }

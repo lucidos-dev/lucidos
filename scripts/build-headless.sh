@@ -162,11 +162,7 @@ command -v tar   >/dev/null || die "tar not found."
 
 step "Building headless bundle lucidos-$VERSION-$TRIPLE"
 
-# ── 1. frontend ──────────────────────────────────────────────────────────────
-step "Building frontend (dist/) + SDK bundle"
-stage_runtime_build_frontend "$REPO_ROOT" "$APP_DIR" || die "frontend build failed"
-
-# ── 2. engine + gateway + cli (release) ──────────────────────────────────────
+# ── 1. engine + gateway + cli (release) ──────────────────────────────────────
 # All three are part of the runtime tree. The `lucidos` CLI is load-bearing: the
 # engine resolves it as a sibling of `lucidos-engine` to launch the CC
 # permission-prompt MCP server, so a headless install that omits it breaks every
@@ -180,6 +176,11 @@ CLI_BIN="$REPO_ROOT/target/release/lucidos"
 [ -x "$ENGINE_BIN" ]  || die "engine binary not found at $ENGINE_BIN"
 [ -x "$GATEWAY_BIN" ] || die "gateway binary not found at $GATEWAY_BIN"
 [ -x "$CLI_BIN" ]     || die "lucidos CLI binary not found at $CLI_BIN"
+
+# ── 2. generated files, SDK bundle and frontend ──────────────────────────────
+# After the binaries: codegen renders with the release lucidos-codegen.
+step "Building generated files + SDK bundle + frontend (dist/)"
+stage_runtime_build_frontend "$REPO_ROOT" "$APP_DIR" || die "frontend build failed"
 
 # ── 3. relocatable PostgreSQL + pgvector ─────────────────────────────────────
 step "Fetching relocatable PostgreSQL $PG_VERSION + building pgvector $PGVECTOR_VERSION ($TRIPLE)"

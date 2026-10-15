@@ -13,7 +13,8 @@
  *    carve-out (Apply can't merge into a foreign repo → Archive instead).
  */
 
-import { threadMap, focusedThreadId, pendingChangeForThread, showConfirm, effectiveThreadStatus, applyingNowThreadIds, applyingChangeThreadIds, discardingCCThreadIds, archivingThreadIds, standingApplyThreadIds, armingStandingApplyThreadIds } from '../store';
+import { threadMap, focusedThreadId, pendingChangeForThread, showConfirm, effectiveThreadStatus, applyingNowThreadIds, applyingChangeThreadIds, discardingCCThreadIds, standingApplyThreadIds, armingStandingApplyThreadIds } from '../store';
+import { archiveRequestInFlight } from '../rowIntents';
 import { getCodingAgentWaitingInfo, threadChangeWork, type ThreadMeta } from '../thread-events';
 import { availableThreadActions, type Action } from '../../generated/thread-lifecycle';
 import { getDraft, draftIsEmpty } from '../composeDrafts';
@@ -327,7 +328,7 @@ export async function runCloseCascade(): Promise<void> {
   if (
     applyingNowThreadIds.value.has(focused) ||
     discardingCCThreadIds.value.has(focused) ||
-    archivingThreadIds.value.has(focused)
+    archiveRequestInFlight(focused)
   ) {
     return; // a layer is still resolving — don't fall through to the next one
   }

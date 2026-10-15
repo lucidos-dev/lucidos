@@ -94,6 +94,33 @@ describe('the wash fades a colour, so no compositing layer is conjured', () => {
     }
   });
 
+  it('stops the underline at the pane edge, never over a divider', () => {
+    // The tint's ::before overhangs the neighbouring divider so the wash has no
+    // seam. An underline drawn there crossed the divider too. It belongs on
+    // ::after, which spans the box exactly and takes no per-pane overhang.
+    for (const rule of tintRules()) {
+      expect(rule.props.get('box-shadow'), `${rule.selector} draws the underline over a divider`)
+        .toBeUndefined();
+    }
+    const lineRules = cssRules(shellCss).filter(
+      r => r.selector.includes(`.${WASH}`) && r.selector.includes('::after'),
+    );
+    const base = lineRules.filter(r => r.selector === `.${WASH}::after`);
+    expect(base.length, `expected exactly one base \`.${WASH}::after\` rule`).toBe(1);
+    expect(base[0].props.get('inset')).toBe('0');
+    for (const rule of lineRules) {
+      for (const edge of ['left', 'right', 'inset']) {
+        const value = rule.props.get(edge);
+        if (value !== undefined) expect(value, `${rule.selector} moves the line off the box`).toBe('0');
+      }
+    }
+    const reveal = lineRules.filter(r => r.props.get('box-shadow')?.includes('var(--focus-header-underline)'));
+    expect(reveal.length, 'the underline is painted from more than one rule').toBe(1);
+    for (const pane of ['drawer', 'thread', 'content']) {
+      expect(reveal[0].selector).toContain(`[data-pane="${pane}"]::after`);
+    }
+  });
+
   it('keeps the box, and only the box, on the pane-resize kill list', () => {
     // The kill rule switches transitions off so the header tracks the pointer
     // 1:1 during a divider drag. It must reach the geometry and leave the fade

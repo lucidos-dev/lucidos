@@ -7,6 +7,10 @@
 - **Amended by**: [0391](0391-agent-teardown-reaps-by-agent-run-marker.md). The
   group teardown below never reached a Bash call, which runs in a group of its
   own. The teardown now also reaps by agent run marker.
+- **Amended by**: [0470](0470-keep-the-prompt-cache-warm.md). Long work now
+  waits in-turn by default, as a polled task whose every `wait` returns inside
+  the prompt cache's life. An event wait that ends the turn stays for an
+  open-ended wait.
 
 ## Context
 

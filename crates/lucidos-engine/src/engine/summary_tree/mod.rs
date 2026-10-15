@@ -33,6 +33,7 @@ pub(crate) mod module;
 mod prompt;
 pub(crate) mod recall;
 mod shape;
+pub(crate) mod spend;
 pub(crate) mod store;
 pub(crate) mod view;
 pub(crate) mod workspace_log;
@@ -42,6 +43,7 @@ pub(crate) use compactor_models::{compactor_selection, default_effort_for, COMPA
 pub use consumer::spawn;
 pub use estimate::{Bounds, EffortCost, ModelCost, TreeBackfillEstimate};
 pub use module::{tree_ready, BackfillProgress, TreeBackfill};
+pub use spend::StartEstimate;
 pub use store::caught_up;
 
 /// Target size of one summary line, in UTF-8 bytes.

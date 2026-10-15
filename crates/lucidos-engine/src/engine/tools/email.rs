@@ -541,6 +541,9 @@ impl LucidosEngine {
 
                 let safe_filename = filename.replace("..", "_").replace(['/', '\\'], "_");
 
+                // Held from the free-name check through the commit, so two
+                // imports of one name cannot both claim it.
+                let held = self.lock_workspace_repo().await;
                 let dest_relative = if let Some(dest) = destination {
                     if is_path_traversal(dest) {
                         return Ok(
@@ -566,6 +569,7 @@ impl LucidosEngine {
                 let commit_sha = match self
                     .artifact_manager
                     .write_and_commit(
+                        &held,
                         &self.event_bus,
                         &dest_relative,
                         &data,
@@ -578,6 +582,7 @@ impl LucidosEngine {
                     Err(e) => return Ok(format!("Error: Failed to save attachment: {}", e)),
                 };
 
+                drop(held);
                 let size_display = format_byte_size(data.len());
                 drop(data);
 

@@ -4,7 +4,8 @@
  * A toggle rather than a push-to-talk button, because the microphone is open
  * for the whole call. A second control for hanging up would be a second thing
  * to find, and so would a picker of its own. So the tap is the call, and the
- * HOLD picks which microphone the next one opens, through `MicrophonePicker`.
+ * HOLD picks which microphone the next one opens, from a menu whose list is
+ * `MicrophoneList` (`MicrophonePicker.tsx`).
  *
  * It renders in the home thread's prompt input alone, since voice sessions
  * live there (ADR 0362). Which thread and which BACKEND may take a call is the
@@ -36,7 +37,9 @@
  */
 import { useRef } from 'preact/hooks';
 import { CallIcon } from '../shared/icons';
-import { MicrophonePicker } from './MicrophonePicker';
+import { OverflowMenu } from '../shared/OverflowMenu';
+import { lazyComponent } from '../../utils/lazyComponent';
+import { prefetchWhenIdle } from '../../utils/idlePrefetch';
 import type { HeaderActionSpec } from '../layout/headerActions';
 import type { OverflowMenuOpener } from '../shared/OverflowMenu';
 import { useLongPress } from '../../hooks/useLongPress';
@@ -100,6 +103,10 @@ const CONNECT_DWELL_MS = 2_000;
  */
 const WAITING_TOOLTIP = 'Waiting for microphone access';
 
+/** The microphone picker's list, fetched once the boot splash lifts (ADR 0436). */
+export const MicrophoneList = lazyComponent(() => import('./MicrophonePicker').then((m) => m.MicrophoneList));
+prefetchWhenIdle(MicrophoneList);
+
 export function CallToggle({ available = true, attrs }: { available?: boolean; attrs?: Record<string, string> }) {
   // Subscribe to the preference signal.
   preferences.value;
@@ -160,7 +167,15 @@ export function CallToggle({ available = true, attrs }: { available?: boolean; a
       <span class="visually-hidden" role="status" data-role="call-state">
         {callStatusLabel(call)}
       </span>
-      <MicrophonePicker openRef={openRef} />
+      {/* The hold is the only way in, so this menu draws no trigger. Its list
+          is code-split, and the menu opens once it is in memory. */}
+      <OverflowMenu
+        ariaLabel="Choose a microphone"
+        stopPropagation
+        hostOpener={{ ref: openRef, trigger: false }}
+        itemsChunk={MicrophoneList}
+        items={({ run }) => <MicrophoneList run={run} />}
+      />
     </>
   );
 }

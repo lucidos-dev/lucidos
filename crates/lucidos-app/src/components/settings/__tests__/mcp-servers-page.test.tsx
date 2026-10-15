@@ -7,12 +7,12 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
 import { mcpServerRow, mcpServersBody, type McpServersBodyProps } from '../McpServersPage';
+import { intentsAfterServe, toolIntentKey, withToolIntents } from '../mcpToolIntents';
 import {
   describeMcpRowError,
   mcpHeaderSummary,
   mcpServerCostLine,
   mcpServerStateLabel,
-  disabledWireNames,
   patchToolDisabled,
   sortToolsByCost,
 } from '../mcpCost';
@@ -185,13 +185,14 @@ describe('mcpServersBody (Loadable discipline)', () => {
     const text = body({ status: 'loaded', data: response() });
     expect(text).toContain('Slack');
     expect(text).toContain('mcp-server-block');
-    expect(text).toContain('1 server on, 1 tool, ~200 tokens per request');
+    expect(text).toContain('Up to 1 tool, ~200 tokens per request, in a thread that enables every server');
     expect(text).not.toContain('empty-state');
   });
 
   it('says once that a running server only runs for this session', () => {
     const text = body({ status: 'loaded', data: response() });
     expect(text).toContain('Nothing starts an MCP server when the engine starts');
+    expect(text).toContain("A thread's next turn starts");
   });
 });
 
@@ -207,14 +208,14 @@ describe('the skeleton row is the real row', () => {
 });
 
 describe('header cost figures', () => {
-  it('reports servers on, tools, tokens and the share of the request budget', () => {
+  it('reports the worst case, every server enabled in one thread, and its share of the request budget', () => {
     const summary = mcpHeaderSummary(
       totals({ running_servers: 2 }),
       200000,
       'claude-sonnet-5',
       budget({ sent_tools: 23, sent_chars: 72000, sent_tokens: 28800 }),
     );
-    expect(summary.live).toBe('2 servers on, 23 tools, ~29k tokens per request');
+    expect(summary.live).toBe('Up to 23 tools, ~29k tokens per request, in a thread that enables every server');
     // Chars over the request's char budget: a quarter of it is 25%, where
     // tokens over the raw window would have said 14%.
     expect(summary.share).toBe('25% of what a request to claude-sonnet-5 can carry (200k context window)');
@@ -240,38 +241,40 @@ describe('header cost figures', () => {
   });
 
   it("shows the engine's warning as it was written, and nothing when there is none", () => {
-    const warning = '3 tools are left out of every request.';
+    const warning = 'A thread that enables every server leaves 3 tools out.';
     expect(mcpHeaderSummary(totals(), 200000, 'm', budget({ warning })).warning).toBe(warning);
     expect(mcpHeaderSummary(totals(), 200000, 'm', budget()).warning).toBeNull();
   });
 
   it('renders the warning line in the header once the engine sends one', () => {
-    const warning = '3 tools are left out of every request.';
+    const warning = 'A thread that enables every server leaves 3 tools out.';
     const text = body({ status: 'loaded', data: response({ budget: budget({ warning }) }) });
     expect(text).toContain('mcp-cost-warning');
     expect(text).toContain(warning);
     expect(body({ status: 'loaded', data: response() })).not.toContain('mcp-cost-warning');
   });
 
-  it('counts the off servers separately from the per-request total', () => {
+  it('says how many servers run, and that a thread pays only for the ones it enabled', () => {
     const summary = mcpHeaderSummary(
-      totals({ running_servers: 1, stopped_tools: 40, stopped_tokens: 12000 }),
+      totals({ servers: 3, running_servers: 1, stopped_tools: 40, stopped_tokens: 12000 }),
       200000,
       'claude-sonnet-5',
-      budget({ sent_tools: 3, sent_tokens: 900 }),
+      budget({ sent_tools: 43, sent_tokens: 12900 }),
     );
-    expect(summary.live).toBe('1 server on, 3 tools, ~900 tokens per request');
-    expect(summary.stopped).toBe('40 more tools available, ~12k tokens if switched on');
+    expect(summary.live).toBe('Up to 43 tools, ~13k tokens per request, in a thread that enables every server');
+    expect(summary.running).toBe(
+      '1 of 3 servers running this session. A thread pays only for the servers it enabled',
+    );
   });
 
   it('states the disabled subtotal so the per-tool switch visibly pays', () => {
     const summary = mcpHeaderSummary(totals({ disabled_tools: 3, disabled_tokens: 800 }), 200000, 'm', budget());
-    expect(summary.disabled).toBe('3 tools switched off, keeping ~800 tokens out of every request');
+    expect(summary.disabled).toBe('3 tools switched off, keeping ~800 tokens out of every thread');
   });
 
-  it('has nothing to say about off servers or off tools when there are none', () => {
-    const summary = mcpHeaderSummary(totals(), 200000, 'm', budget());
-    expect(summary.stopped).toBeNull();
+  it('has nothing to say about servers or off tools when there are none', () => {
+    const summary = mcpHeaderSummary(totals({ servers: 0, running_servers: 0 }), 200000, 'm', budget());
+    expect(summary.running).toBeNull();
     expect(summary.disabled).toBeNull();
   });
 
@@ -282,25 +285,30 @@ describe('header cost figures', () => {
       'claude-sonnet-5',
       budget({ sent_tools: 48, sent_chars: 71000, sent_tokens: 28400 }),
     );
-    expect(summary.live).toBe('2 servers on, 48 tools, ~28k tokens per request');
+    expect(summary.live).toBe('Up to 48 tools, ~28k tokens per request, in a thread that enables every server');
     expect(summary.share).toBe('25% of what a request to claude-sonnet-5 can carry (200k context window)');
   });
 
-  it('does not claim a cost when no server is on', () => {
-    const summary = mcpHeaderSummary(totals({ running_servers: 0, tools: 0, tokens: 0 }), 200000, 'm', budget());
-    expect(summary.live).toBe('No servers on, so MCP adds nothing to a request');
+  it('does not claim a cost when no server is registered', () => {
+    const summary = mcpHeaderSummary(
+      totals({ servers: 0, running_servers: 0, tools: 0, tokens: 0 }),
+      200000,
+      'm',
+      budget(),
+    );
+    expect(summary.live).toBe('No servers registered, so MCP adds nothing to a request');
   });
 });
 
 describe('per-server cost, stated in the tense its state allows', () => {
-  it('a running server pays now', () => {
-    expect(mcpServerCostLine(server())).toBe('1 tool, ~200 tokens in every request.');
+  it('a running server costs each thread that enables it', () => {
+    expect(mcpServerCostLine(server())).toBe('1 tool, ~200 tokens. Adds them to each thread that enables it.');
     expect(mcpServerStateLabel(server())).toBe('Running, this session');
   });
 
   it('a stopped server states it conditionally and stamps the manifest', () => {
     const line = mcpServerCostLine(server({ running: false, tools_source: 'cache' }));
-    expect(line).toContain('Would add 1 tool, ~200 tokens if switched on.');
+    expect(line).toContain('Would add 1 tool, ~200 tokens to each thread that enables it.');
     expect(line).toContain('Tools last seen 3d ago.');
     expect(line).not.toContain('in every request');
   });
@@ -324,7 +332,7 @@ describe('per-server cost, stated in the tense its state allows', () => {
     expect(mcpServerCostLine(unobserved)).toBe(
       'Tools never observed, so what this server would cost is unknown. Start it once to find out.',
     );
-    expect(mcpServerCostLine(zeroCost)).toContain('Would add 0 tools, ~0 tokens if switched on.');
+    expect(mcpServerCostLine(zeroCost)).toContain('Would add 0 tools, ~0 tokens to each thread that enables it.');
     expect(mcpServerCostLine(unobserved)).not.toBe(mcpServerCostLine(zeroCost));
   });
 });
@@ -368,14 +376,12 @@ describe('a row mid-verb and a row that failed', () => {
     expect(text).toContain('disabled="true"');
   });
 
-  it('holds the tool switches while a server verb runs', () => {
-    // The verb reloads the list when it settles, and that reply predates a
-    // flip made under it, so an open switch here would bounce back.
+  it('keeps the tool switches live while a server verb runs', () => {
+    // A switch is a pending intent laid over whatever list the verb reloads
+    // (ADR 0437), so nothing it does can bounce one back.
     const busy = vnodeToText(mcpServerRow({ server: server(), expanded: true, pending: 'start' }));
-    const idle = vnodeToText(mcpServerRow({ server: server(), expanded: true }));
-    expect(busy).toMatch(/disabled="true" ariaLabel="Offer /);
-    expect(idle).not.toMatch(/disabled="true" ariaLabel="Offer /);
-    expect(idle).toContain('ariaLabel="Offer mcp__slack__post_message to the agent"');
+    expect(busy).not.toMatch(/disabled="true" ariaLabel="Offer /);
+    expect(busy).toContain('ariaLabel="Offer mcp__slack__post_message to the agent"');
   });
 
   it('renders the failure inline on the row, tagged by kind', () => {
@@ -448,33 +454,12 @@ describe('the optimistic per-tool switch', () => {
   const a = tool({ name: 'a', wire_name: 'mcp__slack__a' });
   const b = tool({ name: 'b', wire_name: 'mcp__slack__b', disabled: true });
 
-  it('sends the whole set, by wire name, read off the flipped page', () => {
+  it('flips one tool by wire name and leaves the rest alone', () => {
     const before = response({ servers: [server({ tools: [a, b] })] });
     const off = patchToolDisabled(before, 'slack', 'mcp__slack__a', true);
-    expect(disabledWireNames(off.servers[0]).sort()).toEqual([
-      'mcp__slack__a',
-      'mcp__slack__b',
-    ]);
+    expect(off.servers[0].tools.map((t) => t.disabled)).toEqual([true, true]);
     const on = patchToolDisabled(off, 'slack', 'mcp__slack__b', false);
-    expect(disabledWireNames(on.servers[0])).toEqual(['mcp__slack__a']);
-  });
-
-  it('carries an earlier flip along, so two quick clicks cannot undo each other', () => {
-    // Both writes send the same final set, whichever order their round trips
-    // settle in. The bug this pins: a set computed per click sends [A] and
-    // [B], and whichever lands last re-enables the other tool.
-    const base = response({ servers: [server({ tools: [a, tool({ name: 'b', wire_name: 'mcp__slack__b' })] })] });
-    const first = patchToolDisabled(base, 'slack', 'mcp__slack__a', true);
-    const second = patchToolDisabled(first, 'slack', 'mcp__slack__b', true);
-    expect(disabledWireNames(second.servers[0]).sort()).toEqual([
-      'mcp__slack__a',
-      'mcp__slack__b',
-    ]);
-  });
-
-  it('never invents a wire name for a tool that has none', () => {
-    const orphan = tool({ name: 'broken', wire_name: null, disabled: true });
-    expect(disabledWireNames(server({ tools: [orphan] }))).toEqual([]);
+    expect(on.servers[0].tools.map((t) => t.disabled)).toEqual([true, false]);
   });
 
   it('moves the switch and no figure, so no ratio is ever derived here', () => {
@@ -484,6 +469,27 @@ describe('the optimistic per-tool switch', () => {
     expect(after.servers[0].tokens).toBe(before.servers[0].tokens);
     expect(after.servers[0].disabled_tokens).toBe(before.servers[0].disabled_tokens);
     expect(after.totals).toBe(before.totals);
+  });
+});
+
+describe('pending tool switches', () => {
+  const a = tool({ name: 'a', wire_name: 'mcp__slack__a' });
+  const list = response({ servers: [server({ tools: [a] })] });
+  const key = toolIntentKey('slack', 'mcp__slack__a');
+  const off = (ackedAt: number | null) =>
+    new Map([[key, { serverId: 'slack', wireName: 'mcp__slack__a', disabled: true, ackedAt }]]);
+
+  it('lays a pending switch over the served list', () => {
+    expect(withToolIntents(list, off(null)).servers[0].tools[0].disabled).toBe(true);
+  });
+
+  it('keeps a switch over every list fetched before the answer', () => {
+    expect(intentsAfterServe(off(null), 9).size).toBe(1);
+    expect(intentsAfterServe(off(4), 4).size).toBe(1);
+  });
+
+  it('ends a switch once a list fetched after the answer lands, whatever it says', () => {
+    expect(intentsAfterServe(off(4), 5).size).toBe(0);
   });
 });
 
@@ -505,32 +511,15 @@ describe('every figure comes from the API', () => {
   });
 });
 
-describe('an SSE reload never reverts a switch flipped under it', () => {
-  // The page's write races live inside the component, so this is a source
-  // scan rather than a render. What it pins is the pairing: the SSE-driven
-  // reload reads `localWrites` before it starts and drops its reply if the
-  // counter moved, and BOTH local write paths move it. Drop either half and a
-  // reload fired by the user's own flip reverts the next one (`18874e1da`).
+describe('the page keeps no write fences', () => {
+  // Pending switches end on the engine's acknowledgement (ADR 0437). The write
+  // queue and the counters that guessed at it are gone, and must stay gone.
   const here = dirname(fileURLToPath(import.meta.url));
   const src: string = readFileSync(resolve(here, '../McpServersPage.tsx'), 'utf8');
 
-  it('drops an SSE reload whose reply predates a local write', () => {
-    expect(src).toMatch(/const startedAt = localWrites\.current;/);
-    expect(src).toMatch(/refresh\(\(\) => localWrites\.current === startedAt\)/);
-  });
-
-  it('bumps the counter on the optimistic tool flip', () => {
-    // Before the optimistic paint, so a reload started after it sees the move.
-    expect(src).toMatch(/localWrites\.current\+\+;\s*\n\s*showData\(patchToolDisabled\(/);
-  });
-
-  it('bumps the counter on a row verb', () => {
-    expect(src).toMatch(/localWrites\.current\+\+;\s*\n\s*setPending\(/);
-  });
-
-  it('keeps the counter a ref, so no render is needed to read it', () => {
-    // A reactive signal would be read at render time, and the reply arrives
-    // between renders. It has to be readable exactly when the data lands.
-    expect(src).toMatch(/const localWrites = useRef\(0\);/);
+  it('holds no write counter, write queue or reload predicate', () => {
+    for (const name of ['localWrites', 'stillWanted', 'isLast', 'writes.current']) {
+      expect(src, name).not.toContain(name);
+    }
   });
 });

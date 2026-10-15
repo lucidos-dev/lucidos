@@ -83,9 +83,12 @@ function FileSearchPanel() {
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
 
+  // A switch to another panel while it is open closes it. It opens from any
+  // panel, the Home board included, so the panel it opened over keeps it.
   const active = activeMenuItem.value;
+  const openedOver = useRef(active);
   useEffect(() => {
-    if (active !== 'files') closeFileSearch();
+    if (active !== openedOver.current) closeFileSearch();
   }, [active]);
 
   // Auto-focus on mount (the modal only mounts when open). iOS keeps the

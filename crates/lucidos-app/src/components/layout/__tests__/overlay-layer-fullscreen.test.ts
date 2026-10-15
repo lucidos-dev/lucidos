@@ -37,25 +37,22 @@ const previewsCss = src('../../../styles/panels/previews.css');
 describe('overlayLayerTarget', () => {
   const mount = { nodeName: 'DIV' } as unknown as HTMLElement;
 
-  // Nothing fullscreen is the overwhelmingly common case, and it must produce
-  // the DOM the app root had before this component existed: no wrapper element,
-  // no portal, no new stacking context.
-  it('renders inline when no app is natively fullscreen', () => {
-    expect(overlayLayerTarget(null, false)).toBe('inline');
+  it('sits at its home beside the app shell when no app is natively fullscreen', () => {
+    expect(overlayLayerTarget(null, false)).toBe('home');
   });
 
-  it('portals into the mount inside the fullscreen app panel', () => {
+  it('moves into the mount inside the fullscreen app panel', () => {
     expect(overlayLayerTarget(mount, false)).toBe(mount);
   });
 
   // A client refresh has to find the toast where UiBlockingOverlay's carve-out
-  // expects it: that blocker inerts its own SIBLINGS and skips
-  // `.toast-container` by class, and a portaled toast is not a sibling but a
+  // reaches it: the blocker walks the app root and the layer, and skips
+  // `.toast-container` by class. Inside the fullscreen panel the toast is a
   // descendant of `.app-shell`, which the blocker inerts wholesale. `inert`,
   // unlike `pointer-events`, cannot be overridden by a descendant, so the
   // "Refreshing…" toast would be visible and dead.
-  it('stands down during a client refresh, even with an app fullscreen', () => {
-    expect(overlayLayerTarget(mount, true)).toBe('inline');
+  it('stays home during a client refresh, even with an app fullscreen', () => {
+    expect(overlayLayerTarget(mount, true)).toBe('home');
   });
 });
 
@@ -124,7 +121,7 @@ describe('the overlay group is wired through the layer', () => {
   it('wraps the app-facing host surfaces', () => {
     expect(group).not.toBe('');
     for (const slot of [
-      'ConfirmDialog', 'PromptDialog', 'FilePreviewModalSlot', 'Toast',
+      'ConfirmAndPromptSlot', 'FilePreviewModalSlot', 'Toast',
       'SearchEverywhereSlot', 'ScaleModalSlot', 'FileSearchModalSlot',
       'ImagePopupSlot', 'MessageRoutePanelSlot', 'StepDetailModalSlot',
       // The prompt contains fixed descendants (`will-change: translate`), so
@@ -240,11 +237,12 @@ describe('the portaled layer survives the inert-behind rule', () => {
     expect(modalCss).toMatch(/\.app-overlay-layer\s*\{[^}]*display:\s*contents/);
   });
 
-  // One mount, owned by the panel that has to contain it; the layer is a pure
-  // portal into it and adds no second wrapper.
-  it('is the element the panel renders, filled by the layer', () => {
+  // One mount, owned by the panel that has to contain it. The layer portals
+  // into its own lasting node, never into the mount, because changing a
+  // portal's container remounts every overlay under it (ADR 0437).
+  it('is the element the panel renders, and the layer moves its node into it', () => {
     expect(appUiSrc).toContain('class="app-overlay-layer" data-overlay-layer=""');
-    expect(layerSrc).toContain('createPortal(<>{children}</>, target)');
+    expect(layerSrc).toContain('createPortal(<>{children}</>, overlayLayerNode())');
     expect(layerSrc).not.toContain('class="app-overlay-layer"');
   });
 });

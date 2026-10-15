@@ -22,10 +22,12 @@
 mod agent_surface;
 mod background_task;
 mod dispatcher;
+pub(crate) mod keep_alive;
 mod register;
 
 pub(crate) use agent_surface::CancelEventWaitOutcome;
 pub(crate) use background_task::StoppedTask;
+pub(crate) use keep_alive::KeepAliveBeats;
 /// Re-exported so the knowhow pins in `engine::value_pins_tests` can read it.
 #[cfg(test)]
 pub(crate) use register::MAX_LIVE_WAITS_PER_THREAD;
@@ -37,6 +39,7 @@ pub(crate) use register::{describe_subscriptions, AwaitEventOutcome};
 /// A restated number would silently drift from the refusal the model hits.
 pub(crate) use register::{MAX_RECENT_SUBSCRIPTIONS, RECENT_SUBSCRIPTION_WINDOW_SECS};
 
+use crate::engine::thread_events::not_a_keep_alive_idle_sql;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -373,11 +376,12 @@ pub async fn catch_up_from_watermark(
         // that can include rows belonging to no thread. That is exactly what
         // the column holds, and `aggregate_id::uuid` fails to cast on a system
         // row.
-        let rows: Vec<(Uuid, String, Value, Option<Uuid>, i64)> = sqlx::query_as(
+        let rows: Vec<(Uuid, String, Value, Option<Uuid>, i64)> = sqlx::query_as(&format!(
             "SELECT id, event_type, payload, thread_id, sequence FROM events \
-             WHERE sequence > $1 AND event_type = ANY($2) \
+             WHERE sequence > $1 AND event_type = ANY($2) AND {} \
              ORDER BY sequence LIMIT $3",
-        )
+            not_a_keep_alive_idle_sql("")
+        ))
         .bind(after)
         .bind(&types)
         .bind(CATCH_UP_PAGE)
@@ -493,15 +497,16 @@ pub async fn arming_lookback_matches(
         // thrown off by the engine host's clock. See the doc comment.
         // `thread_id` for the same reason as the catch-up scan above: it is the
         // column that answers "which thread, or none" across mixed rows.
-        let rows: Vec<(Uuid, String, Value, Option<Uuid>, i64, i64)> = sqlx::query_as(
+        let rows: Vec<(Uuid, String, Value, Option<Uuid>, i64, i64)> = sqlx::query_as(&format!(
             "SELECT id, event_type, payload, thread_id, \
                     EXTRACT(EPOCH FROM now() - created)::bigint, sequence \
              FROM events \
              WHERE sequence <= $1 \
                AND created >= now() - make_interval(secs => $2) \
-               AND event_type = ANY($3) \
+               AND event_type = ANY($3) AND {} \
              ORDER BY sequence DESC LIMIT $4",
-        )
+            not_a_keep_alive_idle_sql("")
+        ))
         .bind(upper)
         .bind(window_secs)
         .bind(&types)
@@ -698,10 +703,9 @@ pub struct WaitReentryRequest {
 /// `EXCHANGE_START_TYPES` member on the frontend, so the delivery reads as the
 /// new turn it genuinely is, exactly like the child-completion fan-in.
 ///
-/// Emission order matters. The resolution goes first, so a crash between the
-/// two leaves a *resolved* wait rather than an anchor for a wait that still
-/// looks live. A crash after both is what `lost_wait_reentries` picks up, which
-/// is why the anchor is one recognisable event shape.
+/// The two commit together or not at all, so no resolution stands without its
+/// anchor. A crash after both is what `lost_wait_reentries` picks up, which is
+/// why the anchor is one recognisable event shape.
 pub async fn emit_delivery(
     bus: &crate::engine::event_bus::EventBus,
     wait: &LiveWait,
@@ -709,7 +713,7 @@ pub async fn emit_delivery(
     event_type: &str,
     payload: &Value,
     matched_index: usize,
-) -> Result<WaitReentry, ResolutionEmitError> {
+) -> Result<WaitReentry, Box<dyn std::error::Error + Send + Sync>> {
     emit_resolution(
         bus,
         wait,
@@ -731,7 +735,7 @@ pub async fn emit_expiry(
     bus: &crate::engine::event_bus::EventBus,
     wait: &LiveWait,
     never_seen: &[String],
-) -> Result<WaitReentry, ResolutionEmitError> {
+) -> Result<WaitReentry, Box<dyn std::error::Error + Send + Sync>> {
     emit_resolution(
         bus,
         wait,
@@ -760,11 +764,10 @@ pub async fn emit_cancel(
     wait: &LiveWait,
     cause: crate::engine::thread_events::EventWaitCancelCause,
     actor: Option<crate::engine::thread_events::MessageOrigin>,
-) -> Result<(), ResolutionEmitError> {
-    emit_persisted_with(
-        bus,
-        wait.thread_id,
-        ThreadEvent::EventWaitCanceled {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id: wait.thread_id,
+        event: ThreadEvent::EventWaitCanceled {
             wait_id: wait.wait_id,
             cause,
             // Self-contained, like a delivery: a cancel renders at its own
@@ -773,83 +776,56 @@ pub async fn emit_cancel(
             on: wait.on.clone(),
             reason: wait.reason.clone(),
         },
-        EventMeta::with_actor(actor),
-    )
-    .await
-    .map_err(ResolutionEmitError::Unresolved)?;
+        meta: EventMeta::with_actor(actor),
+    })
+    .await?
+    .ok_or("[EventWait] EventWaitCanceled was not persisted")?;
     Ok(())
 }
 
-/// Why a resolution emit failed, and therefore what the caller owes the wait.
+/// The shared body of [`emit_delivery`] and [`emit_expiry`]: the resolution and
+/// its re-entry anchor, as one atomic emit.
 ///
-/// The two arms are NOT the same recovery. That is the structural
-/// justification `.claude/rules/rust.md` asks for a typed error: the caller
-/// branches on it rather than formatting it.
-///
-/// * `Unresolved` means nothing was written. The persisted `EventWaitStarted`
-///   is still live, so the caller MUST put the wait back in the cache. Without
-///   that, a transient write failure strands the thread. It is gone from the
-///   live set, so nothing can match or expire it. It is still live in the event
-///   store, so only the next boot would re-arm it.
-/// * `AnchorMissing` means the resolution landed but its re-entry anchor did not.
-///   Re-arming there would be wrong (the wait IS resolved, and re-arming would
-///   let it deliver twice). The thread is recovered by the ordinary restart
-///   machinery instead: the resolution is its last word, so the orphan sweep
-///   settles the dangling call and the user gets Continue.
-#[derive(Debug)]
-pub enum ResolutionEmitError {
-    /// Nothing was persisted. The wait is still live.
-    Unresolved(Box<dyn std::error::Error + Send + Sync>),
-    /// The resolution was persisted; its anchor was not.
-    AnchorMissing(Box<dyn std::error::Error + Send + Sync>),
-}
-
-impl std::fmt::Display for ResolutionEmitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unresolved(e) => write!(f, "the resolution was not persisted: {e}"),
-            Self::AnchorMissing(e) => write!(f, "the re-entry anchor was not persisted: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ResolutionEmitError {}
-
-/// The shared body of [`emit_delivery`] and [`emit_expiry`]: resolution first,
-/// then its re-entry anchor.
+/// One `Err` therefore means nothing was written. The persisted
+/// `EventWaitStarted` is still live, so the caller MUST put the wait back in
+/// the cache, or a transient write failure strands the thread.
 async fn emit_resolution(
     bus: &crate::engine::event_bus::EventBus,
     wait: &LiveWait,
     resolution: ThreadEvent,
     wake_text: impl FnOnce() -> String,
-) -> Result<WaitReentry, ResolutionEmitError> {
-    // Whether the anchor can point back at this resolution for a structured
-    // render. Only a DELIVERY carries the matched event's name and payload as
-    // fields. An expiry has nothing but the words its own text already says, so
-    // linking one would buy the client nothing. Read before the emit moves it.
+) -> Result<WaitReentry, Box<dyn std::error::Error + Send + Sync>> {
+    // Only a DELIVERY carries the matched event's name and payload as fields,
+    // so only its anchor links back for a structured render. An expiry's text
+    // already says everything it has.
     let resolution_is_delivery = matches!(resolution, ThreadEvent::EventWaitDelivered { .. });
-    let resolution_id = emit_persisted(bus, wait.thread_id, resolution)
-        .await
-        .map_err(ResolutionEmitError::Unresolved)?;
-
+    let resolution_id = Uuid::new_v4();
+    let anchor_event_id = Uuid::new_v4();
     let text = wake_text();
-    let anchor_event_id = emit_persisted(
-        bus,
+    let anchor = ThreadEvent::PromptInjected {
+        text: text.clone(),
+        // Agent mode with an engine origin, by design: see `MessageOrigin`.
+        mode: crate::engine::thread_events::ActorMode::Agent,
+        origin: Some(reentry_origin(wait, resolution_is_delivery)),
+        injected_message_id: None,
+        // The prose in `text` stays exactly as the model needs it. This is
+        // the same delivery addressed to the client instead, so it can name
+        // the event and fold the payload away.
+        delivered_event_id: resolution_is_delivery.then_some(resolution_id),
+    };
+    let with_id = |id| EventMeta {
+        event_id: Some(id),
+        ..EventMeta::NONE
+    };
+    bus.emit_atomically(
         wait.thread_id,
-        ThreadEvent::PromptInjected {
-            text: text.clone(),
-            // Agent mode with an engine origin, by design: see `MessageOrigin`.
-            mode: crate::engine::thread_events::ActorMode::Agent,
-            origin: Some(reentry_origin(wait, resolution_is_delivery)),
-            injected_message_id: None,
-            // The prose in `text` stays exactly as the model needs it. This is
-            // the same delivery addressed to the client instead, so it can name
-            // the event and fold the payload away.
-            delivered_event_id: resolution_is_delivery.then_some(resolution_id),
-        },
+        vec![
+            (resolution, with_id(resolution_id)),
+            (anchor, with_id(anchor_event_id)),
+        ],
     )
-    .await
-    .map_err(ResolutionEmitError::AnchorMissing)?;
+    .await?
+    .ok_or("[EventWait] the resolution and its anchor were not persisted")?;
     Ok(WaitReentry {
         anchor_event_id,
         text,
@@ -874,40 +850,6 @@ fn reentry_origin(wait: &LiveWait, delivered: bool) -> MessageOrigin {
         watched,
         wait_reason: wait.reason.clone(),
     })
-}
-
-/// Emit one persisted thread event and return its row id.
-///
-/// Errors rather than defaulting when the bus reports no `EmitResult`. Every
-/// event here is persisted, so `None` means the write did not happen. A
-/// synthesized id would anchor a re-entry to a row that does not exist.
-async fn emit_persisted(
-    bus: &crate::engine::event_bus::EventBus,
-    thread_id: Uuid,
-    event: ThreadEvent,
-) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
-    emit_persisted_with(bus, thread_id, event, EventMeta::NONE).await
-}
-
-/// [`emit_persisted`] with caller-supplied meta, for the one resolution that
-/// carries an actor.
-async fn emit_persisted_with(
-    bus: &crate::engine::event_bus::EventBus,
-    thread_id: Uuid,
-    event: ThreadEvent,
-    meta: EventMeta,
-) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
-    let event_type = event.event_type();
-    let emitted = bus
-        .emit(crate::engine::event_bus::BusEvent::Thread {
-            thread_id,
-            event,
-            meta,
-        })
-        .await?;
-    emitted
-        .map(|r| r.event_id)
-        .ok_or_else(|| format!("[EventWait] {event_type} was not persisted").into())
 }
 
 /// How often the deadline sweep looks for expired waits.

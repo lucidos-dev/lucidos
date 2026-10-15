@@ -5,8 +5,7 @@ import type { HeaderActionSpec } from '../../layout/headerActions';
 import {
   threadMap,
   focusedThreadId,
-  archivingThreadIds,
-  applyingNowThreadIds,
+  applyNowRequests,
   applyingChangeIds,
   discardingCCThreadIds,
   cancelingThreadIds,
@@ -24,6 +23,7 @@ vi.mock('../../../store/actions/repositories', () => ({
 }));
 
 import { viewChangeDiff, viewThreadCcDiff } from '../../../store/actions/repositories';
+import { _resetRowIntentsForTesting } from '../../../store/rowIntents';
 
 /** Build a close-set TaggedAction the way resolveThreadActions would. */
 function ta(kind: TaggedAction['kind'], label: string, category: TaggedAction['category'] = 'close'): TaggedAction {
@@ -70,8 +70,8 @@ function makeCCThread(id: string, overrides: Partial<ThreadState['meta']> = {}):
 beforeEach(() => {
   threadMap.value = new Map();
   focusedThreadId.value = null;
-  archivingThreadIds.value = new Set();
-  applyingNowThreadIds.value = new Map();
+  _resetRowIntentsForTesting();
+  applyNowRequests.value = new Map();
   applyingChangeIds.value = new Set();
   discardingCCThreadIds.value = new Set();
   cancelingThreadIds.value = new Set();

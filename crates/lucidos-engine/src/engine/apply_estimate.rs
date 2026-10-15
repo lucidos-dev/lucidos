@@ -4,7 +4,7 @@
 //! Two phases run a whole coding-agent session, so they alone are worth an
 //! estimate: a hardening and a conflict resolution. A plain merge takes seconds.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -24,14 +24,14 @@ const MAX_RUN_SECS: f64 = 4.0 * 3_600.0;
 const FRESH_FOR: Duration = Duration::from_secs(600);
 
 /// The typical duration of one phase, and how many runs it rests on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseEstimate {
     pub typical_secs: u64,
     pub runs: usize,
 }
 
 /// One estimate per slow phase. `None` where too few runs exist.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyEstimates {
     pub hardening: Option<PhaseEstimate>,
     pub resolving_conflict: Option<PhaseEstimate>,

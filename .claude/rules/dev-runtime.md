@@ -9,17 +9,23 @@ paths:
   - "scripts/tail.sh"
   - "scripts/populate.sh"
   - "scripts/new-migration.sh"
+  - "scripts/merge-drivers.sh"
+  - "scripts/replay-merge-drivers.sh"
+  - "scripts/lib/merge_drivers*.sh"
   - "scripts/decommission-legacy-postgres.sh"
   - "scripts/dev-codesign-setup.sh"
   - "scripts/dev-refresh-app-frontend.sh"
   - "scripts/deps-state.sh"
   - "scripts/lib/deps_state*.sh"
   - "scripts/test-engine.sh"
+  - "scripts/codegen.sh"
+  - "scripts/lib/codegen*.sh"
   - "scripts/harden-suites.sh"
   - "scripts/lib/harden_suites*.sh"
   - "scripts/harden-scope.sh"
   - "scripts/lib/harden_scope_test.sh"
   - "scripts/harden-codex-review.sh"
+  - "scripts/lane-report.sh"
   - "scripts/lib/harden_codex_review_test.sh"
   - "scripts/lib/proc_tree.sh"
   - "scripts/test-scripts.sh"
@@ -40,6 +46,7 @@ paths:
   - "scripts/check-adrs.sh"
   - "scripts/check-context-budget.sh"
   - "scripts/check-knowhow-refs.sh"
+  - "scripts/check-audit-scans.sh"
   - "scripts/check-prompt-mirror.sh"
   - "scripts/check-build-script-paths.sh"
   - "scripts/check-eval-not-a-test.sh"
@@ -52,8 +59,14 @@ paths:
   - "scripts/lib/prompt_mirror*.sh"
   - "scripts/lib/hooks_registered_test.sh"
   - "scripts/e2e*.sh"
+  - "scripts/main-check.sh"
+  - "scripts/lib/main_check*.sh"
   - "scripts/lib/workspace*.sh"
+  - "scripts/lib/pg_secret*.sh"
   - "scripts/lib/ports*.sh"
+  - "scripts/lib/storage_root*.sh"
+  - "scripts/lib/flock*.sh"
+  - "scripts/lib/build_watch_exec.pl"
   - "scripts/lib/e2e*.sh"
   - "scripts/lib/gateway_supervisor*.sh"
   - "scripts/lib/engine_supervisor*.sh"
@@ -115,17 +128,18 @@ which a worktree refuses.
 ```bash
 ./scripts/web-dev.sh -w <ws> [-b] [-r]    # DEV start (-b builds engine+gateway; -r release; engine serves built dist/; vite watch)
 ./scripts/run.sh -w <ws>                  # USER start (installer entry point): release engine + one-shot vite build, no watcher
-./scripts/tauri-dev.sh -w <ws> [-b]       # web-dev.sh plus a Tauri window: same gateway stack, window on /<slug>/; the window rebuilds on app Rust changes, scoped by the allow-list in crates/.taurignore
+./scripts/tauri-dev.sh -w <ws> [-b]       # web-dev.sh plus a Tauri window: same gateway stack, window on /<slug>/; the window runs from its launch binary and moves to a new build only at the switch (ADR 0461)
 ./scripts/stop.sh -w <ws>                 # Stop a specific workspace
 ./scripts/status.sh                       # Check running status
 ./scripts/populate.sh -w <ws> [-c]        # Populate test history
 ./scripts/new-migration.sh <description>  # Create timestamped migration
 ./scripts/dev-codesign-setup.sh           # One-time: stable macOS code-signing identity
-./scripts/dev-refresh-app-frontend.sh [-a <app>] [--no-build] [--restart]  # macOS: rebuild dist + sync into an installed .app's Resources/frontend + re-seal (fast frontend-only loop; native path is inert in tauri dev so the packaged app is the only place to test it)
+./scripts/dev-refresh-app-frontend.sh [-a <app>] [--no-build] [--restart]  # macOS: rebuild dist + sync into an installed .app's Resources/frontend + re-seal (fast frontend-only loop; native path is inert in the dev window so the packaged app is the only place to test it)
 ./scripts/test-engine.sh [--full|--fresh] # Engine tests against a dedicated Docker PG
+./scripts/main-check.sh <sha>             # The main check (ADR 0464): the engine suite and every e2e suite on GitHub against a stripped copy of <sha>. The engine runs it after a landing; never run it by hand against the real mirror. Ends with one `main-check verdict <json>` line: pass, fail or no-verdict (exit 76). Tested by scripts/lib/main_check_test.sh
 ./scripts/build-memory-gate.sh [--label "<t>"] [--once]  # The build memory gate (ADR 0351): waits for the host to read GO on the pre-flight gate's rule, exits 72 when it never does. Run by with-build-slot.sh and by each /harden cargo suite. Tested by scripts/lib/host_memory_guard_test.sh and scripts/lib/with_build_slot_test.sh
-./scripts/harden-suites.sh start [--early]|stop|wait|verdict  # /harden's Phase 4.5 suites: selection, the early suite run, and whether its result still counts (ADR 0292). Tested by scripts/lib/harden_suites_test.sh
-./scripts/harden-scope.sh <sha> [<base>]  # /harden Phase 0.4: MERGE_ONLY when every commit since the last hardening is a merge of main, INCREMENTAL when the branch also has commits of its own, else FULL <reason>. Tested by scripts/lib/harden_scope_test.sh
+./scripts/harden-suites.sh start [--early]|stop|wait|verdict  # /harden's Phase 4.5 suites: selection, the early suite run, and whether its result still counts (ADR 0292). `start` asks the engine for the tier, and an integrated sub-thread's fast tier drops every crate's test suite (ADR 0465). The engine's answer wins; HARDEN_TIER applies only when no engine answers. Tested by scripts/lib/harden_suites_test.sh
+./scripts/harden-scope.sh <sha> [<base>]  # /harden Phase 0.4: MERGE_ONLY when every unreviewed commit since the last hardening is a merge, INCREMENTAL when the branch also has commits of its own, else FULL <reason>. HARDEN_REVIEWED_HEADS adds integrated children's hardened heads to what counts as reviewed (ADR 0465). Tested by scripts/lib/harden_scope_test.sh
 ./scripts/harden-codex-review.sh          # /harden Phase 1: the Codex review, retried once. The last line is one status line: verdict returned, NO VERDICT with the upstream cause, or unavailable. Tested by scripts/lib/harden_codex_review_test.sh
 ./scripts/test-scripts.sh                 # Run every scripts/lib/*_test.sh (= make test-scripts): per-suite pass/fail + a total, exits non-zero if any suite fails. Needs no Postgres; separate from `make lint` and the engine suite. See below
 ./scripts/preflight-reclaim-engines.sh    # Pre-flight: stop every engine that should not be running, and prove what it freed. Exits non-zero if one survived. See below
@@ -138,6 +152,7 @@ which a worktree refuses.
 ./scripts/check-prose.sh [--base <ref>]     # Fail if the branch ADDS a comment block over 20 lines, a sentence over 25 words, a paragraph over 6 sentences, or an ISO date in a comment (diff-scoped; /harden Phase 4.5, every diff). Rule + rationale: .claude/rules/prose.md
 ./scripts/check-context-budget.sh [--report] # Fail if the always-loaded instruction set grew past its ceiling, or if a rule meant to be path-scoped went resident (whole-tree; /harden Phase 4.5, every diff). Rationale: docs/agent-config.md
 ./scripts/check-knowhow-refs.sh           # Fail if a system-knowhow file names a repo path or sibling knowhow id that does not exist, cites an event no engine enum has, or uses a severity outside workspace-audit.md's legend, in the root or an audit section (whole-tree; /harden Phase 4.5, every diff). Rule: .claude/rules/system-knowhow.md
+./scripts/check-audit-scans.sh           # Fail if a workspace-audit scan pattern misses a fixture line it must catch, or catches one it must not (whole-tree; /harden Phase 4.5, every diff). Rule: .claude/rules/system-knowhow.md
 ./scripts/check-prompt-mirror.sh [--report]  # Fail if the one deliberately mirrored rule (process safety, ADR 0025) lost either half (whole-tree; /harden Phase 4.5, every diff). Rationale: docs/agent-config.md
 ./scripts/check-build-script-paths.sh [--report] # Fail if a cargo build script bakes its checkout path with compile-time `env!` instead of reading it at run time (whole-tree; /harden Phase 4.5, every diff). Rationale: ADR 0079
 ./scripts/check-eval-not-a-test.sh        # Fail if the context-handling benchmark became reachable from `cargo test` (= make lint-eval; part of make lint / make check). Rationale: ADR 0087 decision 15
@@ -403,10 +418,9 @@ brought clean in one mechanical sweep first (424 of 614 files at the time).
 - **This one cargo call carries no `--locked`**, against ADR 0020's blanket rule.
   `cargo fmt` rejects the flag outright and resolves no dependencies, so there is
   no lockfile for it to drift against. Do not "fix" the inconsistency.
-- **Generated Rust must be emitted already-formatted.** A tracked generated file
-  is squeezed between its staleness test (bytes must equal the emitter's output)
-  and this gate (bytes must be rustfmt-clean), and it cannot be excluded. See
-  `capability_manifest/codegen.rs`, which pipes its output through `rustfmt`.
+- **Generated Rust lives in `OUT_DIR`, never in the tree.** The gate would
+  demand a tracked generated file be rustfmt-clean. The CLI's build script
+  renders its commands there instead (`crates/lucidos-cli/build.rs`).
 - **A toolchain bump can now reformat the tree**, so a `rust-toolchain.toml`
   channel bump may have to carry a sweep. See `.claude/rules/build-release.md`
   § "Toolchain pin".
@@ -422,10 +436,10 @@ brought clean in one mechanical sweep first (424 of 614 files at the time).
 
 **The gateway is the only network door, in dev as well as packaged.**
 
-- Dev engines bind loopback, exactly as packaged ones do. `start_gateway` sets no `LUCIDOS_GATEWAY_ENGINE_LOOPBACK`, so the gateway's loopback default applies, the engine's TLS cert is stripped, and the gateway proxies + health-probes over **http**. This is load-bearing rather than tidy. The gateway authenticates every network caller (ADR 0094), and a network-bound engine port walks straight past pairing. Another device reaches a workspace at `https://<host>:5251/<slug>/`.
+- Dev engines bind loopback, exactly as packaged ones do. `start_gateway` sets no `LUCIDOS_GATEWAY_ENGINE_LOOPBACK`, so the gateway's loopback default applies and the engine's TLS cert is stripped. The gateway proxies and health-probes over the engine's Unix socket, never its TCP port (ADR 0445). This is load-bearing rather than tidy. The gateway authenticates every network caller (ADR 0094), and a network-bound engine port walks straight past pairing. Another device reaches a workspace at `https://<host>:5251/<slug>/`.
 - **Set `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0` only to reproduce the old topology.** It reopens that bypass, so it is not something to reach for casually.
 - **A directly-launched engine is not exempt** (legacy no-gateway and e2e; `tauri-dev.sh` runs the gateway now, and reaches `start_engine` only under `LUCIDOS_NO_GATEWAY`). `apply_dev_engine_bind` (`scripts/lib/workspace.sh`) no longer forces all-interfaces: it pins `LUCIDOS_BIND_ADDR=127.0.0.1` for e2e, and otherwise sets nothing so the engine's own resolver applies. That resolver takes an explicit `LUCIDOS_BIND_*`, then `network.toml`, then loopback. Widening it is a deliberate act rather than a script default. `LUCIDOS_BIND_ADDR` rather than `LUCIDOS_BIND_LOOPBACK`, which also carries the `behind_gateway` meaning.
-- **A wide engine bind now asks for a credential** (`api::local_auth`, ADR 0155). On loopback the engine requires nothing, which is every shipped topology and every e2e run, so the layer is inert there. Off loopback it requires the *local token* on every path but `/api/v1/health`, and the *webhook token* reaches only `POST /api/v1/webhooks/<id>/deliver`. It wraps the OUTERMOST router, so `/app`, `/data` and the frontend fallback are covered, not just `/api/v1`. **`LUCIDOS_PERMISSIVE_CORS` does NOT turn it off**: that variable is a CORS escape hatch and must not double as an auth one. A browser therefore cannot reach a wide-bound engine directly; it comes through the gateway at `/<slug>/`.
+- **A wide engine bind now asks for a credential** (`api::local_auth`, ADR 0155). On loopback the engine requires nothing, which is every shipped topology and every e2e run, so the layer is inert there. Off loopback it requires the *local token* on every path but `/api/v1/health`, and the *hook socket token* reaches only `POST /api/v1/webhooks/<id>/deliver`. It wraps the OUTERMOST router, so `/app`, `/data` and the frontend fallback are covered, not just `/api/v1`. **`LUCIDOS_PERMISSIVE_CORS` does NOT turn it off**: that variable is a CORS escape hatch and must not double as an auth one. A browser therefore cannot reach a wide-bound engine directly; it comes through the gateway at `/<slug>/`.
 - The gateway ITSELF binds all interfaces in dev via `LUCIDOS_GATEWAY_BIND_ALL=1` (set by `start_gateway`). It defaults to loopback-only, its packaged security posture, so dev must opt in explicitly. Otherwise a gateway rebuild+reload returns on `127.0.0.1` only, unreachable for the picker and `/<slug>/` routing from other devices (e.g. an iOS PWA over Tailscale).
 - Packaged (`desktop.rs::spawn_gateway`, `LUCIDOS_PACKAGED=1`) does NOT run `start_gateway`, so the gateway stays loopback-only there.
 - **The engine also refuses a cross-origin browser request** (`api::browser_origin`, layered over all of `/api/v1`). Loopback stops a remote caller, not a page on another origin driving that port out of the user's own browser. Non-browser callers send no fetch metadata and pass; app iframes are same-origin and pass. `LUCIDOS_PERMISSIVE_CORS` turns the layer off.
@@ -433,19 +447,19 @@ brought clean in one mechanical sweep first (424 of 614 files at the time).
 **`web-dev.sh -w <ws>` sequence** (`scripts/lib/workspace.sh`):
 
 1. `swap_ports` — `ENGINE_PORT=VITE_PORT` (per-workspace); `GATEWAY_PORT=5251` (**fixed, shared**; override `LUCIDOS_DEV_GATEWAY_PORT`).
-2. `build_or_find_engine`: builds, **publishes** and signs BOTH `lucidos-engine` and `lucidos-gateway` (plus the `lucidos` CLI). See "Published launch binaries" below: the launch path is `.launch/<profile>/<variant>/`, NOT cargo's shared `target/<profile>/lucidos-engine`.
-3. `seed_gateway_registry` — upserts this workspace into the **machine-global** registry `$HOME/.lucidos/gateway/config/workspaces.json` (NOT per-workspace): refreshes its **direct** engine port + workspace dir, removes any legacy `database_url`, **preserves** any picker-set display name + `autostart` flag. A brand-new entry defaults `autostart:false`.
-4. `start_gateway`: reuse a healthy gateway already on 5251, else start ONE under the **dedicated gateway supervisor** `run_gateway_supervised` (`scripts/lib/gateway_supervisor.sh`). Its env is `LUCIDOS_ENGINE_BIN=<engine>`, `LUCIDOS_STATIC_DIR=<dist>`, `LUCIDOS_API_PORT=5251`, `LUCIDOS_GATEWAY_BIND_ALL=1`, `LUCIDOS_GATEWAY_DATA=$HOME/.lucidos/gateway`, `LUCIDOS_GATEWAY_PG_BACKEND=docker`, `LUCIDOS_GATEWAY_PG_PORT=<shared-pg-port>`, `LUCIDOS_GATEWAY_PG_CONTAINER=lucidos-pg-shared`. Nothing sets `LUCIDOS_GATEWAY_ENGINE_LOOPBACK`, so engines stay on loopback.
+2. `build_or_find_engine`: builds, **publishes** and signs BOTH `lucidos-engine` and `lucidos-gateway` (plus the `lucidos` CLI, and the dev window on a checkout that runs one). See "Published launch binaries" below: the launch path is `.launch/<profile>/<variant>/`, NOT cargo's shared `target/<profile>/lucidos-engine`.
+3. `start_gateway`: reuse a healthy gateway already on 5251, else start ONE under the **dedicated gateway supervisor** `run_gateway_supervised` (`scripts/lib/gateway_supervisor.sh`). Its env is `LUCIDOS_ENGINE_BIN=<engine>`, `LUCIDOS_STATIC_DIR=<dist>`, `LUCIDOS_API_PORT=5251`, `LUCIDOS_GATEWAY_BIND_ALL=1`, `LUCIDOS_GATEWAY_DATA=$HOME/.lucidos/gateway`, `LUCIDOS_GATEWAY_PG_BACKEND=docker`, `LUCIDOS_GATEWAY_PG_PORT=<shared-pg-port>`, `LUCIDOS_GATEWAY_PG_CONTAINER=lucidos-pg-shared`. Nothing sets `LUCIDOS_GATEWAY_ENGINE_LOOPBACK`, so engines stay on loopback.
+4. `adopt_into_gateway`: POSTs `/~/api/v1/control/workspaces/adopt` with this workspace's dir and its **direct** engine port, and sets `GATEWAY_WS_ID` from the answer. The gateway keeps any picker-set display name + `autostart` flag, and a brand-new entry defaults `autostart:false`. A refusal fails the launch and quotes the gateway. Nothing in the scripts writes the **machine-global** registry `$HOME/.lucidos/gateway/config/workspaces.json` (ADR 0438).
 5. `ensure_workspace_engine_running`: POSTs `/~/api/v1/control/workspaces/<id>/restart` to start (or respawn, for Apply) THIS workspace's engine. New workspaces default `autostart:false`, so the gateway's own boot won't spawn them. **It ADOPTS an engine already answering** and skips the POST (below). Either way it then waits for `/<slug>/api/v1/health`, and `record_engine_scheme` writes the scheme the engine answers on into the ports file's `PROTO`. Only the file follows the engine: the shell's `$PROTO` keeps naming the gateway, which keeps its TLS. Otherwise a reused stack keeps `detect_tls`'s https from `.certs/` against a plain-http engine, and every CLI call by workspace name fails its TLS handshake.
 
 ### A launch never tears down a healthy engine (ADR 0219)
 
 **A dev launch adopts a running engine. Only `-b` and `--engine-only` replace a live one.** A launcher teardown is unattributed: a script carries no device, so `notify_restart_intent` skips it. Every in-flight thread then settles as an unattributed `engine_shutdown` abort, and NONE auto-resume. A plain `tauri-dev.sh -w dev` used to do that to a whole workspace, twice per launch.
 
-- **Ownership of a port is what the engine ANSWERS, never what a pidfile says.** `GET /api/v1/health` carries `workspace_path`, and `engine_on_port_serves_workspace` (`scripts/lib/ports.sh`) is the one test. `engine.pid` holds whatever the gateway spawned last. A spawn that dies at once leaves a dead pid there while the healthy engine keeps serving. Both pidfile arms of `_port_is_ours_or_free` then read our own live engine as a foreign squatter.
+- **Ownership of a port is what the engine ANSWERS, never what a pidfile says.** `GET /api/v1/health` carries `workspace_path`, and `engine_on_port_serves_workspace` (`scripts/lib/ports.sh`) is the one test. The gateway's probes make the same comparison, and treat a mismatch as `Foreign` (ADR 0438). `engine.pid` outlives the engine that wrote it, so a pidfile arm alone can still read a stale or reused pid.
 - **Stale means not answering.** `_try_reclaim_stale_lucidos_on_port` refuses any listener that serves health on the port it holds, before the `kill -USR1`. The reclaim itself stays: a genuinely crashed engine still bound to the port would otherwise walk the offset forward and persist the drift. The pinned-port sweep likewise skips the port its own engine holds.
 - **The probe is bounded** (`LUCIDOS_HEALTH_PROBE_TIMEOUT_S`, 2s, https then http), so a wedged socket cannot hang a launch. **A timeout is not an answer**: only a REFUSED connection (curl 7) settles that nothing is there, so the reclaim asks twice otherwise. The costs are lopsided. A wrong "dead" stops a working engine and every thread on it; a wrong "alive" costs a refused port and a message naming the holder.
-- **Adopting also requires the gateway to LIST the workspace** (`gateway_lists_workspace`). The restart POST is the only thing that makes a running gateway re-read `workspaces.json` (`sync_registry_from_disk`), and `adopt_running_engines` walks the in-memory list. So an engine answering for a slug the gateway never heard of still takes the POST. Otherwise nothing routes to it for that gateway's whole life.
+- **The gateway always knows the workspace by the time step 5 runs**, because step 4 registered it in the gateway's memory. So `adopt_running_engines` picks up an engine already answering on its next supervise tick.
 - **`wait_for_workspace_health` uses `curl -f`.** A bare `-s` exits 0 for ANY http response, and the gateway answers an unrouted slug with 404 or 503. So the loop used to print "ready!" on its first tick whichever was true. It cannot hurry a route along either: the gateway lazy-starts on a document navigation only, never on this API call.
 - **`wait_for_workspace_health` goes through `gateway_curl`.** The gateway gates every `/<slug>/api/v1/*` path, health included, so a probe without the local token gets 401. Under `-f` that is a failure on every tick, and each launch waited the full 90 seconds on a healthy engine.
 - **`-b` still replaces the engine AND the gateway**, and `--engine-only` still respawns: that IS the Apply switch. `workspace_engine_restart_is_needed` (`scripts/lib/workspace.sh`, pure + tested) encodes both exceptions.
@@ -455,15 +469,32 @@ brought clean in one mechanical sweep first (424 of 614 files at the time).
 
 `run_gateway_supervised` is NOT the engine's `run_supervised`: the gateway is a machine-global daemon, so its supervisor does `trap '' SIGHUP SIGINT SIGTERM` and is launched `disown`ed, surviving the launching `web-dev.sh` shell + terminal close (the way the packaged Rust `--service` survives under launchd `KeepAlive`). Its only legitimate stop is SIGUSR1 to the gateway child.
 
-**To register an existing directory with a RUNNING gateway, POST `/~/api/v1/control/workspaces/adopt`**, and never write `workspaces.json` yourself. Step 3's `seed_gateway_registry` predates the endpoint and writes that file directly. It gets away with it only because step 4 may be starting the gateway for the first time. A running gateway holds its registry in memory and never re-reads the file. So the entry stays invisible until something calls `sync_registry_from_disk`, which the restart POST in step 5 does. A brand-new entry always takes that POST: step 5 only adopts when an engine is already serving, which a new workspace has not got.
+**Pidfiles are written by their owner, under its owner lock (ADR 0438).** Neither supervisor writes one, and neither may start again.
 
-- Body: `{"dir": "<absolute>", "name": "<optional>", "autostart": <optional, default false>}`.
-- The response carries the allocated `port`. Boot your own engine there and the gateway ADOPTS it, rather than spawning a second one against the same database.
+- The engine takes `<ws>/.lucidos/engine.lock` first in `run()`, blocking, then publishes `engine.pid`. A successor waits there until its predecessor's process has exited.
+- The gateway takes `<gateway data>/gateway.lock` first, without blocking, then publishes `gateway.pid`. A loser exits 75 (`ALREADY_RUNNING_EXIT`), and `run_gateway_supervised` stops on it. So two racing `start_gateway`s leave one gateway, with the pidfile naming it.
+- Both supervisors take `<state_dir> <logfile> <cmd...>` and write only their crash sidecar there. Both compute SIGUSR1's clean exit as `128 + $(kill -l USR1)`: 138 on Linux, 158 on macOS.
+- `start_engine` waits for `engine_pid_of_this_launch`: the pid in `engine.pid` whose parent is this launch's supervisor. A predecessor's leftover file never reads as ready.
+- `reload_gateway` carries the lock's descriptor across its `execv`, so the new image takes the lock back and no other launch can win it in between.
+- `start_gateway`'s port reclaim waits for the old gateway's process to exit, not for its port. A draining gateway frees the port seconds before its lock.
+- Never delete a `.lock` file. A new opener would lock a new inode, and two processes would each hold "the" lock.
+- **A script trusts `engine.pid` only while `engine.lock` is held**, through `engine_live_pid` (`scripts/lib/flock.sh`), and no script deletes the file. A script that signals goes through `engine_pids_to_signal`, which also checks the pid still runs `lucidos-engine`: the lock check and the signal are two steps, and the OS reuses pids. `flock.sh` is the shell's one flock helper, over `perl` because macOS ships no `flock(1)`. `flock_open` takes a lock on a shell descriptor, and it stays held across shell code until `flock_close`. A long-lived child spawned meanwhile inherits it, so close the descriptor in that child.
+- **Probe a lock only where its owner acquires blocking.** A probe briefly holds a shared lock, which makes a non-blocking claim fail. The engine and the build-watch acquire blocking. The gateway does not, so nothing probes `gateway.lock`.
+- `service.sh` carries its own copy of the engine check, because `uninstall.sh` fetches it alone. `service_test.sh` pins the two copies to the same answers.
+- `stop.sh` waits for its engine to exit, on a blocking shared acquire of `engine.lock`, before the build-watch teardown. A draining engine still holds its consumer lock.
+
+**To register an existing directory with a RUNNING gateway, POST `/~/api/v1/control/workspaces/adopt`**, and never write `workspaces.json` yourself. The gateway holds its registry in memory, writes the file under its own mutex, and never re-reads it at runtime. A blank registry file is a parse error, since no writer leaves one (ADR 0438).
+
+- Body: `{"dir": "<absolute>", "name": "<optional>", "autostart": <optional, default false>, "port": <optional>}`.
+- The response carries the entry's `port`. Boot your own engine there and the gateway ADOPTS it, rather than spawning a second one against the same database.
+- `port` is for a caller that allocates ports itself, the dev launcher. It moves a stopped workspace's port. It is a 409 when the workspace is running or starting, and when another entry holds the port. Absent, a new entry gets a free port and an existing one keeps its own.
 - Registration only: no engine, no Postgres, nothing written inside `dir`.
-- Re-adopting the same path keeps the port and the picker-set name + autostart. A same-slug adopt of a DIFFERENT path is a 409 naming both.
-- `crates/lucidos-eval/src/gateway.rs` is the first caller (ADR 0087's arms). It treats every failure as one logged line.
+- Re-adopting the same path keeps the picker-set name + autostart. A same-slug adopt of a DIFFERENT path is a 409 naming both.
+- Callers: `adopt_into_gateway` (`scripts/lib/workspace.sh`, the dev launchers and the e2e gateway) and `crates/lucidos-eval/src/gateway.rs` (ADR 0087's arms), which treats every failure as one logged line.
 
 **Postgres:** one shared Docker container/volume (`lucidos-pg-shared` / `lucidos-pg-data-shared`), one database per workspace (`lucidos_<slug>`). Legacy per-workspace containers are migration sources only until explicitly decommissioned.
+
+**Its password is minted, never `lucidos`.** The cluster listens on loopback TCP, which every local user can reach, so `~/.lucidos/pg-shared-password` (0600) holds a generated secret. `shared_pg_password` (`scripts/lib/pg_secret.sh`) and the gateway mint the same file, and each start converges the role on it. The secret goes into a child's environment, never argv or a file another user can read. The disposable `lucidos-pg-test` container keeps a fixed password: it holds throwaway test databases and listens on loopback alone.
 
 **Routing:** the gateway reverse-proxies `/<slug>/` as a pure streaming forward — strips `/<slug>`, adds `X-Forwarded-Prefix: /<slug>/`, forwards the response untouched (no body rewrite). Gateway-owned surface (picker, control API, health) lives behind the reserved **sigil namespace `/~/`**; `/` smart-redirects into the sole workspace, or serves the picker when there are several. The picker lists **every workspace ever launched** (durable membership); a stopped one stays listed and **lazy-starts** on a proxy hit / explicit open. Workspaces created from the picker get their Docker Postgres provisioned by the gateway (container `lucidos-pg-gw-<id>`).
 
@@ -496,10 +527,11 @@ and `ENGINE_BIN` / `GATEWAY_BIN` / `LUCIDOS_ENGINE_BIN` / the engine's `current_
 
 - **Standalone crate (ADR 0014 §1):** the gateway is `crates/lucidos-gateway/` with NO dependency on `lucidos-engine` — the only network-facing process links proxy + supervise + registry code, not the engine's heavy core. It spawns the engine by path via `LUCIDOS_ENGINE_BIN` (its own `current_exe` is the gateway).
 - **Engine serves the frontend directly:** both the gateway (picker) and every spawned engine serve the built `dist/` from `LUCIDOS_STATIC_DIR`. The engine stamps `<base href="/<slug>/">` into `index.html` from `X-Forwarded-Prefix` (default `/` when hit directly) so relative asset refs resolve back through the gateway. **No Vite in the serving path** (no `dev_proxy`, no `vite preview`).
-- **Apply → background build, then switch** (`docs/plans/2026-07-01-new-engine-version-switch-flow.md`). *Apply* is non-disruptive. For an engine-affecting change (dev), the engine starts a BACKGROUND rebuild via `web-dev.sh --engine-build` while the running engine keeps serving. That is build-only: `build_or_find_engine` + `build_sdk`, with NO kill, respawn or Vite.
+- **Apply → background build, then switch** (`docs/plans/2026-07-01-new-engine-version-switch-flow.md`). *Apply* is non-disruptive. For an engine-affecting change (dev), the engine starts a BACKGROUND rebuild via `web-dev.sh --engine-build` while the running engine keeps serving. That is build-only: `build_or_find_engine` + `generate_build_outputs` (which also leaves the main checkout's generated files current, so the build-watch republishes with them), with NO kill, respawn or Vite.
   - **A second Apply joins the build in flight and never aborts it** (*joined build*, ADR 0412). If HEAD moved past the finished build, the same task builds once more. Only the explicit Rebuild (`POST /api/v1/engine/rebuild`) aborts and restarts it.
   - When the on-disk binary's `ENGINE_BUILD_ID` differs from the running one, the frontend surfaces "New version available → Switch to new version" (`GET /api/v1/engine/version-status` poll).
-  - The **switch** (`/api/v1/restart`) only RESPAWNS onto the already-built binary, with no build at switch. Gateway dev and packaged POST `/~/api/v1/control/workspaces/<id>/restart`, and the gateway SIGUSR1s and respawns the engine, peers untouched. Legacy `LUCIDOS_NO_GATEWAY` dev falls back to `web-dev.sh --engine-only`, a fast near-noop build then respawn. Packaged without a gateway uses launchd.
+  - The **switch** (`/api/v1/restart`) only RESPAWNS onto the already-built binary, with no build at switch. Gateway dev and packaged POST `/~/api/v1/control/workspaces/<id>/restart`, and the gateway SIGUSR1s and respawns the engine, peers untouched.
+  - **In dev the switch moves the gateway and the dev window too** (ADR 0461). With a newer gateway on disk, the gateway posts the restart intent, re-execs, and the new image respawns the engine. The dev window then re-execs onto its newer published binary once its engine started after it. Legacy `LUCIDOS_NO_GATEWAY` dev falls back to `web-dev.sh --engine-only`, a fast near-noop build then respawn. Packaged without a gateway uses launchd.
   - Boundary "Switched to new version" events are emitted at ACTUAL teardown by `main.rs::shutdown_signal`, never during the build. A full `-b` still stops the gateway so a rebuilt gateway binary is used.
 - **Consistent version signal + self-heal** (`docs/plans/2026-07-03-engine-version-switch-selfheal.md`). The "New version available" surface used to be driven ONLY by `version-status.update_available` (on-disk binary build-id ≠ running). Dead-end when the background rebuild **fails or never completes** (e.g. the concurrent-`target/`-build failure below): binary stays stale ⇒ `update_available` stays false ⇒ NO Switch — while the frontend-only-Apply INV-A veto (`engine_source_matches_head`) simultaneously and correctly defers every frontend-only Apply to that never-arriving Switch, so all co-located workspaces serve stale JS with no actionable UI. Two fixes:
   - **Consistent signal.** `version-status` also reports **`source_behind_head`** — engine SOURCE is behind HEAD by a restart-requiring change, via the SAME `engine_source_matches_head` git classifier the veto uses, so a new engine version is discoverable before a fresh binary exists. TTL-cached (`engine_version::source_behind_head`, `SOURCE_BEHIND_TTL`) so the `git diff` runs at most once per interval regardless of client count. Frontend surfaces it as a "New engine version pending — Rebuild" toast (`checkEngineVersion`, gated on `!update_available` so it never nags once a switchable binary exists), plus a "Retry build" action on the build-failed toast. `POST /api/v1/engine/rebuild` is the manual trigger behind both (no-op packaged). The pending-Rebuild toast is ALSO gated on `!shared_build_in_progress` (see peer-build spinner below).
@@ -567,24 +599,21 @@ The dot also renders on the **reload icon in the workspace switcher** (control p
 
 **`public/` synced before the SW stamp (sw.js / manifest / favicons).** Each fresh `vite build` copies `publicDir` into the outDir, but the `lucidos-sync-public-dir` plugin (`crates/lucidos-app/vite.config.ts`) re-copies `public/` into the staging outDir on every `writeBundle`, ordered BEFORE `lucidos-sw-stamp`, so the re-copied `sw.js` is guaranteed present for its `BUILD_ID` stamp regardless of plugin ordering. (Historically this also covered the old `vite build --watch`, which copied `publicDir` only on the INITIAL build — vitejs/vite#18655 — so an incremental rebuild plus the atomic-dist swap WIPED `sw.js`/`manifest.json`/favicons from the served `dist/`, breaking SW registration and 404ing the PWA manifest. Fresh-build-per-change has no incremental rebuilds, but the plugin stays as the ordering backstop.) Production builds (no env var) copy `public/` correctly in one shot.
 
-**Shared build-watch (checkout-level singleton).** `dist/` (plus `dist.staging`/`dist.prev`) is a SINGLE directory per checkout — every workspace launched from the same checkout serves the same `crates/lucidos-app/dist/`. So the build-watch is a checkout-level singleton, NOT per workspace: pid + log at `crates/lucidos-app/.build-watch/{pid,log}` (gitignored), tracked by `build_watch_pidfile`/`build_watch_log` in `scripts/lib/workspace.sh`. The first `--built` workspace to start it owns it; later launches **reuse** it.
+**Shared build-watch (checkout-level singleton).** `dist/` (plus `dist.staging`/`dist.prev`) is a SINGLE directory per checkout — every workspace launched from the same checkout serves the same `crates/lucidos-app/dist/`. So the build-watch is a checkout-level singleton, NOT per workspace, held by three locks in `crates/lucidos-app/.build-watch/` (gitignored) beside its `pid` and `log` (ADR 0438). The first `--built` launch to start it owns it; later launches **reuse** it.
 
-- **Reuse rule** (`start_frontend_built`): if a healthy watch exists (live pid + `dist/index.html`) AND either another workspace is already serving this checkout (`running_frontend_workspaces_in_project` non-empty) OR this isn't an explicit `-b`, reuse without rebuilding; otherwise (re)build and take ownership — covering a dead watch and the **solo `-b`** rebuild.
-- **Why:** the old `start_frontend_built` did `rm -rf dist` + a fresh build on EVERY startup — needless I/O on the shared tree. The determinism guard (`lucidos-sw-stamp` hashes asset names, so identical source → identical `BUILD_ID` → byte-identical `sw.js`) means a rebuild only changes the id when source actually differs. (This *used* to also toast every other workspace "New version available", because peers served the live `dist/` and their SW saw a new worker on EVERY rebuild including a no-op one. Impossible now — each engine serves its own pinned snapshot, and the peer sync only advances/toasts when the served `sw.js` BUILD_ID actually changed (`source_rebuilt`) AND advancing is INV-A-safe. The reuse rule stands purely as a build-I/O efficiency measure.)
-- **Teardown is ref-counted, and the authority is a LIVE ENGINE, not the marker file** (ADR 0226). `cleanup_processes` and `stop.sh` call `teardown_shared_build_watch_if_idle`, which takes two keep-alive votes and needs only one to spare the watch. First the `frontend.pid` scan (`running_frontend_workspaces_in_project`); this workspace's marker is removed before the call so it doesn't count itself. Then **`engines_serving_checkout_dist`**, the authoritative one, which asks the process table for a live `lucidos-engine` whose `LUCIDOS_STATIC_DIR` lies inside this checkout.
-
-  Only `start_frontend_built` writes a marker, so an engine the GATEWAY started carried none and was invisible: a lazy start, the restart control API, every in-app Switch. A stop of an unrelated workspace then killed the watch under a live one and froze `dist/` for five hours. Three rules hold the fix up:
-  - **An answer that could not be established is UNKNOWN and never authorizes the kill.** A leaked node process is the cheap failure; this incident is the expensive, silent one. That binds at BOTH probes: the process listing, and the per-engine `ps -E` read. Guarding only the listing left the same hole one level down, where a live engine whose environment will not read counted as idle. `PATH` is the test for a readable environment, and ADR 0226 has the three outcomes.
-  - **Selection is on `argv[0]`** (ADR 0025), and here that is not merely the standing rule. A coding-agent session is forked BY an engine, so it genuinely carries `LUCIDOS_STATIC_DIR`. Matching the command line would count every session as an engine, and the watch would never be torn down at all.
-  - **A `dist/` that will not resolve is compared lexically, never dropped.** The atomic publish renames `dist.staging` onto `dist/`, so it is briefly absent, and that window must not become a teardown window.
-
-  Every refusal prints which vote spared the watch, because a silent one is what made the incident take hours to read back.
-- **The watch installs missing deps.** A coding agent's Apply can land a `package-lock.json` the checkout never installed. `ensure_npm_deps` refuses to install while a frontend is running, by design. Every build afterwards then fails to resolve the new import, while `dist/` quietly stops publishing for every workspace. So before each build the watch compares `scripts/deps-state.sh fingerprint` against `node_modules/.lucidos-deps-stamp`, and runs `npm ci` on drift. It skips that when the same script's `dev-server-running` probe reports a live Vite server, the one case `ensure_npm_deps` exists to protect.
-- **That probe excludes the watch's own pid**, on purpose. `start_frontend_built` records `FRONTEND_PID = BUILD_WATCH_PID`, so asking `running_frontend_workspaces_in_project` plainly would refuse every install.
-- **The watch serves an entry chunk over its budget, and says so.** Every other single-shot build fails on it (`vite/entryChunkBudget.ts`, ADR 0288). Here that would strand every later Apply. The watch runs `node <vite>/bin/vite.js build` directly and sets `LUCIDOS_DEV_BUILD_WATCH` to its own pid. The plugin reports instead of failing only when that value is its parent's pid, so a leaked variable cannot loosen any other build. The measurement lands in `status.json` as `entryChunk`, and an alert goes out on each budget edge.
-- **Every build outcome is recorded, and the edges are announced.** `.build-watch/status.json` carries `{ok, at, error, skippedInstall, entryChunk}` after each build. On the transition into failing, and once again on recovery, the watch runs `lucidos notify`. `LUCIDOS_CLI_BIN` is passed by `start_frontend_built`, and `LUCIDOS_WORKSPACE` is already exported. One alert per streak, since a build fires per change.
+- **Reuse rule** (`start_frontend_built`): a running watch is always reused, and a launch starts one only when none runs. A live watch already serves current source, so neither a peer launch nor a `-b` replaces it. To pick up an edit to `dev-build-watch.mjs` itself, stop the watch (`stop.sh` on the checkout's last workspace, or `kill $(cat crates/lucidos-app/.build-watch/pid)`).
+- **Why reuse:** a fresh build on every startup was needless I/O on the shared tree. `lucidos-sw-stamp` hashes asset names, so identical source gives an identical `BUILD_ID` and a byte-identical `sw.js`. Each engine also serves its own pinned snapshot. So the reuse rule is purely a build-I/O efficiency measure.
+- **Three locks, one role each:**
+  - `watch.lock` is the watcher's owner lock, held for its whole life. `scripts/lib/build_watch_exec.pl` takes it blocking, clears `dist/` as the owner, publishes `.build-watch/pid`, and `exec`s node with the descriptor kept open. The kernel drops it when the watcher dies.
+  - `start.lock` is held by a launcher while it decides whether to spawn. The wrapper inherits it and releases it once it owns `watch.lock`. So a second launcher never sees "no watch" before the first one's watcher holds the lock. Two launches start one watcher, and only that one deletes `dist/`.
+  - `consumers.lock` is shared by every engine serving this checkout's `dist/`, and by a launcher until the watch it started or reused has published `dist/`. The engine takes it first thing in `run()`, before it waits for its predecessor, when `dev-build-watch.mjs` sits beside its `LUCIDOS_STATIC_DIR`. So a respawn never leaves a gap with no consumer.
+  - A watch started before these locks existed holds none of them. `stop_pre_lock_build_watch` stops it once, on the first launch, so a second watcher never runs beside it (temporary measure, § "Pre-lock engine pidfile fallback").
+- **Teardown is one exclusive, non-blocking try on `consumers.lock`** (`teardown_shared_build_watch_if_idle`, from `cleanup_processes` and `stop.sh`). Granted means no engine serves this checkout and no launch is starting the watch, and none can register until it lets go. It then signals the watcher and waits on `watch.lock` for its exit, so a launch that comes next never reuses a dying watch. Every refusal says so. This replaced ADR 0226's process-table vote and the `frontend.pid` ref-count, which an engine the gateway spawned could not cast.
+- **The watch installs missing deps.** A coding agent's Apply can land a `package-lock.json` the checkout never installed. `ensure_npm_deps` refuses to install while this checkout's build-watch runs (`watch.lock` held), by design. Every build afterwards would then fail to resolve the new import, while `dist/` quietly stops publishing for every workspace. So before each build the watch compares `scripts/deps-state.sh fingerprint` against `node_modules/.lucidos-deps-stamp`, and runs `npm ci` on drift.
+- **The watch serves a build over a chunk budget, and says so.** Every other single-shot build fails on the entry chunk or the first-paint set passing its budget (`vite/chunkBudget.ts`, ADR 0288, ADR 0436). Here that would strand every later Apply. The watch runs `node <vite>/bin/vite.js build` directly and sets `LUCIDOS_DEV_BUILD_WATCH` to its own pid. The plugin reports instead of failing only when that value is its parent's pid, so a leaked variable cannot loosen any other build. Each budget's measurement lands in `status.json` under `chunkBudgets`, and an alert goes out on each edge of each budget.
+- **Every build outcome is recorded, and the edges are announced.** `.build-watch/status.json` carries `{ok, at, error, skippedInstall, chunkBudgets}` after each build. On the transition into failing, and once again on recovery, the watch runs `lucidos notify`. `LUCIDOS_CLI_BIN` is passed by `start_frontend_built`, and `LUCIDOS_WORKSPACE` is already exported. One alert per streak, since a build fires per change.
 - **A failed alert is logged and swallowed:** the watch publishing the frontend matters more than any alert it can send. `engine::frontend_refresh` reads the same status file when its post-Apply wait times out, so the stranded toast names the build error instead of guessing. Rationale: `docs/plans/2026-08-21-a-wedged-frontend-build-heals-itself-and-shouts.md`.
-- **The status file says why the last build failed; the PIDFILE beside it says whether anything is still building.** Two questions, two files, and conflating them is what stranded a workspace silently. `status.json` records the last COMPLETED build, so a watch that dies leaves a healthy `{"ok": true}` behind. The engine then reads no error, and the stranded toast falls through to wording that promises the change will appear on its own. So `read_build_watch_state` classifies the pidfile as Running, Stopped or Unknown, and only **Stopped** travels, as `build_watch_stopped` on `FrontendUpdateStranded`. Unknown is packaged serving and e2e's one-shot build, neither of which ever had a watch to lose (`docs/glossary.md` § Shared build-watch).
+- **The status file says why the last build failed; `watch.lock` beside it says whether anything is still building.** Two questions, two files, and conflating them is what stranded a workspace silently. `status.json` records the last COMPLETED build, so a watch that dies leaves a healthy `{"ok": true}` behind. The engine then reads no error, and the stranded toast falls through to wording that promises the change will appear on its own. So `read_build_watch_state` classifies the watch as Running (lock held), Stopped or Unknown, and only **Stopped** travels, as `build_watch_stopped` on `FrontendUpdateStranded`. Unknown is packaged serving and e2e's one-shot build, neither of which ever had a watch to lose (`docs/glossary.md` § Shared build-watch).
 
 **No stale-CSS wedge (fresh build per change).** The build-watch (`dev-build-watch.mjs`) runs a CLEAN `vite build` in a fresh child process on every change (`fs.watch` recursive over `src/`, `public/`, `index.html`, `vite.config.ts`, and the aliased SDK `src/`, debounced 200ms; a change mid-build is coalesced and rebuilt after). A fresh process has no long-lived Rollup incremental cache to corrupt, so the failure mode this section used to guard against — a days-old `vite build --watch` re-emitting fresh JS while serving a FROZEN CSS bundle (renamed/new classes unstyled, or a reverted color silently still showing), invisible to mtime/health checks — **can no longer happen**. The previous mitigations are therefore **removed**: the warn-only `cssStalenessGuard` plugin + `src/dev/cssWedgeDetect.ts`, and the 6h `BUILD_WATCH_MAX_AGE_S` age-recycle. Each build still stages into `dist.staging/` and publishes onto `dist/` only on success.
 
@@ -598,11 +627,18 @@ The **Client** row is deliberately NOT the engine's CalVer. It was, via a `virtu
 
 The old `--hmr` live-Vite-dev-server path was **removed** (ADR 0014): no Vite in the serving path to proxy to. The build-watch skips `tsc --noEmit` — type errors surface at the explicit build / in CC harden.
 
-**Engine-restart interaction (the load-bearing part).** A CC Apply restarts the engine via `web-dev.sh --engine-only` (`crates/lucidos-engine/src/api/history.rs`), which sets `ENGINE_ONLY` and **exits before `start_vite`** — the restart never touches the frontend. `kill_stale_processes` skips the frontend-marker release when `ENGINE_ONLY` is set (and never touches the checkout-level shared build-watch on any per-workspace restart), so the running build-watch survives and the new engine re-serves the same `dist/`; the build-watch picks up the merged source and rebuilds on its own.
+**Engine-restart interaction (the load-bearing part).** A CC Apply restarts the engine via `web-dev.sh --engine-only` (`crates/lucidos-engine/src/api/history.rs`), which sets `ENGINE_ONLY` and **exits before `start_vite`** — the restart never touches the frontend. `kill_stale_processes` never touches the checkout-level shared build-watch on a per-workspace restart. So the running build-watch survives, and the new engine serves the same `dist/`. The build-watch picks up the merged source and rebuilds on its own.
 
-`build_sdk` still runs on this path (before the `ENGINE_ONLY` early-exit), so if the applied change bumped a dependency, `ensure_npm_deps` would want to reinstall the shared workspace `node_modules` — which it must NOT do under a live build-watch (corrupts Vite) and must NOT hard-fail over either (that abort left the workspace with no engine at all — the "workspace didn't come up after restart" bug). Under `ENGINE_ONLY` it **skips the install, warns, and returns 0**, so the engine comes up on the existing working `node_modules`; the stamp is left un-updated, so the deferred deps install on the next *full* restart (stop + `web-dev.sh`). The **`--engine-build` background rebuild** (`ENGINE_BUILD_ONLY`) gets the SAME treatment for the same reason: it too runs `build_sdk` while the frontend is live, and a hard-fail there aborts the whole background build — surfacing as a false "New engine version failed to build" even though the engine binary compiled fine (the on-disk binary is already written by then, so the next Apply also mis-fires "New version available" before its build finishes). Both `ENGINE_ONLY` and `ENGINE_BUILD_ONLY` are "keep the running frontend alive" paths, so `ensure_npm_deps` skips the install for either. (The `npm ci`-never-`npm install` rule that `ensure_npm_deps` implements is `.claude/rules/build-release.md` § "Lockfile determinism", ADR 0020.)
+`generate_build_outputs` still runs on this path, before the `ENGINE_ONLY` early exit. So when the applied change bumped a dependency, `ensure_npm_deps` would reinstall the shared `node_modules`.
 
-Implementation: `start_frontend_built` in `scripts/lib/workspace.sh` — checkout-level build-watch pid in `crates/lucidos-app/.build-watch/pid`, reused across workspaces; each workspace's `frontend.pid` records that shared pid as a ref-count marker; `release_frontend_marker` removes the file without killing the shared watch; `teardown_shared_build_watch_if_idle` (called by `cleanup_processes` and `stop.sh`) kills it only when no workspace of the checkout is left serving. The e2e harness (`scripts/lib/e2e.sh`) does NOT use the build-watch — one-shot `vite build`, legacy engine serves the resulting `dist/` via `LUCIDOS_STATIC_DIR`.
+- **It must not install under a live build-watch,** which would break the build it is running.
+- **It must not hard-fail either.** That abort once left the workspace with no engine at all.
+- **So under `ENGINE_ONLY` it skips the install, warns, and returns 0.** The engine comes up on the existing `node_modules`. The stamp stays un-updated, so the build-watch installs the deferred deps before its next build.
+- **The `--engine-build` background rebuild (`ENGINE_BUILD_ONLY`) gets the same treatment.** It too runs `generate_build_outputs` while the frontend is live. A hard-fail there aborts the whole background build and reports a false "New engine version failed to build", although the binary compiled.
+
+The `npm ci`-never-`npm install` rule that `ensure_npm_deps` implements is `.claude/rules/build-release.md` § "Lockfile determinism", ADR 0020.
+
+Implementation: `start_frontend_built` and `teardown_shared_build_watch_if_idle` in `scripts/lib/workspace.sh`, the wrapper `scripts/lib/build_watch_exec.pl`, and the paths in `lucidos_owner_lock::build_watch`, which the engine reads. Tested by `scripts/lib/workspace_test.sh`. The e2e harness (`scripts/lib/e2e.sh`) does NOT use the build-watch — one-shot `vite build`, legacy engine serves the resulting `dist/` via `LUCIDOS_STATIC_DIR`.
 
 **e2e's one-shot build is staleness-aware, not existence-aware.** `ensure_frontend_built` (`scripts/lib/e2e.sh`) rebuilds when `dist/index.html` is **missing OR older than any build input**, and prints which branch it took (`Frontend build: REBUILDING …` / `REUSED …`) so an unattended nightly log states what the suite actually tested. The input set mirrors the watch list in `crates/lucidos-app/dev-build-watch.mjs` — `src/`, `public/`, `index.html`, `vite.config.ts`, `tsconfig.json`, `package.json`, the aliased workspace-local `packages/lucidos-sdk/src/`, and `crates/lucidos-engine/VERSION` (baked in by the engine-version plugin) — so a new build input must be added in BOTH places. It additionally covers the **repo-root `package.json` + `package-lock.json`**: npm workspaces hoist to the root and `npm ci` restores `node_modules` from the root lockfile, so a dependency bump changes the bundle without touching a single app file (the same two files `_deps_fingerprint` keys the install on). The check is one `find … -newer … -quit` (mtime, first hit wins), not a tree hash: git stamps checkout/merge time onto every file it writes, so moving frontend source forward always leaves it newer than a `dist/` built before it, and the failure direction is a redundant rebuild rather than a silently stale run. The old guard was `[ ! -f dist/index.html ]`, which ran the whole browser suite against a stale frontend and reported green whenever a checkout's `dist/` predated its frontend commits.
 
@@ -613,17 +649,27 @@ Implementation: `start_frontend_built` in `scripts/lib/workspace.sh` — checkou
 signal — it ignores SIGTERM). The gate on that path is
 `is_protected_host_pid`, and two of its four arms are **not defeatable by the
 caller**: the pid must not be this process or an ancestor of it (cached `ps -o
-ppid=` walk from `$$`), and `pid <= 1` is always refused. The other two arms —
-`LUCIDOS_HOST_PID` / `LUCIDOS_FRONTEND_PID`, and a pidfile scan of
-`<home>/workspaces/*/.lucidos/{engine,frontend}.pid` — stay, and that scan
-covers the **password-database home** as well as `$HOME`.
+ppid=` walk from `$$`), and `pid <= 1` is always refused. The other two arms
+stay. One reads `LUCIDOS_HOST_PID` and `LUCIDOS_FRONTEND_PID` (the
+build-watch). The other scans `<home>/workspaces/*/.lucidos/engine.pid`,
+trusting a pid only while its engine holds `engine.lock`. That scan covers the
+**password-database home** as well as `$HOME`.
+
+**The allocation is one critical section** (ADR 0438). `allocate_ports` holds an
+exclusive flock on `$LUCIDOS_PORT_REGISTRY.lock` across lookup, next offset, the
+walk and the save, health probes and reclaims included. A concurrent launch
+waits and says so. The walk refuses an offset another registry entry owns, even
+when that workspace's engine is down. `ports_test.sh` forces the interleaving
+with FIFOs and the `_flock_waiting` hook.
 
 Two rules follow, and both are load-bearing:
 
 - **Sandboxing `HOME` does NOT disarm host protection**, by design. It still
   isolates the port *registry* (`LUCIDOS_PORT_REGISTRY` is `$HOME`-relative).
-  A test that needs a pid to be *unprotected* must use a dead or synthetic one
-  — the `kill -0` liveness gate on the pidfile arms is what makes that work.
+  A test that needs a pid to be *unprotected* must use one no engine lock
+  vouches for. A test that needs one *protected* holds the lock with
+  `start_lock_holder` (`scripts/lib/flock_test_support.sh`), a holder process
+  it spawned and releases by FIFO.
 - **A process-selection guard matches `argv[0]`, NEVER the whole command line.**
   A process is a Playwright browser child if the BINARY IT RUNS lives under the
   browsers cache; what its arguments happen to say is irrelevant. A substring

@@ -83,6 +83,48 @@ export interface ApplyEstimates {
   resolving_conflict: PhaseEstimate | null;
 }
 
+/** What the open lane batch is doing. Mirrors the engine's `LaneStep`:
+ *  `landing` only from its lane thread's clean finish until `main` moves. */
+export type LaneStep = 'resolving' | 'landing';
+
+/** The lane batch resolving now. Mirrors the engine's `OpenBatchSnapshot`. */
+export interface LaneOpenBatch {
+  batch_id: string;
+  /** The coding-agent thread that resolves the batch. */
+  lane_thread_id: string;
+  /** Change ids still to land, in batch order. */
+  members: string[];
+  step: LaneStep;
+}
+
+/** The *landing lane* as it stands. Mirrors the engine's `LaneSnapshot`. */
+export interface LandingLane {
+  open_batch: LaneOpenBatch | null;
+  /** Change ids waiting for the next batch, in landing order. */
+  waiting: string[];
+  /** The queue waits for an Apply All press to hand over the rest of its
+   *  changes, with no batch open (ADR 0480). */
+  gathering: boolean;
+}
+
+/** Where the *main check* stands. Mirrors the engine's `MainCheckState`. */
+export type MainCheckState = 'idle' | 'running' | 'passed' | 'red' | 'unavailable';
+
+/** The *main check*: the GitHub run on a stripped copy of `main` after
+ *  changes landed. Mirrors the engine's `MainCheckSnapshot`; a field a state
+ *  has nothing for is absent. */
+export interface MainCheck {
+  state: MainCheckState;
+  check_id?: string;
+  from_sha?: string;
+  to_sha?: string;
+  run_url?: string;
+  /** The one fix thread a red check opened. */
+  fix_thread_id?: string;
+  /** What failed when red; why the check cannot run when unavailable. */
+  summary?: string;
+}
+
 /** One thread's contribution to the current restart-required toast: derived
  *  server-side from applied-but-not-yet-restarted changes since engine start. */
 export interface ApiRestartGroup {
@@ -107,7 +149,7 @@ export interface ChangesState {
    *  events aren't replayed. */
   apply_all_in_progress: boolean;
   /** The running batch's members in apply order and what each is doing, so a
-   *  reload keeps "change N of M". Null while no batch runs, and briefly after
+   *  reload keeps "N of M done". Null while no batch runs, and briefly after
    *  an engine restart. Absent on an older payload, as are the two member
    *  lists on an engine from before ADR 0314. */
   apply_all_batch?: {
@@ -123,6 +165,12 @@ export interface ChangesState {
   /** How long hardening and conflict resolution usually take here. Absent on
    *  an older payload. */
   apply_estimates?: ApplyEstimates;
+  /** The landing lane. Empty briefly after an engine restart, until the lane
+   *  is rebuilt. Absent on an older payload. */
+  landing_lane?: LandingLane;
+  /** The main check. Idle briefly after an engine restart, until it is
+   *  rebuilt. Absent on an older payload. */
+  main_check?: MainCheck;
 }
 
 export async function fetchChanges(params?: {
@@ -136,7 +184,7 @@ export async function fetchChanges(params?: {
   return json(`${API}/changes${q ? `?${q}` : ''}`);
 }
 
-export type ApplyStatus = 'applied' | 'noop' | 'hardening' | 'conflict';
+export type ApplyStatus = 'applied' | 'noop' | 'hardening' | 'conflict' | 'queued';
 
 /** Response body for POST /api/v1/changes/:id/apply. Mirrors the Rust
  *  `ApplyResult` struct in `crates/lucidos-engine/src/engine/types.rs`. */

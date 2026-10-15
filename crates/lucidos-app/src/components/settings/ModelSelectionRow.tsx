@@ -10,6 +10,7 @@ import type { ModelChoice, TierChoice } from '../../store/modelSelection';
  *  eight. */
 export function ModelSelectionRow({
   label,
+  fieldLabel,
   anchor,
   nested,
   explainer,
@@ -25,6 +26,8 @@ export function ModelSelectionRow({
   onChange,
 }: {
   label: string;
+  /** The picker's own name, when `label` heads more than the picker. */
+  fieldLabel?: string;
   /** `data-search-anchor` for the row. */
   anchor?: string;
   /** The row sits under a parent control, so it indents. Layout only. */
@@ -57,7 +60,7 @@ export function ModelSelectionRow({
         {detail && <span class="list-row-details list-row-details-prose">{detail}</span>}
       </span>
       <ModelSelectionField
-        label={label}
+        label={fieldLabel ?? label}
         models={models}
         vocabulary={vocabulary}
         model={model}

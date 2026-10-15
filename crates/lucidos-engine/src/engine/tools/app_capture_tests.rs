@@ -1,7 +1,8 @@
 //! Which device answers a `capture_app` / `refresh_app` call.
 //!
-//! Only the turn's last used device may answer. A quick "No app UI is currently
-//! open" from another device must never beat the real capture.
+//! Only the target device may answer: the one the agent named, else the turn's
+//! last used device. A quick "No app UI is currently open" from another device
+//! must never beat the real capture.
 
 use super::{
     app_ui_tool_impl, parse_save_target, resolve_capture, CaptureRefusal, PendingCaptures,
@@ -23,7 +24,8 @@ const PHONE: &str = "device-phone";
 const LAPTOP: &str = "device-laptop";
 
 /// An error in the shape a page with no app frame sends back (`captureAppUIInner`).
-const NO_APP_OPEN: &str = "Error: No app UI is currently open. Ask the user to open the app.";
+const NO_APP_OPEN: &str =
+    "Error: No app UI is currently open. Open it with navigate_ui (target=app, app_id).";
 
 async fn setup() -> (Arc<EventBus>, Receiver<EmittedEvent>, PgPool, String) {
     let (pool, db) = setup_test_db().await;
@@ -340,6 +342,85 @@ async fn with_no_last_used_device_any_page_may_answer() {
     next_capture(&mut rx, thread_id).await;
     let out = tool.await.expect("tool task");
     assert!(out.contains("no last used device"), "{out}");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A named device overrides the last used one: only the named device may
+/// answer, and its error says the agent named it.
+#[tokio::test]
+async fn a_named_device_answers_instead_of_the_last_used_one() {
+    let (bus, mut rx, pool, db) = setup().await;
+    let pending: Arc<PendingCaptures> = Arc::default();
+    let thread_id = Uuid::new_v4();
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let artifacts = Arc::new(ArtifactManager::new(workspace.path().to_path_buf()).unwrap());
+    let args = json!({ "app_id": "habit-tracker", "device": PHONE });
+
+    let tool = start_with(&bus, &pool, &pending, &artifacts, args.clone(), thread_id);
+    let (request_id, scoped_to) = next_capture(&mut rx, thread_id).await;
+    assert_eq!(
+        scoped_to.as_deref(),
+        Some(PHONE),
+        "the request names the phone"
+    );
+    assert_eq!(
+        resolve_capture(&pending, &request_id, Some(LAPTOP), answer("", NO_APP_OPEN)),
+        Err(CaptureRefusal::OtherDevice),
+        "the last used laptop must not answer for the phone"
+    );
+    resolve_capture(
+        &pending,
+        &request_id,
+        Some(PHONE),
+        answer("c2NyZWVu", "<main/>"),
+    )
+    .expect("the phone answers its own request");
+    assert!(tool
+        .await
+        .expect("tool task")
+        .starts_with("[APP_CAPTURE:c2NyZWVu]"));
+
+    let tool = start_with(&bus, &pool, &pending, &artifacts, args, thread_id);
+    let (request_id, _) = next_capture(&mut rx, thread_id).await;
+    resolve_capture(&pending, &request_id, Some(PHONE), answer("", NO_APP_OPEN))
+        .expect("the phone answers");
+    let out = tool.await.expect("tool task");
+    assert!(
+        out.starts_with("Error from \"My iPhone\", the device you named:"),
+        "{out}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// An unknown device is refused before any page is asked, with the text
+/// `navigate_ui` gives.
+#[tokio::test]
+async fn an_unknown_device_asks_no_page() {
+    let (bus, mut rx, pool, db) = setup().await;
+    let pending: Arc<PendingCaptures> = Arc::default();
+    let thread_id = Uuid::new_v4();
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let artifacts = Arc::new(ArtifactManager::new(workspace.path().to_path_buf()).unwrap());
+    let args = json!({ "app_id": "habit-tracker", "device": "device-gone" });
+
+    let out = start_with(&bus, &pool, &pending, &artifacts, args, thread_id)
+        .await
+        .expect("tool task");
+    assert!(
+        out.starts_with("Error: device 'device-gone' is not a known device."),
+        "{out}"
+    );
+    assert!(pending.lock().unwrap().is_empty(), "nothing waits");
+    while let Ok(ev) = rx.try_recv() {
+        assert!(
+            !matches!(ev.typed, BusEvent::Thread { thread_id: tid, .. } if tid == thread_id),
+            "no event is emitted for the thread"
+        );
+    }
 
     pool.close().await;
     teardown_test_db(&db).await;

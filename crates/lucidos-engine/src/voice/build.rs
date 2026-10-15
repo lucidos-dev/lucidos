@@ -15,9 +15,9 @@ use sqlx::PgPool;
 use super::live::LiveProvider;
 use super::provider::VoiceProvider;
 use super::realtime::RealtimeProvider;
-use crate::core::{prefs, CredentialStore};
+use crate::core::prefs;
 use crate::engine::LucidosEngine;
-use crate::llm::{openai::codex_detect, resolve_openai_api_key};
+use crate::llm::openai::openai_api_key;
 
 /// The model this call speaks through: the stored one, else the catalog
 /// default. Voice has no "use your own" reading of an unset model, because an
@@ -70,19 +70,7 @@ pub async fn provider_for(engine: &LucidosEngine) -> Result<Arc<dyn VoiceProvide
 
     // The same three sources a chat call resolves on, in the same order. Voice
     // adds none of its own.
-    let credential = match CredentialStore::get(pool, "openai").await {
-        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
-        Ok(None) => None,
-        Err(e) => {
-            log!("[Voice] Could not read the OpenAI credential: {}", e);
-            None
-        }
-    };
-    let Some((api_key, source)) = resolve_openai_api_key(
-        credential,
-        std::env::var("OPENAI_API_KEY").ok(),
-        codex_detect::load(),
-    ) else {
+    let Some((api_key, source)) = openai_api_key(pool).await else {
         return Err("no OpenAI key is configured".to_string());
     };
 
@@ -130,13 +118,17 @@ mod tests {
     #[tokio::test]
     async fn a_stored_preference_wins_over_the_catalog_default() {
         let (pool, db) = setup_test_db().await;
-        seed_preference(&pool, prefs::MODEL_VOICE_TALKER.key(), "gpt-realtime-mini")
-            .await
-            .expect("seed");
+        seed_preference(
+            &pool,
+            prefs::MODEL_VOICE_TALKER.key(),
+            "gpt-realtime-2.1-mini",
+        )
+        .await
+        .expect("seed");
 
         let model = talker_model(&pool).await;
 
-        assert_eq!(model, "gpt-realtime-mini");
+        assert_eq!(model, "gpt-realtime-2.1-mini");
         teardown_test_db(&db).await;
     }
 
@@ -162,14 +154,18 @@ mod tests {
     #[tokio::test]
     async fn a_stored_transcriber_and_voice_win_over_their_defaults() {
         let (pool, db) = setup_test_db().await;
-        seed_preference(&pool, prefs::MODEL_VOICE_TRANSCRIBER.key(), "whisper-1")
-            .await
-            .expect("seed");
+        seed_preference(
+            &pool,
+            prefs::MODEL_VOICE_TRANSCRIBER.key(),
+            "gpt-live-transcribe",
+        )
+        .await
+        .expect("seed");
         seed_preference(&pool, prefs::VOICE_TALKER_VOICE.key(), "cedar")
             .await
             .expect("seed");
 
-        assert_eq!(transcriber_model(&pool).await, "whisper-1");
+        assert_eq!(transcriber_model(&pool).await, "gpt-live-transcribe");
         assert_eq!(talker_voice(&pool).await, "cedar");
 
         teardown_test_db(&db).await;
@@ -185,8 +181,6 @@ mod tests {
             "gpt-realtime-2.1-mini",
             "gpt-realtime-2",
             "gpt-realtime-1.5",
-            "gpt-realtime-mini",
-            "gpt-realtime",
         ] {
             assert!(!speaks_live(realtime), "{} was routed to Live", realtime);
         }
@@ -199,7 +193,7 @@ mod tests {
     /// existed. A model the agent pinned must still reach a socket.
     #[test]
     fn an_unknown_model_still_speaks_realtime() {
-        for unknown in ["", "  ", "some-new-model", "whisper-1"] {
+        for unknown in ["", "  ", "some-new-model", "gpt-transcribe"] {
             assert!(!speaks_live(unknown), "{:?} was routed to Live", unknown);
         }
     }

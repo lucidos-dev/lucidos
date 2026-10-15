@@ -1,12 +1,12 @@
 import { randomUUID } from 'crypto';
 import { test, expect, type Page } from './fixtures';
-import { apiRequest, assertHealthy, clickThreadRow, navigateToApp, newThread, openThreadDrawer } from './helpers';
+import { apiRequest, assertHealthy, clickThreadRow, isMobileViewport, navigateToApp, newThread, openThreadDrawer } from './helpers';
 import { ensureHomeThread, psql } from './db-helpers';
 
 /**
- * `lucidos.ui.focusedThread()` and `onFocusedThreadChange()` from a Home widget
- * window floating over another thread. The window's widget belongs to Home, so
- * the value must follow the thread pane and never name Home.
+ * `lucidos.ui.focusedThread()` and `onFocusedThreadChange()` from a Home board
+ * tile in the desktop rail, beside another thread. The tile's widget belongs to
+ * Home, so the value must follow the thread pane and never name Home.
  *
  * The widget re-reads the getter on every push, so each step checks both the
  * bridge answer and the push.
@@ -75,7 +75,10 @@ test.describe('The focused thread in the SDK', () => {
     for (const path of written) await apiRequest(page).delete(`/api/v1/data/${path}`);
   });
 
-  test('a widget window follows the thread pane, not its own thread', async ({ page }) => {
+  test('a Home board tile follows the thread pane, not its own thread', async ({ page }) => {
+    // The rail is desktop-only. A phone shows the board only as Home's face,
+    // so no other thread is in the pane beside it (ADR 0466).
+    test.skip(isMobileViewport(page), 'the Home rail is desktop-only');
     const home = ensureHomeThread();
     const threadA = randomUUID();
     const threadB = randomUUID();
@@ -90,19 +93,11 @@ test.describe('The focused thread in the SDK', () => {
       event('WidgetPinned', home, `{"app_id":"${appId}"}`, now),
     ].join(';\n'));
 
-    // Thread A open, with Home's widget already floating in a window over it.
-    // Windows float over the header and the drawer. So it sits at the right,
-    // clear of the drawer toggle and the thread rows the test clicks.
-    await page.evaluate(({ tid, homeId, key }) => {
-      localStorage.setItem('lucidos-focused-thread', tid);
-      localStorage.setItem('lucidos-widget-windows', JSON.stringify([{ threadId: homeId, instanceKey: key, raise: 1 }]));
-      localStorage.setItem('lucidos-widget-window-layouts', JSON.stringify([
-        { threadId: homeId, instanceKey: key, x: 880, y: 120, mode: 'minimal' },
-      ]));
-    }, { tid: threadA, homeId: home, key: `${appId}?{}` });
+    // Thread A open, with Home's widget on the board in the rail beside it.
+    await page.evaluate((tid) => localStorage.setItem('lucidos-focused-thread', tid), threadA);
     await navigateToApp(page);
 
-    const frameSelector = `[data-widget-window^="${appId}?"] iframe[data-role="app-ui-frame"]`;
+    const frameSelector = `.home-rail .home-board-tile[data-home-tile^="${appId}?"] iframe[data-role="app-ui-frame"]`;
     await expect(page.locator(frameSelector)).toHaveAttribute('src', new RegExp(`/app/${appId}/`), { timeout: 15_000 });
     const widget = page.frameLocator(frameSelector);
     const read = widget.locator('#read');

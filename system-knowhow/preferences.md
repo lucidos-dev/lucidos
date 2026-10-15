@@ -29,7 +29,7 @@ The other Settings stores have their own tools, never `set_preference`:
 | An API key / secret | `request_credential` (never put secrets in a preference) |
 | A non-secret env var | `env_vars` (`action: set`) |
 | A registered repo | `manage_repositories` |
-| An MCP server | `setup_mcp_server` / `start_mcp_server` / … |
+| An MCP server | the `mcp` tool (`setup`, `enable`, `disable`, …) |
 | Command-safety (the command guard) | not agent-settable: Settings → Permissions |
 
 ## How a write propagates
@@ -101,16 +101,21 @@ override. `get_preferences` shows the per-device effective value and the global 
 **Every background task runs on whichever configured provider serves its
 model.** That covers titles, change summaries, image descriptions, memory,
 query classification, conversation summaries, `find`, the command judge, the
-read decision and the compactor.
+read decision, the wake decision and the compactor.
 
 - **Unset, a key resolves for the providers the user has.** Its own default
   runs if a configured provider serves it. Otherwise the first of
   `gemini-3-flash-preview`, `gpt-5.4-mini` and `claude-haiku-4-5` that one
   serves runs, and with none of those, the chat model. The compactor has its
   own list (see `model_summary_compaction`).
-- **Two tasks try a measured model before their default.** Fact extraction
+- **Four tasks try a measured model before their default.** Fact extraction
   tries `gpt-5.6-luna` first. The conversation summary tries the compactor's
-  three first. Each memory task has its own key, and none follows another.
+  three first. The read decision tries `gemini-3.8-flash`, then
+  `gpt-5.6-luna`. The wake decision tries `gemini-3.8-flash`, `gpt-6.1-sol`
+  and `gpt-5.6-luna`. Each task has its own key, and none follows another.
+- **The wake decision runs only on a measured model.** It skips the shared
+  fallbacks and the chat model. With none of its four served, it asks nothing
+  and wakes the parent.
 - **A key the user set is never moved to another model.** If no configured
   provider serves it, those calls fail, and Settings says so on the row.
 - **The one exception is a retired model.** A provider retired it, so an
@@ -138,16 +143,27 @@ read decision and the compactor.
 it under Settings → System → Memory. While it is `tree`, Settings → Models →
 Background tasks also shows the compactor's model, `model_summary_compaction`.
 
-- `classic`, the default, is the conversation summariser, *memory recall* and
-  *memory search*.
-- `tree` gives each turn two *memory views*: a workspace memory view (summary
-  lines over every thread turn and artifact write) and a thread memory view
-  (this thread, recent entries verbatim). The agent gets the `recall` tool in
+- **A new workspace asks.** While `memory_module` is unset, the workspace runs
+  Classic, and the first client to open it shows the *memory choice*. That
+  modal shows what Tree costs a month and writes the answer. Closing it writes
+  `classic`. A headless workspace with no client open stays on Classic.
+- **Do not choose for the user.** Tree costs money, and writing `tree` with
+  `set_preference` skips the cost the memory choice and Settings show. Even
+  when the user asks for Tree, point them at Settings → System → Memory, which
+  shows the cost before it starts.
+- `tree` gives each turn two *memory views*. The workspace
+  memory view holds summary lines over every thread turn and artifact write.
+  The thread memory view holds this thread, recent entries verbatim. A loaded
+  knowhow doc shows there as a pointer, since its body is in the loaded
+  knowhow section. The agent gets the `recall` tool in
   place of Classic's `memory` tool, which edits a store a Tree turn never reads.
   `zoom` opens a view line down to the exact message, and `find` walks the tree
   for a topic. `search` finds exact words, and `date` says when a line's
   entries happened. Coding-agent sessions get the workspace view in their system prompt
   and the same four as `lucidos recall` commands.
+- `classic` is the conversation summariser, *memory recall* and *memory
+  search*. It is almost free: on long threads it makes a small summary call now and then. A workspace used before the memory
+  choice existed stores `classic`, so it is never asked.
 - Choosing `tree` starts the compactor, which summarises the workspace once in
   the background. **Turns stay on Classic until the workspace tree and the
   threads active in the last 7 days are built.** So setting it changes nothing
@@ -164,6 +180,16 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
   Start Tree button writes `tree`; Cancel spends nothing. The estimate is
   `GET /api/v1/memory/tree-backfill/estimate`. Once a backfill has stored
   summaries, tapping Tree again writes `tree` at once and resumes it.
+- **Backfill calls run on OpenAI's Flex tier** when OpenAI serves the
+  compactor model: half the price, a little slower. A call refused twice for
+  Flex capacity runs on the standard tier. Summaries of live turns always use
+  the standard tier.
+- **A backfill pauses at a spending cap**, 1.5 times the estimated cost,
+  which the dialog states. While it waits, threads it already summarized keep
+  up with new messages, and the rest wait with it. The user gets a notification, and the page reads "Paused at the
+  $X spending cap" with two buttons: Continue to a higher cap, or Switch to
+  Classic. Continue is `POST /api/v1/memory/tree-backfill/cap`. Leave that
+  choice to the user. A model with no price in the estimate gets no cap.
 - **Writing `tree` yourself skips that dialog and starts spending at once.**
   When a user asks for Tree, send them to Settings → System → Memory. There
   they read the estimate and press Start, rather than you setting it.
@@ -175,6 +201,8 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 - **The bar's other labels.** "A summary failed, retrying" means a tree goes
   back on the queue shortly. "Waiting for a background model" means no
   compactor model is usable, so nothing moves until one is picked.
+- **The spend shows under the bar** while a backfill runs, as "$12.40 of
+  $30.00 cap".
 - **"Ready"** means turns now use Tree.
   "Ready. Filling in older threads, 62%" means turns use Tree while older
   threads are still summarised. `GET /api/v1/memory/tree-backfill` serves the
@@ -199,7 +227,7 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `response_style` | global | the id of a style in the library | `standard` | The shape of a chat or trigger answer: how much comes back, and what it is for. `standard` adds nothing. Shipped beside it: `concise`, `minimal` (the outcome, not the process) and `learning` (explains the why as it goes). The user can edit those and add their own, so the set is OPEN: read `response_styles` or `GET /api/v1/response-styles` for the ids here. An undefined id falls back to `standard`. |
 | `response_styles` | global | JSON array of `{id, label, instruction}` | (unset: the shipped styles only) | The user's own styles, and their edits to the shipped ones. See "The style library" above. |
 | `technical_literacy` | global | `not-set` \| `non-technical` \| `technical` \| `developer` | `not-set` (adds nothing; set it to clear a level) | How technical the words are in every answer, from plain words with no jargon (`non-technical`, shown as Keep it plain) to engineering terms with no explanation (`developer`). It never sets how much to say. An old `everyday` value reads as `non-technical`. Reaches chat, triggers, coding-agent sessions and voice calls. See "Technical literacy" above. |
-| `image_model` | global | `auto` \| `imagen-4` \| `gpt-image-1` \| `gpt-image-1.5` \| `gpt-image-2` | `auto` | Model used by `generate_image`. |
+| `image_model` | global | `auto` \| `imagen-4` \| `gpt-image-2.5-flare` \| `gpt-image-2.5-sunburst` \| `gpt-image-2` | `auto` | Model used by `generate_image`. `auto` runs Imagen 4 when a Google Cloud project is configured, else `gpt-image-2.5-flare` on an OpenAI key. Flare is the fast everyday model; Sunburst is for precise edits. OpenAI retired `gpt-image-1` and `gpt-image-1.5`: a write of either is refused, and the engine moves a stored one to `gpt-image-2.5-flare` at startup. |
 | `model_title` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model for thread titles. |
 | `reasoning_title` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for title generation. Naming a thread needs none. |
 | `model_change_summary` | global | a model id | (the `model_title` model) | Background model that writes a *change summary*: one line saying what a coding-agent change of several commits does. It heads the change card, the change toasts and the Changes panel. A single-commit change makes no call: its commit subject is the line. Inherits `model_title` while unset. |
@@ -208,9 +236,11 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `reasoning_summary_compaction` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | (`low` on the default models, else the model's default effort) | Thinking budget for the compactor. While unset it runs its three default models at `low`, the tier their comparison measured, and any other model at its own default effort. |
 | `model_memory_find` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model the recall tool's `find` asks its yes/no questions on, when `judgment_memory_find` leaves it on chat. Each call judges about 40 summary lines. |
 | `reasoning_memory_find` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for `find`, which answers short yes/no questions. |
-| `model_read_decision` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model that makes a turn's *read decision* when the turn ended without one: it sees the turn's message and reply, and must call `request_read`. A Claude model that always thinks cannot be made to, so with one set here every such reply waits under Review. |
+| `model_read_decision` | global | a model id | `gemini-3-flash-preview`, if reachable, after `gemini-3.8-flash` and `gpt-5.6-luna` (see "Background models") | Background model that makes a turn's *read decision* when the turn ended without one: it sees the turn's message, a question the user answered inside the turn, and the reply, and must answer one forced yes/no question. While unset, the first of `gemini-3.8-flash` and `gpt-5.6-luna` that a configured provider serves runs. A Claude model that always thinks cannot be forced, so with one set here every such reply waits under Review. Settings offers the System One models in the same control, which write `judgment_read_decision` instead. |
 | `reasoning_read_decision` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for the read decision, one yes or no. A forced call on Claude runs without thinking whatever this says. |
-| `memory_module` | global | `classic` \| `tree` | `classic` | How a turn gets its past. See "The memory module" above. Applies from the next turn. |
+| `model_wake_decision` | global | a model id | `gemini-3-flash-preview`, if reachable, after `gemini-3.8-flash`, `gpt-6.1-sol` and `gpt-5.6-luna` (see "Background models") | Background model that makes a child thread's *wake decision* when its turn ended without one and `judgment_wake_decision` leaves it on chat. It answers one forced yes/no question. It reads the message that opened the child's turn, the parent's latest reply, the child's reply and how many siblings still run. While unset, only those four measured models run: with none served, no chat model is asked and the parent wakes. A Claude model that always thinks cannot be forced, so the parent wakes. Setting it keeps the wake decision on chat even while OpenAI is configured, on the model it names. A failed call wakes the parent. |
+| `reasoning_wake_decision` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for the wake decision, one yes or no. A forced call on Claude runs without thinking whatever this says. |
+| `memory_module` | global | `classic` \| `tree` | (unset: Classic runs, and the memory choice asks the user) | How a turn gets its past. See "The memory module" above. Do not choose for the user. Applies from the next turn. |
 | `workspace_view_bytes_home` | global | number 0–262144 | `65536` | Bytes of workspace memory view a home thread turn reads, under the `tree` module. `0` turns the view off there. |
 | `workspace_view_bytes_chat` | global | number 0–262144 | `16384` | The same for a chat thread turn. |
 | `workspace_view_bytes_trigger` | global | number 0–262144 | `16384` | The same for a trigger run. Trigger runs are frequent, so this size costs most. |
@@ -223,11 +253,11 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `reasoning_memory` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `low` | Thinking budget for fact extraction, which returns short JSON on every turn. At `none`, GPT-5.6 Luna and GPT-5.4 mini missed facts. |
 | `model_conversation_summary` | global | a model id | `gemini-3-flash-preview`, if reachable, after the compactor's three (see "Background models") | Background model that writes a thread's *conversation summary*: the paragraph standing in for its older assistant turns. While unset, the first of `gpt-6.1-sol`, `gemini-3.8-flash` and `claude-sonnet-5-5` that a configured provider serves runs. Its input can be 80k tokens, far larger than any other background call. |
 | `reasoning_conversation_summary` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `low` | Thinking budget for the conversation summary. Raising it is unlikely to help: output length does not track it, and the summariser's failures are calls that never complete. |
-| `model_query_classification` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model that decides what a turn needs retrieved: long-term memory, the file list, credentials. Settings offers the System One models (Jev, Clef, Clef-flash, a custom endpoint) in the same control, which write `judgment_query_classification` instead. |
+| `model_query_classification` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model that decides what a turn needs retrieved: long-term memory, the file list, credentials. Settings offers the System One models (Jev, Jev through OpenRouter, Clef, Clef-flash, OpenAI Decisions, a custom endpoint) in the same control, which write `judgment_query_classification` instead. |
 | `reasoning_query_classification` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for query classification, which answers three yes/no questions before every turn. |
 | `voice_enabled` | global | `true` \| `false` | `false` | Experimental. `true` puts a call control in the *home thread*'s composer and lets `/api/v1/voice` accept a socket there, so Home can be spoken to. A call runs on the home thread alone, which every workspace has. It rents a speech-to-speech talker and needs the OpenAI provider configured. Every spoken utterance starts an ordinary agent turn, so a short call can cost several. With this off, nothing voice-shaped is reachable and the voice keys below do nothing. |
-| `model_voice_talker` | global | a model id | `gpt-realtime-2.1` | Speech-to-speech model a *voice session* speaks through; the id also picks the call's protocol. It holds the conversation only, so every action goes through the ordinary agent. Settings offers the realtime family newest first: `gpt-realtime-2.1`, `gpt-realtime-2.1-mini`, `gpt-realtime-2` and `gpt-realtime-1.5`. These bill by the token, and the caller can settle a card or ring off out loud. `gpt-live-1` follows: it takes an interruption better, holds no tools, and bills by the minute. A Live caller answers a question out loud, and taps for a permission or to ring off. |
-| `model_voice_transcriber` | global | a model id | `gpt-4o-mini-transcribe` | Model turning the caller's speech into text in a realtime *voice session*. A `gpt-live-1` talker transcribes the caller itself and ignores this key. The second and last model in the voice loop: nothing translates or summarises, and `language` sets its pin. Settings offers six ids. The two built for a live microphone lead and stream as the caller speaks: `gpt-live-transcribe` and `gpt-realtime-whisper`. The engine sends `gpt-live-transcribe`'s language pin as `languages`, an array; every other model reads the singular `language`. The rest transcribe a turn once committed: `gpt-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe` and `whisper-1`. |
+| `model_voice_talker` | global | a model id | `gpt-realtime-2.1` | Speech-to-speech model a *voice session* speaks through; the id also picks the call's protocol. It holds the conversation only, so every action goes through the ordinary agent. Settings offers the realtime family newest first: `gpt-realtime-2.1`, `gpt-realtime-2.1-mini`, `gpt-realtime-2` and `gpt-realtime-1.5`. These bill by the token, and the caller can settle a card or ring off out loud. `gpt-live-1` follows: it takes an interruption better, holds no tools, and bills by the minute. A Live caller answers a question out loud, and taps for a permission or to ring off. OpenAI retired `gpt-realtime`, `gpt-realtime-mini` and the `gpt-4o` realtime models: a write of one is refused, and the engine moves a stored one to `gpt-realtime-2.1` (a mini to `gpt-realtime-2.1-mini`) at startup. |
+| `model_voice_transcriber` | global | a model id | `gpt-transcribe` | Model turning the caller's speech into text in a realtime *voice session*. A `gpt-live-1` talker transcribes the caller itself and ignores this key. The second and last model in the voice loop: nothing translates or summarises, and `language` sets its pin. Settings offers three ids. The two built for a live microphone lead and stream as the caller speaks: `gpt-live-transcribe` and `gpt-realtime-whisper`. Then `gpt-transcribe`, the default, which transcribes a turn once committed. The engine sends the language pin of `gpt-transcribe` and `gpt-live-transcribe` as `languages`, an array; every other model reads the singular `language`. OpenAI retired `whisper-1` and the `gpt-4o` transcribers: a write of one is refused, and the engine moves a stored one to `gpt-transcribe` at startup. |
 | `voice_talker_voice` | global | a provider voice name | `marin` | The voice a call is spoken in. Not a model and not the language: `language` decides what is spoken, this decides who speaks it. A name the provider does not know refuses the call, so pick one the talker model offers. |
 | `voice_resident_sections` | global | comma-separated section ids | `who-and-where,this-thread,workspace-shape` | What a *voice session* loads at the start of a call. The talker cannot look anything up, so this block is all voice answers with no wait; everything else waits for the agent. `who-and-where`: the workspace name, timezone and local time. `this-thread`: the title, the recent turns, and any question the thread is parked on. `workspace-shape`: the names of apps, triggers and unread notifications, plus two thread lines (what Lucidos was working on as the call opened, and what is stopped waiting on an answer). An unknown id is ignored with a log line. A stored row means exactly what it lists; only an absent row means the three above. Turning every section off writes an empty value, which `set_preference` rejects. That state is Settings-only, through the toggles in Settings > Models > Voice. |
 | `vertex_region` | global | text | `europe-west1` | Google Vertex AI region. |
@@ -235,8 +265,8 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `proxy_timeout_secs` | global | number 1–600 | `30` | Seconds the engine proxy waits on one upstream request before it answers 504. Covers every proxied call: `lucidos proxy`, `lucidos.proxy` in an app, the `proxy_request` tool, and the builtin model routes such as `vertex` and `openai`. A streamed reply counts in full, because the proxy reads the whole body first. Raise it when a long model call through the proxy times out. An `apis.json` entry's own `timeout_secs` wins for that entry. Every write path refuses a value outside the range. |
 | `notifications_filter` | global | `all` \| `unread` | `all` | Which notifications the bell shows. |
 | `notification_toasts` | global | `true` \| `false` | `true` | Whether a notification pops an in-app toast on a device the user is looking at. `false` silences the pop-up only: the notification still counts on the bell badge and waits in the Notifications panel. No OS push replaces it, because a present device never gets one. Unlike `push_notifications`, one write covers every device. |
-| `mobile_dynamic_bars` | global | `true` \| `false` | `false` | *Dynamic bars* on a phone. `true` glides the header, the thread title and the prompt away while scrolling down a thread, and back on scroll up or a pane swipe. `false` keeps them always visible. |
-| `automatic_widgets` | global | `true` \| `false` | `true` | Whether you may choose a *widget* on your own: a small interactive answer shown inline in the thread as a *widget card* (`create_app` with `kind="widget"`). `false` stops only your own choice, and a widget the user asks for is still made. Set it to `false` when the user tells you to stop making widgets. |
+| `mobile_dynamic_bars` | global | `true` \| `false` | `false` | *Dynamic bars* on a phone. `true` glides the header, the thread title and the prompt away while scrolling down a thread, and the header while scrolling down an app that loads the SDK. They return on scroll up or a pane swipe. `false` keeps them always visible. |
+| `automatic_widgets` | global | `true` \| `false` | `true` | Whether you may choose a *widget* on your own: a small interactive answer shown inline in the thread as an *inline widget* (`create_app` with `kind="widget"`, then an embed). `false` stops only your own choice, and a widget the user asks for is still made. Set it to `false` when the user tells you to stop making widgets. |
 | `external_link_target` | global | `safari` \| `ask` \| `in-app` | `safari` | Where an external http(s) link goes when tapped in an **installed iOS PWA**. Desktop, Android and a normal Safari tab always open a new tab. `safari` hands it to the Safari app. `ask` opens the OS share sheet, so iOS offers every installed browser, including the user's real default. `in-app` keeps it in the PWA's in-app web view (no address bar, no shared Safari session). |
 | `welcome_suggestions_dismissed` | global | `true` \| `false` | `false` | Hide the new-workspace welcome message. Set `false` to SHOW it again. |
 | `self_curated_context_mode` | global | `true` \| `false` | `false` | **Experimental**: set it only if the user asked. `true` puts a chat or trigger thread in *self-curated context mode*. A sweep then removes tool results in batches: every ten rounds it takes everything more than five rounds old, with the call that made each one. Nothing stands in their place. The agent keeps its picture of the job in a *working understanding*, written as ordinary text in its own reply. It holds one item longer by naming its `evt-<hex>` address under a `[KEEP OPEN]` heading there. A *context panel* at the tail of every round states how full the prompt is, what each item costs and how long it has left. Three other changes: the previous turn's tool calls are not re-sent, the conversation summariser does not run, and `todo_write` is withdrawn (the checklist moved into the same block). The cost is a re-fetch: a result the agent needed and did not write down takes a round to read back. Coding-agent threads are unaffected. |
@@ -248,6 +278,7 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `coding_agent_default` | global | `claude-code` \| `codex` | `claude-code` | Default coding agent the compose picker pre-selects. |
 | `coding_agent_claude_path` | global | absolute path | (auto-detected) | Path to the `claude` CLI for Claude Code threads. Unset = auto-detect (`~/.local/bin`, `~/.claude/local`, Homebrew, PATH). A set path that does not resolve fails the spawn and names this key; it never falls back silently. |
 | `coding_agent_codex_path` | global | absolute path | (auto-detected) | Path to the `codex` CLI for Codex threads. Unset = auto-detect (`~/.local/bin`, Homebrew, PATH). A set path that does not resolve fails the spawn and names this key; it never falls back silently. |
+| `coding_agent_auto_compact_trial` | global | `off` \| `ab` \| `on` | `off` | The auto-compact trial for Claude Code threads. `off` leaves Claude Code's own compaction alone. `ab` gives a 400k-token auto-compact window to half of all top-level threads, each with its sub-threads and successors, picked by a stable hash. A thread keeps the arm it first ran in. `on` gives every family that window. A workspace `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var always wins. `SessionStarted` records the arm. Codex ignores it. Applies to new sessions. A temporary measure. |
 | `coding_agent_claude_permission_mode` | global | `accept-edits` \| `auto` | `accept-edits` | Which of Claude Code's own permission modes coding-agent threads run in. `accept-edits` cards anything outside the session's working directories. `auto` lets Claude Code's safety classifier approve routine actions, reaching shapes no allowlist can (a `cd` combined with a redirect, a write, or git). Four costs: it ignores a bare `Bash` entry in `cc-allowed-tools`, it denies rather than cards when the classifier is unreachable, a denial streak falls back to prompting, and each gated call pays a classifier round-trip. Claude Code only; Codex ignores it. Applies to new sessions. |
 | `backup_schedule` | global | 6-field cron (in the user's timezone) or `off` | `off` | Automatic backup schedule. E.g. `0 0 3 * * *` = daily 03:00, `0 0 3 * * 0` = weekly Sun 03:00, `0 0 */12 * * *` = every 12h. Fires in the user's `timezone`. Requires `backup_provider` set AND its account connected (see that key). |
 | `backup_provider` | global | `google_drive` \| `dropbox` | (unset) | Cloud destination, independent of `backup_schedule`: it stays set with the schedule `off`. The Backup page's provider dropdown opens on it and writes it. Setting this connects NOTHING. Connect the account with `connect_oauth_account`, or the user does it in **Settings → Accounts** (the Backup page has no account UI). Until then backups run and the upload fails. `get_backup_status` reports whether the account is connected. |
@@ -272,8 +303,8 @@ and `set_preference` refuses every one with a hint naming the right surface:
   bash/python) and the model its LLM judge runs on. Settings → Permissions only.
   You must not disable or weaken your own safety gate.
 - `judgment_command_guard`, `judgment_query_classification`: which backend
-  answers each judgment: `chat`, or a System One model (`jev`, `clef`,
-  `clef-flash`, `custom`). Both ask typed questions and decide the outcome in
+  answers each judgment: `chat`, or a System One model (`jev`, `openrouter`,
+  `clef`, `clef-flash`, `openai`, `custom`). Both ask typed questions and decide the outcome in
   code. `chat`, the default, asks the surface's own chat model. A System One
   model answers faster and sends what it judges to that vendor, and the chat
   model takes over if its call fails. Neither key has its own control: **the
@@ -284,10 +315,27 @@ and `set_preference` refuses every one with a hint naming the right surface:
     (Background tasks).
   - A System One row appears only once its provider is set up in Settings →
     Models (Providers), and each sits under that provider's switch below.
+  - `openrouter` and `openai` reuse the OpenRouter and OpenAI chat providers'
+    keys, and sit under `provider_enabled_openrouter` and
+    `provider_enabled_openai`. `openai` asks OpenAI's Decisions API on
+    GPT-6 Luna.
+- `judgment_read_decision`: the same choice for the *read decision* a turn
+  ended without, in the Read decision row of Settings → Models (Background
+  tasks). Unset runs on the chat model, `model_read_decision`. A System One
+  model there reads every undecided reply, so only the user decides. A failed
+  call or a missing answer still asks to be read.
 - `judgment_memory_find`: the same choice for the recall tool's `find`. It has
   no control yet, so `find` runs on chat (`model_memory_find`) unless the user
   sets it. Picking a System One model there would send memory lines to that
   vendor, so only the user decides.
+- `judgment_wake_decision`: the same choice for a child thread's *wake
+  decision*. Its control is the Wake decision row in Settings → Models
+  (Background tasks). Unlike most, unset is not chat: it runs on
+  OpenAI Decisions while the OpenAI provider is configured and on and
+  `model_wake_decision` is unset. `chat`, or a stored `model_wake_decision`,
+  keeps it on the chat model. A System One model there reads the child's
+  reply, so only the user decides. Any doubt or failed call still wakes the
+  parent.
 - `backup_last_run`: internal backup state (the last run's outcome), not a
   setting. The backup *schedule*, *provider* and *retention* ARE settable (see
   the table above). `get_backup_status` reads the current schedule, next and
@@ -361,6 +409,10 @@ and `set_preference` refuses every one with a hint naming the right surface:
   One endpoint lives and which model it is asked for, set on its row in Settings
   → Models → Providers. That host receives every state a judgment sends it and
   can answer the command guard, so you never set either.
+- `system_one_openrouter_model`: the System One model the `openrouter` System One
+  row asks, set on the OpenRouter row in Settings → Models → Providers. Unset
+  asks Jev. It picks which vendor sees what a judgment judges, so you never set
+  it.
 
 > Keep this file in lockstep with `core/preference_catalog.rs`: a `cargo test`
 > sync test fails if a catalog key is missing here, or if a default stated here

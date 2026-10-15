@@ -23,6 +23,7 @@ import {
   APP_ID_HEADER,
   THIS_DEVICE,
   fanOutEventFrame,
+  fanOutEventStreamStatus,
   installAppBridge,
   pathIsAllowed,
   resolveBridgePath,
@@ -314,6 +315,111 @@ describe('the installed router', () => {
     expect(posted).toEqual([]);
 
     document.body.appendChild(frame);
+  });
+
+  describe('typed subscriptions (ADR 0432)', () => {
+    const DELTA = JSON.stringify({ type: 'ThreadEvent', data: { thread_id: 't', event: { type: 'TextStreamed' } } });
+    const PINNED = JSON.stringify({ type: 'ThreadEvent', data: { thread_id: 't', event: { type: 'WidgetPinned' } } });
+    const NOTE = JSON.stringify({ type: 'NotificationCreated', data: {} });
+    let posted: unknown[];
+    let win: Window;
+    const frames = () => posted
+      .map((m) => (m as { data?: { kind?: string; data?: string } }).data)
+      .filter((d) => d?.kind === 'frame')
+      .map((d) => d!.data);
+
+    beforeEach(() => {
+      posted = [];
+      win = frame.contentWindow as Window;
+      vi.spyOn(win, 'postMessage').mockImplementation((m: unknown) => { posted.push(m); });
+    });
+
+    async function send(op: string, args: unknown) {
+      deliver(win, { type: 'lucidos:bridge', op, args });
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    function stream() {
+      for (const data of [DELTA, PINNED, NOTE]) fanOutEventFrame(data);
+    }
+
+    it('relays only the types a frame listens to, never a streaming delta it did not ask for', async () => {
+      await send('sse.open', { types: ['WidgetPinned', 'NotificationCreated'] });
+      stream();
+      expect(frames()).toEqual([PINNED, NOTE]);
+    });
+
+    it('relays everything to a `*` listener, and to an SDK that names no types', async () => {
+      await send('sse.open', { types: ['*'] });
+      stream();
+      expect(frames()).toEqual([DELTA, PINNED, NOTE]);
+
+      posted.length = 0;
+      await send('sse.open', {});
+      stream();
+      expect(frames()).toEqual([DELTA, PINNED, NOTE]);
+    });
+
+    it('a generic ThreadEvent listener hears every thread event', async () => {
+      await send('sse.open', { types: ['ThreadEvent'] });
+      stream();
+      expect(frames()).toEqual([DELTA, PINNED]);
+    });
+
+    it('follows an update of the listened types', async () => {
+      await send('sse.open', { types: [] });
+      stream();
+      expect(frames()).toEqual([]);
+      await send('sse.types', { types: ['NotificationCreated'] });
+      stream();
+      expect(frames()).toEqual([NOTE]);
+    });
+  });
+
+  describe('the stream status an app hears', () => {
+    const OPEN = { type: 'lucidos:bridge:push', channel: 'sse', data: { kind: 'open' } };
+    const ERROR = { type: 'lucidos:bridge:push', channel: 'sse', data: { kind: 'error' } };
+    let posted: unknown[];
+    let win: Window;
+
+    beforeEach(() => {
+      posted = [];
+      win = frame.contentWindow as Window;
+      vi.spyOn(win, 'postMessage').mockImplementation((m: unknown) => { posted.push(m); });
+    });
+
+    async function subscribe() {
+      deliver(win, { type: 'lucidos:bridge', op: 'sse.open', args: {} });
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    it('a frame that subscribes to a live stream gets its open at once', async () => {
+      // The usual case: the shell's stream was up long before the app loaded.
+      // Without this, `lucidos.sse.onOpen` never runs in an app frame.
+      fanOutEventStreamStatus('open');
+      await subscribe();
+      expect(posted).toContainEqual(OPEN);
+    });
+
+    it('a frame that subscribes while the stream is down gets no open', async () => {
+      fanOutEventStreamStatus('open');
+      fanOutEventStreamStatus('error');
+      await subscribe();
+      expect(posted).not.toContainEqual(OPEN);
+
+      // The real open follows, and is the frame's first.
+      fanOutEventStreamStatus('open');
+      expect(posted.filter((m) => JSON.stringify(m) === JSON.stringify(OPEN))).toHaveLength(1);
+    });
+
+    it('relays a drop and the reopen after it, which is where the app resyncs', async () => {
+      fanOutEventStreamStatus('open');
+      await subscribe();
+      posted.length = 0;
+      fanOutEventStreamStatus('error');
+      fanOutEventStreamStatus('open');
+      expect(posted).toEqual([ERROR, OPEN]);
+    });
   });
 
   it('answers the focused thread from the shell, null included', async () => {

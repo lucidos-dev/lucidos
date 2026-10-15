@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::ThreadQueueKind;
-use crate::engine::thread_events::{ActorMode, MessageOrigin};
+use crate::engine::thread_events::{ActorMode, MessageOrigin, WakeMode};
 use crate::runtime::CodingAgent;
 
 fn default_coding_agent() -> CodingAgent {
@@ -35,7 +35,7 @@ pub(crate) fn truncate_summary(text: &str) -> String {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ThreadQueueRequest {
     /// A trigger matched a domain/thread event (`scheduler::task_runner::
-    /// handle_domain_event`). The trigger config is re-read at execution
+    /// fire_matching_triggers`). The trigger config is re-read at execution
     /// time; only the firing context is captured here.
     EventTrigger {
         trigger_id: String,
@@ -64,6 +64,10 @@ pub enum ThreadQueueRequest {
         parent_thread_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawning_event_id: Option<Uuid>,
+        /// The child's wake mode, already resolved. Absent on a top spawn, and
+        /// on a request queued before wake modes, which stays undeclared.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_mode: Option<WakeMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,6 +109,10 @@ pub enum ThreadQueueRequest {
         parent_thread_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawning_event_id: Option<Uuid>,
+        /// The child's wake mode, already resolved. Absent on a top spawn, and
+        /// on a request queued before wake modes, which stays undeclared.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_mode: Option<WakeMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -181,8 +189,16 @@ pub enum ThreadQueueRequest {
         parent_thread_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawning_event_id: Option<Uuid>,
+        /// The child's wake mode, already resolved. Absent on a top spawn, and
+        /// on a request queued before wake modes, which stays undeclared.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_mode: Option<WakeMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_id: Option<String>,
+        /// An *integrated sub-thread* spawn. Persisted with the request, so a
+        /// spawn that queues across a restart still folds into its parent.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        integrated: bool,
     },
 }
 
@@ -210,7 +226,7 @@ impl ThreadQueueRequest {
     ///
     /// A spawn does NOT consume a hop: work a fire hands off runs at the fire's
     /// own depth. A hop is a trigger fire, counted once in
-    /// `task_runner::handle_domain_event`.
+    /// `task_runner::fire_matching_triggers`.
     ///
     /// `Cron` roots a fresh chain, so it carries no field and answers 0. Its
     /// submit sites (the task loop, the missed-grace catch-up, the
@@ -343,10 +359,32 @@ mod tests {
             origin: None,
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             app_id: None,
+            integrated: false,
         };
         assert_eq!(mk(false).kind(), ThreadQueueKind::SubThread);
         assert_eq!(mk(true).kind(), ThreadQueueKind::CodingAgent);
+    }
+
+    /// A request queued before integrated spawns existed carries no flag,
+    /// and re-fires as an independent spawn.
+    #[test]
+    fn an_old_agent_chat_row_reads_as_independent() {
+        let row = serde_json::json!({
+            "type": "agent-chat",
+            "message": "do it",
+            "thread_id": Uuid::new_v4(),
+            "mode": "agent",
+        });
+        let req: ThreadQueueRequest = serde_json::from_value(row).expect("old row parses");
+        assert!(matches!(
+            req,
+            ThreadQueueRequest::AgentChat {
+                integrated: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -400,6 +438,7 @@ mod tests {
             child_thread_id: Uuid::new_v4(),
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             title: None,
             model: None,
             reasoning_effort: None,
@@ -428,6 +467,7 @@ mod tests {
             device_id: None,
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             repo_id: None,
             title: None,
             app_id: None,
@@ -466,6 +506,7 @@ mod tests {
             device_id: None,
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             repo_id: None,
             title: None,
             app_id: None,
@@ -513,6 +554,45 @@ mod tests {
         }
     }
 
+    /// A spawn queued before wake modes reads as undeclared, so its child
+    /// falls back to the wake decision. A declared one survives the round trip.
+    #[test]
+    fn a_spawn_keeps_its_wake_mode_and_an_old_row_reads_as_undeclared() {
+        for kind in ["sub-thread", "coding-agent", "agent-chat"] {
+            let old = serde_json::json!({
+                "type": kind,
+                "prompt": "queued before wake modes",
+                "message": "queued before wake modes",
+                "child_thread_id": Uuid::new_v4(),
+                "cc_thread_id": Uuid::new_v4(),
+                "thread_id": Uuid::new_v4(),
+                "mode": "agent",
+            });
+            let back: ThreadQueueRequest = serde_json::from_value(old).unwrap();
+            assert_eq!(wake_mode_of(&back), None, "{kind}");
+
+            let mut declared = serde_json::to_value(&back).unwrap();
+            declared["wake_mode"] = serde_json::json!("wake-when-all-done");
+            let back: ThreadQueueRequest = serde_json::from_value(declared).unwrap();
+            let again: ThreadQueueRequest =
+                serde_json::from_value(serde_json::to_value(&back).unwrap()).unwrap();
+            assert_eq!(
+                wake_mode_of(&again),
+                Some(WakeMode::WakeWhenAllDone),
+                "{kind}"
+            );
+        }
+    }
+
+    fn wake_mode_of(request: &ThreadQueueRequest) -> Option<WakeMode> {
+        match request {
+            ThreadQueueRequest::SubThread { wake_mode, .. }
+            | ThreadQueueRequest::CodingAgent { wake_mode, .. }
+            | ThreadQueueRequest::AgentChat { wake_mode, .. } => *wake_mode,
+            other => panic!("not a spawn: {other:?}"),
+        }
+    }
+
     /// Rows written before the field existed must still deserialize, falling
     /// back to the linkage-derived origin rather than failing the requeue.
     #[test]
@@ -536,6 +616,7 @@ mod tests {
             child_thread_id: Uuid::new_v4(),
             parent_thread_id: parent,
             spawning_event_id: None,
+            wake_mode: None,
             title: None,
             model: None,
             reasoning_effort: None,
@@ -568,6 +649,7 @@ mod tests {
             device_id,
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             repo_id: None,
             title: None,
             app_id: None,
@@ -632,6 +714,7 @@ mod tests {
             child_thread_id: Uuid::new_v4(),
             parent_thread_id: None,
             spawning_event_id: None,
+            wake_mode: None,
             title: None,
             model: None,
             reasoning_effort: None,

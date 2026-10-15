@@ -9,7 +9,8 @@
 #   unpack <tarball>           put a build back where the harness looks for it
 #   native-postgres <dir>      start a Postgres with pgvector, for runners with no Docker
 #   run <id> <suite> [<project> <shard> <total>]
-#                              run one shard through the ordinary e2e scripts
+#                              run one shard through the ordinary e2e scripts,
+#                              or the engine suite through test-engine.sh
 #
 # The request is .github/e2e-request.json, which scripts/e2e-github.sh wrote.
 
@@ -31,6 +32,9 @@ declare_shards() {
     esac
 }
 SPECS_PER_SHARD_FLOOR=8
+# The engine suite's run limit on a runner, compile included. The engine job's
+# timeout-minutes in e2e.yml sits above it.
+ENGINE_RUN_LIMIT_SECS=5400
 
 # request_field <python expression over `r`>: one value per line.
 request_field() {
@@ -105,10 +109,15 @@ cmd_plan() {
     # shellcheck source=scripts/lib/e2e.sh
     source "$SCRIPT_DIR/lib/e2e.sh"
     mkdir -p "$OUT_ROOT/plan"
-    local entries="$OUT_ROOT/plan/entries" linux="" macos="" suite project count shards i id entry
+    local entries="$OUT_ROOT/plan/entries" linux="" macos="" engine=false suite project count shards i id entry
     : >"$entries"
     while IFS= read -r suite; do
         case "$suite" in
+            engine)
+                # Its own job: it builds nothing the e2e shards share.
+                echo "engine engine - 1 1" >>"$entries"
+                engine=true
+                ;;
             api | wasm | embedder)
                 echo "$suite $suite - 1 1" >>"$entries"
                 linux="$linux{\"id\":\"$suite\",\"suite\":\"$suite\",\"project\":\"-\",\"shard\":1,\"total\":1},"
@@ -140,6 +149,7 @@ EOF
         echo "macos={\"include\":[${macos%,}]}"
         echo "has_linux=$([ -n "$linux" ] && echo true || echo false)"
         echo "has_macos=$([ -n "$macos" ] && echo true || echo false)"
+        echo "has_engine=$engine"
     } >>"${GITHUB_OUTPUT:-/dev/stdout}"
     cat "$entries"
 }
@@ -186,9 +196,11 @@ cmd_native_postgres() {
     source "$SCRIPT_DIR/lib/stage_runtime.sh"
     # shellcheck source=scripts/lib/workspace_constants.sh
     source "$SCRIPT_DIR/lib/workspace_constants.sh"
+    # shellcheck source=scripts/lib/pg_secret.sh
+    source "$SCRIPT_DIR/lib/pg_secret.sh"
     prefix="$(stage_runtime_fetch_postgres "$pg_version" "$pgvector_version" aarch64-apple-darwin "$work")" || return 1
     data="$work/data"
-    printf '%s' "$PG_PASSWORD" >"$work/pwfile"
+    ( umask 077; shared_pg_password >"$work/pwfile" ) || return 1
     "$prefix/bin/initdb" -D "$data" -U "$PG_USER" --pwfile="$work/pwfile" -A scram-sha-256 >/dev/null || return 1
     "$prefix/bin/pg_ctl" -D "$data" -l "$work/postgres.log" -w \
         -o "-p $port -c listen_addresses=127.0.0.1 -c max_connections=$PG_MAX_CONNECTIONS" start >/dev/null || return 1
@@ -213,6 +225,11 @@ cmd_run() {
 
     local cmd=()
     case "$suite" in
+        engine)
+            # A cold runner compiles the whole test binary inside the run limit.
+            export LUCIDOS_TEST_RUN_LIMIT_SECS="${LUCIDOS_TEST_RUN_LIMIT_SECS:-$ENGINE_RUN_LIMIT_SECS}"
+            cmd=("$SCRIPT_DIR/test-engine.sh")
+            ;;
         api)
             cmd=("$SCRIPT_DIR/e2e-api.sh")
             while IFS= read -r a; do [ -z "$a" ] || cmd+=("$a"); done <<EOF

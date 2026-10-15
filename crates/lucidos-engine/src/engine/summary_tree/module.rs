@@ -3,8 +3,8 @@
 //! `memory_module` picks Classic or Tree per workspace. A turn takes the Tree
 //! path only once the workspace is ready: its workspace tree and its recently
 //! active threads are built (I7). Older threads fill in after. Every read here
-//! is total: an unreadable row resolves to Classic and to the default sizes,
-//! because Classic is the behaviour nobody has to opt out of.
+//! is total. An unreadable module or ready flag resolves to Classic, because
+//! Classic spends nothing. An unreadable view size resolves to its default.
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -18,28 +18,58 @@ pub(crate) enum MemoryModule {
 }
 
 impl MemoryModule {
-    const TREE: &'static str = "tree";
-
-    /// A stored `memory_module` value, with an unset or unknown one read as
-    /// the catalog default.
-    pub(crate) fn from_pref(value: Option<&str>) -> Self {
-        if prefs::MEMORY_MODULE.resolve(value) == Self::TREE {
-            Self::Tree
-        } else {
-            Self::Classic
+    /// A stored `memory_module` value, `None` for one the catalog refuses.
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "tree" => Some(Self::Tree),
+            prefs::MEMORY_MODULE_WHILE_UNSET => Some(Self::Classic),
+            _ => None,
         }
     }
 
-    /// The workspace's chosen module, whether or not its trees are ready.
-    pub(crate) async fn chosen(pool: &PgPool) -> Self {
-        Self::from_pref(Some(&prefs::MEMORY_MODULE.read(pool).await))
+    /// The module a stored value runs. An unset or unknown one runs
+    /// [`prefs::MEMORY_MODULE_WHILE_UNSET`].
+    pub(crate) fn from_pref(value: Option<&str>) -> Self {
+        value.and_then(Self::parse).unwrap_or(Self::Classic)
     }
+
+    /// The workspace's own choice, `None` while it has never chosen. The
+    /// memory choice asks the user exactly then.
+    pub(crate) async fn stored(pool: &PgPool) -> Result<Option<Self>, sqlx::Error> {
+        Ok(prefs::MEMORY_MODULE
+            .try_read(pool)
+            .await?
+            .as_deref()
+            .and_then(Self::parse))
+    }
+
+    /// The module the workspace runs, whether or not its trees are ready. An
+    /// unreadable preference is Classic: Tree spends money, and a workspace
+    /// that stored Classic must not start a backfill on a blip.
+    pub(crate) async fn chosen(pool: &PgPool) -> Self {
+        match Self::stored(pool).await {
+            Ok(stored) => stored.unwrap_or(Self::Classic),
+            Err(e) => {
+                log!(
+                    "[SummaryTree] Failed to read the memory module: {}. Staying on Classic",
+                    e
+                );
+                Self::Classic
+            }
+        }
+    }
+}
+
+/// Whether the workspace runs Tree, ready or not: what keeps the compactor
+/// running.
+pub(crate) async fn tree_chosen(pool: &PgPool) -> bool {
+    MemoryModule::chosen(pool).await == MemoryModule::Tree
 }
 
 /// Whether a turn takes the Tree path: the workspace chose Tree, and the ready
 /// flag is set.
 pub async fn tree_ready(pool: &PgPool) -> bool {
-    if MemoryModule::chosen(pool).await != MemoryModule::Tree {
+    if !tree_chosen(pool).await {
         return false;
     }
     match super::store::is_ready(pool).await {
@@ -56,7 +86,7 @@ pub async fn tree_ready(pool: &PgPool) -> bool {
 
 /// How far the backfill has got, in scopes: each in-scope thread plus the
 /// workspace. A scope counts as done once its drain completes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BackfillProgress {
     pub done: usize,
     /// Zero until the compactor has seeded.
@@ -79,6 +109,14 @@ pub struct BackfillProgress {
     /// The ready flag is set, so turns read the trees while the older
     /// threads still fill in.
     pub ready: bool,
+    /// What the backfill episode has spent, when one is open.
+    pub spent_usd: Option<f64>,
+    /// Where it pauses, when its model is priced.
+    pub cap_usd: Option<f64>,
+    /// The cap Continue would set, when the backfill can have one.
+    pub next_cap_usd: Option<f64>,
+    /// The backfill spent its cap and waits for the user. Live work goes on.
+    pub held: bool,
     /// The order of the frame that announced this count, rising across one
     /// engine's life. A snapshot carries the last frame's order, so a client
     /// drops a frame its snapshot already counted.
@@ -86,7 +124,7 @@ pub struct BackfillProgress {
 }
 
 /// What `GET /api/v1/memory/tree-backfill` serves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum TreeBackfill {
     /// The workspace is on Classic. `started` says a backfill has written
@@ -108,8 +146,7 @@ pub(crate) async fn tree_backfill(
     pool: &PgPool,
     runtime: &super::Runtime,
 ) -> Result<TreeBackfill, Box<dyn std::error::Error + Send + Sync>> {
-    let pref = prefs::MEMORY_MODULE.try_read(pool).await?;
-    if MemoryModule::from_pref(Some(&pref)) != MemoryModule::Tree {
+    if MemoryModule::stored(pool).await? != Some(MemoryModule::Tree) {
         return Ok(TreeBackfill::Off {
             started: super::store::has_nodes(pool).await?,
         });
@@ -218,14 +255,37 @@ mod tests {
 
     #[test]
     fn only_tree_selects_tree() {
-        let default = MemoryModule::from_pref(Some(prefs::MEMORY_MODULE.default_text()));
-        assert_eq!(MemoryModule::from_pref(None), default);
-        assert_eq!(MemoryModule::from_pref(Some("bogus")), default);
+        assert_eq!(MemoryModule::from_pref(None), MemoryModule::Classic);
+        assert_eq!(
+            MemoryModule::from_pref(Some("bogus")),
+            MemoryModule::Classic
+        );
         assert_eq!(
             MemoryModule::from_pref(Some("classic")),
             MemoryModule::Classic
         );
         assert_eq!(MemoryModule::from_pref(Some("tree")), MemoryModule::Tree);
+    }
+
+    /// Nothing spends on Tree before someone chooses it: a workspace that
+    /// stores no module runs Classic, and its choice reads as unset.
+    #[tokio::test]
+    async fn an_unset_module_runs_classic() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        assert_eq!(MemoryModule::stored(&pool).await.unwrap(), None);
+        assert_eq!(MemoryModule::chosen(&pool).await, MemoryModule::Classic);
+        assert!(!tree_chosen(&pool).await);
+        assert!(!tree_ready(&pool).await);
+
+        crate::test_support::seed_preference(&pool, prefs::MEMORY_MODULE.key(), "tree")
+            .await
+            .unwrap();
+        assert_eq!(
+            MemoryModule::stored(&pool).await.unwrap(),
+            Some(MemoryModule::Tree)
+        );
+        assert!(tree_chosen(&pool).await);
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 
     /// I6: a surface with no preference row set resolves to the preference

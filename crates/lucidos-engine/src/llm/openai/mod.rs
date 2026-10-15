@@ -21,7 +21,7 @@ use std::time::Duration;
 mod chat;
 pub mod codex_detect;
 mod responses;
-pub(crate) use responses::MAX_BREAKPOINTS;
+pub(crate) use responses::MAX_EXPLICIT_BREAKPOINTS;
 
 const CHUNK_TIMEOUT_SECS: u64 = 300;
 /// The `[tag]` a stream failure logs under, shared by both wire formats.
@@ -51,7 +51,7 @@ impl std::fmt::Display for OpenAiKeySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Credential => "stored credential (Settings → Providers)",
-            Self::Env => "OPENAI_API_KEY",
+            Self::Env => OPENAI_API_KEY_ENV,
             Self::CodexCli => "Codex CLI (~/.codex/auth.json)",
         })
     }
@@ -109,6 +109,34 @@ pub fn resolve_openai_api_key(
         }
     }
     None
+}
+
+/// The launch environment's OpenAI key, read below a stored `openai` credential.
+pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+
+/// The OpenAI key an in-process caller uses: [`resolve_openai_api_key`] over
+/// the stored `openai` credential, [`OPENAI_API_KEY_ENV`] and the Codex login.
+///
+/// A credential that cannot be read logs and falls through to the other two,
+/// as the chat provider's build does. `None` means no source holds a key.
+pub async fn openai_api_key(pool: &sqlx::PgPool) -> Option<(String, OpenAiKeySource)> {
+    let service = crate::llm::ProviderKind::OpenAi.as_str();
+    let credential = match crate::core::CredentialStore::get(pool, service).await {
+        Ok(credential) => credential.map(|c| (c.auth_type, c.auth_value)),
+        Err(e) => {
+            log!(
+                "[OpenAI] Could not read the '{}' credential: {}",
+                service,
+                e
+            );
+            None
+        }
+    };
+    resolve_openai_api_key(
+        credential,
+        std::env::var(OPENAI_API_KEY_ENV).ok(),
+        codex_detect::load(),
+    )
 }
 
 /// Resolve a bearer-style API key from a stored credential (Settings →
@@ -333,6 +361,7 @@ impl OpenAiProvider {
             cache_creation_tokens: meta.cache_write_tokens,
             cache_read_tokens: meta.cache_read_tokens,
             served_model: meta.served_model,
+            service_tier: meta.service_tier,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,
@@ -365,6 +394,8 @@ struct StreamMeta {
     cache_write_tokens: Option<u32>,
     /// The *served model*: what a chunk, or the completed response, names.
     served_model: Option<String>,
+    /// The tier the completed response says served it.
+    service_tier: Option<crate::llm::ServiceTier>,
 }
 
 impl StreamMeta {
@@ -399,6 +430,10 @@ impl StreamMeta {
         if let Some(model) = crate::llm::served_model::served_model_of(resp) {
             self.served_model = Some(model);
         }
+        self.service_tier = resp
+            .get("service_tier")
+            .and_then(|t| t.as_str())
+            .and_then(crate::llm::ServiceTier::from_wire);
         if let Some(usage) = resp.get("usage") {
             if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
                 self.input_tokens = Some(crate::llm::clamp_provider_token_count(input, "OpenAI"));

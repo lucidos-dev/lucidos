@@ -30,6 +30,7 @@ async fn seed_session_started(bus: &EventBus, thread_id: Uuid, session_id: &str,
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "go".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -54,6 +55,9 @@ async fn seed_session_started(bus: &EventBus, thread_id: Uuid, session_id: &str,
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
     )
     .await;
@@ -147,6 +151,9 @@ async fn pending_change_branch_with_idled_session_recovers_sid() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
     )
     .await;
@@ -254,6 +261,7 @@ async fn applied_change_falls_through_to_fresh_start() {
             actor: None,
             pre_merge_sha: None,
             post_merge_sha: None,
+            landing_merge_sha: None,
             path: String::new(),
         },
     )

@@ -168,7 +168,7 @@ describe('WidgetFrame in the transcript', () => {
   it('holds the reader still when a widget crossing their line changes height', () => {
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="embed" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     // Its top is 100px above the line, so the reader reads what follows it.
     layOut(frameBox(), 200, boxHeight);
@@ -184,7 +184,7 @@ describe('WidgetFrame in the transcript', () => {
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
     const clip = document.createElement('div');
-    clip.className = 'widget-card-clip';
+    clip.className = 'inline-widget-clip';
     scroller.append(clip);
     act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, clip); });
     act(() => { reportOnScreen?.(true); });
@@ -198,7 +198,7 @@ describe('WidgetFrame in the transcript', () => {
   it('leaves a widget the reader is using where it is', () => {
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="embed" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     layOut(frameBox(), 200, boxHeight);
     // A tap inside the widget focuses its frame.
@@ -214,7 +214,7 @@ describe('WidgetFrame in the transcript', () => {
     // A frame stays loaded off screen, and scrolling never blurs it.
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="embed" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     frames()[0].tabIndex = 0;
     frames()[0].focus();
@@ -229,7 +229,7 @@ describe('WidgetFrame in the transcript', () => {
   it('leaves the reader alone when nothing after the widget is on screen', () => {
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="embed" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     // 100px above the line and 800px tall, so it runs past the 600px band.
     act(() => {
@@ -245,7 +245,7 @@ describe('WidgetFrame in the transcript', () => {
   it('leaves the reader alone when the widget sits below their line', () => {
     const { scroller, layOut } = transcript(300);
     host.append(scroller);
-    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="embed" />, scroller); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, scroller); });
     act(() => { reportOnScreen?.(true); });
     layOut(frameBox(), 500, boxHeight);
 

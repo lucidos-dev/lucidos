@@ -109,10 +109,13 @@ async function recordBackfillLabels(page: Page): Promise<void> {
 const BUILDING = /^Building memory, (\d+)%.* \| (\d+) of (\d+) trees/;
 
 test.describe('the memory module setting', () => {
+  // Tree tests switch the workspace to Tree, so each test starts where an
+  // upgraded workspace does: on a stored Classic.
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
     await navigateToApp(page);
     await waitForEventStream(page);
+    await resetToClassic(page);
   });
 
   test.afterEach(async ({ page }) => {
@@ -120,8 +123,7 @@ test.describe('the memory module setting', () => {
   });
 
   test('Tree asks first: the estimate shows and Cancel spends nothing', async ({ page }) => {
-    // Nothing writes the key on load, so the default stays Classic.
-    expect(await storedMemoryModule(page) ?? 'classic').toBe('classic');
+    expect(await storedMemoryModule(page)).toBe('classic');
     await readAsNeverStarted(page);
 
     await openMemoryPage(page);
@@ -134,12 +136,12 @@ test.describe('the memory module setting', () => {
     await expect(page.locator(ESTIMATE)).toHaveAttribute('data-state', 'loaded', { timeout: 30_000 });
     await expect(page.locator(ESTIMATE)).toContainText(/calls?/i);
     await expect(page.locator(CONFIRM).getByRole('button', { name: 'Start Tree' })).toBeEnabled();
-    expect(await storedMemoryModule(page) ?? 'classic').toBe('classic');
+    expect(await storedMemoryModule(page)).toBe('classic');
 
     await page.locator(CONFIRM).getByRole('button', { name: 'Cancel' }).click();
     await expect(page.locator(CONFIRM)).toHaveCount(0);
     await expect(moduleButton(page, 'Classic')).toHaveAttribute('aria-pressed', 'true');
-    expect(await storedMemoryModule(page) ?? 'classic').toBe('classic');
+    expect(await storedMemoryModule(page)).toBe('classic');
   });
 
   test('Start runs the backfill: the bar moves to Ready, and Tree survives a reload', async ({ page }) => {

@@ -120,7 +120,7 @@ impl LucidosEngine {
         });
 
         let tools = self
-            .chat_turn_tools(&capabilities.gates, context_window)
+            .chat_turn_tools(thread_id, &capabilities.gates, context_window)
             .await;
         let capture = crate::engine::AuxCapture::new(
             &self.event_bus,

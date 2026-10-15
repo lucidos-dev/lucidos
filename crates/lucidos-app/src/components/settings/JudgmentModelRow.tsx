@@ -1,5 +1,5 @@
 import type { ComponentChildren } from 'preact';
-import { credentials, preferences } from '../../store/store';
+import { configuredProviders, credentials, preferences } from '../../store/store';
 import {
   savePreference,
   saveModelSelection,
@@ -17,8 +17,7 @@ import {
   judgmentSelectedModel,
   judgmentSelectionCaveat,
   offeredEndpoints,
-  pickedEndpoint,
-  storedJudgmentValue,
+  sitePick,
   systemOneConfigured,
   systemOneSwitchedOff,
   JUDGMENT_MODEL_KEY,
@@ -58,7 +57,7 @@ export function JudgmentModelRow(props: {
   const prefs = preferences.value;
   const creds = credentials.value;
 
-  const picked = pickedEndpoint(storedJudgmentValue(prefs, props.site));
+  const picked = sitePick(props.site, prefs, configuredProviders.value);
   const modelKey = JUDGMENT_MODEL_KEY[props.site];
   const reasoningKey = JUDGMENT_REASONING_KEY[props.site];
 
@@ -74,7 +73,7 @@ export function JudgmentModelRow(props: {
     loaded
       ? offeredEndpoints({
           picked,
-          configured: (provider) => systemOneConfigured(provider, creds, prefs),
+          configured: (provider) => systemOneConfigured(provider, creds, prefs, configuredProviders.value),
           switchedOff: (provider) => systemOneSwitchedOff(prefs, provider),
         })
       : [],

@@ -13,9 +13,9 @@ const CONTROL_H = '2.375rem';
 const TALL_CONTROL_H = '12rem';
 
 /** Fields drawn as a loading placeholder in the form's own `.form-group` boxes:
- *  the label as real text where it is known, and the control's box shimmering.
- *  `inline` wraps them in the `.inline-form` a whole form stands in. */
-export function FormSkeleton({ fields, inline = true }: { fields: FormSkeletonField[]; inline?: boolean }) {
+ *  the label as real text where it is known, and the control's box shimmering,
+ *  inside the `.inline-form` a whole form stands in. */
+export function FormSkeleton({ fields }: { fields: FormSkeletonField[] }) {
   const groups = fields.map((f, i) => (
     <div class="form-group" key={i}>
       <label>{f.label ?? <SkText w="6rem" />}</label>
@@ -24,7 +24,7 @@ export function FormSkeleton({ fields, inline = true }: { fields: FormSkeletonFi
   ));
   return (
     <SkeletonProvider>
-      {inline ? <div class="inline-form" aria-hidden="true">{groups}</div> : <div aria-hidden="true">{groups}</div>}
+      <div class="inline-form" aria-hidden="true">{groups}</div>
     </SkeletonProvider>
   );
 }

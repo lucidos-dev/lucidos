@@ -91,16 +91,15 @@ describe('the Voice settings section', () => {
    *  so the array never reaches the string above.
    *
    *  The two streaming models lead because they are the ones built for a
-   *  microphone. The engine branches on `gpt-live-transcribe` to send
-   *  `languages` instead of `language`. A typo here offers a row the call
-   *  cannot pin a language for. */
-  it('offers the streaming transcribers first, without dropping the older models', () => {
+   *  microphone, then the default. The literals pin OpenAI's model ids, and
+   *  the engine sends `languages` instead of `language` for two of them,
+   *  `gpt-live-transcribe` and `gpt-transcribe`. OpenAI retired `whisper-1`
+   *  and the `gpt-4o` transcribers, and the engine refuses them, so the
+   *  picker must not offer one. */
+  it('offers the streaming transcribers first, then the default, and no retired model', () => {
     const ids = TRANSCRIBER_MODELS.map((m) => m.value);
-    expect(ids.slice(0, 2)).toEqual(['gpt-live-transcribe', 'gpt-realtime-whisper']);
-    expect(ids).toContain('gpt-transcribe');
-    expect(ids).toEqual(
-      expect.arrayContaining([DEFAULT_VOICE_TRANSCRIBER_MODEL, 'gpt-4o-transcribe', 'whisper-1']),
-    );
+    expect(ids).toEqual(['gpt-live-transcribe', 'gpt-realtime-whisper', 'gpt-transcribe']);
+    expect(ids).toContain(DEFAULT_VOICE_TRANSCRIBER_MODEL);
   });
 
   /** The picker went stale once: it offered `gpt-realtime`, which left the
@@ -220,14 +219,12 @@ describe('the Voice settings section', () => {
     expect(rendered).toContain(`model="${DEFAULT_VOICE_TALKER_MODEL}"`);
   });
 
-  /** The agent can write any id through `set_preference`. A picker that only
-   *  knew its own list would render a model the call is not dialling.
-   *
-   *  `gpt-realtime-mini` is the case that made this load-bearing: the list
-   *  dropped it when the provider deprecated it, and a workspace pinned to it
-   *  still dials it. */
+  /** The agent can write any current id through `set_preference`. A picker
+   *  that only knew its own list would render a model the call is not
+   *  dialling. A retired id never gets here: the engine refuses it on write
+   *  and replaces a stored one at startup. */
   it('keeps a stored talker the curated list does not carry', () => {
-    for (const pinned of ['gpt-realtime-next', 'gpt-realtime-mini']) {
+    for (const pinned of ['gpt-realtime-next', 'gpt-realtime-2.2-preview']) {
       const rendered = render({ voice_enabled: 'true', model_voice_talker: pinned });
       expect(rendered).toContain(`model="${pinned}"`);
     }

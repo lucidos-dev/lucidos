@@ -38,6 +38,7 @@ async fn start_chat_thread(bus: &EventBus, thread_id: Uuid) {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "write me the report".into(),
             user_image_hashes: vec![],
             device_id: None,

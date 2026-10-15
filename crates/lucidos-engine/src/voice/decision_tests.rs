@@ -306,6 +306,9 @@ async fn a_coding_agent_thread(bus: &EventBus) -> Uuid {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: crate::engine::thread_events::EventMeta {
             channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
@@ -378,6 +381,7 @@ async fn a_turn_starts(bus: &EventBus, thread_id: Uuid) {
         ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "clean up the old releases".to_string(),
             user_image_hashes: vec![],
             device_id: None,

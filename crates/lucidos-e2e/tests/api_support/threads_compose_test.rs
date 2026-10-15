@@ -171,7 +171,21 @@ async fn put_compose_updates_text_images_and_mode() {
         .send()
         .await
         .expect("PUT compose failed");
-    assert_eq!(resp.status(), 204, "PUT should be 204 No Content");
+    assert_eq!(resp.status(), 200, "PUT answers with the compose report");
+    let report: serde_json::Value = resp.json().await.expect("compose report body");
+    let stored_version: i64 =
+        sqlx::query_scalar("SELECT summary_version FROM thread_summaries WHERE thread_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("summary_version query");
+    assert_eq!(
+        report["summary_version"].as_i64(),
+        Some(stored_version),
+        "the report's revision is the row's version after the write: {report}"
+    );
+    assert_eq!(report["text"], "hello world");
+    assert_eq!(report["mode"], "claude_code");
 
     let (_state, text, images, mode) = fetch_compose_row(&pool, id).await;
     assert_eq!(text, "hello world");
@@ -319,7 +333,7 @@ async fn put_compose_persists_and_surfaces_selection() {
         .send()
         .await
         .expect("PUT compose with selection failed");
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200);
 
     // Column persisted.
     assert_eq!(
@@ -405,7 +419,7 @@ async fn delete_thread_marks_discarded() {
         .send()
         .await
         .expect("DELETE failed");
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200);
 
     let (state, _text, _images, _mode) = fetch_compose_row(&pool, id).await;
     assert_eq!(state, "discarded", "DELETE must flip state to discarded");
@@ -462,7 +476,7 @@ async fn delete_then_delete_is_idempotent() {
         .send()
         .await
         .expect("first DELETE failed");
-    assert_eq!(r1.status(), 204);
+    assert_eq!(r1.status(), 200);
 
     let r2 = client
         .delete(thread_url(&id))
@@ -494,7 +508,7 @@ async fn delete_unknown_thread_is_idempotent_no_op() {
 /// MessageReceived already revives an archived thread (state→active), so the
 /// compose layer must accept the keystrokes that lead up to send.
 #[tokio::test]
-async fn put_compose_on_archived_thread_returns_no_content() {
+async fn put_compose_on_archived_thread_is_accepted() {
     let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
@@ -535,7 +549,7 @@ async fn put_compose_on_archived_thread_returns_no_content() {
         .expect("PUT compose on archived failed");
     assert_eq!(
         resp.status(),
-        204,
+        200,
         "PUT compose on an archived thread must accept the draft (got {})",
         resp.status()
     );
@@ -642,8 +656,8 @@ async fn post_threads_rejects_unknown_mode() {
 // the case deterministic and free of an LLM round trip.
 
 /// Stand in for a submission consuming the thread's compose slot. Writes what
-/// the `MessageReceived` projection writes in one transaction: the row leaves
-/// `composing`, the stored draft goes, and the epoch advances.
+/// a send's accept and its `MessageReceived` leave together: the row leaves
+/// `composing`, the stored draft goes, and the epoch advances (ADR 0450).
 ///
 /// The `state` flip is load-bearing, not decoration. It is the column the mode
 /// lock reads, so a stand-in that left the row `composing` could never reach
@@ -694,7 +708,7 @@ async fn put_compose_at_a_consumed_epoch_is_refused_and_changes_nothing() {
         .send()
         .await
         .expect("PUT compose failed");
-    assert_eq!(resp.status(), 204, "the first write is at the live epoch");
+    assert_eq!(resp.status(), 200, "the first write is at the live epoch");
 
     consume_compose_slot(&pool, id).await;
 
@@ -717,6 +731,10 @@ async fn put_compose_at_a_consumed_epoch_is_refused_and_changes_nothing() {
         body["compose_epoch"].as_i64(),
         Some(1),
         "the refusal must hand back the current epoch so the client can re-issue"
+    );
+    assert!(
+        body["summary_version"].as_i64().is_some_and(|v| v > 0) && body["text"] == "",
+        "the refusal carries the current compose report: {body}"
     );
 
     let (_state, text, _images, _mode) = fetch_compose_row(&pool, id).await;
@@ -746,7 +764,7 @@ async fn put_compose_at_the_current_epoch_is_applied() {
         .send()
         .await
         .expect("PUT compose failed");
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200);
 
     let (_state, text, _images, _mode) = fetch_compose_row(&pool, id).await;
     assert_eq!(text, "a genuinely new follow-up");
@@ -778,7 +796,7 @@ async fn consecutive_compose_puts_at_one_epoch_are_all_accepted() {
             .expect("PUT compose failed");
         assert_eq!(
             resp.status(),
-            204,
+            200,
             "keystroke write `{text}` was fenced out"
         );
     }
@@ -822,7 +840,7 @@ async fn a_stale_write_carrying_a_mode_is_refused_as_stale_not_mode_locked() {
         .send()
         .await
         .expect("PUT compose failed");
-    assert_eq!(resp.status(), 204, "the first write is at the live epoch");
+    assert_eq!(resp.status(), 200, "the first write is at the live epoch");
 
     consume_compose_slot(&pool, id).await;
 
@@ -917,7 +935,7 @@ async fn put_compose_without_an_epoch_is_unfenced() {
         .send()
         .await
         .expect("PUT compose failed");
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200);
 
     let (_state, text, _images, _mode) = fetch_compose_row(&pool, id).await;
     assert_eq!(text, "from a client that predates the fence");
@@ -947,7 +965,7 @@ async fn a_composed_draft_is_listed_with_its_edit_time_and_thread_link() {
         .send()
         .await
         .expect("PUT compose failed");
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200);
 
     let drafts: serde_json::Value = client
         .get(format!("{}?limit=1000", drafts_url()))
@@ -995,4 +1013,51 @@ async fn a_composed_draft_is_listed_with_its_edit_time_and_thread_link() {
         .await
         .expect("GET discarded draft failed");
     assert_eq!(gone.status(), 404, "a discarded thread holds no draft");
+}
+
+/// A send consumes the compose slot when the engine accepts it, and the ack
+/// says what that left (ADR 0450). The stored draft was the message, so it is
+/// gone, and the epoch moved once.
+#[tokio::test]
+async fn a_send_consumes_its_draft_at_accept_and_the_ack_reports_it() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "lucidos" }))
+        .send()
+        .await
+        .expect("POST /api/v1/threads failed");
+    let text = format!("Say exactly: \"consumed {id}\"");
+    let resp = client
+        .put(compose_url(&id))
+        .json(&json!({ "text": format!("{text}\n"), "compose_epoch": 0 }))
+        .send()
+        .await
+        .expect("PUT compose failed");
+    assert_eq!(resp.status(), 200);
+
+    let ack: serde_json::Value = client
+        .post(format!("{}/api/v1/chat/stream", base_url()))
+        .json(&json!({ "message": text, "thread_id": id, "mode": "human" }))
+        .send()
+        .await
+        .expect("chat request failed")
+        .json()
+        .await
+        .expect("chat ack body");
+
+    assert_eq!(
+        ack["compose"]["text"], "",
+        "the stored draft was the message: {ack}"
+    );
+    assert_eq!(ack["compose"]["compose_epoch"].as_i64(), Some(1));
+    assert_eq!(
+        fetch_compose_epoch(&pool, id).await,
+        1,
+        "the epoch moved once"
+    );
 }

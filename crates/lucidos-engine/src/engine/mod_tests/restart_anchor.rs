@@ -22,27 +22,10 @@ use super::common::*;
 use super::*;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
-    AbortCause, ActorMode, CancelCause, EventMeta, MessageOrigin, ThreadEvent,
+    AbortCause, CancelCause, EventMeta, MessageOrigin, ThreadEvent,
 };
-use crate::test_support::{setup_test_db, teardown_test_db};
+use crate::test_support::{message_received, setup_test_db, teardown_test_db};
 use uuid::Uuid;
-
-fn message_received(text: &str) -> ThreadEvent {
-    ThreadEvent::MessageReceived {
-        provider: None,
-        voice_session_id: None,
-        text: text.to_string(),
-        user_image_hashes: vec![],
-        device_id: None,
-        image_description: None,
-        parent_thread_id: None,
-        spawning_event_id: None,
-        mode: ActorMode::Human,
-        model: None,
-        reasoning_effort: None,
-        origin: None,
-    }
-}
 
 /// Persist an event with a caller-chosen id, the way the chat path does when it
 /// forwards the frontend's optimistic UUID. Returns that id.
@@ -239,6 +222,7 @@ async fn continuation_started_turn_keeps_its_own_anchor() {
             branch: String::new(),
             origin: None,
             reason: Some(crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON.into()),
+            resumed_abort_id: None,
         },
         Uuid::new_v4(),
     )
@@ -298,6 +282,9 @@ async fn continuation_requested_turn_keeps_its_own_anchor() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),

@@ -49,8 +49,10 @@ const MIDDLE_BUTTON = 1;
  *  hides itself for the same reason.
  *
  *  Tauri is answered first and unconditionally. The shell always has windows,
- *  and a webview's `display-mode` is not a promise worth depending on there. */
-function separateViewIsAvailable(): boolean {
+ *  and a webview's `display-mode` is not a promise worth depending on there.
+ *
+ *  `openThreadInWorkspace` asks this too, so a thread link and a row agree. */
+export function separateViewIsAvailable(): boolean {
   return isTauri() || !isStandalone();
 }
 

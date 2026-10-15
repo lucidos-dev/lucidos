@@ -53,6 +53,7 @@ async fn message_from(bus: &EventBus, thread_id: Uuid, from: &str) -> Uuid {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "open the changelog".into(),
             user_image_hashes: vec![],
             device_id: Some(from.to_string()),

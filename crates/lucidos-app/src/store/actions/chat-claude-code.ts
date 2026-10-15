@@ -1,16 +1,16 @@
 import {
   showToast,
   applyingNowThreadIds,
-  archivingThreadIds,
+  applyNowRequests,
   discardingCCThreadIds,
-  changes,
+  threadMap,
   markThreadAnswering,
   clearThreadAnswering,
   focusedThreadId,
   TOAST_AUTO_DISMISS_MS,
 } from '../store';
-import { refreshChangesState } from './chat-changes';
-import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
+import { archiveRequestInFlight } from '../rowIntents';
+import { applyNow, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
 import { pendingAnswers, unsentPicks } from '../pendingDecisions';
 import { sendFailureOf, withQuietRetries } from './sendRetry';
 import { inSendChain } from './sendChain';
@@ -20,31 +20,13 @@ import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { changeToastMessage } from './changeToast';
 import { focusThread } from './threads';
 import { errorDetail } from '../../utils/errorDetail';
+import { generateUuid } from '../../utils/uuid';
 
-// Safety timers per thread — cleared on re-arm (409 or 404-fallback) to prevent stacking.
-const applyingSafetyTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-/** Remove a thread from the optimistic Apply Now tracking map. */
-function clearApplyingNow(threadId: string): void {
-  const next = new Map(applyingNowThreadIds.value);
+/** End the click's bridge: the engine refused it, or it failed to send. */
+function dropApplyNowRequest(threadId: string): void {
+  const next = new Map(applyNowRequests.value);
   next.delete(threadId);
-  applyingNowThreadIds.value = next;
-}
-
-/** Arm a 60s safety timeout that clears the optimistic "applying" state if no
- *  SSE resolution event (ChangeApplied/ChangeApplyFailed) arrives — e.g. an SSE
- *  reconnection gap. Without it the thread is stuck in the optimistic phase
- *  forever. Re-arming clears any prior timer so it never stacks; the timer is a
- *  no-op if SSE already cleared the thread by the time it fires. */
-function armApplyingSafetyTimeout(threadId: string): void {
-  const prev = applyingSafetyTimers.get(threadId);
-  if (prev) clearTimeout(prev);
-  applyingSafetyTimers.set(threadId, setTimeout(() => {
-    applyingSafetyTimers.delete(threadId);
-    if (applyingNowThreadIds.value.has(threadId)) {
-      clearApplyingNow(threadId);
-    }
-  }, 60_000));
+  applyNowRequests.value = next;
 }
 
 /** Refusal slugs that mean something other than an apply holds the session.
@@ -63,84 +45,42 @@ function refusalMeansApplying(e: ApiError): boolean {
   return typeof slug !== 'string' || !NOT_APPLYING_REFUSALS.has(slug);
 }
 
-/** End a running Claude Code session and immediately apply its changes.
- *  The backend handles the apply flow — SSE events update the thread status.
- *  Sets optimistic "applying" state immediately so the UI responds before SSE arrives. */
+/** Apply a coding-agent thread's change. The engine owns the apply and
+ *  projects it on the thread's row as `applyInFlight` (ADR 0437). The click
+ *  shows "applying" at once, and holds until the row reaches the version the
+ *  engine answered with. No timer and no other event ends it. */
 export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
   if (applyingNowThreadIds.value.has(threadId)) return; // Already in progress
-  if (archivingThreadIds.value.has(threadId)) return; // Can't apply while archiving
+  if (archiveRequestInFlight(threadId)) return; // Can't apply while archiving
   if (discardingCCThreadIds.value.has(threadId)) return; // Can't apply while discarding
-  const next = new Map(applyingNowThreadIds.value);
-  next.set(threadId, 'requesting');
-  applyingNowThreadIds.value = next;
+  // An engine that predates the version: hold until any row newer than this
+  // one. Read before the request, since its frame can beat the response.
+  const legacyVersion = (threadMap.value.get(threadId)?.meta.summaryVersion ?? 0) + 1;
+  applyNowRequests.value = new Map(applyNowRequests.value).set(threadId, null);
   try {
-    await applyNow(threadId);
+    const { summary_version } = await applyNow(threadId);
+    applyNowRequests.value = new Map(applyNowRequests.value).set(threadId, summary_version ?? legacyVersion);
   } catch (e) {
+    dropApplyNowRequest(threadId);
     if (e instanceof ApiError && e.httpCode === 409) {
       // The engine's message names what refused the apply. Keyed under the
-      // apply's result toast, which replaces it once the apply resolves.
+      // apply's result toast, which replaces it once the apply resolves. A
+      // running apply already shows on the row, so nothing else is held.
       const key = `applying-${threadId}`;
       const onClick = () => focusThread(threadId);
       if (refusalMeansApplying(e)) {
         showToast(changeToastMessage('Already applying', threadId, e.reason), 'info', { key, onClick, autoDismissMs: TOAST_AUTO_DISMISS_MS });
-        // An apply really is running, so its SSE resolution will clear this.
-        // The safety timeout covers an SSE gap dropping that resolution.
-        armApplyingSafetyTimeout(threadId);
       } else {
         // A Discard, a stop ending the session, or a question that may still
         // be waiting on the user: nothing is applying.
-        clearApplyingNow(threadId);
         showToast(changeToastMessage('Not applied', threadId, e.reason), 'warning', { key, onClick });
       }
       return;
     }
-    if (e instanceof ApiError && e.httpCode === 404) {
-      // No live session, so apply the thread's pending changes one by one. The
-      // cached list can lag a proposal, or hold a failed load. So re-read it
-      // before naming what is pending, and never call a change absent unread.
-      // A landed read always writes a new `loaded` value, so the same object
-      // means the read did not land.
-      const cached = changes.value;
-      await refreshChangesState();
-      const fresh = changes.value;
-      if (fresh === cached || fresh.status !== 'loaded') {
-        clearApplyingNow(threadId);
-        showToast(changeToastMessage('Not applied', threadId, 'the pending changes could not be read. Try again'), 'error', {
-          key: `applying-${threadId}`,
-        });
-        return;
-      }
-      const pending = fresh.data.filter(
-        c => c.thread_id === threadId && c.status === 'pending',
-      );
-      if (pending.length > 0) {
-        try {
-          for (const c of pending) {
-            await applyChange(c.id);
-          }
-          // SSE ChangeApplied/ChangeApplyFailed events clear applyingNowThreadIds;
-          // arm the same 60s safety timeout the 409 path uses so an SSE
-          // reconnection gap can't strand the thread in the optimistic phase.
-          armApplyingSafetyTimeout(threadId);
-          return;
-        } catch (applyErr) {
-          clearApplyingNow(threadId);
-          showToast(changeToastMessage('Failed to apply changes', threadId, errorDetail(applyErr)), 'error', {
-            key: `applying-${threadId}`,
-          });
-          return;
-        }
-      }
-      clearApplyingNow(threadId);
-      showToast('No pending changes to apply', 'warning', { key: `applying-${threadId}` });
-      return;
-    }
-    // API failed, so clear the optimistic state immediately. Every keyed error
-    // toast in this file names its thread and its cause. A bare "Failed to
-    // start apply" says neither which thread failed nor why: an
-    // auth refusal, a 5xx and a worktree conflict all read alike, and two
+    // Every keyed error toast in this file names its thread and its cause. A
+    // bare "Failed to start apply" says neither which thread failed nor why:
+    // an auth refusal, a 5xx and a worktree conflict all read alike, and two
     // threads applying at once become indistinguishable.
-    clearApplyingNow(threadId);
     showToast(changeToastMessage('Failed to start apply', threadId, errorDetail(e)), 'error', {
       key: `applying-${threadId}`,
     });
@@ -152,7 +92,7 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
 export async function handleDiscardCCChanges(threadId: string): Promise<void> {
   if (discardingCCThreadIds.value.has(threadId)) return;
   if (applyingNowThreadIds.value.has(threadId)) return;
-  if (archivingThreadIds.value.has(threadId)) return;
+  if (archiveRequestInFlight(threadId)) return;
   discardingCCThreadIds.value = new Set([...discardingCCThreadIds.value, threadId]);
   // autoDismissMs is a safety net for the rare zero-pending-changes case
   // where the engine emits no ChangeDiscarded event and the spinner has no
@@ -234,9 +174,14 @@ export async function answerThreadQuestion(
   // A new answer replaces a pick that was not sent.
   unsentPicks.clear(toolUseId);
   // In the thread's send chain, so a message typed after the tap cannot reach
-  // the engine first and be taken as the card's answer.
-  const result = await inSendChain(threadId, () =>
-    withQuietRetries(() => apiAnswerThreadQuestion(threadId, toolUseId, answer), { path: 'answer' }));
+  // the engine first and be taken as the card's answer. Every quiet retry is
+  // the same input, so it resends the same id and place.
+  const eventId = generateUuid();
+  const result = await inSendChain(threadId, (position) =>
+    withQuietRetries(
+      () => apiAnswerThreadQuestion(threadId, toolUseId, answer, { event_id: eventId, ...position }),
+      { path: 'answer' },
+    ));
   // A 409 after a dropped attempt almost always means that attempt arrived:
   // the engine 409s a repeated answer. SSE shows what was recorded.
   if (result.kind === 'done' && (result.value || result.attempts > 1)) return 'sent';

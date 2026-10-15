@@ -4,7 +4,7 @@
  * request answers. An open menu keeps the UI behind inert, so a Send tapped
  * during that round trip only closed the menu and the message never went.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import type { CodingAgentCommandsResponse } from '../../../api/client';
 
@@ -32,6 +32,10 @@ vi.mock('../../../store/actions/chat-claude-code', async (importOriginal) => ({
 }));
 
 const { CodingAgentControlMenu } = await import('../CodingAgentControlMenu');
+const { controlMenuParts } = await import('../controlMenuParts');
+
+// The menus' panel parts are code-split. Warm them, so a press opens at once.
+beforeAll(() => controlMenuParts.preload());
 
 let host: HTMLDivElement;
 

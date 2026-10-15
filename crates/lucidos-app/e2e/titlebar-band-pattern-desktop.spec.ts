@@ -160,7 +160,10 @@ test.describe('the title-bar band continues the header fill', () => {
     const bar = await barHeight(page);
     expect(bar, 'the bar is the 28px band plus the header').toBeGreaterThan(28);
 
-    for (const x of [3, 640, 1270]) {
+    // The bar's own right edge, not the window's: the Home rail holds the
+    // window's right edge, outside the header (ADR 0466).
+    const right = await page.evaluate(() => Math.floor(document.querySelector('.app-header')!.getBoundingClientRect().right));
+    for (const x of [3, 640, right - 10]) {
       const wrong = (await pixelColumn(page, x, bar))
         .map((rgb, y) => ({ y, rgb, want: stripeAt(y) }))
         .filter(r => !close(r.rgb, r.want))

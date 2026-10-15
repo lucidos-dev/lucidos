@@ -379,6 +379,31 @@ function makeEl(opts: {
   return el;
 }
 
+/** Draw a whole reply into `turn` as ONE row, in one commit, laid out the way
+ *  a browser would measure it. It starts where the turn ended, at 3080, and
+ *  its first line ends 20px below that. It stubs the DOM globals the
+ *  first-line measurement reads, so the caller unstubs them. */
+function drawWholeReply(el: any, turn: any) {
+  class LaidOutNode {}
+  const text = { textContent: '\n  1. One' };
+  vi.stubGlobal('Node', LaidOutNode);
+  vi.stubGlobal('NodeFilter', { SHOW_TEXT: 4 });
+  vi.stubGlobal('document', {
+    hasFocus: () => true,
+    createTreeWalker: () => { let walked = false; return { nextNode: () => (walked ? null : (walked = true, text)) }; },
+    createRange: () => ({
+      setStart() {},
+      setEnd() {},
+      getClientRects: () => [{ bottom: 3100 - el.scrollTop }],
+    }),
+  });
+  turn.drawn.push(Object.assign(new LaidOutNode(), {
+    isConnected: true,
+    getBoundingClientRect: () => ({ bottom: 4000 - el.scrollTop }),
+  }));
+  el.scrollHeight = 4000;
+}
+
 /** Park the reader exactly at the live edge without counting it as a write. */
 function atBottom(el: any) {
   el._scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
@@ -3832,6 +3857,65 @@ describe('a submit holds the bottom until the agent draws', () => {
     expect(el.scrollTop).not.toBe(8500);  // and not the end of the reply
   });
 
+  it('rests on the first LINE of a reply that arrives as one row', () => {
+    // A fast reply can draw itself whole in one commit, as ONE row. That row
+    // ends the hold, and the edge it leaves is the end of the reply. Resting
+    // there carried the reader through it (the e2e spec
+    // `thread-scroll-belongs-to-the-reader`, on the mock model). The release
+    // shows where the reply starts instead.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSentMessage();
+    const sent = el.addUserMessage({ top: 2900, height: 120 });
+    el.scrollHeight = 3080;
+    onResize();
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2580); // 3080 - 500: the reader's own turn
+
+    try {
+      drawWholeReply(el, sent.turn);
+      onResize();
+      vi.advanceTimersByTime(1500);
+
+      expect(el.scrollTop).toBe(2600);     // 3100 - 500: its first line in view
+      expect(el.scrollTop).not.toBe(3500); // and not the end of the reply
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('stops a glide in flight on that first line, and never steps back', () => {
+    // The same reply, committed while the landing still glides. The browser
+    // runs the glide's frame before the resize round that ends the hold. That
+    // frame tracked the new edge past the first line. The freeze then aimed
+    // below where the glide had got to, so the next frame stepped back.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSentMessage();
+    const sent = el.addUserMessage({ top: 2900, height: 120 });
+    el.scrollHeight = 3080;
+    onResize();
+    vi.advanceTimersByTime(250);   // the glide is well under way
+
+    try {
+      drawWholeReply(el, sent.turn); // and NO resize round before the frames
+      const tops = [el.scrollTop];
+      for (let ms = 0; ms < 1500; ms += 16) {
+        vi.advanceTimersByTime(16);
+        tops.push(el.scrollTop);
+      }
+
+      expect(el.scrollTop).toBe(2600); // 3100 - 500: its first line in view
+      tops.forEach((top, i) => { if (i > 0) expect(top).toBeGreaterThanOrEqual(tops[i - 1]); });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('carries an ARMED reader through that same fast reply', () => {
     // The half that must NOT change. A reader pinned to the live edge asked to
     // be carried, and being carried is the whole point of the ask. The reply
@@ -4668,6 +4752,37 @@ describe('a side question scrolls to its card start', () => {
     vi.advanceTimersByTime(1500);
 
     expect(el.scrollTop).toBe(3000);
+  });
+
+  it('takes over from a send landing still gliding, as the one tween', () => {
+    // A landing's glide runs its hold before each frame. So a side question
+    // whose card draws mid-glide starts its own tween INSIDE the glide's step.
+    // Rescheduled anyway, the old step kept a second loop writing toward the
+    // live edge, past the card.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSentMessage();
+    const sent = el.addUserMessage({ top: 2900, height: 120 });
+    el.scrollHeight = 3080;
+    onResize();                    // the send's landing glide starts
+    vi.advanceTimersByTime(100);
+    el.drawResponseRow(sent.turn); // a fast reply ends its hold mid-glide
+    el.scrollHeight = 3200;
+    vi.advanceTimersByTime(32);
+
+    followSideQuestion();
+    el.addSideQuestionCard({ id: 'side-question-1', top: 3100, height: 200 });
+    el.scrollHeight = 4000;        // the card, drawn while the glide runs
+    const tops: number[] = [];
+    for (let ms = 0; ms < 1500; ms += 16) {
+      vi.advanceTimersByTime(16);
+      tops.push(el.scrollTop);
+    }
+
+    expect(el.scrollTop).toBe(3100);              // the card's start
+    expect(Math.max(...tops)).toBeLessThanOrEqual(3100); // never toward 3500
   });
 
   it('never goes past the live edge', () => {

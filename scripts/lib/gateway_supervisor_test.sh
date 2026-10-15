@@ -3,8 +3,9 @@
 # auto-restarts the machine-global workspace gateway on unexpected death
 # (SIGKILL, OOM, panic) but, unlike the engine supervisor, IGNORES terminal /
 # launcher signals (SIGHUP/SIGINT/SIGTERM) so it survives the launching shell and
-# terminal. The only legitimate stop is the child exiting cleanly (0/130/138),
-# which the `-b` stop path triggers via SIGUSR1 to the gateway child.
+# terminal. The only legitimate stops are the child exiting cleanly (0, the
+# default exit of SIGINT or SIGUSR1, or already-running), which the `-b` stop
+# path triggers via SIGUSR1 to the gateway child.
 #
 # Run: ./scripts/lib/gateway_supervisor_test.sh
 set -u
@@ -69,40 +70,58 @@ wait_for_counter() {
     return 1
 }
 
-kill_pidfile_pid() {
-    local pidfile="$1"
-    [ -s "$pidfile" ] || return 0
-    kill -KILL "$(cat "$pidfile")" 2>/dev/null || true
+# Kill the pid a mock recorded in $1, if any. Mocks record their own pid, as
+# the real gateway publishes its own.
+kill_child_pid() {
+    local child_file="$1"
+    [ -s "$child_file" ] || return 0
+    kill -KILL "$(cat "$child_file")" 2>/dev/null || true
 }
 
-# ── Test 1: pidfile is written after launch ─────────────────────────────
-test_pidfile_written_on_launch() {
-    echo "test: pidfile is written after launching the child"
-    local tdir="$SANDBOX/t1"; mkdir -p "$tdir"
-    local pidfile="$tdir/pid" logfile="$tdir/log"
+# Write a mock at $1 that records its pid in $2, then sleeps.
+write_sleeping_mock() {
+    local mock="$1" child_file="$2"
+    cat > "$mock" <<EOF
+#!/bin/bash
+echo \$\$ > "$child_file"
+exec sleep 600
+EOF
+    chmod +x "$mock"
+}
 
-    ( run_gateway_supervised "$pidfile" "$logfile" sleep 600 ) &
+# ── Test 1: the supervisor writes no pidfile ────────────────────────────
+# The gateway publishes gateway.pid itself once it owns the data dir. A
+# supervisor write would let a losing launch overwrite the winner's pid.
+test_supervisor_writes_no_pidfile() {
+    echo "test: the supervisor leaves its state dir alone on a launch"
+    local tdir="$SANDBOX/t1"; mkdir -p "$tdir/state"
+    local logfile="$tdir/log"
+    write_sleeping_mock "$tdir/mock" "$tdir/child"
+
+    ( run_gateway_supervised "$tdir/state" "$logfile" "$tdir/mock" ) &
     local sup_pid=$!
     CLEANUP_PIDS+=("$sup_pid")
 
-    if ! wait_for_file "$pidfile" 3; then
-        fail "pidfile $pidfile not written within 3s"; return
+    if ! wait_for_file "$tdir/child" 3; then
+        fail "the child did not start within 3s"
+        kill -KILL "$sup_pid" 2>/dev/null || true; return
     fi
-    local child_pid; child_pid="$(cat "$pidfile")"
-    if [ -z "$child_pid" ] || ! kill -0 "$child_pid" 2>/dev/null; then
-        fail "pid in $pidfile ($child_pid) is not a live process"; return
+    if [ -n "$(ls -A "$tdir/state")" ]; then
+        fail "the supervisor wrote into its state dir: $(ls -A "$tdir/state")"
+    else
+        pass "no pidfile: only the gateway names itself"
     fi
-    pass "pidfile contains live child pid $child_pid"
-    kill -KILL "$sup_pid" "$child_pid" 2>/dev/null || true
+    kill -KILL "$sup_pid" 2>/dev/null || true
+    kill_child_pid "$tdir/child"
     wait_for_exit "$sup_pid" 3
 }
 
-# ── Test 2: clean child exit (0/130/138) stops the supervisor (stay dead) ─
+# ── Test 2: each clean child exit stops the supervisor (stay dead) ───────
 assert_clean_exit_stops_loop() {
     local exit_code="$1" tname="$2"
     echo "test: child exit $exit_code stops the supervisor"
     local tdir="$SANDBOX/$tname"; mkdir -p "$tdir"
-    local pidfile="$tdir/pid" logfile="$tdir/log" counter="$tdir/counter"
+    local logfile="$tdir/log" counter="$tdir/counter"
     echo 0 > "$counter"
 
     local mock="$tdir/mock"
@@ -114,7 +133,7 @@ exit $exit_code
 EOF
     chmod +x "$mock"
 
-    ( run_gateway_supervised "$pidfile" "$logfile" "$mock" ) &
+    ( run_gateway_supervised "$tdir" "$logfile" "$mock" ) &
     local sup_pid=$!
     CLEANUP_PIDS+=("$sup_pid")
 
@@ -130,13 +149,17 @@ EOF
 }
 
 test_clean_exit_zero_stops_loop() { assert_clean_exit_stops_loop 0 t2; }
-test_clean_exit_138_stops_loop()  { assert_clean_exit_stops_loop 138 t3; }
+test_clean_exit_usr1_stops_loop() { assert_clean_exit_stops_loop $((128 + $(kill -l USR1))) t3; }
+# A launch that lost the data dir to a running gateway (server.rs
+# ALREADY_RUNNING_EXIT, pinned there). Respawning it would
+# lose again every backoff, forever.
+test_already_running_stops_loop() { assert_clean_exit_stops_loop 75 t3b; }
 
 # ── Test 3: unexpected exit (137 = SIGKILL) triggers restart ─────────────
 test_unexpected_exit_137_restarts() {
     echo "test: child exit 137 (SIGKILL) triggers restart"
     local tdir="$SANDBOX/t4"; mkdir -p "$tdir"
-    local pidfile="$tdir/pid" logfile="$tdir/log" counter="$tdir/counter"
+    local logfile="$tdir/log" counter="$tdir/counter"
     echo 0 > "$counter"
 
     local mock="$tdir/mock"
@@ -145,84 +168,29 @@ test_unexpected_exit_137_restarts() {
 n=\$(cat "$counter")
 echo \$((n + 1)) > "$counter"
 if [ "\$n" -ge 2 ]; then
-    sleep 600
+    echo \$\$ > "$tdir/child"
+    exec sleep 600
 else
     exit 137
 fi
 EOF
     chmod +x "$mock"
 
-    ( run_gateway_supervised "$pidfile" "$logfile" "$mock" ) &
+    ( run_gateway_supervised "$tdir" "$logfile" "$mock" ) &
     local sup_pid=$!
     CLEANUP_PIDS+=("$sup_pid")
 
     if ! wait_for_counter "$counter" 3 15; then
         fail "child only ran $(cat "$counter") times — expected ≥ 3 (initial + 2 restarts)"
-        kill -KILL "$sup_pid" 2>/dev/null || true; kill_pidfile_pid "$pidfile"; return
+        kill -KILL "$sup_pid" 2>/dev/null || true; kill_child_pid "$tdir/child"; return
     fi
     pass "supervisor restarted child after exit 137 (ran $(cat "$counter") times)"
     kill -KILL "$sup_pid" 2>/dev/null || true
-    kill_pidfile_pid "$pidfile"
+    kill_child_pid "$tdir/child"
     wait_for_exit "$sup_pid" 3
 }
 
-# ── Test 4: pidfile is rewritten to the new pid after a restart ──────────
-test_pidfile_updates_on_restart() {
-    echo "test: pidfile is rewritten to the new pid after a restart"
-    local tdir="$SANDBOX/t5"; mkdir -p "$tdir"
-    local pidfile="$tdir/pid" logfile="$tdir/log" counter="$tdir/counter"
-    echo 0 > "$counter"
-
-    local mock="$tdir/mock"
-    cat > "$mock" <<EOF
-#!/bin/bash
-n=\$(cat "$counter")
-echo \$((n + 1)) > "$counter"
-if [ "\$n" -ge 1 ]; then
-    sleep 600
-else
-    exit 137
-fi
-EOF
-    chmod +x "$mock"
-
-    ( run_gateway_supervised "$pidfile" "$logfile" "$mock" ) &
-    local sup_pid=$!
-    CLEANUP_PIDS+=("$sup_pid")
-
-    if ! wait_for_file "$pidfile" 3; then
-        fail "pidfile not written for first invocation"
-        kill -KILL "$sup_pid" 2>/dev/null || true; return
-    fi
-    local first_pid; first_pid="$(cat "$pidfile")"
-
-    if ! wait_for_counter "$counter" 2 10; then
-        fail "supervisor did not restart child within 10s"
-        kill -KILL "$sup_pid" 2>/dev/null || true; kill_pidfile_pid "$pidfile"; return
-    fi
-
-    local deadline=$(( $(date +%s) + 5 )) second_pid=""
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        second_pid="$(cat "$pidfile" 2>/dev/null || true)"
-        if [ -n "$second_pid" ] && [ "$second_pid" != "$first_pid" ] && kill -0 "$second_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.1
-    done
-
-    if [ -z "$second_pid" ] || [ "$second_pid" = "$first_pid" ]; then
-        fail "pidfile still holds first pid $first_pid after restart"
-    elif ! kill -0 "$second_pid" 2>/dev/null; then
-        fail "pidfile holds dead pid $second_pid after restart"
-    else
-        pass "pidfile updated from $first_pid → $second_pid on restart"
-    fi
-    kill -KILL "$sup_pid" 2>/dev/null || true
-    kill_pidfile_pid "$pidfile"
-    wait_for_exit "$sup_pid" 3
-}
-
-# ── Test 5: THE detach property — HUP/INT/TERM neither stop the supervisor
+# ── Test 4: THE detach property — HUP/INT/TERM neither stop the supervisor
 #    nor reach the child. This is the whole point of decoupling the gateway
 #    supervisor from the engine's: a closing terminal (SIGHUP), a Ctrl-C on the
 #    launcher (SIGINT), or a stray SIGTERM must leave the machine-global gateway
@@ -230,16 +198,17 @@ EOF
 test_terminal_signals_are_ignored() {
     echo "test: SIGHUP/SIGINT/SIGTERM to supervisor are ignored (gateway survives)"
     local tdir="$SANDBOX/t6"; mkdir -p "$tdir"
-    local pidfile="$tdir/pid" logfile="$tdir/log"
+    local logfile="$tdir/log"
+    write_sleeping_mock "$tdir/mock" "$tdir/child"
 
-    ( run_gateway_supervised "$pidfile" "$logfile" sleep 600 ) &
+    ( run_gateway_supervised "$tdir" "$logfile" "$tdir/mock" ) &
     local sup_pid=$!
     CLEANUP_PIDS+=("$sup_pid")
 
-    if ! wait_for_file "$pidfile" 3; then
-        fail "pidfile not written"; kill -KILL "$sup_pid" 2>/dev/null || true; return
+    if ! wait_for_file "$tdir/child" 3; then
+        fail "the child did not start"; kill -KILL "$sup_pid" 2>/dev/null || true; return
     fi
-    local child_pid; child_pid="$(cat "$pidfile")"
+    local child_pid; child_pid="$(cat "$tdir/child")"
     CLEANUP_PIDS+=("$child_pid")
 
     kill -HUP "$sup_pid" 2>/dev/null || true
@@ -262,11 +231,11 @@ test_terminal_signals_are_ignored() {
     wait_for_exit "$sup_pid" 3
 }
 
-# ── Test 6: respawn sidecar written on unexpected death ──────────────────
+# ── Test 5: respawn sidecar written on unexpected death ──────────────────
 test_respawn_sidecar_written_on_unexpected_death() {
     echo "test: respawn sidecar carries old_pid + exit_code on unexpected death"
     local tdir="$SANDBOX/t7"; mkdir -p "$tdir"
-    local pidfile="$tdir/pid" logfile="$tdir/log"
+    local logfile="$tdir/log"
     local sidecar="$tdir/gateway.last-death.json" counter="$tdir/counter"
     echo 0 > "$counter"
 
@@ -278,18 +247,19 @@ echo \$((n + 1)) > "$counter"
 if [ "\$n" -eq 0 ]; then
     exit 137
 else
-    sleep 600
+    echo \$\$ > "$tdir/child"
+    exec sleep 600
 fi
 EOF
     chmod +x "$mock"
 
-    ( run_gateway_supervised "$pidfile" "$logfile" "$mock" ) &
+    ( run_gateway_supervised "$tdir" "$logfile" "$mock" ) &
     local sup_pid=$!
     CLEANUP_PIDS+=("$sup_pid")
 
     if ! wait_for_counter "$counter" 2 10; then
         fail "supervisor did not respawn within 10s"
-        kill -KILL "$sup_pid" 2>/dev/null || true; kill_pidfile_pid "$pidfile"; return
+        kill -KILL "$sup_pid" 2>/dev/null || true; kill_child_pid "$tdir/child"; return
     fi
 
     if [ ! -f "$sidecar" ]; then
@@ -305,15 +275,15 @@ EOF
     fi
 
     kill -KILL "$sup_pid" 2>/dev/null || true
-    kill_pidfile_pid "$pidfile"
+    kill_child_pid "$tdir/child"
     wait_for_exit "$sup_pid" 3
 }
 
-test_pidfile_written_on_launch
+test_supervisor_writes_no_pidfile
 test_clean_exit_zero_stops_loop
-test_clean_exit_138_stops_loop
+test_clean_exit_usr1_stops_loop
+test_already_running_stops_loop
 test_unexpected_exit_137_restarts
-test_pidfile_updates_on_restart
 test_terminal_signals_are_ignored
 test_respawn_sidecar_written_on_unexpected_death
 

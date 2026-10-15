@@ -1,5 +1,5 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, navigateToApp, newThread, waitForVisibleInput, isMobileViewport } from './helpers';
+import { assertHealthy, hideHomeRail, minThreadPane, navigateToApp, newThread, waitForVisibleInput, isMobileViewport } from './helpers';
 
 /** The composer's height is only ever right for the width it was measured at.
  *  Narrow the Conversation pane and the same paragraph needs more lines; widen
@@ -22,11 +22,10 @@ test.use({ viewport: { width: 1280, height: 800 } });
 // pane's floor on purpose: a drag there clamps, so it lands on the wall itself.
 const WIDE_X = 700;
 const NARROW_X = 150;
-// What the pane must actually measure at each end. A drag that silently missed
-// the divider would leave the pane put, and the height assertions would then
-// pass for the wrong reason.
+// What the wide pane must actually measure. A drag that silently missed the
+// divider would leave the pane put, and the height assertions would then pass
+// for the wrong reason. The narrow end is the pane's own floor.
 const WIDE_FLOOR = 600;
-const NARROW_CEILING = 400;
 
 // One paragraph, no newlines, so every line break is the box's own wrapping
 // decision and the line count is a pure function of the width.
@@ -66,6 +65,7 @@ test.describe('the composer re-measures when its pane changes width', () => {
       localStorage.setItem('lucidos-split-ratio', '0.4');
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
     });
+    await hideHomeRail(page);
     await navigateToApp(page);
   });
 
@@ -83,7 +83,7 @@ test.describe('the composer re-measures when its pane changes width', () => {
 
     await dragDivider(page, NARROW_X);
     const narrow = await metrics(page);
-    expect(narrow.pane, 'the narrowing drag reached the pane floor').toBeLessThan(NARROW_CEILING);
+    expect(Math.abs(narrow.pane - await minThreadPane(page)), 'the narrowing drag reached the pane floor').toBeLessThanOrEqual(2);
     expect(narrow.ch, 'the paragraph takes more lines in the narrow pane').toBeGreaterThan(wide.ch);
     expect(narrow.ch, 'and the box grew to show them all').toBeGreaterThanOrEqual(narrow.sh - 4);
 

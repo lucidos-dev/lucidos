@@ -7,7 +7,10 @@
  *  and `)`, which a markdown link cannot, so this scans the text itself. */
 
 import { isWidgetParams } from '@lucidos/sdk';
+import { WIDGET_PARAMS_MAX_BYTES } from '@lucidos/engine-constants';
 import type { WidgetEmbed } from '../generated/thread-event-wire';
+import type { App } from '../store/types';
+import { canonicalWidgetParams } from './widgetParams';
 
 const OPEN = '](app:';
 /** The embed grammar's params marker. It reads like the frame URL's query
@@ -214,4 +217,23 @@ export function withoutWidgetEmbeds(text: string, matches: readonly EmbedMatch[]
   out += text.slice(at);
   const trimmed = out.trim();
   return trimmed ? trimmed : null;
+}
+
+/** Own keys only: `toString` is not a param a widget declared. */
+function hasOwn(record: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+/** Whether this embed may draw in this thread: a widget, reusable or made
+ *  here, given only the params its manifest takes and every required one.
+ *  The engine checks an option's embed before the card; a reply's embed has
+ *  only this check. */
+export function embedDraws(app: App, embed: WidgetEmbed, threadId: string): boolean {
+  if (app.kind !== 'widget') return false;
+  if (!app.reusable && app.origin_thread_id !== threadId) return false;
+  const declared = app.params ?? {};
+  const given = embed.params ?? {};
+  if (Object.keys(given).some((name) => !hasOwn(declared, name))) return false;
+  if (new TextEncoder().encode(canonicalWidgetParams(given)).length > WIDGET_PARAMS_MAX_BYTES) return false;
+  return Object.entries(declared).every(([name, param]) => !param.required || hasOwn(given, name));
 }

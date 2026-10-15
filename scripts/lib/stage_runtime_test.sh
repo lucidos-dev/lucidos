@@ -240,5 +240,20 @@ out="$(stage_runtime_build_binaries /tmp/nope 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -qi "at least one package"; then pass "empty package list refused"; else fail "expected empty-package refusal (rc=$rc): $out"; fi
 
 echo ""
+echo "test: stage_runtime_assert_sdk_built names each missing served SDK file"
+SDK_DIST="$(mktemp -d)"
+for name in "${STAGE_RUNTIME_SERVED_SDK_FILES[@]}"; do printf 'built\n' > "$SDK_DIST/$name"; done
+if stage_runtime_assert_sdk_built "$SDK_DIST" 2>/dev/null; then pass "a complete SDK build passes"; else fail "a complete SDK build was refused"; fi
+rm -f "$SDK_DIST/sse-worker.js"
+out="$(stage_runtime_assert_sdk_built "$SDK_DIST" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "sse-worker.js"; then pass "a missing worker is refused by name"; else fail "expected the missing worker named (rc=$rc): $out"; fi
+rm -rf "$SDK_DIST"
+
+echo ""
+echo "test: stage_runtime_build_frontend refuses to run before the release binaries"
+out="$(stage_runtime_build_frontend /tmp/nope /tmp/nope/app 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "build the release binaries first"; then pass "codegen without its bin refused"; else fail "expected the binaries-first refusal (rc=$rc): $out"; fi
+
+echo ""
 echo "stage_runtime: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

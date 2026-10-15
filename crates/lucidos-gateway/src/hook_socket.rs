@@ -16,11 +16,12 @@
 
 //! # It forwards, it does not decide
 //!
-//! Auth is the engine's, because the secret is. This resolves a slug to a
-//! loopback engine port and streams the body through untouched. A signature is
+//! Auth is the engine's, because the secret is. This resolves a slug to an
+//! engine socket and streams the body through untouched. A signature is
 //! computed over exact bytes, so any reserialization here would break every
 //! signed sender.
 
+use crate::engine_hop::{self, Credential};
 use crate::registry::SIGIL;
 use crate::server::GatewayState;
 use axum::body::Body;
@@ -116,27 +117,25 @@ fn protect(routes: Router) -> Router {
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
 }
 
-/// Build the loopback webhook route without letting a decoded path capture
-/// become URL syntax.
-fn engine_delivery_url(
-    scheme: &str,
-    port: u16,
-    hook_id: &str,
-) -> Result<reqwest::Url, &'static str> {
+/// The engine's delivery route for `hook_id`, without letting a decoded path
+/// capture become URL syntax.
+fn engine_delivery_path(hook_id: &str) -> Result<String, &'static str> {
     // The URL standard treats these two complete segments as navigation, and
     // `Url::path_segments_mut` therefore discards them. Refuse them instead of
     // letting caller input remove a segment from the fixed engine route.
     if matches!(hook_id, "." | "..") {
         return Err("hook ID is a URL dot segment");
     }
-    let mut url = reqwest::Url::parse(&format!("{scheme}://127.0.0.1:{port}/api/v1/webhooks/"))
-        .map_err(|_| "invalid engine URL")?;
+    // Only the path is sent, over the engine socket. The host just lets the
+    // URL parser do the segment encoding.
+    let mut url =
+        reqwest::Url::parse("http://engine/api/v1/webhooks/").map_err(|_| "invalid engine URL")?;
     url.path_segments_mut()
         .map_err(|_| "engine URL cannot carry path segments")?
         .pop_if_empty()
         .push(hook_id)
         .push("deliver");
-    Ok(url)
+    Ok(url.path().to_string())
 }
 
 /// Forward one delivery to the workspace's engine.
@@ -152,18 +151,18 @@ async fn deliver(
     if slug.len() == 1 && slug.starts_with(SIGIL) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(port) = state.engine_port(&slug) else {
+    let Some(engine) = state.engine_address(&slug) else {
         // A slug nobody registered and a workspace that is stopped answer
         // alike. Neither can take a delivery, and distinguishing them tells a
         // public caller which workspaces exist.
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let Ok(url) = engine_delivery_url(state.engine_scheme(), port, &hook_id) else {
+    let Ok(path) = engine_delivery_path(&hook_id) else {
         crate::log!("[Hook] '{slug}' delivery could not construct the engine URL");
         return StatusCode::BAD_GATEWAY.into_response();
     };
-    let mut request = state.engine_client().post(url);
+    let mut request = axum::http::Request::post(path);
     // The sender's headers ride along, because the signature was computed over
     // some of them and this listener cannot know which.
     for (name, value) in &headers {
@@ -172,21 +171,25 @@ async fn deliver(
         }
         request = request.header(name.as_str(), value);
     }
-    // The scope, added by us and never forwarded. `forwarded_to_engine` drops
-    // every inbound `x-lucidos-*`, so a public sender cannot supply this or
-    // upgrade itself to the full-authority token beside it.
+    let Ok(request) = request.body(Body::from(body)) else {
+        crate::log!("[Hook] '{slug}' delivery could not build the engine request");
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+
+    // The scope, presented by the hop and never forwarded. `forwarded_to_engine`
+    // drops every inbound `x-lucidos-*`, so a public sender cannot supply this
+    // or upgrade itself to the full-authority token beside it.
     //
     // It reaches exactly the delivery route on an engine that requires a
     // credential (`lucidos_engine::api::local_auth`). That is what stops a
     // funnel-exposed hook from becoming a workspace restart.
-    if let Some(value) = crate::auth::sensitive_credential(state.webhook_token()) {
-        request = request.header(crate::auth::HEADER_WEBHOOK_TOKEN, value);
-    }
-
-    match request.body(body).send().await {
+    let credential = Credential::HookSocket(state.hook_socket_token());
+    match engine_hop::send(&engine, request, credential).await {
         Ok(upstream) => {
             let status = upstream.status();
-            let bytes = upstream.bytes().await.unwrap_or_default();
+            let bytes = axum::body::to_bytes(Body::new(upstream.into_body()), usize::MAX)
+                .await
+                .unwrap_or_default();
             (status, Body::from(bytes)).into_response()
         }
         Err(e) => {
@@ -206,7 +209,7 @@ async fn deliver(
 ///
 /// Caller passes a lowercase name, which `HeaderName::as_str` guarantees.
 fn forwarded_to_engine(name_lower: &str) -> bool {
-    // Framing, which reqwest sets for itself off the body it is given.
+    // Framing, which the engine hop sets for itself off the body it is given.
     let framing = matches!(name_lower, "host" | "content-length");
     // Trust headers. `x-lucidos-local-token` proves a caller is a process on
     // this machine. `x-lucidos-agent-origin-token` attributes a request to a
@@ -300,28 +303,21 @@ mod tests {
             ("a#b", "a%23b"),
             ("%2F", "%252F"),
         ] {
-            let url = engine_delivery_url("http", 5252, hook_id).unwrap();
-            assert_eq!(
-                url.as_str(),
-                format!("http://127.0.0.1:5252/api/v1/webhooks/{encoded}/deliver")
-            );
-            assert_eq!(url.host_str(), Some("127.0.0.1"));
-            assert_eq!(url.port(), Some(5252));
-            assert_eq!(url.query(), None);
-            assert_eq!(url.fragment(), None);
+            let path = engine_delivery_path(hook_id).unwrap();
+            assert_eq!(path, format!("/api/v1/webhooks/{encoded}/deliver"));
+            assert!(!path.contains(['?', '#']), "{path}");
         }
         for hook_id in [".", ".."] {
-            assert!(engine_delivery_url("http", 5252, hook_id).is_err());
+            assert!(engine_delivery_path(hook_id).is_err());
         }
     }
 
     #[test]
     fn an_ordinary_hook_id_keeps_the_webhook_delivery_route() {
-        let url =
-            engine_delivery_url("https", 5252, "01990ce2-fbed-7fd1-85de-dbc8000418c8").unwrap();
+        let path = engine_delivery_path("01990ce2-fbed-7fd1-85de-dbc8000418c8").unwrap();
         assert_eq!(
-            url.as_str(),
-            "https://127.0.0.1:5252/api/v1/webhooks/01990ce2-fbed-7fd1-85de-dbc8000418c8/deliver"
+            path,
+            "/api/v1/webhooks/01990ce2-fbed-7fd1-85de-dbc8000418c8/deliver"
         );
     }
 
@@ -411,7 +407,7 @@ mod tests {
         // listener it is written by whoever posted the delivery.
         for name in [
             "x-lucidos-local-token",
-            "x-lucidos-webhook-token",
+            "x-lucidos-hook-socket-token",
             "x-lucidos-agent-origin-token",
             "x-lucidos-device-id",
             "x-lucidos-target-workspace",
@@ -424,7 +420,7 @@ mod tests {
         // quietly take either off the list above.
         for name in [
             crate::auth::HEADER_LOCAL_TOKEN,
-            crate::auth::HEADER_WEBHOOK_TOKEN,
+            crate::auth::HEADER_HOOK_SOCKET_TOKEN,
         ] {
             assert!(!forwarded_to_engine(name), "{name} must be dropped");
         }
@@ -445,12 +441,15 @@ mod tests {
     }
 
     /// An upstream that records the raw bytes of the request it is handed.
-    async fn capturing_engine() -> (u16, std::sync::Arc<tokio::sync::Mutex<String>>) {
+    /// The directory holds its engine socket, so the caller keeps it alive.
+    async fn capturing_engine() -> (
+        tempfile::TempDir,
+        crate::engine_hop::EngineAddress,
+        std::sync::Arc<tokio::sync::Mutex<String>>,
+    ) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let dir = crate::engine_hop::test_engine::scratch();
+        let (listener, engine) = crate::engine_hop::test_engine::bind(&dir);
         let captured = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
         let sink = captured.clone();
         tokio::spawn(async move {
@@ -466,16 +465,42 @@ mod tests {
                 let _ = sock.flush().await;
             }
         });
-        (port, captured)
+        (dir, engine, captured)
+    }
+
+    /// I1 on the hook path: a delivery bound for a stranger's engine socket
+    /// sends it nothing, not the hook socket token and not the signed body.
+    #[tokio::test]
+    async fn a_delivery_to_a_strangers_socket_sends_nothing() {
+        let state = crate::server::GatewayState::for_tests();
+        let dir = crate::engine_hop::test_engine::scratch();
+        let (engine, recorded) = crate::engine_hop::test_engine::record_one(&dir);
+        state.set_route_for_test("dev", engine.held_by_a_stranger());
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dev/abc")
+                    .body(Body::from("{\"hello\":\"world\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            recorded.await.expect("recorder").is_empty(),
+            "a stranger's socket must read zero bytes"
+        );
     }
 
     #[tokio::test]
-    async fn a_delivery_carries_the_webhook_scope_and_nothing_wider() {
+    async fn a_delivery_carries_the_hook_socket_scope_and_nothing_wider() {
         // The scope in one test. The hop presents the narrow credential, and a
         // sender that tried to send the wide one gets it dropped.
         let state = crate::server::GatewayState::for_tests();
-        let (port, captured) = capturing_engine().await;
-        state.set_route_for_test("dev", port);
+        let (_dir, engine, captured) = capturing_engine().await;
+        state.set_route_for_test("dev", engine);
 
         let response = router(state)
             .oneshot(
@@ -494,10 +519,10 @@ mod tests {
         let got = captured.lock().await.to_lowercase();
         assert!(
             got.contains(&format!(
-                "{}: test-webhook-token",
-                crate::auth::HEADER_WEBHOOK_TOKEN
+                "{}: test-hook-socket-token",
+                crate::auth::HEADER_HOOK_SOCKET_TOKEN
             )),
-            "the delivery must present the webhook scope; engine saw:\n{got}"
+            "the delivery must present the hook socket token; engine saw:\n{got}"
         );
         assert!(
             !got.contains("sender-forged-full-token"),

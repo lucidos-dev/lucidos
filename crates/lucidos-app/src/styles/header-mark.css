@@ -705,12 +705,11 @@
    free. Those properties exist only inside this breakpoint, which is also why
    the rule is scoped to it: on the phone layout the calc would be invalid and
    the base viewport centring is what the phone wants anyway.
-   The panel is `position: fixed` and portaled to <body>, so the percentages in
-   --divider-x resolve against the viewport, which is exactly the width the
-   full-bleed header measured them against. */
+   The panel is `position: fixed` and portaled to <body>, so it reads the
+   divider in the window's frame, which leaves out the Home rail's room. */
 @media (--desktop-layout) {
     .brand-menu {
-        left: calc((var(--co) + var(--ddo) + var(--divider-x)) / 2);
+        left: calc((var(--co) + var(--ddo) + var(--divider-x-in-window)) / 2);
     }
 }
 
@@ -1307,6 +1306,19 @@ div.brand-menu-ws-row {
     display: flex;
     justify-content: flex-end;
     gap: var(--space-sm);
+}
+
+/* A change waiting in the landing lane: its link, and Remove at the trailing
+   edge, centred on the link's two lines. */
+.brand-menu-activity-entry {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.brand-menu-activity-entry > .brand-menu-activity-link {
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 /* The way to everything the menu deliberately cannot do: create, rename,

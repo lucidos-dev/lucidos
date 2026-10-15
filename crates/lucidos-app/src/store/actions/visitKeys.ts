@@ -84,6 +84,7 @@ export function navigateVisitKey(nav: NavigateLike): string | null {
     case 'changes':
     case 'notifications':
       return panelVisitKey(nav.target);
+    // The Home board is a rail beside every place on desktop, not a place.
     default:
       return null;
   }

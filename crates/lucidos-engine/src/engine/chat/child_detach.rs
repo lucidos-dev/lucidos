@@ -9,7 +9,8 @@
 //! Two callers, told apart by what the engine verified about them:
 //!
 //! - **An agent** holds to ADR 0043's ladder. It moves only its own direct
-//!   children, and the caller is ambient, never a parameter.
+//!   children, and the caller is ambient, never a parameter. Nothing more is
+//!   asked: creating a top-thread needs no authority (ADR 0475).
 //! - **The user** moves any thread that has a parent. The route trusts an
 //!   untokened caller exactly as archive and discard do (ADR 0052).
 //!
@@ -20,12 +21,12 @@
 
 use uuid::Uuid;
 
-use crate::engine::event_bus::BusEvent;
+use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
 /// Who asked for the move, as the engine verified it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetachCaller {
+pub(crate) enum DetachCaller {
     /// The user's own device, or the local API with no origin token.
     User,
     /// A thread-bound caller: an LLM tool's ambient thread, or a verified
@@ -35,7 +36,7 @@ pub enum DetachCaller {
 
 /// Why a move to top level was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChildDetachError {
+pub(crate) enum ChildDetachError {
     /// No `thread_summaries` row for the target id.
     UnknownThread(Uuid),
     /// The user asked to move a thread that is already top level.
@@ -56,7 +57,7 @@ pub enum ChildDetachError {
 
 impl ChildDetachError {
     /// HTTP status for `POST /api/v1/threads/:thread_id/detach`.
-    pub fn status_code(&self) -> u16 {
+    pub(crate) fn status_code(&self) -> u16 {
         match self {
             Self::UnknownThread(_) => 404,
             Self::NotAChild(_) | Self::Discarded(_) => 409,
@@ -95,7 +96,7 @@ impl std::error::Error for ChildDetachError {}
 
 /// What the caller gets back once the move is on the former parent's timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DetachAck {
+pub(crate) struct DetachAck {
     pub child_thread_id: Uuid,
     pub child_title: String,
     pub former_parent_id: Uuid,
@@ -155,18 +156,29 @@ impl crate::engine::LucidosEngine {
     /// Move `target` to top level on `caller`'s authority.
     ///
     /// `meta` carries the actor, so the event says who moved the thread.
-    pub async fn detach_child_thread(
+    pub(crate) async fn detach_child_thread(
         &self,
         caller: DetachCaller,
         target: Uuid,
         meta: EventMeta,
     ) -> Result<DetachAck, ChildDetachError> {
+        Self::move_child_to_top_level(&self.event_bus, caller, target, meta).await
+    }
+
+    /// The move itself, over the bus alone so it is testable without an
+    /// engine. The route, the CLI and the LLM tool all arrive here.
+    pub(crate) async fn move_child_to_top_level(
+        bus: &EventBus,
+        caller: DetachCaller,
+        target: Uuid,
+        meta: EventMeta,
+    ) -> Result<DetachAck, ChildDetachError> {
         let (former_parent_id, child_title) =
-            Self::authorize_child_detach(self.pool(), caller, target).await?;
+            Self::authorize_child_detach(bus.pool(), caller, target).await?;
 
         // Boxed: the emit reaches the fan-in, which can re-enter an agentic
         // loop whose tool dispatch calls back into this function.
-        let emitted = Box::pin(self.event_bus.emit(BusEvent::Thread {
+        let emitted = Box::pin(bus.emit(BusEvent::Thread {
             thread_id: former_parent_id,
             event: ThreadEvent::ChildThreadDetached {
                 child_thread_id: target,

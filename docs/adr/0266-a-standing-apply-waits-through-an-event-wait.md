@@ -3,6 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-09-24
 - **Amends**: [0168: A thread acts in its own subtree](0168-a-thread-acts-in-its-own-subtree.md)
+- **Amended by**: [0441: An event that records another commits with it](0441-an-event-that-records-another-commits-with-it.md)
 
 ## Context
 
@@ -47,8 +48,8 @@ an armed thread. So it would see the resolution event inside the gap every
 time, and merge the branch as the agent resumes.
 
 **The skip closes the gap without state.** `emit_resolution` writes the
-resolution, then at once a `PromptInjected` anchor. That anchor sets the
-status to `running`, before any Thread Queue wait. So the next event the
+resolution and its `PromptInjected` anchor in one atomic emit (ADR 0441). That
+anchor sets the status to `running`, before any Thread Queue wait. So the next event the
 resolver sees after a skipped resolution already reads the true state. A cancel
 re-enters nothing, so it is not skipped, and the arm resolves on it.
 
@@ -59,16 +60,13 @@ the wait and never applies inside it.
 
 **Kept.** A question card drops the arm with a report.
 
-**A lost wake still resolves.** If the anchor fails, or a restart loses the
-wake, boot recovery re-takes every verdict. The thread reads idle with no wait,
-and the arm fires or drops.
+**A lost wake still resolves.** If a restart loses the wake, boot recovery
+re-takes every verdict. The thread reads idle with no wait, and the arm fires
+or drops.
 
-**A narrower window survives.** The resolver reads the row when it handles an
-event, not when the event was emitted. So a resolver still working through an
-older event, or the lag-recovery sweep, can read the row between the resolution
-and its anchor. The bus commits each before broadcasting it, so that window is
-the gap between two back-to-back emits. That is the exposure ADR 0106 accepted
-for the button, and far rarer here.
+**No reader sees a resolution without its anchor.** The two commit in one
+transaction (ADR 0441). So neither a resolver working through an older event
+nor the lag-recovery sweep can read the row between them.
 
 **Renamed.** "Working" meant running or paused. `working_thread_ids`,
 `Change.thread_working` and `ChangeActionRefusal::ThreadWorking` become

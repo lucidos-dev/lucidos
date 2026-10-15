@@ -475,9 +475,8 @@ mod tests {
 
     #[tokio::test]
     async fn script_runs_a_file_and_applies_pipefail() {
-        let dir = std::env::temp_dir().join("lucidos_test_shell_script_pipefail");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let script = dir.join("piped.sh");
         std::fs::write(&script, "sh -c 'exit 101' | tee /dev/null\n").unwrap();
 
@@ -492,7 +491,6 @@ mod tests {
             TaskOutcome::Exited(0)
         };
         assert_eq!(TaskOutcome::from_status(out.status), expected);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A signal that kills a pipeline stage reaches us as the shell's own

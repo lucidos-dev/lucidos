@@ -17,7 +17,7 @@
 use super::error::ApiError;
 use super::*;
 use crate::core::credentials::{AuthType, Credential};
-use crate::core::webhook_deliveries::{Claim, DeliveryLedger, MAX_WINDOW_SECS};
+use crate::core::webhook_deliveries::{DeliveryKey, DeliveryOutcome, MAX_WINDOW_SECS};
 use crate::core::webhook_ingress::{AddressProbe, Family};
 use crate::core::webhook_refusal::{self, RefusalCause};
 use crate::core::webhooks::{
@@ -427,7 +427,7 @@ fn validate_dedupe(dedupe: &DedupeConfig) -> Result<(), ApiError> {
     if dedupe.window_secs > MAX_WINDOW_SECS {
         return Err(ApiError::bad_request(format!(
             "dedupe.window_secs is capped at {} seconds, since the sweep drops \
-             a claim older than that",
+             a delivery record older than that",
             MAX_WINDOW_SECS
         )));
     }
@@ -805,43 +805,20 @@ async fn deliver(
     // Everything below runs only for a delivery that authenticated. A public
     // caller must not be able to write the ledger, or learn from a `duplicate`
     // answer which delivery ids this hook has seen.
-    let window = hook
+    let delivery = hook
         .dedupe
         .as_ref()
-        .map(|cfg| cfg.window_secs)
-        .filter(|secs| *secs > 0);
-    let key = window.map(|_| {
-        let sent_id = hook
-            .dedupe
-            .as_ref()
-            .and_then(|cfg| cfg.header.as_deref())
-            .and_then(|name| header_str(&headers, name));
-        webhooks::dedupe_key(sent_id, body_str)
-    });
-    // Proof this delivery owns its claim, carried to the write that finishes
-    // it. An emit slower than the window can be superseded mid-flight, and the
-    // token is what stops the loser touching the winner's row.
-    let mut claim_id = None;
-    if let (Some(key), Some(window)) = (key.as_deref(), window) {
-        match DeliveryLedger::claim(&state.pool, hook.id, key, window).await {
-            Ok(Claim::Won { claim_id: won }) => claim_id = Some(won),
-            Ok(Claim::Duplicate { event_id }) => {
-                crate::log!("[Webhook] '{}' ignored a resend", hook.name);
-                // A resend verified and landed. Only the second event is
-                // dropped, so the ingress carried this delivery in full.
-                stamp_accepted(&state, &hook).await;
-                return duplicate(event_id);
-            }
-            Err(e) => {
-                // Fail closed. A claim we could not take is not a claim we won.
-                // The sender owns retrying, so refusing costs one retry while
-                // guessing costs a duplicate event.
-                crate::log!("[Webhook] '{}' could not claim a delivery: {e}", hook.name);
-                return emit_failed();
-            }
-        }
-    }
-
+        .filter(|cfg| cfg.window_secs > 0)
+        .map(|cfg| DeliveryKey {
+            webhook_id: hook.id,
+            key: webhooks::dedupe_key(
+                cfg.header
+                    .as_deref()
+                    .and_then(|name| header_str(&headers, name)),
+                body_str,
+            ),
+            window_secs: cfg.window_secs,
+        });
     let payload = delivery_payload(
         body_str,
         &hook.name,
@@ -851,24 +828,23 @@ async fn deliver(
         webhook_id: hook.id.to_string(),
         name: hook.name.clone(),
     };
-    match state
-        .engine
-        // No trigger: a webhook delivery arrives from outside the workspace, so
-        // no fire of ours emitted it and it must wake every subscriber.
-        .emit_domain_event(&hook.event_type, payload, actor, None)
-        .await
-    {
-        Ok(event_id) => {
-            if let (Some(key), Some(claim)) = (key.as_deref(), claim_id) {
-                if let Err(e) =
-                    DeliveryLedger::record_event(&state.pool, hook.id, key, claim, event_id).await
-                {
-                    // The event is out and the claim still stands, so this
-                    // cannot double-emit. A later resend answers `duplicate`
-                    // with no id rather than with this one.
-                    crate::log!("[Webhook] '{}' could not record the event: {e}", hook.name);
-                }
-            }
+    let emitted = match &delivery {
+        Some(delivery) => {
+            state
+                .engine
+                .emit_webhook_delivery(&hook.event_type, payload, actor, delivery)
+                .await
+        }
+        None => state
+            .engine
+            // No trigger: a webhook delivery arrives from outside the workspace,
+            // so no fire of ours emitted it and it must wake every subscriber.
+            .emit_domain_event(&hook.event_type, payload, actor, None)
+            .await
+            .map(DeliveryOutcome::Emitted),
+    };
+    match emitted {
+        Ok(DeliveryOutcome::Emitted(event_id)) => {
             stamp_accepted(&state, &hook).await;
             crate::log!(
                 "[Webhook] '{}' fired {} ({})",
@@ -882,44 +858,24 @@ async fn deliver(
             )
                 .into_response()
         }
+        Ok(DeliveryOutcome::Duplicate(event_id)) => {
+            crate::log!("[Webhook] '{}' ignored a resend", hook.name);
+            // A resend verified and landed. Only the second event is
+            // dropped, so the ingress carried this delivery in full.
+            stamp_accepted(&state, &hook).await;
+            duplicate(event_id)
+        }
         Err(e) => {
+            // Nothing was written, so the sender's retry is a real retry.
             crate::log!("[Webhook] '{}' could not emit: {e}", hook.name);
-            if let (Some(key), Some(claim)) = (key.as_deref(), claim_id) {
-                // Hand the claim back. Holding it would answer the sender's
-                // retry with `duplicate` for an event that never happened,
-                // which is the one way deduping could lose a delivery.
-                if let Err(e) = DeliveryLedger::release(&state.pool, hook.id, key, claim).await {
-                    crate::log!("[Webhook] '{}' could not release a claim: {e}", hook.name);
-                }
-            }
             emit_failed()
         }
     }
 }
 
-/// What a resend gets, which depends on whether the delivery it duplicates has
-/// produced anything yet.
-///
-/// **An emitted event answers 200**, carrying its id. The work is done, so the
-/// sender must stop retrying.
-///
-/// **A claim with no event yet answers 503**, because the holder is still in
-/// flight and may yet fail. Telling this sender "already handled" would be a
-/// promise nobody has kept: the holder's emit can fail, release the claim, and
-/// leave no request anywhere still trying to deliver. A retryable answer costs
-/// one more request and cannot lose the delivery. The retry then finds either a
-/// recorded event, answered 200 above, or a free key it claims and emits.
-fn duplicate(event_id: Option<Uuid>) -> Response {
-    let Some(event_id) = event_id else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "a delivery with this id is still being handled, retry shortly",
-                "duplicate": true,
-            })),
-        )
-            .into_response();
-    };
+/// What a resend gets: 200, carrying the event the first delivery emitted. The
+/// work is done, so the sender must stop retrying.
+fn duplicate(event_id: Uuid) -> Response {
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1347,20 +1303,6 @@ mod tests {
             })
             .is_ok(),
             "zero is the off switch, not an invalid window"
-        );
-    }
-
-    /// A resend is only told "already handled" once something actually handled
-    /// it. While the holder is still in flight, the honest answer is retryable:
-    /// that holder can still fail and release, and a 200 here would have been
-    /// the last word on a delivery nobody emitted.
-    #[test]
-    fn a_resend_is_acknowledged_only_once_an_event_exists() {
-        assert_eq!(duplicate(Some(Uuid::new_v4())).status(), StatusCode::OK);
-        assert_eq!(
-            duplicate(None).status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "a claim with no event yet must leave the sender retrying"
         );
     }
 

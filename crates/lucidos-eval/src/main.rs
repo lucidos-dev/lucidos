@@ -1,5 +1,6 @@
-//! The context-handling benchmark (ADR 0110), and the command judge check
-//! (`command_judge`).
+//! The context-handling benchmark (ADR 0110), and three single-call checks: the
+//! command judge (`command_judge`), the read decision (`read_decision`) and the
+//! wake decision (`wake_decision`).
 //!
 //! One configuration at a time, scored on five absolute axes. `analyse` and
 //! `report` pool several runs, which is how a budget sweep is read.
@@ -15,8 +16,10 @@ mod analyse;
 mod arm;
 mod assertions;
 mod calls;
+mod candidate;
 mod command_judge;
 mod config;
+mod decision_check;
 mod driver;
 #[cfg(feature = "fixture-gen")]
 mod fixture_gen;
@@ -26,8 +29,10 @@ mod judge;
 mod manipulation;
 mod metrics;
 mod probe;
+mod read_decision;
 mod replay;
 mod results;
+mod wake_decision;
 mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -154,9 +159,50 @@ enum Command {
         #[arg(long, default_value = "/tmp/command-judge-results.jsonl")]
         out: PathBuf,
     },
+    /// Decide `eval/read-decision/turns.toml` with each candidate, through the
+    /// turn-end gate's own question and threshold, and print the table. Spends
+    /// real tokens.
+    #[command(name = read_decision::CHECK.command)]
+    ReadDecisionCheck(DecisionCheckArgs),
+    /// Decide `eval/wake-decision/turns.toml` with each candidate, through the
+    /// turn-end gate's own state, question and threshold, and print the table.
+    /// Spends real tokens.
+    #[command(name = wake_decision::CHECK.command)]
+    WakeDecisionCheck(DecisionCheckArgs),
     /// Re-embed the seeded memory rows from `memory-seed.toml`.
     #[cfg(feature = "fixture-gen")]
     GenerateMemoryFixture,
+}
+
+/// What both turn-end decision checks take.
+#[derive(clap::Args)]
+struct DecisionCheckArgs {
+    /// Which backend answers: `chat`, or a System One row id such as `jev`,
+    /// `openrouter` or `openai`. A row reads its key the way the engine does,
+    /// from this workspace's database and environment.
+    #[arg(long, default_value = decision_check::CHAT_BACKEND)]
+    backend: String,
+    /// Chat candidates as `model@tier`, comma separated. Only `chat` reads
+    /// them.
+    #[arg(long, value_delimiter = ',')]
+    models: Vec<String>,
+    /// Where each decision is appended, as JSON lines. Defaults to
+    /// `/tmp/<check>-results.jsonl`.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Another labelled set in the same shape, such as one kept outside the
+    /// tree. Defaults to the shipped `eval/<check>/turns.toml`.
+    #[arg(long)]
+    set: Option<PathBuf>,
+}
+
+impl DecisionCheckArgs {
+    /// The set and the results file, defaulted by the check.
+    fn paths(&self, check: &decision_check::Check) -> (PathBuf, PathBuf) {
+        let set = self.set.clone().unwrap_or_else(|| check.shipped_set());
+        let out = self.out.clone().unwrap_or_else(|| check.default_out());
+        (set, out)
+    }
 }
 
 /// Everything the harness resolves from its environment, in one place.
@@ -305,6 +351,14 @@ async fn dispatch() -> Fallible<()> {
             let set = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../eval/command-judge/commands.toml");
             command_judge::run(&set, &models, &out).await
+        }
+        Command::ReadDecisionCheck(args) => {
+            let (set, out) = args.paths(&read_decision::CHECK);
+            read_decision::run(&set, &args.backend, &args.models, &out).await
+        }
+        Command::WakeDecisionCheck(args) => {
+            let (set, out) = args.paths(&wake_decision::CHECK);
+            wake_decision::run(&set, &args.backend, &args.models, &out).await
         }
         Command::Report { run_id } => {
             let paths = Paths::resolve()?;
@@ -570,7 +624,7 @@ async fn seed_repeat(
         // Both names, because the knowhow tells an operator to open the
         // database by hand and the label makes them run-specific.
         println!("[eval] {slug} seeds into database \"{database}\"");
-        workspace::recreate_database(&paths.pg_base, &database)?;
+        workspace::recreate_database(&paths.pg_base, &database, &ws)?;
         // The tree goes in BEFORE the first boot. The engine adopts `data/`
         // into the workspace repo as it comes up. Replacing the directory
         // afterwards would leave every fixture file an uncommitted delete.

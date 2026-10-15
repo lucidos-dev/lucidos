@@ -227,7 +227,7 @@ impl ScanRoots {
         // So this finds an instance the default prefix would miss, and misses
         // one installed under a prefix nobody named. Reporting the prefixes we
         // can see beats reporting none.
-        let mut installer_prefixes = vec![home.join(".lucidos")];
+        let mut installer_prefixes = vec![lucidos_home::path_in(&home)];
         if let Some(extra) = std::env::var_os("LUCIDOS_PREFIX").map(PathBuf::from) {
             if !installer_prefixes.contains(&extra) {
                 installer_prefixes.push(extra);
@@ -251,7 +251,7 @@ impl ScanRoots {
         ScanRoots {
             home: home.to_path_buf(),
             application_dirs: vec![home.join("Applications")],
-            installer_prefixes: vec![home.join(".lucidos")],
+            installer_prefixes: vec![lucidos_home::path_in(home)],
             systemd_user_dir: home.join(".config/systemd/user"),
             dev_gateway_port: DEFAULT_DEV_GATEWAY_PORT,
         }
@@ -259,7 +259,7 @@ impl ScanRoots {
 
     /// The prefix an instance command omits from `--prefix`.
     fn default_prefix(&self) -> PathBuf {
-        self.home.join(".lucidos")
+        lucidos_home::path_in(&self.home)
     }
 }
 
@@ -429,7 +429,7 @@ fn instances_under(
 /// them: the port it holds is what a conflict turns on, and dropping the row
 /// would hide the very install the user forgot about.
 fn source_checkout(roots: &ScanRoots, running: &RunningProcess) -> Vec<Install> {
-    let data_dir = roots.home.join(".lucidos/gateway");
+    let data_dir = lucidos_home::path_in(&roots.home).join(lucidos_home::GATEWAY_DIR_NAME);
     if !data_dir.is_dir() {
         return Vec::new();
     }

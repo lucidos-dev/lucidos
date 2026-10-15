@@ -107,7 +107,14 @@ async fn serve_gateway(engine: &LiveEngine, slug: &str, token: &str) -> String {
         slug.to_string(),
         engine.port,
     ));
-    state.set_route_for_test(slug, engine.port);
+    // The live engine bound its real socket, under `~/.lucidos/run`, which is
+    // not where a test build roots `EngineAddress::for_workspace`.
+    let socket = lucidos_engine_socket::path_for(&engine.workspace)
+        .expect("the e2e workspace has an engine socket");
+    state.set_route_for_test(
+        slug,
+        crate::engine_hop::EngineAddress::at(socket, engine.port),
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

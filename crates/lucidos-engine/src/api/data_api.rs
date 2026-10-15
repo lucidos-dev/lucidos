@@ -281,6 +281,7 @@ fn extension_of(path: &str) -> String {
 /// a parameter is also what makes the refresh testable: an `AppState` needs a
 /// booted engine, this needs a tempdir.
 async fn write_artifact_data(
+    held: &crate::engine::git_ops::WorkspaceRepoLock,
     am: &ArtifactManager,
     event_bus: &crate::engine::event_bus::EventBus,
     profile_cache: &crate::engine::user_profile::UserProfileCache,
@@ -298,6 +299,7 @@ async fn write_artifact_data(
     // workaround arm for the gap.
     let commit = am
         .write_and_commit(
+            held,
             event_bus,
             artifact_path,
             body,
@@ -318,6 +320,7 @@ async fn write_artifact_data(
 /// [`write_artifact_data`]. Deleting the profile clears the cache: without it
 /// the deleted profile stays in every chat turn's context until a restart.
 async fn delete_artifact_data(
+    held: &crate::engine::git_ops::WorkspaceRepoLock,
     am: &ArtifactManager,
     event_bus: &crate::engine::event_bus::EventBus,
     profile_cache: &crate::engine::user_profile::UserProfileCache,
@@ -325,6 +328,7 @@ async fn delete_artifact_data(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let commit = am
         .delete_and_commit(
+            held,
             event_bus,
             artifact_path,
             &format!("Delete {}", artifact_path),
@@ -364,10 +368,11 @@ pub(super) async fn write_data(
         Err(resp) => return *resp,
     };
 
-    let _repo_guard = state.engine.lock_workspace_repo().await;
+    let held = state.engine.lock_workspace_repo().await;
 
     let (commit_opt, response) = if let Some(artifact_path) = path.strip_prefix("artifacts/") {
         match write_artifact_data(
+            &held,
             &am,
             &state.engine.event_bus,
             state.engine.user_profile_cache(),
@@ -406,7 +411,7 @@ pub(super) async fn write_data(
         }
 
         match am
-            .commit_data_path(&path, &format!("Update {}", path))
+            .commit_data_path(&held, &path, &format!("Update {}", path))
             .await
         {
             Ok(commit) => (
@@ -475,10 +480,11 @@ pub(super) async fn delete_data(
         Err(resp) => return *resp,
     };
 
-    let _repo_guard = state.engine.lock_workspace_repo().await;
+    let held = state.engine.lock_workspace_repo().await;
 
     let (commit_opt, response) = if let Some(artifact_path) = path.strip_prefix("artifacts/") {
         match delete_artifact_data(
+            &held,
             &am,
             &state.engine.event_bus,
             state.engine.user_profile_cache(),
@@ -502,6 +508,7 @@ pub(super) async fn delete_data(
     } else {
         match am
             .delete_data_path_and_commit(
+                &held,
                 &state.engine.event_bus,
                 &path,
                 &format!("Delete {}", path),
@@ -1099,6 +1106,7 @@ mod tests {
         assert_eq!(cache.snapshot().await, "");
 
         write_artifact_data(
+            &crate::engine::git_ops::lock_workspace_repo().await,
             &am,
             &bus,
             &cache,
@@ -1125,9 +1133,17 @@ mod tests {
             "imported/user_profile.md",
             "old_user_profile.md",
         ] {
-            write_artifact_data(&am, &bus, &cache, path, b"theirs", None)
-                .await
-                .expect("write must land");
+            write_artifact_data(
+                &crate::engine::git_ops::lock_workspace_repo().await,
+                &am,
+                &bus,
+                &cache,
+                path,
+                b"theirs",
+                None,
+            )
+            .await
+            .expect("write must land");
             assert_eq!(cache.snapshot().await, "mine", "{} touched the cache", path);
         }
     }
@@ -1139,9 +1155,15 @@ mod tests {
         let (_dir, am, cache) = write_fixture(Some("mine"));
         let bus = crate::test_support::offline_event_bus();
 
-        delete_artifact_data(&am, &bus, &cache, "user_profile.md")
-            .await
-            .expect("delete must land");
+        delete_artifact_data(
+            &crate::engine::git_ops::lock_workspace_repo().await,
+            &am,
+            &bus,
+            &cache,
+            "user_profile.md",
+        )
+        .await
+        .expect("delete must land");
 
         assert_eq!(cache.snapshot().await, "");
     }
@@ -1154,9 +1176,15 @@ mod tests {
         std::fs::create_dir_all(&imported).unwrap();
         std::fs::write(imported.join("user_profile.md"), "theirs").unwrap();
 
-        delete_artifact_data(&am, &bus, &cache, "imported/user_profile.md")
-            .await
-            .expect("delete must land");
+        delete_artifact_data(
+            &crate::engine::git_ops::lock_workspace_repo().await,
+            &am,
+            &bus,
+            &cache,
+            "imported/user_profile.md",
+        )
+        .await
+        .expect("delete must land");
 
         assert_eq!(cache.snapshot().await, "mine");
     }
@@ -1177,10 +1205,17 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
 
-        let result =
-            write_artifact_data(&am, &bus, &cache, "user_profile.md", b"never landed", None)
-                .await
-                .err();
+        let result = write_artifact_data(
+            &crate::engine::git_ops::lock_workspace_repo().await,
+            &am,
+            &bus,
+            &cache,
+            "user_profile.md",
+            b"never landed",
+            None,
+        )
+        .await
+        .err();
 
         assert!(result.is_some(), "the write must report failure");
         assert_eq!(cache.snapshot().await, "mine");

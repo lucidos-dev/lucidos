@@ -49,12 +49,9 @@ PY
 
 # Probe the engine /health endpoint for a workspace's API port. Echoes the
 # raw JSON body and returns 0 when the engine answers; returns non-zero when
-# unreachable (or no port given). This is the reachability source of truth
-# that reconciles a stale .lucidos/engine.pid against an engine that is in
-# fact serving — the pidfile only tracks whether THIS host's supervised
-# process is alive, which goes stale across a restart (old PID dead in the
-# file for a beat, or an engine (re)started by a path that didn't refresh it).
-# See the callers in show_workspace_status / json_workspace_status.
+# unreachable (or no port given). This is the reachability source of truth:
+# the engine lock says which process owns the workspace, not whether it answers
+# yet. See the callers in show_workspace_status / json_workspace_status.
 _engine_health_json() {
     local port="$1" out
     [ -z "$port" ] && return 1
@@ -94,8 +91,6 @@ done
 # Show status for a single workspace
 show_workspace_status() {
     local ws="$1"
-    local engine_pid_file="$ws/.lucidos/engine.pid"
-    local frontend_pid_file="$ws/.lucidos/frontend.pid"
     local ports_file="$ws/.lucidos/ports"
     local engine_log="$ws/.lucidos/engine.log"
 
@@ -120,81 +115,76 @@ show_workspace_status() {
 
     # Probe /health once, up front — both the Engine line and the API line
     # below read this. A responding /health is the truth for "is it serving";
-    # the pidfile only tracks this host's supervised process, which goes stale
-    # across a restart. Reconciling the two stops a serving engine from
-    # reading "STOPPED" directly above an "API: ... (healthy)" line.
+    # the engine lock is the truth for which process owns the workspace.
     local api_healthy=""
     if [ -n "$api_port" ] && _engine_health_json "$api_port" >/dev/null; then
         api_healthy="1"
     fi
 
-    # Engine status: reachability first, then the pidfile. Serving is what
-    # "running" means to a caller; the pid only adds detail. A pid that is alive
-    # but NOT serving gets its own line rather than a bare RUNNING, because that
-    # is a boot in progress or a wedged engine, and either way the workspace
-    # can't be opened yet. `pid_is_live` (lib/workspace.sh) is zombie-aware; a
-    # plain `kill -0` reports a defunct engine as alive.
-    if [ -f "$engine_pid_file" ]; then
-        local pid
-        pid="$(cat "$engine_pid_file")"
-        if [ -n "$api_healthy" ]; then
-            if pid_is_live "$pid"; then
-                echo "  Engine:    RUNNING (PID $pid)"
-            else
-                echo "  Engine:    RUNNING (serving on $api_port; pidfile PID $pid is stale)"
-            fi
-        elif pid_is_live "$pid"; then
-            echo "  Engine:    NOT SERVING (PID $pid alive, no /health on ${api_port:-?})"
+    # Engine status: reachability first, then the owner. Serving is what
+    # "running" means to a caller; the pid only adds detail. An engine that owns
+    # the workspace but does NOT answer gets its own line rather than a bare
+    # RUNNING, because that is a boot in progress or a wedged engine, and
+    # either way the workspace can't be opened yet. The pid is trusted only
+    # while the engine holds its lock (ADR 0438).
+    local pid
+    pid="$(engine_live_pid "$ws")"
+    if [ -n "$api_healthy" ]; then
+        if [ -n "$pid" ]; then
+            echo "  Engine:    RUNNING (PID $pid)"
         else
-            echo "  Engine:    STOPPED (stale pidfile, PID $pid)"
+            echo "  Engine:    RUNNING (serving on $api_port; no engine holds this workspace's lock)"
         fi
-    elif [ -n "$api_healthy" ]; then
-        echo "  Engine:    RUNNING (serving on $api_port; no pidfile)"
+    elif [ -n "$pid" ]; then
+        echo "  Engine:    NOT SERVING (PID $pid owns the workspace, no /health on ${api_port:-?})"
     else
         echo "  Engine:    STOPPED"
     fi
 
-    # Frontend status
-    if [ -f "$frontend_pid_file" ]; then
-        local pid
-        pid="$(cat "$frontend_pid_file")"
-        if pid_is_live "$pid"; then
-            echo "  Frontend:  RUNNING (PID $pid, http://localhost:${vite_port:-?})"
-            # Show LAN IP
-            local lan_ip
+    # The build-watch belongs to this checkout, and serves every workspace of it.
+    local watch_pid
+    watch_pid="$(build_watch_live_pid)"
+    if [ -n "$watch_pid" ]; then
+        echo "  Frontend:  build-watch RUNNING for this checkout (PID $watch_pid)"
+        if [ -n "$api_healthy" ]; then
+            local lan_ip ts_dns
             lan_ip=$(ipconfig getifaddr en0 2>/dev/null || echo "")
             if [ -n "$lan_ip" ] && [ -n "$vite_port" ]; then
                 echo "  Network:   https://${lan_ip}:${vite_port}"
             fi
-            # Show Tailscale HTTPS URL if available
-            local ts_dns
             ts_dns=$(tailscale status --self --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('Self',{}).get('DNSName','').rstrip('.'))" 2>/dev/null)
             if [ -n "$ts_dns" ] && [ -n "$vite_port" ]; then
                 echo "  Tailscale: https://${ts_dns}:${vite_port}"
             fi
-        else
-            echo "  Frontend:  STOPPED (stale pidfile)"
         fi
     else
-        echo "  Frontend:  STOPPED"
+        echo "  Frontend:  build-watch STOPPED for this checkout"
     fi
 
-    # Tauri app status — match by engine port in parent cargo-tauri process
-    local tauri_found=""
-    if [ -n "$api_port" ]; then
-        while IFS= read -r tpid; do
-            [ -z "$tpid" ] && continue
-            local ppid_cmd
-            ppid_cmd=$(ps -p "$(ps -p "$tpid" -o ppid= 2>/dev/null | tr -d ' ')" -o command= 2>/dev/null || true)
-            if [[ "$ppid_cmd" == *"localhost:${api_port}"* ]]; then
-                echo "  Tauri:     RUNNING (PID $tpid)"
-                tauri_found="1"
-                break
-            fi
-        done < <(pgrep -x lucidos-app 2>/dev/null || true)
-    fi
+    # The dev window tauri-dev.sh pointed at this workspace, through the gateway
+    # (/<slug>/) or the engine's own port (LUCIDOS_NO_GATEWAY). After a re-exec
+    # the variable holds the page it showed, so match a prefix.
+    local tauri_found="" tpid window_url
+    while IFS= read -r tpid; do
+        [ -n "$tpid" ] || continue
+        window_url="$(proc_env_value "$(ps -E -p "$tpid" -o command= 2>/dev/null || true)" \
+            LUCIDOS_DEV_WINDOW_URL)"
+        case "$window_url" in
+            *":${api_port:-none}" | *":${api_port:-none}/"*) ;;
+            *)
+                # The first path segment names the workspace.
+                case "${window_url#*://*/}" in
+                    "$(basename "$ws")/"*) ;;
+                    *) continue ;;
+                esac
+                ;;
+        esac
+        echo "  Window:    RUNNING (PID $tpid)"
+        tauri_found="1"
+        break
+    done < <(pgrep -x lucidos-app 2>/dev/null || true)
     if [ -z "$tauri_found" ]; then
-        echo "  Tauri:     STOPPED"
+        echo "  Window:    STOPPED"
     fi
 
     # PostgreSQL status. Steady state is one shared container + one database per

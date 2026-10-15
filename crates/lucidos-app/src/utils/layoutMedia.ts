@@ -52,3 +52,16 @@ export function isPhoneLayout(viewport: { width: number; height: number; coarseP
   return viewport.width <= PHONE_MAX_WIDTH_PX
     || (viewport.height <= PHONE_LANDSCAPE_MAX_HEIGHT_PX && viewport.coarsePointer);
 }
+
+/** True when the primary pointer is a finger. It holds on an iPad wider than
+ *  the breakpoint. It stays false on a touchscreen laptop driven by its
+ *  trackpad. */
+export function hasCoarsePointer(): boolean {
+  return typeof window !== 'undefined' && (window.matchMedia?.('(pointer: coarse)').matches ?? false);
+}
+
+/** Whether the live viewport gets the phone layout. False with no window. */
+export function viewportGetsPhoneLayout(): boolean {
+  if (typeof window === 'undefined') return false;
+  return isPhoneLayout({ width: window.innerWidth, height: window.innerHeight, coarsePointer: hasCoarsePointer() });
+}

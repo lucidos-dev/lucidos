@@ -1,5 +1,6 @@
 import { signal } from '@preact/signals';
-import { getTreeBackfill } from '../../api/client';
+import { getTreeBackfill, raiseTreeBackfillCap } from '../../api/client';
+import { showToast } from '../store';
 import type { BackfillProgress, TreeBackfill } from '../../api/types';
 import { toFailed, type Loadable } from '../types';
 
@@ -17,6 +18,10 @@ export const NO_BACKFILL_PROGRESS: BackfillProgress = {
   waiting_for_model: false,
   retrying: false,
   ready: false,
+  spent_usd: null,
+  cap_usd: null,
+  next_cap_usd: null,
+  held: false,
   seq: 0,
 };
 
@@ -102,6 +107,19 @@ export function backfillDetail(progress: BackfillProgress): string {
   if (progress.nodes_total === 0) return trees;
   const nodes = `${progress.nodes_done.toLocaleString()} of ${progress.nodes_total.toLocaleString()}`;
   return `${trees} · ${nodes} summaries in progress`;
+}
+
+/** Continue a backfill held at `fromCap`, and say whether the engine took
+ *  it. The progress frame that follows the raise moves the page, so only a
+ *  refusal needs saying. */
+export async function continueTreeBackfill(fromCap: number): Promise<boolean> {
+  try {
+    await raiseTreeBackfillCap(fromCap);
+    return true;
+  } catch (e) {
+    showToast(`Could not continue building Tree memory: ${e instanceof Error ? e.message : String(e)}`, 'error');
+    return false;
+  }
 }
 
 /** Whether a backfill started before, so choosing Tree again resumes it with

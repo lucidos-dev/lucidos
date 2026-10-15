@@ -378,6 +378,13 @@
     cursor: zoom-in;
 }
 
+/* `role="button"` (PreviewImage.tsx) pulls in base.css's callout suppression.
+   An image keeps iOS's long-press menu, its only Copy and Save on a phone. The
+   tag makes this outrank `[role="button"]` whatever the load order. */
+img.preview-image {
+    -webkit-touch-callout: default;
+}
+
 /* Every line of this `<pre>` is a `.code-line`, which carries its own
    white-space (panels/content.css § the two line-wrapping modes). So this rule
    is type and metrics only; a white-space value here would reach no text. */

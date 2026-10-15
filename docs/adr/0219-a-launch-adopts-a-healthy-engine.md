@@ -97,6 +97,9 @@ conditional. Rejected because it leaves the reclaim killing the engine before
 answers.** It would have kept the pidfile honest for this case. Rejected as the
 primary fix because it narrows one way of going stale rather than removing the
 dependency. A pidfile is stale the moment after it is checked either way.
+ADR 0438 later removed the dependency for the Rust readers: the engine writes
+`engine.pid` under its owner lock, and a reader trusts it only while the lock
+is held.
 
 **Attribute a launcher restart to a device so the threads auto-resume.** It
 would soften the symptom for `-b`. Rejected: there is no device, and inventing

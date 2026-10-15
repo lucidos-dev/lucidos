@@ -25,7 +25,7 @@ import { submitChat } from '../../api/client';
 vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
   API_BASE: '',
-  submitChat: vi.fn().mockResolvedValue(undefined),
+  submitChat: vi.fn().mockResolvedValue({ event_id: 'e-1' }),
   listAppsApi: vi.fn().mockResolvedValue([]),
 }));
 

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use sqlx::{PgPool, Postgres, Transaction};
 
-use super::EventBus;
+use super::{AppendTicket, EventBus};
 
 /// Advisory-lock class of the in-flight append lock. The two-key form keeps it
 /// apart from the one-key locks elsewhere in the engine.
@@ -30,14 +30,24 @@ impl EventBus {
     ///
     /// The key is this backend's pid, and a backend runs one transaction at a
     /// time, so appends never contend on it. Only a horizon read waits on it.
-    pub(super) async fn begin_append(&self) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+    ///
+    /// The append's ticket opens first, before any sequence is drawn, so a
+    /// lag replay can tell which appends may still send an older row.
+    pub(super) async fn begin_append(&self) -> Result<Append, sqlx::Error> {
+        let ticket = self.append_tickets.open();
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1, pg_backend_pid())")
             .bind(APPEND_IN_FLIGHT_CLASS)
             .execute(&mut *tx)
             .await?;
-        Ok(tx)
+        Ok(Append { tx, ticket })
     }
+}
+
+/// An append's transaction and its ticket, from [`EventBus::begin_append`].
+pub(super) struct Append {
+    pub(super) tx: Transaction<'static, Postgres>,
+    pub(super) ticket: AppendTicket,
 }
 
 /// The event store's **committed horizon**: a sequence at or below which every

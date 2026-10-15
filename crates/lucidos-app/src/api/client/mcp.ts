@@ -46,18 +46,19 @@ export interface McpServerStatus {
   disabled_tokens: number;
 }
 
-/** What the registered servers cost the workspace, split by whether the
- *  workspace is paying it. Every figure is computed in the engine through the
- *  same helpers the request packer uses: format these, never derive them. */
+/** What the registered servers cost a thread that enables them, split by
+ *  whether the process runs (ADR 0430). Every figure is computed in the engine
+ *  through the same helpers the request packer uses: format these, never
+ *  derive them. */
 export interface McpCostTotals {
   servers: number;
   running_servers: number;
-  /** Tools in every request right now. */
+  /** What the running servers offer a thread that enables them. */
   tools: number;
   chars: number;
   tokens: number;
-  /** What the stopped servers would add if switched on. Excludes servers whose
-   *  id cannot dispatch, since those can never be switched on. */
+  /** What the stopped servers would add to a thread that enabled them.
+   *  Excludes servers whose id cannot dispatch, since those can never run. */
   stopped_tools: number;
   stopped_chars: number;
   stopped_tokens: number;
@@ -67,25 +68,25 @@ export interface McpCostTotals {
   disabled_tokens: number;
 }
 
-/** The tools of one running server the MCP tool ceiling leaves out, by wire name. */
+/** The tools of one server the MCP tool ceiling leaves out, by wire name. */
 export interface McpDroppedTools {
   server_id: string;
   tools: string[];
 }
 
-/** The running servers against the request budget, in chars, the unit the
- *  request packer budgets in. */
+/** The worst case against the request budget, one thread that enables every
+ *  server, in chars, the unit the request packer budgets in. */
 export interface McpBudget {
   /** What a whole request may carry: system prompt, tools and messages. */
   request_chars: number;
-  /** The part of it every running server's tools may take together. */
+  /** The part of it the tools of one thread's servers may take together. */
   mcp_ceiling_chars: number;
-  /** What a request really carries once the ceiling applies. Below the
-   *  totals' offered figures exactly when something is dropped. */
+  /** What that thread's request carries once the ceiling applies. Below the
+   *  offered figures exactly when something is dropped. */
   sent_tools: number;
   sent_chars: number;
   sent_tokens: number;
-  /** What the running servers lose to that ceiling right now. */
+  /** What that thread loses to the ceiling. */
   dropped: McpDroppedTools[];
   /** One line once the tools are past or near the ceiling. */
   warning: string | null;
@@ -143,19 +144,23 @@ export async function removeMcpServer(id: string): Promise<void> {
   await throwIfNotOk(resp);
 }
 
-/** Replace the set of switched-off tools, by WIRE name. A replacement rather
- *  than a delta, so a stale client cannot re-enable a tool it never knew
- *  about. */
-export async function setMcpDisabledTools(id: string, disabledTools: string[]): Promise<void> {
+/** Switch one tool off or back on, by WIRE name. One tool per call, so two
+ *  clients' switches commute (ADR 0437). Answers with the stored set. */
+export async function setMcpToolDisabled(
+  id: string,
+  wireName: string,
+  disabled: boolean,
+): Promise<{ disabled_tools: string[] }> {
   const resp = await mutatingFetch(
     `${API}/mcp/servers/${encodeURIComponent(id)}/disabled-tools`,
     {
-      method: 'PUT',
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ disabled_tools: disabledTools }),
+      body: JSON.stringify({ wire_name: wireName, disabled }),
     },
   );
   await throwIfNotOk(resp);
+  return resp.json();
 }
 
 // --- Chat MCP permission allowlist (<workspace>/.lucidos/mcp-allowed-tools) ---

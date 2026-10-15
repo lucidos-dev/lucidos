@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{ChatJudgmentProvider, Judgment, JudgmentProvider, Question, SystemOneProvider};
+use super::{ChatJudgmentProvider, Judgment, JudgmentProvider, Question};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -47,10 +47,10 @@ impl<P: JudgmentProvider, F: JudgmentProvider> JudgmentProvider for WithFallback
     }
 }
 
-/// The provider for one site: a System One pick with the chat model behind it,
-/// or the chat model alone.
+/// The provider for one site: the row [`super::system_one_for`] picked, with
+/// the chat model behind it, or the chat model alone.
 pub fn for_site(
-    system_one: Option<SystemOneProvider>,
+    system_one: Option<Box<dyn JudgmentProvider>>,
     chat: ChatJudgmentProvider,
 ) -> Box<dyn JudgmentProvider> {
     match system_one {

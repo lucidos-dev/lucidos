@@ -305,8 +305,7 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
     expect(diffFn![0]).toMatch(/openThreadDiff\(threadId\)/);
     expect(openDiffFn, 'openThreadDiff not found').not.toBeNull();
     expect(openDiffFn![0]).toMatch(/blurPromptInputIfFocused\(\)/);
-    // Optional on both, because a send no longer needs the textarea node. See
-    // `resolveComposerText`.
+    // Optional on both, because a send reads the draft, not the textarea node.
     expect(submitFn![0]).toMatch(/if \(isMobile\(\)\) el\?\.blur\(\)/);
     expect(multiFn![0]).toMatch(/if \(isMobile\(\)\) el\?\.blur\(\)/);
   });

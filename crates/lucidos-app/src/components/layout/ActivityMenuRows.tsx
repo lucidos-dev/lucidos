@@ -14,15 +14,21 @@
 import { Fragment, type VNode } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { engineBuildDetail, engineRebuildWedged, engineVersionPending } from '../../store/store';
-import {
-  liveActivityRows,
-  type ActivityBody,
-  type ActivityRow,
-  type ApplyThread,
-} from '../../store/actions/activityRows';
+import { liveActivityRows, type ActivityBody, type ActivityRow, type ApplyThread } from '../../store/actions/activityRows';
 import { activityAction, buildTimerIsLive } from '../../store/actions/backgroundActivity';
 import { openApplyPhase } from '../../store/actions/applyProgress';
 import { cancelApplyAllBatch } from '../../store/actions/chat-changes';
+import { LANE_PLACE_LABEL } from '../../store/actions/landingLane';
+import { cancelLaneBatch, closeMainCheck, removeFromLandingLane } from '../../store/actions/laneControls';
+import {
+  LANE_GATHERING_LABEL,
+  LANE_STEP_LABEL,
+  liveLandingLaneView,
+  type LaneEntry,
+  type LaneView,
+  type MainCheckLine,
+} from '../../store/actions/landingLaneRow';
+import { focusThread } from '../../store/actions/threads';
 import { openEngineVersionToast } from '../../store/actions/engine-update';
 import { focusPane } from '../../store/actions/pane';
 import {
@@ -52,9 +58,17 @@ export interface ActivityGroupProps {
   open: ReadonlySet<string>;
   /** What the engine build brings, or `null` when git could not say. */
   commits: PendingCommits | null;
+  /** What the landing lane's row unfolds to. */
+  lane: LaneView;
   onToggle: (key: string) => void;
   onOpenThread: (thread: ApplyThread) => void;
   onCancelApplyAll: () => void;
+  onOpenLaneThread: (threadId: string) => void;
+  onOpenLaneEntry: (entry: LaneEntry) => void;
+  onRemoveFromLane: (changeId: string) => void;
+  onCancelLaneBatch: (batchId: string) => void;
+  onOpenFixThread: (threadId: string) => void;
+  onCloseMainCheck: (checkId: string) => void;
   onOpenPending: () => void;
 }
 
@@ -135,20 +149,156 @@ function backgroundBody(activity: BackgroundActivity, commits: PendingCommits | 
   );
 }
 
-/** The thread an apply is on, as a link to the event its phase started at. */
-function threadLink(thread: ApplyThread, onOpenThread: (thread: ApplyThread) => void): VNode {
+/** A thread as a link: what is happening on one line, its title under it. */
+function linkRow(phase: string, title: string, onClick: () => void): VNode {
   return (
     <button
       type="button"
       role="menuitem"
       class="brand-menu-activity-link"
       data-role="activity-thread-link"
-      onClick={() => onOpenThread(thread)}
+      onClick={onClick}
     >
-      <span class="brand-menu-activity-phase">{thread.phase}</span>
-      <span class="brand-menu-activity-thread">{thread.title}</span>
+      <span class="brand-menu-activity-phase">{phase}</span>
+      <span class="brand-menu-activity-thread">{title}</span>
       <ChevronRightIcon size="1rem" />
     </button>
+  );
+}
+
+/** The thread an apply is on, as a link to the event its phase started at. */
+function threadLink(thread: ApplyThread, onOpenThread: (thread: ApplyThread) => void): VNode {
+  return linkRow(thread.phase, thread.title, () => onOpenThread(thread));
+}
+
+/** The main check's line: passing, running with its run, or red with its
+ *  fix thread and Close. */
+function mainCheckStatus(line: MainCheckLine, props: ActivityGroupProps): VNode {
+  switch (line.kind) {
+    case 'passing':
+      return <div key="main-check" class="brand-menu-activity-position" data-role="main-check">Main check: passing</div>;
+    case 'running':
+      return line.runUrl ? (
+        <a
+          key="main-check"
+          role="menuitem"
+          class="brand-menu-activity-position"
+          data-role="main-check"
+          href={line.runUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Main check: running
+        </a>
+      ) : (
+        <div key="main-check" class="brand-menu-activity-position" data-role="main-check">Main check: running</div>
+      );
+    case 'red': {
+      const phase = `Main red: ${line.summary}`;
+      const fix = line.fixThread;
+      return (
+        <div key="main-check" class="brand-menu-activity-entry" data-role="main-check">
+          {fix
+            ? linkRow(phase, fix.title, () => props.onOpenFixThread(fix.threadId))
+            : <div class="brand-menu-activity-position">{phase}</div>}
+          {!line.closing && (
+            /* Closes the red for good. The fix thread stays an ordinary
+               thread, and what landed meanwhile starts the next check. */
+            <button
+              type="button"
+              role="menuitem"
+              class="action-btn action-btn-secondary"
+              onClick={() => props.onCloseMainCheck(line.checkId)}
+            >
+              Close
+            </button>
+          )}
+        </div>
+      );
+    }
+  }
+}
+
+/** The lane's status lines, in order: the open batch's step on its lane
+ *  thread, how many changes wait for the next batch, or that the lane gathers
+ *  an Apply All press, then the main check. */
+function laneStatusLines(body: LaneView, props: ActivityGroupProps): VNode[] {
+  const lines: VNode[] = [];
+  const { batch } = body;
+  if (batch) {
+    const thread = batch.laneThread;
+    lines.push(
+      <Fragment key="step">
+        {linkRow(LANE_STEP_LABEL[batch.step], thread.title, () => props.onOpenLaneThread(thread.threadId))}
+      </Fragment>,
+    );
+    if (body.waiting.length > 0) {
+      lines.push(
+        <div key="waiting" class="brand-menu-activity-position">
+          {body.waiting.length} waiting for the next batch
+        </div>,
+      );
+    }
+  } else if (body.gathering && body.waiting.length > 0) {
+    lines.push(
+      <div key="gathering" class="brand-menu-activity-position">
+        {LANE_GATHERING_LABEL}
+      </div>,
+    );
+  }
+  if (body.mainCheck) lines.push(mainCheckStatus(body.mainCheck, props));
+  return lines;
+}
+
+/** A member of the open batch: it leaves only with its batch. */
+function laneMember(entry: LaneEntry, props: ActivityGroupProps): VNode {
+  return (
+    <Fragment key={entry.changeId}>
+      {linkRow(LANE_PLACE_LABEL['in-batch'], entry.title, () => props.onOpenLaneEntry(entry))}
+    </Fragment>
+  );
+}
+
+/** A waiting change, with Remove at its trailing edge. */
+function laneWaiting(entry: LaneEntry, props: ActivityGroupProps): VNode {
+  return (
+    <div key={entry.changeId} class="brand-menu-activity-entry" data-role="lane-waiting">
+      {linkRow(LANE_PLACE_LABEL.waiting, entry.title, () => props.onOpenLaneEntry(entry))}
+      <button
+        type="button"
+        role="menuitem"
+        class="action-btn action-btn-danger"
+        aria-label={`Remove ${entry.title} from the landing lane`}
+        onClick={() => props.onRemoveFromLane(entry.changeId)}
+      >
+        Remove
+      </button>
+    </div>
+  );
+}
+
+function landingLaneBody(body: LaneView, props: ActivityGroupProps): VNode {
+  const { batch } = body;
+  return (
+    <>
+      {laneStatusLines(body, props)}
+      {batch?.members.map((entry) => laneMember(entry, props))}
+      {body.waiting.map((entry) => laneWaiting(entry, props))}
+      {batch && !body.canceling && (
+        <div class="brand-menu-activity-actions">
+          {/* Fails the whole batch and stops its lane thread. Every member
+              stays pending, and nothing queues it again until Apply. */}
+          <button
+            type="button"
+            role="menuitem"
+            class="action-btn action-btn-danger"
+            onClick={() => props.onCancelLaneBatch(batch.batchId)}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -161,9 +311,9 @@ function activityBody(body: ActivityBody, props: ActivityGroupProps): VNode {
     case 'apply-all':
       return (
         <>
-          {body.position && (
+          {body.count && (
             <div class="brand-menu-activity-position">
-              Change {body.position.index} of {body.position.total}
+              {body.count.done} of {body.count.total} done
               {body.timeLeft && ` · ${body.timeLeft}`}
             </div>
           )}
@@ -180,6 +330,8 @@ function activityBody(body: ActivityBody, props: ActivityGroupProps): VNode {
           )}
         </>
       );
+    case 'landing-lane':
+      return landingLaneBody(props.lane, props);
   }
 }
 
@@ -245,8 +397,10 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
   const [now, setNow] = useState(() => Date.now());
   const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set());
   const rows = liveActivityRows(now);
-  // A build counts seconds, and an apply's phase counts minutes.
-  const ticking = buildTimerIsLive() || rows.some((row) => row.body.kind !== 'background');
+  // A build counts seconds, and an apply's phase counts minutes. The lane
+  // row counts no time.
+  const ticking = buildTimerIsLive()
+    || rows.some((row) => row.body.kind === 'apply-all' || row.body.kind === 'apply-thread');
   useEffect(() => {
     if (!ticking) return;
     const handle = setInterval(() => setNow(Date.now()), TICK_MS);
@@ -256,12 +410,17 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
   const pending: PendingCode = !engineVersionPending.value
     ? 'none'
     : engineRebuildWedged.value ? 'wedged' : 'pending';
+  const openThread = (threadId: string) => {
+    onClose();
+    focusThread(threadId);
+  };
 
   return activityMenuGroup({
     rows,
     pending,
     open,
     commits: engineBuildDetail.value?.pendingCommits ?? null,
+    lane: liveLandingLaneView(),
     onToggle: (key) => {
       const next = new Set(open);
       if (!next.delete(key)) next.add(key);
@@ -272,6 +431,16 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
       openApplyPhase(thread.threadId, thread.changeId ?? undefined, thread.reading);
     },
     onCancelApplyAll: () => void cancelApplyAllBatch(),
+    onOpenLaneThread: openThread,
+    onOpenLaneEntry: (entry) => {
+      if (!entry.threadId) return;
+      onClose();
+      openApplyPhase(entry.threadId, entry.changeId, null);
+    },
+    onRemoveFromLane: (changeId) => void removeFromLandingLane(changeId),
+    onCancelLaneBatch: (batchId) => void cancelLaneBatch(batchId),
+    onOpenFixThread: openThread,
+    onCloseMainCheck: (checkId) => void closeMainCheck(checkId),
     onOpenPending: () => {
       onClose();
       // `showToast` freezes a new toast over the pane focused at that moment.

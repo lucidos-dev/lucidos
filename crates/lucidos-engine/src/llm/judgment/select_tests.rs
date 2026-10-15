@@ -6,6 +6,7 @@ use crate::core::AuthType;
 use crate::llm::judgment::endpoint::{
     CLOUDFLARE_WORKERS_AI_CREDENTIAL_SERVICE, TYPESAFE_API_KEY_ENV, TYPESAFE_CREDENTIAL_SERVICE,
 };
+use crate::llm::ProviderKind;
 use crate::test_support::{seed_credential, seed_preference, setup_test_db, teardown_test_db};
 
 const A_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,10 +33,28 @@ async fn seed_cloudflare_token(pool: &PgPool) {
     .await;
 }
 
+async fn seed_chat_provider_key(pool: &PgPool, endpoint: SystemOneEndpoint, scope: &str) {
+    seed_credential(
+        pool,
+        endpoint.credential_service(),
+        scope,
+        AuthType::ApiKey,
+        "chat-provider-key",
+    )
+    .await;
+}
+
 /// Every credential a System One row can read, stored at once.
 async fn seed_every_key(pool: &PgPool) {
     seed_key(pool).await;
     seed_cloudflare_token(pool).await;
+    seed_chat_provider_key(
+        pool,
+        SystemOneEndpoint::OpenRouter,
+        "https://openrouter.ai/api/v1",
+    )
+    .await;
+    seed_chat_provider_key(pool, SystemOneEndpoint::OpenAi, "https://api.openai.com/v1").await;
     seed_preference(
         pool,
         prefs::SYSTEM_ONE_CUSTOM_URL.key(),
@@ -57,6 +76,14 @@ fn only_a_row_id_picks_a_system_one_endpoint() {
         "a human types this value"
     );
     assert_eq!(picked_endpoint(Some("clef")), Some(SystemOneEndpoint::Clef));
+    assert_eq!(
+        picked_endpoint(Some("openrouter")),
+        Some(SystemOneEndpoint::OpenRouter)
+    );
+    assert_eq!(
+        picked_endpoint(Some("openai")),
+        Some(SystemOneEndpoint::OpenAi)
+    );
     assert_eq!(
         picked_endpoint(Some("clef-flash")),
         Some(SystemOneEndpoint::ClefFlash)
@@ -369,6 +396,7 @@ fn the_system_one_settings_are_not_agent_settable() {
         .chain([
             prefs::SYSTEM_ONE_CUSTOM_URL.key(),
             prefs::SYSTEM_ONE_CUSTOM_MODEL.key(),
+            prefs::SYSTEM_ONE_OPENROUTER_MODEL.key(),
         ]);
     for key in keys {
         assert!(lookup(key).is_none(), "{key} must not be agent-settable");
@@ -436,10 +464,184 @@ async fn the_custom_key_goes_only_inside_its_scope() {
         seed_preference(&pool, prefs::SYSTEM_ONE_CUSTOM_URL.key(), url)
             .await
             .expect("seed the URL");
-        let provider = system_one_for(&pool, JudgmentSite::CommandGuard, A_TIMEOUT)
+        assert!(
+            system_one_for(&pool, JudgmentSite::CommandGuard, A_TIMEOUT)
+                .await
+                .is_some(),
+            "a URL and a model are enough"
+        );
+        let (_, _, key) = SystemOneEndpoint::Custom
+            .system_one_request(&pool)
             .await
             .expect("a URL and a model are enough");
-        assert_eq!(provider.sends_a_key(), keyed, "{url}");
+        assert_eq!(key.is_some(), keyed, "{url}");
     }
     teardown_test_db(&db).await;
+}
+
+/// OpenRouter asks Jev until its model preference names another decision
+/// model, and always at OpenRouter's System One URL with the OpenRouter key.
+#[tokio::test]
+async fn openrouter_asks_jev_unless_its_model_preference_names_another() {
+    let (pool, db) = setup_test_db().await;
+    seed_every_key(&pool).await;
+
+    let (url, model, key) = SystemOneEndpoint::OpenRouter
+        .system_one_request(&pool)
+        .await
+        .expect("a stored key is enough");
+    assert_eq!(
+        url,
+        crate::llm::judgment::endpoint::openrouter_system_one_url()
+    );
+    assert_eq!(model, crate::llm::judgment::endpoint::OPENROUTER_JEV_MODEL);
+    assert_eq!(key.as_deref(), Some("chat-provider-key"));
+
+    seed_preference(
+        &pool,
+        prefs::SYSTEM_ONE_OPENROUTER_MODEL.key(),
+        "acme/decider-2",
+    )
+    .await
+    .expect("seed the OpenRouter model");
+    let (_, model, _) = SystemOneEndpoint::OpenRouter
+        .system_one_request(&pool)
+        .await
+        .expect("a stored key is enough");
+    assert_eq!(model, "acme/decider-2");
+    teardown_test_db(&db).await;
+}
+
+/// The chat provider's switch is a veto over its System One row too: an
+/// OpenAI switched off for chat is off for decisions.
+#[tokio::test]
+async fn a_switched_off_chat_provider_runs_its_sites_on_chat() {
+    let (pool, db) = setup_test_db().await;
+    seed_every_key(&pool).await;
+    for endpoint in [SystemOneEndpoint::OpenRouter, SystemOneEndpoint::OpenAi] {
+        seed_preference(
+            &pool,
+            JudgmentSite::QueryClassification.preference_key().key(),
+            endpoint.id(),
+        )
+        .await
+        .expect("seed the site preference");
+        assert!(
+            system_one_for(&pool, JudgmentSite::QueryClassification, A_TIMEOUT)
+                .await
+                .is_some(),
+            "{endpoint:?} is configured and on"
+        );
+        seed_preference(&pool, endpoint.switch_key().key(), "false")
+            .await
+            .expect("seed the switch");
+        assert!(
+            system_one_for(&pool, JudgmentSite::QueryClassification, A_TIMEOUT)
+                .await
+                .is_none(),
+            "{endpoint:?} is switched off"
+        );
+    }
+    teardown_test_db(&db).await;
+}
+
+/// ADRs 0435 and 0472: an unset wake decision runs on OpenAI Decisions while
+/// the chat provider serves OpenAI. Nothing else moves, the read decision
+/// included, and an explicit `chat` stays.
+#[tokio::test]
+async fn an_unset_wake_decision_defaults_to_openai_decisions_while_openai_is_served() {
+    let (pool, db) = setup_test_db().await;
+    seed_every_key(&pool).await;
+    let served = [ProviderKind::OpenAi, ProviderKind::OpenRouter];
+
+    for other in [
+        JudgmentSite::ReadDecision,
+        JudgmentSite::CommandGuard,
+        JudgmentSite::QueryClassification,
+        JudgmentSite::MemoryFind,
+    ] {
+        assert!(
+            system_one_or_default_for(&pool, other, A_TIMEOUT, &served)
+                .await
+                .is_none(),
+            "{other:?} has no default"
+        );
+    }
+
+    {
+        let site = JudgmentSite::WakeDecision;
+        assert!(
+            system_one_or_default_for(&pool, site, A_TIMEOUT, &served)
+                .await
+                .is_some(),
+            "{site:?}: unset, with OpenAI served, runs on the default"
+        );
+        assert!(
+            system_one_or_default_for(&pool, site, A_TIMEOUT, &[ProviderKind::OpenRouter])
+                .await
+                .is_none(),
+            "{site:?}: a key the chat provider does not serve moves nothing"
+        );
+        assert!(
+            system_one_for(&pool, site, A_TIMEOUT).await.is_none(),
+            "{site:?}: system_one_for never applies a default"
+        );
+
+        seed_preference(&pool, site.preference_key().key(), "chat")
+            .await
+            .expect("seed the preference");
+        assert!(
+            system_one_or_default_for(&pool, site, A_TIMEOUT, &served)
+                .await
+                .is_none(),
+            "{site:?}: an explicit chat pick stays on chat"
+        );
+
+        seed_preference(&pool, site.preference_key().key(), "")
+            .await
+            .expect("clear the preference");
+        seed_preference(&pool, site.chat_model_key().key(), "local-model")
+            .await
+            .expect("pin a chat model");
+        assert!(
+            system_one_or_default_for(&pool, site, A_TIMEOUT, &served)
+                .await
+                .is_none(),
+            "{site:?}: a pinned chat model is a choice of chat, so its text stays there"
+        );
+        seed_preference(&pool, site.chat_model_key().key(), "")
+            .await
+            .expect("unpin the chat model");
+        assert!(
+            system_one_or_default_for(&pool, site, A_TIMEOUT, &served)
+                .await
+                .is_some(),
+            "{site:?}: an unpinned site takes the default again"
+        );
+    }
+
+    seed_preference(&pool, prefs::PROVIDER_ENABLED_OPENAI.key(), "false")
+        .await
+        .expect("seed the switch");
+    {
+        let site = JudgmentSite::WakeDecision;
+        assert!(
+            system_one_or_default_for(&pool, site, A_TIMEOUT, &served)
+                .await
+                .is_none(),
+            "{site:?}: a switched-off OpenAI runs the default on chat"
+        );
+    }
+    teardown_test_db(&db).await;
+}
+
+/// Only the wake decision has a default, and it rides a chat provider. The
+/// read decision runs on its chat model while unset (ADR 0472).
+#[test]
+fn only_the_wake_decision_has_a_default() {
+    assert!(WAKE_DECISION_DEFAULT.chat_provider().is_some());
+    for site in JudgmentSite::ALL {
+        let expected = (site == JudgmentSite::WakeDecision).then_some(WAKE_DECISION_DEFAULT);
+        assert_eq!(site.default_endpoint(), expected, "{site:?}");
+    }
 }

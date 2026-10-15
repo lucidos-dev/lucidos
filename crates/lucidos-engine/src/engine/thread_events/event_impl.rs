@@ -7,6 +7,25 @@ use super::{EventMeta, ThreadEvent};
 /// The one tool whose args the inline render reads, so the args strip spares it.
 const GENERATE_IMAGE_TOOL: &str = "generate_image";
 
+/// The `reason` on a *cache keep-alive* turn's `CodingAgentIdled`.
+pub const KEEP_ALIVE_IDLE_REASON: &str = "cache_keep_alive";
+
+/// The events that end a *cache keep-alive* turn: a card the agent raised
+/// anyway. The thread now waits on a person, so the card and the turn after
+/// it show.
+pub const KEEP_ALIVE_ENDING_EVENT_TYPES: &[&str] =
+    &["UserQuestionAsked", "CodingAgentPermissionRequest"];
+
+/// SQL true for every `events` row but a keep-alive idle, for each scan that
+/// must agree with [`ThreadEvent::is_cache_keep_alive_idle`]. `prefix` names
+/// the table alias with its dot, or is empty.
+pub fn not_a_keep_alive_idle_sql(prefix: &str) -> String {
+    format!(
+        "NOT ({prefix}event_type = 'CodingAgentIdled' \
+         AND COALESCE({prefix}payload->>'reason', '') = '{KEEP_ALIVE_IDLE_REASON}')"
+    )
+}
+
 impl ThreadEvent {
     /// Names of the four `Response*` events that close a request. A chat turn
     /// ends on one, and so does a coding-agent turn, which stamps its channel.
@@ -190,6 +209,8 @@ impl ThreadEvent {
             Self::ThreadUnarchived => "ThreadUnarchived",
             Self::ThreadReadRequested => "ThreadReadRequested",
             Self::ThreadReadNotRequested => "ThreadReadNotRequested",
+            Self::ParentWakeRequested => "ParentWakeRequested",
+            Self::ParentWakeNotRequested => "ParentWakeNotRequested",
             Self::ThreadReplySeen { .. } => "ThreadReplySeen",
             Self::ThreadTriageProposed { .. } => "ThreadTriageProposed",
             Self::ThreadStarted { .. } => "ThreadStarted",
@@ -206,13 +227,19 @@ impl ThreadEvent {
             Self::ChangeBroughtBack { .. } => "ChangeBroughtBack",
             Self::ChangeWithdrawn { .. } => "ChangeWithdrawn",
             Self::ProposalWithheld { .. } => "ProposalWithheld",
+            Self::ChangeQueued { .. } => "ChangeQueued",
+            Self::ChangeUnqueued { .. } => "ChangeUnqueued",
             Self::ChangeApplyFailed { .. } => "ChangeApplyFailed",
+            Self::ApplyNowStarted => "ApplyNowStarted",
+            Self::ApplyNowEnded { .. } => "ApplyNowEnded",
             Self::MergeConflictDetected { .. } => "MergeConflictDetected",
             Self::MergeResolutionStarted { .. } => "MergeResolutionStarted",
             Self::MergeResolutionCleared { .. } => "MergeResolutionCleared",
             Self::ChangeHardened { .. } => "ChangeHardened",
             Self::ChangeSummarized { .. } => "ChangeSummarized",
             Self::CodingAgentSettingsChanged { .. } => "CodingAgentSettingsChanged",
+            Self::CodingAgentCompacted { .. } => "CodingAgentCompacted",
+            Self::SuccessorThreadSpawned { .. } => "SuccessorThreadSpawned",
             Self::PromptInjected { .. } => "PromptInjected",
             Self::CredentialRequested { .. } => "CredentialRequested",
             Self::PluginInstallRequested { .. } => "PluginInstallRequested",
@@ -235,6 +262,7 @@ impl ThreadEvent {
             Self::CommandCheckpointReverted { .. } => "CommandCheckpointReverted",
             Self::WorktreeCleaned { .. } => "WorktreeCleaned",
             Self::ChildThreadCompleted { .. } => "ChildThreadCompleted",
+            Self::ChildReportFiled { .. } => "ChildReportFiled",
             Self::ChildThreadStopped { .. } => "ChildThreadStopped",
             Self::ChildThreadDetached { .. } => "ChildThreadDetached",
             Self::ContextDismissed { .. } => "ContextDismissed",
@@ -257,6 +285,9 @@ impl ThreadEvent {
             Self::WidgetShown { .. } => "WidgetShown",
             Self::WidgetPinned { .. } => "WidgetPinned",
             Self::WidgetUnpinned { .. } => "WidgetUnpinned",
+            Self::ThreadMcpServerEnabled { .. } => "ThreadMcpServerEnabled",
+            Self::ThreadMcpServerDisabled { .. } => "ThreadMcpServerDisabled",
+            Self::HomeBoardArranged { .. } => "HomeBoardArranged",
             // Transient
             Self::CumulativeTextUpdated { .. } => "CumulativeTextUpdated",
             Self::LlmCallRetried { .. } => "LlmCallRetried",
@@ -326,6 +357,8 @@ impl ThreadEvent {
         "ThreadUnarchived",
         "ThreadReadRequested",
         "ThreadReadNotRequested",
+        "ParentWakeRequested",
+        "ParentWakeNotRequested",
         "ThreadReplySeen",
         "ThreadTriageProposed",
         "ThreadStarted",
@@ -342,13 +375,19 @@ impl ThreadEvent {
         "ChangeBroughtBack",
         "ChangeWithdrawn",
         "ProposalWithheld",
+        "ChangeQueued",
+        "ChangeUnqueued",
         "ChangeApplyFailed",
+        "ApplyNowStarted",
+        "ApplyNowEnded",
         "MergeConflictDetected",
         "MergeResolutionStarted",
         "MergeResolutionCleared",
         "ChangeHardened",
         "ChangeSummarized",
         "CodingAgentSettingsChanged",
+        "CodingAgentCompacted",
+        "SuccessorThreadSpawned",
         "PromptInjected",
         "CredentialRequested",
         "PluginInstallRequested",
@@ -371,6 +410,7 @@ impl ThreadEvent {
         "CommandCheckpointReverted",
         "WorktreeCleaned",
         "ChildThreadCompleted",
+        "ChildReportFiled",
         "ChildThreadStopped",
         "ChildThreadDetached",
         "ContextDismissed",
@@ -403,6 +443,9 @@ impl ThreadEvent {
         "WidgetShown",
         "WidgetPinned",
         "WidgetUnpinned",
+        "ThreadMcpServerEnabled",
+        "ThreadMcpServerDisabled",
+        "HomeBoardArranged",
     ];
 
     /// The `#[serde(alias = ...)]` spellings, kept for rows written before a
@@ -462,6 +505,24 @@ impl ThreadEvent {
         "SideQuestionDismissed",
     ];
 
+    /// The notes a fan-in leaves on a parent that wake nothing. A note after
+    /// an unprocessed `ChildThreadCompleted` is no reaction to it, so readers
+    /// asking "is that card the parent's last word" skip them.
+    pub const PARENT_NOTE_EVENT_TYPES: &'static [&'static str] = &[
+        "ChildThreadStopped",
+        "ChildThreadDetached",
+        "ChildReportFiled",
+    ];
+
+    /// Whether this is the idle a *cache keep-alive* turn ends with. No agent,
+    /// trigger or event wait may read it as the agent finishing.
+    pub fn is_cache_keep_alive_idle(&self) -> bool {
+        matches!(
+            self,
+            Self::CodingAgentIdled { reason: Some(r), .. } if r == KEEP_ALIVE_IDLE_REASON
+        )
+    }
+
     /// Whether this is one of the four side-question events, which no agent,
     /// trigger or event wait may ever see.
     pub fn is_side_question_event(&self) -> bool {
@@ -520,6 +581,7 @@ impl ThreadEvent {
         "ResponseCanceled",
         "ResponseAborted",
         "ChildThreadCompleted",
+        "ChildReportFiled",
         "ImageDescribed",
     ];
 
@@ -551,7 +613,9 @@ impl ThreadEvent {
             Self::ResponseGenerated { text, .. } => Some(text),
             Self::ResponseCanceled { text, .. } => Some(text),
             Self::ResponseAborted { text, .. } => Some(text),
-            Self::ChildThreadCompleted { summary, .. } => Some(summary),
+            Self::ChildThreadCompleted { summary, .. } | Self::ChildReportFiled { summary, .. } => {
+                Some(summary)
+            }
             // Image descriptions carry real shared content (screenshots,
             // tickets, photos). Index them so an image-only turn isn't a
             // memory black hole — the title path already folds them in.

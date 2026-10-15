@@ -26,6 +26,8 @@ mod follow_up;
 mod list;
 mod read_request;
 mod search;
+mod successor;
+mod wake_decision;
 
 // Handler functions consumed by the router and the SearchEverywhere endpoint.
 pub(super) use actions::{
@@ -198,6 +200,11 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/read-request/seen",
             post(read_request::mark_thread_reply_seen),
         )
+        // A coding-agent child deciding whether its report wakes its parent.
+        .route(
+            "/threads/:thread_id/wake-decision",
+            post(wake_decision::record_thread_wake_decision),
+        )
         .route(
             "/threads/:thread_id/background-tasks",
             post(background_tasks::start_background_task),
@@ -205,6 +212,10 @@ pub(super) fn router() -> Router<super::AppState> {
         .route(
             "/threads/:thread_id/background-tasks/:task_id",
             get(background_tasks::background_task_output),
+        )
+        .route(
+            "/threads/:thread_id/background-tasks/:task_id/wait",
+            get(background_tasks::wait_for_background_task),
         )
         .route(
             "/threads/:thread_id/background-tasks/:task_id/stop",
@@ -222,6 +233,14 @@ pub(super) fn router() -> Router<super::AppState> {
         // Move a child to top level. `:thread_id` is the CHILD, and who may
         // move it depends on whether the caller carries an origin token.
         .route("/threads/:thread_id/detach", post(detach::detach_thread))
+        .route(
+            "/threads/:thread_id/context",
+            get(successor::thread_context),
+        )
+        .route(
+            "/threads/:thread_id/successor",
+            post(successor::spawn_successor),
+        )
         // Archive on the caller's own authority (ADR 0310). `:thread_id` is
         // the target; an origin token limits it to the caller or one of its
         // direct children.

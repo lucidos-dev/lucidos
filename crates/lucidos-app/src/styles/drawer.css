@@ -54,6 +54,9 @@
     position: relative;
     flex: 1;
     min-height: 0;
+    /* The desktop drawer's open width, held while the drawer slides, which
+       clips it (ThreadDrawer.tsx). The phone's pane sets none, so 0. */
+    min-width: var(--thread-drawer-open-width, 0px);
     display: flex;
     flex-direction: column;
 }
@@ -781,7 +784,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
  * below. The eye reads the body, so the glyph moves down by the 2.5 of 24
  * units between the body's center and the box's. The body then centers on
  * the caps. */
-.thread-row-actions .pin-thread-btn svg {
+.thread-row-actions .pin-btn svg {
     translate: 0 calc(100% * 2.5 / 24);
 }
 
@@ -925,6 +928,14 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     padding: 0;
 }
 
+/* The row window's gap: the rows it stands in for, at their summed measured
+   height (WindowedRows.tsx). Any padding, border or margin here would move
+   every row below it. It never anchors scrolling, so Chromium anchors on a
+   real row. */
+.drawer-row-gap {
+    overflow-anchor: none;
+}
+
 /* A family or section showing or hiding its rows (useFlipAnimation): copies of
    the rows slide inside this box, whose top edge is the parent's or header's
    bottom edge. The overflow clip hides every copy above that edge. */
@@ -993,19 +1004,28 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 }
 
 /* A split group's parts on its tile (Review, In flight), in words beside the
-   icon, one count per line. */
+   count, one count per line. The counts share a right-aligned column and the
+   words a left-aligned one, so "5 changes" and "4 unread" line up on the
+   number. The gap is the space the word span's leading space would draw. */
 .ongoing-tile-breakdown {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
+    display: grid;
+    grid-template-columns: auto auto;
+    column-gap: 1ch;
     font-size: var(--font-size-2xs);
     font-variant-numeric: tabular-nums;
     color: var(--text-muted);
 }
 
 .ongoing-tile-breakdown-part {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: subgrid;
     white-space: nowrap;
     transition: color var(--duration-normal) ease;
+}
+
+.ongoing-tile-breakdown-count {
+    text-align: end;
 }
 
 /* The count a re-press on the tile narrowed the list to. Brightness alone
@@ -1088,7 +1108,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     color: var(--text-secondary);
     font-size: var(--font-size-xs);
     cursor: pointer;
-    transition: background var(--duration-fast) ease, opacity var(--duration-fast) ease;
+    transition: background var(--duration-fast) ease;
 }
 
 @media (hover: hover) {
@@ -1103,7 +1123,8 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 }
 
 /* The selected tile stays at full strength, empty or not, so the selection
-   always reads. */
+   always reads. The dim lands in the frame the count reads 0, never as a fade:
+   a fade lifts the tile onto a layer that hops to whole pixels. */
 .ongoing-tile-empty:not(.ongoing-tile-selected) {
     opacity: var(--drawer-dim-opacity);
 }
@@ -1113,10 +1134,30 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     box-shadow: var(--focus-ring);
 }
 
+/* The icon lies over the top row's corner, so a breakdown that wraps under
+   the count has the tile's full width. */
 .ongoing-tile-top {
+    display: grid;
+    --ongoing-tile-icon-room: calc(var(--icon-size-sm) + var(--space-sm));
+}
+
+.ongoing-tile-top > * {
+    grid-area: 1 / 1;
+}
+
+/* The breakdown sits beside the count while the two fit with the icon's room,
+   and wraps under it when they do not. Its margin keeps that room. Alone on
+   its line, the margin runs past the edge, where it draws nothing. */
+.ongoing-tile-figures {
     display: flex;
+    flex-wrap: wrap;
     align-items: flex-start;
-    gap: var(--space-sm);
+    gap: var(--space-xs) var(--space-sm);
+    min-width: 0;
+}
+
+.ongoing-tile-figures .ongoing-tile-breakdown {
+    margin-right: var(--ongoing-tile-icon-room);
 }
 
 .ongoing-tile-count {
@@ -1129,6 +1170,8 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 
 .ongoing-tile-icon {
     display: flex;
+    justify-self: end;
+    align-self: start;
     color: var(--text-secondary);
 }
 
@@ -1137,7 +1180,10 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     color: var(--accent);
 }
 
+/* At the tile's foot, so the four labels share a line when one tile's wrapped
+   breakdown makes the row taller. */
 .ongoing-tile-label {
+    margin-top: auto;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1227,9 +1273,9 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     display: flex;
     align-items: flex-start;
     gap: 0.25rem var(--title-column-gap);
-    /* Right padding matches `.pane-header`'s `--header-padding-x` so the action
-     * icons land in the same horizontal slot as the AppHeader icons above. */
-    padding: 0.25rem 0.625rem 0.25rem 1rem;
+    /* The header's own right padding, so the action icons land in the same
+     * horizontal slot as the AppHeader icons above. */
+    padding: 0.25rem var(--header-padding-x) 0.25rem 1rem;
     /* On the page while the transcript rests at its top. Once it scrolls, the
      * faint --bg-secondary band fades in to say there is more above. */
     background: transparent;

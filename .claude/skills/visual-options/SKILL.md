@@ -44,7 +44,7 @@ A mockup on a blank page hides the background, the neighbours and the edges it
 has to line up with. Render inside the running app, in the workspace's theme.
 
 1. Read the dev workspace's URL from `<workspace>/.lucidos/ports`.
-2. Pick a thread with content: `psql -Atc "select thread_id from thread_summaries where has_response order by last_activity desc limit 5"`.
+2. Pick a thread with content: `psql "$LUCIDOS_DATABASE_URL" -Atc "select thread_id from thread_summaries where has_response order by last_activity desc limit 5"`.
 3. Write each variant as a CSS file plus an HTML fragment. Use the component's
    real class names and the theme tokens, never hardcoded colours.
 4. Render it with the helper beside this file. It is read-only: it injects the

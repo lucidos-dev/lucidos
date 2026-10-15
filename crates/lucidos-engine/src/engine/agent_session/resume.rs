@@ -380,7 +380,9 @@ pub(super) async fn resolve_resume_context(
     (None, None)
 }
 
-async fn lookup_session_branch_for_thread(
+/// The branch the thread's latest session ran on. `None` when no session
+/// recorded one, or the lookup failed.
+pub(crate) async fn lookup_session_branch_for_thread(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
 ) -> Option<String> {

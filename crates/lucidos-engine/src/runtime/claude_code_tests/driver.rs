@@ -73,11 +73,12 @@ async fn output_ended_then_exited(
 #[tokio::test]
 async fn driver_task_parses_stdout_into_typed_events() {
     // Subprocess prints two CC-format lines then exits. The driver must
-    // forward both as typed AgentEvents and finish with Exited.
+    // forward both as typed AgentEvents and finish with Exited. The quotes
+    // stay bare: dash's printf, Ubuntu's `sh`, prints a `\"` verbatim.
     let cmd = format!(
         "printf '{}\\n{}\\n'",
-        r#"{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-1\"}"#,
-        r#"{\"type\":\"result\",\"result\":\"done\",\"duration_ms\":42}"#,
+        r#"{"type":"system","subtype":"init","session_id":"sess-1"}"#,
+        r#"{"type":"result","result":"done","duration_ms":42}"#,
     );
     let (mut agent, _cancel) = spawn_driver_for_test("sh", &["-c", &cmd]).await;
 
@@ -215,6 +216,28 @@ async fn driver_task_flags_stray_signal_kill() {
         ),
         "a stray signal kill must set killed_by_signal=true, got {:?}",
         exited,
+    );
+}
+
+/// A killed process closes its stdout before the OS can report it gone. Under
+/// load, that gap made the driver tear down a child that was already dying,
+/// and a stray kill then read as an engine teardown. This child widens the gap
+/// on purpose: it closes stdout, then signals itself a moment later.
+#[tokio::test]
+async fn a_stray_kill_that_lands_after_stdout_closes_still_counts() {
+    let (mut agent, _cancel) =
+        spawn_driver_for_test("sh", &["-c", "exec 1>&-; sleep 0.3; kill -TERM $$"]).await;
+
+    let exited =
+        output_ended_then_exited(&mut agent.events_rx, std::time::Duration::from_secs(10)).await;
+    assert!(
+        matches!(
+            exited,
+            AgentEvent::Exited {
+                killed_by_signal: true
+            }
+        ),
+        "a process that kills itself after closing stdout must set killed_by_signal=true, got {exited:?}",
     );
 }
 

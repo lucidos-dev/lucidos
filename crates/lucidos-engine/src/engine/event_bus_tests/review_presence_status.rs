@@ -73,6 +73,7 @@ async fn cc_idle_no_changes_from_inbox_stays_inbox() {
             actor: None,
             pre_merge_sha: None,
             post_merge_sha: None,
+            landing_merge_sha: None,
             path: String::new(),
         },
         meta: EventMeta::NONE,
@@ -114,6 +115,7 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "dispatch work".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -141,6 +143,7 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
             event: ThreadEvent::MessageReceived {
                 provider: None,
                 voice_session_id: None,
+                wake_mode: None,
                 text: format!("child task {}", i),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -339,6 +342,7 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -368,6 +372,9 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
             coding_agent_kind: Default::default(),
             coding_agent_folder: String::new(),
             app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -457,6 +464,7 @@ async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "do work".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -542,6 +550,7 @@ async fn emit_with_existing_event_id_fails_with_pkey_violation() {
         event: ThreadEvent::MessageReceived {
             provider: None,
             voice_session_id: None,
+            wake_mode: None,
             text: "first".into(),
             user_image_hashes: vec![],
             device_id: None,

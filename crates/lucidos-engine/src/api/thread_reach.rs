@@ -12,6 +12,10 @@
 //! *owner approval* for that one act (ADR 0387, `api::owner_approval`). This
 //! module refuses when none of the three covers the act.
 //!
+//! **Creating a thread is not on the list.** Any caller may create a
+//! top-thread, or move its own child to top level (ADR 0475). Those two verbs
+//! stay in the enum only because stored approval cards name them.
+//!
 //! The gate is per VERB, never per route. Three verbs arrive by more than one
 //! path, and gating the first path of each is how the ungated set grew.
 //!
@@ -75,10 +79,15 @@ pub enum ThreadReachVerb {
     /// by [`refuse_agent_always_allow`].
     ResolvePermission,
     Continue,
-    /// Creating a thread with no parent, which aims at the workspace root. The
-    /// root is not a thread and gets no row (ADR 0168 clause 1), so no place in
-    /// the tree reaches it.
+    /// Retired: creating a top-thread needs no authority (ADR 0475). Kept so
+    /// approval cards asked before then still deserialize.
     CreateTopThread,
+    /// Retired with [`Self::CreateTopThread`]: an agent moves its own child to
+    /// top level with no authority beyond the detach ladder (ADR 0475).
+    DetachChild,
+    /// Starting a *successor thread* under a thread's parent, in the place of
+    /// one of its children. It takes that parent as its target.
+    SpawnSuccessor,
 }
 
 impl ThreadReachVerb {
@@ -103,6 +112,8 @@ impl ThreadReachVerb {
             Self::ResolvePermission => "answer a permission card on",
             Self::Continue => "restart the turn on",
             Self::CreateTopThread => "create a top-thread beside",
+            Self::DetachChild => "detach",
+            Self::SpawnSuccessor => "start a successor thread under",
         }
     }
 
@@ -126,6 +137,8 @@ impl ThreadReachVerb {
             Self::ResolvePermission => "answering a permission card",
             Self::Continue => "restarting a turn",
             Self::CreateTopThread => "creating a top-thread",
+            Self::DetachChild => "moving a child thread to top level",
+            Self::SpawnSuccessor => "starting a successor thread",
         }
     }
 
@@ -138,12 +151,10 @@ impl ThreadReachVerb {
         !matches!(self, Self::AnswerQuestion | Self::ResolvePermission)
     }
 
-    /// Does this verb aim at the workspace root rather than at a thread?
-    ///
-    /// Only creating a top-thread does. Every other verb an approval names
-    /// takes a target, so an unscoped cancel can never be approved.
-    pub(crate) fn aims_at_root(self) -> bool {
-        self == Self::CreateTopThread
+    /// Is this still a clause-4 verb? The two retired ones are not, so the
+    /// gate allows them and no card proposes them (ADR 0475).
+    pub(crate) fn needs_authority(self) -> bool {
+        !matches!(self, Self::CreateTopThread | Self::DetachChild)
     }
 }
 
@@ -157,9 +168,9 @@ pub(crate) enum ThreadReachError {
     /// exactly as `ChildFollowUpError::NotYourChild` is: the caller learns the
     /// thread is out of reach, and nothing about whose it is.
     OutOfReach { target: Uuid, verb: ThreadReachVerb },
-    /// A verb aimed at the workspace root rather than at a thread, by a caller
-    /// carrying no standing instruction. Creating a top-thread is the case:
-    /// the root is nobody's subtree, so only the owner reaches it.
+    /// A verb aimed at the workspace rather than at a thread, by a caller
+    /// carrying no standing instruction. Applying a change that names no
+    /// thread is the case: the workspace is nobody's subtree.
     NoStandingInstruction(ThreadReachVerb),
     /// A verified subprocess with no thread of its own, and not a trigger's
     /// fire either. It has no subtree to scope to and no turn to carry an
@@ -227,8 +238,8 @@ impl std::fmt::Display for ThreadReachError {
             ),
             Self::NoStandingInstruction(verb) => write!(
                 f,
-                "This request is {}, which aims at the workspace root rather than at a \
-                 thread. The root is nobody's subtree. {OWNERS_TO_PRESS}",
+                "This request is {}, aimed at the workspace rather than at a thread. The \
+                 workspace is nobody's subtree. {OWNERS_TO_PRESS}",
                 verb.act()
             ),
             Self::NoCallerThread(verb) => write!(
@@ -448,10 +459,10 @@ pub(in crate::api) async fn refuse_permission_answer(
 /// Anything wider is the owner's button, and only a standing instruction lets
 /// the caller press it (clause 5).
 ///
-/// `target` is optional because two verbs aim at no single thread: `POST
-/// /api/v1/chat/cancel` with no thread id means "everything", and creating a
-/// top-thread means "at the root". Both are wider than any subtree, so both
-/// take the standing-instruction path.
+/// `target` is optional because some acts aim at no single thread: `POST
+/// /api/v1/chat/cancel` with no thread id means "everything", and a change
+/// naming no thread belongs to the workspace. Both are wider than any subtree,
+/// so both take the standing-instruction path.
 ///
 /// Runs BEFORE the handler writes anything, so a refusal leaves no half-applied
 /// cascade, no merged branch and no cancel-stamped question card behind.
@@ -516,6 +527,8 @@ pub(crate) async fn refuse_thread_without_authority(
 /// approval* is weighed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeldAuthority {
+    /// The verb is retired and needs no authority (ADR 0475).
+    NoneNeeded,
     /// The target is the caller or one of its descendants (clause 3).
     OwnSubtree,
     /// The caller carries the owner's standing instruction (clause 5).
@@ -531,7 +544,11 @@ pub(crate) async fn authority_held(
     source_thread_id: Option<Uuid>,
     emitting_trigger_id: Option<&str>,
     target: Option<Uuid>,
+    verb: ThreadReachVerb,
 ) -> Result<Option<HeldAuthority>, ThreadReachError> {
+    if !verb.needs_authority() {
+        return Ok(Some(HeldAuthority::NoneNeeded));
+    }
     // A threadless caller has no subtree, so it skips straight to the owner's
     // question below.
     if let (Some(caller), Some(target)) = (source_thread_id, target) {
@@ -554,8 +571,16 @@ async fn weigh_authority(
     target: Option<Uuid>,
     verb: ThreadReachVerb,
 ) -> Result<(), ThreadReachError> {
-    match authority_held(bus.pool(), source_thread_id, emitting_trigger_id, target).await? {
-        Some(HeldAuthority::OwnSubtree) => return Ok(()),
+    match authority_held(
+        bus.pool(),
+        source_thread_id,
+        emitting_trigger_id,
+        target,
+        verb,
+    )
+    .await?
+    {
+        Some(HeldAuthority::NoneNeeded | HeldAuthority::OwnSubtree) => return Ok(()),
         Some(HeldAuthority::StandingInstruction) => {
             crate::log!(
                 "[ThreadReach] Allowed on the owner's standing instruction: caller {:?} may {} {:?}",
@@ -569,8 +594,8 @@ async fn weigh_authority(
     }
 
     // An approval names one thread's act, so a threadless caller holds none.
-    // A proposable verb with no target is only ever one aimed at the root, so
-    // an unscoped cancel cannot match a card.
+    // Every proposable verb names a target, so an unscoped act cannot match a
+    // card.
     if let Some(caller) = source_thread_id {
         if spend_owner_approval(bus, caller, verb, target).await {
             crate::log!(

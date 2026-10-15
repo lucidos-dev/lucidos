@@ -33,6 +33,7 @@ use crate::core::plugin_marketplaces::{
 };
 use crate::core::ArtifactManager;
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
+use crate::engine::git_ops::WorkspaceRepoLock;
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::LucidosEngine;
 
@@ -96,6 +97,7 @@ async fn announce(bus: &dyn EventBusEmitter, event: BusEvent, ctx: &str) {
 /// `PluginMarketplaceRegistered` (see the variant's doc for why the rename is
 /// not its own event).
 pub(crate) async fn register_with_bus(
+    held: &WorkspaceRepoLock,
     workspace_path: &Path,
     artifact_manager: &ArtifactManager,
     bus: &dyn EventBusEmitter,
@@ -112,6 +114,7 @@ pub(crate) async fn register_with_bus(
 
     let commit = artifact_manager
         .commit_data_path(
+            held,
             MARKETPLACES_DATA_PATH,
             if created {
                 "Register plugin marketplace"
@@ -146,6 +149,7 @@ pub(crate) async fn register_with_bus(
 /// Unregister the marketplace with `id`. `Ok(None)` when no such marketplace is
 /// registered: nothing is written, committed, or announced.
 pub(crate) async fn unregister_with_bus(
+    held: &WorkspaceRepoLock,
     workspace_path: &Path,
     artifact_manager: &ArtifactManager,
     bus: &dyn EventBusEmitter,
@@ -166,7 +170,7 @@ pub(crate) async fn unregister_with_bus(
     }
 
     let commit = artifact_manager
-        .commit_data_path(MARKETPLACES_DATA_PATH, "Remove plugin marketplace")
+        .commit_data_path(held, MARKETPLACES_DATA_PATH, "Remove plugin marketplace")
         .await
         .map_err(|e| format!("commit marketplace registry: {e}"))?;
 
@@ -219,8 +223,8 @@ impl LucidosEngine {
         actor: Option<MessageOrigin>,
     ) -> Result<MarketplaceRegistration, MarketplaceWriteError> {
         let registration = {
-            let _repo_guard = self.lock_workspace_repo().await;
             register_with_bus(
+                &self.lock_workspace_repo().await,
                 &self.workspace_path,
                 &self.artifact_manager,
                 &self.event_bus,
@@ -259,8 +263,8 @@ impl LucidosEngine {
         id: &str,
         actor: Option<MessageOrigin>,
     ) -> Result<Option<MarketplaceRemoval>, String> {
-        let _repo_guard = self.lock_workspace_repo().await;
         unregister_with_bus(
+            &self.lock_workspace_repo().await,
             &self.workspace_path,
             &self.artifact_manager,
             &self.event_bus,

@@ -154,6 +154,8 @@ If the user says "notify me when X" and X isn't an event yet, you have two work 
 
 **Check first whether the engine already emits it.** An `on:` entry takes a persisted thread event, a domain event your workspace emits, or a persisted **system event**: `BackupCompleted`, `BackupFailed`, `NotificationCreated`, `TriggerCompleted`, `PluginInstalled` and the rest (ADR 0113). "Tell me if a backup fails" needs no new emitter. What stays out is a transient frame such as `BackupProgress` or `Toast`, which writes no row and reaches no matcher. Subscribe to the event that ends the run instead. `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist" carries the full rule.
 
+**A persisted event fires its trigger even under heavy load.** When a burst of events outruns the scheduler, it reads the missed ones back from the event log and fires for them, once each. A transient domain event (one emitted with `transient: true`) writes no row, so there is nothing to read back. A trigger on one is best-effort: under heavy load it can miss a fire. When every occurrence matters, emit the event durably.
+
 **Do not guess the name.** Create and update both check every `on:` entry. A misspelled or retired engine name is refused, with the real one named, because an exact-string match would arm clean and never fire. A name outside the engine's set is accepted, with a warning when this workspace has never emitted it. Look one up with the `events` tool's `event_types` action.
 
 ### One trigger, multiple events
@@ -324,6 +326,14 @@ A day-of-month that the month is never long enough to contain is valid syntax an
 
 `0 0 9 29 2 *` is NOT in this class. Feb 29 is rare, not impossible: it fires 2028, 2032, then 2036. Every create and update reports the **next 3 fire times** back to you, and the trigger's row in the panel shows them too. Read them against what the user asked for before you confirm: three dates a year apart when they said "monthly" is the tell.
 
+### A fire due while the engine restarts
+
+A scheduled fire never starts on an engine that is shutting down, because its run could not reach the API. The slot stays unrun, and the next engine's **missed-slot catch-up** fires it when it starts. A fire already waiting in the Thread Queue stays queued and runs on the next engine instead.
+
+The catch-up fires only the most recent slot of the past hour, and only one with no recorded run at or after it. A recorded run counts whatever its status, `failed` included. So a run that failed on a healthy engine is not repeated on restart. Fix the cause, then run the trigger once if the user wants the result now.
+
+A run already in progress when the shutdown starts may finish. If it fails because the API went away, it stays failed and is not re-run.
+
 ## `condition`: when to filter
 
 Set `condition` on a trigger subscription when the event is high-volume and you care about only a slice. Example: subscribe to `EmailReceived` but fire only on emails from one sender. Without a condition, the trigger fires for every email and the run has to filter, which is slow and wasteful.
@@ -429,7 +439,12 @@ body = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
 
 Call `send_notification` only when there is something the user wants to hear about. A morning summary that finds nothing new sends no notification: silent success is the norm.
 
-When a run found something worth reading, call `request_read` with `read: true`. The thread then waits under Review until the user has read its reply. A run that found nothing just finishes and sends no notification. Every run still records a read decision: Lucidos decides one the run left open.
+End every run with your own read decision, `request_read`:
+
+- **`read: false`** when the run found nothing new, however much you checked. Also `false` when a notification you sent already carried the news, so the reply only repeats it.
+- **`read: true`** only when the reply holds something the user would miss without reading it: a finding no push carried, a failure, or a decision only they can make. The thread then waits under Review until the user has read its reply.
+
+A run you leave undecided is decided by a background call, which reads more runs as worth reading than you would. So decide it yourself.
 
 A trigger that orchestrates *sub-threads* or waits on events wakes many times in one run. Each wake that only reports progress is `read: false`, so only the ending lands in Review. Say `read: true` on a step only for something the user should read before the run finishes, such as a failure.
 
@@ -705,6 +720,19 @@ The chat command guard fails the *whole* run on an ungranted side-effect, but th
 
 The flow follows child spawns only. A top spawn, by `spawn_thread` with `relation: "top"` or by `lucidos spawn-thread` without `--relation child`, is independent of the trigger: its cards wait for a human. Spawn the coding agent as a child when the run must finish unattended. A spawn into another workspace is always a top spawn, so it always asks.
 
+## MCP servers the fires use: `mcp_servers`
+
+A running *MCP server* offers its tools only to the threads that enabled it (ADR 0430). A trigger lists the servers its intent needs in `mcp_servers`, for example `["slack"]`. Each fire then enables them in its thread and starts any that are not running, before the first step. So the tools are there from round 1. A listed id that no server has becomes a line in the fire's `[MCP SERVERS]` block, and so does a server that fails to start. The run still goes ahead.
+
+**List every server the intent needs.** Two things happen to an unlisted one:
+
+- **Its calls are refused.** A trigger thread has nobody to approve an MCP call. So it runs one silently only when the trigger lists the server, or the server has auto-approve set. Any other call is refused, and the agent is told not to call that server again in this fire. The user gets one notification naming the trigger and the server, which opens the trigger.
+- **Enabling it costs a mid-turn write.** The fire's agent can still `mcp enable` an unlisted server, but that rewrites its tool array mid-turn, and the calls are refused anyway.
+
+Do not list a server the intent does not need. Its tools then ride every request of every fire for nothing. The `triggers` tool sets the field on `create` and `update`, and so do `lucidos triggers` and the HTTP API. Each write is a full replacement, and `null` or `[]` clears it. A trigger that calls no MCP server leaves it out.
+
+The audit's `triggers` section flags a trigger whose fires enabled a server it does not list. Its `prompt-footprint` section flags one that lists a server its fires never call.
+
 ## Edit, don't recreate
 
 **Always look for an existing trigger first** (`list_triggers`) and change it with `update_trigger`. Call `create_trigger` only when no comparable trigger exists. Recreating gives the new trigger a fresh `trigger_id` and orphans the old one's run history. The threads still exist, but no longer match the live trigger in the filter dropdown, trigger-scoped reports, or anything else that joins by id. The user sees no threads for a workflow that has fired for months.
@@ -814,9 +842,9 @@ Never claim "I'll delete it after it runs" without one of the above.
 **The scheduler never reads this file.** `data/triggers/<slug>/trigger.toml` is a
 **derived read-model** of the trigger's definition. It mirrors the durable
 subset of its config (`name`, `slug`, `schedule`, `timezone`, `run`, `on`,
-`app_id`, `go_to_review`, `group_id`, `side_effect_grant`, `model`,
-`reasoning_effort`, `provider`). A trigger on the account chat defaults omits
-the last three. The engine maintains it from the trigger events: written on
+`app_id`, `go_to_review`, `group_id`, `side_effect_grant`, `mcp_servers`,
+`model`, `reasoning_effort`, `provider`). A trigger on the account chat defaults
+omits the last three. The engine maintains it from the trigger events: written on
 create/update, removed on delete, rebuilt from events on boot (ADR 0019).
 Runtime and identity fields (`id`, `last_run`, `last_run_status`, `paused`) are
 left out. It is **not version-controlled**: the engine adds
@@ -879,6 +907,7 @@ candidate in the path-resolution fallback, not the configured path, which
    Shared `data/knowhow/` is what you can write first. Trigger-scoped is the
    exception to the ordering: write that one *after* `create_trigger` returns,
    because only then is `<slug>` authoritative.
+5. **List the MCP servers the intent calls** in `mcp_servers`, and only those. An unlisted server's calls are refused in the fire (§ "MCP servers the fires use: `mcp_servers`").
 
 ## Common mistakes to avoid
 
@@ -888,6 +917,7 @@ candidate in the path-resolution fallback, not the configured path, which
 - **A trigger that manages another trigger.** Refused at fire time, and nothing catches it earlier. See § "What a trigger fire may not do to other triggers".
 - **Recipe-in-text.** Procedure in `run.intent` instead of knowhow, almost always because the knowhow file was never written first. See "Write the knowhow file FIRST, then the intent" above.
 - **A webhook condition without the `payload.` prefix.** `{"action": "completed"}` matches nothing, and nothing warns you. See § "The envelope: a webhook's body lands under `payload`".
+- **An MCP server the intent uses but the trigger does not list.** Every call to it is refused in the fire, with a notification. See § "MCP servers the fires use: `mcp_servers`".
 - **Cron when a trigger subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.
 - **Picking a trigger per event to maintain an aggregate without measuring first.** Weigh it against a projection. See § "Aggregating events: cron, per event, or a projection".
 - **Assuming day-of-month and day-of-week are ORed.** They are ANDed, unlike Vixie cron. See § "Writing cron expressions".

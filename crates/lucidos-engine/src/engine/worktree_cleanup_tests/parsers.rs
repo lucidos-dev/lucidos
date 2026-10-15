@@ -37,7 +37,8 @@ fn parse_thread_short_rejects_legacy_and_garbage_names() {
 #[test]
 fn is_safe_subpath_blocks_escapes() {
     use super::is_safe_subpath;
-    let parent = std::env::temp_dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().to_path_buf();
     let child = parent.join("inner");
     std::fs::create_dir_all(&child).ok();
     assert!(is_safe_subpath(&parent, &child));
@@ -335,8 +336,8 @@ async fn last_activity_is_the_newest_timestamp_not_the_last_insert() {
 #[test]
 fn available_disk_bytes_returns_some_for_existing_path() {
     use super::available_disk_bytes;
-    let tmp = std::env::temp_dir();
-    let bytes = available_disk_bytes(&tmp);
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes = available_disk_bytes(tmp.path());
     assert!(
         bytes.is_some(),
         "should return Some for an existing tempdir"
@@ -357,36 +358,40 @@ fn available_disk_bytes_returns_none_for_missing_path() {
 /// An empty session map with nothing registered anywhere.
 fn idle_engine_probe() -> (
     super::EngineActiveThreads,
-    Arc<crate::engine::agent_session::SpawnsInFlight>,
+    Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, crate::engine::AgentSession>>>,
     crate::engine::tools::bash_background::BackgroundBashRegistry,
 ) {
     let sessions = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let spawns = Arc::new(crate::engine::agent_session::SpawnsInFlight::default());
     let registry = crate::engine::tools::bash_background::BackgroundBashRegistry::new();
-    let probe = super::EngineActiveThreads::new(sessions, spawns.clone(), registry.clone());
-    (probe, spawns, registry)
+    let probe = super::EngineActiveThreads::new(sessions.clone(), registry.clone());
+    (probe, sessions, registry)
 }
 
-/// A spawn sets up the worktree, hardlinks included, well before its session
-/// registers. The spawn registry covers that window.
+/// A spawn sets up the worktree, hardlinks included, well before its process
+/// runs. Its claimed entry covers that window, until the run lets go.
 #[tokio::test]
-async fn a_spawn_in_flight_makes_its_thread_active() {
+async fn a_claimed_run_makes_its_thread_active_until_it_lets_go() {
     use super::ActiveThreads;
 
-    let (probe, spawns, _registry) = idle_engine_probe();
+    let (probe, sessions, _registry) = idle_engine_probe();
     let thread_id = Uuid::new_v4();
     assert!(!probe.is_active(thread_id).await, "nothing running yet");
-    {
-        let _slot = spawns.enter(thread_id);
-        assert!(probe.is_active(thread_id).await, "the spawn is in flight");
-        assert!(
-            !probe.is_active(Uuid::new_v4()).await,
-            "another thread's spawn does not count"
-        );
-    }
+    let claim = crate::engine::agent_session::spawn_claim::claim_thread_for(
+        &mut *sessions.lock().await,
+        thread_id,
+        crate::runtime::CodingAgent::ClaudeCode,
+        crate::engine::agent_session::spawn_claim::ClaimFor::Run,
+    )
+    .unwrap();
+    assert!(probe.is_active(thread_id).await, "the run is starting");
+    assert!(
+        !probe.is_active(Uuid::new_v4()).await,
+        "another thread's run does not count"
+    );
+    drop(claim);
     assert!(
         !probe.is_active(thread_id).await,
-        "a returned spawn does not count"
+        "a run that let go does not count"
     );
 }
 
@@ -397,7 +402,7 @@ async fn a_running_background_task_makes_its_thread_active() {
     use super::ActiveThreads;
 
     let tmp = tempfile::tempdir().unwrap();
-    let (probe, _spawns, registry) = idle_engine_probe();
+    let (probe, _sessions, registry) = idle_engine_probe();
     let thread_id = Uuid::new_v4();
     assert!(!probe.is_active(thread_id).await, "nothing running yet");
 

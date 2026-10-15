@@ -57,12 +57,7 @@ e2e_gateway_dir() { echo "$E2E_WORKSPACE/.lucidos/e2e-gateway"; }
 # outlive its process, so the pid counts only while its argv[0] is the gateway
 # binary (ADR 0025): a reused pid is never signalled.
 _e2e_gateway_live_pid() {
-    local pid argv0
-    pid="$(cat "$(e2e_gateway_dir)/gateway.pid" 2>/dev/null)" || return 0
-    case "$pid" in '' | *[!0-9]*) return 0 ;; esac
-    argv0="$(ps -o command= -p "$pid" 2>/dev/null)" || return 0
-    argv0="${argv0%% *}"
-    if [ "${argv0##*/}" = lucidos-gateway ]; then echo "$pid"; fi
+    pidfile_pid_running "$(e2e_gateway_dir)/gateway.pid" lucidos-gateway
 }
 
 _e2e_free_port() {
@@ -85,8 +80,8 @@ e2e_gateway_env() {
 
 # Start the harness's own gateway, or reuse the one this session started.
 # Sets E2E_GATEWAY_PORT. It only ever adopts the engine the harness starts: the
-# registry lists the workspace at the engine's port with autostart off, and
-# nothing navigates to /<slug>/, so it never spawns an engine or a Postgres.
+# workspace is registered at the engine's port with autostart off, and nothing
+# navigates to /<slug>/, so it never spawns an engine or a Postgres.
 start_e2e_gateway() {
     local dir pid port
     dir="$(e2e_gateway_dir)"
@@ -108,10 +103,6 @@ start_e2e_gateway() {
 
     mkdir -p "$dir"
     port="$(_e2e_free_port)" || return 1
-    (
-        export LUCIDOS_GATEWAY_DATA="$dir" GATEWAY_PORT="$port"
-        seed_gateway_registry
-    ) || return 1
 
     local env_args=() line
     while IFS= read -r line; do env_args+=("$line"); done <<EOF
@@ -121,16 +112,22 @@ EOF
         -u LUCIDOS_TLS_CERT -u LUCIDOS_TLS_KEY \
         -u LUCIDOS_GATEWAY_TLS_CERT -u LUCIDOS_GATEWAY_TLS_KEY \
         "${env_args[@]}" "$GATEWAY_BIN" >>"$dir/gateway.log" 2>&1 &
+    # The gateway publishes gateway.pid itself once it owns $dir (ADR 0438).
     pid=$!
-    echo "$pid" >"$dir/gateway.pid"
     echo "$port" >"$dir/port"
 
     local _
     for _ in {1..60}; do
         if curl -sf --max-time 1 "http://127.0.0.1:$port/~/api/v1/health" >/dev/null 2>&1; then
             echo "e2e gateway: started its own on :$port (PID $pid, log $dir/gateway.log)"
-            E2E_GATEWAY_PORT="$port"
-            return 0
+            # A subshell, so the dev launcher's GATEWAY_WS_ID never leaks here.
+            # A refusal is printed by adopt_into_gateway itself.
+            if ( adopt_into_gateway "http://127.0.0.1:$port" >/dev/null ); then
+                E2E_GATEWAY_PORT="$port"
+                return 0
+            fi
+            stop_e2e_gateway
+            return 1
         fi
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.5

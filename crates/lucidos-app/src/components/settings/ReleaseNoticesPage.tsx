@@ -5,8 +5,8 @@ import {
   loadReleaseNotices,
   takeReleaseNoticeAction,
 } from '../../store/actions/releaseNotices';
-import { renderMarkdown } from '../../utils/renderMarkdown';
 import { Disclosure } from '../shared/Disclosure';
+import { ReleaseNoticeBody } from '../shared/ReleaseNoticeBody';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
@@ -121,10 +121,7 @@ function NoticeRow({ notice, state = 'owed', blockedBy }: Partial<NoticeRow> & {
         {state !== 'resolved' && <span class="release-notice-row-mark">New</span>}
         <span class="release-notice-row-since">Since Lucidos {notice.since}</span>
       </div>
-      <div
-        class="markdown-content release-notice-body"
-        dangerouslySetInnerHTML={{ __html: renderMarkdown(notice.body) }}
-      />
+      <ReleaseNoticeBody body={notice.body} />
       {(notice.action_label || state !== 'resolved') && (
         <div class="release-notice-row-actions">
           {/* Before the buttons, so the reading order matches the row: the

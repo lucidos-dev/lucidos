@@ -43,6 +43,8 @@ const ALLOWED: ReadonlyArray<readonly [selector: string, why: string]> = [
     'a <button> row that opens the step modal; renders its own text, no anchors'],
   ['.thread-row',
     'thread-drawer rows: whole-row tap targets; ThreadDrawer.tsx renders no anchor'],
+  ['.app-row',
+    'apps panel rows: whole-row tap targets with a long-press menu; AppCard.tsx renders no anchor'],
 ];
 
 /** Every selector whose block sets `-webkit-touch-callout: none`, normalized to
@@ -81,6 +83,15 @@ describe('iOS long-press callout suppression', () => {
       + 'per-link "Open in Safari" an installed PWA has, which Settings → Appearance & Behavior → Links tells users '
       + 'to use. Prove no anchor lives there, then add the selector to ALLOWED with a reason.',
     ).toEqual([]);
+  });
+
+  it('gives the file preview image its menu back, though it wears role="button"', () => {
+    // The `[role="button"]` entry above reaches PreviewImage's <img>. On a
+    // phone, iOS's long-press menu is that image's only Copy and Save.
+    const component = readFileSync(resolve(STYLES_ROOT, '../components/files/PreviewImage.tsx'), 'utf8');
+    expect(component).toMatch(/class="preview-image"[\s\S]*role="button"/);
+    const css = readFileSync(resolve(STYLES_ROOT, 'panels/previews.css'), 'utf8');
+    expect(css).toMatch(/img\.preview-image\s*\{[^}]*-webkit-touch-callout:\s*default/);
   });
 
   it('keeps the allowlist honest, so a removed rule does not leave a stale entry', () => {

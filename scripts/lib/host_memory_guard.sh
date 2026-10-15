@@ -177,6 +177,9 @@
 
 # shellcheck source=proc_tree.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proc_tree.sh"
+# For `engine_live_pid`: the e2e engine's pid counts only while it owns its lock.
+# shellcheck source=flock.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/flock.sh"
 
 # A memory stop must never read as a red project, so it carries its own exit
 # code. 71 is sysexits' EX_OSERR: an OS resource condition, not a test verdict.
@@ -968,11 +971,10 @@ _host_mem_attr_report() {
     local topn="${HOST_MEMORY_ATTR_TOP_N:-8}"
 
     # The e2e engine is the primary suspect, keyed on the disposable workspace's
-    # OWN pidfile so we never confuse it with the user's dev/personal engines.
+    # OWN engine so we never confuse it with the user's dev/personal engines.
     local ws engine_pid="" ws_real=""
     ws="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
-    engine_pid="$(cat "$ws/.lucidos/engine.pid" 2>/dev/null || true)"
-    case "$engine_pid" in '' | *[!0-9]*) engine_pid="" ;; esac
+    engine_pid="$(engine_live_pid "$ws")"
     ws_real="$(cd "$ws" 2>/dev/null && pwd -P)" || ws_real=""
 
     # A browser belongs to the RUN when its executable path sits under the
@@ -1128,7 +1130,7 @@ EOF
             echo "$tag after $where: e2e engine pid=$engine_pid not among measured candidates (it may have exited or been unreadable)"
         fi
     else
-        echo "$tag after $where: e2e engine pidfile absent or unreadable at $ws/.lucidos/engine.pid"
+        echo "$tag after $where: no e2e engine owns $ws"
     fi
 
     # Coding-agent subprocesses in aggregate: the tests spawn real ones, at least
@@ -1829,7 +1831,7 @@ _host_mem_left_behind_report() {
     local where="$1" tag="$HOST_MEMORY_ATTR_TAG" ws engine_pid counts apps files commits
     local agents_now="" pid started n=0 engine_part="e2e engine unmeasured"
     ws="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
-    engine_pid="$(cat "$ws/.lucidos/engine.pid" 2>/dev/null || true)"
+    engine_pid="$(engine_live_pid "$ws")"
 
     if [ -n "$HOST_MEMORY_ENGINE_MB_NOW" ]; then
         if [ "$engine_pid" != "$HOST_MEMORY_LB_ENGINE_PID" ] || [ -z "$HOST_MEMORY_LB_ENGINE_FIRST_MB" ]; then

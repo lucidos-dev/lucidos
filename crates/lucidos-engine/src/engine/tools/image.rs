@@ -284,6 +284,7 @@ impl LucidosEngine {
             // artifact list until a reload and was never indexed into memory.
             self.artifact_manager
                 .write_and_commit(
+                    &self.lock_workspace_repo().await,
                     &self.event_bus,
                     artifact_path,
                     &raw_bytes,
@@ -346,6 +347,7 @@ impl LucidosEngine {
 
         self.artifact_manager
             .write_and_commit(
+                &self.lock_workspace_repo().await,
                 &self.event_bus,
                 artifact_path,
                 &raw_bytes,

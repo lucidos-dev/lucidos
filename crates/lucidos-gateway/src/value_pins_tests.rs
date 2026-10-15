@@ -8,10 +8,11 @@
 //! `harden_suites_test.sh` checks that it does.
 
 use crate::postgres::{
-    PG_IMAGE, PG_MAX_CONNECTIONS, PG_PASSWORD, PG_SHM_SIZE, PG_USER, SHARED_DOCKER_CONTAINER,
+    PG_IMAGE, PG_MAX_CONNECTIONS, PG_SHM_SIZE, PG_USER, SHARED_DOCKER_CONTAINER,
     SHARED_DOCKER_VOLUME,
 };
 use lucidos_installs::{BUNDLE_IDENTIFIER, DEFAULT_DEV_GATEWAY_PORT, DEFAULT_GATEWAY_PORT};
+use lucidos_local_token::{MINT_LOCK_SUFFIX, SHARED_PG_PASSWORD_FILE, TOKEN_BYTES};
 use std::path::Path;
 
 /// One copy of a value. Every place `file` says `before`, then a slot, then
@@ -62,7 +63,6 @@ fn pins() -> Vec<Pin> {
         ),
         shell_const(CONSTANTS_SH, "PG_IMAGE", PG_IMAGE),
         shell_const(CONSTANTS_SH, "PG_USER", PG_USER),
-        shell_const(CONSTANTS_SH, "PG_PASSWORD", PG_PASSWORD),
         shell_const(CONSTANTS_SH, "PG_SHM_SIZE", PG_SHM_SIZE),
         shell_const(CONSTANTS_SH, "PG_MAX_CONNECTIONS", PG_MAX_CONNECTIONS),
         shell_const(
@@ -71,6 +71,31 @@ fn pins() -> Vec<Pin> {
             SHARED_DOCKER_CONTAINER,
         ),
         shell_const(CONSTANTS_SH, "SHARED_DOCKER_VOLUME", SHARED_DOCKER_VOLUME),
+        shell_const(
+            CONSTANTS_SH,
+            "SHARED_PG_PASSWORD_FILE",
+            SHARED_PG_PASSWORD_FILE,
+        ),
+        shell_const(CONSTANTS_SH, "TOKEN_BYTES", TOKEN_BYTES),
+        shell_const(CONSTANTS_SH, "MINT_LOCK_SUFFIX", MINT_LOCK_SUFFIX),
+        Pin {
+            file: "crates/lucidos-app/e2e/db-helpers.ts",
+            before: "`psql \"postgres://".into(),
+            after: "@localhost",
+            value: PG_USER.into(),
+        },
+        Pin {
+            file: "crates/lucidos-e2e/tests/api_support/mod.rs",
+            before: "\"postgres://".into(),
+            after: ":{password}@localhost",
+            value: PG_USER.into(),
+        },
+        Pin {
+            file: "crates/lucidos-app/e2e/db-helpers.ts",
+            before: "join(homedir(), '.lucidos', '".into(),
+            after: "')",
+            value: SHARED_PG_PASSWORD_FILE.into(),
+        },
         Pin {
             file: "README.md",
             before: "| `LUCIDOS_DEV_GATEWAY_PORT` | `".into(),

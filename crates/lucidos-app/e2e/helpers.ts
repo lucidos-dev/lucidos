@@ -1,10 +1,10 @@
 import { Page, APIResponse, expect, Locator, Request } from '@playwright/test';
 import { HARNESS_DEVICE_ID, ensurePageDeviceRegistered, registerHarnessDevice } from './harnessDevice';
 import { MODAL_EXIT_DRAWING_CLASS } from '../src/components/shared/overlayExitClass';
+import { computeMinThreadPaneWidth, THREAD_ROW_LEAD_CONTROLS } from '../src/store/paneMinimums';
+import { HOME_RAIL_SHOWN_KEY } from '../src/store/homeRailKeys';
+import { DEVICE_ID_KEY } from '../src/utils/deviceIdKey';
 import { homeThreadIdInDb } from './db-helpers';
-
-/** Where the app keeps this browser's device id (`utils/deviceIdHeader.ts`). */
-const DEVICE_ID_KEY = 'lucidos-device-id';
 
 /** The device id this page registered at boot, or null before it navigates. */
 async function pageDeviceId(page: Page): Promise<string | null> {
@@ -350,6 +350,33 @@ export async function disarmFollowSeed(page: Page): Promise<void> {
   await page.addInitScript(() => {
     localStorage.setItem('lucidos-follow-live-edge', 'false');
   });
+}
+
+/** Hide the desktop Home rail before the app boots. It shows by default and
+ *  takes width from the panes (ADR 0466). A spec that measures pane geometry
+ *  at a fixed window therefore opts out of it.
+ *
+ *  An init script for the same reason as `disarmFollowSeed`: `homeRailShown`
+ *  reads the key once at module load. */
+export async function hideHomeRail(page: Page): Promise<void> {
+  await page.addInitScript((key) => {
+    localStorage.setItem(key, 'false');
+  }, HOME_RAIL_SHOWN_KEY);
+}
+
+/** The Conversation pane's floor, by the app's own function, from what the
+ *  page shows: the root font size, the lights reserve and the controls leading
+ *  the row. Home joining the row raises it. */
+export async function minThreadPane(page: Page): Promise<number> {
+  const row = await page.evaluate((selector) => {
+    const root = getComputedStyle(document.documentElement);
+    return {
+      remPx: parseFloat(root.fontSize),
+      reservePx: parseFloat(root.getPropertyValue('--titlebar-lights-reserve')),
+      leadControls: document.querySelectorAll(selector).length,
+    };
+  }, THREAD_ROW_LEAD_CONTROLS);
+  return computeMinThreadPaneWidth(row.remPx, row.reservePx, row.leadControls);
 }
 
 /** Put the WHOLE thread in the DOM, the way a reader does: press the up
@@ -747,7 +774,7 @@ export async function showOngoingGroup(page: Page, label: string): Promise<void>
  *  menu, find nothing, and leave it standing over the app for the rest of the
  *  spec.
  *
- *  The menu opens only once its lazy chunk has loaded (`whenLoaded` in
+ *  The menu opens only once its rows' chunk has loaded (`usePendingOpen` in
  *  HeaderMark.tsx), so the row is awaited rather than looked up once. A menu
  *  that never shows the row throws: skipping it would leave the old draft on
  *  screen and fail the caller far from the cause. */

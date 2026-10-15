@@ -597,7 +597,7 @@ fn both_session_exits_reach_the_api_drop_auto_resume() {
          notices, which is the bug this whole feature exists to fix.",
     );
     let teardown = arm
-        .find("self.clear_spawn_debounce(thread_id);")
+        .find("self.upsert_cc_commands_cache(repo_key, info)")
         .expect("the idle-exit arm must still tear the session down before returning");
     let drain = arm
         .find("let orphans = lost_followups_to_orphans(")
@@ -795,9 +795,9 @@ fn the_idle_arm_proposes_before_it_idles() {
     }
 }
 
-/// The turn-end gate brackets the idle (ADR 0417). The forced read decision
-/// runs before `CodingAgentIdled`, so the turn's decision is recorded before
-/// its end. The re-entries run after it, so each opens its own exchange.
+/// The turn-end gate brackets the idle (ADR 0417). The forced read and wake
+/// decisions run before `CodingAgentIdled`, so the turn's decisions are
+/// recorded before its end, where the fan-in reads them. The re-entries run after it, so each opens its own exchange.
 #[test]
 fn the_idle_arm_decides_before_it_idles_and_re_enters_after() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
@@ -810,14 +810,14 @@ fn the_idle_arm_decides_before_it_idles_and_re_enters_after() {
         .find("self.emit_coding_agent_idled(")
         .expect("the Result arm must still emit this turn's CodingAgentIdled");
     let decide = arm
-        .find("self.gate_coding_agent_read_decision(thread_id)")
-        .expect("the Result arm must force a missing read decision");
+        .find("self.gate_coding_agent_turn_end(thread_id, wt_has_changes)")
+        .expect("the Result arm must force the missing turn-end decisions");
     let reenter = arm
         .find("reentry_ledger.take_due(&gate)")
         .expect("the Result arm must send the turn-end re-entries");
     assert!(
         decide < idle_emit,
-        "the read decision is recorded before the idle"
+        "the turn-end decisions are recorded before the idle"
     );
     assert!(
         idle_emit < reenter,
@@ -930,35 +930,56 @@ fn the_idle_keep_alive_cannot_be_fed_by_a_phantom_count() {
          N-1 follow-ups that had already been consumed.",
     );
 
+    // Every site that decides the idle exit passes the ledger's count.
+    let calls: Vec<&str> = RUN_SRC
+        .match_indices("self.exit_idle_subprocess_unless_owed(")
+        .map(|(at, _)| {
+            let call = &RUN_SRC[at..];
+            &call[..call.find(";").expect("the call ends")]
+        })
+        .collect();
+    assert!(
+        calls.len() >= 2,
+        "the idle arm and the withdraw arm both decide the idle exit"
+    );
+    for call in &calls {
+        assert!(
+            call.contains("inputs.owed()"),
+            "the idle exit must read what is still unread from the input ledger. A count \
+             settled at each Result is how a Claude Code input that arrived after the \
+             turn's last tool call was killed with the subprocess (ADR 0268). Got: {call}",
+        );
+    }
     let exit_arm = RUN_SRC
         .find("IdleAction::ExitSubprocess => {")
         .expect("run.rs must still carry the idle-exit subprocess decision");
-    let arm = &RUN_SRC[exit_arm..];
-    let decision = arm
-        .find("match terminate_decision(")
-        .expect("the ExitSubprocess arm must still route through terminate_decision");
-    let owed = arm.find("inputs.owed()").expect(
-        "the ExitSubprocess arm must read what is still unread from the input ledger. A \
-         count settled at each Result is how a Claude Code input that arrived after the \
-         turn's last tool call was killed with the subprocess (ADR 0268).",
-    );
+    let arm_body = &RUN_SRC[exit_arm..];
     assert!(
-        owed < decision,
-        "the ledger must be read before the decision uses it",
+        arm_body[..arm_body.find('}').expect("the arm closes")]
+            .contains("self.exit_idle_subprocess_unless_owed("),
+        "the ExitSubprocess arm must route through exit_idle_subprocess_unless_owed",
     );
-    // Scoped to the call's own argument list rather than the whole arm, so a
+
+    let body = &RUN_SRC[RUN_SRC
+        .find("async fn exit_idle_subprocess_unless_owed(")
+        .expect("run.rs must still carry the idle-exit decision")..];
+    let decision = body
+        .find("match terminate_decision(")
+        .expect("the idle exit must still route through terminate_decision");
+    // Scoped to the call's own argument list rather than the whole body, so a
     // passing mention of `msg_rx` in a comment cannot satisfy the guard. (It did:
-    // the comment above the lock names the read, and an arm-wide search found that
+    // the comment above the lock names the read, and a body-wide search found that
     // instead of the argument.)
-    let args_end = arm[decision..]
+    let args_end = body[decision..]
         .find(") {")
         .expect("terminate_decision's argument list must be closed");
     assert!(
-        arm[decision..decision + args_end].contains("msg_rx.len()"),
+        body[decision..decision + args_end].contains("msg_rx.len()"),
         "the channel depth must be an ARGUMENT of terminate_decision. `msg_rx` is the only \
          authoritative answer to `is a follow-up still unread`, and it is exact here because \
-         this arm holds the same agent_sessions lock the fast-path send takes.",
+         the decision holds the same agent_sessions lock the fast-path send takes.",
     );
+    let arm = &body[decision..];
 
     // Both halves of the ledger. An input is owed from its forward until the
     // agent reports it read, and nothing else may settle it.
@@ -971,8 +992,34 @@ fn the_idle_keep_alive_cannot_be_fed_by_a_phantom_count() {
     // The `Terminate` branch is what carries an API-drop turn to the idle exit the
     // sibling test pins. If it ever stops cancelling, the recovery goes with it.
     assert!(
-        arm[decision..].contains("TerminateDecision::Terminate =>"),
-        "terminate_decision's Terminate branch must still exist in this arm: it is the only \
+        arm.contains("TerminateDecision::Terminate =>"),
+        "terminate_decision's Terminate branch must still exist in the idle exit: it is the only \
          path from a transient API drop to the auto-resume emit site.",
+    );
+}
+
+/// A resolution session ends at an idle by the rule an ordinary session exits
+/// by. A follow-up the maintainer sent to a lane thread mid-turn is owed, so
+/// the session takes it as its next turn. Ending at once would land the batch
+/// without it. Source-text, as its siblings, and for their reason.
+#[test]
+fn a_resolution_session_ends_only_when_no_follow_up_is_owed() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+    let end_arm = RUN_SRC
+        .find("IdleAction::EndSession => {")
+        .expect("run.rs must still decide where a resolution session ends");
+    let arm = &RUN_SRC[end_arm..];
+    let arm = &arm[..arm
+        .find("IdleAction::ExitSubprocess => {")
+        .expect("the next arm")];
+    let decision = arm
+        .find("self.exit_idle_subprocess_unless_owed(")
+        .expect("the EndSession arm must ask whether a follow-up is owed");
+    let end = arm
+        .find("break 'event_loop;")
+        .expect("the EndSession arm still ends the loop");
+    assert!(
+        decision < end,
+        "the session may end only after the owed-input check said nothing is coming"
     );
 }
