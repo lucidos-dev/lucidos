@@ -1,0 +1,254 @@
+/* Settings → System. The column cap comes from `.content-view.active`
+   (panels/content.css), which every Settings page shares. */
+
+/* The state's two quantities, named because the note under the row derives its
+   indent from them: the row's dot plus the gap after it is exactly where the
+   state word starts. On :root so the live style remote can retune them, and so
+   the note cannot drift off that column. */
+:root {
+    --system-status-dot: 0.5rem;
+    --system-status-gap: 0.5rem;
+    /* The space under the whole Connection block, wherever it ends: the row
+       when there is nothing to explain, the note when there is. Named because
+       the two both spend it, and a copy in the second would keep the old value
+       the moment the first is retuned. */
+    --system-status-pad-bottom: 0.625rem;
+}
+
+.system-status-row {
+    display: flex;
+    align-items: center;
+    gap: var(--system-status-gap);
+    /* The note takes the row's bottom padding when it is present, so the two
+       read as one block rather than as a line with something stuck under it. */
+    padding: 0.25rem 0 var(--system-status-pad-bottom);
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.system-status-row.has-note {
+    padding-bottom: 0;
+}
+
+.system-status-row .status-dot {
+    width: var(--system-status-dot);
+    height: var(--system-status-dot);
+}
+
+/* The dot is already red, so the blink fades opacity, which the compositor
+   animates without a repaint. */
+@keyframes status-dot-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}
+
+.system-status-row .status-dot.disconnected {
+    animation: status-dot-blink 0.6s ease-in-out infinite;
+}
+
+/* Reduced motion: a steady red dot. The word beside it carries the state. */
+:root[data-motion="reduce"] .system-status-row .status-dot.disconnected {
+    animation: none;
+}
+
+/* What the state means for the app, under the state itself. The row above says
+   which state it is and has said it in one word for as long as this page has
+   existed; a word is not a message, and this is the same sentence the Lucidos
+   menu's notice and the header's connection bar state (utils/connectionNotice.ts).
+   Quieter and lighter than the row, so it reads as the explanation rather than
+   as a second heading, and indented to the state word's own column. */
+.system-status-note {
+    margin: 0;
+    padding: 0 0 var(--system-status-pad-bottom) calc(var(--system-status-dot) + var(--system-status-gap));
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+    color: var(--text-secondary);
+}
+
+/* A block of facts, as a two-column definition list. No surface, and no rule
+   per row: the LABEL COLUMN is the whole structure.
+
+   Don't put either back. A rule only earns its place when the label and the
+   value sit at opposite ends of the pane, which is a thousand pixels at a wide
+   pane and a high UI scale. The label track closes that gap instead, and a
+   surface drawn around a gap already closed is decoration.
+
+   The padding is deliberate with nothing painted behind it. It is the block's
+   own breathing room, holding the first row off its eyebrow and indenting the
+   run under it. */
+.system-info-list {
+    display: grid;
+    grid-template-columns: 9rem minmax(0, 1fr);
+    /* A label and a value at different steps sit on one line, not on one box
+       top. The flex row this replaced said `align-items: baseline` for the same
+       reason, and grid drops to `stretch` if nobody says otherwise. */
+    align-items: baseline;
+    row-gap: var(--space-xs);
+    column-gap: var(--space-lg);
+    padding: var(--space-sm) var(--space-md);
+}
+
+/* On a phone the fixed column is half the row, and it spends that width on
+   trailing space no label uses: the value is what gets squeezed, and a version
+   or a path is what wraps for it. So the label track sizes to the longest label
+   instead. Values still share one edge WITHIN a block, which is what the reader
+   scans; only the alignment BETWEEN two stacked blocks is given up, and that
+   one is invisible on a screen you scroll a block at a time. */
+@media (--phone-layout) {
+    .system-info-list {
+        grid-template-columns: max-content minmax(0, 1fr);
+    }
+}
+
+/* The row groups its two cells in the markup and contributes no box of its own,
+   so both land directly in the grid above and every value starts on one column.
+   Safe here because a row is two plain spans carrying no role: nothing depends
+   on the wrapper being rendered. */
+.system-info-row {
+    display: contents;
+}
+
+/* Quiet label, loud value. The value is what the reader came for, and it used
+   to be the dimmest text in its own row. */
+.system-info-label {
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+}
+
+.system-info-value {
+    min-width: 0;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    overflow-wrap: anywhere;
+}
+
+/* A long technical value (the workspace path, the API URL) is the only thing in
+   this list that can't fit beside its label on a phone, so it drops a step below
+   the rest of the values and goes mono: smaller keeps the wrapped block from
+   dominating the row it belongs to. This also supplies the font-family that
+   overrides the UA button font on .system-api-url. Never a `font` shorthand
+   there, which would reset font-size to the page base and blow it up. */
+.system-info-long {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-xs);
+    /* One step back down from the value colour. A path or a build id is a value
+       you copy rather than one you read, so it stays quiet while the version
+       numbers beside it carry the block. */
+    color: var(--text-secondary);
+}
+
+/* The copy button hugs its own URL. As a grid item it would otherwise stretch
+   across the whole value column, so a click on the blank surface to the right
+   of the address would silently copy it. */
+.system-api-url {
+    background: none;
+    border: none;
+    padding: 0;
+    justify-self: start;
+    text-align: left;
+}
+
+/* Update markers ("*", "(latest: …)", "(update available)"), on the accent
+   rather than an amber hue. Weight and contrast used to carry them, against a
+   value text that was muted; the value rests at --text-primary now, so there is
+   no contrast left above it and the marker needs a colour of its own. */
+.system-update {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.system-footnote {
+    margin-top: 0.5rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+}
+
+/* Actionable callout (restart/update/network). Neutral raised surface + bold
+   text — distinct without the muddy amber. No left accent bar (see
+   .claude/rules/frontend.md — left-accent stripes on cards are forbidden). */
+.system-notice {
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    font-weight: 600;
+    padding: 0.5rem 0.625rem;
+    margin-bottom: 0.625rem;
+    background: var(--bg-tertiary);
+    border-radius: calc(var(--radius-surface) / 3);
+    line-height: 1.4;
+}
+
+/* What to DO about the state, under the notice stating it. A second card at the
+   notice's own weight reads as a second alarm, which is what the source-checkout
+   guidance under a restart notice looked like. No surface and no bold, so the
+   pair reads as one thing said twice over: the state, then the answer. Padded to
+   the notice's text inset above it, so the two share a left column. */
+.system-guidance {
+    background: none;
+    font-weight: 400;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    padding: 0 0.625rem;
+}
+
+/* Determinate progress under a .system-notice narrating a live packaged update.
+   The notice is a card, so this is internal component spacing, not a structural
+   gutter. */
+.system-update-progress {
+    margin-top: 0.5rem;
+}
+
+/* Which of the listed installs is answering this workspace. It rides beside the
+   install's own name, and is the one fact the Installs list exists to deliver,
+   so it takes the accent exactly as the update markers above do. */
+.install-live {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+/* Buttons size to their own labels. Give the row a flex basis instead and it
+   splits the pane between them, which hands a routine Refresh Client the same
+   weight as a rebuild.
+
+   The row packs right, weightiest action last, on System and on Network
+   Access alike. On System that is already the DOM order (Rebuild & Restart is
+   last), so reordering the buttons also reorders their weight. */
+.system-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+/* On System the row CLOSES its section, so it takes a step of its own above it.
+   What precedes it there is a stack of notices, and an action flush under the
+   last of them reads as part of that message.
+
+   `padding`, not `margin`: the notice above carries a bottom margin, adjacent
+   siblings collapse to the larger of the two, and a step that only wins by the
+   difference is no step. */
+.system-page .system-actions {
+    padding-top: var(--space-sm);
+}
+
+/* Settings → Coding Agents: the per-agent binary-path override row.
+   The input and its Save/Clear actions share one horizontal row so the buttons
+   sit level with the input rather than the title. Both action slots are always
+   rendered (disabled — greyed via .action-btn:disabled — when their action
+   isn't available), so the input width never shifts as you type. */
+.coding-agent-row-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.coding-agent-row-controls .device-name-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.coding-agent-row-controls .list-row-actions {
+    flex-shrink: 0;
+    flex-wrap: nowrap;
+}

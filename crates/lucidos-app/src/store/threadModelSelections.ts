@@ -1,0 +1,165 @@
+/** Per-thread Lucidos Agent model + reasoning-effort memory for ACTIVE threads.
+ *
+ *  A thread remembers the model/effort it last ran with instead of snapping back
+ *  to the account default on every new message. The DURABLE record of that is the
+ *  model/reasoning_effort the backend stamps on each `MessageReceived` event — so
+ *  resolution is `this thread's pending pick ?? the thread's last message ?? the
+ *  account default` (`currentModel` and `accountChatEffort`, backed by the
+ *  `chat_model` / `chat_reasoning_efforts` preferences, editable in Settings).
+ *  A tier is remembered with its model, so switching model never carries one.
+ *
+ *  This map holds ONLY a not-yet-sent pick made from the in-thread control menu.
+ *  It is IN-MEMORY / ephemeral (unlike `composeSelections`, which is DB-backed):
+ *  once the pick is sent it is stamped on the message and becomes the thread's
+ *  remembered value, so `sendMessage` clears the entry after a successful send and
+ *  a reload self-heals from the thread's events. Keeping it keyed per thread means
+ *  a pick on thread A can never leak into thread B — and, per the "this thread
+ *  only" decision, an active-thread pick NEVER writes the account preference
+ *  (that stays a Settings-only default). The backend owns the follow-up fallback
+ *  (see `PreferenceStore::resolve_chat_overrides_for_thread`); the frontend sends
+ *  an override only when the user made an explicit pick this turn. */
+
+import { signal } from '@preact/signals';
+import { threadMap, currentModel } from './store';
+import { accountChatEffort, storedChatModel } from './actions/preferences';
+import type { StoredEvent } from './thread-events';
+
+export interface ThreadModelOverride {
+  /** Lucidos Agent model id (the in-thread mirror of `chat_model`). */
+  model?: string;
+  /** Lucidos Agent reasoning effort. */
+  reasoningEffort?: string;
+  /** The backend picked for `model`. Absent means the model's own default. */
+  provider?: string;
+}
+
+/** Pending, not-yet-sent active-thread picks, keyed by thread id. */
+export const threadModelSelections = signal<Map<string, ThreadModelOverride>>(new Map());
+
+/** Stable empty override so read-then-fallback callers can't accidentally write
+ *  a shared default. */
+const EMPTY_OVERRIDE: ThreadModelOverride = Object.freeze({});
+
+export function getThreadModelOverride(threadId: string | null | undefined): ThreadModelOverride {
+  if (!threadId) return EMPTY_OVERRIDE;
+  return threadModelSelections.value.get(threadId) ?? EMPTY_OVERRIDE;
+}
+
+/** Patch a thread's pending override. Callers pass only the fields they set.
+ *  Returns a new Map/object so signal subscribers re-render. */
+export function patchThreadModelOverride(threadId: string, patch: ThreadModelOverride): void {
+  const prev = threadModelSelections.value.get(threadId) ?? EMPTY_OVERRIDE;
+  const next: ThreadModelOverride = { ...prev, ...patch };
+  const map = new Map(threadModelSelections.value);
+  map.set(threadId, next);
+  threadModelSelections.value = map;
+}
+
+/** Drop a thread's pending override (called by `sendMessage` after a successful
+ *  send — the sent message now carries the value, so resolution falls to the
+ *  thread's last message). No-op when there's nothing to clear. */
+export function clearThreadModelOverride(threadId: string | null | undefined): void {
+  if (!threadId || !threadModelSelections.value.has(threadId)) return;
+  const map = new Map(threadModelSelections.value);
+  map.delete(threadId);
+  threadModelSelections.value = map;
+}
+
+type StarterEvent = Extract<StoredEvent, { type: 'MessageReceived' | 'TriggerStarted' }>;
+
+/** The non-empty string `read` picks from the thread's most recent starter
+ *  event that carries one. Mirrors the backend's newest-by-sequence lookup so
+ *  the menu displays what the next send will actually use. Synthetic
+ *  failed-send rows carry no model, so the filter skips them.
+ *
+ *  Both starter kinds count, mirroring the backend's
+ *  `IN ('MessageReceived', 'TriggerStarted')`: a chat turn starts with
+ *  `MessageReceived`, while a trigger fire starts with `TriggerStarted` and
+ *  emits no `MessageReceived` at all. Reading only the former would show the
+ *  account model on a trigger thread however the trigger was pinned. */
+function newestStarterValue(
+  threadId: string | null | undefined,
+  read: (event: StarterEvent) => unknown,
+): string | undefined {
+  if (!threadId) return undefined;
+  const thread = threadMap.value.get(threadId);
+  if (!thread) return undefined;
+  let bestSeq = -Infinity;
+  let bestValue: string | undefined;
+  for (const [seq, event] of thread.events) {
+    if (event.type !== 'MessageReceived' && event.type !== 'TriggerStarted') continue;
+    const value = read(event);
+    if (typeof value !== 'string' || value === '') continue;
+    if (seq > bestSeq) {
+      bestSeq = seq;
+      bestValue = value;
+    }
+  }
+  return bestValue;
+}
+
+export function lastThreadModel(threadId: string | null | undefined): string | undefined {
+  return newestStarterValue(threadId, (event) => event.model);
+}
+
+/** The tier this thread last ran `model` at. Mirrors the backend's
+ *  `last_thread_chat_settings`: a tier is remembered WITH its model, and
+ *  `undefined` matches starters that stamped no model. */
+function lastThreadReasoningEffort(
+  threadId: string | null | undefined,
+  model: string | undefined,
+): string | undefined {
+  return newestStarterValue(threadId, (event) => ((event.model || undefined) === model ? event.reasoning_effort : undefined));
+}
+
+/** The backend this thread last pinned for `model`. Mirrors the backend's
+ *  `last_thread_chat_settings`: a pick is remembered WITH its model, so a
+ *  thread switched to another model does not carry the old backend along. */
+export function lastThreadProvider(
+  threadId: string | null | undefined,
+  model: string,
+): string | undefined {
+  return newestStarterValue(threadId, (event) => (event.model === model ? event.provider : undefined));
+}
+
+// --- Resolvers: pending pick ?? thread's last message ?? account default ---
+
+export function resolveActiveThreadModel(threadId: string | null | undefined): string {
+  return getThreadModelOverride(threadId).model ?? lastThreadModel(threadId) ?? currentModel.value;
+}
+
+/** The backend the next send on this thread pins, or `null` for the model's
+ *  own default: this thread's pending pick, then its memory for `model`. */
+export function resolveActiveThreadProvider(
+  threadId: string | null | undefined,
+  model: string,
+): string | null {
+  const pending = getThreadModelOverride(threadId);
+  if (pending.model === model && pending.provider) return pending.provider;
+  return lastThreadProvider(threadId, model) ?? null;
+}
+
+/** The tier the next send on this thread runs at, for `model`: this thread's
+ *  pending pick, then its memory for `model`, then the account's tier for it.
+ *  `null` sends no effort. */
+export function resolveActiveThreadReasoningEffort(
+  threadId: string | null | undefined,
+  model: string,
+): string | null {
+  const pending = getThreadModelOverride(threadId);
+  if (pending.reasoningEffort && (pending.model ?? model) === model) return pending.reasoningEffort;
+  // The model the thread names, which is unset when it never stamped one.
+  const named = model === resolveActiveThreadModel(threadId)
+    ? pending.model ?? lastThreadModel(threadId)
+    : model;
+  // A thread that named no model ran on the router's, so its tier never
+  // carries onto a `chat_model` set since.
+  const remembered = named === undefined && storedChatModel() !== null
+    ? undefined
+    : lastThreadReasoningEffort(threadId, named);
+  return remembered ?? accountChatEffort(model);
+}
+
+export function _resetThreadModelSelectionsForTesting(): void {
+  threadModelSelections.value = new Map();
+}

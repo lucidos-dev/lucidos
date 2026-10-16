@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lucidos-build-slot",
+    "crates/lucidos-capabilities",
+    "crates/lucidos-engine",
+    "crates/lucidos-gateway",
+    "crates/lucidos-app",
+    "crates/lucidos-cli",
+    "crates/lucidos-e2e",
+    "crates/lucidos-engine-socket",
+    "crates/lucidos-eval",
+    "crates/lucidos-file-backup-exclusion",
+    "crates/lucidos-frame-capability",
+    "crates/lucidos-gateway-constants",
+    "crates/lucidos-home",
+    "crates/lucidos-installs",
+    "crates/lucidos-local-token",
+    "crates/lucidos-owner-lock",
+    "crates/lucidos-pg-url",
+    "crates/lucidos-tailscale",
+]
+# Third-party source carried for a patch, never linted or formatted as ours.
+# A temporary measure: docs/temporary-measures.md, "chromiumoxide is vendored
+# for a pipe transport".
+exclude = ["crates/vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Full debuginfo made every coding-agent worktree's target 15 to 24 GB.
+# Our crates keep file and line in panics and backtraces (ADR 0311).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# chromiumoxide gains a pipe transport here, so the agent browser opens no TCP
+# debugging port. A temporary measure: see crates/vendor/chromiumoxide/Cargo.toml.
+[patch.crates-io]
+chromiumoxide = { path = "crates/vendor/chromiumoxide" }

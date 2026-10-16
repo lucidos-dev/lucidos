@@ -1,0 +1,87 @@
+{
+  "name": "Parts at every cap",
+  "description": "Browser test fixture: every theme part at its caps. Not a shipped theme.",
+  "light": {
+    "parts": {
+      "screen": {
+        "background-image": "repeating-linear-gradient(transparent 0, transparent 4px, rgba(255, 255, 255, 0.25) 4px, rgba(255, 255, 255, 0.25) 8px)"
+      }
+    }
+  },
+  "parts": {
+    "chat-text": {
+      "color": "#cc3366",
+      "text-shadow": "0.1em 0.1em 0.6em var(--accent)",
+      "letter-spacing": "0.12em"
+    },
+    "chat-heading": {
+      "color": "#cc3366",
+      "text-shadow": "-0.1em -0.1em 0.6em var(--accent)",
+      "letter-spacing": "0.12em"
+    },
+    "chat-link": {
+      "color": "#cc3366",
+      "text-shadow": "0.1em 0.1em 0.6em var(--accent)"
+    },
+    "inline-code": {
+      "color": "#ffd54a",
+      "background-color": "#101010"
+    },
+    "code-block": {
+      "background-color": "#050805",
+      "box-shadow": "4px 4px 16px 2px var(--accent), -4px -4px 16px -2px var(--accent)",
+      "text-shadow": "0.1em 0.1em 0.6em var(--accent)"
+    },
+    "actor-label": {
+      "text-shadow": "0.1em 0.1em 0.6em var(--accent)",
+      "letter-spacing": "0.12em"
+    },
+    "actor-icon": {
+      "filter": "drop-shadow(2px 2px 6px var(--accent))"
+    },
+    "header-icon": {
+      "filter": "drop-shadow(-2px -2px 6px var(--accent))"
+    },
+    "header-title": {
+      "text-shadow": "0.1em 0.1em 0.6em var(--accent)",
+      "letter-spacing": "0.12em"
+    },
+    "composer": {
+      "background-color": "#050805",
+      "border-color": "#33ff33",
+      "box-shadow": "inset 4px 4px 16px 2px var(--accent)"
+    },
+    "composer-text": {
+      "color": "#cc3366",
+      "caret-color": "#cc3366",
+      "caret-shape": "block",
+      "text-shadow": "0.1em 0.1em 0.6em var(--accent)",
+      "letter-spacing": "0.12em"
+    },
+    "card": {
+      "border-style": "double",
+      "border-width": "4px",
+      "border-color": "#33ff33"
+    },
+    "surface": {
+      "border-style": "double",
+      "border-width": "4px",
+      "border-color": "#33ff33"
+    },
+    "screen": {
+      "background-image": "repeating-linear-gradient(transparent 0, transparent 4px, rgba(0, 0, 0, 0.25) 4px, rgba(0, 0, 0, 0.25) 8px)"
+    },
+    "app-text": {
+      "text-shadow": "0.1em 0.1em 0.6em var(--accent)",
+      "letter-spacing": "0.12em"
+    },
+    "app-link": {
+      "text-decoration-color": "#33ff33",
+      "text-shadow": "0.1em 0.1em 0.6em var(--accent)"
+    },
+    "app-control": {
+      "border-color": "#33ff33",
+      "box-shadow": "4px 4px 16px 2px var(--accent)"
+    }
+  }
+}

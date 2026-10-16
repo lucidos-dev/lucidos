@@ -1,0 +1,190 @@
+import { describe, it, expect } from 'vitest';
+import {
+  collectSearchResults,
+  filterSearchResults,
+  openableChangeFiles,
+  visibleSearchResults,
+  MAX_SHOWN_RESULTS,
+  type FileSearchResult,
+} from '../fileSearch';
+
+/** Regression: the workspace Files view listed every pending change's files,
+ *  badged "C". Selecting one closed the modal and did nothing, because
+ *  `openRepoFilePreview` returns silently with no bound repository. */
+describe('openableChangeFiles', () => {
+  const files = [{ path: 'src/api.rs' }, { path: 'src/new.rs' }];
+
+  it('keeps change rows while a repository is bound', () => {
+    expect(openableChangeFiles(files, true)).toEqual(files);
+  });
+
+  it('drops them with no repository bound, where they would open nothing', () => {
+    expect(openableChangeFiles(files, false)).toEqual([]);
+  });
+});
+
+describe('collectSearchResults', () => {
+  it('collects workspace files', () => {
+    const results = collectSearchResults(
+      ['data/intents/daily.md', 'data/knowhow/git.md'],
+      [], [], [],
+    );
+    expect(results).toEqual([
+      { path: 'data/intents/daily.md', source: 'workspace' },
+      { path: 'data/knowhow/git.md', source: 'workspace' },
+    ]);
+  });
+
+  it('collects repo files', () => {
+    const results = collectSearchResults(
+      [],
+      ['src/main.rs', 'src/lib.rs'],
+      [], [],
+    );
+    expect(results).toEqual([
+      { path: 'src/main.rs', source: 'repo' },
+      { path: 'src/lib.rs', source: 'repo' },
+    ]);
+  });
+
+  it('collects diff change files with status', () => {
+    const results = collectSearchResults(
+      [], [],
+      [{ path: 'src/api.rs', status: 'modified' }, { path: 'src/new.rs', status: 'added' }],
+      [],
+    );
+    expect(results).toEqual([
+      { path: 'src/api.rs', source: 'change', changeStatus: 'modified' },
+      { path: 'src/new.rs', source: 'change', changeStatus: 'added' },
+    ]);
+  });
+
+  it('collects CC change files without status', () => {
+    const results = collectSearchResults(
+      [], [], [],
+      [{ path: 'crates/app/src/App.tsx' }],
+    );
+    expect(results).toEqual([
+      { path: 'crates/app/src/App.tsx', source: 'change', changeStatus: undefined },
+    ]);
+  });
+
+  it('combines all sources', () => {
+    const results = collectSearchResults(
+      ['data/readme.md'],
+      ['src/main.rs'],
+      [{ path: 'src/api.rs', status: 'modified' }],
+      [{ path: 'crates/app/index.ts' }],
+    );
+    expect(results).toHaveLength(4);
+    expect(results[0]).toEqual({ path: 'data/readme.md', source: 'workspace' });
+    expect(results[1]).toEqual({ path: 'src/main.rs', source: 'repo' });
+    expect(results[2]).toEqual({ path: 'src/api.rs', source: 'change', changeStatus: 'modified' });
+    expect(results[3]).toEqual({ path: 'crates/app/index.ts', source: 'change', changeStatus: undefined });
+  });
+
+  it('deduplicates diff and CC change files by path', () => {
+    const results = collectSearchResults(
+      [], [],
+      [{ path: 'src/api.rs', status: 'modified' }],
+      [{ path: 'src/api.rs' }],
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].source).toBe('change');
+  });
+
+  it('allows same path in different sources (workspace and repo)', () => {
+    const results = collectSearchResults(
+      ['README.md'],
+      ['README.md'],
+      [], [],
+    );
+    expect(results).toHaveLength(2);
+    expect(results[0]).toEqual({ path: 'README.md', source: 'workspace' });
+    expect(results[1]).toEqual({ path: 'README.md', source: 'repo' });
+  });
+
+  it('returns empty array for no inputs', () => {
+    const results = collectSearchResults([], [], [], []);
+    expect(results).toEqual([]);
+  });
+});
+
+describe('filterSearchResults', () => {
+  const allResults: FileSearchResult[] = [
+    { path: 'data/intents/daily.md', source: 'workspace' },
+    { path: 'src/main.rs', source: 'repo' },
+    { path: 'src/api.rs', source: 'change', changeStatus: 'modified' },
+    { path: 'crates/app/FileSearch.tsx', source: 'change', changeStatus: 'added' },
+  ];
+
+  it('returns all results for empty query', () => {
+    expect(filterSearchResults(allResults, '')).toEqual(allResults);
+  });
+
+  it('returns all results for whitespace query', () => {
+    expect(filterSearchResults(allResults, '   ')).toEqual(allResults);
+  });
+
+  it('filters by substring match on path', () => {
+    const filtered = filterSearchResults(allResults, 'api');
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].path).toBe('src/api.rs');
+  });
+
+  it('is case-insensitive', () => {
+    const filtered = filterSearchResults(allResults, 'FILESEARCH');
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].path).toBe('crates/app/FileSearch.tsx');
+  });
+
+  it('matches across path segments', () => {
+    const filtered = filterSearchResults(allResults, 'intents/daily');
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].path).toBe('data/intents/daily.md');
+  });
+
+  it('returns empty for no matches', () => {
+    const filtered = filterSearchResults(allResults, 'nonexistent');
+    expect(filtered).toHaveLength(0);
+  });
+
+  it('filters across all sources', () => {
+    const filtered = filterSearchResults(allResults, '.rs');
+    expect(filtered).toHaveLength(2);
+    expect(filtered.map(r => r.source)).toEqual(['repo', 'change']);
+  });
+});
+
+/** Regression: the modal rendered every match, about 3,400 rows in a real
+ *  workspace, so opening it on a phone took seconds. */
+describe('visibleSearchResults', () => {
+  const results: FileSearchResult[] = Array.from({ length: 250 }, (_, i) => ({
+    path: `apps/demo/file-${i}.md`,
+    source: 'workspace',
+  }));
+
+  it('shows at most the cap and counts the rest as hidden', () => {
+    const { shown, hidden } = visibleSearchResults(results);
+    expect(shown).toHaveLength(MAX_SHOWN_RESULTS);
+    expect(shown[0]).toBe(results[0]);
+    expect(hidden).toBe(250 - MAX_SHOWN_RESULTS);
+  });
+
+  it('keeps change rows visible when repo rows alone would fill the cap', () => {
+    const repo: FileSearchResult[] = Array.from({ length: 150 }, (_, i) => ({
+      path: `src/file-${i}.rs`,
+      source: 'repo',
+    }));
+    const change: FileSearchResult = { path: 'src/api.rs', source: 'change', changeStatus: 'modified' };
+    const { shown, hidden } = visibleSearchResults([...repo, change]);
+    expect(shown[0]).toBe(change);
+    expect(shown[1]).toBe(repo[0]);
+    expect(hidden).toBe(151 - MAX_SHOWN_RESULTS);
+  });
+
+  it('shows everything when the matches fit', () => {
+    const few = results.slice(0, 3);
+    expect(visibleSearchResults(few)).toEqual({ shown: few, hidden: 0 });
+  });
+});
