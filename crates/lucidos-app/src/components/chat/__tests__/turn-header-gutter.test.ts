@@ -1,0 +1,225 @@
+import { describe, it, expect } from 'vitest';
+// @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error — same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error — same
+import { fileURLToPath } from 'node:url';
+
+const here: string = dirname(fileURLToPath(import.meta.url));
+const inputCss = readFileSync(resolve(here, '../../../styles/chat/input-messages.css'), 'utf-8');
+const responseCss = readFileSync(resolve(here, '../../../styles/chat/response.css'), 'utf-8');
+const baseCss = readFileSync(resolve(here, '../../../styles/global/base.css'), 'utf-8');
+
+function getBlock(css: string, selector: string): string {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`, 'g');
+  return [...css.matchAll(re)].map(m => m[1]).join('\n');
+}
+
+function declarationValue(block: string, property: string): string | undefined {
+  const escaped = property.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return block.match(new RegExp(`${escaped}\\s*:\\s*([^;]+)`))?.[1].trim();
+}
+
+/**
+ * The gap under a header, and NOT any `*-margin-bottom` that shares its tail.
+ * `declarationValue` matches anywhere in the block, so a header declaring both
+ * answers whichever comes first in source order: correct on the day it is
+ * written, and quietly wrong the day the two swap places. The leading boundary
+ * is what tells the longhand apart.
+ *
+ * `.response-header` was the header that declared both, until its
+ * `scroll-margin-bottom` went with the landing that read it (a submit rests on
+ * the live edge now, see `landAtLiveEdge`). The boundary stays: it costs
+ * nothing, and it is what makes re-adding such a property safe rather than
+ * silently wrong.
+ */
+function gapBelow(block: string): string | undefined {
+  return block.match(/(?:^|[;{\s])margin-bottom\s*:\s*([^;]+)/)?.[1].trim();
+}
+
+describe('turn header gutter', () => {
+  it('keeps actor and executor icons aligned with turn body content', () => {
+    const initiatorHeader = getBlock(inputCss, '.initiator-header');
+    const initiatorBody = getBlock(inputCss, '.initiator-body');
+    const responseHeader = getBlock(responseCss, '.response-header');
+    const responseContent = getBlock(responseCss, '.response-content');
+
+    expect(declarationValue(initiatorHeader, 'padding-left')).toBe('var(--turn-body-inset)');
+    expect(declarationValue(responseHeader, 'padding-left')).toBe('var(--turn-body-inset)');
+    expect(declarationValue(initiatorBody, 'padding-left')).toBe('var(--turn-body-inset)');
+    expect(declarationValue(responseContent, 'padding-left')).toBe('var(--turn-body-inset)');
+  });
+
+  // The gap UNDER a header is one measurement with two copies, the same shape
+  // as the inset above: the initiator's row and the response's row sit one
+  // above the other in a turn, so a value moved on one and not the other ships
+  // two rhythms in one transcript. A comment at each site says they move
+  // together, and this is what makes that hold. It is not hypothetical upkeep:
+  // the value has already moved twice (0.35rem to 0.7rem on 2026-06-09, then to
+  // 0.5rem) and nothing else in the gate can catch a mismatch, since
+  // `vite build` parses the CSS without comparing two rules in different files.
+  //
+  // Equality rather than a pinned literal, deliberately. The number is a
+  // judgment call that is expected to keep moving, so pinning it would fail
+  // every retune and teach the next person to edit the test; only DRIFT between
+  // the two copies is a defect, and only drift fails here.
+  it('keeps the gap under both turn headers on one value', () => {
+    const initiatorGap = gapBelow(getBlock(inputCss, '.initiator-header'));
+    expect(initiatorGap, '.initiator-header declares no gap under the header').toBeTruthy();
+    expect(
+      gapBelow(getBlock(responseCss, '.response-header')),
+      'the two turn headers must carry the same gap under them',
+    ).toBe(initiatorGap);
+  });
+
+  // The panels carry the RIGHT inset in the BASE layout (mirroring the content's
+  // left inset above), so a turn sits symmetrically inside the pane. This is
+  // load-bearing for the nav focus marker: it lets both marker rules below keep
+  // their horizontal sides at 0/base — no rightward box growth — so the marker's
+  // border gets equal breathing room from both pane edges instead of sitting
+  // flush against the right one ("border is all the way to the right").
+  it('gives the panels a base right inset matching the content left inset', () => {
+    const base = inputCss.match(/\.initiator-panel\s*,\s*\.response-panel\s*\{([^}]*)\}/)?.[1] ?? '';
+    expect(base).not.toBe('');
+    expect(declarationValue(base, 'padding')).toBe(
+      'var(--turn-feed-pad-y) var(--turn-body-inset) var(--turn-feed-pad-y) 0',
+    );
+  });
+
+  // The feed rhythm separates a turn from the NEXT one, so the LAST turn has
+  // nothing below it for its bottom half to separate from: there it stacked on
+  // the transcript's own bottom padding (--prompt-fade + --nav-focus-reach) and
+  // opened a hole under the running step, floating the reply's live edge clear
+  // of the composer. Both panel kinds are covered, because a turn whose
+  // response has not started ends on its initiator panel.
+  it('drops the feed rhythm below the last turn, where nothing follows it', () => {
+    // `.thread-feed`, the box the turns live in. It is what rests them on the
+    // bottom, so it is also what "last turn" is scoped to.
+    const re = /\.thread-feed > \.chat-exchange:last-child > ([^{]*)\{([^}]*)\}/;
+    const [, selectorTail, block] = inputCss.match(re) ?? [];
+    expect(block, 'no last-turn rule').toBeTruthy();
+    expect(declarationValue(block!, 'padding-bottom')).toBe('0');
+
+    for (const panel of ['initiator-panel', 'response-panel']) {
+      // Both panel kinds, because either can be the turn's last child: a turn
+      // whose response has not started yet ends on its initiator panel.
+      expect(selectorTail, `.${panel} not covered`).toContain(`.${panel}:last-child`);
+    }
+    // It must YIELD to the panel-level nav focus marker. At (0,5,0) it
+    // out-ranks that rule's (0,2,0), so without the exclusion a deep link
+    // landing on the last turn paints the marker's wash flush against the last
+    // line while the other three sides keep their inset, which is the exact
+    // asymmetry the marker rule exists to remove.
+    expect(selectorTail).toContain(':not(.nav-focus-stuck)');
+  });
+
+  // The first turn starts right under the thread title: the transcript's top
+  // reserve holds only the anchor rest, and the turn's feed padding is the gap. No
+  // first-turn rule: the window draws older turns above as the reader scrolls
+  // up, and the old first turn would jump each time.
+  it('starts the first turn right under the title, on its own feed padding', () => {
+    const transcript = inputCss.match(/\n\.thread-content\s*\{([^}]*)\}/)?.[1] ?? '';
+    const top = declarationValue(transcript, 'padding')?.split('\n')[0].trim();
+    expect(top).toBe('var(--anchor-subpixel, 0px)');
+    expect(inputCss).not.toMatch(/\.chat-exchange:first-child > \.(initiator|response)-panel/);
+
+    // That padding is also the focus marker's room above the first turn: the
+    // wash grows up by the body inset, and its glow reaches past that.
+    const rem = (name: string) =>
+      parseFloat(baseCss.match(new RegExp(`${name}:\\s*([\\d.]+)rem`))?.[1] ?? 'NaN');
+    expect(rem('--turn-feed-pad-y') - rem('--turn-body-inset')).toBeGreaterThanOrEqual(
+      rem('--nav-focus-reach'),
+    );
+  });
+
+  // The nav focus marker washes the panel box edge to edge,
+  // so the gap it shows on each side equals that side's padding. The horizontal
+  // sides are symmetric in the base layout (left inset on the content, right
+  // inset on the panel — pinned above), so the marker rule only normalizes the
+  // far larger feed padding var(--turn-feed-pad-y) TOP/BOTTOM. It must target
+  // the CURRENT marker class (.nav-focus-stuck) on BOTH deep-link hosts (an
+  // event / resolution card lands on .initiator-panel, a change proposing-turn
+  // on .response-panel). A rename that leaves this rule on the old class names
+  // silently drops it and the padding regresses (which is exactly what happened
+  // when the unified focus marker landed).
+  it('gives the focus-marked panels a uniform gap on all four sides', () => {
+    const re =
+      /\.initiator-panel\.nav-focus-stuck\s*,\s*\.response-panel\.nav-focus-stuck\s*\{([^}]*)\}/;
+    const block = responseCss.match(re)?.[1] ?? '';
+    expect(block).not.toBe('');
+    // LEFT inset comes from the body's padding-left, RIGHT from the base panel
+    // padding; the shorthand restates them (T R B L = inset inset inset 0).
+    expect(declarationValue(block, 'padding')).toBe(
+      'var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0',
+    );
+    // NO rightward box growth: a negative margin-right here pushes the marker
+    // into the .thread-content gutter until it sits flush against the
+    // pane's right edge while the left keeps its breathing room, the "border
+    // is all the way to the right" report. The base right inset (pinned above)
+    // makes the growth unnecessary.
+    expect(declarationValue(block, 'margin-right')).toBeUndefined();
+    // The shrunk feed padding is handed back as vertical margin, so top/bottom
+    // match left/right without moving the turn's content or its neighbours.
+    expect(declarationValue(block, 'margin-top')).toBe(
+      'calc(var(--turn-feed-pad-y) - var(--turn-body-inset))',
+    );
+    expect(declarationValue(block, 'margin-bottom')).toBe(
+      'calc(var(--turn-feed-pad-y) - var(--turn-body-inset))',
+    );
+    // The pre-rename class names must be gone — their presence means the rule
+    // was copied, not migrated.
+    expect(responseCss).not.toMatch(/\.event-pulse|\.event-focus-stuck/);
+  });
+
+  // Keyboard ⌘↑/⌘↓ turn-nav marks the WHOLE TURN (.chat-exchange, TURN_SELECTOR in
+  // scrollState.ts), not an inner panel — so the panel rule above never fires for it.
+  // Without a counterpart rule the wash filled the exchange while the panel's feed
+  // padding + left inset leaked through (top/bottom ~2× the sides, right gap collapsed
+  // to nothing), the asymmetry the panel rule already fixed for deep-links.
+  // The exchange rule normalizes every side to var(--turn-body-inset): a uniform
+  // exchange padding, the inner left inset stripped, the first/last panel's feed
+  // padding dropped, and the feed rhythm handed back as exchange margin. It can NOT
+  // use the panel rule's negative margin-right (the exchange is auto-centered via
+  // .thread-content > * { margin: 0 auto }; a negative margin-right would fight it).
+  it('gives the focus-marked whole turn (.chat-exchange) a uniform gap too', () => {
+    const block = getBlock(responseCss, '.chat-exchange.nav-focus-stuck');
+    expect(block).not.toBe('');
+    // Horizontal sides stay 0 — both come through the panels (LEFT from the
+    // inner content's padding-left, RIGHT from the panels' base padding-right),
+    // so marking the exchange never reflows its content. Only TOP/BOTTOM are
+    // re-added (2-value shorthand = vertical inset, horizontal 0). No negative
+    // margins either — the exchange is auto-centered
+    // (.thread-content > * { margin: 0 auto }) and they would fight that.
+    expect(declarationValue(block, 'padding')).toBe('var(--turn-body-inset) 0');
+    expect(declarationValue(block, 'margin-right')).toBeUndefined();
+    // Feed rhythm handed back as exchange margin so content / neighbours don't move.
+    expect(declarationValue(block, 'margin-top')).toBe(
+      'calc(var(--turn-feed-pad-y) - var(--turn-body-inset))',
+    );
+    expect(declarationValue(block, 'margin-bottom')).toBe(
+      'calc(var(--turn-feed-pad-y) - var(--turn-body-inset))',
+    );
+    // The first/last panel's feed padding is dropped (it lives on the panel, not the
+    // exchange; leaving it would stack on the exchange padding and inflate top/bottom).
+    // Whitespace-tolerant regexes (selectors span lines) — mirrors the panel test.
+    const firstChild =
+      responseCss.match(
+        /\.chat-exchange\.nav-focus-stuck > \.initiator-panel:first-child\s*,\s*\.chat-exchange\.nav-focus-stuck > \.response-panel:first-child\s*\{([^}]*)\}/,
+      )?.[1] ?? '';
+    expect(declarationValue(firstChild, 'padding-top')).toBe('0');
+    const lastChild =
+      responseCss.match(
+        /\.chat-exchange\.nav-focus-stuck > \.initiator-panel:last-child\s*,\s*\.chat-exchange\.nav-focus-stuck > \.response-panel:last-child\s*\{([^}]*)\}/,
+      )?.[1] ?? '';
+    expect(declarationValue(lastChild, 'padding-bottom')).toBe('0');
+    // Error turns append .exchange-error after the panels, so no panel is :last-child
+    // and no bottom feed padding is removed — the margin-bottom above would then have
+    // nothing to hand back and shove the next turn down by the exchange padding. The
+    // :has() override cancels the exchange's own padding-bottom instead (net-zero).
+    const errorTurn = getBlock(responseCss, '.chat-exchange.nav-focus-stuck:has(> .exchange-error:last-child)');
+    expect(errorTurn).not.toBe('');
+    expect(declarationValue(errorTurn, 'margin-bottom')).toBe('calc(-1 * var(--turn-body-inset))');
+  });
+});

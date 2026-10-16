@@ -1,0 +1,895 @@
+# The read decision check's labelled set (`lucidos-eval read-decision`).
+#
+# Every turn is synthetic, with placeholder names and paths, because this file
+# ships publicly. Each reaches the forced call in the shape the turn-end gate
+# builds it: what opened the turn, an optional question the user answered
+# inside it, the reply, and what the thread still waits on.
+#
+# - source: user, child-report, trigger or agent.
+# - report_wakes_parent: true when the turn's report wakes the parent agent,
+#   which then acts on it (ADR 0446). Defaults to false.
+# - read: true when the user should read the reply, false when not.
+# - kind: the turn's shape, for the per-kind breakdown.
+#
+# The noise kinds follow the forced yeses sampled in the plan
+# `docs/plans/2026-10-11-read-decision-sees-the-answer-and-a-measured-model.md`.
+
+# --- must read --------------------------------------------------------------
+
+[[turn]]
+kind = "answer"
+source = "user"
+message = "Why does the nightly backup fail on Sundays?"
+reply = """
+It fails because the Sunday run overlaps the weekly database vacuum. Both lock the same table, and the backup times out after 10 minutes.
+
+- **Cause:** the vacuum starts at 03:00 on Sundays, the backup at 03:05.
+- **Evidence:** all four failed runs logged a lock timeout on `events`.
+- **Fix options:** move the backup to 04:00, or raise its lock timeout to 30 minutes.
+"""
+read = true
+
+[[turn]]
+kind = "answer"
+source = "user"
+message = "Which charting libraries can export SVG and work without a build step?"
+reply = """
+Three fit both needs:
+
+| Library | SVG export | No build step | Size |
+|---|---|---|---|
+| Chart Lite | yes | yes, one script tag | 40 KB |
+| PlotKit | yes | yes, ES module | 120 KB |
+| Vega Embed | yes | yes | 400 KB |
+
+PlotKit is the best balance. Chart Lite is smallest but has no log scales.
+"""
+read = true
+
+[[turn]]
+kind = "answer"
+source = "user"
+message = "Summarize the vendor contract in artifacts/projects/backoffice/contract.pdf"
+reply = """
+The contract runs for two years and renews by itself unless you cancel 90 days before the end.
+
+- **Price:** 1,200 per month, rising 3% each year.
+- **Exit:** a fee of three months' price if you leave in year one.
+- **Data:** they keep backups for 30 days after you leave, then delete them.
+- **Watch out:** clause 9 lets them change the support hours with 14 days' notice.
+"""
+read = true
+
+[[turn]]
+kind = "answer"
+source = "user"
+message = "Remind me what we decided about the pricing tiers"
+reply = "We settled on two tiers last week: Free with three apps, and Pro at 8 per month with no limit. You dropped the Team tier because nobody asked for shared workspaces yet."
+read = true
+
+[[turn]]
+kind = "deliverable"
+source = "user"
+message = "Draft a short cover letter for the data analyst role"
+reply = """
+Here is a draft:
+
+Dear hiring team,
+
+I am applying for the Data Analyst role. For four years I have turned messy operational data into reports that teams act on. At my current job I cut the monthly close report from three days to four hours by automating the joins and checks.
+
+I would like to bring the same care to your analytics team.
+
+Kind regards,
+Alex
+"""
+read = true
+
+[[turn]]
+kind = "answer"
+source = "user"
+message = "Why is the release build so slow now?"
+reply = """
+Most of the time goes to one crate. The build takes 9 minutes, and `report-gen` takes 6 of them.
+
+- It recompiles from scratch each time, because a build script writes a timestamp into its output.
+- Removing the timestamp brings an unchanged rebuild down to 40 seconds.
+
+I have not changed anything yet. Should I remove the timestamp?
+"""
+read = true
+
+[[turn]]
+kind = "failure"
+source = "user"
+message = "Deploy the site to production"
+reply = "The deploy failed. The TLS certificate for example.com expired yesterday, so the health check after the upload was refused. Nothing went live, and the old version still serves. Renew the certificate, then I can deploy again."
+read = true
+
+[[turn]]
+kind = "trigger-found"
+source = "trigger"
+message = "Check my inbox for invoices due this week and list them."
+reply = """
+Two invoices are due this week:
+
+- **Hosting:** 49.00, due Wednesday.
+- **Design contractor:** 1,800.00, due Friday. This one is 300 more than last month.
+"""
+read = true
+
+[[turn]]
+kind = "trigger-found"
+source = "trigger"
+message = "Catch me up on what my testers said in the testing channel since you last looked. Open anything worth acting on on my work board."
+reply = """
+One tester reported a real bug at 11:20: exporting a habit-tracker history with more than 5,000 rows crashes the app on iPhone. Two others confirmed it.
+
+I opened it on the work board as a high-priority bug and started a coding session to reproduce it. Nothing else new in the channel.
+"""
+read = true
+
+[[turn]]
+kind = "trigger-found"
+source = "trigger"
+message = "Send me the weekly spend report every Monday."
+reply = """
+Spend last week was 412, up 38% on the week before.
+
+- **Model calls:** 301, mostly summary compaction on Tuesday.
+- **Hosting:** 61, unchanged.
+- **New:** 50 for the image model, which you started using on Thursday.
+"""
+read = true
+
+[[turn]]
+kind = "finding"
+source = "agent"
+message = "The event wait on PriceDropped delivered: the flight watch fired."
+reply = "The Oslo to Lisbon flight on 14 March dropped to 2,140, under your 2,500 limit. The fare holds until Friday at noon. Book it here: https://example.com/flights/oslo-lisbon"
+read = true
+
+[[turn]]
+kind = "finding"
+source = "child-report"
+message = "Security scan finished: one high-severity finding. The session token is written to the request log in plain text."
+sub_threads = 2
+reply = "The security scan found a high-severity hole: the session token is written to the request log in plain text, so anyone with the logs can sign in as you. I started a fix session. Two other nightly steps still run."
+read = true
+
+[[turn]]
+kind = "failure"
+source = "child-report"
+message = "Step 3 (full e2e) failed: 4 failures in the sync suite, all on mobile."
+reply = """
+The nightly run stopped at step 3. The full e2e suite failed with 4 failures, all in the sync suite on mobile. The first three steps passed and are on main.
+
+The failures look real, not flaky: each one failed in all three retries. Do you want me to start a fix session, or leave it for the morning?
+"""
+read = true
+
+[[turn]]
+kind = "end-report"
+source = "child-report"
+message = "Final step finished. All gates green."
+reply = """
+The nightly run is done. Three fixes landed on main, and one step needs your decision.
+
+- **Landed:** the export crash, the stale badge count, and the slow search.
+- **Needs you:** the dependency upgrade changes the license of one package from MIT to AGPL. I did not apply it.
+"""
+read = true
+
+[[turn]]
+kind = "answer"
+source = "child-report"
+message = "Research finished: three vendors compared on price, data residency and API limits."
+reply = """
+The vendor research you asked for is back.
+
+| Vendor | Price | Data in the EU | API limit |
+|---|---|---|---|
+| Northwind | 20 per seat | yes | 100 per minute |
+| Contoso | 15 per seat | no | 60 per minute |
+| Fabrikam | 25 per seat | yes | no limit |
+
+Northwind is the only one that is both EU-hosted and under budget.
+"""
+read = true
+
+[[turn]]
+kind = "answer-after-question"
+source = "trigger"
+message = "Catch me up on what my testers said in the testing channel since you last looked."
+question = "A tester says the app crashed twice today. Should I dig into the crash logs?"
+answer = "Yes, look into it"
+reply = """
+I dug in. Both crashes come from the same place: the widget refresh runs while the app is in the background, and iOS kills it for using too much memory.
+
+- It affects every user with more than 20 widgets.
+- It started with last Tuesday's release.
+
+I opened it as a high-priority bug. Want me to start a fix session?
+"""
+read = true
+
+[[turn]]
+kind = "answer-after-question"
+source = "user"
+message = "Find out why sign-ups dropped last week"
+question = "I found three possible causes. Which should I look into further?"
+answer = "The second one, the new captcha"
+reply = """
+The captcha is the cause. Sign-ups from mobile fell 60% the day it shipped, and desktop barely moved.
+
+- On small screens the captcha's submit button sits under the keyboard.
+- 70% of mobile visitors who saw it left the page.
+
+Moving the button above the fold should fix it.
+"""
+read = true
+
+# --- noise ------------------------------------------------------------------
+
+[[turn]]
+kind = "confirmation"
+source = "trigger"
+message = "Catch me up on what my testers said in the testing channel since you last looked. Open anything worth acting on on my work board."
+question = "What do you want done with the tester's question about agents using apps?"
+answer = "They were happy with my answer, it seems"
+reply = "Yes, they were happy with it. They replied \"Yep\" under your answer at 12:39. I closed the board item as answered with no product work, and put your answer and their reply in its notes. Nothing else is new in the channel."
+read = false
+
+[[turn]]
+kind = "confirmation"
+source = "user"
+message = "Go through the idea backlog with me"
+question = "Park the offline mode idea, or drop it?"
+answer = "Drop it"
+reply = "Dropped. The offline mode item is closed as won't do, with a note that you decided it today."
+read = false
+
+[[turn]]
+kind = "confirmation"
+source = "user"
+message = "Set up the demo film's look"
+question = "Which theme should the film use?"
+answer = "The warm one"
+reply = "Done. The film uses the warm theme now, and the preview shows it."
+read = false
+
+[[turn]]
+kind = "confirmation"
+source = "user"
+message = "Draft the team update email"
+question = "Send the email now?"
+answer = "Yes"
+reply = "Sent to the team list at 14:02."
+read = false
+
+[[turn]]
+kind = "confirmation"
+source = "user"
+message = "Apply the drawer change"
+question = "The change needs a restart. Restart now?"
+answer = "Later"
+reply = "Okay, no restart. The switch stays in the banner until you are ready."
+read = false
+
+[[turn]]
+kind = "applied-change"
+source = "child-report"
+message = "The export fix is done and hardened. The change is ready to apply."
+reply = """
+I applied the export fix to main: 4 commits, 6 files. It needs a restart, so it goes live when you switch to the new version.
+
+- **What was wrong:** the CSV writer used a semicolon when the locale used a comma for decimals.
+- **What changed:** it now always quotes numbers and uses a comma separator.
+"""
+read = false
+
+[[turn]]
+kind = "applied-change"
+source = "child-report"
+message = "Drawer padding change is ready. CSS only."
+reply = "The even drawer padding is on main: 2 commits, 2 files. It needs no restart, so the drawer shows the new 1.5rem padding as soon as the page reloads."
+read = false
+
+[[turn]]
+kind = "applied-change"
+source = "user"
+message = "Apply it"
+reply = "Applied: 8 commits, 16 files. The cost widget now updates live. Every new model call is priced the moment it lands, and the corner shows a green Live dot."
+read = false
+
+[[turn]]
+kind = "applied-change"
+source = "agent"
+message = "The fix session for lost follow-ups finished. The change is ready."
+reply = """
+The fix for lost follow-ups is on main: 3 commits, 6 files, applied at 02:19.
+
+Before this, a follow-up you typed into a running turn got no answer if the model call failed. Now every way a turn ends picks the follow-up up.
+"""
+read = false
+
+[[turn]]
+kind = "applied-change"
+source = "child-report"
+message = "Step 1 (clean build) passed. Change ready."
+reply = "Step 1 passed, and I applied its change to main: 4 commits across 30 files. All gates pass: release build, lint and tests. It needs a restart, but nothing tonight depends on it."
+read = false
+
+[[turn]]
+kind = "kickoff"
+source = "user"
+message = "The toast never disappears on my phone. Fix it."
+sub_threads = 1
+reply = "I started a coding session on it: [Open thread](thread:myws/00000000-0000-4000-8000-000000000001). It will check the toast timer on iOS first, then the dismiss gesture, and report back here when it is done."
+read = false
+
+[[turn]]
+kind = "kickoff"
+source = "user"
+message = "Cut the 1.4 release"
+event_waits = 1
+reply = "Phase A of v1.4.0 is running. The changelog is at artifacts/releases/changelog-v1.4.0.md. I will report back when the release candidate passes its checks, in about 10 minutes."
+read = false
+
+[[turn]]
+kind = "kickoff"
+source = "user"
+message = "Render both endings for the demo film"
+sub_threads = 2
+reply = "Two sessions are working now, one per ending. When both report back you get one card with both previews, so you can pick in one go."
+read = false
+
+[[turn]]
+kind = "kickoff"
+source = "trigger"
+message = "Run the nightly build, harden and e2e pipeline."
+sub_threads = 3
+reply = """
+The night has started. All three sessions began at 22:50, and each reports back to this thread when it finishes:
+
+- Step 1: clean build
+- Backlog triage
+- Security scan
+"""
+read = false
+
+[[turn]]
+kind = "progress"
+source = "child-report"
+message = "Backlog triage finished. No code change. 40 rows updated."
+sub_threads = 2
+reply = "Backlog triage finished at 22:59. It changed no code, so there is nothing to apply. It reviewed the 40 oldest open rows and wrote the results into the work board. The build and the security scan still run."
+read = false
+
+[[turn]]
+kind = "progress"
+source = "child-report"
+message = "Step 2 passed."
+sub_threads = 1
+reply = "Step 2 passed and is merged: 2 commits in 1 file. Step 3, the full e2e suite, is running now."
+read = false
+
+[[turn]]
+kind = "small-talk"
+source = "user"
+message = "thanks!"
+reply = "You're welcome."
+read = false
+
+[[turn]]
+kind = "small-talk"
+source = "user"
+message = "ok sounds good, leave it as it is"
+reply = "Great, I will leave it as it is."
+read = false
+
+[[turn]]
+kind = "trigger-nothing"
+source = "trigger"
+message = "Catch me up on what my testers said in the testing channel since you last looked."
+reply = "Nothing new in the channel since the 11:00 check."
+read = false
+
+[[turn]]
+kind = "trigger-nothing"
+source = "trigger"
+message = "Check my inbox for invoices due this week and list them."
+reply = "No invoices are due this week."
+read = false
+
+[[turn]]
+kind = "acknowledgement"
+source = "user"
+message = "Send me a test notification"
+reply = "I sent a test notification at 13:21. It should show on your phone as a banner, and tapping it opens this thread."
+read = false
+
+[[turn]]
+kind = "acknowledgement"
+source = "user"
+message = "Rename this thread to Pricing research"
+reply = "Renamed to Pricing research."
+read = false
+
+[[turn]]
+kind = "acknowledgement"
+source = "user"
+message = "Stop the run"
+reply = "Stopped. Nothing was applied, and the branch is kept in case you want to pick it up later."
+read = false
+
+# --- harder cases -----------------------------------------------------------
+#
+# Shaped like the real replies that still passed on the old default: long,
+# detailed and friendly, but nothing the user would miss.
+
+[[turn]]
+kind = "applied-change"
+source = "child-report"
+message = "The fix is done and hardened. The change waits for your Apply."
+reply = """
+I applied the log size fix to main at 02:40. It came in as 2 commits touching 3 files.
+
+- **What was wrong:** error output was supposed to be capped at 4 KB, but the cap only counted lines. So one 100 KB line still came through whole and filled the agent's context.
+- **What changed:** the cap now counts bytes too, and keeps the first and last 2 KB of a long line.
+- **Tests:** a new test feeds one 100 KB line and checks the result stays under 4 KB.
+"""
+read = false
+
+[[turn]]
+kind = "applied-change"
+source = "child-report"
+message = "Step 4 is done. The audit found one high-severity hole, now fixed and merged."
+reply = """
+Step 4 passed and is merged into main, with 2 commits in 1 file. It fixed one high-severity hole: the command guard let `grep` and `less` run without a permission card even when an environment variable pointed them at a file outside the workspace.
+
+Now any such variable sends the command to the judge first. The regression test covers both commands.
+"""
+read = false
+
+[[turn]]
+kind = "done-as-asked"
+source = "user"
+message = "make this thread a top level choice in the cost widget, nothing else on that row"
+reply = """
+**This thread** is now a top-level choice in the [Cost](app:cost-widget) widget.
+
+- **New top row:** a two-way switch, **All threads | This thread**. It shows only when the widget can see which thread you have open.
+- **All threads** keeps today's filters below it.
+- **This thread** hides the filters, since they would only narrow one thread.
+"""
+read = false
+
+[[turn]]
+kind = "done-as-asked"
+source = "user"
+message = "drop the show more button and do infinite scroll"
+reply = """
+I removed the Show more button from the widget. The list now loads more rows as you scroll down. The syntax check passes. I have not seen it rendered, because the widget isn't open here.
+
+- **How it works:** the last row is watched, and when it comes into view the next 50 rows load.
+- **At the end:** a quiet "That's everything" line replaces the spinner.
+"""
+read = false
+
+[[turn]]
+kind = "progress"
+source = "agent"
+message = "The event wait on ReleasePhaseFinished delivered: phase A of v1.4.0 finished."
+reply = """
+Every v1.4.0 release candidate check passed, so phase B is running. It is not public yet. Changelog: artifacts/releases/changelog-v1.4.0.md
+
+**Release candidate checks (all green)**
+- Source install on Ubuntu, then the smoke test.
+- The macOS disk image opens and passes the notarization check.
+- The private-data scan found nothing.
+
+Phase B takes about 30 minutes. I will report when it is public.
+"""
+read = false
+
+[[turn]]
+kind = "progress"
+source = "child-report"
+message = "The backlog triage finished. No code changed."
+reply = """
+**Backlog triage** finished at 22:59. It changed no code, so it left nothing to apply. It reviewed the 40 oldest open rows and wrote the results straight into the work board:
+
+- 12 closed as already fixed.
+- 9 merged into duplicates.
+- 19 kept, with a clearer title and a size estimate.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-nothing"
+source = "child-report"
+message = "Security pass finished. No criticals."
+reply = """
+The security pass finished at 23:06 with nothing to apply. It changed no code, because it found no criticals.
+
+- **Dependencies are clean.** The audit found no advisories.
+- **Secrets:** no tokens or keys in the tree.
+- **Permissions:** the guard tests all pass.
+"""
+read = false
+
+[[turn]]
+kind = "kickoff"
+source = "user"
+message = "The notification still never shows, even with notifications on. Look into it."
+question = "Did the in-app notification show this time?"
+answer = "No, nothing there either"
+reply = """
+I've started a coding session on it: [Open thread](thread:myws/00000000-0000-4000-8000-000000000002).
+
+Your result rules out my earlier explanation. Notifications were on for this test and it still didn't show. The session will trace the notification from the moment it is sent to the moment the page should draw it, and report back here.
+"""
+read = false
+
+[[turn]]
+kind = "acknowledgement"
+source = "user"
+message = "send it again"
+reply = "I sent a second test notification at 13:21. It went out before this reply, so it should show on your phone as an in-app banner, not a push. Tap it and it opens this thread. The release is still a draft and not public."
+read = false
+
+[[turn]]
+kind = "confirmation"
+source = "agent"
+message = "The event wait on ChangeApplied delivered."
+question = "Is the widget rework applied on your side?"
+answer = "its all applied"
+reply = "You're right, it's all on main. The widget window rework and the old session's last change both landed, and you are on the newest build. Nothing is waiting in Changes."
+read = false
+
+[[turn]]
+kind = "answer"
+source = "user"
+message = "Is the website on the latest version?"
+reply = """
+Yes. I checked with cache-busted requests, and example.com is on **v1.4.0** everywhere:
+
+- **Install script:** installs 1.4.0.
+- **Download button:** links to the 1.4.0 disk image.
+- **Update check:** reports 1.4.0 as the latest.
+"""
+read = true
+
+[[turn]]
+kind = "failure"
+source = "agent"
+message = "The event wait on ReleaseTestsFinished delivered: the release test run finished."
+reply = "The release test run has finished: 22 of 24 jobs passed and 2 failed. Both failures are the same home screen test, so v1.4.0 is still not public. I have not retried. Do you want me to fix the test first, or release with it skipped?"
+read = true
+
+[[turn]]
+kind = "answer"
+source = "user"
+message = "I fixed one toast bug already, but this looks like a different one?"
+reply = """
+You're right, they are two different bugs.
+
+- **The one you fixed:** an app toast with a key stayed on screen, because the timer only ran for toasts without one.
+- **This one:** the notification never reaches the page at all. The engine sends it, but the page drops it while the thread is open.
+
+The second needs its own fix.
+"""
+read = true
+
+# --- reports a parent agent acts on -----------------------------------------
+#
+# A sub-thread started by another agent, whose report wakes that agent. The
+# parent reads the reply and acts on it, and the user reads the parent. A
+# routine result is noise here, however detailed. A failure, a risk or a
+# decision only the user can handle still reads (ADR 0446).
+
+[[turn]]
+kind = "parent-report"
+source = "agent"
+report_wakes_parent = true
+message = "Archive job for the demo take. Run the archive script with --archive-now, then with --archive-status. Report the exit codes and each summary line in under 6 lines."
+reply = """
+The token was set and both runs exited 0.
+
+- **--archive-now:** 216 already present, 6 archived. Each upload was checked against its content hash.
+- **--archive-status:** 260 present, 0 missing, 0 unknown, 260 on disk (4557.3 MB).
+- **Take folder:** all 36 files are present, 18 videos and 18 sidecars.
+- Nothing was deleted, moved or published.
+"""
+read = false
+
+[[turn]]
+kind = "parent-report"
+source = "agent"
+report_wakes_parent = true
+message = "Convert the 12 photos in artifacts/photos/raw/ to WebP and report the sizes."
+reply = """
+Converted all 12 photos to WebP in `artifacts/photos/webp/`.
+
+- **Before:** 11.3 MB in total.
+- **After:** 4.1 MB in total, at quality 82.
+- The largest file is `harbour-07.webp` at 610 KB. No photo failed.
+"""
+read = false
+
+[[turn]]
+kind = "parent-report"
+source = "agent"
+report_wakes_parent = true
+message = "Check the three hotels on the list for a double room on 14 March and report the price of each."
+reply = """
+All three have a double room on 14 March:
+
+- **Harbour Hotel:** 1,450 a night, breakfast included.
+- **Station Inn:** 1,180 a night, breakfast 150 extra.
+- **Old Town Rooms:** 990 a night, no breakfast, shared bathroom.
+"""
+read = false
+
+[[turn]]
+kind = "parent-report"
+source = "agent"
+report_wakes_parent = true
+message = "Refresh the sales dashboard data from the export and report the row counts."
+reply = "Refreshed. The export added 1,204 rows, for 58,310 in total. All 6 data checks passed, and the dashboard shows data up to yesterday at 23:59."
+read = false
+
+[[turn]]
+kind = "failure"
+source = "agent"
+report_wakes_parent = true
+message = "Archive job for the demo take. Run the archive script with --archive-now, then with --archive-status. Report the exit codes and each summary line."
+reply = """
+Nothing was archived. The Dropbox token was not set, so `--archive-now` exited 2 before it uploaded a file.
+
+`--archive-status` could not reach Dropbox either: 0 present, 0 missing, 264 unknown. Dropbox has to be connected again in Settings before any archive run can work.
+"""
+read = true
+
+[[turn]]
+kind = "failure"
+source = "agent"
+report_wakes_parent = true
+message = "Check that the recorder is still writing, and report the free disk space."
+reply = "The recorder is still writing, but the disk is 98% full: 3.1 GB free. At the current rate it stops in about 10 minutes, and the last 3 takes exist only on this disk. They are not archived yet."
+read = true
+
+[[turn]]
+kind = "decision"
+source = "agent"
+report_wakes_parent = true
+message = "Ask the venue whether 14 March is still free, and report what they need."
+reply = "14 March is still free. The venue holds it only with a deposit of 4,000, paid by Friday at noon. I cannot pay it. If nobody pays by then, they release the date."
+read = true
+
+# --- trigger runs: the run's own report against the push it already sent ----
+#
+# Copied in shape from real trigger runs the forced call read as yeses (plan
+# `docs/plans/2026-10-14-trigger-runs-out-of-review.md`). `pushed` lists the
+# notifications the turn sent before its reply.
+
+[[turn]]
+kind = "trigger-nothing"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Daily price check\" (id: t-001)]\n\nCheck the official prices from every supplier against my price table. If a price changed, a promo ended or an item I use has no price, record it and tell me what changed. If nothing changed, stay quiet."
+reply = """
+I checked every supplier against the price table. Nothing changed, so I left `artifacts/prices/table.json` alone and sent no notification.
+
+- **Suppliers A, B and C:** every rate matches the table, including the bulk tiers.
+- **Supplier D:** every item you use matches. One item you never bought is no longer listed, so no cost changes.
+- **Promos still running:** Supplier B's lower rate holds until 30 November. Supplier C's intro price ends on 31 December, and the table already has the dated rise.
+- **No price yet:** none. Every item used in the last 7 days has a price.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-nothing"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Inbox triage\" (id: t-002)]\n\nTriage my inbox using my rules, and only tell me about mail that actually needs me."
+reply = """
+Nothing new needs you, so I didn't send a push. There are 9 unread messages, and you were already notified about every one of them on earlier runs.
+
+These are still waiting for you:
+- **Streaming service:** the card on file has expired, and the service stops if you don't update it.
+- **Cloud storage:** a payment failed on the 100 GB plan. The notice said files would be locked after 7 days.
+- **Utility bill:** 1,240 due on the 10th.
+
+I didn't mark anything read or move anything.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-nothing"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Beta access watch\" (id: t-003)]\n\nCheck whether my account can reach the new model yet. Stay quiet while it is still blocked. The moment it clears, tell me straight away."
+reply = """
+The model is still blocked, so I sent no notification. A real test call returned 403: the project does not have access. That is the same answer as every check this month.
+
+A 403 means the model is live, and the block is on your project. Only you can clear it, from the provider's dashboard: add the model to the project's allow-list, or finish the organisation check. I'll keep watching.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-nothing"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Weekly site notes\" (id: t-004)]\n\nReview what I did in the browser since last time, and write down what's worth remembering about each site, especially the things that failed."
+reply = """
+Nothing to update this time. I went through 14 browser calls on 2 sites since the last pass. None of them failed, and everything they showed is already in the site notes.
+
+- **jobs-site.example (12 calls):** the daily job search, five search terms. The address-based search worked every time, as the notes say.
+- **shop.example (2 calls):** the price page loaded on the first try, at the price the notes already have.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-pushed"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Training reminder\" (id: t-005)]\n\nRemind me about training on weekdays around noon if I've barely started today. Say nothing if I've already hit the target."
+pushed = [{ title = "Training", message = "No sets logged yet today. 3 sets left to your daily target, do one now." }]
+reply = "I sent the noon training reminder. You have no sets logged today and your daily target is 3. Today is a normal workday, not a holiday. Tapping the reminder opens the Training tab in [Habit Tracker](app:habit-tracker)."
+read = false
+
+[[turn]]
+kind = "trigger-pushed"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Daily price check\" (id: t-001)]\n\nCheck the official prices from every supplier against my price table. If a price changed, a promo ended or an item I use has no price, record it and tell me what changed. If nothing changed, stay quiet."
+pushed = [{ title = "Prices changed", message = "Item X had no price, now 0.10 per unit, 0.50 per unit above 1,000. Priced from its launch on 22 September. Its 31 uses so far add under 0.01 to the total." }]
+reply = """
+One price changed today. I wrote it to `artifacts/prices/table.json` and sent you a notification.
+
+- **Item X** had no price, so its use was left out of the total. It has 31 uses so far.
+- New rates: **0.10 per unit**, and 0.50 per unit above 1,000.
+- The price applies from its launch on 22 September.
+- No other supplier changed anything.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-pushed"
+source = "trigger"
+message = "[EVENT TRIGGER FIRE: trigger \"Release prep\" (id: t-006)]\n\nWhen the nightly build finishes green, get the next release ready for me. Never publish anything: stop at a staged release candidate, and tell me what happened."
+pushed = [{ title = "Release prep: skipped", message = "No release candidate tonight. Nothing was built and nothing is public.\n\nWhy: 3 files the last release ships are deleted on main, and only you may accept that. They look like planned removals: two old tests and a retired script.\n\nTo unblock: approve the deletions and run the release with --accept-drift. The next nightly skips again until you do." }]
+reply = """
+I skipped tonight's release prep. Nothing was built or published, and you have one notification about it.
+
+**Why it skipped:** 3 files the last release ships are deleted on main, and an unattended run must never accept that on its own. They all look like planned removals:
+- `tests/old_filter_test.ts` and `tests/old_heading_test.ts`, removed with the features they tested
+- `scripts/legacy_export.sh`, replaced last week
+
+Everything else was clean. To unblock, approve the deletions and run the release with `--accept-drift`.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-pushed"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Job list\" (id: t-007)]\n\nKeep my job list fresh every morning, and only disturb me when something in the top 20 actually changed or a deadline is about to run out."
+pushed = [{ title = "2 new jobs in the top 20", message = "Example Corp: Director of Data (match 77%, deadline 21.10). Sample Bank: Java Developer (match 64%, deadline soon)." }]
+reply = """
+This morning's check found 2 new jobs in your top 20, so I sent you a notification about them.
+
+**New in the top 20:**
+- **Example Corp:** Director of Data, 77% match, deadline 21.10. New today.
+- **Sample Bank:** Java Developer, 64% match, deadline soon. It moved up because six jobs above it expired.
+
+**Expired and removed (6):** four developer roles and two architect roles. The list now holds 86 active ads, and [Job Board](app:job-board) has all of them.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-pushed"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Morning dashboard\" (id: t-008)]\n\nGenerate today's morning dashboard and send me a push notification with the headline."
+pushed = [{ title = "Morning dashboard, Saturday", message = "Readiness 71, HRV balance 88. Rain all day, about 3 degrees. Nothing urgent." }]
+reply = """
+Today's dashboard is ready in [Dashboard](app:daily-dashboard), and the push went out.
+
+- **Sleep:** 6 h 42 min, sleep score 85.
+- **Readiness:** 71, down from 74. HRV balance 88.
+- **Weather:** rain all day, about 10 mm and around 3 degrees.
+- **Tasks:** nothing urgent.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-pushed-more"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Reply targets\" (id: t-009)]\n\nFind me the people who publicly described a problem my product solves, so I can reply to them. Keep only the ones worth my time, with a line each on what they said and what I'd be replying to."
+pushed = [{ title = "2 reply targets", message = "Alex (tracker #4512): the agent forgets project conventions overnight. Sam (tracker #4530): scheduled runs finished but nothing showed where." }]
+reply = """
+This morning's scan turned up two people worth answering. Both are on the [Replies board](app:replies-board), and the notification went out.
+
+**1. Alex, priority 87.** https://example.com/issues/4512
+- **What they said:** the agent forgot their project's conventions every morning and they had to explain them again. It cost them about an hour a day.
+- **What you'd reply to:** only that point. Agree first, then show how knowhow keeps the conventions between sessions.
+
+**2. Sam, priority 74.** https://example.com/issues/4530
+- **What they said:** their scheduled runs finished, but the results landed nowhere they look.
+- **What you'd reply to:** a run that reports back where you already work. Keep it to two sentences.
+"""
+read = true
+
+[[turn]]
+kind = "trigger-pushed-more"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Weekly learning sweep\" (id: t-010)]\n\nRun a learning sweep over the last 7 days and write me a report. Only push me if something new shows up, and when you do, tapping it should take me straight to this run so I can read it."
+pushed = [{ title = "Weekly sweep: 1 new pattern", message = "The heat pump script crashed 10 times in 6 days while reading device status. No fix has landed." }]
+reply = """
+I found one new problem this week, so I sent you a push. Tapping it opens this run. The full report is in [report.md](artifacts/learning/weekly/report.md).
+
+**The heat pump script keeps crashing.** It failed 10 times in 6 days, and each crash sent you a failure push. 7 of the 10 failed while reading a device's status. One failed read from the vendor's cloud kills the whole run.
+
+**The fix:** retry the status read once, and skip a device that still fails instead of ending the run. It is one function, and I can start a coding session for it if you want.
+"""
+read = true
+
+[[turn]]
+kind = "trigger-pushed-more"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Inbox triage\" (id: t-002)]\n\nTriage my inbox using my rules, and only tell me about mail that actually needs me."
+pushed = [{ title = "Inbox: 3 need you", message = "3 new messages need you. Open the run for details." }]
+reply = """
+3 new messages need you, and I sent one push about them.
+
+- **Landlord:** the inspection moves to Thursday at 09:00. Reply by Wednesday if that time does not work.
+- **Insurance:** the renewal is 2,310, up 18%. It renews by itself on the 1st unless you cancel.
+- **School:** the trip form for the 14th needs a signature by Friday.
+
+Everything else matched your rules: 6 newsletters marked read, 2 offers deleted.
+"""
+read = true
+
+[[turn]]
+kind = "trigger-failure"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Inbox triage\" (id: t-002)]\n\nTriage my inbox using my rules, and only tell me about mail that actually needs me."
+reply = """
+Nothing new needs you, so I didn't send a notification.
+
+- **4 new unread emails.** Your rules matched all of them, and I marked them read.
+- **28 older unread emails I left alone.** You were told about each one on an earlier run.
+
+**Config mismatch:** the account's config entry names a fetch method the triage steps no longer support, and it has no mail host. The standard read-only fetch cannot run on it, so I used a fallback script. Mail was never at risk, but until the entry is fixed, each run has to work around it.
+"""
+read = true
+
+[[turn]]
+kind = "trigger-failure"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Morning dashboard\" (id: t-008)]\n\nGenerate today's morning dashboard and send me a push notification with the headline."
+reply = """
+I couldn't build today's dashboard, so I sent no push.
+
+The health service refused the sign-in with 401 since 03:00, so there are no sleep or readiness numbers for today. The weather and calendar parts worked. Reconnect the health account in Settings, and the next run picks it up.
+"""
+read = true
+
+[[turn]]
+kind = "trigger-failure"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Daily price check\" (id: t-001)]\n\nCheck the official prices from every supplier against my price table. If a price changed, a promo ended or an item I use has no price, record it and tell me what changed. If nothing changed, stay quiet."
+reply = """
+I checked four of the five suppliers, and none of them changed a price.
+
+Supplier D's price page now sits behind a sign-in, so I could not read it. You use three of its items. Their prices in the table could be out of date until the page is reachable again, or until you give me a login for it.
+"""
+read = true
+
+[[turn]]
+kind = "trigger-kickoff"
+source = "trigger"
+sub_threads = 1
+message = "[EVENT TRIGGER FIRE: trigger \"Build report\" (id: t-011)]\n\nI pressed Report on a pull request. Build the report and put it in the Report app, without asking me anything first."
+reply = """
+I've started a coding agent to update the report for #42, "Add a nightly export check": [Open thread](thread:myws/00000000-0000-0000-0000-000000000001).
+
+- **Update only:** the current report was read at an older commit. The agent reads only the commits since then and keeps the earlier findings.
+- In the [Report](app:report) app, the #42 row keeps spinning until the session publishes the new report.
+"""
+read = false

@@ -1,0 +1,167 @@
+# 0092: system theme follows the OS live, with the iOS snapshot-pass flips guarded out
+
+- **Status**: Accepted
+- **Date**: 2026-08-18
+
+## Context
+
+A `theme: system` preference used to resolve against the OS once per page load,
+plus whatever the `prefers-color-scheme` change event delivered later. That
+listener was skipped on iOS. Telemetry had caught WKWebView firing it with the
+wrong value 24 or more times in one session, flashing the page light.
+
+The result was a theme that went stale in two different ways. An installed iOS
+PWA is resumed rather than reloaded, and had no listener. It kept its boot theme
+for as long as the webview lived. Off iOS the listener was live, but a change
+announced to a frozen tab or a sleeping machine was lost. Nothing re-read the
+value on wake. Either way the user pressed Dark by hand every evening.
+
+## Decision
+
+`system` re-resolves on the media query's `change` **and** on the page's own
+resume, on every platform, iOS included. Three guards decide whether a
+re-resolve paints: the preference still follows the OS, the document is visible,
+and the resolved value differs from what is already on `<html>`. Every trigger
+schedules one shared settle timer, and the value is re-READ when that fires,
+never taken from the event.
+
+The platform carve-out is gone from both the shell
+(`crates/lucidos-app/src/store/actions/preferences.ts`) and the SDK
+(`packages/lucidos-sdk/src/ui.ts`).
+
+## Rationale
+
+The carve-out was written as though WKWebView reports garbage at random. The
+real mechanism is documented and narrow, which is what makes a guard possible.
+
+A UIKit engineer's explanation is recorded in
+[rdar://7213631](https://openradar.appspot.com/7213631). An app entering the
+background has its trait collection flipped to the opposite appearance and back,
+so iOS can render both app-switcher snapshots. WKWebView passes each flip into
+the page as a real media query change. The events were therefore never corrupt.
+They described an appearance that genuinely existed, for the moments the app was
+being snapshotted.
+
+That is exactly when the user is not looking, so **visibility** is the guard
+that fits the cause. The radar records the same symptom we saw, the content
+"abruptly shifting from light to dark when the app is selected". The **settle**
+re-read covers the residual race, since the bogus value is immediately followed
+by its correction. The **difference** check keeps a wake that changed nothing
+from re-tinting the title bar and re-asserting every style override.
+
+Resume is the other half, and it is the one that answers the actual report. It
+is the only moment an installed iOS PWA offers, and off iOS it repairs a change
+event lost to a frozen tab.
+
+### The residual the snapshot model does not explain
+
+One earlier observation does not fit, and is recorded here rather than argued
+away. `fix(theme): skip loadPreferences re-apply when theme value unchanged`
+caught a **synchronous** read returning light on a dark device, ten seconds
+into a foreground session, watched live through an in-PWA debug overlay. No
+backgrounding was involved, so the trait-collection pass above cannot account
+for it.
+
+So the guards narrow this class rather than close it. A wrong value read while
+the page is genuinely visible still paints, and is corrected by the next event.
+Three things bound the damage. The difference check means only a *changed*
+value paints at all, which is that commit's own guard, kept. Nothing acts on an
+event's value, so a lie shorter than the settle delay never lands. And
+`applyTheme` samples the media query once, handing that value to both the paint
+and its `__themeModeLogEvt` breadcrumb, so a recurrence is legible in `engine.log`.
+
+The settle delay is not a measured number. It was picked to outlast the
+snapshot pass, which is fast, and 300ms is imperceptible on a theme change. If
+the residual above turns out to be common, the breadcrumbs are what would say
+so, and the delay is the knob.
+
+### Amendment: a moved theme must hold through a confirming read
+
+The breadcrumbs did say so, though not by turning the settle knob. Gateway logs
+caught the same shape twice on an iPhone set to dark under `system`:
+
+1. A wake lasts under a second: a visible presence post, then a hidden one.
+2. Inside it, the settle read sees `mqLight: true` and paints light.
+3. The page hides, and iOS snapshots it light.
+4. The next real return opens on that light page. The resume read then paints
+   dark, which the user reports as a light blink on coming back.
+
+So on a brief wake the media query still reports the snapshot pass's
+appearance, past the settle delay. A longer settle delay would only move the
+race. A **confirming read** closes it instead: a read that sees a move arms a
+second read `SYSTEM_THEME_MODE_CONFIRM_MS` later, and only a move still there
+then paints. A hide cancels both, so a brief wake paints nothing.
+
+The cost is that a real flip found on resume paints about a second later than
+before. One helper, `followSystemThemeMode` in
+`packages/lucidos-sdk/src/appearance.ts`, now carries the timers for the shell
+and every app iframe, so the two cannot drift apart.
+
+### Amendment: only the follower moves a page already on `system`
+
+The guards held only for the follower. Every other repaint re-resolved `system`
+against the live media query, with none of them. In the shell that is
+`applyTheme`, run by startup's first preference load, every theme fetch and
+every edit of the active theme's file. In an app frame it is `paint`, run by
+every shell push and every preference fetch.
+
+A mobile-webkit run of `system-theme-follows-os.spec.ts` caught it. The test
+hid the page and flipped the OS to light. Startup's preference load, slow on
+that runner, landed afterwards and painted the hidden page light. On an iPhone
+the same repaint can land inside the snapshot pass.
+
+So a repaint under a preference that was already `system` now keeps the mode
+on `<html>` (`repaintThemeMode` in `packages/lucidos-sdk/src/appearance.ts`).
+Only the follower's confirmed read takes a fresh OS read and moves it. A
+change of preference into `system` still resolves against the OS at once,
+since the user just chose it. A repaint also no longer cancels a pending
+follower read, which would otherwise lose a real flip.
+
+An app frame's shell push now carries the mode the shell painted
+(`PAINTED_THEME_MODE_PUSH_KEY`), and a frame on `system` paints it. Before, the
+push made the frame re-read the OS. That is how a frame followed a flip the
+shell caught on a window `focus` the frame never received. The shell's mode
+already passed the guards, so adopting it keeps that path without an unguarded
+read.
+
+## Consequences
+
+- A theme flip is applied about 1.3 seconds after the OS announces it, on every
+  platform: the settle delay plus the confirming read. That is the price of one
+  code path instead of two, and of never painting a brief wake's stale value.
+- The shell and every app iframe run the same contract. An open app cannot sit
+  on a stale theme while the shell around it moves.
+- The two guards are load-bearing rather than defensive. Dropping the visibility
+  check re-opens the flash on iOS, so it is pinned by unit tests in both
+  surfaces rather than left to review.
+- Under `system`, the follower is the only path from the OS appearance to the
+  page. A new repaint path inherits the guards by going through
+  `repaintThemeMode`, and must never sample the media query itself.
+- **iOS 17 is not fixed by this, and cannot be.** A home-screen PWA froze
+  `prefers-color-scheme` at its launch value there, so no listener and no
+  re-read can move it ([Apple Developer Forums thread](https://developer.apple.com/forums/thread/739154),
+  FB12858610). The original reporter confirms it fixed in iOS 18, and our own
+  telemetry shows change events arriving there.
+
+## Alternatives considered
+
+**Keep the carve-out and add only a resume re-read.** This was the first plan,
+and the research above retired it. It leaves the theme frozen on iPhone for
+anyone who keeps the app foregrounded through a flip. It also keeps two code
+paths for a problem one guard solves.
+
+**Poll the media query while the page is visible.** The fallback for a listener
+that could not be trusted. With the guards in place the listener is trusted, so
+a poll is a second mechanism doing the first one's job. It also samples at
+arbitrary moments, which is the shape the carve-out existed to avoid.
+
+**Resolve `system` in CSS, with `@media (prefers-color-scheme: …)` token
+blocks.** The architecturally cleaner answer: the browser resolves it, so
+staleness stops being representable. Rejected on cost and risk, not on merit.
+
+It rewrites both token blocks, roughly eight component-level
+`html[data-theme=…]` rules and the engine-served iframe stylesheet. It still
+could not cover the inline pre-stylesheet paint, the `theme-color` meta tag,
+`style.colorScheme` or the Tauri title-bar tint without a JS resolve anyway. So
+it is a FOUC-risking refactor of the appearance boot contract, and this report
+did not need one. Worth revisiting on its own terms.

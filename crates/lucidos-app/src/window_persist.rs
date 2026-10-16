@@ -1,0 +1,569 @@
+//! Remembering the user's windows across a launch, and the gates on writing.
+//!
+//! Two records, and they do not overlap. The window-state plugin covers `main`
+//! ALONE, which is the one label that means the same thing every launch. It
+//! restores that window before anything knows what it will show, and it is
+//! where maximized and fullscreen live. The session record is per WORKSPACE:
+//! which ones had a window, and how big each was. Every other window is its
+//! business, and [`plugin_tracks`] is what holds the split.
+//!
+//! Both are written together, so a window recorded in one is recorded in the
+//! other. Two gates decide whether a write happens at all: a teardown is not
+//! the user closing their windows, and a launch nobody looked at has no
+//! arrangement to record.
+//!
+//! The clamp that sanitises a restored frame is `window_restore`, and the
+//! record's own format is `window_session`.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
+
+use tauri::Manager;
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+
+use crate::{desktop, window_restore, window_session};
+
+/// Window state the app persists and restores via `tauri-plugin-window-state`.
+/// Deliberately EXCLUDES two flags:
+/// - `VISIBLE`: the packaged client hides its window rather than closing it. A
+///   flush taken while hidden would persist `visible: false`, and the plugin
+///   would restore the window hidden on the next launch.
+/// - `DECORATIONS`: toggling it on macOS rebuilds the NSWindow style mask and
+///   can drop the `titleBarStyle: "Overlay"` configuration, turning the
+///   reclaimed title-bar band back into an opaque bar.
+pub(crate) fn window_state_flags() -> StateFlags {
+    StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
+}
+
+/// Which windows `tauri-plugin-window-state` may restore and save: `main`, and
+/// nothing else. Passed to its builder as the tracking filter.
+///
+/// The plugin keys on the window LABEL, and `window-<n>` comes off a counter
+/// that resets each process. So that key names a different window every launch,
+/// which is the whole reason ADR 0123 keys the session by workspace instead.
+/// Unfiltered, the plugin restored one runtime window's geometry onto an
+/// unrelated one, and `MAXIMIZED` and `FULLSCREEN` with it. Placing a frame
+/// undoes neither, so a fresh window could come up fullscreen inherited from a
+/// past life.
+///
+/// This is the "for `main` only" the ADR already promised. `main` is declared in
+/// `tauri.conf.json`, so its label does mean one window across launches.
+pub(crate) fn plugin_tracks(label: &str) -> bool {
+    label == crate::app_window::MAIN_WINDOW_LABEL
+}
+
+/// How long the windows must sit still before the debounced background flush
+/// writes. Short enough that a quick move-then-relaunch is remembered, long
+/// enough that a drag doesn't thrash the disk on every intermediate
+/// `Moved`/`Resized` event.
+const WINDOW_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// How often the flush thread wakes to ask whether the windows have gone quiet.
+const WINDOW_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Coordinates the debounced flush of both window records. The window-state
+/// plugin writes to disk only on `RunEvent::Exit`, which the packaged client
+/// never reaches. Without this, a moved or resized window is remembered in
+/// memory alone. A background thread flushes once the windows have been quiet
+/// for [`WINDOW_SAVE_DEBOUNCE`] (see [`should_persist_windows`]).
+///
+/// Windows rather than geometry, because a navigation owes a write too: the
+/// session record holds a workspace per window as well as a frame. See
+/// [`note_windows_changed`].
+pub(crate) struct WindowSaver {
+    dirty: AtomicBool,
+    last_change: Mutex<Instant>,
+}
+
+impl Default for WindowSaver {
+    fn default() -> Self {
+        Self {
+            dirty: AtomicBool::new(false),
+            last_change: Mutex::new(Instant::now()),
+        }
+    }
+}
+
+impl WindowSaver {
+    /// A write is owed, and the quiet period starts again.
+    fn note_changed(&self) {
+        *self.last_change.lock().unwrap() = Instant::now();
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Is a write owed, and have the windows been quiet long enough for it?
+    fn write_is_due(&self) -> bool {
+        should_persist_windows(
+            self.dirty.load(Ordering::Acquire),
+            self.last_change.lock().unwrap().elapsed(),
+        )
+    }
+
+    /// Claim the owed write. The flush is a one-shot, so a caller that claims
+    /// it owns it: nothing re-takes it until something notes a change.
+    fn take_write(&self) {
+        self.dirty.store(false, Ordering::Release);
+    }
+
+    /// Is a write still owed? Test seam for the sequence a cold boot takes.
+    #[cfg(test)]
+    fn owes_a_write(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+}
+
+/// Whether the debounced flush should run now: a write is owed and the windows
+/// have been quiet at least [`WINDOW_SAVE_DEBOUNCE`].
+///
+/// A write is owed by a move, a resize OR a navigation, so this asks about the
+/// debt rather than about geometry. [`note_windows_changed`] is what records
+/// all three.
+fn should_persist_windows(dirty: bool, since_last_change: std::time::Duration) -> bool {
+    dirty && since_last_change >= WINDOW_SAVE_DEBOUNCE
+}
+
+/// Something about the windows changed, so the flush is owed. Called from the
+/// window event handler on every intermediate move and resize, which is why the
+/// write itself is debounced rather than immediate.
+///
+/// Also called when a page starts loading on a URL past the splash, and that
+/// arm is what stops the session record losing a launch.
+/// [`persist_window_session`] refuses to write while every window is still on
+/// the boot splash, and the debounced write lands there on a cold boot: the
+/// engine is restarting, so the first navigation is many seconds out. The
+/// refusal used to be the end of it, because nothing re-armed the flush. Now
+/// the navigation itself does, at the one moment the gate can open.
+///
+/// That caller carries `window_target::window_is_navigated`, the same predicate
+/// the gate reads, so the two cannot drift. It rules out the bundled splash and
+/// not the gateway's, which is served at the workspace's own url.
+///
+/// So the name is windows rather than geometry, and so is the whole mechanism
+/// this arms. The record holds a workspace per window as well as a frame, and a
+/// navigation changes the first half.
+pub(crate) fn note_windows_changed(app: &tauri::AppHandle) {
+    app.state::<WindowSaver>().note_changed();
+}
+
+/// Start the debounced window flush. Its own thread, for the life of the
+/// process. The save is marshalled onto the main thread, for the reason
+/// [`persist_window_state_on_main`] gives.
+pub(crate) fn spawn_window_flush(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(WINDOW_POLL);
+        let saver = app.state::<WindowSaver>();
+        if saver.write_is_due() {
+            saver.take_write();
+            persist_window_state_on_main(&app);
+        }
+    });
+}
+
+/// Persist window geometry, forcing the work onto the MAIN thread.
+///
+/// `tauri-plugin-window-state::save_window_state` holds an internal cache lock
+/// while it reads each window's live geometry. Off the main thread those getters
+/// block on a round-trip to the event loop. So a worker-thread save holds the
+/// cache lock across a wait for the main thread, while the main thread blocks
+/// taking that same lock: a full-UI deadlock. Every caller NOT already on the
+/// main thread must route through here. Fire-and-forget, so the save runs on the
+/// next main-loop turn.
+fn persist_window_state_on_main(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || persist_windows(&handle)) {
+        eprintln!("[Tauri] Failed to schedule window-state save: {e}");
+    }
+}
+
+/// Persist BOTH records the client keeps about its windows. Main thread only,
+/// for the reason [`persist_window_state_on_main`] gives.
+///
+/// Every save site calls this, so a window recorded in one file is recorded in
+/// the other. The module header says why there are two.
+pub(crate) fn persist_windows(app: &tauri::AppHandle) {
+    save_plugin_state(app, "Failed to persist window state");
+    persist_window_session(app);
+}
+
+/// Let the window-state plugin record, unless `main` is wearing a correction.
+///
+/// The plugin covers `main` alone, and reads its live geometry itself. So not
+/// calling it is the only way to keep a rescue out of its file. A correction is
+/// not an arrangement (ADR 0215). The session record enforces that for every
+/// window, and this is the same rule for the one file we do not write.
+///
+/// It matters in one corner. `app_window::main_frame_owed` prefers the session
+/// record, so the plugin's frame is read only for a workspace that record holds
+/// nothing for. Main thread only, like every geometry read here.
+fn save_plugin_state(app: &tauri::AppHandle, what: &str) {
+    if main_is_wearing_a_rescue(app) {
+        return;
+    }
+    if let Err(e) = app.save_window_state(window_state_flags()) {
+        eprintln!("[Tauri] {what}: {e}");
+    }
+}
+
+/// Is `main` on screen at a frame the clamp chose for it?
+///
+/// Unreadable geometry answers no, so the plugin still records. A missed skip
+/// costs what shipped before ADR 0215, and skipping on a guess would lose a
+/// real arrangement.
+fn main_is_wearing_a_rescue(app: &tauri::AppHandle) -> bool {
+    let Some(window) = app.get_window(crate::app_window::MAIN_WINDOW_LABEL) else {
+        return false;
+    };
+    let Some(frame) = window_restore::live_frame(&window) else {
+        return false;
+    };
+    window_restore::is_wearing_a_rescue(crate::app_window::MAIN_WINDOW_LABEL, frame)
+}
+
+/// Persist the plugin's record alone, without the session.
+///
+/// The one caller is a window CLOSE, where the session is written separately
+/// and only when the close is the user's own. See the `CloseRequested` arm.
+pub(crate) fn persist_window_state_only(app: &tauri::AppHandle) {
+    save_plugin_state(app, "Failed to persist window state on close");
+}
+
+/// What this launch restores: a workspace per window, and the frame each wants.
+///
+/// Resolved once, in `setup`, and read again by `desktop::launch` on its own
+/// thread once the gateway is healthy. Memoized because the two reads must
+/// agree: the first window to settle rewrites the record underneath them.
+///
+/// A workspace with no remembered frame still gets a window, built at the
+/// default size.
+pub(crate) fn resolve_window_session_plan(
+) -> &'static [(String, Option<window_restore::RememberedFrame>)] {
+    static PLAN: std::sync::OnceLock<Vec<(String, Option<window_restore::RememberedFrame>)>> =
+        std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        // Dev restores nothing: it shares the packaged app-data dir and
+        // `desktop::launch` is a no-op there, so the record is not its to read.
+        if tauri::is_dev() {
+            return Vec::new();
+        }
+        let Ok(app_data) = desktop::app_data_dir_from_env() else {
+            return Vec::new();
+        };
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let restore = crate::should_show_window_at_startup(&args, false);
+        window_session::restore_plan(&window_session::read(&app_data), restore)
+    })
+}
+
+/// The window session this process may act on, or an empty one when there is
+/// none to read.
+///
+/// Dev is empty by construction. It shares the packaged app-data dir, so acting
+/// on the record would let a dev run rearrange the packaged client's windows.
+/// The same rule [`persist_window_session`] follows on the write side.
+pub(crate) fn readable_window_session() -> window_session::WindowSession {
+    if tauri::is_dev() {
+        return window_session::WindowSession::default();
+    }
+    desktop::app_data_dir_from_env()
+        .map(|app_data| window_session::read(&app_data))
+        .unwrap_or_default()
+}
+
+/// The frame the workspace `url` serves was last left at, for a window about to
+/// be built for it. `None` asks for the declared default.
+///
+/// Reads the record fresh rather than the memoized launch plan. The two answer
+/// different questions: that one is what THIS launch owed, and this is where a
+/// workspace was left, which the user has been rearranging ever since.
+///
+/// A file read per call is right here. Every caller is a click or a banner tap,
+/// and a stale answer would place the window wrong.
+pub(crate) fn remembered_frame(url: &str) -> Option<window_restore::RememberedFrame> {
+    window_session::frame_for_url(&readable_window_session(), url)
+}
+
+/// Put `main` at the frame the workspace it will open remembers.
+///
+/// Before the show, so the window appears at its size rather than jumping to it
+/// a second later. The frame arrives already judged: `app_window`'s
+/// `settle_main_geometry` is the only caller, and it runs a chosen rect through
+/// `window_restore::sanitized_frame` first. No clamp follows this, because a
+/// clamp issued behind a deferred placement reads the rect it is replacing
+/// (ADR 0202).
+///
+/// This is the one placement that can meet an ALREADY arranged window. It runs
+/// from the startup show, and from a reopen. So it is the one that has to skip
+/// a fullscreen window, for the reason `window_restore::clamp_restored_geometry`
+/// gives: macOS owns that frame, and sizing it fights the AppKit transition. A
+/// window built for a frame cannot be fullscreen yet, so no other caller needs
+/// the test.
+///
+/// By window, not webview window, per ADR 0140. Sizing and placing are window
+/// operations, and by the time a reopen runs `main` is the likeliest window of
+/// all to be hosting a URL preview.
+pub(crate) fn size_main_window_for_its_workspace(
+    app: &tauri::AppHandle,
+    frame: window_restore::Rect,
+) {
+    let Some(window) = app.get_window(crate::app_window::MAIN_WINDOW_LABEL) else {
+        return;
+    };
+    if window.is_fullscreen().unwrap_or(false) {
+        return;
+    }
+    crate::app_window::place_window(&window, frame, "the main window for its workspace");
+}
+
+/// Set once the client has begun a deliberate teardown: a quit, a restart, or
+/// the relaunch an update ends with.
+///
+/// Every one of those destroys its windows on the way out, one at a time. The
+/// `Destroyed` recapture would read that as the user closing them, and empty
+/// the record milliseconds after the teardown wrote it. The last record written
+/// BEFORE the teardown is the one that must stand.
+static TEARING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Declare that the windows are about to go away because the client is. Called
+/// by each deliberate exit path, right after its own [`persist_windows`].
+pub(crate) fn begin_teardown() {
+    TEARING_DOWN.store(true, Ordering::SeqCst);
+}
+
+/// Is the client on its way out? A close arriving now is the teardown's, not
+/// the user's.
+pub(crate) fn tearing_down() -> bool {
+    TEARING_DOWN.load(Ordering::SeqCst)
+}
+
+/// Whether this launch has ever put a window on screen, and the gate that rides
+/// on it.
+///
+/// The half of the session-write gate that rules out a LOGIN START. That launch
+/// comes up menu-bar-only and shows nothing, while `desktop::launch` still
+/// navigates the hidden `main` to the gateway root. The navigation half of the
+/// gate therefore passes, and the write replaced the user's arrangement with
+/// the empty one nobody was looking at.
+///
+/// A latch rather than a live visibility test. A hidden window IS part of the
+/// arrangement, since `main` is hidden rather than closed and the tray brings
+/// it back on its workspace. Testing visibility instead blocked the one write
+/// whose job is to SHRINK the record. What must not count is a launch where the
+/// user never saw anything at all.
+///
+/// A struct rather than a bare static, for the reason `StartupShow` is one:
+/// the rule is then testable against an instance a test owns.
+struct PresentedGate(AtomicBool);
+
+impl PresentedGate {
+    const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// A window is now on screen. Every path that puts one there says so.
+    fn note_presented(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Is the session record worth writing? BOTH halves, so the one expression
+    /// carries the whole rule.
+    fn may_write(&self, any_window_is_navigated: bool) -> bool {
+        self.0.load(Ordering::SeqCst) && any_window_is_navigated
+    }
+}
+
+static PRESENTED: PresentedGate = PresentedGate::new();
+
+/// A window just reached the screen. Every path that shows one says so, which
+/// is what opens the session-write gate. See [`PresentedGate`].
+pub(crate) fn note_presented() {
+    PRESENTED.note_presented();
+}
+
+/// Re-record the window set after one closed, so the record stops naming it.
+///
+/// Stood down by a teardown, since a window destroyed on the way out was not
+/// closed by the user. See [`TEARING_DOWN`].
+pub(crate) fn forget_closed_window(app: &tauri::AppHandle) {
+    if tearing_down() {
+        return;
+    }
+    persist_window_session(app);
+}
+
+/// Fold the live windows into the session record and write it.
+///
+/// Reading each window's geometry is a main-thread call, same as the plugin's
+/// save, so this is only ever reached through [`persist_windows`].
+pub(crate) fn persist_window_session(app: &tauri::AppHandle) {
+    // Dev shares the packaged install's app-data dir, and `desktop::launch`
+    // restores nothing there. Writing would only let a dev run rearrange the
+    // packaged client's windows.
+    if tauri::is_dev() {
+        return;
+    }
+    let Ok(app_data) = desktop::app_data_dir_from_env() else {
+        // No `HOME`, so nowhere to keep a record.
+        return;
+    };
+    // Enumerates WEBVIEWS and reaches each window through `webview.window()`,
+    // per ADR 0140. A snapshot needs the URL, a page read, and the geometry, a
+    // window read. The blind flavour dropped whichever window was hosting a URL
+    // preview, and the next launch forgot its workspace and frame (ADR 0123).
+    let windows: Vec<window_session::WindowSnapshot> = app
+        .webviews()
+        .into_iter()
+        .filter(|(label, _)| crate::app_window::is_app_window(label))
+        .filter_map(|(label, webview)| {
+            let window = webview.window();
+            // Through `window_restore::live_frame`, the one reader of a live
+            // window's geometry, so the capture and the clamp cannot come to
+            // different numbers for one window. Unreadable drops the window
+            // from the capture rather than recording a guess: a frame taken at
+            // the wrong scale is what puts one off screen at twice its size on
+            // the next restore (ADR 0173).
+            let (Ok(url), Some(frame)) = (webview.url(), window_restore::live_frame(&window))
+            else {
+                return None;
+            };
+            Some(window_session::WindowSnapshot {
+                // Asked of the frame the window is wearing RIGHT NOW, which is
+                // what makes the answer expire on the user's first drag. See
+                // `window_restore::is_wearing_a_rescue`.
+                rescued: window_restore::is_wearing_a_rescue(&label, frame),
+                whereabouts: window_restore::whereabouts_now(app, &label, frame),
+                label,
+                url: url.to_string(),
+                frame,
+            })
+        })
+        .collect();
+    // A launch that never showed a window has no arrangement to record, and
+    // neither has one whose windows are all still on the splash. Each emptied
+    // the record through a different writer before this gate existed.
+    if !PRESENTED.may_write(window_session::any_window_is_navigated(&windows)) {
+        return;
+    }
+    let previous = window_session::read(&app_data);
+    window_session::write(&app_data, &window_session::capture(&previous, &windows));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // A login start comes up menu-bar-only, and `desktop::launch` navigates the
+    // hidden `main` to the gateway root anyway. The navigation half therefore
+    // passes on its own, and writing then replaced the whole record with an
+    // empty one nobody was looking at.
+    #[test]
+    fn a_launch_that_never_showed_a_window_writes_nothing() {
+        let gate = PresentedGate::new();
+        assert!(!gate.may_write(true), "navigated is not enough on its own");
+        assert!(!gate.may_write(false));
+    }
+
+    // Boot: the startup geometry write arms the debounced flush while every
+    // window still sits on the splash.
+    #[test]
+    fn a_launch_still_on_the_splash_writes_nothing() {
+        let gate = PresentedGate::new();
+        gate.note_presented();
+        assert!(
+            !gate.may_write(false),
+            "a shown window is not enough either"
+        );
+    }
+
+    #[test]
+    fn a_shown_and_navigated_launch_writes() {
+        let gate = PresentedGate::new();
+        gate.note_presented();
+        assert!(gate.may_write(true));
+    }
+
+    // A latch, not a live visibility test. `main` is hidden rather than closed,
+    // so a trayed client must still be able to record a window closing.
+    #[test]
+    fn the_gate_stays_open_once_a_window_has_been_shown() {
+        let gate = PresentedGate::new();
+        gate.note_presented();
+        gate.note_presented();
+        assert!(gate.may_write(true));
+    }
+
+    /// The sequence a cold boot takes, and the launch this used to lose.
+    ///
+    /// The startup placement arms the flush. The flush fires while every window
+    /// is still on the boot splash, so `persist_window_session` refuses. The
+    /// claim is unconditional, so the refusal ended it: nothing re-armed, and
+    /// the record kept whatever it held before.
+    ///
+    /// The engine is cold after an update, so the first navigation is the
+    /// slowest it ever is, and that is the launch where this bites. Arming on
+    /// the navigation is what closes it.
+    #[test]
+    fn a_write_refused_on_the_splash_is_armed_again_by_the_navigation() {
+        let saver = WindowSaver::default();
+        saver.note_changed();
+        assert!(saver.owes_a_write(), "the startup placement owes a write");
+
+        saver.take_write();
+        assert!(!saver.owes_a_write(), "the flush is a one-shot");
+
+        // The session write was refused behind it: every window is on the
+        // splash, so the gate is shut.
+        assert!(!window_session::any_window_is_navigated(&[]));
+
+        saver.note_changed();
+        assert!(
+            saver.owes_a_write(),
+            "the navigation owes the record a write the flush already spent"
+        );
+    }
+
+    #[test]
+    fn should_persist_windows_waits_for_quiet_then_fires() {
+        // Nothing owed, so never flush, however long it has been.
+        assert!(!should_persist_windows(false, Duration::from_secs(10)));
+        // Owed, but the user is still moving or resizing, so wait.
+        assert!(!should_persist_windows(true, Duration::from_millis(0)));
+        assert!(!should_persist_windows(
+            true,
+            WINDOW_SAVE_DEBOUNCE - Duration::from_millis(1)
+        ));
+        // Owed and quiet for at least the debounce window, so flush.
+        assert!(should_persist_windows(true, WINDOW_SAVE_DEBOUNCE));
+        assert!(should_persist_windows(
+            true,
+            WINDOW_SAVE_DEBOUNCE + Duration::from_millis(1)
+        ));
+    }
+
+    // The plugin keys on the label, and only `main`'s means one window across
+    // launches. Tracking a `window-<n>` restored a past session's second window
+    // onto whatever this session's second window turned out to be, fullscreen
+    // flag included.
+    #[test]
+    fn the_plugin_tracks_main_and_nothing_else() {
+        assert!(plugin_tracks(crate::app_window::MAIN_WINDOW_LABEL));
+        for label in ["window-0", "window-7", "url-preview-1", "lucidos-tray", ""] {
+            assert!(!plugin_tracks(label), "{label:?} is tracked");
+        }
+    }
+
+    #[test]
+    fn window_state_flags_remembers_geometry_not_visibility() {
+        let flags = window_state_flags();
+        // Remember where the window is, how big, and on which screen.
+        assert!(flags.contains(StateFlags::SIZE));
+        assert!(flags.contains(StateFlags::POSITION));
+        assert!(flags.contains(StateFlags::MAXIMIZED));
+        assert!(flags.contains(StateFlags::FULLSCREEN));
+        // But NOT VISIBLE (a flush taken while hidden would restore hidden) and
+        // NOT DECORATIONS (toggling it on macOS drops the Overlay title bar).
+        assert!(!flags.contains(StateFlags::VISIBLE));
+        assert!(!flags.contains(StateFlags::DECORATIONS));
+    }
+}

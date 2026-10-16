@@ -1,0 +1,579 @@
+/**
+ * Workspace gateway control plane client (ADR 0014).
+ *
+ * The gateway serves these under the reserved sigil namespace
+ * `/~/api/v1/control/*` (ADR 0014 §2) — an absolute path that can never collide
+ * with a workspace slug. This client uses that absolute path deliberately
+ * (bypassing `API_BASE`) so the same calls work from the picker (served at `/`
+ * with base `/~/`) AND from the in-app switcher inside a workspace (`/<slug>/`):
+ * the browser hits `/~/…`, which the gateway owns. In legacy (non-gateway) mode
+ * these routes don't exist, so callers treat a failure as "no gateway".
+ */
+
+import { deviceIdHeader } from '../../utils/deviceIdHeader';
+import { replaceDocument } from '../../utils/documentNavigation';
+import { landingHash, type WorkspaceLanding } from '../../utils/workspaceLanding';
+import { gatewayErrorReason } from './gatewayError';
+import type { AppUpdateProgress } from '../../utils/tauri';
+
+const CONTROL = '/~/api/v1/control';
+
+export type WorkspaceHealth = 'booting' | 'healthy' | 'unhealthy';
+
+export interface WorkspaceStatus {
+  id: string;
+  name: string;
+  port: number;
+  health: WorkspaceHealth;
+  /** Whether the gateway auto-starts this workspace's engine on boot. The picker
+   *  renders a per-workspace toggle bound to it (ADR 0014). */
+  autostart: boolean;
+  last_error?: string;
+  /** Unread-notification count for this workspace's per-row badge. Present only
+   *  for a RUNNING (healthy, polled) engine — the gateway has no DB handle, so a
+   *  stopped workspace reports no count. Omitted (not 0) when unknown. */
+  unread_count?: number;
+  /** What this workspace's engine says about its backups, for the picker's
+   *  per-row backup line. Present only for a RUNNING engine, on exactly the
+   *  terms `unread_count` is: the gateway holds no DB handle, so with nothing to
+   *  ask it reports nothing rather than calling a workspace un-backed-up.
+   *
+   *  Absent ALSO means an engine too old to answer, which reads the same way.
+   *  A present object with a null `at` is the opposite: a real answer saying
+   *  this workspace has never backed up. */
+  last_successful_backup?: LastSuccessfulBackup;
+}
+
+/** One workspace's backup line. Mirrors the gateway's `LastSuccessfulBackup`,
+ *  which forwards the engine's `/backup/last-successful` answer verbatim. */
+export interface LastSuccessfulBackup {
+  /** When the newest successful backup run finished (RFC 3339), or null when
+   *  there has never been one. */
+  at: string | null;
+  /** The ENGINE's verdict that `at` is too old, or absent. Read rather than
+   *  re-derived: the threshold lives once, in `core::backup`. */
+  stale: boolean;
+  /** Whether backups are set up here at all (a destination and an active
+   *  schedule). It separates a schedule that has never produced an archive from
+   *  a workspace nobody set backups up for. */
+  configured: boolean;
+}
+
+async function controlJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${CONTROL}${path}`, init);
+  if (!res.ok) throw new Error(await gatewayErrorReason(res));
+  // 204 (rename / autostart / delete) and 202 (restart / stop — "accepted,
+  // async") are bodyless; calling res.json() on an empty body throws a
+  // SyntaxError, which would surface a spurious error and skip the refresh.
+  return res.status === 204 || res.status === 202 ? (undefined as T) : res.json();
+}
+
+export async function listWorkspaces(): Promise<WorkspaceStatus[]> {
+  const body = await controlJson<{ workspaces: WorkspaceStatus[] }>('/workspaces');
+  return body.workspaces ?? [];
+}
+
+export async function createWorkspace(name: string): Promise<WorkspaceStatus> {
+  const body = await controlJson<{ workspace: WorkspaceStatus }>('/workspaces', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  return body.workspace;
+}
+
+export async function renameWorkspace(id: string, name: string): Promise<void> {
+  await controlJson<void>(`/workspaces/${encodeURIComponent(id)}/rename`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+}
+
+/** Start a stopped workspace, retry an unhealthy one, or respawn a running one
+ *  (all route to the gateway's restart control).
+ *
+ *  Sends the device-id header, and that is load-bearing rather than bookkeeping:
+ *  the gateway forwards it to the engine it is about to signal, which is the
+ *  only way that engine can tell a person's Restart from a crash. Without it the
+ *  interrupted threads settle at `failed` with "Response interrupted" and no
+ *  auto-resume, instead of `paused` with "Paused by restart" like the
+ *  in-workspace Switch. A browser with no id yet (the picker opened before any
+ *  workspace ever was) simply sends no header and gets the old behaviour. */
+export async function restartWorkspace(id: string): Promise<void> {
+  await controlJson<void>(`/workspaces/${encodeURIComponent(id)}/restart`, {
+    method: 'POST',
+    headers: deviceIdHeader(),
+  });
+}
+
+/** Stop a workspace's engine. It stays listed in the picker as stopped (the
+ *  registry entry survives, since membership is "all ever launched").
+ *
+ *  Carries the device id for the same reason {@link restartWorkspace} does: a
+ *  Stop somebody clicked is a deliberate pause of the work, and its threads
+ *  resume when the workspace next boots. */
+export async function stopWorkspace(id: string): Promise<void> {
+  await controlJson<void>(`/workspaces/${encodeURIComponent(id)}/stop`, {
+    method: 'POST',
+    headers: deviceIdHeader(),
+  });
+}
+
+/** Toggle whether the gateway auto-starts this workspace on boot (registry-only;
+ *  does not start or stop the engine). */
+export async function setAutostart(id: string, enabled: boolean): Promise<void> {
+  await controlJson<void>(`/workspaces/${encodeURIComponent(id)}/autostart`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+/** Delete-to-trash. `confirm` must equal the workspace's current display name
+ *  (the server re-checks the type-the-name confirmation). */
+export async function deleteWorkspace(id: string, confirm: string): Promise<void> {
+  await controlJson<void>(`/workspaces/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirm }),
+  });
+}
+
+/** Navigate the browser to a workspace (`/<slug>/`, ADR 0014), optionally
+ *  landing on a view inside it.
+ *
+ *  REPLACES the current history entry rather than pushing one, so the workspace
+ *  you leave does not stay on the back stack. See `utils/documentNavigation.ts`
+ *  for why a flat history is what keeps a stray back gesture harmless.
+ *
+ *  `landing` becomes the URL's fragment, which the target page reads in
+ *  `store/actions/hash-deeplink-router.ts`. It carries no id, so the target
+ *  needs nothing fetched before it can honour it. `utils/workspaceLanding.ts`
+ *  owns the fragment, and taking the landing by NAME is what keeps this
+ *  exhaustive: a second channel cannot be silently dropped here.
+ *
+ *  A SAME-WINDOW navigation whatever the landing. A named `window.open` target
+ *  is what `openThreadInWorkspace` uses, and it is wrong here: an installed PWA
+ *  has origin-wide scope, so `/<slug>/` stays inside the app while a new window
+ *  drops the user into the browser. */
+export function openWorkspace(id: string, landing?: WorkspaceLanding): void {
+  replaceDocument(`/${encodeURIComponent(id)}/${landingHash(landing)}`);
+}
+
+// ── Gateway self-update (picker reload control) ────────────────────────────
+
+/** The running gateway's build id plus whether a rebuilt binary is waiting on
+ *  disk. Mirrors the Rust `gateway_status` handler. */
+export interface GatewayStatus {
+  build_id: string;
+  update_available: boolean;
+  /** True under the packaged desktop runtime. The picker hides the dev-only
+   *  gateway self-reload control when set (packaged updates go through the app
+   *  updater + a full service restart, not a gateway re-exec). Absent on an older
+   *  gateway → treated as dev (control shown). */
+  packaged?: boolean;
+  /** The machine's release check (ADR 0108). Absent on an older gateway, which
+   *  the frontend reads as "no offer" rather than as "up to date". */
+  release_check?: ReleaseCheck;
+  /** The update relay to the desktop client (ADR 0338). Absent on an older
+   *  gateway, which the frontend reads as "no client to relay to". */
+  update_relay?: UpdateRelay;
+}
+
+/** The update relay's state. Mirrors `update_relay::UpdateRelay::snapshot`. */
+export interface UpdateRelay {
+  /** The desktop client, or `null` when none has sent a heartbeat lately. */
+  client: DesktopClient | null;
+  /** The newest request, or `null` when there is none, or it expired or died. */
+  request: UpdateRelayRequest | null;
+}
+
+export interface DesktopClient {
+  version: string;
+  /** Why an unattended install could not run there, or `null` when it could. */
+  blocker: string | null;
+}
+
+export interface UpdateRelayRequest {
+  id: string;
+  version: string;
+  /** `requested` waits for the client to claim it. `ended` is over without a
+   *  restart, and its `progress` says how. */
+  state: 'requested' | 'running' | 'ended';
+  /** The client's latest progress frame, exactly as its own dialog reads it. */
+  progress: AppUpdateProgress | null;
+}
+
+/** A request the relay accepted. */
+export interface UpdateRelayTicket {
+  id: string;
+  version: string;
+}
+
+/** Ask the desktop client to install the newest published release (ADR 0338).
+ *  Rejects with the gateway's reason when it cannot: no client, a blocker, no
+ *  newer release, or a run already under way. */
+export async function requestUpdateRelay(): Promise<UpdateRelayTicket> {
+  return controlJson<UpdateRelayTicket>('/update-relay', { method: 'POST' });
+}
+
+/** How this install takes an update, from the gateway's read of its own
+ *  executable path. `desktop-app` installs in the client; `installer-rerun`
+ *  means re-running `install.sh`, and carries the command to copy. */
+export type InstallShape = 'desktop-app' | 'installer-rerun';
+
+/** A published release newer than the one running. */
+export interface ReleaseOffer {
+  version: string;
+  /** Raw markdown for the offered release, when the origin carries it. Optional
+   *  in the contract: absent means the offer shows no "What's new" link, and
+   *  the release still appears in the panel once the changelog is fetched. */
+  notes: string | null;
+  install: InstallShape | null;
+  /** The `install.sh` re-run for this instance, or `null` when the client
+   *  installs instead. Composed by the gateway from the live slug and prefix. */
+  command: string | null;
+}
+
+/** The gateway's release check. Mirrors `release_check::ReleaseCheck::snapshot`. */
+export interface ReleaseCheck {
+  /** The machine-global preference, on by default. False stops the automatic
+   *  check; the Settings button still asks by hand. */
+  enabled: boolean;
+  /** Whether this deployment may poll at all: installed, on a published target.
+   *  False for a dev gateway, which must never appear in the numbers. */
+  supported: boolean;
+  current_version: string;
+  /** When an answer last arrived, or `null` when none has. */
+  checked_at: string | null;
+  /** Why the last poll failed, cleared by the next success. Without it the
+   *  caller reads the unchanged snapshot as "you are up to date". */
+  last_error: string | null;
+  latest: ReleaseOffer | null;
+}
+
+/** Build id of the running gateway + whether a newer binary is on disk (the dev
+ *  picker's "new gateway available" badge), plus the release check's last known
+ *  answer. Never waits on the origin: the picker polls this every 2s. */
+export async function getGatewayStatus(): Promise<GatewayStatus> {
+  return controlJson<GatewayStatus>('/gateway/status');
+}
+
+/** What the banner may recommend about a group. Only an `app` can be quit by
+ *  name; a `process` may be a system service. Mirrors the gateway's
+ *  `UserKind`. */
+export type UserKind = 'lucidos' | 'app' | 'process';
+
+/** One group's share of this machine's memory. Mirrors the gateway's
+ *  `MemoryUser`. */
+export interface MemoryUser {
+  name: string;
+  bytes: number;
+  kind: UserKind;
+}
+
+/** One group's share of this machine's processor. `percent` is of the whole
+ *  computer, every core together. Mirrors the gateway's `ProcessorUser`. */
+export interface ProcessorUser {
+  name: string;
+  percent: number;
+  kind: UserKind;
+}
+
+/** What is wrong with a database an engine reported down. Mirrors the
+ *  gateway's `DatabaseProblem`. */
+export type DatabaseProblem = 'not_answering' | 'pool_exhausted';
+
+/** Why an open episode says Lucidos is slow. Mirrors the gateway's
+ *  `SlownessReason`: disk and memory show in every workspace, database and
+ *  unclear only in the windows of `slow_workspaces`. */
+export type SlownessReason =
+  | { reason: 'disk'; free_bytes: number }
+  | { reason: 'database'; problem: DatabaseProblem; slow_workspaces: string[] }
+  | { reason: 'memory'; top_users: MemoryUser[] }
+  | { reason: 'unclear'; busiest_apps: ProcessorUser[]; slow_workspaces: string[] };
+
+/** Is Lucidos slow, and why (ADRs 0274, 0283, 0301)? Mirrors the gateway's
+ *  `SlownessStatus`. */
+export type SlownessStatus =
+  | { state: 'normal' }
+  | ({ state: 'slow'; episode_id: string } & SlownessReason);
+
+/** The gateway's cached slowness answer. It never samples on request. */
+export async function getSlownessStatus(): Promise<SlownessStatus> {
+  return controlJson<SlownessStatus>('/slowness');
+}
+
+/** Ask the gateway to poll lucidos.dev if its answer is stale, and return the
+ *  result. Concurrent callers coalesce inside the gateway, so N open windows
+ *  still make one outbound request.
+ *
+ *  `force` is the Settings button, which asks for a poll now. It is still
+ *  floored at one a minute on the gateway side. */
+export async function requestUpdateCheck(force = false): Promise<ReleaseCheck> {
+  return controlJson<ReleaseCheck>('/gateway/check-updates', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force }),
+  });
+}
+
+/** Write the machine-global release-check preference and return the result.
+ *  The field is optional: a body that names nothing settles on the stored
+ *  value. Takes effect on the next tick, with no restart. */
+export async function setReleaseCheckConfig(body: {
+  enabled?: boolean;
+}): Promise<ReleaseCheck> {
+  return controlJson<ReleaseCheck>('/release-check', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+/** Adopt the rebuilt gateway binary: the gateway re-execs itself (same PID). The
+ *  call resolves on the 202; the gateway then briefly drops while the new image
+ *  binds and the picker's poll reconnects. */
+export async function reloadGateway(): Promise<void> {
+  await controlJson<void>('/gateway/reload', { method: 'POST' });
+}
+
+// ── Coexisting installs ─────────────────────────────────────────────────────
+
+/** Which vehicle laid an install down. Mirrors `lucidos_installs::InstallKind`,
+ *  whose serde rename is kebab-case. */
+export type InstallKind = 'desktop-app' | 'headless-installer' | 'source-checkout';
+
+/** A registered job that can start an install with nobody clicking anything. */
+export interface InstallLaunchAgent {
+  label: string;
+  path: string;
+  manager: 'launchd' | 'systemd';
+}
+
+/** One Lucidos install the gateway found on this machine.
+ *
+ *  `null` means the filesystem said nothing, never a default. An unreadable
+ *  version renders as "unknown", because the whole value of this surface is
+ *  that the user can trust every number on it. */
+export interface InstallRecord {
+  kind: InstallKind;
+  name: string;
+  root: string | null;
+  version: string | null;
+  data_dir: string | null;
+  port: number | null;
+  agents: InstallLaunchAgent[];
+  /** The gateway answering this request belongs to this install. */
+  running_here: boolean;
+  /** Exactly what removes it, ready to copy. */
+  removal: string;
+}
+
+/** Two or more installs configured for one port. Only one can bind it. */
+export interface InstallPortConflict {
+  port: number;
+  /** The contending installs, by `InstallRecord.name`. */
+  installs: string[];
+}
+
+export interface InstallInventory {
+  installs: InstallRecord[];
+  conflicts: InstallPortConflict[];
+}
+
+/** Every Lucidos install on the machine this workspace runs on.
+ *
+ *  Its own route rather than a field on `gateway/status`, which the picker
+ *  polls every two seconds: the scan walks directories and reads a plist.
+ *
+ *  A gateway too old to carry the route throws, which System > Overview shows
+ *  as a failed load rather than as an empty machine. That distinction matters
+ *  here most of all: an ancient gateway is the condition this explains. */
+export async function fetchInstallInventory(): Promise<InstallInventory> {
+  return controlJson<InstallInventory>('/installs');
+}
+
+// ── Where a workspace this gateway does not serve lives ─────────────────────
+
+/** The gateway's answer about a workspace on another install on this machine.
+ *
+ *  Mirrors the gateway's `WorkspaceLocation`, whose serde tag is `status` and
+ *  whose variants are kebab-case. Only the reachable arm carries a `scheme`:
+ *  it is what the peer answered, and the two shipped gateways disagree (the
+ *  packaged one serves http, a dev checkout serves https). */
+export type WorkspaceLocation =
+  | {
+      status: 'reachable';
+      install: string;
+      gateway_port: number;
+      scheme: string;
+      slug: string;
+    }
+  | { status: 'install-not-running'; install: string; gateway_port: number; slug: string }
+  | { status: 'ambiguous'; installs: string[] };
+
+/** Locate a workspace this gateway does not serve, by name.
+ *
+ *  `null` means nothing here can say where it is, so the caller reports the
+ *  workspace unavailable exactly as it did before this route existed. Two
+ *  different things arrive as null, and both have to (ADR 0105):
+ *
+ *   • A 404, the gateway saying no other install on this machine carries it.
+ *   • A **picker shell**, from a gateway too old to know the route. An
+ *     unmatched `/~/…` path falls through to the SPA fallback, so the answer is
+ *     200 and HTML rather than a 404. Parsing it would report a syntax error
+ *     over a workspace that is merely somewhere this gateway cannot see. That
+ *     pairing is the ordinary case here: the install this feature reaches for
+ *     is the one running an old gateway. */
+export async function locateWorkspace(name: string): Promise<WorkspaceLocation | null> {
+  const res = await fetch(`${CONTROL}/workspace-location?name=${encodeURIComponent(name)}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(await gatewayErrorReason(res));
+  const body = (await res.json().catch(() => null)) as WorkspaceLocation | null;
+  return body && typeof body.status === 'string' ? body : null;
+}
+
+// ── Network access (machine-global gateway bind) ────────────────────────────
+
+/** The machine-global network bind config from `~/.lucidos/network.toml`.
+ *  Mirrors the gateway `network_config` handler. `gateway_bind` is `loopback` |
+ *  `all` | an IP; `inherit` controls whether engines follow the gateway bind. */
+export interface GatewayNetworkConfig {
+  gateway_bind: string;
+  inherit: boolean;
+  detected_tailscale_ip: string | null;
+}
+
+export async function getGatewayNetworkConfig(): Promise<GatewayNetworkConfig> {
+  return controlJson<GatewayNetworkConfig>('/network-config');
+}
+
+/** Write the machine-global gateway bind + engine-inherit toggle. Takes effect
+ *  after a gateway / engine restart. */
+export async function setGatewayNetworkConfig(body: {
+  gateway_bind: string;
+  inherit: boolean;
+}): Promise<void> {
+  await controlJson<void>('/network-config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+// ── Restore from backup (picker) ───────────────────────────────────────────
+
+/** State of the gateway's restore-from-backup flow. Mirrors the Rust
+ *  `RestoreStatus` enum; the picker polls `getRestoreStatus()` for it. */
+export type GwRestoreStatus =
+  | { status: 'idle' }
+  | { status: 'running'; id: string; name: string; phase: string }
+  | { status: 'completed'; id: string; name: string }
+  | { status: 'failed'; name: string; error: string };
+
+export interface RestoreStarted {
+  id: string;
+  name: string;
+}
+
+/** Restore a local encrypted `.enc` backup into a NEW workspace. `name` is sent
+ *  only to resolve a collision (otherwise the gateway derives it from the
+ *  archive filename). Resolves once the background restore has STARTED (the
+ *  returned `{id, name}`); poll {@link getRestoreStatus} for progress. A 409 is
+ *  surfaced as an Error whose message is the collision / in-progress reason. */
+export async function restoreBackup(file: File, key: string, name?: string): Promise<RestoreStarted> {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('key', key);
+  if (name && name.trim()) form.append('name', name.trim());
+  // No explicit Content-Type — the browser sets the multipart boundary. Streams
+  // the (possibly large) file rather than buffering a JSON-encoded copy.
+  return controlJson<RestoreStarted>('/workspaces/restore', { method: 'POST', body: form });
+}
+
+/** Current restore-flow state, for the picker's poll. */
+export async function getRestoreStatus(): Promise<GwRestoreStatus> {
+  return controlJson<GwRestoreStatus>('/restore-status');
+}
+
+/** Dismiss a terminal (completed/failed) restore result. Refused while running. */
+export async function clearRestoreStatus(): Promise<void> {
+  await controlJson<void>('/restore-status', { method: 'DELETE' });
+}
+
+// ── Paired devices (ADR 0094) ─────────────────────────────────────────────
+//
+// Under `/~/api/v1/auth/`, a sibling of the control plane rather than part of
+// it, so these do not go through `controlJson`. Same reasoning for the absolute
+// path: the gateway owns `/~/`, and the calls work from the picker and from
+// inside a workspace alike. In legacy no-gateway mode they do not exist, and a
+// caller reads the failure as "no gateway, so nothing is paired".
+
+const AUTH = '/~/api/v1/auth';
+
+/** One device that has paired with this machine's gateway.
+ *
+ *  `last_seen_at` is absent for a device paired before the gateway recorded it,
+ *  and fills in on that device's next request. It moves at most once a day, so
+ *  it says which rows are live without being an access log. */
+export interface PairedDevice {
+  id: string;
+  label: string;
+  paired_at: string;
+  last_seen_at?: string;
+}
+
+/** A gateway call that failed, carrying the status so a caller can tell a
+ *  MISSING gateway from a broken one.
+ *
+ *  A page served off a direct engine port resolves `/~/` against the engine and
+ *  gets a 404, which is not an error to report: there is no pairing surface on
+ *  that deployment. Any other status is a real failure and must look like one.
+ *  `status` is 0 when the request never got an answer at all. */
+export class GatewayError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = 'GatewayError';
+  }
+
+  /** Is this "no gateway serves this page", rather than "the gateway broke"? */
+  get isAbsent(): boolean {
+    return this.status === 404;
+  }
+}
+
+async function authJson<T>(path: string, init?: RequestInit): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${AUTH}${path}`, init);
+  } catch (e) {
+    throw new GatewayError(e instanceof Error ? e.message : 'could not reach the gateway', 0);
+  }
+  // Same `{"error": …}` body every gateway handler answers with, read through
+  // the one helper `controlJson` uses. Only the status has to be kept here.
+  if (!res.ok) throw new GatewayError(await gatewayErrorReason(res), res.status);
+  return res.status === 204 ? (undefined as T) : res.json();
+}
+
+export function listPairedDevices(): Promise<PairedDevice[]> {
+  return authJson<PairedDevice[]>('/devices');
+}
+
+/** Forget a paired device, so its credential resolves to nobody.
+ *
+ *  Revoking the device you are ON is allowed and is sometimes the point (a
+ *  phone you no longer hold). The gateway clears the cookie in the same
+ *  response, so this browser lands back on the pairing screen. */
+export async function revokePairedDevice(id: string): Promise<void> {
+  await authJson<void>(`/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+/** Derive the workspace name a backup archive was produced for, from its
+ *  filename (`lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.enc`). Returns null for a
+ *  non-archive name. Mirrors `core::backup::parse_workspace_name_from_archive`. */
+export function parseWorkspaceNameFromArchive(filename: string): string | null {
+  const m = filename.match(/^lucidos-backup-(.+)-\d{8}-\d{6}\.enc$/);
+  return m ? m[1] : null;
+}

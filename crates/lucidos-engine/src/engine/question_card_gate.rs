@@ -1,0 +1,792 @@
+//! Refuses a question card when the agent owes the user an answer first.
+//!
+//! The user reads only the agent's text and its cards, never a tool result or
+//! the agent's reasoning. So a card may not be the first thing they get after
+//! tool work nobody reported. Nor may it point "above" at words the user never
+//! read. A typed answer counts as a message: it may answer the card, ask back
+//! or say something else. One rule for the chat agent,
+//! Claude Code and Codex, read from the thread's events so every agent sees
+//! the same facts.
+//!
+//! Nor may it follow an artifact the agent saved and the user cannot see: a
+//! picture nobody drew, or a page nobody linked.
+//!
+//! A card question longer than any note reports the tool work before it: the
+//! user reads it in full. So does the chat card's `message`, which the user
+//! reads as the agent's reply.
+//!
+//! Nor may a card follow a *progress note* without a `message`. The user read
+//! only the provider's summary of what the agent wrote, and the agent believes
+//! they read all of it. The stream marks a note, so this rule guesses nothing.
+//!
+//! A model-tolerance measure: `docs/temporary-measures.md` § "A question card
+//! with no answer before it". Plans:
+//! `docs/plans/2026-09-23-a-card-never-replaces-the-answer.md`,
+//! `docs/plans/2026-09-24-a-card-that-points-above-at-nothing.md` and
+//! `docs/plans/2026-09-25-a-card-after-a-picture-nobody-saw.md`. The registry
+//! entry records the widening to every artifact.
+
+use sqlx::PgPool;
+use uuid::Uuid;
+
+/// Starts every refusal, and is how the query knows one was already sent.
+const REFUSAL_MARKER: &str = "Question card not shown.";
+
+/// Follows the marker in an artifact refusal, so the query can tell it apart.
+const ARTIFACT_REFUSAL_LEAD: &str = "Since the user's last input you saved";
+
+/// How far into a result the marker may sit. Codex wraps an MCP result in
+/// JSON, which puts it about 40 chars in. Coding-agent results are stored
+/// whole, so without a bound a grep quoting the marker would read as a refusal.
+const REFUSAL_WINDOW_CHARS: i32 = 200;
+
+/// Where a refusal sends content the user must read in full. Only the chat
+/// tool has the field, so every agent reads the condition.
+macro_rules! card_message_hint {
+    () => {
+        "in the card's `message` field if your tool has one"
+    };
+}
+#[cfg(test)]
+const CARD_MESSAGE_HINT: &str = card_message_hint!();
+
+/// How much of what the user read a refusal quotes.
+const QUOTED_READ_CHARS: usize = 600;
+
+/// What every refusal says the user read since their last input: the words
+/// themselves, or that they read nothing. The agent's own context holds more
+/// than that, since the API hands it back its hidden reasoning.
+fn what_they_read(words: &str) -> String {
+    match words.trim() {
+        "" => "they have read nothing from you".to_string(),
+        words => match words.char_indices().nth(QUOTED_READ_CHARS) {
+            Some((cut, _)) => format!(
+                "what they have read from you is longer than fits here. It begins: \"{}...\"",
+                &words[..cut]
+            ),
+            None => format!("all they have read from you is this: \"{words}\""),
+        },
+    }
+}
+
+/// How a refusal ends. Each question is one the agent can answer from what the
+/// refusal quoted, never one about the user's screen.
+fn send_again_unchanged(words: &str) -> &'static str {
+    if words.trim().is_empty() {
+        "If they need nothing more from you, send the same question again unchanged: it will not \
+         be refused twice."
+    } else {
+        "If the words quoted above already give them everything, send the same question again \
+         unchanged: it will not be refused twice."
+    }
+}
+
+/// A refusal that quotes the user's input reads like news of a new message.
+/// An agent once asked the user to resend a reply it had already acted on.
+const NOTHING_NEW: &str = "Nothing new has arrived since. This is not a new message. Do not \
+     ask the user to resend anything.";
+
+/// Long enough to recognise the input, short enough to stay one line.
+const QUOTED_INPUT_CHARS: usize = 200;
+
+/// More than any progress note, less than any reply a card could point at.
+/// A model that thinks every turn shows its prose before a tool call only as
+/// a note. The longest one measured was 441 characters, the shortest reply
+/// before a card 1,075.
+const NOTE_SIZED_CHARS: usize = 600;
+
+/// Why a card is refused. Each reason carries its own tool result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Tool work went unreported. `input` is the user's last input, quoted so
+    /// it never reads as new. `words` is all the user read since.
+    OwesWords { input: LastInput, words: String },
+    /// The card points "above", and all the user read since their last input
+    /// is `words`, too short to hold what it points at.
+    PointsAboveAtNothing { words: String },
+    /// The agent saved these artifacts since the user's last input, and
+    /// neither its words nor the card show or link them. `words` is all the
+    /// user read since.
+    ArtifactNotShown { paths: Vec<String>, words: String },
+    /// The last words before the card were a progress note: `note` is all the
+    /// user read of what the agent wrote there.
+    NoteShownAsSummary { note: String },
+}
+
+impl Refusal {
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::OwesWords { input, words } => {
+                let owed = format!(
+                    concat!(
+                        "Since the user's last input, {seen}. You have not told them what your \
+                         tools found. They read only your text and your cards, never your tool \
+                         results or your reasoning, and nothing else you wrote reached them. Say \
+                         what you found in plain prose now, or ",
+                        card_message_hint!(),
+                        ". If they asked something, answer it the same way. Then ask your \
+                         question again, and keep everything already on the card, pictures and \
+                         links included. {again}"
+                    ),
+                    seen = what_they_read(words),
+                    again = send_again_unchanged(words)
+                );
+                match input.quoted() {
+                    Some(quoted) => format!(
+                        "{REFUSAL_MARKER} The user's last input is {quoted}. You already \
+                         received it. {NOTHING_NEW} {owed}"
+                    ),
+                    None => format!("{REFUSAL_MARKER} {owed}"),
+                }
+            }
+            Self::PointsAboveAtNothing { words } => format!(
+                concat!(
+                    "{REFUSAL_MARKER} Your card points at something \"above\", but since the \
+                     user's last input, {seen}. Nothing else you drafted reached them. They never \
+                     see your reasoning. Write out what the card refers to as your reply, or put \
+                     it on the card itself: ",
+                    card_message_hint!(),
+                    ", or else in the question or the option descriptions. Then ask again. \
+                     {again}"
+                ),
+                REFUSAL_MARKER = REFUSAL_MARKER,
+                seen = what_they_read(words),
+                again = send_again_unchanged(words)
+            ),
+            Self::NoteShownAsSummary { note } => format!(
+                concat!(
+                    "{REFUSAL_MARKER} The text you wrote just before this card was longer than \
+                     a note, so the user saw only this summary of it: \"{note}\". Nothing else \
+                     of it reached them. Text written before any tool call reaches them only \
+                     as such a summary. Put what they need, such as the answer, steps, links or \
+                     pictures, ",
+                    card_message_hint!(),
+                    ", or else in the question. Then ask again. If the summary already gives \
+                     them everything, send the same question again unchanged: it will not be \
+                     refused twice."
+                ),
+                REFUSAL_MARKER = REFUSAL_MARKER,
+                note = quote(note)
+            ),
+            Self::ArtifactNotShown { paths, words } => {
+                let paths = paths
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    concat!(
+                        "{REFUSAL_MARKER} {ARTIFACT_REFUSAL_LEAD} {paths}, and they cannot see \
+                         it. Saving shows nothing. Since then, {seen}. Put the line `lucidos data \
+                         write` printed ON the card. A picture's \
+                         `![...]` line goes ",
+                        card_message_hint!(),
+                        ", or in the question. An option's picture goes in its `preview` or \
+                         description, whichever your tool has. When the options look different, \
+                         give each its own picture of only that option. The `[...](...)` link to any other file goes ",
+                        card_message_hint!(),
+                        " or in the question: an option shows a link as plain text. If they \
+                         asked something, answer it in plain prose or ",
+                        card_message_hint!(),
+                        ". If you ran other tools, say what you found. Then ask again. If it \
+                         is not meant for them, send the same question again unchanged: it will \
+                         not be refused twice."
+                    ),
+                    REFUSAL_MARKER = REFUSAL_MARKER,
+                    ARTIFACT_REFUSAL_LEAD = ARTIFACT_REFUSAL_LEAD,
+                    paths = paths,
+                    seen = what_they_read(words)
+                )
+            }
+        }
+    }
+}
+
+/// Everything the card renders, one field per line. `questions` is the
+/// tool's `questions` array.
+fn card_text(questions: &serde_json::Value) -> String {
+    let input = serde_json::json!({ "questions": questions });
+    let mut text = String::new();
+    for q in crate::engine::agent_session::parse_ask_user_question_inputs(&input) {
+        text.push_str(&q.question);
+        for o in &q.options {
+            let fields = [Some(&o.label), o.description.as_ref(), o.preview.as_ref()];
+            for field in fields.into_iter().flatten() {
+                text.push('\n');
+                text.push_str(&without_link_targets(field));
+            }
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// The card's longest question text. Unlike an option, it reads like a reply.
+/// Several short questions never add up to one.
+fn longest_card_question(questions: &serde_json::Value) -> String {
+    let input = serde_json::json!({ "questions": questions });
+    crate::engine::agent_session::parse_ask_user_question_inputs(&input)
+        .into_iter()
+        .map(|q| q.question)
+        .max_by_key(|question| question.trim().chars().count())
+        .unwrap_or_default()
+}
+
+/// Whether `card` says "above" as a whole word. "None of the above" points
+/// at the card's own options, so it never counts.
+fn says_above(card: &str) -> bool {
+    card.to_lowercase()
+        .replace("of the above", "")
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == "above")
+}
+
+/// A file saved as an artifact, the kind an agent saves for the user. An app
+/// asset under `apps/` is saved for the app, not for the chat.
+fn is_shown_artifact(path: &str) -> bool {
+    path.starts_with("artifacts/")
+}
+
+/// The extensions mirror `is_image` in the CLI's `data.rs`, which prints a
+/// picture's line as `![...]` and every other file's as a plain link.
+fn is_picture(path: &str) -> bool {
+    const EXTENSIONS: &[&str] = &["gif", "jpeg", "jpg", "png", "svg", "webp"];
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+}
+
+/// Whether `text` holds a markdown target for `path`, as the CLI prints it or
+/// with the leading `data/` the renderer also accepts. A picture needs the
+/// image form, `![...](path)`: a plain link does not draw it. Any other file
+/// needs a link, `[...](path)`. A bare path counts for neither. A path with a
+/// space must be angle-bracketed, since markdown ends a bare target there. A
+/// fragment such as the CLI's image size hint may follow the path.
+fn shows_artifact(text: &str, path: &str) -> bool {
+    let needs_image = is_picture(path);
+    let bare_ok = !path.contains(char::is_whitespace);
+    let targets = ["", "data/"].into_iter().flat_map(|prefix| {
+        [
+            bare_ok.then(|| (format!("]({prefix}{path}"), ")")),
+            Some((format!("](<{prefix}{path}"), ">)")),
+        ]
+        .into_iter()
+        .flatten()
+    });
+    targets.into_iter().any(|(start, close)| {
+        text.match_indices(start.as_str()).any(|(at, _)| {
+            let rest = &text[at + start.len()..];
+            let rest = rest.strip_prefix('#').map_or(rest, |fragment| {
+                fragment.trim_start_matches(|c: char| !matches!(c, ')' | '>') && !c.is_whitespace())
+            });
+            rest.starts_with(close) && target_kind(text, at) == Some(needs_image)
+        })
+    })
+}
+
+/// For the `](` at byte `at` in `text`: `Some(true)` when it ends an image's
+/// `![...]`, `Some(false)` when it ends a link's `[...]`, `None` when no `[`
+/// opens it.
+fn target_kind(text: &str, at: usize) -> Option<bool> {
+    text[..at]
+        .rfind('[')
+        .map(|open| text[..open].ends_with('!'))
+}
+
+/// `field` as an option renders it. Inside the option's button a link shows
+/// as its label alone, while a picture still draws. So each link loses its
+/// target, and only the question can carry a link.
+fn without_link_targets(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut rest = field;
+    while let Some(at) = rest.find("](") {
+        let (head, target) = rest.split_at(at + 1);
+        out.push_str(head);
+        rest = if target_kind(rest, at) == Some(false) {
+            target.find(')').map_or("", |close| &target[close + 1..])
+        } else {
+            out.push('(');
+            &target[1..]
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Tools whose calls are not work the user needs to hear about: the question
+/// tools themselves, and the todo list.
+fn not_work() -> Vec<&'static str> {
+    let mut names = vec![
+        crate::llm::tool_names::ASK_USER_QUESTION,
+        crate::llm::tool_names::TODO_WRITE,
+        "TodoWrite",
+    ];
+    names.extend(crate::runtime::USER_QUESTION_TOOLS);
+    names
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LastInput {
+    /// Nothing the user said is on the thread yet.
+    None,
+    /// A message or an injected follow-up, with its text.
+    Message(String),
+    /// A card answer that only picked options.
+    Picked,
+    /// Text the user typed into a card, with or without a pick.
+    Typed(String),
+}
+
+impl LastInput {
+    fn from_answer(answer: &serde_json::Value) -> Self {
+        let typed_text = answer
+            .get("text")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.trim().is_empty());
+        match (answer.get("kind").and_then(|k| k.as_str()), typed_text) {
+            (Some("FreeText" | "MultiSelected"), Some(text)) => Self::Typed(text.to_string()),
+            _ => Self::Picked,
+        }
+    }
+
+    /// The input named and quoted, for a refusal. `None` when it has no text.
+    fn quoted(&self) -> Option<String> {
+        match self {
+            Self::Typed(text) if !text.trim().is_empty() => Some(format!(
+                "the text they typed into your card: \"{}\"",
+                quote(text)
+            )),
+            Self::Message(text) if !text.trim().is_empty() => {
+                Some(format!("this message: \"{}\"", quote(text)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `text` on one line, cut to [`QUOTED_INPUT_CHARS`].
+fn quote(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.char_indices().nth(QUOTED_INPUT_CHARS) {
+        Some((cut, _)) => format!("{}...", &line[..cut]),
+        None => line,
+    }
+}
+
+/// What happened on the thread since the user's last input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SinceLastInput {
+    pub(crate) last_input: LastInput,
+    /// Tool calls after the agent's last words, or after the input if it said
+    /// nothing. "Let me check the log" reports nothing the log said.
+    pub(crate) unreported_tool_calls: i64,
+    /// A card was refused since that input, for any reason.
+    pub(crate) refused: bool,
+    /// One of those refusals asked for an artifact.
+    pub(crate) artifact_refused: bool,
+    /// Everything the agent wrote since that input: all the user has read.
+    pub(crate) words: String,
+    /// Artifacts this thread saved through the data API since that input.
+    pub(crate) saved_artifacts: Vec<String>,
+    /// The card carries a `message`, which the user reads in full above it.
+    pub(crate) card_has_message: bool,
+    /// The progress note the user read last, when it is the latest of the
+    /// agent's words since that input.
+    pub(crate) last_progress_note: Option<String>,
+}
+
+impl SinceLastInput {
+    /// Fold in the chat round's own text, which may not be in the events yet.
+    /// Words written after the tool work report it.
+    fn with_round_text(mut self, round_text: &str) -> Self {
+        if round_text.trim().is_empty() {
+            return self;
+        }
+        self.unreported_tool_calls = 0;
+        if self.words.contains(round_text) {
+            return self;
+        }
+        // The persist task may have stored a prefix of the round. Counting it
+        // twice would stretch a note past the threshold, so skip the overlap.
+        let overlap = round_text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain([round_text.len()])
+            .rev()
+            .find(|&end| self.words.ends_with(&round_text[..end]))
+            .unwrap_or(0);
+        self.words.push_str(&round_text[overlap..]);
+        self
+    }
+
+    /// Fold in the chat round: its text, and its last progress note when the
+    /// text ends on it. Prose after the note is what the user read last.
+    fn with_round(self, round: ChatRound<'_>) -> Self {
+        let mut since = self.with_round_text(round.text);
+        since.last_progress_note = round
+            .progress_notes
+            .last()
+            .filter(|note| round.text.trim_end().ends_with(note.trim()))
+            .cloned();
+        since
+    }
+
+    /// Fold in the card's `message`, which the user reads as a reply shown
+    /// just above the card. So the card may also point "above" at it.
+    fn with_card_message(self, message: &str) -> Self {
+        if message.trim().is_empty() {
+            return self;
+        }
+        Self {
+            card_has_message: true,
+            ..self.with_round_text(message)
+        }
+    }
+
+    /// A card `question` longer than any note reports the tool work before
+    /// it.
+    fn with_card_question(mut self, question: &str) -> Self {
+        if question.trim().chars().count() >= NOTE_SIZED_CHARS {
+            self.unreported_tool_calls = 0;
+        }
+        self
+    }
+}
+
+/// Refuse when a saved artifact shows nowhere. Or when a progress note was
+/// the last thing the user read. Or when tool work went unreported. Or when
+/// the card points "above" at note-sized words. A card carrying a `message`
+/// passes all but the first. `card` is everything the card renders.
+///
+/// One refusal per input, plus one artifact refusal. The artifact goes first:
+/// the work that made it is usually the unreported work. A retry after any
+/// other refusal may drop an artifact the refused card showed.
+pub(crate) fn should_refuse(s: &SinceLastInput, card: &str) -> Option<Refusal> {
+    if !s.artifact_refused {
+        let unseen: Vec<String> = s
+            .saved_artifacts
+            .iter()
+            .filter(|path| !shows_artifact(&s.words, path) && !shows_artifact(card, path))
+            .cloned()
+            .collect();
+        if !unseen.is_empty() {
+            return Some(Refusal::ArtifactNotShown {
+                paths: unseen,
+                words: s.words.trim().to_string(),
+            });
+        }
+    }
+    if s.refused {
+        return None;
+    }
+    if let Some(note) = s
+        .last_progress_note
+        .as_ref()
+        .filter(|_| !s.card_has_message)
+    {
+        return Some(Refusal::NoteShownAsSummary { note: note.clone() });
+    }
+    if s.unreported_tool_calls > 0 {
+        return Some(Refusal::OwesWords {
+            input: s.last_input.clone(),
+            words: s.words.trim().to_string(),
+        });
+    }
+    let words = s.words.trim();
+    if s.card_has_message || words.chars().count() >= NOTE_SIZED_CHARS {
+        return None;
+    }
+    says_above(card).then(|| Refusal::PointsAboveAtNothing {
+        words: words.to_string(),
+    })
+}
+
+/// The refusal for the card `tool_use_id` is about to raise on `thread_id`,
+/// or `None` to show it. `questions` is the tool's `questions` array,
+/// `message` the chat card's `message`, and `round` whatever the chat round
+/// wrote before the call, with the progress notes among it.
+///
+/// A card already shown always passes, so a crash-recovery re-POST is safe.
+/// A query error shows the card: blocking a question on a DB blip helps nobody.
+pub(crate) async fn refuse_card(
+    pool: &PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+    questions: &serde_json::Value,
+    message: Option<&str>,
+    round: Option<ChatRound<'_>>,
+) -> Option<Refusal> {
+    match read_since_last_input(pool, thread_id, tool_use_id).await {
+        Ok(Some(since)) => {
+            let since = match round {
+                Some(round) => since.with_round(round),
+                None => since,
+            };
+            let since = since
+                .with_card_message(message.unwrap_or_default())
+                .with_card_question(&longest_card_question(questions));
+            should_refuse(&since, &card_text(questions))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            crate::log!(
+                "[QuestionCardGate] thread={thread_id} query failed, showing the card: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// What the chat round wrote before its card. The text may not be in the
+/// events yet, and the progress notes among it are never marked there.
+#[derive(Clone, Copy)]
+pub(crate) struct ChatRound<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) progress_notes: &'a [String],
+}
+
+/// [`refuse_card`] for a coding agent's hook, which races the session loop
+/// persisting the text written just before the card. A refusal needs two
+/// looks. The second waits for `text_persisted`, which resolves once the loop
+/// has persisted that text or has ended. So a card that followed real text is
+/// never refused.
+pub(crate) async fn refuse_coding_agent_card(
+    pool: &PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+    questions: &serde_json::Value,
+    text_persisted: impl std::future::Future<Output = ()>,
+) -> Option<Refusal> {
+    refuse_card(pool, thread_id, tool_use_id, questions, None, None).await?;
+    text_persisted.await;
+    refuse_card(pool, thread_id, tool_use_id, questions, None, None).await
+}
+
+/// Starts every question id the MCP ask tool mints (`mcp_permission_server.rs`
+/// in the CLI). The stream never carries such an id.
+const MCP_ASK_ID_PREFIX: &str = "codex-q-";
+
+/// Which question tool use a card waits for in [`QuestionFlushes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CardAsk {
+    /// A Claude Code hook names the tool use the agent's stream carries.
+    ToolUse(String),
+    /// The session's n-th MCP ask, counting from 1. Each MCP question tool
+    /// use makes exactly one ask, so it pairs with the n-th one flushed.
+    McpAsk(u64),
+}
+
+/// The question tool uses a coding-agent session loop has handled, each after
+/// it persisted the text written before it. A card's gate waits here for its
+/// own tool use before the second look. One per session, ephemeral: a restart
+/// ends the loop and every waiter with it.
+#[derive(Debug, Default)]
+pub(crate) struct QuestionFlushes {
+    state: std::sync::Mutex<Flushed>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct Flushed {
+    /// Claude Code's own question tool uses, by id.
+    hook_tool_uses: std::collections::HashSet<String>,
+    /// MCP question tool uses flushed, and MCP asks arrived.
+    mcp_flushed: u64,
+    mcp_asked: u64,
+    /// The loop ended, so nothing more will be persisted.
+    loop_ended: bool,
+}
+
+impl QuestionFlushes {
+    /// The loop persisted the text before question tool use `tool_use_id`,
+    /// a call of tool `name`.
+    pub(crate) fn flushed(&self, tool_use_id: &str, name: &str, input: &serde_json::Value) {
+        self.update(|state| {
+            if name == crate::runtime::CC_NATIVE_ASK_USER_QUESTION_TOOL {
+                state.hook_tool_uses.insert(tool_use_id.to_string());
+            } else if mcp_ask_is_sent(input) {
+                state.mcp_flushed += 1;
+            }
+        });
+    }
+
+    /// The loop ended. Every waiter's second look may run now.
+    pub(crate) fn loop_ended(&self) {
+        self.update(|state| state.loop_ended = true);
+    }
+
+    fn update(&self, change: impl FnOnce(&mut Flushed)) {
+        change(&mut self.lock());
+        self.changed.notify_waiters();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Flushed> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The card a request for `tool_use_id` asks. Called once per request
+    /// from this session's agent, since an MCP ask takes the next ordinal.
+    pub(crate) fn ask(&self, tool_use_id: &str) -> CardAsk {
+        if !tool_use_id.starts_with(MCP_ASK_ID_PREFIX) {
+            return CardAsk::ToolUse(tool_use_id.to_string());
+        }
+        let mut state = self.lock();
+        state.mcp_asked += 1;
+        CardAsk::McpAsk(state.mcp_asked)
+    }
+
+    /// Resolves once `ask`'s tool use is flushed, or the loop ended.
+    pub(crate) async fn wait_for(&self, ask: CardAsk) {
+        loop {
+            // Registered before the check, so a flush between the two wakes it.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_flushed(&ask) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn is_flushed(&self, ask: &CardAsk) -> bool {
+        let state = self.lock();
+        state.loop_ended
+            || match ask {
+                CardAsk::ToolUse(id) => state.hook_tool_uses.contains(id),
+                CardAsk::McpAsk(n) => state.mcp_flushed >= *n,
+            }
+    }
+}
+
+/// Whether the MCP ask tool posts this call to the engine. It refuses one with
+/// no question before asking, so that call takes no ordinal.
+fn mcp_ask_is_sent(input: &serde_json::Value) -> bool {
+    input
+        .get("question")
+        .and_then(|q| q.as_str())
+        .is_some_and(|q| !q.trim().is_empty())
+}
+
+/// Marks the loop ended when the session loop holding it returns, by any path.
+pub(crate) struct LoopEndsFlushes(pub(crate) std::sync::Arc<QuestionFlushes>);
+
+impl Drop for LoopEndsFlushes {
+    fn drop(&mut self) {
+        self.0.loop_ended();
+    }
+}
+
+/// `None` when the card was already shown.
+async fn read_since_last_input(
+    pool: &PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+) -> Result<Option<SinceLastInput>, sqlx::Error> {
+    type Row = (
+        bool,
+        Option<String>,
+        Option<serde_json::Value>,
+        Option<String>,
+        i64,
+        bool,
+        bool,
+        Option<String>,
+        Vec<String>,
+        Option<String>,
+    );
+    // `DataFileWritten` has no thread_id: the saving thread is its actor. The
+    // `created` bound only lets the index narrow the scan, with a minute of
+    // slack for clock skew between transactions. `sequence` decides.
+    let row: Row = sqlx::query_as(
+        "WITH last_input AS ( \
+               SELECT sequence, created, event_type, payload->'answer' AS answer, \
+                 payload->>'text' AS text FROM events \
+               WHERE thread_id = $1 \
+                 AND event_type IN ('MessageReceived', 'PromptInjected', 'UserQuestionAnswered') \
+               ORDER BY sequence DESC LIMIT 1 \
+             ), since AS ( \
+               SELECT sequence, event_type, payload FROM events \
+               WHERE thread_id = $1 \
+                 AND sequence > COALESCE((SELECT sequence FROM last_input), 0) \
+                 AND event_type IN ('TextStreamed', 'CodingAgentTextStreamed', 'ToolCalled', \
+                   'CodingAgentToolCalled', 'ToolResult', 'CodingAgentToolResult') \
+             ), last_words AS ( \
+               SELECT MAX(sequence) AS sequence FROM since \
+               WHERE event_type IN ('TextStreamed', 'CodingAgentTextStreamed') \
+                 AND btrim(payload->>'text', E' \\t\\r\\n') <> '' \
+             ) \
+             SELECT \
+               EXISTS (SELECT 1 FROM events WHERE thread_id = $1 \
+                 AND event_type = 'UserQuestionAsked' \
+                 AND starts_with(payload->>'tool_use_id', $2 || '#')), \
+               (SELECT event_type FROM last_input), \
+               (SELECT answer FROM last_input), \
+               (SELECT text FROM last_input), \
+               (SELECT COUNT(*) FROM since \
+                 WHERE event_type IN ('ToolCalled', 'CodingAgentToolCalled') \
+                   AND NOT (payload->>'name' = ANY($3)) \
+                   AND sequence > COALESCE((SELECT sequence FROM last_words), 0)), \
+               EXISTS (SELECT 1 FROM since \
+                 WHERE event_type IN ('ToolResult', 'CodingAgentToolResult') \
+                   AND strpos(left(payload->>'result', $5), $4) > 0), \
+               EXISTS (SELECT 1 FROM since \
+                 WHERE event_type IN ('ToolResult', 'CodingAgentToolResult') \
+                   AND strpos(left(payload->>'result', $5), $6) > 0), \
+               (SELECT string_agg(payload->>'text', '' ORDER BY sequence) FROM since \
+                 WHERE event_type IN ('TextStreamed', 'CodingAgentTextStreamed')), \
+               (SELECT COALESCE(array_agg(DISTINCT payload->'data'->>'path'), '{}') FROM events \
+                 WHERE event_type = 'DataFileWritten' \
+                   AND created >= COALESCE((SELECT created FROM last_input) - interval '1 minute', \
+                     '-infinity'::timestamptz) \
+                   AND sequence > COALESCE((SELECT sequence FROM last_input), 0) \
+                   AND payload->'data'->'actor'->>'source_thread_id' = $1::text), \
+               (SELECT CASE WHEN COALESCE((payload->>'progress_note')::boolean, false) \
+                   THEN btrim(payload->>'text', E' \\t\\r\\n') END FROM since \
+                 WHERE event_type = 'CodingAgentTextStreamed' \
+                   AND payload->>'parent_tool_use_id' IS NULL \
+                   AND btrim(payload->>'text', E' \\t\\r\\n') <> '' \
+                 ORDER BY sequence DESC LIMIT 1)",
+    )
+    .bind(thread_id)
+    .bind(tool_use_id)
+    .bind(not_work())
+    .bind(REFUSAL_MARKER)
+    .bind(REFUSAL_WINDOW_CHARS)
+    .bind(format!("{REFUSAL_MARKER} {ARTIFACT_REFUSAL_LEAD}"))
+    .fetch_one(pool)
+    .await?;
+    let (
+        already_shown,
+        input_type,
+        answer,
+        message,
+        unreported_tool_calls,
+        refused,
+        artifact_refused,
+        words,
+        saved,
+        last_progress_note,
+    ) = row;
+    if already_shown {
+        return Ok(None);
+    }
+    let last_input = match (input_type.as_deref(), answer) {
+        (None, _) => LastInput::None,
+        (Some("UserQuestionAnswered"), Some(answer)) => LastInput::from_answer(&answer),
+        _ => LastInput::Message(message.unwrap_or_default()),
+    };
+    Ok(Some(SinceLastInput {
+        last_input,
+        unreported_tool_calls,
+        refused,
+        artifact_refused,
+        words: words.unwrap_or_default(),
+        saved_artifacts: saved.into_iter().filter(|p| is_shown_artifact(p)).collect(),
+        card_has_message: false,
+        last_progress_note,
+    }))
+}
+
+#[cfg(test)]
+#[path = "question_card_gate_tests.rs"]
+mod tests;

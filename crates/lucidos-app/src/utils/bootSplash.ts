@@ -1,0 +1,215 @@
+/**
+ * Boot-splash controller.
+ *
+ * The splash itself is inlined in `index.html` (markup + style) so it paints on
+ * the FIRST frame, before this bundle loads — that is what makes the cold launch
+ * connection-independent. This module is the runtime that takes over once the
+ * bundle is live: it updates the status line and dismisses the splash when the
+ * app is ready (readiness-gated — see `hooks/useBootSplashReady.ts`) or when the
+ * picker decides to show its workspace list.
+ *
+ * It operates on the inline DOM via `querySelector` (the `#app`-only
+ * getElementById ban in `.claude/rules/frontend.md`); the splash node is a
+ * sibling of `#app` in `<body>`, owned by no Preact tree, so manual teardown
+ * here never fights reconciliation.
+ *
+ * Across the picker→workspace cross-document navigation each document carries its
+ * own inline splash, so module state does not need to persist — a fresh document
+ * gets a fresh, present splash.
+ */
+import { scaledDurationMs } from './motion';
+import { startIdlePrefetch } from './idlePrefetch';
+import { markBoot } from './bootTiming';
+
+const SPLASH_SELECTOR = '.boot-splash';
+const STATUS_SELECTOR = '.boot-splash-status';
+const LEAVING_CLASS = 'boot-splash-leaving';
+// The `.boot-splash-status-swap` fade-out in index.html, at 1x. The words swap
+// once it has run, while the line is invisible.
+const SWAP_CLASS = 'boot-splash-status-swap';
+export const STATUS_SWAP_MS = 150;
+// Set by the inline handover script in index.html when the gateway boot splash
+// had already built the mark on this url, so this document skips its reveal.
+const FORMED_CLASS_SELECTOR = '.boot-splash-formed';
+// Set on <html> by the quiet script in index.html's <head>. It marks a document
+// whose load CONTINUES a session rather than starting one, so it carries no mark.
+// Two triggers: a user-requested refresh (permanent) and a notification-tap
+// deep link (whose URL form is the temporary half, tracked at
+// docs/temporary-measures.md § "Cross-document notification-tap reload on iOS").
+// The cover itself is permanent either way: do NOT delete it with that measure.
+const QUIET_ATTRIBUTE = 'data-boot-splash-quiet';
+
+// The longest `.boot-splash-leaving` fade in index.html, the veil's 0.65s at 1x
+// (the mark and the status finish inside it). The removal fallback, used when
+// `animationend` doesn't fire, is this scaled by the Animation speed slider plus
+// the slack. It MUST stay ahead of the fade: set below it, it stops being a
+// fallback and becomes the thing that removes the splash mid-dissolve. The
+// slack also covers the fixed 0.15s fade reduced motion keeps.
+const VEIL_FADE_MS = 650;
+const FADE_REMOVE_SLACK_MS = 250;
+
+let dismissed = false;
+
+/** True while the inline splash is still in the DOM. */
+export function bootSplashPresent(): boolean {
+  return !dismissed && document.querySelector(SPLASH_SELECTOR) !== null;
+}
+
+/** True when this document plays no mark reveal, so `useBootSplashReady` has no
+ *  min-reveal floor to hold before dismissing. Two documents qualify, both
+ *  decided by an inline script in index.html before first paint:
+ *
+ *  - `boot-splash-formed` (gateway handover): the mark was already built by the
+ *    gateway boot splash on this url and is standing on screen, so this document
+ *    only carries it.
+ *  - `data-boot-splash-quiet` (a refresh, or a notification tap): the document
+ *    carries no mark at all. See QUIET_ATTRIBUTE above.
+ *
+ *  Both arms are permanent.
+ *
+ *  One predicate rather than two exported halves, because the caller only ever
+ *  wants the disjunction, and a caller-side `a() || b()` is what a unit test
+ *  cannot reach through the module mock. */
+export function bootSplashPlaysNoReveal(): boolean {
+  return (
+    document.querySelector(SPLASH_SELECTOR + FORMED_CLASS_SELECTOR) !== null ||
+    document.documentElement.hasAttribute(QUIET_ATTRIBUTE)
+  );
+}
+
+/** Does replacing the words on screen with `next` fade out and back in, rather
+ *  than swap in place? A new label does: it is a new width, and an instant swap
+ *  makes the centred line lurch sideways. A ticking counter does not
+ *  ("… (9s)" to "… (10s)"), or the line would blink every second. Appearing
+ *  from, or clearing to, nothing is the shown class's own fade. Pure. */
+export function statusChangeFades(shown: string, next: string): boolean {
+  if (shown === '' || next === '') return false;
+  const withoutCounters = (text: string) => text.replace(/\d+/g, '0');
+  return withoutCounters(shown) !== withoutCounters(next);
+}
+
+let pendingSwap: number | undefined;
+
+/** Update the status line under the mark (e.g. "Opening your workspace…",
+ *  "Connecting…") and fade it in (it starts hidden so a fast load never flashes
+ *  text). A different label crossfades (see {@link statusChangeFades}). No-op if
+ *  the splash is absent.
+ *
+ *  A label carrying line breaks is a FAILURE REPORT, not a status: the packaged
+ *  desktop sends one when the background service has crash-looped
+ *  (`desktop::crash_loop_label`). The one-line rules in index.html would clip it
+ *  to its first ellipsized line, so a multi-line label switches the element into
+ *  the wrapping report state. Decided on the text rather than by a second
+ *  argument, so every caller inherits it and none has to know the state exists. */
+export function setBootStatus(text: string): void {
+  const el = document.querySelector(SPLASH_SELECTOR + ' ' + STATUS_SELECTOR);
+  if (!el) return;
+  window.clearTimeout(pendingSwap);
+  const write = () => {
+    el.textContent = text;
+    el.classList.toggle(SWAP_CLASS, false);
+    el.classList.toggle('boot-splash-status-shown', text.length > 0);
+    el.classList.toggle('boot-splash-status-report', text.includes('\n'));
+  };
+  if (!statusChangeFades(el.textContent ?? '', text)) {
+    write();
+    return;
+  }
+  el.classList.toggle(SWAP_CLASS, true);
+  pendingSwap = window.setTimeout(write, scaledDurationMs(STATUS_SWAP_MS));
+}
+
+/** Reveal the inline splash's gateway escape link, when this document has one to
+ *  offer. Returns true if a link is now showing.
+ *
+ *  The link, its href rule and the conditions for offering it all live in the
+ *  inline document (see the boot watchdog in index.html), which exposes the
+ *  reveal as `window.__lucidosGatewayEscape`. This is a thin call through rather
+ *  than a second implementation: the same escape must be offered whether or not
+ *  the application bundle loaded, and two copies of "where does the gateway live"
+ *  would be free to drift apart.
+ *
+ *  Returns false when the hook is absent (the splash is already gone, or this
+ *  document is behind the gateway / has no gateway to escape to) so callers can
+ *  stay indifferent to which case they are in. */
+export function revealBootEscape(): boolean {
+  const reveal = (window as Window & { __lucidosGatewayEscape?: () => unknown })
+    .__lucidosGatewayEscape;
+  if (typeof reveal !== 'function') return false;
+  return reveal() != null;
+}
+
+/** Tell the inline boot watchdog (index.html) that the module graph is live.
+ *
+ *  It clears the 15s stall timer and the entry-script error listener. A boot
+ *  failure after this call is the application's to recover, not the document's.
+ *  Handing over too early is therefore a real regression: the watchdog is the
+ *  only recovery a picker document has.
+ *
+ *  Two callers, and each is deliberate about WHEN. `main.tsx` hands over at once
+ *  on the workspace path, and defers to the picker's lazy loader on the picker
+ *  path. `PairingGate` hands over once it knows this device is unpaired, because
+ *  that screen paints entirely from its own chunk, which has landed by then, so
+ *  nothing is in flight. Its camera scanner is lazy, and a tap fetches it long
+ *  after this.
+ *
+ *  Lives here rather than in `main.tsx` so both reach one implementation. */
+export function handOverBootOwnership(): void {
+  (window as Window & { __lucidosBootLoaded?: () => void }).__lucidosBootLoaded?.();
+}
+
+/** Fade out and remove the splash. Idempotent — safe to call from the readiness
+ *  gate, the safety cap, and the picker's "show the list" path. */
+export function dismissBootSplash(): void {
+  if (dismissed) return;
+  dismissed = true;
+  // The boot document paints the brand gradient on both canvas layers. iOS
+  // fills the standalone bottom safe-area strip from the canvas, and no element
+  // reaches it. So the strip must leave on the veil's own curve and length. A
+  // snap at either end of the fade shows as a band.
+  const canvases = [document.documentElement, document.body].filter(Boolean);
+  // Once the splash is gone the stylesheet's own `html` background takes over,
+  // and on-demand surfaces may load (ADR 0288). Not before: the prefetch parses
+  // on the main thread, and WebKit has no idle callback to keep it off the fade.
+  const lifted = () => {
+    markBoot('splashLifted');
+    for (const canvas of canvases) {
+      canvas.style.background = '';
+      canvas.style.transition = '';
+    }
+    startIdlePrefetch();
+  };
+  const el = document.querySelector(SPLASH_SELECTOR);
+  if (!el) {
+    lifted();
+    return;
+  }
+  el.classList.add(LEAVING_CLASS);
+  // Read off the veil rather than restated: reduced motion and the quiet cover
+  // each give it a length of its own.
+  const veil = getComputedStyle(el);
+  for (const canvas of canvases) {
+    canvas.style.transition = `background-color ${veil.animationDuration} ${veil.animationTimingFunction}`;
+    canvas.style.background = 'var(--bg-primary)';
+  }
+  let removed = false;
+  const remove = () => {
+    if (removed) return;
+    removed = true;
+    el.remove();
+    lifted();
+  };
+  // Only THIS element's own fade may remove it. `animationend` bubbles, and the
+  // exit choreography (index.html) runs shorter animations on the mark and the
+  // status inside the veil's: acting on one of those tore the splash out at 57%
+  // veil opacity, snapping the app in mid-fade. `once` is deliberately not used
+  // for the same reason, since a child's event would spend it.
+  const onAnimationEnd = (event: Event) => {
+    if (event.target !== el) return;
+    el.removeEventListener('animationend', onAnimationEnd);
+    remove();
+  };
+  el.addEventListener('animationend', onAnimationEnd);
+  // Fallback: if the fade animation is suppressed (no animationend), still remove.
+  window.setTimeout(remove, scaledDurationMs(VEIL_FADE_MS) + FADE_REMOVE_SLACK_MS);
+}

@@ -1,0 +1,239 @@
+import { describe, it, expect, afterEach } from 'vitest';
+import {
+  leftAction, rightAction, nodeKey, sectionNavKey, ongoingTileNavKey, handleDrawerKeyDown, landingGroupFor,
+  type DrawerNavNode, type NavCollapseState,
+} from './ThreadDrawer';
+import type { OngoingGroup } from '../../store/store';
+import { openThreadFilterPanel, closeThreadFilterPanel } from '../../store/threadFilterPanel';
+
+// Pure ←/→ tree-navigation logic for the drawer — no signals, no DOM.
+
+const state = (sections: string[] = [], families: string[] = [], revealed: string[] = []): NavCollapseState => ({
+  sectionCollapsed: (k) => sections.includes(k),
+  familyCollapsed: (id) => families.includes(id),
+  archivedRevealed: (id) => revealed.includes(id),
+});
+
+const section = (sectionKey: 'saved' | 'current' | 'archive'): DrawerNavNode =>
+  ({ kind: 'section', sectionKey });
+
+const thread = (
+  id: string,
+  depth: number,
+  parentId: string | null,
+  hasChildren: boolean,
+  sectionKey: 'saved' | 'current' | 'archive' | null,
+  hiddenArchivedCount = 0,
+): DrawerNavNode => ({ kind: 'thread', id, depth, parentId, hasChildren, hiddenArchivedCount, sectionKey });
+
+describe('nodeKey / sectionNavKey', () => {
+  it('keys a section header by its prefixed name', () => {
+    expect(sectionNavKey('current')).toBe('__section_current');
+    expect(nodeKey(section('current'))).toBe('__section_current');
+  });
+  it('keys a thread by its id', () => {
+    expect(nodeKey(thread('t-1', 0, null, false, 'current'))).toBe('t-1');
+  });
+});
+
+describe('leftAction (collapse / ascend)', () => {
+  it('collapses an expanded section, focusing its header', () => {
+    expect(leftAction(section('current'), state())).toEqual({ type: 'collapseSection', sectionKey: 'current' });
+  });
+  it('is a no-op on an already-collapsed section', () => {
+    expect(leftAction(section('current'), state(['current']))).toEqual({ type: 'none' });
+  });
+  it('collapses a top-level parent’s own family first, staying put', () => {
+    expect(leftAction(thread('p', 0, null, true, 'current'), state())).toEqual({
+      type: 'collapseFamily', threadId: 'p', focusKey: 'p',
+    });
+  });
+  it('collapses the section once a top-level parent’s family is already collapsed', () => {
+    expect(leftAction(thread('p', 0, null, true, 'current'), state([], ['p']))).toEqual({
+      type: 'collapseSection', sectionKey: 'current',
+    });
+  });
+  it('collapses the section from a top-level leaf', () => {
+    expect(leftAction(thread('t', 0, null, false, 'current'), state())).toEqual({
+      type: 'collapseSection', sectionKey: 'current',
+    });
+  });
+  it('on a sub-thread, collapses the PARENT family (child + siblings) and focuses the parent', () => {
+    expect(leftAction(thread('c', 1, 'p', false, 'current'), state())).toEqual({
+      type: 'collapseFamily', threadId: 'p', focusKey: 'p',
+    });
+  });
+  it('on a sub-thread that is itself an expanded parent, collapses its own family first', () => {
+    expect(leftAction(thread('c', 1, 'p', true, 'current'), state())).toEqual({
+      type: 'collapseFamily', threadId: 'c', focusKey: 'c',
+    });
+  });
+  it('is inert on a flat-view node (no section)', () => {
+    expect(leftAction(thread('t', 0, null, false, null), state())).toEqual({ type: 'none' });
+  });
+
+  it('cascades child → parent family → section (the spec example)', () => {
+    // ← on a child collapses the parent's family and focuses the parent.
+    expect(leftAction(thread('c-1', 1, 'p-1', false, 'current'), state())).toEqual({
+      type: 'collapseFamily', threadId: 'p-1', focusKey: 'p-1',
+    });
+    // ← again, now on the parent (family collapsed), collapses the section.
+    expect(leftAction(thread('p-1', 0, null, true, 'current'), state([], ['p-1']))).toEqual({
+      type: 'collapseSection', sectionKey: 'current',
+    });
+  });
+
+  it('hides revealed archived children before collapsing the parent family / section', () => {
+    // No live family (hasChildren false), but archived children are revealed:
+    // ← turns the archived-reveal toggle off instead of jumping to the section.
+    const node = thread('p', 0, null, false, 'current', 2);
+    expect(leftAction(node, state([], [], ['p']))).toEqual({ type: 'hideArchived', threadId: 'p' });
+  });
+
+  it('collapses a live family before touching its own archived-reveal toggle', () => {
+    const node = thread('p', 0, null, true, 'current', 2);
+    expect(leftAction(node, state([], [], ['p']))).toEqual({
+      type: 'collapseFamily', threadId: 'p', focusKey: 'p',
+    });
+  });
+
+  it('is a no-op on a top-level thread with nothing revealed and no section to collapse', () => {
+    expect(leftAction(thread('p', 0, null, false, null, 2), state())).toEqual({ type: 'none' });
+  });
+});
+
+describe('rightAction (expand / descend)', () => {
+  it('expands a collapsed section, staying on the header', () => {
+    const nodes = [section('current')];
+    expect(rightAction(nodes[0], nodes, 0, state(['current']))).toEqual({ type: 'expandSection', sectionKey: 'current' });
+  });
+  it('descends an expanded section to its first thread', () => {
+    const nodes = [section('current'), thread('t', 0, null, false, 'current')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'focusKey', key: 't' });
+  });
+  it('is a no-op on an expanded section with no following thread', () => {
+    const nodes = [section('current')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'none' });
+  });
+  it('expands a collapsed family, staying on the parent', () => {
+    const nodes = [thread('p', 0, null, true, 'current')];
+    expect(rightAction(nodes[0], nodes, 0, state([], ['p']))).toEqual({ type: 'expandFamily', threadId: 'p' });
+  });
+  it('descends an expanded parent to its first child', () => {
+    const nodes = [thread('p', 0, null, true, 'current'), thread('c', 1, 'p', false, 'current')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'focusKey', key: 'c' });
+  });
+
+  it('reveals archived children before descending, on an already-expanded parent with both', () => {
+    // A row with one live child AND hidden archived children renders expanded
+    // by default (families aren't collapsed unless the user collapses them).
+    // Without this ordering, → always matched the descend branch below and the
+    // archived toggle was never reachable by keyboard for such a row at all.
+    const nodes = [thread('p', 0, null, true, 'current', 1), thread('c', 1, 'p', false, 'current')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'revealArchived', threadId: 'p' });
+    // A second → press, now that it's revealed, descends into the live child.
+    expect(rightAction(nodes[0], nodes, 0, state([], [], ['p']))).toEqual({ type: 'focusKey', key: 'c' });
+  });
+  it('is a no-op on an expanded parent whose next row is a sibling (no rendered child)', () => {
+    const nodes = [thread('p', 0, null, true, 'current'), thread('s', 0, null, false, 'current')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'none' });
+  });
+  it('is a no-op on a leaf thread', () => {
+    const nodes = [thread('t', 0, null, false, 'current')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'none' });
+  });
+
+  it('reveals hidden archived children on a thread with no live family', () => {
+    const nodes = [thread('p', 0, null, false, 'current', 3)];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'revealArchived', threadId: 'p' });
+  });
+
+  it('expands a collapsed live family before revealing its own archived children', () => {
+    const nodes = [thread('p', 0, null, true, 'current', 2)];
+    expect(rightAction(nodes[0], nodes, 0, state([], ['p']))).toEqual({ type: 'expandFamily', threadId: 'p' });
+  });
+
+  it('reveals archived children once the live family has nothing left to descend into', () => {
+    // Expanded live family with no rendered next child (edge case) still falls
+    // through to the archived-reveal toggle instead of stopping at none.
+    const nodes = [thread('p', 0, null, true, 'current', 2), thread('s', 0, null, false, 'current')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'revealArchived', threadId: 'p' });
+  });
+
+  it('is a no-op once archived children are already revealed and there is nothing else', () => {
+    const nodes = [thread('p', 0, null, false, 'current', 2)];
+    expect(rightAction(nodes[0], nodes, 0, state([], [], ['p']))).toEqual({ type: 'none' });
+  });
+});
+
+const tile = (g: OngoingGroup, selected = false): DrawerNavNode => ({ kind: 'tile', group: g, selected });
+const groupRow = (id: string, g: OngoingGroup): DrawerNavNode =>
+  ({ kind: 'thread', id, depth: 0, parentId: null, hasChildren: false, sectionKey: null, group: g });
+
+describe('the Ongoing grouping (tiles)', () => {
+  it('keys a tile apart from every section header', () => {
+    const keys = [
+      ...(['saved', 'current', 'archive'] as const).map(k => nodeKey(section(k))),
+      ...(['blocked', 'review', 'drafts', 'in-flight'] as const).map(g => nodeKey(tile(g))),
+    ];
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(nodeKey(tile('in-flight'))).toBe(ongoingTileNavKey('in-flight'));
+    // Section-prefixed, so nothing reads a tile as a thread.
+    expect(nodeKey(tile('in-flight')).startsWith(sectionNavKey(''))).toBe(true);
+  });
+
+  it('→ steps to the next tile, and stops at the last', () => {
+    const nodes = [tile('drafts'), tile('in-flight', true), groupRow('t', 'in-flight')];
+    expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'focusKey', key: ongoingTileNavKey('in-flight') });
+    expect(rightAction(nodes[1], nodes, 1, state())).toEqual({ type: 'none' });
+  });
+
+  it('← steps to the previous tile, and stops at the first', () => {
+    expect(leftAction(tile('review'), state())).toEqual({ type: 'focusKey', key: ongoingTileNavKey('blocked') });
+    expect(leftAction(tile('blocked', true), state())).toEqual({ type: 'none' });
+  });
+
+  it('← on a row returns to its tile', () => {
+    expect(leftAction(groupRow('t', 'in-flight'), state())).toEqual({ type: 'focusKey', key: ongoingTileNavKey('in-flight') });
+  });
+
+  it('opens a Blocked or Review row on what needs the user, and every other row as it was', () => {
+    expect(landingGroupFor('ongoing', 'blocked')).toBe('blocked');
+    expect(landingGroupFor('ongoing', 'review')).toBe('review');
+    expect(landingGroupFor('ongoing', 'drafts')).toBeNull();
+    expect(landingGroupFor('ongoing', 'in-flight')).toBeNull();
+    expect(landingGroupFor('folders', 'blocked')).toBeNull();
+  });
+});
+
+describe('handleDrawerKeyDown: filter-panel suppression', () => {
+  // The filter panel is a view inside this pane, covering the list, and its rows
+  // are real controls. Their keys bubble out to the pane container, so the
+  // container's list-nav has to stand down while the panel is up: otherwise
+  // Enter on a View row would ALSO open whatever thread the invisible list
+  // happens to have highlighted.
+  const keyEvent = (key: string) => {
+    let prevented = false;
+    const e = { key, preventDefault: () => { prevented = true; } } as unknown as KeyboardEvent;
+    return { e, wasPrevented: () => prevented };
+  };
+
+  afterEach(() => closeThreadFilterPanel());
+
+  it('consumes Enter and the vertical arrows while the panel is closed', () => {
+    for (const key of ['Enter', 'ArrowDown', 'ArrowUp']) {
+      const { e, wasPrevented } = keyEvent(key);
+      handleDrawerKeyDown(e);
+      expect(wasPrevented(), key).toBe(true);
+    }
+  });
+
+  it('acts on nothing while the panel is open', () => {
+    openThreadFilterPanel();
+    for (const key of ['Enter', 'ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight']) {
+      const { e, wasPrevented } = keyEvent(key);
+      handleDrawerKeyDown(e);
+      expect(wasPrevented(), key).toBe(false);
+    }
+  });
+});

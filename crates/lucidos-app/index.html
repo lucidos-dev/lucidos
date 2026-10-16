@@ -1,0 +1,1004 @@
+<!DOCTYPE html>
+<html lang="en" translate="no" data-theme-mode="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">
+    <meta name="google" content="notranslate">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Lucidos">
+    <meta name="theme-color" content="#07172e">
+    <title>Lucidos</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="icon" type="image/png" sizes="48x48" href="favicon-48.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png">
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+    <!-- Relative ref (ADR 0014): resolves against the engine-stamped
+         `<base href="/<slug>/">`. Direct engine access serves the bundled
+         manifest as-is, so "." installs a per-workspace PWA. Gateway access on
+         port 5252 serves /<slug>/manifest.json itself and widens scope to "/",
+         so switching workspaces stays in the standalone PWA. In the picker
+         context (base "/~/") this resolves to /~/manifest.json, which the
+         gateway also re-stamps with scope "/" + start_url "/~/". -->
+    <link rel="manifest" href="manifest.json">
+    <!--
+      iOS PWA splash screens. Without exact-resolution apple-touch-startup-image
+      tags, iOS shows a white screen with the app title during WKWebView cold
+      restart (e.g. memory eviction on resume). Solid-#0d1117 PNGs make that
+      transition dark instead of white. Portrait-only — landscape PWA is rare
+      and iOS has a long-standing bug where it stretches portrait into landscape
+      anyway. Each PNG is ~700B (1-color palette).
+    -->
+    <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="splash/splash-750x1334.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="splash/splash-828x1792.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 360px) and (device-height: 780px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1080x2340.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1125x2436.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1170x2532.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 393px) and (device-height: 852px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1179x2556.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 402px) and (device-height: 874px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1206x2622.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 414px) and (device-height: 896px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1242x2688.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 428px) and (device-height: 926px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1284x2778.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 430px) and (device-height: 932px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1290x2796.png">
+    <link rel="apple-touch-startup-image" media="(device-width: 440px) and (device-height: 956px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)" href="splash/splash-1320x2868.png">
+    <!--
+      History bounce: the installed iOS app never rests on a page it reached by
+      going back. It steps forward again, onto the page the user was on.
+
+      Every iOS notification tap loads a new document, so the page before it
+      stays one entry back (temporary measure "Cross-document notification-tap
+      reload on iOS"). A swipe from the left edge is iOS's back gesture, and the
+      edge guard cannot catch every touch (`utils/documentNavigation.ts`). Without
+      this step, a stray swipe strands the user on that stale page's boot splash.
+
+      `navigator.standalone` is true only in a Safari web app (an iOS home-screen
+      app, or a macOS Dock one). Neither can leave by going back, and every back
+      target is a stale Lucidos page. A browser tab and an Android install keep
+      their back. The flag stands the picker's cold-start redirect down, which
+      would otherwise replace the pending step.
+    -->
+    <script>
+      (function () {
+        try {
+          if (navigator.standalone !== true) return;
+          var bounce = function () {
+            if (window.navigation && !window.navigation.canGoForward) return;
+            window.lucidosHistoryBounce = true;
+            history.forward();
+          };
+          var entry = performance.getEntriesByType('navigation')[0];
+          if (entry && entry.type === 'back_forward') bounce();
+          addEventListener('pageshow', function (e) { if (e.persisted) bounce(); });
+        } catch (e) { /* a missing API leaves the page where it is */ }
+      })();
+    </script>
+    <!--
+      PWA cold-start fast path (the load-bearing smoothness fix). When the picker
+      (server-stamped <base href="/~/">) would auto-open the last workspace, do the
+      redirect HERE — in <head>, before the bundle loads and before anything
+      paints — so the picker NEVER renders a splash and there is no
+      picker→workspace cross-document reload seam (the persistent cold-start
+      jank/flicker). The browser goes straight to /<slug>/, which plays the single
+      reveal. Skipped when `?pick` is present (the in-app "Manage workspaces"
+      escape), when `?pair=` is (a scanned pairing QR, which has to stay on the
+      public picker path so the gateway can stamp its code into the manifest),
+      or when no workspace is remembered, so the picker still renders its list.
+      Reads the RAW device-global `lucidos-last-workspace` key (this runs before
+      workspaceStorage.install namespacing, matching how the picker writes it).
+      `location.replace` so the picker is not left in history. A since-deleted slug
+      is caught by the gateway, which 302s it to `/~/?pick` (server.rs) — `?pick`
+      then stands this redirect down, so there is no loop. Mirrors openWorkspace()
+      (`/${encodeURIComponent(id)}/`).
+
+      PRESERVES `location.search` + `location.hash` through the redirect. A push
+      tap can cold-launch the PWA in picker context with a deep link on the URL
+      (`/?notification=…&thread=…&tap=…` when the push subscription scope is the
+      gateway root). Redirecting to a bare `/<slug>/` dropped those params before
+      the app ever booted — so every such tap landed on the workspace with the
+      deep link gone (`handle_hash_location {found:false}`), turning the flaky iOS
+      push tap into a consistent failure. Carrying search+hash forward lands
+      `/<slug>/?notification=…`, which `handleHashLocation` then dispatches. (`?pick`
+      already returned above, so it can't be carried into a loop.)
+    -->
+    <script>
+      (function () {
+        try {
+          var base = document.querySelector('base');
+          if (!base || base.getAttribute('href') !== '/~/') return;
+          if (window.lucidosHistoryBounce) return;
+          // The pairing screen is the picker document, served in place at the
+          // url asked for (gateway `serve_pairing_shell`). So it wears the base
+          // this redirect keys on, and redirecting lands right back on it. The
+          // gateway stamps `PAIRING_SHELL_META` ahead of this script to say so.
+          if (document.querySelector('meta[name="lucidos-pairing"]')) return;
+          var search = new URLSearchParams(location.search);
+          if (search.has('pick')) return;
+          // A scanned pairing QR lands on `/~/?pair=<code>`, which is public,
+          // and the gateway stamps that code into the manifest `start_url` an
+          // Add-to-Home-Screen install then launches with. Redirecting carries
+          // the code onto `/<slug>/`, which is gated: the caller is unpaired,
+          // so `enforce` answers with the pairing shell and the install gets a
+          // manifest with no code in it. Pairing belongs on the picker anyway.
+          if (search.has('pair')) return;
+          var slug = localStorage.getItem('lucidos-last-workspace');
+          // Preserve the deep link (notification/thread/tap query + any hash) so a
+          // push tap that cold-launches into the picker still reaches the workspace
+          // WITH its params, instead of a bare /<slug>/.
+          if (slug) location.replace('/' + encodeURIComponent(slug) + '/' + location.search + location.hash);
+        } catch (e) { /* fall through to the normal picker render */ }
+      })();
+    </script>
+    <!--
+      localStorage-driven FOUC. localStorage is the per-browser source of
+      truth for the user's theme/font/scale (preferences.ts mirrors every
+      change there); reading it synchronously before any stylesheet
+      evaluates makes first paint match the user's choice without a cookie
+      or DB roundtrip. These keys are PER-WORKSPACE (workspaceStorage.ts),
+      so they live under `ws:<slug>:…`. This script runs before the app
+      bundle installs the namespacing override, so it prefixes by hand via
+      `wsKey()` (slug from the stamped <base href>, mirroring basePath.ts).
+      Same-origin app iframes derive the SAME slug from their `/<slug>/…`
+      URL (sdk_prefs.rs + sdk/_storage.ts), so the parent and every app
+      iframe agree on first-paint values.
+    -->
+    <!-- The appearance FOUC script: theme, font, ligatures, UI scale and the
+         style remote, resolved from localStorage and written onto <html> before
+         any stylesheet is parsed or any module loads, so the first frame is
+         already the user's appearance.
+
+         ONE program, embedded in two documents: the engine serves the same
+         thing to every app iframe as /api/v1/sdk-prefs.js. It is built from
+         packages/lucidos-sdk/src/boot/ and substituted for the marker below by
+         the `lucidos-appearance-boot` Vite plugin (in serve as well as build),
+         which fails the build if the marker or the bundle is missing. -->
+    <!-- lucidos:appearance-boot -->
+    <script>
+      (function() {
+        var t = document.documentElement.getAttribute('data-theme-mode') || 'dark';
+        document.documentElement.style.colorScheme = t;
+        var m = document.querySelector('meta[name="theme-color"]');
+        if (m) m.setAttribute('content', t === 'light' ? '#ffffff' : '#07172e');
+      })();
+    </script>
+    <script>
+      // Quiet the splash for a load that CONTINUES a session rather than
+      // starting one. The user was in the app a moment ago, so a full brand
+      // launch is a lie about what just happened. Two loads qualify:
+      //   1. A REFRESH the user asked for (`lucidos-splash-quiet`, a one-shot
+      //      sessionStorage flag stamped by `refreshClient` in hooks/sw-update.ts,
+      //      the single refresh funnel). This trigger is PERMANENT.
+      //   2. A NOTIFICATION TAP (`?notification=…` on the URL). TEMPORARY MEASURE
+      //      (docs/temporary-measures.md § "Cross-document notification-tap reload
+      //      on iOS"): WebKit gives a push tap no reload-free channel
+      //      (system-knowhow/notifications.md §4.5), so the reload IS the
+      //      navigation. Only this trigger goes away when WebKit gives us one.
+      //
+      // Decided HERE, in <head>, and never in the body. Every body script waits
+      // for the bundle stylesheet, and WebKit paints a frame the moment it lands.
+      // A body-side decision is therefore one frame late, and that frame shows
+      // the blue launch splash. <html> exists already, so
+      // the decision is an attribute on it, and the stylesheet's
+      // `[data-boot-splash-quiet]` rules apply from the first frame on.
+      (function () {
+        var d = document.documentElement;
+        // Per-workspace key, by hand. `refreshClient` writes through the app's
+        // namespacing override (utils/workspaceStorage.ts), whose prototype patch
+        // ALSO covers sessionStorage, so the flag lands at `ws:<slug>:…`. This
+        // script runs before that override exists, so it must build the same
+        // prefix itself or it would read a key nobody writes, and the cover would
+        // silently never appear behind the gateway. Mirrors the boot watchdog's
+        // own wsKey below (and basePath.ts): picker (`/~/`) and legacy root (`/`)
+        // have no slug and stay raw, exactly as the override no-ops there.
+        var bootBase = document.querySelector('base');
+        var bootBaseHref = bootBase && bootBase.getAttribute('href');
+        // Absolute base href: normalize to its pathname first, as the FOUC copy
+        // above and basePath.ts do. See that comment for why.
+        if (bootBaseHref && /^https?:\/\//i.test(bootBaseHref)) {
+          try { bootBaseHref = new URL(bootBaseHref).pathname; } catch (e) { /* keep the raw value */ }
+        }
+        // Strip THEN compare, matching the FOUC copy: comparing the raw href
+        // against '/' and '/~/' first would call a slash-less `~` a workspace
+        // slug and namespace under `ws:~:`, where basePath.ts derives null.
+        var bootSlug = (function () {
+          if (!bootBaseHref) return null;
+          var seg = bootBaseHref.replace(/^\/+|\/+$/g, '');
+          return (seg === '' || seg === '~') ? null : seg;
+        })();
+        function wsKey(name) { return bootSlug ? 'ws:' + bootSlug + ':' + name : name; }
+        // Consume the refresh flag FIRST and unconditionally, so it cannot survive
+        // a load that then declines to quiet for some other reason. One-shot, so a
+        // refresh whose reload never happened can quiet at most ONE later load.
+        var quiet;
+        try {
+          quiet = sessionStorage.getItem(wsKey('lucidos-splash-quiet')) === '1';
+          sessionStorage.removeItem(wsKey('lucidos-splash-quiet'));
+        } catch (e) { quiet = false; }
+        // The deep-link gate mirrors `handleHashLocation`
+        // (store/actions/hash-deeplink-router.ts) branch for branch, and that
+        // precision is load-bearing three times over:
+        //   • A bare `#thread=<uuid>` is the cross-workspace landing channel, which
+        //     the router checks FIRST (THREAD_HASH_RE, store/actions/cross-workspace.ts)
+        //     and which wins even when a notification param is also present. That hop
+        //     goes through the gateway and can lazy-start a stopped engine, so
+        //     "Opening your workspace…" is true there: it stays a launch.
+        //   • The router reads the notification id with the HASH winning over the query
+        //     (its `get` is `hash ?? query`), so a present-but-empty hash value beats a
+        //     good query one.
+        //   • It dispatches on the VALUE being non-empty (`hasDeepLinkParams` is
+        //     `!!notification`), not on the key existing. So `?notification=` and a bare
+        //     `thread=`/`event=` pair both stay launches: quieting a document that then
+        //     routes nothing would drop the mark and the reveal floor for a real cold
+        //     start.
+        // Reads `location` and never writes it: consuming the deep link belongs to
+        // handleHashLocation alone.
+        if (!quiet) {
+          try {
+            if (/^#thread=[0-9a-f-]+$/.test(location.hash)) return;
+            var hashParams = location.hash.charAt(0) === '#'
+              ? new URLSearchParams(location.hash.slice(1))
+              : new URLSearchParams();
+            var notification = hashParams.get('notification');
+            if (notification === null) {
+              notification = new URLSearchParams(location.search).get('notification');
+            }
+            quiet = !!notification;
+          } catch (e) { quiet = false; }
+        }
+        if (!quiet) return;
+        // The gateway handover WINS, and this is the one case where a deep-link
+        // document is not a continuation of a live session. A tap on a stopped
+        // workspace is lazy-started by the gateway, which serves its own boot
+        // splash on this exact url until the engine answers. By then the user has
+        // watched a fully built mark for seconds, and the handover script in the
+        // body keeps it standing. Quieting that would hide the mark mid-boot and
+        // snap the gradient flat in one frame, the seam jump the handover exists
+        // to prevent. Read here, never consumed: the handover script owns the flag.
+        try {
+          if (sessionStorage.getItem('lucidos-splash-mark-formed') === '1') return;
+        } catch (e) { /* no storage means no handover either */ }
+        d.setAttribute('data-boot-splash-quiet', '');
+        // The canvas goes flat too, because the iOS standalone bottom safe-area
+        // strip is filled from it and no element reaches it. The colour is the one
+        // the appearance script above resolved, recomputed from data-theme-mode
+        // when that script could not run (a browser refusing localStorage throws
+        // out of it), so the canvas never keeps the gradient under a flat cover.
+        d.style.background = d.style.getPropertyValue('--bg-primary') ||
+          (d.getAttribute('data-theme-mode') === 'light' ? '#ffffff' : '#07172e');
+      })();
+    </script>
+    <!--
+      Boot splash — inlined here (markup + style) so it paints on the FIRST
+      frame, BEFORE the JS/CSS bundle downloads. That is what makes the cold
+      launch connection-independent: on a slow link the splash shows immediately
+      instead of a black/empty #app. The SAME inline splash ships in every served
+      context (picker `/~/`, workspace `/<slug>/`, direct `/`) — the engine and
+      gateway both serve this one `index.html`.
+
+      REVEAL ONLY IN THE FINAL DOCUMENT (the load-bearing rule). The picker→
+      workspace auto-open is a full cross-document navigation (a reload). A reveal
+      animation that played in BOTH documents would build, reload, and build again
+      — the jank we hit before. So:
+        • The picker (base href `/~/`) hides the mark (the inline script below
+          tags the splash `boot-splash-reload`) so the reveal plays only in the
+          workspace. When the picker LIST renders (no remembered workspace to
+          auto-open, or an explicit `?pick`) that script also CLEARS the baked
+          "Opening your workspace…" status — on the picker you choose a workspace,
+          you don't open one — so it shows only the silent gradient cover. The
+          auto-open path (a remembered workspace) keeps the status and carries it
+          into the workspace document.
+        • The final document (workspace / direct, base href NOT `/~/`) plays the
+          reveal ONCE, then settles into a gentle breathe. So the mark builds up
+          exactly once, on a clean gradient, in the destination: never a double
+          build and never a formed→rebuild jump (the picker showed no mark to
+          jump from). hooks/useBootSplashReady.ts keeps the splash up until the
+          reveal has finished at least once (min-reveal), THEN dismisses on
+          readiness.
+        • Unless the mark is ALREADY BUILT when this document loads, which is the
+          case when the gateway boot splash was up. It stands one there at the
+          same size and place and hands it over (see the body script), so the
+          reveal is skipped entirely: the mark just keeps standing, and there is
+          no min-reveal to wait out.
+
+      STATUS LINE: hangs below the mark, out of flow, so no status change can
+      move the mark, and a change crossfades rather than snapping to the new
+      width. A baked default ("Opening your workspace…") shows from first
+      paint. This SAME text is baked into both documents; the auto-open path does
+      NOT override it, so the status is byte-identical across the picker→workspace
+      reload — it neither vanishes ("message that disappears immediately") nor
+      swaps wording ("opening your workspace" → "opening") at the seam. (The
+      picker-LIST render path is the exception — it clears the status, since you're
+      choosing a workspace there, not opening one; see the body script below.)
+      The gateway splash lifts this baked text too (proxy.rs `app_status_text`).
+      It crossfades to it before it reloads into this document, so that seam
+      is byte-identical as well.
+      src/utils/bootSplash.ts updates the text; it fades the whole splash out once
+      the app is ready. The mark geometry mirrors
+      scripts/generate-brand-icons.mjs / components/shared/LucidosMark.tsx
+      verbatim; the gradient is the brand radial. z-index 2500 sits above every
+      overlay + the floating header chrome (modals 2300, toasts 2400, control
+      panel 2200; see styles/global/base.css) and is hardcoded because the bundle
+      CSS isn't loaded yet at first paint.
+
+      SINGLE SOURCE FOR BOTH SPLASH SURFACES. The gateway serves its own 503 boot
+      splash while a workspace engine starts, on the SAME url this document then
+      loads at (crates/lucidos-gateway/src/proxy.rs). It cannot link a stylesheet
+      (there is no engine to serve one yet), so it `include_str!`s THIS FILE at
+      compile time and lifts the stylesheet and the mark markup out of it
+      verbatim, between the lucidos-boot-splash-css and lucidos-boot-splash-mark
+      marker pairs below. So the two surfaces are the same splash by
+      construction, not two copies kept in step: edit a value here and the
+      gateway moves with it. Two things follow.
+        • Keep those markers, exactly one pair of each. Both sides pin them
+          (src/utils/bootSplash.test.ts and proxy.rs), so dropping one fails a
+          test rather than silently unstyling the gateway splash.
+        • Every length here is in FIXED px, never rem. This document's <html>
+          font-size is var(--user-ui-scale) (base.css, 112.5% by default on
+          mobile.css) and the gateway's is the browser default, so one rem value
+          paints at two different sizes: at 137.5% scale a 15rem mark was 330px
+          here and 240px there, and it visibly grew when this document took over.
+    -->
+    <style>
+      /* lucidos-boot-splash-css-start */
+      .boot-splash {
+        position: fixed;
+        /* The height is PINNED against growth, so the mark and the status line
+           never drop. An installed iOS app can open on a viewport that stops
+           short of the home-bar strip, and gain the strip later. A box sized by
+           the viewport then grows, and everything centred in it drops by half
+           the strip. The pin script under the markup measures the box at first
+           paint and re-measures only when the width changes. A viewport that
+           SHRINKS still shrinks the box (max-height), so a stalled splash keeps
+           its escape link on screen. Without the pin (the gateway page) the box
+           is the plain viewport. The cover is ::before, which fills the whole
+           viewport whatever the pin holds. */
+        inset: 0 0 auto;
+        height: var(--boot-splash-height, 100%);
+        max-height: 100%;
+        z-index: 2500;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        /* px, not rem: see the no-rem rule in the comment above. 240px is what
+           the old 15rem mark cap resolved to at a default 16px root. */
+        --boot-mark-size: min(46vmin, 240px);
+        --boot-splash-gap: 24px;
+        /* Only spaces anything when the foot is back in flow (see
+           .boot-splash-foot): normally the mark is the one in-flow child. */
+        gap: var(--boot-splash-gap);
+        /* Type for the whole splash, set once here so every line on either
+           surface inherits it (the gateway adds an escape link; this document's
+           status is the only child today).
+           FIXED font stack, deliberately NOT var(--font-ui): the workspace font
+           preference can be a web font (Inter / JetBrains Mono / IBM Plex Mono)
+           that isn't downloaded yet at first paint, so the text would paint in a
+           fallback and then reflow when the web font swaps, which is visible
+           jank on the boot splash. An all-system monospace stack paints
+           instantly with no swap. Size in px for the no-rem reason above. */
+        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+        font-size: 15px;
+        line-height: 1.4;
+        letter-spacing: 0.01em;
+        /* Smoothing belongs to "type set once here" as much as the size does,
+           and it is the one property that made the two surfaces disagree. The
+           app shell antialiases every glyph from `body` in
+           styles/global/base.css, which is BUNDLE css: the gateway splash
+           cannot load it (there is no engine yet to serve it, which is why that
+           page lifts only this marker-fenced block), so its status rendered at
+           the macOS default, subpixel-antialiased. That reads visibly heavier
+           than grayscale, so the line appeared to un-bold at the seam, on the
+           same frame its text changed from a boot phase to "Opening your
+           workspace…". Declared here rather than left to inherit, so it also
+           holds before the bundle stylesheet applies. Keep in step with the
+           `body` rule in base.css: a guard in src/utils/bootSplash.test.ts
+           reads both files and fails if the two ever disagree. */
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-rendering: optimizeLegibility;
+        /* Decorative during normal boot: the app shell loads + is interactive
+           behind it, so the splash does not intercept pointer events. The
+           guarded terminal-recovery state deliberately enables a tap below. */
+        pointer-events: none;
+      }
+      /* The cover. Fixed, so it fills the viewport rather than the pinned box,
+         and z-index -1 keeps it under the mark inside the splash's stacking
+         context. The gradient stretches with it: a soft gradient rescaled by a
+         strip's height reads as nothing, where a seam at the strip shows. The
+         splash's opacity and visibility carry it out with the rest. */
+      .boot-splash::before {
+        content: '';
+        position: fixed;
+        inset: 0;
+        z-index: -1;
+        background: radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%);
+      }
+      .boot-splash-mark {
+        width: var(--boot-mark-size);
+        height: var(--boot-mark-size);
+        /* Reveal the WHOLE mark as one compositor layer (svg-root transform +
+           opacity), then breathe. The previous reveal animated transform:scale on
+           each SVG shape (.bs-tile/.bs-spark) — iOS WebKit does NOT GPU-composite
+           SVG sub-element transforms, so they ran on the main thread and janked
+           while boot saturated it (bundle parse + initial render). Animating the
+           svg element itself composites cleanly (will-change hints the layer), so
+           the reveal stays smooth regardless of main-thread load. */
+        will-change: transform, opacity;
+        transform-origin: center;
+        animation: boot-mark-reveal calc(0.6s * var(--duration-scale, 1)) cubic-bezier(0.34, 1.56, 0.64, 1) both,
+                   boot-mark-breathe 2.8s ease-in-out calc(1.3s * var(--duration-scale, 1)) infinite;
+      }
+      /* Everything under the mark: the status line and the escape link. It
+         hangs from the mark's bottom edge, out of flow, so the mark alone is
+         centred. A status that changes, wraps, or gains a link below it then
+         grows downward and can never move the mark. */
+      .boot-splash-foot {
+        position: absolute;
+        top: calc(50% + var(--boot-mark-size) / 2 + var(--boot-splash-gap));
+        left: 0;
+        right: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: var(--boot-splash-gap);
+      }
+      /* Hung under the mark, the foot can run past the bottom edge, and a
+         fixed box never scrolls. Two cases re-centre the whole group instead.
+         A failure report runs to eight lines. A shown escape link is often the
+         only way out, so it must stay reachable. Both are failure states,
+         entered once. A short window is the third case. */
+      .boot-splash:has(.boot-splash-status-report) .boot-splash-foot,
+      .boot-splash:has(.boot-splash-escape:not([hidden])) .boot-splash-foot { position: static; }
+      @media (max-height: 520px) {
+        .boot-splash-foot { position: static; }
+      }
+      /* Picker (about to reload): hide the mark so the reveal happens ONLY in the
+         workspace. Space is reserved (visibility, not display) so the status line
+         keeps its position. */
+      .boot-splash-reload .boot-splash-mark { visibility: hidden; }
+      /* The mark was already built by a previous document (the gateway boot
+         splash, or an earlier refresh of it) and is standing on screen right now
+         (see the handover script in the body). Skip the reveal and settle
+         straight into the breathe, so the swap leaves the mark where it is
+         instead of dropping it to opacity 0 and building it a second time.
+         Higher specificity than the reveal rule above, so it wins without
+         touching it. Used by BOTH surfaces. */
+      .boot-splash-formed .boot-splash-mark {
+        animation: boot-mark-breathe 2.8s ease-in-out infinite;
+      }
+      /* The QUIET cover: a refresh, or a notification tap (see the quiet script
+         in <head>, which sets the attribute on <html> before the splash parses).
+         A push tap arrives as a full cross-document load of `?notification=…`,
+         and this splash is what the user stares at. But that load CONTINUES a
+         session, so it gets no launch ceremony: no mark, no status, and the
+         app's own flat --bg-primary instead of the brand gradient. The cover
+         then reads as the app redrawing rather than relaunching.
+         hooks/useBootSplashReady.ts also skips the min-reveal floor here, since
+         there is no reveal to wait out. Only the DELAYED status survives
+         (utils/bootSplash.ts writes it past STATUS_DELAY_MS): quiet is not
+         silent, and a genuinely stuck tap still has to say so. */
+      :root[data-boot-splash-quiet] .boot-splash::before {
+        background: var(--bg-primary, #07172e);
+      }
+      :root[data-boot-splash-quiet] .boot-splash-mark { display: none; }
+      /* No mark to hang from, so the status takes the centre itself. */
+      :root[data-boot-splash-quiet] .boot-splash-foot { position: static; }
+      /* The baked launch status is still in the markup until the body script
+         clears it and tags the splash `boot-splash-quiet`. That script runs
+         after WebKit's first frame, so hide the line until it has. */
+      :root[data-boot-splash-quiet] .boot-splash:not(.boot-splash-quiet) .boot-splash-status {
+        visibility: hidden;
+      }
+      /* Both foregrounds on this splash are hardcoded white, which is right on
+         the brand gradient and wrong on a quiet cover: in light theme
+         --bg-primary is #ffffff, so the delayed status ("Connecting…",
+         "Workspace not started") and the watchdog's escape link ("Start this
+         workspace", the ONLY way out of a stopped direct-port workspace) would
+         both be white on white. That would make "quiet, but not silent"
+         literally false for a light-theme user, at exactly the moment boot has
+         given up. Keyed on data-theme-mode, which the FOUC script resolves before
+         first paint, so it holds even when the bundle CSS never loads, which is
+         precisely the case the escape link exists for. Values mirror
+         --text-primary in styles/global/base.css; px/hex only, per the no-rem
+         rule above. */
+      :root[data-theme-mode="light"][data-boot-splash-quiet] .boot-splash-status {
+        color: rgba(31, 35, 40, 0.82);
+      }
+      :root[data-theme-mode="light"][data-boot-splash-quiet] .boot-splash-escape { color: #1f2328; }
+      /* Nothing branded to fade out, so the cover leaves faster than a launch
+         splash does. Its specificity (0,3,0) is what lets it beat the
+         `animation` shorthand on .boot-splash-leaving below. The reduced-motion
+         rule below restates it, so the 0.15s exit wins here too. */
+      :root[data-boot-splash-quiet] .boot-splash-leaving { animation-duration: calc(0.2s * var(--duration-scale, 1)); }
+      .boot-splash-status {
+        /* Type is inherited from .boot-splash (one declaration for both
+           surfaces); this rule owns only what is the status line's own. The
+           gateway lets this same line wrap for its longer labels and overrides
+           nothing else. */
+        color: rgba(255, 255, 255, 0.82);
+        /* Constant size, reserved identically whether the text is present,
+           empty, or invisible, so the escape link below it never shifts. One
+           line at the inherited 1.4 line-height. */
+        height: 1.4em;
+        /* A fixed width, not one that shrinks to the words. When a shorter
+           label replaces a longer one, iOS WebKit leaves the old label's edges
+           painted where the box shrank. The two then read as one garbled line.
+           A box that never resizes repaints whole. */
+        width: 80vw;
+        text-align: center;
+        will-change: opacity;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        opacity: 0;
+        transition: opacity calc(0.3s * var(--duration-scale, 1)) ease;
+      }
+      .boot-splash-status.boot-splash-status-shown { opacity: 1; }
+      /* A status CHANGE: fade the old words out, swap them while invisible,
+         and let the shown rule above fade the new ones in. A new label is a
+         new width, and an instant swap lurches the centred line sideways.
+         Both surfaces run it: src/utils/bootSplash.ts and the gateway page's
+         poller wait out this 0.15s before they swap. */
+      .boot-splash-status.boot-splash-status-swap {
+        opacity: 0;
+        transition-duration: calc(0.15s * var(--duration-scale, 1));
+      }
+      /* A FAILURE REPORT, which is several lines rather than one: what went
+         wrong, the reason the background service gave, and where to read more
+         (desktop.rs `crash_loop_label`). The one-line rules above exist so the
+         mark never shifts during an ordinary start, and they still do: this is
+         a separate state, entered only once there is a failure to show, and by
+         then nothing above is still animating. Kept off the one-line path so a
+         reason with no line breaks in it cannot silently widen the splash. */
+      .boot-splash-status.boot-splash-status-report {
+        height: auto;
+        /* Generous, and viewport-relative rather than a line count. A real
+           staging failure names a path twice over, so the report runs to about
+           eight wrapped lines: an 8.4em (six-line) cap clipped the LAST line,
+           which is the log path, the one actionable thing on the splash. The
+           inherited overflow:hidden stays as the last-resort guard. */
+        max-height: 40vh;
+        /* px, not rem: see the no-rem rule on .boot-splash. 720px is about 80
+           columns at the 15px monospace above. */
+        max-width: min(80vw, 720px);
+        white-space: pre-line;
+        /* `break-word`, not `anywhere`: a long path must wrap rather than
+           overflow, and this is the form every WebKit the gateway splash can
+           land in already supports. */
+        overflow-wrap: break-word;
+        text-overflow: clip;
+      }
+      /* The one action a splash can offer when boot cannot proceed: a link out.
+         Both surfaces render one, so the appearance is declared here once and
+         each surface owns only WHEN it is shown. The gateway page renders its
+         link outright (its stalled/failed pages have nothing else left to
+         offer); this document ships its own with the `hidden` attribute and
+         drops that only in the recovery state, so a healthy boot never shows
+         it. Reads brighter than the status and is underlined, so it reads as a
+         tap target, and it takes its pointer events back from the
+         pointer-events:none splash that covers a live shell. */
+      .boot-splash-escape {
+        color: #fff;
+        opacity: 0.92;
+        text-decoration: underline;
+        text-underline-offset: 0.2em;
+        pointer-events: auto;
+      }
+      .boot-splash.boot-splash-stalled { pointer-events: auto; cursor: pointer; }
+      /* THE EXIT IS TWO BEATS, and the split is what makes the hand-off read as
+         one. Fading the whole splash on one curve (what this did until
+         2026-08-11) dissolves the veil, the white mark and the status line
+         together, so for most of the fade a 240px mark and a line of text sit
+         ghosting ON TOP of the app's own content: in a captured frame the mark
+         read as grey blocks over the file tree and the status as a second line
+         across a row of it. `ease` has a long tail, so the ghost is thinnest
+         exactly where the UI underneath has become readable. Slowing that fade
+         down (the obvious answer to "the transition is a little fast") only
+         lengthens the ghost.
+         So the brand leaves the stage first: the status in 0.18s, the mark in
+         0.3s, and only then does the gradient veil finish dissolving on its own
+         over 0.65s. By the time the veil is thin enough to read the app
+         through, nothing white is left over it.
+         src/utils/bootSplash.ts removes the node when THIS element's animation
+         ends (a child's `animationend` bubbles, and acting on one would tear the
+         splash out mid-veil), and its fallback timer outlives this duration. */
+      .boot-splash-leaving { animation: boot-splash-out calc(0.65s * var(--duration-scale, 1)) ease forwards; }
+      /* A cover on its way out is not a target. `.boot-splash-escape` takes its
+         own pointer events back and `.boot-splash-stalled` takes the whole
+         container's, both for a splash that is still standing; once dismissal
+         has started, a click belongs to the app underneath. Two-class
+         specificity and declared after the stalled rule, so it wins. */
+      .boot-splash.boot-splash-leaving,
+      .boot-splash-leaving .boot-splash-escape { pointer-events: none; }
+      /* Beat one, the status. Same specificity as `.boot-splash-status-shown`
+         above and later in the file, which is what lets it win. */
+      .boot-splash-leaving .boot-splash-status {
+        opacity: 0;
+        transition: opacity calc(0.18s * var(--duration-scale, 1)) ease;
+      }
+      /* Beat one, the mark. The exit is APPENDED to the animation list rather
+         than replacing it, and the entries ahead of it are restated verbatim:
+         an animation keeps its start time as long as its name stays at the same
+         index, so the reveal does not re-run, and the exit's implicit `from`
+         composites over whatever the breathe is currently producing. Redeclaring
+         the shorthand with the exit alone would instead drop the breathe and
+         start from the base opacity 1, jumping the mark up to 16% brighter on
+         the frame dismissal happens to land in.
+         The scale is the same 1.06 the reveal overshoots to, so the mark leaves
+         the way it arrived. Two rules because the two states carry two different
+         lists: a formed mark (the gateway handover) never played a reveal, and
+         putting one back in its list here would rebuild it mid-exit. */
+      .boot-splash-leaving .boot-splash-mark {
+        animation: boot-mark-reveal calc(0.6s * var(--duration-scale, 1)) cubic-bezier(0.34, 1.56, 0.64, 1) both,
+                   boot-mark-breathe 2.8s ease-in-out calc(1.3s * var(--duration-scale, 1)) infinite,
+                   boot-mark-out calc(0.3s * var(--duration-scale, 1)) cubic-bezier(0.4, 0, 1, 1) forwards;
+      }
+      .boot-splash-formed.boot-splash-leaving .boot-splash-mark {
+        animation: boot-mark-breathe 2.8s ease-in-out infinite,
+                   boot-mark-out calc(0.3s * var(--duration-scale, 1)) cubic-bezier(0.4, 0, 1, 1) forwards;
+      }
+      @keyframes boot-mark-reveal {
+        from { opacity: 0; transform: scale(0.86); }
+        70%  { opacity: 1; transform: scale(1.04); }
+        to   { opacity: 1; transform: scale(1); }
+      }
+      @keyframes boot-mark-breathe {
+        0%, 100% { opacity: 1; }
+        50%      { opacity: 0.84; }
+      }
+      /* No `from`: the underlying value is whatever the animations ahead of this
+         one in the list are producing, so the mark fades from where the breathe
+         has it rather than snapping to full opacity first. */
+      @keyframes boot-mark-out { to { opacity: 0; transform: scale(1.06); } }
+      @keyframes boot-splash-out { to { opacity: 0; visibility: hidden; } }
+      /* Reduced motion, keyed on the `data-motion` attribute the boot script
+         sets before this markup parses. Each exit selector is restated so
+         every exit rule above meets a reduced-motion rule of its own, and a
+         reduced-motion user never gets the scale. Same for the status, whose
+         exit rule declares a transition this one has to silence. */
+      :root[data-motion="reduce"] .boot-splash-mark,
+      :root[data-motion="reduce"] .boot-splash-formed .boot-splash-mark,
+      :root[data-motion="reduce"] .boot-splash-leaving .boot-splash-mark,
+      :root[data-motion="reduce"] .boot-splash-formed.boot-splash-leaving .boot-splash-mark { animation: none; }
+      :root[data-motion="reduce"] .boot-splash-status,
+      :root[data-motion="reduce"] .boot-splash-leaving .boot-splash-status { transition: none; }
+      :root[data-motion="reduce"] .boot-splash-leaving,
+      :root[data-motion="reduce"][data-boot-splash-quiet] .boot-splash-leaving { animation-duration: 0.15s; }
+      /* lucidos-boot-splash-css-end */
+    </style>
+</head>
+<body style="background:#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed">
+    <div class="boot-splash" aria-hidden="true">
+      <!-- lucidos-boot-splash-mark-start -->
+      <svg class="boot-splash-mark" viewBox="0 0 100 100" aria-hidden="true">
+        <g transform="translate(11 11) scale(0.78)" fill="#ffffff">
+          <rect x="17" y="17" width="29" height="29" rx="7" />
+          <rect x="17" y="54" width="29" height="29" rx="7" />
+          <rect x="54" y="54" width="29" height="29" rx="7" />
+          <path d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z" />
+        </g>
+      </svg>
+      <!-- lucidos-boot-splash-mark-end -->
+      <div class="boot-splash-foot">
+        <div class="boot-splash-status boot-splash-status-shown" role="status" aria-live="polite">Opening your workspace…</div>
+        <!-- The way out of a workspace this document cannot reach, revealed only
+             when boot has given up (see the watchdog below and
+             src/utils/bootSplash.ts). `hidden` until then, and it carries no href
+             until one is built, so a healthy boot has nothing here to see or tap.
+             Kept OUTSIDE the mark markers: the gateway splash lifts only the mark
+             and renders its own escape link. -->
+        <a class="boot-splash-escape" hidden></a>
+      </div>
+    </div>
+    <script>
+      // Pin the splash box to its first-paint height (see `.boot-splash`). A
+      // height-only resize is iOS correcting its viewport, so the pin holds.
+      // A width change is a rotation, which needs a fresh measure. A rotation
+      // can change the width before its height settles, so the pin follows
+      // the height for a moment after one.
+      (function () {
+        var ROTATION_SETTLE_MS = 500;
+        var splash = document.querySelector('.boot-splash');
+        if (!splash) return;
+        var pinnedWidth;
+        var settlesAt = 0;
+        function pin() {
+          if (!splash.isConnected) {
+            window.removeEventListener('resize', pin);
+            return;
+          }
+          if (window.innerWidth !== pinnedWidth) {
+            if (pinnedWidth !== undefined) settlesAt = Date.now() + ROTATION_SETTLE_MS;
+            pinnedWidth = window.innerWidth;
+          } else if (Date.now() > settlesAt) {
+            return;
+          }
+          splash.style.removeProperty('--boot-splash-height');
+          splash.style.setProperty('--boot-splash-height', splash.getBoundingClientRect().height + 'px');
+        }
+        pin();
+        window.addEventListener('resize', pin);
+      })();
+    </script>
+    <script>
+      // Gateway-splash handover, before first paint. The gateway serves its own
+      // 503 boot splash on the SAME url while the engine starts (proxy.rs), with
+      // the mark at the same size and position as this one; when the engine
+      // answers, that document is replaced by this one. Left alone, this document
+      // would re-play its reveal, so a mark that was already standing on screen
+      // drops to opacity 0 and builds a second time. The gateway page hands over
+      // a one-shot sessionStorage flag: consume it (removing it as we read, so it
+      // can only suppress that ONE rebuild) and tag the splash `boot-splash-formed`
+      // to skip straight to the breathe. No flag (engine already up, or a direct
+      // engine port with no gateway) means no mark was on screen, so the reveal
+      // plays as usual. See the splash comment above.
+      (function () {
+        var formed;
+        try {
+          formed = sessionStorage.getItem('lucidos-splash-mark-formed') === '1';
+          sessionStorage.removeItem('lucidos-splash-mark-formed');
+        } catch (e) { formed = false; }
+        if (!formed) return;
+        var splash = document.querySelector('.boot-splash');
+        if (splash) splash.classList.add('boot-splash-formed');
+      })();
+    </script>
+    <script>
+      // Picker context (server-stamped <base href="/~/">). Two jobs, both before
+      // first paint:
+      //   1. Hide the mark (tag `boot-splash-reload`) so the reveal plays
+      //      ONLY in the workspace document, never double-builds across the
+      //      picker→workspace auto-open navigation.
+      //   2. When the picker LIST is what renders — i.e. we are NOT auto-opening a
+      //      remembered workspace (explicit `?pick`, or none remembered: the SAME
+      //      condition the <head> redirect uses to NOT redirect) — clear the baked
+      //      "Opening your workspace…" status. On the picker you choose a
+      //      workspace, you don't open one, so that message is wrong; cleared, the
+      //      picker shows a silent gradient cover that fades into the list. The
+      //      auto-open path keeps the status (it redirects in <head> and the text
+      //      carries into the workspace document, byte-identical across the seam).
+      // See the splash comment above + hooks/useBootSplashReady.ts.
+      (function () {
+        var base = document.querySelector('base');
+        if (!base || base.getAttribute('href') !== '/~/') return;
+        var splash = document.querySelector('.boot-splash');
+        if (splash) splash.classList.add('boot-splash-reload');
+        var renderingList;
+        try {
+          renderingList = new URLSearchParams(location.search).has('pick') ||
+            !localStorage.getItem('lucidos-last-workspace');
+        } catch (e) { renderingList = true; }
+        if (renderingList && splash) {
+          var status = splash.querySelector('.boot-splash-status');
+          if (status) { status.textContent = ''; status.classList.remove('boot-splash-status-shown'); }
+        }
+      })();
+    </script>
+    <script>
+      // Apply the quiet cover the <head> script decided on. The stylesheet has
+      // already dropped the mark and the gradient off the attribute. Two things
+      // left need this markup:
+      //   • The baked "Opening your workspace…" is a launch message, so clear it.
+      //     The `boot-splash-quiet` tag says it is cleared, which lifts the
+      //     stylesheet's first-frame hide off the status line for the DELAYED
+      //     status (utils/bootSplash.ts writes it past STATUS_DELAY_MS).
+      //   • Repaint <body> flat to match the canvas, since its inline gradient
+      //     would otherwise show through the cover's exit fade.
+      (function () {
+        var d = document.documentElement;
+        if (!d.hasAttribute('data-boot-splash-quiet')) return;
+        var splash = document.querySelector('.boot-splash');
+        if (splash) {
+          var status = splash.querySelector('.boot-splash-status');
+          if (status) { status.textContent = ''; status.classList.remove('boot-splash-status-shown'); }
+          splash.classList.add('boot-splash-quiet');
+        }
+        if (document.body) document.body.style.background = d.style.background;
+      })();
+    </script>
+    <div id="app"></div>
+    <script>
+      /* lucidos-boot-watchdog-start
+         The application module normally takes ownership immediately below. If
+         its content-hashed entry is stale/missing, none of the module-owned
+         status or safety timers can run, so keep the recovery floor in this
+         classic inline script. Retry automatically once; a second failure stops
+         with a tappable action instead of reload-looping forever. */
+      (function () {
+        var RETRY_KEY = 'lucidos-boot-retry';
+        var RETRY_PARAM = '_boot_retry';
+        var base = document.querySelector('base');
+        var baseHref = base && base.getAttribute('href');
+        // Slug only: `baseHref` itself stays raw, because revealGatewayEscape
+        // below keys on its mere PRESENCE ("direct" is exactly "no base
+        // element"). Absolute base href normalized to its pathname, as the two
+        // wsKey copies above do; see the FOUC one for why.
+        var slugHref = baseHref;
+        if (slugHref && /^https?:\/\//i.test(slugHref)) {
+          try { slugHref = new URL(slugHref).pathname; } catch (e) { /* keep the raw value */ }
+        }
+        // Strip THEN compare, matching the two copies above (see the FOUC one).
+        var workspaceSlug = (function () {
+          if (!slugHref) return null;
+          var seg = slugHref.replace(/^\/+|\/+$/g, '');
+          return (seg === '' || seg === '~') ? null : seg;
+        })();
+        function wsKey(name) { return workspaceSlug ? 'ws:' + workspaceSlug + ':' + name : name; }
+        var recovered = false;
+        var handedOver = false;
+        // The service worker's bundle caches. Must match SHELL_CACHE in sw.js.
+        var SHELL_CACHE_PREFIX = 'lucidos-shell-';
+        var EVICT_BOUND_MS = 2000;
+
+        /* Every reload below exists because a bundle failed, and the service
+           worker serves bundles cache-first. A bad cached copy would load again
+           on each reload, so drop the bundle caches first. Offline, keep them:
+           nothing could refetch the shell. Best effort: a missing, failing or
+           hung Cache API still reloads, within the bound. */
+        function evictBundlesThen(next) {
+          var done = false;
+          function go() {
+            if (done) return;
+            done = true;
+            next();
+          }
+          if (typeof caches === 'undefined' || navigator.onLine === false) { go(); return; }
+          window.setTimeout(go, EVICT_BOUND_MS);
+          try {
+            caches.keys().then(function (names) {
+              return Promise.all(names
+                .filter(function (name) { return name.indexOf(SHELL_CACHE_PREFIX) === 0; })
+                .map(function (name) { return caches.delete(name); }));
+            }).then(go, go);
+          } catch (e) { go(); }
+        }
+
+        function metaContent(name) {
+          var el = document.querySelector('meta[name="' + name + '"]');
+          var value = el && el.getAttribute('content');
+          return value ? value.trim() : '';
+        }
+
+        /* The way out of a workspace this document cannot reach, and the reason
+           the engine stamps a gateway port and a workspace id into every shell
+           (api/base_path.rs): built from those two metas plus `location`, so it
+           needs no engine, no network and no application bundle. Exactly the
+           resources a document served from the service worker's cache against a
+           dead origin still has.
+
+           Only a DIRECT-PORT document gets one. Direct access is the case with
+           no way out: nothing on that origin lazy-starts a stopped workspace,
+           and the gateway is a different origin (its own port), so no relative
+           route reaches it. A document already behind the gateway (base
+           `/<slug>/`), the picker (`/~/`), and an engine with no gateway at all
+           (no port meta) each have nothing to offer here, and keep the plain
+           retry. `inject_base_href` is a no-op for `/`, so "direct" is exactly
+           "no base element".
+
+           Prefers `/<slug>/`, whose navigation is what makes the gateway
+           lazy-start the workspace. A shell cached before the id stamp existed
+           falls back to the picker, which is a tap further but still a way in.
+
+           Returns the revealed anchor, or null when there is nothing to offer. */
+        function revealGatewayEscape() {
+          var splash = document.querySelector('.boot-splash');
+          if (!splash || baseHref) return null;
+          var port = metaContent('lucidos-gateway-port');
+          if (!port) return null;
+          var link = splash.querySelector('.boot-splash-escape');
+          if (!link) return null;
+          var slug = metaContent('lucidos-workspace-id');
+          var origin = location.protocol + '//' + location.hostname + ':' + port;
+          link.href = slug
+            ? origin + '/' + encodeURIComponent(slug) + '/'
+            : origin + '/~/?pick';
+          link.textContent = slug ? 'Start this workspace' : 'Back to workspaces';
+          link.hidden = false;
+          // The splash ships aria-hidden (it is decorative over a live shell).
+          // The moment it carries the only action on screen that has to stop:
+          // otherwise the status naming the problem is never announced, and the
+          // link is a focusable element inside an aria-hidden subtree.
+          splash.setAttribute('aria-hidden', 'false');
+          return link;
+        }
+
+        // One automatic retry, then a tappable action. Reached two ways, and the
+        // distinction is the whole point of the pair: the timer below covers a
+        // module that never takes ownership (a hang, where waiting IS the test),
+        // and `onEntryModuleError` covers a module that reported it CANNOT load
+        // (a stale bundle, or an engine that isn't answering at all), where the
+        // answer is already in and there is nothing left to wait for. Before the
+        // error arm, a dead direct engine port left the user staring at
+        // "Opening your workspace…" for 15s, then again after the silent retry.
+        function recover() {
+          if (recovered) return;
+          recovered = true;
+          window.clearTimeout(timer);
+          var tried = false;
+          try { tried = sessionStorage.getItem(wsKey(RETRY_KEY)) === '1'; } catch (e) {}
+          // The retry marks the URL as well as sessionStorage, and either mark
+          // spends the one attempt. A browser that refuses storage would
+          // otherwise never observe its own retry and would reload forever.
+          try {
+            tried = tried || new URL(location.href).searchParams.has(RETRY_PARAM);
+          } catch (e) {}
+          if (!tried) {
+            try { sessionStorage.setItem(wsKey(RETRY_KEY), '1'); } catch (e) {}
+            var retryUrl = new URL(location.href);
+            retryUrl.searchParams.set(RETRY_PARAM, '1');
+            // A module that took boot over during the eviction needs no retry.
+            evictBundlesThen(function () { if (!handedOver) location.replace(retryUrl.toString()); });
+            return;
+          }
+          var splash = document.querySelector('.boot-splash');
+          var status = splash && splash.querySelector('.boot-splash-status');
+          // On a direct engine port the gateway is the only thing that can help:
+          // reloading cannot start a stopped workspace, and the gateway starts
+          // one on a navigation to it. So where an escape exists it REPLACES
+          // tap-to-retry rather than sitting beside it, leaving exactly one tap
+          // target in the recovery state.
+          var escape = revealGatewayEscape();
+          if (status) {
+            status.textContent = escape ? "Can't reach this workspace" : 'Tap to retry';
+            status.classList.add('boot-splash-status-shown');
+          }
+          if (splash && !escape) {
+            splash.classList.add('boot-splash-stalled');
+            splash.setAttribute('aria-hidden', 'false');
+            splash.addEventListener('click', function () {
+              try { sessionStorage.removeItem(wsKey(RETRY_KEY)); } catch (e) {}
+              evictBundlesThen(function () { location.reload(); });
+            }, { once: true });
+          }
+        }
+
+        var timer = window.setTimeout(recover, 15000);
+
+        // A script that fails to fetch (or is refused for its MIME type, which
+        // is how the SPA fallback's HTML answer for a deleted bundle arrives)
+        // fires `error` on its own element. That event does not bubble, but it
+        // does reach window in the CAPTURE phase, so this needs no attribute on
+        // the tag below and survives the build rewriting that tag's src.
+        //
+        // Keyed on the event, never on elapsed time: a slow but working load
+        // fires nothing, so it is untouched and still owned by the timer.
+        function onEntryModuleError(e) {
+          var el = e && e.target;
+          // A runtime exception targets window, not an element; only a module
+          // script's own load failure is evidence the entry never arrived.
+          if (!el || el === window || el.tagName !== 'SCRIPT' || el.type !== 'module') return;
+          recover();
+        }
+        window.addEventListener('error', onEntryModuleError, true);
+
+        // The application faces the same dead end when its bundle DID load but
+        // the engine is unreachable (utils/bootSplash.ts, reached from the
+        // direct-port branch of hooks/useBootSplashReady.ts). It reuses this
+        // one implementation rather than rebuilding the href rule in TS, so the
+        // two can never disagree about where the escape points. Deliberately
+        // NOT deleted by the handover below, unlike __lucidosBootLoaded: the
+        // application needs it precisely after boot has taken over.
+        window.__lucidosGatewayEscape = revealGatewayEscape;
+
+        window.__lucidosBootLoaded = function () {
+          recovered = true;
+          handedOver = true;
+          window.clearTimeout(timer);
+          // Boot is the module's now. A later module-script failure is the
+          // application's to handle, and must never reload the page under it.
+          window.removeEventListener('error', onEntryModuleError, true);
+          try { sessionStorage.removeItem(wsKey(RETRY_KEY)); } catch (e) {}
+          try {
+            var current = new URL(location.href);
+            if (current.searchParams.has(RETRY_PARAM)) {
+              current.searchParams.delete(RETRY_PARAM);
+              history.replaceState(history.state, '', current.toString());
+            }
+          } catch (e) {}
+          delete window.__lucidosBootLoaded;
+        };
+      })();
+      /* lucidos-boot-watchdog-end */
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

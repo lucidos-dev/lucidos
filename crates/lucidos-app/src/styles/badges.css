@@ -1,0 +1,205 @@
+/* ── Where a number sits inside its badge ─────────────────────────────────
+ *
+ * One rule for every badge carrying a number, a sign or a status word, because
+ * they all had the same bug. Each centred its text LINE BOX, and a line box is
+ * not the digits: the baseline sits wherever the font's ascent and descent put
+ * it, and those are asymmetric. So the digits rode high in every badge, and the two
+ * engines disagreed about how high. Measured over the whole set, the worst was
+ * 1.55px off in Chromium and 0.48px in WebKit, which is the same badge drawn
+ * differently on iOS and on Chrome.
+ *
+ * `text-box-trim` takes the font metrics out of the question. It trims the
+ * line box down to the cap band, so the thing being centred IS the digits.
+ * That drops the worst badge to 0.05px on both engines, and no badge changes
+ * size.
+ *
+ * Imported LAST (see main.tsx), which is also why it can be one rule: these
+ * badges come from many stylesheets, most of which set their own `display`, so
+ * a later file re-homes their centring without doubling every selector.
+ * `styles/__tests__/badge-glyph-centring.test.ts` holds that position. */
+
+/* ── And where it sits ACROSS the badge ───────────────────────────────────
+ *
+ * `letter-spacing` is added after EVERY character, the last one included. So a
+ * centred box carries one trailing gap with no glyph after it, and centring
+ * that box parks the digits half a gap to the left.
+ *
+ * One badge inherits any today: the section count, from the 0.05em
+ * its section title wears. The title's font is the larger of the two, so the
+ * pill inherits 6.5% of its OWN em. At 200% ui-scale that put the digits
+ * 0.65px left of the pill's middle, about two device pixels on a phone, and
+ * plain enough to be reported.
+ *
+ * `normal` rather than a compensating margin, because a count is data and not
+ * a heading. Tracking belongs to the uppercase title; the pill has no use for
+ * it, and the pill is content-sized, so it simply comes in a little tighter.
+ * Stated for every badge, so the next one to land inside a tracked host does
+ * not acquire the lean. NOT gated below: this half needs no new feature. */
+.badge,
+.section-count-badge,
+.drawer-badge,
+.brand-menu-ws-badge,
+.ws-picker-badge,
+.thread-status-question-badge,
+.app-store-status,
+.app-store-modified-chip,
+.theme-card-badge {
+    letter-spacing: normal;
+}
+
+/* ── And where its INK sits across it ─────────────────────────────────────
+ *
+ * Centring places a glyph's advance, and a font may draw the glyph off it.
+ * Fira Code's bold "3" sits 0.027em left of its slot, so at 200% the count on
+ * the mark hugged the left of its pill. `GlyphBadge` measures the text in its
+ * real font and states the gap as `--badge-ink-shift`.
+ *
+ * The text's own span moves, relatively, so only the paint shifts: the pill
+ * keeps its width and the line keeps its centring. */
+.badge-ink {
+    position: relative;
+    left: var(--badge-ink-shift, 0em);
+}
+
+/* ── And where it sits on the pixel grid ACROSS it ────────────────────────
+ *
+ * Chrome snaps a pill's left and right edges to whole CSS pixels, even on a
+ * 2x or 4x screen, but places the glyph at its exact x. So a badge on a
+ * fractional x drew its digit up to half a pixel off the pill's middle. A
+ * quarter-pixel move flipped which side. The drawer's attention count, put on
+ * a half pixel by its own column margin, sat visibly left at 200%.
+ *
+ * `will-change: transform` gives each badge its own compositing layer. Chrome
+ * puts the layer on a whole pixel and draws pill and glyph inside it together.
+ * Measured at eight sub-pixel x positions, the digit's spread drops from 0.75px
+ * to zero. WebKit already snaps both to one device-pixel grid.
+ *
+ * A heavier rule that restates `will-change` keeps `transform` in it.
+ * Measured in Chrome, `opacity` alone leaves the digit drifting at rest. */
+.badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
+.section-count-badge,
+.drawer-badge,
+.brand-menu-ws-badge,
+.ws-picker-badge,
+.thread-status-question-badge,
+.app-store-status,
+.app-store-modified-chip,
+.theme-card-badge {
+    will-change: transform;
+}
+
+/* The layer fixes WHERE the pill lands, not how wide it is. A content-sized
+   pill ends on a fraction (32.48px for the section count at 200%), and Chrome
+   rounds that edge alone. The digit then sat a quarter pixel right. So the
+   width rounds UP to a whole pixel, which never clips the content. A badge's
+   own `min-width` still sets the floor, which is why none states a `width`. */
+@supports (width: calc-size(fit-content, size)) {
+    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
+    .section-count-badge,
+    .drawer-badge,
+    .brand-menu-ws-badge,
+    .ws-picker-badge,
+    .thread-status-question-badge,
+    .app-store-status,
+    .app-store-modified-chip,
+    .theme-card-badge {
+        width: calc-size(fit-content, round(up, size, 1px));
+    }
+}
+
+/* ── And where it sits on the PIXEL GRID ──────────────────────────────────
+ *
+ * Chrome paints a baseline on a whole CSS pixel, and a pill's edges too, each
+ * rounding on its own. So a digit centred in layout still landed up to a pixel
+ * off, and WHICH way depended on where the badge sat. Moved by a sixteenth of
+ * a pixel, the same badge jumped a whole pixel against its pill. That is why
+ * the mark's unread count sat low.
+ *
+ * Both roundings agree when the pill's height and the baseline's offset inside
+ * it are whole pixels. So each badge states the height it was designed at as
+ * `--badge-height`, and the rule below derives the box from it. The baseline
+ * sits a whole-pixel padding above the bottom edge. The height is whichever of
+ * the two whole pixels at or just below the design splits more evenly around
+ * the cap band. Never above: a count sized by its row's line would grow the
+ * row, and a section header would jump as it collapsed.
+ *
+ * Measured at eight sub-pixel positions and at 100, 125 and 150% ui-scale, every
+ * badge now draws identically wherever it sits. Its glyph lands within a
+ * quarter pixel of the middle, in Chrome and in WebKit alike. */
+
+/* Gated on support, so a browser without `text-box-trim` keeps exactly the
+   flex centring each badge already declares. Nothing to fall back to, and
+   nothing lost by waiting for it. */
+@supports (text-box-trim: trim-both) {
+    /* The trim applies to the block container holding the text. A flex
+       container's text lives in an ANONYMOUS item, which inherits none of it,
+       so each badge stops being a flex box and `align-content` takes over the
+       job `align-items` was doing. Aligned to the END, because the trimmed
+       box's bottom edge IS the baseline.
+
+       `inline-block` rather than `block`: every badge here is absolutely
+       positioned or a flex item, so both blockify to the same shrink-to-fit
+       box. This one also survives a badge landing in a plain line of text.
+
+       The two dots that wear `.badge` draw no glyph, so they keep the box their
+       own rules give them. `:where()` weighs nothing, so neither does the
+       `:not()` around it, and this still ties with every rule it re-homes.
+
+       A badge with no `--badge-height` gets an invalid box, so its height and
+       padding stay at their initial values. */
+    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
+    .section-count-badge,
+    .drawer-badge,
+    .brand-menu-ws-badge,
+    .ws-picker-badge,
+    .thread-status-question-badge,
+    .app-store-status,
+    .app-store-modified-chip,
+    .theme-card-badge {
+        display: inline-block;
+        text-align: center;
+        align-content: end;
+        text-box-trim: trim-both;
+        text-box-edge: cap alphabetic;
+        --badge-floor: round(down, var(--badge-height), 1px);
+        --badge-box: clamp(var(--badge-floor) - 1px,
+            round(1cap + 2 * round((var(--badge-floor) - 0.5px - 1cap) / 2, 1px), 1px),
+            var(--badge-floor));
+        height: var(--badge-box);
+        min-height: 0;
+        --badge-baseline-inset: round((var(--badge-box) - 1cap) / 2, 1px);
+        padding-block: 0 var(--badge-baseline-inset);
+    }
+
+    /* The one badge whose content can be an icon. While work runs, the brand
+       badge holds a spinning glyph instead of the "!", and while it waits, a
+       still hourglass. A line box trimmed to a cap band neither has would park
+       the icon off centre. So would the padding that lifts a baseline. It
+       keeps the flex centring. */
+    .badge:has(.brand-badge-spinner, .brand-badge-queued) {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-box-trim: none;
+        padding-block: 0;
+    }
+}
+
+/* ── And its corners ──────────────────────────────────────────────────────
+ *
+ * A badge is a circle, or a pill once its count outgrows one. That holds in
+ * every theme, a square one included: a square count reads as a key cap or a
+ * checkbox, not as a mark on the icon it rides. So the corner is a literal no
+ * radius token reaches, and it lives here alone. A badge rule elsewhere that
+ * set its own corner would hand the shape back to the theme.
+ * `styles/__tests__/radius-token-guard.test.ts` holds both halves. */
+.badge,
+.drawer-badge,
+.section-count-badge,
+.brand-menu-ws-badge,
+.ws-picker-badge,
+.thread-status-question-badge,
+.system-attention-badge,
+.brand-menu-refresh-badge {
+    border-radius: 999px;
+}
