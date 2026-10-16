@@ -1,0 +1,279 @@
+/* ───────────────────────────────────────────────────────────────────────
+   WaitingIndicator: the waiting indicator (ADR 0047), covering both things
+   that park a thread. A live event wait, and sub-threads still working.
+
+   Sits beside TodoListIndicator in the prompt-bar actions row and follows the
+   same contract: hidden entirely when the thread is waiting on nothing (the
+   component returns null), sizing inherited from .icon-btn.header-icon, and
+   the panel opened through <Overlay> with the indicator as its anchor. Its own
+   accent paint lives with the row's other lit controls, in
+   `styles/chat/input-messages.css`.
+
+   For an event wait it is the PRIMARY surface, not a shortcut to the
+   transcript card. A wait survives an interruption, so a thread can read as
+   idle and still be watching for something. This is the only place answering
+   "subscribed to what, for how much longer" without scrolling.
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* Shell geometry, placement, the title bar and the close button all come
+   from `.anchored-popover*` in `styles/global/anchored-popover.css`, which
+   the todo indicator beside it uses too. Only the width is this surface's own:
+   its rows carry a reason, a subscription, a countdown and a button. Both
+   bounds go through the shell's fit cap, since a bare `min-width` outranks
+   `max-width` and would put the panel back off the edge of a phone.
+
+   The fit is the THREAD PANE's width, published inline per-open by the
+   component, so 40rem is the cap only while the pane is wider than that; below
+   it the pane wins and the reason wraps. The panel is shrink-to-fit. A short
+   reason gets a narrow panel, and a long one uses a wide pane instead of
+   wrapping into a column. This rule only started binding when
+   the shell moved into its own file: `chat.css` imported `todo-list.css` after
+   this file, and the shell's own `max-width` sat in there at the same
+   specificity, so it beat this cap and the panel grew to the viewport. */
+/* The transcript chip's condition popover shows the same body as the drill-in,
+   so it shares these caps. */
+.waiting-panel,
+.event-condition-popover {
+    min-width: min(18rem, var(--anchored-popover-fit));
+    max-width: min(40rem, var(--anchored-popover-fit));
+}
+
+/* On a phone it takes the header palette width, so it matches the Lucidos
+   menu and the composer's model menu beside it. The component centres it in
+   the pane ('container-center'). */
+@media (--phone-layout) {
+    .waiting-panel {
+        width: min(var(--header-surface-width), var(--anchored-popover-fit));
+        min-width: 0;
+    }
+}
+
+/* One section per kind of wait. The gap is what separates them, so a panel
+   showing only one section is exactly the panel that shipped before the
+   sub-thread half joined it. */
+.waiting-panel-section + .waiting-panel-section {
+    margin-top: var(--space-lg);
+}
+
+/* Names the section rather than heading it, so it is a small caps label under
+   the panel's title rather than a second title. A real heading element
+   would pick up the h1-h6 sizing from shared-components.css, which is built
+   for page content and dwarfs a popover row.
+
+   `waitingPanelBody` draws it only when BOTH kinds of wait are present, since
+   that is when there are two lists to tell apart. */
+.waiting-panel-section-label {
+    display: block;
+    margin-bottom: var(--space-sm);
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+
+.waiting-panel-child-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+/* The whole row is the target, so a thumb can land anywhere on it. The button
+   carries the padding rather than the `li`, since the `li` is only there to
+   keep the list semantic.
+
+   Flat at rest, and tinted under a pointer only. A resting fill made every row
+   a small card inside the panel's own card, which is the nesting the report
+   named. The panel is already a box, and a second one around each row says
+   nothing the gap does not. */
+.waiting-panel-child-link {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.375rem 0.25rem;
+    border: none;
+    border-radius: calc(var(--radius-control) * 0.5);
+    background: none;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    line-height: 1.3;
+    text-align: left;
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .waiting-panel-child-link:hover {
+        background: var(--bg-tertiary, var(--bg-primary));
+    }
+}
+
+/* One column for the status mark, so every title starts on the same x. The
+   marks differ in size (the 0.4rem dot, the 0.7rem spinner and question
+   badge), and `.thread-status` is only as wide as whichever one it
+   holds, so without a column each row would indent by its own status.
+
+   One line tall, so the mark centres on the title's first line when the
+   title wraps. */
+.waiting-panel-child-link .thread-status {
+    flex: 0 0 0.75rem;
+    height: 1lh;
+    justify-content: center;
+}
+
+.waiting-panel-child-title {
+    min-width: 0;
+    flex: 1 1 auto;
+    word-break: break-word;
+}
+
+/* The children the server counts and this client cannot name. Muted and
+   unclickable, because there is nothing to open: it is a statement about the
+   list, not a row in it. */
+.waiting-panel-child-more {
+    padding: 0.375rem 0.25rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
+.event-wait-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+}
+
+/* The row STACKS rather than sitting in three columns, and that is the width
+   fix, not a style preference. The reason is the only part with something to
+   say, but it was the only part that could shrink: the mode + countdown column
+   and the Stop button were both `flex: 0 0 auto`, so on a phone they took their
+   full width first and left the reason two words per line. Stacked, the reason
+   gets the whole panel and the fixed-size chrome sits under it on one line.
+
+   It carries no fill and no padding of its own. A filled row inside the
+   popover's own filled box read as a card in a card, and on the common panel
+   holding ONE wait the inner box traced the outer one a few pixels in. The rule
+   below tells two rows apart, at the cost of a hairline instead of a surface. */
+.event-wait-item {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    font-size: var(--font-size-md);
+    line-height: 1.3;
+}
+
+/* Only BETWEEN rows, so the single-wait panel (nearly every one) draws no rule
+   at all and reads as plain content under the title bar. */
+.event-wait-item + .event-wait-item {
+    padding-top: var(--space-md);
+    border-top: 1px solid var(--border-color);
+}
+
+.event-wait-main {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+.event-wait-reason {
+    color: var(--text-primary);
+    word-break: break-word;
+}
+
+/* Wraps rather than ellipsizing. It is a list of event-type names joined by
+   " or " (`subscriptionLine`), so it breaks cleanly at a space, and now
+   that the panel is capped to the thread pane an ellipsis would hide the very
+   thing the row is answering: WHICH event this thread is watching for. */
+.event-wait-subscription {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    word-break: break-word;
+}
+
+/* A filtered entry, which opens its condition. It stays part of the muted line
+   rather than becoming a chip: the transcript's `.event-name` is already an
+   accent chip on its own row, but here every entry sits inside one sentence and
+   chipping them would make the panel's quietest line its loudest.
+
+   So it inherits the line's colour and takes ONLY the underline, drawn in the
+   accent at the same 40% strength `.accent-link` and `.event-name-link` use, so
+   "there is more behind this" reads the same wherever it appears. */
+.event-wait-subscription-filter {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    /* Family and size come from `base.css`'s control default, which inherits
+       them from the `<code>` around this. Weight and leading are named because
+       the UA button box supplies its own; the `font` shorthand would carry all
+       four and is banned (.claude/rules/frontend-css.md), since it also resets
+       font-feature-settings and hands a Fira Code user ligatures back. */
+    font-weight: inherit;
+    line-height: inherit;
+    color: inherit;
+    /* The UA centres a button's text, and this one is a run of prose in the
+       middle of a sentence. A wrapped event type therefore sat centred under a
+       left-aligned reason, on its own axis. An event type is long and the panel
+       is narrow, so it wraps on almost every phone. */
+    text-align: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    text-underline-offset: 0.125rem;
+}
+
+@media (hover: hover) {
+    .event-wait-subscription-filter:hover {
+        color: var(--accent);
+        text-decoration-color: var(--accent);
+    }
+}
+
+/* The row's fixed-size chrome, on one line under the reason: state and
+   countdown on the left, the Stop control pushed to the right. The margin
+   adds to the row's gap, so the button clears the subscription line. */
+.event-wait-foot {
+    display: flex;
+    /* The growing meta already pushes Stop to the right end. */
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-sm);
+    margin-top: var(--space-sm);
+}
+
+.event-wait-meta {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+.event-wait-countdown {
+    /* Tabular figures so a per-second countdown does not jitter the row's
+       width as the digits change. */
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+}
+
+.event-wait-stop {
+    flex: 0 0 auto;
+}
+
+/* The indicator's own paint is the accent, and it lives beside the row's other
+   lit controls in `styles/chat/input-messages.css` rather than here. Sizing is
+   still plain `.icon-btn.header-icon`.
+
+   It was `--text-secondary`, on the grounds that the button existing at all
+   already reported presence. True, and beside a lit follow toggle and a lit
+   todo indicator the one control saying "this thread is parked" was the
+   quietest thing in the row. An earlier `opacity: 0.7` on top of that gray was
+   worse still: an unconditional dim on a button whose neighbours are full
+   strength reads as disabled, and nothing about it is. */

@@ -1,0 +1,28 @@
+# ShellCheck configuration for the whole repo. Tracked on purpose: it must apply
+# to a bare `shellcheck scripts/foo.sh` typed by hand and to an editor's inline
+# ShellCheck just as it does to `make lint-shell`. A gate whose verdict disagrees
+# with the tool a developer runs by hand trains people to distrust the gate.
+#
+# Both settings exist to make ShellCheck resolve `source` the way the scripts
+# actually resolve it at RUNTIME. Every script here sources its libs relative to
+# its own location (`source "$SCRIPT_DIR/lib/workspace.sh"`, `source ./ports.sh`
+# from within scripts/lib/), but ShellCheck's default is to resolve a relative
+# source against the process CWD — so from the repo root it simply cannot find
+# scripts/lib/ports.sh behind `source ./ports.sh`, and reports SC1091.
+#
+#   external-sources  — follow `source`d files at all (the -x flag). Without it
+#                       ShellCheck refuses to read any file not named on the
+#                       command line, and a `# shellcheck source=...` directive
+#                       has no effect.
+#   source-path       — SCRIPTDIR is the special value meaning "the directory of
+#                       the script being checked", which is exactly the runtime
+#                       semantics above.
+#
+# This is STRICTLY MORE analysis, not less: ShellCheck parses the sourced lib and
+# sees the other side of every cross-file reference. That is also why it removes
+# far more than the SC1091s — most of the "SC2034 appears unused" and "SC2329
+# never invoked" reports in this repo were artifacts of ShellCheck not being able
+# to see the consumer. Suppressing those would have papered over this
+# misconfiguration and disarmed a check that is load-bearing for the genuine ones.
+external-sources=true
+source-path=SCRIPTDIR

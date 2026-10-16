@@ -1,0 +1,15 @@
+# Merge drivers for files a text merge gets wrong (ADR 0460). Register them
+# with ./scripts/merge-drivers.sh; /harden does it before merging main. A clone
+# without the registration merges these paths as plain text.
+
+# The ADR index: numbered lines, kept sorted, one per number.
+docs/adr/index.md merge=lucidos-sorted-lines
+
+# Registries: entries keyed by heading path or bullet label. Two entries added
+# at one spot both stay; two edits to one entry still conflict.
+docs/code-review-priors.md merge=lucidos-blocks
+docs/temporary-measures.md merge=lucidos-blocks
+docs/glossary.md merge=lucidos-blocks
+system-knowhow/glossary.md merge=lucidos-blocks
+CHANGELOG.md merge=lucidos-blocks
+.claude/rules/db.md merge=lucidos-blocks

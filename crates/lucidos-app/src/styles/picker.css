@@ -1,0 +1,1515 @@
+/* Workspace picker (ADR 0014) — the gateway root surface. Standalone screen.
+   The page wears the Lucidos brand blue (the same gradient the app mark uses),
+   the mark is the animated hero, and the workspace list is flat — no card chrome.
+   Everything is white-on-blue with translucent affordances. */
+
+.ws-picker {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4rem 1rem 3rem;
+  overflow-y: auto;
+  color: #fff;
+  /* The gateway surface wears a neutral sans-serif rather than the app's
+     monospace --font-ui — a calmer welcome screen. */
+  font-family: var(--font-sans);
+  /* The mark's own radial gradient, scaled to fill the viewport — a lighter
+     take on the brand blue, with a soft highlight for depth. */
+  background:
+    radial-gradient(60% 50% at 80% 0%, rgba(150, 200, 255, 0.45), transparent 70%),
+    radial-gradient(130% 120% at 28% 12%, #4a97ee 0%, #1f6fce 50%, #0c52ad 100%);
+  background-attachment: fixed;
+}
+
+.ws-picker-shell {
+  width: 100%;
+  max-width: 30rem;
+}
+
+/* The band the macOS traffic lights centre on, and nothing else. The picker
+   draws no header, so without this the shell centres the OS buttons on whatever
+   bar the last app page happened to persist. Measured through
+   [data-titlebar-band], exactly like the shell's own header.
+
+   The SAME token the shell's bar is built from, so the two cannot drift. That
+   token is declared inside the desktop media query, and the 3rem fallback covers
+   a window narrow enough to miss it. Invisible, and never a hit target: the
+   whole picker background is the window drag region. */
+.ws-picker-titlebar-band {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--desktop-bar-height, 3rem);
+  pointer-events: none;
+}
+
+/* Buttons/inputs don't inherit font-family from their container, so opt them
+   into the picker's neutral sans explicitly — otherwise they'd fall back to the
+   UA default and read differently from the surrounding text. */
+.ws-picker button,
+.ws-picker input {
+  font-family: inherit;
+}
+
+/* ── Header / animated mark ───────────────────────────────────────────────── */
+
+/* Header is the centered brand lockup, nothing else: the list and the footer
+   entry points below it are self-describing, so there is no subtitle. This
+   margin is therefore the whole gap to whatever follows (the brand lockup owns
+   none of its own, or the two would collapse into one). */
+.ws-picker-header {
+  text-align: center;
+  margin-bottom: 1.5rem;
+  position: relative;
+}
+
+/* Gateway reload control — sits just to the LEFT of the settings gear in the
+   header's top-right (2rem gear width + a 0.25rem gap), clear of the centered
+   brand lockup. Subtle until a new build is available, when it warms and grows a
+   badge dot. (Dev surface: only lights up when a rebuilt gateway binary is on
+   disk.) */
+.ws-picker-reload {
+  position: absolute;
+  top: 0;
+  right: 2.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease, opacity var(--duration-fast) ease;
+}
+.ws-picker-reload svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+@media (hover: hover) {
+  .ws-picker-reload:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+  }
+}
+.ws-picker-reload:disabled {
+  cursor: default;
+}
+/* New build waiting: warm gold + a badge dot. */
+.ws-picker-reload.has-update {
+  color: #ffd45e;
+}
+@media (hover: hover) {
+  .ws-picker-reload.has-update:hover {
+    color: #ffdf7e;
+  }
+}
+.ws-picker-reload.has-update::after {
+  content: '';
+  position: absolute;
+  top: 0.25rem;
+  right: 0.25rem;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-round);
+  background: #ffd45e;
+  box-shadow: 0 0 0 0.125rem rgba(10, 78, 168, 0.9);
+}
+/* Spin while the gateway re-execs. */
+.ws-picker-reload.is-reloading {
+  color: #fff;
+}
+.ws-picker-reload.is-reloading svg {
+  animation: ws-reload-spin 0.8s linear infinite;
+}
+@keyframes ws-reload-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Network access (settings) control — the RIGHTMOST header control, pinned to the
+   top-right corner (its natural corner); the reload control sits just to its left.
+   Mirrors the reload control's subtle styling. */
+.ws-picker-net-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+.ws-picker-net-btn svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+@media (hover: hover) {
+  .ws-picker-net-btn:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+  }
+}
+.ws-picker-net-btn:disabled {
+  cursor: default;
+}
+
+/* Network access popover — drops from the settings gear in the header's top-right
+   corner, right-aligned to the same edge (the gear is at right:0). Inherits
+   ws-picker-confirm's chrome. Tuned for a compact, refined rhythm: secondary prose
+   uses translucent white (the picker's white-on-blue stand-in for
+   --text-secondary, applied via color not opacity so the accent inside it stays
+   full-strength). */
+.ws-picker-net {
+  top: 2.25rem;
+  right: 0;
+  width: min(21rem, calc(100vw - 2rem));
+  text-align: left;
+}
+.ws-picker-net-title {
+  margin: 0 0 0.25rem;
+  /* Clearly larger + brighter than the description below. The class also sets an
+     explicit white color: as a bare <h2> it would otherwise inherit the global
+     `h2 { color: var(--text-primary) }`, which is dark in light theme and renders
+     the heading near-invisible on the dark-blue popover — so the muted-white
+     description visually outweighed it. */
+  font-size: var(--font-size-2xl);
+  font-weight: 600;
+  line-height: 1.25;
+  color: #fff;
+}
+.ws-picker-net-desc {
+  margin: 0 0 0.625rem;
+  font-size: var(--font-size-md);
+  color: rgba(255, 255, 255, 0.62);
+  line-height: 1.4;
+}
+
+/* Value-bearing controls (segmented bind picker, address field, inherit toggle).
+   They render at full structure immediately so the popover's height is fixed at
+   open; until the gateway config lands they dim + go inert, with NO value marked
+   active, so the popover can never show a bind other than the saved one. When it
+   settles they fade to full strength and the saved segment's thumb fades in.
+   `data-state` is the single marker for that: loading (or not-loaded yet) and
+   failed both read as unsettled. */
+.ws-picker-net-controls {
+  transition: opacity var(--duration-normal) ease;
+}
+.ws-picker-net-controls[data-state='loading'],
+.ws-picker-net-controls[data-state='failed'] {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* A row whose presence depends on the loaded value (the address field, the
+   failure notice). It stays MOUNTED and animates its own height, so settling on
+   a saved IP grows the popover smoothly instead of snapping, and switching
+   modes glides. `grid-template-rows: 0fr -> 1fr` is what lets a transition run
+   to an auto height; the inner element owns the overflow clip. */
+.ws-picker-net-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows var(--duration-normal) ease,
+    opacity var(--duration-normal) ease;
+}
+.ws-picker-net-collapse > * {
+  overflow: hidden;
+  min-height: 0;
+}
+.ws-picker-net-collapse.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+/* Each collapsible owns its leading gap as PADDING inside the clipped box, so a
+   closed row contributes exactly zero height. A margin would survive the clip
+   and leave a phantom gap when the row is shut. */
+.ws-picker-net-address,
+.ws-picker-net-failure {
+  padding-top: 0.5rem;
+}
+.ws-picker-net-failure .ws-picker-net-error {
+  margin-top: 0;
+}
+
+/* Three-mode bind picker as a single connected segmented control: an inset
+   track holds equal-width segments, the selected one lifts to a white thumb
+   (the picker's accent idiom — matching the unread badge / play pill). */
+.ws-picker-net-modes {
+  display: flex;
+  gap: 0.1875rem;
+  padding: 0.1875rem;
+  /* No bottom margin: the gap below belongs to whatever follows (the address
+     collapse's own padding, or the toggle's margin), so a closed collapse
+     leaves the spacing exactly as if it were not there. */
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-control);
+}
+.ws-picker-net-mode {
+  flex: 1 1 0;
+  padding: 0.375rem 0.25rem;
+  border: none;
+  border-radius: calc(var(--radius-control) * 0.75);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  line-height: 1.25;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+@media (hover: hover) {
+  .ws-picker-net-mode:hover:not(.active) {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+  }
+}
+.ws-picker-net-mode.active {
+  background: rgba(255, 255, 255, 0.92);
+  color: #0c3f86;
+  font-weight: 600;
+  box-shadow: 0 0.0625rem 0.1875rem rgba(3, 25, 60, 0.35);
+}
+.ws-picker-net-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.625rem;
+  font-size: var(--font-size-md);
+  cursor: pointer;
+}
+.ws-picker-net-hint {
+  margin: 0.25rem 0 0;
+  font-size: var(--font-size-sm);
+  color: rgba(255, 255, 255, 0.6);
+  line-height: 1.4;
+}
+/* Inline text-button affordances inside the popover: the detected Tailscale IP
+   (one tap drops it into the address field) and the failure row's Retry. Both
+   are accent-tinted and underline on hover. Full-strength color (their parent
+   line uses color, not opacity) so they read as interactive. */
+.ws-picker-net-detected,
+.ws-picker-net-retry {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  /* `font` resets font-feature-settings to initial; keep inheriting it
+     so a Fira Code user does not get ligatures back here. */
+  font-feature-settings: inherit;
+  font-weight: 600;
+  color: #bcd8ff;
+  cursor: pointer;
+  border-radius: calc(var(--radius-control) * 0.5);
+}
+.ws-picker-net-detected:focus-visible,
+.ws-picker-net-retry:focus-visible {
+  color: #e7f1ff;
+  text-decoration: underline;
+  outline: none;
+}
+@media (hover: hover) {
+  .ws-picker-net-detected:hover,
+  .ws-picker-net-retry:hover {
+    color: #e7f1ff;
+    text-decoration: underline;
+  }
+}
+.ws-picker-net-error {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: var(--font-size-sm);
+  color: #ffd9d4;
+}
+.ws-picker-net-restart {
+  margin: 0.625rem 0 0;
+  font-size: var(--font-size-sm);
+  color: rgba(255, 255, 255, 0.7);
+  font-style: italic;
+}
+/* A touch of breathing room above Save / Cancel after the compacted body. The
+   confirm button holds a width: the row is right-aligned, so letting it grow
+   from "Save" to "Saving…" would shove Cancel sideways mid-save. Sized to the
+   LONGER label, or it would not hold anything: "Saving…" is ~3.5rem of 14px/500
+   text plus the button's 1.75rem of side padding, so the floor has to clear
+   ~5.25rem. In rem, so it tracks the user's UI scale with the text. */
+.ws-picker-net .ws-picker-confirm-actions {
+  margin-top: 0.75rem;
+}
+.ws-picker-net .ws-picker-btn-confirm {
+  min-width: 5.75rem;
+}
+/* Why Save is unavailable, on the same row as the buttons so it costs no
+   height. Takes the leftover width (the row is right-aligned) and is clipped
+   rather than wrapped, so a long reason can never grow the row and reflow the
+   popover mid-interaction. */
+.ws-picker-net-blocked {
+  margin-right: auto;
+  min-width: 0;
+  align-self: center;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--font-size-sm);
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/* Brand lockup: the animated mark with the wordmark vertically centered to it,
+   the pair centered horizontally in the header. */
+.ws-picker-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+}
+
+.ws-picker-mark {
+  flex: 0 0 auto;
+  width: 3rem;
+  height: 3rem;
+  display: block;
+  /* Corner radius + shadow are kept proportional to the mark size (the original
+     5rem mark used 1.375rem / 0.75rem / 1.75rem) so the squircle shape and depth
+     read the same at this smaller size instead of over-rounding. */
+  border-radius: calc(var(--radius-control) * 1.65);
+  filter: drop-shadow(0 0.45rem 1.05rem rgba(3, 33, 80, 0.55));
+}
+
+/* Logo reveal (Logo Studio): a sparkle flashes at each tile in turn, drops a
+   square behind it, and rests as the spark at the top-right — TL → BL → BR → TR.
+   Each element shares keyframes; the per-tile order comes from inline delays.
+   Those delays scale too (see WorkspacePicker.tsx): scaling a duration without
+   its delay slides the tiles out of order at any speed but 1x. */
+.ws-rv-sq,
+.ws-rv-flash,
+.ws-rv-final {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+/* Squares settle in (base state visible, so reduced-motion shows the mark). */
+.ws-rv-sq {
+  animation: ws-rv-pop var(--duration-emphasis) cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* Transient sparkles burst then vanish as their square lands (base hidden). */
+.ws-rv-flash {
+  opacity: 0;
+  animation: ws-rv-flash var(--duration-emphasis) ease-out both;
+}
+
+/* The top-right spark lands last with one clean spring pop, then idles with a
+   subtle scale-only pulse. Pulsing scale (not opacity) keeps it full-brightness
+   so it never dims below the squares, and the pulse's 0% IS the landed state
+   (scale 1, opacity untouched) so the hand-off is seamless — no jump. */
+.ws-rv-final {
+  animation:
+    ws-rv-final-in calc(0.55s * var(--duration-scale))
+      cubic-bezier(0.34, 1.56, 0.64, 1) calc(1.5s * var(--duration-scale)) both,
+    /* The pulse is indefinite, so its duration stays a literal. Its delay is
+       the hand-off point and scales with the landing that precedes it. */
+    ws-rv-pulse 3.4s ease-in-out calc(2.05s * var(--duration-scale)) infinite;
+}
+
+@keyframes ws-rv-pop {
+  0% { opacity: 0; transform: scale(0); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes ws-rv-flash {
+  0% { opacity: 0; transform: scale(0) rotate(0deg); }
+  35% { opacity: 1; transform: scale(1) rotate(45deg); }
+  70% { opacity: 0.9; transform: scale(0.95) rotate(80deg); }
+  100% { opacity: 0; transform: scale(0.4) rotate(110deg); }
+}
+@keyframes ws-rv-final-in {
+  0% { opacity: 0; transform: scale(0) rotate(-30deg); }
+  100% { opacity: 1; transform: scale(1) rotate(0deg); }
+}
+@keyframes ws-rv-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); }
+}
+
+.ws-picker-header h1 {
+  margin: 0;
+  /* line-height 1 trims the wordmark's line box to the glyphs so it centers
+     cleanly against the logo without the font's leading offsetting it. */
+  line-height: 1;
+  color: #fff;
+  font-size: var(--font-size-display);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* ── States ──────────────────────────────────────────────────────────────── */
+
+.ws-picker-error {
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 138, 128, 0.6);
+  color: #ffd9d4;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
+  padding: 0.625rem 0.875rem;
+  margin-bottom: 1rem;
+  font-size: var(--font-size-lg);
+}
+
+/* ── Loading skeleton ────────────────────────────────────────────────────────
+   The list placeholder renders the real `.ws-picker-row`/`.ws-picker-open`
+   markup via the shared self-skeletonizing primitives (Skeleton.tsx → `.sk-bar`
+   leaves), so its row height is the real row's by construction and the
+   skeleton→list handoff does not reflow. Every cell a loaded row always draws
+   therefore has a placeholder: the dot, the name, the backup line under it, and
+   the 2rem action block. The picker sits on the brand-blue gradient, where an
+   accent shine would vanish, so its two bar colours are white-on-blue instead.
+   Scoped to the whole picker so both the workspace-list rows and the Network
+   access popover skeleton share the shimmer. */
+.ws-picker .sk-bar {
+  --sk-base: rgba(255, 255, 255, 0.08);
+  --sk-shine: rgba(255, 255, 255, 0.2);
+}
+
+/* ── List / rows (flat, no card) ─────────────────────────────────────────── */
+
+.ws-picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.ws-picker-row {
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+.ws-picker-row:last-child {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+/* The two quantities the row's own geometry is made of, named because a third
+   thing now derives from them: the fault note indents itself to the name
+   column, which is exactly the dot plus one gap. A copy of either number there
+   would put the note off that column the moment the row is retuned. On :root
+   rather than on the row, so the live style remote can reach them (see the
+   header of styles/header-mark.css for why that matters). */
+:root {
+  /* The picker's popovers (row menu, reload and stop confirms, network access).
+     The gateway page wears its own brand skin rather than the app theme, so
+     its surface colours are named here once instead of in each rule. */
+  --ws-picker-surface: #0c3f86;
+  --ws-picker-surface-edge: rgba(255, 255, 255, 0.2);
+  --ws-picker-surface-shadow: 0 0.5rem 1.5rem rgba(3, 25, 60, 0.55);
+  --ws-picker-dot-size: 0.625rem;
+  --ws-picker-row-gap: 0.75rem;
+  /* The name's line-height, named because the dot derives its offset from it:
+     the dot sits on the name's FIRST line, and a copy of this number there
+     would drift the moment the name is retuned. */
+  --ws-picker-name-line-height: 1.25;
+  /* The line-height of the quiet lines stacked under the name (the address,
+     the backup note). Named because the backup slot reserves its own height
+     from it, so the reservation is exactly the line it holds open. */
+  --ws-picker-sub-line-height: 1.4;
+  /* The gap between the row and the fault note under it. Its own quantity
+     rather than the row gap above, which is a column gap between three cells on
+     one line and reads as a chasm when spent vertically. */
+  --ws-picker-note-gap: 0.25rem;
+  /* The one coral the fault wears, on the dot, on its glow, and on the sentence
+     that explains it. Stated once so the three cannot drift; a literal, like
+     every other colour on this surface, because the picker is the gateway's own
+     white-on-blue screen and never wears an app theme (see the file header). */
+  --ws-picker-fault-color: #ff7b72;
+}
+
+/* The whole row opens the workspace. It stacks at most two boxes: the row line,
+   and an unhealthy row's fault note under it.
+
+   Keep it a COLUMN, never one wrapping flex line. A wrapping line collects its
+   items by HYPOTHETICAL size, which is content size before any shrinking. An
+   ellipsis and a `min-width: 0` therefore buy nothing at that stage, and a long
+   workspace name or a long `/slug/` address pushes the play and ⋯ buttons onto a
+   line of their own. Only the note may take a second line, so it gets its own
+   box and the three cells keep theirs. */
+.ws-picker-open {
+  display: flex;
+  flex-direction: column;
+  padding: 0.625rem 0.625rem 0.625rem 0.75rem;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+.ws-picker-open:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
+  outline: none;
+}
+@media (hover: hover) {
+  .ws-picker-open:hover {
+    background: rgba(255, 255, 255, 0.1);
+  }
+}
+
+/* The row's three cells (dot · name · actions), on one line and staying there.
+   It never wraps, so the name grows and ellipsizes and every workspace renders
+   identically regardless of how long it is called. */
+.ws-picker-line {
+  display: flex;
+  align-items: center;
+  gap: var(--ws-picker-row-gap);
+}
+
+.ws-picker-dot {
+  flex: 0 0 auto;
+  width: var(--ws-picker-dot-size);
+  height: var(--ws-picker-dot-size);
+  border-radius: var(--radius-round);
+  background: rgba(255, 255, 255, 0.45);
+}
+
+/* In a PICKER row, the dot sits on the name's first line rather than centred on
+   the cell: a wrapped name with the address under it is three lines deep, and a
+   centred dot lands beside line two, reading as a mark on that line.
+   Scoped to the row line, because the in-app workspace switcher wears this same
+   class (WorkspaceSwitcher.tsx) and its rows are a single centred line, which a
+   first-line offset would knock askew. */
+.ws-picker-line .ws-picker-dot {
+  align-self: flex-start;
+  margin-top: calc(
+    (var(--font-size-xl) * var(--ws-picker-name-line-height) - var(--ws-picker-dot-size)) / 2
+  );
+}
+.ws-picker-dot-healthy { background: #56d364; box-shadow: 0 0 0.5rem rgba(86, 211, 100, 0.7); }
+.ws-picker-dot-booting { background: #e3b341; animation: ws-dot-pulse 1.2s ease-in-out infinite; }
+.ws-picker-dot-stopped { background: rgba(255, 255, 255, 0.4); }
+.ws-picker-dot-unhealthy {
+  background: var(--ws-picker-fault-color);
+  box-shadow: 0 0 0.5rem color-mix(in srgb, var(--ws-picker-fault-color) 70%, transparent);
+}
+
+/* Why the dot is red, in words, on the row it belongs to. The second box in the
+   row's column (see .ws-picker-open), so it sits under the line rather than
+   inside it. It indents to the name column, which is the dot's width plus the
+   gap after it: derived rather than guessed, so it starts where the workspace
+   name starts.
+
+   It wraps rather than truncating. This is the gateway's own error text and its
+   length is not ours to predict, and a reason the user can only half-read is not
+   a reason. Quieter than the name above it and in the fault's own coral, so the
+   pairing with the dot is obvious without the row shouting. */
+.ws-picker-row-note {
+  margin: var(--ws-picker-note-gap) 0 0;
+  padding-left: calc(var(--ws-picker-dot-size) + var(--ws-picker-row-gap));
+  font-size: var(--font-size-sm);
+  color: var(--ws-picker-fault-color);
+  overflow-wrap: anywhere;
+}
+
+@keyframes ws-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* Name over address, as one cell. They identify the same workspace, so they
+   stack rather than compete for the row's one horizontal budget: side by side,
+   a long name and a long address each ellipsised the other down to about half,
+   and two rows differing only in their tail read as the same row.
+
+   It tops out with the dot, which gives the dot's offset above one origin to
+   measure from. Centred, this cell drops down the line whenever the ACTIONS
+   are the taller item. The dot stays pinned to the line's top, and floats
+   above the name it marks. */
+.ws-picker-id {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-self: flex-start;
+}
+
+/* The name is spelled WHOLE, however long, over as many lines as that needs.
+   It is the only thing telling two workspaces apart, and two names can share
+   every character up to their last word, so an ellipsis renders them the same
+   row. The row's height therefore follows the name, and not the reverse. */
+.ws-picker-name {
+  font-weight: 600;
+  font-size: var(--font-size-xl);
+  line-height: 1.25;
+  /* A workspace name can be one long unbroken token, which no soft break point
+     would let wrap. */
+  overflow-wrap: anywhere;
+}
+
+/* The workspace address (`/slug/`), shown only when it would otherwise surprise:
+   a rename moved the name off its address, or two rows share a name. Quiet and
+   monospaced so it reads as the path it is, and under the name rather than
+   beside it, since in both of those cases it is what tells two rows apart and
+   must be readable whole. */
+.ws-picker-address {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  line-height: var(--ws-picker-sub-line-height);
+  color: rgba(255, 255, 255, 0.6);
+  overflow-wrap: anywhere;
+}
+
+/* When this workspace last backed up successfully, stacked under the name (and
+   under the address when that shows). Quiet by default: it is reassurance, not
+   an announcement, and it sits on every row.
+
+   Warn wears the row's own coral, the same one the fault note and the unhealthy
+   dot use. So "something needs your attention" looks like one thing on this
+   surface, whatever raised it. Three states land there, and each is a real
+   warning: a stale backup, a schedule that has never produced one, and a
+   workspace with no backups at all.
+
+   The line stays open whether or not there is a sentence in it. That is what
+   makes every row one height, and keeps the row still when the poll answers.
+   A block, so the reservation applies: `min-height` says nothing to a
+   non-replaced inline. */
+.ws-picker-backup {
+  display: block;
+  font-size: var(--font-size-sm);
+  line-height: var(--ws-picker-sub-line-height);
+  min-height: calc(var(--font-size-sm) * var(--ws-picker-sub-line-height));
+  color: rgba(255, 255, 255, 0.6);
+}
+.ws-picker-backup-warn {
+  color: var(--ws-picker-fault-color);
+}
+
+/* Per-workspace unread-notification count. Sits between the (flex-grow) name and
+ * the row actions, so a long name ellipsizes before crowding the badge. A calm
+ * white-on-translucent pill — distinct from the status dot's green/gold/red so it
+ * reads as a count, not a health state. */
+.ws-picker-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* The design height, which styles/badges.css rounds to whole pixels. */
+  --badge-height: 1.25rem;
+  min-width: var(--badge-box, var(--badge-height));
+  height: var(--badge-height);
+  padding: 0 0.375rem;
+  background: rgba(255, 255, 255, 0.92);
+  color: #0a3d91;
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.ws-picker-actions {
+  flex: 0 0 auto;
+  display: flex;
+  /* The row's line already ends with this cell. */
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.125rem;
+}
+
+/* ── Icon action buttons ─────────────────────────────────────────────────── */
+
+.ws-picker-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease, opacity var(--duration-fast) ease;
+}
+.ws-picker-icon svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+@media (hover: hover) {
+  .ws-picker-icon:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+  }
+}
+.ws-picker-icon:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Play/pause is the prominent inline control — filled white pill. */
+.ws-picker-icon-play {
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+}
+@media (hover: hover) {
+  .ws-picker-icon-play:hover {
+    background: rgba(255, 255, 255, 0.32);
+  }
+}
+
+/* Stop reuses the play pill, but warns on hover — stopping is destructive
+   (the workspace becomes unreachable until restarted). */
+@media (hover: hover) {
+  .ws-picker-icon-stop:hover:not(:disabled) {
+    background: rgba(248, 81, 73, 0.9);
+    color: #fff;
+  }
+}
+
+/* Positioned wrapper so the (backdrop-less) stop-confirm <Overlay> can hang
+   just below the stop button, the same way the ⋯ menu hangs off its trigger. */
+.ws-picker-stop-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+/* Overflow (⋯) trigger — quiet, like the play button's restrained sibling. */
+.ws-picker-icon-more { color: rgba(255, 255, 255, 0.8); }
+
+/* ── Overflow menu (autostart / rename / delete) ─────────────────────────── */
+
+/* The ⋯ button anchors the menu — a positioned wrapper so the (backdrop-less)
+   <Overlay> panel can place itself just below-right of the trigger. */
+.ws-picker-menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.ws-picker-menu {
+  position: absolute;
+  top: calc(100% + 0.25rem);
+  right: 0;
+  z-index: var(--z-float);
+  min-width: 11rem;
+  display: flex;
+  flex-direction: column;
+  padding: 0.25rem;
+  border-radius: var(--radius-surface);
+  /* Solid panel so it reads above the translucent rows; brand-dark with a hairline
+     edge and a soft drop shadow for separation. */
+  background: var(--ws-picker-surface);
+  border: 1px solid var(--ws-picker-surface-edge);
+  box-shadow: var(--ws-picker-surface-shadow);
+}
+
+.ws-picker-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  width: 100%;
+  padding: 0.5rem 0.625rem;
+  border: none;
+  border-radius: calc(var(--radius-control) * 0.875);
+  background: transparent;
+  color: #fff;
+  font-size: var(--font-size-lg);
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
+}
+.ws-picker-menu-item svg {
+  flex: 0 0 auto;
+  width: 1.0625rem;
+  height: 1.0625rem;
+  color: rgba(255, 255, 255, 0.75);
+}
+@media (hover: hover) {
+  .ws-picker-menu-item:hover:not(:disabled) { background: rgba(255, 255, 255, 0.16); }
+}
+.ws-picker-menu-item:disabled { opacity: 0.5; cursor: default; }
+/* Autostart-on: warm gold, matching the old toggle's "on" state. */
+.ws-picker-menu-item.is-on svg { color: #ffd45e; }
+@media (hover: hover) {
+  .ws-picker-menu-item-danger:hover:not(:disabled) {
+    background: rgba(248, 81, 73, 0.3);
+    color: #ffd9d4;
+  }
+  .ws-picker-menu-item-danger:hover:not(:disabled) svg { color: #ffd9d4; }
+}
+
+/* ── Anchored confirm popover (gateway reload) ───────────────────────────── */
+
+.ws-picker-confirm {
+  position: absolute;
+  z-index: var(--z-float);
+  width: 16rem;
+  padding: 0.75rem;
+  border-radius: var(--radius-surface);
+  background: var(--ws-picker-surface);
+  border: 1px solid var(--ws-picker-surface-edge);
+  box-shadow: var(--ws-picker-surface-shadow);
+  text-align: left;
+}
+/* The reload icon sits just left of the settings gear (right: 2.25rem), so the
+   confirm hangs below it, right-aligned to the icon's right edge. */
+.ws-picker-confirm-reload {
+  top: 2.25rem;
+  right: 2.25rem;
+}
+/* The stop confirm hangs below-right of the row's stop button. */
+.ws-picker-confirm-stop {
+  top: calc(100% + 0.25rem);
+  right: 0;
+}
+.ws-picker-confirm-text {
+  margin: 0 0 0.625rem;
+  font-size: var(--font-size-md);
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.85);
+}
+.ws-picker-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.375rem;
+}
+
+/* ── Inline forms (rename / delete / create) ─────────────────────────────── */
+
+.ws-picker-inline {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  flex-wrap: wrap;
+  width: 100%;
+  padding: 0.5rem 0.25rem;
+}
+
+.ws-picker-delete {
+  font-size: var(--font-size-lg);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+/* Rename: the field row plus the "that name is taken" line under it. */
+.ws-picker-rename {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  width: 100%;
+  padding-bottom: 0.5rem;
+}
+.ws-picker-rename .ws-picker-note {
+  padding: 0 0.25rem;
+}
+
+.ws-picker-input {
+  flex: 1;
+  min-width: 8rem;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: var(--radius-control);
+  color: #fff;
+  padding: 0.4375rem 0.625rem;
+  font-size: var(--font-size-xl);
+}
+.ws-picker-input::placeholder { color: rgba(255, 255, 255, 0.55); }
+.ws-picker-input:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.6);
+}
+
+.ws-picker-btn {
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  border-radius: var(--radius-control);
+  padding: 0.4375rem 0.875rem;
+  font-size: var(--font-size-lg);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease;
+}
+@media (hover: hover) {
+  .ws-picker-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.24); }
+}
+.ws-picker-btn:disabled { opacity: 0.45; cursor: default; }
+.ws-picker-btn-confirm { background: #2ea043; border-color: transparent; }
+@media (hover: hover) {
+  .ws-picker-btn-confirm:hover:not(:disabled) { background: #3fb950; }
+}
+.ws-picker-btn-danger { background: #da3633; border-color: transparent; }
+@media (hover: hover) {
+  .ws-picker-btn-danger:hover:not(:disabled) { background: #f85149; }
+}
+
+/* Create form: stacks the quick-fill suggestion chips above the name-input row. */
+.ws-picker-create {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  width: 100%;
+}
+
+/* First-run quick-fill name chips, shown while the name field is empty. */
+.ws-picker-suggestions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  padding: 0.25rem 0.25rem 0;
+}
+
+.ws-picker-suggestions-label {
+  font-size: var(--font-size-md);
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.ws-picker-suggestion {
+  border: 1px solid rgba(255, 255, 255, 0.32);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  border-radius: calc(var(--radius-control) * 2);
+  padding: 0.25rem 0.75rem;
+  font-size: var(--font-size-md);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
+}
+@media (hover: hover) {
+  .ws-picker-suggestion:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.2);
+    border-color: rgba(255, 255, 255, 0.6);
+  }
+}
+.ws-picker-suggestion:disabled { opacity: 0.45; cursor: default; }
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+
+/* The gap is what separates the two entry points from whichever form is
+   unfolded under them, so it is wide enough to read as a break rather than as
+   part of the same control cluster. */
+.ws-picker-footer {
+  margin-top: 1.5rem;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.ws-picker-new {
+  border: 1px dashed rgba(255, 255, 255, 0.4);
+  background: transparent;
+  color: #fff;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
+  padding: 0.625rem 1.125rem;
+  font-size: var(--font-size-xl);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
+}
+@media (hover: hover) {
+  .ws-picker-new:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.7);
+  }
+}
+.ws-picker-new:disabled { opacity: 0.45; cursor: default; }
+/* The entry point whose form is unfolded below it: solid border and a lifted
+   surface, so the two permanent controls read as a pair with one of them open
+   rather than as two identical buttons. */
+.ws-picker-new.is-open {
+  border-style: solid;
+  border-color: rgba(255, 255, 255, 0.75);
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* The two footer entry points (New / Restore) sit side by side. */
+.ws-picker-footer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+/* On a phone they stop being two ragged pills floating in the middle: each
+   takes the full shell width and they stack, so the tap targets line up with
+   the workspace rows above them. Shrink-to-fit is a desktop affordance here;
+   at this width the shell IS the column, so anything narrower reads as
+   unfinished. */
+@media (--phone-layout) {
+  .ws-picker-footer-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+/* ── Restore from backup ─────────────────────────────────────────────────── */
+
+.ws-picker-restore-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.5rem 0.25rem;
+}
+
+/* Labelled field: a caption above its control. Placeholders alone left the
+   restore form unreadable (three unlabelled boxes, one of them a password), and
+   a caption survives being filled in. */
+.ws-picker-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  text-align: left;
+}
+
+.ws-picker-field-label {
+  font-size: var(--font-size-md);
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+/* Lead sentence for a form: what this does and what you need for it. */
+.ws-picker-lead {
+  margin: 0;
+  font-size: var(--font-size-md);
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.75);
+}
+.ws-picker-lead code {
+  font-size: inherit;
+  padding: 0 0.1875rem;
+  border-radius: calc(var(--radius-control) * 0.5);
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* Explanatory line under a form: what is still missing, or what the address
+   will end up being. Never an error, so it stays in the muted voice. */
+.ws-picker-note {
+  margin: 0;
+  text-align: left;
+  font-size: var(--font-size-md);
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.72);
+}
+.ws-picker-note-warn { color: #ffd9d4; }
+
+/* Drop-or-click target for the .enc file. Dashed like the New button so it
+   reads as the same family of affordance. */
+.ws-picker-restore-drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 3rem;
+  padding: 0.75rem 1rem;
+  border: 1px dashed rgba(255, 255, 255, 0.45);
+  border-radius: calc(var(--radius-surface) * 5 / 6);
+  color: rgba(255, 255, 255, 0.8);
+  font-size: var(--font-size-lg);
+  text-align: center;
+  cursor: pointer;
+  transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
+}
+@media (hover: hover) {
+  .ws-picker-restore-drop:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.7);
+  }
+}
+/* A chosen file must be unmistakable: the empty and filled states differed only
+   by their text, so a form that had silently lost its file looked ready. */
+.ws-picker-restore-drop[data-picked="true"] {
+  border-style: solid;
+  border-color: rgba(86, 211, 100, 0.7);
+  background: rgba(86, 211, 100, 0.12);
+  color: #fff;
+  font-weight: 500;
+  word-break: break-all;
+}
+
+/* Collision: the message plus the way out of it (delete the workspace holding
+   the address), on one line that wraps on a narrow screen. */
+.ws-picker-restore-warn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  text-align: left;
+  font-size: var(--font-size-md);
+  color: #ffd9d4;
+}
+.ws-picker-restore-warn > span { flex: 1 1 12rem; min-width: 0; }
+
+/* Status banner above the footer (running / completed / failed). */
+.ws-picker-restore-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  flex-wrap: wrap;
+  margin-top: 1.25rem;
+  padding: 0.625rem 0.875rem;
+  border-radius: calc(var(--radius-surface) * 5 / 6);
+  font-size: var(--font-size-lg);
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+.ws-picker-restore-banner[data-state="completed"] {
+  border-color: rgba(86, 211, 100, 0.6);
+}
+.ws-picker-restore-banner[data-state="failed"] {
+  border-color: rgba(255, 138, 128, 0.6);
+  color: #ffd9d4;
+}
+/* The message is addressed by class, never by position. `> span:first-of-type`
+   reads as "the message", but in the running banner the SPINNER is the first
+   span, and at (0,2,1) that selector outranks the spinner's own flex rule
+   (0,1,0): the spinner grew to the full banner width and
+   `border-radius: 50%` turned it into a rotating ellipse spilling out of the
+   box. */
+.ws-picker-restore-banner > .ws-picker-restore-text { flex: 1 1 auto; min-width: 0; }
+
+/* The shared .mini-spinner, in white: the picker's brand blue is the same in
+   every theme, so its ink is too. */
+.ws-picker-restore-spinner {
+  --spinner-color: #fff;
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────────── */
+
+/* No reveal: squares and the final spark are visible at rest, transient sparks stay
+   hidden, so the static mark shows immediately. */
+:root[data-motion="reduce"] .ws-rv-sq,
+:root[data-motion="reduce"] .ws-rv-flash,
+:root[data-motion="reduce"] .ws-rv-final,
+:root[data-motion="reduce"] .ws-picker-dot-booting,
+:root[data-motion="reduce"] .ws-picker-reload.is-reloading svg {
+  animation: none;
+}
+/* The Network access popover settles instantly instead of fading/expanding.
+   It still never shows a value before it is settled, so the guarantee holds
+   without the motion. */
+:root[data-motion="reduce"] .ws-picker-net-controls,
+:root[data-motion="reduce"] .ws-picker-net-collapse,
+:root[data-motion="reduce"] .ws-picker-net-mode {
+  transition: none;
+}
+/* The pairing caret rests visible rather than blinking. It says where the
+   next digit lands, which is a fact rather than an animation. */
+:root[data-motion="reduce"] .pairing-code-field:focus-within .pairing-code-box[data-caret]::after {
+  animation: none;
+  opacity: 1;
+}
+
+/* ── Pairing gate ────────────────────────────────────────────────────────────
+   The screen an unpaired device sees before the picker. Sized for a phone
+   first: this is where a new phone lands after the gateway redirects it. */
+
+/* The gate scrolls itself, the way `.ws-picker` above does. `mobile.css` sets
+   `html { overflow: hidden }` on the phone layout, to hold the composer still when the
+   iOS keyboard opens, so a phone document does not scroll at all. A gate
+   leaning on document scroll is therefore simply clipped, and the install
+   recipe is the tallest thing it draws.
+
+   The gutter clears the safe area, which the gate has to do for itself. The
+   page is `viewport-fit=cover` under a translucent status bar, so an installed
+   app draws under the clock at the top and the home indicator at the bottom.
+   Nothing else insets this screen: it renders instead of the shell. */
+.pairing-gate {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  overflow-y: auto;
+  padding: calc(1.5rem + var(--safe-area-top))
+    calc(1.5rem + var(--safe-area-right)) calc(1.5rem + var(--safe-area-bottom))
+    calc(1.5rem + var(--safe-area-left));
+}
+
+/* A column on the page, not a card. Nothing shares this screen, so a border
+   round the only thing on it separates the content from nothing at all, and on
+   a phone it costs a gutter's width of the line length the steps need. The
+   gate's own padding is the gutter now.
+
+   Every field and control below wears a fill a step up from the page rather
+   than a step down, since the card no longer sits behind them to hold that
+   contrast. */
+.pairing-column {
+  width: 100%;
+  max-width: 24rem;
+  /* Centred by auto margins rather than by the gate's `align-items`, which
+     would put the top of an over-tall column above the scroll origin, where
+     nothing can reach it. Auto margins collapse to zero with no free space, so
+     the column starts at the top edge instead and every line stays
+     reachable. */
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.pairing-title {
+  margin: 0 0 0.25rem;
+  font-size: var(--font-size-3xl);
+  font-weight: 600;
+}
+
+.pairing-lede {
+  margin: 0 0 0.75rem;
+  color: var(--text-secondary);
+  font-size: var(--font-size-lg);
+  line-height: 1.5;
+}
+
+.pairing-label {
+  font-size: var(--font-size-md);
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.pairing-optional {
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+/* Box and focus: global/text-input.css. */
+.pairing-input {
+  padding: 0.625rem 0.75rem;
+  margin-bottom: 0.5rem;
+  /* 1rem, so iOS Safari does not zoom the page when the field takes focus. */
+  font-size: var(--font-size-xl);
+}
+
+/* The code field: one input under one box per digit. The input fills the
+   field, so a tap anywhere in it lands in the input.
+
+   A query container, because the row is the one place in the app where eight
+   boxes have to fit across a phone at any UI scale. Every rem below the row
+   would keep growing with the root while the card cannot, so the box sizes are
+   capped against this container's width. */
+.pairing-code-field {
+  position: relative;
+  margin-bottom: 0.5rem;
+  container-type: inline-size;
+}
+
+.pairing-code-entry {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  /* Invisible, never hidden. The browser still counts it as the field on
+     screen, so autofill and scroll-into-view aim at the boxes. */
+  color: transparent;
+  caret-color: transparent;
+  text-align: center;
+  font-size: var(--font-size-xl);
+  /* The active box wears the focus ring. The browser's own would draw a second
+     one, around a field whose edges nothing else marks. */
+  outline: none;
+}
+
+/* A selection would paint a block across the boxes the digits are drawn in. */
+.pairing-code-entry::selection {
+  background: transparent;
+  color: transparent;
+}
+
+.pairing-code-boxes {
+  display: grid;
+  /* Column per box, from however many boxes the markup drew. */
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: min(0.375rem, 2cqi);
+  /* Drawn, not typed into: every pointer event belongs to the input beneath. */
+  pointer-events: none;
+  /* Positioned, so these paint OVER the input rather than under it. The input
+     is absolutely positioned, and a browser repainting it (an autofilled field
+     gets its own background) would otherwise cover the boxes. */
+  position: relative;
+}
+
+.pairing-code-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Each capped against the row's own width, so eight boxes fit a phone at
+     every UI scale. The rem arm is what a roomy row uses, and the cqi arm
+     takes over once the boxes are narrower than the digits they hold. */
+  height: min(3rem, 18cqi);
+  border: 1px solid var(--border-color);
+  border-radius: calc(var(--radius-surface) * 2 / 3);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: min(var(--font-size-3xl), 8cqi);
+  line-height: 1;
+}
+
+/* Four and four. A code is read off a terminal a group at a time, and the
+   double gap is where the eye keeps its place. */
+.pairing-code-box:nth-child(4n + 1):not(:first-child) {
+  margin-inline-start: min(0.375rem, 2cqi);
+}
+
+.pairing-code-box[data-filled] {
+  border-color: var(--text-muted);
+}
+
+/* The box the next digit lands in, marked only while the field holds focus.
+   Away from it there is no cursor to point at. */
+.pairing-code-field:focus-within .pairing-code-box[data-active] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.pairing-code-box[data-caret]::after {
+  content: '';
+  width: 1px;
+  /* Half the box, so it stays a caret rather than a bar at any size. */
+  height: 50%;
+  background: var(--accent);
+  opacity: 0;
+}
+
+/* The caret the transparent input cannot draw. Indefinite, so it carries a
+   literal duration rather than a scaled token. */
+.pairing-code-field:focus-within .pairing-code-box[data-caret]::after {
+  animation: pairing-caret 1.06s step-end infinite;
+}
+
+@keyframes pairing-caret {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.pairing-error {
+  margin: 0 0 0.5rem;
+  color: var(--accent-red);
+  font-size: var(--font-size-md);
+}
+
+.pairing-submit {
+  padding: 0.75rem 1rem;
+  border: none;
+  border-radius: var(--radius-control);
+  background: var(--accent-action);
+  color: var(--text-on-accent);
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pairing-submit:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ── Install first ───────────────────────────────────────────────────────────
+   What a phone browser sees instead of the form. */
+
+.pairing-steps {
+  margin: 0 0 0.75rem;
+  padding-inline-start: 1.25rem;
+  color: var(--text-secondary);
+  font-size: var(--font-size-lg);
+  line-height: 1.6;
+}
+
+.pairing-steps li + li {
+  margin-top: 0.375rem;
+}
+
+/* The already-installed case, set apart from the steps above it: those two
+   answer different questions, and running them together reads as step four. */
+.pairing-aside {
+  margin-bottom: 0.75rem;
+  padding: 0.875rem;
+  border-radius: calc(var(--radius-surface) * 2 / 3);
+  background: var(--bg-tertiary);
+}
+
+.pairing-aside-title {
+  margin: 0 0 0.25rem;
+  font-size: var(--font-size-md);
+  font-weight: 600;
+}
+
+.pairing-aside-body {
+  margin: 0 0 0.75rem;
+  color: var(--text-secondary);
+  font-size: var(--font-size-md);
+  line-height: 1.5;
+}
+
+.pairing-code-readout {
+  margin-bottom: 0.625rem;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-2xl);
+  /* Four and four, as the boxes above group them. */
+  letter-spacing: 0.15em;
+}
+
+.pairing-code-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+/* The viewfinder. Square, so the QR the user is aiming at sits in the middle of
+   a shape that matches it, and `cover` because a phone's rear camera is far
+   from square and letterboxing it would shrink what the decoder sees. */
+.pairing-scanner-video {
+  width: 100%;
+  aspect-ratio: 1;
+  margin-bottom: 0.75rem;
+  border-radius: calc(var(--radius-surface) * 2 / 3);
+  background: var(--bg-secondary);
+  object-fit: cover;
+}
+
+.pairing-secondary {
+  padding: 0.5rem 0.875rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-control);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: var(--font-size-md);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.pairing-secondary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The escape, drawn as a link rather than a button: it is the way past advice
+   the user has read and decided against, not a second thing to do. */
+.pairing-escape {
+  align-self: center;
+  padding: 0.5rem;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  font-size: var(--font-size-md);
+  text-decoration: underline;
+  cursor: pointer;
+}
